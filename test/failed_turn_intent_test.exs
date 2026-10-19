@@ -43,6 +43,7 @@ defmodule Tightbeam.FailedTurnIntentTest do
       Wakes.schedule(ctx.db, %{
         session_key: ctx.child.session_key,
         origin: "agent:sender",
+        creator_session_key: ctx.parent.session_key,
         prompt: "continue the work",
         due_at: 1
       })
@@ -80,7 +81,7 @@ defmodule Tightbeam.FailedTurnIntentTest do
     assert String.starts_with?(retry_id, "wr_")
 
     assert {:accepted_in_txn, _event_id, %{canceled: true}} =
-             public_cancel(ctx.db, wake.wake_id, "agent:sender")
+             public_cancel(ctx.db, wake.wake_id, "agent:sender", ctx.parent.session_key)
 
     assert Wakes.get(ctx.db, retry_id).state == "canceled"
 
@@ -188,19 +189,19 @@ defmodule Tightbeam.FailedTurnIntentTest do
     seq
   end
 
-  defp public_cancel(db, wake_id, expected_origin) do
+  defp public_cancel(db, wake_id, expected_origin, sender) do
     case DB.transaction(db, fn txn ->
            Wakes.cancel_in_txn(txn, %{
              wake_id: wake_id,
              expected_origin: expected_origin,
-             requester: %{kind: "session", id: "test-session"},
+             requester: %{kind: "session", id: sender},
              reason_kind: "requester_withdrew",
              causal_source: %{
                kind: "verb_call",
                accepted_event: %{
                  origin: expected_origin,
-                 session_key: "test-session",
-                 principal: {:session, "test-session"}
+                 session_key: sender,
+                 principal: {:session, sender}
                }
              },
              outcome: %{kind: "no_replacement"}

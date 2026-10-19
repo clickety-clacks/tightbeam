@@ -219,14 +219,14 @@ defmodule Tightbeam.CronWakeTest do
     handler = Gateway.handlers(%{db: db})["wake"]
 
     for fired? <- [false, true] do
-      wake = schedule(db)
+      wake = schedule(db, %{origin: "session:recipient", creator_session_key: "recipient"})
       {:ok, []} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
       if fired?, do: CronWake.fire_due(db, System.system_time(:millisecond))
 
       result =
         handler.(%{
-          origin: "process:clock",
-          principal: {:process, "clock"},
+          origin: "session:recipient",
+          principal: {:session, "recipient"},
           session_key: "recipient",
           params: %{cancel_wake_id: wake.wake_id}
         })

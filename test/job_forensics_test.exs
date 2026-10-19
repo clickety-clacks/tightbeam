@@ -252,7 +252,7 @@ defmodule Tightbeam.JobForensicsTest do
   test "proof 6: every cancel path stamps canceledAt", %{db: db} do
     session(db, "k1")
 
-    # Path 1: an origin-guarded authenticated requester.
+    # Path 1: the authenticated recorded sender.
     a = Wakes.schedule(db, %{session_key: "k1", origin: "user:flynn", prompt: "a", due_at: 1})
     assert public_cancel(db, a.wake_id, "user:flynn", %{kind: "user", id: "flynn"})
     assert is_integer(Wakes.get(db, a.wake_id).canceled_at)
@@ -281,7 +281,7 @@ defmodule Tightbeam.JobForensicsTest do
 
     # A refused cancel stamps nothing.
     c = Wakes.schedule(db, %{session_key: "k1", origin: "user:flynn", prompt: "c", due_at: 1})
-    refute public_cancel(db, c.wake_id, "user:someone-else", %{kind: "user", id: "flynn"})
+    refute public_cancel(db, c.wake_id, "user:flynn", %{kind: "user", id: "someone-else"})
     assert is_nil(Wakes.get(db, c.wake_id).canceled_at)
     assert Wakes.get(db, c.wake_id).state == "pending"
 
@@ -345,6 +345,7 @@ defmodule Tightbeam.JobForensicsTest do
     work_item(db, "wi_requester")
     :ok = DB.execute(db, "UPDATE work_items SET state='closed' WHERE id='wi_requester'")
     session(db, "requester-session")
+    session(db, "other-session")
 
     wake =
       Wakes.schedule(db, %{
@@ -360,17 +361,18 @@ defmodule Tightbeam.JobForensicsTest do
              cancel_via_gateway(
                db,
                wake.wake_id,
-               "agent:another-role",
-               {:session, "requester-session"}
+               "agent:reviewer",
+               {:session, "other-session"}
              )
 
     refute Enum.any?(trace(db, "wi_requester").timeline, &(&1.type == "wake_canceled"))
 
+    # A changed role label does not change the recorded sender.
     assert %{canceled: true} =
              cancel_via_gateway(
                db,
                wake.wake_id,
-               "agent:reviewer",
+               "agent:another-role",
                {:session, "requester-session"}
              )
 
