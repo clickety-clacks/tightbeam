@@ -67,10 +67,12 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
   test "a delivered finish notice starts successive fallback reminders and survives restart",
        ctx do
+    stop_supervised!(ctx.scheduler)
     {parent_assignment, child_assignment, root} = completed_child(ctx)
     assert parent_assignment.state == "open"
     assert reminders(ctx.db, root.wake_id) == []
 
+    start_scheduler(ctx.db)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, root.wake_id).state == "fired"
     root_carrier_id = assert_delivered_carrier(ctx.db, root.wake_id)
@@ -82,7 +84,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
     finish_carrier_turn!(ctx.db, root_carrier_id)
 
-    [first] = pending_reminders(ctx.db, root.wake_id)
+    [first] = await_pending_reminders(ctx.db, root.wake_id)
     assert String.starts_with?(first.condition_kind, "terminal-child-owner-action-")
     assert first.condition_scope == root.wake_id
     assert first.owner_user_id == "flynn"
@@ -100,7 +102,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
              )
 
     assert replay.wake_id == root.wake_id
-    assert [^first] = pending_reminders(ctx.db, root.wake_id)
+    assert [^first] = await_pending_reminders(ctx.db, root.wake_id)
 
     set_due_now(ctx.db, first.wake_id)
     assert :ok = Wakes.fire_due(ctx.scheduler)
@@ -108,7 +110,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     first_carrier_id = assert_delivered_carrier(ctx.db, first.wake_id)
     finish_carrier_turn!(ctx.db, first_carrier_id)
 
-    assert [second] = pending_reminders(ctx.db, root.wake_id),
+    assert [second] = await_pending_reminders(ctx.db, root.wake_id),
            inspect(reminders(ctx.db, root.wake_id))
 
     refute second.wake_id == first.wake_id
@@ -123,11 +125,12 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert Wakes.get(ctx.db, second.wake_id).state == "fired"
     assert assert_delivered_carrier(ctx.db, first.wake_id) == first_carrier_id
     assert_delivered_carrier(ctx.db, second.wake_id)
-    [third] = pending_reminders(ctx.db, root.wake_id)
+    [third] = await_pending_reminders(ctx.db, root.wake_id)
     refute third.wake_id in [first.wake_id, second.wake_id]
   end
 
   test "startup recovers a terminal reminder when the gateway stops after root delivery", ctx do
+    stop_supervised!(ctx.scheduler)
     {_parent_assignment, _child_assignment, root} = completed_child(ctx)
     set_due_now(ctx.db, root.wake_id)
 
@@ -148,11 +151,10 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert Wakes.get(ctx.db, root.wake_id).delivered_turn_seq != nil
     assert reminders(ctx.db, root.wake_id) == []
 
-    stop_supervised!(ctx.scheduler)
     restarted = start_scheduler(ctx.db)
     assert :ok = Wakes.fire_due(restarted)
 
-    assert [reminder] = pending_reminders(ctx.db, root.wake_id)
+    assert [reminder] = await_pending_reminders(ctx.db, root.wake_id)
     assert reminder.session_key == "notice-parent"
   end
 
@@ -684,10 +686,10 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert :ok = Wakes.fire_due(ctx.scheduler)
     root_carrier_id = hd(NoticeBatcher.source_refs(ctx.db, root.wake_id)).delivery_wake_id
     finish_carrier_turn!(ctx.db, root_carrier_id)
-    [pending] = pending_reminders(ctx.db, root.wake_id)
+    [pending] = await_pending_reminders(ctx.db, root.wake_id)
     set_due_now(ctx.db, pending.wake_id)
     assert :ok = Wakes.fire_due(ctx.scheduler)
-    [successor] = pending_reminders(ctx.db, root.wake_id)
+    [successor] = await_pending_reminders(ctx.db, root.wake_id)
     assert_delivered_carrier(ctx.db, pending.wake_id)
 
     action = action_note(child_assignment.id, root, "retired", "retired the idle child session")
@@ -787,6 +789,18 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
   defp pending_reminders(db, root_id),
     do: Enum.filter(reminders(db, root_id), &(&1.state == "pending"))
+
+  # Observe the source owner's asynchronous follow-through without firing another pass.
+  defp await_pending_reminders(db, root_id, attempts \\ 200) do
+    case pending_reminders(db, root_id) do
+      [] when attempts > 0 ->
+        Process.sleep(10)
+        await_pending_reminders(db, root_id, attempts - 1)
+
+      reminders ->
+        reminders
+    end
+  end
 
   defp terminal_notices(db) do
     {:ok, rows} =

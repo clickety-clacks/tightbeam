@@ -1196,13 +1196,12 @@ defmodule Tightbeam.WakesTest do
     assert_received {:self_fire_returned, wake_id, nested_wake_id}
     assert wake_id == wake.wake_id
 
-    # The self-enqueued pass precedes this mailbox barrier. This does not
-    # request another delivery pass and cannot mask a missing continuation.
-    _ = :sys.get_state(scheduler)
-    assert Process.alive?(GenServer.whereis(scheduler))
-
+    # The self-cast queues a later pass, so a single mailbox barrier is not
+    # its completion signal. Observe delivery without requesting another pass.
     assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
-             NoticeBatcher.source_refs(db, nested_wake_id)
+             await_delivered_source(db, nested_wake_id)
+
+    assert Process.alive?(GenServer.whereis(scheduler))
 
     assert {:ok, [["k2", "queued", content]]} =
              DB.query(
@@ -1558,6 +1557,17 @@ defmodule Tightbeam.WakesTest do
                )
 
       assert parent_relation_snapshot(db) == before
+    end
+  end
+
+  defp await_delivered_source(db, wake_id, attempts \\ 200) do
+    refs = NoticeBatcher.source_refs(db, wake_id)
+
+    if attempts > 0 and not Enum.any?(refs, &(&1.batch_state == "delivered")) do
+      Process.sleep(10)
+      await_delivered_source(db, wake_id, attempts - 1)
+    else
+      refs
     end
   end
 
