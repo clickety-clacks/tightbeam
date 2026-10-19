@@ -195,6 +195,7 @@ defmodule Tightbeam.JobTraceTest do
       assert entry.schedulingOrigin == "process:tightbeam"
       assert {entry.requesterKind, entry.requesterId} == {"process", "tightbeam:assignments"}
       assert entry.workImpactKind == "linked_work_open"
+
       assert {entry.livenessTriggerKind, entry.livenessTriggerId, entry.actionNeeded} ==
                {nil, nil, false}
 
@@ -307,33 +308,35 @@ defmodule Tightbeam.JobTraceTest do
     assert is_integer(canceled_at) and canceled_at >= completion.ts
 
     # Exact equality also excludes private prompt, attest and transcript fields.
-    assert Enum.filter(trace.timeline, &(&1.type == "wake_canceled")) == source_cancellations ++ [
-             %{
-               assignmentId: "asg_direct",
-               at: canceled_at,
-               id: notice_id,
-               reason: nil,
-               seqTiebreak: wake_rowid,
-               type: "wake_canceled",
-               provenanceStatus: "proven",
-               schedulingOrigin: "process:tightbeam",
-               requesterKind: "process",
-               requesterId: "tightbeam:wake-scheduler",
-               reasonKind: "target_unresolvable",
-               causalSourceKind: "scheduler_delivery",
-               causalSourceId: notice_id,
-               outcomeKind: "no_replacement",
-               replacementWakeId: nil,
-               dispositionKind: nil,
-               dispositionId: nil,
-               primaryWorkKind: nil,
-               primaryWorkId: nil,
-               workImpactKind: "no_linked_work",
-               livenessTriggerKind: nil,
-               livenessTriggerId: nil,
-               actionNeeded: false
-             }
-           ]
+    assert Enum.filter(trace.timeline, &(&1.type == "wake_canceled")) ==
+             source_cancellations ++
+               [
+                 %{
+                   assignmentId: "asg_direct",
+                   at: canceled_at,
+                   id: notice_id,
+                   reason: nil,
+                   seqTiebreak: wake_rowid,
+                   type: "wake_canceled",
+                   provenanceStatus: "proven",
+                   schedulingOrigin: "process:tightbeam",
+                   requesterKind: "process",
+                   requesterId: "tightbeam:wake-scheduler",
+                   reasonKind: "target_unresolvable",
+                   causalSourceKind: "scheduler_delivery",
+                   causalSourceId: notice_id,
+                   outcomeKind: "no_replacement",
+                   replacementWakeId: nil,
+                   dispositionKind: nil,
+                   dispositionId: nil,
+                   primaryWorkKind: nil,
+                   primaryWorkId: nil,
+                   workImpactKind: "no_linked_work",
+                   livenessTriggerKind: nil,
+                   livenessTriggerId: nil,
+                   actionNeeded: false
+                 }
+               ]
 
     refute Enum.any?(trace.timeline, &(&1.type in ["marker", "disposition"]))
 
