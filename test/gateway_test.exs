@@ -1062,6 +1062,7 @@ defmodule Tightbeam.GatewayTest do
     Org.create(ctx.db, %{
       session_key: sender,
       display_name: "Sender",
+      kind: "main",
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: "default",
