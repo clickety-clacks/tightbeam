@@ -12,6 +12,41 @@ defmodule Tightbeam.HomesTest do
     %{base_dir: base_dir}
   end
 
+  test "copy projection replaces a planted link without changing operator credentials", %{
+    base_dir: base_dir
+  } do
+    auth_dir = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(auth_dir)
+    File.chmod!(auth_dir, 0o700)
+    operator_credential = Path.join(auth_dir, "cli-config.json")
+    File.write!(operator_credential, ~s({"version":1,"operator":true}))
+    File.chmod!(operator_credential, 0o600)
+
+    home = Homes.home_path(base_dir, "machine", :cursor)
+    File.mkdir_p!(home)
+    projected_credential = Path.join(home, "cli-config.json")
+    File.ln_s!(operator_credential, projected_credential)
+
+    Homes.reconcile(
+      %{host_config: %{ssh: nil, base_dir: base_dir}},
+      home,
+      %{harness: :cursor, machine: "machine", rails: nil, auth_dir: auth_dir},
+      credential_names: ["cli-config.json"],
+      credential_projection: :copy_readable,
+      preserve_manifest_dir: true,
+      before_credential_projection_promote: fn projected ->
+        File.rm!(projected)
+        File.ln_s!(operator_credential, projected)
+      end
+    )
+
+    assert File.read!(operator_credential) == ~s({"version":1,"operator":true})
+    assert Bitwise.band(File.stat!(operator_credential).mode, 0o777) == 0o600
+
+    assert File.read!(projected_credential) == ~s({"version":1,"operator":true})
+    assert Bitwise.band(File.stat!(projected_credential).mode, 0o777) == 0o640
+  end
+
   test "projects one generic home per machine and harness", %{base_dir: base_dir} do
     auth = Path.join(Homes.home_path(base_dir, "machine-a", :codex), "auth.json")
     File.mkdir_p!(Path.dirname(auth))
