@@ -199,7 +199,7 @@ defmodule Tightbeam.RestExecutionMapTest do
     send(reader_conn, :continue)
 
     assert {:ok, {:ok, :written}} = write_result
-    assert {:ok, {:ok, {[[1]], [[1]]}}} = Task.await(reader_task, 5_000)
+    assert {:ok, {[[1]], [[1]]}} = Task.await(reader_task, 5_000)
     assert {:ok, [[2]]} = DB.query(db, "SELECT value FROM read_snapshot_probe")
   end
 
