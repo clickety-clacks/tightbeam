@@ -133,6 +133,24 @@ defmodule Tightbeam.Productions.BubbleSweeper do
           {:error, %DB.Overloaded{}} ->
             {count, state}
 
+          {:error, {:source_actions, %DB.Overloaded{}}} ->
+            {count, state}
+
+          {:error, {:source_actions, error}} ->
+            # Delivered-record follow-through is never skipped: the turn stays
+            # behind the cursor and is retried every pass until its source
+            # actions succeed, so a restart still finds it (SN10).
+            failures = Map.get(state.failures, seq, 0) + 1
+
+            if rem(failures, 5) == 0 do
+              Logger.error(
+                "delivered source actions for turn #{seq} still failing after " <>
+                  "#{failures} attempts: #{inspect(error)}"
+              )
+            end
+
+            {count, %{state | failures: Map.put(state.failures, seq, failures)}}
+
           _ ->
             failures = Map.get(state.failures, seq, 0) + 1
 
@@ -197,7 +215,7 @@ defmodule Tightbeam.Productions.BubbleSweeper do
 
   defp recognize_one(db, seq) do
     case Bubble.recognize_terminal(db, seq) do
-      {:error, error} -> {:error, error}
+      {:error, error} -> {:error, {:source_actions, error}}
       _ -> :ok
     end
   rescue

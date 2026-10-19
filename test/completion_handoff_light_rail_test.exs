@@ -171,6 +171,78 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert [^reminder] = pending_reminders(ctx.db, root.wake_id)
   end
 
+  test "the turn-end sweep keeps retrying a failing terminal reminder and does not pass it",
+       ctx do
+    stop_supervised!(ctx.scheduler)
+    {_parent_assignment, _child_assignment, root} = completed_child(ctx)
+    set_due_now(ctx.db, root.wake_id)
+
+    assert {:ok, {:appended, _recipient, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 root.session_key,
+                 root.origin,
+                 root.prompt,
+                 wake_id: root.wake_id,
+                 sender: root.origin,
+                 target_gate: root,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    finish_carrier_turn!(ctx.db, root.wake_id)
+
+    assert {:ok, [[seq]]} =
+             DB.query(
+               ctx.db,
+               "SELECT seq FROM turns WHERE wakeId=?1 AND sessionKey='notice-parent'",
+               [root.wake_id]
+             )
+
+    # Every attempt to store the reminder fails until the trigger is dropped.
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               CREATE TEMP TRIGGER refuse_terminal_action_reminder
+               BEFORE INSERT ON main.wakes
+               WHEN NEW.obligationRef LIKE 'terminal-child-owner-action-reminder:%'
+               BEGIN SELECT RAISE(ABORT, 'reminder store refused'); END
+               """,
+               []
+             )
+
+    sweeper =
+      start_supervised!(
+        {Tightbeam.Productions.BubbleSweeper,
+         db: ctx.db, interval: 3_600_000, name: :completion_handoff_retry_sweeper}
+      )
+
+    ExUnit.CaptureLog.capture_log(fn ->
+      for _ <- 1..6, do: Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
+    end)
+
+    assert reminders(ctx.db, root.wake_id) == []
+    assert bubble_cursor(ctx.db) < seq
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "DROP TRIGGER temp.refuse_terminal_action_reminder", [])
+
+    Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
+
+    assert [reminder] = pending_reminders(ctx.db, root.wake_id)
+    assert reminder.session_key == "notice-parent"
+    assert bubble_cursor(ctx.db) >= seq
+  end
+
+  defp bubble_cursor(db) do
+    case DB.query(db, "SELECT seq FROM production_cursors WHERE name='bubble'", []) do
+      {:ok, [[cursor]]} -> cursor
+      {:ok, []} -> 0
+    end
+  end
+
   test "a retired opener is routed to Main when the finish notice is stored", ctx do
     stop_supervised!(ctx.scheduler)
     item = create_work_item(ctx, "completion with retired opener")
