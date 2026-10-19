@@ -1859,6 +1859,69 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
+  test "turn-end no-receipt prod skips an assignment opened after the turn began", ctx do
+    {:ok, _} = DB.query(ctx.db, "DELETE FROM assignments WHERE id='asg_1'")
+    seq = terminal!(ctx.db, "holder")
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE turns SET startedAt=100 WHERE seq=?1", [seq])
+    assignment(ctx.db, "asg_late", "holder", "review", 200)
+    insert_entitlement!(ctx.db, "asg_late", generation: 1, due_at: 0)
+
+    assert {:no_match, :turn_not_asked, %{id: "asg_late"}} =
+             Supervision.prod_production_matches?(ctx.db, "holder", seq)
+
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert Wakes.list_pending(ctx.db) == []
+
+    assert [%{"decision" => "none", "ref" => "asg_late", "statute" => nil}] =
+             rail_sweep_details(ctx.db, "holder")
+  end
+
+  test "turn-end no-receipt prod skips an assignment reopened after the turn began", ctx do
+    seq = terminal!(ctx.db, "holder")
+    {:ok, _} = DB.query(ctx.db, "UPDATE turns SET startedAt=100 WHERE seq=?1", [seq])
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO assignment_reopenings
+          (assignmentId, ts, reopenedBySession, reason, priorOutcome, priorClosedAt)
+        VALUES ('asg_1', 200, 'holder', 'reopened during unrelated turn', 'revoked', 50)
+        """
+      )
+
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+
+    assert {:no_match, :turn_not_asked, %{id: "asg_1"}} =
+             Supervision.prod_production_matches?(ctx.db, "holder", seq)
+
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert Wakes.list_pending(ctx.db) == []
+  end
+
+  test "turn-end no-receipt prod still checks an assignment open when the turn began", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert %{prodCount: 1} = Supervision.prod_state(ctx.db, "asg_1")
+    assert [%{assignment_id: "asg_1"}] = Wakes.list_pending(ctx.db)
+  end
+
+  test "turn-end no-receipt prod honors the assignment attached to the turn", ctx do
+    seq = terminal!(ctx.db, "holder")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE turns SET startedAt=100, assignmentId='asg_1' WHERE seq=?1", [seq])
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE assignments SET openedAt=200 WHERE id='asg_1'")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+
+    assert {:match, %{id: "asg_1"}} = Supervision.prod_production_matches?(ctx.db, "holder", seq)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+  end
+
   # The suppression is keyed on the assignment and lives in the branch that runs
   # only for a matched production, so a retractable no-match is untouched: a
   # work-blocked holder must still re-match this very terminal when the block is
