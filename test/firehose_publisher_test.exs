@@ -474,7 +474,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     assert {:ok, [[initial_deadline]]} =
-             DB.query(db, "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'", [assignment.id])
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               [assignment.id]
+             )
 
     assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
              Dispatch.dispatch(db, handlers, tests_passed)
@@ -482,17 +486,29 @@ defmodule Tightbeam.Firehose.PublisherTest do
     # The holder's attest and its holder-authored opener notice each reset inactivity.
     verdict_notices = observed_notices()
     assert Enum.count(verdict_notices, &(&1["class"] == "verb.accepted")) == 1
+
     assert [first_reset, second_reset, attest_notice] =
-             Enum.filter(verdict_notices, &match?({:ok, _}, Tightbeam.Firehose.Registry.fetch(&1["class"])))
+             Enum.filter(
+               verdict_notices,
+               &match?({:ok, _}, Tightbeam.Firehose.Registry.fetch(&1["class"]))
+             )
+
     final_deadline =
       Enum.reduce([first_reset, second_reset], initial_deadline, fn cancellation, wake_id ->
         assert cancellation["class"] == "wake.canceled"
         assert cancellation["refs"]["wakeId"] == wake_id
         assert cancellation["payload"]["state"] == "canceled"
+
         assert {:ok, [[replacement]]} =
-                 DB.query(db, "SELECT c.replacementWakeId FROM wake_cancellations c JOIN wakes w ON w.wakeId=c.wakeId WHERE c.wakeId=?1 AND w.assignmentId=?2 AND w.consumer='assignment_inactivity_deadline' AND c.reasonKind='superseded' AND c.causalSourceKind='wake' AND c.causalSourceId=c.replacementWakeId AND c.outcomeKind='replacement'", [wake_id, assignment.id])
+                 DB.query(
+                   db,
+                   "SELECT c.replacementWakeId FROM wake_cancellations c JOIN wakes w ON w.wakeId=c.wakeId WHERE c.wakeId=?1 AND w.assignmentId=?2 AND w.consumer='assignment_inactivity_deadline' AND c.reasonKind='superseded' AND c.causalSourceKind='wake' AND c.causalSourceId=c.replacementWakeId AND c.outcomeKind='replacement'",
+                   [wake_id, assignment.id]
+                 )
+
         replacement
       end)
+
     assert %{state: "pending"} = Wakes.get(db, final_deadline)
     assert attest_notice["class"] == "attest.filed"
     assert observed_state_classes() == []
@@ -1549,6 +1565,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
   defp observed_notices(acc \\ []) do
     _ = :sys.get_state(Hub)
+
     receive do
       {:firehose_notice, notice} ->
         Hub.delivered(Hub, self())
@@ -1560,7 +1577,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
   defp pending_decision_notice!(db, request_id) do
     assert {:ok, [[wake_id]]} =
-             DB.query(db, "SELECT wakeId FROM wakes WHERE consumer='prompt' AND state='pending' AND obligationRef=?1", [Wakes.decision_request_notice_ref(request_id)])
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE consumer='prompt' AND state='pending' AND obligationRef=?1",
+               [Wakes.decision_request_notice_ref(request_id)]
+             )
+
     wake_id
   end
 
@@ -1570,8 +1592,25 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert cancellation["refs"]["wakeId"] == wake_id
     assert cancellation["payload"]["state"] == "canceled"
     assert %{state: "canceled", fired_at: nil} = Wakes.get(db, wake_id)
-    assert {:ok, [["process", "tightbeam:escalation", "obligation_disposed", "decision_request", ^request_id, "disposition", "decision_request_transition", ^request_id]]} =
-             DB.query(db, "SELECT requesterKind,requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind,dispositionKind,dispositionId FROM wake_cancellations WHERE wakeId=?1", [wake_id])
+
+    assert {:ok,
+            [
+              [
+                "process",
+                "tightbeam:escalation",
+                "obligation_disposed",
+                "decision_request",
+                ^request_id,
+                "disposition",
+                "decision_request_transition",
+                ^request_id
+              ]
+            ]} =
+             DB.query(
+               db,
+               "SELECT requesterKind,requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind,dispositionKind,dispositionId FROM wake_cancellations WHERE wakeId=?1",
+               [wake_id]
+             )
   end
 
   defp receive_notice do
