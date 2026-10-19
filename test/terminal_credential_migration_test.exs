@@ -87,6 +87,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
 
     assert [
              @successor,
+             "decision-request-row-schema-v2-019",
              "notice-source-storage-v1-019",
              "assignment-source-replacement-v1-019",
              "work-item-delivery-owner-v1-019",
