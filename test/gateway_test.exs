@@ -1143,7 +1143,12 @@ defmodule Tightbeam.GatewayTest do
 
     post = Gateway.handlers(%{db: ctx.db})["post"]
 
-    attachment = %{"type" => "image", "name" => "diagram.png", "url" => "attachment://diagram"}
+    attachment = %{
+      "assetId" => "asset-post-1",
+      "mimeType" => "image/png",
+      "filename" => "diagram.png",
+      "size" => 123
+    }
 
     call = %{
       session_key: "k1",
