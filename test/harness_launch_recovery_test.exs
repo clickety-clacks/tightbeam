@@ -216,6 +216,26 @@ defmodule Tightbeam.HarnessLaunchRecoveryTest do
     assert HarnessProcess.fenced?(ctx.db, @key)
   end
 
+  test "a remote launch is never reboot proof", ctx do
+    {row, _} =
+      prepare(ctx,
+        cmd: ["ssh", "remote.invalid", "claude", "acp"],
+        process_ssh: "remote.invalid",
+        process_helper: "/satellite/bin/tightbeam",
+        process_identity_dir: "/satellite/tmp"
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE harness_processes SET preparationBootIdentity='previous-boot' WHERE launchId=?1",
+        [row.launch_id]
+      )
+
+    assert {:error, _} = settle(ctx, row)
+    assert HarnessProcess.fenced?(ctx.db, @key)
+  end
+
   test "a persistence fault rolls the row fence and lifecycle event back together", ctx do
     {row, _} = prepare(ctx)
     terminal(row)
