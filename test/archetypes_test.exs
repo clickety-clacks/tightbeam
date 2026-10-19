@@ -715,6 +715,17 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
+  test "legacy owner child prod manifest key is accepted and ignored" do
+    archetype =
+      Archetypes.parse_manifest!(
+        "name = \"legacy\"\nowner_open_child_prod = true\n",
+        "legacy.toml"
+      )
+
+    assert archetype.name == "legacy"
+    refute Map.has_key?(archetype, :owner_open_child_prod)
+  end
+
   test "idle cleanup is an optional boolean with a true default" do
     assert Archetypes.builtin_default().idle_cleanup == true
 
@@ -730,45 +741,6 @@ defmodule Tightbeam.ArchetypesTest do
       assert_raise ArgumentError, ~r/archetype idle_cleanup must be a boolean/, fn ->
         Archetypes.parse_manifest!("name = \"quiet\"\nidle_cleanup = #{value}\n", "quiet.toml")
       end
-    end
-  end
-
-  test "owner child prod marker is a default-off optional boolean" do
-    assert Archetypes.builtin_default().owner_open_child_prod == false
-
-    for {body, expected} <- [
-          {"name = \"quiet\"\n", false},
-          {"name = \"quiet\"\nowner_open_child_prod = false\n", false},
-          {"name = \"quiet\"\nowner_open_child_prod = true\n", true}
-        ] do
-      assert Archetypes.parse_manifest!(body, "quiet.toml").owner_open_child_prod ==
-               expected
-    end
-
-    for value <- ["\"false\"", "0", "[]"] do
-      assert_raise ArgumentError,
-                   ~r/archetype owner_open_child_prod must be a boolean/,
-                   fn ->
-                     Archetypes.parse_manifest!(
-                       "name = \"quiet\"\nowner_open_child_prod = #{value}\n",
-                       "quiet.toml"
-                     )
-                   end
-    end
-  end
-
-  test "shipped owner-role manifests opt into the child follow-up prod" do
-    for name <- ["product-owner", "pdo", "orchestrator"] do
-      path =
-        Application.app_dir(
-          :tightbeam,
-          "priv/kungfu/agentic-engineering/archetypes/#{name}.toml"
-        )
-
-      archetype = Archetypes.parse_manifest!(File.read!(path), path)
-
-      assert archetype.owner_open_child_prod == true
-      if name in ["product-owner", "pdo"], do: assert(archetype.idle_cleanup == false)
     end
   end
 
