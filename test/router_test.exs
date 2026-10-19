@@ -2541,11 +2541,12 @@ defmodule Tightbeam.Wire.RouterTest do
     assert after_turns == before_turns
   end
 
-  test "the dispatch boundary strips a wake's substrate-only carriers", ctx do
-    # Law 0: a client-supplied wake `assignmentId` would forge
-    # wake -> turn -> trace attribution. The spec pins that it is STRIPPED at the
-    # dispatch boundary, so this drives a REAL authenticated /agent/dispatch
-    # request rather than calling the handler or the strip helper directly.
+  test "the dispatch boundary strips an immediate wake's assignment link and request provenance",
+       ctx do
+    # An immediate conversational wake is not an assignment-linked continuation,
+    # so its assignmentId is dropped. The requestRef remains substrate-only. Drive
+    # a REAL authenticated /agent/dispatch request rather than calling the handler
+    # or the strip helper directly.
     #
     # The other half of the rule — that the strip is SCOPED to that carrier and
     # leaves `assignmentId` alone on attest/assign/dispatch — is proven at the
@@ -2580,7 +2581,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call, %{verb: "wake", params: wake_params}}
 
     refute Map.has_key?(wake_params, :assignment_id),
-           "an ordinary notification assignmentId must never reach the handler"
+           "an immediate conversational wake must not carry assignment attribution"
 
     refute Map.has_key?(wake_params, :request_ref),
            "a client-supplied wake requestRef must never reach the handler"
@@ -2625,6 +2626,20 @@ defmodule Tightbeam.Wire.RouterTest do
         Router.atomize_params_for_test("wake", Map.put(malformed, "assignmentId", "asg_named"))
 
       refute Map.has_key?(params, :assignment_id)
+    end
+
+    for timing <- [
+          %{"afterMs" => 3_600_000},
+          %{"at" => 1_900_000_000_000},
+          %{"conditionKind" => "build-finished", "conditionScope" => "build-1"}
+        ] do
+      params =
+        Router.atomize_params_for_test(
+          "wake",
+          Map.put(timing, "assignmentId", "asg_named")
+        )
+
+      assert params.assignment_id == "asg_named"
     end
   end
 

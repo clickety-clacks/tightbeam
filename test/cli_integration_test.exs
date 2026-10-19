@@ -370,6 +370,66 @@ defmodule Tightbeam.CliIntegrationTest do
     assert JSON.decode!(state)["currentConsequence"] == payload
   end
 
+  test "real CLI scheduled wakes retain their assignment link", ctx do
+    {assignment_output, 0} =
+      System.cmd(
+        ctx.binary,
+        ["assign", "--session", "cli-holder", "--subject", "scheduled wake link"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assignment = JSON.decode!(assignment_output)["id"]
+    at = Integer.to_string(System.system_time(:millisecond) + 3_600_000)
+
+    forms = [
+      {"after", ["--after", "1h"]},
+      {"at", ["--at", at]},
+      {"fact",
+       [
+         "--when-fact",
+         "build-finished",
+         "--when-scope",
+         "build-1",
+         "--fallback-after",
+         "1h"
+       ]}
+    ]
+
+    for {name, timing_args} <- forms do
+      prompt = "scheduled wake link: #{name}"
+
+      {output, 0} =
+        System.cmd(
+          ctx.binary,
+          ["wake", "--session", "cli-holder", "--assignment", assignment] ++
+            timing_args ++ ["--prompt", prompt],
+          cd: ctx.workdir,
+          stderr_to_stdout: true
+        )
+
+      assert_receive {:cli_call, %{verb: "wake", params: wire_params}}
+      assert wire_params.assignment_id == assignment
+
+      wake = Wakes.get(ctx.db, JSON.decode!(output)["wakeId"])
+      assert wake.assignment_id == assignment
+      assert wake.prompt == prompt
+      assert is_nil(wake.wait_mode)
+
+      case name do
+        "after" ->
+          assert wake.due_at > System.system_time(:millisecond)
+
+        "at" ->
+          assert wake.due_at == String.to_integer(at)
+
+        "fact" ->
+          assert wake.condition_kind == "build-finished"
+          assert wake.condition_scope == "build-1"
+      end
+    end
+  end
+
   test "manual obligation continuation examples register rows and deliver intact prompts", ctx do
     {help, 0} = System.cmd(ctx.binary, ["wake", "--help"])
     assert help =~ "--after-turn"
@@ -508,6 +568,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     dependency_id = JSON.decode!(dependency_output)["wakeId"]
     dependency = Wakes.get(ctx.db, dependency_id)
+    assert dependency.assignment_id == assignment
     assert dependency.obligation_ref == assignment
     assert dependency.creator_session_key == "cli-holder"
     assert dependency.originating_turn_seq == turn.seq

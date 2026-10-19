@@ -6933,13 +6933,10 @@ defmodule Tightbeam.Gateway do
         reresolve: p[:reresolve],
         reresolve_seed: p[:reresolve_seed],
         reresolve_rung: p[:reresolve_rung],
-        # SUBSTRATE-ONLY carrier. `wake` is an agent-callable verb, so an arbitrary
-        # params value here would let an agent stamp a conversational wake with any
-        # assignment and have delivery promote that forged carrier into the turn and
-        # the trace — agent-authored attribution, which Law 0 forbids (F6). Only
-        # Tightbeam's reserved process principal and a bound internal remedy principal
-        # may set it. Neither can be claimed over the wire. Conversational and owner
-        # wakes stay NULL, as the spec requires.
+        # Immediate conversational wakes have their assignment link stripped by the
+        # router. Timed and fact-triggered registrations retain the explicit link;
+        # typed waits validate it through register_wait_in_txn/2. Internal process
+        # and bound remedy wakes continue to use their trusted carriers.
         assignment_id: wake_assignment_id_in_txn(txn, call)
       })
 
@@ -7001,7 +6998,20 @@ defmodule Tightbeam.Gateway do
        when is_binary(assignment_id),
        do: assignment_id
 
+  defp wake_assignment_id_in_txn(_txn, %{principal: {:session, _}, params: params}),
+    do: scheduled_wake_assignment_id(params)
+
+  defp wake_assignment_id_in_txn(_txn, %{principal: {:user, _}, params: params}),
+    do: scheduled_wake_assignment_id(params)
+
   defp wake_assignment_id_in_txn(_txn, _call), do: nil
+
+  defp scheduled_wake_assignment_id(params) do
+    if is_number(params[:after_ms]) or is_number(params[:at]) or
+         is_binary(params[:condition_kind]),
+       do: params[:assignment_id],
+       else: nil
+  end
 
   defp creator_session_key({:session, key}), do: key
   defp creator_session_key(_principal), do: nil
