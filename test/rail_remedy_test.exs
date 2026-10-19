@@ -1100,7 +1100,7 @@ defmodule Tightbeam.RailRemedyTest do
     assert RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id).status ==
              "closed"
 
-    new_refs = [%{"repo" => "racter:/tmp/o2", "commit" => String.duplicate("b", 40)}]
+    new_refs = [%{"repo" => "testhost:/tmp/o2", "commit" => String.duplicate("b", 40)}]
     assert %{outcome: "claimed-dispatched"} = fire_review_notice(ctx, assignment, new_refs)
     next = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
     assert next.occurrence == 2
@@ -2984,7 +2984,7 @@ defmodule Tightbeam.RailRemedyTest do
   end
 
   defp notice_refs do
-    [%{"repo" => "racter:/tmp/o2", "commit" => String.duplicate("a", 40)}]
+    [%{"repo" => "testhost:/tmp/o2", "commit" => String.duplicate("a", 40)}]
   end
 
   defp mark_notice_turn(db, assignment_id, wake_id, status) do
