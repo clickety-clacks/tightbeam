@@ -1261,6 +1261,134 @@ defmodule Tightbeam.HarnessProcessFixture do
                flunk("same-group harness-group timed out — caller frozen")
   end
 
+  defp scenario(33, ctx) do
+    key = {:claude, "shared", "testhost"}
+    parent = self()
+    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
+    task_sup = start_supervised!({Task.Supervisor, []})
+
+    manager =
+      start_supervised!(
+        {Tightbeam.LaneManager,
+         name: :failed_park_recovery_manager,
+         db: ctx.db,
+         lane_sup: ctx.sup,
+         task_sup: task_sup,
+         runner: fn turn ->
+           send(parent, {:recovered_turn, turn.seq})
+           {:ok, %{text: "done"}}
+         end}
+      )
+
+    assert eventually(fn -> :sys.get_state(manager).park_recovery == nil end)
+
+    :ok =
+      DB.execute(ctx.db, """
+      INSERT INTO sessions
+        (sessionKey,displayName,ownerUserId,origin,spawnedBy,archetype,
+         harness,provider,model,thinkingLevel,host,createdAt,updatedAt)
+      VALUES ('parked-session','Parked','fixture','user:fixture','parked-session','default',
+              'claude','anthropic','claude-sonnet-5','medium','testhost',1,1)
+      """)
+
+    script = Path.join(ctx.test_dir, "vanished-leader.js")
+
+    File.write!(script, ~S"""
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const [mode, root] = process.argv.slice(2);
+    if (mode === "leader") {
+      const child = require("node:child_process").spawn(process.execPath,
+        [__filename, "child", root], {stdio: "ignore"});
+      child.unref();
+      fs.writeFileSync(path.join(root, "child-pid"), String(child.pid));
+      setInterval(() => {
+        if (fs.existsSync(path.join(root, "leave-leader"))) process.exit(0);
+      }, 10);
+    } else {
+      fs.writeFileSync(path.join(root, "child-ready"), "ready");
+      setInterval(() => {
+        if (fs.existsSync(path.join(root, "leave-child"))) process.exit(0);
+      }, 10);
+    }
+    """)
+
+    {port, row} =
+      launch(ctx, key, [System.find_executable("node"), script, "leader", ctx.test_dir])
+
+    assert eventually(fn -> File.exists?(Path.join(ctx.test_dir, "child-ready")) end)
+    child = File.read!(Path.join(ctx.test_dir, "child-pid"))
+    File.touch!(Path.join(ctx.test_dir, "leave-leader"))
+    assert_receive {^port, {:exit_status, 0}}, 5_000
+    assert {:ok, parked} = HarnessProcess.begin_park(ctx.db, key)
+
+    assert {:error, {:kill_failed, {:signal_refused, reason}}} =
+             HarnessProcess.park(ctx.db, parked)
+
+    assert reason =~ "group left unsignalled"
+    serving_key = {:claude, "serving", "testhost"}
+    {_serving_port, serving} = launch_stubborn(ctx, serving_key)
+    assert :ok = Tightbeam.LaneManager.reconcile(manager)
+    assert eventually(fn -> :sys.get_state(manager).park_recovery == nil end)
+    assert HarnessProcess.parked?(ctx.db, key)
+    assert {_, 0} = System.cmd("/bin/kill", ["-0", child], stderr_to_stdout: true)
+
+    assert %{state: "kill_failed", resolved_at: nil, kill_sent_at: nil} =
+             Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == row.launch_id))
+
+    assert %{state: "running", resolved_at: nil} =
+             Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == serving.launch_id))
+
+    assert {_, 0} =
+             System.cmd("/bin/kill", ["-0", Integer.to_string(serving.os_pid)],
+               stderr_to_stdout: true
+             )
+
+    {:ok, seq} =
+      Tightbeam.Ledger.enqueue(ctx.db, %{
+        session_key: "parked-session",
+        message_id: "held-turn",
+        origin: "user:fixture",
+        prompt: "continue after cleanup"
+      })
+
+    assert :ok = Tightbeam.LaneManager.ensure_lane(manager, "parked-session")
+    assert {:ok, [["queued"]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+    refute_receive {:recovered_turn, _}, 100
+
+    File.touch!(Path.join(ctx.test_dir, "leave-child"))
+
+    assert eventually(fn ->
+             elem(System.cmd("/bin/kill", ["-0", child], stderr_to_stdout: true), 1) != 0
+           end)
+
+    assert :ok = Tightbeam.LaneManager.reconcile(manager)
+    assert eventually(fn -> not HarnessProcess.parked?(ctx.db, key) end)
+    assert_receive {:recovered_turn, ^seq}, 5_000
+
+    assert eventually(fn ->
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq]) ==
+               {:ok, [["delivered"]]}
+           end)
+
+    assert Process.alive?(manager)
+
+    assert %{launch_id: launch_id, state: "exited", resolved_at: resolved_at} =
+             Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == row.launch_id))
+
+    assert launch_id == row.launch_id
+    assert is_integer(resolved_at)
+
+    assert Enum.any?(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "harness_failed_park_reconciled")
+           )
+
+    assert {:ok, serving_park} = HarnessProcess.begin_park(ctx.db, serving_key)
+    assert :ok = HarnessProcess.park(ctx.db, serving_park)
+    assert :ok = HarnessProcess.complete_park(ctx.db, serving_key)
+  end
+
   defp launch_stubborn(ctx, key) do
     launch(ctx, key, ["sh", "-c", "trap '' HUP TERM; while :; do sleep 1; done"])
   end

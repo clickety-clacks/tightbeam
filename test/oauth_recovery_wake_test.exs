@@ -280,6 +280,90 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     refute_received {:lane_started, _}
   end
 
+  test "finish cleanup refusal is distinct from credential rejection and supports retry", ctx do
+    {:ok, cleanup} = Agent.start_link(fn -> :refused end)
+    on_exit(fn -> if Process.alive?(cleanup), do: Agent.stop(cleanup) end)
+
+    start_credentials!(ctx,
+      sh: fn _ -> {"", 0} end,
+      stop: fn :anthropic ->
+        case Agent.get(cleanup, & &1) do
+          :refused ->
+            {:error,
+             {:kill_failed,
+              {:signal_refused,
+               "harness session leader disappeared while process group still has members"}}}
+
+          :exited ->
+            :ok
+        end
+      end
+    )
+
+    onboard = onboard_handler(ctx, start_noop_scheduler!())
+    lease = begin_and_stage!(onboard, "anthropic", "subscription")
+
+    assert %{
+             code: "onboarding_cleanup_failed",
+             message: message,
+             recovery: recovery,
+             diagnostic: diagnostic
+           } =
+             finish(onboard, "anthropic", lease, "subscription")
+
+    assert message =~ "credential validity is unverified"
+    assert message =~ "retry onboarding"
+    assert diagnostic["kind"] == "cleanup"
+    assert diagnostic["credentialValidity"] == "unverified"
+    assert recovery =~ "retry onboarding"
+    assert recovery =~ "unverified process group"
+
+    assert {:needs_onboarding, {:present_but_unverified, cause}} =
+             Credentials.status(:anthropic)
+
+    assert cause["phase"] == "cleanup"
+    refute inspect(cause) =~ "revoked"
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+
+    Agent.update(cleanup, fn _ -> :exited end)
+    stop_supervised!(Credentials)
+    start_credentials!(ctx, sh: fn _ -> {"", 0} end)
+    assert {:needs_onboarding, {:present_but_unverified, ^cause}} = Credentials.status(:anthropic)
+    retry = begin_and_stage!(onboard, "anthropic", "subscription")
+    assert %{status: "onboarded"} = finish(onboard, "anthropic", retry, "subscription")
+    assert Credentials.status(:anthropic) == :onboarded
+  end
+
+  test "successful credential recovery releases an orphan fence with the same coordinator", ctx do
+    adapter_sup = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
+
+    coordinator =
+      start_supervised!(
+        {Tightbeam.AdapterCoordinator,
+         adapter_sup: adapter_sup,
+         db: ctx.db,
+         name: Tightbeam.AdapterCoordinator,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ -> flunk("no adapter launch is needed for this orphan park") end}
+      )
+
+    key = {:claude, "shared", @host}
+
+    start_credentials!(ctx,
+      sh: fn _ -> {"", 0} end,
+      stop: fn :anthropic -> Tightbeam.AdapterCoordinator.close_adapter(coordinator, key) end
+    )
+
+    assert {:ok, :no_launch} = Tightbeam.HarnessProcess.begin_park(ctx.db, key)
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, key)
+    onboard = onboard_handler(ctx, start_noop_scheduler!())
+    lease = begin_and_stage!(onboard, "anthropic", "subscription")
+    assert %{status: "onboarded"} = finish(onboard, "anthropic", lease, "subscription")
+    refute Tightbeam.HarnessProcess.parked?(ctx.db, key)
+    assert Process.whereis(Tightbeam.AdapterCoordinator) == coordinator
+    assert Credentials.status(:anthropic) == :onboarded
+  end
+
   defp start_credentials!(ctx, opts \\ []) do
     start_supervised!(
       {Credentials,

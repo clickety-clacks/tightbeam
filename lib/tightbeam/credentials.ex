@@ -32,9 +32,6 @@ defmodule Tightbeam.Credentials do
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @status_budget_ms 5_000
   @status_cleanup_ms 500
-  # The adapter's first logged-out report can be transient during startup. Ignore
-  # one such report only shortly after a subscription was successfully banked.
-  @fresh_subscription_auth_none_window_ms 15_000
   @fixture_provider? Application.compile_env(:tightbeam, :fixture_harness, false)
 
   @type provider ::
@@ -200,16 +197,16 @@ defmodule Tightbeam.Credentials do
   def cancel_onboard(provider, lease_id, reason, server),
     do: GenServer.call(server, {:cancel_onboard, provider, lease_id, reason})
 
-  @doc "Record terminal evidence, gate new sessions, and park running sessions."
-  @spec mark_terminal(provider(), term(), GenServer.server()) :: :ok | {:error, term()}
+  @doc """
+  Record confirmed terminal evidence, gate new sessions, and park running sessions.
+
+  Claude's ambiguous `none` status requires an authenticated provider rejection.
+  Returns `:ignored` for a live credential and an error for unknown health, with
+  no validity change in either case.
+  """
+  @spec mark_terminal(provider(), term(), GenServer.server()) :: :ok | :ignored | {:error, term()}
   def mark_terminal(provider, evidence, server \\ __MODULE__),
     do: GenServer.call(server, {:mark_terminal, provider, evidence}, :infinity)
-
-  @doc "Consume the one-time grace for a fresh Claude subscription's first logged-out status."
-  @spec suppress_fresh_subscription_auth_none(provider(), term(), GenServer.server()) ::
-          :ignored | :continue
-  def suppress_fresh_subscription_auth_none(provider, evidence, server \\ __MODULE__),
-    do: GenServer.call(server, {:suppress_fresh_subscription_auth_none, provider, evidence})
 
   @doc "Classify only pinned terminal evidence. Unknown is always non-terminal."
   @spec terminal_evidence?(provider(), term()) :: boolean()
@@ -610,19 +607,19 @@ defmodule Tightbeam.Credentials do
     {:reply, credential_kind(state, provider), state}
   end
 
-  def handle_call({:suppress_fresh_subscription_auth_none, provider, evidence}, _from, state) do
-    {:reply, consume_fresh_subscription_auth_none(state, provider, evidence), state}
-  end
-
   def handle_call({:mark_terminal, provider, evidence}, from, state) do
-    state =
-      if terminal_evidence?(provider, evidence),
-        do: cancel_status_reads(state, provider),
-        else: state
+    confirmation = confirm_terminal_auth(state, provider, evidence)
+    state = if confirmation == :terminal, do: cancel_status_reads(state, provider), else: state
 
     cond do
-      not terminal_evidence?(provider, evidence) ->
+      confirmation == :ignored ->
+        {:reply, :ignored, state}
+
+      confirmation == :not_terminal ->
         {:reply, :ok, state}
+
+      match?({:error, _}, confirmation) ->
+        {:reply, confirmation, state}
 
       pending = state.park_pending[provider] ->
         pending = update_in(pending.waiters, &[from | &1])
@@ -804,51 +801,33 @@ defmodule Tightbeam.Credentials do
     end
   end
 
-  defp consume_fresh_subscription_auth_none(state, provider, evidence) do
-    case fresh_subscription_auth_none_metadata(state, provider, evidence) do
-      {:ignore, metadata} ->
-        write_metadata!(
-          state,
-          provider,
-          Map.put(metadata, "initial_auth_none_ignored", true)
-        )
+  # Claude ACP can report `none` for a logged-in account whose optional
+  # subscriptionType is absent. Only the existing authenticated provider probe
+  # can turn that ambiguous report into revocation; transport failure is unknown.
+  # Run under the credential owner so onboarding cannot replace the credential
+  # between confirmation and committing the terminal marker.
+  defp confirm_terminal_auth(state, :anthropic, %{"authStatus" => %{"kind" => "none"}}) do
+    home = Homes.home_path(state.base_dir, state.machine, :claude)
 
-        :ignored
+    case credential_kind(state, :anthropic) do
+      kind when kind in [:subscription, :api_key] ->
+        case Tightbeam.Harness.Claude.credential_live?(credential_target(state), home,
+               credential_kind: kind,
+               transport: &Tightbeam.Harness.Support.credential_transport/2
+             ) do
+          {:dead, _reason} -> :terminal
+          :live -> :ignored
+          {:unknown, reason} -> {:error, {:auth_status_unconfirmed, reason}}
+        end
 
-      :continue ->
-        :continue
+      reason ->
+        {:error, {:auth_status_unconfirmed, reason}}
     end
   end
 
-  defp fresh_subscription_auth_none_metadata(
-         state,
-         :anthropic,
-         %{"authStatus" => %{"kind" => "none"}} = evidence
-       ) do
-    if terminal_evidence?(:anthropic, evidence) do
-      case read_metadata(state, :anthropic) do
-        {:ok, metadata} ->
-          now = System.system_time(:millisecond)
-          onboarded_at = metadata["onboarded_at_ms"]
-
-          if metadata["kind"] == "subscription" and metadata["onboarded"] == true and
-               metadata["terminal"] != true and metadata["initial_auth_none_ignored"] != true and
-               is_integer(onboarded_at) and onboarded_at <= now and
-               now - onboarded_at <= @fresh_subscription_auth_none_window_ms do
-            {:ignore, metadata}
-          else
-            :continue
-          end
-
-        {:error, _reason} ->
-          :continue
-      end
-    else
-      :continue
-    end
+  defp confirm_terminal_auth(_state, provider, evidence) do
+    if terminal_evidence?(provider, evidence), do: :terminal, else: :not_terminal
   end
-
-  defp fresh_subscription_auth_none_metadata(_state, _provider, _evidence), do: :continue
 
   @impl true
   def handle_info({:status_result, ref, result}, state) do
@@ -1598,10 +1577,17 @@ defmodule Tightbeam.Credentials do
   end
 
   defp activate_staged_credential(state, provider, kind, credential) do
-    with :ok <- state.stop.(provider),
+    with :ok <- stop_for_finish(state, provider),
          :ok <- start_for_finish(state, provider, kind),
          :ok <- mark_onboarded_for_finish(state, provider, kind, credential) do
       :ok
+    end
+  end
+
+  defp stop_for_finish(state, provider) do
+    case state.stop.(provider) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:credential_cleanup_failed, reason}}
     end
   end
 
@@ -1674,6 +1660,21 @@ defmodule Tightbeam.Credentials do
   defp failed_finish(state, provider, kind, failure) do
     cause = %{"finish" => ErrorDiagnostic.redact_text(inspect(failure))}
 
+    cause =
+      case failure do
+        {:error, {:credential_cleanup_failed, _}} ->
+          Map.merge(cause, %{
+            "phase" => "cleanup",
+            "recovery" =>
+              "Allow the recorded harness process group to exit, then retry onboarding. " <>
+                "If it remains, use session-diagnose to inspect it before operator cleanup; " <>
+                "do not signal an unverified process group."
+          })
+
+        _ ->
+          cause
+      end
+
     marker_result =
       write_metadata_result(state, provider, %{
         "provider" => Atom.to_string(provider),
@@ -1723,8 +1724,7 @@ defmodule Tightbeam.Credentials do
 
     metadata =
       if provider == :anthropic and kind == :subscription do
-        # Non-secret timing evidence lets the credential owner distinguish the
-        # first adapter status from later terminal reports without a provider probe.
+        # Retain non-secret onboarding timing for incident correlation.
         Map.put(metadata, "onboarded_at_ms", System.system_time(:millisecond))
       else
         metadata

@@ -1792,9 +1792,9 @@ defmodule Tightbeam.Placement do
   end
 
   defp persist_terminal_auth_event(db, host, module, event) do
-    suppression_result =
+    mark_result =
       try do
-        Tightbeam.Credentials.suppress_fresh_subscription_auth_none(
+        Tightbeam.Credentials.mark_terminal(
           module.credential_provider(),
           event,
           Tightbeam.Credentials.server(host)
@@ -1803,13 +1803,23 @@ defmodule Tightbeam.Placement do
         :exit, reason -> {:error, {:credential_owner_exit, reason}}
       end
 
-    case suppression_result do
+    # A failed park still means confirmed invalid credentials. An ambiguous
+    # status (including an unavailable confirmation probe) is not auth-dead.
+    case mark_result do
       :ignored ->
+        Logger.info("unconfirmed logged-out status ignored for #{module.id()} on #{host}")
+
+      {:error, {:auth_status_unconfirmed, reason}} ->
         Logger.warning(
-          "ignored the first Claude logged-out status within the fresh subscription window on #{host}; waiting for another adapter status"
+          "auth status unconfirmed for #{module.id()} on #{host}: #{inspect(reason)}"
         )
 
-      _continue ->
+      {:error, {:credential_owner_exit, reason}} ->
+        Logger.error(
+          "credential owner unavailable for #{module.id()} on #{host}: #{inspect(reason)}"
+        )
+
+      result ->
         try do
           HarnessHealth.observe_provider_invalidation(db, module.id(), host, event,
             principal: "process:tightbeam/provider:#{module.credential_provider()}"
@@ -1822,25 +1832,10 @@ defmodule Tightbeam.Placement do
             )
         end
 
-        mark_result =
-          try do
-            Tightbeam.Credentials.mark_terminal(
-              module.credential_provider(),
-              event,
-              Tightbeam.Credentials.server(host)
-            )
-          catch
-            :exit, reason -> {:error, {:credential_owner_exit, reason}}
-          end
-
-        case mark_result do
-          :ok ->
-            :ok
-
-          {:error, reason} ->
-            Logger.error(
-              "credential park failed for #{module.credential_provider()} on #{host}: #{inspect(reason)}"
-            )
+        if match?({:error, _}, result) do
+          Logger.error(
+            "credential park failed for #{module.credential_provider()} on #{host}: #{inspect(result)}"
+          )
         end
     end
   end

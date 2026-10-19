@@ -17,7 +17,7 @@ def evaluate(expression, context):
     if ''.join(tokens) != re.sub(r'\s+', '', expression):
         raise ValueError('unsupported expression: ' + expression)
     words = {'&&': ' and ', '||': ' or ', '!=': ' != ', '==': ' == ',
-             '(': '(', ')': ')', ',': ',', 'startsWith': '_starts'}
+             '(': '(', ')': ')', ',': ',', 'startsWith': '_starts', 'false': 'False'}
     code = ''.join(
         words.get(token) or (repr(token[1:-1]) if token.startswith("'")
                              else repr(context[token]))
@@ -117,7 +117,7 @@ class ExactHeadCI(unittest.TestCase):
         self.assertIn('${CI_SOURCE_SHA::7}.tgz', job)
         self.assertNotIn('${GITHUB_SHA::7}.tgz', job)
 
-    def test_only_guard_release_uses_directly_affected_mix_checks(self):
+    def test_maintenance_releases_use_directly_affected_mix_checks(self):
         test_job = self.jobs['test']
         targeted_release = re.search(
             r'(?m)^      TARGETED_GUARD_RELEASE: \$\{\{ (.*?) \}\}$', test_job).group(1)
@@ -131,16 +131,22 @@ class ExactHeadCI(unittest.TestCase):
 
         cases = [
             ('push', 'refs/tags/v0.1.9+2857', False, True),
-            ('push', 'refs/tags/v0.1.9+2855', True, False),
-            ('push', 'refs/tags/v0.1.9+2856', True, False),
-            ('push', 'refs/tags/v0.1.9+2858', True, False),
+            ('push', 'refs/tags/v0.1.9+2855', False, True),
+            ('push', 'refs/tags/v0.1.9+2856', False, True),
+            ('push', 'refs/tags/v0.1.9+2858', False, True),
+            ('push', 'refs/tags/v0.1.9+2883', False, True),
+            ('push', 'refs/tags/v0.1.9+2884', False, True),
             ('push', 'refs/tags/v0.1.10+2857', True, False),
             ('workflow_dispatch', 'refs/tags/v0.1.9+2857', True, False),
             ('push', 'refs/heads/0.1.9', False, False),
             ('pull_request', 'refs/tags/v0.1.9+2857', False, False),
         ]
         for event, ref, expected_full_suite, expected_targeted in cases:
-            context = {'github.event_name': event, 'github.ref': ref}
+            context = {
+                'github.event_name': event,
+                'github.ref': ref,
+                'env.TARGETED_GUARD_RELEASE': 'true' if expected_targeted else 'false',
+            }
             self.assertEqual(evaluate(targeted_release, context), expected_targeted,
                              ('TARGETED_GUARD_RELEASE', event, ref))
             self.assertEqual(evaluate(full_suite, context), expected_full_suite,

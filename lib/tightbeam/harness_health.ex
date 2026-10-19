@@ -1273,7 +1273,7 @@ defmodule Tightbeam.HarnessHealth do
 
   @doc "Resolve one class-specific open incident on normal-turn success."
   @spec resolve(DB.server(), map()) ::
-          {:resolved | :duplicate, map()} | :already_healthy | :repair_required
+          {:resolved | :duplicate, map()} | :already_healthy
   def resolve(db \\ DB, input) do
     input = input |> Map.put(:evidence_kind, "normal-turn-success") |> normalize_common!()
     transaction!(db, &resolve_in_txn(&1, input))
@@ -1281,19 +1281,17 @@ defmodule Tightbeam.HarnessHealth do
 
   @doc "The class-specific resolution mutation inside a caller-owned transaction."
   @spec resolve_in_txn(Txn.t(), map()) ::
-          {:resolved | :duplicate, map()} | :already_healthy | :repair_required
+          {:resolved | :duplicate, map()} | :already_healthy
   def resolve_in_txn(%Txn{} = txn, input) do
     input = input |> Map.put(:evidence_kind, "normal-turn-success") |> normalize_common!()
     validate_session_membership!(txn, input)
 
-    if input.failure_class == "rate-limit-dead" and
-         HarnessProcess.parked_in_txn?(txn, adapter_key(input.harness, input.host)) do
-      :repair_required
-    else
-      case observation_by_correlation(txn, input.correlation_id) do
-        nil -> resolve_open(txn, input)
-        prior -> duplicate_or_refuse!(txn, prior, input, "normal-turn-success")
-      end
+    # A concurrent normal turn can succeed while another session opens the
+    # shared rate-limit park. Its observed success is recovery evidence even
+    # while that fence stands; requiring the fence to be gone deadlocks it.
+    case observation_by_correlation(txn, input.correlation_id) do
+      nil -> resolve_open(txn, input)
+      prior -> duplicate_or_refuse!(txn, prior, input, "normal-turn-success")
     end
   end
 
