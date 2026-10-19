@@ -1713,7 +1713,8 @@ defmodule Tightbeam.Assignments do
   defp attest_result(db, call) do
     with :ok <- principal_allowed(call.principal, "attest"),
          :ok <- commit_ref_filing_allowed(db, call),
-         {:ok, call} <- prepare_attest_commit_refs(db, call) do
+         {:ok, call} <- prepare_attest_commit_refs(db, call),
+         {:ok, call} <- prepare_review_reopen_arm(db, call) do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
 
@@ -1903,6 +1904,31 @@ defmodule Tightbeam.Assignments do
         %{base | host: holder.host, path: local_origin_path(config, holder, origin)}
     end
   end
+
+  defp prepare_review_reopen_arm(
+         db,
+         %{params: %{kind: "verdict", verdict_kind: "changes-requested"}} = call
+       ) do
+    case DB.query(
+           db,
+           "SELECT reviewsAssignmentId FROM assignments WHERE id=?1",
+           [call.params[:assignment_id]]
+         ) do
+      {:ok, [[producer_id]]} when is_binary(producer_id) ->
+        config = effort_config(db, call)
+        prepared = EffortCheckin.prepare_reopen_arm(db, config, producer_id)
+
+        {:ok,
+         call
+         |> Map.put(:effort_config, config)
+         |> Map.put(:prepared_effort_arm, prepared)}
+
+      _ ->
+        {:ok, call}
+    end
+  end
+
+  defp prepare_review_reopen_arm(_db, call), do: {:ok, call}
 
   defp local_origin_path(config, holder, origin) do
     if Path.type(origin) == :absolute,
@@ -2672,7 +2698,42 @@ defmodule Tightbeam.Assignments do
        ),
        do: cannot_proceed_in_txn(txn, call, assignment, attest)
 
+  defp apply_lifecycle_attest(
+         txn,
+         %{params: %{kind: "completion"}, review_pending: true} = call,
+         assignment,
+         attest,
+         holder
+       ) do
+    case completion_review_conclusion_in_txn(txn, assignment, call.params[:commit_refs]) do
+      "reviewed-clean" ->
+        completion_call = Map.delete(call, :review_pending)
+
+        case applicable_code_completion_in_txn(txn, assignment, completion_call) do
+          :ok ->
+            close_completed_assignment_in_txn(txn, completion_call, assignment, attest, holder)
+
+          _ ->
+            append_attest_marker(txn, attest)
+            %{assignment: assignment, attest: attest}
+        end
+
+      "changes-requested" ->
+        schedule_author_review_changes_in_txn(txn, assignment, attest)
+        append_attest_marker(txn, attest)
+        %{assignment: assignment, attest: attest}
+
+      _ ->
+        append_attest_marker(txn, attest)
+        %{assignment: assignment, attest: attest}
+    end
+  end
+
   defp apply_lifecycle_attest(txn, call, assignment, attest, holder) do
+    close_completed_assignment_in_txn(txn, call, assignment, attest, holder)
+  end
+
+  defp close_completed_assignment_in_txn(txn, call, assignment, attest, holder) do
     Txn.q(
       txn,
       """
@@ -2983,6 +3044,8 @@ defmodule Tightbeam.Assignments do
                       attest_id: attest.id
                     })
 
+                  :ok = settle_reviewed_assignment_in_txn(txn, call, assignment, attest)
+
                   append_attest_marker(txn, attest)
                   result = %{assignment: assignment, attest: attest}
                   file_attest_condition_fact(txn, assignment, attest, result)
@@ -2992,6 +3055,169 @@ defmodule Tightbeam.Assignments do
                 end
             end
         end
+    end
+  end
+
+  defp settle_reviewed_assignment_in_txn(
+         _txn,
+         _call,
+         %{reviewsAssignmentId: producer_id},
+         _review_attest
+       )
+       when not is_binary(producer_id),
+       do: :ok
+
+  defp settle_reviewed_assignment_in_txn(txn, call, review_assignment, review_attest) do
+    case fetch_assignment(txn, review_assignment.reviewsAssignmentId) do
+      %{id: producer_id} = producer ->
+        case latest_completion_attest_in_txn(txn, producer_id, producer.holderKey) do
+          %{id: _completion_id} = completion ->
+            case completion_review_conclusion_in_txn(txn, producer, completion.commitRefs) do
+              "reviewed-clean" ->
+                settle_completed_assignment_after_review_in_txn(
+                  txn,
+                  call,
+                  producer,
+                  completion
+                )
+
+              "changes-requested" ->
+                reopen_completed_assignment_for_review_in_txn(
+                  txn,
+                  call,
+                  producer,
+                  review_assignment,
+                  review_attest
+                )
+
+              _ ->
+                :ok
+            end
+
+          _ ->
+            :ok
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp settle_completed_assignment_after_review_in_txn(txn, call, producer, completion) do
+    cond do
+      producer.state != "open" ->
+        :ok
+
+      true ->
+        completion_call =
+          call
+          |> Map.delete(:review_pending)
+          |> Map.put(:params, %{
+            assignment_id: producer.id,
+            kind: "completion",
+            commit_refs: completion.commitRefs
+          })
+
+        case applicable_code_completion_in_txn(txn, producer, completion_call) do
+          :ok ->
+            close_completed_assignment_in_txn(
+              txn,
+              call,
+              producer,
+              completion,
+              producer.holderKey
+            )
+
+            :ok
+
+          _ ->
+            :ok
+        end
+    end
+  end
+
+  defp reopen_completed_assignment_for_review_in_txn(
+         txn,
+         call,
+         producer,
+         review_assignment,
+         review_attest
+       ) do
+    producer =
+      if producer.state == "closed" and producer.outcome == "completed" do
+        reopen_call =
+          Map.put(
+            call,
+            :params,
+            Map.merge(call.params, %{
+              assignment_id: producer.id,
+              reason:
+                "Independent review #{review_assignment.id} requested changes on " <>
+                  "the completed assignment."
+            })
+          )
+
+        apply_reopen(txn, reopen_call, producer)
+      else
+        producer
+      end
+
+    schedule_author_review_changes_in_txn(txn, producer, review_attest)
+    :ok
+  end
+
+  defp schedule_author_review_changes_in_txn(txn, assignment, review_attest) do
+    Wakes.schedule_in_txn(txn, %{
+      session_key: assignment.holderKey,
+      origin: "remedy:completion-requires-review",
+      creator_session_key: review_attest.bySession,
+      prompt:
+        "Independent review #{review_attest.id} requested changes to assignment #{assignment.id}; " <>
+          "address the review and record the next result.",
+      due_at: now(),
+      assignment_id: assignment.id,
+      work_item_id: assignment.workItemId,
+      class: "input-needed"
+    })
+
+    :ok
+  end
+
+  defp latest_completion_attest_in_txn(txn, assignment_id, holder_key) do
+    case Txn.q(
+           txn,
+           """
+           SELECT id,assignmentId,kind,verdictKind,note,bySession,byUser,producer,
+             producerCommand,byHarness,byProvider,commitRefs,artifactId,contentSha256,
+             waitId,ts
+           FROM attests
+           WHERE assignmentId=?1 AND kind='completion' AND bySession=?2
+           ORDER BY ts DESC,rowid DESC
+           LIMIT 1
+           """,
+           [assignment_id, holder_key]
+         ) do
+      [row] -> attest(row)
+      [] -> nil
+    end
+  end
+
+  defp completion_review_conclusion_in_txn(txn, assignment, refs) do
+    case latest_review_conclusion_in_txn(txn, assignment.id) do
+      %{kind: kind, holder: review_holder, refs: review_refs}
+      when review_holder != assignment.holderKey and
+             kind in ["reviewed-clean", "changes-requested"] ->
+        if assignment.effectKind == "code" do
+          case canonical_commit_refs(refs) do
+            {:ok, [_ | _] = expected} when expected == review_refs -> kind
+            _ -> nil
+          end
+        else
+          kind
+        end
+
+      _ ->
+        nil
     end
   end
 
@@ -4122,18 +4348,41 @@ defmodule Tightbeam.Assignments do
     review = latest_review_conclusion_in_txn(txn, assignment.id)
     verification = latest_verification_conclusion_in_txn(txn, assignment.id, assignment.holderKey)
 
-    with [_ | _] <- refs,
-         %{kind: "reviewed-clean", holder: review_holder, refs: ^refs} <- review,
-         true <- review_holder != assignment.holderKey,
-         %{kind: "verified", holder: assignment_holder, refs: ^refs} <- verification,
-         true <- assignment_holder == assignment.holderKey do
+    verification_matches? =
+      case verification do
+        %{kind: "verified", holder: holder, refs: ^refs} ->
+          holder == assignment.holderKey
+
+        _ ->
+          false
+      end
+
+    review_matches? =
+      case review do
+        %{kind: "reviewed-clean", holder: holder, refs: ^refs} ->
+          holder != assignment.holderKey
+
+        _ ->
+          false
+      end
+
+    if is_list(refs) and refs != [] and verification_matches? and
+         (Map.get(call, :review_pending, false) or review_matches?) do
       :ok
     else
-      _ ->
-        error(
-          "inapplicable_code_evidence",
-          "code completion requires the latest independent clean review and holder verification to match its immutable commitRefs"
-        )
+      latest_review =
+        case review do
+          %{kind: kind, refs: review_refs} ->
+            "#{kind} commitRefs=#{JSON.encode!(review_refs)}"
+
+          nil ->
+            "none commitRefs=null"
+        end
+
+      error(
+        "inapplicable_code_evidence",
+        "code completion requires holder verification and, unless review is pending, the latest independent clean review to match its immutable commitRefs; expected commitRefs=#{JSON.encode!(refs)}; latest linked review conclusion=#{latest_review}"
+      )
     end
   end
 

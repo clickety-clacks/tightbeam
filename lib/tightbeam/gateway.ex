@@ -6873,19 +6873,24 @@ defmodule Tightbeam.Gateway do
     case DB.Txn.q(
            txn,
            """
-           SELECT a.openedByUser,a.openedBySession,a.workItemId,w.ownerUserId
-           FROM assignments a JOIN work_items w ON w.id=a.workItemId
+           SELECT a.openedByUser,a.openedBySession,a.workItemId,
+             COALESCE(w.ownerUserId,a.openedByUser,opener.ownerUserId)
+           FROM assignments a
+           LEFT JOIN work_items w ON w.id=a.workItemId
+           LEFT JOIN sessions opener ON opener.sessionKey=a.openedBySession
            WHERE a.id=?1
            """,
            [assignment_id]
          ) do
       [[opened_by_user, opened_by_session, work_item_id, owner]] ->
         current =
-          DeliveryResponsibilities.current_accountable_recipient_in_txn(
-            txn,
-            work_item_id,
-            owner
-          )
+          if is_binary(work_item_id) do
+            DeliveryResponsibilities.current_accountable_recipient_in_txn(
+              txn,
+              work_item_id,
+              owner
+            )
+          end
 
         opener =
           cond do
@@ -6908,6 +6913,7 @@ defmodule Tightbeam.Gateway do
 
         delegated_opener =
           if is_binary(opener) and is_binary(opened_by_session) and
+               is_binary(work_item_id) and
                DeliveryResponsibilities.responsibility_in_txn(
                  txn,
                  opened_by_session,
@@ -6916,8 +6922,10 @@ defmodule Tightbeam.Gateway do
              do: opener,
              else: nil
 
+        owner_main = if is_binary(owner), do: Org.personal_session_key(owner)
+
         recipient =
-          [delegated_opener, current, opener, Org.personal_session_key(owner)]
+          [delegated_opener, current, opener, owner_main]
           |> Enum.reject(&is_nil/1)
           |> Enum.uniq()
           |> Enum.find(fn candidate ->

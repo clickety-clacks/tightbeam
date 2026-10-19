@@ -176,9 +176,26 @@ defmodule Tightbeam.Dispatch do
 
       {:remedy, statute, ref, error} ->
         outcome = RailRemedy.fire(db, handlers, statute, ref, call)
-        error = remedy_error(error, outcome)
-        best_effort_denial(db, verb, origin, principal, session_key, error)
-        {:error, error}
+
+        if statute.name == "completion-requires-review" and verb == "attest" and
+             call.params[:kind] == "completion" and review_notice_routed?(outcome) do
+          # A missing review keeps the assignment open, but it does not erase
+          # the holder's completion report. The remedy still routes review
+          # staffing to the accountable owner before the handler records it.
+          dispatch_to_handler(
+            db,
+            handlers,
+            Map.put(call, :review_pending, true),
+            verb,
+            origin,
+            principal,
+            session_key
+          )
+        else
+          error = remedy_error(error, outcome)
+          best_effort_denial(db, verb, origin, principal, session_key, error)
+          {:error, error}
+        end
 
       {:escalate, statute, ctx, dr_id} ->
         outcome =
@@ -758,6 +775,13 @@ defmodule Tightbeam.Dispatch do
     params[:assignment_id] || params["assignment_id"] || params[:reviews_assignment_id] ||
       params["reviews_assignment_id"] || params[:work_item_id] || params["work_item_id"]
   end
+
+  defp review_notice_routed?(%{outcome: outcome, producer_id: producer_id})
+       when outcome in ["claimed-dispatched", "recurrence-suppressed", "notification-stopped"] and
+              is_binary(producer_id),
+       do: true
+
+  defp review_notice_routed?(_outcome), do: false
 
   defp remedy_error(error, %{denial: denial}) do
     error
