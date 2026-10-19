@@ -170,6 +170,101 @@ defmodule Tightbeam.Artifacts do
     end
   end
 
+  @doc false
+  def collection_page_in_txn(%Txn{} = txn, filters, visibility, boundary, limit) do
+    {where, params} = artifact_collection_where(filters, visibility)
+
+    select_from = """
+    SELECT a.artifactId, a.kind, a.title, a.description, a.createdBySession,
+           a.workItemId, a.parentSession, a.originPath, a.contentSha256,
+           a.recordedMessageId, a.recordedTurnEvidence, a.state, a.home,
+           a.createdAt, a.updatedAt, f.rowVersion
+    FROM artifacts AS a
+    LEFT JOIN work_items AS wi ON wi.id = a.workItemId
+    LEFT JOIN artifact_version_floors AS f ON f.artifactId = a.artifactId
+    """
+
+    probe_from = """
+    artifacts AS a
+    LEFT JOIN work_items AS wi ON wi.id = a.workItemId
+    LEFT JOIN artifact_version_floors AS f ON f.artifactId = a.artifactId
+    """
+
+    query = fn sql, query_params -> Txn.q(txn, sql, query_params) end
+
+    page =
+      Tightbeam.Keyset.page(
+        query,
+        select_from,
+        probe_from,
+        where,
+        params,
+        ["a.createdAt", "a.artifactId"],
+        boundary,
+        limit,
+        fn row -> [Enum.at(row, 13), hd(row)] end
+      )
+
+    %{page | rows: Enum.map(page.rows, &artifact_collection_row/1)}
+  end
+
+  defp artifact_collection_where(filters, {visibility, visibility_params}) do
+    Enum.reduce(filters, {visibility, visibility_params}, fn {field, values}, {where, params} ->
+      column =
+        case field do
+          "workItemId" -> "a.workItemId"
+          "createdBySession" -> "a.createdBySession"
+          "kind" -> "a.kind"
+          "state" -> "a.state"
+          _ -> raise ArgumentError, "unsupported artifact collection filter"
+        end
+
+      predicate = column <> " IN (" <> Enum.map_join(values, ", ", fn _ -> "?" end) <> ")"
+      {"(" <> where <> ") AND " <> predicate, params ++ values}
+    end)
+  end
+
+  defp artifact_collection_row([
+         artifact_id,
+         kind,
+         title,
+         description,
+         created_by_session,
+         work_item_id,
+         parent_session,
+         origin_path,
+         content_sha256,
+         recorded_message_id,
+         recorded_turn_evidence,
+         state,
+         home,
+         created_at,
+         updated_at,
+         row_version
+       ]) do
+    artifact([
+      artifact_id,
+      kind,
+      title,
+      description,
+      created_by_session,
+      work_item_id,
+      nil,
+      parent_session,
+      origin_path,
+      content_sha256,
+      recorded_message_id,
+      recorded_turn_evidence,
+      state,
+      home,
+      created_at,
+      updated_at,
+      nil,
+      nil
+    ])
+    |> Map.put(:row_version, row_version)
+  end
+
   @doc """
   Record a deliberate artifact pointer for the authenticated calling session.
 

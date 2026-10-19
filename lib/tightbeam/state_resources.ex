@@ -776,6 +776,39 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  def query_artifact(db, %{collection: request}) do
+    principal = request.principal
+    visibility = StateVisibility.artifact_collection_scope(principal)
+
+    case DB.transaction(db, fn txn ->
+           txn = Txn.observe_queries(txn, Map.get(principal, :core_detail_trace))
+
+           page =
+             Artifacts.collection_page_in_txn(
+               txn,
+               request.filters,
+               visibility,
+               request.boundary,
+               request.limit
+             )
+
+           unless Enum.all?(page.rows, fn row ->
+                    StateVisibility.core_detail_visible?(txn, "artifacts", row, principal)
+                  end) do
+             raise ArgumentError, "artifact collection visibility selection drift"
+           end
+
+           %{
+             rows: page.rows,
+             has_more_before: page.has_more_before,
+             has_more_after: page.has_more_after
+           }
+         end) do
+      {:ok, page} -> page
+      {:error, error} -> raise error
+    end
+  end
+
   def query_artifact(db, %{key: id, principal: principal}) do
     detail_selection(db, "artifacts", principal, &Artifacts.canonical_in_txn(&1, id))
   end
@@ -785,6 +818,44 @@ defmodule Tightbeam.StateResources do
   def query_artifact(db, id) do
     case DB.transaction(db, &Artifacts.canonical_in_txn(&1, id)) do
       {:ok, row} -> row
+      {:error, error} -> raise error
+    end
+  end
+
+  def query_attest(db, %{collection: request}) do
+    principal = request.principal
+
+    case DB.transaction(db, fn txn ->
+           txn = Txn.observe_queries(txn, Map.get(principal, :core_detail_trace))
+
+           case query_assignment(txn, request.parent_id, %{rest_principal: principal}) do
+             nil ->
+               :not_found
+
+             _assignment ->
+               page =
+                 Assignments.list_attests(txn, %{
+                   assignment_id: request.parent_id,
+                   filters: request.filters,
+                   boundary: request.boundary,
+                   limit: request.limit
+                 })
+
+               if Enum.all?(page.rows, fn row ->
+                    StateVisibility.core_detail_visible?(txn, "attests", row, principal)
+                  end) do
+                 {:ok,
+                  %{
+                    rows: page.rows,
+                    has_more_before: page.has_more_before,
+                    has_more_after: page.has_more_after
+                  }}
+               else
+                 :not_found
+               end
+           end
+         end) do
+      {:ok, result} -> result
       {:error, error} -> raise error
     end
   end
