@@ -6215,15 +6215,15 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    #[ignore = "requires the authorized Racter-to-Eezo isolated scratch route"]
-    fn linux_to_eezo_selects_stages_and_retries_the_exact_darwin_candidate() {
+    #[ignore = "requires the authorized Linux sender-to-macOS scratch route"]
+    fn linux_sender_to_macos_scratch_selects_stages_and_retries_the_exact_darwin_candidate() {
         use std::os::unix::fs::PermissionsExt;
 
         let ssh_dest = std::env::var("TB_SATELLITE_REFRESH_SSH_DEST")
-            .expect("set the authorized Eezo SSH destination for this isolated test");
+            .expect("set the authorized macOS scratch destination for this Linux sender test");
         let candidate_binary = std::env::var_os("TB_SATELLITE_REFRESH_CANDIDATE_BINARY")
             .map(PathBuf::from)
-            .expect("set the exact candidate Darwin executable copied from Eezo");
+            .expect("set the exact candidate Darwin executable staged on the macOS scratch host");
         let binary_bytes = fs::read(&candidate_binary).expect("read candidate Darwin CLI");
         let git = ProcessCommand::new("git")
             .args(["rev-parse", "HEAD"])
@@ -6246,7 +6246,7 @@ mod tests {
             .to_owned();
         assert!(
             home.starts_with("/Users/"),
-            "unexpected Eezo home path: {home}"
+            "unexpected macOS scratch home path: {home}"
         );
         let root = format!(
             "{home}/tmp/tightbeam-satellite-refresh-{}-{}",
