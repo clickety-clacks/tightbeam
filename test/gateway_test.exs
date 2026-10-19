@@ -1043,7 +1043,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   @tag recipient_readiness: true
-  test "Codex oversized source keeps the ready snapshot editable under a named refusal", ctx do
+  test "Codex oversized source ends while healthy notices deliver in the same drain", ctx do
     assert {:ok, []} =
              DB.query(
                ctx.db,
@@ -1057,6 +1057,20 @@ defmodule Tightbeam.GatewayTest do
     assert length(String.to_charlist(oversized_payload)) == 1_048_576
     assert byte_size(oversized_payload) == 4 * 1_048_576
 
+    sender = Org.personal_session_key("flynn")
+
+    Org.create(ctx.db, %{
+      session_key: sender,
+      display_name: "Sender",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
     sources =
       for i <- 1..51 do
         Tightbeam.Wakes.schedule(ctx.db, %{
@@ -1068,24 +1082,45 @@ defmodule Tightbeam.GatewayTest do
         })
       end
 
-    assert NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1000,
-             conn_registry: ctx.registry,
-             lane_manager: ctx.lane
-           ) == []
+    assert [carrier] =
+             NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1000,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
 
     assert length(sources) == 51
-
-    assert Enum.all?(sources, fn wake ->
-             current = Tightbeam.Wakes.get(ctx.db, wake.wake_id)
-
-             current.state == "pending" and current.prompt == wake.prompt and
-               current.session_key == "k1" and
-               NoticeBatcher.source_refs(ctx.db, wake.wake_id) == []
-           end)
-
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='k1'")
-
     oversized_id = List.last(sources).wake_id
+    assert Tightbeam.Wakes.get(ctx.db, oversized_id).state == "canceled"
+    assert NoticeBatcher.source_refs(ctx.db, oversized_id) == []
+
+    for wake <- Enum.drop(sources, -1) do
+      current = Tightbeam.Wakes.get(ctx.db, wake.wake_id)
+      assert current.state == "fired"
+      assert current.prompt == wake.prompt
+      assert current.session_key == "k1"
+
+      assert [%{delivery_wake_id: ^carrier, member_state: "included", batch_state: "delivered"}] =
+               NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+    end
+
+    assert {:ok, [[^carrier, prompt]]} =
+             DB.query(ctx.db, "SELECT wakeId,prompt FROM turns WHERE sessionKey='k1'")
+
+    refute prompt =~ oversized_payload
+
+    assert {:ok, [["consumer_unavailable", "scheduler_delivery", "no_replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reasonKind,causalSourceKind,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [oversized_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE sessionKey=?1 AND clientMessageId=?2",
+               [sender, "wake-undeliverable:#{oversized_id}"]
+             )
 
     assert {:ok, [[detail]]} =
              DB.query(

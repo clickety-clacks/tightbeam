@@ -765,10 +765,18 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   defp dispose_unresolved_source_in_txn(txn, source, at) do
+    reason =
+      if is_binary(source.target_role) and
+           Txn.q(txn, "SELECT name FROM roles WHERE name=?1", [source.target_role]) == [] do
+        "role #{source.target_role} no longer exists"
+      else
+        "recipient is not currently resolvable"
+      end
+
     case Wakes.undeliverable_delivery_in_txn(
            txn,
            source.wake_id,
-           "recipient is not currently resolvable",
+           reason,
            at
          ) do
       {:canceled, {wake_id, notice}} ->
@@ -1154,7 +1162,7 @@ defmodule Tightbeam.NoticeBatcher do
 
     Txn.q(
       txn,
-      "UPDATE wakes SET sourceVisibilityScope=COALESCE(sourceVisibilityScope,?2),sourceAddress=?3 WHERE wakeId=?1",
+      "UPDATE wakes SET sourceVisibilityScope=COALESCE(sourceVisibilityScope,?2),sourceAddress=COALESCE(sourceAddress,?3) WHERE wakeId=?1",
       [
         wake.wake_id,
         scope,
