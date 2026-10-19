@@ -1948,8 +1948,10 @@ defmodule Tightbeam.AssignmentsTest do
                [carrier_wake_id]
              )
 
-    # recover now commits the actual turn atomically; a second append would be a duplicate.
-    {:appended, target, Projection.get(db, message_id), []}
+    # recover already committed and published the turn; report its disposition
+    # without appending or publishing the same carrier again.
+    assert %{session_key: ^target} = Projection.get(db, message_id)
+    :appended
   end
 
   defp deliver_scheduled_wake(db, wake) do

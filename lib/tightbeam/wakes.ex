@@ -1633,6 +1633,7 @@ defmodule Tightbeam.Wakes do
       state: "pending",
       created_at: created_at,
       fired_at: nil,
+      delivered_turn_seq: nil,
       condition_kind: condition_kind,
       condition_scope: Map.get(input, :condition_scope),
       condition_after_id: condition_after_id,
