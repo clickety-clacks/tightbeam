@@ -794,7 +794,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   @tag recipient_readiness: true
-  test "an idle post joins an eligible role source after its role moves", ctx do
+  test "an idle post keeps its own row when an eligible role source moves", ctx do
     alias Tightbeam.{Roles, Wakes}
 
     Org.create(ctx.db, %{
@@ -842,26 +842,51 @@ defmodule Tightbeam.GatewayTest do
     }
 
     assert %{ack: "alias-post-1"} = post.(call)
+
+    assert {:ok, [[post_wake_id]]} =
+             DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE prompt='new direct post'")
+
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE clientMessageId='alias-post-1'")
+
     assert %{dedupe: "duplicate"} = post.(call)
 
-    assert [carrier] =
+    assert [^post_wake_id, carrier] =
              NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1000,
                conn_registry: ctx.registry,
                lane_manager: ctx.lane
+             )
+
+    assert {:ok,
+            [[human_message_id, "user", "new direct post", "user:flynn", "alias-post-device", "alias-post-1"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,role,content,sender,deviceId,clientMessageId FROM messages WHERE clientMessageId='alias-post-1'"
+             )
+
+    assert {:ok, [[^human_message_id, "queued", "new direct post"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT messageId,status,prompt FROM turns WHERE wakeId=?1",
+               [post_wake_id]
              )
 
     assert {:ok, [["k1", prompt]]} =
              DB.query(ctx.db, "SELECT sessionKey,prompt FROM turns WHERE wakeId=?1", [carrier])
 
     assert prompt =~ "urgent role source"
-    assert prompt =~ "new direct post"
-    assert :binary.match(prompt, "urgent role source") < :binary.match(prompt, "new direct post")
+    refute prompt =~ "new direct post"
     assert [%{delivery_wake_id: ^carrier}] = NoticeBatcher.source_refs(ctx.db, source.wake_id)
+    assert NoticeBatcher.source_refs(ctx.db, post_wake_id) == []
     assert Wakes.get(ctx.db, source.wake_id).session_key == "k2"
     assert Wakes.get(ctx.db, source.wake_id).target_role == "post-recipient"
     assert %{dedupe: "duplicate"} = post.(call)
-    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE clientMessageId='alias-post-1'")
   end
 
   @tag recipient_readiness: true

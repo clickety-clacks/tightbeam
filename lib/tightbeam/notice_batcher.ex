@@ -849,9 +849,10 @@ defmodule Tightbeam.NoticeBatcher do
 
     {human_posts, batch_sources} =
       Enum.split_with(sources_with_client_identity, fn source ->
+        # Only the post handler writes client identity sidecars; keep every other
+        # source, including agent and process wakes, in the established batch path.
         is_binary(source.origin) and String.starts_with?(source.origin, "user:") and
-          is_map(source.source_client_identity) and
-          Map.get(source.source_client_identity, "waitingForBusySession") == true
+          is_map(source.source_client_identity)
       end)
 
     human_deliveries =
