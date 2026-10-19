@@ -445,7 +445,9 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     assert excluded_turn_response.resp_body == from_turn_response.resp_body
 
     assert {:ok, _rows} = DB.query(ctx.db, "DELETE FROM turns WHERE seq=999999")
-    assert {:ok, _rows} = DB.query(ctx.db, "DELETE FROM assignments WHERE id=?1", [excluded_chain])
+
+    assert {:ok, _rows} =
+             DB.query(ctx.db, "DELETE FROM assignments WHERE id=?1", [excluded_chain])
 
     absent_turn_response = get(ctx, "/api/work-items/#{from_turn}/trace")
     assert absent_turn_response.resp_body == from_turn_response.resp_body
