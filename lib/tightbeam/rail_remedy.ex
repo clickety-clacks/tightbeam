@@ -411,10 +411,10 @@ defmodule Tightbeam.RailRemedy do
         case DB.transaction(db, fn txn ->
                case Txn.q(
                       txn,
-                      "SELECT noticeState FROM rail_remedy_episodes WHERE statute=?1 AND subject=?2 AND status='live' AND occurrence=?3",
-                      [statute, subject, occurrence]
+                      "SELECT status,occurrence,noticeState FROM rail_remedy_episodes WHERE statute=?1 AND subject=?2",
+                      [statute, subject]
                     ) do
-                 [[encoded]] ->
+                 [["live", ^occurrence, encoded]] ->
                    state = decode_notice_state(encoded)
 
                    if get_in(state, ["reassessment", "wakeId"]) == wake.wake_id and
@@ -509,20 +509,21 @@ defmodule Tightbeam.RailRemedy do
                      raise ArgumentError, "stale review remedy reassessment"
                    end
 
-                 _ ->
-                   # The episode closed or moved to another occurrence, so this
-                   # reassessment can never apply. Consume it once instead of
-                   # failing on every scheduler tick.
-                   Tightbeam.Wakes.consume_internal_in_txn(txn, wake.wake_id)
-
-                   EventLog.lifecycle_in_txn(
-                     txn,
-                     "rail_remedy_reassessment_retired",
-                     subject,
-                     "wakeId=#{wake.wake_id} cause=episode_not_live occurrence=#{occurrence} principal=process:tightbeam"
-                   )
-
+                 [] ->
+                   settle_stale_reassessment_in_txn(txn, wake, subject, occurrence)
                    :ok
+
+                 [["closed", current_occurrence, _encoded]]
+                 when current_occurrence >= occurrence ->
+                   settle_stale_reassessment_in_txn(txn, wake, subject, occurrence)
+                   :ok
+
+                 [["live", current_occurrence, _encoded]] when current_occurrence > occurrence ->
+                   settle_stale_reassessment_in_txn(txn, wake, subject, occurrence)
+                   :ok
+
+                 _ ->
+                   raise ArgumentError, "review remedy episode is not live"
                end
              end) do
           {:ok, :ok} -> :ok
@@ -533,6 +534,39 @@ defmodule Tightbeam.RailRemedy do
         raise ArgumentError, "invalid review remedy reassessment payload"
     end
   end
+
+  defp settle_stale_reassessment_in_txn(
+         %Txn{} = txn,
+         %{consumer: "review_remedy_reconcile", prompt: prompt, wake_id: wake_id},
+         subject,
+         occurrence
+       ) do
+    case Txn.q(txn, "SELECT consumer,prompt,state FROM wakes WHERE wakeId=?1", [wake_id]) do
+      [["review_remedy_reconcile", ^prompt, "pending"]] ->
+        Wakes.consume_internal_in_txn(txn, wake_id)
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "rail_remedy_reassessment_retired",
+          subject,
+          "wakeId=#{wake_id} cause=episode_not_live occurrence=#{occurrence} principal=process:tightbeam"
+        )
+
+        :ok
+
+      [["review_remedy_reconcile", ^prompt, state]] when state in ["fired", "canceled"] ->
+        :ok
+
+      [] ->
+        :ok
+
+      _ ->
+        raise ArgumentError, "stale review remedy reassessment identity changed"
+    end
+  end
+
+  defp settle_stale_reassessment_in_txn(_txn, _wake, _subject, _occurrence),
+    do: raise(ArgumentError, "stale review remedy reassessment identity changed")
 
   @doc "Return the occurrence when one statute/subject episode is live."
   @spec live?(DB.server(), String.t(), String.t()) :: pos_integer() | nil
