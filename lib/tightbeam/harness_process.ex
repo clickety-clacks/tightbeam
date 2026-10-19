@@ -530,7 +530,26 @@ defmodule Tightbeam.HarnessProcess do
     Enum.map(rows, &decode_row/1)
   end
 
-  defp reconcile_row(db, row, terminal_state \\ "killed") do
+  defp reconcile_row(db, row, terminal_state \\ "killed")
+
+  # A graceful park close keeps its own terminal state and its park
+  # completion; settlement always records the launch as exited. Settle only
+  # a launch whose identity cannot be recovered, and keep the identity
+  # failure as the recorded reason when settlement also refuses.
+  defp reconcile_row(db, row, "closed_gracefully" = terminal_state) do
+    with {:ok, recovered} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
+      kill(db, recovered, terminal_state)
+    else
+      {:error, identity_failure} ->
+        case settle(db, row.launch_id, row.adapter_key, "automatic-reconcile") do
+          {:ok, _} -> :settled
+          :already_resolved -> :already_resolved
+          {:error, _} -> unidentified(db, row, identity_failure)
+        end
+    end
+  end
+
+  defp reconcile_row(db, row, terminal_state) do
     case settle(db, row.launch_id, row.adapter_key, "automatic-reconcile") do
       {:ok, _} ->
         :settled
