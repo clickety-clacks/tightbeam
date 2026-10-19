@@ -257,68 +257,229 @@ defmodule Tightbeam.RestExecutionMapTest do
     end
   end
 
-  test "hidden-only state is byte-identical to its absence in the composed response", ctx do
-    before = get(ctx, "/api/execution-map", ctx.token)
-    assert decode_success(before)["items"] == []
-    assert get_resp_header(before, "cache-control") == ["no-store"]
-    assert {:ok, [[cutoff]]} = DB.query(ctx.db, "SELECT at FROM causal_events_epoch WHERE id=0")
+  test "hidden activity linked to visible items leaves response bytes and nodes unchanged", ctx do
+    user_visible_item = insert_work_item!(ctx.db, "wi_user_twin_visible", "owner", 41_000)
+    filtered_tree_path = "/api/execution-map/tree?state=closed"
 
-    hidden_item = insert_work_item!(ctx.db, "wi_hidden_twin", "other", 41_000)
+    before_user = get(ctx, filtered_tree_path, ctx.token)
+    assert decode_success(before_user)["roots"] == []
+    assert get_resp_header(before_user, "cache-control") == ["no-store"]
 
-    hidden_assignment =
-      insert_assignment!(ctx.db, "asg_hidden_twin",
-        opener_user: "other",
-        holder: ctx.other_session.session_key,
-        work_item_id: hidden_item
-      )
+    user_nodes_before =
+      execution_map_tree_node_bytes(ctx, %{kind: "user", id: "owner", is_admin: false})
 
-    assert {:ok, _rows} =
-             DB.query(
-               ctx.db,
-               """
-               INSERT INTO attests (id, assignmentId, kind, bySession, ts)
-               VALUES (?1, ?2, 'progress', ?3, ?4)
-               """,
-               ["att_hidden_twin", hidden_assignment, ctx.other_session.session_key, 1]
-             )
+    user_node_ids = user_nodes_before |> Enum.map(&JSON.decode!/1) |> Enum.map(& &1["id"])
+    assert user_node_ids == [user_visible_item]
 
     assert {:ok, _seq} =
              Ledger.enqueue(ctx.db, %{
                session_key: ctx.other_session.session_key,
-               message_id: "execution-map-hidden-twin-turn",
+               message_id: "execution-map-hidden-user-turn",
                origin: "user:other",
-               prompt: "hidden turn data",
-               job_ref: hidden_item
+               prompt: "turn attached to a visible item",
+               job_ref: user_visible_item
              })
 
-    assert {:ok, _rows} =
-             DB.query(ctx.db, "UPDATE causal_events_epoch SET at=?1 WHERE id=0", [cutoff])
+    after_user = get(ctx, filtered_tree_path, ctx.token)
+    assert response_signature(after_user) == response_signature(before_user)
 
-    after_hidden = get(ctx, "/api/execution-map", ctx.token)
-    assert get_resp_header(after_hidden, "cache-control") == ["no-store"]
-    assert response_signature(after_hidden) == response_signature(before)
+    user_nodes_after =
+      execution_map_tree_node_bytes(ctx, %{kind: "user", id: "owner", is_admin: false})
+
+    assert user_nodes_after == user_nodes_before
+
+    session_visible_item =
+      insert_work_item!(ctx.db, "wi_session_twin_visible", "other", 42_000,
+        created_by_session: ctx.owner_session.session_key
+      )
+
+    session_bearer = ctx.owner_session.cli_token
+    before_session = get(ctx, filtered_tree_path, session_bearer)
+    assert decode_success(before_session)["roots"] == []
+    assert get_resp_header(before_session, "cache-control") == ["no-store"]
+
+    session_nodes_before =
+      execution_map_tree_node_bytes(ctx, %{
+        kind: "session",
+        id: ctx.owner_session.session_key,
+        is_admin: false
+      })
+
+    session_node_ids = session_nodes_before |> Enum.map(&JSON.decode!/1) |> Enum.map(& &1["id"])
+    assert session_node_ids == [session_visible_item]
+
+    hidden_assignment =
+      insert_assignment!(ctx.db, "asg_session_twin_hidden",
+        opener_user: "other",
+        holder: ctx.other_session.session_key,
+        work_item_id: session_visible_item
+      )
+
+    insert_attest!(
+      ctx.db,
+      "att_session_twin_hidden",
+      hidden_assignment,
+      ctx.other_session.session_key,
+      1
+    )
+
+    insert_pending_wake!(
+      ctx.db,
+      "wake_session_twin_hidden",
+      ctx.other_session.session_key,
+      hidden_assignment,
+      1
+    )
+
+    after_session = get(ctx, filtered_tree_path, session_bearer)
+    assert response_signature(after_session) == response_signature(before_session)
+
+    session_nodes_after =
+      execution_map_tree_node_bytes(ctx, %{
+        kind: "session",
+        id: ctx.owner_session.session_key,
+        is_admin: false
+      })
+
+    assert session_nodes_after == session_nodes_before
   end
 
-  test "dependency versions change for visible sources and ignore hidden or unlisted changes",
+  test "each listed visible source changes dependencyVersion while hidden and unlisted changes do not",
        ctx do
     visible = insert_work_item!(ctx.db, "wi_dependency_visible", "owner", 42_000)
     hidden = insert_work_item!(ctx.db, "wi_dependency_hidden", "other", 43_000)
+    assignment =
+      insert_assignment!(ctx.db, "asg_dependency_visible",
+        opener_user: "owner",
+        holder: ctx.owner_session.session_key,
+        work_item_id: visible
+      )
+
+    insert_attest!(ctx.db, "att_dependency_visible", assignment, ctx.owner_session.session_key, 1)
+
+    {:ok, turn_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: ctx.owner_session.session_key,
+        message_id: "execution-map-dependency-turn",
+        origin: "user:owner",
+        prompt: "visible dependency turn",
+        job_ref: visible
+      })
+
+    insert_pending_wake!(
+      ctx.db,
+      "wake_dependency_visible",
+      ctx.owner_session.session_key,
+      assignment,
+      1
+    )
+    insert_open_statute_request!(ctx.db, "dr_dependency_visible", assignment)
+
+    insert_subagent_marker!(
+      ctx.db,
+      "subagent_dependency_1",
+      "event_dependency_1",
+      assignment,
+      ctx.owner_session.session_key
+    )
+
+    insert_disposition_event!(ctx.db, visible, assignment)
 
     baseline = get(ctx, "/api/execution-map", ctx.token) |> decode_success()
     assert Enum.map(baseline["items"], & &1["id"]) == [visible]
-    baseline_version = baseline["dependencyVersion"]
 
-    assert {:ok, _rows} =
-             DB.query(
-               ctx.db,
-               "UPDATE work_items SET title='Visible changed' WHERE id=?1",
-               [visible]
-             )
+    changes = [
+      {"work items",
+       fn ->
+         assert {:ok, _rows} =
+                  DB.query(ctx.db, "UPDATE work_items SET title='Visible changed' WHERE id=?1", [
+                    visible
+                  ])
 
-    stamp_work_item_version!(ctx.db, visible, 42_001)
+         stamp_work_item_version!(ctx.db, visible, 42_001)
+       end},
+      {"assignments",
+       fn ->
+         assert {:ok, _rows} =
+                  DB.query(ctx.db, "UPDATE assignments SET openedAt=openedAt+1 WHERE id=?1", [
+                    assignment
+                  ])
+       end},
+      {"attests",
+       fn ->
+         assert {:ok, _rows} =
+                  DB.query(ctx.db, "UPDATE attests SET ts=ts+1 WHERE id=?1", [
+                    "att_dependency_visible"
+                  ])
+       end},
+      {"turns",
+       fn ->
+         assert {:ok, _rows} =
+                  DB.query(ctx.db, "UPDATE turns SET createdAt=createdAt+1 WHERE seq=?1", [
+                    turn_seq
+                  ])
+       end},
+      {"pending wakes",
+       fn ->
+         assert {:ok, _rows} =
+                  DB.query(ctx.db, "UPDATE wakes SET createdAt=createdAt+1 WHERE wakeId=?1", [
+                    "wake_dependency_visible"
+                  ])
+       end},
+      {"open decision requests",
+       fn ->
+         assert {:ok, _rows} =
+                  DB.query(
+                    ctx.db,
+                    "UPDATE decision_requests SET question=question || ' revised' WHERE id=?1",
+                    ["dr_dependency_visible"]
+                  )
+       end},
+      {"sessions",
+       fn ->
+         assert {:ok, _rows} =
+                  DB.query(
+                    ctx.db,
+                    "UPDATE sessions SET updatedAt=updatedAt+1 WHERE sessionKey=?1",
+                    [ctx.owner_session.session_key]
+                  )
+       end},
+      {"principal user row",
+       fn ->
+         assert {:ok, _rows} =
+                  DB.query(
+                    ctx.db,
+                    "UPDATE admin_projection_versions SET rowVersion=rowVersion+1 WHERE resource='users' AND primaryKey='owner'"
+                  )
+       end},
+      {"subagent markers",
+       fn ->
+         insert_subagent_marker!(
+           ctx.db,
+           "subagent_dependency_2",
+           "event_dependency_2",
+           assignment,
+           ctx.owner_session.session_key
+         )
+       end},
+      {"disposition causal events",
+       fn -> insert_disposition_event!(ctx.db, visible, assignment) end},
+      {"causal event epoch",
+       fn ->
+         assert {:ok, _rows} = DB.query(ctx.db, "UPDATE causal_events_epoch SET at=at+1 WHERE id=0")
+       end}
+    ]
 
-    visible_changed = get(ctx, "/api/execution-map", ctx.token) |> decode_success()
-    refute visible_changed["dependencyVersion"] == baseline_version
+    visible_version =
+      Enum.reduce(changes, baseline["dependencyVersion"], fn {source, mutate}, previous ->
+        mutate.()
+        changed = get(ctx, "/api/execution-map", ctx.token) |> decode_success()
+
+        refute changed["dependencyVersion"] == previous,
+               "changing a visible #{source} dependency must change dependencyVersion"
+
+        changed["dependencyVersion"]
+      end)
 
     assert {:ok, _rows} =
              DB.query(
@@ -330,7 +491,7 @@ defmodule Tightbeam.RestExecutionMapTest do
     stamp_work_item_version!(ctx.db, hidden, 43_001)
 
     hidden_changed = get(ctx, "/api/execution-map", ctx.token) |> decode_success()
-    assert hidden_changed["dependencyVersion"] == visible_changed["dependencyVersion"]
+    assert hidden_changed["dependencyVersion"] == visible_version
 
     assert {:ok, _rows} =
              DB.query(
@@ -922,6 +1083,87 @@ defmodule Tightbeam.RestExecutionMapTest do
              )
   end
 
+  defp insert_attest!(db, id, assignment_id, by_session, ts) do
+    assert {:ok, _rows} =
+             DB.query(
+               db,
+               "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES (?1, ?2, 'progress', ?3, ?4)",
+               [id, assignment_id, by_session, ts]
+             )
+
+    id
+  end
+
+  defp insert_pending_wake!(db, id, session_key, assignment_id, created_at) do
+    assert {:ok, _rows} =
+             DB.query(
+               db,
+               """
+               INSERT INTO wakes
+                 (wakeId, sessionKey, origin, prompt, consumer, dueAt, state, createdAt,
+                  creatorSessionKey, assignmentId, class)
+               VALUES (?1, ?2, ?3, 'pending execution map fixture', 'prompt', ?4,
+                       'pending', ?5, ?2, ?6, 'fyi')
+               """,
+               [
+                 id,
+                 session_key,
+                 "session:#{session_key}",
+                 created_at + 1_000,
+                 created_at,
+                 assignment_id
+               ]
+             )
+
+    id
+  end
+
+  defp insert_open_statute_request!(db, id, assignment_id) do
+    assert {:ok, _rows} =
+             DB.query(
+               db,
+               """
+               INSERT INTO decision_requests
+                 (id, kind, raiserId, ownerUserId, assignmentId, raisedAt, deadlineAt,
+                  statuteName, actionKey, question, context, status)
+               VALUES (?1, 'statute', 'user:owner', 'owner', ?2, 1, 50_000,
+                       'execution-map-test', 'visible-dependency', 'Question', '{}', 'open')
+               """,
+               [id, assignment_id]
+             )
+
+    id
+  end
+
+  defp insert_subagent_marker!(db, subagent_ref, event_ref, assignment_id, session_key) do
+    assert {:ok, _rows} =
+             DB.query(
+               db,
+               """
+               INSERT INTO subagent_markers
+                 (kind, principal, subagentRef, sourceEventRef, harness, at, assignmentId)
+               VALUES ('subagent_start', ?1, ?2, ?3, 'claude', 1, ?4)
+               """,
+               [session_key, subagent_ref, event_ref, assignment_id]
+             )
+
+    :ok
+  end
+
+  defp insert_disposition_event!(db, item_id, assignment_id) do
+    assert {:ok, _rows} =
+             DB.query(
+               db,
+               """
+               INSERT INTO causal_events (at, jobRef, assignmentId, kind, detail)
+               VALUES (1, ?1, ?2, 'disposition_transition', ?3)
+               """,
+               [item_id, assignment_id, JSON.encode!(%{"fromState" => "open", "toState" => "open"})]
+             )
+
+    :ok
+  end
+
   defp insert_assignment!(db, id, opts) do
     assert {:ok, _rows} =
              DB.query(
@@ -979,6 +1221,17 @@ defmodule Tightbeam.RestExecutionMapTest do
     traced = %{ctx | opts: Keyword.put(ctx.opts, :core_detail_trace, self())}
     response = get(traced, path, bearer)
     {response, drain_core_detail_trace([])}
+  end
+
+  defp execution_map_tree_node_bytes(ctx, principal) do
+    ctx.db
+    |> ExecutionMap.query_execution_map_tree(%{
+      principal: principal,
+      filters: %{},
+      now: 2_000_000_000_000
+    })
+    |> Map.fetch!(:roots)
+    |> Enum.map(&ExecutionMap.execution_map_node/1)
   end
 
   defp drain_core_detail_trace(events) do
