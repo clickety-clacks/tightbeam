@@ -704,11 +704,10 @@ defmodule Tightbeam.HarnessProcessFixture do
     [%{launch_id: launch_id}] = AdapterCoordinator.harness_processes(coordinator)
 
     # A GENUINE cannot-identify: corrupt the identity file the signal helper
-    # verifies before it will authorize a kill. (This test once faked the
-    # row's bootIdentity instead — but a recorded-boot mismatch is now proof
-    # of a reboot orphan and RESOLVES; reality cannot produce a row whose
-    # boot disagrees with its own identity file, since capture copies one
-    # from the other.)
+    # verifies before it will authorize a kill. With identity unproved and
+    # termination unproved, every cleanup path fails closed: the launch stays
+    # unresolved, its fence stays, and no successor may start until an
+    # operator settles the launch with proof.
     identity_path = Path.join([ctx.test_dir, "harness-processes", launch_id <> ".identity"])
     File.write!(identity_path, "not	an	identity
 ")
@@ -717,9 +716,13 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     assert eventually(fn ->
              match?(
-               %{generation: 2, pid: nil, timer: timer} when is_reference(timer),
-               :sys.get_state(coordinator).adapters[key]
+               [%{state: "kill_failed", resolved_at: nil}],
+               AdapterCoordinator.harness_processes(coordinator)
              )
+           end)
+
+    assert eventually(fn ->
+             match?(%{generation: 2, pid: nil}, :sys.get_state(coordinator).adapters[key])
            end)
 
     send(coordinator, {:restart_adapter, key, 2})
@@ -730,49 +733,25 @@ defmodule Tightbeam.HarnessProcessFixture do
         Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
       end
 
-    assert_receive {:adapter_started, 2}, 2_000
-
-    assert [{:ok, successor_pid, 2}] =
+    assert [{:error, {:park_fenced, "claude:shared@testhost"}}] =
              checkouts
              |> Enum.map(&Task.await(&1, 2_000))
              |> Enum.uniq()
 
-    assert Process.alive?(successor_pid)
-    refute_receive {:adapter_started, 3}, 700
+    refute_receive {:adapter_started, 2}, 700
 
-    assert eventually(fn ->
-             case :sys.get_state(coordinator).adapters[key] do
-               %{generation: 2, pid: pid} when is_pid(pid) -> Process.alive?(pid)
-               _ -> false
-             end
-           end)
-
-    assert [successor, failed] = HarnessProcess.list(ctx.db)
-    assert successor.state == "running"
+    assert [failed] = HarnessProcess.list(ctx.db)
     assert failed.launch_id == launch_id
-    assert failed.state == "exited"
-    assert is_integer(failed.resolved_at)
+    assert failed.state == "kill_failed"
+    assert failed.resolved_at == nil
     assert failed.last_error =~ "signal_refused"
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1",
                ["claude:shared@testhost"]
              )
-
-    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
-             event.kind == "harness_cleanup_failed" and
-               event.subject == "claude:shared@testhost" and
-               event.detail =~ launch_id and
-               event.detail =~ "process_group_kill" and
-               event.detail =~ "signal_refused"
-           end)
-
-    refute Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
-             event.kind == "adapter_reconcile_failed" and
-               event.subject == "claude:shared@testhost"
-           end)
   end
 
   defp scenario(22, ctx) do

@@ -263,7 +263,7 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 20)
   end
 
-  test "a proven-dead cleanup refusal records the failure and starts one successor", %{
+  test "a proven-dead cleanup refusal stays fenced and refuses a successor", %{
     tmp_dir: tmp
   } do
     Tightbeam.HarnessProcessFixture.run!(tmp, 21)
