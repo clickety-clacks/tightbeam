@@ -2465,8 +2465,10 @@ defmodule Tightbeam.HarnessHealthTest do
     restoration = restore_health_turn!(ctx.db, source.session, "restore-after-route-switch")
     restoration_seq = restoration.seq
     source_wake_id = wake.wake_id
+    restored_session = Org.get(ctx.db, source.session)
 
-    assert restoration.harness == "codex"
+    assert restored_session.harness == "codex"
+    assert restored_session.host == "alternate-host"
 
     assert {:ok, [[^source_wake_id, ^restoration_seq, redelivery_seq, ^prompt]]} =
              DB.query(
