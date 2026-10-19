@@ -1,4 +1,3 @@
-use sha2::{Digest, Sha256};
 use std::ffi::CStr;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -485,13 +484,7 @@ fn verify_launch_args(args: &[String]) -> Result<&[String], String> {
     if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("cursor execution identity refused: managed hook hash is invalid".into());
     }
-    let hooks = account_named(ACCOUNT)?.home.join(".cursor/hooks.json");
-    let bytes = fs::read(&hooks).map_err(|error| {
-        format!("cursor execution identity refused: managed hooks are unreadable: {error}")
-    })?;
-    if format!("{:x}", Sha256::digest(&bytes)) != expected.to_ascii_lowercase() {
-        return Err("cursor execution identity refused: managed hook hash differs from the compiled projection".into());
-    }
+    crate::cursor_rails::verify_managed(&account_named(ACCOUNT)?.home, expected)?;
     Ok(&args[6..])
 }
 

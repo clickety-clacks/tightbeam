@@ -5,11 +5,63 @@ defmodule Tightbeam.HomesTest do
 
   @hollow_vendor_record ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"refreshTokenExpiresAt":0,"scopes":[],"subscriptionType":"","rateLimitTier":""}})
   @healthy_vendor_record ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-fresh","refreshToken":"sk-ant-ort01-fresh","expiresAt":4102444800000,"refreshTokenExpiresAt":4102444800000,"scopes":["user:inference","user:sessions:claude_code"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}})
+  @primary_gid System.cmd("id", ["-g"]) |> elem(0) |> String.trim() |> String.to_integer()
+  @groups System.cmd("id", ["-G"]) |> elem(0) |> String.split() |> Enum.map(&String.to_integer/1)
+  @projection_gid Enum.find(@groups, &(&1 != @primary_gid))
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-homes-#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf!(base_dir) end)
     %{base_dir: base_dir}
+  end
+
+  @tag skip:
+         if(is_nil(@projection_gid),
+           do: "requires a distinct shared group for the projection directory",
+           else: false
+         )
+  test "copy projection replaces a planted link and preserves shared group access", %{
+    base_dir: base_dir
+  } do
+    auth_dir = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(auth_dir)
+    File.chgrp!(auth_dir, @primary_gid)
+    File.chmod!(auth_dir, 0o700)
+    operator_credential = Path.join(auth_dir, "cli-config.json")
+    File.write!(operator_credential, ~s({"version":1,"operator":true}))
+    File.chgrp!(operator_credential, @primary_gid)
+    File.chmod!(operator_credential, 0o600)
+
+    home = Homes.home_path(base_dir, "machine", :cursor)
+    File.mkdir_p!(home)
+    File.chgrp!(home, @projection_gid)
+    File.chmod!(home, 0o2770)
+    projected_credential = Path.join(home, "cli-config.json")
+    File.ln_s!(operator_credential, projected_credential)
+
+    Homes.reconcile(
+      %{host_config: %{ssh: nil, base_dir: base_dir}},
+      home,
+      %{harness: :cursor, machine: "machine", rails: nil, auth_dir: auth_dir},
+      credential_names: ["cli-config.json"],
+      credential_projection: :copy_readable,
+      preserve_manifest_dir: true,
+      before_credential_projection_promote: fn projected ->
+        File.rm!(projected)
+        File.ln_s!(operator_credential, projected)
+      end
+    )
+
+    assert File.read!(operator_credential) == ~s({"version":1,"operator":true})
+    assert Bitwise.band(File.stat!(operator_credential).mode, 0o777) == 0o600
+    assert File.stat!(operator_credential).gid == @primary_gid
+
+    assert File.read!(projected_credential) == ~s({"version":1,"operator":true})
+    assert Bitwise.band(File.stat!(projected_credential).mode, 0o777) == 0o640
+    assert File.stat!(home).gid == @projection_gid
+    assert File.stat!(projected_credential).gid == @projection_gid
+    refute File.stat!(projected_credential).gid == File.stat!(auth_dir).gid
+    assert Bitwise.band(File.stat!(projected_credential).mode, 0o040) == 0o040
   end
 
   test "projects one generic home per machine and harness", %{base_dir: base_dir} do
