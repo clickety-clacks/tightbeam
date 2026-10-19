@@ -600,7 +600,16 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, review} = Dispatch.dispatch(db, handlers, review_call)
     assert review.holderKey != assignment.holderKey
     assert review.reviewsAssignmentId == assignment.id
-    assert observed_state_classes() == ["assignment.opened"]
+
+    # The reviewer's opened notice is a stored message beside the transition.
+    review_notices = observed_state_notices()
+    assert map_size(review_notices) == 2
+
+    assert %{"assignment.opened" => [_opened], "message.created" => [review_notice]} =
+             review_notices
+
+    assert review_notice["payload"]["sessionKey"] == review.holderKey
+    assert review_notice["payload"]["content"] == "[assignment opened: #{review.id}]"
 
     clean = %{
       tests_passed
@@ -654,7 +663,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
              Dispatch.dispatch(db, handlers, reopen)
 
     assert reopened_id == assignment.id
-    assert_per_verb_effects!(config, "reopen-assignment", observed_state_classes())
+    {holder_notices, reopen_effects} = Map.pop(observed_state_notices(), "message.created", [])
+    assert [%{"payload" => reopen_message}] = holder_notices
+    assert reopen_message["sessionKey"] == assignment.holderKey
+
+    assert reopen_message["content"] ==
+             "[assignment reopened: #{assignment.id} by session:effect-target — continue the real assignment]"
+
+    assert_per_verb_effects!(config, "reopen-assignment", Map.keys(reopen_effects))
     history = Tightbeam.Assignments.list_reopenings(db, assignment.id)
     assert [%{priorOutcome: "completed", reason: "continue the real assignment"}] = history
     assert {:error, %{code: "assignment_open"}} = Dispatch.dispatch(db, handlers, reopen)
@@ -1571,6 +1587,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
   defp observed_state_classes do
     observed_classes()
     |> state_classes()
+  end
+
+  defp observed_state_notices do
+    observed_notices()
+    |> Enum.filter(&match?({:ok, _row}, Tightbeam.Firehose.Registry.fetch(&1["class"])))
+    |> Enum.group_by(& &1["class"])
   end
 
   defp state_classes(classes) do
