@@ -192,6 +192,7 @@ defmodule Tightbeam.HarnessProcess do
       )
     )
     |> Keyword.put(:harness_process_launch_id, launch_id)
+    |> Keyword.put(:harness_process_satellite_host, if(is_binary(ssh), do: elem(key, 2)))
   end
 
   @doc "Read and persist the identity written by the launched process itself."
@@ -344,6 +345,16 @@ defmodule Tightbeam.HarnessProcess do
   def park(db, row) do
     with {:ok, row} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
       kill(db, row)
+    else
+      {:error, reason} -> unidentified(db, row, reason)
+    end
+  end
+
+  @doc "Kill only the gateway-recorded process group during credential replacement."
+  @spec park_credential_group(DB.server(), row()) :: :ok | :already_resolved | {:error, term()}
+  def park_credential_group(db, row) do
+    with {:ok, row} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
+      kill(db, row, "killed", :credential_group)
     else
       {:error, reason} -> unidentified(db, row, reason)
     end
@@ -609,7 +620,7 @@ defmodule Tightbeam.HarnessProcess do
 
   defp unidentified(db, row, reason), do: kill_failed(db, row, reason)
 
-  defp kill(db, row, terminal_state \\ "killed") do
+  defp kill(db, row, terminal_state \\ "killed", signal_scope \\ :process_tree) do
     attempted_at = now()
 
     {:ok, _} =
@@ -623,7 +634,7 @@ defmodule Tightbeam.HarnessProcess do
         [row.launch_id, attempted_at]
       )
 
-    case send_sigkill(row) do
+    case send_sigkill(row, signal_scope) do
       :ok ->
         sent_at = now()
 
@@ -648,8 +659,14 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
-  defp send_sigkill(row) do
-    case run_group_command(row, command_timeout_ms()) do
+  defp send_sigkill(row, signal_scope) do
+    command_result =
+      case signal_scope do
+        :process_tree -> run_group_command(row, command_timeout_ms())
+        :credential_group -> run_credential_group_command(row, command_timeout_ms())
+      end
+
+    case command_result do
       {_output, 0} ->
         :ok
 
@@ -659,10 +676,19 @@ defmodule Tightbeam.HarnessProcess do
       {output, status} ->
         reason = one_line(output)
 
-        if String.starts_with?(reason, "harness ") do
-          {:refused, reason}
-        else
-          {:error, {:sigkill_not_delivered, status, reason}}
+        mismatch =
+          if is_binary(row.ssh) do
+            Tightbeam.Harness.Support.satellite_command_version_mismatch(
+              output,
+              row.host,
+              "harness-group"
+            )
+          end
+
+        cond do
+          mismatch -> {:error, mismatch}
+          String.starts_with?(reason, "harness ") -> {:refused, reason}
+          true -> {:error, {:sigkill_not_delivered, status, reason}}
         end
     end
   end
@@ -820,6 +846,28 @@ defmodule Tightbeam.HarnessProcess do
           destination,
           shell_quote(row.helper_path),
           "harness-group"
+          | group_args(row)
+        ],
+      timeout_ms
+    )
+  end
+
+  # The gateway's own 0.1.10 helper still accepts the identity-fenced group
+  # command without this option. Satellite credentials are parked by the
+  # deployed 0.1.9+2908 command, which accepts the narrower tracked-group form.
+  # A refusal is returned to the caller and leaves the durable park fence up.
+  defp run_credential_group_command(%{ssh: nil} = row, timeout_ms),
+    do: run_group_command(row, timeout_ms)
+
+  defp run_credential_group_command(%{ssh: destination} = row, timeout_ms) do
+    bounded_command(
+      "ssh",
+      @ssh_opts ++
+        [
+          destination,
+          shell_quote(row.helper_path),
+          "harness-group",
+          "--tracked-group-only"
           | group_args(row)
         ],
       timeout_ms

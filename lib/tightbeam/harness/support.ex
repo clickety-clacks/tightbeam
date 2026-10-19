@@ -96,7 +96,12 @@ defmodule Tightbeam.Harness.Support do
   """
   @spec catalog_probe(fun(), [String.t()]) ::
           {:ok, String.t(), [String.t()]} | {:error, term()}
-  def catalog_probe(sh, argv) do
+  def catalog_probe(sh, argv), do: catalog_probe(sh, argv, nil)
+
+  @doc false
+  @spec catalog_probe(fun(), [String.t()], String.t() | nil) ::
+          {:ok, String.t(), [String.t()]} | {:error, term()}
+  def catalog_probe(sh, argv, host) do
     case sh.(argv) do
       {output, 0} ->
         {body, last_line} = split_trailing_line(output)
@@ -114,9 +119,29 @@ defmodule Tightbeam.Harness.Support do
         end
 
       {output, exit} ->
-        {:error, {:probe_failed, exit, String.trim(output)}}
+        case satellite_command_version_mismatch(output, host, "catalog-probe") do
+          nil -> {:error, {:probe_failed, exit, String.trim(output)}}
+          mismatch -> {:error, mismatch}
+        end
     end
   end
+
+  @doc false
+  @spec satellite_command_version_mismatch(String.t(), String.t() | nil, String.t()) ::
+          {:satellite_command_version_mismatch, String.t(), String.t()} | nil
+  def satellite_command_version_mismatch(output, host, command)
+      when is_binary(output) and is_binary(host) and is_binary(command) do
+    lowered = String.downcase(output)
+
+    if String.contains?(lowered, "unknown command") or
+         String.contains?(lowered, "no such command") or
+         String.contains?(lowered, "unrecognized command") or
+         String.match?(output, ~r/(?:\A|\n)usage:\s*tightbeam(?:\s|\z)/i) do
+      {:satellite_command_version_mismatch, host, command}
+    end
+  end
+
+  def satellite_command_version_mismatch(_output, _host, _command), do: nil
 
   defp split_trailing_line(output) do
     case output |> String.trim_trailing("\n") |> String.split("\n") |> Enum.split(-1) do

@@ -2089,6 +2089,27 @@ defmodule Tightbeam.ModelCatalogTest do
       refute script =~ ctx.satellite_base
     end
 
+    test "a satellite catalog-probe mismatch names the registered host", ctx do
+      sh = fn command ->
+        if Enum.member?(command, "sat.example") and claude_probe?(command) do
+          {"unknown command: catalog-probe\n", 2}
+        else
+          catalog_reply(ctx.codex_json)
+        end
+      end
+
+      catalog = start_catalog(ctx, sh: sh)
+
+      expected =
+        {[],
+         {:unavailable,
+          {:satellite_command_version_mismatch, "satellite", "catalog-probe"}}}
+
+      await(fn -> ModelCatalog.get("satellite", "claude", catalog) == expected end)
+
+      assert ModelCatalog.get("satellite", "claude", catalog) == expected
+    end
+
     test "without CODEX_PATH the codex client_version comes from bare PATH on the owning host",
          ctx do
       parent = self()

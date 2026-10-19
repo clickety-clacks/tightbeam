@@ -440,7 +440,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
     {result, state} =
       Enum.reduce_while(command.adapter_keys, {:ok, state}, fn key, {:ok, state} ->
-        case do_close_adapter(key, state) do
+        case do_close_adapter(key, state, :credential_group) do
           {:ok, state} -> {:cont, {:ok, state}}
           {{:error, _reason} = error, state} -> {:halt, {error, state}}
         end
@@ -515,7 +515,9 @@ defmodule Tightbeam.AdapterCoordinator do
     {:noreply, release_slot(machine, slot, state)}
   end
 
-  defp do_close_adapter(key, state) do
+  defp do_close_adapter(key, state), do: do_close_adapter(key, state, :process_tree)
+
+  defp do_close_adapter(key, state, cleanup_scope) do
     {:ok, process_row} = Tightbeam.HarnessProcess.begin_park(state.db, key)
     state = cancel_pending_starts(key, state)
 
@@ -563,6 +565,9 @@ defmodule Tightbeam.AdapterCoordinator do
     reconcile_result =
       case process_row do
         :no_launch -> :ok
+        row when cleanup_scope == :credential_group ->
+          Tightbeam.HarnessProcess.park_credential_group(state.db, row)
+
         _row when exited? -> Tightbeam.HarnessProcess.reconcile_key(state.db, key)
         row -> Tightbeam.HarnessProcess.park(state.db, row)
       end

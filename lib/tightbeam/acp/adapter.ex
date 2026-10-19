@@ -436,7 +436,12 @@ defmodule Tightbeam.Acp.Adapter do
     rescue
       error ->
         {:stop,
-         adapter_failure_reason({:boot_failed, Exception.message(error)}, stderr_path, offset),
+         adapter_failure_reason(
+           {:boot_failed, Exception.message(error)},
+           stderr_path,
+           offset,
+           Keyword.get(opts, :harness_process_satellite_host)
+         ),
          nil}
     end
   end
@@ -508,7 +513,13 @@ defmodule Tightbeam.Acp.Adapter do
         gate(opts, state)
 
       other ->
-        {:stop, adapter_failure_reason({:initialize_failed, other}, stderr_path, offset), state}
+        {:stop,
+         adapter_failure_reason(
+           {:initialize_failed, other},
+           stderr_path,
+           offset,
+           Keyword.get(opts, :harness_process_satellite_host)
+         ), state}
     end
   end
 
@@ -2924,13 +2935,25 @@ defmodule Tightbeam.Acp.Adapter do
   # An offset that was never measured is no attempt boundary: any line in the
   # log may be a previous spawn's, so none is reported as this one's, and the
   # stat error says why.
-  defp adapter_failure_reason(reason, _stderr_path, {:unmeasured, errno}),
+  defp adapter_failure_reason(reason, stderr_path, offset, satellite_host \\ nil)
+
+  defp adapter_failure_reason(reason, _stderr_path, {:unmeasured, errno}, _satellite_host),
     do: with_stderr_facts(reason, stderr_offset: "unmeasured", stderr_stat_error: errno)
 
-  defp adapter_failure_reason(reason, stderr_path, offset) do
+  defp adapter_failure_reason(reason, stderr_path, offset, satellite_host) do
     case last_stderr_line(stderr_path, offset) do
       {:ok, nil} -> reason
-      {:ok, line} -> {:adapter_fault, %{reason: reason, stderr: line}}
+
+      {:ok, line} ->
+        case Tightbeam.Harness.Support.satellite_command_version_mismatch(
+               line,
+               satellite_host,
+               "harness-exec"
+             ) do
+          nil -> {:adapter_fault, %{reason: reason, stderr: line}}
+          mismatch -> mismatch
+        end
+
       {:error, errno} -> with_stderr_facts(reason, stderr_read_error: errno)
     end
   end
