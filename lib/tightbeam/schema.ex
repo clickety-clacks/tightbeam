@@ -1818,13 +1818,12 @@ defmodule Tightbeam.Schema do
     # SQLite busy_timeout are unaffected.
     db = DB.migration_context(db)
 
-    {:ok, existing_tables} =
-      DB.query(
-        db,
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
-      )
+    # The stamp table is the first object every boot creates, so its absence
+    # marks a database that has never booted.
+    {:ok, stamp_table} =
+      DB.query(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_stamp'")
 
-    fresh? = existing_tables == []
+    fresh? = stamp_table == []
     :ok = ensure_stamp_table(db)
     :ok = ensure_fresh_owner_link_origin(db)
     :ok = check_shape(db)

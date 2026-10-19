@@ -114,7 +114,7 @@ defmodule Tightbeam.CompletionHandoffRestart do
         work_item_id: item_id,
         effect_kind: "coordination"
       })
-      |> Map.merge(%{target_role: nil, role_fallback: false})
+      |> Map.merge(%{target_role: nil, role_fallback: false, supervision_interval_ms: 3_600_000})
     )
   end
 
