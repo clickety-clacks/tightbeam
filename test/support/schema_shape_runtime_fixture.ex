@@ -831,11 +831,24 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
       )
 
   defp current_continuation_guard!() do
-    Regex.replace(
-      ~r/AND EXISTS \(SELECT 1 FROM \(SELECT t.seq AS turnSeq.*?delivery.assignmentId=w.assignmentId\)/s,
-      historical_continuation_guard!(),
-      "AND old.deliveredTurnSeq=failed.seq"
+    recorded =
+      Regex.replace(
+        ~r/AND EXISTS \(SELECT 1 FROM \(SELECT t.seq AS turnSeq.*?delivery.assignmentId=w.assignmentId\)/s,
+        historical_continuation_guard!(),
+        "AND old.deliveredTurnSeq=failed.seq"
+      )
+
+    ancestry =
+      ~r/AND EXISTS \(\s*WITH RECURSIVE lineage\(sessionKey,spawnedBy\) AS \(.*?SELECT 1 FROM lineage WHERE sessionKey=w.creatorSessionKey\s*\)/s
+
+    assert Regex.match?(ancestry, recorded)
+
+    Regex.replace(ancestry, recorded, """
+    AND EXISTS (
+      SELECT 1 FROM sessions creator
+      WHERE creator.sessionKey=w.creatorSessionKey AND creator.ownerUserId=w.ownerUserId
     )
+    """)
   end
 
   defp historical_continuation_guard!(),
