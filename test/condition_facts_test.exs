@@ -313,12 +313,6 @@ defmodule Tightbeam.ConditionFactsTest do
     assert session_payload["mechanicalStatus"] == "running"
     Hub.delivered(hub, self())
 
-    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => payload}}
-    assert payload["wakeId"] == wake.wake_id
-    assert payload["state"] == "fired"
-    assert payload["firedBy"] == "condition"
-    Hub.delivered(hub, self())
-
     assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => carrier_payload}}
     assert carrier_payload["digest"] == true
     assert carrier_payload["deliveryStatus"] == "queued"
@@ -331,6 +325,13 @@ defmodule Tightbeam.ConditionFactsTest do
     assert message_payload["sender"] == "process:tightbeam"
     assert message_payload["content"] =~ "re-adjudicate"
     assert message_payload["content"] =~ "sender=agent:owner"
+    Hub.delivered(hub, self())
+
+    # Carrier admission publishes its turn and message before completing the source.
+    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => payload}}
+    assert payload["wakeId"] == wake.wake_id
+    assert payload["state"] == "fired"
+    assert payload["firedBy"] == "condition"
     Hub.delivered(hub, self())
     assert_receive {:lane_nudged, key}
     assert key == ctx.session.session_key

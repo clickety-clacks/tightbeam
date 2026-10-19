@@ -160,12 +160,6 @@ defmodule Tightbeam.WorkItemsTest do
     assert session_payload["mechanicalStatus"] == "running"
     Hub.delivered(hub, self())
 
-    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => source_payload}}
-    assert source_payload["wakeId"] == wake.wake_id
-    assert source_payload["digest"] == false
-    assert source_payload["state"] == "fired"
-    Hub.delivered(hub, self())
-
     assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => payload}}
     assert payload["wakeId"] == carrier_id
     assert payload["digest"] == true
@@ -178,6 +172,13 @@ defmodule Tightbeam.WorkItemsTest do
     assert message_payload["id"] == message_id
     assert message_payload["sessionKey"] == ctx.holder.session_key
     assert message_payload["content"] == content
+    Hub.delivered(hub, self())
+
+    # Carrier admission publishes its turn and message before completing the source.
+    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => source_payload}}
+    assert source_payload["wakeId"] == wake.wake_id
+    assert source_payload["digest"] == false
+    assert source_payload["state"] == "fired"
     Hub.delivered(hub, self())
     assert %{queued: 0, in_flight: false, overflowed: false} = Hub.connection_stats(hub, self())
 
