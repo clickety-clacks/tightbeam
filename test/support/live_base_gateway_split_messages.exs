@@ -150,6 +150,12 @@ defmodule GuardSplitMessages do
                      client_message_id: "c_recovered_result"
                    )
 
+          late_echo_notice = receive_notice()
+          assert late_echo_notice["payload"]["role"] == "user"
+          assert late_echo_notice["payload"]["clientMessageId"] == "c_recovered_result"
+          assert late_echo_notice["payload"]["content"] =~ "late assistant result"
+          assert_notice_matches_rest!(late_echo_notice, db)
+
           {:ok, session_lane} =
             Tightbeam.SessionLane.start_link(
               session_key: "k1",
