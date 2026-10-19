@@ -43,6 +43,8 @@ defmodule Tightbeam.RestAttestsCollectionTest do
 
     reader_work_item = create_work_item(db, "reader", "Reader-owned item")
     other_work_item = create_work_item(db, "other", "Other-owned item")
+    set_delivery_owner(db, "reader", reader_work_item, other_session)
+    set_delivery_owner(db, "other", other_work_item, reader_session)
 
     opener_assignment =
       create_assignment(db, "reader", other_session, other_work_item, "User opener grant")
@@ -371,6 +373,7 @@ defmodule Tightbeam.RestAttestsCollectionTest do
 
   test "top-level paging omits a boundary attest after its parent grant becomes hidden", ctx do
     work_item = create_work_item(ctx.db, "reader", "Attest cursor visibility")
+    set_delivery_owner(ctx.db, "reader", work_item, ctx.other_session)
 
     assignment =
       create_assignment(ctx.db, "other", ctx.other_session, work_item, "Owner-only grant")
@@ -420,6 +423,22 @@ defmodule Tightbeam.RestAttestsCollectionTest do
       session_key: nil,
       params: %{title: title}
     })
+  end
+
+  defp set_delivery_owner(db, user_id, work_item, session) do
+    assert %{deliveryOwnerSessionKey: owner_session_key} =
+             WorkItems.__handle__(db, "work-item-update", %{
+               verb: "work-item-update",
+               origin: "user:#{user_id}",
+               principal: {:user, user_id},
+               session_key: nil,
+               params: %{
+                 work_item_id: work_item.id,
+                 delivery_owner_session_key: session.session_key
+               }
+             })
+
+    assert owner_session_key == session.session_key
   end
 
   defp create_assignment(db, user_id, session, work_item, subject) do
