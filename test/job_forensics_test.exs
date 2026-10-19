@@ -385,11 +385,16 @@ defmodule Tightbeam.JobForensicsTest do
       reasonKind: "requester_withdrew",
       causalSourceKind: "verb_call",
       outcomeKind: "no_replacement",
-      primaryWorkKind: "work_item",
-      primaryWorkId: "wi_requester",
-      workImpactKind: "linked_work_not_open",
+      primaryWorkKind: nil,
+      primaryWorkId: nil,
+      workImpactKind: "no_linked_work",
       actionNeeded: false
     })
+
+    # Sender withdrawal does not evaluate linked-work liveness or dispose of it.
+    # The notice still retains its association for trace discovery.
+    assert Wakes.get(db, wake.wake_id).work_item_id == "wi_requester"
+    assert {:ok, [["closed"]]} = DB.query(db, "SELECT state FROM work_items WHERE id='wi_requester'")
 
     assert is_binary(first.causalSourceId) and first.causalSourceId != ""
 
