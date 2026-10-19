@@ -511,8 +511,9 @@ defmodule Tightbeam.Firehose.PublisherTest do
                [assignment.id]
              )
 
-    # Discard only the already asserted tests-passed verdict and denied observation.
-    assert observed_state_classes() == ["attest.filed"]
+    # The pending delivery may finish its fallback after earlier mailbox drains.
+    # Its committed restart marker is now published alongside this verdict.
+    assert observed_state_classes() == ["message.created", "attest.filed"]
 
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
