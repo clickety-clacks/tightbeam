@@ -1,7 +1,14 @@
 defmodule Tightbeam.AdapterCoordinatorTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{AdapterCoordinator, DB, EventLog, HarnessProcess, HarnessProcessCensus}
+  alias Tightbeam.{
+    AdapterCoordinator,
+    CommandEdge,
+    DB,
+    EventLog,
+    HarnessProcess,
+    HarnessProcessCensus
+  }
 
   @process_helper Path.expand("../cli/target/release/tightbeam", __DIR__)
 
@@ -1220,7 +1227,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert detail =~ "137"
   end
 
-  test "a park that closes the adapter as asked records no death", ctx do
+  test "a credential park that closes the adapter as asked reconciles gracefully", ctx do
     path = Path.join(ctx.test_dir, "fake_harness.js")
     File.write!(path, @fake)
 
@@ -1245,10 +1252,19 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
     ref = Process.monitor(adapter)
 
-    assert :ok = AdapterCoordinator.close_adapter(coordinator, key)
+    command = %CommandEdge.CredentialPark{
+      provider: :anthropic,
+      machine: "testhost",
+      adapter_keys: [key],
+      observed_at: System.system_time(:millisecond)
+    }
+
+    assert :ok = GenServer.call(coordinator, {:tightbeam_command, command})
     assert_receive {:DOWN, ^ref, :process, ^adapter, _reason}, 2_000
 
     assert [] = ctx.db |> EventLog.lifecycle_events() |> Enum.filter(&(&1.kind == "adapter_down"))
+    assert [%{state: "closed_gracefully", resolved_at: resolved_at}] = HarnessProcess.list(ctx.db)
+    assert is_integer(resolved_at)
   end
 
   @tag timeout: 5_000
