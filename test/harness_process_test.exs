@@ -54,14 +54,19 @@ defmodule Tightbeam.HarnessProcessTest do
     group_command = Enum.drop_while(args, &(&1 != "harness-group"))
     identity_path = row.identity_path
 
-    assert [
+    assert ["harness-group" | _] = group_command
+
+    assert Enum.take(group_command, 6) == [
              "harness-group",
              "4242",
-             ^identity_path,
+             identity_path,
              "satellite-boot",
              "satellite-launch",
              "tightbeam-harness-identity-v2"
-           ] = group_command
+           ]
+
+    refute "--tracked-group-only" in group_command
+    assert Enum.count(args, &(&1 == "harness-group")) == 1
   end
 
   test "satellite command usage failures report the host and keep the park fenced", %{
