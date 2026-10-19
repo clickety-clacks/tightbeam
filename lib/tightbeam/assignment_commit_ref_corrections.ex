@@ -191,8 +191,8 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
     end)
   end
 
-  # Corrections are deliberately exact-id only. Session access follows the
-  # target's holder or opener lane, with the opener's own session retained.
+  # Corrections are deliberately exact-id only. A session caller must be the
+  # exact opener or in the target holder's product-owner lane.
   defp resolve_visible_assignment(txn, call, actor) do
     supplied = call.params[:assignment_id]
 
@@ -259,13 +259,9 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
     if caller == opened_by_session do
       true
     else
-      case {
-        product_owner_lane(txn, caller),
-        product_owner_lane(txn, holder),
-        product_owner_lane(txn, opened_by_session)
-      } do
-        {lane, holder_lane, opener_lane} when is_binary(lane) ->
-          lane == holder_lane or lane == opener_lane
+      case {product_owner_lane(txn, caller), product_owner_lane(txn, holder)} do
+        {lane, lane} when is_binary(lane) ->
+          true
 
         _ ->
           false
