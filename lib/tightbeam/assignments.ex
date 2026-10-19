@@ -1174,7 +1174,7 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  @doc "Return the current independent clean review only when it names the submitted result."
+  @doc "Return the current independent clean review when its source commits match the submitted result."
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
           [String.t()]
   def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, commit_refs) do
@@ -1196,7 +1196,7 @@ defmodule Tightbeam.Assignments do
              [assignment_id]
            ),
          true <- review_holder != assignment_holder_key,
-         ^expected <- canonical_stored_commit_refs(encoded) do
+         true <- same_commit_ref_identity?(expected, canonical_stored_commit_refs(encoded)) do
       ["reviewed-clean"]
     else
       _ -> []
@@ -1221,7 +1221,7 @@ defmodule Tightbeam.Assignments do
              """,
              [assignment_id, holder_key]
            ),
-         ^expected <- canonical_stored_commit_refs(encoded) do
+         true <- same_commit_ref_identity?(expected, canonical_stored_commit_refs(encoded)) do
       ["verified"]
     else
       _ -> []
@@ -4052,10 +4052,12 @@ defmodule Tightbeam.Assignments do
     verification = latest_verification_conclusion_in_txn(txn, assignment.id, assignment.holderKey)
 
     with [_ | _] <- refs,
-         %{kind: "reviewed-clean", holder: review_holder, refs: ^refs} <- review,
+         %{kind: "reviewed-clean", holder: review_holder, refs: review_refs} <- review,
          true <- review_holder != assignment.holderKey,
-         %{kind: "verified", holder: assignment_holder, refs: ^refs} <- verification,
-         true <- assignment_holder == assignment.holderKey do
+         true <- same_commit_ref_identity?(refs, review_refs),
+         %{kind: "verified", holder: assignment_holder, refs: verification_refs} <- verification,
+         true <- assignment_holder == assignment.holderKey,
+         true <- same_commit_ref_identity?(refs, verification_refs) do
       :ok
     else
       _ ->
@@ -4129,6 +4131,16 @@ defmodule Tightbeam.Assignments do
         nil
     end
   end
+
+  defp same_commit_ref_identity?(left, right) when is_list(left) and is_list(right) do
+    commit_identity = fn refs ->
+      refs |> Enum.map(& &1["commit"]) |> Enum.uniq() |> Enum.sort()
+    end
+
+    commit_identity.(left) == commit_identity.(right)
+  end
+
+  defp same_commit_ref_identity?(_left, _right), do: false
 
   defp run_git_cat_file(db, host, path, commit) do
     base_dir =
