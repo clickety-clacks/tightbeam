@@ -2052,6 +2052,26 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  @doc false
+  def deliver_waiting_human_post_in_txn(
+        %DB.Txn{} = txn,
+        session_key,
+        origin,
+        prompt,
+        identity,
+        opts \\ []
+      )
+      when is_map(identity) do
+    opts =
+      opts
+      |> Keyword.put(:sender, origin)
+      |> Keyword.put(:device_id, Map.fetch!(identity, "deviceId"))
+      |> Keyword.put(:client_message_id, Map.fetch!(identity, "clientMessageId"))
+      |> Keyword.put(:queued_human_post_delivery, true)
+
+    deliver_prompt_in_txn(txn, session_key, origin, prompt, opts)
+  end
+
   defp deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts) do
     case Wakes.terminal_notice_delivery_in_txn(txn, opts[:wake_id]) do
       :ordinary ->
@@ -2189,7 +2209,12 @@ defmodule Tightbeam.Gateway do
 
   defp deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts) do
     opts = delivery_attachments_in_txn(txn, opts)
-    stamped = decorate_delivery_prompt(prompt, opts[:sender])
+    queued_human_post_delivery? = opts[:queued_human_post_delivery] == true
+
+    stamped =
+      if queued_human_post_delivery?,
+        do: prompt,
+        else: decorate_delivery_prompt(prompt, opts[:sender])
 
     case delivery_target(txn, session_key, opts[:target_gate]) do
       nil ->
@@ -2205,16 +2230,27 @@ defmodule Tightbeam.Gateway do
 
       {target, role_ref, role_fallback} when not is_nil(target) ->
         if Ledger.enqueueable_in_txn?(txn, target) do
-          case Projection.prompt_message_result_in_txn(txn, %{
-                 session_key: target,
-                 role: "user",
-                 content: stamped,
-                 raw_content: prompt,
-                 device_id: opts[:device_id],
-                 client_message_id: opts[:client_message_id]
-               }) do
+          message_result =
+            if queued_human_post_delivery? do
+              # The staged source's own sidecar is the identity being materialized.
+              # Its wake id and the message table's unique client identity guard
+              # replay; querying the sidecar here would mistake the source itself
+              # for an earlier post.
+              :new
+            else
+              Projection.prompt_message_result_in_txn(txn, %{
+                session_key: target,
+                role: "user",
+                content: stamped,
+                raw_content: prompt,
+                device_id: opts[:device_id],
+                client_message_id: opts[:client_message_id]
+              })
+            end
+
+          case message_result do
             :new ->
-              if stage_for_queue?(txn, target, opts) do
+              if not queued_human_post_delivery? and stage_for_queue?(txn, target, opts) do
                 stage_prompt_in_txn(
                   txn,
                   target,
