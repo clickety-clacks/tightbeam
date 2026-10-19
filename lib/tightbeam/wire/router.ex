@@ -148,6 +148,12 @@ defmodule Tightbeam.Wire.Router do
       filters: ~w(workItemId createdBySession kind state),
       order: ~w(createdAt artifactId)
     },
+    harness_processes: %{
+      resource: "harness processes",
+      route: "harness_processes.collection",
+      filters: ~w(host harness state),
+      order: ~w(createdAt id)
+    },
     assignment_attests: %{
       resource: "attests",
       route: "assignment_attests.collection",
@@ -574,6 +580,10 @@ defmodule Tightbeam.Wire.Router do
 
   get "/api/artifacts" do
     d1_collection(conn, Map.fetch!(@d1_resources, :artifacts))
+  end
+
+  get "/api/harness-processes" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :harness_processes))
   end
 
   get "/api/read-markers/:scope_key" do
@@ -1676,6 +1686,9 @@ defmodule Tightbeam.Wire.Router do
   defp d1_row_tuple(:artifacts, item),
     do: [Map.fetch!(item, "createdAt"), Map.fetch!(item, "artifactId")]
 
+  defp d1_row_tuple(:harness_processes, item),
+    do: [Map.fetch!(item, "createdAt"), Map.fetch!(item, "id")]
+
   defp d1_row_tuple(:assignment_attests, item),
     do: [Map.fetch!(item, "ts"), Map.fetch!(item, "id")]
 
@@ -1689,6 +1702,9 @@ defmodule Tightbeam.Wire.Router do
     do: StateResources.encode_item("decision requests", item, %{})
 
   defp d1_encode(:artifacts, item), do: StateResources.encode_item("artifacts", item, %{})
+
+  defp d1_encode(:harness_processes, item),
+    do: StateResources.encode_item("harness processes", item, %{})
 
   defp d1_encode(:assignment_attests, item), do: StateResources.encode_item("attests", item, %{})
 
@@ -1732,6 +1748,27 @@ defmodule Tightbeam.Wire.Router do
                     has_more_after: page.has_more_after
                   }
                 }
+
+              resource == :harness_processes ->
+                if D1Read.visible?(resource, principal.is_admin) do
+                  page =
+                    Tightbeam.HarnessProcess.rest_collection_page(
+                      db(conn),
+                      request.filters,
+                      boundary,
+                      request.limit
+                    )
+
+                  %{
+                    items: Enum.map(page.rows, &StateResources.harness_process/1),
+                    flags: %{
+                      has_more_before: page.has_more_before,
+                      has_more_after: page.has_more_after
+                    }
+                  }
+                else
+                  %{items: [], flags: %{has_more_before: false, has_more_after: false}}
+                end
 
               D1Read.visible?(resource, principal.is_admin) ->
                 D1Read.page(
@@ -2344,6 +2381,9 @@ defmodule Tightbeam.Wire.Router do
   defp d1_filter_value?("work items", "state", value),
     do: value in ~w(open iceboxed closed failed)
 
+  defp d1_filter_value?("harness processes", "state", value),
+    do: value in ~w(launching running park_requested closed_gracefully killed kill_failed exited)
+
   defp d1_filter_value?("decision requests", "kind", value),
     do: value in ~w(statute effort agent)
 
@@ -2408,6 +2448,11 @@ defmodule Tightbeam.Wire.Router do
     do: is_integer(created_at) and is_binary(artifact_id) and artifact_id != ""
 
   defp d1_tuple?(_tuple, :artifacts), do: false
+
+  defp d1_tuple?([created_at, id], :harness_processes),
+    do: is_integer(created_at) and is_binary(id) and id != ""
+
+  defp d1_tuple?(_tuple, :harness_processes), do: false
 
   defp d1_tuple?([ts, id], :assignment_attests),
     do: is_integer(ts) and is_binary(id) and id != ""

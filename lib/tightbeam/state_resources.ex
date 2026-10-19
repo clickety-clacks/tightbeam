@@ -95,6 +95,7 @@ defmodule Tightbeam.StateResources do
     "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
     "users" => ~w(userId isAdmin createdAt rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
+    "harness processes" => ~w(id host harness pid state createdAt resolvedAt),
     "artifacts" =>
       ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
     "read markers" => ~w(userId scopeKey marker updatedAt rowVersion),
@@ -199,6 +200,12 @@ defmodule Tightbeam.StateResources do
       integers: ~w(createdAt rowVersion),
       booleans: [],
       nullable: ~w(claimedName platform model)
+    },
+    "harness processes" => %{
+      strings: ~w(id host harness),
+      integers: ~w(pid createdAt resolvedAt),
+      booleans: [],
+      nullable: ~w(pid resolvedAt)
     },
     "artifacts" => %{
       strings:
@@ -322,6 +329,8 @@ defmodule Tightbeam.StateResources do
     {"sessions", "state"} => ~w(active retired),
     {"sessions", "mechanicalStatus"} => ~w(idle running),
     {"devices", "status"} => ~w(allowlisted pending denied),
+    {"harness processes", "state"} =>
+      ~w(launching running park_requested closed_gracefully killed kill_failed exited),
     {"artifacts", "kind"} => ~w(spec report doc data other),
     {"artifacts", "recordedTurnEvidence"} => ~w(tool-call-observed session-concurrent none),
     {"artifacts", "state"} => ~w(in-workspace archived released),
@@ -1731,6 +1740,27 @@ defmodule Tightbeam.StateResources do
   end
 
   def critical_state(row), do: public(row)
+
+  def harness_process(%{
+        launch_id: id,
+        host: host,
+        harness: harness,
+        pid: pid,
+        state: state,
+        created_at: created_at,
+        resolved_at: resolved_at
+      }) do
+    %{
+      "id" => id,
+      "host" => host,
+      "harness" => harness,
+      "pid" => pid,
+      "state" => state,
+      "createdAt" => created_at,
+      "resolvedAt" => resolved_at
+    }
+    |> closed_projection("harness processes")
+  end
 
   def device(row) do
     row = row |> public() |> Map.delete("isAdmin")

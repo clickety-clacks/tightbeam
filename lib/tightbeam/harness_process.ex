@@ -10,7 +10,7 @@ defmodule Tightbeam.HarnessProcess do
   identity file until the launch resolves to a terminal state.
   """
 
-  alias Tightbeam.{DB, ErrorDiagnostic, EventLog, Id}
+  alias Tightbeam.{DB, ErrorDiagnostic, EventLog, Id, Keyset}
 
   require Logger
 
@@ -19,6 +19,10 @@ defmodule Tightbeam.HarnessProcess do
   @cursor_account "tightbeam-cursor"
   @cursor_launcher "/usr/local/libexec/tightbeam-cursor-launcher"
   @old_schema_refusal "The database carries a pre-release harness_processes shape; it is not upgraded by design. Reset the database and restart Tightbeam."
+  @rest_collection_states ~w(
+    launching running park_requested closed_gracefully killed kill_failed exited
+  )
+  @rest_collection_filters ~w(host harness state)
 
   @process_ddl """
   CREATE TABLE IF NOT EXISTS harness_processes (
@@ -536,6 +540,92 @@ defmodule Tightbeam.HarnessProcess do
       )
 
     Enum.map(rows, &decode_row/1)
+  end
+
+  @doc "Read one bounded REST page using only the public HarnessProcess columns."
+  def rest_collection_page(db, filters, boundary, limit)
+      when is_map(filters) and is_integer(limit) and limit > 0 do
+    {where, params} = rest_collection_filters(filters)
+
+    case DB.transaction(db, fn txn ->
+           query = fn sql, query_params -> DB.Txn.q(txn, sql, query_params) end
+
+           page =
+             Keyset.page(
+               query,
+               "SELECT launchId, host, harness, osPid, state, createdAt, resolvedAt FROM harness_processes",
+               "harness_processes",
+               where,
+               params,
+               ["createdAt", "launchId"],
+               boundary,
+               limit,
+               fn [launch_id, _host, _harness, _pid, _state, created_at, _resolved_at] ->
+                 [created_at, launch_id]
+               end
+             )
+
+           %{
+             rows: Enum.map(page.rows, &rest_collection_row/1),
+             has_more_before: page.has_more_before,
+             has_more_after: page.has_more_after
+           }
+         end) do
+      {:ok, page} -> page
+      {:error, error} -> raise error
+    end
+  end
+
+  defp rest_collection_filters(filters) do
+    unless Enum.all?(Map.keys(filters), &(&1 in @rest_collection_filters)) do
+      raise ArgumentError, "unsupported HarnessProcess REST filter"
+    end
+
+    {clauses, params} =
+      Enum.reduce(@rest_collection_filters, {[], []}, fn field, {clauses, params} ->
+        values = Map.get(filters, field, [])
+
+        unless is_list(values) and Enum.all?(values, &is_binary/1) do
+          raise ArgumentError, "invalid HarnessProcess REST filter"
+        end
+
+        values = values |> Enum.uniq() |> Enum.sort()
+
+        if values == [] do
+          {clauses, params}
+        else
+          if field == "state" and not Enum.all?(values, &(&1 in @rest_collection_states)) do
+            raise ArgumentError, "invalid HarnessProcess REST state filter"
+          end
+
+          placeholders = Enum.map_join(values, ", ", fn _ -> "?" end)
+          {["#{rest_collection_column(field)} IN (#{placeholders})" | clauses], params ++ values}
+        end
+      end)
+
+    where =
+      case Enum.reverse(clauses) do
+        [] -> nil
+        parts -> Enum.join(parts, " AND ")
+      end
+
+    {where, params}
+  end
+
+  defp rest_collection_column("host"), do: "host"
+  defp rest_collection_column("harness"), do: "harness"
+  defp rest_collection_column("state"), do: "state"
+
+  defp rest_collection_row([launch_id, host, harness, pid, state, created_at, resolved_at]) do
+    %{
+      launch_id: launch_id,
+      host: host,
+      harness: harness,
+      pid: pid,
+      state: state,
+      created_at: created_at,
+      resolved_at: resolved_at
+    }
   end
 
   defp reconcile_row(db, row, terminal_state \\ "killed")
