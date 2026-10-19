@@ -754,6 +754,70 @@ defmodule Tightbeam.Firehose.PublisherTest do
     refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
   end
 
+  test "a committed session-restart marker publishes one canonical message.created" do
+    db = :firehose_session_restart_marker_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    :ok =
+      Hub.register(Hub, self(), %{mode: :subscribed, db: db, user_id: "flynn", is_admin: false})
+
+    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
+    register_testhost(db)
+
+    session_key = "firehose-session-restart-target"
+
+    Org.create(db, %{
+      session_key: session_key,
+      display_name: "Session restart target",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    :ok =
+      Hub.subscribe(Hub, self(), "session-restart-markers", %{
+        "classes" => ["message.created"],
+        "sessionKey" => session_key
+      })
+
+    assert {:ok, {:appended, marker}} =
+             DB.transaction(db, fn txn ->
+               Projection.append_marker_in_txn(txn, session_key, %{
+                 kind: "session-restart",
+                 from: "old-session",
+                 to: "new-session"
+               })
+             end)
+
+    notice = receive_notice()
+    assert notice["class"] == "message.created"
+    assert notice["refs"]["messageId"] == marker.id
+    assert notice["refs"]["sessionKey"] == session_key
+    assert notice["refs"]["ownerUserId"] == "flynn"
+
+    canonical =
+      db
+      |> StateResources.query_message(marker.id)
+      |> StateResources.message()
+
+    assert notice["payload"] == canonical
+    assert notice["payload"]["marker"] == %{
+             "kind" => "session-restart",
+             "from" => "old-session",
+             "to" => "new-session"
+           }
+
+    item_bytes = StateResources.encode_item("transcript messages", canonical)
+    assert String.contains?(Publisher.encode_wire_notice(notice), "\"payload\":" <> item_bytes)
+
+    refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
+  end
+
   @tag rest_r7_closure: true
   test "transactional message refs equal the payload and detect missing or mismatched keys" do
     db = :firehose_message_ref_equality_db
