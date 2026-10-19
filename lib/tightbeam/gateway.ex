@@ -5497,8 +5497,9 @@ defmodule Tightbeam.Gateway do
   defp maybe_put_guidance(status, guidance), do: Map.put(status, :guidance, guidance)
 
   defp identity_apply_result(config, db, %{params: %{all: true}}) do
+    revision = Identity.live_revision!(config.base_dir)
     sessions = Org.list_for_user(db, "", true)
-    identity_apply_sessions(config, db, sessions)
+    identity_apply_sessions(config, db, sessions, revision)
   end
 
   # A retired session is not a target. `Org.get/2` returns retired rows — retiring
@@ -5506,136 +5507,328 @@ defmodule Tightbeam.Gateway do
   # `--all` query already filters to active. A retired key and an unknown key get
   # the same answer, because apply has nothing to do for either.
   defp identity_apply_result(config, db, %{params: %{session_key: session_key}}) do
+    revision = Identity.live_revision!(config.base_dir)
+
     sessions =
       case Org.get(db, session_key) do
         %{state: "active"} = session -> [session]
         _retired_or_missing -> []
       end
 
-    identity_apply_sessions(config, db, sessions)
+    identity_apply_sessions(config, db, sessions, revision)
   end
 
-  defp identity_apply_sessions(_config, _db, []),
+  defp identity_apply_sessions(_config, _db, [], _revision),
     do: %{code: "not_found", message: "no matching session"}
 
-  defp identity_apply_sessions(config, db, sessions) do
-    live = Identity.live_revision!(config.base_dir)
+  defp identity_apply_sessions(config, db, sessions, revision) do
+    results = Enum.map(sessions, &identity_apply_session_result(config, db, &1, revision))
 
-    sessions
-    |> Enum.reduce_while([], fn session, applied ->
-      case identity_apply_session(config, db, session, live) do
-        :applied ->
-          best_effort(fn ->
-            stream = db |> Org.get(session.session_key) |> Payloads.stream_session()
-            broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
-          end)
+    results = Enum.map(results, &identity_apply_stream_update(db, &1))
 
-          {:cont, [session.session_key | applied]}
+    applied =
+      for %{outcome: "applied", session_key: session_key} <- results,
+          do: session_key
 
-        :skipped ->
-          {:cont, applied}
+    complete? =
+      Enum.all?(results, fn result ->
+        result.outcome in ["applied", "skipped"] and
+          result.stream_update in ["sent", "not_attempted"]
+      end)
 
-        {:error, refusal} ->
-          {:halt, refusal}
-      end
-    end)
-    |> case do
-      applied when is_list(applied) ->
-        %{applied: Enum.reverse(applied), identity_revision: live}
-
-      refusal ->
-        refusal
-    end
+    %{
+      status: if(complete?, do: "complete", else: "partial"),
+      complete: complete?,
+      identity_revision: revision,
+      target_session_keys: Enum.map(sessions, & &1.session_key),
+      applied: applied,
+      results: results
+    }
   end
 
-  # Apply refreshes the Tightbeam-owned skill FILES and then asks the session to
-  # re-read them. It changes nothing a running turn has already composed, so
-  # there is no turn boundary to wait for and no session to refuse. A session
-  # with no current harness session has nobody to ask: the files and the stamp
-  # are the whole of its application.
-  #
-  # The row is re-read here, not trusted from selection: `--all` captures its set
-  # once, and a session that retires between that capture and its own update gets
-  # no file update and no nudge. This is a fresh read of a fact, not a lifecycle
-  # hold — nothing here keeps the row from retiring a moment later.
-  defp identity_apply_session(config, db, session, revision) do
+  defp identity_apply_session_result(config, db, session, revision) do
+    result =
+      with_session_mutation_lock(session.session_key, fn ->
+        Identity.with_live_revision_lock(config.base_dir, fn current_revision ->
+          if current_revision == revision do
+            identity_apply_session_at_revision(config, db, session, revision)
+          else
+            %{
+              session_key: session.session_key,
+              outcome: "superseded",
+              files: "not_started",
+              stamp: "not_committed",
+              prompt_enqueue: "not_attempted",
+              prompt_delivery: "not_started",
+              reread: "unconfirmed",
+              stream_update: "not_attempted",
+              current_identity_revision: current_revision
+            }
+          end
+        end)
+      end)
+
+    if is_map(result),
+      do: result,
+      else:
+        identity_apply_failure_result(session, "session apply lock returned #{inspect(result)}")
+  rescue
+    error -> identity_apply_exception_result(session, error)
+  catch
+    :exit, reason -> identity_apply_failure_result(session, "exit: #{inspect(reason)}")
+  end
+
+  defp identity_apply_session_at_revision(config, db, session, revision) do
     case Org.get(db, session.session_key) do
-      %{state: "active"} = session -> identity_apply_active(config, db, session, revision)
-      _retired_or_missing -> :skipped
+      %{state: "active"} = current ->
+        harness = Harness.parse!(current.harness).id()
+        snapshot = complete_session_snapshot(config, current, harness, revision)
+
+        files =
+          if identity_stamp_matches?(current, snapshot) do
+            "already_current"
+          else
+            Placement.materialize_identity(config, current, snapshot)
+            "materialized"
+          end
+
+        identity_apply_persist_result(db, current, snapshot, revision, files)
+
+      _retired_or_missing ->
+        %{
+          session_key: session.session_key,
+          outcome: "skipped",
+          files: "not_updated",
+          stamp: "not_attempted",
+          prompt_enqueue: "not_required",
+          prompt_delivery: "not_required",
+          reread: "not_applicable",
+          stream_update: "not_attempted"
+        }
     end
   end
 
-  defp identity_apply_active(config, db, session, revision) do
-    case identity_apply_files(config, db, session, revision) do
-      :applied ->
-        case Org.current_pointer(db, session.session_key) do
-          nil -> :applied
-          _pointer -> identity_apply_nudge(config, db, session, revision)
+  defp identity_apply_persist_result(db, session, snapshot, revision, files) do
+    result =
+      try do
+        DB.transaction(db, fn txn ->
+          case Org.get_in_txn(txn, session.session_key) do
+            %{state: "active"} = current
+            when current.host == session.host and current.harness == session.harness and
+                   current.archetype == session.archetype ->
+              Org.set_identity_stamp_in_txn(
+                txn,
+                session.session_key,
+                snapshot.revision,
+                snapshot.render_contract,
+                snapshot.guidance_digest
+              )
+
+              case Org.current_pointer_snapshot_in_txn(txn, session.session_key) do
+                nil ->
+                  %{
+                    stamp: "committed",
+                    enqueue: "not_required",
+                    delivery: "not_required",
+                    reread: "not_applicable"
+                  }
+
+                _pointer ->
+                  notification =
+                    identity_apply_prompt_record_in_txn(txn, session.session_key, revision)
+
+                  Map.put(notification, :stamp, "committed")
+              end
+
+            _changed_or_retired ->
+              %{lifecycle_changed: true}
+          end
+        end)
+      catch
+        :exit, reason -> {:unknown_commit, reason}
+      end
+
+    case result do
+      {:ok, %{lifecycle_changed: true}} ->
+        %{
+          session_key: session.session_key,
+          outcome: "partial",
+          files: files,
+          stamp: "not_committed",
+          prompt_enqueue: "not_attempted",
+          prompt_delivery: "not_started",
+          reread: "unconfirmed",
+          stream_update: "not_attempted",
+          reason: "session lifecycle or placement changed during apply"
+        }
+
+      {:ok, persisted} ->
+        outcome =
+          if persisted.enqueue in [
+               "not_required",
+               "recorded_pending",
+               "already_pending",
+               "already_recorded"
+             ],
+             do: "applied",
+             else: "partial"
+
+        %{
+          session_key: session.session_key,
+          outcome: outcome,
+          files: files,
+          stamp: persisted.stamp,
+          prompt_enqueue: persisted.enqueue,
+          prompt_delivery: persisted.delivery,
+          reread: persisted.reread,
+          wake_id: persisted[:wake_id],
+          stream_update: "not_attempted"
+        }
+
+      {:error, error} ->
+        %{
+          session_key: session.session_key,
+          outcome: "partial",
+          files: files,
+          stamp: "not_committed",
+          prompt_enqueue: "persistence_failed",
+          prompt_delivery: "not_started",
+          reread: "unconfirmed",
+          stream_update: "not_attempted",
+          reason: Exception.message(error)
+        }
+
+      {:unknown_commit, reason} ->
+        %{
+          session_key: session.session_key,
+          outcome: "partial",
+          files: files,
+          stamp: "unknown",
+          prompt_enqueue: "unknown",
+          prompt_delivery: "unknown",
+          reread: "unconfirmed",
+          stream_update: "not_attempted",
+          reason: "database transaction outcome unknown: #{inspect(reason)}"
+        }
+    end
+  end
+
+  defp identity_apply_prompt_record_in_txn(txn, session_key, revision) do
+    prompt = identity_apply_prompt(revision)
+
+    existing_wakes =
+      DB.Txn.q(
+        txn,
+        "SELECT wakeId,state FROM wakes WHERE sessionKey=?1 AND origin='process:tightbeam' AND consumer='prompt' AND prompt=?2 AND state IN ('pending','fired') ORDER BY createdAt,wakeId",
+        [session_key, prompt]
+      )
+
+    delivered =
+      Enum.find_value(existing_wakes, fn [wake_id, _state] ->
+        case NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id) do
+          [[_seq, status, _assignment_id] | _]
+          when status in ["queued", "running", "delivered"] ->
+            %{wake_id: wake_id, status: status}
+
+          _ ->
+            nil
         end
+      end)
 
-      {:error, refusal} ->
-        {:error, refusal}
+    pending =
+      Enum.find(existing_wakes, fn [wake_id, state] ->
+        state == "pending" or NoticeBatcher.pending?(txn, wake_id)
+      end)
+
+    cond do
+      delivered ->
+        %{
+          stamp: "committed",
+          enqueue: "already_recorded",
+          delivery: delivered.status,
+          reread: "unconfirmed",
+          wake_id: delivered.wake_id
+        }
+
+      pending ->
+        [wake_id, _state] = pending
+
+        %{
+          stamp: "committed",
+          enqueue: "already_pending",
+          delivery: "pending",
+          reread: "unconfirmed",
+          wake_id: wake_id
+        }
+
+      true ->
+        wake =
+          Wakes.schedule_in_txn(txn, %{
+            session_key: session_key,
+            target_role: nil,
+            origin: "process:tightbeam",
+            prompt: prompt,
+            due_at: System.system_time(:millisecond),
+            consumer: "prompt",
+            target_gate: 1
+          })
+
+        Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
+
+        %{
+          stamp: "committed",
+          enqueue: "recorded_pending",
+          delivery: "pending",
+          reread: "unconfirmed",
+          wake_id: wake.wake_id
+        }
     end
   end
 
-  # Writer then stamp, in that order and only that order: the stamp asserts that
-  # the projection writer returned success for this revision, so a writer that
-  # raises leaves no stamp and no nudge. The failure is this session's refusal —
-  # nothing here retries, stages, or repairs.
-  defp identity_apply_files(config, db, session, revision) do
-    harness = Harness.parse!(session.harness).id()
-    snapshot = served_snapshot(config, session, harness, revision)
-    stamp_session_identity(db, session.session_key, snapshot)
-    :applied
-  rescue
-    error -> {:error, identity_apply_raised(session, error, __STACKTRACE__)}
+  defp identity_stamp_matches?(session, snapshot) do
+    session.identity_revision == snapshot.revision and
+      session.identity_render_contract == snapshot.render_contract and
+      session.identity_guidance_digest == snapshot.guidance_digest
   end
 
-  # An ordinary prompt, submitted and never waited on: the session re-reads its
-  # skill files when it next runs, and apply neither confirms that it did nor
-  # can. Ordinary prompt ordering decides when it lands. A failed submission
-  # leaves the files and the stamp alone — they are already true.
-  #
-  # Delivery reports a prompt it declined to submit as `:skipped` and does not
-  # raise, so the return is read rather than discarded — a started session whose
-  # nudge never reached the ledger is not applied. `:duplicate` IS a submitted
-  # prompt (dedupe found the turn already there); `:conflict` and
-  # `:invalid_reply_reference` need a reply reference this call never passes.
-  #
-  # No state the substrate can reach today produces `:skipped` here: four of
-  # delivery's five skip sites need a `wake_id` this call never passes, and the
-  # fifth needs the session's row to be absent, which nothing deletes. The
-  # guard stays because the callee DECLARES `:skipped` as a failure return, and
-  # this call must not answer applied on one — not because it is seen. Do not
-  # read it as evidence that it happens, and build no defenses on top of it.
-  defp identity_apply_nudge(config, db, session, revision) do
-    case notify_session(config, db, session.session_key, identity_apply_prompt(revision)) do
-      :skipped -> {:error, identity_apply_failed(session, "the re-read prompt was not submitted")}
-      _submitted -> :applied
+  defp identity_apply_stream_update(db, %{outcome: "applied"} = result) do
+    try do
+      session = Org.get(db, result.session_key)
+      stream = Payloads.stream_session(session)
+      broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
+      %{result | stream_update: "sent"}
+    rescue
+      error -> %{result | stream_update: "failed", stream_update_error: Exception.message(error)}
+    catch
+      :exit, reason ->
+        %{result | stream_update: "unknown", stream_update_error: "exit: #{inspect(reason)}"}
     end
-  rescue
-    error -> {:error, identity_apply_raised(session, error, __STACKTRACE__)}
+  end
+
+  defp identity_apply_stream_update(_db, result), do: result
+
+  defp identity_apply_exception_result(session, error) do
+    identity_apply_failure_result(session, Exception.message(error))
+  end
+
+  defp identity_apply_failure_result(session, reason) do
+    %{
+      session_key: session.session_key,
+      outcome: "partial",
+      files: "partial_or_unknown",
+      stamp: "not_committed",
+      prompt_enqueue: "not_attempted",
+      prompt_delivery: "not_started",
+      reread: "unconfirmed",
+      stream_update: "not_attempted",
+      reason: reason
+    }
   end
 
   defp identity_apply_prompt(revision) do
     "Your Tightbeam-owned skill files changed to identity revision #{revision}.\n" <>
       "Re-read your Tightbeam skills before you continue work. This update does not\n" <>
       "reload your current model context."
-  end
-
-  defp identity_apply_raised(session, error, stacktrace) do
-    ErrorDiagnostic.put(
-      identity_apply_failed(session, Exception.message(error)),
-      ErrorDiagnostic.exception(error, stacktrace, operation: "identity_apply")
-    )
-  end
-
-  defp identity_apply_failed(session, reason) when is_binary(reason) do
-    %{
-      code: "apply_failed",
-      message: "identity apply could not reach #{session.session_key}: #{reason}",
-      sessions: [session.session_key]
-    }
   end
 
   defp turn_in_progress(sessions) do

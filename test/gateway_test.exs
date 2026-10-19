@@ -9888,12 +9888,29 @@ defmodule Tightbeam.GatewayTest do
 
     result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
-    assert %{applied: [session_key], identity_revision: ^next} = result
-    assert session_key == session.session_key
+    assert %{
+             status: "complete",
+             complete: true,
+             applied: [session_key],
+             identity_revision: ^next,
+             target_session_keys: [target_key],
+             results: [
+               %{
+                 outcome: "applied",
+                 files: "materialized",
+                 stamp: "committed",
+                 prompt_enqueue: "recorded_pending",
+                 prompt_delivery: "pending",
+                 reread: "unconfirmed",
+                 stream_update: "sent",
+                 wake_id: wake_id
+               }
+             ]
+           } = result
 
-    # No confirmation, no reload result, no effect id: the response says what was
-    # written and to which revision, and nothing about what any context loaded.
-    assert Map.keys(result) |> Enum.sort() == [:applied, :identity_revision]
+    assert session_key == session.session_key
+    assert target_key == session_key
+    assert is_binary(wake_id)
 
     assert File.read!(skill) == "new served skill"
     assert Org.get(ctx.db, session.session_key).identity_revision == next
@@ -9907,20 +9924,16 @@ defmodule Tightbeam.GatewayTest do
 
     refute_receive {:push, %{"type" => "stream_updated"}}, 200
 
-    # An ORDINARY prompt: it lands in the queue behind whatever is already there
-    # and rings the same doorbell any delivery rings.
-    assert_receive {:ensure_lane, ^session_key}
+    prompt =
+      "Your Tightbeam-owned skill files changed to identity revision #{next}.\n" <>
+        "Re-read your Tightbeam skills before you continue work. This update does not\n" <>
+        "reload your current model context."
 
-    assert {:ok, [[prompt]]} =
-             DB.query(ctx.db, "SELECT prompt FROM turns WHERE sessionKey=?1 ORDER BY seq", [
-               session.session_key
-             ])
+    assert [%{wake_id: ^wake_id, state: "pending", prompt: ^prompt}] =
+             Tightbeam.Wakes.list_for_session(ctx.db, session_key)
 
-    assert prompt ==
-             "[from process:tightbeam]\n\n" <>
-               "Your Tightbeam-owned skill files changed to identity revision #{next}.\n" <>
-               "Re-read your Tightbeam skills before you continue work. This update does not\n" <>
-               "reload your current model context."
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", [session_key])
   end
 
   # T-CONCURRENCY, settled the other way: apply changes FILES, not the world a
@@ -9991,7 +10004,7 @@ defmodule Tightbeam.GatewayTest do
 
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
 
-    assert %{applied: [session_key], identity_revision: ^next} =
+    assert %{status: "complete", applied: [session_key], identity_revision: ^next} =
              apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
     assert session_key == session.session_key
@@ -10269,25 +10282,108 @@ defmodule Tightbeam.GatewayTest do
 
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
 
-    assert %{applied: applied, identity_revision: ^next} =
+    assert %{
+             status: "complete",
+             applied: applied,
+             identity_revision: ^next,
+             target_session_keys: target_session_keys,
+             results: results
+           } =
              apply.(%{origin: "user:flynn", params: %{all: true}})
 
     for key <- [started.session_key, unstarted.session_key], do: assert(key in applied)
 
+    assert target_session_keys ==
+             Enum.map(Org.list_for_user(ctx.db, "", true), & &1.session_key)
+
+    assert Enum.all?(results, &(&1.stamp == "committed"))
+
     # Both are stamped; only the started one is asked to re-read.
     assert Org.get(ctx.db, started.session_key).identity_revision == next
     assert Org.get(ctx.db, unstarted.session_key).identity_revision == next
-    assert Ledger.pending_count(ctx.db, started.session_key) == 1
+    assert [%{state: "pending"}] = Tightbeam.Wakes.list_for_session(ctx.db, started.session_key)
     assert Ledger.pending_count(ctx.db, unstarted.session_key) == 0
     assert Org.current_pointer(ctx.db, unstarted.session_key) == nil
   end
 
-  # Writer first, stamp second, nudge third — and the ordering is load-bearing
-  # exactly here: a writer that raises leaves the PRIOR stamp standing and sends
-  # no nudge, because there is nothing new to re-read. Nothing rolls back, reads
-  # back, records an effect row, or repairs; the failure is a named refusal and
-  # the operator's move is to retry.
-  test "a writer failure refuses by name, leaves the prior stamp, and sends no nudge", ctx do
+  test "identity apply --all preserves completed targets and continues after a writer failure",
+       ctx do
+    base_dir = role_test_base("identity-apply-all-partial")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    make = fn key, order ->
+      session =
+        Org.create(ctx.db, %{
+          session_key: key,
+          display_name: key,
+          owner_user_id: "flynn",
+          origin: "user:flynn",
+          archetype: "coder",
+          identity_name: "coder",
+          identity_revision: revision,
+          order_index: order,
+          host: "testhost",
+          harness: "codex",
+          provider: "openai",
+          model: Model.new("gpt-5.6-sol", effort: "medium")
+        })
+
+      Org.append_pointer(ctx.db, key, "thread-#{order}", "created")
+      {session, Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)}
+    end
+
+    {first, _first_cwd} = make.("agent:apply-all-partial-first", 701)
+    {failed, failed_cwd} = make.("agent:apply-all-partial-failed", 702)
+    {last, _last_cwd} = make.("agent:apply-all-partial-last", 703)
+
+    File.mkdir_p!(failed_cwd)
+    File.write!(Path.join(failed_cwd, ".codex"), "not a directory")
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "partial pass guidance",
+        "test"
+      )
+
+    ensure_global_registry()
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    result = apply.(%{origin: "user:flynn", params: %{all: true}})
+
+    assert %{status: "partial", complete: false, identity_revision: ^next} = result
+    assert first.session_key in result.target_session_keys
+    assert failed.session_key in result.target_session_keys
+    assert last.session_key in result.target_session_keys
+    assert first.session_key in result.applied
+    assert failed.session_key not in result.applied
+    assert last.session_key in result.applied
+
+    first_result = Enum.find(result.results, &(&1.session_key == first.session_key))
+    failed_result = Enum.find(result.results, &(&1.session_key == failed.session_key))
+    last_result = Enum.find(result.results, &(&1.session_key == last.session_key))
+
+    assert first_result.outcome == "applied"
+    assert first_result.stamp == "committed"
+    assert first_result.prompt_enqueue == "recorded_pending"
+    assert failed_result.outcome == "partial"
+    assert failed_result.files == "partial_or_unknown"
+    assert failed_result.stamp == "not_committed"
+    assert failed_result.prompt_enqueue == "not_attempted"
+    assert last_result.outcome == "applied"
+    assert last_result.stamp == "committed"
+    assert last_result.prompt_enqueue == "recorded_pending"
+    assert Org.get(ctx.db, first.session_key).identity_revision == next
+    assert Org.get(ctx.db, failed.session_key).identity_revision == revision
+    assert Org.get(ctx.db, last.session_key).identity_revision == next
+  end
+
+  # The materializer can fail after touching an unknown subset of files. Report
+  # the target and that uncertainty without claiming the stamp or prompt landed.
+  test "a writer failure reports the target and leaves the prior stamp", ctx do
     base_dir = role_test_base("identity-apply-writer-fail")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -10338,10 +10434,26 @@ defmodule Tightbeam.GatewayTest do
 
     result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
-    # A NAMED refusal, not a raise and not a raw envelope from three layers down.
-    assert %{code: "apply_failed", sessions: [session_key]} = result
+    assert %{
+             status: "partial",
+             complete: false,
+             target_session_keys: [session_key],
+             applied: [],
+             results: [
+               %{
+                 outcome: "partial",
+                 files: "partial_or_unknown",
+                 stamp: "not_committed",
+                 prompt_enqueue: "not_attempted",
+                 prompt_delivery: "not_started",
+                 reread: "unconfirmed",
+                 reason: reason
+               }
+             ]
+           } = result
+
     assert session_key == session.session_key
-    assert result.message =~ session.session_key
+    assert is_binary(reason) and reason != ""
 
     assert Org.get(ctx.db, session.session_key).identity_revision == revision
     assert Ledger.pending_count(ctx.db, session.session_key) == 0
@@ -10351,9 +10463,9 @@ defmodule Tightbeam.GatewayTest do
     assert File.read!(Path.join(cwd, ".codex")) == "not a directory"
   end
 
-  # Retry converges, and a duplicate nudge is acceptable — the prompt is idempotent
-  # advice, not a command that must be delivered exactly once.
-  test "a retried apply converges and a repeated nudge is acceptable", ctx do
+  # Same-revision retries reuse the durable pending wake and do not rewrite a
+  # complete projection or create another effective prompt.
+  test "a same-revision retry reuses its pending prompt", ctx do
     base_dir = role_test_base("identity-apply-retry")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -10391,24 +10503,39 @@ defmodule Tightbeam.GatewayTest do
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
     call = %{origin: "user:flynn", params: %{session_key: session.session_key}}
 
-    assert %{applied: [_], identity_revision: ^next} = apply.(call)
-    assert %{applied: [_], identity_revision: ^next} = apply.(call)
+    assert %{
+             applied: [session_key],
+             identity_revision: ^next,
+             results: [
+               %{files: "materialized", prompt_enqueue: "recorded_pending", wake_id: wake_id}
+             ]
+           } = apply.(call)
+
+    assert %{
+             applied: [^session_key],
+             identity_revision: ^next,
+             results: [
+               %{
+                 files: "already_current",
+                 prompt_enqueue: "already_pending",
+                 prompt_delivery: "pending",
+                 wake_id: ^wake_id
+               }
+             ]
+           } = apply.(call)
 
     assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")) ==
              "retried served skill"
 
     assert Org.get(ctx.db, session.session_key).identity_revision == next
 
-    assert {:ok, rows} =
-             DB.query(ctx.db, "SELECT prompt FROM turns WHERE sessionKey=?1 ORDER BY seq", [
+    assert [%{wake_id: ^wake_id, state: "pending"}] =
+             Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", [
                session.session_key
              ])
-
-    assert length(rows) >= 1
-
-    for [prompt] <- rows do
-      assert prompt =~ "Re-read your Tightbeam skills before you continue work."
-    end
   end
 
   # R-02: a retired session is not a target. Retiring is a state flip, not a
@@ -10463,11 +10590,9 @@ defmodule Tightbeam.GatewayTest do
     assert Ledger.pending_count(ctx.db, session.session_key) == 0
   end
 
-  # R-02 again, at the other end: `--all` captures its set ONCE, and a session can
-  # retire inside the pass. The row is re-read at ITS update, so the retirement is
-  # observed rather than raced past. Nothing holds the row still — this asserts a
-  # fresh read, not a lock, and a session retiring one instruction later would be
-  # updated, which is the honest boundary of a best-effort refresh.
+  # `--all` captures its set once. A target retiring during the pass is re-read
+  # before its own materialization; this does not hold the lifecycle row against a
+  # later retirement.
   test "identity apply --all skips a session that retires between capture and update",
        ctx do
     base_dir = role_test_base("identity-apply-mid-retire")
@@ -10541,10 +10666,138 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, first.session_key).identity_revision == next
   end
 
-  # A-03/A-04: a writer that fails BETWEEN two skill files leaves a partial file
-  # set, and that is allowed. Apply makes no atomic-snapshot and no single-revision
-  # claim, so nothing rolls the written file back and nothing repairs it; the
-  # unwritten one stays as it was and the prior stamp stands.
+  test "identity apply does not write a captured revision after a newer revision publishes",
+       ctx do
+    base_dir = role_test_base("identity-apply-newer-revision")
+    learn_engineering_identity!(base_dir)
+    original = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-newer-revision",
+        display_name: "Identity apply newer revision",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: original,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-newer-revision", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, original, "coder", :codex, cwd)
+    skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
+    original_body = File.read!(skill)
+
+    captured =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "captured revision",
+        "test"
+      )
+
+    ensure_global_registry()
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+    parent = self()
+
+    lock =
+      Task.async(fn ->
+        :global.trans({{Gateway, :session_mutation, session.session_key}, self()}, fn ->
+          send(parent, :identity_apply_session_lock_held)
+
+          receive do
+            :release_identity_apply_session_lock -> :released
+          end
+        end)
+      end)
+
+    assert_receive :identity_apply_session_lock_held
+
+    apply_task =
+      Task.async(fn ->
+        apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+      end)
+
+    waiting_for_session_lock? =
+      Enum.reduce_while(1..100, false, fn _, _ ->
+        {:current_stacktrace, stacktrace} = Process.info(apply_task.pid, :current_stacktrace)
+
+        waiting? =
+          Enum.any?(stacktrace, fn
+            {:global, function, _arity, _location} when function in [:set_lock, :random_sleep] ->
+              true
+
+            _ ->
+              false
+          end)
+
+        if waiting? do
+          {:halt, true}
+        else
+          Process.sleep(10)
+          {:cont, false}
+        end
+      end)
+
+    assert waiting_for_session_lock?,
+           "expected apply to wait on the held session lock, observed #{inspect(Process.info(apply_task.pid, [:status, :current_function, :current_stacktrace]))}"
+
+    newer =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "newer published revision",
+        "test"
+      )
+
+    send(lock.pid, :release_identity_apply_session_lock)
+    assert {:ok, :released} = Task.yield(lock, 5_000)
+
+    assert %{
+             status: "partial",
+             complete: false,
+             identity_revision: ^captured,
+             target_session_keys: [session_key],
+             applied: [],
+             results: [
+               %{
+                 outcome: "superseded",
+                 files: "not_started",
+                 stamp: "not_committed",
+                 prompt_enqueue: "not_attempted",
+                 current_identity_revision: ^newer
+               }
+             ]
+           } = Task.await(apply_task, 10_000)
+
+    assert session_key == session.session_key
+    assert Identity.live_revision!(base_dir) == newer
+    assert File.read!(skill) == original_body
+    assert Org.get(ctx.db, session.session_key).identity_revision == original
+    assert Tightbeam.Wakes.list_for_session(ctx.db, session.session_key) == []
+
+    assert %{
+             status: "complete",
+             identity_revision: ^newer,
+             results: [
+               %{outcome: "applied", files: "materialized", prompt_enqueue: "recorded_pending"}
+             ]
+           } = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert File.read!(skill) == "newer published revision"
+    assert Org.get(ctx.db, session.session_key).identity_revision == newer
+    assert [%{state: "pending"}] = Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
+  end
+
+  # A writer that fails BETWEEN two skill files leaves a partial file set. The
+  # per-target result must preserve the observed partial write without stamping it.
   @tag pr230_behavior_repair: true
   test "a failure between two skill writes leaves the partial file set and no stamp", ctx do
     base_dir = role_test_base("identity-apply-partial")
@@ -10612,7 +10865,21 @@ defmodule Tightbeam.GatewayTest do
 
     result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
-    assert %{code: "apply_failed", sessions: [session_key]} = result
+    assert %{
+             status: "partial",
+             complete: false,
+             target_session_keys: [session_key],
+             results: [
+               %{
+                 outcome: "partial",
+                 files: "partial_or_unknown",
+                 stamp: "not_committed",
+                 prompt_enqueue: "not_attempted",
+                 prompt_delivery: "not_started"
+               }
+             ]
+           } = result
+
     assert session_key == session.session_key
 
     # Partial, and left partial: the file that landed is the new one, the file
@@ -10624,11 +10891,9 @@ defmodule Tightbeam.GatewayTest do
     refute_receive {:push, %{"type" => "stream_updated"}}, 200
   end
 
-  # A-04: the stamp is the second step, and its failure is the writer's failure —
-  # files new, stamp old, no nudge. There is nothing to re-read on ANOTHER
-  # session's behalf and nothing to undo: a stamp that did not move is a stamp
-  # that will be moved by the retry.
-  test "a stamp failure after the files land sends no nudge and moves no stamp", ctx do
+  # Stamp and prompt record commit together. A stamp failure leaves files visible
+  # but does not claim either durable session state or accepted notification.
+  test "a stamp failure leaves the files but atomically withholds the prompt", ctx do
     base_dir = role_test_base("identity-apply-stamp-fail")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -10684,7 +10949,20 @@ defmodule Tightbeam.GatewayTest do
 
     result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
-    assert %{code: "apply_failed", sessions: [session_key]} = result
+    assert %{
+             status: "partial",
+             target_session_keys: [session_key],
+             results: [
+               %{
+                 outcome: "partial",
+                 files: "materialized",
+                 stamp: "not_committed",
+                 prompt_enqueue: "persistence_failed",
+                 prompt_delivery: "not_started"
+               }
+             ]
+           } = result
+
     assert session_key == session.session_key
 
     assert File.read!(skill) == "stamp-fail served skill"
@@ -10696,17 +10974,16 @@ defmodule Tightbeam.GatewayTest do
     # the stamp. No recovery protocol ran; the operator simply asked again.
     :ok = DB.execute(ctx.db, "DROP TRIGGER identity_apply_stamp_failure")
 
-    assert %{applied: [_], identity_revision: ^next} =
+    assert %{status: "complete", applied: [_], identity_revision: ^next} =
              apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
     assert Org.get(ctx.db, session.session_key).identity_revision == next
-    assert Ledger.pending_count(ctx.db, session.session_key) == 1
+    assert [%{state: "pending"}] = Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
   end
 
-  # A-04: the nudge is the third step, and its failure is the LEAST consequential
-  # one — the files and the stamp are already true, so nothing is undone. What the
-  # caller gets is a named per-session refusal, not a silent success.
-  test "a prompt-submission failure keeps the files and the stamp and names the session",
+  # A failed durable enqueue rolls the stamp back with it; otherwise a same-revision
+  # retry could wrongly believe the prompt had been recorded.
+  test "a prompt persistence failure reports files without adopting the revision",
        ctx do
     base_dir = role_test_base("identity-apply-nudge-fail")
     learn_engineering_identity!(base_dir)
@@ -10744,7 +11021,10 @@ defmodule Tightbeam.GatewayTest do
     :ok =
       DB.execute(ctx.db, """
       CREATE TRIGGER identity_apply_nudge_failure
-      BEFORE INSERT ON turns
+      BEFORE INSERT ON wakes
+      WHEN NEW.sessionKey = '#{session.session_key}'
+        AND NEW.origin = 'process:tightbeam'
+        AND NEW.consumer = 'prompt'
       BEGIN SELECT RAISE(ABORT, 'injected-nudge-failure'); END;
       """)
 
@@ -10754,30 +11034,42 @@ defmodule Tightbeam.GatewayTest do
 
     result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
-    assert %{code: "apply_failed", sessions: [session_key]} = result
-    assert session_key == session.session_key
-    assert result.message =~ session.session_key
+    assert %{
+             status: "partial",
+             target_session_keys: [session_key],
+             results: [
+               %{
+                 outcome: "partial",
+                 files: "materialized",
+                 stamp: "not_committed",
+                 prompt_enqueue: "persistence_failed",
+                 prompt_delivery: "not_started",
+                 reason: reason
+               }
+             ]
+           } = result
 
-    # Both earlier steps stand. The prompt is the only thing missing, and the
-    # operator's move is the same retry as for any other step.
+    assert session_key == session.session_key
+    assert reason =~ "injected-nudge-failure"
+
+    # Files remain, while the transaction leaves the previous stamp and no wake.
     assert File.read!(skill) == "nudge-fail served skill"
-    assert Org.get(ctx.db, session.session_key).identity_revision == next
+    assert Org.get(ctx.db, session.session_key).identity_revision == revision
     assert Ledger.pending_count(ctx.db, session.session_key) == 0
+    assert [] = Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
 
     :ok = DB.execute(ctx.db, "DROP TRIGGER identity_apply_nudge_failure")
 
-    assert %{applied: [_], identity_revision: ^next} =
+    assert %{status: "complete", applied: [_], identity_revision: ^next} =
              apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
-    assert Ledger.pending_count(ctx.db, session.session_key) == 1
+    assert Org.get(ctx.db, session.session_key).identity_revision == next
+    assert [%{state: "pending"}] = Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
   end
 
-  # A-04, the last failure window: the prompt was ACCEPTED and the caller lost the
-  # response, so it retries a call that already fully succeeded. A second nudge is
-  # the correct outcome, not a defect to deduplicate — the prompt is idempotent
-  # advice, and suppressing it would need exactly the delivery bookkeeping this
-  # design refuses to carry.
-  test "a retry after a lost response converges and a duplicate nudge is permitted", ctx do
+  # A caller can lose the response after the transaction commits. A retry checks
+  # the durable wake before writing another one, so restart/retry cannot duplicate it.
+  test "a lost apply response retries the existing durable prompt", ctx do
     base_dir = role_test_base("identity-apply-lost-response")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -10816,44 +11108,189 @@ defmodule Tightbeam.GatewayTest do
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
     call = %{origin: "user:flynn", params: %{session_key: session.session_key}}
 
-    # The call that succeeded, whose response the caller never saw.
-    assert %{applied: [_], identity_revision: ^next} = apply.(call)
-    assert Ledger.pending_count(ctx.db, session.session_key) == 1
+    # The call committed, but the caller did not receive its response.
+    assert %{
+             applied: [session_key],
+             identity_revision: ^next,
+             results: [%{prompt_enqueue: "recorded_pending", wake_id: wake_id}]
+           } = apply.(call)
+
+    assert session_key == session.session_key
 
     # The retry, issued because the caller cannot tell success from silence.
-    assert %{applied: [_], identity_revision: ^next} = apply.(call)
+    assert %{
+             applied: [^session_key],
+             identity_revision: ^next,
+             results: [
+               %{
+                 files: "already_current",
+                 prompt_enqueue: "already_pending",
+                 prompt_delivery: "pending",
+                 reread: "unconfirmed",
+                 wake_id: ^wake_id
+               }
+             ]
+           } = apply.(call)
 
     assert File.read!(skill) == "lost-response served skill"
     assert Org.get(ctx.db, session.session_key).identity_revision == next
-    # The retry remains a distinct durable nudge, but the first immediate
-    # prompt already owns the recipient's pending turn. Keep the retry as an
-    # editable source row until that turn ends instead of queuing a second
-    # ungrouped turn ahead of recipient readiness.
-    assert Ledger.pending_count(ctx.db, session.session_key) == 1
 
-    assert {:ok, rows} =
-             DB.query(ctx.db, "SELECT prompt FROM turns WHERE sessionKey=?1 ORDER BY seq", [
-               session.session_key
-             ])
+    assert [%{wake_id: ^wake_id, state: "pending", prompt: prompt}] =
+             Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
 
-    assert length(rows) == 1
-
-    expected =
-      "[from process:tightbeam]\n\n" <>
-        "Your Tightbeam-owned skill files changed to identity revision #{next}.\n" <>
-        "Re-read your Tightbeam skills before you continue work. This update does not\n" <>
-        "reload your current model context."
-
-    assert rows == [[expected]]
+    assert prompt =~ "Re-read your Tightbeam skills before you continue work."
 
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM wakes WHERE sessionKey=?1 AND state='pending' AND consumer='prompt' AND prompt=?2",
+               [session.session_key, prompt]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", [
+               session.session_key
+             ])
+  end
+
+  test "identity apply commits while the scheduler is delayed and recovers after restart", ctx do
+    base_dir = role_test_base("identity-apply-scheduler-delay")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-scheduler-delay",
+        display_name: "Identity apply scheduler delay",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-scheduler-delay", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "scheduler recovery skill",
+        "test"
+      )
+
+    ensure_global_registry()
+
+    deliver = fn wake ->
+      Gateway.deliver_prompt(
+        wake.session_key,
+        wake.origin,
+        wake.prompt,
+        db: ctx.db,
+        wake_id: wake.wake_id,
+        sender: wake.origin,
+        target_gate: if(wake.target_gate == 0, do: nil, else: wake),
+        fire_wake_in_txn: wake.origin == "process:tightbeam",
+        conn_registry: ctx.registry,
+        lane_manager: ctx.lane
+      )
+    end
+
+    {:ok, scheduler} =
+      Tightbeam.Wakes.start_link(
+        db: ctx.db,
+        name: Tightbeam.WakeScheduler,
+        tick_ms: 60_000,
+        deliver: deliver
+      )
+
+    Process.unlink(scheduler)
+    on_exit(fn -> if Process.alive?(scheduler), do: GenServer.stop(scheduler) end)
+    :ok = :sys.suspend(scheduler)
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+    call = %{origin: "user:flynn", params: %{session_key: session.session_key}}
+    task = Task.async(fn -> apply.(call) end)
+    fast_result = Task.yield(task, 3_000)
+    :ok = :sys.resume(scheduler)
+
+    result =
+      case fast_result do
+        {:ok, result} -> result
+        nil -> Task.await(task, 10_000)
+        other -> flunk("identity apply task failed: #{inspect(other)}")
+      end
+
+    assert match?({:ok, _result}, fast_result),
+           "identity apply waited for the suspended wake scheduler"
+
+    assert %{
+             status: "complete",
+             identity_revision: ^next,
+             results: [
+               %{prompt_enqueue: "recorded_pending", prompt_delivery: "pending", wake_id: wake_id}
+             ]
+           } = result
+
+    assert [%{wake_id: ^wake_id, state: "pending"}] =
+             Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
+
+    assert Org.get(ctx.db, session.session_key).identity_revision == next
+
+    # Restart the scheduler against the same product database. Its ordinary due
+    # scan delivers the accepted record; apply itself does not make the call.
+    :ok = GenServer.stop(scheduler)
+
+    {:ok, restarted} =
+      Tightbeam.Wakes.start_link(
+        db: ctx.db,
+        name: Tightbeam.WakeScheduler,
+        tick_ms: 60_000,
+        deliver: deliver
+      )
+
+    Process.unlink(restarted)
+    on_exit(fn -> if Process.alive?(restarted), do: GenServer.stop(restarted) end)
+    assert :ok = Tightbeam.Wakes.fire_due(Tightbeam.WakeScheduler)
+    assert_receive {:ensure_lane, key}
+    assert key == session.session_key
+
+    assert %{state: "fired"} = Tightbeam.Wakes.get(ctx.db, wake_id)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND origin='process:tightbeam'",
                [
-                 session.session_key,
-                 String.replace_prefix(expected, "[from process:tightbeam]\n\n", "")
+                 session.session_key
                ]
+             )
+
+    assert %{
+             status: "complete",
+             results: [
+               %{
+                 files: "already_current",
+                 prompt_enqueue: "already_recorded",
+                 prompt_delivery: "queued",
+                 reread: "unconfirmed",
+                 wake_id: ^wake_id
+               }
+             ]
+           } = apply.(call)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND origin='process:tightbeam'",
+               [session.session_key]
              )
   end
 
