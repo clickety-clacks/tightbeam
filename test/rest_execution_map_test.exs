@@ -11,6 +11,7 @@ defmodule Tightbeam.RestExecutionMapTest do
     ExecutionMap,
     Identity,
     Ledger,
+    LiveBaseAdmission,
     LiveBaseGuard,
     LiveBasePayload,
     Schema
@@ -136,10 +137,9 @@ defmodule Tightbeam.RestExecutionMapTest do
 
   test "file-backed read snapshots do not hold the single writer", _ctx do
     base_dir =
-      Path.join(
-        System.tmp_dir!(),
-        "tightbeam-execution-map-read-snapshot-#{System.unique_integer([:positive])}"
-      )
+      System.tmp_dir!()
+      |> Path.join("tightbeam-execution-map-read-snapshot-#{System.unique_integer([:positive])}")
+      |> LiveBaseAdmission.canonical!()
 
     File.mkdir_p!(base_dir)
     on_exit(fn -> File.rm_rf!(base_dir) end)
