@@ -424,13 +424,13 @@ defmodule Tightbeam.WorkItemTraceRestTest do
       opened_at: 450
     )
 
-    after = get(ctx, "/api/work-items/#{root}/trace")
+    after_response = get(ctx, "/api/work-items/#{root}/trace")
     child_after = get(ctx, "/api/work-items/#{child}/trace")
-    assert after.resp_body == before.resp_body
+    assert after_response.resp_body == before.resp_body
     assert child_after.resp_body == child_before.resp_body
     assert_trace_parent_matches_execution_map!(ctx, child, decode_trace!(child_after))
-    refute after.resp_body =~ "asg_trace_hidden_middle_hidden"
-    refute after.resp_body =~ "asg_trace_hidden_middle_second"
+    refute after_response.resp_body =~ "asg_trace_hidden_middle_hidden"
+    refute after_response.resp_body =~ "asg_trace_hidden_middle_second"
   end
 
   test "rejects paging and gives hidden and unknown roots the same not-found response", ctx do
