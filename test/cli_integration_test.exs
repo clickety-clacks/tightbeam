@@ -661,6 +661,9 @@ defmodule Tightbeam.CliIntegrationTest do
       receive do: (:never -> {:ok, %{}})
     end
 
+    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
+    start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
+
     {:ok, _seq} =
       Ledger.enqueue(ctx.db, %{
         session_key: target.session_key,
