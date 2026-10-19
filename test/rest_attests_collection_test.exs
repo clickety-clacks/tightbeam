@@ -4,7 +4,8 @@ defmodule Tightbeam.RestAttestsCollectionTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Tightbeam.{Archetypes, Assignments, DB, Devices, Identity, Txn, WorkItems}
+  alias Tightbeam.{Archetypes, Assignments, DB, Devices, Identity, WorkItems}
+  alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Hub
   alias Tightbeam.Wire.Router
 
