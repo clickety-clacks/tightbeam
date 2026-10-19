@@ -302,7 +302,7 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     from_turn =
       insert_work_item!(ctx.db, "wi_trace_no_parent_turn", "owner", 52_000, context_known: true)
 
-    visible_turn = insert_turn!(ctx, "trace-no-parent-turn")
+    visible_turn = insert_turn!(ctx, "trace-no-parent-turn", [])
     set_creation_turn!(ctx.db, from_turn, visible_turn)
 
     unrecorded_trace = get(ctx, "/api/work-items/#{unrecorded}/trace") |> decode_trace!()
