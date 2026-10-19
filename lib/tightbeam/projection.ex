@@ -12,6 +12,7 @@ defmodule Tightbeam.Projection do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
   alias Tightbeam.Origin
 
   @type db :: GenServer.server()
@@ -249,14 +250,27 @@ defmodule Tightbeam.Projection do
   @spec append_substrate_in_txn(Txn.t(), String.t(), String.t(), attention()) ::
           {:appended, message()}
   def append_substrate_in_txn(%Txn{} = txn, session_key, content, attention \\ :normal) do
-    append_in_txn(txn, %{
-      session_key: session_key,
-      role: "assistant",
-      content: content,
-      sender: "process:tightbeam",
-      message_type: "substrate",
-      attention_tier: attention_tier(attention)
-    })
+    case append_in_txn(txn, %{
+           session_key: session_key,
+           role: "assistant",
+           content: content,
+           sender: "process:tightbeam",
+           message_type: "substrate",
+           attention_tier: attention_tier(attention)
+         }) do
+      {:appended, message} = appended ->
+        Publisher.message_in_txn(txn, session_key, message)
+        appended
+
+      other ->
+        other
+    end
+  end
+
+  @doc "Append a substrate notice and queue its post-commit message notice."
+  @spec append_substrate(db(), String.t(), String.t(), attention()) :: {:appended, message()}
+  def append_substrate(db, session_key, content, attention \\ :normal) do
+    transaction!(db, &append_substrate_in_txn(&1, session_key, content, attention))
   end
 
   @doc """
