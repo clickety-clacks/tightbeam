@@ -184,6 +184,9 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     assert invalid_enum.status == 400
     assert JSON.decode!(invalid_enum.resp_body)["error"]["code"] == "invalid_filter"
 
+    invalid_identity_state = get(ctx, "/api/artifacts?state=ready")
+    assert_error(invalid_identity_state, 400, "artifacts", "invalid_filter")
+
     first = get(ctx, "/api/artifacts?workItemId=#{ctx.work_item.id}&limit=1&tail=false")
     assert first.status == 200
     first_page = JSON.decode!(first.resp_body)

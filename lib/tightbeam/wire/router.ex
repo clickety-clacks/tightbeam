@@ -1666,7 +1666,7 @@ defmodule Tightbeam.Wire.Router do
     with {:ok, auth} <- d1_bearer_auth(conn),
          {:ok, query} <- d1_query(conn.query_string),
          {:ok, principal} <- d1_principal(auth, query, conn),
-         {:ok, request} <- d1_collection_request(query, spec),
+         {:ok, request} <- d1_d2_collection_request(query, spec),
          {:ok, request} <- d1_collection_parent_scope(request, d1_resource(spec), parent_id),
          :ok <- d1_d2_filter_validation(d1_resource(spec), request.filters),
          {:ok, boundary} <- d1_boundary(request, principal, spec, conn) do
@@ -1724,6 +1724,29 @@ defmodule Tightbeam.Wire.Router do
       d1_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
 
+  defp d1_d2_collection_request(query, spec) do
+    case d1_resource(spec) do
+      :artifacts -> d1_artifact_collection_request(query, spec)
+      _resource -> d1_collection_request(query, spec)
+    end
+  end
+
+  defp d1_artifact_collection_request(query, spec) do
+    states = Map.get(query, "state", [])
+
+    with {:ok, request} <- d1_collection_request(Map.delete(query, "state"), spec),
+         true <- Enum.all?(states, &(&1 in ~w(in-workspace archived released))) do
+      filters =
+        if states == [],
+          do: request.filters,
+          else: Map.put(request.filters, "state", states |> Enum.uniq() |> Enum.sort())
+
+      {:ok, %{request | filters: filters}}
+    else
+      _ -> {:error, 400, "invalid_filter", nil}
+    end
+  end
+
   defp d1_collection_parent_scope(request, :assignment_attests, parent_id)
        when is_binary(parent_id) and parent_id != "" do
     {:ok, %{request | filters: Map.put(request.filters, "$parentAssignmentId", [parent_id])}}
@@ -1737,9 +1760,7 @@ defmodule Tightbeam.Wire.Router do
   defp d1_collection_parent_scope(request, _resource, _parent_id), do: {:ok, request}
 
   defp d1_d2_filter_validation(:artifacts, filters) do
-    valid? =
-      Enum.all?(Map.get(filters, "kind", []), &(&1 in ~w(spec report doc data other))) and
-        Enum.all?(Map.get(filters, "state", []), &(&1 in ~w(in-workspace archived released)))
+    valid? = Enum.all?(Map.get(filters, "kind", []), &(&1 in ~w(spec report doc data other)))
 
     if valid?, do: :ok, else: {:error, 400, "invalid_filter", nil}
   end
