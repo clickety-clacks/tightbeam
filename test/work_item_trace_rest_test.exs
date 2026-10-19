@@ -14,12 +14,16 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     StateResources,
     WorkItems
   }
+
   alias Tightbeam.Firehose.Hub
   alias Tightbeam.Wire.Router
 
   setup do
     base_dir =
-      Path.join(System.tmp_dir!(), "tightbeam-work-item-trace-#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-work-item-trace-#{System.unique_integer([:positive])}"
+      )
 
     File.mkdir_p!(base_dir)
     :initialized = Identity.init!(base_dir)
@@ -58,13 +62,18 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     }
   end
 
-  test "returns canonical R7 rows, transitive assignment membership, direct children and T-C6 bytes", ctx do
+  test "returns canonical R7 rows, transitive assignment membership, direct children and T-C6 bytes",
+       ctx do
     parent = insert_work_item!(ctx.db, "wi_trace_parent", "owner", 10_000)
     other_parent = insert_work_item!(ctx.db, "wi_trace_other_parent", "owner", 15_000)
     root = insert_work_item!(ctx.db, "wi_trace_root", "owner", 20_000, context_known: true)
     child = insert_work_item!(ctx.db, "wi_trace_child_job", "owner", 30_000, context_known: true)
-    review_child = insert_work_item!(ctx.db, "wi_trace_child_review", "owner", 40_000, context_known: true)
-    other_child = insert_work_item!(ctx.db, "wi_trace_child_other", "owner", 45_000, context_known: true)
+
+    review_child =
+      insert_work_item!(ctx.db, "wi_trace_child_review", "owner", 40_000, context_known: true)
+
+    other_child =
+      insert_work_item!(ctx.db, "wi_trace_child_other", "owner", 45_000, context_known: true)
 
     root_turn = insert_turn!(ctx, "trace-root-turn", job_ref: parent)
     child_turn = insert_turn!(ctx, "trace-child-job-turn", job_ref: root)
@@ -105,7 +114,13 @@ defmodule Tightbeam.WorkItemTraceRestTest do
 
     assert get_resp_header(response, "cache-control") == ["no-store"]
     assert trace["workItem"]["id"] == root
-    assert Enum.map(trace["assignments"], & &1["id"]) == [base_assignment, review_assignment, second_review]
+
+    assert Enum.map(trace["assignments"], & &1["id"]) == [
+             base_assignment,
+             review_assignment,
+             second_review
+           ]
+
     assert trace["causalChildren"] == [child, review_child]
 
     assert trace["attribution"] == %{
@@ -143,11 +158,16 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     end
 
     hidden_child =
-      insert_work_item!(ctx.db, "wi_trace_hidden_child", "other", 50_000,
-        context_known: true
+      insert_work_item!(ctx.db, "wi_trace_hidden_child", "other", 50_000, context_known: true)
+
+    hidden_turn =
+      insert_turn_for_session!(
+        ctx,
+        ctx.other_session.session_key,
+        "trace-hidden-child-turn",
+        root
       )
 
-    hidden_turn = insert_turn_for_session!(ctx, ctx.other_session.session_key, "trace-hidden-child-turn", root)
     set_creation_turn!(ctx.db, hidden_child, hidden_turn)
     assert get(ctx, "/api/work-items/#{root}/trace").resp_body == response.resp_body
 
@@ -176,12 +196,14 @@ defmodule Tightbeam.WorkItemTraceRestTest do
       )
 
     assert {:ok, _rows} = DB.query(ctx.db, "PRAGMA foreign_keys=OFF")
+
     insert_assignment!(ctx.db, "asg_trace_twin_review",
       holder: ctx.owner_session.session_key,
       opener_session: ctx.owner_session.session_key,
       reviews_assignment_id: "asg_trace_twin_hidden_base",
       opened_at: 300
     )
+
     assert {:ok, _rows} = DB.query(ctx.db, "PRAGMA foreign_keys=ON")
 
     before = get(ctx, "/api/work-items/#{root}/trace", ctx.owner_session.cli_token)
@@ -214,9 +236,13 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     assert after_trace["dependencyVersion"] == before_trace["dependencyVersion"]
   end
 
-  test "cycle-closing edges are demoted and every visible cycle member contributes to T-C6", ctx do
+  test "cycle-closing edges are demoted and every visible cycle member contributes to T-C6",
+       ctx do
     root = insert_work_item!(ctx.db, "wi_trace_cycle_root", "owner", 10_000, context_known: true)
-    middle = insert_work_item!(ctx.db, "wi_trace_cycle_middle", "owner", 20_000, context_known: true)
+
+    middle =
+      insert_work_item!(ctx.db, "wi_trace_cycle_middle", "owner", 20_000, context_known: true)
+
     tail = insert_work_item!(ctx.db, "wi_trace_cycle_tail", "owner", 30_000, context_known: true)
 
     root_turn = insert_turn!(ctx, "trace-cycle-root", job_ref: middle)
@@ -231,23 +257,41 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     assert before["attribution"]["provenanceStatus"] == "linked"
     assert before["attribution"]["primaryWorkId"] == middle
 
-    assert {:ok, _rows} =
-             DB.query(ctx.db,
-               "INSERT INTO work_item_versions (workItemId, rowVersion) VALUES (?1, 99999)",
-               [tail]
-             )
+    assert before["dependencyVersion"] ==
+             expected_dependency_version([
+               ["work items", root, item_version(ctx.db, root)],
+               ["work items", middle, item_version(ctx.db, middle)],
+               ["work items", tail, item_version(ctx.db, tail)],
+               ["turns", root_turn, turn_version(ctx.db, root_turn)],
+               ["turns", middle_turn, turn_version(ctx.db, middle_turn)],
+               ["turns", tail_turn, turn_version(ctx.db, tail_turn)]
+             ])
 
-    after_trace = get(ctx, "/api/work-items/#{root}/trace") |> decode_trace!()
-    refute after_trace["dependencyVersion"] == before["dependencyVersion"]
+    for cycle_member <- [middle, tail] do
+      assert {:ok, _rows} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO work_item_versions (workItemId, rowVersion) VALUES (?1, 99999)",
+                 [cycle_member]
+               )
+
+      changed_trace = get(ctx, "/api/work-items/#{root}/trace") |> decode_trace!()
+      refute changed_trace["dependencyVersion"] == before["dependencyVersion"]
+
+      assert {:ok, _rows} =
+               DB.query(
+                 ctx.db,
+                 "DELETE FROM work_item_versions WHERE workItemId=?1",
+                 [cycle_member]
+               )
+    end
   end
 
   test "unrecorded and no-turn-observed creation contexts stay distinct", ctx do
     unrecorded = insert_work_item!(ctx.db, "wi_trace_unrecorded", "owner", 50_000)
 
     no_turn =
-      insert_work_item!(ctx.db, "wi_trace_no_turn", "owner", 51_000,
-        context_known: true
-      )
+      insert_work_item!(ctx.db, "wi_trace_no_turn", "owner", 51_000, context_known: true)
 
     unrecorded_trace = get(ctx, "/api/work-items/#{unrecorded}/trace") |> decode_trace!()
     no_turn_trace = get(ctx, "/api/work-items/#{no_turn}/trace") |> decode_trace!()
@@ -378,13 +422,25 @@ defmodule Tightbeam.WorkItemTraceRestTest do
                INSERT INTO turns (seq, sessionKey, messageId, origin, prompt, status, createdAt, jobRef)
                VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7)
                """,
-               [seq, session_key, "hidden-turn-#{seq}", "session:#{session_key}", "Hidden", 70_000, job_ref]
+               [
+                 seq,
+                 session_key,
+                 "hidden-turn-#{seq}",
+                 "session:#{session_key}",
+                 "Hidden",
+                 70_000,
+                 job_ref
+               ]
              )
   end
 
   defp set_creation_turn!(db, id, seq) do
     assert {:ok, _rows} =
-             DB.query(db, "UPDATE work_items SET createdInTurnSeq=?2, createdContextKnown=1 WHERE id=?1", [id, seq])
+             DB.query(
+               db,
+               "UPDATE work_items SET createdInTurnSeq=?2, createdContextKnown=1 WHERE id=?1",
+               [id, seq]
+             )
   end
 
   defp item_version(db, id) do
@@ -440,6 +496,7 @@ defmodule Tightbeam.WorkItemTraceRestTest do
 
   defp ordered_keys?(body, keys) do
     positions = Enum.map(keys, &:binary.match(body, "\"#{&1}\":"))
+
     Enum.all?(positions, &match?({position, _length} when is_integer(position), &1)) and
       Enum.map(positions, &elem(&1, 0)) == Enum.sort(Enum.map(positions, &elem(&1, 0)))
   end

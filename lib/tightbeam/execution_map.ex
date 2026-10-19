@@ -745,18 +745,23 @@ defmodule Tightbeam.ExecutionMap do
     {linked, cycles}
   end
 
-  defp cycle_members(id, id, _candidates, members), do: MapSet.put(members, id)
+  defp cycle_members(child, parent, candidates),
+    do: cycle_members(child, parent, candidates, MapSet.new([child]))
 
-  defp cycle_members(id, parent, candidates, members) do
-    if MapSet.member?(members, id) do
+  defp cycle_members(child, child, _candidates, members), do: members
+
+  defp cycle_members(child, current, candidates, members) do
+    if MapSet.member?(members, current) do
       members
     else
-      cycle_members(Map.fetch!(candidates, id), parent, candidates, MapSet.put(members, id))
+      cycle_members(
+        child,
+        Map.fetch!(candidates, current),
+        candidates,
+        MapSet.put(members, current)
+      )
     end
   end
-
-  defp cycle_members(id, parent, candidates),
-    do: cycle_members(id, parent, candidates, MapSet.new())
 
   ## REST D2 query path. Source admission happens before every derived map.
 

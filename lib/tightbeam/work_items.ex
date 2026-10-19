@@ -26,6 +26,7 @@ defmodule Tightbeam.WorkItems do
     StateVisibility,
     Wakes
   }
+
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -1001,7 +1002,8 @@ defmodule Tightbeam.WorkItems do
 
     relevant_item_ids =
       [root.id | causal_children] ++
-        if(parent.status == "linked", do: [parent.item], else: []) ++ MapSet.to_list(cycle_members)
+        if(parent.status == "linked", do: [parent.item], else: []) ++
+        MapSet.to_list(cycle_members)
 
     relevant_items =
       relevant_item_ids
@@ -1030,7 +1032,10 @@ defmodule Tightbeam.WorkItems do
 
     chain_ids =
       Enum.reduce(emitted_assignments, MapSet.new(), fn assignment, ids ->
-        MapSet.union(ids, work_item_trace_assignment_chain_ids(assignment["id"], assignments_by_id))
+        MapSet.union(
+          ids,
+          work_item_trace_assignment_chain_ids(assignment["id"], assignments_by_id)
+        )
       end)
 
     chain_ids =
@@ -1073,7 +1078,8 @@ defmodule Tightbeam.WorkItems do
       [is_admin, principal_kind, principal_id]
     )
     |> Enum.map(fn [id, work_item_id, reviews_assignment_id, opened_at, closed_at] ->
-      version = StateResources.assignment(%{opened_at: opened_at, closed_at: closed_at})["rowVersion"]
+      version =
+        StateResources.assignment(%{opened_at: opened_at, closed_at: closed_at})["rowVersion"]
 
       %{
         id: id,
