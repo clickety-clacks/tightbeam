@@ -4457,7 +4457,7 @@ defmodule Tightbeam.Wakes do
            causal_source: %{kind: "scheduler_delivery", id: wake_id},
            outcome: %{kind: "no_replacement"}
          },
-         %{wake_id: wake_id}
+         %{wake_id: wake_id, consumer: "prompt"}
        )
        when reason_kind in ["target_unresolvable", "consumer_unavailable"],
        do: true
