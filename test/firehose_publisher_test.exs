@@ -810,6 +810,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
       |> StateResources.message()
 
     assert notice["payload"] == canonical
+
     assert notice["payload"]["marker"] == %{
              "kind" => "session-restart",
              "from" => "old-session",
