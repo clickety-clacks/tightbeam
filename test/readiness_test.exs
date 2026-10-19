@@ -144,7 +144,7 @@ defmodule Tightbeam.ReadinessTest do
 
     statement =
       "racter lost codex: its openai credential was rejected. Redirect destination: eezo. racter needs a human sign-in for codex; run " <>
-        "on racter: tightbeam onboard openai --as-user <adminUserId> " <>
+        "on testhost: tightbeam onboard openai --as-user <adminUserId> " <>
         "(replace <adminUserId> with your own administrator id)."
 
     config =
