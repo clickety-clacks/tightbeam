@@ -74,9 +74,12 @@ defmodule Tightbeam.LifecycleRuntimeIndexesTest do
              (0,'idle_cleanup_pending_observed','bad','not json');
       """)
 
+    assert {:ok, history} = DB.query(db, "SELECT * FROM lifecycle_events ORDER BY id")
+
     # Retired source machinery no longer interprets its historical rows during
     # boot. The data remains available for audit and does not block startup.
     _log = capture_log(fn -> assert :ok = Schema.ensure_all(db) end)
+    assert DB.query(db, "SELECT * FROM lifecycle_events ORDER BY id") == {:ok, history}
 
     assert {:ok, [[2]]} =
              DB.query(db, "SELECT count(*) FROM lifecycle_events WHERE detail='not json'")

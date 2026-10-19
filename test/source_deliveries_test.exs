@@ -178,6 +178,7 @@ defmodule Tightbeam.SourceDeliveriesTest do
       DB.execute(ctx.db, """
       DROP TRIGGER supervision_liveness_sidecar_insert_coherent;
       DROP INDEX wakes_delivered_turn;
+      DROP INDEX wakes_delivered_obligation;
       ALTER TABLE wakes DROP COLUMN deliveredTurnSeq;
       DROP TABLE wake_delivery_backfill;
       UPDATE wakes SET state='pending' WHERE wakeId='w_direct';

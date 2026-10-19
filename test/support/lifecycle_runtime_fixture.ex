@@ -5,22 +5,15 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
 
   # Extract the shipped literal SQL, including the surrounding correlated
   # queries. A changed or removed query must update this explicit coverage map;
-  # the test cannot pass against a faster handwritten substitute.
+  # the test cannot pass against a faster handwritten substitute. Retired
+  # supervision and idle-cleanup readers are gone; their historical rows remain
+  # in the seed to prove the surviving readers still select only their data.
   def cases do
     [
-      {"supervision.ex", "SELECT kind, detail FROM lifecycle_events", ["index-assignment"],
-       [["supervision_entitlement_rearmed", "new"]]},
-      {"supervision.ex", "SELECT 1 FROM supervision_liveness_sidecar", ["index-assignment"],
-       [[1]]},
-      {"supervision.ex", "SELECT 1 FROM lifecycle_events WHERE subject",
-       ["index-assignment", "refusal"], [[1]]},
-      {"supervision.ex", "SELECT w.wakeId,w.sessionKey FROM wakes w", [],
-       [["index-unobserved", "index-session"]]},
       {"gateway.ex", "SELECT seq, role, sender, content, attachments", ["index-session", 3, 100],
        [[1, "user", nil, "visible", "[]"]]},
       {"workspace_cleanup.ex", "SELECT sessionKey,nextAt FROM retired_workspace_cleanup", [],
        [["index-session", 0]]},
-      {"wakes.ex", "SELECT detail FROM lifecycle_events", ["index-observed"], [["wake-detail"]]},
       {"escalation.ex", "SELECT COUNT(*) FROM lifecycle_events WHERE kind", ["index-decision"],
        [[2]]}
     ]
@@ -33,7 +26,6 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
             if String.starts_with?(String.trim(sql), prefix) and
                  (String.contains?(sql, "lifecycle_events") or
                     prefix in [
-                      "SELECT w.wakeId,w.sessionKey FROM wakes w",
                       "SELECT sessionKey,nextAt FROM retired_workspace_cleanup"
                     ]),
                do: {sql, [sql | acc]},
