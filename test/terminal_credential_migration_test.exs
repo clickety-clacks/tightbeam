@@ -63,7 +63,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
     assert {:ok, _} =
              DB.query(
                db,
-               "INSERT INTO condition_facts(ts,kind,scope,origin) VALUES (1,'credential-present','racter:openai','process:tightbeam')"
+               "INSERT INTO condition_facts(ts,kind,scope,origin) VALUES (1,'credential-present','testhost:openai','process:tightbeam')"
              )
 
     preserved_sql =
