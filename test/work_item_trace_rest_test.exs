@@ -8,6 +8,7 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     Archetypes,
     DB,
     Devices,
+    ExecutionMap,
     Identity,
     Ledger,
     Schema,
@@ -372,14 +373,15 @@ defmodule Tightbeam.WorkItemTraceRestTest do
       insert_work_item!(ctx.db, "wi_trace_no_turn", "owner", 51_000, context_known: true)
 
     from_turn =
-      insert_work_item!(ctx.db, "wi_trace_no_parent_turn", "owner", 52_000, context_known: true)
-
-    visible_turn = insert_turn!(ctx, "trace-no-parent-turn", [])
-    set_creation_turn!(ctx.db, from_turn, visible_turn)
+      insert_work_item!(ctx.db, "wi_trace_no_parent_turn", "owner", 52_000,
+        context_known: true,
+        created_in_turn_seq: 999_999
+      )
 
     unrecorded_trace = get(ctx, "/api/work-items/#{unrecorded}/trace") |> decode_trace!()
     no_turn_trace = get(ctx, "/api/work-items/#{no_turn}/trace") |> decode_trace!()
-    from_turn_trace = get(ctx, "/api/work-items/#{from_turn}/trace") |> decode_trace!()
+    from_turn_response = get(ctx, "/api/work-items/#{from_turn}/trace")
+    from_turn_trace = decode_trace!(from_turn_response)
 
     assert unrecorded_trace["attribution"] == %{
              "provenanceStatus" => "unrecorded",
@@ -410,6 +412,43 @@ defmodule Tightbeam.WorkItemTraceRestTest do
              expected_dependency_version([
                ["work items", from_turn, item_version(ctx.db, from_turn)]
              ])
+
+    assert {:ok, _rows} = DB.query(ctx.db, "PRAGMA foreign_keys=OFF")
+
+    excluded_chain =
+      insert_assignment!(ctx.db, "asg_trace_excluded_turn_chain",
+        holder: ctx.owner_session.session_key,
+        opener_user: "owner",
+        reviews_assignment_id: "asg_trace_excluded_turn_missing",
+        opened_at: 530
+      )
+
+    assert {:ok, _rows} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO turns (seq, sessionKey, messageId, origin, prompt, status, createdAt,
+                                  assignmentId)
+               VALUES (999999, ?1, 'trace-excluded-turn', ?2, 'No visible item link', 'queued',
+                       53_000, ?3)
+               """,
+               [
+                 ctx.owner_session.session_key,
+                 "session:#{ctx.owner_session.session_key}",
+                 excluded_chain
+               ]
+             )
+
+    assert {:ok, _rows} = DB.query(ctx.db, "PRAGMA foreign_keys=ON")
+
+    excluded_turn_response = get(ctx, "/api/work-items/#{from_turn}/trace")
+    assert excluded_turn_response.resp_body == from_turn_response.resp_body
+
+    assert {:ok, _rows} = DB.query(ctx.db, "DELETE FROM turns WHERE seq=999999")
+    assert {:ok, _rows} = DB.query(ctx.db, "DELETE FROM assignments WHERE id=?1", [excluded_chain])
+
+    absent_turn_response = get(ctx, "/api/work-items/#{from_turn}/trace")
+    assert absent_turn_response.resp_body == from_turn_response.resp_body
   end
 
   test "a hidden middle assignment hop and an absent hop produce identical traces", ctx do
@@ -487,13 +526,29 @@ defmodule Tightbeam.WorkItemTraceRestTest do
   end
 
   defp assert_trace_parent_matches_execution_map!(ctx, work_item_id, trace, bearer \\ nil) do
-    response = get(ctx, "/api/execution-map", bearer)
-    assert response.status == 200, "execution map response: #{response.resp_body}"
-    execution_map = JSON.decode!(response.resp_body)
-    node = Enum.find(execution_map["items"], &(&1["id"] == work_item_id))
+    principal =
+      if bearer == ctx.owner_session.cli_token do
+        %{kind: "session", id: ctx.owner_session.session_key, is_admin: false}
+      else
+        %{kind: "user", id: "owner", is_admin: false}
+      end
+
+    # Compare with the node from the same query the REST route encodes; the
+    # parent is independent of unrelated telemetry projection fields.
+    execution_map =
+      ExecutionMap.list_execution_map(ctx.db, %{
+        filters: %{},
+        principal: principal,
+        boundary: :latest,
+        limit: 500,
+        work_item_id: nil,
+        assignment_ids: []
+      })
+
+    node = Enum.find(execution_map.items, &(&1.id == work_item_id))
     refute is_nil(node)
-    assert trace["attribution"]["provenanceStatus"] == node["parent"]["status"]
-    assert trace["attribution"]["primaryWorkId"] == node["parent"]["item"]
+    assert trace["attribution"]["provenanceStatus"] == node.parent.status
+    assert trace["attribution"]["primaryWorkId"] == node.parent.item
   end
 
   defp insert_attest!(db, id, assignment_id, by_session, ts) do
