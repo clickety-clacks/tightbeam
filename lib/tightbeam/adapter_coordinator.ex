@@ -564,12 +564,17 @@ defmodule Tightbeam.AdapterCoordinator do
 
     reconcile_result =
       case process_row do
-        :no_launch -> :ok
+        :no_launch ->
+          :ok
+
         row when cleanup_scope == :credential_group ->
           Tightbeam.HarnessProcess.park_credential_group(state.db, row)
 
-        _row when exited? -> Tightbeam.HarnessProcess.reconcile_key(state.db, key)
-        row -> Tightbeam.HarnessProcess.park(state.db, row)
+        _row when exited? ->
+          Tightbeam.HarnessProcess.reconcile_key(state.db, key)
+
+        row ->
+          Tightbeam.HarnessProcess.park(state.db, row)
       end
 
     result = if reconcile_result == :already_resolved, do: :ok, else: reconcile_result

@@ -76,6 +76,7 @@ defmodule Tightbeam.HarnessProcessTest do
              HarnessProcess.park_credential_group(db, row)
 
     assert HarnessProcess.fenced?(db, {:claude, "shared", "satellite-fixture"})
+
     assert [%{state: "kill_failed", resolved_at: nil, kill_sent_at: nil}] =
              HarnessProcess.list(db)
 

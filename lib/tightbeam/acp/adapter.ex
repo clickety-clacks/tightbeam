@@ -441,8 +441,7 @@ defmodule Tightbeam.Acp.Adapter do
            stderr_path,
            offset,
            Keyword.get(opts, :harness_process_satellite_host)
-         ),
-         nil}
+         ), nil}
     end
   end
 
@@ -2942,7 +2941,8 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp adapter_failure_reason(reason, stderr_path, offset, satellite_host) do
     case last_stderr_line(stderr_path, offset) do
-      {:ok, nil} -> reason
+      {:ok, nil} ->
+        reason
 
       {:ok, line} ->
         case Tightbeam.Harness.Support.satellite_command_version_mismatch(
@@ -2954,7 +2954,8 @@ defmodule Tightbeam.Acp.Adapter do
           mismatch -> mismatch
         end
 
-      {:error, errno} -> with_stderr_facts(reason, stderr_read_error: errno)
+      {:error, errno} ->
+        with_stderr_facts(reason, stderr_read_error: errno)
     end
   end
 
