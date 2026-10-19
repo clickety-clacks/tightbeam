@@ -2176,7 +2176,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
            ]
 
     cross_session = get(ctx, "/api/work-items?before=" <> before, ctx.admin_session.cli_token)
-    assert_error(cross_session, 404, "work items", "not_found")
+    assert_error(cross_session, 400, "work items", "invalid_cursor")
 
     org_page = get(ctx, path <> "&asUser=flynn", "tbc_core_detail")
     assert org_page.status == 200
