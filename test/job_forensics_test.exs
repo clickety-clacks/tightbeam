@@ -1382,14 +1382,21 @@ defmodule Tightbeam.JobForensicsTest do
       end)
 
     status = Keyword.get(opts, :status, "queued")
+    created_at = Keyword.get(opts, :created_at, 10)
+    started_at = Keyword.get(opts, :started_at, if(status == "queued", do: nil, else: created_at))
 
     {:ok, _} =
-      DB.query(db, "UPDATE turns SET status = ?2, createdAt = ?3, endedAt = ?4 WHERE seq = ?1", [
-        seq,
-        status,
-        Keyword.get(opts, :created_at, 10),
-        if(status in ~w(queued running), do: nil, else: Keyword.get(opts, :ended_at, 100))
-      ])
+      DB.query(
+        db,
+        "UPDATE turns SET status = ?2, createdAt = ?3, startedAt = ?4, endedAt = ?5 WHERE seq = ?1",
+        [
+          seq,
+          status,
+          created_at,
+          started_at,
+          if(status in ~w(queued running), do: nil, else: Keyword.get(opts, :ended_at, 100))
+        ]
+      )
 
     seq
   end

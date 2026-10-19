@@ -3453,6 +3453,17 @@ defmodule Tightbeam.AssignmentsTest do
                [first.id, second.id]
              )
 
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO turns
+                 (seq,sessionKey,messageId,origin,prompt,status,createdAt,startedAt,endedAt)
+               VALUES (1,'holder','m_prod_scope','user:flynn','prod scope','delivered',?1,?1,?2)
+               """,
+               [second_opened_at, second_opened_at + 1]
+             )
+
     assert %{code: "missing_reason"} =
              handle(
                ctx,

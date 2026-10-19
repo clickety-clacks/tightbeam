@@ -1703,7 +1703,9 @@ defmodule Tightbeam.Supervision do
   §The prod production), declared in this one site and read from durable
   state only — rows, never process state. Conjuncts, in evaluation order:
 
-    1. an open assignment obligation exists for the holder;
+    1. an open assignment obligation exists for the holder; for a terminal
+       turn, it was open when that turn started or that turn carries its
+       assignment id;
     2. no typed cannot-proceed condition is standing for that assignment;
     3. this terminal seq was not already evaluated — the
        `supervision_watermarks` dedupe (`:terminal_already_evaluated`) — and
@@ -1724,7 +1726,9 @@ defmodule Tightbeam.Supervision do
   Liveness receipts are deliberately NOT match conditions. The act consumes
   only typed durable sources: an assignment artifact, work-item update,
   verdict fact, or one unexpired assignment-bound checkpoint. Progress prose
-  is never parsed and never resets the ladder by itself.
+  is never parsed and never resets the ladder by itself. A nil terminal
+  sequence is the periodic path and keeps its existing all-open-assignment
+  selection.
 
   A no-match verdict names the failing conjunct. Verdicts the turn-end
   schedule must still see — the rail production outranks the prod ladder
@@ -1739,9 +1743,17 @@ defmodule Tightbeam.Supervision do
           Txn.q(
             txn,
             """
-            SELECT a.id,a.subject,a.holderKey,p.lastEvaluatedTerminal
+            SELECT a.id,a.subject,a.holderKey,p.lastEvaluatedTerminal,
+                   CASE WHEN ?2 IS NULL OR a.id=t.assignmentId OR
+                     (a.openedAt <= t.startedAt AND NOT EXISTS (
+                       SELECT 1 FROM assignment_reopenings r
+                       WHERE r.assignmentId=a.id
+                         AND r.priorClosedAt <= t.startedAt AND r.ts > t.startedAt
+                     ))
+                   THEN 1 ELSE 0 END
             FROM assignments a LEFT JOIN supervision_watermarks p
               ON p.assignmentId=a.id AND p.sessionKey=a.holderKey
+            LEFT JOIN turns t ON t.seq=?2
             WHERE a.holderKey=?1 AND a.state='open'
               AND NOT EXISTS (
                 SELECT 1 FROM assignment_cannot_proceed cp
@@ -1749,11 +1761,16 @@ defmodule Tightbeam.Supervision do
               )
             ORDER BY a.openedAt,a.id
             """,
-            [session_key]
+            [session_key, terminal_seq]
           )
 
+        turn_candidates =
+          Enum.filter(candidates, fn [_id, _subject, _holder, _prior, asked_for_turn] ->
+            asked_for_turn == 1
+          end)
+
         assignment =
-          Enum.find_value(candidates, fn [id, subject, holder, prior] ->
+          Enum.find_value(turn_candidates, fn [id, subject, holder, prior, _asked_for_turn] ->
             if (is_nil(terminal_seq) or is_nil(prior) or prior < terminal_seq) and
                  not Wakes.covering_continuation_in_txn?(txn, id),
                do: %{id: id, subject: subject, holderKey: holder}
@@ -1763,15 +1780,19 @@ defmodule Tightbeam.Supervision do
           assignment ->
             {:assignment, assignment}
 
+          turn_candidates == [] and candidates != [] ->
+            [id, subject, holder | _] = hd(candidates)
+            {:not_asked, %{id: id, subject: subject, holderKey: holder}}
+
           candidates == [] ->
             {:no_match, :no_open_obligation}
 
-          Enum.any?(candidates, fn [id, _, _, _] ->
+          Enum.any?(turn_candidates, fn [id, _, _, _, _] ->
             Wakes.covering_continuation_in_txn?(txn, id)
           end) ->
             {:no_match, :strand_moving}
 
-          Enum.any?(candidates, fn [_, _, _, prior] -> prior == terminal_seq end) ->
+          Enum.any?(turn_candidates, fn [_, _, _, prior, _] -> prior == terminal_seq end) ->
             {:no_match, :terminal_already_evaluated}
 
           true ->
@@ -1783,12 +1804,15 @@ defmodule Tightbeam.Supervision do
       {:no_match, _} = verdict ->
         verdict
 
-      {:assignment, assignment} ->
+      {selection_kind, assignment} when selection_kind in [:assignment, :not_asked] ->
         with :live <- holder_state(db, session_key),
              :available <- harness_gate(db, session_key),
              :evaluable <- terminal_gate(terminal_seq),
              :unblocked <- block_gate(db, session_key) do
-          {:match, assignment}
+          case selection_kind do
+            :assignment -> {:match, assignment}
+            :not_asked -> {:no_match, :turn_not_asked, assignment}
+          end
         else
           :retired -> {:no_match, :holder_retired}
           :unavailable -> {:no_match, :harness_unavailable, assignment}
@@ -2077,6 +2101,11 @@ defmodule Tightbeam.Supervision do
         # obligation stands, and retraction re-matches this same terminal
         # (spec production-machine-v1).
         {:halt, :blocked}
+
+      {:no_match, :turn_not_asked, _assignment} ->
+        # The turn-end rail still sees the current open assignment, but this
+        # unrelated turn cannot spend its no-receipt prod on it.
+        {:halt, :idle}
 
       {:match, assignment} ->
         result =
