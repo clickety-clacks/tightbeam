@@ -765,6 +765,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     assert Enum.map(first_page["items"], & &1["state"]) == ["launching", "running"]
 
     assert first_page["page"]["hasMoreAfter"]
+
     cursor_payload =
       first_page["page"]["newestCursor"]
       |> Base.url_decode64!(padding: false)
@@ -813,7 +814,9 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     refute fourth_page["page"]["hasMoreAfter"]
     assert Enum.map(fourth_page["items"], & &1["id"]) == ["launch-g"]
 
-    all_items = first_page["items"] ++ second_page["items"] ++ third_page["items"] ++ fourth_page["items"]
+    all_items =
+      first_page["items"] ++ second_page["items"] ++ third_page["items"] ++ fourth_page["items"]
+
     item_ids = Enum.map(all_items, & &1["id"])
     assert item_ids == ~w(launch-a launch-b launch-c launch-d launch-e launch-f launch-g)
 
@@ -831,6 +834,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     assert Enum.at(all_items, 0)["resolvedAt"] == nil
 
     host_filter = get(ctx, "/api/harness-processes?host=fixture-node-a", ctx.admin_token)
+
     assert Enum.map(JSON.decode!(host_filter.resp_body)["items"], & &1["id"]) == [
              "launch-a",
              "launch-b",
@@ -838,6 +842,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
            ]
 
     harness_filter = get(ctx, "/api/harness-processes?harness=claude", ctx.admin_token)
+
     assert Enum.map(JSON.decode!(harness_filter.resp_body)["items"], & &1["id"]) == [
              "launch-c",
              "launch-e",

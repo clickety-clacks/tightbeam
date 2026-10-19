@@ -608,6 +608,7 @@ defmodule Tightbeam.HarnessProcess do
         [] -> nil
         parts -> Enum.join(parts, " AND ")
       end
+
     {where, params}
   end
 
