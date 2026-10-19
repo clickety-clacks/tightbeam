@@ -1183,9 +1183,12 @@ defmodule Tightbeam.Homes do
               end
 
               try do
-                # Cursor's credential store is operator-only. Set the copy's
-                # mode there, then atomically replace the projection entry;
-                # rename replaces a planted symlink instead of following it.
+                # Cursor's credential store is operator-only. Preserve the
+                # projection's shared group while the copy is still private;
+                # rename keeps this inode's group instead of inheriting the
+                # destination directory's setgid group. Then atomically
+                # replace a planted symlink instead of following it.
+                File.chgrp!(temporary, File.stat!(home).gid)
                 File.chmod!(temporary, 0o640)
                 before_projection_promote.(target)
                 File.rename!(temporary, target)
