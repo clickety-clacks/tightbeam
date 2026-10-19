@@ -78,14 +78,65 @@ defmodule OnboardWireRuntime do
         refute File.exists?(Path.join(base, "auth"))
         refute File.exists?(Path.join(base, "homes"))
         assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM turns")
+
+        {:ok, credential_server} =
+          Credentials.start_link(
+            name: Credentials,
+            base_dir: base,
+            machine: "testhost",
+            gate: fn _provider -> :ok end,
+            stop: fn :anthropic -> :ok end,
+            start: fn :anthropic, :subscription -> :ok end,
+            resume: fn _provider -> :ok end,
+            capture_sessions: fn _provider -> [] end,
+            publish_sessions: fn _captured, _transition -> :ok end,
+            sh: fn _argv -> {"", 0} end
+          )
+
+        try do
+          assert {200,
+                  %{
+                    "result" => %{
+                      "status" => "ready",
+                      "stagingPath" => staging,
+                      "leaseId" => lease_id
+                    }
+                  }} =
+                   request(port, %{provider: "anthropic", phase: "begin", kind: "subscription"})
+
+          File.write!(Path.join(staging, ".credentials.json"), "synthetic credential")
+
+          assert {200,
+                  %{
+                    "result" => %{
+                      "status" => "onboarded",
+                      "credentialKind" => "subscription"
+                    }
+                  }} =
+                   request(port, %{
+                     provider: "anthropic",
+                     phase: "finish",
+                     kind: "subscription",
+                     leaseId: lease_id
+                   })
+
+          assert Credentials.status(:anthropic, Credentials) == :onboarded
+        after
+          GenServer.stop(credential_server)
+        end
       after
         Supervisor.stop(listener)
       end
     end)
   end
 
-  defp request(port, provider, actor \\ "synthetic-admin") do
-    body = JSON.encode!(%{verb: "onboard", asUser: actor, params: %{provider: provider}})
+  defp request(port, provider_or_params, actor \\ "synthetic-admin") do
+    params =
+      if is_map(provider_or_params),
+        do: provider_or_params,
+        else: %{provider: provider_or_params}
+
+    body = JSON.encode!(%{verb: "onboard", asUser: actor, params: params})
 
     headers = [
       {~c"authorization", ~c"Bearer synthetic-wire-token"},

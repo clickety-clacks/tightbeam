@@ -272,4 +272,8 @@ defmodule Tightbeam.HarnessProcessTest do
        %{tmp_dir: tmp} do
     Tightbeam.HarnessProcessFixture.run!(tmp, 33)
   end
+
+  test "credential replacement finishes after killing only the tracked group", %{tmp_dir: tmp} do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 34)
+  end
 end

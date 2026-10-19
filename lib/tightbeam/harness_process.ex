@@ -349,6 +349,16 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
+  @doc "Kill only the gateway-recorded process group during credential replacement."
+  @spec park_credential_group(DB.server(), row()) :: :ok | :already_resolved | {:error, term()}
+  def park_credential_group(db, row) do
+    with {:ok, row} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
+      kill(db, row, "killed", :credential_group)
+    else
+      {:error, reason} -> unidentified(db, row, reason)
+    end
+  end
+
   @doc false
   @spec record_park_failure(DB.server(), row(), term()) :: :already_resolved | {:error, term()}
   def record_park_failure(db, row, reason), do: kill_failed(db, row, reason)
@@ -633,7 +643,7 @@ defmodule Tightbeam.HarnessProcess do
 
   defp unidentified(db, row, reason), do: kill_failed(db, row, reason)
 
-  defp kill(db, row, terminal_state \\ "killed") do
+  defp kill(db, row, terminal_state \\ "killed", signal_scope \\ :process_tree) do
     attempted_at = now()
 
     {:ok, _} =
@@ -647,7 +657,7 @@ defmodule Tightbeam.HarnessProcess do
         [row.launch_id, attempted_at]
       )
 
-    case send_sigkill(row) do
+    case send_sigkill(row, signal_scope) do
       :ok ->
         sent_at = now()
 
@@ -672,8 +682,14 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
-  defp send_sigkill(row) do
-    case run_group_command(row, command_timeout_ms()) do
+  defp send_sigkill(row, signal_scope) do
+    command_result =
+      case signal_scope do
+        :process_tree -> run_group_command(row, command_timeout_ms())
+        :credential_group -> run_credential_group_command(row, command_timeout_ms())
+      end
+
+    case command_result do
       {_output, 0} ->
         :ok
 
@@ -850,7 +866,42 @@ defmodule Tightbeam.HarnessProcess do
     )
   end
 
-  defp run_cursor_group_command(row, timeout_ms) do
+  defp run_credential_group_command(%{ssh: nil, harness: "cursor"} = row, timeout_ms),
+    do: run_cursor_group_command(row, timeout_ms, :credential_group)
+
+  defp run_credential_group_command(%{ssh: nil} = row, timeout_ms) do
+    bounded_command(
+      row.helper_path,
+      ["harness-group", "--tracked-group-only" | group_args(row)],
+      timeout_ms
+    )
+  end
+
+  defp run_credential_group_command(%{ssh: destination} = row, timeout_ms) do
+    bounded_command(
+      "ssh",
+      @ssh_opts ++
+        [
+          destination,
+          shell_quote(row.helper_path),
+          "harness-group",
+          "--tracked-group-only"
+          | group_args(row)
+        ],
+      timeout_ms
+    )
+  end
+
+  defp run_cursor_group_command(row, timeout_ms),
+    do: run_cursor_group_command(row, timeout_ms, :process_tree)
+
+  defp run_cursor_group_command(row, timeout_ms, signal_scope) do
+    group_args =
+      case signal_scope do
+        :process_tree -> group_args(row)
+        :credential_group -> ["--tracked-group-only" | group_args(row)]
+      end
+
     bounded_command(
       "/usr/bin/sudo",
       cursor_sudo_args() ++
@@ -862,8 +913,7 @@ defmodule Tightbeam.HarnessProcess do
           cursor_org_base(row.helper_path),
           operator_uid(),
           operator_home()
-          | group_args(row)
-        ],
+        ] ++ group_args,
       timeout_ms
     )
   end

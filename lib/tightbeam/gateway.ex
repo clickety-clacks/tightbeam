@@ -9593,7 +9593,7 @@ defmodule Tightbeam.Gateway do
     |> harnesses_for_provider()
     |> Enum.reduce(:ok, fn module, result ->
       close_result =
-        AdapterCoordinator.close_adapter(
+        AdapterCoordinator.close_adapter_for_credential(
           Tightbeam.AdapterCoordinator,
           {module.id(), "shared", machine}
         )

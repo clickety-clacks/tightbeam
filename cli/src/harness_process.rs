@@ -222,6 +222,13 @@ pub fn print_boot_identity() -> Result<(), String> {
 }
 
 pub fn group(args: &[String]) -> Result<i32, String> {
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--tracked-group-only")
+    {
+        return tracked_group_only(&args[1..]);
+    }
+
     if args.len() != 4 && args.len() != 5 {
         return Err(
             "usage: tightbeam harness-group <process-group-id> <identity-path> <boot-identity> <launch-id> [authority-version]"
@@ -250,6 +257,46 @@ pub fn group(args: &[String]) -> Result<i32, String> {
     match freeze_harness_tree(&target)? {
         Some(sweep) => kill_harness_tree(&target, sweep),
         None => Ok(0),
+    }
+}
+
+fn tracked_group_only(args: &[String]) -> Result<i32, String> {
+    if args.len() != 4 && args.len() != 5 {
+        return Err(
+            "usage: tightbeam harness-group --tracked-group-only <process-group-id> <identity-path> <boot-identity> <launch-id> [authority-version]"
+                .into(),
+        );
+    }
+
+    let pgid: libc::pid_t = args[0]
+        .parse::<i32>()
+        .ok()
+        .filter(|pgid| *pgid > 0)
+        .ok_or_else(|| "process group id must be a positive integer".to_string())?;
+
+    if args
+        .get(4)
+        .is_some_and(|version| version != IDENTITY_AUTHORITY_VERSION)
+    {
+        return Err("harness authority protocol version is not supported".into());
+    }
+
+    // Credential replacement already has the gateway's launch row and its
+    // launch identity. Signal only that recorded group; helpers outside it
+    // are not part of this cleanup.
+    let _target = HarnessTarget::load(pgid, &args[1], &args[2], &args[3])?;
+    let result = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    if result == 0 {
+        return Ok(0);
+    }
+
+    let error = io::Error::last_os_error();
+    if process_signal_target_gone(&error) {
+        Ok(0)
+    } else {
+        Err(format!(
+            "process group {pgid} could not be signalled: {error}"
+        ))
     }
 }
 

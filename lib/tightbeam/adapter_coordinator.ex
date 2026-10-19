@@ -220,6 +220,15 @@ defmodule Tightbeam.AdapterCoordinator do
     :exit, reason -> {:error, {:coordinator_unavailable, reason}}
   end
 
+  @doc "Close an adapter for credential replacement, cleaning only its recorded process group."
+  @spec close_adapter_for_credential(GenServer.server(), adapter_key()) ::
+          :ok | {:error, term()}
+  def close_adapter_for_credential(server \\ __MODULE__, key) do
+    GenServer.call(server, {:close_adapter_for_credential, key}, 30_000)
+  catch
+    :exit, reason -> {:error, {:coordinator_unavailable, reason}}
+  end
+
   @doc """
   Request planned teardown without synchronously entering the coordinator.
 
@@ -454,6 +463,11 @@ defmodule Tightbeam.AdapterCoordinator do
     {:reply, result, state}
   end
 
+  def handle_call({:close_adapter_for_credential, key}, _from, state) do
+    {result, state} = do_close_adapter(key, state, :credential_group)
+    {:reply, result, state}
+  end
+
   defp adapter_for_reply(key, context, from, state, authoritative?) do
     entry = Map.get(state.adapters, key, fresh_entry())
 
@@ -515,7 +529,9 @@ defmodule Tightbeam.AdapterCoordinator do
     {:noreply, release_slot(machine, slot, state)}
   end
 
-  defp do_close_adapter(key, state) do
+  defp do_close_adapter(key, state), do: do_close_adapter(key, state, :process_tree)
+
+  defp do_close_adapter(key, state, cleanup_scope) do
     {:ok, process_row} = Tightbeam.HarnessProcess.begin_park(state.db, key)
     state = cancel_pending_starts(key, state)
 
@@ -562,9 +578,20 @@ defmodule Tightbeam.AdapterCoordinator do
 
     reconcile_result =
       case process_row do
-        :no_launch -> :ok
-        _row when exited? -> Tightbeam.HarnessProcess.reconcile_key(state.db, key)
-        row -> Tightbeam.HarnessProcess.park(state.db, row)
+        :no_launch ->
+          :ok
+
+        row ->
+          cond do
+            cleanup_scope == :credential_group ->
+              Tightbeam.HarnessProcess.park_credential_group(state.db, row)
+
+            exited? ->
+              Tightbeam.HarnessProcess.reconcile_key(state.db, key)
+
+            true ->
+              Tightbeam.HarnessProcess.park(state.db, row)
+          end
       end
 
     result = if reconcile_result == :already_resolved, do: :ok, else: reconcile_result

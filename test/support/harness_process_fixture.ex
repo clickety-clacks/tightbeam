@@ -1389,6 +1389,117 @@ defmodule Tightbeam.HarnessProcessFixture do
     assert :ok = HarnessProcess.complete_park(ctx.db, serving_key)
   end
 
+  defp scenario(34, ctx) do
+    key = {:claude, "shared", "testhost"}
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ -> [] end,
+         db: ctx.db,
+         name: nil}
+      )
+
+    script = Path.join(ctx.test_dir, "credential-cleanup-leader.js")
+
+    File.write!(script, ~S"""
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const { spawn } = require("node:child_process");
+    const [mode, root] = process.argv.slice(2);
+    if (mode === "leader") {
+      const sameGroup = spawn(process.execPath, [__filename, "same-group", root],
+        {stdio: "ignore"});
+      const detached = spawn(process.execPath, [__filename, "detached", root],
+        {stdio: "ignore", detached: true});
+      sameGroup.unref();
+      detached.unref();
+      fs.writeFileSync(path.join(root, "same-group-pid"), String(sameGroup.pid));
+      fs.writeFileSync(path.join(root, "detached-pid"), String(detached.pid));
+      setInterval(() => {
+        if (fs.existsSync(path.join(root, "leave-leader"))) process.exit(0);
+      }, 10);
+    } else {
+      fs.writeFileSync(path.join(root, `${mode}-ready`), "ready");
+      setInterval(() => {}, 1000);
+    }
+    """)
+
+    {port, row} =
+      launch(ctx, key, [System.find_executable("node"), script, "leader", ctx.test_dir])
+
+    assert eventually(fn ->
+             File.exists?(Path.join(ctx.test_dir, "same-group-ready")) and
+               File.exists?(Path.join(ctx.test_dir, "detached-ready"))
+           end)
+
+    same_group = File.read!(Path.join(ctx.test_dir, "same-group-pid"))
+    detached = File.read!(Path.join(ctx.test_dir, "detached-pid"))
+    File.touch!(Path.join(ctx.test_dir, "leave-leader"))
+    assert_receive {^port, {:exit_status, 0}}, 5_000
+
+    {:ok, credentials} =
+      Tightbeam.Credentials.start_link(
+        name: Tightbeam.Credentials,
+        base_dir: ctx.test_dir,
+        machine: "testhost",
+        gate: fn _provider -> :ok end,
+        stop: fn :anthropic ->
+          AdapterCoordinator.close_adapter_for_credential(coordinator, key)
+        end,
+        start: fn :anthropic, :subscription -> :ok end,
+        resume: fn _provider -> :ok end,
+        capture_sessions: fn _provider -> [] end,
+        publish_sessions: fn _captured, _transition -> :ok end,
+        sh: fn _argv -> {"", 0} end
+      )
+
+    on_exit(fn ->
+      if Process.alive?(credentials), do: GenServer.stop(credentials)
+    end)
+
+    {:ok, staging, lease_id} =
+      Tightbeam.Credentials.begin_onboard(:anthropic, Tightbeam.Credentials)
+
+    File.write!(Path.join(staging, ".credentials.json"), "synthetic credential")
+
+    assert :ok =
+             Tightbeam.Credentials.finish_onboard(
+               :anthropic,
+               :subscription,
+               lease_id,
+               Tightbeam.Credentials
+             )
+
+    assert Tightbeam.Credentials.status(:anthropic, Tightbeam.Credentials) == :onboarded
+    assert Tightbeam.Credentials.kind(:anthropic, Tightbeam.Credentials) == :subscription
+    refute HarnessProcess.parked?(ctx.db, key)
+    refute HarnessProcess.fenced?(ctx.db, key)
+
+    metadata =
+      Path.join([ctx.test_dir, "homes", "testhost", "claude", ".tightbeam", "credential.json"])
+      |> File.read!()
+      |> JSON.decode!()
+
+    assert metadata["onboarded"]
+    refute Map.has_key?(metadata, "present_but_unverified")
+
+    assert eventually(fn ->
+             elem(System.cmd("/bin/kill", ["-0", same_group], stderr_to_stdout: true), 1) != 0
+           end)
+
+    assert {_, 0} = System.cmd("/bin/kill", ["-0", detached], stderr_to_stdout: true)
+    refute HarnessProcess.parked?(ctx.db, key)
+
+    assert %{state: "killed", resolved_at: resolved_at} =
+             Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == row.launch_id))
+
+    assert is_integer(resolved_at)
+    System.cmd("/bin/kill", ["-KILL", detached], stderr_to_stdout: true)
+  end
+
   defp launch_stubborn(ctx, key) do
     launch(ctx, key, ["sh", "-c", "trap '' HUP TERM; while :; do sleep 1; done"])
   end
