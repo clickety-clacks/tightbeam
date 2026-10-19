@@ -4,7 +4,17 @@ defmodule Tightbeam.RestExecutionMapTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Tightbeam.{Archetypes, DB, Devices, ExecutionMap, Identity, Ledger, Schema}
+  alias Tightbeam.{
+    Archetypes,
+    DB,
+    Devices,
+    ExecutionMap,
+    Identity,
+    Ledger,
+    LiveBaseGuard,
+    LiveBasePayload,
+    Schema
+  }
   alias Tightbeam.Firehose.Hub
   alias Tightbeam.Wire.Router
 
@@ -134,10 +144,21 @@ defmodule Tightbeam.RestExecutionMapTest do
     File.mkdir_p!(base_dir)
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
+    payload_root = Path.join(base_dir, "payload")
+    File.mkdir_p!(Path.join(payload_root, "ebin"))
+    File.mkdir_p!(Path.join(payload_root, "priv"))
+    File.write!(Path.join(payload_root, "priv/read-snapshot-test"), "test payload")
+    {:ok, manifest} = LiveBaseGuard.generate_manifest(LiveBasePayload.files!(payload_root))
+    File.write!(Path.join(payload_root, "build-manifest.json"), JSON.encode!(manifest))
+
     db =
       start_supervised!(
         Supervisor.child_spec(
-          {DB, path: Path.join(base_dir, "state.db"), name: nil, guard_inputs: []},
+          {DB,
+           path: Path.join(base_dir, "state.db"),
+           name: nil,
+           guard_inputs: [],
+           payload_root: payload_root},
           id: {:execution_map_read_snapshot, System.unique_integer([:positive])}
         )
       )
