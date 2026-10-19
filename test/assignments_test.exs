@@ -3471,6 +3471,56 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
   end
 
+  test "cannot-proceed identifies closed outcomes and remains accepted while open", ctx do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    completed =
+      assign_call({:user, "flynn"}, "completed assignment")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{assignment: %{state: "closed", outcome: "completed"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "holder"}, completed.id, "completion")
+             )
+
+    assert %{code: "assignment_closed", message: completed_message} =
+             attest_call({:session, "holder"}, completed.id, "cannot-proceed")
+             |> put_in([:params, :note], "blocked after completion")
+             |> then(&handle(ctx, "attest", &1))
+
+    assert completed_message =~ "closed"
+    assert completed_message =~ "completed"
+
+    revoked =
+      assign_call({:user, "flynn"}, "revoked assignment")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{state: "closed", outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, revoked.id))
+
+    assert %{code: "assignment_closed", message: revoked_message} =
+             attest_call({:session, "holder"}, revoked.id, "cannot-proceed")
+             |> put_in([:params, :note], "blocked after revocation")
+             |> then(&handle(ctx, "attest", &1))
+
+    assert revoked_message =~ "closed"
+    assert revoked_message =~ "revoked"
+
+    open =
+      assign_call({:user, "flynn"}, "open assignment")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{assignment: %{state: "open"}, cannotProceed: %{state: "standing"}} =
+             attest_call({:session, "holder"}, open.id, "cannot-proceed")
+             |> put_in([:params, :note], "blocked while open")
+             |> then(&handle(ctx, "attest", &1))
+  end
+
   test "cannot-proceed is holder-only, idempotent, pauses one card, and releases on its exact fact",
        ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
