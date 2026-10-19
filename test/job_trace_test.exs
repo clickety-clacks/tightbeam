@@ -156,6 +156,25 @@ defmodule Tightbeam.JobTraceTest do
                ]
              })
 
+    # Completion stores an event report even when its personal recipient is absent.
+    notice_digest =
+      :crypto.hash(
+        :sha256,
+        JSON.encode!(["terminal-child-owner-notification", "attest", completion.id])
+      )
+      |> Base.encode16(case: :lower)
+
+    notice_id = "w_terminal_" <> notice_digest
+
+    personal = Org.personal_session_key("owner")
+    assert %{state: "pending", session_key: ^personal} = Tightbeam.Wakes.get(db, notice_id)
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [notice_id])
+
+    assert [] =
+             Tightbeam.NoticeBatcher.recover(db, System.system_time(:millisecond), [], personal)
+
     trace = trace(db, {:user, "owner"}, "wi_trace")
     assert trace == trace(db, {:session, "owner-session"}, "wi_trace")
     assert trace == trace(db, {:user, "admin"}, "wi_trace")
@@ -170,6 +189,8 @@ defmodule Tightbeam.JobTraceTest do
     assert_keys(trace.workItem, ~w(failReason id ownerUserId state title)a)
 
     assert Enum.map(trace.assignments, & &1.id) == ["asg_bad", "asg_direct", "asg_review"]
+    assert trace.workItem.state == "open"
+    assert %{state: "open"} = Enum.find(trace.assignments, &(&1.id == "asg_bad"))
 
     Enum.each(trace.assignments, fn assignment ->
       assert_keys(
@@ -227,19 +248,8 @@ defmodule Tightbeam.JobTraceTest do
              _ -> false
            end)
 
-    # The fixture has no personal Main for owner. Completion therefore records
-    # its exact terminal notice as undeliverable, with the remaining open work
-    # kept live by asg_bad's entitlement. Derive the notice identity from the
-    # immutable completion source, not from whichever cancellation trace returns.
-    notice_digest =
-      :crypto.hash(
-        :sha256,
-        JSON.encode!(["terminal-child-owner-notification", "attest", completion.id])
-      )
-      |> Base.encode16(case: :lower)
-
-    notice_id = "w_terminal_" <> notice_digest
-
+    # The unavailable recipient is recorded by the real delivery attempt.
+    # The trace keeps the exact immutable completion notice identity.
     assert {:ok, [[canceled_at, wake_rowid]]} =
              DB.query(
                db,
@@ -269,12 +279,12 @@ defmodule Tightbeam.JobTraceTest do
                replacementWakeId: nil,
                dispositionKind: nil,
                dispositionId: nil,
-               primaryWorkKind: "work_item",
-               primaryWorkId: "wi_trace",
-               workImpactKind: "linked_work_open",
-               livenessTriggerKind: "supervision_entitlement",
-               livenessTriggerId: "asg_bad#1",
-               actionNeeded: true
+               primaryWorkKind: nil,
+               primaryWorkId: nil,
+               workImpactKind: "no_linked_work",
+               livenessTriggerKind: nil,
+               livenessTriggerId: nil,
+               actionNeeded: false
              }
            ]
 
