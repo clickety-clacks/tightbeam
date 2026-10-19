@@ -3842,13 +3842,14 @@ defmodule Tightbeam.GatewayTest do
                       "payload" => harness_changed
                     }}
 
+    :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
+
     assert_receive {:firehose_notice, %{"class" => "message.created"} = message_notice}
     assert_message_notice_matches_rest!(ctx.db, message_notice)
     assert message_notice["payload"]["marker"]["kind"] == "harness-switch"
 
     assert harness_changed["clearedThroughSeq"] == Org.get(ctx.db, "swapme").cleared_through_seq
 
-    :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
     :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
     :sys.get_state(Tightbeam.Firehose.Hub)
     refute_receive {:firehose_notice, %{"class" => "session.harness_changed"}}, 0
