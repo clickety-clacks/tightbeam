@@ -156,7 +156,15 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
              })
 
     review = with_param(ctx, :assignment_id, "asg_review")
-    assert %{correction: %{assignmentId: "asg_review"}} = correct(review, {:session, "po-owner"})
+
+    assert %{
+             correction: %{
+               assignmentId: "asg_review",
+               commitRefs: [%{"verifiedRefCommit" => verified}]
+             }
+           } = correct(review, {:session, "po-owner"})
+
+    assert verified == ctx.commit
   end
 
   test "open, absent, and unbound evidence refuse before git proof", ctx do
