@@ -1431,10 +1431,11 @@ defmodule Tightbeam.GatewayTest do
                  DB.query(
                    ctx.db,
                    """
-                   SELECT e.dueAt - a.openedAt, e.supervisionIntervalMs
+                   SELECT w.dueAt - a.openedAt, json_extract(w.prompt, '$.intervalMs')
                    FROM assignments a
-                   JOIN supervision_entitlements e ON e.assignmentId=a.id
-                   WHERE a.id=?1
+                   JOIN wakes w ON w.assignmentId=a.id
+                   WHERE a.id=?1 AND w.consumer='assignment_inactivity_deadline'
+                     AND w.state='pending'
                    """,
                    [assignment_id]
                  )
@@ -1447,15 +1448,15 @@ defmodule Tightbeam.GatewayTest do
                    params: %{assignment_id: assignment_id, kind: "progress"}
                  })
 
-        assert {:ok, [["assignment_open", ^expected_interval, ^expected_interval]]} =
+        assert {:ok, [[^expected_interval, ^expected_interval]]} =
                  DB.query(
                    ctx.db,
                    """
-                   SELECT e.basisKind, e.supervisionIntervalMs, e.dueAt - a.openedAt
-                   FROM supervision_entitlements e
-                   JOIN assignments a ON a.id=e.assignmentId
-                   WHERE e.assignmentId=?1
-                   ORDER BY e.generation DESC LIMIT 1
+                   SELECT dueAt - json_extract(prompt, '$.activityAt'),
+                          json_extract(prompt, '$.intervalMs')
+                   FROM wakes
+                   WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline'
+                     AND state='pending'
                    """,
                    [assignment_id]
                  )
@@ -1464,7 +1465,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   @tag cold_gateway: true, gateway_cadence: true, tmp_dir: true
-  test "wake polling and supervision child cadence are independent", %{tmp_dir: tmp} do
+  test "wake polling cadence ignores the inactivity interval", %{tmp_dir: tmp} do
     Tightbeam.GuardRuntimeFixture.run!(
       tmp,
       "live_base_gateway_cadence.exs",
@@ -2307,7 +2308,7 @@ defmodule Tightbeam.GatewayTest do
         {%{supervision_interval_ms: 4_321}, "live_base_gateway_liveness_override.exs"}
       ] do
     @tag cold_gateway: true, gateway_cadence: true, tmp_dir: true
-    test "children recovers liveness with interval #{inspect(override)}", %{tmp_dir: tmp} do
+    test "children backfills an inactivity deadline with interval #{inspect(override)}", %{tmp_dir: tmp} do
       Tightbeam.GuardRuntimeFixture.run!(tmp, unquote(script), "guarded-gateway-liveness: ok")
     end
   end

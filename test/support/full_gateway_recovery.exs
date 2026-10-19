@@ -185,7 +185,9 @@ defmodule Tightbeam.RecoveryScenario do
           rows(
             "SELECT state FROM wakes WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY wakeId"
           ) == [["fired"], ["fired"]] and
-          rows("SELECT state FROM wakes WHERE assignmentId='asg_recovery_preserve' AND digest=0") ==
+          rows(
+            "SELECT state FROM wakes WHERE assignmentId='asg_recovery_preserve' AND digest=0 AND consumer='prompt'"
+          ) ==
             [
               ["fired"]
             ] and
@@ -332,7 +334,7 @@ defmodule Tightbeam.RecoveryScenario do
         rows("SELECT reminderState FROM assignments WHERE id='asg_recovery_preserve'"),
       assignment_wakes:
         rows(
-          "SELECT wakeId,state,digest FROM wakes WHERE assignmentId='asg_recovery_preserve' ORDER BY digest,wakeId"
+          "SELECT wakeId,consumer,state,digest FROM wakes WHERE assignmentId='asg_recovery_preserve' ORDER BY digest,wakeId"
         ),
       assignment_turns:
         rows(

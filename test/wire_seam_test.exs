@@ -127,7 +127,7 @@ defmodule Tightbeam.Wire.SeamTest do
     assert Wakes.get(ctx.db, wrong_origin.wake_id).state == "pending"
   end
 
-  test "a holder cancels a dependency wake through the wire with liveness provenance", ctx do
+  test "a holder withdraws its own dependency wake through the wire", ctx do
     holder = create_session(ctx.db, "g23-holder", "flynn")
     resolver = create_session(ctx.db, "g23-resolver", "flynn")
     verifier = create_session(ctx.db, "g23-verifier", "flynn")
@@ -254,12 +254,12 @@ defmodule Tightbeam.Wire.SeamTest do
                 "verb_call",
                 causal_source_id,
                 "no_replacement",
-                "assignment",
-                ^holder_assignment,
-                "linked_work_open",
-                "supervision_entitlement",
-                liveness_trigger_id,
-                1
+                nil,
+                nil,
+                "no_linked_work",
+                nil,
+                nil,
+                0
               ]
             ]} =
              DB.query(
@@ -275,7 +275,6 @@ defmodule Tightbeam.Wire.SeamTest do
 
     assert holder_session_key == holder.session_key
     assert is_binary(causal_source_id) and causal_source_id != ""
-    assert String.starts_with?(liveness_trigger_id, holder_assignment <> "#")
 
     # Replay is a refusal, not a second cancellation or a second liveness action.
     assert ok!(

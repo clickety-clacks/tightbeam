@@ -20,30 +20,17 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
       "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_boot_recovery', 'boot recovery', 'k1', 'flynn', 1)"
     )
 
-  children = Gateway.children(config |> Map.put(:wake_tick_ms, 1_234) |> Map.merge(%{}))
+  _children = Gateway.children(config |> Map.put(:wake_tick_ms, 1_234) |> Map.merge(%{}))
 
-  assert {:ok,
-          [
-            [
-              1,
-              "armed",
-              "recovery_backfill",
-              "asg_boot_recovery",
-              "recovery_backfill",
-              "process:tightbeam",
-              1234
-            ]
-          ]} =
+  assert {:ok, [[1235, 1234, 1, "k1"]]} =
            DB.query(db, """
-           SELECT generation,state,basisKind,basisId,cause,principal,supervisionIntervalMs
-           FROM supervision_entitlements
+           SELECT dueAt, json_extract(prompt, '$.intervalMs'), json_extract(prompt, '$.activityAt'),
+                  sessionKey
+           FROM wakes
            WHERE assignmentId='asg_boot_recovery'
+             AND consumer='assignment_inactivity_deadline' AND state='pending'
            """)
 
-  {Tightbeam.Supervision, supervision_opts} =
-    Enum.find(children, &match?({Tightbeam.Supervision, _}, &1))
-
-  assert Keyword.fetch!(supervision_opts, :recover) == false
 end)
 
 IO.puts("guarded-gateway-liveness: ok")

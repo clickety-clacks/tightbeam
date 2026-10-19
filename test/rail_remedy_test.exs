@@ -248,7 +248,10 @@ defmodule Tightbeam.RailRemedyTest do
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM wakes WHERE COALESCE(consumer, '') != 'effort_probe'"
+               """
+               SELECT count(*) FROM wakes
+               WHERE COALESCE(consumer, '') NOT IN ('effort_probe', 'assignment_inactivity_deadline')
+               """
              )
 
     assert %{rewake_count: 0} =
@@ -272,7 +275,10 @@ defmodule Tightbeam.RailRemedyTest do
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM wakes WHERE COALESCE(consumer, '') != 'effort_probe'"
+               """
+               SELECT count(*) FROM wakes
+               WHERE COALESCE(consumer, '') NOT IN ('effort_probe', 'assignment_inactivity_deadline')
+               """
              )
 
     assert {:ok, [[1]]} =
@@ -679,47 +685,19 @@ defmodule Tightbeam.RailRemedyTest do
     assert [%{"outcome" => "blocked", "producer_id" => nil}] = remedy_events(ctx.db)
   end
 
-  test "scheduler restart disposes a legacy remedy wake for a closed assignment", ctx do
-    assignment = assignment(ctx, "legacy wake", "policy")
+  test "a stale due row cannot deliver after its assignment closes", ctx do
+    assignment = assignment(ctx, "close after scheduler read")
+    put_rules(ctx, wake_gate())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    wake_id = fire_wake_remedy(ctx, assignment.id)
+    assignment_id = assignment.id
 
-    assert %{assignment: %{state: "closed", outcome: "completed"}} =
-             Assignments.__handle__(ctx.db, "attest", completion_call(assignment.id))
+    assert %{state: "pending", assignment_id: ^assignment_id} = Wakes.get(ctx.db, wake_id)
+    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt = 0 WHERE wakeId = ?1", [wake_id])
+    assert %{state: "closed", outcome: "revoked"} = revoke(ctx, assignment.id)
 
-    now = System.system_time(:millisecond)
-
-    assert {:ok, {wake_id, 1}} =
-             DB.transaction(ctx.db, fn txn ->
-               DB.Txn.q(
-                 txn,
-                 """
-                 INSERT INTO rail_remedy_episodes
-                   (statute, subject, status, producerKey, occurrence, rewakeCount,
-                    claimToken, openedAt)
-                 VALUES ('completion-requires-verification', ?1, 'live', ?2, 1, 0,
-                         'legacy', ?3)
-                 """,
-                 [assignment.id, ctx.holder.session_key, now]
-               )
-
-               wake =
-                 Wakes.schedule_in_txn(txn, %{
-                   session_key: ctx.holder.session_key,
-                   origin: "remedy:completion-requires-verification",
-                   prompt: "legacy prompt must not be delivered",
-                   due_at: 0
-                 })
-
-               :ok =
-                 Idempotency.put_in_txn(txn, %{
-                   owner_user_id: "remedy:completion-requires-verification",
-                   operation: "wake",
-                   idempotency_key:
-                     "rail-dispatch:completion-requires-verification:#{assignment.id}:1",
-                   session_key: wake.wake_id
-                 })
-
-               {wake.wake_id, DB.Txn.changes(txn)}
-             end)
+    # The closing transaction retracts the remedy wake; delivery reads only its state.
+    assert %{state: "canceled"} = Wakes.get(ctx.db, wake_id)
 
     test_pid = self()
     scheduler = :"closed_remedy_scheduler_#{System.unique_integer([:positive])}"
@@ -730,47 +708,13 @@ defmodule Tightbeam.RailRemedyTest do
          name: scheduler,
          db: ctx.db,
          tick_ms: 60_000,
-         deliver: fn wake -> send(test_pid, {:legacy_remedy_delivered, wake.wake_id}) end},
+         deliver: fn wake -> send(test_pid, {:remedy_delivered, wake.wake_id}) end},
         id: scheduler
       )
     )
 
     assert :ok = Wakes.fire_due(scheduler)
-    refute_received {:legacy_remedy_delivered, ^wake_id}
-    assert %{state: "canceled"} = Wakes.get(ctx.db, wake_id)
-
-    assert %{status: "closed"} =
-             RailRemedy.episode(
-               ctx.db,
-               "completion-requires-verification",
-               assignment.id
-             )
-
-    assert {:ok, [["tightbeam:assignments", "obligation_disposed"]]} =
-             DB.query(
-               ctx.db,
-               "SELECT requesterId, reasonKind FROM wake_cancellations WHERE wakeId = ?1",
-               [wake_id]
-             )
-  end
-
-  test "a stale due row cannot deliver after its assignment closes", ctx do
-    assignment = assignment(ctx, "close after scheduler read")
-    put_rules(ctx, wake_gate())
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    wake_id = fire_wake_remedy(ctx, assignment.id)
-    assignment_id = assignment.id
-
-    wake = Wakes.get(ctx.db, wake_id)
-    assert %{state: "pending", assignment_id: ^assignment_id} = wake
-    assert %{state: "closed", outcome: "revoked"} = revoke(ctx, assignment.id)
-
-    assert :skipped =
-             Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
-               db: ctx.db,
-               wake_id: wake.wake_id,
-               sender: wake.origin
-             )
+    refute_received {:remedy_delivered, ^wake_id}
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [wake_id])

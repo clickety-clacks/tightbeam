@@ -89,7 +89,8 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
     assert :ok = Roles.rm(db, "reviewer")
     {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt = 0 WHERE wakeId = ?1", [deleted.wake_id])
     assert :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(db, deleted.wake_id).state == "fired"
+    # A notice whose role no longer exists ends undeliverable; it is never readdressed.
+    assert Wakes.get(db, deleted.wake_id).state == "canceled"
     assert Wakes.get(db, deleted.wake_id).prompt == "will disappear"
     assert [] = NoticeBatcher.source_refs(db, deleted.wake_id)
     assert :ok = Wakes.fire_due(scheduler)
@@ -97,8 +98,15 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
     assert {:ok, [[0]]} =
              DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [deleted.wake_id])
 
+    assert {:ok, [["target_unresolvable", "scheduler_delivery", "no_replacement"]]} =
+             DB.query(
+               db,
+               "SELECT reasonKind, causalSourceKind, outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [deleted.wake_id]
+             )
+
     assert Enum.count(EventLog.lifecycle_events(db), fn event ->
-             event.kind == "wake_unresolved" and event.subject == deleted.wake_id and
+             event.kind == "wake_undeliverable" and event.subject == deleted.wake_id and
                event.detail == "role reviewer no longer exists"
            end) == 1
 

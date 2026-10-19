@@ -1142,7 +1142,17 @@ defmodule Tightbeam.NoticeBatcher do
            "SELECT t.sessionKey FROM wakes w JOIN turns t ON t.seq=w.deliveredTurnSeq WHERE w.wakeId=?1",
            [wake_id]
          ) do
-      [[_delivered_to]] ->
+      [[delivered_to]] ->
+        # A pre-batching delivery may have committed its turn before the wake
+        # row was marked fired. On recovery, acknowledge that exact source
+        # instead of creating a second carrier for an already-visible message.
+        Txn.q(
+          txn,
+          "UPDATE wakes SET state='fired',firedAt=COALESCE(firedAt,?3) WHERE wakeId=?1 AND state='pending' AND sessionKey=?2",
+          [wake_id, delivered_to, now()]
+        )
+
+        if Txn.changes(txn) == 1, do: Wakes.publish_change_in_txn(txn, "wake.fired", wake_id)
         false
 
       [] ->

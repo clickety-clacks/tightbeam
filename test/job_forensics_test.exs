@@ -820,14 +820,9 @@ defmodule Tightbeam.JobForensicsTest do
                "SELECT COUNT(*) FROM attests WHERE assignmentId='asg_open_cancel' AND kind='progress'"
              )
 
-    assert {:ok, [["armed", 1, 1000]]} =
-             DB.query(
-               db,
-               "SELECT state, generation, dueAt FROM supervision_entitlements WHERE assignmentId='asg_open_cancel'"
-             )
-
+    # Later progress does not rewrite the recorded cancellation provenance.
     after_progress = canceled_entry(db, "wi_open_cancel", wake.wake_id)
-    assert after_progress.livenessTriggerId == "asg_open_cancel#1"
+    assert after_progress.livenessTriggerId == trigger_id
     assert after_progress.actionNeeded
   end
 

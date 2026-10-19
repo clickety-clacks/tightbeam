@@ -801,14 +801,21 @@ defmodule Tightbeam.EffortCheckinTest do
              outcome: "disposition",
              disposition_kind: "decision_request_transition",
              disposition_id: first_disposition_id,
-             liveness_kind: "supervision_entitlement",
+             liveness_kind: "pending_wake",
              liveness_id: first_liveness_id,
              action_needed: 1
            } = cancellation(ctx.db, first.deadline_wake_id)
 
     assert first_source_id == first.id
     assert first_disposition_id == first.id
-    assert first_liveness_id == "#{item.id}#1"
+
+    # The assignment's own inactivity deadline is what keeps the open work live.
+    assert {:ok, [["assignment_inactivity_deadline", assignment_id]]} =
+             DB.query(ctx.db, "SELECT consumer,assignmentId FROM wakes WHERE wakeId=?1", [
+               first_liveness_id
+             ])
+
+    assert assignment_id == item.id
 
     # The agent was prodded once at the top of this silent streak; every later
     # bracket in the same streak goes straight to the owner.

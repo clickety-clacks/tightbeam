@@ -131,6 +131,45 @@ defmodule Tightbeam.Supervision do
 
   def activity_in_txn(_txn, _assignment_id, _actor_session_key, _at), do: :ignored
 
+  @doc """
+  Close open assignments whose holder is already retired.
+
+  Retirement normally closes them in its own transaction; this recovers rows a
+  predecessor left open. Runs at boot after row recognition is installed so the
+  closures reach rules like any other retirement.
+  """
+  @spec close_retired_holder_assignments(DB.server()) :: :ok
+  def close_retired_holder_assignments(db) do
+    case DB.transaction_then(
+           db,
+           fn txn ->
+             txn
+             |> Txn.q("""
+             SELECT DISTINCT s.sessionKey, s.ownerUserId
+             FROM sessions s
+             JOIN assignments a ON a.holderKey=s.sessionKey
+             WHERE s.state='retired' AND a.state='open'
+             ORDER BY s.sessionKey
+             """)
+             |> Enum.each(fn [session_key, owner_user_id] ->
+               Tightbeam.Assignments.interrupt_for_retire_in_txn(
+                 txn,
+                 session_key,
+                 owner_user_id,
+                 "process:tightbeam"
+               )
+             end)
+           end,
+           fn txn, result ->
+             Wakes.row_commit_in_txn(txn, [])
+             result
+           end
+         ) do
+      {:ok, _} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
   @doc false
   def migrate_open_assignments(db, default_interval_ms \\ @default_interval_ms)
       when is_integer(default_interval_ms) and default_interval_ms > 0 do

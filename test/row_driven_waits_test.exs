@@ -25,7 +25,6 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     Org,
     Roles,
     Rules,
-    Supervision,
     Wakes,
     WorkItems
   }
@@ -320,7 +319,14 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert wake.verification_holder_key == "verifier"
     assert is_binary(wake.verification_notice_wake_id)
 
-    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE consumer='prompt'")
+
+    # Registering the wait is holder activity on A, so it schedules A's deadline.
+    assert {:ok, [["A", "pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId,state FROM wakes WHERE consumer='assignment_inactivity_deadline'"
+             )
 
     assert %{outcome: "revoked"} = revoke(ctx.db, "R")
 
@@ -1304,7 +1310,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
              end)
 
     register_wait(ctx.db, due_after(), predicate("R", "open"))
-    assert effort_relief_active?(ctx.db, "A")
+    refute effort_relief_active?(ctx.db, "A")
 
     assert {:ok, [[nil, 0]]} =
              DB.query(
@@ -1379,21 +1385,8 @@ defmodule Tightbeam.RowDrivenWaitsTest do
           assert :ok = Wakes.fire_due(ctx.scheduler)
 
         "cancel" ->
-          opened_at = System.system_time(:millisecond)
-
-          assert {:ok, _} =
-                   DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id='A'", [opened_at])
-
-          assert {:ok, :ok} =
-                   DB.transaction(ctx.db, fn txn ->
-                     Supervision.assignment_opened_in_txn(txn, "A", opened_at, 60_000)
-                   end)
-
           assert {:ok, {:accepted_in_txn, _, %{canceled: true}}} =
                    DB.transaction(ctx.db, fn txn ->
-                     {:ok, trigger} =
-                       Supervision.inactivity_deadline_trigger_in_txn(txn, {:assignment, "A"})
-
                      Wakes.cancel_in_txn(txn, %{
                        wake_id: wake.wake_id,
                        expected_origin: wake.origin,
@@ -1407,7 +1400,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                            principal: {:session, "holder"}
                          }
                        },
-                       outcome: %{kind: "no_replacement", liveness_trigger: trigger}
+                       outcome: %{kind: "no_replacement"}
                      })
                    end)
       end
@@ -1438,14 +1431,13 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     end
   end
 
-  test "failed and unknown continuation outcomes end relief without answering work", ctx do
+  test "failed and unknown continuation outcomes do not answer work", ctx do
     qualification_policy(ctx)
 
     for status <- ~w(failed failed_unknown) do
       wake = register_wait(ctx.db, due_after(), predicate("R", "open"))
       assert :ok = Wakes.fire_due(ctx.scheduler)
       assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "fixture")
-      assert effort_relief_active?(ctx.db, "A")
 
       assert [
                %{delivery_wake_id: carrier_id}

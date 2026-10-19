@@ -240,6 +240,7 @@ defmodule Tightbeam.Gateway do
     # scheduler can consume them. Later changes are written by assignment and
     # holder-activity transactions.
     :ok = Wakes.activate_wait_recognition(db)
+    :ok = Supervision.close_retired_holder_assignments(db)
 
     case Supervision.migrate_open_assignments(db, supervision_interval_ms(config)) do
       :ok ->
