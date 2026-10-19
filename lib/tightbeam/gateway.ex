@@ -10365,11 +10365,12 @@ defmodule Tightbeam.Gateway do
                current_host != session.host ->
                  :placement_changed
 
-               not EffortCheckin.prepared_rearms_current?(
-                 txn,
-                 session.session_key,
-                 prepared
-               ) ->
+               EffortCheckin.enabled?(config) and
+                   not EffortCheckin.prepared_rearms_current?(
+                     txn,
+                     session.session_key,
+                     prepared
+                   ) ->
                  :retry
 
                true ->

@@ -1740,6 +1740,59 @@ defmodule Tightbeam.EffortCheckinTest do
              )
   end
 
+  test "host move succeeds with older generations after effort check-ins are disabled", ctx do
+    assigned = assignment(ctx, "assign", {:user, "h1"}, "holder", %{subject: "before opt-out"})
+    original_wake = current_wake(ctx.db, assigned.id)
+
+    manifests = Path.join([ctx.base_dir, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+
+    File.write!(
+      Path.join(manifests, "default.toml"),
+      """
+      name = "default"
+      where = ["#{Placement.local_host_name()}", "satellite"]
+      """
+    )
+
+    Archetypes.load!(ctx.base_dir)
+    on_exit(fn -> :persistent_term.erase(Archetypes) end)
+
+    register_hosts(ctx.db, %{
+      "satellite" => %{ssh: "satellite.example", base_dir: "/srv/tightbeam", cli_bin: nil}
+    })
+
+    parent = self()
+
+    sh = fn invocation ->
+      if hd(invocation) == "rsync", do: send(parent, :workdir_copied)
+      {"", 0}
+    end
+
+    config = ctx.config |> Map.put(:effort_checkins_enabled, false) |> Map.put(:sh, sh)
+
+    assert %{ok: true, host: "satellite"} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:h2",
+               principal: {:user, "h2"},
+               session_key: "holder",
+               params: %{setting: "set_host", host: "satellite"}
+             })
+
+    assert_received :workdir_copied
+    assert Org.get(ctx.db, "holder").host == "satellite"
+    assert current_wake(ctx.db, assigned.id).wake_id == original_wake.wake_id
+
+    assert [[1, "armed", host]] =
+             rows(
+               ctx.db,
+               "SELECT generation,state,host FROM effort_checkin_generations WHERE assignmentId=?1",
+               [assigned.id]
+             )
+
+    assert host == Placement.local_host_name()
+  end
+
   test "an exact effort transition cancels its deadline with absent or terminal liveness", ctx do
     for liveness <- [:absent, :terminal], action <- ["continue", "dismiss"] do
       assignment =
