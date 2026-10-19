@@ -5319,6 +5319,22 @@ defmodule Tightbeam.GatewayTest do
     assert [%{error: reason}] =
              ctx.db |> Ledger.unpublished_terminals() |> Enum.filter(&(&1.seq == seq))
 
+    start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
+
+    :ok =
+      Tightbeam.Firehose.Hub.register(Tightbeam.Firehose.Hub, self(), %{
+        mode: :subscribed,
+        db: ctx.db,
+        user_id: "flynn",
+        is_admin: false
+      })
+
+    :ok =
+      Tightbeam.Firehose.Hub.subscribe(Tightbeam.Firehose.Hub, self(), "turn-failed-marker", %{
+        "classes" => ["message.created"],
+        "sessionKey" => "k1"
+      })
+
     publisher = Gateway.terminal_publisher_for_test(ctx.db)
     # The marker is appended before the wire publish; the publish leg needs a
     # live registry that this test does not care about.
@@ -5327,6 +5343,13 @@ defmodule Tightbeam.GatewayTest do
     catch
       :exit, _ -> :ok
     end
+
+    assert_receive {:firehose_notice, %{"class" => "message.created"} = notice}
+    assert_message_notice_matches_rest!(ctx.db, notice)
+    assert notice["payload"]["messageType"] == "substrate"
+    :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
+    :sys.get_state(Tightbeam.Firehose.Hub)
+    refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
 
     marker =
       ctx.db

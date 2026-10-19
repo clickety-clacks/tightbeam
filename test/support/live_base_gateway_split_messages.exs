@@ -192,7 +192,7 @@ defmodule GuardSplitMessages do
                            100
 
             :sys.get_state(Hub)
-            refute_receive {:firehose_notice, %{"class" => "message.created"}}, 100
+            refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
           after
             GenServer.stop(session_lane)
             Supervisor.stop(task_sup)
