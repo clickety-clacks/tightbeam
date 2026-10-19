@@ -4060,7 +4060,7 @@ mod tests {
             parse(strings(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR=value=with=equals",
@@ -4069,7 +4069,7 @@ mod tests {
             ])),
             Ok(Command::HostEnvSet {
                 identity: Identity::Role("operator".to_owned()),
-                host: "gibson".to_owned(),
+                host: "testhost-a".to_owned(),
                 harness: "claude".to_owned(),
                 name: "EXAMPLE_OVERLAY_VAR".to_owned(),
                 value: "value=with=equals".to_owned(),
@@ -4080,7 +4080,7 @@ mod tests {
             parse(strings(&[
                 "host-env-list",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "--harness",
                 "claude",
                 "--as-user",
@@ -4088,7 +4088,7 @@ mod tests {
             ])),
             Ok(Command::HostEnvList {
                 identity: Identity::User("flynn".to_owned()),
-                host: Some("gibson".to_owned()),
+                host: Some("testhost-a".to_owned()),
                 harness: Some("claude".to_owned()),
             })
         );
@@ -4097,7 +4097,7 @@ mod tests {
             parse(strings(&[
                 "host-env-unset",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR",
@@ -4106,7 +4106,7 @@ mod tests {
             ])),
             Ok(Command::HostEnvUnset {
                 identity: Identity::User("flynn".to_owned()),
-                host: "gibson".to_owned(),
+                host: "testhost-a".to_owned(),
                 harness: "claude".to_owned(),
                 name: "EXAMPLE_OVERLAY_VAR".to_owned(),
             })
@@ -4286,13 +4286,13 @@ mod tests {
             strings(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "EXAMPLE_OVERLAY_VAR=value",
             ]),
             strings(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR",
@@ -4314,7 +4314,7 @@ mod tests {
             parse(strings(&[
                 "host-toolchain-set",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "--dirs",
                 r#"["/tools/one","/tools/two"]"#,
                 "--as-user",
@@ -4322,7 +4322,7 @@ mod tests {
             ])),
             Ok(Command::HostToolchainSet {
                 identity: Identity::User("flynn".to_owned()),
-                host: "gibson".to_owned(),
+                host: "testhost-a".to_owned(),
                 dirs: vec!["/tools/one".to_owned(), "/tools/two".to_owned()],
             })
         );
@@ -4331,13 +4331,13 @@ mod tests {
             parse(strings(&[
                 "host-toolchain-set",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "--dirs",
                 "[]",
             ])),
             Ok(Command::HostToolchainSet {
                 identity: Identity::Session,
-                host: "gibson".to_owned(),
+                host: "testhost-a".to_owned(),
                 dirs: vec![],
             })
         );
@@ -4349,7 +4349,7 @@ mod tests {
             "usage: tightbeam host-toolchain-set --host <host> --dirs '<json-array>'".to_owned();
 
         assert_eq!(
-            parse(strings(&["host-toolchain-set", "--host", "gibson"])),
+            parse(strings(&["host-toolchain-set", "--host", "testhost-a"])),
             Err(usage.clone())
         );
         assert_eq!(
@@ -4360,7 +4360,7 @@ mod tests {
             parse(strings(&[
                 "host-toolchain-set",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "--dirs",
                 r#"[1]"#,
             ])),
@@ -6458,7 +6458,7 @@ mod tests {
                     "--name",
                     "reviewer",
                     "--host",
-                    "eezo",
+                    "testhost-c",
                     "--as-user",
                     "flynn",
                 ]),
@@ -6472,7 +6472,7 @@ mod tests {
                     effort: Some(Some("high".to_owned())),
                     context: Some(Some("1m".to_owned())),
                     handle: Some("reviewer".to_owned()),
-                    host: Some("eezo".to_owned()),
+                    host: Some("testhost-c".to_owned()),
                     work_item_id: None,
                 },
             ),

@@ -4479,23 +4479,23 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "spawn uses the next where host when the first cannot run the requested harness", ctx do
-    base_dir = placement_test_base("later-eligible", ["eurisko", "racter"])
+    base_dir = placement_test_base("later-eligible", ["testhost-d", "testhost-b"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
-    await_host_catalog("racter", "codex")
+    await_host_catalog("testhost-b", "codex")
 
     config =
       gateway_config(base_dir, ctx.db, 0)
       |> Map.put(:default_harness, :codex)
       |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
       |> Map.put(:credential_status, fn
-        :openai, "eurisko" -> {:needs_onboarding, :missing}
-        :openai, "racter" -> :onboarded
+        :openai, "testhost-d" -> {:needs_onboarding, :missing}
+        :openai, "testhost-b" -> :onboarded
       end)
       |> Map.put(:sh, fn _command -> {"", 0} end)
 
@@ -4509,21 +4509,21 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "racter"
+    assert Org.get(ctx.db, session_key).host == "testhost-b"
   end
 
   test "spawn uses the next where host when the first has no usable catalog", ctx do
-    base_dir = placement_test_base("later-catalog", ["eurisko", "racter"])
+    base_dir = placement_test_base("later-catalog", ["testhost-d", "testhost-b"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
-    await_host_catalog("eurisko", "codex")
-    await_host_catalog("racter", "codex")
-    degrade_host_catalog("eurisko", "codex", :ssh_unreachable)
+    await_host_catalog("testhost-d", "codex")
+    await_host_catalog("testhost-b", "codex")
+    degrade_host_catalog("testhost-d", "codex", :ssh_unreachable)
 
     config =
       gateway_config(base_dir, ctx.db, 0)
@@ -4542,23 +4542,23 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "racter"
+    assert Org.get(ctx.db, session_key).host == "testhost-b"
   end
 
   test "spawn records one real redirect when an open exact key is skipped", ctx do
-    base_dir = placement_test_base("terminal-redirect", ["eurisko", "racter"])
+    base_dir = placement_test_base("terminal-redirect", ["testhost-d", "testhost-b"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
-    await_host_catalog("racter", "codex")
+    await_host_catalog("testhost-b", "codex")
 
     assert {:opened, incident} =
              Tightbeam.TerminalCredentialFailure.open(ctx.db, %{
-               host: "eurisko",
+               host: "testhost-d",
                harness: "codex",
                provider: "openai",
                correlation_id: "gateway-terminal-redirect",
@@ -4571,8 +4571,8 @@ defmodule Tightbeam.GatewayTest do
       |> Map.put(:default_harness, :codex)
       |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
       |> Map.put(:credential_status, fn
-        :openai, "eurisko" -> flunk("suppressed key must not read credential state")
-        :openai, "racter" -> :onboarded
+        :openai, "testhost-d" -> flunk("suppressed key must not read credential state")
+        :openai, "testhost-b" -> :onboarded
       end)
       |> Map.put(:sh, fn _command -> {"", 0} end)
 
@@ -4588,10 +4588,10 @@ defmodule Tightbeam.GatewayTest do
     }
 
     assert %{session_key: session_key} = spawn.(call)
-    assert Org.get(ctx.db, session_key).host == "racter"
+    assert Org.get(ctx.db, session_key).host == "testhost-b"
     assert %{session_key: ^session_key} = spawn.(call)
 
-    assert {:ok, [["racter", 1]]} =
+    assert {:ok, [["testhost-b", 1]]} =
              DB.query(
                ctx.db,
                "SELECT destinationHost,COUNT(*) FROM terminal_credential_redirects WHERE incidentId=?1 GROUP BY destinationHost",
@@ -4600,17 +4600,17 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "an explicit suppressed host refuses without probing or recording a redirect", ctx do
-    base_dir = placement_test_base("terminal-explicit", ["eurisko", "racter"])
+    base_dir = placement_test_base("terminal-explicit", ["testhost-d", "testhost-b"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
     assert {:opened, incident} =
              Tightbeam.TerminalCredentialFailure.open(ctx.db, %{
-               host: "eurisko",
+               host: "testhost-d",
                harness: "codex",
                provider: "openai",
                correlation_id: "gateway-terminal-explicit",
@@ -4623,7 +4623,7 @@ defmodule Tightbeam.GatewayTest do
       |> Map.put(:default_harness, :codex)
       |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
       |> Map.put(:credential_status, fn
-        :openai, "eurisko" -> flunk("suppressed key must not read credential state")
+        :openai, "testhost-d" -> flunk("suppressed key must not read credential state")
       end)
 
     assert %{
@@ -4636,7 +4636,7 @@ defmodule Tightbeam.GatewayTest do
                session_key: nil,
                params: %{
                  display_name: "Terminal explicit refusal",
-                 host: "eurisko",
+                 host: "testhost-d",
                  idempotency_key: "spawn-terminal-explicit"
                }
              })
@@ -4652,18 +4652,18 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "spawn refusal relays each where host's catalog cause and remedy", ctx do
-    base_dir = placement_test_base("catalog-causes", ["eurisko", "testhost"])
+    base_dir = placement_test_base("catalog-causes", ["testhost-d", "testhost"])
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
       "testhost" => %{ssh: "testhost", base_dir: "/srv/testhost", cli_bin: nil}
     })
 
-    await_host_catalog("eurisko", "codex")
+    await_host_catalog("testhost-d", "codex")
     await_host_catalog("testhost", "codex")
 
     degrade_host_catalog(
-      "eurisko",
+      "testhost-d",
       "codex",
       {:empty_catalog_for_client_version, "0.145.0"}
     )
@@ -4686,27 +4686,27 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert message =~ "eurisko: cannot route gpt-5.6-sol (effort medium) on eurisko"
-    assert message =~ "upgrade codex on eurisko"
+    assert message =~ "testhost-d: cannot route gpt-5.6-sol (effort medium) on testhost-d"
+    assert message =~ "upgrade codex on testhost-d"
     assert message =~ "testhost: cannot route gpt-5.6-sol (effort medium) on testhost"
     assert message =~ "run tightbeam onboard openai --as-user <userId> on testhost"
   end
 
   test "spawn uses the next where host when the first fails live spinup", ctx do
-    base_dir = placement_test_base("later-spinup", ["eurisko", "racter"])
+    base_dir = placement_test_base("later-spinup", ["testhost-d", "testhost-b"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
-    await_host_catalog("eurisko", "codex")
-    await_host_catalog("racter", "codex")
+    await_host_catalog("testhost-d", "codex")
+    await_host_catalog("testhost-b", "codex")
 
     sh = fn command ->
-      if List.last(command) == "true" and Enum.member?(command, "eurisko") do
-        {"ssh: connect to host eurisko port 22: Connection refused", 255}
+      if List.last(command) == "true" and Enum.member?(command, "testhost-d") do
+        {"ssh: connect to host testhost-d port 22: Connection refused", 255}
       else
         {"", 0}
       end
@@ -4729,25 +4729,25 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "racter"
+    assert Org.get(ctx.db, session_key).host == "testhost-b"
   end
 
   test "spawn stops after the first ready where host and probes it once", ctx do
-    base_dir = placement_test_base("first-ready-once", ["eurisko", "racter"])
+    base_dir = placement_test_base("first-ready-once", ["testhost-d", "testhost-b"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
-    await_host_catalog("eurisko", "codex")
-    await_host_catalog("racter", "codex")
+    await_host_catalog("testhost-d", "codex")
+    await_host_catalog("testhost-b", "codex")
     parent = self()
 
     sh = fn command ->
       if List.last(command) == "true" do
-        host = Enum.find(["eurisko", "racter"], &Enum.member?(command, &1))
+        host = Enum.find(["testhost-d", "testhost-b"], &Enum.member?(command, &1))
         send(parent, {:spinup_probe, host})
       end
 
@@ -4771,28 +4771,28 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "eurisko"
-    assert_receive {:spinup_probe, "eurisko"}
+    assert Org.get(ctx.db, session_key).host == "testhost-d"
+    assert_receive {:spinup_probe, "testhost-d"}
     refute_receive {:spinup_probe, _host}
   end
 
   test "spawn acts on the routed answer from the candidate decision", ctx do
-    base_dir = placement_test_base("one-route-answer", ["eurisko", "racter"])
+    base_dir = placement_test_base("one-route-answer", ["testhost-d", "testhost-b"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
-    await_host_catalog("eurisko", "codex")
-    await_host_catalog("racter", "codex")
+    await_host_catalog("testhost-d", "codex")
+    await_host_catalog("testhost-b", "codex")
     degraded = :atomics.new(1, [])
 
     sh = fn command ->
-      if List.last(command) == "true" and Enum.member?(command, "eurisko") and
+      if List.last(command) == "true" and Enum.member?(command, "testhost-d") and
            :atomics.compare_exchange(degraded, 1, 0, 1) == :ok do
-        degrade_host_catalog("eurisko", "codex", :catalog_refreshed)
+        degrade_host_catalog("testhost-d", "codex", :catalog_refreshed)
       end
 
       {"", 0}
@@ -4815,11 +4815,11 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "eurisko"
+    assert Org.get(ctx.db, session_key).host == "testhost-d"
   end
 
   test "spawn refusal gives an unconfigured where host its assimilation remedy", ctx do
-    base_dir = placement_test_base("missing-host-remedy", ["eurisko"])
+    base_dir = placement_test_base("missing-host-remedy", ["testhost-d"])
 
     config =
       gateway_config(base_dir, ctx.db, 0)
@@ -4837,16 +4837,16 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert message =~ "no host in archetype default's where can run codex"
-    assert message =~ "eurisko: host eurisko is not configured"
-    assert message =~ "tightbeam assimilate <ssh-dest> --name eurisko"
+    assert message =~ "testhost-d: host testhost-d is not configured"
+    assert message =~ "tightbeam assimilate <ssh-dest> --name testhost-d"
   end
 
   test "spawn refusal names every where host, harness, cause, and remedy", ctx do
-    base_dir = placement_test_base("all-ineligible", ["eurisko", "racter"])
+    base_dir = placement_test_base("all-ineligible", ["testhost-d", "testhost-b"])
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
     config =
@@ -4871,7 +4871,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "no host in archetype default's where can run codex"
 
-    for {host, _base} <- [{"eurisko", "/srv/eurisko"}, {"racter", "/srv/racter"}] do
+    for {host, _base} <- [{"testhost-d", "/srv/testhost-d"}, {"testhost-b", "/srv/testhost-b"}] do
       assert message =~ "Tightbeam has no credential for openai on #{host}"
       assert message =~ "Run on #{host}: tightbeam onboard openai --as-user <userId>"
     end
