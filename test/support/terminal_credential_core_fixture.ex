@@ -37,14 +37,14 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
     assert same_id == incident.id
 
     assert TerminalCredentialFailure.statement(db, incident.id) ==
-             "racter lost codex: its openai credential was rejected. Redirect destination: not yet observed; lawful alternate " <>
-               "routing remains enabled. racter needs a human sign-in for codex; run on " <>
-               "racter: tightbeam onboard openai --as-user <adminUserId> (replace " <>
+             "testhost lost codex: its openai credential was rejected. Redirect destination: not yet observed; lawful alternate " <>
+               "routing remains enabled. testhost needs a human sign-in for codex; run on " <>
+               "testhost: tightbeam onboard openai --as-user <adminUserId> (replace " <>
                "<adminUserId> with your own administrator id)."
 
     expected =
-      "racter lost codex: its openai credential was rejected. Redirect destination: alternate. racter needs a human sign-in for codex; " <>
-        "run on racter: tightbeam onboard openai --as-user <adminUserId> " <>
+      "testhost lost codex: its openai credential was rejected. Redirect destination: alternate. testhost needs a human sign-in for codex; " <>
+        "run on testhost: tightbeam onboard openai --as-user <adminUserId> " <>
         "(replace <adminUserId> with your own administrator id)."
 
     assert {:ok, :recorded} =
@@ -226,14 +226,14 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
     assert {:ok, [[1]]} =
              DB.query(
                db,
-               "SELECT COUNT(*) FROM terminal_credential_incidents WHERE host='racter' AND harness='codex' AND state='open'"
+               "SELECT COUNT(*) FROM terminal_credential_incidents WHERE host='testhost' AND harness='codex' AND state='open'"
              )
 
     assert {:ok, [[1]]} =
              DB.query(
                db,
                "SELECT COUNT(*) FROM condition_facts WHERE kind='catalog-terminal-credential-failure' AND scope=?1",
-               [TerminalCredentialFailure.scope("racter", "codex")]
+               [TerminalCredentialFailure.scope("testhost", "codex")]
              )
   end
 
@@ -277,7 +277,7 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
              )
 
     assert resolved.state == "resolved"
-    refute TerminalCredentialFailure.open?(db, "racter", "codex")
+    refute TerminalCredentialFailure.open?(db, "testhost", "codex")
     assert TerminalCredentialFailure.views(db) == []
   end
 
@@ -289,7 +289,7 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
 
     assert claim == %{
              incident_id: incident.id,
-             host: "racter",
+             host: "testhost",
              harness: "codex",
              fact_id: fact_id
            }
@@ -345,12 +345,12 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
              DB.transaction(db, fn txn ->
                HarnessHealth.resolve_normal_turn_in_txn(
                  txn,
-                 %{host: "racter", harness: "codex"},
+                 %{host: "testhost", harness: "codex"},
                  %{seq: 42, session_key: "fixture-session", origin: "agent:fixture"}
                )
              end)
 
-    assert TerminalCredentialFailure.get_open(db, "racter", "codex").id == incident.id
+    assert TerminalCredentialFailure.get_open(db, "testhost", "codex").id == incident.id
   end
 
   def proof!("call-site-accounting", _db, _base) do
@@ -385,7 +385,7 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
 
   defp open(db, correlation_id) do
     TerminalCredentialFailure.open(db, %{
-      host: "racter",
+      host: "testhost",
       harness: "codex",
       provider: "openai",
       correlation_id: correlation_id,
@@ -399,7 +399,7 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
              DB.transaction(db, fn txn ->
                ConditionFacts.file_in_txn(txn, %{
                  kind: "credential-present",
-                 scope: "racter:openai",
+                 scope: "testhost:openai",
                  origin: "process:tightbeam"
                })
              end)
