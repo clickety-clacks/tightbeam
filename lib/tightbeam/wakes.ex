@@ -3449,7 +3449,24 @@ defmodule Tightbeam.Wakes do
           ]
         )
 
-        if Txn.changes(txn) == 1 and is_binary(parent_session_key) do
+        inserted = Txn.changes(txn) == 1
+
+        if not inserted and failure_class == "adapter_unavailable" do
+          # A refused adapter redelivery has the same message ID as its source.
+          # Re-arm that exact row only when this failed turn was its redelivery.
+          Txn.q(
+            txn,
+            """
+            UPDATE health_redelivery_attempts
+            SET restorationTurnSeq=NULL,redeliveryTurnSeq=NULL
+            WHERE sessionKey=?1 AND sourceMessageId=?2 AND redeliveryTurnSeq=?3
+              AND parentSessionKey IS NULL
+            """,
+            [session_key, message_id, source_turn_seq]
+          )
+        end
+
+        if inserted and is_binary(parent_session_key) do
           ask_interrupted_redelivery_parent_in_txn(
             txn,
             parent_session_key,
@@ -3547,6 +3564,9 @@ defmodule Tightbeam.Wakes do
     restoration_turn_seq = Map.fetch!(turn, :seq)
 
     if is_binary(host) and String.trim(host) != "" do
+      # A session that has moved to another route can still consume its own
+      # pending prompt on its next normal turn. Keep other sessions gated on
+      # recovery of the source route; this does not resolve that shared incident.
       Txn.q(
         txn,
         """
@@ -3554,18 +3574,23 @@ defmodule Tightbeam.Wakes do
                a.sourceWakeId,a.origin,a.prompt,a.roleRef,a.roleFallback,a.assignmentId,
                a.jobRef,a.requestRef
         FROM health_redelivery_attempts a
-        WHERE a.sourceHarness=?1
-          AND a.sourceHost=?2
+        WHERE ((a.sourceHarness=?1 AND a.sourceHost=?2) OR a.sessionKey=?3)
           AND a.redeliveryTurnSeq IS NULL
           AND a.parentSessionKey IS NULL
-          AND NOT EXISTS (
-            SELECT 1
-            FROM harness_health_observations observation
-            JOIN harness_health_incidents incident ON incident.id=observation.incidentId
-            WHERE observation.correlationId =
-              'harness-turn:' || a.sourceTurnSeq || ':' || a.failureClass
-              AND observation.evidenceKind='terminal-failure'
-              AND incident.state='open'
+          AND (
+            (
+              (a.sourceHarness != ?1 OR a.sourceHost != ?2)
+              AND a.sessionKey=?3
+            )
+            OR NOT EXISTS (
+              SELECT 1
+              FROM harness_health_observations observation
+              JOIN harness_health_incidents incident ON incident.id=observation.incidentId
+              WHERE observation.correlationId =
+                'harness-turn:' || a.sourceTurnSeq || ':' || a.failureClass
+                AND observation.evidenceKind='terminal-failure'
+                AND incident.state='open'
+            )
           )
           AND NOT EXISTS (
             SELECT 1 FROM wake_retry_attempts retry
@@ -3573,7 +3598,7 @@ defmodule Tightbeam.Wakes do
           )
         ORDER BY a.sourceTurnSeq
         """,
-        [harness, host]
+        [harness, host, session.session_key]
       )
       |> Enum.reduce(0, fn source, count ->
         count + redeliver_health_source_in_txn(txn, source, restoration_turn_seq)

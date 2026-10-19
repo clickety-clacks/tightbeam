@@ -1620,6 +1620,139 @@ defmodule Tightbeam.RulesTest do
     assert review_count(ctx.db, producer.id) == 1
   end
 
+  test "shipped completion accepts same source commits across checkouts and refuses another commit",
+       ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    holder = session(ctx.db, "same-source-completion-holder", "flynn", archetype: "coder")
+
+    reviewer =
+      session(ctx.db, "same-source-completion-reviewer", "flynn", archetype: "reviewer-code")
+
+    commit = String.duplicate("a", 40)
+
+    producer_refs = [%{"repo" => "testhost:/tmp/producer-checkout", "commit" => commit}]
+    reviewer_refs = [%{"repo" => "testhost:/tmp/reviewer-checkout", "commit" => commit}]
+
+    producer =
+      assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "code")
+
+    review =
+      assignment(ctx, reviewer.session_key, {:user, "flynn"},
+        reviews: producer.id,
+        effect_kind: "review"
+      )
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, reviewer.session_key}, %{
+                 assignment_id: review.id,
+                 kind: "verdict",
+                 verdict_kind: "reviewed-clean",
+                 commit_refs: reviewer_refs
+               })
+             )
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, holder.session_key}, %{
+                 assignment_id: producer.id,
+                 kind: "verdict",
+                 verdict_kind: "verified",
+                 commit_refs: producer_refs
+               })
+             )
+
+    assert Assignments.qualifying_verification_verdict_kinds(
+             ctx.db,
+             producer.id,
+             holder.session_key,
+             reviewer_refs
+           ) == ["verified"]
+
+    completion =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: producer.id,
+        kind: "completion",
+        commit_refs: producer_refs
+      })
+
+    assert :ok = Rules.evaluate(ctx.db, completion)
+
+    different_holder =
+      session(ctx.db, "different-source-completion-holder", "flynn", archetype: "coder")
+
+    different_reviewer =
+      session(ctx.db, "different-source-completion-reviewer", "flynn", archetype: "reviewer-code")
+
+    different_producer =
+      assignment(ctx, different_holder.session_key, {:user, "flynn"}, effect_kind: "code")
+
+    different_review =
+      assignment(ctx, different_reviewer.session_key, {:user, "flynn"},
+        reviews: different_producer.id,
+        effect_kind: "review"
+      )
+
+    different_review_refs = [
+      %{
+        "repo" => "testhost:/tmp/different-review-checkout",
+        "commit" => String.duplicate("b", 40)
+      }
+    ]
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, different_reviewer.session_key}, %{
+                 assignment_id: different_review.id,
+                 kind: "verdict",
+                 verdict_kind: "reviewed-clean",
+                 commit_refs: different_review_refs
+               })
+             )
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, different_holder.session_key}, %{
+                 assignment_id: different_producer.id,
+                 kind: "verdict",
+                 verdict_kind: "verified",
+                 commit_refs: producer_refs
+               })
+             )
+
+    different_completion =
+      p3_call("attest", {:session, different_holder.session_key}, %{
+        assignment_id: different_producer.id,
+        kind: "completion",
+        commit_refs: producer_refs
+      })
+
+    assert {:deny, %{rule: "completion-requires-review"}} =
+             Rules.evaluate(ctx.db, different_completion)
+  end
+
   test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do
     :ok =
       DB.execute(ctx.db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1),('reviewer',1)")

@@ -138,7 +138,8 @@ defmodule Tightbeam.Homes do
               Map.fetch!(desired, :auth_dir),
               home,
               credential_names,
-              Keyword.get(mechanics, :credential_projection, :link)
+              Keyword.get(mechanics, :credential_projection, :link),
+              Keyword.get(mechanics, :before_credential_projection_promote, fn _target -> :ok end)
             )
         }
 
@@ -1150,7 +1151,7 @@ defmodule Tightbeam.Homes do
     end
   end
 
-  defp project_auth(auth_dir, home, credential_names, projection) do
+  defp project_auth(auth_dir, home, credential_names, projection, before_projection_promote) do
     auth_dir
     |> credential_store_files(credential_names)
     |> Enum.map(fn file ->
@@ -1165,28 +1166,48 @@ defmodule Tightbeam.Homes do
           end
 
         :copy_readable ->
-          # The target's directory may be writable by the execution identity, so
-          # never follow whatever is at `target`: remove it (a planted symlink
-          # goes with it) and create the copy exclusively, which fails rather
-          # than writes through anything re-planted in between.
-          case File.rm(target) do
-            :ok -> :ok
-            {:error, :enoent} -> :ok
-            {:error, reason} -> raise File.Error, reason: reason, action: "remove", path: target
-          end
-
           bytes = File.read!(source)
 
-          case :file.open(target, [:write, :exclusive, :binary]) do
+          temporary =
+            Path.join(
+              auth_dir,
+              ".#{file}.tightbeam-projection-#{System.unique_integer([:positive])}"
+            )
+
+          case :file.open(temporary, [:write, :exclusive, :binary]) do
             {:ok, io} ->
-              :ok = :file.write(io, bytes)
-              :ok = :file.close(io)
+              try do
+                :ok = :file.write(io, bytes)
+              after
+                :ok = :file.close(io)
+              end
+
+              try do
+                # Cursor's credential store is operator-only. Preserve the
+                # projection's shared group while the copy is still private;
+                # rename keeps this inode's group instead of inheriting the
+                # destination directory's setgid group. Then atomically
+                # replace a planted symlink instead of following it.
+                File.chgrp!(temporary, File.stat!(home).gid)
+                File.chmod!(temporary, 0o640)
+                before_projection_promote.(target)
+                File.rename!(temporary, target)
+              after
+                case File.rm(temporary) do
+                  :ok ->
+                    :ok
+
+                  {:error, :enoent} ->
+                    :ok
+
+                  {:error, reason} ->
+                    raise File.Error, reason: reason, action: "remove", path: temporary
+                end
+              end
 
             {:error, reason} ->
-              raise File.Error, reason: reason, action: "create exclusively", path: target
+              raise File.Error, reason: reason, action: "create exclusively", path: temporary
           end
-
-          File.chmod!(target, 0o640)
       end
 
       file

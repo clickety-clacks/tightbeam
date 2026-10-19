@@ -3471,6 +3471,56 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
   end
 
+  test "cannot-proceed identifies closed outcomes and remains accepted while open", ctx do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    completed =
+      assign_call({:user, "flynn"}, "completed assignment")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{assignment: %{state: "closed", outcome: "completed"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "holder"}, completed.id, "completion")
+             )
+
+    assert %{code: "assignment_closed", message: completed_message} =
+             attest_call({:session, "holder"}, completed.id, "cannot-proceed")
+             |> put_in([:params, :note], "blocked after completion")
+             |> then(&handle(ctx, "attest", &1))
+
+    assert completed_message =~ "closed"
+    assert completed_message =~ "completed"
+
+    revoked =
+      assign_call({:user, "flynn"}, "revoked assignment")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{state: "closed", outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, revoked.id))
+
+    assert %{code: "assignment_closed", message: revoked_message} =
+             attest_call({:session, "holder"}, revoked.id, "cannot-proceed")
+             |> put_in([:params, :note], "blocked after revocation")
+             |> then(&handle(ctx, "attest", &1))
+
+    assert revoked_message =~ "closed"
+    assert revoked_message =~ "revoked"
+
+    open =
+      assign_call({:user, "flynn"}, "open assignment")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{assignment: %{state: "open"}, cannotProceed: %{state: "standing"}} =
+             attest_call({:session, "holder"}, open.id, "cannot-proceed")
+             |> put_in([:params, :note], "blocked while open")
+             |> then(&handle(ctx, "attest", &1))
+  end
+
   test "cannot-proceed is holder-only, idempotent, pauses one card, and releases on its exact fact",
        ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
@@ -6818,6 +6868,106 @@ defmodule Tightbeam.AssignmentsTest do
                ctx.db,
                "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
                [producer.id]
+             )
+  end
+
+  test "code completion accepts the same commit from different checkout paths", ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    commit = String.duplicate("a", 40)
+    producer_refs = [%{"repo" => "testhost:/tmp/producer-checkout", "commit" => commit}]
+    review_refs = [%{"repo" => "testhost:/tmp/reviewer-checkout", "commit" => commit}]
+
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "same-commit producer"))
+
+    review =
+      assign_call({:user, "flynn"}, "same-commit review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], review_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], producer_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    completion =
+      attest_call({:session, "holder"}, producer.id, "completion")
+      |> put_in([:params, :commit_refs], producer_refs)
+
+    assert %{attest: %{kind: "completion"}, assignment: %{outcome: "completed"}} =
+             handle(ctx, "attest", completion)
+  end
+
+  test "code completion rejects producer and review evidence for different commits", ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    producer_refs = [
+      %{"repo" => "testhost:/tmp/producer-checkout", "commit" => String.duplicate("a", 40)}
+    ]
+
+    review_refs = [
+      %{"repo" => "testhost:/tmp/reviewer-checkout", "commit" => String.duplicate("b", 40)}
+    ]
+
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "different-commit producer"))
+
+    review =
+      assign_call({:user, "flynn"}, "different-commit review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], review_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], producer_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    completion =
+      attest_call({:session, "holder"}, producer.id, "completion")
+      |> put_in([:params, :commit_refs], producer_refs)
+
+    assert %{code: "inapplicable_code_evidence"} = handle(ctx, "attest", completion)
+
+    assert %{state: "open", closingAttestId: nil} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:session, "holder"}, producer.id)
              )
   end
 

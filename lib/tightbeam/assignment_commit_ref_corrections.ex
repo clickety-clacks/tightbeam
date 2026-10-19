@@ -191,8 +191,8 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
     end)
   end
 
-  # Corrections are deliberately exact-id only. A caller outside the target's
-  # product lane gets the same unknown result for an existing and absent id.
+  # Corrections are deliberately exact-id only. A session caller must be the
+  # exact opener or in the target holder's product-owner lane.
   defp resolve_visible_assignment(txn, call, actor) do
     supplied = call.params[:assignment_id]
 
@@ -221,7 +221,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
     case Txn.q(
            txn,
            """
-           SELECT a.state, a.holderKey, a.workItemId, w.ownerUserId
+           SELECT a.state, a.holderKey, a.openedBySession, a.workItemId, w.ownerUserId
            FROM assignments AS a
            LEFT JOIN work_items AS w ON w.id = a.workItemId
            WHERE a.id = ?1
@@ -231,11 +231,12 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
       [] ->
         {:error, error("unknown_assignment", "unknown assignment: #{assignment_id}")}
 
-      [[state, holder, work_item_id, owner_user_id]] ->
+      [[state, holder, opened_by_session, work_item_id, owner_user_id]] ->
         context = %{
           assignment_id: assignment_id,
           state: state,
           holder: holder,
+          opened_by_session: opened_by_session,
           work_item_id: work_item_id,
           owner_user_id: owner_user_id
         }
@@ -251,10 +252,20 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
   defp authorized?(_txn, %{kind: "user", ref: user}, %{owner_user_id: owner}),
     do: user == owner
 
-  defp authorized?(txn, %{kind: "session", ref: caller}, %{holder: holder}) do
-    case {product_owner_lane(txn, caller), product_owner_lane(txn, holder)} do
-      {lane, lane} when is_binary(lane) -> true
-      _ -> false
+  defp authorized?(txn, %{kind: "session", ref: caller}, %{
+         holder: holder,
+         opened_by_session: opened_by_session
+       }) do
+    if caller == opened_by_session do
+      true
+    else
+      case {product_owner_lane(txn, caller), product_owner_lane(txn, holder)} do
+        {lane, lane} when is_binary(lane) ->
+          true
+
+        _ ->
+          false
+      end
     end
   end
 

@@ -604,6 +604,10 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                     string_field("setting", "set_fast_mode"),
                     string_field("fastMode", value),
                 ],
+                TuneControl::Host(host) => vec![
+                    string_field("setting", "set_host"),
+                    string_field("host", host),
+                ],
             };
             Ok(request(
                 identity,
@@ -839,6 +843,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("assignmentId", assignment_id),
                 string_field("reason", reason),
             ],
+        )),
+        Command::CancelTurn {
+            identity,
+            session_key,
+        } => Ok(request(
+            identity,
+            "cancel",
+            vec![string_field("sessionKey", session_key)],
+            vec![],
         )),
         Command::RevokeAssignment {
             identity,
@@ -3550,6 +3563,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::DecisionRequests { identity, .. }
         | Command::DecisionRequest { identity, .. }
         | Command::AssignmentStopTurn { identity, .. }
+        | Command::CancelTurn { identity, .. }
         | Command::RevokeAssignment { identity, .. }
         | Command::ReopenAssignment { identity, .. }
         | Command::RepairAssignment { identity, .. }
@@ -4709,6 +4723,16 @@ mod tests {
                 "parent",
             ]),
             r#"{"as":"parent","verb":"cancel","params":{"assignmentId":"asg_1","reason":"replace the stale turn"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "cancel-turn",
+                "--session",
+                "worker s_1",
+                "--as-user",
+                "owner",
+            ]),
+            r#"{"asUser":"owner","verb":"cancel","sessionKey":"worker s_1","params":{}}"#
         );
         assert_eq!(
             body(&[

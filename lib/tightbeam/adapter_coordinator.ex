@@ -562,9 +562,14 @@ defmodule Tightbeam.AdapterCoordinator do
 
     reconcile_result =
       case process_row do
-        :no_launch -> :ok
-        _row when exited? -> Tightbeam.HarnessProcess.reconcile_key(state.db, key)
-        row -> Tightbeam.HarnessProcess.park(state.db, row)
+        :no_launch ->
+          :ok
+
+        _row when exited? ->
+          Tightbeam.HarnessProcess.reconcile_key(state.db, key)
+
+        row ->
+          Tightbeam.HarnessProcess.park(state.db, row)
       end
 
     result = if reconcile_result == :already_resolved, do: :ok, else: reconcile_result

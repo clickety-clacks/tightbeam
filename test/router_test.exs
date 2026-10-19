@@ -264,6 +264,17 @@ defmodule Tightbeam.Wire.RouterTest do
     }
   end
 
+  test "D2 artifact and nested attest collection routes dispatch through the read plane", ctx do
+    artifacts = get_device(ctx, ctx.device, "/api/artifacts")
+    assert artifacts.status == 200, artifacts.resp_body
+    assert JSON.decode!(artifacts.resp_body)["resource"] == "artifacts"
+
+    missing_parent = get_device(ctx, ctx.device, "/api/assignments/asg_missing/attests")
+    assert missing_parent.status == 404
+    assert JSON.decode!(missing_parent.resp_body)["resource"] == "attests"
+    assert JSON.decode!(missing_parent.resp_body)["error"]["code"] == "not_found"
+  end
+
   test "selected session REST routes use only the credential-derived read principal", ctx do
     session = create_session(ctx.db, "selected-session", ctx.device.user_id)
 
