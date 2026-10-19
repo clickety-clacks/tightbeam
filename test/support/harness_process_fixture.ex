@@ -815,6 +815,15 @@ defmodule Tightbeam.HarnessProcessFixture do
              match?([%{state: "running"}], AdapterCoordinator.harness_processes(coordinator))
            end)
 
+    # Reconciliation may settle the launch on a termination proof (probed via
+    # harness-check, so the wrapper sabotage above never fires) or kill it
+    # through the helper, depending on how fast the adapter process dies. A
+    # directory at the terminal-record path makes identity removal fail on
+    # both routes.
+    [%{identity_path: identity_path}] = AdapterCoordinator.harness_processes(coordinator)
+    File.mkdir!(identity_path <> ".failed")
+    File.write!(Path.join(identity_path <> ".failed", "residual"), "")
+
     Process.exit(adapter, :kill)
 
     assert_receive {:adapter_started, 2}, 2_000
