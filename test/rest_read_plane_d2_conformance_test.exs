@@ -62,10 +62,12 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     artifact_doc = record_artifact(db, flynn_session, work_item, "doc", "Visible document")
 
     other_work_item = create_work_item(db, "other", "Other owner's item")
+
     other_work_item_artifact =
       record_artifact(db, flynn_session, other_work_item, "data", "Creator-only artifact")
 
     admin_work_item = create_work_item(db, "admin", "Administrator-owned item")
+
     admin_work_item_artifact =
       record_artifact(db, other_session, admin_work_item, "other", "Owner-only artifact")
 
@@ -119,7 +121,8 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     }
   end
 
-  test "artifacts use canonical filters, visibility, keyset pages, and the closed public shape", ctx do
+  test "artifacts use canonical filters, visibility, keyset pages, and the closed public shape",
+       ctx do
     :ok = Artifacts.release(ctx.db, ctx.artifact_doc.artifact_id)
 
     assert {:ok, _rows} =
@@ -140,8 +143,10 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     assert decoded["resource"] == "artifacts"
     refute Map.has_key?(decoded, "dependencyVersion")
     assert Enum.sort(Enum.map(decoded["items"], & &1["kind"])) == ["doc", "report"]
+
     assert Enum.map(decoded["items"], & &1["artifactId"]) ==
              Enum.sort([ctx.artifact.artifact_id, ctx.artifact_doc.artifact_id])
+
     assert Plug.Conn.get_resp_header(filtered, "cache-control") == ["no-store"]
 
     for item <- decoded["items"] do
@@ -152,6 +157,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     end
 
     released = get(ctx, "/api/artifacts?workItemId=#{ctx.work_item.id}&state=released")
+
     assert Enum.map(JSON.decode!(released.resp_body)["items"], & &1["artifactId"]) == [
              ctx.artifact_doc.artifact_id
            ]
@@ -168,6 +174,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     assert first.status == 200
     first_page = JSON.decode!(first.resp_body)
     assert first_page["page"]["hasMoreAfter"]
+
     next_page =
       get(
         ctx,
@@ -179,6 +186,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     assert JSON.decode!(next_page.resp_body)["page"]["hasMoreBefore"]
 
     cursor = first_page["page"]["newestCursor"]
+
     cross_principal =
       get(
         ctx,
@@ -222,6 +230,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
 
     hidden_from_unlinked_user =
       get(ctx, "/api/artifacts?workItemId=#{ctx.other_work_item.id}", ctx.outsider_token)
+
     assert JSON.decode!(hidden_from_unlinked_user.resp_body)["items"] == []
 
     admin_user =
@@ -245,7 +254,8 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     assert JSON.decode!(admin_session.resp_body)["items"] == []
   end
 
-  test "assignment-attests bind the parent, filter before paging, and expose no private attest links", ctx do
+  test "assignment-attests bind the parent, filter before paging, and expose no private attest links",
+       ctx do
     insert_attest(ctx, "att_d2_001", ctx.assignment.id, 1001, "progress", %{note: "first"})
     insert_attest(ctx, "att_d2_002", ctx.assignment.id, 1001, "progress", %{note: "second"})
 
@@ -281,14 +291,17 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     [verdict_item] = JSON.decode!(verdict.resp_body)["items"]
     assert Enum.sort(Map.keys(verdict_item)) == Enum.sort(@attest_fields)
     assert verdict_item["rowVersion"] == 1003
+
     assert verdict_item["commitRefs"] == [
              %{"repo" => "example/repo", "commit" => "0123456789abcdef"}
            ]
+
     refute Map.has_key?(verdict_item, "artifactId")
     refute Map.has_key?(verdict_item, "contentSha256")
     refute Map.has_key?(verdict_item, "waitId")
 
     by_session = get(ctx, base <> "?bySession=#{ctx.flynn_session.session_key}")
+
     assert Enum.map(JSON.decode!(by_session.resp_body)["items"], & &1["id"]) == [
              "att_d2_001",
              "att_d2_002"

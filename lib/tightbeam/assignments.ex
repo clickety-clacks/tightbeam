@@ -1306,7 +1306,7 @@ defmodule Tightbeam.Assignments do
 
   defp attest_collection_where(assignment_id, filters) do
     Enum.reduce(filters, {"att.assignmentId = ?", [assignment_id]}, fn {field, values},
-                                                                         {where, params} ->
+                                                                       {where, params} ->
       column =
         case field do
           "assignmentId" -> "att.assignmentId"

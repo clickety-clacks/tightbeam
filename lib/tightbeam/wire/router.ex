@@ -1730,8 +1730,10 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp d1_collection_parent_scope(request, :artifacts, nil), do: {:ok, request}
+
   defp d1_collection_parent_scope(_request, :assignment_attests, _parent_id),
     do: {:error, 404, "not_found", nil}
+
   defp d1_collection_parent_scope(request, _resource, _parent_id), do: {:ok, request}
 
   defp d1_d2_filter_validation(:artifacts, filters) do
