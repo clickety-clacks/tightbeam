@@ -2291,12 +2291,27 @@ defmodule Tightbeam.HarnessHealthTest do
                [failed.session, message_id]
              )
 
-    repeated_refusal =
-      fail_health_turn!(ctx.db, failed.session, message_id, prompt, reason,
+    # The normal lane claims the queued redelivery first. Stage a failed retry
+    # directly to exercise INSERT OR IGNORE against this otherwise unreachable
+    # intermediate row state.
+    {:ok, retry_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: failed.session,
+        message_id: message_id,
+        origin: "agent:health-redelivery",
+        prompt: prompt,
         assignment_id: failed.assignment
-      )
+      })
 
-    assert repeated_refusal.seq > redelivery_seq
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE turns SET status='failed' WHERE seq=?1", [retry_seq])
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.record_health_redelivery_source_in_txn(txn, retry_seq, "adapter_unavailable")
+             end)
+
+    assert retry_seq > redelivery_seq
     first_source_seq = first_refusal.seq
     restoration_seq = restoration.seq
 
