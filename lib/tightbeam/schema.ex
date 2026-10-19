@@ -1817,6 +1817,14 @@ defmodule Tightbeam.Schema do
     # DDL, later migrations and final marker publication. Runtime handles and
     # SQLite busy_timeout are unaffected.
     db = DB.migration_context(db)
+
+    {:ok, existing_tables} =
+      DB.query(
+        db,
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
+      )
+
+    fresh? = existing_tables == []
     :ok = ensure_stamp_table(db)
     :ok = ensure_fresh_owner_link_origin(db)
     :ok = check_shape(db)
@@ -1941,7 +1949,9 @@ defmodule Tightbeam.Schema do
     :ok = migrate_continuation_retry_guard(db)
     :ok = upgrade_decision_request_row_schema_revision(db)
     :ok = ensure_hot_query_indexes(db)
-    :ok = ensure_supervision_source_indexes(db)
+
+    # An upgraded database builds these after boot, from the wake scheduler.
+    :ok = if fresh?, do: build_supervision_source_indexes_now(db), else: :ok
     :ok = migrate_retired_workspace_cleanup(db)
     :ok = Tightbeam.Ephemeral.migrate(db)
 
@@ -3045,32 +3055,46 @@ defmodule Tightbeam.Schema do
     end
   end
 
-  defp ensure_supervision_source_indexes(db) do
-    indexes = [
-      "CREATE INDEX IF NOT EXISTS wakes_assignment_consumer_created_order " <>
-        "ON wakes(assignmentId,consumer,createdAt DESC,wakeId DESC)",
-      "CREATE INDEX IF NOT EXISTS wakes_assignment_consumer_pending_created " <>
-        "ON wakes(assignmentId,consumer,createdAt DESC,wakeId DESC) WHERE state='pending'",
-      "CREATE INDEX IF NOT EXISTS wakes_assignment_pending_created_order " <>
-        "ON wakes(assignmentId,createdAt DESC,wakeId DESC) WHERE state='pending'",
-      "CREATE INDEX IF NOT EXISTS wakes_activity_source_order " <>
-        "ON wakes(assignmentId,creatorSessionKey,createdAt DESC)",
-      "CREATE INDEX IF NOT EXISTS attests_activity_source_order " <>
-        "ON attests(assignmentId,bySession,ts DESC)",
-      "CREATE INDEX IF NOT EXISTS attests_terminal_action_note " <>
-        "ON attests(bySession,kind,note COLLATE NOCASE)",
-      "CREATE INDEX IF NOT EXISTS artifacts_activity_source_order " <>
-        "ON artifacts(producedByAssignmentId,createdBySession,createdAt DESC)",
-      "CREATE INDEX IF NOT EXISTS decision_requests_activity_source_order " <>
-        "ON decision_requests(assignmentId,raiserSessionKey,raisedAt DESC)",
-      "CREATE INDEX IF NOT EXISTS assignment_reopenings_activity_source_order " <>
-        "ON assignment_reopenings(assignmentId,ts DESC)",
-      "CREATE INDEX IF NOT EXISTS wakes_pending_session_obligation " <>
-        "ON wakes(sessionKey,obligationRef) WHERE state='pending'"
-    ]
+  @supervision_source_indexes [
+    {"wakes_assignment_consumer_created_order",
+     "CREATE INDEX IF NOT EXISTS wakes_assignment_consumer_created_order " <>
+       "ON wakes(assignmentId,consumer,createdAt DESC,wakeId DESC)"},
+    {"wakes_assignment_consumer_pending_created",
+     "CREATE INDEX IF NOT EXISTS wakes_assignment_consumer_pending_created " <>
+       "ON wakes(assignmentId,consumer,createdAt DESC,wakeId DESC) WHERE state='pending'"},
+    {"wakes_assignment_pending_created_order",
+     "CREATE INDEX IF NOT EXISTS wakes_assignment_pending_created_order " <>
+       "ON wakes(assignmentId,createdAt DESC,wakeId DESC) WHERE state='pending'"},
+    {"wakes_activity_source_order",
+     "CREATE INDEX IF NOT EXISTS wakes_activity_source_order " <>
+       "ON wakes(assignmentId,creatorSessionKey,createdAt DESC)"},
+    {"attests_activity_source_order",
+     "CREATE INDEX IF NOT EXISTS attests_activity_source_order " <>
+       "ON attests(assignmentId,bySession,ts DESC)"},
+    {"attests_terminal_action_note",
+     "CREATE INDEX IF NOT EXISTS attests_terminal_action_note " <>
+       "ON attests(bySession,kind,note COLLATE NOCASE)"},
+    {"artifacts_activity_source_order",
+     "CREATE INDEX IF NOT EXISTS artifacts_activity_source_order " <>
+       "ON artifacts(producedByAssignmentId,createdBySession,createdAt DESC)"},
+    {"decision_requests_activity_source_order",
+     "CREATE INDEX IF NOT EXISTS decision_requests_activity_source_order " <>
+       "ON decision_requests(assignmentId,raiserSessionKey,raisedAt DESC)"},
+    {"assignment_reopenings_activity_source_order",
+     "CREATE INDEX IF NOT EXISTS assignment_reopenings_activity_source_order " <>
+       "ON assignment_reopenings(assignmentId,ts DESC)"},
+    {"wakes_pending_session_obligation",
+     "CREATE INDEX IF NOT EXISTS wakes_pending_session_obligation " <>
+       "ON wakes(sessionKey,obligationRef) WHERE state='pending'"}
+  ]
 
-    # Run once and recorded, like the hot query indexes. A failed build leaves
-    # no record, so the next boot retries it; this boot serves without them.
+  # Run once and recorded after the gateway serves: each pass builds at most one
+  # missing index in its own transaction, so ordinary work runs between them.
+  # Queries are correct without these indexes, only slower. A failed pass
+  # records nothing and the caller retries it.
+  @doc false
+  @spec build_supervision_source_index(DB.server()) :: :done | :more | {:error, term()}
+  def build_supervision_source_index(db) do
     case DB.migration_transaction(db, :supervision_source_indexes_v1, [], [], fn txn ->
            :ok =
              Txn.exec(txn, """
@@ -3082,34 +3106,54 @@ defmodule Tightbeam.Schema do
 
            case Txn.q(txn, "SELECT id,appliedAt FROM supervision_source_indexes_migration") do
              [] ->
-               Enum.each(indexes, &(:ok = Txn.exec(txn, &1)))
+               missing =
+                 Enum.find(@supervision_source_indexes, fn {name, _sql} ->
+                   Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1", [
+                     name
+                   ]) == []
+                 end)
 
-               Txn.q(
-                 txn,
-                 "INSERT INTO supervision_source_indexes_migration(id,appliedAt) VALUES(0,?1)",
-                 [System.system_time(:millisecond)]
-               )
+               case missing do
+                 {_name, sql} ->
+                   :ok = Txn.exec(txn, sql)
+                   :more
+
+                 nil ->
+                   Txn.q(
+                     txn,
+                     "INSERT INTO supervision_source_indexes_migration(id,appliedAt) VALUES(0,?1)",
+                     [System.system_time(:millisecond)]
+                   )
+
+                   :done
+               end
 
              [[0, applied_at]] when is_integer(applied_at) and applied_at >= 0 ->
-               :ok
+               :done
 
              rows ->
                raise ShapeError,
                  message: "incompatible_supervision_source_indexes_migration: #{inspect(rows)}"
            end
-
-           :ok
          end) do
-      {:ok, :ok} ->
-        :ok
+      {:ok, result} ->
+        result
 
       {:error, error} ->
         Logger.warning(
-          "supervision source indexes were not built; continuing without them: " <>
-            Exception.message(error)
+          "supervision source index build deferred: " <> Exception.message(error)
         )
 
-        :ok
+        {:error, error}
+    end
+  end
+
+  # A fresh database has empty tables, so its first boot builds them at once.
+  defp build_supervision_source_indexes_now(db) do
+    case build_supervision_source_index(db) do
+      :more -> build_supervision_source_indexes_now(db)
+      :done -> :ok
+      {:error, error} -> raise error
     end
   end
 
@@ -4421,26 +4465,25 @@ defmodule Tightbeam.Schema do
   @doc false
   @spec upgrade_effort_holder_activity_cancellation_v1(DB.server()) :: :ok
   def upgrade_effort_holder_activity_cancellation_v1(db) do
-    {:ok, [[foreign_keys]]} = DB.query(db, "PRAGMA foreign_keys")
-    {:ok, [[legacy_alter_table]]} = DB.query(db, "PRAGMA legacy_alter_table")
-    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
-    :ok = DB.execute(db, "PRAGMA legacy_alter_table = ON")
+    # Run once and recorded by its epoch row. The restore pragma also covers a
+    # failed transaction, so schema editing is never left enabled.
+    case DB.migration_transaction(
+           db,
+           :effort_holder_activity_cancellation_v1,
+           [],
+           ["PRAGMA writable_schema = OFF"],
+           &upgrade_effort_holder_activity_cancellation_v1_in_txn/1
+         ) do
+      {:ok, :ok} ->
+        :ok
 
-    # Run once and recorded by its epoch row. A refusal rolls back, leaves the
-    # previous cancellation table in place and does not block boot.
-    try do
-      case DB.transaction(db, &upgrade_effort_holder_activity_cancellation_v1_in_txn/1) do
-        {:ok, :ok} ->
-          :ok
+      {:error, %ShapeError{} = error} ->
+        raise error
 
-        {:error, error} ->
-          Logger.error("effort holder activity cancellation migration skipped: #{inspect(error)}")
-
-          :ok
-      end
-    after
-      :ok = DB.execute(db, "PRAGMA legacy_alter_table = #{legacy_alter_table}")
-      :ok = DB.execute(db, "PRAGMA foreign_keys = #{foreign_keys}")
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_effort_holder_activity_cancellation_v1: migration failed: #{Exception.message(error)}"
     end
   end
 
@@ -4477,10 +4520,12 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  # The new CHECK only adds alternatives, so every stored row already satisfies
+  # it and the table's stored format is unchanged. SQLite's documented
+  # procedure for such a change rewrites the stored definition in place, with
+  # no table copy, so boot does no data work here:
+  # https://sqlite.org/lang_altertable.html#otheralter
   defp migrate_effort_holder_activity_cancellation_v1_in_txn(txn) do
-    previous_fk_violations =
-      Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wake_cancellations))
-
     old_table =
       Enum.find(
         @assignment_source_replacement_liveness_objects,
@@ -4497,50 +4542,34 @@ defmodule Tightbeam.Schema do
 
     trigger_names = ~w(wake_cancellations_pending_insert wakes_typed_cancellation_required)
 
-    old_triggers =
-      Enum.filter(@assignment_source_replacement_liveness_objects, fn object ->
-        object.type == "trigger" and object.name in trigger_names
-      end)
-
-    new_triggers =
+    triggers =
       Enum.filter(@effort_holder_activity_cancellation_objects, fn object ->
         object.type == "trigger" and object.name in trigger_names
       end)
 
     validate_owned_object!(txn, old_table)
-    Enum.each(old_triggers, &validate_owned_object!(txn, &1))
-    Enum.each(old_triggers, &Txn.exec(txn, "DROP TRIGGER #{&1.name}"))
+    Enum.each(triggers, &validate_owned_object!(txn, &1))
 
-    [[cancellation_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
+    stored_sql =
+      new_table.sql
+      |> String.replace(~r/\bIF\s+NOT\s+EXISTS\s+/u, "", global: false)
+      |> String.trim()
+      |> String.trim_trailing(";")
 
-    :ok =
-      Txn.exec(
-        txn,
-        "ALTER TABLE wake_cancellations RENAME TO wake_cancellations_effort_activity_previous_v1"
-      )
-
-    :ok = Txn.exec(txn, new_table.sql)
-
-    columns =
-      "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
-        "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
-        "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
-        "livenessTriggerKind,livenessTriggerId,actionNeeded"
+    [[schema_version]] = Txn.q(txn, "PRAGMA schema_version")
+    :ok = Txn.exec(txn, "PRAGMA writable_schema = ON")
 
     Txn.q(
       txn,
-      "INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM wake_cancellations_effort_activity_previous_v1"
+      "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='wake_cancellations'",
+      [stored_sql]
     )
 
-    if Txn.changes(txn) != cancellation_count do
-      raise ShapeError,
-        message:
-          "effort holder activity cancellation migration copied #{Txn.changes(txn)} of #{cancellation_count} rows"
-    end
-
-    [[^cancellation_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
-    :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_effort_activity_previous_v1")
-    Enum.each(new_triggers, &Txn.exec(txn, &1.sql))
+    1 = Txn.changes(txn)
+    :ok = Txn.exec(txn, "PRAGMA schema_version = #{schema_version + 1}")
+    # RESET also reloads this connection's schema, so the owner enforces the
+    # new CHECK at once; the version bump makes other connections reload.
+    :ok = Txn.exec(txn, "PRAGMA writable_schema = RESET")
     :ok = Txn.exec(txn, marker.sql)
 
     Txn.q(
@@ -4550,19 +4579,8 @@ defmodule Tightbeam.Schema do
     )
 
     validate_owned_object!(txn, new_table)
-    Enum.each(new_triggers, &validate_owned_object!(txn, &1))
+    Enum.each(triggers, &validate_owned_object!(txn, &1))
     validate_owned_object!(txn, marker)
-
-    case Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wake_cancellations)) --
-           previous_fk_violations do
-      [] ->
-        :ok
-
-      rows ->
-        raise ShapeError,
-          message:
-            "effort holder activity cancellation migration left invalid foreign keys: #{inspect(rows)}"
-    end
   end
 
   @doc false

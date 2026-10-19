@@ -129,7 +129,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     refute third.wake_id in [first.wake_id, second.wake_id]
   end
 
-  test "the turn-end sweep recovers a terminal reminder when the gateway stops after root delivery",
+  test "the slow check recovers a terminal reminder lost to a stop after delivery before the turn ends",
        ctx do
     stop_supervised!(ctx.scheduler)
     {_parent_assignment, _child_assignment, root} = completed_child(ctx)
@@ -152,14 +152,19 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert Wakes.get(ctx.db, root.wake_id).delivered_turn_seq != nil
     assert reminders(ctx.db, root.wake_id) == []
 
-    # The stop lost the post-delivery action. After boot the recipient's turn
-    # ends and the turn-end sweep acts from the delivered record.
-    finish_carrier_turn!(ctx.db, root.wake_id)
-    assert reminders(ctx.db, root.wake_id) == []
+    # The stop lost the post-delivery action. After boot the slow check acts
+    # from the delivered record while the recipient's turn is still queued.
+    assert {:ok, [[nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT endedAt FROM turns WHERE wakeId=?1 AND sessionKey='notice-parent'",
+               [root.wake_id]
+             )
 
     sweeper =
       start_supervised!(
-        {Tightbeam.Productions.BubbleSweeper, db: ctx.db, name: :completion_handoff_sweeper}
+        {Tightbeam.Productions.BubbleSweeper,
+         db: ctx.db, interval: 3_600_000, name: :completion_handoff_sweeper}
       )
 
     Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
@@ -167,6 +172,8 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert [reminder] = pending_reminders(ctx.db, root.wake_id)
     assert reminder.session_key == "notice-parent"
 
+    # The turn ending later does not repeat the action.
+    finish_carrier_turn!(ctx.db, root.wake_id)
     Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
     assert [^reminder] = pending_reminders(ctx.db, root.wake_id)
   end
@@ -190,8 +197,6 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
                  fire_wake_in_txn: true
                )
              end)
-
-    finish_carrier_turn!(ctx.db, root.wake_id)
 
     assert {:ok, [[seq]]} =
              DB.query(
@@ -219,7 +224,11 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
          db: ctx.db, interval: 3_600_000, name: :completion_handoff_retry_sweeper}
       )
 
+    # Failed attempts while the turn is queued and after it ends are not
+    # remembered as done.
     ExUnit.CaptureLog.capture_log(fn ->
+      for _ <- 1..3, do: Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
+      finish_carrier_turn!(ctx.db, root.wake_id)
       for _ <- 1..6, do: Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
     end)
 

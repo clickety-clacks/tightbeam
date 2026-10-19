@@ -593,12 +593,13 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc """
-  Act on the delivered records a finished turn carried.
+  Act on the delivered records a turn carried.
 
-  The turn-end sweeper calls this for every terminal turn, after the delivery
-  step's own post-commit attempt. Each source action is idempotent, so a turn
-  whose follow-through already ran is a no-op; a turn whose follow-through was
-  lost to a restart is repaired from its delivered records.
+  The turn-end sweeper calls this for every turn past its cursor, ended or
+  not, after the delivery step's own post-commit attempt. Each source action
+  is idempotent, so a turn whose follow-through already ran is a no-op; a turn
+  whose follow-through was lost to a restart is repaired from its delivered
+  records.
   """
   @spec reconcile_turn_delivered_sources(DB.server(), integer()) :: :ok | {:error, term()}
   def reconcile_turn_delivered_sources(db, seq) when is_integer(seq) do
@@ -1045,7 +1046,7 @@ defmodule Tightbeam.Wakes do
 
     txn
     |> Txn.q(
-      "SELECT id,note FROM attests INDEXED BY attests_terminal_action_note " <>
+      "SELECT id,note FROM attests " <>
         "WHERE bySession=?1 AND kind='progress' AND note LIKE ?2 ESCAPE ?3 ORDER BY rowid",
       [parent, pattern, "\\"]
     )
@@ -6414,6 +6415,7 @@ defmodule Tightbeam.Wakes do
     Process.send_after(self(), :detect_misses, @miss_detector_ms)
     send(self(), :recover_notices)
     Process.send_after(self(), :backfill_wake_delivery, 100)
+    Process.send_after(self(), :build_supervision_source_index, 100)
 
     {:ok, invalid} =
       DB.query(
@@ -6501,6 +6503,23 @@ defmodule Tightbeam.Wakes do
       :overloaded -> Process.send_after(self(), :backfill_wake_delivery, 5_000)
       :more -> Process.send_after(self(), :backfill_wake_delivery, 100)
       {:error, _error} -> Process.send_after(self(), :backfill_wake_delivery, 5_000)
+      :done -> :ok
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info(:build_supervision_source_index, state) do
+    result =
+      DB.background_pass(
+        fn -> Tightbeam.Schema.build_supervision_source_index(state.db) end,
+        :overloaded
+      )
+
+    case result do
+      :overloaded -> Process.send_after(self(), :build_supervision_source_index, 5_000)
+      :more -> Process.send_after(self(), :build_supervision_source_index, 100)
+      {:error, _error} -> Process.send_after(self(), :build_supervision_source_index, 60_000)
       :done -> :ok
     end
 
