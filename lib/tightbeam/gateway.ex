@@ -7290,13 +7290,20 @@ defmodule Tightbeam.Gateway do
          params[:after_turn] != true and is_binary(params[:assignment_id]) do
       case Assignments.condition_wait_hint(db, params.assignment_id) do
         %{kind: kind, scope: scope} = hint ->
+          record_message =
+            case Map.get(hint, :record_dependency) do
+              %{message: message} when is_binary(message) -> message
+              _ -> "This recheck can wait on #{kind} at scope #{scope}."
+            end
+
           Map.put(
             response,
             :fact_hint,
             Map.merge(hint, %{
               advisory: true,
               message:
-                "Advisory: this recheck can wait on #{kind} at scope #{scope} with --when-fact #{kind} --when-scope #{scope} --fallback-after 2h."
+                "Advisory: #{record_message} The legacy --when-fact #{kind} at scope " <>
+                  "#{scope} resolves only on its completion-attestation producer."
             })
           )
 
