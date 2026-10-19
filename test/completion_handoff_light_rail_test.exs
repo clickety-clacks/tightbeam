@@ -159,6 +159,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
   end
 
   test "a retired opener is routed to Main when the finish notice is stored", ctx do
+    stop_supervised!(ctx.scheduler)
     item = create_work_item(ctx, "completion with retired opener")
     personal = Org.personal_session_key("flynn")
     session(ctx.db, personal, "flynn")
@@ -187,6 +188,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert root.session_key == personal
     assert reminders(ctx.db, root.wake_id) == []
 
+    start_scheduler(ctx.db)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, root.wake_id).state == "fired"
     assert_delivered_carrier(ctx.db, root.wake_id)
