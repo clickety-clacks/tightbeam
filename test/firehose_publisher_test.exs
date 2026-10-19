@@ -1,7 +1,19 @@
 defmodule Tightbeam.Firehose.PublisherTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConnRegistry, DB, Dispatch, Escalation, Gateway, Ledger, Org, Wakes}
+  alias Tightbeam.{
+    ConnRegistry,
+    DB,
+    Dispatch,
+    Escalation,
+    Gateway,
+    Ledger,
+    Org,
+    Projection,
+    StateResources,
+    Wakes
+  }
+
   alias Tightbeam.NoticeBatcher
   alias Tightbeam.Firehose.{Hub, Publisher}
 
@@ -724,6 +736,60 @@ defmodule Tightbeam.Firehose.PublisherTest do
              "refs" => %{"messageId" => "s_1"},
              "payload" => %{"id" => "s_1", "rowVersion" => 9}
            } = receive_notice()
+  end
+
+  test "a substrate append publishes one canonical message.created after commit" do
+    db = :firehose_substrate_append_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    :ok =
+      Hub.register(Hub, self(), %{mode: :subscribed, db: db, user_id: "flynn", is_admin: false})
+
+    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
+    register_testhost(db)
+
+    session_key = "firehose-substrate-target"
+
+    Org.create(db, %{
+      session_key: session_key,
+      display_name: "Substrate target",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    :ok =
+      Hub.subscribe(Hub, self(), "substrate-appends", %{
+        "classes" => ["message.created"],
+        "sessionKey" => session_key
+      })
+
+    assert {:ok, {:appended, message}} =
+             DB.transaction(db, fn txn ->
+               Projection.append_substrate_in_txn(txn, session_key, "A substrate notice")
+             end)
+
+    notice = receive_notice()
+    assert notice["class"] == "message.created"
+    assert notice["refs"]["messageId"] == message.id
+
+    item =
+      db
+      |> StateResources.query_message(message.id)
+      |> StateResources.message()
+
+    assert notice["payload"] == item
+    item_bytes = StateResources.encode_item("transcript messages", item)
+    wire_notice = Publisher.encode_wire_notice(notice)
+    assert String.contains?(wire_notice, "\"payload\":" <> item_bytes)
+
+    :sys.get_state(Hub)
+    refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
   end
 
   @tag rest_r7_closure: true

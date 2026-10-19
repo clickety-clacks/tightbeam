@@ -33,7 +33,7 @@ defmodule Tightbeam.Gateway do
   3. No pointer yet → Adapter.new_session, append pointer "created".
   4. Adapter.prompt; append each distinct ACP assistant message to Projection
      (sender "tightbeam", reply_to the echo) in one transaction, then publish
-     each committed row via ConnRegistry in seq order.
+     each committed row to Firehose and ConnRegistry in seq order.
   5. Terminal: Ledger.finish CAS in the lane; broadcast terminal
      prompt_turn_state + typing(off) + activity(off). Golden frame order for
      the canonical turn: echo → accepted → running → typing(on) →
@@ -3338,6 +3338,7 @@ defmodule Tightbeam.Gateway do
           attention_tier: attention_tier
         })
 
+      Tightbeam.Firehose.Publisher.message_in_txn(txn, turn.session_key, reply)
       reply
     end)
   end
@@ -6755,13 +6756,20 @@ defmodule Tightbeam.Gateway do
          params[:after_turn] != true and is_binary(params[:assignment_id]) do
       case Assignments.condition_wait_hint(db, params.assignment_id) do
         %{kind: kind, scope: scope} = hint ->
+          record_message =
+            case Map.get(hint, :record_dependency) do
+              %{message: message} when is_binary(message) -> message
+              _ -> "This recheck can wait on #{kind} at scope #{scope}."
+            end
+
           Map.put(
             response,
             :fact_hint,
             Map.merge(hint, %{
               advisory: true,
               message:
-                "Advisory: this recheck can wait on #{kind} at scope #{scope} with --when-fact #{kind} --when-scope #{scope} --fallback-after 2h."
+                "Advisory: #{record_message} The legacy --when-fact #{kind} at scope " <>
+                  "#{scope} resolves only on its completion-attestation producer."
             })
           )
 
@@ -7977,6 +7985,13 @@ defmodule Tightbeam.Gateway do
                 to: describe_engine(harness, model)
               })
 
+            Tightbeam.Firehose.Publisher.message_in_txn(
+              txn,
+              call.session_key,
+              marker,
+              session.owner_user_id
+            )
+
             Org.append_pointer_in_txn(txn, call.session_key, destination_sid, "created")
             marker
           end)
@@ -8651,6 +8666,13 @@ defmodule Tightbeam.Gateway do
                    to: Model.describe(new_ref)
                  })
 
+               Tightbeam.Firehose.Publisher.message_in_txn(
+                 txn,
+                 session.session_key,
+                 marker,
+                 session.owner_user_id
+               )
+
                {:changed, marker}
 
              {:duplicate, _current} ->
@@ -8714,6 +8736,13 @@ defmodule Tightbeam.Gateway do
                 from: Model.describe(session.model),
                 to: Model.describe(new_ref)
               })
+
+            Tightbeam.Firehose.Publisher.message_in_txn(
+              txn,
+              session.session_key,
+              marker,
+              session.owner_user_id
+            )
 
             {:changed, marker}
 
@@ -9930,13 +9959,7 @@ defmodule Tightbeam.Gateway do
   # are not structural markers; only Projection.append_marker stamps one of
   # the three structured boundary kinds.
   defp append_substrate(db, session_key, content) do
-    case Projection.append(db, %{
-           session_key: session_key,
-           role: "assistant",
-           content: content,
-           sender: "process:tightbeam",
-           message_type: "substrate"
-         }) do
+    case Projection.append_substrate(db, session_key, content) do
       {:appended, notice} -> publish_message(db, session_key, notice)
       _ -> :ok
     end

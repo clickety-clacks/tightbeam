@@ -10,7 +10,8 @@ end
 
 defmodule GuardSplitMessages do
   import ExUnit.Assertions
-  alias Tightbeam.{ConnRegistry, Gateway, Ledger, Model, Org, Projection}
+  alias Tightbeam.{ConnRegistry, Gateway, Ledger, Model, Org, Projection, StateResources}
+  alias Tightbeam.Firehose.{Hub, Publisher}
   alias Tightbeam.GatewayTurnFixture.{AdapterStub, CoordinatorStub}
 
   def run do
@@ -26,6 +27,16 @@ defmodule GuardSplitMessages do
         provider: "anthropic",
         model: Model.new("fable")
       })
+
+      {:ok, _hub} = Hub.start_link(name: Hub)
+
+      :ok =
+        Hub.register(Hub, self(), %{
+          mode: :subscribed,
+          db: db,
+          user_id: "flynn",
+          is_admin: false
+        })
 
       {:ok, lane} = GenServer.start_link(GuardSplitDoorbell, self())
       {:ok, adapter} = AdapterStub.start_link(self())
@@ -56,6 +67,12 @@ defmodule GuardSplitMessages do
                    client_message_id: "c_boundaries"
                  )
 
+        :ok =
+          Hub.subscribe(Hub, self(), "messages", %{
+            "classes" => ["message.created"],
+            "sessionKey" => "k1"
+          })
+
         assert {:ok, turn} = Ledger.claim_next(db, "k1", "test")
         echo = Projection.get(db, turn.message_id)
         task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
@@ -84,6 +101,11 @@ defmodule GuardSplitMessages do
                  ]
 
           assert Enum.map(replies, & &1.seq) == Enum.sort(Enum.map(replies, & &1.seq))
+
+          notices = Enum.map(1..2, fn _ -> receive_notice() end)
+          assert Enum.map(notices, & &1["class"]) == ["message.created", "message.created"]
+          assert Enum.map(notices, & &1["refs"]["messageId"]) == Enum.map(replies, & &1.id)
+          Enum.each(notices, &assert_notice_matches_rest!(&1, db))
 
           frames = collect_pushes(10, [])
 
@@ -128,6 +150,12 @@ defmodule GuardSplitMessages do
                      client_message_id: "c_recovered_result"
                    )
 
+          late_echo_notice = receive_notice()
+          assert late_echo_notice["payload"]["role"] == "user"
+          assert late_echo_notice["payload"]["clientMessageId"] == "c_recovered_result"
+          assert late_echo_notice["payload"]["content"] =~ "late assistant result"
+          assert_notice_matches_rest!(late_echo_notice, db)
+
           {:ok, session_lane} =
             Tightbeam.SessionLane.start_link(
               session_key: "k1",
@@ -168,6 +196,9 @@ defmodule GuardSplitMessages do
             refute_receive {:push_message, _, _,
                             %{"role" => "assistant", "content" => "LATE ASSISTANT RESULT"}},
                            100
+
+            :sys.get_state(Hub)
+            refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
           after
             GenServer.stop(session_lane)
             Supervisor.stop(task_sup)
@@ -231,6 +262,24 @@ defmodule GuardSplitMessages do
        do: "activity:#{active}"
 
   defp frame_name(%{"type" => "ack"}), do: "ack"
+
+  defp receive_notice do
+    assert_receive {:firehose_notice, notice}, 60_000
+    Hub.delivered(Hub, self())
+    notice
+  end
+
+  defp assert_notice_matches_rest!(notice, db) do
+    item =
+      db
+      |> StateResources.query_message(notice["payload"]["id"])
+      |> StateResources.message()
+
+    assert notice["payload"] == item
+    item_bytes = StateResources.encode_item("transcript messages", item)
+    wire_notice = Publisher.encode_wire_notice(notice)
+    assert String.contains?(wire_notice, "\"payload\":" <> item_bytes)
+  end
 end
 
 GuardSplitMessages.run()

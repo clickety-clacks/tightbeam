@@ -31,6 +31,10 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   - `identity/` — archetypes, guidance and rails, WITH its git repo: the
     identity seam refuses to work from a dirty tree, so the copy keeps
     `.git` and commits nothing.
+  - bin/tightbeam — the candidate CLI, built from the same clean checkout as
+    the gateway before provisioning. Catalog preflight resolves this binary
+    through the leg's base directory, so a template binary could test a
+    different build.
 
   What is NOT copied: `state.db`, `gateway.json`, logs, `work/`. Those are the
   org's history, and history is the thing a fresh leg must not have.
@@ -55,12 +59,12 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   @doc """
   Copies a provisioned template org into `base_dir` (which must not exist).
 
-  Raises when the template is missing the credential material a leg needs —
+  Raises when template credentials or the candidate CLI are missing —
   failing at provisioning with a legible message beats failing three journeys
   later as `model_unavailable`.
   """
-  @spec provision!(String.t(), String.t()) :: String.t()
-  def provision!(template_dir, base_dir) do
+  @spec provision!(String.t(), String.t(), String.t()) :: String.t()
+  def provision!(template_dir, base_dir, cli_path) do
     if File.exists?(base_dir) do
       raise "client-e2e leg base_dir already exists: #{base_dir} (each leg provisions a fresh one)"
     end
@@ -69,11 +73,23 @@ defmodule Tightbeam.ClientE2E.LegGateway do
       raise "no template org at #{template_dir}"
     end
 
+    unless File.regular?(cli_path) do
+      raise "no candidate CLI at #{cli_path}"
+    end
+
     File.mkdir_p!(base_dir)
 
     for dir <- @copied, File.dir?(Path.join(template_dir, dir)) do
       File.cp_r!(Path.join(template_dir, dir), Path.join(base_dir, dir))
     end
+
+    # The catalog preflight executes this binary from the fresh base. Always
+    # copy it from the current candidate build; never inherit a template's CLI.
+    bin_dir = Path.join(base_dir, "bin")
+    File.mkdir_p!(bin_dir)
+    leg_cli = Path.join(bin_dir, "tightbeam")
+    File.cp!(cli_path, leg_cli)
+    File.chmod!(leg_cli, 0o755)
 
     base_dir
   end

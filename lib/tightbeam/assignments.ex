@@ -1458,12 +1458,32 @@ defmodule Tightbeam.Assignments do
   defp condition_wait_hint(assignment_id) do
     kind = "assignment-landed"
 
+    record_condition = %{
+      fact: "assignment.state",
+      op: "eq",
+      value: "closed"
+    }
+
+    record_dependency = %{
+      conditions: [record_condition],
+      bindings: %{"assignmentId" => assignment_id},
+      message:
+        "Partial row-condition hint only; it is not a complete --predicate. For any terminal " <>
+          "card outcome, use assignment.state with assignmentId=#{assignment_id}. Registering " <>
+          "a durable row wait also requires a caller-selected resolverRef (an accessible " <>
+          "same-owner assignment or decision_request), a nonblank necessity, and verificationRef " <>
+          "(an accessible same-owner open assignment)."
+    }
+
     %{
       kind: kind,
       scope: assignment_id,
       fallback_after: "2h",
+      record_dependency: record_dependency,
       message:
-        "Wait for this card with --when-fact #{kind} --when-scope #{assignment_id} --fallback-after 2h.",
+        "For any terminal card outcome, use the assignment.state row condition with " <>
+          "assignmentId=#{assignment_id}. The legacy --when-fact #{kind} path is for a " <>
+          "completion attestation only.",
       example:
         "tightbeam wake --session <session> --when-fact #{kind} --when-scope #{assignment_id} --fallback-after 2h --prompt \"re-read this card\""
     }
@@ -2247,9 +2267,8 @@ defmodule Tightbeam.Assignments do
 
     predecessor = fetch_assignment(txn, predecessor_id)
 
-    if is_nil(predecessor) or
-         not successor_predecessor_visible?(txn, call.principal, predecessor),
-       do: successor_error!("unknown_assignment", "unknown assignment: #{supplied}")
+    if is_nil(predecessor),
+      do: successor_error!("unknown_assignment", "unknown assignment: #{supplied}")
 
     if predecessor.state != "closed",
       do:
@@ -2307,31 +2326,6 @@ defmodule Tightbeam.Assignments do
           :unknown
         end
     end
-  end
-
-  defp successor_predecessor_visible?(txn, principal, predecessor) do
-    work_owner =
-      case predecessor.workItemId do
-        nil ->
-          nil
-
-        work_item_id ->
-          case Txn.q(txn, "SELECT ownerUserId FROM work_items WHERE id = ?1", [work_item_id]) do
-            [[owner_user_id]] -> owner_user_id
-            [] -> nil
-          end
-      end
-
-    principal in Enum.reject(
-      [
-        {:session, predecessor.holderKey},
-        predecessor.openedBySession && {:session, predecessor.openedBySession},
-        predecessor.openedByUser && {:user, predecessor.openedByUser},
-        work_owner && {:user, work_owner},
-        work_owner && {:session, Org.personal_session_key(work_owner)}
-      ],
-      &is_nil/1
-    )
   end
 
   defp successor_chain_in_txn!(

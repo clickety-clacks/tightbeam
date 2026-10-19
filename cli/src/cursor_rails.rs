@@ -80,6 +80,40 @@ fn read_payload(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+pub(crate) fn verify_managed(home: &Path, expected: &str) -> Result<(), String> {
+    let home_fd = open_dir_path(home).map_err(|error| {
+        format!(
+            "cursor execution identity refused: managed execution home is not a stable directory: {error}"
+        )
+    })?;
+    let cursor_name = cstring(CURSOR_DIR)?;
+    let cursor_fd = open_dir_at(home_fd.as_raw_fd(), &cursor_name).map_err(|error| {
+        format!("cursor execution identity refused: .cursor is not a no-follow directory: {error}")
+    })?;
+    ensure_same_dir(home_fd.as_raw_fd(), cursor_fd.as_raw_fd(), &cursor_name).map_err(|_| {
+        "cursor execution identity refused: .cursor changed during launch verification".to_owned()
+    })?;
+
+    let hooks_name = cstring(RAILS_FILE)?;
+    let hooks = entry_at(cursor_fd.as_raw_fd(), &hooks_name)?
+        .ok_or_else(|| "cursor execution identity refused: hooks.json is missing".to_owned())?;
+    if !hooks.is_regular() {
+        return Err("cursor execution identity refused: hooks.json is not a regular file".into());
+    }
+
+    verify_published(
+        cursor_fd.as_raw_fd(),
+        &hooks_name,
+        hooks,
+        expected,
+        "cursor execution identity refused",
+    )?;
+    ensure_same_dir(home_fd.as_raw_fd(), cursor_fd.as_raw_fd(), &cursor_name).map_err(|_| {
+        "cursor execution identity refused: .cursor changed during launch verification".to_owned()
+    })?;
+    Ok(())
+}
+
 fn publish_bytes<F>(
     home: &Path,
     bytes: &[u8],
@@ -191,7 +225,13 @@ where
         }
 
         ensure_same_dir(home_fd.as_raw_fd(), cursor_fd.as_raw_fd(), &cursor_name)?;
-        verify_published(cursor_fd.as_raw_fd(), &hooks_name, staged, expected)?;
+        verify_published(
+            cursor_fd.as_raw_fd(),
+            &hooks_name,
+            staged,
+            expected,
+            "Cursor rails publication refused",
+        )?;
         sync_fd(cursor_fd.as_raw_fd())?;
 
         if recovery_present {
@@ -287,6 +327,7 @@ fn verify_published(
     name: &CStr,
     staged: Entry,
     expected: &str,
+    refusal_prefix: &str,
 ) -> Result<(), String> {
     let fd = unsafe {
         libc::openat(
@@ -296,22 +337,31 @@ fn verify_published(
         )
     };
     if fd < 0 {
-        return Err(refusal(format!(
-            "cannot reopen published hooks.json: {}",
+        return Err(format!(
+            "{refusal_prefix}: cannot open managed hooks.json without following links: {}",
             io::Error::last_os_error()
-        )));
+        ));
     }
 
     let mut file = unsafe { File::from_raw_fd(fd) };
     if fstat(file.as_raw_fd())? != staged {
-        return Err(refusal("published hooks.json identity changed"));
+        return Err(format!(
+            "{refusal_prefix}: managed hooks.json identity changed"
+        ));
     }
 
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
-        .map_err(|error| refusal(format!("cannot verify published hooks.json: {error}")))?;
-    if sha256(&bytes) != expected {
-        return Err(refusal("published hooks.json digest changed"));
+        .map_err(|error| format!("{refusal_prefix}: cannot read managed hooks.json: {error}"))?;
+    if !sha256(&bytes).eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "{refusal_prefix}: published hooks.json digest changed"
+        ));
+    }
+    if entry_at(directory, name)? != Some(staged) {
+        return Err(format!(
+            "{refusal_prefix}: managed hooks.json was replaced during verification"
+        ));
     }
     Ok(())
 }
@@ -609,6 +659,29 @@ mod tests {
             fs::read(external.join(RAILS_FILE)).unwrap(),
             b"operator bytes"
         );
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(external).unwrap();
+    }
+
+    #[test]
+    fn launch_verification_refuses_symlinked_hooks_and_parent_paths() {
+        let home = fixture();
+        let external = fixture();
+        let bytes = b"{\"version\":1}";
+        let external_hooks = external.join(RAILS_FILE);
+        fs::write(&external_hooks, bytes).unwrap();
+        let expected = sha256(bytes);
+        let cursor = home.join(CURSOR_DIR);
+
+        symlink(&external, &cursor).unwrap();
+        assert!(verify_managed(&home, &expected).is_err());
+
+        fs::remove_file(&cursor).unwrap();
+        fs::create_dir(&cursor).unwrap();
+        symlink(&external_hooks, cursor.join(RAILS_FILE)).unwrap();
+        assert!(verify_managed(&home, &expected).is_err());
+        assert_eq!(fs::read(&external_hooks).unwrap(), bytes);
+
         fs::remove_dir_all(home).unwrap();
         fs::remove_dir_all(external).unwrap();
     }

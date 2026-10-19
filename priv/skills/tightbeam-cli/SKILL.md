@@ -95,8 +95,20 @@ identifiers and one bounded request. Do not infer the owner from `tightbeam list
 Target another agent by role when its office should answer. Target a session only when that
 exact session incarnation matters. A wake carries a prompt; it is not an empty notification.
 
-Use `tightbeam operator-ask --question "..." --assignment <assignment-id>` when work needs
-an owner decision. The CLI derives the owner from this session and returns a `dr_...`
+Use `tightbeam operator-ask --question "..." --note "..." --assignment <assignment-id>`
+when work needs an owner decision. Follow the operating manual's Authority section:
+the question contains everything needed to understand the choice; the note holds
+supporting technical detail and references. For example, substitute the actual
+assignment and supporting references in this illustrative product choice:
+
+```sh
+tightbeam operator-ask \
+  --assignment '<assignment-id>' \
+  --question 'Garden Planner helps households schedule garden work. Weather alerts are ready, but sending them by email would cost ten dollars per month. Should we add email alerts at that cost, or keep alerts inside the app at no extra cost? I recommend keeping them in the app until users ask for email. Email would reach people while the app is closed; in-app alerts appear when they open it. While you decide, the existing garden schedule remains available and email delivery stays off.' \
+  --note 'Email delivery would use an external delivery service; in-app alerts use the existing notification store. Supporting evaluation: <evaluation-report>. Cost estimate: <cost-estimate>.'
+```
+
+The CLI derives the owner from this session and returns a `dr_...`
 identifier for the durable decision request. Use `tightbeam decision-requests` to read its
 answer. Do not bury a decision need in an attest or poll a human.
 

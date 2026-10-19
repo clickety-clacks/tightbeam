@@ -635,7 +635,7 @@ defmodule Tightbeam.SessionReparentTest do
     assert count(ctx.db, "session_reparent_events") == 2
   end
 
-  test "corrected ancestor admission agrees with the migrated trigger and preserves old waits",
+  test "reparenting preserves existing waits and permits either registrant",
        ctx do
     assert {:ok, _} =
              DB.query(ctx.db, "UPDATE sessions SET spawnedBy='old' WHERE sessionKey='child'")
@@ -670,8 +670,11 @@ defmodule Tightbeam.SessionReparentTest do
     assert is_binary(SessionReparent.handle(ctx.db, call(ctx.params))["eventId"])
     assert rows(ctx.db, "SELECT * FROM wakes ORDER BY rowid") == before
 
-    assert {:ok, {:error, %{code: "not_holder"}}} =
+    assert {:ok, repeated_wait} =
              DB.transaction(ctx.db, &Tightbeam.Wakes.register_wait_in_txn(&1, input))
+
+    assert repeated_wait.wake_id != old_wait.wake_id
+    assert repeated_wait.creator_session_key == "old"
 
     corrected = %{input | origin: "agent:" <> ctx.parent, registrant_session_key: ctx.parent}
 
@@ -684,7 +687,7 @@ defmodule Tightbeam.SessionReparentTest do
     assert rows(
              ctx.db,
              "SELECT COUNT(*) FROM supervision_liveness_sidecar WHERE controllerOrigin='holder_continuation'"
-           ) == [[2]]
+           ) == [[3]]
 
     assert :ok = Schema.ensure_all(ctx.db)
   end

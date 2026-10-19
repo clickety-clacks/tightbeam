@@ -1843,7 +1843,6 @@ defmodule Tightbeam.Wakes do
   def register_wait_in_txn(%Txn{} = txn, input) do
     with :ok <- validate_wait_input(input),
          {:ok, obligation} <- wait_obligation_in_txn(txn, input),
-         :ok <- wait_registrant_allowed(txn, input, obligation),
          :ok <- wait_target_allowed(input, obligation),
          :ok <- recheck_wait_admission_in_txn(txn, input) do
       if Map.get(input, :after_turn) do
@@ -2263,30 +2262,6 @@ defmodule Tightbeam.Wakes do
       _ ->
         wait_error("unknown_assignment", "unknown or inaccessible open covered assignment")
     end
-  end
-
-  defp wait_registrant_allowed(txn, input, %{holder_key: holder_key, owner_user_id: owner}) do
-    # Read lineage in the admission transaction. The creator remains the actual
-    # registrant; authority never substitutes the covered holder's identity.
-    authorized =
-      Txn.q(
-        txn,
-        """
-        WITH RECURSIVE lineage(sessionKey,spawnedBy) AS (
-          SELECT sessionKey,#{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey=?1 AND ownerUserId=?3
-          UNION
-          SELECT s.sessionKey,#{Tightbeam.Org.current_parent_sql("s")} FROM sessions s JOIN lineage l ON s.sessionKey=l.spawnedBy
-          WHERE s.ownerUserId=?3
-        )
-        SELECT 1 FROM lineage WHERE sessionKey=?2
-        """,
-        [holder_key, input[:registrant_session_key], owner]
-      ) == [[1]]
-
-    if authorized,
-      do: :ok,
-      else:
-        wait_error("not_holder", "registrant is neither the holder nor its supervising ancestor")
   end
 
   defp wait_target_allowed(input, %{holder_key: holder_key}) do
@@ -5598,6 +5573,10 @@ defmodule Tightbeam.Wakes do
                 device_id: "process:tightbeam",
                 client_message_id: "wake-undelivered:#{seq}"
               })
+
+            if disposition == :appended do
+              Tightbeam.Firehose.Publisher.message_in_txn(txn, recipient, marker, owner)
+            end
 
             if disposition in [:appended, :duplicate],
               do: [{recipient, owner, marker}],

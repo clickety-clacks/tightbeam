@@ -213,6 +213,7 @@ defmodule Tightbeam.AssignmentsTest do
         |> put_in([:params, :effect_kind], "coordination")
 
       assignment = handle(ctx, "assign", assignment_call)
+      assert ConditionFacts.latest(ctx.db, "assignment-landed", assignment.id) == nil
 
       wake =
         Wakes.schedule(ctx.db, %{
@@ -511,9 +512,20 @@ defmodule Tightbeam.AssignmentsTest do
     assert hint.kind == "assignment-landed"
     assert hint.scope == assignment.id
     assert hint.fallback_after == "2h"
+
+    assert hint.record_dependency.conditions == [
+             %{fact: "assignment.state", op: "eq", value: "closed"}
+           ]
+
+    assert hint.record_dependency.bindings == %{"assignmentId" => assignment.id}
+    assert hint.record_dependency.message =~ "not a complete --predicate"
+    assert hint.record_dependency.message =~ "caller-selected resolverRef"
+    assert hint.record_dependency.message =~ "nonblank necessity"
+    assert hint.record_dependency.message =~ "same-owner open assignment"
     assert hint.message =~ "--when-fact assignment-landed"
-    assert hint.message =~ "--when-scope #{assignment.id}"
-    assert hint.message =~ "--fallback-after 2h"
+    assert hint.message =~ "assignmentId=#{assignment.id}"
+    assert hint.message =~ "assignment.state"
+    assert hint.message =~ "completion attestation only"
 
     assert %{condition_wake_hint: replay_hint} = dispatch!(ctx, dispatch)
     assert replay_hint.scope == assignment.id
@@ -531,6 +543,9 @@ defmodule Tightbeam.AssignmentsTest do
     assert result.fact_hint.kind == "assignment-landed"
     assert result.fact_hint.scope == assignment.id
     assert result.fact_hint.message =~ "Advisory:"
+    assert result.fact_hint.record_dependency == hint.record_dependency
+    assert result.fact_hint.message =~ "assignment.state"
+    assert result.fact_hint.message =~ "completion-attestation producer"
 
     no_hint =
       ctx.handlers["wake"].(
@@ -2936,6 +2951,60 @@ defmodule Tightbeam.AssignmentsTest do
                ctx,
                "attest",
                attest_call({:session, "holder"}, first.id, "completion")
+             )
+  end
+
+  test "operator ruling refuses an open cannot-proceed request without side effects", ctx do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    assignment =
+      assign_call({:user, "flynn"}, "blocked card")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    filed =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "awaiting the opener")
+      |> then(&handle(ctx, "attest", &1))
+
+    request_id = filed.decisionRequest.id
+    assert %{kind: "agent", status: "open", options: nil} = filed.decisionRequest
+
+    snapshot = fn ->
+      DB.query(
+        ctx.db,
+        """
+        SELECT status, decision, rationale, ruledBy, ruledViaPrincipal, ruledViaSessionKey,
+               ruledAt, rulingFactId, options,
+               (SELECT COUNT(*) FROM condition_facts),
+               (SELECT COUNT(*) FROM wakes),
+               (SELECT COUNT(*) FROM lifecycle_events)
+        FROM decision_requests WHERE id=?1
+        """,
+        [request_id]
+      )
+    end
+
+    before = snapshot.()
+
+    for params <- [%{decision: "resume"}, %{response: "resume the work"}] do
+      ruling =
+        call("operator-rule", {:user, "flynn"}, nil, Map.put(params, :request, request_id))
+        |> Map.put(:transport_session_key, "holder")
+
+      assert %{code: "invalid", message: "agent requests use answer or return"} =
+               Tightbeam.Escalation.operator_rule(ctx.db, ruling)
+
+      assert snapshot.() == before
+    end
+
+    assert {:ok, [["standing"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state FROM assignment_cannot_proceed WHERE assignmentId=?1",
+               [
+                 assignment.id
+               ]
              )
   end
 
