@@ -42,6 +42,7 @@ pub enum TuneControl {
     },
     Effort(String),
     Fast(String),
+    Host(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -769,7 +770,7 @@ COMMANDS:
       End a session deliberately.
 
   tune --session <key> (--harness <harness> [--model <model>] |
-       --model <model> | --effort <level> | --fast on|off)
+       --model <model> | --effort <level> | --fast on|off | --host <host>)
        [--effort <level>] [--context <variant>]
       Change one runtime control on an existing session. Model identity remains
       separate fields. Same-harness model, effort, and Fast changes preserve the
@@ -777,7 +778,8 @@ COMMANDS:
       keeping the Tightbeam session, role, work, and graph position. Fast is
       ephemeral and uses only the resident adapter's live advertised option;
       unsupported sessions refuse it. Naming the resident harness again is a
-      refusal: omit --harness for a same-harness model change.
+      refusal: omit --harness for a same-harness model change. --host moves the
+      session workdir to an allowed host and keeps the Tightbeam session.
 
   work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex>]
                    [--priority <0..8>] [--key <idempotencyKey>]
@@ -3371,7 +3373,7 @@ fn parse_host_toolchain_set(
 }
 
 fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
-    const USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> [--model <model>] [--effort <level>] [--context <variant>] | --model <model> [--effort <level>] [--context <variant>] | --effort <level> | --fast on|off)";
+    const USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> [--model <model>] [--effort <level>] [--context <variant>] | --model <model> [--effort <level>] [--context <variant>] | --effort <level> | --fast on|off | --host <host>)";
     const ALLOWED: &[&str] = &[
         "session",
         "harness",
@@ -3379,6 +3381,7 @@ fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command
         "effort",
         "context",
         "fast",
+        "host",
         "as",
         "as-user",
         "as-process",
@@ -3393,7 +3396,7 @@ fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command
     };
     let session_key = required("session")?;
 
-    for name in ["harness", "model", "effort", "context", "fast"] {
+    for name in ["harness", "model", "effort", "context", "fast", "host"] {
         if flags.contains_key(name) && nonempty(flags, name).is_none() {
             return Err(format!("--{name} requires a non-empty value"));
         }
@@ -3404,32 +3407,38 @@ fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command
     let effort = nonempty(flags, "effort");
     let context = nonempty(flags, "context");
     let fast = nonempty(flags, "fast");
+    let host = nonempty(flags, "host");
 
     if model.as_deref().is_some_and(has_packed_effort) {
         return Err("--model must not pack an effort; pass --effort separately".to_owned());
     }
 
-    let control = match (harness, model, effort, context, fast) {
-        (Some(harness), model, effort, context, None) => TuneControl::Harness {
+    let control = match (harness, model, effort, context, fast, host) {
+        (Some(harness), model, effort, context, None, None) => TuneControl::Harness {
             harness,
             model,
             effort,
             context,
         },
-        (None, Some(model), effort, context, None) => TuneControl::Model {
+        (None, Some(model), effort, context, None, None) => TuneControl::Model {
             model,
             effort,
             context,
         },
-        (None, None, Some(effort), None, None) => TuneControl::Effort(effort),
-        (None, None, None, None, Some(fast)) if fast == "on" || fast == "off" => {
+        (None, None, Some(effort), None, None, None) => TuneControl::Effort(effort),
+        (None, None, None, None, Some(fast), None) if fast == "on" || fast == "off" => {
             TuneControl::Fast(fast)
         }
-        (None, None, None, None, Some(_)) => return Err("--fast must be on or off".to_owned()),
-        (None, None, None, Some(_), None) => return Err("--context requires --model".to_owned()),
-        (_, _, _, _, Some(_)) => {
+        (None, None, None, None, Some(_), None) => {
+            return Err("--fast must be on or off".to_owned());
+        }
+        (None, None, None, None, None, Some(host)) => TuneControl::Host(host),
+        (None, None, None, Some(_), None, None) => {
+            return Err("--context requires --model".to_owned());
+        }
+        (_, _, _, _, Some(_), _) => {
             return Err(
-                "--fast is mutually exclusive with --harness, --model, --effort, and --context"
+                "--fast is mutually exclusive with --harness, --model, --effort, --context, and --host"
                     .to_owned(),
             );
         }
@@ -4467,6 +4476,14 @@ mod tests {
                     "params": {"setting": "set_fast_mode", "fastMode": "on"}
                 }),
             ),
+            (
+                strings(&["tune", "--session", "agent:coder:x s_1", "--host", "worker"]),
+                serde_json::json!({
+                    "verb": "tune",
+                    "sessionKey": "agent:coder:x s_1",
+                    "params": {"setting": "set_host", "host": "worker"}
+                }),
+            ),
         ];
 
         for (args, expected) in cases {
@@ -4507,6 +4524,25 @@ mod tests {
             strings(&["tune", "--session", "s_1", "--fast", "yes"]),
             strings(&["tune", "--session", "s_1", "--model", "gpt-5.6-sol[high]"]),
             strings(&["tune", "--session", "s_1", "--model", ""]),
+            strings(&["tune", "--session", "s_1", "--host", ""]),
+            strings(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--host",
+                "worker",
+                "--effort",
+                "high",
+            ]),
+            strings(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--host",
+                "worker",
+                "--model",
+                "model",
+            ]),
             strings(&[
                 "tune",
                 "--session",

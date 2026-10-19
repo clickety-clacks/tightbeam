@@ -293,15 +293,22 @@ defmodule Tightbeam.Projection do
         attention
       )
       when kind in @marker_kinds and is_binary(from) and is_binary(to) do
-    append_in_txn(txn, %{
-      session_key: session_key,
-      role: "assistant",
-      content: marker_content(kind, from, to),
-      sender: "process:tightbeam",
-      message_type: "marker",
-      marker: marker,
-      attention_tier: attention_tier(attention)
-    })
+    case append_in_txn(txn, %{
+           session_key: session_key,
+           role: "assistant",
+           content: marker_content(kind, from, to),
+           sender: "process:tightbeam",
+           message_type: "marker",
+           marker: marker,
+           attention_tier: attention_tier(attention)
+         }) do
+      {:appended, message} = appended when kind == "session-restart" ->
+        Publisher.message_in_txn(txn, session_key, message)
+        appended
+
+      other ->
+        other
+    end
   end
 
   def append_marker_in_txn(%Txn{}, _session_key, marker, _attention) do
