@@ -2511,6 +2511,7 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TABLE IF EXISTS supervision_liveness_epoch;
       DROP TABLE IF EXISTS supervision_liveness_migrations;
       DROP INDEX IF EXISTS wakes_cancellation_state;
+      DROP TABLE IF EXISTS effort_holder_activity_cancellation_epoch;
       """)
   end
 
