@@ -8233,36 +8233,6 @@ defmodule Tightbeam.GatewayTest do
       VALUES ('asg_handoff','coordination')
       """)
 
-    wake =
-      Wakes.schedule(ctx.db, %{
-        session_key: "k1",
-        origin: "process:tightbeam",
-        prompt: "superseded liveness notice",
-        due_at: System.system_time(:millisecond) + 60_000,
-        assignment_id: "asg_handoff",
-        consumer: "effort_probe"
-      })
-
-    assert {:ok, {:appended, "k1", suppressed_message, _opts}} =
-             DB.transaction(ctx.db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 wake.session_key,
-                 wake.origin,
-                 wake.prompt,
-                 wake_id: wake.wake_id,
-                 sender: wake.origin,
-                 device_id: "test",
-                 client_message_id: wake.wake_id,
-                 target_gate: wake
-               )
-             end)
-
-    assert {:ok, [[suppressed_seq]]} =
-             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
-
-    assert suppressed_message.seq != suppressed_seq
-
     {other_suppressed_seq, other_suppressed_message} =
       enqueue_gateway_prompt!(
         ctx.db,
@@ -8332,6 +8302,29 @@ defmodule Tightbeam.GatewayTest do
                )
              end)
 
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "k1",
+        origin: "process:tightbeam",
+        prompt: "pending plain notice",
+        due_at: System.system_time(:millisecond),
+        assignment_id: "asg_handoff"
+      })
+
+    assert [carrier_id] =
+             Tightbeam.NoticeBatcher.recover(ctx.db, System.system_time(:millisecond),
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
+
+    assert %{delivered_turn_seq: notice_seq} = Wakes.get(ctx.db, wake.wake_id)
+
+    assert {:ok, [[^notice_seq, notice_message_id]]} =
+             DB.query(ctx.db, "SELECT seq,messageId FROM turns WHERE wakeId=?1", [carrier_id])
+
+    notice_message = Projection.get(ctx.db, notice_message_id)
+    assert notice_message.seq != notice_seq
+
     {first_seq, first_message} =
       enqueue_gateway_prompt!(ctx.db, "k1", "user:flynn", "first queued request")
 
@@ -8353,7 +8346,7 @@ defmodule Tightbeam.GatewayTest do
     assert guidance =~ "Cross-harness handoff from durable session records"
     assert guidance =~ ~s("sender":"user:flynn")
     assert guidance =~ ~s("sender":"agent:reviewer")
-    assert guidance =~ "superseded liveness notice"
+    refute guidance =~ "pending plain notice"
     refute guidance =~ "exact sender replacement source to omit"
     assert guidance =~ "other suppression reason durable context"
     assert guidance =~ "unattributed canceled durable context"
@@ -8387,28 +8380,30 @@ defmodule Tightbeam.GatewayTest do
              )
 
     assert queued_rows == [
-             [suppressed_seq, "queued", suppressed_message.id],
              [other_suppressed_seq, "canceled", other_suppressed_message.id],
              [replacement_source_seq, "canceled", replacement_source_message.id],
              [unattributed_canceled_seq, "canceled", unattributed_canceled_message.id],
+             [notice_seq, "queued", notice_message.id],
              [first_seq, "queued", first_message.id],
              [second_seq, "queued", second_message.id],
              [late_seq, "queued", late_message.id]
            ]
 
     assert {:ok, [["queued"]]} =
-             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [suppressed_seq])
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [notice_seq])
 
     visible_after_switch = Projection.list_after(ctx.db, "k1", nil, 100, history_agent.seq)
 
+    assert Enum.any?(visible_after_switch, &(&1.id == notice_message.id))
     assert Enum.any?(visible_after_switch, &(&1.id == first_message.id))
     assert Enum.any?(visible_after_switch, &(&1.id == second_message.id))
     assert Enum.any?(visible_after_switch, &(&1.id == late_message.id))
     assert Enum.any?(visible_after_switch, &(&1.marker && &1.marker.kind == "harness-switch"))
 
-    for expected_seq <- [first_seq, second_seq, late_seq] do
+    for expected_seq <- [notice_seq, first_seq, second_seq, late_seq] do
       assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
       assert turn.seq == expected_seq
+      if expected_seq == notice_seq, do: assert(turn.prompt =~ "pending plain notice")
 
       assert :ok =
                Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
