@@ -1193,7 +1193,10 @@ defmodule Tightbeam.GatewayTest do
     assert NoticeBatcher.recover(ctx.db) == []
 
     assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE clientMessageId='post-queued-1'")
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE clientMessageId='post-queued-1'"
+             )
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -1225,8 +1228,17 @@ defmodule Tightbeam.GatewayTest do
       )
 
     assert {:ok,
-            [[human_message_id, "user", "queued human message", "session:k1", "post-device",
-              "post-queued-1", encoded_attachments]]} =
+            [
+              [
+                human_message_id,
+                "user",
+                "queued human message",
+                "session:k1",
+                "post-device",
+                "post-queued-1",
+                encoded_attachments
+              ]
+            ]} =
              DB.query(
                ctx.db,
                "SELECT id,role,content,sender,deviceId,clientMessageId,attachments FROM messages WHERE clientMessageId=?1",
