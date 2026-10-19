@@ -138,7 +138,7 @@ defmodule Tightbeam.RestExecutionMapTest do
         ~s(,"assignments":{"open":2,"closed":1),
         ~s(,"byOutcome":{"completed":1,"surrendered":0,"revoked":0}}),
         ~s(,"jobs":2),
-        ~s(,"attests":{"total":2,"byKind":{"completion":1,"progress":1}},),
+        ~s(,"attests":{"total":2,"byKind":{"completion":1,"progress":1},),
         ~s("byVerdictKind":{"landed":1}}),
         ~s(,"startedAt":15),
         ~s(,"closingAttests":[{"assignmentId":"asg_a","attestId":"att_a",),
