@@ -156,9 +156,10 @@ class PackageSoakChecks(unittest.TestCase):
                                             "buildIdentity": identity}))
             # Archive and receipt live outside the enumerated package, as in real staging.
             with tempfile.TemporaryDirectory() as outside:
-                archive = Path(outside) / "package.tgz"
+                outside_root = Path(outside).resolve()
+                archive = outside_root / "package.tgz"
                 archive.write_bytes(b"opaque fixture archive")
-                proof = Path(outside) / "accepted.json"
+                proof = outside_root / "accepted.json"
                 proof.write_text(json.dumps({"acceptance_reference": "unit-only",
                     "source_sha": "a" * 40, "archive_sha256": soak.digest(archive),
                     "build_identity": identity, "payload_manifest_sha256": soak.digest(manifest)}))
