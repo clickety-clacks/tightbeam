@@ -2414,6 +2414,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
     first_restoration =
       restore_health_turn!(ctx.db, failed.session, "restore-before-refused-redelivery")
+
     first_source_seq = first_refusal.seq
 
     assert {:ok, [[^first_source_seq, first_redelivery_seq]]} =
