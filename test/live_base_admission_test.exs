@@ -314,7 +314,9 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
     File.write!(Path.join(template, "identity/synthetic"), "public fixture")
     # Adapter packages legitimately contain internal links.
     File.ln_s!("../identity/synthetic", Path.join(template, "adapters/link"))
-    Tightbeam.ClientE2E.LegGateway.provision!(template, ctx.base)
+    candidate_cli = Path.join(Path.dirname(ctx.base), "candidate-cli")
+    File.write!(candidate_cli, "candidate CLI")
+    Tightbeam.ClientE2E.LegGateway.provision!(template, ctx.base, candidate_cli)
     File.write!(Path.join(ctx.base, "gateway.log"), "pre-admission boot log\n")
     admission = LiveBaseAdmission.prepare!(ctx.base, ctx.options)
     assert admission.stamp == :fresh

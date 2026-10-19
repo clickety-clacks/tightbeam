@@ -19,8 +19,8 @@ Tightbeam.RecoveryFixture.place_adapter!(template, seed_credential: false)
 identity_revision = Tightbeam.Identity.live_revision!(template)
 File.mkdir_p!(Path.join(template, "homes/testhost"))
 File.write!(Path.join(template, "homes/testhost/synthetic.txt"), "no credentials\n")
-Tightbeam.ClientE2E.LegGateway.provision!(template, base)
-["adapters", "homes", "identity"] = File.ls!(base) |> Enum.sort()
+Tightbeam.ClientE2E.LegGateway.provision!(template, base, cli)
+["adapters", "bin", "homes", "identity"] = File.ls!(base) |> Enum.sort()
 # The supported boot redirection opens this log before starting the gateway.
 File.write!(Path.join(base, "gateway.log"), "synthetic preboot log\n")
 # Public synthetic shapes only: no real onboarding, credentials or providers.

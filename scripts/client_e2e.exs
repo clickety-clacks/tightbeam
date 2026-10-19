@@ -46,12 +46,14 @@ defmodule ClientE2ERunner do
     end
 
     provenance = provenance!()
+    IO.puts("building client-e2e CLI from candidate #{provenance}")
+    candidate_cli = build_cli!(repo_root)
 
     legs =
       legs()
       |> Enum.with_index()
       |> Enum.map(fn {harness, index} ->
-        run_leg(harness, template, base_port + index, repo_root, journeys)
+        run_leg(harness, template, candidate_cli, base_port + index, repo_root, journeys)
       end)
 
     scorecard = %Scorecard{
@@ -77,10 +79,10 @@ defmodule ClientE2ERunner do
     end
   end
 
-  defp run_leg(harness, template, port, repo_root, journeys) do
+  defp run_leg(harness, template, candidate_cli, port, repo_root, journeys) do
     base_dir = Path.expand("~/.tightbeam-client-e2e-#{harness}-#{System.os_time(:second)}")
     IO.puts("\nclient-e2e leg #{harness} port=#{port} base_dir=#{base_dir}")
-    LegGateway.provision!(template, base_dir)
+    LegGateway.provision!(template, base_dir, candidate_cli)
 
     # Preflight FIRST, against the provisioned org, while no gateway exists.
     preflight_row = ClientE2E.preflight(harness, base_dir)
@@ -204,6 +206,40 @@ defmodule ClientE2ERunner do
             "(#{inspect(reason)}); base_dir KEPT at #{gateway.base_dir}"
         )
     end
+  end
+
+  defp build_cli!(repo_root) do
+    target_dir = Path.join(repo_root, "cli/target")
+    cli_path = Path.join(target_dir, "release/tightbeam")
+
+    {output, status} =
+      System.cmd(
+        "cargo",
+        [
+          "build",
+          "--locked",
+          "--offline",
+          "--release",
+          "--manifest-path",
+          Path.join(repo_root, "cli/Cargo.toml"),
+          "--target-dir",
+          target_dir
+        ],
+        cd: repo_root,
+        stderr_to_stdout: true
+      )
+
+    IO.write(output)
+
+    if status != 0 do
+      raise "candidate CLI build failed with exit status #{status}"
+    end
+
+    unless File.regular?(cli_path) do
+      raise "candidate CLI build produced no binary at #{cli_path}"
+    end
+
+    cli_path
   end
 
   # BOTH FIELDS, ALWAYS. A model and its effort are separate fields now
