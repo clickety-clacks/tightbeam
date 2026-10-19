@@ -16,7 +16,17 @@ defmodule Tightbeam.WorkItems do
   fail/reopen) are owner-or-admin verbs that write `state`/`failReason`.
   """
 
-  alias Tightbeam.{CausalEvents, DB, EffortCheckin, Org, Wakes}
+  alias Tightbeam.{
+    CausalEvents,
+    DB,
+    EffortCheckin,
+    ExecutionMap,
+    Org,
+    StateResources,
+    StateVisibility,
+    Wakes
+  }
+
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -900,6 +910,286 @@ defmodule Tightbeam.WorkItems do
 
   defp trace_allowed?(_db, _principal, _item), do: false
   defp trace_not_found, do: error("not_found", "work item not found")
+
+  @doc false
+  def query_work_item_trace(db, %{id: id, principal: principal}) do
+    case DB.read_transaction(db, fn txn ->
+           if work_item_trace_visible?(txn, id, principal) do
+             root = StateResources.query_work_item(txn, id, %{rest_principal: principal})
+
+             if is_nil(root) do
+               {:error, 404, "not_found", nil}
+             else
+               {:ok, work_item_trace_for_root(txn, root, principal)}
+             end
+           else
+             {:error, 404, "not_found", nil}
+           end
+         end) do
+      {:ok, {:ok, trace}} -> trace
+      {:ok, {:error, _status, _code, _message} = error} -> error
+      {:error, error} -> raise error
+    end
+  end
+
+  @doc false
+  def work_item_trace_visible?(source, id, principal),
+    do: StateVisibility.execution_map_node_visible?(source, id, principal)
+
+  @doc false
+  def work_item_trace(%{
+        work_item: work_item,
+        assignments: assignments,
+        causal_children: causal_children,
+        parent: parent,
+        dependency_entries: dependency_entries
+      }) do
+    linked = parent.status == "linked"
+    attributed = parent.status in ["linked", "from_turn"]
+
+    %{
+      work_item: work_item,
+      assignments: assignments,
+      causal_children: causal_children,
+      attribution: %{
+        provenance_status: parent.status,
+        reason_kind: if(attributed, do: "concurrent_turn"),
+        primary_work_kind: if(linked, do: "work_item"),
+        primary_work_id: if(linked, do: parent.item)
+      },
+      dependency_version: work_item_trace_dependency_version(dependency_entries)
+    }
+  end
+
+  defp work_item_trace_for_root(txn, root, principal) do
+    item_rows = StateResources.query_work_item(txn, %{}, %{rest_principal: principal})
+    items_by_id = Map.new(item_rows, &{&1.id, &1})
+    assignment_rows = work_item_trace_visible_assignments(txn, principal)
+    assignments_by_id = Map.new(assignment_rows, &{&1.id, &1})
+    item_nodes = Enum.map(item_rows, &work_item_trace_item_node/1)
+    assignment_nodes = Enum.map(assignment_rows, &work_item_trace_assignment_node/1)
+    resolution = ExecutionMap.work_item_trace_resolution(item_nodes, assignment_nodes)
+    turn_rows = work_item_trace_visible_turns(txn, item_rows, principal, resolution)
+
+    parent_data =
+      ExecutionMap.work_item_trace_parent_data(
+        item_nodes,
+        assignment_nodes,
+        turn_rows,
+        resolution
+      )
+
+    emitted_assignments =
+      assignment_rows
+      |> Enum.filter(&(Map.get(parent_data.resolved, &1.id) == root.id))
+      |> Enum.sort_by(&{&1.opened_at, &1.id})
+      |> Enum.map(fn assignment ->
+        case StateResources.query_assignment(txn, assignment.id, %{rest_principal: principal}) do
+          nil -> raise ArgumentError, "visible assignment disappeared inside read transaction"
+          row -> StateResources.assignment(row)
+        end
+      end)
+
+    causal_children =
+      parent_data.linked
+      |> Enum.filter(fn {_child_id, parent_id} -> parent_id == root.id end)
+      |> Enum.map(&elem(&1, 0))
+      |> Enum.sort()
+
+    parent = Map.fetch!(parent_data.parents, root.id)
+
+    cycle_members =
+      parent_data.cycles
+      |> Map.values()
+      |> Enum.filter(&MapSet.member?(&1, root.id))
+      |> Enum.reduce(MapSet.new(), &MapSet.union/2)
+
+    relevant_item_ids =
+      [root.id | causal_children] ++
+        if(parent.status == "linked", do: [parent.item], else: []) ++
+        MapSet.to_list(cycle_members)
+
+    relevant_items =
+      relevant_item_ids
+      |> Enum.uniq()
+      |> Enum.map(&Map.fetch!(items_by_id, &1))
+
+    relevant_turn_item_ids =
+      [root.id | causal_children] ++ MapSet.to_list(cycle_members)
+
+    relevant_turn_seqs =
+      relevant_turn_item_ids
+      |> Enum.uniq()
+      |> Enum.map(&Map.fetch!(items_by_id, &1))
+      |> Enum.filter(&(&1.created_context_known and is_integer(&1.created_in_turn_seq)))
+      |> Enum.map(& &1.created_in_turn_seq)
+      |> Enum.uniq()
+
+    relevant_turns =
+      relevant_turn_seqs
+      |> Enum.flat_map(fn seq ->
+        case Enum.find(turn_rows, &(&1.seq == seq)) do
+          nil -> []
+          turn -> [turn]
+        end
+      end)
+
+    chain_ids =
+      Enum.reduce(emitted_assignments, MapSet.new(), fn assignment, ids ->
+        MapSet.union(
+          ids,
+          work_item_trace_assignment_chain_ids(assignment["id"], assignments_by_id)
+        )
+      end)
+
+    chain_ids =
+      Enum.reduce(relevant_turns, chain_ids, fn turn, ids ->
+        MapSet.union(ids, work_item_trace_turn_chain_ids(turn, assignments_by_id))
+      end)
+
+    dependency_entries =
+      work_item_trace_dependency_entries(
+        relevant_items,
+        MapSet.to_list(chain_ids),
+        relevant_turns,
+        assignments_by_id
+      )
+
+    work_item_trace(%{
+      work_item: StateResources.work_item(root),
+      assignments: emitted_assignments,
+      causal_children: causal_children,
+      parent: parent,
+      dependency_entries: dependency_entries
+    })
+  end
+
+  defp work_item_trace_visible_assignments(txn, principal) do
+    {principal_kind, principal_id, is_admin} =
+      {principal.kind, principal.id, bool_to_int(principal.is_admin)}
+
+    Txn.q(
+      txn,
+      """
+      SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.openedAt, a.closedAt
+      FROM assignments AS a
+      LEFT JOIN work_items AS wi ON wi.id = a.workItemId
+      WHERE (?1 = 1 OR
+        (?2 = 'session' AND (a.holderKey = ?3 OR a.openedBySession = ?3)) OR
+        (?2 = 'user' AND (wi.ownerUserId = ?3 OR a.openedByUser = ?3)))
+      ORDER BY a.openedAt, a.id
+      """,
+      [is_admin, principal_kind, principal_id]
+    )
+    |> Enum.map(fn [id, work_item_id, reviews_assignment_id, opened_at, closed_at] ->
+      version =
+        StateResources.assignment(%{opened_at: opened_at, closed_at: closed_at})["rowVersion"]
+
+      %{
+        id: id,
+        work_item_id: work_item_id,
+        reviews_assignment_id: reviews_assignment_id,
+        opened_at: opened_at,
+        row_version: version
+      }
+    end)
+  end
+
+  defp work_item_trace_visible_turns(txn, item_rows, principal, resolution) do
+    item_rows
+    |> Enum.map(& &1.created_in_turn_seq)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.flat_map(fn seq ->
+      case StateResources.query_turn_in_txn(txn, seq) do
+        nil ->
+          []
+
+        turn ->
+          if StateVisibility.core_detail_visible?(txn, "turns", turn, principal) and
+               ExecutionMap.work_item_trace_turn_has_visible_link?(turn, resolution),
+             do: [turn],
+             else: []
+      end
+    end)
+  end
+
+  defp work_item_trace_item_node(item) do
+    %{
+      id: item.id,
+      context_known: item.created_context_known,
+      created_in_turn_seq: item.created_in_turn_seq
+    }
+  end
+
+  defp work_item_trace_assignment_node(assignment) do
+    %{
+      id: assignment.id,
+      work_item_id: assignment.work_item_id,
+      reviews_assignment_id: assignment.reviews_assignment_id
+    }
+  end
+
+  defp work_item_trace_assignment_chain_ids(id, assignments_by_id),
+    do: work_item_trace_assignment_chain_ids(id, assignments_by_id, MapSet.new())
+
+  defp work_item_trace_assignment_chain_ids(id, assignments_by_id, seen) do
+    cond do
+      not is_binary(id) or MapSet.member?(seen, id) ->
+        seen
+
+      assignment = Map.get(assignments_by_id, id) ->
+        seen = MapSet.put(seen, id)
+
+        if is_binary(assignment.work_item_id) do
+          seen
+        else
+          work_item_trace_assignment_chain_ids(
+            assignment.reviews_assignment_id,
+            assignments_by_id,
+            seen
+          )
+        end
+
+      true ->
+        seen
+    end
+  end
+
+  defp work_item_trace_turn_chain_ids(%{job_ref: job_ref}, _assignments_by_id)
+       when is_binary(job_ref),
+       do: MapSet.new()
+
+  defp work_item_trace_turn_chain_ids(%{assignment_id: assignment_id}, assignments_by_id),
+    do: work_item_trace_assignment_chain_ids(assignment_id, assignments_by_id)
+
+  defp work_item_trace_dependency_entries(items, assignment_ids, turns, assignments_by_id) do
+    item_entries =
+      Enum.map(items, fn item -> ["work items", item.id, item.row_version] end)
+
+    assignment_entries =
+      assignment_ids
+      |> Enum.uniq()
+      |> Enum.map(fn id ->
+        assignment = Map.fetch!(assignments_by_id, id)
+        ["assignments", id, assignment.row_version]
+      end)
+
+    turn_entries =
+      Enum.map(turns, fn turn ->
+        ["turns", turn.seq, StateResources.turn(turn)["rowVersion"]]
+      end)
+
+    (item_entries ++ assignment_entries ++ turn_entries)
+    |> Enum.uniq_by(fn [resource, key, _version] -> {resource, key} end)
+    |> Enum.sort_by(fn [resource, key, _version] -> {resource, JSON.encode!(key)} end)
+  end
+
+  defp work_item_trace_dependency_version(entries) do
+    :crypto.hash(:sha256, JSON.encode!(entries))
+    |> Base.encode16(case: :lower)
+  end
 
   defp list_result(db, call) do
     with :ok <- ensure_body_schema_for_use(db),

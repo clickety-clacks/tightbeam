@@ -624,6 +624,48 @@ defmodule Tightbeam.ExecutionMap do
     Enum.max([max(item.created_at, world.cutoff) | ended ++ attested ++ disposed])
   end
 
+  @doc false
+  def work_item_trace_parent_data(items, assignments, turns)
+      when is_list(items) and is_list(assignments) and is_list(turns) do
+    work_item_trace_parent_data(
+      items,
+      assignments,
+      turns,
+      work_item_trace_resolution(items, assignments)
+    )
+  end
+
+  @doc false
+  def work_item_trace_parent_data(items, assignments, turns, resolution)
+      when is_list(items) and is_list(assignments) and is_list(turns) and is_map(resolution) do
+    turns_by_seq = Map.new(turns, &{&1.seq, &1})
+    candidates = candidate_edges(items, resolution.items_by_id, turns_by_seq, resolution.resolved)
+    {linked, cycles} = retain_acyclic_with_cycles(items, candidates)
+
+    %{
+      resolved: resolution.resolved,
+      linked: linked,
+      parents: parents(items, linked),
+      cycles: cycles
+    }
+  end
+
+  @doc false
+  def work_item_trace_resolution(items, assignments)
+      when is_list(items) and is_list(assignments) do
+    assignments_by_id = Map.new(assignments, &{&1.id, &1})
+    items_by_id = Map.new(items, &{&1.id, &1})
+
+    %{
+      items_by_id: items_by_id,
+      resolved: resolve_all(assignments, assignments_by_id)
+    }
+  end
+
+  @doc false
+  def work_item_trace_turn_has_visible_link?(turn, resolution) when is_map(resolution),
+    do: turn_has_visible_link?(turn, resolution.resolved, resolution.items_by_id)
+
   ## Parent derivation — total over missing, legacy and corrupt rows
 
   # The four statuses are exhaustive and mutually exclusive, and `linked` is the
@@ -713,6 +755,35 @@ defmodule Tightbeam.ExecutionMap do
           MapSet.member?(settled, parent) -> {dropped, settled}
           true -> walk(parent, candidates, dropped, settled, ancestry)
         end
+    end
+  end
+
+  defp retain_acyclic_with_cycles(items, candidates) do
+    linked = retain_acyclic(items, candidates)
+
+    cycles =
+      candidates
+      |> Enum.reject(fn {child, _parent} -> Map.has_key?(linked, child) end)
+      |> Map.new(fn {child, parent} -> {child, cycle_members(child, parent, candidates)} end)
+
+    {linked, cycles}
+  end
+
+  defp cycle_members(child, parent, candidates),
+    do: cycle_members(child, parent, candidates, MapSet.new([child]))
+
+  defp cycle_members(child, current, _candidates, members) when child == current, do: members
+
+  defp cycle_members(child, current, candidates, members) do
+    if MapSet.member?(members, current) do
+      members
+    else
+      cycle_members(
+        child,
+        Map.fetch!(candidates, current),
+        candidates,
+        MapSet.put(members, current)
+      )
     end
   end
 
