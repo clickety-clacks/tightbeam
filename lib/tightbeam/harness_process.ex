@@ -1235,9 +1235,16 @@ defmodule Tightbeam.HarnessProcess do
         if row.harness == "cursor" do
           bounded_command(
             "/usr/bin/sudo",
-            cursor_sudo_args() ++ [@cursor_launcher, "cursor-exec", "check",
-              Tightbeam.Harness.Cursor.execution_base(nil), cursor_org_base(row.helper_path),
-              operator_uid(), operator_home() | args],
+            cursor_sudo_args() ++
+              [
+                @cursor_launcher,
+                "cursor-exec",
+                "check",
+                Tightbeam.Harness.Cursor.execution_base(nil),
+                cursor_org_base(row.helper_path),
+                operator_uid(),
+                operator_home() | args
+              ],
             command_timeout_ms()
           )
         else

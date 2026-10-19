@@ -968,6 +968,7 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     assert [%{state: "kill_failed", resolved_at: nil, last_error: error}] =
              HarnessProcess.list(ctx.db)
+
     assert error =~ "identity_unavailable"
     assert HarnessProcess.fenced?(ctx.db, key)
   end
@@ -1023,7 +1024,10 @@ defmodule Tightbeam.HarnessProcessFixture do
     )
 
     assert {:ok, %{state: "park_requested"}} = HarnessProcess.begin_park(ctx.db, key)
-    {:ok, _} = DB.query(ctx.db, "UPDATE harness_processes SET preparationBootIdentity='previous-boot'")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE harness_processes SET preparationBootIdentity='previous-boot'")
+
     owner = self()
 
     # The successor coordinator reconciles at init, exactly as the rebooted
@@ -1068,6 +1072,7 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     assert {:error, {:launch_identity_failed, ^launch_id, {:identity_authority_unproved, _}}} =
              HarnessProcess.capture_identity(ctx.db, launch_id)
+
     assert [%{os_pid: nil, process_group_id: nil, resolved_at: nil}] = HarnessProcess.list(ctx.db)
     assert HarnessProcess.fenced?(ctx.db, {:claude, "shared", "legacy-four-field"})
   end
@@ -1115,6 +1120,7 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     assert {:error, {:launch_identity_failed, ^launch_id, {:identity_authority_unproved, _}}} =
              HarnessProcess.capture_identity(ctx.db, launch_id)
+
     refute File.exists?(row.identity_path <> ".authority")
 
     assert {:error, {:kill_failed, {:identity_authority_unproved, _}}} =
@@ -1153,6 +1159,7 @@ defmodule Tightbeam.HarnessProcessFixture do
         key
       )
     end
+
     assert HarnessProcess.list(ctx.db) == []
     refute HarnessProcess.fenced?(ctx.db, key)
   end

@@ -31,7 +31,10 @@ defmodule Tightbeam.HarnessProcess.Recovery do
 
           # Preserve the existing rate-limit incident fence, which has a separate owner.
           incident_guard =
-            if DB.Txn.q(txn, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='harness_health_incidents'") == [[1]] do
+            if DB.Txn.q(
+                 txn,
+                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='harness_health_incidents'"
+               ) == [[1]] do
               "AND NOT EXISTS (SELECT 1 FROM harness_health_incidents WHERE state='open' AND failureClass='rate-limit-dead' AND harness || ':shared@' || host = harness_park_fences.adapterKey)"
             else
               ""

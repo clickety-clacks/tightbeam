@@ -16,8 +16,15 @@ defmodule Tightbeam.HarnessLaunchRecoveryTest do
 
   defp eventually(check, attempts \\ 200)
   defp eventually(check, 0), do: check.()
+
   defp eventually(check, attempts) do
-    if check.(), do: true, else: (Process.sleep(10); eventually(check, attempts - 1))
+    if check.(),
+      do: true,
+      else:
+        (
+          Process.sleep(10)
+          eventually(check, attempts - 1)
+        )
   end
 
   defp prepare(ctx, opts \\ []) do
