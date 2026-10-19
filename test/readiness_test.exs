@@ -143,13 +143,13 @@ defmodule Tightbeam.ReadinessTest do
     catalog = catalog!(Map.new(Harness.all(), &{&1.wire_name(), live("m")}))
 
     statement =
-      "racter lost codex: its openai credential was rejected. Redirect destination: eezo. racter needs a human sign-in for codex; run " <>
+      "testhost lost codex: its openai credential was rejected. Redirect destination: alternate. testhost needs a human sign-in for codex; run " <>
         "on testhost: tightbeam onboard openai --as-user <adminUserId> " <>
         "(replace <adminUserId> with your own administrator id)."
 
     config =
       Map.put(ctx.config, :terminal_credential_views, [
-        %{canonical_statement: statement, host: "racter", harness: "codex"}
+        %{canonical_statement: statement, host: "testhost", harness: "codex"}
       ])
 
     summary = Readiness.summary(config, catalog)
