@@ -4,9 +4,6 @@ defmodule Tightbeam.Productions.BubbleSweeper do
   check repairs missed signals using the durable terminal-prefix cursor.
   An in-memory set prevents repeated recognition of out-of-order terminals
   until restart. Recognition is idempotent across restarts.
-
-  The same check repairs delivered-record follow-through for turns that have
-  not ended, so a queued or long-running recipient turn cannot postpone it.
   """
 
   use GenServer
@@ -46,7 +43,6 @@ defmodule Tightbeam.Productions.BubbleSweeper do
       db: Keyword.get(opts, :db, Tightbeam.DB),
       interval: Keyword.get(opts, :interval, 180_000),
       recognized: MapSet.new(),
-      sourced: MapSet.new(),
       missed: MapSet.new(),
       failures: %{},
       boot_at: System.system_time(:millisecond)
@@ -137,24 +133,6 @@ defmodule Tightbeam.Productions.BubbleSweeper do
           {:error, %DB.Overloaded{}} ->
             {count, state}
 
-          {:error, {:source_actions, %DB.Overloaded{}}} ->
-            {count, state}
-
-          {:error, {:source_actions, error}} ->
-            # Delivered-record follow-through is never skipped: the turn stays
-            # behind the cursor and is retried every pass until its source
-            # actions succeed, so a restart still finds it (SN10).
-            failures = Map.get(state.failures, seq, 0) + 1
-
-            if rem(failures, 5) == 0 do
-              Logger.error(
-                "delivered source actions for turn #{seq} still failing after " <>
-                  "#{failures} attempts: #{inspect(error)}"
-              )
-            end
-
-            {count, %{state | failures: Map.put(state.failures, seq, failures)}}
-
           _ ->
             failures = Map.get(state.failures, seq, 0) + 1
 
@@ -173,56 +151,7 @@ defmodule Tightbeam.Productions.BubbleSweeper do
         end
       end)
 
-    {count, state |> repair_unended_sources(cursor) |> advance_cursor()}
-  end
-
-  # A delivered record whose source action was lost (for example by a stop
-  # right after delivery) is repaired here without waiting for the turn to end.
-  # Only a success is remembered; a failure is retried on the next pass.
-  defp repair_unended_sources(state, cursor) do
-    {:ok, rows} =
-      DB.query(
-        state.db,
-        """
-        SELECT seq FROM turns
-        WHERE seq > ?1 AND endedAt IS NULL AND wakeId IS NOT NULL
-          AND seq NOT IN (SELECT value FROM json_each(?3))
-        ORDER BY seq LIMIT ?2
-        """,
-        [cursor, @batch, JSON.encode!(MapSet.to_list(state.sourced))]
-      )
-
-    Enum.reduce(rows, state, fn [seq], state ->
-      case reconcile_sources(state.db, seq) do
-        :ok -> %{state | sourced: MapSet.put(state.sourced, seq)}
-        {:error, _error} -> state
-      end
-    end)
-  end
-
-  defp reconcile_sources(db, seq) do
-    case Tightbeam.Wakes.reconcile_turn_delivered_sources(db, seq) do
-      :ok ->
-        :ok
-
-      {:error, %DB.Overloaded{}} = overloaded ->
-        overloaded
-
-      {:error, error} ->
-        Logger.warning("delivered source actions for turn #{seq} deferred: #{inspect(error)}")
-        {:error, error}
-    end
-  rescue
-    error in DB.Overloaded ->
-      {:error, error}
-
-    error ->
-      Logger.error(
-        "delivered source actions for turn #{seq} crashed and were contained: " <>
-          Exception.format(:error, error, __STACKTRACE__)
-      )
-
-      {:error, error}
+    {count, advance_cursor(state)}
   end
 
   defp advance_cursor(state) do
@@ -254,7 +183,6 @@ defmodule Tightbeam.Productions.BubbleSweeper do
     %{
       state
       | recognized: MapSet.reject(state.recognized, &(&1 <= last)),
-        sourced: MapSet.reject(state.sourced, &(&1 <= last)),
         missed: MapSet.reject(state.missed, &(&1 <= last))
     }
   end
@@ -269,7 +197,7 @@ defmodule Tightbeam.Productions.BubbleSweeper do
 
   defp recognize_one(db, seq) do
     case Bubble.recognize_terminal(db, seq) do
-      {:error, error} -> {:error, {:source_actions, error}}
+      {:error, error} -> {:error, error}
       _ -> :ok
     end
   rescue

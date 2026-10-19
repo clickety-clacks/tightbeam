@@ -3,6 +3,7 @@ defmodule Tightbeam.SupervisionTest do
 
   alias Tightbeam.{DB, Gateway, Org, Supervision, Wakes}
   alias Tightbeam.Model
+  alias Tightbeam.DB.Txn
 
   setup do
     db = String.to_atom("supervision_db_#{System.unique_integer([:positive])}")
@@ -290,7 +291,7 @@ defmodule Tightbeam.SupervisionTest do
              )
 
     assert Enum.any?(reopen_plan, fn [_, _, _, detail] ->
-             String.contains?(detail, "assignment_reopenings_activity_source_order")
+             String.contains?(detail, "assignment_reopenings_assignment")
            end)
 
     direct_wake_id = "delivery-history-target"
@@ -336,7 +337,27 @@ defmodule Tightbeam.SupervisionTest do
              )
 
     assert Enum.any?(terminal_action_plan, fn [_, _, _, detail] ->
-             String.contains?(detail, "attests_terminal_action_note")
+             detail =~ "SEARCH attests" and detail =~ "bySession=?"
+           end)
+
+    refute Enum.any?(terminal_action_plan, fn [_, _, _, detail] ->
+             String.contains?(detail, "SCAN attests")
+           end)
+
+    assert {:ok, reminder_plan} =
+             DB.query(
+               ctx.db,
+               "EXPLAIN QUERY PLAN SELECT wakeId FROM wakes WHERE state='pending' " <>
+                 "AND sessionKey=?1 AND obligationRef>=?2 AND obligationRef<?3 ORDER BY rowid",
+               [
+                 ctx.main.session_key,
+                 "terminal-child-owner-action-reminder:",
+                 "terminal-child-owner-action-reminder;"
+               ]
+             )
+
+    assert Enum.any?(reminder_plan, fn [_, _, _, detail] ->
+             String.contains?(detail, "wakes_pending_session_obligation")
            end)
   end
 
@@ -503,6 +524,75 @@ defmodule Tightbeam.SupervisionTest do
 
     assert pending_deadline!(ctx.db, "asg_inactive").wake_id == deadline.wake_id
     assert pending_deadline!(ctx.db, "asg_inactive").due_at == event_at + interval_ms
+  end
+
+  test "a refused deadline or retraction write fails the assignment change that caused it",
+       ctx do
+    opened_at = System.system_time(:millisecond)
+    interval_ms = 60_000
+
+    refuse!(ctx.db, "BEFORE INSERT ON wakes WHEN NEW.consumer='assignment_inactivity_deadline'")
+
+    assert {:error, _} =
+             DB.transaction(ctx.db, fn txn ->
+               Txn.exec(txn, "UPDATE assignments SET subject='changed' WHERE id='asg_inactive'")
+               Supervision.assignment_opened_in_txn(txn, "asg_inactive", opened_at, interval_ms)
+             end)
+
+    assert subject(ctx.db) == "ship it"
+    assert deadline_count(ctx.db) == 0
+
+    assert {:error, _} =
+             DB.transaction(ctx.db, fn txn ->
+               Txn.exec(txn, "UPDATE assignments SET subject='changed' WHERE id='asg_inactive'")
+               Supervision.activity_in_txn(txn, "asg_inactive", ctx.holder.session_key, opened_at)
+             end)
+
+    assert subject(ctx.db) == "ship it"
+    assert deadline_count(ctx.db) == 0
+
+    assert :ok = DB.execute(ctx.db, "DROP TRIGGER refuse_supervision_write")
+    open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    refuse!(
+      ctx.db,
+      "BEFORE UPDATE OF state ON wakes WHEN OLD.consumer='assignment_inactivity_deadline'"
+    )
+
+    assert {:error, _} =
+             DB.transaction(ctx.db, fn txn ->
+               Txn.exec(txn, "UPDATE assignments SET state='closed' WHERE id='asg_inactive'")
+               Supervision.assignment_closed_in_txn(txn, "asg_inactive")
+             end)
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id='asg_inactive'")
+
+    assert pending_deadline!(ctx.db, "asg_inactive").wake_id == deadline.wake_id
+  end
+
+  defp refuse!(db, condition) do
+    assert :ok =
+             DB.execute(db, """
+             CREATE TRIGGER refuse_supervision_write #{condition}
+             BEGIN SELECT RAISE(ABORT,'supervision write refused'); END
+             """)
+  end
+
+  defp subject(db) do
+    {:ok, [[subject]]} = DB.query(db, "SELECT subject FROM assignments WHERE id='asg_inactive'")
+    subject
+  end
+
+  defp deadline_count(db) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='assignment_inactivity_deadline'"
+      )
+
+    count
   end
 
   defp open_deadline!(db, assignment_id, opened_at, interval_ms) do

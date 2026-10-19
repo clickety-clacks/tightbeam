@@ -43,35 +43,32 @@ defmodule Tightbeam.Supervision do
   def assignment_opened_in_txn(%Txn{} = txn, assignment_id, opened_at, interval_ms)
       when is_binary(assignment_id) and is_integer(opened_at) and is_integer(interval_ms) and
              interval_ms > 0 do
-    isolated_side_task(txn, assignment_id, "open", fn ->
-      with [[holder, work_item_id, "open"]] <-
-             Txn.q(
-               txn,
-               "SELECT holderKey,workItemId,state FROM assignments WHERE id=?1",
-               [assignment_id]
-             ),
-           true <- is_binary(holder) and holder != "" do
-        deadline =
-          schedule_deadline_in_txn(
-            txn,
-            assignment_id,
-            holder,
-            work_item_id,
-            opened_at,
-            interval_ms
-          )
+    # The deadline and the retraction it replaces are the assignment's
+    # supervision state: they commit or fail with the opening transaction.
+    with [[holder, work_item_id, "open"]] <-
+           Txn.q(
+             txn,
+             "SELECT holderKey,workItemId,state FROM assignments WHERE id=?1",
+             [assignment_id]
+           ),
+         true <- is_binary(holder) and holder != "" do
+      deadline =
+        schedule_deadline_in_txn(
+          txn,
+          assignment_id,
+          holder,
+          work_item_id,
+          opened_at,
+          interval_ms
+        )
 
-        cancel_assignment_sources_in_txn(txn, assignment_id, {:replacement, deadline.wake_id})
+      cancel_assignment_sources_in_txn(txn, assignment_id, {:replacement, deadline.wake_id})
+      :ok
+    else
+      _ ->
+        Logger.warning("assignment inactivity deadline unavailable for #{inspect(assignment_id)}")
         :ok
-      else
-        _ ->
-          Logger.warning(
-            "assignment inactivity deadline unavailable for #{inspect(assignment_id)}"
-          )
-
-          :ok
-      end
-    end)
+    end
   end
 
   def assignment_opened_in_txn(_txn, assignment_id, _opened_at, _interval_ms) do
@@ -83,11 +80,8 @@ defmodule Tightbeam.Supervision do
   def assignment_closed_in_txn(%Txn{} = txn, assignment_id)
       when is_binary(assignment_id) do
     :ok = Wakes.assignment_closed_in_txn(txn, assignment_id)
-
-    isolated_side_task(txn, assignment_id, "close", fn ->
-      cancel_assignment_sources_in_txn(txn, assignment_id, :disposed)
-      :ok
-    end)
+    cancel_assignment_sources_in_txn(txn, assignment_id, :disposed)
+    :ok
   end
 
   def assignment_closed_in_txn(_txn, _assignment_id), do: :ok
@@ -95,46 +89,44 @@ defmodule Tightbeam.Supervision do
   @doc false
   def activity_in_txn(%Txn{} = txn, assignment_id, actor_session_key, at)
       when is_binary(assignment_id) and is_binary(actor_session_key) and is_integer(at) do
-    isolated_side_task(txn, assignment_id, "activity", fn ->
-      case Txn.q(
-             txn,
-             "SELECT holderKey,workItemId,openedAt,state FROM assignments WHERE id=?1",
-             [assignment_id]
-           ) do
-        [[^actor_session_key, work_item_id, opened_at, "open"]]
-        when is_integer(opened_at) ->
-          activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
+    case Txn.q(
+           txn,
+           "SELECT holderKey,workItemId,openedAt,state FROM assignments WHERE id=?1",
+           [assignment_id]
+         ) do
+      [[^actor_session_key, work_item_id, opened_at, "open"]]
+      when is_integer(opened_at) ->
+        activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
 
-          {interval_ms, last_activity} =
-            latest_deadline_state_in_txn(txn, assignment_id, activity_start)
+        {interval_ms, last_activity} =
+          latest_deadline_state_in_txn(txn, assignment_id, activity_start)
 
-          effective_at = max(activity_start, max(last_activity, at))
+        effective_at = max(activity_start, max(last_activity, at))
 
-          deadline =
-            schedule_deadline_in_txn(
-              txn,
-              assignment_id,
-              actor_session_key,
-              work_item_id,
-              effective_at,
-              interval_ms
-            )
-
-          # Stamp the replacement at the activity itself: cancellation also
-          # settles effort relief, which must start when a wait was registered.
-          cancel_assignment_sources_in_txn(
+        deadline =
+          schedule_deadline_in_txn(
             txn,
             assignment_id,
-            {:replacement, deadline.wake_id},
-            fn -> at end
+            actor_session_key,
+            work_item_id,
+            effective_at,
+            interval_ms
           )
 
-          :reset
+        # Stamp the replacement at the activity itself: cancellation also
+        # settles effort relief, which must start when a wait was registered.
+        cancel_assignment_sources_in_txn(
+          txn,
+          assignment_id,
+          {:replacement, deadline.wake_id},
+          fn -> at end
+        )
 
-        _ ->
-          :ignored
-      end
-    end)
+        :reset
+
+      _ ->
+        :ignored
+    end
   end
 
   def activity_in_txn(_txn, _assignment_id, _actor_session_key, _at), do: :ignored

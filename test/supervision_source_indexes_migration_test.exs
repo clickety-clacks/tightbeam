@@ -6,13 +6,6 @@ defmodule Tightbeam.SupervisionSourceIndexesMigrationTest do
   @indexes ~w(
     wakes_assignment_consumer_created_order
     wakes_assignment_consumer_pending_created
-    wakes_assignment_pending_created_order
-    wakes_activity_source_order
-    attests_activity_source_order
-    attests_terminal_action_note
-    artifacts_activity_source_order
-    decision_requests_activity_source_order
-    assignment_reopenings_activity_source_order
     wakes_pending_session_obligation
   )
 

@@ -593,13 +593,12 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc """
-  Act on the delivered records a turn carried.
+  Act on the delivered records a finished turn carried.
 
-  The turn-end sweeper calls this for every turn past its cursor, ended or
-  not, after the delivery step's own post-commit attempt. Each source action
-  is idempotent, so a turn whose follow-through already ran is a no-op; a turn
-  whose follow-through was lost to a restart is repaired from its delivered
-  records.
+  The turn-end sweeper calls this for every terminal turn, after the delivery
+  step's own post-commit attempt. Each source action is idempotent, so a turn
+  whose follow-through already ran is a no-op; a turn whose follow-through was
+  lost to a restart is repaired from its delivered records.
   """
   @spec reconcile_turn_delivered_sources(DB.server(), integer()) :: :ok | {:error, term()}
   def reconcile_turn_delivered_sources(db, seq) when is_integer(seq) do

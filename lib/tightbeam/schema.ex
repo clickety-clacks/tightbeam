@@ -3062,27 +3062,6 @@ defmodule Tightbeam.Schema do
     {"wakes_assignment_consumer_pending_created",
      "CREATE INDEX IF NOT EXISTS wakes_assignment_consumer_pending_created " <>
        "ON wakes(assignmentId,consumer,createdAt DESC,wakeId DESC) WHERE state='pending'"},
-    {"wakes_assignment_pending_created_order",
-     "CREATE INDEX IF NOT EXISTS wakes_assignment_pending_created_order " <>
-       "ON wakes(assignmentId,createdAt DESC,wakeId DESC) WHERE state='pending'"},
-    {"wakes_activity_source_order",
-     "CREATE INDEX IF NOT EXISTS wakes_activity_source_order " <>
-       "ON wakes(assignmentId,creatorSessionKey,createdAt DESC)"},
-    {"attests_activity_source_order",
-     "CREATE INDEX IF NOT EXISTS attests_activity_source_order " <>
-       "ON attests(assignmentId,bySession,ts DESC)"},
-    {"attests_terminal_action_note",
-     "CREATE INDEX IF NOT EXISTS attests_terminal_action_note " <>
-       "ON attests(bySession,kind,note COLLATE NOCASE)"},
-    {"artifacts_activity_source_order",
-     "CREATE INDEX IF NOT EXISTS artifacts_activity_source_order " <>
-       "ON artifacts(producedByAssignmentId,createdBySession,createdAt DESC)"},
-    {"decision_requests_activity_source_order",
-     "CREATE INDEX IF NOT EXISTS decision_requests_activity_source_order " <>
-       "ON decision_requests(assignmentId,raiserSessionKey,raisedAt DESC)"},
-    {"assignment_reopenings_activity_source_order",
-     "CREATE INDEX IF NOT EXISTS assignment_reopenings_activity_source_order " <>
-       "ON assignment_reopenings(assignmentId,ts DESC)"},
     {"wakes_pending_session_obligation",
      "CREATE INDEX IF NOT EXISTS wakes_pending_session_obligation " <>
        "ON wakes(sessionKey,obligationRef) WHERE state='pending'"}
@@ -3140,9 +3119,7 @@ defmodule Tightbeam.Schema do
         result
 
       {:error, error} ->
-        Logger.warning(
-          "supervision source index build deferred: " <> Exception.message(error)
-        )
+        Logger.warning("supervision source index build deferred: " <> Exception.message(error))
 
         {:error, error}
     end
