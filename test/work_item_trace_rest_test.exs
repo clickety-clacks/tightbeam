@@ -488,7 +488,7 @@ defmodule Tightbeam.WorkItemTraceRestTest do
 
   defp assert_trace_parent_matches_execution_map!(ctx, work_item_id, trace, bearer \\ nil) do
     response = get(ctx, "/api/execution-map", bearer)
-    assert response.status == 200
+    assert response.status == 200, "execution map response: #{response.resp_body}"
     execution_map = JSON.decode!(response.resp_body)
     node = Enum.find(execution_map["items"], &(&1["id"] == work_item_id))
     refute is_nil(node)
