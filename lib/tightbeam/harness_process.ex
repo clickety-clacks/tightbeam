@@ -99,9 +99,16 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp ensure_schema_in_txn(txn, version) do
-    ddl = if version == :current,
-      do: String.replace(@ddl, "lastError        TEXT", "lastError        TEXT,\n    preparationBootIdentity TEXT"),
-      else: @ddl
+    ddl =
+      if version == :current,
+        do:
+          String.replace(
+            @ddl,
+            "lastError        TEXT",
+            "lastError        TEXT,\n    preparationBootIdentity TEXT"
+          ),
+        else: @ddl
+
     DB.Txn.exec(txn, ddl)
 
     DB.Txn.exec(
@@ -127,11 +134,15 @@ defmodule Tightbeam.HarnessProcess do
 
     identity_path = Path.join([root, "harness-processes", launch_id <> ".identity"])
     dedicated_cursor? = Keyword.get(opts, :cursor_execution_identity, false)
+
     preparation_boot =
       if is_nil(ssh) do
         case local_boot_identity(%{helper_path: helper_path}) do
-          {:ok, boot} -> boot
-          {:error, reason} -> raise "harness launch preparation failed for #{key_name(key)}: #{inspect(reason)}"
+          {:ok, boot} ->
+            boot
+
+          {:error, reason} ->
+            raise "harness launch preparation failed for #{key_name(key)}: #{inspect(reason)}"
         end
       end
 
@@ -216,17 +227,33 @@ defmodule Tightbeam.HarnessProcess do
   def capture_identity(db, launch_id, timeout_ms \\ 5_000, conn \\ nil)
       when is_integer(timeout_ms) and timeout_ms >= 0 do
     row = fetch!(db, launch_id)
+
     case await_identity(row, deadline(timeout_ms), conn) do
-      {:ok, pid, pgid, boot, token} -> persist_identity(db, row, pid, pgid, boot, token, true)
+      {:ok, pid, pgid, boot, token} ->
+        persist_identity(db, row, pid, pgid, boot, token, true)
+
       {:error, reason} ->
         failure = {:launch_identity_failed, launch_id, reason}
-        {:ok, :ok} = DB.transaction(db, fn txn ->
-          DB.Txn.q(txn, "UPDATE harness_processes SET state='kill_failed', lastError=?2 WHERE launchId=?1 AND resolvedAt IS NULL", [launch_id, inspect(failure)])
-          if DB.Txn.changes(txn) == 1 do
-            DB.Txn.q(txn, "INSERT OR IGNORE INTO harness_park_fences(adapterKey,requestedAt) VALUES(?1,?2)", [row.adapter_key, now()])
-          end
-          :ok
-        end)
+
+        {:ok, :ok} =
+          DB.transaction(db, fn txn ->
+            DB.Txn.q(
+              txn,
+              "UPDATE harness_processes SET state='kill_failed', lastError=?2 WHERE launchId=?1 AND resolvedAt IS NULL",
+              [launch_id, inspect(failure)]
+            )
+
+            if DB.Txn.changes(txn) == 1 do
+              DB.Txn.q(
+                txn,
+                "INSERT OR IGNORE INTO harness_park_fences(adapterKey,requestedAt) VALUES(?1,?2)",
+                [row.adapter_key, now()]
+              )
+            end
+
+            :ok
+          end)
+
         {:error, failure}
     end
   end
@@ -415,7 +442,7 @@ defmodule Tightbeam.HarnessProcess do
     if is_map(process_row) do
       DB.Txn.q(
         txn,
-        "UPDATE harness_processes SET state = 'kill_failed', lastError = ?2 WHERE launchId = ?1 AND resolvedAt IS NULL",
+        "UPDATE harness_processes SET state = 'kill_failed', lastError = CASE WHEN lastError LIKE '{:launch_identity_failed,%' THEN lastError ELSE ?2 END WHERE launchId = ?1 AND resolvedAt IS NULL",
         [process_row.launch_id, inspect(failure)]
       )
     end
@@ -435,6 +462,7 @@ defmodule Tightbeam.HarnessProcess do
   @spec reconcile(DB.server()) :: :ok
   def reconcile(db) do
     :ok = clear_orphan_fences(db)
+
     Enum.each(unresolved(db), fn row ->
       :ok = ensure_fence(db, row.adapter_key)
 
@@ -503,8 +531,12 @@ defmodule Tightbeam.HarnessProcess do
 
   defp reconcile_row(db, row, terminal_state \\ "killed") do
     case settle(db, row.launch_id, row.adapter_key, "automatic-reconcile") do
-      {:ok, _} -> :settled
-      :already_resolved -> :already_resolved
+      {:ok, _} ->
+        :settled
+
+      :already_resolved ->
+        :already_resolved
+
       {:error, _} ->
         with {:ok, recovered} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
           kill(db, recovered, terminal_state)
@@ -530,8 +562,12 @@ defmodule Tightbeam.HarnessProcess do
           "" -> {:error, :boot_identity_empty}
           boot -> {:ok, boot}
         end
-      {:error, :timeout} -> {:error, :boot_identity_timeout}
-      {output, status} -> {:error, {:boot_identity_unavailable, status, one_line(output)}}
+
+      {:error, :timeout} ->
+        {:error, :boot_identity_timeout}
+
+      {output, status} ->
+        {:error, {:boot_identity_unavailable, status, one_line(output)}}
     end
   end
 
@@ -642,19 +678,34 @@ defmodule Tightbeam.HarnessProcess do
   defp await_identity(row, until, conn \\ nil) do
     remaining = max(until - System.monotonic_time(:millisecond), 0)
     receipt = if conn, do: Tightbeam.Acp.Conn.launch_exit(conn, max(remaining, 1)), else: nil
+
     case receipt do
       %{launch_id: id, status: status} when id == row.launch_id ->
-        {:error, {:launcher_exited, status, Tightbeam.HarnessProcess.Recovery.terminal_record(row)}}
+        {:error,
+         {:launcher_exited, status, Tightbeam.HarnessProcess.Recovery.terminal_record(row)}}
+
       _ ->
         case Tightbeam.HarnessProcess.Recovery.terminal_record(row) do
-          {:ok, record} -> {:error, {:launcher_failed, record}}
+          {:ok, record} ->
+            {:error, {:launcher_failed, record}}
+
           _ ->
             case read_identity(row, min(command_timeout_ms(), remaining)) do
               {:ok, pid, pgid, boot, token} = identity ->
-                case check_identity(%{row | os_pid: pid, process_group_id: pgid, boot_identity: boot, identity_token: token}, true) do
+                case check_identity(
+                       %{
+                         row
+                         | os_pid: pid,
+                           process_group_id: pgid,
+                           boot_identity: boot,
+                           identity_token: token
+                       },
+                       true
+                     ) do
                   {:ok, _} -> identity
                   {:error, _} = error -> error
                 end
+
               {:error, reason} ->
                 if System.monotonic_time(:millisecond) < until do
                   Process.sleep(min(25, remaining))
@@ -678,7 +729,9 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp parse_identity(output, expected_launch_id) do
-    case (if String.ends_with?(output, "\n"), do: output |> String.trim() |> String.split("\t"), else: []) do
+    case if String.ends_with?(output, "\n"),
+           do: output |> String.trim() |> String.split("\t"),
+           else: [] do
       [pid, process_group_id, boot_identity, launch_id] ->
         validate_identity(pid, process_group_id, boot_identity, launch_id, expected_launch_id)
 
@@ -1115,12 +1168,16 @@ defmodule Tightbeam.HarnessProcess do
 
   @doc false
   def fetch_in_txn(txn, launch_id) do
-    case DB.Txn.q(txn, """
-      SELECT launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
-             launchSequence, osPid, processGroupId, bootIdentity, identityToken,
-             state, createdAt, parkRequestedAt, killAttemptedAt, killSentAt, resolvedAt,
-             lastError, preparationBootIdentity FROM harness_processes WHERE launchId=?1
-      """, [launch_id]) do
+    case DB.Txn.q(
+           txn,
+           """
+           SELECT launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
+                  launchSequence, osPid, processGroupId, bootIdentity, identityToken,
+                  state, createdAt, parkRequestedAt, killAttemptedAt, killSentAt, resolvedAt,
+                  lastError, preparationBootIdentity FROM harness_processes WHERE launchId=?1
+           """,
+           [launch_id]
+         ) do
       [row] -> {:ok, decode_row(row)}
       [] -> {:error, :launch_not_found}
     end
@@ -1129,7 +1186,13 @@ defmodule Tightbeam.HarnessProcess do
   @doc false
   def read_proved_identity(row) do
     with {:ok, pid, pgid, boot, token} <- read_identity(row, command_timeout_ms()),
-         identity = %{row | os_pid: pid, process_group_id: pgid, boot_identity: boot, identity_token: token},
+         identity = %{
+           row
+           | os_pid: pid,
+             process_group_id: pgid,
+             boot_identity: boot,
+             identity_token: token
+         },
          {:ok, _} <- check_identity(identity, true) do
       {:ok, identity}
     end
@@ -1137,13 +1200,41 @@ defmodule Tightbeam.HarnessProcess do
 
   @doc false
   def check_identity(row, recorded_only? \\ false) do
-    args = [Integer.to_string(row.process_group_id), row.identity_path, row.boot_identity, row.identity_token]
+    args = [
+      Integer.to_string(row.process_group_id),
+      row.identity_path,
+      row.boot_identity,
+      row.identity_token
+    ]
+
     args = if recorded_only?, do: args ++ ["recorded"], else: args
-    result = if row.ssh do
-      bounded_command("ssh", @ssh_opts ++ [row.ssh, shell_quote(row.helper_path), "harness-check" | Enum.map(args, &shell_quote/1)], command_timeout_ms())
-    else
-      bounded_command(row.helper_path, ["harness-check" | args], command_timeout_ms())
-    end
+
+    result =
+      if row.ssh do
+        bounded_command(
+          "ssh",
+          @ssh_opts ++
+            [
+              row.ssh,
+              shell_quote(row.helper_path),
+              "harness-check" | Enum.map(args, &shell_quote/1)
+            ],
+          command_timeout_ms()
+        )
+      else
+        if row.harness == "cursor" do
+          bounded_command(
+            "/usr/bin/sudo",
+            cursor_sudo_args() ++ [@cursor_launcher, "cursor-exec", "check",
+              Tightbeam.Harness.Cursor.execution_base(nil), cursor_org_base(row.helper_path),
+              operator_uid(), operator_home() | args],
+            command_timeout_ms()
+          )
+        else
+          bounded_command(row.helper_path, ["harness-check" | args], command_timeout_ms())
+        end
+      end
+
     case result do
       {_, 0} -> {:ok, :gone}
       {_, 3} -> {:ok, :live}
@@ -1366,28 +1457,28 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   def decode_row([
-         launch_id,
-         adapter_key,
-         harness,
-         preset,
-         host,
-         ssh,
-         helper_path,
-         identity_path,
-         launch_sequence,
-         os_pid,
-         process_group_id,
-         boot_identity,
-         identity_token,
-         state,
-         created_at,
-         park_requested_at,
-         kill_attempted_at,
-         kill_sent_at,
-         resolved_at,
-         last_error,
-         preparation_boot_identity
-       ]) do
+        launch_id,
+        adapter_key,
+        harness,
+        preset,
+        host,
+        ssh,
+        helper_path,
+        identity_path,
+        launch_sequence,
+        os_pid,
+        process_group_id,
+        boot_identity,
+        identity_token,
+        state,
+        created_at,
+        park_requested_at,
+        kill_attempted_at,
+        kill_sent_at,
+        resolved_at,
+        last_error,
+        preparation_boot_identity
+      ]) do
     %{
       launch_id: launch_id,
       adapter_key: adapter_key,

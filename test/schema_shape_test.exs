@@ -23,7 +23,7 @@ defmodule Tightbeam.SchemaShapeTest do
     Wakes
   }
 
-  @shape "decision-request-row-schema-v2-019"
+  @shape "launch-preparation-boot-v1-0110"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
   @owner_link_history_ddl """
   CREATE TABLE work_item_delivery_scope_events (

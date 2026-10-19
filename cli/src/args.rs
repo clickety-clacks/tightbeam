@@ -572,7 +572,11 @@ pub enum Command {
         identity: Identity,
         session_key: String,
     },
-    HarnessProcessSettle { identity: Identity, launch_id: String, adapter_key: String },
+    HarnessProcessSettle {
+        identity: Identity,
+        launch_id: String,
+        adapter_key: String,
+    },
     HarnessProcesses {
         identity: Identity,
     },
@@ -3465,10 +3469,15 @@ fn parse_harness_process(
             identity: identity(flags)?,
         }),
         (Some("settle"), Some(launch_id), None) => Ok(Command::HarnessProcessSettle {
-            identity: identity(flags)?, launch_id: launch_id.clone(),
-            adapter_key: nonempty(flags, "adapter-key").ok_or_else(|| "harness-process settle requires --adapter-key".to_owned())?,
+            identity: identity(flags)?,
+            launch_id: launch_id.clone(),
+            adapter_key: nonempty(flags, "adapter-key")
+                .ok_or_else(|| "harness-process settle requires --adapter-key".to_owned())?,
         }),
-        _ => Err("usage: tightbeam harness-process list | settle <launch-id> --adapter-key <key>".to_owned()),
+        _ => Err(
+            "usage: tightbeam harness-process list | settle <launch-id> --adapter-key <key>"
+                .to_owned(),
+        ),
     }
 }
 

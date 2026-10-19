@@ -281,7 +281,9 @@ defmodule Tightbeam.HarnessProcessFixture do
     # See the forged-pgid note above: 999999123 is unallocatable by construction.
     File.write!(row.identity_path, "999999123\t999999123\t0\t0\tboot-marker\t#{launch_id}\n")
 
-    assert_raise FunctionClauseError, fn -> HarnessProcess.capture_identity(ctx.db, launch_id, :infinity) end
+    assert_raise FunctionClauseError, fn ->
+      HarnessProcess.capture_identity(ctx.db, launch_id, :infinity)
+    end
   end
 
   defp scenario(9, ctx) do
@@ -511,7 +513,6 @@ defmodule Tightbeam.HarnessProcessFixture do
       assert unresolved.kill_attempted_at == fixture["kill_attempted_at"]
       assert unresolved.kill_sent_at == fixture["kill_sent_at"]
       assert unresolved.last_error =~ "identity_unavailable"
-
     end
   end
 
@@ -965,16 +966,10 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     assert :ok = HarnessProcess.reconcile(ctx.db)
 
-    assert [%{state: "exited", resolved_at: resolved_at, last_error: nil}] =
+    assert [%{state: "kill_failed", resolved_at: nil, last_error: error}] =
              HarnessProcess.list(ctx.db)
-
-    assert is_integer(resolved_at)
-    refute HarnessProcess.fenced?(ctx.db, key)
-
-    assert Enum.any?(
-             EventLog.lifecycle_events(ctx.db),
-             &(&1.kind == "harness_launch_unlaunched" and &1.subject == "claude:shared@testhost")
-           )
+    assert error =~ "identity_unavailable"
+    assert HarnessProcess.fenced?(ctx.db, key)
   end
 
   defp scenario(26, ctx) do
@@ -1009,8 +1004,8 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     assert Enum.any?(
              EventLog.lifecycle_events(ctx.db),
-             &(&1.kind == "harness_launch_reboot_orphan" and
-                 &1.subject == "claude:shared@testhost")
+             &(&1.kind == "harness_launch_settled" and
+                 &1.subject == "claude:shared@testhost" and &1.detail =~ "identity_boot_ended")
            )
   end
 
@@ -1028,6 +1023,7 @@ defmodule Tightbeam.HarnessProcessFixture do
     )
 
     assert {:ok, %{state: "park_requested"}} = HarnessProcess.begin_park(ctx.db, key)
+    {:ok, _} = DB.query(ctx.db, "UPDATE harness_processes SET preparationBootIdentity='previous-boot'")
     owner = self()
 
     # The successor coordinator reconciles at init, exactly as the rebooted
@@ -1070,12 +1066,10 @@ defmodule Tightbeam.HarnessProcessFixture do
     [row] = HarnessProcess.list(ctx.db)
     File.write!(row.identity_path, "999999123\t999999123\tboot-marker\t#{launch_id}\n")
 
-    assert :ok = HarnessProcess.capture_identity(ctx.db, launch_id)
-    [captured] = HarnessProcess.list(ctx.db)
-    assert captured.os_pid == 999_999_123
-    assert captured.process_group_id == 999_999_123
-    assert captured.boot_identity == "boot-marker"
-    assert captured.identity_token == launch_id
+    assert {:error, {:launch_identity_failed, ^launch_id, {:identity_authority_unproved, _}}} =
+             HarnessProcess.capture_identity(ctx.db, launch_id)
+    assert [%{os_pid: nil, process_group_id: nil, resolved_at: nil}] = HarnessProcess.list(ctx.db)
+    assert HarnessProcess.fenced?(ctx.db, {:claude, "shared", "legacy-four-field"})
   end
 
   defp scenario(29, ctx) do
@@ -1119,10 +1113,11 @@ defmodule Tightbeam.HarnessProcessFixture do
     [row] = HarnessProcess.list(ctx.db)
     File.write!(row.identity_path, "999999123\t999999123\tboot-marker\t#{launch_id}\n")
 
-    assert :ok = HarnessProcess.capture_identity(ctx.db, launch_id)
+    assert {:error, {:launch_identity_failed, ^launch_id, {:identity_authority_unproved, _}}} =
+             HarnessProcess.capture_identity(ctx.db, launch_id)
     refute File.exists?(row.identity_path <> ".authority")
 
-    assert {:error, {:kill_failed, {:sigkill_not_delivered, 64, ""}}} =
+    assert {:error, {:kill_failed, {:identity_authority_unproved, _}}} =
              HarnessProcess.reconcile_key(ctx.db, key)
 
     refute File.exists?(marker), "legacy helper reached its numeric group-signal body"
@@ -1151,39 +1146,15 @@ defmodule Tightbeam.HarnessProcessFixture do
     File.chmod!(helper, 0o755)
     key = {:claude, "shared", "boot-unreadable"}
 
-    opts =
+    assert_raise RuntimeError, ~r/boot_identity_unavailable.*boot id source unreadable/, fn ->
       HarnessProcess.prepare_launch(
         [cmd: ["unused"], process_identity_dir: ctx.test_dir, process_helper: helper],
         ctx.db,
         key
       )
-
-    launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
-    [row] = HarnessProcess.list(ctx.db)
-    File.write!(row.identity_path, "999999124\t999999124\tboot-marker\t#{launch_id}\n")
-    assert :ok = HarnessProcess.capture_identity(ctx.db, launch_id)
-
-    assert {:error, {:kill_failed, _reason}} = HarnessProcess.reconcile_key(ctx.db, key)
-
-    # An unreadable boot identity keeps the fence; it is not reported as a live process
-    # or a reboot orphan, and the helper's own answer is kept.
-    assert HarnessProcess.fenced?(ctx.db, key)
-
-    refute Enum.any?(
-             EventLog.lifecycle_events(ctx.db),
-             &(&1.kind == "harness_launch_reboot_orphan")
-           )
-
-    assert [event] =
-             Enum.filter(
-               EventLog.lifecycle_events(ctx.db),
-               &(&1.kind == "harness_boot_identity_unknown")
-             )
-
-    assert event.subject == "claude:shared@boot-unreadable"
-    assert event.detail =~ launch_id
-    assert event.detail =~ "boot_identity_unavailable"
-    assert event.detail =~ "boot id source unreadable"
+    end
+    assert HarnessProcess.list(ctx.db) == []
+    refute HarnessProcess.fenced?(ctx.db, key)
   end
 
   defp scenario(30, ctx) do

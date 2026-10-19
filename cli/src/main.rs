@@ -127,7 +127,10 @@ fn main() {
     if args.first().is_some_and(|arg| arg == "harness-check") {
         match harness_process::check_group(&args[1..]) {
             Ok(status) => std::process::exit(status),
-            Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
         }
     }
 

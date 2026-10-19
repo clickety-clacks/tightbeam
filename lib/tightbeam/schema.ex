@@ -2083,7 +2083,8 @@ defmodule Tightbeam.Schema do
                [[@notice_source_payload_shape]] ->
                  validate_notice_source_payload_in_txn!(txn)
 
-               [[shape]] when shape in [@decision_request_row_schema_shape, @launch_preparation_boot_shape] ->
+               [[shape]]
+               when shape in [@decision_request_row_schema_shape, @launch_preparation_boot_shape] ->
                  validate_notice_source_payload_in_txn!(txn)
 
                [[@assignment_source_replacement_shape]] ->
@@ -3804,23 +3805,39 @@ defmodule Tightbeam.Schema do
   # rows remain NULL; a missing value is never backfilled as termination proof.
   defp upgrade_launch_preparation_boot(db) do
     case DB.transaction(db, fn txn ->
-      case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-        [[@decision_request_row_schema_shape]] ->
-          :ok = Txn.exec(txn, "ALTER TABLE harness_processes ADD COLUMN preparationBootIdentity TEXT")
-          Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
-            @launch_preparation_boot_shape, System.system_time(:millisecond), @decision_request_row_schema_shape])
-          1 = Txn.changes(txn)
-          :ok
-        [[@launch_preparation_boot_shape]] ->
-          # A stamped successor missing its required column is corruption, not a
-          # second opportunity to migrate an inferred shape.
-          Txn.q(txn, "SELECT preparationBootIdentity FROM harness_processes LIMIT 0")
-          :ok
-        rows -> raise ShapeError, message: "incompatible launch preparation predecessor: #{inspect(rows)}"
-      end
-    end) do
-      {:ok, :ok} -> :ok
-      {:error, error} -> raise ShapeError, message: "launch preparation migration rolled back: #{inspect(error)}"
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@decision_request_row_schema_shape]] ->
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "ALTER TABLE harness_processes ADD COLUMN preparationBootIdentity TEXT"
+                 )
+
+               Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                 @launch_preparation_boot_shape,
+                 System.system_time(:millisecond),
+                 @decision_request_row_schema_shape
+               ])
+
+               1 = Txn.changes(txn)
+               :ok
+
+             [[@launch_preparation_boot_shape]] ->
+               # A stamped successor missing its required column is corruption, not a
+               # second opportunity to migrate an inferred shape.
+               Txn.q(txn, "SELECT preparationBootIdentity FROM harness_processes LIMIT 0")
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible launch preparation predecessor: #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError, message: "launch preparation migration rolled back: #{inspect(error)}"
     end
   end
 
@@ -3844,7 +3861,8 @@ defmodule Tightbeam.Schema do
 
                :ok
 
-             [[shape]] when shape in [@decision_request_row_schema_shape, @launch_preparation_boot_shape] ->
+             [[shape]]
+             when shape in [@decision_request_row_schema_shape, @launch_preparation_boot_shape] ->
                :ok =
                  Tightbeam.Escalation.validate_decision_row_schema_revision_in_txn(
                    txn,
@@ -4416,7 +4434,8 @@ defmodule Tightbeam.Schema do
       when shape in [@assignment_source_replacement_shape, @notice_source_payload_shape] ->
         check_work_item_owner_link_shape(db)
 
-      {:ok, [[shape]]} when shape in [@decision_request_row_schema_shape, @launch_preparation_boot_shape] ->
+      {:ok, [[shape]]}
+      when shape in [@decision_request_row_schema_shape, @launch_preparation_boot_shape] ->
         :ok = check_work_item_owner_link_shape(db)
         check_decision_request_row_schema_shape(db)
 
@@ -4753,7 +4772,8 @@ defmodule Tightbeam.Schema do
     end
   end
 
-  defp bootstrap_module(db, Tightbeam.HarnessProcess, _current?), do: Tightbeam.HarnessProcess.ensure_historical_schema(db)
+  defp bootstrap_module(db, Tightbeam.HarnessProcess, _current?),
+    do: Tightbeam.HarnessProcess.ensure_historical_schema(db)
 
   defp bootstrap_module(db, module, _current?), do: module.ensure_schema(db)
 

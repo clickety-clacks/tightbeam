@@ -336,7 +336,12 @@ defmodule Tightbeam.Acp.Conn do
   end
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
-    receipt = %{launch_id: state.launch_id, status: status, direct_launcher: state.direct_launcher}
+    receipt = %{
+      launch_id: state.launch_id,
+      status: status,
+      direct_launcher: state.direct_launcher
+    }
+
     state = %{state | launch_exit: receipt}
     emit(state, {:acp_exit, status})
     {:noreply, fail_all(%{state | closed: true, closed_by: {:exit, status}})}
