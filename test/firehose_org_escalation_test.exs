@@ -242,12 +242,26 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
 
     assert %{decisionRequest: request} = Assignments.__handle__(db, "attest", call)
 
-    # The attest, decision request and holder-authored wake each reset the deadline.
+    # The attest, decision request and holder-authored wake each reset the
+    # deadline. The decision notice and the three cancellations share one
+    # commit; their relative order is not part of the contract.
+    published =
+      for _ <- 1..4 do
+        assert_receive {:firehose_notice, published}
+        Hub.delivered(hub, self())
+        published
+      end
+
+    {[notice], cancellations} =
+      Enum.split_with(published, &(&1["class"] == "decision_request.opened"))
+
+    cancellations = Map.new(cancellations, &{&1["refs"]["wakeId"], &1})
+    assert map_size(cancellations) == 3
+
     final_deadline =
       Enum.reduce(1..3, initial_deadline, fn _, wake_id ->
-        assert_receive {:firehose_notice, cancellation}
+        cancellation = Map.fetch!(cancellations, wake_id)
         assert cancellation["class"] == "wake.canceled"
-        assert cancellation["refs"]["wakeId"] == wake_id
         assert cancellation["payload"]["state"] == "canceled"
 
         assert {:ok, [[replacement]]} =
@@ -257,7 +271,6 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
                    [wake_id, assignment.id]
                  )
 
-        Hub.delivered(hub, self())
         replacement
       end)
 
@@ -270,8 +283,6 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     assert {:ok, [[^expected_cancellations]]} =
              DB.query(db, "SELECT COUNT(*) FROM wake_cancellations")
 
-    assert_receive {:firehose_notice, notice}
-    assert notice["class"] == "decision_request.opened"
     assert notice["schemaVersion"] == 2
     assert notice["resource"] == "decision requests"
     assert notice["op"] == "upsert"
