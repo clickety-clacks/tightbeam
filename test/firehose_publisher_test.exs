@@ -548,7 +548,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, review} = Dispatch.dispatch(db, handlers, review_call)
     assert review.holderKey != assignment.holderKey
     assert review.reviewsAssignmentId == assignment.id
-    assert observed_state_classes() == ["assignment.opened"]
+    # A queued restart-boundary publication can arrive after earlier drains.
+    assert observed_state_classes() == ["message.created", "assignment.opened"]
 
     clean = %{
       tests_passed
