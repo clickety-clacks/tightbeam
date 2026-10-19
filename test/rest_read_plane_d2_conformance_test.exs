@@ -11,7 +11,6 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     DB,
     Devices,
     Identity,
-    JSON,
     Wakes,
     WorkItems
   }
@@ -123,7 +122,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
 
   test "artifacts use canonical filters, visibility, keyset pages, and the closed public shape",
        ctx do
-    :ok = Artifacts.release(ctx.db, ctx.artifact_doc.artifact_id)
+    assert %{state: "released"} = Artifacts.release(ctx.db, ctx.artifact_doc.artifact_id)
 
     assert {:ok, _rows} =
              DB.query(

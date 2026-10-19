@@ -1350,7 +1350,7 @@ defmodule Tightbeam.Assignments do
       producer_command: producer_command,
       by_harness: by_harness,
       by_provider: by_provider,
-      commit_refs: if(is_binary(commit_refs), do: Tightbeam.JSON.decode!(commit_refs), else: nil),
+      commit_refs: if(is_binary(commit_refs), do: JSON.decode!(commit_refs), else: nil),
       ts: ts
     }
   end
