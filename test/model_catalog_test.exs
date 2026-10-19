@@ -2100,7 +2100,8 @@ defmodule Tightbeam.ModelCatalogTest do
 
       catalog = start_catalog(ctx, sh: sh)
 
-      expected = {[], {:unavailable, {:satellite_command_version_mismatch, "satellite", "catalog-probe"}}}
+      expected =
+        {[], {:unavailable, {:satellite_command_version_mismatch, "satellite", "catalog-probe"}}}
 
       await(fn -> ModelCatalog.get("satellite", "claude", catalog) == expected end)
 
