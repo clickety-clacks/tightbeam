@@ -314,6 +314,21 @@ defmodule Tightbeam.DB do
     end
   end
 
+  @doc "Run a read-only snapshot callback on the file-backed reader pool."
+  @spec read_transaction(server(), (Tightbeam.DB.Txn.t() -> result)) ::
+          {:ok, result} | {:error, Exception.t()}
+        when result: term()
+  def read_transaction(server \\ __MODULE__, fun) when is_function(fun, 1) do
+    case reader(server, "SELECT 1") do
+      reader when is_pid(reader) ->
+        Tightbeam.DB.Reader.read_transaction(reader, fun, call_timeout())
+
+      _ ->
+        # Private in-memory databases have no separate connection pool.
+        transaction(server, fun)
+    end
+  end
+
   @doc """
   Commit one transaction, then run a publication callback after the owner has replied.
 

@@ -148,6 +148,34 @@ defmodule Tightbeam.StateVisibility do
 
   def artifact_collection_scope(_principal), do: {"0 = 1", []}
 
+  @doc "Compose the existing work-item AU4 grant for one ExecutionMap node."
+  def execution_map_node_visible?(source, work_item_id, principal)
+      when is_binary(work_item_id) and is_map(principal) do
+    trace_core_detail(principal, {:au4_visibility, "work items"})
+
+    not is_nil(
+      Tightbeam.StateResources.query_work_item(source, work_item_id, %{
+        rest_principal: principal
+      })
+    )
+  end
+
+  def execution_map_node_visible?(_source, _work_item_id, _principal), do: false
+
+  @doc "Compose the existing assignment AU4 grant for one ExecutionMap selector."
+  def execution_map_assignment_visible?(source, assignment_id, principal)
+      when is_binary(assignment_id) and is_map(principal) do
+    trace_core_detail(principal, {:au4_visibility, "assignments"})
+
+    not is_nil(
+      Tightbeam.StateResources.query_assignment(source, assignment_id, %{
+        rest_principal: principal
+      })
+    )
+  end
+
+  def execution_map_assignment_visible?(_source, _assignment_id, _principal), do: false
+
   @doc "Return the AU4 scope that selects visible attest rows before filtering and paging."
   def attest_collection_scope(principal) do
     trace_core_detail(principal, {:au4_visibility, "attests"})
