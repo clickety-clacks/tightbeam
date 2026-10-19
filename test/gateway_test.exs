@@ -22,7 +22,7 @@ defmodule Tightbeam.GatewayTest do
       expected ++
         ~w(harness-health-observe-other harness-health-resolve-other harness-health-review-other harness-health-close-promotion harness-health-evidence-other)
 
-    expected = expected ++ ~w(clear-stranded settle-turn)
+    expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle)
     expected = expected ++ ~w(kungfu-setup sentinel-enable sentinel-disable sentinel-list)
     assert Enum.sort(Map.keys(handlers)) == Enum.sort(expected)
     assert Enum.sort(Map.keys(effects)) == Enum.sort(expected)
@@ -3181,7 +3181,7 @@ defmodule Tightbeam.GatewayTest do
         cmd: ["/bin/true"],
         stderr_path: Path.join(ctx.catalog_base, "rate-reconcile-race.stderr"),
         process_identity_dir: ctx.catalog_base,
-        process_helper: "/bin/true"
+        process_helper: Path.expand("../cli/target/release/tightbeam", __DIR__)
       ],
       ctx.db,
       adapter_key
