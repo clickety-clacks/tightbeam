@@ -136,8 +136,10 @@ defmodule Tightbeam.RestExecutionMapTest do
 
     db =
       start_supervised!(
-        {DB,
-         path: Path.join(base_dir, "state.db"), name: nil, guard_inputs: []}
+        Supervisor.child_spec(
+          {DB, path: Path.join(base_dir, "state.db"), name: nil, guard_inputs: []},
+          id: {:execution_map_read_snapshot, System.unique_integer([:positive])}
+        )
       )
 
     :ok = DB.execute(db, "CREATE TABLE read_snapshot_probe (value INTEGER NOT NULL)")

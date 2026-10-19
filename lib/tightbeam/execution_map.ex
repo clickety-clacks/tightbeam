@@ -961,27 +961,11 @@ defmodule Tightbeam.ExecutionMap do
       session_key: session_key,
       status: status,
       model: model,
-      model_context: model_context,
-      thinking_level: thinking_level,
+      context: model_context,
+      effort: thinking_level,
       harness: harness,
       ended_at: ended_at,
       row_version: row_version
-    }
-  end
-
-  defp rest_turn(row) do
-    %{
-      seq: row.seq,
-      assignment_id: row.assignment_id,
-      job_ref: row.job_ref,
-      session_key: row.session_key,
-      status: row.status,
-      model: row.model,
-      context: row.model_context,
-      effort: row.thinking_level,
-      harness: row.harness,
-      ended_at: row.ended_at,
-      row_version: row.row_version
     }
   end
 
