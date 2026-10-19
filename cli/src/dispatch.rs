@@ -604,6 +604,10 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                     string_field("setting", "set_fast_mode"),
                     string_field("fastMode", value),
                 ],
+                TuneControl::Host(host) => vec![
+                    string_field("setting", "set_host"),
+                    string_field("host", host),
+                ],
             };
             Ok(request(
                 identity,
