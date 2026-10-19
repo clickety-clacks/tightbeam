@@ -209,6 +209,7 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     before = get(ctx, "/api/work-items/#{root}/trace", ctx.owner_session.cli_token)
     before_trace = decode_trace!(before)
     assert before_trace["assignments"] == []
+    assert before_trace["causalChildren"] == []
     assert before_trace["attribution"]["provenanceStatus"] == "from_turn"
     child_before = get(ctx, "/api/work-items/#{child}/trace", ctx.owner_session.cli_token)
     assert decode_trace!(child_before)["attribution"]["provenanceStatus"] == "from_turn"
@@ -228,6 +229,7 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     after_response = get(ctx, "/api/work-items/#{root}/trace", ctx.owner_session.cli_token)
     after_trace = decode_trace!(after_response)
     assert after_response.resp_body == before.resp_body
+    assert after_trace["causalChildren"] == []
     child_after = get(ctx, "/api/work-items/#{child}/trace", ctx.owner_session.cli_token)
     assert child_after.resp_body == child_before.resp_body
     refute after_response.resp_body =~ "asg_trace_twin_hidden_base"
@@ -267,6 +269,10 @@ defmodule Tightbeam.WorkItemTraceRestTest do
                ["turns", tail_turn, turn_version(ctx.db, tail_turn)]
              ])
 
+    tail_trace = get(ctx, "/api/work-items/#{tail}/trace") |> decode_trace!()
+    assert tail_trace["attribution"]["provenanceStatus"] == "from_turn"
+    assert tail_trace["dependencyVersion"] == before["dependencyVersion"]
+
     for cycle_member <- [middle, tail] do
       assert {:ok, _rows} =
                DB.query(
@@ -293,8 +299,15 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     no_turn =
       insert_work_item!(ctx.db, "wi_trace_no_turn", "owner", 51_000, context_known: true)
 
+    from_turn =
+      insert_work_item!(ctx.db, "wi_trace_no_parent_turn", "owner", 52_000, context_known: true)
+
+    visible_turn = insert_turn!(ctx, "trace-no-parent-turn")
+    set_creation_turn!(ctx.db, from_turn, visible_turn)
+
     unrecorded_trace = get(ctx, "/api/work-items/#{unrecorded}/trace") |> decode_trace!()
     no_turn_trace = get(ctx, "/api/work-items/#{no_turn}/trace") |> decode_trace!()
+    from_turn_trace = get(ctx, "/api/work-items/#{from_turn}/trace") |> decode_trace!()
 
     assert unrecorded_trace["attribution"] == %{
              "provenanceStatus" => "unrecorded",
@@ -309,6 +322,19 @@ defmodule Tightbeam.WorkItemTraceRestTest do
              "primaryWorkKind" => nil,
              "primaryWorkId" => nil
            }
+
+    assert from_turn_trace["attribution"] == %{
+             "provenanceStatus" => "from_turn",
+             "reasonKind" => "concurrent_turn",
+             "primaryWorkKind" => nil,
+             "primaryWorkId" => nil
+           }
+
+    assert from_turn_trace["dependencyVersion"] ==
+             expected_dependency_version([
+               ["work items", from_turn, item_version(ctx.db, from_turn)],
+               ["turns", visible_turn, turn_version(ctx.db, visible_turn)]
+             ])
   end
 
   test "rejects paging and gives hidden and unknown roots the same not-found response", ctx do

@@ -748,7 +748,7 @@ defmodule Tightbeam.ExecutionMap do
   defp cycle_members(child, parent, candidates),
     do: cycle_members(child, parent, candidates, MapSet.new([child]))
 
-  defp cycle_members(child, child, _candidates, members), do: members
+  defp cycle_members(child, current, _candidates, members) when child == current, do: members
 
   defp cycle_members(child, current, candidates, members) do
     if MapSet.member?(members, current) do
