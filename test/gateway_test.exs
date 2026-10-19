@@ -1152,7 +1152,7 @@ defmodule Tightbeam.GatewayTest do
 
     call = %{
       session_key: "k1",
-      origin: "session:k1",
+      origin: "user:flynn",
       params: %{
         content: "queued human message",
         device_id: "post-device",
@@ -1238,7 +1238,7 @@ defmodule Tightbeam.GatewayTest do
                 human_message_id,
                 "user",
                 "queued human message",
-                "session:k1",
+                "user:flynn",
                 "post-device",
                 "post-queued-1",
                 encoded_attachments

@@ -849,7 +849,8 @@ defmodule Tightbeam.NoticeBatcher do
 
     {human_posts, batch_sources} =
       Enum.split_with(sources_with_client_identity, fn source ->
-        source.origin == "session:" <> target and not is_nil(source.source_client_identity)
+        is_binary(source.origin) and String.starts_with?(source.origin, "user:") and
+          not is_nil(source.source_client_identity)
       end)
 
     human_deliveries =
@@ -884,12 +885,12 @@ defmodule Tightbeam.NoticeBatcher do
         JSON.decode!(encoded)
 
       _ ->
-        raise DB.Error, message: "waiting_human_post_source_identity_missing"
+        nil
     end
   end
 
   defp admit_waiting_human_post_in_txn(txn, target, source, _at, delivery_opts) do
-    identity = validate_waiting_human_post_identity!(source, target)
+    identity = source.source_client_identity
 
     opts =
       Keyword.merge(delivery_opts,
@@ -914,25 +915,6 @@ defmodule Tightbeam.NoticeBatcher do
         raise DB.Error, message: "notice_human_post_admission_refused: #{inspect(other)}"
     end
   end
-
-  defp validate_waiting_human_post_identity!(source, target) do
-    identity = source.source_client_identity
-    prompt_hash = if is_binary(source.prompt), do: sha256(source.prompt), else: nil
-
-    valid? =
-      is_map(identity) and
-        Map.get(identity, "targetSessionKey") == target and
-        Map.get(identity, "sourceWakeId") == source.wake_id and
-        nonempty_binary?(Map.get(identity, "deviceId")) and
-        nonempty_binary?(Map.get(identity, "clientMessageId")) and
-        Map.get(identity, "payloadSha256") == prompt_hash
-
-    if valid?,
-      do: identity,
-      else: raise(DB.Error, message: "waiting_human_post_source_identity_mismatch")
-  end
-
-  defp nonempty_binary?(value), do: is_binary(value) and value != ""
 
   defp admit_notice_batch_snapshot_in_txn(txn, target, sources, at, delivery_opts) do
     address = "session:" <> target
