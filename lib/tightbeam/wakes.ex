@@ -3537,6 +3537,9 @@ defmodule Tightbeam.Wakes do
     restoration_turn_seq = Map.fetch!(turn, :seq)
 
     if is_binary(host) and String.trim(host) != "" do
+      # A session that has moved to another route can still consume its own
+      # pending prompt on its next normal turn. Keep other sessions gated on
+      # recovery of the source route; this does not resolve that shared incident.
       Txn.q(
         txn,
         """
@@ -3544,18 +3547,23 @@ defmodule Tightbeam.Wakes do
                a.sourceWakeId,a.origin,a.prompt,a.roleRef,a.roleFallback,a.assignmentId,
                a.jobRef,a.requestRef
         FROM health_redelivery_attempts a
-        WHERE a.sourceHarness=?1
-          AND a.sourceHost=?2
+        WHERE ((a.sourceHarness=?1 AND a.sourceHost=?2) OR a.sessionKey=?3)
           AND a.redeliveryTurnSeq IS NULL
           AND a.parentSessionKey IS NULL
-          AND NOT EXISTS (
-            SELECT 1
-            FROM harness_health_observations observation
-            JOIN harness_health_incidents incident ON incident.id=observation.incidentId
-            WHERE observation.correlationId =
-              'harness-turn:' || a.sourceTurnSeq || ':' || a.failureClass
-              AND observation.evidenceKind='terminal-failure'
-              AND incident.state='open'
+          AND (
+            (
+              (a.sourceHarness != ?1 OR a.sourceHost != ?2)
+              AND a.sessionKey=?3
+            )
+            OR NOT EXISTS (
+              SELECT 1
+              FROM harness_health_observations observation
+              JOIN harness_health_incidents incident ON incident.id=observation.incidentId
+              WHERE observation.correlationId =
+                'harness-turn:' || a.sourceTurnSeq || ':' || a.failureClass
+                AND observation.evidenceKind='terminal-failure'
+                AND incident.state='open'
+            )
           )
           AND NOT EXISTS (
             SELECT 1 FROM wake_retry_attempts retry
@@ -3563,7 +3571,7 @@ defmodule Tightbeam.Wakes do
           )
         ORDER BY a.sourceTurnSeq
         """,
-        [harness, host]
+        [harness, host, session.session_key]
       )
       |> Enum.reduce(0, fn source, count ->
         count + redeliver_health_source_in_txn(txn, source, restoration_turn_seq)
