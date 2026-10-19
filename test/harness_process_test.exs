@@ -42,7 +42,7 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 6)
   end
 
-  test "satellite credential parking uses the tracked-group command", %{tmp_dir: tmp} do
+  test "satellite credential parking uses the shared identity-fenced command", %{tmp_dir: tmp} do
     db = start_process_db()
     capture = Path.join(tmp, "satellite-group-args-#{System.unique_integer([:positive])}")
     install_fake_ssh(tmp, capture, "exit 0")
@@ -53,7 +53,14 @@ defmodule Tightbeam.HarnessProcessTest do
     args = File.read!(capture) |> String.split("\n", trim: true)
     group_command = Enum.drop_while(args, &(&1 != "harness-group"))
 
-    assert ["harness-group", "--tracked-group-only" | _] = group_command
+    assert [
+             "harness-group",
+             "4242",
+             row.identity_path,
+             "satellite-boot",
+             "satellite-launch",
+             "tightbeam-harness-identity-v2"
+           ] = group_command
   end
 
   test "satellite command usage failures report the host and keep the park fenced", %{
@@ -61,11 +68,14 @@ defmodule Tightbeam.HarnessProcessTest do
   } do
     db = start_process_db()
     capture = Path.join(tmp, "satellite-group-usage-#{System.unique_integer([:positive])}")
+    usage =
+      "usage: tightbeam harness-group <process-group-id> <identity-path> " <>
+        "<boot-identity> <launch-id>"
 
     install_fake_ssh(
       tmp,
       capture,
-      "printf '%s\\n' 'usage: tightbeam harness-group --tracked-group-only <args>' >&2\nexit 2"
+      "printf '%s\\n' '#{usage}' >&2\nexit 2"
     )
 
     row = remote_park_row(db)

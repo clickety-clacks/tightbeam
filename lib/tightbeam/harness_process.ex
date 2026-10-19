@@ -852,27 +852,12 @@ defmodule Tightbeam.HarnessProcess do
     )
   end
 
-  # The gateway's own 0.1.10 helper still accepts the identity-fenced group
-  # command without this option. Satellite credentials are parked by the
-  # deployed 0.1.9+2908 command, which accepts the narrower tracked-group form.
-  # A refusal is returned to the caller and leaves the durable park fence up.
-  defp run_credential_group_command(%{ssh: nil} = row, timeout_ms),
+  # Keep the identity-fenced positional form shared by 0.1.10 and command 2908.
+  # The satellite validates the recorded boot and launch identity, then freezes
+  # and revalidates the tracked process tree before signalling it. A refusal is
+  # returned to the caller and leaves the durable park fence up.
+  defp run_credential_group_command(row, timeout_ms),
     do: run_group_command(row, timeout_ms)
-
-  defp run_credential_group_command(%{ssh: destination} = row, timeout_ms) do
-    bounded_command(
-      "ssh",
-      @ssh_opts ++
-        [
-          destination,
-          shell_quote(row.helper_path),
-          "harness-group",
-          "--tracked-group-only"
-          | group_args(row)
-        ],
-      timeout_ms
-    )
-  end
 
   defp run_cursor_group_command(row, timeout_ms) do
     bounded_command(
