@@ -1174,7 +1174,7 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  @doc "Return the current independent clean review only when it names the submitted result."
+  @doc "Return the current independent clean review when its source commits match the submitted result."
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
           [String.t()]
   def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, commit_refs) do
@@ -1196,7 +1196,7 @@ defmodule Tightbeam.Assignments do
              [assignment_id]
            ),
          true <- review_holder != assignment_holder_key,
-         ^expected <- canonical_stored_commit_refs(encoded) do
+         true <- same_commit_ref_identity?(expected, canonical_stored_commit_refs(encoded)) do
       ["reviewed-clean"]
     else
       _ -> []
@@ -1221,7 +1221,7 @@ defmodule Tightbeam.Assignments do
              """,
              [assignment_id, holder_key]
            ),
-         ^expected <- canonical_stored_commit_refs(encoded) do
+         true <- same_commit_ref_identity?(expected, canonical_stored_commit_refs(encoded)) do
       ["verified"]
     else
       _ -> []
