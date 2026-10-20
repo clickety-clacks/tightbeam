@@ -83,8 +83,8 @@ data shows whether the event path ever drops anything.
 - The canonical gate handles environment hygiene. For ad-hoc Mix runs outside the
   script, such as `mix test path/to/file.exs`, use `env -u NAME` to remove every
   inherited `TIGHTBEAM_*` and `RELEASE_*` variable.
-  After `wi_8f90c5b3` merges, the suite is immune to the
-  known `TIGHTBEAM_*` config leaks. Keep stripping both prefixes: that proof covers
+  The canonical gate removes inherited `TIGHTBEAM_*` variables before setting its
+  test-specific values. Keep stripping both prefixes: that proof covers
   only config, while `RELEASE_ROOT` is read directly from the environment in `lib/`.
 - Make the requested change first, then run the focused checks that exercise it.
   Do not run a full-suite baseline before writing code; an untouched-tree replay
