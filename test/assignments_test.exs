@@ -6126,9 +6126,13 @@ defmodule Tightbeam.AssignmentsTest do
     end)
 
     candidate_commit = String.duplicate("a", 40)
-    candidate_refs = [%{"repo" => "testhost:/tmp/producer-checkout", "commit" => candidate_commit}]
 
-    producer = handle(ctx, "assign", assign_call({:user, "other"}, "missing review refs producer"))
+    candidate_refs = [
+      %{"repo" => "testhost:/tmp/producer-checkout", "commit" => candidate_commit}
+    ]
+
+    producer =
+      handle(ctx, "assign", assign_call({:user, "other"}, "missing review refs producer"))
 
     review =
       assign_call({:user, "other"}, "missing review refs review")
