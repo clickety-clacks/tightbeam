@@ -430,7 +430,7 @@ pub fn run(args: &[String]) -> Result<i32, String> {
             crate::harness_process::check_group(&rest[4..])
         }
         "group" => {
-            if rest.len() != 8 {
+            if !(8..=10).contains(&rest.len()) {
                 return Err(usage().to_owned());
             }
             verify_identity(Path::new(&rest[0]), Path::new(&rest[1]), &rest[2], &rest[3])?;

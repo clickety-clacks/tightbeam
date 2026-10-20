@@ -101,6 +101,19 @@ impl Snapshot {
         self.processes.iter().find(|process| process.pid == pid)
     }
 
+    /// Processes whose process group is exactly `pgid`.
+    pub(crate) fn group_members(&self, pgid: libc::pid_t) -> Vec<Process> {
+        if pgid <= 1 {
+            return Vec::new();
+        }
+
+        self.processes
+            .iter()
+            .filter(|process| process.pid > 1 && process.pgid == pgid)
+            .copied()
+            .collect()
+    }
+
     /// The distinct process groups those pids sit in, including detached escapees.
     #[cfg(test)]
     pub(crate) fn process_groups(&self, pids: &BTreeSet<libc::pid_t>) -> BTreeSet<libc::pid_t> {

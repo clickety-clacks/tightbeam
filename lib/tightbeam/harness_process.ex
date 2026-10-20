@@ -393,9 +393,14 @@ defmodule Tightbeam.HarnessProcess do
 
   @doc "Deliver SIGKILL to a parked process group."
   @spec park(DB.server(), row()) :: :ok | :already_resolved | {:error, term()}
-  def park(db, row) do
+  def park(db, row), do: park(db, row, :process_tree)
+
+  @doc false
+  @spec park(DB.server(), row(), :process_tree | :credential_replacement) ::
+          :ok | :already_resolved | {:error, term()}
+  def park(db, row, cleanup_scope) when cleanup_scope in [:process_tree, :credential_replacement] do
     with {:ok, row} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
-      kill(db, row)
+      kill(db, row, "killed", cleanup_scope)
     else
       {:error, reason} -> unidentified(db, row, reason)
     end
@@ -485,7 +490,13 @@ defmodule Tightbeam.HarnessProcess do
 
   @doc "Reconcile the latest unresolved launch for one adapter after its BEAM owner goes down."
   @spec reconcile_key(DB.server(), tuple()) :: :ok | :already_resolved | {:error, term()}
-  def reconcile_key(db, key) do
+  def reconcile_key(db, key), do: reconcile_key(db, key, :process_tree)
+
+  @doc false
+  @spec reconcile_key(DB.server(), tuple(), :process_tree | :credential_replacement) ::
+          :ok | :already_resolved | {:error, term()}
+  def reconcile_key(db, key, cleanup_scope)
+      when cleanup_scope in [:process_tree, :credential_replacement] do
     case latest_unresolved(db, key) do
       nil ->
         :ok
@@ -495,7 +506,7 @@ defmodule Tightbeam.HarnessProcess do
 
         terminal_state = if row.state == "park_requested", do: "closed_gracefully", else: "exited"
 
-        case reconcile_row(db, row, terminal_state) do
+        case reconcile_row(db, row, terminal_state, cleanup_scope) do
           :settled -> :ok
           :ok -> complete_park(db, key)
           :already_resolved -> :already_resolved
@@ -628,15 +639,20 @@ defmodule Tightbeam.HarnessProcess do
     }
   end
 
-  defp reconcile_row(db, row, terminal_state \\ "killed")
+  defp reconcile_row(
+         db,
+         row,
+         terminal_state \\ "killed",
+         cleanup_scope \\ :process_tree
+       )
 
   # A graceful park close keeps its own terminal state and its park
   # completion; settlement always records the launch as exited. Settle only
   # a launch whose identity cannot be recovered, and keep the identity
   # failure as the recorded reason when settlement also refuses.
-  defp reconcile_row(db, row, "closed_gracefully" = terminal_state) do
+  defp reconcile_row(db, row, "closed_gracefully" = terminal_state, cleanup_scope) do
     with {:ok, recovered} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
-      kill(db, recovered, terminal_state)
+      kill(db, recovered, terminal_state, cleanup_scope)
     else
       {:error, identity_failure} ->
         case settle(db, row.launch_id, row.adapter_key, "automatic-reconcile") do
@@ -647,7 +663,7 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
-  defp reconcile_row(db, row, terminal_state) do
+  defp reconcile_row(db, row, terminal_state, cleanup_scope) do
     case settle(db, row.launch_id, row.adapter_key, "automatic-reconcile") do
       {:ok, _} ->
         :settled
@@ -657,7 +673,7 @@ defmodule Tightbeam.HarnessProcess do
 
       {:error, _} ->
         with {:ok, recovered} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
-          kill(db, recovered, terminal_state)
+          kill(db, recovered, terminal_state, cleanup_scope)
         else
           {:error, reason} -> unidentified(db, row, reason)
         end
@@ -693,7 +709,7 @@ defmodule Tightbeam.HarnessProcess do
 
   defp unidentified(db, row, reason), do: kill_failed(db, row, reason)
 
-  defp kill(db, row, terminal_state \\ "killed") do
+  defp kill(db, row, terminal_state \\ "killed", cleanup_scope \\ :process_tree) do
     attempted_at = now()
 
     {:ok, _} =
@@ -707,7 +723,7 @@ defmodule Tightbeam.HarnessProcess do
         [row.launch_id, attempted_at]
       )
 
-    case send_sigkill(row) do
+    case send_sigkill(row, cleanup_scope) do
       :ok ->
         sent_at = now()
 
@@ -732,7 +748,7 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
-  defp send_sigkill(row) do
+  defp send_sigkill(row, cleanup_scope) do
     case run_group_command(row, command_timeout_ms()) do
       {_output, 0} ->
         :ok
@@ -743,20 +759,40 @@ defmodule Tightbeam.HarnessProcess do
       {output, status} ->
         reason = one_line(output)
 
-        mismatch =
-          if is_binary(row.ssh) do
-            Tightbeam.Harness.Support.satellite_command_version_mismatch(
-              output,
-              row.host,
-              "harness-group"
-            )
+        if cleanup_scope == :credential_replacement and
+             reason ==
+               "harness session leader #{row.process_group_id} disappeared while process group still has members; group left unsignalled" do
+          case run_tracked_group_command(row, command_timeout_ms()) do
+            {_output, 0} -> :ok
+            # The helper's status 4 means the recorded group no longer has live members.
+            {_output, 4} -> {:refused, reason}
+            result -> classify_signal_result(result, row)
           end
-
-        cond do
-          mismatch -> {:error, mismatch}
-          String.starts_with?(reason, "harness ") -> {:refused, reason}
-          true -> {:error, {:sigkill_not_delivered, status, reason}}
+        else
+          classify_signal_result({output, status}, row)
         end
+    end
+  end
+
+  defp classify_signal_result({:error, :timeout}, _row),
+    do: {:error, :sigkill_delivery_unconfirmed}
+
+  defp classify_signal_result({output, status}, row) do
+    reason = one_line(output)
+
+    mismatch =
+      if is_binary(row.ssh) do
+        Tightbeam.Harness.Support.satellite_command_version_mismatch(
+          output,
+          row.host,
+          "harness-group"
+        )
+      end
+
+    cond do
+      mismatch -> {:error, mismatch}
+      String.starts_with?(reason, "harness ") -> {:refused, reason}
+      true -> {:error, {:sigkill_not_delivered, status, reason}}
     end
   end
 
@@ -925,7 +961,43 @@ defmodule Tightbeam.HarnessProcess do
     )
   end
 
+  defp run_tracked_group_command(%{ssh: nil, harness: "cursor"} = row, timeout_ms),
+    do: run_cursor_group_command(row, timeout_ms, :tracked_group_only)
+
+  defp run_tracked_group_command(%{ssh: nil} = row, timeout_ms) do
+    bounded_command(
+      row.helper_path,
+      ["harness-group", "--tracked-group-only" | group_args(row)],
+      timeout_ms
+    )
+  end
+
+  defp run_tracked_group_command(%{ssh: destination} = row, timeout_ms) do
+    bounded_command(
+      "ssh",
+      @ssh_opts ++
+        [
+          destination,
+          shell_quote(row.helper_path),
+          "harness-group",
+          "--tracked-group-only"
+          | group_args(row)
+        ],
+      timeout_ms
+    )
+  end
+
   defp run_cursor_group_command(row, timeout_ms) do
+    run_cursor_group_command(row, timeout_ms, :process_tree)
+  end
+
+  defp run_cursor_group_command(row, timeout_ms, cleanup_scope) do
+    group_args =
+      case cleanup_scope do
+        :process_tree -> group_args(row)
+        :tracked_group_only -> ["--tracked-group-only" | group_args(row)]
+      end
+
     bounded_command(
       "/usr/bin/sudo",
       cursor_sudo_args() ++
@@ -937,8 +1009,7 @@ defmodule Tightbeam.HarnessProcess do
           cursor_org_base(row.helper_path),
           operator_uid(),
           operator_home()
-          | group_args(row)
-        ],
+        ] ++ group_args,
       timeout_ms
     )
   end
