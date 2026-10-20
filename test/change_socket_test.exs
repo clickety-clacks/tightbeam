@@ -278,6 +278,48 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     refute ctx.device.token in Map.values(Map.from_struct(state))
   end
 
+  test "a withheld notice stays silent and does not advance the sequence", ctx do
+    {:push, {:text, _auth}, state} =
+      inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
+
+    {:push, {:text, _ready}, state} =
+      inbound(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "work",
+          "filters" => %{"classes" => ["work_item."]}
+        },
+        state
+      )
+
+    Hub.publish(ctx.hub, notice(ctx, "change-before-withheld"))
+    assert_receive {:firehose_notice, first}
+    assert first["seq"] == 1
+
+    assert {:push, {:text, _bytes}, state} =
+             ChangeSocket.handle_info({:firehose_notice, first}, state)
+
+    withheld =
+      notice(ctx, "change-withheld")
+      |> Map.update!("payload", &Map.put(&1, "nested", %{"token" => "withheld-test-value"}))
+
+    Hub.publish(ctx.hub, withheld)
+
+    assert Hub.sequence(ctx.hub, self()) == 1
+    refute_receive {:firehose_notice, _notice}, 50
+    assert is_pid(Process.whereis(ctx.hub))
+
+    Hub.publish(ctx.hub, notice(ctx, "change-after-withheld"))
+    assert_receive {:firehose_notice, after_withheld}
+    assert after_withheld["seq"] == 2
+    assert after_withheld["refs"]["workItemId"] == "change-after-withheld"
+
+    assert {:push, {:text, bytes}, _state} =
+             ChangeSocket.handle_info({:firehose_notice, after_withheld}, state)
+
+    assert JSON.decode!(bytes)["seq"] == 2
+  end
+
   test "heartbeat closes a revoked credential without a revocation notice", ctx do
     {:push, {:text, _auth}, state} =
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
@@ -363,7 +405,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
   end
 
   test "the per-connection queue is exact and overflow closes once", ctx do
-    {:push, {:text, _auth}, _state} =
+    {:push, {:text, _auth}, state} =
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
 
     :ok = Hub.subscribe(ctx.hub, self(), "work", %{})
@@ -381,6 +423,36 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert_receive :firehose_overflow
     refute_receive :firehose_overflow, 50
     refute_receive {:firehose_notice, _notice}, 50
+
+    assert {:stop, :normal, 4008, ^state} =
+             ChangeSocket.handle_info(:firehose_overflow, state)
+  end
+
+  test "ingress overflow closes the authenticated socket with retryable code", ctx do
+    {:push, {:text, _auth}, state} =
+      inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
+
+    :ok = :sys.suspend(ctx.hub)
+
+    try do
+      Enum.each(1..1_500, fn index ->
+        id = "overflow-#{index}"
+
+        Hub.publish(ctx.hub, %{
+          "class" => "work_item.updated",
+          "refs" => %{"workItemId" => id, "ownerUserId" => ctx.device.user_id},
+          "payload" => %{"id" => id, "ownerUserId" => ctx.device.user_id}
+        })
+      end)
+    after
+      :ok = :sys.resume(ctx.hub)
+    end
+
+    assert_receive :firehose_overflow, 5_000
+    assert is_pid(Process.whereis(ctx.hub))
+
+    assert {:stop, :normal, 4008, ^state} =
+             ChangeSocket.handle_info(:firehose_overflow, state)
   end
 
   test "gateway shutdown closes change sockets with restarting code", ctx do

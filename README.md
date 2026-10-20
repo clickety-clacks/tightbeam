@@ -687,6 +687,7 @@ cannot run a single turn.
   authoritative fresh-org install path.
 - `docs/ARCHITECTURE.md` — the substrate's shape.
 - `docs/SATELLITE.md` — adding a machine to an existing org.
+- `docs/firehose.md` — live change delivery, recovery limits, and snapshot costs.
 
 ## Developing Tightbeam
 
