@@ -303,6 +303,23 @@ defmodule Tightbeam.Identity do
   end
 
   @doc false
+  def with_live_revision_lock(base_dir, fun) when is_function(fun, 1) do
+    init!(base_dir)
+    with_live_revision_lock_in_dir(identity_dir(base_dir), fun)
+  end
+
+  # Apply holds this lock for one target's materialization and durable stamp.
+  # Live-ref writers take the same lock so an older projection cannot write
+  # after a newer revision becomes live.
+  defp with_live_revision_lock_in_dir(identity_dir, fun) do
+    lock = {{__MODULE__, :live_revision, Path.expand(identity_dir)}, self()}
+
+    :global.trans(lock, fn ->
+      fun.(git_output!(identity_dir, ["rev-parse", @live]))
+    end)
+  end
+
+  @doc false
   def with_recovery_law!(base_dir, load) do
     dir = identity_dir(base_dir)
 
@@ -1719,38 +1736,40 @@ defmodule Tightbeam.Identity do
     revision = Map.fetch!(candidate, :candidate_revision)
     expected = Map.fetch!(candidate, :expected_prior)
     validate_revision_dir!(dir, revision)
-    actual = git_output!(dir, ["rev-parse", @live])
 
-    cond do
-      actual == revision ->
-        {:ok, revision}
+    with_live_revision_lock_in_dir(dir, fn actual ->
+      cond do
+        actual == revision ->
+          {:ok, revision}
 
-      actual != expected ->
-        {:error, %{code: "identity_publication_conflict", expected: expected, actual: actual}}
+        actual != expected ->
+          {:error, %{code: "identity_publication_conflict", expected: expected, actual: actual}}
 
-      true ->
-        case System.cmd("git", ["merge-base", "--is-ancestor", expected, revision], cd: dir) do
-          {_output, 0} ->
-            git!(dir, ["update-ref", "refs/heads/#{@live}", revision, expected])
-            {:ok, revision}
+        true ->
+          case System.cmd("git", ["merge-base", "--is-ancestor", expected, revision], cd: dir) do
+            {_output, 0} ->
+              git!(dir, ["update-ref", "refs/heads/#{@live}", revision, expected])
+              {:ok, revision}
 
-          _ ->
-            {:error, %{code: "identity_publication_non_fast_forward", expected: expected}}
-        end
-    end
+            _ ->
+              {:error, %{code: "identity_publication_non_fast_forward", expected: expected}}
+          end
+      end
+    end)
   end
 
   defp publish_live_unmarked!(dir) do
-    live = git_output!(dir, ["rev-parse", @live])
-    main = git_output!(dir, ["rev-parse", "main"])
-    validate_revision_dir!(dir, main)
+    with_live_revision_lock_in_dir(dir, fn live ->
+      main = git_output!(dir, ["rev-parse", "main"])
+      validate_revision_dir!(dir, main)
 
-    case System.cmd("git", ["merge-base", "--is-ancestor", live, main], cd: dir) do
-      {_output, 0} -> git!(dir, ["update-ref", "refs/heads/#{@live}", main, live])
-      _ -> raise ArgumentError, "tightbeam/live cannot fast-forward to main"
-    end
+      case System.cmd("git", ["merge-base", "--is-ancestor", live, main], cd: dir) do
+        {_output, 0} -> git!(dir, ["update-ref", "refs/heads/#{@live}", main, live])
+        _ -> raise ArgumentError, "tightbeam/live cannot fast-forward to main"
+      end
 
-    main
+      main
+    end)
   end
 
   defp candidate_result(dir, expected_prior, fingerprint) do

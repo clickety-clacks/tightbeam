@@ -604,6 +604,10 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                     string_field("setting", "set_fast_mode"),
                     string_field("fastMode", value),
                 ],
+                TuneControl::Host(host) => vec![
+                    string_field("setting", "set_host"),
+                    string_field("host", host),
+                ],
             };
             Ok(request(
                 identity,
@@ -839,6 +843,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("assignmentId", assignment_id),
                 string_field("reason", reason),
             ],
+        )),
+        Command::CancelTurn {
+            identity,
+            session_key,
+        } => Ok(request(
+            identity,
+            "cancel",
+            vec![string_field("sessionKey", session_key)],
+            vec![],
         )),
         Command::RevokeAssignment {
             identity,
@@ -1549,6 +1562,19 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                     "\"dirs\":{}",
                     serde_json::to_string(dirs).expect("toolchain directories serialize")
                 ),
+            ],
+        )),
+        Command::HarnessProcessSettle {
+            identity,
+            launch_id,
+            adapter_key,
+        } => Ok(request(
+            identity,
+            "harness-process-settle",
+            vec![],
+            vec![
+                string_field("launchId", launch_id),
+                string_field("adapterKey", adapter_key),
             ],
         )),
         Command::HarnessProcesses { identity } => {
@@ -3537,6 +3563,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::DecisionRequests { identity, .. }
         | Command::DecisionRequest { identity, .. }
         | Command::AssignmentStopTurn { identity, .. }
+        | Command::CancelTurn { identity, .. }
         | Command::RevokeAssignment { identity, .. }
         | Command::ReopenAssignment { identity, .. }
         | Command::RepairAssignment { identity, .. }
@@ -3586,6 +3613,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::SentinelEnvUnset { identity, .. }
         | Command::HostToolchainSet { identity, .. }
         | Command::SessionDiagnose { identity, .. }
+        | Command::HarnessProcessSettle { identity, .. }
         | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
@@ -3870,6 +3898,22 @@ mod tests {
             }
             assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
         }
+    }
+
+    #[test]
+    fn builds_exact_launch_settlement_request() {
+        assert_eq!(
+            body(&[
+                "harness-process",
+                "settle",
+                "launch-one",
+                "--adapter-key",
+                "claude:shared@worker",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"harness-process-settle","params":{"launchId":"launch-one","adapterKey":"claude:shared@worker"}}"#
+        );
     }
 
     #[test]
@@ -4679,6 +4723,16 @@ mod tests {
                 "parent",
             ]),
             r#"{"as":"parent","verb":"cancel","params":{"assignmentId":"asg_1","reason":"replace the stale turn"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "cancel-turn",
+                "--session",
+                "worker s_1",
+                "--as-user",
+                "owner",
+            ]),
+            r#"{"asUser":"owner","verb":"cancel","sessionKey":"worker s_1","params":{}}"#
         );
         assert_eq!(
             body(&[

@@ -436,8 +436,12 @@ defmodule Tightbeam.Acp.Adapter do
     rescue
       error ->
         {:stop,
-         adapter_failure_reason({:boot_failed, Exception.message(error)}, stderr_path, offset),
-         nil}
+         adapter_failure_reason(
+           {:boot_failed, Exception.message(error)},
+           stderr_path,
+           offset,
+           Keyword.get(opts, :harness_process_satellite_host)
+         ), nil}
     end
   end
 
@@ -460,16 +464,34 @@ defmodule Tightbeam.Acp.Adapter do
         env: Keyword.get(opts, :env, []),
         stderr_path: stderr_path,
         subscriber: self(),
-        connection_generation: Keyword.get(opts, :connection_generation)
+        connection_generation: Keyword.get(opts, :connection_generation),
+        harness_process_launch_id: Keyword.get(opts, :harness_process_launch_id),
+        harness_process_direct_launcher:
+          Keyword.get(opts, :harness_process_direct_launcher, false)
       )
 
     case Keyword.fetch(opts, :harness_process_launch_id) do
       {:ok, launch_id} ->
         db = Keyword.get(opts, :db, Tightbeam.DB)
 
-        case Tightbeam.HarnessProcess.capture_identity(db, launch_id, :infinity) do
-          :ok -> :ok
-          {:error, reason} -> raise "harness process identity unavailable: #{inspect(reason)}"
+        case Tightbeam.HarnessProcess.capture_identity(db, launch_id, 5_000, conn) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            row = Enum.find(Tightbeam.HarnessProcess.list(db), &(&1.launch_id == launch_id))
+            receipt = Conn.launch_exit(conn, 100)
+
+            _ =
+              Tightbeam.HarnessProcess.settle(
+                db,
+                launch_id,
+                row.adapter_key,
+                "adapter-boot",
+                receipt
+              )
+
+            raise "harness process identity unavailable: #{inspect(reason)}"
         end
 
       :error ->
@@ -508,7 +530,13 @@ defmodule Tightbeam.Acp.Adapter do
         gate(opts, state)
 
       other ->
-        {:stop, adapter_failure_reason({:initialize_failed, other}, stderr_path, offset), state}
+        {:stop,
+         adapter_failure_reason(
+           {:initialize_failed, other},
+           stderr_path,
+           offset,
+           Keyword.get(opts, :harness_process_satellite_host)
+         ), state}
     end
   end
 
@@ -2924,14 +2952,28 @@ defmodule Tightbeam.Acp.Adapter do
   # An offset that was never measured is no attempt boundary: any line in the
   # log may be a previous spawn's, so none is reported as this one's, and the
   # stat error says why.
-  defp adapter_failure_reason(reason, _stderr_path, {:unmeasured, errno}),
+  defp adapter_failure_reason(reason, stderr_path, offset, satellite_host \\ nil)
+
+  defp adapter_failure_reason(reason, _stderr_path, {:unmeasured, errno}, _satellite_host),
     do: with_stderr_facts(reason, stderr_offset: "unmeasured", stderr_stat_error: errno)
 
-  defp adapter_failure_reason(reason, stderr_path, offset) do
+  defp adapter_failure_reason(reason, stderr_path, offset, satellite_host) do
     case last_stderr_line(stderr_path, offset) do
-      {:ok, nil} -> reason
-      {:ok, line} -> {:adapter_fault, %{reason: reason, stderr: line}}
-      {:error, errno} -> with_stderr_facts(reason, stderr_read_error: errno)
+      {:ok, nil} ->
+        reason
+
+      {:ok, line} ->
+        case Tightbeam.Harness.Support.satellite_command_version_mismatch(
+               line,
+               satellite_host,
+               "harness-exec"
+             ) do
+          nil -> {:adapter_fault, %{reason: reason, stderr: line}}
+          mismatch -> mismatch
+        end
+
+      {:error, errno} ->
+        with_stderr_facts(reason, stderr_read_error: errno)
     end
   end
 

@@ -256,8 +256,8 @@ defmodule Tightbeam.D1ReadRouteTest do
         ctx.operator.token
       )
 
-    assert stale_principal.status == 400
-    assert JSON.decode!(stale_principal.resp_body)["error"]["code"] == "invalid_cursor"
+    assert stale_principal.status == 404
+    assert JSON.decode!(stale_principal.resp_body)["error"]["code"] == "not_found"
 
     malformed = get(ctx.opts, users_path <> "&after=not-a-cursor", ctx.admin.token)
     assert malformed.status == 400

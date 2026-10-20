@@ -23,7 +23,6 @@ defmodule Tightbeam.Archetypes do
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
           model_preferences: [Tightbeam.Model.t()],
           ephemeral: boolean(),
-          owner_open_child_prod: boolean(),
           containment: %{fs: :off, network: :open},
           mcp: [
             %{
@@ -603,7 +602,6 @@ defmodule Tightbeam.Archetypes do
       references: [],
       model_preferences: [],
       ephemeral: false,
-      owner_open_child_prod: false,
       containment: %{fs: :off, network: :open},
       mcp: [],
       guidance: nil,
@@ -621,7 +619,10 @@ defmodule Tightbeam.Archetypes do
         "references",
         "model_preferences",
         "ephemeral",
+        # Shipped 0.1.9 identity manifests may still contain these retired keys.
+        # Accept them for compatibility, but do not read them into archetype state.
         "owner_open_child_prod",
+        "idle_cleanup",
         "guidance",
         "mcp",
         "containment"
@@ -647,13 +648,6 @@ defmodule Tightbeam.Archetypes do
 
     unless is_boolean(ephemeral) do
       raise ArgumentError, "archetype ephemeral must be a boolean: #{path}"
-    end
-
-    owner_open_child_prod = Map.get(manifest, "owner_open_child_prod", false)
-
-    unless is_boolean(owner_open_child_prod) do
-      raise ArgumentError,
-            "archetype owner_open_child_prod must be a boolean: #{path}"
     end
 
     unless is_list(skills) and Enum.all?(skills, &is_binary/1) do
@@ -713,7 +707,6 @@ defmodule Tightbeam.Archetypes do
       where: where,
       model_preferences: model_preferences,
       ephemeral: ephemeral,
-      owner_open_child_prod: owner_open_child_prod,
       containment: containment,
       defaults: defaults,
       references: references,

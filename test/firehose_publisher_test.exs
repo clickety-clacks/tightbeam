@@ -498,7 +498,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     # The holder's attest and its holder-authored opener notice each count as
     # holder activity. Activity in the millisecond of the pending deadline
     # reuses it, so zero to two replacements follow the initial deadline.
-    verdict_notices = observed_notices()
+    verdict_notices = drain_notices()
     assert Enum.count(verdict_notices, &(&1["class"] == "verb.accepted")) == 1
 
     %{"wake.canceled" => cancellations, "message.created" => [opener_notice]} =
@@ -640,8 +640,20 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
              Dispatch.dispatch(db, handlers, completion)
 
-    completion_effects = observed_state_classes()
-    asynchronous_delivery = ~w(message.created session.updated wake.fired)
+    completion_publications =
+      assert_substrate_messages_created!(
+        db,
+        [
+          {"effect-dispatcher", "[verdict filed: reviewed-clean on #{review.id}]"},
+          {"effect-target", "[verdict filed: verified on #{assignment.id}]"},
+          {"effect-target", "[completion filed on #{assignment.id}]"},
+          {"effect-target", "[assignment closed: #{assignment.id} — completed]"}
+        ],
+        [assignment.id, review.id]
+      )
+
+    completion_effects = notice_state_classes(completion_publications)
+    asynchronous_delivery = ~w(session.updated wake.fired)
 
     assert Enum.all?(asynchronous_delivery, &(&1 in completion_effects))
 
@@ -673,9 +685,21 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert_per_verb_effects!(config, "reopen-assignment", Map.keys(reopen_effects))
     history = Tightbeam.Assignments.list_reopenings(db, assignment.id)
     assert [%{priorOutcome: "completed", reason: "continue the real assignment"}] = history
+
+    :ok = Wakes.fire_due(scheduler)
+
+    pending_publications =
+      assert_substrate_messages_created!(db, [], [assignment.id, review.id])
+
+    assert Enum.all?(notice_state_classes(pending_publications), &(&1 in asynchronous_delivery))
+
     assert {:error, %{code: "assignment_open"}} = Dispatch.dispatch(db, handlers, reopen)
     assert Tightbeam.Assignments.list_reopenings(db, assignment.id) == history
-    assert observed_state_classes() == []
+
+    replay_publications = assert_substrate_messages_created!(db, [], [])
+
+    assert elem(replay_publications, 1) == []
+    assert notice_state_classes(replay_publications) == []
   end
 
   test "a raised state handler emits denied and never accepted state effects" do
@@ -820,6 +844,75 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert String.contains?(wire_notice, "\"payload\":" <> item_bytes)
 
     :sys.get_state(Hub)
+    refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
+  end
+
+  test "a committed session-restart marker publishes one canonical message.created" do
+    db = :firehose_session_restart_marker_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    :ok =
+      Hub.register(Hub, self(), %{mode: :subscribed, db: db, user_id: "flynn", is_admin: false})
+
+    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
+    register_testhost(db)
+
+    session_key = "firehose-session-restart-target"
+
+    Org.create(db, %{
+      session_key: session_key,
+      display_name: "Session restart target",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    :ok =
+      Hub.subscribe(Hub, self(), "session-restart-markers", %{
+        "classes" => ["message.created"],
+        "sessionKey" => session_key
+      })
+
+    assert {:ok, {:appended, marker}} =
+             DB.transaction(db, fn txn ->
+               assert {:appended, marker} =
+                        Projection.append_marker_in_txn(txn, session_key, %{
+                          kind: "session-restart",
+                          from: "old-session",
+                          to: "new-session"
+                        })
+
+               refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
+               {:appended, marker}
+             end)
+
+    notice = receive_notice()
+    assert notice["class"] == "message.created"
+    assert notice["refs"]["messageId"] == marker.id
+    assert notice["refs"]["sessionKey"] == session_key
+    assert notice["refs"]["ownerUserId"] == "flynn"
+
+    canonical =
+      db
+      |> StateResources.query_message(marker.id)
+      |> StateResources.message()
+
+    assert notice["payload"] == canonical
+
+    assert notice["payload"]["marker"] == %{
+             "kind" => "session-restart",
+             "from" => "old-session",
+             "to" => "new-session"
+           }
+
+    item_bytes = StateResources.encode_item("transcript messages", canonical)
+    assert String.contains?(Publisher.encode_wire_notice(notice), "\"payload\":" <> item_bytes)
+
     refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
   end
 
@@ -1572,13 +1665,18 @@ defmodule Tightbeam.Firehose.PublisherTest do
     end
   end
 
-  defp observed_classes(acc \\ []) do
+  defp observed_classes do
+    drain_notices()
+    |> Enum.map(& &1["class"])
+  end
+
+  defp drain_notices(acc \\ []) do
     _ = :sys.get_state(Hub)
 
     receive do
-      {:firehose_notice, %{"class" => class}} ->
+      {:firehose_notice, notice} ->
         Hub.delivered(Hub, self())
-        observed_classes([class | acc])
+        drain_notices([notice | acc])
     after
       0 -> Enum.reverse(acc)
     end
@@ -1590,9 +1688,127 @@ defmodule Tightbeam.Firehose.PublisherTest do
   end
 
   defp observed_state_notices do
-    observed_notices()
+    drain_notices()
     |> Enum.filter(&match?({:ok, _row}, Tightbeam.Firehose.Registry.fetch(&1["class"])))
     |> Enum.group_by(& &1["class"])
+  end
+
+  defp assert_substrate_messages_created!(db, expected_messages, expected_batch_assignment_ids) do
+    expected_rows =
+      Enum.map(expected_messages, fn {session_key, content} ->
+        rows =
+          db
+          |> StateResources.query_messages_for_session(session_key)
+          |> Enum.filter(fn row ->
+            row.role == "assistant" and row.message_type == "substrate" and
+              row.sender == "process:tightbeam" and row.content == content
+          end)
+
+        assert [message] = rows
+        canonical = StateResources.message(message)
+
+        assert canonical["sessionKey"] == session_key
+        assert canonical["messageType"] == "substrate"
+        assert canonical["content"] == content
+        refute Map.has_key?(canonical, "marker")
+
+        {message, canonical, session_key}
+      end)
+
+    notices = drain_notices()
+    message_notices = Enum.filter(notices, &(&1["class"] == "message.created"))
+    expected_ids = expected_rows |> Enum.map(fn {message, _, _} -> message.id end) |> Enum.sort()
+    actual_ids = Enum.map(message_notices, & &1["payload"]["id"])
+    extra_ids = actual_ids -- expected_ids
+
+    assert length(actual_ids) == length(Enum.uniq(actual_ids)),
+           "duplicate message.created rows: #{inspect(actual_ids)}"
+
+    assert Enum.all?(expected_ids, &(&1 in actual_ids))
+
+    Enum.each(message_notices, fn notice ->
+      message_id = notice["payload"]["id"]
+      row = StateResources.query_message(db, message_id)
+      assert row
+      canonical = StateResources.message(row)
+
+      assert notice["refs"]["messageId"] == message_id
+      assert notice["refs"]["sessionKey"] == row.session_key
+      assert notice["refs"]["ownerUserId"] == "flynn"
+      assert notice["payload"] == canonical
+      assert JSON.decode!(Publisher.encode_wire_notice(notice))["payload"] == canonical
+
+      if message_id in extra_ids do
+        assert_batched_attest_message!(db, row, expected_batch_assignment_ids)
+      end
+
+      item_bytes = StateResources.encode_item("transcript messages", canonical)
+
+      assert String.contains?(
+               Publisher.encode_wire_notice(notice),
+               "\"payload\":" <> item_bytes
+             )
+    end)
+
+    {notices, actual_ids}
+  end
+
+  defp assert_batched_attest_message!(db, row, expected_assignment_ids) do
+    assert row.session_key == Org.personal_session_key("flynn")
+    assert row.role == "user"
+    assert row.message_type == "substrate"
+    assert row.sender == "process:tightbeam"
+
+    prefix = "[from process:tightbeam]\n\n"
+    assert String.starts_with?(row.content, prefix)
+    envelope = String.replace_prefix(row.content, prefix, "")
+
+    assert [batch_id] =
+             Regex.run(~r/^\[batched notices: \d+\]\nbatchId=(nb_[0-9a-f-]+) /, envelope,
+               capture: :all_but_first
+             )
+
+    batch = NoticeBatcher.batch(db, batch_id)
+    assert batch
+    assert batch.session_key == row.session_key
+    assert batch.envelope == envelope
+
+    members = NoticeBatcher.members(db, batch_id)
+    assert length(members) == batch.member_count
+    assert members != []
+
+    Enum.each(members, fn member ->
+      wake = Wakes.get(db, member.source_wake_id)
+      assert wake
+      assert wake.session_key == row.session_key
+      assert wake.origin == member.sender_principal
+      assert wake.prompt == member.payload
+      assert wake.assignment_id in expected_assignment_ids
+      assert member.class == "fyi"
+      assert member.state == "included"
+
+      assert [attest_id, kind, assignment_id] =
+               Regex.run(
+                 ~r/^Attest (att_[A-Za-z0-9-]+) \(([^)]+)\) was filed on assignment (asg_[A-Za-z0-9-]+)\.$/,
+                 member.payload,
+                 capture: :all_but_first
+               )
+
+      assert assignment_id == wake.assignment_id
+
+      assert Enum.any?(Tightbeam.Assignments.list_attests(db, assignment_id), fn attest ->
+               attest.id == attest_id and attest.kind == kind
+             end)
+    end)
+  end
+
+  defp notice_state_classes({notices, message_ids}) do
+    notices
+    |> Enum.reject(fn notice ->
+      notice["class"] == "message.created" and notice["payload"]["id"] in message_ids
+    end)
+    |> Enum.map(& &1["class"])
+    |> state_classes()
   end
 
   defp state_classes(classes) do
@@ -1664,18 +1880,6 @@ defmodule Tightbeam.Firehose.PublisherTest do
       provider: "anthropic",
       model: Tightbeam.Model.new("fable")
     })
-  end
-
-  defp observed_notices(acc \\ []) do
-    _ = :sys.get_state(Hub)
-
-    receive do
-      {:firehose_notice, notice} ->
-        Hub.delivered(Hub, self())
-        observed_notices([notice | acc])
-    after
-      0 -> Enum.reverse(acc)
-    end
   end
 
   defp pending_decision_notice!(db, request_id) do

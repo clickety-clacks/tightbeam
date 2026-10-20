@@ -562,9 +562,14 @@ defmodule Tightbeam.AdapterCoordinator do
 
     reconcile_result =
       case process_row do
-        :no_launch -> :ok
-        _row when exited? -> Tightbeam.HarnessProcess.reconcile_key(state.db, key)
-        row -> Tightbeam.HarnessProcess.park(state.db, row)
+        :no_launch ->
+          :ok
+
+        _row when exited? ->
+          Tightbeam.HarnessProcess.reconcile_key(state.db, key)
+
+        row ->
+          Tightbeam.HarnessProcess.park(state.db, row)
       end
 
     result = if reconcile_result == :already_resolved, do: :ok, else: reconcile_result
@@ -1080,6 +1085,11 @@ defmodule Tightbeam.AdapterCoordinator do
 
             :already_resolved ->
               :ok
+
+            {:error, reason} ->
+              Logger.error(
+                "adapter launch remains fenced for #{key_name(key)}: #{inspect(reason)}"
+              )
           end
 
           failures = entry.failures + 1

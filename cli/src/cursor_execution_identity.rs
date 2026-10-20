@@ -422,6 +422,13 @@ pub fn run(args: &[String]) -> Result<i32, String> {
             verify_launch_command(Path::new(&rest[0]), Path::new(&rest[1]), command)?;
             crate::harness_process::cursor_session_exec(command)
         }
+        "check" => {
+            if rest.len() != 8 && rest.len() != 9 {
+                return Err(usage().to_owned());
+            }
+            verify_identity(Path::new(&rest[0]), Path::new(&rest[1]), &rest[2], &rest[3])?;
+            crate::harness_process::check_group(&rest[4..])
+        }
         "group" => {
             if rest.len() != 8 {
                 return Err(usage().to_owned());
@@ -717,7 +724,7 @@ fn account_from_passwd(pwd: &libc::passwd) -> Result<Account, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: tightbeam cursor-exec <verify|launch|group> <managed-base> <org-base> <operator-uid> <operator-home> -- ..."
+    "usage: tightbeam cursor-exec <verify|launch|group|check> <managed-base> <org-base> <operator-uid> <operator-home> -- ..."
 }
 
 #[cfg(test)]

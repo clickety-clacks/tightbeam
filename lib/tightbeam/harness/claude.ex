@@ -525,7 +525,9 @@ defmodule Tightbeam.Harness.Claude do
         #{Support.shell_quote(credential_path)} #{Support.shell_quote("#{@api_base}#{path}")}
       """
 
-      case Support.catalog_probe(sh, Support.catalog_probe_argv(dest, script)) do
+      host = if dest, do: Map.get(state, :host_name) || dest
+
+      case Support.catalog_probe(sh, Support.catalog_probe_argv(dest, script), host) do
         {:ok, body, _trailer} -> {:ok, body}
         {:error, reason} -> {:error, reason}
       end

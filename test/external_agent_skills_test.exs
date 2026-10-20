@@ -60,7 +60,7 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
     end
 
     assert cli =~
-             ~s(tightbeam operator-ask --question "..." --assignment <assignment-id>)
+             ~s(tightbeam operator-ask --question "..." --note "..." --assignment <assignment-id>)
 
     refute Regex.match?(~r/\btightbeam ask(?:\s|`)/, cli)
 

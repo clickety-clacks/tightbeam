@@ -1173,7 +1173,7 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  @doc "Return the current independent clean review only when it names the submitted result."
+  @doc "Return the current independent clean review when its source commits match the submitted result."
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
           [String.t()]
   def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, commit_refs) do
@@ -1195,7 +1195,7 @@ defmodule Tightbeam.Assignments do
              [assignment_id]
            ),
          true <- review_holder != assignment_holder_key,
-         ^expected <- canonical_stored_commit_refs(encoded) do
+         true <- same_commit_ref_identity?(expected, canonical_stored_commit_refs(encoded)) do
       ["reviewed-clean"]
     else
       _ -> []
@@ -1220,7 +1220,7 @@ defmodule Tightbeam.Assignments do
              """,
              [assignment_id, holder_key]
            ),
-         ^expected <- canonical_stored_commit_refs(encoded) do
+         true <- same_commit_ref_identity?(expected, canonical_stored_commit_refs(encoded)) do
       ["verified"]
     else
       _ -> []
@@ -1252,8 +1252,88 @@ defmodule Tightbeam.Assignments do
   end
 
   @doc "List every attest filed against an assignment in deterministic order."
-  @spec list_attests(DB.server(), String.t()) :: [map()]
-  def list_attests(db, assignment_id) do
+  @spec list_attests(DB.server() | map(), String.t() | map()) :: [map()] | map()
+  def list_attests(%Txn{} = txn, %{
+        assignment_id: assignment_id,
+        filters: filters,
+        boundary: boundary,
+        limit: limit
+      }) do
+    {where, params} = attest_collection_where(assignment_id, filters)
+
+    select_from = """
+    SELECT att.id, att.assignmentId, att.kind, att.verdictKind, att.note,
+           att.bySession, att.byUser, att.producer, att.producerCommand,
+           att.byHarness, att.byProvider, att.commitRefs, att.ts
+    FROM attests AS att
+    JOIN assignments AS parent ON parent.id = att.assignmentId
+    LEFT JOIN work_items AS wi ON wi.id = parent.workItemId
+    """
+
+    probe_from = """
+    attests AS att
+    JOIN assignments AS parent ON parent.id = att.assignmentId
+    LEFT JOIN work_items AS wi ON wi.id = parent.workItemId
+    """
+
+    query = fn sql, query_params -> Txn.q(txn, sql, query_params) end
+
+    Tightbeam.Keyset.page(
+      query,
+      select_from,
+      probe_from,
+      where,
+      params,
+      ["att.ts", "att.id"],
+      boundary,
+      limit,
+      fn row -> [Enum.at(row, 12), hd(row)] end
+    )
+    |> then(fn page -> %{page | rows: Enum.map(page.rows, &attest_collection_row/1)} end)
+  end
+
+  def list_attests(%Txn{} = txn, %{
+        filters: filters,
+        principal: principal,
+        boundary: boundary,
+        limit: limit
+      }) do
+    {visible_where, visible_params} = Tightbeam.StateVisibility.attest_collection_scope(principal)
+    {filter_where, filter_params} = attest_collection_where(nil, filters)
+    where = "(" <> visible_where <> ") AND (" <> filter_where <> ")"
+
+    select_from = """
+    SELECT att.id, att.assignmentId, att.kind, att.verdictKind, att.note,
+           att.bySession, att.byUser, att.producer, att.producerCommand,
+           att.byHarness, att.byProvider, att.commitRefs, att.ts
+    FROM attests AS att
+    JOIN assignments AS parent ON parent.id = att.assignmentId
+    LEFT JOIN work_items AS wi ON wi.id = parent.workItemId
+    """
+
+    probe_from = """
+    attests AS att
+    JOIN assignments AS parent ON parent.id = att.assignmentId
+    LEFT JOIN work_items AS wi ON wi.id = parent.workItemId
+    """
+
+    query = fn sql, query_params -> Txn.q(txn, sql, query_params) end
+
+    Tightbeam.Keyset.page(
+      query,
+      select_from,
+      probe_from,
+      where,
+      visible_params ++ filter_params,
+      ["att.ts", "att.id"],
+      boundary,
+      limit,
+      fn row -> [Enum.at(row, 12), hd(row)] end
+    )
+    |> then(fn page -> %{page | rows: Enum.map(page.rows, &attest_collection_row/1)} end)
+  end
+
+  def list_attests(db, assignment_id) when is_binary(assignment_id) do
     {:ok, rows} =
       DB.query(
         db,
@@ -1262,6 +1342,61 @@ defmodule Tightbeam.Assignments do
       )
 
     Enum.map(rows, &attest/1)
+  end
+
+  defp attest_collection_where(assignment_id, filters) do
+    initial =
+      if is_nil(assignment_id),
+        do: {"1 = 1", []},
+        else: {"att.assignmentId = ?", [assignment_id]}
+
+    Enum.reduce(filters, initial, fn {field, values}, {where, params} ->
+      column =
+        case field do
+          "assignmentId" -> "att.assignmentId"
+          "workItemId" -> "parent.workItemId"
+          "kind" -> "att.kind"
+          "verdictKind" -> "att.verdictKind"
+          "bySession" -> "att.bySession"
+          "byUser" -> "att.byUser"
+          _ -> raise ArgumentError, "unsupported attest collection filter"
+        end
+
+      predicate = column <> " IN (" <> Enum.map_join(values, ", ", fn _ -> "?" end) <> ")"
+      {"(" <> where <> ") AND " <> predicate, params ++ values}
+    end)
+  end
+
+  defp attest_collection_row([
+         id,
+         assignment_id,
+         kind,
+         verdict_kind,
+         note,
+         by_session,
+         by_user,
+         producer,
+         producer_command,
+         by_harness,
+         by_provider,
+         commit_refs,
+         ts
+       ]) do
+    %{
+      id: id,
+      assignment_id: assignment_id,
+      kind: kind,
+      verdict_kind: verdict_kind,
+      note: note,
+      by_session: by_session,
+      by_user: by_user,
+      producer: producer,
+      producer_command: producer_command,
+      by_harness: by_harness,
+      by_provider: by_provider,
+      commit_refs: if(is_binary(commit_refs), do: JSON.decode!(commit_refs), else: nil),
+      ts: ts
+    }
   end
 
   @spec list_reopenings(DB.server(), String.t()) :: [map()]
@@ -2523,6 +2658,9 @@ defmodule Tightbeam.Assignments do
         cond do
           not match?({:session, ^holder}, call.principal) ->
             error("not_holder", "assignment is held by session #{holder}")
+
+          assignment.state != "open" and call.params[:kind] == "cannot-proceed" ->
+            cannot_proceed_closed(assignment.outcome)
 
           assignment.state != "open" ->
             assignment_closed()
@@ -4033,21 +4171,60 @@ defmodule Tightbeam.Assignments do
     verification = latest_verification_conclusion_in_txn(txn, assignment.id, assignment.holderKey)
 
     with [_ | _] <- refs,
-         %{kind: "reviewed-clean", holder: review_holder, refs: ^refs} <- review,
+         %{kind: "reviewed-clean", holder: review_holder, refs: review_refs} <- review,
          true <- review_holder != assignment.holderKey,
-         %{kind: "verified", holder: assignment_holder, refs: ^refs} <- verification,
-         true <- assignment_holder == assignment.holderKey do
+         true <- same_commit_ref_identity?(refs, review_refs),
+         %{kind: "verified", holder: assignment_holder, refs: verification_refs} <- verification,
+         true <- assignment_holder == assignment.holderKey,
+         true <- same_commit_ref_identity?(refs, verification_refs) do
       :ok
     else
       _ ->
-        error(
-          "inapplicable_code_evidence",
-          "code completion requires the latest independent clean review and holder verification to match its immutable commitRefs"
-        )
+        code_completion_evidence_error(refs, review, assignment)
     end
   end
 
   defp applicable_code_completion_in_txn(_txn, _assignment, _call), do: :ok
+
+  defp code_completion_evidence_error(
+         [_ | _] = candidate_refs,
+         %{kind: "reviewed-clean", holder: review_holder, refs: review_refs},
+         %{holderKey: assignment_holder}
+       )
+       when review_holder != assignment_holder do
+    cond do
+      review_refs in [nil, []] ->
+        error(
+          "inapplicable_code_evidence",
+          "the linked independent reviewed-clean verdict is missing commitRefs for completion candidate #{format_commit_refs(candidate_refs)}; file a new independent reviewed-clean verdict for the candidate commits, then retry completion"
+        )
+
+      not same_commit_ref_identity?(candidate_refs, review_refs) ->
+        error(
+          "inapplicable_code_evidence",
+          "the linked independent reviewed-clean verdict commitRefs #{format_commit_refs(review_refs)} do not match completion candidate #{format_commit_refs(candidate_refs)}; file a new independent reviewed-clean verdict for the candidate commits, then retry completion"
+        )
+
+      true ->
+        inapplicable_code_evidence_error()
+    end
+  end
+
+  defp code_completion_evidence_error(_refs, _review, _assignment),
+    do: inapplicable_code_evidence_error()
+
+  defp inapplicable_code_evidence_error do
+    error(
+      "inapplicable_code_evidence",
+      "code completion requires the latest independent clean review and holder verification to match its immutable commitRefs"
+    )
+  end
+
+  defp format_commit_refs(refs) do
+    Enum.map_join(refs, ", ", fn %{"repo" => repo, "commit" => commit} ->
+      "#{repo}@#{commit}"
+    end)
+  end
 
   defp latest_review_conclusion_in_txn(txn, assignment_id) do
     case Txn.q(
@@ -4110,6 +4287,16 @@ defmodule Tightbeam.Assignments do
         nil
     end
   end
+
+  defp same_commit_ref_identity?(left, right) when is_list(left) and is_list(right) do
+    commit_identity = fn refs ->
+      refs |> Enum.map(& &1["commit"]) |> Enum.uniq() |> Enum.sort()
+    end
+
+    commit_identity.(left) == commit_identity.(right)
+  end
+
+  defp same_commit_ref_identity?(_left, _right), do: false
 
   defp run_git_cat_file(db, host, path, commit) do
     base_dir =
@@ -4339,6 +4526,14 @@ defmodule Tightbeam.Assignments do
   defp opener({:remedy, %{owner: owner}}), do: {owner, nil}
 
   defp assignment_closed, do: error("assignment_closed", "assignment is already closed")
+
+  defp cannot_proceed_closed(outcome),
+    do:
+      error(
+        "assignment_closed",
+        "cannot-proceed is refused because assignment is closed with outcome #{outcome}"
+      )
+
   defp error(code, message), do: %{code: code, message: message}
 
   defp notify(call, key, first, second) do

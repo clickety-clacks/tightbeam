@@ -909,6 +909,16 @@ defmodule Tightbeam.Org do
     )
   end
 
+  @doc false
+  def set_identity_stamp_in_txn(%Txn{} = txn, session_key, revision, contract, digest) do
+    update_in_txn(
+      txn,
+      session_key,
+      "identityRevision = ?2, identityRenderContract = ?3, identityGuidanceDigest = ?4",
+      [revision, contract, digest]
+    )
+  end
+
   @doc """
   Record the history barrier: replay serves only messages with seq > this.
   Rows are never deleted — the chat's past remains in the store (and in any

@@ -95,6 +95,7 @@ defmodule Tightbeam.StateResources do
     "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
     "users" => ~w(userId isAdmin createdAt rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
+    "harness processes" => ~w(id host harness pid state createdAt resolvedAt),
     "artifacts" =>
       ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
     "read markers" => ~w(userId scopeKey marker updatedAt rowVersion),
@@ -199,6 +200,12 @@ defmodule Tightbeam.StateResources do
       integers: ~w(createdAt rowVersion),
       booleans: [],
       nullable: ~w(claimedName platform model)
+    },
+    "harness processes" => %{
+      strings: ~w(id host harness),
+      integers: ~w(pid createdAt resolvedAt),
+      booleans: [],
+      nullable: ~w(pid resolvedAt)
     },
     "artifacts" => %{
       strings:
@@ -322,6 +329,8 @@ defmodule Tightbeam.StateResources do
     {"sessions", "state"} => ~w(active retired),
     {"sessions", "mechanicalStatus"} => ~w(idle running),
     {"devices", "status"} => ~w(allowlisted pending denied),
+    {"harness processes", "state"} =>
+      ~w(launching running park_requested closed_gracefully killed kill_failed exited),
     {"artifacts", "kind"} => ~w(spec report doc data other),
     {"artifacts", "recordedTurnEvidence"} => ~w(tool-call-observed session-concurrent none),
     {"artifacts", "state"} => ~w(in-workspace archived released),
@@ -776,6 +785,39 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  def query_artifact(db, %{collection: request}) do
+    principal = request.principal
+    visibility = StateVisibility.artifact_collection_scope(principal)
+
+    case DB.transaction(db, fn txn ->
+           txn = Txn.observe_queries(txn, Map.get(principal, :core_detail_trace))
+
+           page =
+             Artifacts.collection_page_in_txn(
+               txn,
+               request.filters,
+               visibility,
+               request.boundary,
+               request.limit
+             )
+
+           unless Enum.all?(page.rows, fn row ->
+                    StateVisibility.core_detail_visible?(txn, "artifacts", row, principal)
+                  end) do
+             raise ArgumentError, "artifact collection visibility selection drift"
+           end
+
+           %{
+             rows: page.rows,
+             has_more_before: page.has_more_before,
+             has_more_after: page.has_more_after
+           }
+         end) do
+      {:ok, page} -> page
+      {:error, error} -> raise error
+    end
+  end
+
   def query_artifact(db, %{key: id, principal: principal}) do
     detail_selection(db, "artifacts", principal, &Artifacts.canonical_in_txn(&1, id))
   end
@@ -785,6 +827,62 @@ defmodule Tightbeam.StateResources do
   def query_artifact(db, id) do
     case DB.transaction(db, &Artifacts.canonical_in_txn(&1, id)) do
       {:ok, row} -> row
+      {:error, error} -> raise error
+    end
+  end
+
+  def query_attest(db, %{collection: request}) do
+    principal = request.principal
+
+    case DB.transaction(db, fn txn ->
+           txn = Txn.observe_queries(txn, Map.get(principal, :core_detail_trace))
+
+           case query_assignment(txn, request.parent_id, %{rest_principal: principal}) do
+             nil ->
+               :not_found
+
+             _assignment ->
+               page =
+                 Assignments.list_attests(txn, %{
+                   assignment_id: request.parent_id,
+                   filters: request.filters,
+                   boundary: request.boundary,
+                   limit: request.limit
+                 })
+
+               if Enum.all?(page.rows, fn row ->
+                    StateVisibility.core_detail_visible?(txn, "attests", row, principal)
+                  end) do
+                 {:ok,
+                  %{
+                    rows: page.rows,
+                    has_more_before: page.has_more_before,
+                    has_more_after: page.has_more_after
+                  }}
+               else
+                 :not_found
+               end
+           end
+         end) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  def query_attests(db, %{collection: request}) do
+    principal = request.principal
+
+    case DB.transaction(db, fn txn ->
+           txn = Txn.observe_queries(txn, Map.get(principal, :core_detail_trace))
+
+           Assignments.list_attests(txn, %{
+             filters: request.filters,
+             principal: principal,
+             boundary: request.boundary,
+             limit: request.limit
+           })
+         end) do
+      {:ok, page} -> page
       {:error, error} -> raise error
     end
   end
@@ -1642,6 +1740,27 @@ defmodule Tightbeam.StateResources do
   end
 
   def critical_state(row), do: public(row)
+
+  def harness_process(%{
+        launch_id: id,
+        host: host,
+        harness: harness,
+        pid: pid,
+        state: state,
+        created_at: created_at,
+        resolved_at: resolved_at
+      }) do
+    %{
+      "id" => id,
+      "host" => host,
+      "harness" => harness,
+      "pid" => pid,
+      "state" => state,
+      "createdAt" => created_at,
+      "resolvedAt" => resolved_at
+    }
+    |> closed_projection("harness processes")
+  end
 
   def device(row) do
     row = row |> public() |> Map.delete("isAdmin")

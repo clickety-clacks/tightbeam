@@ -42,6 +42,7 @@ pub enum TuneControl {
     },
     Effort(String),
     Fast(String),
+    Host(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -296,6 +297,10 @@ pub enum Command {
         identity: Identity,
         assignment_id: String,
         reason: String,
+    },
+    CancelTurn {
+        identity: Identity,
+        session_key: String,
     },
     RevokeAssignment {
         identity: Identity,
@@ -572,6 +577,11 @@ pub enum Command {
         identity: Identity,
         session_key: String,
     },
+    HarnessProcessSettle {
+        identity: Identity,
+        launch_id: String,
+        adapter_key: String,
+    },
     HarnessProcesses {
         identity: Identity,
     },
@@ -769,7 +779,7 @@ COMMANDS:
       End a session deliberately.
 
   tune --session <key> (--harness <harness> [--model <model>] |
-       --model <model> | --effort <level> | --fast on|off)
+       --model <model> | --effort <level> | --fast on|off | --host <host>)
        [--effort <level>] [--context <variant>]
       Change one runtime control on an existing session. Model identity remains
       separate fields. Same-harness model, effort, and Fast changes preserve the
@@ -777,7 +787,8 @@ COMMANDS:
       keeping the Tightbeam session, role, work, and graph position. Fast is
       ephemeral and uses only the resident adapter's live advertised option;
       unsupported sessions refuse it. Naming the resident harness again is a
-      refusal: omit --harness for a same-harness model change.
+      refusal: omit --harness for a same-harness model change. --host moves the
+      session workdir to an allowed host and keeps the Tightbeam session.
 
   work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex>]
                    [--priority <0..8>] [--key <idempotencyKey>]
@@ -884,6 +895,8 @@ COMMANDS:
       existing visibility rules.
   assignment-stop-turn <assignmentId> --reason "<why>"
       Stop the current turn only when you opened that assignment.
+  cancel-turn --session <key> --as-user <ownerUserId>
+      Stop a running turn in a session owned by that user.
   revoke-assignment <assignmentId> --reason "..."
       Revoke when the assignment handler already authorizes your principal.
   reopen-assignment <assignmentId> --reason <reason>
@@ -1022,6 +1035,7 @@ COMMANDS:
       Replace the host's ordered toolchain directories. An empty array restores
       the inherited PATH. The result previews the PATH shape adapters will use.
   harness-process list
+  harness-process settle <launch-id> --adapter-key <key>
       List the durable harness launch ledger, newest launch first.
 
   session-diagnose --session EXACT --as-user USER [--json]
@@ -2547,6 +2561,23 @@ fn parse_with_optional_catalog(
                 reason,
             })
         }
+        "cancel-turn" => {
+            let usage = "usage: tightbeam cancel-turn --session <key> --as-user <ownerUserId>";
+            const ALLOWED: &[&str] = &["session", "as-user"];
+            if parsed.positional.len() != 1
+                || parsed.duplicates.contains("session")
+                || parsed.duplicates.contains("as-user")
+                || flags.keys().any(|flag| !ALLOWED.contains(&flag.as_str()))
+            {
+                return Err(usage.to_owned());
+            }
+            Ok(Command::CancelTurn {
+                identity: Identity::User(
+                    nonempty(flags, "as-user").ok_or_else(|| usage.to_owned())?,
+                ),
+                session_key: nonempty(flags, "session").ok_or_else(|| usage.to_owned())?,
+            })
+        }
         "revoke-assignment" => {
             let usage = "usage: tightbeam revoke-assignment <assignmentId> --reason \"...\"";
             if parsed.positional.len() != 2 || parsed.duplicates.contains("reason") {
@@ -3371,7 +3402,7 @@ fn parse_host_toolchain_set(
 }
 
 fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
-    const USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> [--model <model>] [--effort <level>] [--context <variant>] | --model <model> [--effort <level>] [--context <variant>] | --effort <level> | --fast on|off)";
+    const USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> [--model <model>] [--effort <level>] [--context <variant>] | --model <model> [--effort <level>] [--context <variant>] | --effort <level> | --fast on|off | --host <host>)";
     const ALLOWED: &[&str] = &[
         "session",
         "harness",
@@ -3379,6 +3410,7 @@ fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command
         "effort",
         "context",
         "fast",
+        "host",
         "as",
         "as-user",
         "as-process",
@@ -3393,7 +3425,7 @@ fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command
     };
     let session_key = required("session")?;
 
-    for name in ["harness", "model", "effort", "context", "fast"] {
+    for name in ["harness", "model", "effort", "context", "fast", "host"] {
         if flags.contains_key(name) && nonempty(flags, name).is_none() {
             return Err(format!("--{name} requires a non-empty value"));
         }
@@ -3404,32 +3436,38 @@ fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command
     let effort = nonempty(flags, "effort");
     let context = nonempty(flags, "context");
     let fast = nonempty(flags, "fast");
+    let host = nonempty(flags, "host");
 
     if model.as_deref().is_some_and(has_packed_effort) {
         return Err("--model must not pack an effort; pass --effort separately".to_owned());
     }
 
-    let control = match (harness, model, effort, context, fast) {
-        (Some(harness), model, effort, context, None) => TuneControl::Harness {
+    let control = match (harness, model, effort, context, fast, host) {
+        (Some(harness), model, effort, context, None, None) => TuneControl::Harness {
             harness,
             model,
             effort,
             context,
         },
-        (None, Some(model), effort, context, None) => TuneControl::Model {
+        (None, Some(model), effort, context, None, None) => TuneControl::Model {
             model,
             effort,
             context,
         },
-        (None, None, Some(effort), None, None) => TuneControl::Effort(effort),
-        (None, None, None, None, Some(fast)) if fast == "on" || fast == "off" => {
+        (None, None, Some(effort), None, None, None) => TuneControl::Effort(effort),
+        (None, None, None, None, Some(fast), None) if fast == "on" || fast == "off" => {
             TuneControl::Fast(fast)
         }
-        (None, None, None, None, Some(_)) => return Err("--fast must be on or off".to_owned()),
-        (None, None, None, Some(_), None) => return Err("--context requires --model".to_owned()),
-        (_, _, _, _, Some(_)) => {
+        (None, None, None, None, Some(_), None) => {
+            return Err("--fast must be on or off".to_owned());
+        }
+        (None, None, None, None, None, Some(host)) => TuneControl::Host(host),
+        (None, None, None, Some(_), None, None) => {
+            return Err("--context requires --model".to_owned());
+        }
+        (_, _, _, _, Some(_), _) => {
             return Err(
-                "--fast is mutually exclusive with --harness, --model, --effort, and --context"
+                "--fast is mutually exclusive with --harness, --model, --effort, --context, and --host"
                     .to_owned(),
             );
         }
@@ -3462,7 +3500,16 @@ fn parse_harness_process(
         (Some("list"), None, None) => Ok(Command::HarnessProcesses {
             identity: identity(flags)?,
         }),
-        _ => Err("usage: tightbeam harness-process list".to_owned()),
+        (Some("settle"), Some(launch_id), None) => Ok(Command::HarnessProcessSettle {
+            identity: identity(flags)?,
+            launch_id: launch_id.clone(),
+            adapter_key: nonempty(flags, "adapter-key")
+                .ok_or_else(|| "harness-process settle requires --adapter-key".to_owned())?,
+        }),
+        _ => Err(
+            "usage: tightbeam harness-process list | settle <launch-id> --adapter-key <key>"
+                .to_owned(),
+        ),
     }
 }
 
@@ -3796,6 +3843,41 @@ mod tests {
     }
 
     #[test]
+    fn cancel_turn_requires_an_explicit_user_and_session() {
+        for args in [
+            strings(&["cancel-turn"]),
+            strings(&["cancel-turn", "--session", "s1"]),
+            strings(&["cancel-turn", "--as-user", "owner"]),
+            strings(&["cancel-turn", "--session", "s1", "--as", "owner"]),
+            strings(&[
+                "cancel-turn",
+                "--session",
+                "s1",
+                "--as-user",
+                "owner",
+                "--reason",
+                "extra",
+            ]),
+        ] {
+            assert!(parse(args).is_err());
+        }
+
+        assert_eq!(
+            parse(strings(&[
+                "cancel-turn",
+                "--session",
+                "agent:worker s_123",
+                "--as-user",
+                "owner",
+            ])),
+            Ok(Command::CancelTurn {
+                identity: Identity::User("owner".to_owned()),
+                session_key: "agent:worker s_123".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn identity_current_rejects_other_session_overrides() {
         assert_eq!(
             super::parse(vec!["identity".into(), "current".into()]),
@@ -3978,7 +4060,7 @@ mod tests {
             parse(strings(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR=value=with=equals",
@@ -3987,7 +4069,7 @@ mod tests {
             ])),
             Ok(Command::HostEnvSet {
                 identity: Identity::Role("operator".to_owned()),
-                host: "gibson".to_owned(),
+                host: "testhost-a".to_owned(),
                 harness: "claude".to_owned(),
                 name: "EXAMPLE_OVERLAY_VAR".to_owned(),
                 value: "value=with=equals".to_owned(),
@@ -3998,7 +4080,7 @@ mod tests {
             parse(strings(&[
                 "host-env-list",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "--harness",
                 "claude",
                 "--as-user",
@@ -4006,7 +4088,7 @@ mod tests {
             ])),
             Ok(Command::HostEnvList {
                 identity: Identity::User("flynn".to_owned()),
-                host: Some("gibson".to_owned()),
+                host: Some("testhost-a".to_owned()),
                 harness: Some("claude".to_owned()),
             })
         );
@@ -4015,7 +4097,7 @@ mod tests {
             parse(strings(&[
                 "host-env-unset",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR",
@@ -4024,7 +4106,7 @@ mod tests {
             ])),
             Ok(Command::HostEnvUnset {
                 identity: Identity::User("flynn".to_owned()),
-                host: "gibson".to_owned(),
+                host: "testhost-a".to_owned(),
                 harness: "claude".to_owned(),
                 name: "EXAMPLE_OVERLAY_VAR".to_owned(),
             })
@@ -4204,13 +4286,13 @@ mod tests {
             strings(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "EXAMPLE_OVERLAY_VAR=value",
             ]),
             strings(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR",
@@ -4232,7 +4314,7 @@ mod tests {
             parse(strings(&[
                 "host-toolchain-set",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "--dirs",
                 r#"["/tools/one","/tools/two"]"#,
                 "--as-user",
@@ -4240,7 +4322,7 @@ mod tests {
             ])),
             Ok(Command::HostToolchainSet {
                 identity: Identity::User("flynn".to_owned()),
-                host: "gibson".to_owned(),
+                host: "testhost-a".to_owned(),
                 dirs: vec!["/tools/one".to_owned(), "/tools/two".to_owned()],
             })
         );
@@ -4249,13 +4331,13 @@ mod tests {
             parse(strings(&[
                 "host-toolchain-set",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "--dirs",
                 "[]",
             ])),
             Ok(Command::HostToolchainSet {
                 identity: Identity::Session,
-                host: "gibson".to_owned(),
+                host: "testhost-a".to_owned(),
                 dirs: vec![],
             })
         );
@@ -4267,7 +4349,7 @@ mod tests {
             "usage: tightbeam host-toolchain-set --host <host> --dirs '<json-array>'".to_owned();
 
         assert_eq!(
-            parse(strings(&["host-toolchain-set", "--host", "gibson"])),
+            parse(strings(&["host-toolchain-set", "--host", "testhost-a"])),
             Err(usage.clone())
         );
         assert_eq!(
@@ -4278,7 +4360,7 @@ mod tests {
             parse(strings(&[
                 "host-toolchain-set",
                 "--host",
-                "gibson",
+                "testhost-a",
                 "--dirs",
                 r#"[1]"#,
             ])),
@@ -4467,6 +4549,14 @@ mod tests {
                     "params": {"setting": "set_fast_mode", "fastMode": "on"}
                 }),
             ),
+            (
+                strings(&["tune", "--session", "agent:coder:x s_1", "--host", "worker"]),
+                serde_json::json!({
+                    "verb": "tune",
+                    "sessionKey": "agent:coder:x s_1",
+                    "params": {"setting": "set_host", "host": "worker"}
+                }),
+            ),
         ];
 
         for (args, expected) in cases {
@@ -4507,6 +4597,25 @@ mod tests {
             strings(&["tune", "--session", "s_1", "--fast", "yes"]),
             strings(&["tune", "--session", "s_1", "--model", "gpt-5.6-sol[high]"]),
             strings(&["tune", "--session", "s_1", "--model", ""]),
+            strings(&["tune", "--session", "s_1", "--host", ""]),
+            strings(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--host",
+                "worker",
+                "--effort",
+                "high",
+            ]),
+            strings(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--host",
+                "worker",
+                "--model",
+                "model",
+            ]),
             strings(&[
                 "tune",
                 "--session",
@@ -4930,6 +5039,7 @@ mod tests {
                 "repair-assignment",
                 "assignment-commitref-correct",
                 "assignment-stop-turn",
+                "cancel-turn",
                 "revoke-assignment",
                 "reopen-assignment",
                 "spawn",
@@ -5750,7 +5860,7 @@ mod tests {
                 "assignment-commitref-correct",
                 "asg_1",
                 "--commit-refs",
-                r#"[{"repo":"gibson:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                r#"[{"repo":"testhost:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
                 "--evidence",
                 "art_1",
                 "--reason",
@@ -5774,7 +5884,7 @@ mod tests {
                 "assignment-commitref-correct",
                 "asg_1",
                 "--commit-refs",
-                r#"[{"repo":"gibson:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                r#"[{"repo":"testhost:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
                 "--evidence",
                 "art_1",
                 "--reason",
@@ -6348,7 +6458,7 @@ mod tests {
                     "--name",
                     "reviewer",
                     "--host",
-                    "eezo",
+                    "testhost-c",
                     "--as-user",
                     "flynn",
                 ]),
@@ -6362,7 +6472,7 @@ mod tests {
                     effort: Some(Some("high".to_owned())),
                     context: Some(Some("1m".to_owned())),
                     handle: Some("reviewer".to_owned()),
-                    host: Some("eezo".to_owned()),
+                    host: Some("testhost-c".to_owned()),
                     work_item_id: None,
                 },
             ),

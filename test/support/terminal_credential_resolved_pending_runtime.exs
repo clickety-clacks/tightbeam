@@ -19,7 +19,7 @@ try do
 
   assert {:opened, incident} =
            TerminalCredentialFailure.open(db, %{
-             host: "racter",
+             host: "testhost",
              harness: "codex",
              provider: "openai",
              correlation_id: "resolved-before-session",
@@ -38,7 +38,7 @@ try do
            DB.transaction(db, fn txn ->
              ConditionFacts.file_in_txn(txn, %{
                kind: "credential-present",
-               scope: "racter:openai",
+               scope: "testhost:openai",
                origin: "process:tightbeam"
              })
            end)
@@ -60,7 +60,7 @@ try do
     owner_user_id: "mike",
     origin: "user:mike",
     archetype: "default",
-    host: "racter",
+    host: "testhost",
     harness: "codex",
     provider: "openai",
     model: Model.new("gpt-fixture")

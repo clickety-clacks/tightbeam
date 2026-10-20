@@ -2,7 +2,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   @moduledoc false
   import ExUnit.Assertions
   alias Tightbeam.{DB, NoticeBatcher, Schema}
-  @shape "decision-request-row-schema-v2-019"
+  @shape "launch-preparation-boot-v1-0110"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -422,7 +422,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     assert :ok = Schema.ensure_all(second)
     assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
     trigger = object_sql(second, "trigger", "supervision_liveness_sidecar_insert_coherent")
-    assert trigger =~ "withrecursivelineage"
+    assert trigger =~ "creator.owneruserid=w.owneruserid"
     refute trigger =~ "w.creatorsessionkey=a.holderkey"
     assert trigger =~ "t.sessionkey=w.creatorsessionkey"
     assert :ok = Schema.ensure_all(second)
@@ -879,11 +879,24 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
       )
 
   defp current_continuation_guard!() do
-    Regex.replace(
-      ~r/AND EXISTS \(SELECT 1 FROM \(SELECT t.seq AS turnSeq.*?delivery.assignmentId=w.assignmentId\)/s,
-      historical_continuation_guard!(),
-      "AND old.deliveredTurnSeq=failed.seq"
+    recorded =
+      Regex.replace(
+        ~r/AND EXISTS \(SELECT 1 FROM \(SELECT t.seq AS turnSeq.*?delivery.assignmentId=w.assignmentId\)/s,
+        historical_continuation_guard!(),
+        "AND old.deliveredTurnSeq=failed.seq"
+      )
+
+    ancestry =
+      ~r/AND EXISTS \(\s*WITH RECURSIVE lineage\(sessionKey,spawnedBy\) AS \(.*?SELECT 1 FROM lineage WHERE sessionKey=w.creatorSessionKey\s*\)/s
+
+    assert Regex.match?(ancestry, recorded)
+
+    Regex.replace(ancestry, recorded, """
+    AND EXISTS (
+      SELECT 1 FROM sessions creator
+      WHERE creator.sessionKey=w.creatorSessionKey AND creator.ownerUserId=w.ownerUserId
     )
+    """)
   end
 
   # The released form after the ancestry restriction was removed: the creator

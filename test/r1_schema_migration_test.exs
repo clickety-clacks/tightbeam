@@ -12,7 +12,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     db: db
   } do
     assert :ok = Schema.ensure_all(db)
-    assert shape(db) == [["decision-request-row-schema-v2-019"]]
+    assert shape(db) == [["launch-preparation-boot-v1-0110"]]
     assert_columns(db)
     seed(db)
     assert rows(db, "SELECT reminderState FROM assignments") == [[nil]]
@@ -32,7 +32,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     facts = rows(db, "SELECT * FROM condition_facts")
     objects = guards(db)
     assert :ok = Schema.ensure_all(db)
-    assert shape(db) == [["decision-request-row-schema-v2-019"]]
+    assert shape(db) == [["launch-preparation-boot-v1-0110"]]
     # Preserve every historical value despite Firehose's explicit table rebuild.
     assert rows(db, "SELECT #{Enum.join(assignment_columns, ",")} FROM assignments") ==
              assignments

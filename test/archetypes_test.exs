@@ -726,41 +726,27 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
-  test "owner child prod marker is a default-off optional boolean" do
-    assert Archetypes.builtin_default().owner_open_child_prod == false
+  test "legacy owner child prod manifest key is accepted and ignored" do
+    archetype =
+      Archetypes.parse_manifest!(
+        "name = \"legacy\"\nowner_open_child_prod = true\n",
+        "legacy.toml"
+      )
 
-    for {body, expected} <- [
-          {"name = \"quiet\"\n", false},
-          {"name = \"quiet\"\nowner_open_child_prod = false\n", false},
-          {"name = \"quiet\"\nowner_open_child_prod = true\n", true}
-        ] do
-      assert Archetypes.parse_manifest!(body, "quiet.toml").owner_open_child_prod ==
-               expected
-    end
-
-    for value <- ["\"false\"", "0", "[]"] do
-      assert_raise ArgumentError,
-                   ~r/archetype owner_open_child_prod must be a boolean/,
-                   fn ->
-                     Archetypes.parse_manifest!(
-                       "name = \"quiet\"\nowner_open_child_prod = #{value}\n",
-                       "quiet.toml"
-                     )
-                   end
-    end
+    assert archetype.name == "legacy"
+    refute Map.has_key?(archetype, :owner_open_child_prod)
   end
 
-  test "shipped owner-role manifests opt into the child follow-up prod" do
-    for name <- ["product-owner", "pdo", "orchestrator"] do
-      path =
-        Application.app_dir(
-          :tightbeam,
-          "priv/kungfu/agentic-engineering/archetypes/#{name}.toml"
+  test "legacy idle cleanup manifest key is accepted and ignored" do
+    for value <- ["true", "false"] do
+      archetype =
+        Archetypes.parse_manifest!(
+          "name = \"legacy\"\nidle_cleanup = #{value}\n",
+          "legacy.toml"
         )
 
-      archetype = Archetypes.parse_manifest!(File.read!(path), path)
-
-      assert archetype.owner_open_child_prod == true
+      assert archetype.name == "legacy"
+      refute Map.has_key?(archetype, :idle_cleanup)
     end
   end
 

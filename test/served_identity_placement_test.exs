@@ -10,6 +10,21 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
     File.mkdir_p!(base)
     db = :"served_placement_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+
+    :ok =
+      Tightbeam.DB.execute(db, """
+      CREATE TABLE sessions (
+        sessionKey TEXT PRIMARY KEY,
+        ownerUserId TEXT
+      );
+
+      CREATE TABLE ephemeral_sessions (
+        sessionKey TEXT PRIMARY KEY REFERENCES sessions(sessionKey),
+        callerSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+        turnUsed INTEGER NOT NULL DEFAULT 0 CHECK(turnUsed IN (0, 1))
+      )
+      """)
+
     old_local = Application.get_env(:tightbeam, :local_host_name)
     old_url = Application.get_env(:tightbeam, :advertised_url)
 

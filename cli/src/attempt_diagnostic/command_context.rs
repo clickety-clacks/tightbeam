@@ -88,6 +88,7 @@ impl CommandContext {
             DecisionRequests { .. } => ("cli.decision_requests", DispatchPath),
             DecisionRequest { .. } => ("cli.decision_request", DispatchPath),
             AssignmentStopTurn { .. } => ("cli.assignment_stop_turn", DispatchPath),
+            CancelTurn { .. } => ("cli.cancel_turn", DispatchPath),
             RevokeAssignment { .. } => ("cli.revoke_assignment", DispatchPath),
             ReopenAssignment { .. } => ("cli.reopen_assignment", DispatchPath),
             RepairAssignment { .. } => ("cli.repair_assignment", DispatchPath),
@@ -140,6 +141,7 @@ impl CommandContext {
             HostEnvList { .. } => ("cli.host_env_list", DispatchPath),
             HostEnvUnset { .. } => ("cli.host_env_unset", DispatchPath),
             HostToolchainSet { .. } => ("cli.host_toolchain_set", DispatchPath),
+            HarnessProcessSettle { .. } => ("cli.harness_process_settle", DispatchPath),
             HarnessProcesses { .. } => ("cli.harness_processes", DispatchPath),
             UpdateClients { .. } => ("cli.update_clients", DispatchPath),
             Assimilate(_) => ("cli.assimilate", CatalogAndDispatch),
@@ -321,6 +323,11 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | HarnessProcesses { .. }
         | UpdateClients { .. } => Read,
 
+        // Settlement resolves the launch row, may remove its park fence and
+        // records a lifecycle event. It carries no idempotency key; the
+        // guarded operation itself reports already-settled on a repeat.
+        HarnessProcessSettle { .. } => WriteWithoutIdempotency,
+
         Wake {
             idempotency_key, ..
         }
@@ -411,6 +418,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | OperatorRule { .. }
         | OperatorWithdraw { .. }
         | AssignmentStopTurn { .. }
+        | CancelTurn { .. }
         | RevokeAssignment { .. }
         | ReopenAssignment { .. }
         | WorkItemUpdate { .. }
@@ -504,6 +512,29 @@ mod tests {
         assert!(!debug.contains("PRIVATE_USER"));
         assert!(!debug.contains("PRIVATE_ASSIGNMENT"));
         assert!(!debug.contains("PRIVATE_REASON"));
+    }
+
+    #[test]
+    fn cancel_turn_is_an_unkeyed_dispatch_write_without_retained_identity() {
+        let command = Command::CancelTurn {
+            identity: Identity::User("PRIVATE_USER".into()),
+            session_key: "PRIVATE_SESSION".into(),
+        };
+        let context = CommandContext::for_command(&command).unwrap();
+        assert_eq!(
+            context
+                .operation_for_request("POST", "/agent/dispatch")
+                .unwrap()
+                .as_str(),
+            "cli.cancel_turn"
+        );
+        assert_eq!(
+            effect(context, "POST", "/agent/dispatch"),
+            EffectContract::WriteWithoutIdempotency
+        );
+        let debug = format!("{context:?}");
+        assert!(!debug.contains("PRIVATE_USER"));
+        assert!(!debug.contains("PRIVATE_SESSION"));
     }
 
     #[test]

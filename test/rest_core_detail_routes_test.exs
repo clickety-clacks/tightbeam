@@ -2170,7 +2170,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   end
 
   @tag rest_r7_boundary: true
-  test "B2 collection enforces principal resolution and rejects cross-principal cursors", ctx do
+  test "B2 collection returns not-found for a valid cursor bound to another principal", ctx do
     outsider = outsider_device(ctx)
     path = "/api/work-items?limit=1"
     page = get(ctx, path)
@@ -2186,7 +2186,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert other.status == 200
     assert JSON.decode!(other.resp_body)["items"] == []
     cross = get(ctx, "/api/work-items?before=" <> before, outsider.token)
-    assert_error(cross, 400, "work items", "invalid_cursor")
+    assert_error(cross, 404, "work items", "not_found")
 
     session_page = get(ctx, path, ctx.admin_session.cli_token)
     assert session_page.status == 200
@@ -2196,7 +2196,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
            ]
 
     cross_session = get(ctx, "/api/work-items?before=" <> before, ctx.admin_session.cli_token)
-    assert_error(cross_session, 400, "work items", "invalid_cursor")
+    assert_error(cross_session, 404, "work items", "not_found")
 
     org_page = get(ctx, path <> "&asUser=flynn", "tbc_core_detail")
     assert org_page.status == 200

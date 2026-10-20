@@ -22,7 +22,7 @@ defmodule Tightbeam.GatewayTest do
       expected ++
         ~w(harness-health-observe-other harness-health-resolve-other harness-health-review-other harness-health-close-promotion harness-health-evidence-other)
 
-    expected = expected ++ ~w(clear-stranded settle-turn)
+    expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle)
     expected = expected ++ ~w(kungfu-setup sentinel-enable sentinel-disable sentinel-list)
     assert Enum.sort(Map.keys(handlers)) == Enum.sort(expected)
     assert Enum.sort(Map.keys(effects)) == Enum.sort(expected)
@@ -794,7 +794,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   @tag recipient_readiness: true
-  test "an idle post joins an eligible role source after its role moves", ctx do
+  test "an idle post keeps its own row when an eligible role source moves", ctx do
     alias Tightbeam.{Roles, Wakes}
 
     Org.create(ctx.db, %{
@@ -842,26 +842,66 @@ defmodule Tightbeam.GatewayTest do
     }
 
     assert %{ack: "alias-post-1"} = post.(call)
+
+    assert {:ok, [[post_wake_id]]} =
+             DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE prompt='new direct post'")
+
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE clientMessageId='alias-post-1'"
+             )
+
     assert %{dedupe: "duplicate"} = post.(call)
 
-    assert [carrier] =
+    assert [^post_wake_id, carrier] =
              NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1000,
                conn_registry: ctx.registry,
                lane_manager: ctx.lane
+             )
+
+    assert {:ok,
+            [
+              [
+                human_message_id,
+                "user",
+                "new direct post",
+                "user:flynn",
+                "alias-post-device",
+                "alias-post-1"
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,role,content,sender,deviceId,clientMessageId FROM messages WHERE clientMessageId='alias-post-1'"
+             )
+
+    assert {:ok, [[^human_message_id, "queued", "new direct post"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT messageId,status,prompt FROM turns WHERE wakeId=?1",
+               [post_wake_id]
              )
 
     assert {:ok, [["k1", prompt]]} =
              DB.query(ctx.db, "SELECT sessionKey,prompt FROM turns WHERE wakeId=?1", [carrier])
 
     assert prompt =~ "urgent role source"
-    assert prompt =~ "new direct post"
-    assert :binary.match(prompt, "urgent role source") < :binary.match(prompt, "new direct post")
+    refute prompt =~ "new direct post"
     assert [%{delivery_wake_id: ^carrier}] = NoticeBatcher.source_refs(ctx.db, source.wake_id)
+    assert NoticeBatcher.source_refs(ctx.db, post_wake_id) == []
     assert Wakes.get(ctx.db, source.wake_id).session_key == "k2"
     assert Wakes.get(ctx.db, source.wake_id).target_role == "post-recipient"
     assert %{dedupe: "duplicate"} = post.(call)
-    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE clientMessageId='alias-post-1'"
+             )
   end
 
   @tag recipient_readiness: true
@@ -1161,13 +1201,34 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, %{seq: ^current_seq, owner_lease: lease}} =
              Tightbeam.Ledger.claim_next(ctx.db, "k1", "post-batch-test")
 
+    start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
+
+    :ok =
+      Tightbeam.Firehose.Hub.register(Tightbeam.Firehose.Hub, self(), %{
+        mode: :subscribed,
+        db: ctx.db,
+        user_id: "flynn",
+        is_admin: false
+      })
+
+    :ok =
+      Tightbeam.Firehose.Hub.subscribe(Tightbeam.Firehose.Hub, self(), "waiting-human-post", %{
+        "classes" => ["message.created"],
+        "sessionKey" => "k1"
+      })
+
     post = Gateway.handlers(%{db: ctx.db})["post"]
 
-    attachment = %{"type" => "image", "name" => "diagram.png", "url" => "attachment://diagram"}
+    attachment = %{
+      "assetId" => "asset-post-1",
+      "mimeType" => "image/png",
+      "filename" => "diagram.png",
+      "size" => 123
+    }
 
     call = %{
       session_key: "k1",
-      origin: "session:k1",
+      origin: "user:flynn",
       params: %{
         content: "queued human message",
         device_id: "post-device",
@@ -1193,6 +1254,17 @@ defmodule Tightbeam.GatewayTest do
 
     assert JSON.decode!(encoded_attachments) == [attachment]
 
+    notice_sources =
+      for content <- ["first ready notice", "second ready notice"] do
+        Tightbeam.Wakes.schedule(ctx.db, %{
+          session_key: "k1",
+          origin: "process:tightbeam",
+          prompt: content,
+          due_at: System.system_time(:millisecond),
+          class: "fyi"
+        })
+      end
+
     assert {:ok, [["running"]]} =
              DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [current_seq])
 
@@ -1200,6 +1272,12 @@ defmodule Tightbeam.GatewayTest do
              DB.query(ctx.db, "SELECT seq FROM turns WHERE sessionKey='k1' AND status='queued'")
 
     assert NoticeBatcher.recover(ctx.db) == []
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE clientMessageId='post-queued-1'"
+             )
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -1224,25 +1302,86 @@ defmodule Tightbeam.GatewayTest do
     assert :ok =
              Tightbeam.Ledger.finish(ctx.db, current_seq, "delivered", nil, owner_lease: lease)
 
-    [carrier_id] =
+    [^source_wake_id, carrier_id] =
       Tightbeam.NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000,
         conn_registry: ctx.registry,
         lane_manager: ctx.lane
       )
 
-    assert {:ok, [[encoded_attachments]]} =
+    assert {:ok,
+            [
+              [
+                human_message_id,
+                "user",
+                "queued human message",
+                "user:flynn",
+                "post-device",
+                "post-queued-1",
+                encoded_attachments
+              ]
+            ]} =
              DB.query(
                ctx.db,
-               "SELECT attachments FROM messages WHERE id=(SELECT messageId FROM turns WHERE wakeId=?1)",
-               [carrier_id]
+               "SELECT id,role,content,sender,deviceId,clientMessageId,attachments FROM messages WHERE clientMessageId=?1",
+               ["post-queued-1"]
              )
 
     assert JSON.decode!(encoded_attachments) == [attachment]
 
-    assert {:ok, [["delivered"]]} =
-             DB.query(ctx.db, "SELECT state FROM notice_batches WHERE deliveryWakeId=?1", [
-               carrier_id
-             ])
+    assert {:ok, [[human_turn_seq, "queued", ^human_message_id, "queued human message"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT seq,status,messageId,prompt FROM turns WHERE wakeId=?1",
+               [source_wake_id]
+             )
+
+    assert {:ok, [["delivered", 2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,memberCount FROM notice_batches WHERE deliveryWakeId=?1",
+               [carrier_id]
+             )
+
+    assert {:ok, [[carrier_message_id, "user", "process:tightbeam", batched_content, "[]"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT m.id,m.role,m.sender,m.content,m.attachments FROM messages m JOIN turns t ON t.messageId=m.id WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
+    assert batched_content =~ "first ready notice"
+    assert batched_content =~ "second ready notice"
+    refute batched_content =~ "queued human message"
+
+    assert {:ok, [[carrier_turn_seq]]} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert human_turn_seq < carrier_turn_seq
+
+    assert_receive {:firehose_notice, %{"class" => "message.created"} = human_notice}
+    assert human_notice["refs"]["messageId"] == human_message_id
+    assert human_notice["payload"]["deviceId"] == "post-device"
+    assert human_notice["payload"]["clientMessageId"] == "post-queued-1"
+    assert_message_notice_matches_rest!(ctx.db, human_notice)
+    :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
+
+    assert_receive {:firehose_notice, %{"class" => "message.created"} = carrier_notice}
+    assert carrier_notice["refs"]["messageId"] == carrier_message_id
+    assert_message_notice_matches_rest!(ctx.db, carrier_notice)
+    :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
+    :sys.get_state(Tightbeam.Firehose.Hub)
+
+    for notice <- notice_sources do
+      assert [
+               %{
+                 delivery_wake_id: ^carrier_id,
+                 batch_state: "delivered",
+                 member_state: "included"
+               }
+             ] = NoticeBatcher.source_refs(ctx.db, notice.wake_id)
+    end
+
+    assert NoticeBatcher.source_refs(ctx.db, source_wake_id) == []
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -1256,7 +1395,10 @@ defmodule Tightbeam.GatewayTest do
     assert %{dedupe: "conflict"} =
              post.(put_in(call, [:params, :content], "different payload"))
 
-    assert {:ok, [[0]]} =
+    :sys.get_state(Tightbeam.Firehose.Hub)
+    refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
+
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM messages WHERE clientMessageId='post-queued-1'"
@@ -3073,16 +3215,33 @@ defmodule Tightbeam.GatewayTest do
         owner_lease: claimed_turn.owner_lease
       )
 
-    Tightbeam.HarnessProcess.prepare_launch(
-      [
-        cmd: ["/bin/true"],
-        stderr_path: Path.join(ctx.catalog_base, "rate-reconcile-race.stderr"),
-        process_identity_dir: ctx.catalog_base,
-        process_helper: "/bin/true"
-      ],
-      ctx.db,
-      adapter_key
-    )
+    # Reconciliation's cleanup-boundary fence delete runs only for a launch it
+    # must kill itself: a live identified group that settlement proof refuses
+    # (the process is alive) and the group kill then resolves. The bounded
+    # sleep keeps the group alive through the kill and self-terminates if a
+    # failed run leaks it.
+    launch_opts =
+      Tightbeam.HarnessProcess.prepare_launch(
+        [
+          cmd: [System.find_executable("sleep"), "120"],
+          stderr_path: Path.join(ctx.catalog_base, "rate-reconcile-race.stderr"),
+          process_identity_dir: ctx.catalog_base,
+          process_helper: Path.expand("../cli/target/release/tightbeam", __DIR__)
+        ],
+        ctx.db,
+        adapter_key
+      )
+
+    [launcher | launcher_args] = Keyword.fetch!(launch_opts, :cmd)
+
+    _port =
+      Port.open({:spawn_executable, launcher}, [:binary, :exit_status, {:args, launcher_args}])
+
+    :ok =
+      Tightbeam.HarnessProcess.capture_identity(
+        ctx.db,
+        Keyword.fetch!(launch_opts, :harness_process_launch_id)
+      )
 
     prior_wait = Application.get_env(:tightbeam, :harness_process_identity_wait_ms)
     Application.put_env(:tightbeam, :harness_process_identity_wait_ms, 0)
@@ -4362,23 +4521,23 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "spawn uses the next where host when the first cannot run the requested harness", ctx do
-    base_dir = placement_test_base("later-eligible", ["eurisko", "racter"])
+    base_dir = placement_test_base("later-eligible", ["testhost-d", "testhost-b"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
-    await_host_catalog("racter", "codex")
+    await_host_catalog("testhost-b", "codex")
 
     config =
       gateway_config(base_dir, ctx.db, 0)
       |> Map.put(:default_harness, :codex)
       |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
       |> Map.put(:credential_status, fn
-        :openai, "eurisko" -> {:needs_onboarding, :missing}
-        :openai, "racter" -> :onboarded
+        :openai, "testhost-d" -> {:needs_onboarding, :missing}
+        :openai, "testhost-b" -> :onboarded
       end)
       |> Map.put(:sh, fn _command -> {"", 0} end)
 
@@ -4392,21 +4551,21 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "racter"
+    assert Org.get(ctx.db, session_key).host == "testhost-b"
   end
 
   test "spawn uses the next where host when the first has no usable catalog", ctx do
-    base_dir = placement_test_base("later-catalog", ["eurisko", "racter"])
+    base_dir = placement_test_base("later-catalog", ["testhost-d", "testhost-b"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
-    await_host_catalog("eurisko", "codex")
-    await_host_catalog("racter", "codex")
-    degrade_host_catalog("eurisko", "codex", :ssh_unreachable)
+    await_host_catalog("testhost-d", "codex")
+    await_host_catalog("testhost-b", "codex")
+    degrade_host_catalog("testhost-d", "codex", :ssh_unreachable)
 
     config =
       gateway_config(base_dir, ctx.db, 0)
@@ -4425,23 +4584,23 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "racter"
+    assert Org.get(ctx.db, session_key).host == "testhost-b"
   end
 
   test "spawn records one real redirect when an open exact key is skipped", ctx do
-    base_dir = placement_test_base("terminal-redirect", ["eurisko", "racter"])
+    base_dir = placement_test_base("terminal-redirect", ["testhost-d", "testhost-b"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
-    await_host_catalog("racter", "codex")
+    await_host_catalog("testhost-b", "codex")
 
     assert {:opened, incident} =
              Tightbeam.TerminalCredentialFailure.open(ctx.db, %{
-               host: "eurisko",
+               host: "testhost-d",
                harness: "codex",
                provider: "openai",
                correlation_id: "gateway-terminal-redirect",
@@ -4454,8 +4613,8 @@ defmodule Tightbeam.GatewayTest do
       |> Map.put(:default_harness, :codex)
       |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
       |> Map.put(:credential_status, fn
-        :openai, "eurisko" -> flunk("suppressed key must not read credential state")
-        :openai, "racter" -> :onboarded
+        :openai, "testhost-d" -> flunk("suppressed key must not read credential state")
+        :openai, "testhost-b" -> :onboarded
       end)
       |> Map.put(:sh, fn _command -> {"", 0} end)
 
@@ -4471,10 +4630,10 @@ defmodule Tightbeam.GatewayTest do
     }
 
     assert %{session_key: session_key} = spawn.(call)
-    assert Org.get(ctx.db, session_key).host == "racter"
+    assert Org.get(ctx.db, session_key).host == "testhost-b"
     assert %{session_key: ^session_key} = spawn.(call)
 
-    assert {:ok, [["racter", 1]]} =
+    assert {:ok, [["testhost-b", 1]]} =
              DB.query(
                ctx.db,
                "SELECT destinationHost,COUNT(*) FROM terminal_credential_redirects WHERE incidentId=?1 GROUP BY destinationHost",
@@ -4483,17 +4642,17 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "an explicit suppressed host refuses without probing or recording a redirect", ctx do
-    base_dir = placement_test_base("terminal-explicit", ["eurisko", "racter"])
+    base_dir = placement_test_base("terminal-explicit", ["testhost-d", "testhost-b"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
     assert {:opened, incident} =
              Tightbeam.TerminalCredentialFailure.open(ctx.db, %{
-               host: "eurisko",
+               host: "testhost-d",
                harness: "codex",
                provider: "openai",
                correlation_id: "gateway-terminal-explicit",
@@ -4506,7 +4665,7 @@ defmodule Tightbeam.GatewayTest do
       |> Map.put(:default_harness, :codex)
       |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
       |> Map.put(:credential_status, fn
-        :openai, "eurisko" -> flunk("suppressed key must not read credential state")
+        :openai, "testhost-d" -> flunk("suppressed key must not read credential state")
       end)
 
     assert %{
@@ -4519,7 +4678,7 @@ defmodule Tightbeam.GatewayTest do
                session_key: nil,
                params: %{
                  display_name: "Terminal explicit refusal",
-                 host: "eurisko",
+                 host: "testhost-d",
                  idempotency_key: "spawn-terminal-explicit"
                }
              })
@@ -4535,23 +4694,23 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "spawn refusal relays each where host's catalog cause and remedy", ctx do
-    base_dir = placement_test_base("catalog-causes", ["eurisko", "racter"])
+    base_dir = placement_test_base("catalog-causes", ["testhost-d", "testhost"])
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost" => %{ssh: "testhost", base_dir: "/srv/testhost", cli_bin: nil}
     })
 
-    await_host_catalog("eurisko", "codex")
-    await_host_catalog("racter", "codex")
+    await_host_catalog("testhost-d", "codex")
+    await_host_catalog("testhost", "codex")
 
     degrade_host_catalog(
-      "eurisko",
+      "testhost-d",
       "codex",
       {:empty_catalog_for_client_version, "0.145.0"}
     )
 
-    degrade_host_catalog("racter", "codex", {:needs_onboarding, :missing})
+    degrade_host_catalog("testhost", "codex", {:needs_onboarding, :missing})
 
     config =
       gateway_config(base_dir, ctx.db, 0)
@@ -4569,27 +4728,27 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert message =~ "eurisko: cannot route gpt-5.6-sol (effort medium) on eurisko"
-    assert message =~ "upgrade codex on eurisko"
-    assert message =~ "racter: cannot route gpt-5.6-sol (effort medium) on racter"
-    assert message =~ "run tightbeam onboard openai --as-user <userId> on racter"
+    assert message =~ "testhost-d: cannot route gpt-5.6-sol (effort medium) on testhost-d"
+    assert message =~ "upgrade codex on testhost-d"
+    assert message =~ "testhost: cannot route gpt-5.6-sol (effort medium) on testhost"
+    assert message =~ "run tightbeam onboard openai --as-user <userId> on testhost"
   end
 
   test "spawn uses the next where host when the first fails live spinup", ctx do
-    base_dir = placement_test_base("later-spinup", ["eurisko", "racter"])
+    base_dir = placement_test_base("later-spinup", ["testhost-d", "testhost-b"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
-    await_host_catalog("eurisko", "codex")
-    await_host_catalog("racter", "codex")
+    await_host_catalog("testhost-d", "codex")
+    await_host_catalog("testhost-b", "codex")
 
     sh = fn command ->
-      if List.last(command) == "true" and Enum.member?(command, "eurisko") do
-        {"ssh: connect to host eurisko port 22: Connection refused", 255}
+      if List.last(command) == "true" and Enum.member?(command, "testhost-d") do
+        {"ssh: connect to host testhost-d port 22: Connection refused", 255}
       else
         {"", 0}
       end
@@ -4612,25 +4771,25 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "racter"
+    assert Org.get(ctx.db, session_key).host == "testhost-b"
   end
 
   test "spawn stops after the first ready where host and probes it once", ctx do
-    base_dir = placement_test_base("first-ready-once", ["eurisko", "racter"])
+    base_dir = placement_test_base("first-ready-once", ["testhost-d", "testhost-b"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
-    await_host_catalog("eurisko", "codex")
-    await_host_catalog("racter", "codex")
+    await_host_catalog("testhost-d", "codex")
+    await_host_catalog("testhost-b", "codex")
     parent = self()
 
     sh = fn command ->
       if List.last(command) == "true" do
-        host = Enum.find(["eurisko", "racter"], &Enum.member?(command, &1))
+        host = Enum.find(["testhost-d", "testhost-b"], &Enum.member?(command, &1))
         send(parent, {:spinup_probe, host})
       end
 
@@ -4654,28 +4813,28 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "eurisko"
-    assert_receive {:spinup_probe, "eurisko"}
+    assert Org.get(ctx.db, session_key).host == "testhost-d"
+    assert_receive {:spinup_probe, "testhost-d"}
     refute_receive {:spinup_probe, _host}
   end
 
   test "spawn acts on the routed answer from the candidate decision", ctx do
-    base_dir = placement_test_base("one-route-answer", ["eurisko", "racter"])
+    base_dir = placement_test_base("one-route-answer", ["testhost-d", "testhost-b"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
-    await_host_catalog("eurisko", "codex")
-    await_host_catalog("racter", "codex")
+    await_host_catalog("testhost-d", "codex")
+    await_host_catalog("testhost-b", "codex")
     degraded = :atomics.new(1, [])
 
     sh = fn command ->
-      if List.last(command) == "true" and Enum.member?(command, "eurisko") and
+      if List.last(command) == "true" and Enum.member?(command, "testhost-d") and
            :atomics.compare_exchange(degraded, 1, 0, 1) == :ok do
-        degrade_host_catalog("eurisko", "codex", :catalog_refreshed)
+        degrade_host_catalog("testhost-d", "codex", :catalog_refreshed)
       end
 
       {"", 0}
@@ -4698,11 +4857,11 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "eurisko"
+    assert Org.get(ctx.db, session_key).host == "testhost-d"
   end
 
   test "spawn refusal gives an unconfigured where host its assimilation remedy", ctx do
-    base_dir = placement_test_base("missing-host-remedy", ["eurisko"])
+    base_dir = placement_test_base("missing-host-remedy", ["testhost-d"])
 
     config =
       gateway_config(base_dir, ctx.db, 0)
@@ -4720,16 +4879,16 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert message =~ "no host in archetype default's where can run codex"
-    assert message =~ "eurisko: host eurisko is not configured"
-    assert message =~ "tightbeam assimilate <ssh-dest> --name eurisko"
+    assert message =~ "testhost-d: host testhost-d is not configured"
+    assert message =~ "tightbeam assimilate <ssh-dest> --name testhost-d"
   end
 
   test "spawn refusal names every where host, harness, cause, and remedy", ctx do
-    base_dir = placement_test_base("all-ineligible", ["eurisko", "racter"])
+    base_dir = placement_test_base("all-ineligible", ["testhost-d", "testhost-b"])
 
     register_hosts(ctx.db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
     })
 
     config =
@@ -4754,7 +4913,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "no host in archetype default's where can run codex"
 
-    for {host, _base} <- [{"eurisko", "/srv/eurisko"}, {"racter", "/srv/racter"}] do
+    for {host, _base} <- [{"testhost-d", "/srv/testhost-d"}, {"testhost-b", "/srv/testhost-b"}] do
       assert message =~ "Tightbeam has no credential for openai on #{host}"
       assert message =~ "Run on #{host}: tightbeam onboard openai --as-user <userId>"
     end
@@ -9751,12 +9910,29 @@ defmodule Tightbeam.GatewayTest do
 
     result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
-    assert %{applied: [session_key], identity_revision: ^next} = result
-    assert session_key == session.session_key
+    assert %{
+             status: "complete",
+             complete: true,
+             applied: [session_key],
+             identity_revision: ^next,
+             target_session_keys: [target_key],
+             results: [
+               %{
+                 outcome: "applied",
+                 files: "materialized",
+                 stamp: "committed",
+                 prompt_enqueue: "recorded_pending",
+                 prompt_delivery: "pending",
+                 reread: "unconfirmed",
+                 stream_update: "sent",
+                 wake_id: wake_id
+               }
+             ]
+           } = result
 
-    # No confirmation, no reload result, no effect id: the response says what was
-    # written and to which revision, and nothing about what any context loaded.
-    assert Map.keys(result) |> Enum.sort() == [:applied, :identity_revision]
+    assert session_key == session.session_key
+    assert target_key == session_key
+    assert is_binary(wake_id)
 
     assert File.read!(skill) == "new served skill"
     assert Org.get(ctx.db, session.session_key).identity_revision == next
@@ -9770,20 +9946,16 @@ defmodule Tightbeam.GatewayTest do
 
     refute_receive {:push, %{"type" => "stream_updated"}}, 200
 
-    # An ORDINARY prompt: it lands in the queue behind whatever is already there
-    # and rings the same doorbell any delivery rings.
-    assert_receive {:ensure_lane, ^session_key}
+    prompt =
+      "Your Tightbeam-owned skill files changed to identity revision #{next}.\n" <>
+        "Re-read your Tightbeam skills before you continue work. This update does not\n" <>
+        "reload your current model context."
 
-    assert {:ok, [[prompt]]} =
-             DB.query(ctx.db, "SELECT prompt FROM turns WHERE sessionKey=?1 ORDER BY seq", [
-               session.session_key
-             ])
+    assert [%{wake_id: ^wake_id, state: "pending", prompt: ^prompt}] =
+             Tightbeam.Wakes.list_for_session(ctx.db, session_key)
 
-    assert prompt ==
-             "[from process:tightbeam]\n\n" <>
-               "Your Tightbeam-owned skill files changed to identity revision #{next}.\n" <>
-               "Re-read your Tightbeam skills before you continue work. This update does not\n" <>
-               "reload your current model context."
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", [session_key])
   end
 
   # T-CONCURRENCY, settled the other way: apply changes FILES, not the world a
@@ -9854,7 +10026,7 @@ defmodule Tightbeam.GatewayTest do
 
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
 
-    assert %{applied: [session_key], identity_revision: ^next} =
+    assert %{status: "complete", applied: [session_key], identity_revision: ^next} =
              apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
     assert session_key == session.session_key
@@ -10132,25 +10304,108 @@ defmodule Tightbeam.GatewayTest do
 
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
 
-    assert %{applied: applied, identity_revision: ^next} =
+    assert %{
+             status: "complete",
+             applied: applied,
+             identity_revision: ^next,
+             target_session_keys: target_session_keys,
+             results: results
+           } =
              apply.(%{origin: "user:flynn", params: %{all: true}})
 
     for key <- [started.session_key, unstarted.session_key], do: assert(key in applied)
 
+    assert target_session_keys ==
+             Enum.map(Org.list_for_user(ctx.db, "", true), & &1.session_key)
+
+    assert Enum.all?(results, &(&1.stamp == "committed"))
+
     # Both are stamped; only the started one is asked to re-read.
     assert Org.get(ctx.db, started.session_key).identity_revision == next
     assert Org.get(ctx.db, unstarted.session_key).identity_revision == next
-    assert Ledger.pending_count(ctx.db, started.session_key) == 1
+    assert [%{state: "pending"}] = Tightbeam.Wakes.list_for_session(ctx.db, started.session_key)
     assert Ledger.pending_count(ctx.db, unstarted.session_key) == 0
     assert Org.current_pointer(ctx.db, unstarted.session_key) == nil
   end
 
-  # Writer first, stamp second, nudge third — and the ordering is load-bearing
-  # exactly here: a writer that raises leaves the PRIOR stamp standing and sends
-  # no nudge, because there is nothing new to re-read. Nothing rolls back, reads
-  # back, records an effect row, or repairs; the failure is a named refusal and
-  # the operator's move is to retry.
-  test "a writer failure refuses by name, leaves the prior stamp, and sends no nudge", ctx do
+  test "identity apply --all preserves completed targets and continues after a writer failure",
+       ctx do
+    base_dir = role_test_base("identity-apply-all-partial")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    make = fn key, order ->
+      session =
+        Org.create(ctx.db, %{
+          session_key: key,
+          display_name: key,
+          owner_user_id: "flynn",
+          origin: "user:flynn",
+          archetype: "coder",
+          identity_name: "coder",
+          identity_revision: revision,
+          order_index: order,
+          host: "testhost",
+          harness: "codex",
+          provider: "openai",
+          model: Model.new("gpt-5.6-sol", effort: "medium")
+        })
+
+      Org.append_pointer(ctx.db, key, "thread-#{order}", "created")
+      {session, Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)}
+    end
+
+    {first, _first_cwd} = make.("agent:apply-all-partial-first", 701)
+    {failed, failed_cwd} = make.("agent:apply-all-partial-failed", 702)
+    {last, _last_cwd} = make.("agent:apply-all-partial-last", 703)
+
+    File.mkdir_p!(failed_cwd)
+    File.write!(Path.join(failed_cwd, ".codex"), "not a directory")
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "partial pass guidance",
+        "test"
+      )
+
+    ensure_global_registry()
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    result = apply.(%{origin: "user:flynn", params: %{all: true}})
+
+    assert %{status: "partial", complete: false, identity_revision: ^next} = result
+    assert first.session_key in result.target_session_keys
+    assert failed.session_key in result.target_session_keys
+    assert last.session_key in result.target_session_keys
+    assert first.session_key in result.applied
+    assert failed.session_key not in result.applied
+    assert last.session_key in result.applied
+
+    first_result = Enum.find(result.results, &(&1.session_key == first.session_key))
+    failed_result = Enum.find(result.results, &(&1.session_key == failed.session_key))
+    last_result = Enum.find(result.results, &(&1.session_key == last.session_key))
+
+    assert first_result.outcome == "applied"
+    assert first_result.stamp == "committed"
+    assert first_result.prompt_enqueue == "recorded_pending"
+    assert failed_result.outcome == "partial"
+    assert failed_result.files == "partial_or_unknown"
+    assert failed_result.stamp == "not_committed"
+    assert failed_result.prompt_enqueue == "not_attempted"
+    assert last_result.outcome == "applied"
+    assert last_result.stamp == "committed"
+    assert last_result.prompt_enqueue == "recorded_pending"
+    assert Org.get(ctx.db, first.session_key).identity_revision == next
+    assert Org.get(ctx.db, failed.session_key).identity_revision == revision
+    assert Org.get(ctx.db, last.session_key).identity_revision == next
+  end
+
+  # The materializer can fail after touching an unknown subset of files. Report
+  # the target and that uncertainty without claiming the stamp or prompt landed.
+  test "a writer failure reports the target and leaves the prior stamp", ctx do
     base_dir = role_test_base("identity-apply-writer-fail")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -10201,10 +10456,26 @@ defmodule Tightbeam.GatewayTest do
 
     result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
-    # A NAMED refusal, not a raise and not a raw envelope from three layers down.
-    assert %{code: "apply_failed", sessions: [session_key]} = result
+    assert %{
+             status: "partial",
+             complete: false,
+             target_session_keys: [session_key],
+             applied: [],
+             results: [
+               %{
+                 outcome: "partial",
+                 files: "partial_or_unknown",
+                 stamp: "not_committed",
+                 prompt_enqueue: "not_attempted",
+                 prompt_delivery: "not_started",
+                 reread: "unconfirmed",
+                 reason: reason
+               }
+             ]
+           } = result
+
     assert session_key == session.session_key
-    assert result.message =~ session.session_key
+    assert is_binary(reason) and reason != ""
 
     assert Org.get(ctx.db, session.session_key).identity_revision == revision
     assert Ledger.pending_count(ctx.db, session.session_key) == 0
@@ -10214,9 +10485,9 @@ defmodule Tightbeam.GatewayTest do
     assert File.read!(Path.join(cwd, ".codex")) == "not a directory"
   end
 
-  # Retry converges, and a duplicate nudge is acceptable — the prompt is idempotent
-  # advice, not a command that must be delivered exactly once.
-  test "a retried apply converges and a repeated nudge is acceptable", ctx do
+  # Same-revision retries reuse the durable pending wake and do not rewrite a
+  # complete projection or create another effective prompt.
+  test "a same-revision retry reuses its pending prompt", ctx do
     base_dir = role_test_base("identity-apply-retry")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -10254,24 +10525,39 @@ defmodule Tightbeam.GatewayTest do
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
     call = %{origin: "user:flynn", params: %{session_key: session.session_key}}
 
-    assert %{applied: [_], identity_revision: ^next} = apply.(call)
-    assert %{applied: [_], identity_revision: ^next} = apply.(call)
+    assert %{
+             applied: [session_key],
+             identity_revision: ^next,
+             results: [
+               %{files: "materialized", prompt_enqueue: "recorded_pending", wake_id: wake_id}
+             ]
+           } = apply.(call)
+
+    assert %{
+             applied: [^session_key],
+             identity_revision: ^next,
+             results: [
+               %{
+                 files: "already_current",
+                 prompt_enqueue: "already_pending",
+                 prompt_delivery: "pending",
+                 wake_id: ^wake_id
+               }
+             ]
+           } = apply.(call)
 
     assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")) ==
              "retried served skill"
 
     assert Org.get(ctx.db, session.session_key).identity_revision == next
 
-    assert {:ok, rows} =
-             DB.query(ctx.db, "SELECT prompt FROM turns WHERE sessionKey=?1 ORDER BY seq", [
+    assert [%{wake_id: ^wake_id, state: "pending"}] =
+             Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", [
                session.session_key
              ])
-
-    assert length(rows) >= 1
-
-    for [prompt] <- rows do
-      assert prompt =~ "Re-read your Tightbeam skills before you continue work."
-    end
   end
 
   # R-02: a retired session is not a target. Retiring is a state flip, not a
@@ -10326,11 +10612,9 @@ defmodule Tightbeam.GatewayTest do
     assert Ledger.pending_count(ctx.db, session.session_key) == 0
   end
 
-  # R-02 again, at the other end: `--all` captures its set ONCE, and a session can
-  # retire inside the pass. The row is re-read at ITS update, so the retirement is
-  # observed rather than raced past. Nothing holds the row still — this asserts a
-  # fresh read, not a lock, and a session retiring one instruction later would be
-  # updated, which is the honest boundary of a best-effort refresh.
+  # `--all` captures its set once. A target retiring during the pass is re-read
+  # before its own materialization; this does not hold the lifecycle row against a
+  # later retirement.
   test "identity apply --all skips a session that retires between capture and update",
        ctx do
     base_dir = role_test_base("identity-apply-mid-retire")
@@ -10404,10 +10688,138 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, first.session_key).identity_revision == next
   end
 
-  # A-03/A-04: a writer that fails BETWEEN two skill files leaves a partial file
-  # set, and that is allowed. Apply makes no atomic-snapshot and no single-revision
-  # claim, so nothing rolls the written file back and nothing repairs it; the
-  # unwritten one stays as it was and the prior stamp stands.
+  test "identity apply does not write a captured revision after a newer revision publishes",
+       ctx do
+    base_dir = role_test_base("identity-apply-newer-revision")
+    learn_engineering_identity!(base_dir)
+    original = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-newer-revision",
+        display_name: "Identity apply newer revision",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: original,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-newer-revision", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, original, "coder", :codex, cwd)
+    skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
+    original_body = File.read!(skill)
+
+    captured =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "captured revision",
+        "test"
+      )
+
+    ensure_global_registry()
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+    parent = self()
+
+    lock =
+      Task.async(fn ->
+        :global.trans({{Gateway, :session_mutation, session.session_key}, self()}, fn ->
+          send(parent, :identity_apply_session_lock_held)
+
+          receive do
+            :release_identity_apply_session_lock -> :released
+          end
+        end)
+      end)
+
+    assert_receive :identity_apply_session_lock_held
+
+    apply_task =
+      Task.async(fn ->
+        apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+      end)
+
+    waiting_for_session_lock? =
+      Enum.reduce_while(1..100, false, fn _, _ ->
+        {:current_stacktrace, stacktrace} = Process.info(apply_task.pid, :current_stacktrace)
+
+        waiting? =
+          Enum.any?(stacktrace, fn
+            {:global, function, _arity, _location} when function in [:set_lock, :random_sleep] ->
+              true
+
+            _ ->
+              false
+          end)
+
+        if waiting? do
+          {:halt, true}
+        else
+          Process.sleep(10)
+          {:cont, false}
+        end
+      end)
+
+    assert waiting_for_session_lock?,
+           "expected apply to wait on the held session lock, observed #{inspect(Process.info(apply_task.pid, [:status, :current_function, :current_stacktrace]))}"
+
+    newer =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "newer published revision",
+        "test"
+      )
+
+    send(lock.pid, :release_identity_apply_session_lock)
+    assert {:ok, :released} = Task.yield(lock, 5_000)
+
+    assert %{
+             status: "partial",
+             complete: false,
+             identity_revision: ^captured,
+             target_session_keys: [session_key],
+             applied: [],
+             results: [
+               %{
+                 outcome: "superseded",
+                 files: "not_started",
+                 stamp: "not_committed",
+                 prompt_enqueue: "not_attempted",
+                 current_identity_revision: ^newer
+               }
+             ]
+           } = Task.await(apply_task, 10_000)
+
+    assert session_key == session.session_key
+    assert Identity.live_revision!(base_dir) == newer
+    assert File.read!(skill) == original_body
+    assert Org.get(ctx.db, session.session_key).identity_revision == original
+    assert Tightbeam.Wakes.list_for_session(ctx.db, session.session_key) == []
+
+    assert %{
+             status: "complete",
+             identity_revision: ^newer,
+             results: [
+               %{outcome: "applied", files: "materialized", prompt_enqueue: "recorded_pending"}
+             ]
+           } = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert File.read!(skill) == "newer published revision"
+    assert Org.get(ctx.db, session.session_key).identity_revision == newer
+    assert [%{state: "pending"}] = Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
+  end
+
+  # A writer that fails BETWEEN two skill files leaves a partial file set. The
+  # per-target result must preserve the observed partial write without stamping it.
   @tag pr230_behavior_repair: true
   test "a failure between two skill writes leaves the partial file set and no stamp", ctx do
     base_dir = role_test_base("identity-apply-partial")
@@ -10475,7 +10887,21 @@ defmodule Tightbeam.GatewayTest do
 
     result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
-    assert %{code: "apply_failed", sessions: [session_key]} = result
+    assert %{
+             status: "partial",
+             complete: false,
+             target_session_keys: [session_key],
+             results: [
+               %{
+                 outcome: "partial",
+                 files: "partial_or_unknown",
+                 stamp: "not_committed",
+                 prompt_enqueue: "not_attempted",
+                 prompt_delivery: "not_started"
+               }
+             ]
+           } = result
+
     assert session_key == session.session_key
 
     # Partial, and left partial: the file that landed is the new one, the file
@@ -10487,11 +10913,9 @@ defmodule Tightbeam.GatewayTest do
     refute_receive {:push, %{"type" => "stream_updated"}}, 200
   end
 
-  # A-04: the stamp is the second step, and its failure is the writer's failure —
-  # files new, stamp old, no nudge. There is nothing to re-read on ANOTHER
-  # session's behalf and nothing to undo: a stamp that did not move is a stamp
-  # that will be moved by the retry.
-  test "a stamp failure after the files land sends no nudge and moves no stamp", ctx do
+  # Stamp and prompt record commit together. A stamp failure leaves files visible
+  # but does not claim either durable session state or accepted notification.
+  test "a stamp failure leaves the files but atomically withholds the prompt", ctx do
     base_dir = role_test_base("identity-apply-stamp-fail")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -10547,7 +10971,20 @@ defmodule Tightbeam.GatewayTest do
 
     result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
-    assert %{code: "apply_failed", sessions: [session_key]} = result
+    assert %{
+             status: "partial",
+             target_session_keys: [session_key],
+             results: [
+               %{
+                 outcome: "partial",
+                 files: "materialized",
+                 stamp: "not_committed",
+                 prompt_enqueue: "persistence_failed",
+                 prompt_delivery: "not_started"
+               }
+             ]
+           } = result
+
     assert session_key == session.session_key
 
     assert File.read!(skill) == "stamp-fail served skill"
@@ -10559,17 +10996,16 @@ defmodule Tightbeam.GatewayTest do
     # the stamp. No recovery protocol ran; the operator simply asked again.
     :ok = DB.execute(ctx.db, "DROP TRIGGER identity_apply_stamp_failure")
 
-    assert %{applied: [_], identity_revision: ^next} =
+    assert %{status: "complete", applied: [_], identity_revision: ^next} =
              apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
     assert Org.get(ctx.db, session.session_key).identity_revision == next
-    assert Ledger.pending_count(ctx.db, session.session_key) == 1
+    assert [%{state: "pending"}] = Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
   end
 
-  # A-04: the nudge is the third step, and its failure is the LEAST consequential
-  # one — the files and the stamp are already true, so nothing is undone. What the
-  # caller gets is a named per-session refusal, not a silent success.
-  test "a prompt-submission failure keeps the files and the stamp and names the session",
+  # A failed durable enqueue rolls the stamp back with it; otherwise a same-revision
+  # retry could wrongly believe the prompt had been recorded.
+  test "a prompt persistence failure reports files without adopting the revision",
        ctx do
     base_dir = role_test_base("identity-apply-nudge-fail")
     learn_engineering_identity!(base_dir)
@@ -10607,7 +11043,10 @@ defmodule Tightbeam.GatewayTest do
     :ok =
       DB.execute(ctx.db, """
       CREATE TRIGGER identity_apply_nudge_failure
-      BEFORE INSERT ON turns
+      BEFORE INSERT ON wakes
+      WHEN NEW.sessionKey = '#{session.session_key}'
+        AND NEW.origin = 'process:tightbeam'
+        AND NEW.consumer = 'prompt'
       BEGIN SELECT RAISE(ABORT, 'injected-nudge-failure'); END;
       """)
 
@@ -10617,30 +11056,42 @@ defmodule Tightbeam.GatewayTest do
 
     result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
-    assert %{code: "apply_failed", sessions: [session_key]} = result
-    assert session_key == session.session_key
-    assert result.message =~ session.session_key
+    assert %{
+             status: "partial",
+             target_session_keys: [session_key],
+             results: [
+               %{
+                 outcome: "partial",
+                 files: "materialized",
+                 stamp: "not_committed",
+                 prompt_enqueue: "persistence_failed",
+                 prompt_delivery: "not_started",
+                 reason: reason
+               }
+             ]
+           } = result
 
-    # Both earlier steps stand. The prompt is the only thing missing, and the
-    # operator's move is the same retry as for any other step.
+    assert session_key == session.session_key
+    assert reason =~ "injected-nudge-failure"
+
+    # Files remain, while the transaction leaves the previous stamp and no wake.
     assert File.read!(skill) == "nudge-fail served skill"
-    assert Org.get(ctx.db, session.session_key).identity_revision == next
+    assert Org.get(ctx.db, session.session_key).identity_revision == revision
     assert Ledger.pending_count(ctx.db, session.session_key) == 0
+    assert [] = Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
 
     :ok = DB.execute(ctx.db, "DROP TRIGGER identity_apply_nudge_failure")
 
-    assert %{applied: [_], identity_revision: ^next} =
+    assert %{status: "complete", applied: [_], identity_revision: ^next} =
              apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
-    assert Ledger.pending_count(ctx.db, session.session_key) == 1
+    assert Org.get(ctx.db, session.session_key).identity_revision == next
+    assert [%{state: "pending"}] = Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
   end
 
-  # A-04, the last failure window: the prompt was ACCEPTED and the caller lost the
-  # response, so it retries a call that already fully succeeded. A second nudge is
-  # the correct outcome, not a defect to deduplicate — the prompt is idempotent
-  # advice, and suppressing it would need exactly the delivery bookkeeping this
-  # design refuses to carry.
-  test "a retry after a lost response converges and a duplicate nudge is permitted", ctx do
+  # A caller can lose the response after the transaction commits. A retry checks
+  # the durable wake before writing another one, so restart/retry cannot duplicate it.
+  test "a lost apply response retries the existing durable prompt", ctx do
     base_dir = role_test_base("identity-apply-lost-response")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -10679,44 +11130,189 @@ defmodule Tightbeam.GatewayTest do
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
     call = %{origin: "user:flynn", params: %{session_key: session.session_key}}
 
-    # The call that succeeded, whose response the caller never saw.
-    assert %{applied: [_], identity_revision: ^next} = apply.(call)
-    assert Ledger.pending_count(ctx.db, session.session_key) == 1
+    # The call committed, but the caller did not receive its response.
+    assert %{
+             applied: [session_key],
+             identity_revision: ^next,
+             results: [%{prompt_enqueue: "recorded_pending", wake_id: wake_id}]
+           } = apply.(call)
+
+    assert session_key == session.session_key
 
     # The retry, issued because the caller cannot tell success from silence.
-    assert %{applied: [_], identity_revision: ^next} = apply.(call)
+    assert %{
+             applied: [^session_key],
+             identity_revision: ^next,
+             results: [
+               %{
+                 files: "already_current",
+                 prompt_enqueue: "already_pending",
+                 prompt_delivery: "pending",
+                 reread: "unconfirmed",
+                 wake_id: ^wake_id
+               }
+             ]
+           } = apply.(call)
 
     assert File.read!(skill) == "lost-response served skill"
     assert Org.get(ctx.db, session.session_key).identity_revision == next
-    # The retry remains a distinct durable nudge, but the first immediate
-    # prompt already owns the recipient's pending turn. Keep the retry as an
-    # editable source row until that turn ends instead of queuing a second
-    # ungrouped turn ahead of recipient readiness.
-    assert Ledger.pending_count(ctx.db, session.session_key) == 1
 
-    assert {:ok, rows} =
-             DB.query(ctx.db, "SELECT prompt FROM turns WHERE sessionKey=?1 ORDER BY seq", [
-               session.session_key
-             ])
+    assert [%{wake_id: ^wake_id, state: "pending", prompt: prompt}] =
+             Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
 
-    assert length(rows) == 1
-
-    expected =
-      "[from process:tightbeam]\n\n" <>
-        "Your Tightbeam-owned skill files changed to identity revision #{next}.\n" <>
-        "Re-read your Tightbeam skills before you continue work. This update does not\n" <>
-        "reload your current model context."
-
-    assert rows == [[expected]]
+    assert prompt =~ "Re-read your Tightbeam skills before you continue work."
 
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM wakes WHERE sessionKey=?1 AND state='pending' AND consumer='prompt' AND prompt=?2",
+               [session.session_key, prompt]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", [
+               session.session_key
+             ])
+  end
+
+  test "identity apply commits while the scheduler is delayed and recovers after restart", ctx do
+    base_dir = role_test_base("identity-apply-scheduler-delay")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-scheduler-delay",
+        display_name: "Identity apply scheduler delay",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-scheduler-delay", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "scheduler recovery skill",
+        "test"
+      )
+
+    ensure_global_registry()
+
+    deliver = fn wake ->
+      Gateway.deliver_prompt(
+        wake.session_key,
+        wake.origin,
+        wake.prompt,
+        db: ctx.db,
+        wake_id: wake.wake_id,
+        sender: wake.origin,
+        target_gate: if(wake.target_gate == 0, do: nil, else: wake),
+        fire_wake_in_txn: wake.origin == "process:tightbeam",
+        conn_registry: ctx.registry,
+        lane_manager: ctx.lane
+      )
+    end
+
+    {:ok, scheduler} =
+      Tightbeam.Wakes.start_link(
+        db: ctx.db,
+        name: Tightbeam.WakeScheduler,
+        tick_ms: 60_000,
+        deliver: deliver
+      )
+
+    Process.unlink(scheduler)
+    on_exit(fn -> if Process.alive?(scheduler), do: GenServer.stop(scheduler) end)
+    :ok = :sys.suspend(scheduler)
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+    call = %{origin: "user:flynn", params: %{session_key: session.session_key}}
+    task = Task.async(fn -> apply.(call) end)
+    fast_result = Task.yield(task, 3_000)
+    :ok = :sys.resume(scheduler)
+
+    result =
+      case fast_result do
+        {:ok, result} -> result
+        nil -> Task.await(task, 10_000)
+        other -> flunk("identity apply task failed: #{inspect(other)}")
+      end
+
+    assert match?({:ok, _result}, fast_result),
+           "identity apply waited for the suspended wake scheduler"
+
+    assert %{
+             status: "complete",
+             identity_revision: ^next,
+             results: [
+               %{prompt_enqueue: "recorded_pending", prompt_delivery: "pending", wake_id: wake_id}
+             ]
+           } = result
+
+    assert [%{wake_id: ^wake_id, state: "pending"}] =
+             Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
+
+    assert Org.get(ctx.db, session.session_key).identity_revision == next
+
+    # Restart the scheduler against the same product database. Its ordinary due
+    # scan delivers the accepted record; apply itself does not make the call.
+    :ok = GenServer.stop(scheduler)
+
+    {:ok, restarted} =
+      Tightbeam.Wakes.start_link(
+        db: ctx.db,
+        name: Tightbeam.WakeScheduler,
+        tick_ms: 60_000,
+        deliver: deliver
+      )
+
+    Process.unlink(restarted)
+    on_exit(fn -> if Process.alive?(restarted), do: GenServer.stop(restarted) end)
+    assert :ok = Tightbeam.Wakes.fire_due(Tightbeam.WakeScheduler)
+    assert_receive {:ensure_lane, key}
+    assert key == session.session_key
+
+    assert %{state: "fired"} = Tightbeam.Wakes.get(ctx.db, wake_id)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND origin='process:tightbeam'",
                [
-                 session.session_key,
-                 String.replace_prefix(expected, "[from process:tightbeam]\n\n", "")
+                 session.session_key
                ]
+             )
+
+    assert %{
+             status: "complete",
+             results: [
+               %{
+                 files: "already_current",
+                 prompt_enqueue: "already_recorded",
+                 prompt_delivery: "queued",
+                 reread: "unconfirmed",
+                 wake_id: ^wake_id
+               }
+             ]
+           } = apply.(call)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND origin='process:tightbeam'",
+               [session.session_key]
              )
   end
 

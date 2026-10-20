@@ -42,6 +42,65 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 6)
   end
 
+  test "satellite parking uses the shared identity-fenced command", %{tmp_dir: tmp} do
+    db = start_process_db()
+    capture = Path.join(tmp, "satellite-group-args-#{System.unique_integer([:positive])}")
+    install_fake_ssh(tmp, capture, "exit 0")
+    row = remote_park_row(db)
+
+    assert :ok = HarnessProcess.park(db, row)
+
+    args = File.read!(capture) |> String.split("\n", trim: true)
+    group_command = Enum.drop_while(args, &(&1 != "harness-group"))
+    identity_path = row.identity_path
+
+    assert ["harness-group" | _] = group_command
+
+    assert Enum.take(group_command, 6) == [
+             "harness-group",
+             "4242",
+             identity_path,
+             "satellite-boot",
+             "satellite-launch",
+             "tightbeam-harness-identity-v2"
+           ]
+
+    refute "--tracked-group-only" in group_command
+    assert Enum.count(args, &(&1 == "harness-group")) == 1
+  end
+
+  test "satellite command usage failures report the host and keep the park fenced", %{
+    tmp_dir: tmp
+  } do
+    db = start_process_db()
+    capture = Path.join(tmp, "satellite-group-usage-#{System.unique_integer([:positive])}")
+
+    usage =
+      "usage: tightbeam harness-group <process-group-id> <identity-path> " <>
+        "<boot-identity> <launch-id>"
+
+    install_fake_ssh(
+      tmp,
+      capture,
+      "printf '%s\\n' '#{usage}' >&2\nexit 2"
+    )
+
+    row = remote_park_row(db)
+
+    assert {:error,
+            {:kill_failed,
+             {:satellite_command_version_mismatch, "satellite-fixture", "harness-group"}}} =
+             HarnessProcess.park(db, row)
+
+    assert HarnessProcess.fenced?(db, {:claude, "shared", "satellite-fixture"})
+
+    assert [%{state: "kill_failed", resolved_at: nil, kill_sent_at: nil}] =
+             HarnessProcess.list(db)
+
+    args = File.read!(capture) |> String.split("\n", trim: true)
+    assert Enum.count(args, &(&1 == "harness-group")) == 1
+  end
+
   test "identity capture cannot mutate an already-resolved launch", %{tmp_dir: tmp} do
     Tightbeam.HarnessProcessFixture.run!(tmp, 7)
   end
@@ -145,7 +204,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert length(transactions) == 1
   end
 
-  test "identity capture accepts an unbounded wait", %{tmp_dir: tmp} do
+  test "identity capture refuses an unbounded wait", %{tmp_dir: tmp} do
     Tightbeam.HarnessProcessFixture.run!(tmp, 8)
   end
 
@@ -183,7 +242,7 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 16)
   end
 
-  test "proven-dead settlement resolves the captured missing-identity rows and is inert when repeated",
+  test "owner death leaves missing-identity rows unresolved without termination proof",
        %{tmp_dir: tmp} do
     Tightbeam.HarnessProcessFixture.run!(tmp, 17)
   end
@@ -204,7 +263,7 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 20)
   end
 
-  test "a proven-dead cleanup refusal records the failure and starts one successor", %{
+  test "a proven-dead cleanup refusal stays fenced and refuses a successor", %{
     tmp_dir: tmp
   } do
     Tightbeam.HarnessProcessFixture.run!(tmp, 21)
@@ -224,7 +283,7 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 24)
   end
 
-  test "a launch that never minted a process is resolved by reconciliation, not fenced", %{
+  test "a launch without identity or observed termination remains fenced", %{
     tmp_dir: tmp
   } do
     Tightbeam.HarnessProcessFixture.run!(tmp, 25)
@@ -242,7 +301,7 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 27)
   end
 
-  test "identity capture accepts an unresolved legacy four-field record", %{tmp_dir: tmp} do
+  test "identity capture refuses a legacy four-field record without authority", %{tmp_dir: tmp} do
     Tightbeam.HarnessProcessFixture.run!(tmp, 28)
   end
 
@@ -262,9 +321,64 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 31)
   end
 
-  test "an unreadable boot identity keeps the fence and records the helper's answer", %{
+  test "an unreadable preparation boot identity refuses before inserting a launch", %{
     tmp_dir: tmp
   } do
     Tightbeam.HarnessProcessFixture.run!(tmp, 32)
+  end
+
+  defp start_process_db do
+    db = String.to_atom("satellite_harness_process_#{System.unique_integer([:positive])}")
+    start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: db}, id: db))
+    :ok = HarnessProcess.ensure_schema(db)
+    db
+  end
+
+  defp remote_park_row(db) do
+    key = {:claude, "shared", "satellite-fixture"}
+
+    HarnessProcess.prepare_launch(
+      [
+        cmd: ["ssh", "remote.example", "claude", "acp"],
+        process_ssh: "remote.example",
+        process_helper: "/satellite/bin/tightbeam",
+        process_identity_dir: "/satellite/tmp"
+      ],
+      db,
+      key
+    )
+
+    [row] = HarnessProcess.list(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        UPDATE harness_processes
+           SET osPid = 4242, processGroupId = 4242,
+               bootIdentity = 'satellite-boot', identityToken = 'satellite-launch'
+         WHERE launchId = ?1
+        """,
+        [row.launch_id]
+      )
+
+    {:ok, row} = HarnessProcess.begin_park(db, key)
+    row
+  end
+
+  defp install_fake_ssh(tmp, capture, result) do
+    fake_bin = Path.join(tmp, "fake-ssh-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(fake_bin)
+    ssh = Path.join(fake_bin, "ssh")
+
+    File.write!(
+      ssh,
+      "#!/bin/sh\nprintf '%s\\n' \"$@\" >> #{Tightbeam.Harness.Support.shell_quote(capture)}\n#{result}\n"
+    )
+
+    File.chmod!(ssh, 0o755)
+    prior_path = System.get_env("PATH") || ""
+    System.put_env("PATH", fake_bin <> ":" <> prior_path)
+    on_exit(fn -> System.put_env("PATH", prior_path) end)
   end
 end

@@ -131,6 +131,71 @@ defmodule Tightbeam.StateVisibility do
     do_core_detail_visible?(db, resource, row, principal)
   end
 
+  @doc false
+  def artifact_collection_scope(%{is_admin: true}), do: {"1 = 1", []}
+
+  def artifact_collection_scope(%{kind: "user", id: user_id}) do
+    {"wi.ownerUserId = ?", [user_id]}
+  end
+
+  def artifact_collection_scope(%{kind: "session", id: session_key}) do
+    {
+      "(a.createdBySession = ? OR wi.createdBySession = ? OR EXISTS (" <>
+        "SELECT 1 FROM assignments AS held WHERE held.workItemId = wi.id AND held.holderKey = ?))",
+      [session_key, session_key, session_key]
+    }
+  end
+
+  def artifact_collection_scope(_principal), do: {"0 = 1", []}
+
+  @doc "Compose the existing work-item AU4 grant for one ExecutionMap node."
+  def execution_map_node_visible?(source, work_item_id, principal)
+      when is_binary(work_item_id) and is_map(principal) do
+    trace_core_detail(principal, {:au4_visibility, "work items"})
+
+    not is_nil(
+      Tightbeam.StateResources.query_work_item(source, work_item_id, %{
+        rest_principal: principal
+      })
+    )
+  end
+
+  def execution_map_node_visible?(_source, _work_item_id, _principal), do: false
+
+  @doc "Compose the existing assignment AU4 grant for one ExecutionMap selector."
+  def execution_map_assignment_visible?(source, assignment_id, principal)
+      when is_binary(assignment_id) and is_map(principal) do
+    trace_core_detail(principal, {:au4_visibility, "assignments"})
+
+    not is_nil(
+      Tightbeam.StateResources.query_assignment(source, assignment_id, %{
+        rest_principal: principal
+      })
+    )
+  end
+
+  def execution_map_assignment_visible?(_source, _assignment_id, _principal), do: false
+
+  @doc "Return the AU4 scope that selects visible attest rows before filtering and paging."
+  def attest_collection_scope(principal) do
+    trace_core_detail(principal, {:au4_visibility, "attests"})
+
+    case principal do
+      %{kind: "user", id: user_id, is_admin: true} when is_binary(user_id) and user_id != "" ->
+        {"1 = 1", []}
+
+      %{kind: "user", id: user_id} when is_binary(user_id) and user_id != "" ->
+        {"(parent.openedByUser = ? OR wi.ownerUserId = ?)", [user_id, user_id]}
+
+      %{kind: "session", id: session_key}
+      when is_binary(session_key) and session_key != "" ->
+        {"(parent.holderKey = ? OR parent.openedBySession = ?)", [session_key, session_key]}
+
+      _ ->
+        {"0 = 1", []}
+    end
+  end
+
   defp do_core_detail_visible?(_db, resource, _row, _principal)
        when resource in ["work items", "assignments"],
        do: true
