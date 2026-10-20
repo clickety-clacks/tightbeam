@@ -398,7 +398,8 @@ defmodule Tightbeam.HarnessProcess do
   @doc false
   @spec park(DB.server(), row(), :process_tree | :credential_replacement) ::
           :ok | :already_resolved | {:error, term()}
-  def park(db, row, cleanup_scope) when cleanup_scope in [:process_tree, :credential_replacement] do
+  def park(db, row, cleanup_scope)
+      when cleanup_scope in [:process_tree, :credential_replacement] do
     with {:ok, row} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
       kill(db, row, "killed", cleanup_scope)
     else
@@ -470,6 +471,40 @@ defmodule Tightbeam.HarnessProcess do
       )
 
     :ok
+  end
+
+  @doc "Retry failed parks and release completed orphan fences without replacing a coordinator."
+  @spec reconcile_failed_parks(DB.server()) :: {:ok, [String.t()]}
+  def reconcile_failed_parks(db) do
+    recovered =
+      for row <- unresolved(db), row.state == "kill_failed", reduce: [] do
+        released ->
+          :ok = ensure_fence(db, row.adapter_key)
+
+          case reconcile_row(db, row, "exited") do
+            result when result in [:ok, :settled] ->
+              :ok =
+                EventLog.lifecycle(
+                  db,
+                  "harness_failed_park_reconciled",
+                  row.adapter_key,
+                  inspect(%{launch_id: row.launch_id})
+                )
+
+              if result == :ok do
+                :ok = complete_reconciled_park_name(db, row.adapter_key)
+              end
+
+              if park_fence_exists?(db, row.adapter_key),
+                do: released,
+                else: [row.adapter_key | released]
+
+            _other_result ->
+              released
+          end
+      end
+
+    {:ok, Enum.uniq(recovered ++ clear_orphan_fence_names(db))}
   end
 
   @doc "Reconcile every unresolved launch left by an earlier coordinator."
@@ -1493,10 +1528,24 @@ defmodule Tightbeam.HarnessProcess do
     :ok
   end
 
+  defp park_fence_exists?(db, adapter_key) do
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1", [
+        adapter_key
+      ])
+
+    count > 0
+  end
+
   defp clear_orphan_fences(db) do
+    _released = clear_orphan_fence_names(db)
+    :ok
+  end
+
+  defp clear_orphan_fence_names(db) do
     incident_guard = rate_limit_incident_guard(db)
 
-    {:ok, _} =
+    {:ok, released} =
       DB.query(
         db,
         """
@@ -1509,10 +1558,11 @@ defmodule Tightbeam.HarnessProcess do
               AND resolvedAt IS NULL
          )
          #{incident_guard}
+         RETURNING adapterKey
         """
       )
 
-    :ok
+    Enum.map(released, fn [adapter_key] -> adapter_key end)
   end
 
   defp rate_limit_incident_guard(db) do
