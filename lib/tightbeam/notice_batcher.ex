@@ -925,19 +925,13 @@ defmodule Tightbeam.NoticeBatcher do
 
     case batch_sources do
       [] ->
-        {:deliveries, human_deliveries}
+        {:deliveries, human_deliveries, []}
 
       _ ->
-        case admit_notice_batch_snapshot_in_txn(txn, target, batch_sources, at, delivery_opts) do
-          {:deliveries, batch_deliveries} ->
-            {:deliveries, human_deliveries ++ batch_deliveries}
+        {:deliveries, batch_deliveries, notices} =
+          admit_notice_batch_snapshot_in_txn(txn, target, batch_sources, at, delivery_opts)
 
-          {:submission_size_refused, target} when human_deliveries == [] ->
-            {:submission_size_refused, target}
-
-          {:submission_size_refused, _target} ->
-            {:deliveries, human_deliveries}
-        end
+        {:deliveries, human_deliveries ++ batch_deliveries, notices}
     end
   end
 
