@@ -6570,11 +6570,17 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
-    progress = handle(ctx, "attest", attest_call({:session, "holder"}, completed.id, "progress"))
+    progress_note = "Started the focused review.\nThe receipt stays readable."
+
+    progress =
+      attest_call({:session, "holder"}, completed.id, "progress")
+      |> put_in([:params, :note], progress_note)
+      |> then(&handle(ctx, "attest", &1))
 
     verdict_call =
       attest_call({:session, "holder"}, completed.id, "verdict")
       |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> put_in([:params, :note], "The review found no blockers.")
 
     verdict = handle(ctx, "attest", verdict_call)
 
@@ -6588,8 +6594,12 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert length(marker_contents(ctx.db, "holder")) == marker_count_before_user_verdict
 
+    completion_note = String.duplicate("c", 130)
+
     completion =
-      handle(ctx, "attest", attest_call({:session, "holder"}, completed.id, "completion"))
+      attest_call({:session, "holder"}, completed.id, "completion")
+      |> put_in([:params, :note], completion_note)
+      |> then(&handle(ctx, "attest", &1))
 
     paused = handle(ctx, "assign", assign_call({:user, "flynn"}, "cannot-proceed markers"))
 
@@ -6603,9 +6613,9 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert marker_contents(ctx.db, "holder") == [
              "[assignment opened: #{completed.id}]",
-             "[progress filed on #{completed.id}]",
-             "[verdict filed: reviewed-clean on #{completed.id}]",
-             "[completion filed on #{completed.id}]",
+             "[progress filed on #{completed.id}: Started the focused review. The receipt stays readable.]",
+             "[verdict filed: reviewed-clean on #{completed.id}: The review found no blockers.]",
+             "[completion filed on #{completed.id}: #{String.duplicate("c", 119)}…]",
              "[assignment closed: #{completed.id} — completed]",
              "[assignment opened: #{paused.id}]",
              "[cannot-proceed filed on #{paused.id}: needs input]",

@@ -3639,8 +3639,36 @@ defmodule Tightbeam.Assignments do
           "[progress filed on #{attest.assignmentId}]"
       end
 
+    text =
+      if attest.kind in ["progress", "completion", "verdict"] do
+        append_attest_marker_summary(text, attest.note)
+      else
+        text
+      end
+
     append_substrate(txn, attest.bySession, text)
   end
+
+  @attest_marker_summary_limit 120
+
+  defp append_attest_marker_summary(text, note) when is_binary(note) do
+    summary = note |> String.replace(~r/\s+/u, " ") |> String.trim()
+    graphemes = String.graphemes(summary)
+
+    case graphemes do
+      [] ->
+        text
+
+      graphemes when length(graphemes) > @attest_marker_summary_limit ->
+        summary = graphemes |> Enum.take(@attest_marker_summary_limit - 1) |> Enum.join()
+        String.replace_suffix(text, "]", ": #{summary}…]")
+
+      _ ->
+        String.replace_suffix(text, "]", ": #{summary}]")
+    end
+  end
+
+  defp append_attest_marker_summary(text, _note), do: text
 
   defp notify_assignment_opener_of_attest_in_txn(txn, assignment, attest) do
     recipient = assignment_opener_session(assignment)
