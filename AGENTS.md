@@ -11,12 +11,28 @@ older guidance, specs, or cards name another default integration branch, read
 "highest `0.1.*` branch" on this line. If a card names a branch explicitly, the
 card wins.
 
-## Keep the substrate neutral
+## Kungfu never leaks into the substrate
 
-The substrate (`priv/seed`, `priv/guidance`, `priv/skills`, and Main's default
-archetype) stays neutral. Put ways of working — such as PO/PDO roles, delivery
-and review process, and how to build a product org — in the applicable kungfu
-bundle, never in substrate guidance.
+This is the founding invariant of Tightbeam; kungfu exists because of it. The
+substrate is everything outside `priv/kungfu/`: the gateway (`lib/`), the CLI
+(`cli/src`), core guidance (`priv/guidance`), the seed (`priv/seed`), core skills
+(`priv/skills`) and Main's default archetype. It provides only domain-blind
+mechanism: records, wakes, rules and rails, assignments, attests, decision
+requests, and seams such as running a kungfu's scripts and sentinels. It never
+knows what any kungfu knows. Git, commits, branches, remotes, pull or merge
+requests, CI, GitHub, engineering roles such as coder or reviewer, verdicts such
+as reviewed-clean or verified, and any delivery or review process belong to the
+kungfu that defines them.
+
+Enforce process with rules and rails a kungfu ships, never with substrate code.
+When a kungfu needs a capability the substrate lacks, add a general seam that
+any kungfu could use, the way the landing watcher runs through the generic
+sentinel seam, and keep the domain on the kungfu side. Opaque data a kungfu
+records stays opaque to the substrate. Tightbeam's own use of git to store
+identity is an implementation detail, not domain knowledge.
+
+Reviewing a change to this repository includes asking whether it teaches the
+substrate anything a kungfu owns. If it does, that is a blocker.
 
 ## ACP / harness facts (for anyone touching the adapter layer)
 
