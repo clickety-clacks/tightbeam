@@ -1135,6 +1135,19 @@ defmodule Tightbeam.Wakes do
     ) == [[1]]
   end
 
+  defp terminal_notice_has_finished_delivery_turn_in_txn?(txn, source_wake_id, session_key) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1
+      FROM wakes w
+      JOIN turns t ON t.seq=w.deliveredTurnSeq
+      WHERE w.wakeId=?1 AND t.sessionKey=?2 AND t.endedAt IS NOT NULL
+      """,
+      [source_wake_id, session_key]
+    ) == [[1]]
+  end
+
   defp terminal_action_note_matches?(note, event) when is_binary(note) do
     case Regex.run(
            ~r/\Acompletion-handoff-action ([^\s]+) ([^\s]+) ([^\s]+) (kept|parked|retired): (.+)\z/u,
@@ -5420,29 +5433,36 @@ defmodule Tightbeam.Wakes do
   def delivery_projection_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
     # One fixed selection for both absent and hidden wakes: a second lookup
     # conditional on finding the wake would disclose its existence in the trace.
-    carrier_columns =
-      ", (SELECT status FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
-        ", (SELECT createdAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
-        ", (SELECT startedAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
-        ", (SELECT endedAt FROM turns WHERE turns.wakeId=wakes.wakeId)"
+    carrier_columns = delivery_projection_columns()
 
     case Txn.q(txn, select_wake_sql(carrier_columns) <> " WHERE wakeId=?1", [wake_id]) do
       [] ->
         nil
 
       [row] ->
-        {wake_columns, [status, created_at, started_at, ended_at]} = Enum.split(row, -4)
-        wake = to_wake(wake_columns)
-
-        # Keep the existing maximum-durable-timestamp version convention, now
-        # including the row from which this additive projection is derived.
-        version =
-          [wake.created_at, wake.fired_at, wake.canceled_at, created_at, started_at, ended_at]
-          |> Enum.filter(&is_integer/1)
-          |> Enum.max()
-
-        wake |> Map.put(:delivery_status, status) |> Map.put(:row_version, version)
+        wake_with_delivery_projection(row)
     end
+  end
+
+  defp delivery_projection_columns do
+    ", (SELECT status FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
+      ", (SELECT createdAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
+      ", (SELECT startedAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
+      ", (SELECT endedAt FROM turns WHERE turns.wakeId=wakes.wakeId)"
+  end
+
+  defp wake_with_delivery_projection(row) do
+    {wake_columns, [status, created_at, started_at, ended_at]} = Enum.split(row, -4)
+    wake = to_wake(wake_columns)
+
+    # Keep the existing maximum-durable-timestamp version convention, now
+    # including the row from which this additive projection is derived.
+    version =
+      [wake.created_at, wake.fired_at, wake.canceled_at, created_at, started_at, ended_at]
+      |> Enum.filter(&is_integer/1)
+      |> Enum.max()
+
+    wake |> Map.put(:delivery_status, status) |> Map.put(:row_version, version)
   end
 
   @doc "Record a failed carrier's outcome in its sender's existing transcript, without a turn."
@@ -5626,7 +5646,7 @@ defmodule Tightbeam.Wakes do
 
   @doc "Return one bounded page of wakes targeting a session in stable creation order."
   def list_for_session_page(db, session_key, boundary, limit) do
-    select_from = select_wake_sql()
+    select_from = select_wake_sql(delivery_projection_columns())
 
     case DB.transaction(db, fn txn ->
            query = fn sql, params -> Txn.q(txn, sql, params) end
@@ -5643,8 +5663,11 @@ defmodule Tightbeam.Wakes do
              fn row -> [Enum.at(row, 8), hd(row)] end
            )
          end) do
-      {:ok, page} -> %{rows: Enum.map(page.rows, &to_wake/1), flags: page}
-      {:error, error} -> raise error
+      {:ok, page} ->
+        %{rows: Enum.map(page.rows, &wake_with_delivery_projection/1), flags: page}
+
+      {:error, error} ->
+        raise error
     end
   end
 
@@ -7392,7 +7415,9 @@ defmodule Tightbeam.Wakes do
         true -> nil
       end
 
-    if cause do
+    # A parent action reminder waits until the turn that delivered its notice
+    # has ended, so it never queues behind the notice it follows up.
+    if cause && not terminal_action_reminder_waiting_for_notice_turn?(txn, wake) do
       fired_at = now()
 
       stamp =
@@ -7457,6 +7482,25 @@ defmodule Tightbeam.Wakes do
   end
 
   defp fire_in_txn(_txn, _wake, _fact_id), do: :noop
+
+  defp terminal_action_reminder_waiting_for_notice_turn?(
+         txn,
+         %{obligation_ref: @terminal_action_marker <> _} = wake
+       ) do
+    case terminal_action_root_event_in_txn(txn, wake) do
+      {:ok, root, _event} ->
+        not terminal_notice_has_finished_delivery_turn_in_txn?(
+          txn,
+          root.wake_id,
+          root.session_key
+        )
+
+      :error ->
+        false
+    end
+  end
+
+  defp terminal_action_reminder_waiting_for_notice_turn?(_txn, _wake), do: false
 
   defp wake_owner_in_txn(txn, wake) do
     case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [wake.session_key]) do

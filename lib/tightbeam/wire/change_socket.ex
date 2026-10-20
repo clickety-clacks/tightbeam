@@ -5,6 +5,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
   alias Tightbeam.StateVisibility
   alias Tightbeam.Devices
   alias Tightbeam.Org
+  alias Tightbeam.Wire.OperatorSession
   @max_subscriptions 100
   @filter_keys ~w(classes sessionKey workItemId origin principal)
   defstruct phase: :unauthed,
@@ -13,6 +14,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
             principal_kind: nil,
             principal_id: nil,
             credential_digest: nil,
+            selected_session_key: nil,
             is_admin: false,
             subscriptions: %{},
             heartbeat_timer: nil,
@@ -103,8 +105,8 @@ defmodule Tightbeam.Wire.ChangeSocket do
     token = string(message["token"])
 
     cond do
-      token == Map.get(state.deps, :cli_token) ->
-        stop_with(auth_failure("org_token_read_forbidden"), 1008, state)
+      OperatorSession.operator_token?(token, state.deps) ->
+        authenticate_operator(message, token, state)
 
       session = active_session(state, token) ->
         :ok =
@@ -185,6 +187,46 @@ defmodule Tightbeam.Wire.ChangeSocket do
     end
   end
 
+  defp authenticate_operator(message, token, state) do
+    case OperatorSession.resolve(db(state), message) do
+      {:ok, user, session} ->
+        :ok =
+          Hub.register(hub(state), self(), %{
+            mode: :filtered,
+            db: db(state),
+            user_id: user.user_id,
+            principal_kind: :user,
+            principal_id: user.user_id,
+            is_admin: user.is_admin
+          })
+
+        state = %{
+          state
+          | phase: :live,
+            user_id: user.user_id,
+            principal_kind: :user,
+            principal_id: user.user_id,
+            is_admin: user.is_admin,
+            selected_session_key: session.session_key,
+            credential_digest: credential_digest(token)
+        }
+
+        push(
+          %{
+            "type" => "auth_result",
+            "success" => true,
+            "userId" => user.user_id,
+            "isAdmin" => user.is_admin,
+            "sessionKey" => session.session_key
+          },
+          schedule_heartbeat(state)
+        )
+
+      {:error, _reason} ->
+        stop_with(auth_failure("org_token_read_forbidden"), 1008, state)
+    end
+  end
+
   defp subscribe(message, state) do
     id = message["subscriptionId"]
 
@@ -250,6 +292,15 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
   defp normalize_filters(_filters), do: :error
 
+  defp authorized_filters(%{selected_session_key: session_key}, filters)
+       when is_binary(session_key) do
+    if filters["sessionKey"] == session_key do
+      :ok
+    else
+      {:error, "sessionKey must match selected session"}
+    end
+  end
+
   defp authorized_filters(%{principal_kind: :session, principal_id: session_key}, filters) do
     if filters["sessionKey"] == session_key do
       :ok
@@ -306,6 +357,20 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
   # The revocation notice is best-effort. Heartbeats also compare the exact
   # credential generation so a lost notice cannot leave a revoked socket live.
+  defp credential_current?(%{selected_session_key: key} = state) when is_binary(key) do
+    with {:ok, user, _session} <-
+           OperatorSession.resolve(db(state), %{
+             "asUser" => state.user_id,
+             "sessionKey" => key
+           }),
+         true <- user.is_admin == state.is_admin,
+         token when is_binary(token) <- state.deps[:cli_token] do
+      credential_digest(token) == state.credential_digest
+    else
+      _ -> false
+    end
+  end
+
   defp credential_current?(state) do
     case state.principal_kind do
       :session ->

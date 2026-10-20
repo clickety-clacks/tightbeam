@@ -13,6 +13,7 @@ defmodule Tightbeam.RulesTest do
     Gateway,
     Ledger,
     Org,
+    RailRemedy,
     Roles,
     Rules,
     Toplines,
@@ -717,6 +718,54 @@ defmodule Tightbeam.RulesTest do
              )
 
     assert [%{kind: "denied", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
+  end
+
+  test "code completion refusal identifies expected and latest clean review refs", ctx do
+    :ok =
+      DB.execute(ctx.db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1),('reviewer',1)")
+
+    holder = session(ctx.db, "null-ref-review-author", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "null-ref-review-judge", "reviewer", archetype: "reviewer-code")
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    review =
+      assignment(ctx, reviewer.session_key, {:user, "reviewer"}, reviews: producer.id)
+
+    assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: nil}} =
+             verdict(ctx, reviewer.session_key, review.id, "reviewed-clean")
+
+    assert %{assignment: %{state: "closed"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, reviewer.session_key}, %{
+                 assignment_id: review.id,
+                 kind: "completion"
+               })
+             )
+
+    stub_commit_ref_validation()
+    refs = gooarchy_commit_refs()
+
+    assert %{attest: %{verdictKind: "verified", commitRefs: ^refs}} =
+             commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
+
+    Rules.load!(ctx.base_dir, [])
+
+    assert {:error, %{code: "inapplicable_code_evidence", message: message}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               p3_call("attest", {:session, holder.session_key}, %{
+                 assignment_id: producer.id,
+                 kind: "completion",
+                 commit_refs: refs
+               })
+             )
+
+    assert message =~ "expected commitRefs=#{JSON.encode!(refs)}"
+    assert message =~ "6e3fc667ccf47013b3c5fb2d434ab5bd28559e0b"
+    assert message =~ "latest linked review conclusion=reviewed-clean commitRefs=null"
   end
 
   test "matching a constitutional denial is monotonic and leaves domain state unchanged", ctx do
@@ -1458,58 +1507,328 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
-  test "shipped completion gate blocks and stores one ordinary holder notice", ctx do
+  test "shipped completion is recorded while a same-source independent review is pending", ctx do
     holder = session(ctx.db, "receipt-remedy-holder", "flynn", archetype: "coder")
-    producer = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "code")
+    reviewer = session(ctx.db, "receipt-remedy-reviewer", "flynn", archetype: "reviewer-code")
+
+    _owner =
+      session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
+
+    {:ok, _} =
+      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
+
+    Roles.create!(ctx.db, "reviewer-code", "flynn", reviewer.session_key)
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+    attach_work_item(ctx, producer.id, "review-notice")
 
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    stub_commit_ref_validation()
+    refs = fixture_commit_refs()
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
 
     completion =
       p3_call("attest", {:session, holder.session_key}, %{
         assignment_id: producer.id,
-        kind: "completion"
+        kind: "completion",
+        commit_refs: refs
       })
 
-    assert {:error,
+    assert {:ok,
             %{
-              reason: "remedy_fired",
-              producer: wake_id,
-              rule: "completion-requires-review",
-              ref: producer_id
-            }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+              assignment: %{id: producer_id, state: "open"},
+              attest: %{kind: "completion"} = completion_attest
+            }} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
     assert producer_id == producer.id
+    assert completion_attest.bySession == holder.session_key
+    assert completion_attest.commitRefs == refs
     assert review_count(ctx.db, producer.id) == 0
 
-    assert {:ok, [[session_key, prompt, consumer, origin, creator_session_key, summon]]} =
-             DB.query(
-               ctx.db,
-               "SELECT sessionKey,prompt,consumer,origin,creatorSessionKey,summon FROM wakes WHERE wakeId=?1 AND assignmentId=?2",
-               [wake_id, producer.id]
-             )
+    # The gate's notice is one ordinary stored notice to the holder; it starts no
+    # review-remedy episode and staffs no reviewer.
+    assert RailRemedy.episode(ctx.db, "completion-requires-review", producer.id) == nil
 
-    assert session_key == holder.session_key
+    assert [notice] = review_gate_notices(ctx.db, producer.id)
+    assert notice.session_key == holder.session_key
+    assert notice.consumer == "prompt"
+    assert notice.summon == 1
+    assert notice.creator_session_key == nil
 
-    assert prompt ==
+    assert notice.prompt ==
              "Coordinate independent review of assignment #{producer.id}; preserve current evidence and direct staffing through its accountable owner."
 
-    assert consumer == "prompt"
-    assert origin == "remedy:completion-requires-review"
-    assert creator_session_key == nil
-    assert summon == 1
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId=?1", [
+               "review-notice"
+             ])
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId=?1", [
+               "review-notice"
+             ])
+
+    assert {:ok, review} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               p3_call("assign", {:user, "flynn"}, %{
+                 subject: "owner-directed independent review",
+                 reviews_assignment_id: producer.id,
+                 idempotency_key: nil,
+                 files: nil
+               })
+               |> Map.put(:session_key, reviewer.session_key)
+             )
+
+    assert review.holderKey != holder.session_key
+
+    reviewer_refs =
+      Enum.map(refs, fn ref ->
+        Map.put(ref, "repo", "#{Tightbeam.Placement.local_host_name()}:/tmp/reviewer-result")
+      end)
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             commit_ref_verdict(
+               ctx,
+               reviewer.session_key,
+               review.id,
+               "reviewed-clean",
+               reviewer_refs,
+               "reviewed exact result"
+             )
+
+    assert {:ok, [["closed", "completed", closing_attest_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
+               [producer.id]
+             )
+
+    assert closing_attest_id == completion_attest.id
+    assert review_count(ctx.db, producer.id) == 1
+  end
+
+  test "shipped completion records pending release and live-mutation work", ctx do
+    holder = session(ctx.db, "non-code-completion-holder", "flynn", archetype: "coder")
+
+    _owner =
+      session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
+
+    {:ok, _} =
+      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
+
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    for effect_kind <- ["release", "live_mutation"] do
+      producer = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: effect_kind)
+
+      assert {:ok, %{assignment: %{state: "open"}, attest: %{kind: "completion"}}} =
+               Dispatch.dispatch(
+                 ctx.db,
+                 ctx.handlers,
+                 p3_call("attest", {:session, holder.session_key}, %{
+                   assignment_id: producer.id,
+                   kind: "completion"
+                 })
+               )
+
+      assert review_count(ctx.db, producer.id) == 0
+
+      assert [%{session_key: session_key}] = review_gate_notices(ctx.db, producer.id)
+      assert session_key == holder.session_key
+    end
+  end
+
+  test "changes-requested wakes and reopens the author card, then clean review closes it", ctx do
+    holder = session(ctx.db, "review-change-author", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "review-change-judge", "reviewer", archetype: "reviewer-code")
+
+    _owner =
+      session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1),('reviewer', 0, 1)"
+      )
+
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+    attach_work_item(ctx, producer.id, "review-change-reopen")
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    stub_commit_ref_validation()
+    refs = fixture_commit_refs()
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
+
+    completion_call =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: producer.id,
+        kind: "completion",
+        commit_refs: refs
+      })
+
+    assert {:ok, %{assignment: %{state: "open"}, attest: completion_attest}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call)
+
+    first_review =
+      assignment(ctx, reviewer.session_key, {:user, "reviewer"}, reviews: producer.id)
+
+    assert %{attest: %{verdictKind: "changes-requested"}} =
+             commit_ref_verdict(
+               ctx,
+               reviewer.session_key,
+               first_review.id,
+               "changes-requested",
+               refs
+             )
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [producer.id])
+
+    assert Enum.any?(Wakes.list_pending(ctx.db), fn wake ->
+             wake.session_key == holder.session_key and wake.assignment_id == producer.id and
+               wake.prompt =~ "requested changes"
+           end)
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             commit_ref_verdict(
+               ctx,
+               reviewer.session_key,
+               first_review.id,
+               "reviewed-clean",
+               refs
+             )
+
+    assert {:ok, [["closed", "completed", closing_attest_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
+               [producer.id]
+             )
+
+    assert closing_attest_id == completion_attest.id
+
+    assert %{assignment: %{state: "closed"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, reviewer.session_key}, %{
+                 assignment_id: first_review.id,
+                 kind: "completion"
+               })
+             )
+
+    second_review =
+      assignment(ctx, reviewer.session_key, {:user, "reviewer"}, reviews: producer.id)
+
+    assert %{attest: %{verdictKind: "changes-requested"}} =
+             commit_ref_verdict(
+               ctx,
+               reviewer.session_key,
+               second_review.id,
+               "changes-requested",
+               refs
+             )
+
+    assert {:ok, [["open", nil, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
+               [producer.id]
+             )
 
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM wakes WHERE assignmentId=?1 AND origin='remedy:completion-requires-review'",
+               "SELECT count(*) FROM assignment_reopenings WHERE assignmentId=?1",
                [producer.id]
              )
 
-    assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId=?1", [
-               producer.workItemId
-             ])
+    assert Enum.any?(Wakes.list_pending(ctx.db), fn wake ->
+             wake.session_key == holder.session_key and wake.assignment_id == producer.id and
+               wake.prompt =~ "requested changes"
+           end)
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             commit_ref_verdict(
+               ctx,
+               reviewer.session_key,
+               second_review.id,
+               "reviewed-clean",
+               refs
+             )
+
+    assert {:ok, [["closed", "completed", closing_attest_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
+               [producer.id]
+             )
+
+    assert closing_attest_id == completion_attest.id
+  end
+
+  test "completion accepts a closed linked review of the exact integrated heads", ctx do
+    holder = session(ctx.db, "integrated-subject-author", "flynn", archetype: "coder")
+
+    reviewer =
+      session(ctx.db, "integrated-subject-reviewer", "reviewer", archetype: "reviewer-code")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1),('reviewer', 0, 1)"
+      )
+
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+    review = assignment(ctx, reviewer.session_key, {:user, "reviewer"}, reviews: producer.id)
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    stub_commit_ref_validation()
+    refs = integrated_commit_refs()
+
+    assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: ^refs}} =
+             commit_ref_verdict(
+               ctx,
+               reviewer.session_key,
+               review.id,
+               "reviewed-clean",
+               refs
+             )
+
+    assert %{assignment: %{state: "closed"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, reviewer.session_key}, %{
+                 assignment_id: review.id,
+                 kind: "completion"
+               })
+             )
+
+    assert %{attest: %{verdictKind: "verified", commitRefs: ^refs}} =
+             commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
+
+    assert {:ok, %{assignment: %{id: producer_id, state: "closed"}, attest: %{commitRefs: ^refs}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               p3_call("attest", {:session, holder.session_key}, %{
+                 assignment_id: producer.id,
+                 kind: "completion",
+                 commit_refs: refs
+               })
+             )
+
+    assert producer_id == producer.id
+    assert review_count(ctx.db, producer.id) == 1
   end
 
   test "shipped completion accepts same source commits across checkouts and refuses another commit",
@@ -1643,6 +1962,123 @@ defmodule Tightbeam.RulesTest do
 
     assert {:deny, %{rule: "completion-requires-review"}} =
              Rules.evaluate(ctx.db, different_completion)
+  end
+
+  test "completion stays pending when the latest closed clean review lacks exact refs", ctx do
+    holder = session(ctx.db, "unreferenced-review-author", "flynn", archetype: "coder")
+
+    reviewer =
+      session(ctx.db, "unreferenced-review-judge", "reviewer", archetype: "reviewer-code")
+
+    owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1),('reviewer', 0, 1)"
+      )
+
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    stub_commit_ref_validation()
+
+    scenarios = [
+      {"gooarchy", gooarchy_commit_refs(), false},
+      {"lachesis", integrated_commit_refs(), true}
+    ]
+
+    for {label, refs, older_exact_review?} <- scenarios do
+      producer = assignment(ctx, holder.session_key, {:user, "flynn"}, subject: label)
+
+      if older_exact_review? do
+        older_review =
+          assignment(ctx, reviewer.session_key, {:user, "reviewer"},
+            reviews: producer.id,
+            subject: "#{label} earlier exact review"
+          )
+
+        assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: ^refs}} =
+                 commit_ref_verdict(
+                   ctx,
+                   reviewer.session_key,
+                   older_review.id,
+                   "reviewed-clean",
+                   refs
+                 )
+
+        assert %{assignment: %{state: "closed"}} =
+                 Assignments.__handle__(
+                   ctx.db,
+                   "attest",
+                   p3_call("attest", {:session, reviewer.session_key}, %{
+                     assignment_id: older_review.id,
+                     kind: "completion"
+                   })
+                 )
+      end
+
+      latest_review =
+        assignment(ctx, reviewer.session_key, {:user, "reviewer"},
+          reviews: producer.id,
+          subject: "#{label} latest review"
+        )
+
+      assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: nil}} =
+               verdict(ctx, reviewer.session_key, latest_review.id, "reviewed-clean")
+
+      assert %{assignment: %{state: "closed"}} =
+               Assignments.__handle__(
+                 ctx.db,
+                 "attest",
+                 p3_call("attest", {:session, reviewer.session_key}, %{
+                   assignment_id: latest_review.id,
+                   kind: "completion"
+                 })
+               )
+
+      assert ["reviewed-clean"] ==
+               Assignments.qualifying_review_verdict_kinds(
+                 ctx.db,
+                 producer.id,
+                 holder.session_key
+               )
+
+      assert [] ==
+               Assignments.qualifying_review_verdict_kinds(
+                 ctx.db,
+                 producer.id,
+                 holder.session_key,
+                 refs
+               )
+
+      assert %{attest: %{verdictKind: "verified", commitRefs: ^refs}} =
+               commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
+
+      assert {:ok,
+              %{
+                assignment: %{id: producer_id, state: "open"},
+                attest: %{kind: "completion", commitRefs: ^refs}
+              }} =
+               Dispatch.dispatch(
+                 ctx.db,
+                 ctx.handlers,
+                 p3_call("attest", {:session, holder.session_key}, %{
+                   assignment_id: producer.id,
+                   kind: "completion",
+                   commit_refs: refs
+                 })
+               )
+
+      assert producer_id == producer.id
+      assert review_count(ctx.db, producer.id) == if(older_exact_review?, do: 2, else: 1)
+
+      notice_id =
+        RailRemedy.episode(ctx.db, "completion-requires-review", producer.id).producer_key
+
+      notice = Wakes.get(ctx.db, notice_id)
+      assert notice.session_key == owner.session_key
+      assert notice.assignment_id == producer.id
+    end
   end
 
   test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do
@@ -4021,6 +4457,69 @@ defmodule Tightbeam.RulesTest do
     )
   end
 
+  defp commit_ref_verdict(ctx, session_key, assignment_id, verdict_kind, refs, note \\ nil) do
+    Assignments.__handle__(
+      ctx.db,
+      "attest",
+      p3_call("attest", {:session, session_key}, %{
+        assignment_id: assignment_id,
+        kind: "verdict",
+        verdict_kind: verdict_kind,
+        note: note,
+        commit_refs: refs
+      })
+    )
+  end
+
+  defp stub_commit_ref_validation do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+  end
+
+  defp fixture_commit_refs do
+    host = Tightbeam.Placement.local_host_name()
+
+    [
+      %{
+        "repo" => "#{host}:/tmp/review-result-service",
+        "commit" => String.duplicate("a", 40)
+      }
+    ]
+  end
+
+  defp integrated_commit_refs do
+    host = Tightbeam.Placement.local_host_name()
+
+    [
+      %{
+        "repo" => "#{host}:/tmp/lachesis",
+        "commit" => "5a4c3ed6ad1527f17069208bcb476aeff7ea27aa"
+      },
+      %{
+        "repo" => "#{host}:/tmp/lachesis-omarchy",
+        "commit" => "3f318f86d8922b8c8c9f4ce4bdaa174dea421b95"
+      }
+    ]
+  end
+
+  defp gooarchy_commit_refs do
+    [
+      %{
+        "repo" => "#{Tightbeam.Placement.local_host_name()}:/tmp/gooarchy",
+        "commit" => "6e3fc667ccf47013b3c5fb2d434ab5bd28559e0b"
+      }
+    ]
+  end
+
   defp user_verdict(ctx, user, assignment_id, verdict_kind, note \\ nil) do
     Assignments.__handle__(
       ctx.db,
@@ -4068,6 +4567,30 @@ defmodule Tightbeam.RulesTest do
         produced_by_assignment_id: producer_id
       }
     })
+  end
+
+  defp review_gate_notices(db, producer_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT sessionKey,prompt,consumer,creatorSessionKey,summon
+        FROM wakes
+        WHERE assignmentId=?1 AND origin='remedy:completion-requires-review'
+        ORDER BY createdAt,wakeId
+        """,
+        [producer_id]
+      )
+
+    Enum.map(rows, fn [session_key, prompt, consumer, creator_session_key, summon] ->
+      %{
+        session_key: session_key,
+        prompt: prompt,
+        consumer: consumer,
+        creator_session_key: creator_session_key,
+        summon: summon
+      }
+    end)
   end
 
   defp review_count(db, producer_id) do

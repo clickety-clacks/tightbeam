@@ -57,7 +57,7 @@ defmodule Tightbeam.Wire.Socket do
   @behaviour WebSock
 
   alias Tightbeam.{ConnRegistry, DB, Devices, Dispatch, ErrorDiagnostic, Org, Projection}
-  alias Tightbeam.Wire.Payloads
+  alias Tightbeam.Wire.{OperatorSession, Payloads}
 
   @max_content_bytes 64 * 1024
 
@@ -67,6 +67,7 @@ defmodule Tightbeam.Wire.Socket do
           user_id: String.t() | nil,
           device_id: String.t() | nil,
           is_admin: boolean(),
+          selected_session_key: String.t() | nil,
           phase: :unauthed | :replaying | :live,
           subscriptions: MapSet.t(String.t()) | nil,
           buffer: [tuple()],
@@ -79,6 +80,7 @@ defmodule Tightbeam.Wire.Socket do
             user_id: nil,
             device_id: nil,
             is_admin: false,
+            selected_session_key: nil,
             phase: :unauthed,
             subscriptions: nil,
             buffer: [],
@@ -196,6 +198,16 @@ defmodule Tightbeam.Wire.Socket do
     :ok
   end
 
+  defp route(%{"type" => "message"} = msg, %{selected_session_key: key} = state)
+       when is_binary(key), do: client_message(msg, state)
+
+  defp route(_msg, %{selected_session_key: key} = state) when is_binary(key) do
+    push(
+      Payloads.wire_error("invalid_message", "selected-session connection accepts messages only"),
+      state
+    )
+  end
+
   defp route(%{"type" => "pair_request"} = msg, state), do: pair(msg, state)
   defp route(%{"type" => "auth"} = msg, state), do: auth(msg, state)
 
@@ -282,6 +294,56 @@ defmodule Tightbeam.Wire.Socket do
   defp auth(msg, state) do
     token = string(msg["token"])
 
+    if OperatorSession.operator_token?(token, state.deps) do
+      auth_operator(msg, state)
+    else
+      auth_device(msg, token, state)
+    end
+  end
+
+  defp auth_operator(msg, %{phase: :unauthed} = state) do
+    with {:ok, user, session} <- OperatorSession.resolve(db(state), msg),
+         device_id when is_binary(device_id) and device_id != "" <- msg["deviceId"],
+         {:ok, subscriptions} <- parse_subscriptions(msg, MapSet.new(["chat"])),
+         true <- subscriptions == MapSet.new(["chat"]) do
+      # This is a send connection. History and notices stay on the selected
+      # transcript and Firehose paths; no device is enrolled or replayed here.
+      payload =
+        Payloads.auth_result_success(%{
+          user_id: user.user_id,
+          session_id: "conn_#{device_id}",
+          is_admin: user.is_admin,
+          replay_count: 0,
+          replay_truncated: false,
+          history_reset: false,
+          session_keys: [session.session_key],
+          stream_read_states: %{},
+          stream_tail_states: %{},
+          features: ["tightbeam"],
+          dm_scope: nil
+        })
+
+      state = %{
+        state
+        | user_id: user.user_id,
+          device_id: device_id,
+          is_admin: user.is_admin,
+          selected_session_key: session.session_key,
+          subscriptions: subscriptions,
+          phase: :live
+      }
+
+      state = state |> schedule_ping() |> arm_pong_deadline()
+      push_many([payload, Payloads.sync_complete()], state)
+    else
+      _ -> stop_with(Payloads.auth_result_failure("auth_failed"), state)
+    end
+  end
+
+  defp auth_operator(_msg, state),
+    do: stop_with(Payloads.auth_result_failure("auth_failed"), state)
+
+  defp auth_device(msg, token, state) do
     case Devices.by_token(db(state), token) do
       nil ->
         known = Devices.by_id(db(state), string(msg["deviceId"]))
@@ -454,6 +516,9 @@ defmodule Tightbeam.Wire.Socket do
     session = Org.get(db(state), session_key)
 
     cond do
+      is_binary(state.selected_session_key) and session_key != state.selected_session_key ->
+        push(Payloads.wire_error("not_found", nil, id), state)
+
       not String.starts_with?(id, "c_") ->
         push(Payloads.wire_error("invalid_message", "message id must start with c_"), state)
 
@@ -476,6 +541,11 @@ defmodule Tightbeam.Wire.Socket do
           }
         }
 
+        call =
+          if state.selected_session_key,
+            do: Map.put(call, :principal, {:user, state.user_id}),
+            else: call
+
         case Dispatch.dispatch(db(state), state.deps.handlers, call) do
           {:ok, %{dedupe: dedupe}} when dedupe in [:conflict, "conflict"] ->
             push(
@@ -492,6 +562,16 @@ defmodule Tightbeam.Wire.Socket do
 
           {:error, error} ->
             push(dispatch_error_frame(error, id), state)
+
+          {:decision_pending, request_id} ->
+            push(
+              Payloads.wire_error(
+                "decision_pending",
+                "decision request #{request_id} is open",
+                id
+              ),
+              state
+            )
         end
     end
   end
