@@ -779,6 +779,15 @@ defmodule Tightbeam.PlacementTest do
              Tightbeam.EventLog.lifecycle_events(db),
              &(&1.kind == "harness_health_auth_blocker")
            )
+
+    [incident] = HarnessHealth.active(db)
+
+    assert eventually(fn ->
+             incident = HarnessHealth.get(db, incident.id)
+
+             Enum.map(incident.credentialHealthTrace, & &1.phase) ==
+               ["provider-observed", "credential-transition"]
+           end)
   end
 
   test "adapter_opts appends a local overlay and absent rows leave env unchanged", %{

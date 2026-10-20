@@ -242,6 +242,10 @@ pub enum Command {
     List {
         identity: Identity,
     },
+    HarnessHealth {
+        identity: Identity,
+        incident_id: Option<String>,
+    },
     Retire {
         identity: Identity,
         session_key: String,
@@ -755,6 +759,10 @@ COMMANDS:
       org's shape — archetypes (with allowed hosts), known hosts, and the
       valid model catalog per harness — and, for admins, pending devices.
         tightbeam list --as orchestrator:news
+
+  harness-health [incidentId]
+      Read active shared-harness incidents, or one incident with its immutable
+      redacted credential-health and adapter provenance trace.
 
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
@@ -2195,6 +2203,15 @@ fn parse_with_optional_catalog(
         "list" => Ok(Command::List {
             identity: identity(flags)?,
         }),
+        "harness-health" => {
+            if parsed.positional.len() > 2 {
+                return Err("usage: tightbeam harness-health [incidentId]".to_owned());
+            }
+            Ok(Command::HarnessHealth {
+                identity: identity(flags)?,
+                incident_id: parsed.positional.get(1).cloned(),
+            })
+        }
         "retire" => {
             let session_key = nonempty(flags, "session");
             if parsed.positional.get(1).is_some()
@@ -4085,6 +4102,7 @@ mod tests {
                 "dispatch",
                 "doctor",
                 "effort-rule",
+                "harness-health",
                 "harness-process",
                 "host-env-list",
                 "host-env-set",
@@ -4674,6 +4692,24 @@ mod tests {
         assert_eq!(
             parse(strings(&["list", "--as", "coder", "--as-user", "flynn"])),
             Err("identity flags are mutually exclusive: pass exactly one of --as, --as-user, or --as-process".to_owned())
+        );
+    }
+
+    #[test]
+    fn parses_harness_health_read_surface() {
+        assert_eq!(
+            parse(strings(&["harness-health"])),
+            Ok(Command::HarnessHealth {
+                identity: Identity::Session,
+                incident_id: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["harness-health", "hhi_1", "--as-user", "flynn"])),
+            Ok(Command::HarnessHealth {
+                identity: Identity::User("flynn".to_owned()),
+                incident_id: Some("hhi_1".to_owned()),
+            })
         );
     }
 
