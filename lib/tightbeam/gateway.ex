@@ -3569,8 +3569,6 @@ defmodule Tightbeam.Gateway do
               List.last(assistant_message_texts(result))
             )
 
-            Tightbeam.ReminderDelivery.delivered_in_txn(txn, turn.seq)
-
             health_publication =
               HarnessHealth.resolve_normal_turn_in_txn(txn, active_session, turn)
 
