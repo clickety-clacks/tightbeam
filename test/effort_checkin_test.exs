@@ -2141,15 +2141,19 @@ defmodule Tightbeam.EffortCheckinTest do
   end
 
   defp start_default_checkin_scheduler!(config) do
-    {Wakes, opts} =
-      config
-      |> Gateway.children_after_preflight()
-      |> Enum.find(&match?({Wakes, _}, &1))
-
     scheduler = :effort_default_checkin_scheduler
 
+    # Use the production check-in consumer with the real scheduler. Prompt
+    # delivery is outside this proof, so keep the resulting holder wake pending.
     start_supervised!(
-      {Wakes, Keyword.merge(opts, name: scheduler, tick_ms: 60_000)},
+      {Wakes,
+       db: config.db,
+       name: scheduler,
+       tick_ms: 60_000,
+       deliver: fn _wake -> :retry end,
+       internal_consumers: %{
+         "effort_probe" => &EffortCheckin.probe(config.db, config, &1)
+       }},
       id: scheduler
     )
 
