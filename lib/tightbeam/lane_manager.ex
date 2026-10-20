@@ -5,7 +5,8 @@ defmodule Tightbeam.LaneManager do
   """
 
   use GenServer
-  alias Tightbeam.{DB, HarnessHealth, Ledger, SessionLane}
+  require Logger
+  alias Tightbeam.{DB, HarnessHealth, HarnessProcess, Ledger, SessionLane}
 
   defstruct [
     :db,
@@ -16,6 +17,7 @@ defmodule Tightbeam.LaneManager do
     :interval,
     :terminal_publisher,
     :on_terminal,
+    park_recovery: nil,
     lanes: %{},
     reaping: %{}
   ]
@@ -145,6 +147,26 @@ defmodule Tightbeam.LaneManager do
     {:noreply, do_reconcile(state, true)}
   end
 
+  def handle_info({ref, {:ok, released}}, %{park_recovery: ref} = state) do
+    Process.demonitor(ref, [:flush])
+
+    # Only an observed release rings these doorbells. An empty recovery pass
+    # must not race the ordinary missed-doorbell detector or declare health.
+    if released != [] do
+      for session_key <- Ledger.pending_sessions(state.db) do
+        ensure(state, session_key)
+        SessionLane.nudge(session_key)
+      end
+    end
+
+    {:noreply, %{state | park_recovery: nil}}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{park_recovery: ref} = state) do
+    Logger.error("failed park recovery task exited: #{inspect(reason)}")
+    {:noreply, %{state | park_recovery: nil}}
+  end
+
   def handle_info({ref, result}, state) when is_map_key(state.reaping, ref) do
     Process.demonitor(ref, [:flush])
     if match?({:ok, [_ | _]}, result), do: republish_terminals(state, false)
@@ -167,6 +189,7 @@ defmodule Tightbeam.LaneManager do
   end
 
   defp reconcile_pass(state, detect) do
+    state = recover_failed_parks(state)
     republish_terminals(state, detect)
 
     Enum.reduce(Ledger.pending_sessions(state.db), state, fn session_key, acc ->
@@ -186,6 +209,17 @@ defmodule Tightbeam.LaneManager do
       end
     end)
   end
+
+  defp recover_failed_parks(%{park_recovery: nil} = state) do
+    task =
+      Task.Supervisor.async_nolink(state.task_sup, fn ->
+        DB.background_pass(fn -> HarnessProcess.reconcile_failed_parks(state.db) end, {:ok, []})
+      end)
+
+    %{state | park_recovery: task.ref}
+  end
+
+  defp recover_failed_parks(state), do: state
 
   defp republish_terminals(state, detect) do
     DB.background_pass(fn ->

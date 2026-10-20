@@ -1273,7 +1273,7 @@ defmodule Tightbeam.HarnessHealth do
 
   @doc "Resolve one class-specific open incident on normal-turn success."
   @spec resolve(DB.server(), map()) ::
-          {:resolved | :duplicate, map()} | :already_healthy | :repair_required
+          {:resolved | :duplicate, map()} | :already_healthy
   def resolve(db \\ DB, input) do
     input = input |> Map.put(:evidence_kind, "normal-turn-success") |> normalize_common!()
     transaction!(db, &resolve_in_txn(&1, input))
@@ -1281,19 +1281,17 @@ defmodule Tightbeam.HarnessHealth do
 
   @doc "The class-specific resolution mutation inside a caller-owned transaction."
   @spec resolve_in_txn(Txn.t(), map()) ::
-          {:resolved | :duplicate, map()} | :already_healthy | :repair_required
+          {:resolved | :duplicate, map()} | :already_healthy
   def resolve_in_txn(%Txn{} = txn, input) do
     input = input |> Map.put(:evidence_kind, "normal-turn-success") |> normalize_common!()
     validate_session_membership!(txn, input)
 
-    if input.failure_class == "rate-limit-dead" and
-         HarnessProcess.parked_in_txn?(txn, adapter_key(input.harness, input.host)) do
-      :repair_required
-    else
-      case observation_by_correlation(txn, input.correlation_id) do
-        nil -> resolve_open(txn, input)
-        prior -> duplicate_or_refuse!(txn, prior, input, "normal-turn-success")
-      end
+    # A normal turn may finish while another session opens the shared
+    # rate-limit park. Its observed success is recovery evidence even while
+    # that fence stands; requiring the fence to be gone would deadlock it.
+    case observation_by_correlation(txn, input.correlation_id) do
+      nil -> resolve_open(txn, input)
+      prior -> duplicate_or_refuse!(txn, prior, input, "normal-turn-success")
     end
   end
 
@@ -2774,9 +2772,13 @@ defmodule Tightbeam.HarnessHealth do
     unless observed_at <= accepted_at,
       do: raise(ArgumentError, "stale_other_evidence")
 
-    unless is_integer(valid_until) and valid_until > accepted_at and
-             valid_until <= observed_at + @other_max_validity_ms,
-           do: raise(ArgumentError, "invalid_other_evidence")
+    unless is_integer(valid_until) and valid_until > accepted_at,
+      do: raise(ArgumentError, "invalid_other_evidence")
+
+    if valid_until > observed_at + @other_max_validity_ms do
+      raise ArgumentError,
+            "invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
+    end
 
     unless evidence_mode in ~w(exact_error probe_digest),
       do: raise(ArgumentError, "invalid_other_evidence")

@@ -172,6 +172,9 @@ defmodule Tightbeam.GatewayTest do
     def start_link({parent, result}), do: GenServer.start_link(__MODULE__, {parent, result})
     def init(state), do: {:ok, state}
 
+    def handle_call({:close_adapter, key, _cleanup_scope}, from, state),
+      do: handle_call({:close_adapter, key}, from, state)
+
     def handle_call({:close_adapter, key}, _from, {parent, result} = state) do
       send(parent, {:repair_close_adapter, key})
       {:reply, result, state}
@@ -2853,22 +2856,6 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [["queued"]]} =
              DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [blocked_seq])
 
-    assert :repair_required =
-             HarnessHealth.resolve(ctx.db, %{
-               correlation_id: "rate-success-before-resume",
-               harness: "claude",
-               host: "testhost",
-               failure_class: "rate-limit-dead",
-               session_key: "k1",
-               assignment_id: nil,
-               observed_at: 61,
-               cause: "a concurrent turn delivered before explicit resume",
-               principal: "agent:k1"
-             })
-
-    assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
-    assert HarnessHealth.get(ctx.db, repair.incident.id).state == "open"
-
     {:ok, repair_coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
 
     handler =
@@ -3278,7 +3265,7 @@ defmodule Tightbeam.GatewayTest do
     assert HarnessProcess.parked?(ctx.db, adapter_key)
     assert HarnessHealth.get(ctx.db, incident.id).state == "open"
 
-    assert :repair_required =
+    assert {:resolved, resolved} =
              HarnessHealth.resolve(ctx.db, %{
                correlation_id: "rate-reconcile-race-normal-success",
                harness: session.harness,
@@ -3287,33 +3274,13 @@ defmodule Tightbeam.GatewayTest do
                session_key: "k1",
                assignment_id: nil,
                observed_at: 72,
-               cause: "normal success before explicit resume",
+               cause: "normal success while the recovered park fence stood",
                principal: "agent:k1"
              })
 
-    {:ok, repair_coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
-
-    handler =
-      ctx.catalog_base
-      |> gateway_config(ctx.db, 0)
-      |> Map.put(:adapter_coordinator, repair_coordinator)
-      |> Gateway.handlers()
-      |> Map.fetch!("repair-assignment")
-
-    assert %{ok: true, action: "resume"} =
-             handler.(%{
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
-               lane_manager: ctx.lane,
-               params: %{
-                 assignment_id: assignment_id,
-                 action: "resume",
-                 idempotency_key: "rate-reconcile-race-resume"
-               }
-             })
-
+    assert resolved.id == incident.id
+    assert HarnessHealth.get(ctx.db, incident.id).state == "resolved"
     refute HarnessProcess.parked?(ctx.db, adapter_key)
-    assert_receive {:repair_close_adapter, ^adapter_key}
   end
 
   @tag cold_gateway: true, gateway_no_harvest: true, tmp_dir: true

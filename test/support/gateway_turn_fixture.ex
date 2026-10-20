@@ -42,6 +42,9 @@ defmodule Tightbeam.GatewayTurnFixture do
     def handle_call({:acquire_load_slot, _machine, _borrower}, _from, state),
       do: {:reply, make_ref(), state}
 
+    def handle_call({:close_adapter, key, _cleanup_scope}, from, state),
+      do: handle_call({:close_adapter, key}, from, state)
+
     def handle_call({:close_adapter, key}, _from, {adapter, parent} = state) do
       if is_pid(parent), do: send(parent, {:close_adapter, key})
       GenServer.stop(adapter)
