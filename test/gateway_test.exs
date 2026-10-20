@@ -1980,6 +1980,8 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "harness-health handler retrieves active and historical redacted provenance", ctx do
+    secret = "historical-credential-like-cause"
+
     trace = %{
       captured_at: 1_000,
       health: %{
@@ -2004,14 +2006,20 @@ defmodule Tightbeam.GatewayTest do
     }
 
     assert {:opened, incident} =
-             HarnessHealth.observe_provider_invalidation(
-               ctx.db,
-               "codex",
-               "testhost",
-               %{"authStatus" => %{"kind" => "none"}},
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "historical-auth-observation",
+               harness: "codex",
+               host: "testhost",
+               failure_class: "auth-dead",
+               evidence_kind: "authoritative-provider",
+               session_key: nil,
+               assignment_id: nil,
+               observed_at: 1_000,
+               cause: secret,
+               principal: "process:historical-provider/#{secret}",
                credential_trace: trace,
                conn_registry: :missing_harness_health_registry
-             )
+             })
 
     handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["harness-health"]
     call = %{origin: "user:flynn", session_key: nil, params: %{}}
@@ -2026,6 +2034,13 @@ defmodule Tightbeam.GatewayTest do
     assert [retained] = detail.credentialHealthTrace
     assert retained.adapterSourceSha256 == String.duplicate("b", 64)
     assert retained.authMapping == "claude:classify_auth_event/1"
+
+    encoded = JSON.encode!(detail)
+    refute encoded =~ secret
+    refute Map.has_key?(detail, :observations)
+    refute Map.has_key?(detail, :affectedSessions)
+    refute Map.has_key?(detail, :affectedAssignments)
+    refute Map.has_key?(detail, :repair)
   end
 
   test "reconciliation cannot delete a rate-limit fence opened at its cleanup boundary", ctx do

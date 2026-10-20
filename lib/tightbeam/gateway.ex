@@ -5141,13 +5141,26 @@ defmodule Tightbeam.Gateway do
           incident_id when is_binary(incident_id) and incident_id != "" ->
             case HarnessHealth.get(db, incident_id) do
               nil -> %{code: "unknown_harness_health_incident"}
-              incident -> %{incident: incident}
+              incident -> %{incident: redacted_harness_health_incident(incident)}
             end
 
           _ ->
             %{incidents: HarnessHealth.active(db)}
         end
     end
+  end
+
+  defp redacted_harness_health_incident(incident) do
+    Map.take(incident, [
+      :id,
+      :harness,
+      :host,
+      :failureClass,
+      :state,
+      :openedAt,
+      :resolvedAt,
+      :credentialHealthTrace
+    ])
   end
 
   defp inspect_wake(db, wake, principal) do
