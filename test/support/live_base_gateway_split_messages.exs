@@ -198,7 +198,17 @@ defmodule GuardSplitMessages do
                            100
 
             :sys.get_state(Hub)
-            refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
+
+            # Session recovery may publish a context-reset message here; only
+            # a Firehose notice carrying the late assistant result is forbidden.
+            refute_receive {:firehose_notice,
+                            %{
+                              "class" => "message.created",
+                              "payload" => %{
+                                "role" => "assistant",
+                                "content" => "LATE ASSISTANT RESULT"
+                              }
+                            }}, 0
           after
             GenServer.stop(session_lane)
             Supervisor.stop(task_sup)
