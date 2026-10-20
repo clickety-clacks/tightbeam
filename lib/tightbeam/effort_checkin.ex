@@ -3,14 +3,15 @@ defmodule Tightbeam.EffortCheckin do
   Event-driven effort-without-effect brackets for assignments.
 
   EFFECT is any of, since the bracket armed: an artifact the holder recorded for
-  the assignment's work item, an attest on the assignment, or an update to that
-  work item. Turns and workspace writes are effort, never effect. Work done
+  the assignment's work item, an attest on the assignment, an update to that
+  work item, or a completed turn by the holder. A turn counts whether or not it
+  is attributed to this assignment. Workspace writes do not count. Work done
   elsewhere (another machine, a service, a person) is surfaced by RECORDING AN
   ARTIFACT on the card's work item.
 
-  Zero effect on every channel prods the AGENT first — one wake naming the three
-  channels. Only continued silence at the next bracket escalates to the owner's
-  decision request. Owners get decisions, not status.
+  No activity on any signal prods the AGENT first. Only continued silence at the
+  next bracket escalates to the owner's decision request. Owners get decisions,
+  not status.
 
   A placement observation is prepared before the callback transaction for rearm
   compatibility; it never counts as activity. The transaction then CASes the
@@ -1514,8 +1515,8 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  # The three activity channels, all read in the verdict's own transaction. Turns ride
-  # along as EFFORT — they are reported, never counted as effect.
+  # Activity channels are read in the verdict's own transaction. Holder turns
+  # are session-scoped, so a completed turn can count even when it has no card link.
   defp channels(txn, generation, _inspection) do
     %{
       artifacts: artifact_updates(txn, generation),
@@ -1531,7 +1532,8 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp effect?(channels) do
-    channels.artifacts > 0 or channels.attests > 0 or channels.workItems > 0
+    channels.artifacts > 0 or channels.attests > 0 or channels.workItems > 0 or
+      channels.turns > 0
   end
 
   defp artifact_updates(txn, generation) do
@@ -1672,7 +1674,7 @@ defmodule Tightbeam.EffortCheckin do
 
   defp channel_sentence(evidence) do
     "no artifacts, attests, or work-item updates observed since " <>
-      "#{evidence.minutesSinceArmed}m ago (#{evidence.turnsSinceArmed} turns taken)."
+      "#{evidence.minutesSinceArmed}m ago (#{evidence.turnsSinceArmed} completed holder turns)."
   end
 
   defp advanced_baseline(_baseline, {:ok, _observation} = inspection), do: inspection
