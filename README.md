@@ -304,7 +304,7 @@ runtime. Cleanup is conditional: keep intentional pins that the target supports.
    its conversation continues. Record the results before calling the upgrade
    successful. This checklist is not proof that an untested release works.
 
-**Recorded upgrade example (2026-09-05):** Gibson's Codex overlay was saved
+**Recorded upgrade example (2026-09-05):** A host's Codex overlay was saved
 with reported runtime version `0.153.2` and SHA-256
 `f8786262ebc0fa1337448a2977332beadec66c8d0cda0ce973c7849766d7943c`.
 The prior overlay was absent. The saved override was not activated, and no
@@ -584,10 +584,10 @@ meet the requirements above. `UserName` keeps the process off root.
   <key>WorkingDirectory</key><string>/Users/you</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>TIGHTBEAM_LOCAL_HOST_NAME</key><string>gibson</string>
+    <key>TIGHTBEAM_LOCAL_HOST_NAME</key><string>your-host</string>
     <key>TIGHTBEAM_BASE_DIR</key><string>/Users/you/.tightbeam</string>
     <key>TIGHTBEAM_PORT</key><string>11373</string>
-    <key>TIGHTBEAM_ADVERTISED_URL</key><string>ws://gibson.local:11373</string>
+    <key>TIGHTBEAM_ADVERTISED_URL</key><string>ws://your-host.local:11373</string>
     <key>PATH</key><string>/Users/you/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>
@@ -627,10 +627,10 @@ Group=you
 WorkingDirectory=/home/you
 # npm decides where -g bins land; use the output of: command -v tightbeam-gateway
 ExecStart=/home/you/.local/bin/tightbeam-gateway
-Environment=TIGHTBEAM_LOCAL_HOST_NAME=gibson
+Environment=TIGHTBEAM_LOCAL_HOST_NAME=your-host
 Environment=TIGHTBEAM_BASE_DIR=/home/you/.tightbeam
 Environment=TIGHTBEAM_PORT=11373
-Environment=TIGHTBEAM_ADVERTISED_URL=ws://gibson.local:11373
+Environment=TIGHTBEAM_ADVERTISED_URL=ws://your-host.local:11373
 Environment=PATH=/home/you/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 RestartSec=5s
