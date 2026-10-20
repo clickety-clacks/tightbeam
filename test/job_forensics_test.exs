@@ -19,7 +19,6 @@ defmodule Tightbeam.JobForensicsTest do
     Org,
     Roles,
     SubagentMarkers,
-    Supervision,
     Wakes,
     WorkItems
   }
@@ -253,7 +252,7 @@ defmodule Tightbeam.JobForensicsTest do
   test "proof 6: every cancel path stamps canceledAt", %{db: db} do
     session(db, "k1")
 
-    # Path 1: an origin-guarded authenticated requester.
+    # Path 1: the authenticated recorded sender.
     a = Wakes.schedule(db, %{session_key: "k1", origin: "user:flynn", prompt: "a", due_at: 1})
     assert public_cancel(db, a.wake_id, "user:flynn", %{kind: "user", id: "flynn"})
     assert is_integer(Wakes.get(db, a.wake_id).canceled_at)
@@ -282,7 +281,7 @@ defmodule Tightbeam.JobForensicsTest do
 
     # A refused cancel stamps nothing.
     c = Wakes.schedule(db, %{session_key: "k1", origin: "user:flynn", prompt: "c", due_at: 1})
-    refute public_cancel(db, c.wake_id, "user:someone-else", %{kind: "user", id: "flynn"})
+    refute public_cancel(db, c.wake_id, "user:flynn", %{kind: "user", id: "someone-else"})
     assert is_nil(Wakes.get(db, c.wake_id).canceled_at)
     assert Wakes.get(db, c.wake_id).state == "pending"
 
@@ -346,6 +345,7 @@ defmodule Tightbeam.JobForensicsTest do
     work_item(db, "wi_requester")
     :ok = DB.execute(db, "UPDATE work_items SET state='closed' WHERE id='wi_requester'")
     session(db, "requester-session")
+    session(db, "other-session")
 
     wake =
       Wakes.schedule(db, %{
@@ -361,17 +361,18 @@ defmodule Tightbeam.JobForensicsTest do
              cancel_via_gateway(
                db,
                wake.wake_id,
-               "agent:another-role",
-               {:session, "requester-session"}
+               "agent:reviewer",
+               {:session, "other-session"}
              )
 
     refute Enum.any?(trace(db, "wi_requester").timeline, &(&1.type == "wake_canceled"))
 
+    # A changed role label does not change the recorded sender.
     assert %{canceled: true} =
              cancel_via_gateway(
                db,
                wake.wake_id,
-               "agent:reviewer",
+               "agent:another-role",
                {:session, "requester-session"}
              )
 
@@ -384,11 +385,18 @@ defmodule Tightbeam.JobForensicsTest do
       reasonKind: "requester_withdrew",
       causalSourceKind: "verb_call",
       outcomeKind: "no_replacement",
-      primaryWorkKind: "work_item",
-      primaryWorkId: "wi_requester",
-      workImpactKind: "linked_work_not_open",
+      primaryWorkKind: nil,
+      primaryWorkId: nil,
+      workImpactKind: "no_linked_work",
       actionNeeded: false
     })
+
+    # Sender withdrawal does not evaluate linked-work liveness or dispose of it.
+    # The notice still retains its association for trace discovery.
+    assert Wakes.get(db, wake.wake_id).work_item_id == "wi_requester"
+
+    assert {:ok, [["closed"]]} =
+             DB.query(db, "SELECT state FROM work_items WHERE id='wi_requester'")
 
     assert is_binary(first.causalSourceId) and first.causalSourceId != ""
 
@@ -698,6 +706,24 @@ defmodule Tightbeam.JobForensicsTest do
     session(db, "open-holder")
     assignment(db, "asg_open_cancel", "wi_open_cancel", "open-holder")
 
+    opened_at = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
+               "asg_open_cancel",
+               opened_at
+             ])
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.Supervision.assignment_opened_in_txn(
+                 txn,
+                 "asg_open_cancel",
+                 opened_at,
+                 60_000
+               )
+             end)
+
     wake =
       Wakes.schedule(db, %{
         session_key: "open-holder",
@@ -732,27 +758,27 @@ defmodule Tightbeam.JobForensicsTest do
     assert Wakes.get(db, wake.wake_id).state == "pending"
     refute Enum.any?(trace(db, "wi_open_cancel").timeline, &(&1.type == "wake_canceled"))
 
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-        INSERT INTO supervision_entitlements
-          (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
-           basisKind, basisId, terminusAt, cause, principal, supervisionIntervalMs)
-        VALUES ('asg_open_cancel', 1, 1000, 'armed', NULL, NULL,
-                'assignment_open', 'asg_open_cancel', NULL, 'assignment_open',
-                'process:tightbeam', 1000)
-        """
-      )
+    assert {:ok, [[trigger_id]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               ["asg_open_cancel"]
+             )
 
-    valid_command =
-      put_in(command, [:outcome, :liveness_trigger], %{
-        kind: "supervision_entitlement",
-        id: "asg_open_cancel#1"
-      })
+    assert {:ok, true} =
+             DB.transaction(db, fn txn ->
+               {:ok, trigger} =
+                 Tightbeam.Supervision.inactivity_deadline_trigger_in_txn(
+                   txn,
+                   {:assignment, "asg_open_cancel"}
+                 )
 
-    {:ok, true} =
-      DB.transaction(db, fn txn -> typed_cancel_in_txn(txn, wake.wake_id, valid_command) end)
+               typed_cancel_in_txn(
+                 txn,
+                 wake.wake_id,
+                 put_in(command, [:outcome, :liveness_trigger], trigger)
+               )
+             end)
 
     entry = canceled_entry(db, "wi_open_cancel", wake.wake_id)
 
@@ -769,8 +795,8 @@ defmodule Tightbeam.JobForensicsTest do
       primaryWorkKind: "assignment",
       primaryWorkId: "asg_open_cancel",
       workImpactKind: "linked_work_open",
-      livenessTriggerKind: "supervision_entitlement",
-      livenessTriggerId: "asg_open_cancel#1",
+      livenessTriggerKind: "pending_wake",
+      livenessTriggerId: trigger_id,
       actionNeeded: true
     })
 
@@ -794,14 +820,9 @@ defmodule Tightbeam.JobForensicsTest do
                "SELECT COUNT(*) FROM attests WHERE assignmentId='asg_open_cancel' AND kind='progress'"
              )
 
-    assert {:ok, [["armed", 1, 1000]]} =
-             DB.query(
-               db,
-               "SELECT state, generation, dueAt FROM supervision_entitlements WHERE assignmentId='asg_open_cancel'"
-             )
-
+    # Later progress does not rewrite the recorded cancellation provenance.
     after_progress = canceled_entry(db, "wi_open_cancel", wake.wake_id)
-    assert after_progress.livenessTriggerId == "asg_open_cancel#1"
+    assert after_progress.livenessTriggerId == trigger_id
     assert after_progress.actionNeeded
   end
 
@@ -901,7 +922,17 @@ defmodule Tightbeam.JobForensicsTest do
 
     :ok = DB.execute(legacy_db, wakes_ddl <> ";")
 
-    # A predecessor fixture must exclude later delivery and cleanup columns too.
+    # Model an older schema that already had the retired supervision history
+    # columns. The 0.1.10 source migration must preserve these when restoring
+    # the newer notice columns below; it need not create them on a fresh store.
+    :ok =
+      DB.execute(legacy_db, """
+      ALTER TABLE wakes ADD COLUMN idleCleanupObserved INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE wakes ADD COLUMN idleCleanupGroup TEXT;
+      ALTER TABLE wakes ADD COLUMN idleCleanupRecorded INTEGER NOT NULL DEFAULT 0;
+      """)
+
+    # A predecessor fixture must exclude later delivery and source columns.
     :ok =
       DB.execute(legacy_db, """
       ALTER TABLE wakes DROP COLUMN sourceClientIdentity;
@@ -909,16 +940,13 @@ defmodule Tightbeam.JobForensicsTest do
       ALTER TABLE wakes DROP COLUMN sourceVisibilityScope;
       ALTER TABLE wakes DROP COLUMN sourceAddress;
       ALTER TABLE wakes DROP COLUMN deliveredTurnSeq;
-      ALTER TABLE wakes DROP COLUMN idleCleanupObserved;
-      ALTER TABLE wakes DROP COLUMN idleCleanupGroup;
-      ALTER TABLE wakes DROP COLUMN idleCleanupRecorded;
       """)
 
     assert {:ok, []} =
              DB.query(legacy_db, """
              SELECT name FROM pragma_table_info('wakes')
              WHERE name IN ('sourceClientIdentity','sourceAttachments','sourceVisibilityScope','sourceAddress',
-                            'deliveredTurnSeq','idleCleanupObserved','idleCleanupGroup','idleCleanupRecorded')
+                            'deliveredTurnSeq')
              """)
 
     :ok =
@@ -988,89 +1016,6 @@ defmodule Tightbeam.JobForensicsTest do
     )
   end
 
-  ## Proofs 2 + 3 — supervision prods, and prod-turn attribution end to end
-
-  test "proofs 2 and 3: a prod carries its tier, its wake carries the assignment, and the delivered turn is attributed",
-       ctx do
-    db = ctx.db
-    work_item(db, "wi_prod")
-    session(db, "supervisor")
-    session(db, "holder", "supervisor")
-    assignment(db, "asg_prod", "wi_prod", "holder")
-    insert_entitlement!(db, "asg_prod")
-    handlers = Gateway.handlers(%{db: db, base_dir: System.tmp_dir!(), default_harness: :claude})
-
-    seq = turn(db, "holder", status: "delivered")
-    assert {:prodded, 1} = Supervision.evaluate(db, handlers, 3, "holder", seq)
-
-    assert [%{kind: "prod_fired"} = fired] = CausalEvents.for_job(db, "wi_prod", [])
-    assert fired.detail["tier"] == 1
-    assert fired.assignment_id == "asg_prod"
-    assert fired.job_ref == "wi_prod"
-    assert fired.session_key == "holder"
-
-    # The wake now CARRIES the assignment — v1's missing durable carrier.
-    [prod] = Wakes.list_pending(db)
-    assert prod.assignment_id == "asg_prod"
-
-    assert :appended =
-             Gateway.deliver_prompt(prod.session_key, prod.origin, prod.prompt,
-               db: db,
-               wake_id: prod.wake_id,
-               sender: prod.origin,
-               target_gate: prod,
-               fire_wake_in_txn: true,
-               conn_registry: ctx.registry,
-               lane_manager: ctx.lane
-             )
-
-    # ...so the delivered turn is stamped with BOTH carriers.
-    assert {:ok, [["asg_prod", "wi_prod"]]} =
-             DB.query(db, "SELECT assignmentId, jobRef FROM turns WHERE wakeId = ?1", [
-               prod.wake_id
-             ])
-
-    # ...and therefore appears in the trace, closing the v1 exclusion.
-    timeline = trace(db, "wi_prod").timeline
-
-    assert Enum.any?(timeline, fn
-             %{type: "turn_start", assignmentId: "asg_prod", jobRef: "wi_prod"} -> true
-             _ -> false
-           end)
-
-    assert Enum.any?(timeline, &(&1.type == "causal_event" and &1.kind == "prod_fired"))
-  end
-
-  test "proof 2: vague attests do not mint legacy prod_answered events", ctx do
-    db = ctx.db
-    work_item(db, "wi_answer")
-    session(db, "supervisor")
-    session(db, "holder", "supervisor")
-    assignment(db, "asg_answer", "wi_answer", "holder")
-    insert_entitlement!(db, "asg_answer")
-    handlers = Gateway.handlers(%{db: db, base_dir: System.tmp_dir!(), default_harness: :claude})
-
-    assert {:prodded, 1} = evaluate(db, handlers, "holder")
-    assert answered(db) == []
-
-    # TWO untyped completion claims land between evaluations. Neither is a
-    # liveness receipt and the retired causal kind stays empty.
-    attest(db, "att_b", "asg_answer")
-    attest(db, "att_a", "asg_answer")
-
-    evaluate(db, handlers, "holder")
-    assert answered(db) == []
-
-    # Re-evaluating sees nothing new: this table is its own watermark.
-    evaluate(db, handlers, "holder")
-    assert answered(db) == []
-
-    # A later vague claim also remains inert.
-    attest(db, "att_c", "asg_answer")
-    evaluate(db, handlers, "holder")
-    assert answered(db) == []
-  end
-
   test "proof 2: an effort rung advance records the rung and expecter it left", ctx do
     db = ctx.db
     work_item(db, "wi_effort")
@@ -1122,14 +1067,14 @@ defmodule Tightbeam.JobForensicsTest do
     assignment(db, "asg_rank", "wi_rank")
     turn(db, "holder", assignment_id: "asg_rank", job_ref: "wi_rank", status: "delivered")
 
-    for kind <- ["prod_fired", "disposition_transition"] do
+    for kind <- ["disposition_transition"] do
       {:ok, :ok} =
         DB.transaction(db, fn txn ->
           CausalEvents.append_in_txn(txn, %{
             kind: kind,
             at: 50,
             job_ref: "wi_rank",
-            assignment_id: if(kind == "prod_fired", do: "asg_rank"),
+            assignment_id: "asg_rank",
             detail: %{tier: 1, workItemId: "wi_rank", fromState: "open", toState: "closed"}
           })
         end)
@@ -1143,77 +1088,14 @@ defmodule Tightbeam.JobForensicsTest do
     assert Enum.map(v1_types, & &1.type) == ["turn_start", "turn_end"]
 
     causal = Enum.filter(timeline, &(&1.type == "causal_event"))
-    assert length(causal) == 2
+    assert length(causal) == 1
+    assert hd(causal).kind == "disposition_transition"
     assert Enum.map(causal, & &1.seqTiebreak) == Enum.sort(Enum.map(causal, & &1.seqTiebreak))
     assert Enum.all?(causal, &String.starts_with?(&1.id, "ce:"))
 
     # Equal `at` -> rank decides: causal_event (5) sorts after decision_request
     # (4) and before effort_generation (6), and turn_end (8) stays last.
     assert List.last(timeline).type == "turn_end"
-  end
-
-  ## Cross-review regressions (Sol CHANGES-REQUIRED, 2026-07-26)
-
-  test "F5: the retired prod_answered writer does not reinterpret attest history", ctx do
-    db = ctx.db
-    work_item(db, "wi_pre")
-    session(db, "supervisor")
-    session(db, "holder", "supervisor")
-    assignment(db, "asg_pre", "wi_pre", "holder")
-    insert_entitlement!(db, "asg_pre")
-    handlers = Gateway.handlers(%{db: db, base_dir: System.tmp_dir!(), default_harness: :claude})
-
-    # The v2-epoch cutoff is when causal_events was created; PRE-v2 attests are the
-    # ones filed before it. `attestCount` is deliberately left stale here (0) so
-    # the bound cannot be coming from the counter — only the timestamp floor can
-    # keep these three out.
-    cutoff = CausalEvents.epoch(db)
-
-    for id <- ["att_old_a", "att_old_b", "att_old_c"],
-        do: attest(db, id, "asg_pre", cutoff - 5_000)
-
-    assert answered(db) == []
-
-    # ONE attest arrives AFTER the cutoff.
-    attest(db, "att_new", "asg_pre", cutoff + 1_000)
-    evaluate(db, handlers, "holder")
-
-    assert answered(db) == [], "attest history is not a liveness receipt"
-
-    # A later evaluation still never reaches back across the cutoff.
-    attest(db, "att_newer", "asg_pre", cutoff + 2_000)
-    evaluate(db, handlers, "holder")
-    assert answered(db) == []
-  end
-
-  test "F5: a stale pre-v2 aggregate cannot revive the retired writer", ctx do
-    db = ctx.db
-    work_item(db, "wi_stale")
-    session(db, "supervisor")
-    session(db, "holder", "supervisor")
-    assignment(db, "asg_stale", "wi_stale", "holder")
-    insert_entitlement!(db, "asg_stale")
-    handlers = Gateway.handlers(%{db: db, base_dir: System.tmp_dir!(), default_harness: :claude})
-
-    cutoff = CausalEvents.epoch(db)
-    for id <- ["att_p1", "att_p2", "att_p3"], do: attest(db, id, "asg_stale", cutoff - 9_000)
-
-    # An UNDERSTATED aggregate — the shape a pre-v2 row takes after a prod reset,
-    # and the one that breaks a count-delta bound: delta would be 4-0=4, sweeping
-    # all three historical attests along with the new one. attestCount is a
-    # MUTABLE aggregate, which is exactly why the bound cannot be built on it.
-    :ok =
-      DB.execute(db, """
-      INSERT INTO assignment_prods
-        (assignmentId, attemptCount, prodCount, deniedStreak, attestCount)
-      VALUES ('asg_stale', 0, 1, 0, 0)
-      """)
-
-    attest(db, "att_after", "asg_stale", cutoff + 500)
-    evaluate(db, handlers, "holder")
-
-    assert answered(db) == [],
-           "a mutable aggregate cannot turn attest history into receipts"
   end
 
   test "F6: an agent cannot forge wake or turn attribution", ctx do
@@ -1269,44 +1151,6 @@ defmodule Tightbeam.JobForensicsTest do
 
   ## Helpers
 
-  defp insert_entitlement!(db, assignment_id) do
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-        INSERT INTO supervision_entitlements
-          (assignmentId,generation,dueAt,state,lastAttemptGeneration,claimClock,
-           basisKind,basisId,terminusAt,cause,principal,supervisionIntervalMs)
-        VALUES (?1,1,0,'armed',NULL,NULL,'assignment_open',?1,NULL,
-                'assignment_open','process:tightbeam',60000)
-        """,
-        [assignment_id]
-      )
-
-    :ok
-  end
-
-  # One turn-end shift. A prod leaves a PENDING wake, and the turn-end schedule's
-  # pending-wake gate halts before the ladder while one exists — delivery is what
-  # clears it in production, so fire it here.
-  defp evaluate(db, handlers, session_key) do
-    {:ok, _} =
-      DB.query(db, "UPDATE wakes SET state = 'fired', firedAt = 1 WHERE state = 'pending'")
-
-    seq = turn(db, session_key, status: "delivered")
-    Supervision.evaluate(db, handlers, 3, session_key, seq)
-  end
-
-  defp answered(db) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT json_extract(detail, '$.byAttestId') FROM causal_events WHERE kind = 'prod_answered' ORDER BY seq"
-      )
-
-    Enum.map(rows, &hd/1)
-  end
-
   defp trace(db, work_item_id) do
     WorkItems.__handle__(db, "work-item-trace", %{
       verb: "work-item-trace",
@@ -1340,16 +1184,6 @@ defmodule Tightbeam.JobForensicsTest do
       DB.execute(db, """
       INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt, state, workItemId)
       VALUES ('#{id}', 'subject #{id}', '#{holder}', 'flynn', 1, 'open', '#{work_item_id}')
-      """)
-  end
-
-  defp attest(db, id, assignment_id, ts \\ nil) do
-    ts = ts || System.system_time(:millisecond)
-
-    :ok =
-      DB.execute(db, """
-      INSERT INTO attests (id, assignmentId, kind, bySession, ts)
-      VALUES ('#{id}', '#{assignment_id}', 'completion', 'holder', #{ts})
       """)
   end
 

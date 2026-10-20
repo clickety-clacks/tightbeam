@@ -28,6 +28,8 @@ defmodule Tightbeam.WorkItems do
   }
 
   alias Tightbeam.DB.Txn
+
+  require Logger
   alias Tightbeam.Firehose.Publisher
 
   @origin "process:tightbeam"
@@ -303,6 +305,10 @@ defmodule Tightbeam.WorkItems do
       updated = fetch_in_txn(txn, item.id)
       changed? = metadata(item) != metadata(updated)
 
+      if item.deliveryOwnerSessionKey != updated.deliveryOwnerSessionKey do
+        Wakes.readdress_accountability_notices_in_txn(txn, item.id)
+      end
+
       if changed?, do: stamp_version_in_txn(txn, item.id, now())
       {:updated, fetch_in_txn(txn, item.id), changed?}
     end
@@ -462,7 +468,9 @@ defmodule Tightbeam.WorkItems do
 
     values = [item.id | Enum.map(updates, &elem(&1, 1))]
     Txn.q(txn, "UPDATE work_items SET #{assignments} WHERE id = ?1", values)
-    fetch_in_txn(txn, item.id)
+    updated = fetch_in_txn(txn, item.id)
+
+    updated
   end
 
   defp patch_spec_ref(item, params) do
@@ -780,11 +788,9 @@ defmodule Tightbeam.WorkItems do
   def arm_slate_in_txn(%Txn{} = _txn, nil), do: :ok
 
   @doc """
-  Re-arm the bracket wake being delivered, IN the delivery transaction, when
-  the item is still unrouted/un-iceboxed (bracket 1) or the slate is still
-  clear (bracket 2). The match on `routingWakeId`/`slateWakeId` is the sole
-  discriminator: a rumination or ordinary wake never matches, so it no-ops.
-  Nag-by-re-arm: the supervision lattice does not watch holderless work.
+  Re-arm a still-current routing or slate bracket after its durable delivery
+  record commits. The pointer match is the discriminator, so a replay or an
+  unrelated notice cannot advance the bracket twice.
   """
   @spec rearm_on_fire_in_txn(Txn.t(), String.t() | nil, map() | nil) :: :ok
   def rearm_on_fire_in_txn(%Txn{} = txn, wake_id, %{work_item_id: item_id})
@@ -827,6 +833,87 @@ defmodule Tightbeam.WorkItems do
   end
 
   def rearm_on_fire_in_txn(%Txn{} = _txn, _wake_id, _gate), do: :ok
+
+  @doc false
+  @spec reconcile_delivered_brackets(DB.server(), String.t(), String.t()) ::
+          :ok | {:error, term()}
+  def reconcile_delivered_brackets(db, recipient_session_key, delivered_wake_id)
+      when is_binary(recipient_session_key) and is_binary(delivered_wake_id) do
+    case DB.transaction(db, fn txn ->
+           txn
+           |> delivered_bracket_sources_for_wake(recipient_session_key, delivered_wake_id)
+           |> reconcile_delivered_bracket_rows(txn)
+         end) do
+      {:ok, []} -> :ok
+      {:ok, failures} -> {:error, {:source_action_failed, failures}}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp delivered_bracket_sources_for_wake(txn, session_key, wake_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT item_id,wake_id,wake_rowid FROM (
+        SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
+        FROM work_items wi JOIN wakes w ON w.wakeId=wi.routingWakeId
+        WHERE wi.state='open' AND w.deliveredTurnSeq IS NOT NULL
+          AND w.sessionKey=?2 AND w.wakeId=?1
+        UNION ALL
+        SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
+        FROM work_items wi JOIN wakes w ON w.wakeId=wi.slateWakeId
+        WHERE wi.state='open' AND w.deliveredTurnSeq IS NOT NULL
+          AND w.sessionKey=?2 AND w.wakeId=?1
+        UNION ALL
+        SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
+        FROM notice_batches b
+        JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
+        JOIN wakes w ON w.wakeId=m.sourceWakeId
+        JOIN work_items wi ON wi.routingWakeId=w.wakeId
+        WHERE b.deliveryWakeId=?1 AND b.state='delivered'
+          AND w.sessionKey=?2 AND w.deliveredTurnSeq IS NOT NULL AND wi.state='open'
+        UNION ALL
+        SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
+        FROM notice_batches b
+        JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
+        JOIN wakes w ON w.wakeId=m.sourceWakeId
+        JOIN work_items wi ON wi.slateWakeId=w.wakeId
+        WHERE b.deliveryWakeId=?1 AND b.state='delivered'
+          AND w.sessionKey=?2 AND w.deliveredTurnSeq IS NOT NULL AND wi.state='open'
+      ) ORDER BY wake_rowid
+      """,
+      [wake_id, session_key]
+    )
+  end
+
+  defp reconcile_delivered_bracket_rows(rows, txn) do
+    Enum.reduce(rows, [], fn
+      [work_item_id, wake_id, wake_rowid], failures
+      when is_binary(wake_id) and is_binary(work_item_id) and is_integer(wake_rowid) ->
+        :ok = Txn.exec(txn, "SAVEPOINT reconcile_work_item_bracket")
+
+        try do
+          :ok = rearm_on_fire_in_txn(txn, wake_id, %{work_item_id: work_item_id})
+          :ok = Txn.exec(txn, "RELEASE reconcile_work_item_bracket")
+          failures
+        rescue
+          error ->
+            :ok = Txn.exec(txn, "ROLLBACK TO reconcile_work_item_bracket")
+            :ok = Txn.exec(txn, "RELEASE reconcile_work_item_bracket")
+
+            Logger.warning(
+              "work-item bracket action failed for #{wake_id}: #{Exception.message(error)}"
+            )
+
+            [wake_id | failures]
+        end
+
+      malformed, failures ->
+        Logger.warning("malformed delivered work-item bracket ignored: #{inspect(malformed)}")
+        failures
+    end)
+    |> Enum.reverse()
+  end
 
   defp arm_routing_in_txn(txn, id, owner, title) do
     wake =

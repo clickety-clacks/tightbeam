@@ -60,7 +60,7 @@ defmodule Tightbeam.HarnessHealthTest do
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: "default",
-      host: "gibson",
+      host: "testhost",
       harness: "codex",
       provider: "openai",
       model: Model.new("gpt-5")
@@ -76,7 +76,7 @@ defmodule Tightbeam.HarnessHealthTest do
           owner_user_id: "flynn",
           origin: "user:flynn",
           archetype: "coder",
-          host: "gibson",
+          host: "testhost",
           harness: "claude",
           provider: "anthropic",
           model: Model.new("claude-fable-5")
@@ -136,7 +136,7 @@ defmodule Tightbeam.HarnessHealthTest do
              HarnessHealth.observe(ctx.db, failure(first, "auth-dead", 1_000, "failure-1"))
 
     assert HarnessHealth.active(ctx.db) == []
-    refute ConditionFacts.harness_unavailable?(ctx.db, "claude", "gibson")
+    refute ConditionFacts.harness_unavailable?(ctx.db, "claude", "testhost")
 
     assert {:pending, %{distinctSessions: 1}} =
              HarnessHealth.observe(
@@ -161,7 +161,7 @@ defmodule Tightbeam.HarnessHealthTest do
              )
 
     assert opened.failureClass == "auth-dead"
-    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "auth-dead")
+    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "testhost", "auth-dead")
 
     incident = HarnessHealth.get(ctx.db, opened.id)
     assert incident.affectedSessions == Enum.sort(Enum.map(ctx.sessions, & &1.session))
@@ -191,12 +191,12 @@ defmodule Tightbeam.HarnessHealthTest do
     assert Enum.map(HarnessHealth.active(ctx.db), & &1.failureClass) ==
              ["auth-dead", "rate-limit-dead"]
 
-    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "auth-dead")
+    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "testhost", "auth-dead")
 
     assert ConditionFacts.harness_failure_standing?(
              ctx.db,
              "claude",
-             "gibson",
+             "testhost",
              "rate-limit-dead"
            )
   end
@@ -207,7 +207,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
     input = %{
       harness: "claude",
-      host: "gibson",
+      host: "testhost",
       source_session_key: member.session,
       principal: {:session, member.session},
       description: "provider returned an unclassified transport failure",
@@ -230,7 +230,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:opened, opened} = HarnessHealth.observe_other(ctx.db, input)
     assert opened.failureClass == "other"
     assert HarnessHealth.get(ctx.db, opened.id).repair.action == "review"
-    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "other")
+    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "testhost", "other")
 
     assert {:duplicate, duplicate} = HarnessHealth.observe_other(ctx.db, input)
     assert duplicate["id"] == opened.id
@@ -249,7 +249,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
     recovery = %{
       harness: "claude",
-      host: "gibson",
+      host: "testhost",
       incident_id: opened.id,
       session_key: member.session,
       principal: {:session, member.session},
@@ -270,7 +270,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
     assert {:resolved, resolved} = HarnessHealth.resolve_other(ctx.db, recovery)
     assert resolved.state == "resolved"
-    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "other")
+    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "testhost", "other")
   end
 
   test "other evidence validity accepts the 15-minute boundary and explains excess validity",
@@ -345,7 +345,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:opened, opened} =
              HarnessHealth.observe_other(ctx.db, %{
                harness: "claude",
-               host: "gibson",
+               host: "testhost",
                source_session_key: child.session,
                principal: {:session, child.session},
                description: "owner main appears as ancestor",
@@ -419,7 +419,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:opened, opened} =
              HarnessHealth.observe_other(ctx.db, %{
                harness: "claude",
-               host: "gibson",
+               host: "testhost",
                source_session_key: child.session,
                principal: {:session, child.session},
                description: "idle route identity evidence",
@@ -489,9 +489,12 @@ defmodule Tightbeam.HarnessHealthTest do
                [opened.id, parent_session]
              )
 
-    # Restart reconciliation must not settle against the unrelated delivered turn.
+    # Restart reconciliation must not settle against the unrelated delivered turn
+    # or publish a later rung while the actual recipient still has queued work.
+    assert {:ok, queued_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
     assert :ok = HarnessHealth.resume_other_routes(ctx.db)
     assert :ok = HarnessHealth.resume_other_routes(ctx.db)
+    assert {:ok, ^queued_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
 
     assert {:ok, [["pending", ^turn_seq]]} =
              DB.query(
@@ -551,7 +554,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:opened, opened} =
              HarnessHealth.observe_other(ctx.db, %{
                harness: "claude",
-               host: "gibson",
+               host: "testhost",
                source_session_key: child.session,
                principal: {:session, child.session},
                description: "busy route batching evidence",
@@ -616,11 +619,25 @@ defmodule Tightbeam.HarnessHealthTest do
 
     assert content =~ original_prompt
 
-    assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [expected_wake_id])
+    # Delivery persists the receipt but does not mutate the source owner's route.
+    # The boot recovery path must bind it even if no delivery callback survived.
+    assert Wakes.get(ctx.db, expected_wake_id).delivered_turn_seq == turn_seq
+
+    assert {:ok, [[nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT turnSeq FROM harness_health_other_routes WHERE noticeWakeId=?1",
+               [expected_wake_id]
+             )
 
     assert {:ok, before_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
     assert {:ok, before_messages} = DB.query(ctx.db, "SELECT * FROM messages ORDER BY seq")
+
+    assert :ok = HarnessHealth.resume_other_routes(ctx.db)
+    assert :ok = HarnessHealth.resume_other_routes(ctx.db)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [expected_wake_id])
 
     assert {:ok, {:duplicate, %{wake_id: ^carrier_id, turn_seq: ^turn_seq}}} =
              DB.transaction(ctx.db, fn txn ->
@@ -647,6 +664,135 @@ defmodule Tightbeam.HarnessHealthTest do
              )
   end
 
+  for clearing <- [:resolved, :expired] do
+    test "a #{clearing} incident retracts its undelivered review notice", ctx do
+      registry = :"health_clear_registry_#{System.unique_integer([:positive])}"
+      lane = :"health_clear_lane_#{System.unique_integer([:positive])}"
+      start_supervised!({Tightbeam.ConnRegistry, name: registry})
+      start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
+
+      [child, parent | _] = ctx.sessions
+      parent_session = parent.session
+      at = System.system_time(:millisecond)
+
+      assert {:ok, []} =
+               DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
+                 child.session,
+                 parent.session
+               ])
+
+      {:appended, current_message} =
+        Projection.append(ctx.db, %{
+          session_key: parent.session,
+          role: "user",
+          content: "current bounded work",
+          sender: "session:#{parent.session}"
+        })
+
+      {:ok, current_seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: parent.session,
+          message_id: current_message.id,
+          origin: "session:#{parent.session}",
+          prompt: "current bounded work"
+        })
+
+      assert {:ok, %{seq: ^current_seq, owner_lease: lease}} =
+               Ledger.claim_next(ctx.db, parent.session, "other-route-clearing")
+
+      assert {:opened, opened} =
+               HarnessHealth.observe_other(ctx.db, %{
+                 harness: "claude",
+                 host: "testhost",
+                 source_session_key: child.session,
+                 principal: {:session, child.session},
+                 description: "clearing route evidence",
+                 evidence_mode: "exact_error",
+                 observed_state: "provider route failed",
+                 exact_observed_error: "clearing route reset",
+                 exact_probe: "provider health probe",
+                 recovery_condition: "a normal provider turn completes",
+                 not_known_class_reason: "not one of the named classes",
+                 observed_at: at,
+                 accepted_at: at,
+                 valid_until: at + 500,
+                 world_status: "UNKNOWN",
+                 redaction_confirmed: true,
+                 idempotency_key: "clearing-route"
+               })
+
+      wake_id = "other-review:#{opened.id}:#{parent_session}"
+      assert Wakes.get(ctx.db, wake_id).state == "pending"
+
+      case unquote(clearing) do
+        :resolved ->
+          probe = "normal turn #{at + 1} delivered"
+
+          assert {:resolved, _} =
+                   HarnessHealth.resolve_other(ctx.db, %{
+                     harness: "claude",
+                     host: "testhost",
+                     incident_id: opened.id,
+                     session_key: child.session,
+                     principal: {:session, child.session},
+                     observed_state: "normal turn delivered",
+                     exact_probe: probe,
+                     output_digest: :crypto.hash(:sha256, probe) |> Base.encode16(case: :lower),
+                     recovery_condition_digest:
+                       :crypto.hash(:sha256, "a normal provider turn completes")
+                       |> Base.encode16(case: :lower),
+                     recovery_satisfied: true,
+                     world_status: "PROVEN",
+                     redaction_confirmed: true,
+                     cause: "normal turn delivered",
+                     observed_at: at + 1,
+                     accepted_at: at + 1,
+                     idempotency_key: "clearing-route-recovery"
+                   })
+
+        :expired ->
+          assert {:ok, :available} =
+                   DB.transaction(ctx.db, fn txn ->
+                     HarnessHealth.prod_shape_gate_in_txn(txn, "claude", "testhost", at + 1_000)
+                   end)
+      end
+
+      assert Wakes.get(ctx.db, wake_id).state == "canceled"
+
+      assert {:ok,
+              [
+                [
+                  "tightbeam:harness-health",
+                  "condition_cleared",
+                  "harness_health_transition",
+                  causal_id
+                ]
+              ]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT requesterId,reasonKind,causalSourceKind,causalSourceId FROM wake_cancellations WHERE wakeId=?1",
+                 [wake_id]
+               )
+
+      assert causal_id == opened.id
+
+      assert :ok = Ledger.finish(ctx.db, current_seq, "delivered", nil, owner_lease: lease)
+
+      Tightbeam.NoticeBatcher.recover(ctx.db, at + 2_000,
+        conn_registry: registry,
+        lane_manager: lane
+      )
+
+      refute Enum.any?(
+               Tightbeam.NoticeBatcher.source_refs(ctx.db, wake_id),
+               &(&1.member_state == "included")
+             )
+
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
+    end
+  end
+
   test "non-delivered route settlement publishes the next rung once", ctx do
     [child, parent | _] = ctx.sessions
     at = System.system_time(:millisecond)
@@ -660,7 +806,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:opened, opened} =
              HarnessHealth.observe_other(ctx.db, %{
                harness: "claude",
-               host: "gibson",
+               host: "testhost",
                source_session_key: child.session,
                principal: {:session, child.session},
                description: "route settlement evidence",
@@ -749,7 +895,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:opened, opened} =
              HarnessHealth.observe_other(ctx.db, %{
                harness: "claude",
-               host: "gibson",
+               host: "testhost",
                source_session_key: child.session,
                principal: {:session, child.session},
                description: "restart route evidence",
@@ -839,7 +985,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:opened, opened} =
              HarnessHealth.observe_other(ctx.db, %{
                harness: "claude",
-               host: "gibson",
+               host: "testhost",
                source_session_key: member.session,
                principal: {:session, member.session},
                description: "record-only route evidence",
@@ -875,7 +1021,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:duplicate, _} =
              HarnessHealth.observe_other(ctx.db, %{
                harness: "claude",
-               host: "gibson",
+               host: "testhost",
                source_session_key: member.session,
                principal: {:session, member.session},
                description: "record-only route evidence",
@@ -908,7 +1054,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:opened, opened} =
              HarnessHealth.observe_other(ctx.db, %{
                harness: "claude",
-               host: "gibson",
+               host: "testhost",
                source_session_key: member.session,
                principal: {:session, member.session},
                description: "route guard evidence",
@@ -966,7 +1112,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:opened, opened} =
              HarnessHealth.observe_other(ctx.db, %{
                harness: "claude",
-               host: "gibson",
+               host: "testhost",
                source_session_key: member.session,
                principal: {:session, member.session},
                description: "promotion requires recurrence",
@@ -1001,7 +1147,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:opened, known_incident} =
              HarnessHealth.observe_other(ctx.db, %{
                harness: "claude",
-               host: "gibson",
+               host: "testhost",
                source_session_key: member.session,
                principal: {:session, member.session},
                description: "known-class first reclassification",
@@ -1032,7 +1178,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:opened, new_incident} =
              HarnessHealth.observe_other(ctx.db, %{
                harness: "claude",
-               host: "gibson",
+               host: "testhost",
                source_session_key: member.session,
                principal: {:session, member.session},
                description: "new-class first reclassification",
@@ -1068,7 +1214,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
     common = %{
       harness: "claude",
-      host: "gibson",
+      host: "testhost",
       source_session_key: member.session,
       principal: {:session, member.session},
       description: description,
@@ -1380,7 +1526,7 @@ defmodule Tightbeam.HarnessHealthTest do
       owner_user_id: "zoe",
       origin: "user:zoe",
       archetype: "default",
-      host: "gibson",
+      host: "testhost",
       harness: "codex",
       provider: "openai",
       model: Model.new("gpt-5")
@@ -1392,7 +1538,7 @@ defmodule Tightbeam.HarnessHealthTest do
       owner_user_id: "zoe",
       origin: "user:zoe",
       archetype: "coder",
-      host: "gibson",
+      host: "testhost",
       harness: "claude",
       provider: "anthropic",
       model: Model.new("claude-fable-5")
@@ -1413,7 +1559,7 @@ defmodule Tightbeam.HarnessHealthTest do
              HarnessHealth.observe_provider_invalidation(
                ctx.db,
                "claude",
-               "gibson",
+               "testhost",
                %{"authMode" => nil, "planType" => nil},
                conn_registry: :missing_harness_health_registry
              )
@@ -1422,7 +1568,7 @@ defmodule Tightbeam.HarnessHealthTest do
              HarnessHealth.observe_provider_invalidation(
                ctx.db,
                "claude",
-               "gibson",
+               "testhost",
                %{"authMode" => nil, "planType" => nil},
                conn_registry: :missing_harness_health_registry
              )
@@ -1779,7 +1925,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
     assert HarnessHealth.active(ctx.db) == []
     assert HarnessHealth.get(ctx.db, incident.id).state == "resolved"
-    refute HarnessHealth.unavailable?(ctx.db, "claude", "gibson")
+    refute HarnessHealth.unavailable?(ctx.db, "claude", "testhost")
 
     assert {:ok, [[first_source_seq]]} =
              DB.query(
@@ -2811,7 +2957,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
     resolution = %{
       harness: "claude",
-      host: "gibson",
+      host: "testhost",
       failure_class: "auth-dead",
       session_key: first.session,
       assignment_id: first.assignment,
@@ -2824,7 +2970,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:resolved, resolved} = HarnessHealth.resolve(ctx.db, resolution)
     assert resolved.id == opened.id
     assert resolved.state == "resolved"
-    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "auth-dead")
+    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "testhost", "auth-dead")
 
     assert {:duplicate, duplicate} = HarnessHealth.resolve(ctx.db, resolution)
     assert duplicate.id == opened.id
@@ -2861,7 +3007,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:opened, opened} =
              HarnessHealth.observe_other(ctx.db, %{
                harness: "claude",
-               host: "gibson",
+               host: "testhost",
                source_session_key: member.session,
                principal: {:session, member.session},
                description: description,
@@ -2953,7 +3099,7 @@ defmodule Tightbeam.HarnessHealthTest do
   test "evidence cannot claim a different shared harness membership", ctx do
     input = %{
       harness: "claude",
-      host: "gibson",
+      host: "testhost",
       failure_class: "auth-dead",
       evidence_kind: "terminal-failure",
       session_key: ctx.outside_session,
@@ -2986,7 +3132,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM harness_health_observations")
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM harness_health_incidents")
 
-    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "auth-dead")
+    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "testhost", "auth-dead")
 
     refute Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
              event.kind == "harness_health_incident_opened"
@@ -3098,7 +3244,7 @@ defmodule Tightbeam.HarnessHealthTest do
   defp failure(ref, failure_class, observed_at, correlation_id) do
     %{
       harness: "claude",
-      host: "gibson",
+      host: "testhost",
       failure_class: failure_class,
       evidence_kind: "terminal-failure",
       session_key: ref.session,

@@ -64,7 +64,7 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, %{"post" => fn _ -> %{ok: true} end}, call())
   end
 
-  test "shipped wait qualification matrix follows TOML reload with a fresh query snapshot", ctx do
+  test "shipped wait effort-relief policy follows TOML reload with a fresh query snapshot", ctx do
     shipped =
       File.read!(
         Path.expand("../priv/kungfu/agentic-engineering/rules/verification.toml", __DIR__)
@@ -76,8 +76,6 @@ defmodule Tightbeam.RulesTest do
     facts = %{
       "wait.obligation_matches" => true,
       "wait.admitted" => true,
-      "wait.after_turn_eligible" => true,
-      "wait.coverage_valid" => true,
       "wait.continuation_state" => "pending",
       "wait.recognized" => false,
       "resolver.open" => true,
@@ -87,39 +85,27 @@ defmodule Tightbeam.RulesTest do
       "wait.verification_state" => "provisional"
     }
 
-    query = fn purpose, snapshot ->
-      DB.transaction(ctx.db, &Rules.select_policy_in_txn(&1, purpose, %{wait_facts: snapshot}))
+    query = fn snapshot ->
+      DB.transaction(
+        ctx.db,
+        &Rules.select_policy_in_txn(&1, "wait-effort-relief", %{wait_facts: snapshot})
+      )
     end
 
-    assert {:ok, {:ok, %{name: "holder-continuation-coverage"}}} =
-             query.("wait-prod-coverage", facts)
-
-    assert {:ok, {:ok, %{name: "justified-unresolved-dependency"}}} =
-             query.("wait-effort-relief", facts)
+    assert {:ok, {:ok, %{name: "justified-unresolved-dependency"}}} = query.(facts)
 
     for field <-
-          ~w(wait.obligation_matches wait.admitted wait.after_turn_eligible wait.coverage_valid) do
-      assert {:ok, :none} = query.("wait-prod-coverage", Map.put(facts, field, false))
+          ~w(wait.obligation_matches wait.admitted resolver.open resolver.owed_by_other wait.declaration_complete wait.verification_accountable) do
+      assert {:ok, :none} = query.(Map.put(facts, field, false))
     end
 
     for state <- ~w(queued running) do
-      snapshot = Map.put(facts, "wait.continuation_state", state)
-      assert {:ok, {:ok, _}} = query.("wait-prod-coverage", snapshot)
-      assert {:ok, :none} = query.("wait-effort-relief", snapshot)
+      assert {:ok, :none} = query.(Map.put(facts, "wait.continuation_state", state))
     end
 
-    for field <-
-          ~w(resolver.open resolver.owed_by_other wait.declaration_complete wait.verification_accountable) do
-      assert {:ok, :none} = query.("wait-effort-relief", Map.put(facts, field, false))
-    end
-
-    assert {:ok, :none} = query.("wait-effort-relief", Map.put(facts, "wait.recognized", true))
-
-    assert {:ok, :none} =
-             query.("wait-effort-relief", Map.put(facts, "wait.verification_state", "challenged"))
-
-    assert {:ok, {:ok, _}} =
-             query.("wait-effort-relief", Map.put(facts, "wait.verification_state", "confirmed"))
+    assert {:ok, :none} = query.(Map.put(facts, "wait.recognized", true))
+    assert {:ok, :none} = query.(Map.put(facts, "wait.verification_state", "challenged"))
+    assert {:ok, {:ok, _}} = query.(Map.put(facts, "wait.verification_state", "confirmed"))
 
     put_raw(
       ctx,
@@ -131,10 +117,8 @@ defmodule Tightbeam.RulesTest do
     )
 
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    assert {:ok, :none} = query.("wait-effort-relief", facts)
-
-    assert {:ok, {:ok, _}} =
-             query.("wait-effort-relief", Map.put(facts, "resolver.owed_by_other", false))
+    assert {:ok, :none} = query.(facts)
+    assert {:ok, {:ok, _}} = query.(Map.put(facts, "resolver.owed_by_other", false))
   end
 
   test "predicate policy loading refuses incomplete verification and invalid conditions", ctx do
@@ -1123,7 +1107,7 @@ defmodule Tightbeam.RulesTest do
     assert {:deny, %{rule: "needs-review"}} = Rules.evaluate(ctx.db, completion)
   end
 
-  test "completion notice loader exception preserves unrelated wake and review-link validation",
+  test "completion gate loader exception preserves unrelated remedy-link validation",
        ctx do
     shipped = File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
     put_raw(ctx, shipped)
@@ -1526,6 +1510,7 @@ defmodule Tightbeam.RulesTest do
   test "shipped completion is recorded while a same-source independent review is pending", ctx do
     holder = session(ctx.db, "receipt-remedy-holder", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "receipt-remedy-reviewer", "flynn", archetype: "reviewer-code")
+
     owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
 
     {:ok, _} =
@@ -1562,12 +1547,19 @@ defmodule Tightbeam.RulesTest do
     assert completion_attest.commitRefs == refs
     assert review_count(ctx.db, producer.id) == 0
 
-    notice_id = RailRemedy.episode(ctx.db, "completion-requires-review", producer.id).producer_key
-    notice = Wakes.get(ctx.db, notice_id)
+    # The gate's notice is one ordinary stored notice to the accountable owner; it
+    # starts no review-remedy episode and staffs no reviewer.
+    assert RailRemedy.episode(ctx.db, "completion-requires-review", producer.id) == nil
+
+    assert [notice] = review_gate_notices(ctx.db, producer.id)
     assert notice.session_key == owner.session_key
     assert notice.owner_user_id == "flynn"
-    assert notice.assignment_id == producer.id
-    assert notice.prompt =~ producer.id
+    assert notice.consumer == "prompt"
+    assert notice.summon == 1
+    assert notice.creator_session_key == nil
+
+    assert notice.prompt ==
+             "Coordinate independent review of assignment #{producer.id}; preserve current evidence and direct staffing through its accountable owner."
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId=?1", [
@@ -1617,6 +1609,7 @@ defmodule Tightbeam.RulesTest do
 
   test "shipped completion records pending release and live-mutation work", ctx do
     holder = session(ctx.db, "non-code-completion-holder", "flynn", archetype: "coder")
+
     owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
 
     {:ok, _} =
@@ -1640,10 +1633,8 @@ defmodule Tightbeam.RulesTest do
 
       assert review_count(ctx.db, producer.id) == 0
 
-      notice_id =
-        RailRemedy.episode(ctx.db, "completion-requires-review", producer.id).producer_key
-
-      assert Wakes.get(ctx.db, notice_id).session_key == owner.session_key
+      assert [%{session_key: session_key}] = review_gate_notices(ctx.db, producer.id)
+      assert session_key == owner.session_key
     end
   end
 
@@ -2075,12 +2066,9 @@ defmodule Tightbeam.RulesTest do
       assert producer_id == producer.id
       assert review_count(ctx.db, producer.id) == if(older_exact_review?, do: 2, else: 1)
 
-      notice_id =
-        RailRemedy.episode(ctx.db, "completion-requires-review", producer.id).producer_key
-
-      notice = Wakes.get(ctx.db, notice_id)
+      assert RailRemedy.episode(ctx.db, "completion-requires-review", producer.id) == nil
+      assert [notice] = review_gate_notices(ctx.db, producer.id)
       assert notice.session_key == owner.session_key
-      assert notice.assignment_id == producer.id
     end
   end
 
@@ -4570,6 +4558,31 @@ defmodule Tightbeam.RulesTest do
         produced_by_assignment_id: producer_id
       }
     })
+  end
+
+  defp review_gate_notices(db, producer_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT sessionKey,ownerUserId,prompt,consumer,creatorSessionKey,summon
+        FROM wakes
+        WHERE assignmentId=?1 AND origin='remedy:completion-requires-review'
+        ORDER BY createdAt,wakeId
+        """,
+        [producer_id]
+      )
+
+    Enum.map(rows, fn [session_key, owner_user_id, prompt, consumer, creator_session_key, summon] ->
+      %{
+        session_key: session_key,
+        owner_user_id: owner_user_id,
+        prompt: prompt,
+        consumer: consumer,
+        creator_session_key: creator_session_key,
+        summon: summon
+      }
+    end)
   end
 
   defp review_count(db, producer_id) do

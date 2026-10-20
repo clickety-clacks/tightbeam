@@ -73,17 +73,6 @@ when = [
 verification = { trigger = "registration", terminal = "bound-verdict-or-obligation-terminal", fallback = "wake-due-at" }
 
 [[policy]]
-name = "holder-continuation-coverage"
-purpose = "wait-prod-coverage"
-when = [
-  { fact = "wait.obligation_matches", op = "eq", value = true },
-  { fact = "wait.admitted", op = "eq", value = true },
-  { fact = "wait.after_turn_eligible", op = "eq", value = true },
-  { fact = "wait.coverage_valid", op = "eq", value = true },
-  { fact = "wait.continuation_state", op = "in", value = ["pending", "queued", "running"] },
-]
-
-[[policy]]
 name = "justified-unresolved-dependency"
 purpose = "wait-effort-relief"
 when = [

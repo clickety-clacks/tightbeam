@@ -398,6 +398,7 @@ defmodule Tightbeam.Schema do
   @fresh_owner_link_origin_table "schema_bootstrap_origin"
   @work_item_owner_link_shape "work-item-delivery-owner-v1-019"
   @assignment_source_replacement_shape "assignment-source-replacement-v1-019"
+  @effort_holder_activity_cancellation_shape "effort-holder-activity-cancellation-v1-019"
   @notice_source_payload_shape "notice-source-storage-v1-019"
   @decision_request_row_schema_shape "decision-request-row-schema-v2-019"
   @launch_preparation_boot_shape "launch-preparation-boot-v1-0110"
@@ -1362,7 +1363,9 @@ defmodule Tightbeam.Schema do
   never to deduce a shape and accommodate it. Each migration is selected by an
   exact predecessor stamp; none sniffs stored DDL or infers from a column name.
   """
-  # Keep historical DDL immutable. Only O2 activation uses these two additions.
+  # Historical O2 databases may contain typed cancellation rows from the
+  # retired review-notice reconciler. Preserve those rows during migration;
+  # active code no longer creates or validates new review-remedy cancellations.
   @o2_liveness_objects Enum.map(@supervision_liveness_objects, fn
                          %{name: "wake_cancellations", sql: sql} = object ->
                            outcome = """
@@ -1531,8 +1534,172 @@ defmodule Tightbeam.Schema do
                                                     end
                                                   )
 
+  # A current holder's progress attest clears its pending effort prod directly;
+  # no later liveness action is owed for that exact source event. Keep the
+  # earlier stamped cancellation DDL byte-exact and migrate this narrow route
+  # behind its own activation marker.
+  @effort_holder_activity_cancellation_objects [
+    %{
+      type: "table",
+      name: "effort_holder_activity_cancellation_epoch",
+      sql: """
+      CREATE TABLE IF NOT EXISTS effort_holder_activity_cancellation_epoch (
+        id INTEGER PRIMARY KEY CHECK(id = 0),
+        shape TEXT NOT NULL CHECK(shape = 'effort-holder-activity-cancellation-v1-019'),
+        activatedAt INTEGER NOT NULL CHECK(activatedAt >= 0),
+        principal TEXT NOT NULL CHECK(principal = 'process:tightbeam')
+      )
+      """
+    }
+    | Enum.map(@assignment_source_replacement_liveness_objects, fn
+        %{name: "wake_cancellations", sql: sql} = object ->
+          disposition_anchor = "(outcomeKind = 'disposition' AND replacementWakeId IS NULL AND"
+
+          no_replacement_anchor =
+            "(outcomeKind = 'no_replacement' AND replacementWakeId IS NULL AND"
+
+          fallback_clause =
+            "(workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND\n" <>
+              "       livenessTriggerId IS NULL AND actionNeeded = 0)))"
+
+          # Each match admits exactly one occurrence: the disposition arm, then
+          # the no-replacement arm, each closed by its no-linked-work fallback.
+          [head, disposition_and_rest] = String.split(sql, disposition_anchor)
+
+          [disposition_arm, no_replacement_and_rest] =
+            String.split(disposition_and_rest, no_replacement_anchor)
+
+          [disposition_head, disposition_tail] = String.split(disposition_arm, fallback_clause)
+
+          [no_replacement_head, no_replacement_tail] =
+            String.split(no_replacement_and_rest, fallback_clause)
+
+          # The O2 predecessor adds a historical rail-remedy alternative before
+          # the ordinary no-linked-work fallback. Insert the new source routes
+          # at that boundary, preserving both predecessor alternatives verbatim.
+          true =
+            String.contains?(no_replacement_head, "requesterId = 'tightbeam:rail-remedy' AND")
+
+          holder_activity_arm =
+            "(workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND " <>
+              "livenessTriggerId IS NULL AND actionNeeded = 0 AND requesterKind = 'process' AND " <>
+              "requesterId = 'tightbeam:effort-checkin' AND reasonKind = 'superseded' AND " <>
+              "causalSourceKind = 'progress_attest')"
+
+          # The source owns these clears. They happen in the same transaction
+          # as an assignment completion or terminal decision transition, so
+          # open linked work must not require an inactivity deadline to permit
+          # the source's own notice to be retracted.
+          source_disposition_arms = """
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND requesterKind = 'process' AND
+             requesterId = 'tightbeam:assignments' AND reasonKind = 'obligation_disposed' AND
+             causalSourceKind = 'assignment_transition' AND dispositionKind = 'assignment_transition' AND
+             causalSourceId = dispositionId)
+            OR
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND requesterKind = 'process' AND
+             requesterId = 'tightbeam:escalation' AND reasonKind = 'obligation_disposed' AND
+             causalSourceKind = 'decision_request' AND dispositionKind = 'decision_request_transition' AND
+             causalSourceId = dispositionId)
+            OR
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND requesterKind = 'process' AND
+             requesterId = 'tightbeam:retirement' AND reasonKind = 'obligation_disposed' AND
+             causalSourceKind = 'assignment_transition' AND dispositionKind = 'assignment_transition' AND
+             causalSourceId = dispositionId)
+            OR
+          """
+
+          no_replacement_source_arms = """
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND requesterKind = 'process' AND
+             requesterId = 'tightbeam:retirement' AND reasonKind = 'target_retired' AND
+             causalSourceKind = 'session_transition')
+            OR
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND requesterKind = 'process' AND
+             requesterId = 'tightbeam:assignments' AND reasonKind = 'cannot_proceed_released' AND
+             causalSourceKind = 'condition_fact')
+            OR
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND requesterKind = 'process' AND
+             requesterId = 'tightbeam:sentinel-supervisor' AND reasonKind = 'condition_cleared' AND
+             causalSourceKind = 'sentinel_transition')
+            OR
+          """
+
+          sql =
+            head <>
+              disposition_anchor <>
+              disposition_head <>
+              source_disposition_arms <>
+              fallback_clause <>
+              disposition_tail <>
+              no_replacement_anchor <>
+              no_replacement_head <>
+              holder_activity_arm <>
+              " OR\n            " <>
+              no_replacement_source_arms <>
+              fallback_clause <>
+              no_replacement_tail
+
+          # Older stamped cancellation DDL predates the sentinel's and harness
+          # health's source-owned condition clears. Extend only the reason-kind
+          # whitelist; the scheduler's terminal-outcome rule uses the same
+          # values but is intentionally unchanged.
+          old_reason_tail = "'consumer_unavailable','target_unresolvable'\n  )),"
+
+          new_reason_tail =
+            "'consumer_unavailable','target_unresolvable','condition_cleared'\n  )),"
+
+          old_source_tail = "'session_transition','scheduler_delivery'"
+
+          new_source_tail =
+            "'session_transition','scheduler_delivery','sentinel_transition','harness_health_transition'"
+
+          requester_anchor =
+            "(requesterId = 'tightbeam:supervision' AND reasonKind = 'superseded' AND"
+
+          source_requester_routes =
+            "(requesterId = 'tightbeam:effort-checkin' AND reasonKind = 'superseded' AND\n" <>
+              "     causalSourceKind = 'progress_attest' AND outcomeKind = 'no_replacement')\n" <>
+              "    OR\n    " <>
+              "(requesterId = 'tightbeam:escalation' AND reasonKind = 'obligation_disposed' AND " <>
+              "causalSourceKind = 'decision_request' AND outcomeKind = 'disposition')\n    OR\n    " <>
+              "(requesterId = 'tightbeam:sentinel-supervisor' AND reasonKind = 'condition_cleared' AND " <>
+              "causalSourceKind = 'sentinel_transition' AND outcomeKind = 'no_replacement')\n    OR\n    " <>
+              "(requesterId = 'tightbeam:harness-health' AND reasonKind = 'condition_cleared' AND " <>
+              "causalSourceKind = 'harness_health_transition' AND outcomeKind = 'no_replacement')\n    OR\n    "
+
+          [_, _] = String.split(sql, old_reason_tail)
+          [_, _] = String.split(sql, old_source_tail)
+          [_, _] = String.split(sql, requester_anchor)
+
+          sql =
+            sql
+            |> String.replace(old_reason_tail, new_reason_tail, global: false)
+            |> String.replace(old_source_tail, new_source_tail, global: false)
+            |> String.replace(requester_anchor, source_requester_routes <> requester_anchor,
+              global: false
+            )
+
+          %{object | sql: sql}
+
+        object ->
+          object
+      end)
+  ]
+
   @doc false
   def live_base_upgrade_predecessor, do: @operator_decision_shape
+
+  @doc false
+  def assignment_source_replacement_cancellation_ddl do
+    @assignment_source_replacement_liveness_objects
+    |> Enum.find(&(&1.name == "wake_cancellations"))
+    |> Map.fetch!(:sql)
+  end
 
   @doc false
   def guard_compatible_stamps do
@@ -1778,7 +1945,6 @@ defmodule Tightbeam.Schema do
     :ok = migrate_continuation_retry_guard(db)
     :ok = upgrade_decision_request_row_schema_revision(db)
     :ok = upgrade_launch_preparation_boot(db)
-    :ok = migrate_supervision_recorded_state(db)
     :ok = ensure_hot_query_indexes(db)
     :ok = migrate_retired_workspace_cleanup(db)
     :ok = Tightbeam.Ephemeral.migrate(db)
@@ -1798,6 +1964,7 @@ defmodule Tightbeam.Schema do
     # Building it here keeps a refused migration's schema untouched and makes
     # the first and every later boot leave the same objects.
     :ok = ensure_notice_delivery_runtime_indexes(db)
+    :ok = upgrade_effort_holder_activity_cancellation_v1(db)
 
     case DB.finish_schema(db) do
       :ok -> Tightbeam.Recognition.activate(db)
@@ -1966,80 +2133,6 @@ defmodule Tightbeam.Schema do
         Logger.error("retired workspace cleanup migration deferred: #{inspect(error)}")
         :ok
     end
-  end
-
-  # This additive marker is independent of the predecessor shape migrations.
-  # Historical cleanup state is copied in the same transaction as the marker.
-  defp migrate_supervision_recorded_state(db) do
-    {:ok, :ok} =
-      DB.transaction(db, fn txn ->
-        Txn.exec(txn, """
-        CREATE TABLE IF NOT EXISTS supervision_state_migration (
-          id INTEGER PRIMARY KEY CHECK(id=0)
-        )
-        """)
-
-        if Txn.q(txn, "SELECT 1 FROM supervision_state_migration WHERE id=0") == [] do
-          :ok =
-            Txn.exec(txn, """
-            CREATE TABLE idle_cleanup_state (
-              sessionKey TEXT NOT NULL, groupDigest TEXT NOT NULL, memberToken TEXT NOT NULL,
-              deliveredCount INTEGER NOT NULL, lastDeliveredAt INTEGER NOT NULL,
-              deliveredDepth INTEGER NOT NULL, deliveredMain INTEGER NOT NULL,
-              PRIMARY KEY(groupDigest,memberToken)
-            );
-            ALTER TABLE sessions ADD COLUMN idleCleanupObservedWake TEXT;
-            ALTER TABLE sessions ADD COLUMN idleCleanupPreviousWake TEXT;
-            ALTER TABLE wakes ADD COLUMN idleCleanupObserved INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE wakes ADD COLUMN idleCleanupGroup TEXT;
-            ALTER TABLE wakes ADD COLUMN idleCleanupRecorded INTEGER NOT NULL DEFAULT 0;
-            CREATE INDEX idle_cleanup_pending_group ON wakes(idleCleanupGroup)
-              WHERE state='pending' AND consumer='prompt';
-            CREATE TABLE supervision_ended_controllers (
-              wakeId TEXT PRIMARY KEY REFERENCES supervision_liveness_sidecar(wakeId) ON DELETE CASCADE,
-              assignmentId TEXT NOT NULL,
-              endedWakeState TEXT NOT NULL CHECK(endedWakeState IN ('fired','canceled'))
-            );
-            CREATE INDEX supervision_liveness_ended_controller
-              ON supervision_ended_controllers(assignmentId,wakeId);
-            INSERT INTO supervision_ended_controllers(wakeId,assignmentId,endedWakeState)
-            SELECT s.wakeId,s.assignmentId,w.state FROM supervision_liveness_sidecar s
-            JOIN wakes w ON w.wakeId=s.wakeId
-            WHERE s.controllerOrigin='scheduled' AND s.controllerState='pending'
-              AND w.state IN ('fired','canceled');
-            CREATE TRIGGER supervision_record_controller_end AFTER UPDATE OF state ON wakes
-            WHEN NEW.state IN ('fired','canceled') AND OLD.state<>NEW.state
-            BEGIN
-              INSERT OR REPLACE INTO supervision_ended_controllers(wakeId,assignmentId,endedWakeState)
-              SELECT wakeId,assignmentId,NEW.state FROM supervision_liveness_sidecar
-              WHERE wakeId=NEW.wakeId AND controllerOrigin='scheduled' AND controllerState = 'pending';
-            END;
-            CREATE TRIGGER supervision_forget_settled_controller AFTER UPDATE OF controllerState ON supervision_liveness_sidecar
-            WHEN NEW.controllerState='settled'
-            BEGIN
-              DELETE FROM supervision_ended_controllers WHERE wakeId=NEW.wakeId;
-            END;
-            ALTER TABLE patrol_failure_boundary ADD COLUMN lastTurnSeq INTEGER NOT NULL DEFAULT 0;
-            CREATE TRIGGER patrol_terminal_checkpoint_rewind AFTER UPDATE OF endedAt ON turns
-            WHEN NEW.endedAt IS NOT NULL AND OLD.endedAt IS NULL
-            BEGIN
-              UPDATE patrol_failure_boundary SET lastTurnSeq=MIN(lastTurnSeq,NEW.seq-1) WHERE id=0;
-            END;
-            CREATE TRIGGER patrol_terminal_checkpoint_insert AFTER INSERT ON turns
-            WHEN NEW.endedAt IS NOT NULL
-            BEGIN
-              UPDATE patrol_failure_boundary SET lastTurnSeq=MIN(lastTurnSeq,NEW.seq-1) WHERE id=0;
-            END;
-            """)
-
-          :ok = Tightbeam.Supervision.copy_idle_cleanup_history_in_txn(txn)
-          :ok = Txn.exec(txn, "INSERT INTO supervision_state_migration(id) VALUES(0)")
-        end
-
-        :ok
-      end)
-
-    :ok
   end
 
   @source_client_column """
@@ -3063,7 +3156,7 @@ defmodule Tightbeam.Schema do
                  @launch_preparation_boot_shape,
                  @decision_request_row_schema_shape
                ],
-               do: @assignment_source_replacement_liveness_objects,
+               do: assignment_source_replacement_liveness_objects(txn),
                else: @supervision_receipt_cancellation_liveness_objects
 
           Enum.reject(liveness_objects, &(&1.name == "supervision_receipt_cancellation_epoch"))
@@ -3079,7 +3172,7 @@ defmodule Tightbeam.Schema do
           )
 
           Enum.reject(
-            @assignment_source_replacement_liveness_objects,
+            assignment_source_replacement_liveness_objects(txn),
             &(&1.name == "supervision_receipt_cancellation_epoch")
           )
 
@@ -3206,6 +3299,40 @@ defmodule Tightbeam.Schema do
         rows ->
           Logger.warning(
             "supervision_receipt_cancellation_epoch row 0 unavailable: #{inspect(rows)}"
+          )
+
+          false
+      end
+    else
+      false
+    end
+  end
+
+  defp assignment_source_replacement_liveness_objects(txn) do
+    if effort_holder_activity_cancellation_active?(txn),
+      do: @effort_holder_activity_cancellation_objects,
+      else: @assignment_source_replacement_liveness_objects
+  end
+
+  defp effort_holder_activity_cancellation_active?(txn) do
+    marker =
+      Enum.find(@effort_holder_activity_cancellation_objects, fn object ->
+        object.name == "effort_holder_activity_cancellation_epoch"
+      end)
+
+    if owned_object_present?(txn, marker) do
+      validate_owned_object!(txn, marker)
+
+      case Txn.q(
+             txn,
+             "SELECT shape FROM effort_holder_activity_cancellation_epoch WHERE id=0"
+           ) do
+        [[@effort_holder_activity_cancellation_shape]] ->
+          true
+
+        rows ->
+          Logger.warning(
+            "effort_holder_activity_cancellation_epoch row 0 unavailable: #{inspect(rows)}"
           )
 
           false
@@ -4198,8 +4325,10 @@ defmodule Tightbeam.Schema do
            ] ->
         :ok = marker_shape.()
 
+        current_liveness_objects = assignment_source_replacement_liveness_objects(txn)
+
         Enum.each(
-          Enum.filter(@assignment_source_replacement_liveness_objects, fn object ->
+          Enum.filter(current_liveness_objects, fn object ->
             object.name in [
               "wake_cancellations",
               "wake_cancellations_pending_insert",
@@ -4315,6 +4444,128 @@ defmodule Tightbeam.Schema do
         raise ShapeError,
           message: "incompatible assignment source replacement predecessor: #{inspect(rows)}"
     end
+  end
+
+  @doc false
+  @spec upgrade_effort_holder_activity_cancellation_v1(DB.server()) :: :ok
+  def upgrade_effort_holder_activity_cancellation_v1(db) do
+    # Run once and recorded by its epoch row. The restore pragma also covers a
+    # failed transaction, so schema editing is never left enabled.
+    case DB.migration_transaction(
+           db,
+           :effort_holder_activity_cancellation_v1,
+           [],
+           ["PRAGMA writable_schema = OFF"],
+           &upgrade_effort_holder_activity_cancellation_v1_in_txn/1
+         ) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_effort_holder_activity_cancellation_v1: migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  defp upgrade_effort_holder_activity_cancellation_v1_in_txn(%Txn{} = txn) do
+    case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+      [[shape]]
+      when shape in [
+             @assignment_source_replacement_shape,
+             @notice_source_payload_shape,
+             @decision_request_row_schema_shape,
+             @launch_preparation_boot_shape
+           ] ->
+        if effort_holder_activity_cancellation_active?(txn) do
+          Enum.each(
+            Enum.filter(@effort_holder_activity_cancellation_objects, fn object ->
+              object.name in [
+                "effort_holder_activity_cancellation_epoch",
+                "wake_cancellations",
+                "wake_cancellations_pending_insert",
+                "wakes_typed_cancellation_required"
+              ]
+            end),
+            &validate_owned_object!(txn, &1)
+          )
+
+          :ok
+        else
+          migrate_effort_holder_activity_cancellation_v1_in_txn(txn)
+        end
+
+      rows ->
+        raise ShapeError,
+          message:
+            "incompatible_effort_holder_activity_cancellation_v1 predecessor: #{inspect(rows)}"
+    end
+  end
+
+  # The new CHECK only adds alternatives, so every stored row already satisfies
+  # it and the table's stored format is unchanged. SQLite's documented
+  # procedure for such a change rewrites the stored definition in place, with
+  # no table copy, so boot does no data work here:
+  # https://sqlite.org/lang_altertable.html#otheralter
+  defp migrate_effort_holder_activity_cancellation_v1_in_txn(txn) do
+    old_table =
+      Enum.find(
+        @assignment_source_replacement_liveness_objects,
+        &(&1.name == "wake_cancellations")
+      )
+
+    new_table =
+      Enum.find(@effort_holder_activity_cancellation_objects, &(&1.name == "wake_cancellations"))
+
+    marker =
+      Enum.find(@effort_holder_activity_cancellation_objects, fn object ->
+        object.name == "effort_holder_activity_cancellation_epoch"
+      end)
+
+    trigger_names = ~w(wake_cancellations_pending_insert wakes_typed_cancellation_required)
+
+    triggers =
+      Enum.filter(@effort_holder_activity_cancellation_objects, fn object ->
+        object.type == "trigger" and object.name in trigger_names
+      end)
+
+    validate_owned_object!(txn, old_table)
+    Enum.each(triggers, &validate_owned_object!(txn, &1))
+
+    stored_sql =
+      new_table.sql
+      |> String.replace(~r/\bIF\s+NOT\s+EXISTS\s+/u, "", global: false)
+      |> String.trim()
+      |> String.trim_trailing(";")
+
+    [[schema_version]] = Txn.q(txn, "PRAGMA schema_version")
+    :ok = Txn.exec(txn, "PRAGMA writable_schema = ON")
+
+    Txn.q(
+      txn,
+      "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='wake_cancellations'",
+      [stored_sql]
+    )
+
+    1 = Txn.changes(txn)
+    :ok = Txn.exec(txn, "PRAGMA schema_version = #{schema_version + 1}")
+    # RESET also reloads this connection's schema, so the owner enforces the
+    # new CHECK at once; the version bump makes other connections reload.
+    :ok = Txn.exec(txn, "PRAGMA writable_schema = RESET")
+    :ok = Txn.exec(txn, marker.sql)
+
+    Txn.q(
+      txn,
+      "INSERT INTO effort_holder_activity_cancellation_epoch (id,shape,activatedAt,principal) VALUES (0,?1,?2,'process:tightbeam')",
+      [@effort_holder_activity_cancellation_shape, System.system_time(:millisecond)]
+    )
+
+    validate_owned_object!(txn, new_table)
+    Enum.each(triggers, &validate_owned_object!(txn, &1))
+    validate_owned_object!(txn, marker)
   end
 
   @doc false

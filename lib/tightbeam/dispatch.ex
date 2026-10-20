@@ -208,8 +208,8 @@ defmodule Tightbeam.Dispatch do
         if statute.name == "completion-requires-review" and verb == "attest" and
              call.params[:kind] == "completion" and review_notice_routed?(outcome) do
           # A missing review keeps the assignment open, but it does not erase
-          # the holder's completion report. The remedy still routes review
-          # staffing to the accountable owner before the handler records it.
+          # the holder's completion report. The remedy's notice is stored
+          # before the handler records it.
           dispatch_to_handler(
             db,
             handlers,
@@ -805,8 +805,12 @@ defmodule Tightbeam.Dispatch do
   end
 
   defp review_notice_routed?(%{outcome: outcome, producer_id: producer_id})
-       when outcome in ["claimed-dispatched", "recurrence-suppressed", "notification-stopped"] and
-              is_binary(producer_id),
+       when outcome in [
+              "notice-stored",
+              "claimed-dispatched",
+              "recurrence-suppressed",
+              "notification-stopped"
+            ] and is_binary(producer_id),
        do: true
 
   defp review_notice_routed?(_outcome), do: false

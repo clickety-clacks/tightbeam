@@ -425,15 +425,6 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
         else: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms)
     end)
 
-    start_supervised!(
-      {Tightbeam.Supervision,
-       db: ctx.db,
-       handlers: ctx.handlers,
-       sweep_ms: 25,
-       prod_limit: 3,
-       name: Tightbeam.Supervision}
-    )
-
     # Drain only the preparatory rumination through the real claim/terminal
     # seams, explicitly canceled as fixture setup. No provider reply or model
     # execution is fabricated. The subsequent holder dispatch stays queued.

@@ -160,12 +160,6 @@ defmodule Tightbeam.WorkItemsTest do
     assert session_payload["mechanicalStatus"] == "running"
     Hub.delivered(hub, self())
 
-    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => source_payload}}
-    assert source_payload["wakeId"] == wake.wake_id
-    assert source_payload["digest"] == false
-    assert source_payload["state"] == "fired"
-    Hub.delivered(hub, self())
-
     assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => payload}}
     assert payload["wakeId"] == carrier_id
     assert payload["digest"] == true
@@ -178,6 +172,13 @@ defmodule Tightbeam.WorkItemsTest do
     assert message_payload["id"] == message_id
     assert message_payload["sessionKey"] == ctx.holder.session_key
     assert message_payload["content"] == content
+    Hub.delivered(hub, self())
+
+    # Carrier admission publishes its turn and message before completing the source.
+    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => source_payload}}
+    assert source_payload["wakeId"] == wake.wake_id
+    assert source_payload["digest"] == false
+    assert source_payload["state"] == "fired"
     Hub.delivered(hub, self())
     assert %{queued: 0, in_flight: false, overflowed: false} = Hub.connection_stats(hub, self())
 
@@ -347,6 +348,58 @@ defmodule Tightbeam.WorkItemsTest do
              DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE wakeId=?1", [wake_id])
 
     assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+  end
+
+  test "turn-end recognition rearms a delivered routing bracket after its callback is missed",
+       ctx do
+    _main = ensure_main_session(ctx.db, "flynn")
+    item = create(ctx, {:user, "flynn"}, %{title: "Recover delivered routing bracket"})
+
+    assert {:ok, [[wake_id]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
+
+    wake = Tightbeam.Wakes.get(ctx.db, wake_id)
+
+    assert {:ok, {:appended, _target, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 wake.session_key,
+                 wake.origin,
+                 wake.prompt,
+                 wake_id: wake.wake_id
+               )
+             end)
+
+    assert {:ok, [[delivered_turn_seq]]} =
+             DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [wake_id])
+
+    assert is_integer(delivered_turn_seq)
+
+    assert {:ok, [[routing_wake_id]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
+
+    assert routing_wake_id == wake_id
+
+    assert {:ok, turn} = Tightbeam.Ledger.claim_next(ctx.db, wake.session_key, "work-items-test")
+    assert turn.seq == delivered_turn_seq
+
+    assert :ok =
+             Tightbeam.Ledger.finish(ctx.db, turn.seq, "delivered", nil,
+               owner_lease: turn.owner_lease
+             )
+
+    assert :ok = Tightbeam.Productions.Bubble.recognize_terminal(ctx.db, turn.seq)
+
+    assert {:ok, [[replacement_id]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
+
+    refute replacement_id == wake_id
+
+    assert %{state: "pending", session_key: session_key} =
+             Tightbeam.Wakes.get(ctx.db, replacement_id)
+
+    assert session_key == wake.session_key
   end
 
   test "Firehose work-item routing callback failure rolls back rows and notices", ctx do
@@ -1006,14 +1059,14 @@ defmodule Tightbeam.WorkItemsTest do
     era = assign(ctx, "holder", "era", first.id)
     revoked = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call(era.id))
     assert revoked.state == "closed"
-    # The last-close slate is the actual liveness carrier for the open item;
-    # unavailable terminal notification admission must not invent or omit it.
-    assert {:ok, [["canceled", nil, "routing_bracket", item_id, "pending"]]} =
+    # Closure stores the terminal report and independently schedules the slate.
+    # Recipient availability is decided when delivery is attempted, not here.
+    assert {:ok, [["pending", nil, nil, item_id, "pending"]]} =
              DB.query(
                ctx.db,
                """
-               SELECT notice.state,notice.firedAt,c.livenessTriggerKind,c.livenessTriggerId,slate.state
-               FROM wakes notice JOIN wake_cancellations c ON c.wakeId=notice.wakeId
+               SELECT notice.state,notice.firedAt,c.wakeId,wi.id,slate.state
+               FROM wakes notice LEFT JOIN wake_cancellations c ON c.wakeId=notice.wakeId
                JOIN work_items wi ON wi.id=notice.work_item_id
                JOIN wakes slate ON slate.wakeId=wi.slateWakeId
                WHERE notice.assignmentId=?1 AND notice.obligationRef=?2

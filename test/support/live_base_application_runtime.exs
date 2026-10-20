@@ -108,7 +108,6 @@ try do
         DB,
         Tightbeam.Firehose.Hub,
         Tightbeam.WakeScheduler,
-        Tightbeam.Supervision,
         Tightbeam.LaneManager
       ] do
     true = is_pid(Process.whereis(name))

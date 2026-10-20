@@ -737,21 +737,16 @@ defmodule Tightbeam.ArchetypesTest do
     refute Map.has_key?(archetype, :owner_open_child_prod)
   end
 
-  test "idle cleanup is an optional boolean with a true default" do
-    assert Archetypes.builtin_default().idle_cleanup == true
+  test "legacy idle cleanup manifest key is accepted and ignored" do
+    for value <- ["true", "false"] do
+      archetype =
+        Archetypes.parse_manifest!(
+          "name = \"legacy\"\nidle_cleanup = #{value}\n",
+          "legacy.toml"
+        )
 
-    for {body, expected} <- [
-          {"name = \"quiet\"\n", true},
-          {"name = \"quiet\"\nidle_cleanup = true\n", true},
-          {"name = \"quiet\"\nidle_cleanup = false\n", false}
-        ] do
-      assert Archetypes.parse_manifest!(body, "quiet.toml").idle_cleanup == expected
-    end
-
-    for value <- ["\"false\"", "0", "[]"] do
-      assert_raise ArgumentError, ~r/archetype idle_cleanup must be a boolean/, fn ->
-        Archetypes.parse_manifest!("name = \"quiet\"\nidle_cleanup = #{value}\n", "quiet.toml")
-      end
+      assert archetype.name == "legacy"
+      refute Map.has_key?(archetype, :idle_cleanup)
     end
   end
 

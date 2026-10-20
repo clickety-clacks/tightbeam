@@ -52,7 +52,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
 
   try do
     assert :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(db, source.wake_id).state == "fired"
+    assert Wakes.get(db, source.wake_id).state == "canceled"
     assert Wakes.get(db, source.wake_id).prompt == "batched role delivery"
     assert :ok = Wakes.fire_due(scheduler)
     assert [] = NoticeBatcher.source_refs(db, source.wake_id)
@@ -65,8 +65,15 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
                recipient.session_key
              ])
 
+    assert {:ok, [["target_unresolvable", "scheduler_delivery", "no_replacement"]]} =
+             DB.query(
+               db,
+               "SELECT reasonKind, causalSourceKind, outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [source.wake_id]
+             )
+
     assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
-             event.kind == "wake_unresolved" and event.subject == source.wake_id and
+             event.kind == "wake_undeliverable" and event.subject == source.wake_id and
                event.detail == "role batch-recipient no longer exists"
            end)
   after

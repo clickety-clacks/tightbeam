@@ -185,16 +185,6 @@ defmodule Tightbeam.LateRulingHandoffTest do
 
     Org.retire(ctx.db, ctx.raiser.session_key, "session:#{ctx.opener.session_key}", 1_000)
 
-    # Exercise the actual retirement callback before ruling, including the
-    # crash-recovery path; Org.retire alone does not run this cleanup.
-    retirement_state = %{db: ctx.db, delivery_opts: []}
-
-    assert {:noreply, ^retirement_state} =
-             Tightbeam.Supervision.handle_cast(
-               {:retired, ctx.raiser.session_key},
-               retirement_state
-             )
-
     assert :ok = Escalation.recover_retired(ctx.db)
 
     assert {:ok, [["open"]]} =

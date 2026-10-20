@@ -2,9 +2,8 @@ defmodule Tightbeam.AssignmentQueue do
   @moduledoc """
   Read-only queue summaries for a single assignment's queued turns.
 
-  A turn may carry its assignment directly, through its source wake, or through
-  the audited liveness scope. Scheduled wakes without a queued turn are not in
-  the holder's current inbox.
+  A turn may carry its assignment directly or through its source wake.
+  Scheduled wakes without a queued turn are not in the holder's current inbox.
   """
 
   alias Tightbeam.DB.Txn
@@ -49,13 +48,11 @@ defmodule Tightbeam.AssignmentQueue do
         SELECT t.origin,t.createdAt
         FROM turns AS t
         LEFT JOIN wakes AS w ON w.wakeId=t.wakeId
-        LEFT JOIN queued_message_scopes AS q ON q.turnSeq=t.seq
         WHERE t.sessionKey=?1
           AND t.status='queued'
-          AND (t.assignmentId=?2 OR w.assignmentId=?2 OR q.assignmentId=?2)
+          AND (t.assignmentId=?2 OR w.assignmentId=?2)
           AND (t.assignmentId IS NULL OR t.assignmentId=?2)
           AND (w.assignmentId IS NULL OR w.assignmentId=?2)
-          AND (q.assignmentId IS NULL OR q.assignmentId=?2)
         ORDER BY t.createdAt,t.seq
         """,
         [holder_key, assignment_id]

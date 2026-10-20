@@ -84,7 +84,7 @@ defmodule Tightbeam.Rules do
   @condition_keys MapSet.new(["fact", "op", "value"])
   @policy_keys MapSet.new(["name", "purpose", "when", "verification"])
   @verification_keys MapSet.new(["trigger", "terminal", "fallback"])
-  @policy_purposes ~w(wait-prod-coverage wait-effort-relief wait-verification-admission)
+  @policy_purposes ~w(wait-effort-relief wait-verification-admission)
   @recurrence_keys MapSet.new([
                      "scope",
                      "fingerprint",
@@ -1789,8 +1789,8 @@ defmodule Tightbeam.Rules do
         :ok
     end
 
-    # The completion notice binds its subject through the accountable-owner protocol;
-    # it does not create a review assignment. Other linked remedies retain that binding.
+    # This gate records one ordinary holder notice; it does not create a linked
+    # review assignment or require the linked-review remedy binding.
     if not (name == "completion-requires-review" and action == "wake") and
          is_nil(check) and
          Enum.any?(requirements, fn {fact, kinds} ->

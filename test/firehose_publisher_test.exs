@@ -485,8 +485,60 @@ defmodule Tightbeam.Firehose.PublisherTest do
       }
     }
 
+    assert {:ok, [[initial_deadline]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               [assignment.id]
+             )
+
     assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
              Dispatch.dispatch(db, handlers, tests_passed)
+
+    # The holder's attest and its holder-authored opener notice each count as
+    # holder activity. Activity in the millisecond of the pending deadline
+    # reuses it, so zero to two replacements follow the initial deadline.
+    verdict_notices = drain_notices()
+    assert Enum.count(verdict_notices, &(&1["class"] == "verb.accepted")) == 1
+
+    %{"wake.canceled" => cancellations, "message.created" => [opener_notice]} =
+      published =
+      verdict_notices
+      |> Enum.filter(&match?({:ok, _}, Tightbeam.Firehose.Registry.fetch(&1["class"])))
+      |> Enum.group_by(& &1["class"])
+      |> Map.put_new("wake.canceled", [])
+
+    assert %{"attest.filed" => [_attest_notice]} = published
+    assert map_size(published) == 3
+
+    assert opener_notice["payload"]["content"] ==
+             "[verdict filed: tests-passed on #{assignment.id}: effect matrix tests passed]"
+
+    chain =
+      Stream.unfold(initial_deadline, fn wake_id ->
+        case DB.query(
+               db,
+               "SELECT c.replacementWakeId FROM wake_cancellations c JOIN wakes w ON w.wakeId=c.wakeId WHERE c.wakeId=?1 AND w.assignmentId=?2 AND w.consumer='assignment_inactivity_deadline' AND c.reasonKind='superseded' AND c.causalSourceKind='wake' AND c.causalSourceId=c.replacementWakeId AND c.outcomeKind='replacement'",
+               [wake_id, assignment.id]
+             ) do
+          {:ok, [[replacement]]} -> {{wake_id, replacement}, replacement}
+          {:ok, []} -> nil
+        end
+      end)
+      |> Enum.to_list()
+
+    assert length(chain) in 0..2
+
+    assert Enum.sort(Enum.map(cancellations, & &1["refs"]["wakeId"])) ==
+             Enum.sort(Enum.map(chain, &elem(&1, 0)))
+
+    for cancellation <- cancellations do
+      assert cancellation["payload"]["state"] == "canceled"
+    end
+
+    {_, final_deadline} = List.last(chain, {nil, initial_deadline})
+    assert %{state: "pending"} = Wakes.get(db, final_deadline)
+    assert observed_state_classes() == []
 
     completion = %{
       verb: "attest",
@@ -511,17 +563,9 @@ defmodule Tightbeam.Firehose.PublisherTest do
                [assignment.id]
              )
 
-    verdict_publications =
-      assert_substrate_messages_created!(
-        db,
-        [
-          {"effect-target",
-           "[verdict filed: tests-passed on #{assignment.id}: effect matrix tests passed]"}
-        ],
-        [assignment.id]
-      )
-
-    assert notice_state_classes(verdict_publications) == ["attest.filed"]
+    # The refused completion must not publish a transition or reset inactivity.
+    assert observed_state_classes() == []
+    assert %{state: "pending"} = Wakes.get(db, final_deadline)
 
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
@@ -557,16 +601,15 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert review.holderKey != assignment.holderKey
     assert review.reviewsAssignmentId == assignment.id
 
-    assign_publications =
-      assert_substrate_messages_created!(
-        db,
-        [
-          {"effect-dispatcher", "[assignment opened: #{review.id}]"}
-        ],
-        [assignment.id]
-      )
+    # The reviewer's opened notice is a stored message beside the transition.
+    review_notices = observed_state_notices()
+    assert map_size(review_notices) == 2
 
-    assert notice_state_classes(assign_publications) == ["assignment.opened"]
+    assert %{"assignment.opened" => [_opened], "message.created" => [review_notice]} =
+             review_notices
+
+    assert review_notice["payload"]["sessionKey"] == review.holderKey
+    assert review_notice["payload"]["content"] == "[assignment opened: #{review.id}]"
 
     clean = %{
       tests_passed
@@ -634,21 +677,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
              Dispatch.dispatch(db, handlers, reopen)
 
     assert reopened_id == assignment.id
+    {holder_notices, reopen_effects} = Map.pop(observed_state_notices(), "message.created", [])
+    assert [%{"payload" => reopen_message}] = holder_notices
+    assert reopen_message["sessionKey"] == assignment.holderKey
 
-    reopen_publications =
-      assert_substrate_messages_created!(
-        db,
-        [
-          {
-            "effect-target",
-            "[assignment reopened: #{assignment.id} by session:effect-target — continue the real assignment]"
-          }
-        ],
-        [assignment.id, review.id]
-      )
+    assert reopen_message["content"] ==
+             "[assignment reopened: #{assignment.id} by session:effect-target — continue the real assignment]"
 
-    reopen_effects = notice_state_classes(reopen_publications)
-    assert_per_verb_effects!(config, "reopen-assignment", reopen_effects)
+    assert_per_verb_effects!(config, "reopen-assignment", Map.keys(reopen_effects))
     history = Tightbeam.Assignments.list_reopenings(db, assignment.id)
     assert [%{priorOutcome: "completed", reason: "continue the real assignment"}] = history
 
@@ -1212,8 +1248,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
           params: Map.put(payload, :request, request.id)
       }
 
+      notice_wake = pending_decision_notice!(db, request.id)
       assert {:ok, %{status: ^status}} = Dispatch.dispatch(db, handlers, response)
       assert %{"class" => "verb.accepted"} = receive_notice()
+      assert_decision_notice_cleared!(db, request.id, notice_wake)
       notice = receive_notice()
       assert notice["class"] == class
       assert notice["schemaVersion"] == 2
@@ -1255,8 +1293,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
         params: %{request: request.id, reason: "No longer needed"}
     }
 
+    notice_wake = pending_decision_notice!(db, request.id)
     assert {:ok, %{status: "withdrawn"}} = Dispatch.dispatch(db, handlers, withdraw)
     assert %{"class" => "verb.accepted"} = receive_notice()
+    assert_decision_notice_cleared!(db, request.id, notice_wake)
     notice = receive_notice()
     assert notice["class"] == "decision_request.withdrawn"
     assert notice["schemaVersion"] == 2
@@ -1649,6 +1689,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
     |> state_classes()
   end
 
+  defp observed_state_notices do
+    drain_notices()
+    |> Enum.filter(&match?({:ok, _row}, Tightbeam.Firehose.Registry.fetch(&1["class"])))
+    |> Enum.group_by(& &1["class"])
+  end
+
   defp assert_substrate_messages_created!(db, expected_messages, expected_batch_assignment_ids) do
     expected_rows =
       Enum.map(expected_messages, fn {session_key, content} ->
@@ -1836,6 +1882,44 @@ defmodule Tightbeam.Firehose.PublisherTest do
       provider: "anthropic",
       model: Tightbeam.Model.new("fable")
     })
+  end
+
+  defp pending_decision_notice!(db, request_id) do
+    assert {:ok, [[wake_id]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE consumer='prompt' AND state='pending' AND obligationRef=?1",
+               [Wakes.decision_request_notice_ref(request_id)]
+             )
+
+    wake_id
+  end
+
+  defp assert_decision_notice_cleared!(db, request_id, wake_id) do
+    cancellation = receive_notice()
+    assert cancellation["class"] == "wake.canceled"
+    assert cancellation["refs"]["wakeId"] == wake_id
+    assert cancellation["payload"]["state"] == "canceled"
+    assert %{state: "canceled", fired_at: nil} = Wakes.get(db, wake_id)
+
+    assert {:ok,
+            [
+              [
+                "process",
+                "tightbeam:escalation",
+                "obligation_disposed",
+                "decision_request",
+                ^request_id,
+                "disposition",
+                "decision_request_transition",
+                ^request_id
+              ]
+            ]} =
+             DB.query(
+               db,
+               "SELECT requesterKind,requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind,dispositionKind,dispositionId FROM wake_cancellations WHERE wakeId=?1",
+               [wake_id]
+             )
   end
 
   defp receive_notice do

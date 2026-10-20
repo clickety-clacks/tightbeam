@@ -644,14 +644,6 @@ defmodule Tightbeam.Assignments do
 
       liveness_trigger = disposition_liveness_trigger!(txn, work_item_id)
 
-      supervision_transition!(txn, :terminal_disposition, %{
-        kind: "terminal_disposition",
-        assignment_id: assignment_id,
-        cause: "holder_retired",
-        principal: principal,
-        requester_id: "tightbeam:retirement"
-      })
-
       disposition =
         assignment_disposition_command(
           assignment_id,
@@ -667,6 +659,8 @@ defmodule Tightbeam.Assignments do
         disposition,
         %{verb: "retire", principal: principal}
       )
+
+      Supervision.assignment_closed_in_txn(txn, assignment_id)
 
       DB.record_row_commit(txn, %{
         verb: "retire",
@@ -840,19 +834,16 @@ defmodule Tightbeam.Assignments do
       )
 
       if Txn.changes(txn) == 1 do
-        :ok =
-          Escalation.settle_agent_request_in_txn(
-            txn,
-            request_id,
-            "process:tightbeam",
-            "cannot-proceed released by condition fact #{fact.fact_id}"
-          )
-
+        # Retract the active retry leaf under the clearing fact's provenance
+        # before settling the linked request. Settling the request also clears
+        # its stored notice, which would otherwise win first and hide the
+        # source-owned condition clear.
         wake_id = Tightbeam.NoticeAuthority.current!(txn, wake_id)
 
         case Txn.q(txn, "SELECT state FROM wakes WHERE wakeId=?1", [wake_id]) do
           [["pending"]] ->
-            trigger = liveness_trigger!(txn, {:assignment, assignment_id})
+            # A block held past ladder end leaves no pending trigger (SN12(e)).
+            trigger = optional_liveness_trigger(txn, {:assignment, assignment_id})
 
             true =
               Wakes.cancel_in_txn(txn, %{
@@ -866,6 +857,14 @@ defmodule Tightbeam.Assignments do
           [[state]] when state in ["fired", "canceled"] ->
             :ok
         end
+
+        :ok =
+          Escalation.settle_agent_request_in_txn(
+            txn,
+            request_id,
+            "process:tightbeam",
+            "cannot-proceed released by condition fact #{fact.fact_id}"
+          )
 
         :ok = EffortCheckin.reconcile_wait_relief_in_txn(txn, assignment_id, fact.ts)
 
@@ -2439,26 +2438,25 @@ defmodule Tightbeam.Assignments do
           )
         end)
 
-        supervision_transition!(txn, :armed, %{
-          kind: "assignment_open",
-          assignment_id: id,
-          opened_at: now,
-          supervision_interval_ms: call.supervision_interval_ms,
-          principal: principal_id(call.principal)
-        })
-
-        entitlement_trigger = liveness_trigger!(txn, {:assignment, id})
+        Supervision.assignment_opened_in_txn(
+          txn,
+          id,
+          now,
+          call.supervision_interval_ms
+        )
 
         # This assign/dispatch routed the item: cancel bracket 1 (and bracket 2
         # if a prior last-close armed a slate wake — the slate is no longer clear).
         if work_item_id do
+          bracket_trigger = liveness_trigger!(txn, {:work_item, work_item_id})
+
           Tightbeam.WorkItems.cancel_brackets_in_txn(txn, work_item_id, %{
             causal_source: %{kind: "assignment_transition", id: id},
             outcome: %{
               kind: "disposition",
               disposition_kind: "assignment_transition",
               disposition_id: id,
-              liveness_trigger: entitlement_trigger
+              liveness_trigger: bracket_trigger
             }
           })
         end
@@ -2844,6 +2842,7 @@ defmodule Tightbeam.Assignments do
 
   defp insert_and_apply_lifecycle_attest(txn, call, assignment, holder) do
     attest = insert_attest(txn, call, assignment.id)
+    EffortCheckin.holder_activity_in_txn(txn, assignment.id, holder, attest)
     Wakes.record_terminal_handoff_action_in_txn(txn, holder, attest)
     result = apply_lifecycle_attest(txn, call, assignment, attest, holder)
     file_attest_condition_fact(txn, assignment, attest, result)
@@ -2930,14 +2929,6 @@ defmodule Tightbeam.Assignments do
 
     liveness_trigger = disposition_liveness_trigger!(txn, closed_assignment.workItemId)
 
-    supervision_transition!(txn, :terminal_disposition, %{
-      kind: "terminal_disposition",
-      assignment_id: assignment.id,
-      cause: "terminal_disposition",
-      principal: principal_id(call.principal),
-      requester_id: "tightbeam:assignments"
-    })
-
     disposition =
       assignment_disposition_command(
         assignment.id,
@@ -2953,6 +2944,8 @@ defmodule Tightbeam.Assignments do
       disposition,
       %{verb: "attest", principal: principal_id(call.principal)}
     )
+
+    Supervision.assignment_closed_in_txn(txn, assignment.id)
 
     append_attest_marker(txn, attest)
     append_assignment_marker(txn, closed_assignment, :closed)
@@ -3666,14 +3659,6 @@ defmodule Tightbeam.Assignments do
       liveness_trigger
     )
 
-    supervision_transition!(txn, :terminal_disposition, %{
-      kind: "terminal_disposition",
-      assignment_id: assignment_id,
-      cause: "terminal_disposition",
-      principal: principal_id(call.principal),
-      requester_id: "tightbeam:assignments"
-    })
-
     disposition =
       assignment_disposition_command(
         assignment_id,
@@ -3689,6 +3674,8 @@ defmodule Tightbeam.Assignments do
       disposition,
       %{verb: "revoke-assignment", principal: principal_id(call.principal)}
     )
+
+    Supervision.assignment_closed_in_txn(txn, assignment_id)
 
     append_assignment_marker(txn, revoked_assignment, :revoked)
     revoked_assignment
@@ -3837,24 +3824,23 @@ defmodule Tightbeam.Assignments do
       call.prepared_effort_arm
     )
 
-    supervision_transition!(txn, :armed, %{
-      kind: "assignment_open",
-      assignment_id: assignment_id,
-      opened_at: reopened_at,
-      supervision_interval_ms: call.supervision_interval_ms,
-      principal: principal_id(call.principal)
-    })
-
-    liveness_trigger = liveness_trigger!(txn, {:assignment, assignment_id})
+    Supervision.assignment_opened_in_txn(
+      txn,
+      assignment_id,
+      reopened_at,
+      call.supervision_interval_ms
+    )
 
     if reopened.workItemId do
+      bracket_trigger = liveness_trigger!(txn, {:work_item, reopened.workItemId})
+
       Tightbeam.WorkItems.cancel_brackets_in_txn(txn, reopened.workItemId, %{
         causal_source: %{kind: "assignment_transition", id: assignment_id},
         outcome: %{
           kind: "disposition",
           disposition_kind: "assignment_transition",
           disposition_id: assignment_id,
-          liveness_trigger: liveness_trigger
+          liveness_trigger: bracket_trigger
         }
       })
     end
@@ -4183,13 +4169,8 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
 
-    if attrs.kind == "verdict" do
-      [[subject]] =
-        Txn.q(txn, "SELECT COALESCE(reviewsAssignmentId,id) FROM assignments WHERE id=?1", [
-          attrs.assignment_id
-        ])
-
-      Tightbeam.Wakes.schedule_changed_in_txn(txn, {:review_remedy_changed, subject})
+    if is_binary(attrs.by_session) do
+      Supervision.activity_in_txn(txn, attrs.assignment_id, attrs.by_session, ts)
     end
 
     attest([
@@ -4875,29 +4856,22 @@ defmodule Tightbeam.Assignments do
   defp row_commit_principal_id({:remedy, %{statute: statute}}), do: "remedy:" <> statute
   defp row_commit_principal_id(principal), do: principal_id(principal)
 
-  defp supervision_transition!(txn, expected, observation) do
-    case Supervision.transition_in_txn(txn, observation) do
-      ^expected -> expected
-      {:error, reason} -> raise "supervision transition refused: #{inspect(reason)}"
-      other -> raise "invalid supervision transition result: #{inspect(other)}"
-    end
-  end
-
   defp disposition_liveness_trigger!(_txn, nil), do: nil
 
-  defp disposition_liveness_trigger!(txn, work_item_id) do
-    case Supervision.liveness_trigger_in_txn(txn, {:work_item, work_item_id}) do
+  defp disposition_liveness_trigger!(txn, work_item_id),
+    do: optional_liveness_trigger(txn, {:work_item, work_item_id})
+
+  defp optional_liveness_trigger(txn, primary) do
+    case Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
       {:ok, trigger} when is_map(trigger) -> trigger
-      :none -> raise "open work item #{work_item_id} has no liveness trigger"
-      {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"
+      :none -> nil
     end
   end
 
   defp liveness_trigger!(txn, primary) do
-    case Supervision.liveness_trigger_in_txn(txn, primary) do
+    case Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
       {:ok, trigger} when is_map(trigger) -> trigger
       :none -> raise "#{inspect(primary)} has no liveness trigger"
-      {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"
     end
   end
 

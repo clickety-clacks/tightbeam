@@ -63,28 +63,48 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
           assert before[table] == after_state[table], "unexpected mutation of #{table}"
         end
 
-        # R1 permits one notice for the legacy-null open obligation. Its
-        # immediate wake may finish while A's recovery and B/C are settling.
+        # The open obligation's inactivity deadline was stored before the
+        # crash and is overdue at restart. It fires once and raises one plain
+        # notice to the holder, which may finish while A's recovery and B/C
+        # are settling. The assignment row itself is untouched.
         assert before["columns"] == after_state["columns"]
         assignment_columns = before["columns"]["assignments"]
         assert [prior_row] = before["assignments"]
         assert [current_row] = after_state["assignments"]
         prior = Map.new(Enum.zip(assignment_columns, prior_row))
         current = Map.new(Enum.zip(assignment_columns, current_row))
-        assert {nil, preserved} = Map.pop(prior, "reminderState")
-        assert {encoded, ^preserved} = Map.pop(current, "reminderState")
+        assert current == prior
         assert prior["id"] == "asg_recovery_preserve"
         assert prior["holderKey"] == "agent:recovery:a"
         assert prior["openedByUser"] == "recovery-admin"
         assert prior["state"] == "open"
-        claim = JSON.decode!(encoded)
-        assert %{"lastConsumer" => %{"wake" => notice_id}} = claim
 
         wake_columns = after_state["columns"]["wakes"]
         before_wakes = Enum.map(before["wakes"], &Map.new(Enum.zip(wake_columns, &1)))
         after_wakes = Enum.map(after_state["wakes"], &Map.new(Enum.zip(wake_columns, &1)))
+
+        deadline? = fn wake ->
+          wake["assignmentId"] == prior["id"] and
+            wake["consumer"] == "assignment_inactivity_deadline"
+        end
+
+        assert [%{"state" => "pending", "wakeId" => deadline_id}] =
+                 Enum.filter(before_wakes, deadline?)
+
+        assert [%{"state" => "fired", "wakeId" => ^deadline_id}] =
+                 Enum.filter(after_wakes, deadline?)
+
+        assert [notice] =
+                 Enum.filter(after_wakes, fn wake ->
+                   wake["assignmentId"] == prior["id"] and wake["consumer"] == "prompt" and
+                     String.starts_with?(
+                       wake["obligationRef"] || "",
+                       "assignment-inactivity-episode-v1:"
+                     )
+                 end)
+
+        notice_id = notice["wakeId"]
         refute Enum.any?(before_wakes, &(&1["wakeId"] == notice_id))
-        assert [notice] = Enum.filter(after_wakes, &(&1["wakeId"] == notice_id))
         assert notice["assignmentId"] == prior["id"]
         assert notice["sessionKey"] == prior["holderKey"]
         assert notice["ownerUserId"] == prior["openedByUser"]
@@ -147,23 +167,7 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
         assert notice_turn["status"] == "delivered"
         assert is_integer(notice_turn["endedAt"])
 
-        notice_snapshot = %{
-          "kind" => "prod",
-          "target" => prior["holderKey"],
-          "consequence" => nil
-        }
-
-        assert claim == %{
-                 "version" => 1,
-                 "claimEpoch" => 1,
-                 "pending" => nil,
-                 "lastSnapshot" => notice_snapshot,
-                 "lastIntent" => notice_id,
-                 "lastConsumer" => %{"wake" => notice_id},
-                 "lastDeliveredAt" => notice_turn["endedAt"],
-                 "backoffStep" => 0,
-                 "nextEligibleAt" => notice_turn["endedAt"] + 300_000
-               }
+        assert notice["prompt"] =~ "has had no recorded activity"
 
         assert notice_turn["origin"] == notice["origin"]
 

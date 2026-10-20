@@ -20,6 +20,7 @@ defmodule Tightbeam.Sentinels do
   alias Tightbeam.DB.Txn
   alias Tightbeam.Identity
   alias Tightbeam.Placement
+  alias Tightbeam.Wakes
 
   @states_ddl """
   CREATE TABLE IF NOT EXISTS sentinel_states (
@@ -198,6 +199,8 @@ defmodule Tightbeam.Sentinels do
           """,
           [host, qualified, sha256, started_at]
         )
+
+        Wakes.clear_sentinel_stop_notice_in_txn(txn, host, qualified)
 
         :ok
       end)
