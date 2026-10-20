@@ -275,7 +275,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(missing_parent.resp_body)["error"]["code"] == "not_found"
   end
 
-  test "selected session REST routes use only the credential-derived read principal", ctx do
+  test "selected session REST routes require explicit operator identity only for history", ctx do
     session = create_session(ctx.db, "selected-session", ctx.device.user_id)
 
     catalog = %{
@@ -298,7 +298,7 @@ defmodule Tightbeam.Wire.RouterTest do
       attributed = request.(path <> "?asUser=#{ctx.device.user_id}", "tbc_test")
 
       assert denied.status == 403
-      assert attributed.status == 403
+      assert attributed.status == if(suffix == "/messages", do: 200, else: 403)
       assert JSON.decode!(denied.resp_body)["error"]["code"] == "org_token_read_forbidden"
       refute denied.resp_body =~ session.session_key
     end
@@ -3141,6 +3141,29 @@ defmodule Tightbeam.Wire.RouterTest do
                     }}
 
     assert JSON.decode!(facts.resp_body)["result"] == %{"exists" => false, "fact" => nil}
+
+    assignment_opts =
+      with_handler(ctx.opts, "assignment-get", fn call ->
+        send(parent, {:assignment_call, call})
+        %{accepted: true}
+      end)
+
+    assignment =
+      dispatch_cli(%{ctx | opts: assignment_opts}, "tbc_test", %{
+        verb: "assignment-get",
+        asUser: "flynn",
+        params: %{assignmentId: "assignment-example", factId: 42}
+      })
+
+    assert assignment.status == 200
+
+    assert_receive {:assignment_call,
+                    %{
+                      verb: "assignment-get",
+                      params: %{assignment_id: "assignment-example", fact_id: 42}
+                    }}
+
+    assert JSON.decode!(assignment.resp_body)["result"] == %{"accepted" => true}
 
     list_opts =
       with_handler(ctx.opts, "inspect", fn _call ->

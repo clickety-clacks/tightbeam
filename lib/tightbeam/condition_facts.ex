@@ -514,6 +514,22 @@ defmodule Tightbeam.ConditionFacts do
     end
   end
 
+  @doc "Read one stored condition fact by its existing identifier."
+  @spec by_id(DB.server(), pos_integer()) :: map() | nil
+  def by_id(db, fact_id) when is_integer(fact_id) and fact_id > 0 do
+    case DB.query(
+           db,
+           "SELECT id, ts, kind, scope, origin FROM condition_facts WHERE id = ?1",
+           [fact_id]
+         ) do
+      {:ok, [[id, ts, kind, scope, origin]]} ->
+        %{id: id, ts: ts, kind: kind, scope: scope, origin: origin}
+
+      {:ok, []} ->
+        nil
+    end
+  end
+
   @doc """
   Whether the assert kind of a standing pair currently STANDS for `scope`:
   the latest fact of either kind in the pair is the assert. Derived, never
