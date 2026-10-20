@@ -665,7 +665,7 @@ defmodule Tightbeam.CredentialsTest do
     refute_receive {:forbidden_cancel_publish, _}
   end
 
-  test "a second begin supersedes the pending lease and its stale finish fails loudly", ctx do
+  test "an overlapping begin fails closed while the first lease can finish", ctx do
     owner = self()
 
     {:ok, server} =
@@ -673,54 +673,100 @@ defmodule Tightbeam.CredentialsTest do
         name: nil,
         base_dir: ctx.base,
         machine: "eezo",
-        stop: fn provider ->
-          send(owner, {:stop, provider})
-          :ok
+        log_event: fn kind, subject, detail ->
+          send(owner, {:event, kind, subject, detail})
         end
       )
 
-    assert {:ok, staging, stale_lease_id} = Credentials.begin_onboard(:openai, server)
-    File.write!(Path.join(staging, "auth.json"), ~S({"token":"stale"}))
-    refute_receive {:stop, :openai}
+    assert {:ok, installed_staging, installed_lease_id} =
+             Credentials.begin_onboard(:openai, server)
 
-    assert {:ok, fresh, current_lease_id} = Credentials.begin_onboard(:openai, server)
-    assert fresh != staging
-    assert current_lease_id != stale_lease_id
-    refute_receive {:stop, :openai}
+    File.write!(Path.join(installed_staging, "auth.json"), ~S({"token":"installed"}))
+
+    assert :ok =
+             Credentials.finish_onboard(
+               :openai,
+               :subscription,
+               installed_lease_id,
+               server
+             )
+
+    assert Credentials.status(:openai, server) == :onboarded
+    assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
+    staged_secret = ~S({"token":"first-ceremony-secret"})
+    File.write!(Path.join(staging, "auth.json"), staged_secret)
+
+    metadata = credential_metadata(ctx.base, "codex")
+
+    assert {:error, :onboarding_already_in_progress} =
+             Credentials.begin_onboard(:openai, server)
+
+    assert File.read!(Path.join(staging, "auth.json")) == staged_secret
+    assert credential_metadata(ctx.base, "codex") == metadata
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :in_progress}
+
+    assert_received conflict_event =
+                      {:event, "credential_onboarding_conflict", "openai@eezo", nil}
+
+    conflict = inspect(conflict_event)
+    refute conflict =~ lease_id
+    refute conflict =~ staging
+    refute conflict =~ staged_secret
+
+    assert :ok = Credentials.finish_onboard(:openai, :subscription, lease_id, server)
     refute File.exists?(staging)
-    File.write!(Path.join(fresh, "auth.json"), ~S({"token":"successor"}))
 
-    assert {:error, :onboarding_lease_superseded} =
-             Credentials.finish_onboard(:openai, :subscription, stale_lease_id, server)
-
-    refute File.exists?(Path.join([ctx.base, "auth", "codex", "auth.json"]))
-    assert File.exists?(fresh)
+    assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+             staged_secret
   end
 
-  test "a stale cancel does not cancel the successor's lease", ctx do
+  test "a rejected overlapping begin leaves cancellation with the first lease owner", ctx do
     {:ok, server} =
       Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
-    assert {:ok, _abandoned, stale_lease_id} = Credentials.begin_onboard(:anthropic, server)
-    assert {:ok, fresh, current_lease_id} = Credentials.begin_onboard(:anthropic, server)
+    assert {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
+
+    assert {:error, :onboarding_already_in_progress} =
+             Credentials.begin_onboard(:anthropic, server)
 
     assert {:error, :onboarding_lease_superseded} =
-             Credentials.cancel_onboard(:anthropic, stale_lease_id, server)
+             Credentials.cancel_onboard(:anthropic, "stale-lease-id", server)
 
-    assert File.exists?(fresh)
+    assert File.exists?(staging)
     assert Credentials.status(:anthropic, server) == {:needs_onboarding, :in_progress}
-    assert :ok = Credentials.cancel_onboard(:anthropic, current_lease_id, server)
-    refute File.exists?(fresh)
+    assert :ok = Credentials.cancel_onboard(:anthropic, lease_id, server)
+    refute File.exists?(staging)
+    assert Credentials.status(:anthropic, server) == {:needs_onboarding, :missing}
   end
 
-  test "an operator whose CLI died can immediately begin again", ctx do
-    {:ok, server} =
-      Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+  test "begin replaces only a server-expired lease for the same provider owner", ctx do
+    clock = :counters.new(1, [])
+    :counters.put(clock, 1, 1_000)
 
-    assert {:ok, abandoned, _abandoned_id} = Credentials.begin_onboard(:anthropic, server)
-    assert {:ok, fresh, _fresh_id} = Credentials.begin_onboard(:anthropic, server)
+    {:ok, server} =
+      Credentials.start_link(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "eezo",
+        onboarding_lease_ms: 60_000,
+        now: fn -> :counters.get(clock, 1) end
+      )
+
+    assert {:ok, abandoned, abandoned_id} = Credentials.begin_onboard(:anthropic, server)
+    File.write!(Path.join(abandoned, ".credentials.json"), "expired-staged-secret")
+
+    assert {:error, :onboarding_already_in_progress} =
+             Credentials.begin_onboard(:anthropic, server)
+
+    assert File.exists?(abandoned)
+    :counters.add(clock, 1, 61)
+
+    assert {:ok, fresh, fresh_id} = Credentials.begin_onboard(:anthropic, server)
+
     assert fresh != abandoned
+    assert fresh_id != abandoned_id
     refute File.exists?(abandoned)
+    assert File.exists?(fresh)
   end
 
   test "an abandoned onboarding lease expires server-side at a read seam", ctx do
