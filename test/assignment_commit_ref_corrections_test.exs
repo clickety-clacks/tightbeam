@@ -77,7 +77,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     assert entry.verifiedAt == correction.verifiedAt
   end
 
-  test "a new correction publishes one canonical assignment update and replay is quiet", ctx do
+  test "a new correction publishes the current lifecycle row and replay is quiet", ctx do
     start_supervised!({Hub, name: Hub})
 
     :ok =
@@ -89,7 +89,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
       })
 
     :ok =
-      Hub.subscribe(Hub, self(), "commit-ref-correction", %{"classes" => ["assignment.updated"]})
+      Hub.subscribe(Hub, self(), "commit-ref-correction", %{"classes" => ["assignment.closed"]})
 
     before =
       ctx.db
@@ -102,7 +102,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
 
     assert_received {:firehose_notice,
                      %{
-                       "class" => "assignment.updated",
+                       "class" => "assignment.closed",
                        "op" => "upsert",
                        "refs" => %{"assignmentId" => "asg_closed"},
                        "payload" => %{"commitRefCorrections" => [event_correction]} = payload

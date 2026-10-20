@@ -29,7 +29,6 @@ defmodule Tightbeam.Firehose.Registry do
     {"assignment.opened", "assignments", "upsert", "assignmentId"},
     {"assignment.closed", "assignments", "upsert", "assignmentId"},
     {"assignment.reopened", "assignments", "upsert", "assignmentId"},
-    {"assignment.updated", "assignments", "upsert", "assignmentId"},
     {"attest.filed", "attests", "upsert", "attestId"},
     {"wake.scheduled", "wakes", "upsert", "wakeId"},
     {"wake.fired", "wakes", "upsert", "wakeId"},

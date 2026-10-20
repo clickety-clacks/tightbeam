@@ -194,9 +194,14 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
                     raise ArgumentError,
                           "corrected assignment is missing from its committing transaction"
 
+                class =
+                  if assignment.state == "closed",
+                    do: "assignment.closed",
+                    else: "assignment.opened"
+
                 Publisher.committed_in_txn(
                   txn,
-                  "assignment.updated",
+                  class,
                   assignment,
                   %{"assignmentId" => context.assignment_id}
                 )

@@ -71,7 +71,7 @@ defmodule Tightbeam.GatewayTest do
     assert effects["tune"] == ["message.created", "session.updated", "session.harness_changed"]
     assert effects["repair-assignment"] == ["message.created", "session.updated", "turn.queued"]
     assert effects["session-reparent"] == ["session.updated"]
-    assert effects["assignment-commitref-correct"] == ["assignment.updated"]
+    assert effects["assignment-commitref-correct"] == ["assignment.closed"]
     assert effects["session-po-set"] == ["wake.scheduled"]
 
     assert effects["wake"] == [
