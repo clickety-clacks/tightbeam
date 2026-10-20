@@ -288,7 +288,7 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
       end)
 
     assert attest_notices["message.created"]["payload"]["content"] ==
-             "[progress filed on #{assignment.id}]"
+             "[progress filed on #{assignment.id}: authoritative A4 append]"
 
     notices = Map.put(notices, "attest.filed", attest_notices["attest.filed"])
 
