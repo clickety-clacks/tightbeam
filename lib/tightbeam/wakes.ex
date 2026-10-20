@@ -5697,7 +5697,8 @@ defmodule Tightbeam.Wakes do
       {:ok, page} ->
         %{rows: Enum.map(page.rows, &wake_with_delivery_projection/1), flags: page}
 
-      {:error, error} -> raise error
+      {:error, error} ->
+        raise error
     end
   end
 
