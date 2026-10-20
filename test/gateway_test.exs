@@ -27,10 +27,49 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.sort(Map.keys(handlers)) == Enum.sort(expected)
     assert Enum.sort(Map.keys(effects)) == Enum.sort(expected)
     assert Enum.all?(Map.values(handlers), &is_function(&1, 1))
-    assert effects["reopen-assignment"] == ["assignment.reopened"]
+    assert "assignment.reopened" in effects["reopen-assignment"]
+    assert "work_item.updated" in effects["reopen-assignment"]
+    assert "wake.scheduled" in effects["ask"]
+    assert "wake.scheduled" in effects["answer"]
+    assert "wake.scheduled" in effects["return"]
+    assert "wake.scheduled" in effects["assign"]
+    assert "turn.queued" in effects["post"]
+    assert "turn.queued" in effects["wake"]
+    assert "turn.queued" in effects["condition"]
+    assert "turn.queued" in effects["dispatch"]
+    assert "wake.canceled" in effects["assign"]
+    assert "work_item.updated" in effects["assign"]
+    assert "wake.canceled" in effects["reopen-assignment"]
+    assert "wake.scheduled" in effects["reopen-assignment"]
+    assert "wake.scheduled" in effects["work-item-update"]
+    assert "wake.canceled" in effects["work-item-close"]
+    assert "wake.canceled" in effects["work-item-icebox"]
+    assert "wake.scheduled" in effects["work-item-reopen"]
+    assert effects["attend"] == ["turn.started"]
+    assert "assignment.opened" in effects["attest"]
+    assert "turn.queued" in effects["attest"]
+    assert "decision_request.opened" in effects["attest"]
+    assert "decision_request.withdrawn" in effects["attest"]
+    assert "decision_request.superseded" in effects["attest"]
+
+    assert effects["retire"] == [
+             "session.retired",
+             "wake.scheduled",
+             "wake.canceled",
+             "turn.ended",
+             "assignment.closed",
+             "decision_request.withdrawn",
+             "decision_request.superseded",
+             "work_item.updated"
+           ]
+
+    assert "work_item.updated" in effects["attest"]
+    assert "work_item.updated" in effects["revoke-assignment"]
+    assert "wake.scheduled" in effects["revoke-assignment"]
+    assert "wake.canceled" in effects["revoke-assignment"]
     assert effects["artifact-content-fetch"] == []
     assert effects["tune"] == ["message.created", "session.updated", "session.harness_changed"]
-    assert effects["repair-assignment"] == ["message.created", "session.updated"]
+    assert effects["repair-assignment"] == ["message.created", "session.updated", "turn.queued"]
     assert effects["session-reparent"] == ["session.updated"]
     assert effects["assignment-commitref-correct"] == ["assignment.updated"]
     assert effects["session-po-set"] == ["wake.scheduled"]
@@ -40,7 +79,8 @@ defmodule Tightbeam.GatewayTest do
              "wake.canceled",
              "wake.fired",
              "message.created",
-             "session.updated"
+             "session.updated",
+             "turn.queued"
            ]
 
     assert effects["cancel"] == ["turn.ended", "session.updated"]

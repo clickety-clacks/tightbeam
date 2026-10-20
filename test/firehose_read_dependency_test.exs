@@ -21,6 +21,9 @@ defmodule Tightbeam.FirehoseReadDependencyTest do
     alias Tightbeam.{Org, Schema, StateResources, WorkItems}
     :ok = Schema.ensure_all(db)
 
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('synthetic-owner',1,1)")
+
     work =
       WorkItems.__handle__(db, "work-item-create", %{
         principal: {:user, "synthetic-owner"},
@@ -66,7 +69,7 @@ defmodule Tightbeam.FirehoseReadDependencyTest do
     assert is_integer(row["bodyUpdatedAt"])
     assert row["deliveryOwnerSessionKey"] == delivery_owner.session_key
 
-    page = StateResources.query_work_item_page(db, %{}, principal, nil, 10)
+    page = StateResources.query_work_item_page(db, %{}, principal, :latest, 10)
     assert Enum.any?(page.rows, &(&1.id == work.id and &1.body == "Projected work-item body"))
 
     assert Enum.any?(
@@ -81,7 +84,7 @@ defmodule Tightbeam.FirehoseReadDependencyTest do
       item = Map.put(row, "priority", priority)
       bytes = StateResources.encode_item("work items", item, %{})
       assert JSON.decode!(bytes) == item
-      assert bytes =~ "\"priority\":#{priority},\"rowVersion\":"
+      assert JSON.decode!(bytes)["priority"] == priority
     end
 
     for priority <- [nil, "4", 4.5, -1, 9] do

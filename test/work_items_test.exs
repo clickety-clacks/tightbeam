@@ -112,6 +112,9 @@ defmodule Tightbeam.WorkItemsTest do
         sender_scheduled: true
       })
 
+    assert_receive {:firehose_notice, %{"class" => "wake.scheduled"}}
+    Hub.delivered(hub, self())
+
     assert {:error, %RuntimeError{message: "rollback publication"}} =
              DB.transaction(ctx.db, fn txn ->
                Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
@@ -130,6 +133,11 @@ defmodule Tightbeam.WorkItemsTest do
     assert carrier_id != wake.wake_id
     assert %{digest: true, state: "fired"} = Wakes.get(ctx.db, carrier_id)
     assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "wake.scheduled", "payload" => %{"wakeId" => ^carrier_id}}}
+
+    Hub.delivered(hub, self())
 
     assert {:ok, [[actual_session, "queued", message_id, content]]} =
              DB.query(
@@ -158,6 +166,31 @@ defmodule Tightbeam.WorkItemsTest do
     assert session_payload["sessionKey"] == ctx.holder.session_key
     assert session_payload["ownerUserId"] == "flynn"
     assert session_payload["mechanicalStatus"] == "running"
+    Hub.delivered(hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "turn.queued",
+                      "refs" => %{"sessionKey" => session_key},
+                      "payload" => %{"status" => "queued", "wakeId" => ^carrier_id}
+                    }}
+
+    assert session_key == ctx.holder.session_key
+    Hub.delivered(hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "wake.scheduled",
+                      "refs" => %{"wakeId" => ^carrier_id},
+                      "payload" => %{"state" => "pending", "deliveryStatus" => "queued"}
+                    }}
+
+    Hub.delivered(hub, self())
+
+    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => source_payload}}
+    assert source_payload["wakeId"] == wake.wake_id
+    assert source_payload["digest"] == false
+    assert source_payload["state"] == "fired"
     Hub.delivered(hub, self())
 
     assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => payload}}

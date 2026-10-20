@@ -214,6 +214,7 @@ defmodule Tightbeam.Ledger do
       end
 
       Org.sync_mechanical_status_in_txn(txn, session_key)
+      :ok = Publisher.turn_in_txn(txn, "turn.queued", seq)
       {:ok, seq}
     else
       {:error, eligibility}
@@ -1425,18 +1426,42 @@ defmodule Tightbeam.Ledger do
   @spec mark_published(db(), integer()) :: :ok
   def mark_published(db \\ Tightbeam.DB, seq) do
     now = System.system_time(:millisecond)
-    {:ok, _} = DB.query(db, "UPDATE turns SET publishedAt = ?2 WHERE seq = ?1", [seq, now])
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Txn.q(
+          txn,
+          "UPDATE turns SET publishedAt = ?2 WHERE seq = ?1 AND endedAt IS NOT NULL AND publishedAt IS NULL",
+          [seq, now]
+        )
+
+        if Txn.changes(txn) == 1 do
+          turn = Tightbeam.StateResources.query_turn_in_txn(txn, seq)
+
+          Publisher.committed_in_txn(txn, "turn.ended", turn, %{"turnSeq" => seq})
+        end
+      end)
+
     :ok
   end
 
   @doc "Stamp the adapter generation selected for a running turn."
   @spec stamp_adapter(db(), integer(), non_neg_integer()) :: :ok
   def stamp_adapter(db \\ Tightbeam.DB, seq, generation) do
-    {:ok, _} =
-      DB.query(db, "UPDATE turns SET adapterGen = ?2 WHERE seq = ?1 AND status = 'running'", [
-        seq,
-        generation
-      ])
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Txn.q(
+          txn,
+          "UPDATE turns SET adapterGen = ?2 WHERE seq = ?1 AND status = 'running' AND adapterGen IS NOT ?2",
+          [seq, generation]
+        )
+
+        if Txn.changes(txn) == 1 do
+          turn = Tightbeam.StateResources.query_turn_in_txn(txn, seq)
+
+          Publisher.committed_in_txn(txn, "turn.started", turn, %{"turnSeq" => seq})
+        end
+      end)
 
     :ok
   end

@@ -55,6 +55,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
              })
 
     assert {:ok, busy_turn} = Ledger.claim_next(db, target, "lane:firehose-boundary")
+    _claim_notices = observed_classes()
 
     wake =
       Wakes.schedule(db, %{
@@ -64,7 +65,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
         due_at: 1
       })
 
-    _seed_notices = observed_classes()
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "wake.scheduled",
+                      "refs" => %{"wakeId" => wake_id}
+                    }}
+
+    assert wake_id == wake.wake_id
+    Hub.delivered(Hub, self())
     opts = [wake_id: wake.wake_id, fire_wake_in_txn: true]
 
     assert {:error, %RuntimeError{message: "rollback winning fire"}} =
@@ -83,7 +91,9 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, [[0]]} =
              DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
 
-    assert observed_classes() == []
+    refute Enum.any?(observed_notices(), fn notice ->
+             get_in(notice, ["refs", "wakeId"]) == wake.wake_id
+           end)
 
     assert {:ok, {:staged, _source}} =
              DB.transaction(
@@ -93,7 +103,17 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert NoticeBatcher.source_refs(db, wake.wake_id) == []
     assert Wakes.get(db, wake.wake_id).state == "pending"
-    assert observed_classes() == []
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "wake.scheduled",
+                      "refs" => %{"wakeId" => wake_id},
+                      "payload" => %{"state" => "pending", "firedAt" => fired_at}
+                    }}
+
+    assert wake_id == wake.wake_id
+    assert is_integer(fired_at)
+    Hub.delivered(Hub, self())
 
     assert :ok =
              Ledger.finish(db, busy_turn.seq, "delivered", nil,
@@ -158,7 +178,42 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, [[0]]} =
              DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [external.wake_id])
 
-    assert observed_classes() == []
+    external_wake_notices = observed_notices()
+    assert Enum.map(external_wake_notices, & &1["class"]) == ["wake.scheduled"]
+    external_wake_notice = hd(external_wake_notices)
+    external_wake_row = db |> StateResources.query_wake(external.wake_id) |> StateResources.wake()
+    assert external_wake_notice["refs"]["wakeId"] == external.wake_id
+    assert external_wake_notice["payload"] == external_wake_row
+    assert external_wake_row["state"] == "pending"
+    assert is_integer(external_wake_row["firedAt"])
+  end
+
+  test "transactional wake creation publishes its canonical scheduled row" do
+    db = :firehose_wake_creation_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "wake-target",
+        origin: "process:tightbeam",
+        prompt: "inspect this scheduled row",
+        due_at: 1
+      })
+
+    assert %{
+             "class" => "wake.scheduled",
+             "resource" => "wakes",
+             "op" => "upsert",
+             "refs" => %{"wakeId" => wake_id, "sessionKey" => "wake-target"},
+             "payload" => payload
+           } = receive_notice()
+
+    assert wake_id == wake.wake_id
+    assert payload["wakeId"] == wake.wake_id
+    assert payload["prompt"] == "inspect this scheduled row"
+    assert payload["state"] == "pending"
   end
 
   test "work-item-create emits its committed routing wake once, never on keyed replay" do
@@ -244,23 +299,28 @@ defmodule Tightbeam.Firehose.PublisherTest do
                authenticated_device_message: true
              )
 
-    assert %{
-             "class" => "session.updated",
-             "payload" => %{"mechanicalStatus" => "running", "sessionKey" => "post-target"}
-           } = receive_notice()
+    post_notices = Enum.map(1..3, fn _ -> receive_notice() end)
+
+    assert Enum.sort(Enum.map(post_notices, & &1["class"])) ==
+             Enum.sort(["turn.queued", "session.updated", "message.created"])
+
+    assert %{"payload" => %{"mechanicalStatus" => "running", "sessionKey" => "post-target"}} =
+             Enum.find(post_notices, &(&1["class"] == "session.updated"))
+
+    assert %{"payload" => %{"status" => "queued", "sessionKey" => "post-target"}} =
+             Enum.find(post_notices, &(&1["class"] == "turn.queued"))
 
     assert %{
-             "class" => "message.created",
              "payload" => %{
                "content" => "[from user:flynn]\n\nexact A1 post reproduction"
              }
-           } = receive_notice()
+           } = Enum.find(post_notices, &(&1["class"] == "message.created"))
 
     declared = Gateway.handler_effects(%{db: db})["post"]
-    observed = ["message.created", "session.updated"]
+    observed = Enum.map(post_notices, & &1["class"])
     assert_effects_match!(declared, observed)
 
-    assert_raise ArgumentError, ~r/missing=\["message.created", "session.updated"\]/, fn ->
+    assert_raise ArgumentError, ~r/missing=/, fn ->
       assert_effects_match!([], observed)
     end
   end
@@ -433,6 +493,20 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, work_item} = Dispatch.dispatch(db, handlers, work_item_create)
     _ = observed_classes()
 
+    work_item_dispatch = %{
+      dispatch
+      | params:
+          Map.merge(dispatch.params, %{
+            subject: "Effect work-item dispatch",
+            brief: "Exercise work-item assignment publication.",
+            work_item_id: work_item.id
+          })
+    }
+
+    assert {:ok, _work_item_assignment} = Dispatch.dispatch(db, handlers, work_item_dispatch)
+    work_item_dispatch_observed = observed_state_classes()
+    _work_item_dispatched_turn = finish_next_turn!(db, "effect-target", "lane:effects")
+
     rumination_dispatch = %{
       verb: "dispatch",
       origin: "agent:effect-dispatcher",
@@ -458,7 +532,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
     dispatch_delivery_effects = observed_state_classes()
 
     dispatch_events =
-      dispatch_observed ++ state_classes(rumination_classes) ++ dispatch_delivery_effects
+      dispatch_observed ++
+        work_item_dispatch_observed ++
+        state_classes(rumination_classes) ++
+        dispatch_delivery_effects
 
     # The rumination's asynchronous wake delivery has its own wake.fired event;
     # the dispatch handler's declared effects describe its direct commit effects.
@@ -659,11 +736,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert Enum.all?(asynchronous_delivery, &(&1 in completion_effects))
 
-    assert_per_verb_effects!(
-      config,
-      "attest",
+    direct_completion_effects =
       Enum.reject(completion_effects, &(&1 in asynchronous_delivery))
-    )
+
+    declared_attest_effects = Gateway.handler_effects(config)["attest"]
+    assert Enum.all?(direct_completion_effects, &(&1 in declared_attest_effects))
+    assert "attest.filed" in direct_completion_effects
+    assert "assignment.closed" in direct_completion_effects
+    assert "turn.queued" in direct_completion_effects
 
     reopen = %{
       verb: "reopen-assignment",
@@ -1111,8 +1191,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     assert {:ok, %{status: "open"} = request} = Dispatch.dispatch(db, handlers, ask)
-    assert observed_state_classes() == ["decision_request.opened"]
-    assert Gateway.handler_effects(%{db: db})["operator-ask"] == ["decision_request.opened"]
+    assert observed_state_classes() == ["wake.scheduled", "decision_request.opened"]
+
+    assert Gateway.handler_effects(%{db: db})["operator-ask"] ==
+             ["decision_request.opened", "wake.scheduled"]
 
     assert {:ok, %{id: replay_id}} = Dispatch.dispatch(db, handlers, ask)
     assert replay_id == request.id
@@ -1175,7 +1257,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, %{status: "open"} = withdraw_request} =
              Dispatch.dispatch(db, handlers, ask_withdraw)
 
-    assert observed_state_classes() == ["decision_request.opened"]
+    assert observed_state_classes() == ["wake.scheduled", "decision_request.opened"]
 
     withdraw = %{
       verb: "operator-withdraw",
@@ -1236,7 +1318,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
           {"return", %{reason: "Need evidence"}, "returned", "decision_request.returned"}
         ] do
       assert {:ok, request} = Dispatch.dispatch(db, handlers, ask)
-      assert observed_state_classes() == ["decision_request.opened"]
+      assert observed_state_classes() == ["wake.scheduled", "decision_request.opened"]
 
       response = %{
         ask
@@ -1250,9 +1332,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
       notice_wake = pending_decision_notice!(db, request.id)
       assert {:ok, %{status: ^status}} = Dispatch.dispatch(db, handlers, response)
-      assert %{"class" => "verb.accepted"} = receive_notice()
+      response_notices = Enum.map(1..3, fn _ -> receive_notice() end)
+
+      assert Enum.sort(Enum.map(response_notices, & &1["class"])) ==
+               Enum.sort(["verb.accepted", "wake.scheduled", class])
       assert_decision_notice_cleared!(db, request.id, notice_wake)
-      notice = receive_notice()
+      notice = Enum.find(response_notices, &(&1["class"] == class))
       assert notice["class"] == class
       assert notice["schemaVersion"] == 2
       assert notice["resource"] == "decision requests"
@@ -1284,7 +1369,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     end
 
     assert {:ok, request} = Dispatch.dispatch(db, handlers, ask)
-    assert observed_state_classes() == ["decision_request.opened"]
+    assert observed_state_classes() == ["wake.scheduled", "decision_request.opened"]
 
     withdraw = %{
       ask
@@ -1327,17 +1412,57 @@ defmodule Tightbeam.Firehose.PublisherTest do
       model: Tightbeam.Model.new("fable")
     })
 
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "turn-target",
+        origin: "user:flynn",
+        prompt: "run",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    assert %{"class" => "wake.scheduled", "payload" => %{"state" => "pending"}} =
+             receive_notice()
+
     assert {:ok, seq} =
              Ledger.enqueue(db, %{
                session_key: "turn-target",
+               wake_id: wake.wake_id,
                message_id: "turn-message",
                origin: "user:flynn",
                prompt: "run"
              })
 
+    enqueue_notices = Enum.map(1..3, fn _ -> receive_notice() end)
+
+    assert Enum.sort(Enum.map(enqueue_notices, & &1["class"])) ==
+             Enum.sort(["session.updated", "turn.queued", "wake.scheduled"])
+
+    queued = Enum.find(enqueue_notices, &(&1["class"] == "turn.queued"))
+    queued_row = db |> StateResources.query_turn_by_seq(seq) |> StateResources.turn()
+    assert queued["refs"] == %{"turnSeq" => seq, "sessionKey" => "turn-target"}
+    assert queued["payload"] == queued_row
+    assert queued_row["status"] == "queued"
+    queued_version = queued_row["rowVersion"]
+    session_notice = Enum.find(enqueue_notices, &(&1["class"] == "session.updated"))
+    assert session_notice["payload"]["mechanicalStatus"] == "running"
+    queued_wake = Enum.find(enqueue_notices, &(&1["class"] == "wake.scheduled"))
+    assert queued_wake["payload"]["wakeId"] == wake.wake_id
+    assert queued_wake["payload"]["deliveryStatus"] == "queued"
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1 AND state='pending'",
+                 [wake.wake_id, System.system_time(:millisecond)]
+               )
+
+               Wakes.publish_change_in_txn(txn, "wake.fired", wake.wake_id)
+             end)
+
     assert %{
-             "class" => "session.updated",
-             "payload" => %{"mechanicalStatus" => "running", "sessionKey" => "turn-target"}
+             "class" => "wake.fired",
+             "payload" => %{"state" => "fired", "deliveryStatus" => "queued"}
            } = receive_notice()
 
     assert {:ok, %{seq: ^seq, owner_lease: seq_lease}} =
@@ -1346,7 +1471,25 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert %{
              "class" => "turn.started",
              "refs" => %{"turnSeq" => ^seq},
-             "payload" => %{"status" => "running", "seq" => ^seq}
+             "payload" => started_payload
+           } = receive_notice()
+
+    started = db |> StateResources.query_turn_by_seq(seq) |> StateResources.turn()
+    assert started_payload == started
+    started_version = started["rowVersion"]
+    assert started_version > queued_version
+
+    assert %{
+             "class" => "wake.fired",
+             "payload" => %{"state" => "fired", "deliveryStatus" => "running"}
+           } = receive_notice()
+
+    assert :ok = Ledger.stamp_adapter(db, seq, 7)
+
+    assert %{
+             "class" => "turn.started",
+             "refs" => %{"turnSeq" => ^seq},
+             "payload" => %{"adapterGen" => 7, "seq" => ^seq}
            } = receive_notice()
 
     assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: seq_lease)
@@ -1354,13 +1497,131 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert %{
              "class" => "turn.ended",
              "refs" => %{"turnSeq" => ^seq},
-             "payload" => %{"status" => "delivered", "seq" => ^seq}
+             "payload" => ended_payload
+           } = receive_notice()
+
+    ended = db |> StateResources.query_turn_by_seq(seq) |> StateResources.turn()
+    assert ended_payload == ended
+    ended_version = ended["rowVersion"]
+    assert ended_version > started_version
+
+    assert %{
+             "class" => "wake.fired",
+             "payload" => %{"state" => "fired", "deliveryStatus" => "delivered"}
            } = receive_notice()
 
     assert %{
              "class" => "session.updated",
              "payload" => %{"mechanicalStatus" => "idle", "sessionKey" => "turn-target"}
            } = receive_notice()
+
+    assert :ok = Ledger.mark_published(db, seq)
+
+    assert %{
+             "class" => "turn.ended",
+             "refs" => %{"turnSeq" => ^seq},
+             "payload" => %{"publishedAt" => published_at, "seq" => ^seq}
+           } = receive_notice()
+
+    assert is_integer(published_at)
+  end
+
+  test "a pending wake prompt mutation publishes the canonical wake row" do
+    db = :firehose_pending_wake_update_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn',1,1)")
+    register_testhost(db)
+
+    Org.create(db, %{
+      session_key: "wake-target",
+      display_name: "Wake target",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
+    :ok = Hub.subscribe(Hub, self(), "wake-prompt-update", %{"classes" => ["wake.scheduled"]})
+
+    wake =
+      Wakes.schedule(db, %{
+        wake_id: "ephemeral-result:firehose-test",
+        session_key: "wake-target",
+        origin: "user:flynn",
+        prompt: "original prompt",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    assert_receive {:firehose_notice, %{"class" => "wake.scheduled"}}
+    Hub.delivered(Hub, self())
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.Ephemeral.final_message_in_txn(txn, "firehose-test", "updated result")
+             end)
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "wake.scheduled",
+                      "refs" => %{"wakeId" => "ephemeral-result:firehose-test"},
+                      "payload" => payload
+                    }}
+
+    assert payload["wakeId"] == wake.wake_id
+    assert payload["prompt"] =~ "updated result"
+  end
+
+  test "wake retargeting publishes the replacement row" do
+    db = :firehose_wake_retarget_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn',1,1)")
+    register_testhost(db)
+
+    Org.create(db, %{
+      session_key: "replacement-target",
+      display_name: "Replacement target",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
+
+    source =
+      Wakes.schedule(db, %{
+        session_key: "previous-target",
+        origin: "user:flynn",
+        prompt: "keep this prompt",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    assert %{"class" => "wake.scheduled"} = receive_notice()
+
+    assert {:ok, replacement} =
+             DB.transaction(db, fn txn ->
+               Wakes.retarget_in_txn(txn, source.wake_id, "replacement-target")
+             end)
+
+    assert %{
+             "class" => "wake.scheduled",
+             "resource" => "wakes",
+             "op" => "upsert",
+             "refs" => %{"wakeId" => wake_id},
+             "payload" => %{"sessionKey" => "replacement-target", "prompt" => "keep this prompt"}
+           } = receive_notice()
+
+    assert wake_id == replacement.wake_id
   end
 
   test "concurrent transaction handoffs reach the firehose in database commit order" do
@@ -1668,9 +1929,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
   end
 
   defp observed_classes do
-    drain_notices()
+    observed_notices()
     |> Enum.map(& &1["class"])
   end
+
+  defp observed_notices, do: drain_notices()
 
   defp drain_notices(acc \\ []) do
     _ = :sys.get_state(Hub)

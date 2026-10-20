@@ -149,7 +149,16 @@ defmodule Tightbeam.WorkItems do
 
               put_priority_in_txn(txn, id, priority)
               stamp_version_in_txn(txn, id, created_at)
-              routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
+
+              routing_wake =
+                arm_routing_in_txn(
+                  txn,
+                  id,
+                  owner,
+                  call.params.title,
+                  false,
+                  not is_function(Map.get(call, :on_routing_wake_scheduled_in_txn))
+                )
 
               if key do
                 Txn.q(
@@ -857,6 +866,8 @@ defmodule Tightbeam.WorkItems do
               })
             end
 
+            disposed = fetch_in_txn(txn, id)
+
             {:disposed, disposed, true, item.state}
         end
     end
@@ -943,9 +954,25 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
+  @doc false
+  def publish_change_in_txn(%Txn{} = txn, work_item_id) do
+    case fetch_in_txn(txn, work_item_id) do
+      nil ->
+        :ok
+
+      item ->
+        Publisher.committed_in_txn(
+          txn,
+          "work_item.updated",
+          item,
+          %{"workItemId" => work_item_id}
+        )
+    end
+  end
+
   @doc "Cancel both bracket wakes through one typed transition and clear their ids."
   @spec cancel_brackets_in_txn(Txn.t(), String.t(), map()) :: :ok
-  def cancel_brackets_in_txn(%Txn{} = txn, work_item_id, transition) do
+  def cancel_brackets_in_txn(%Txn{} = txn, work_item_id, transition, opts \\ []) do
     case Txn.q(
            txn,
            "SELECT routingWakeId, slateWakeId FROM work_items WHERE id = ?1",
@@ -966,6 +993,9 @@ defmodule Tightbeam.WorkItems do
             "UPDATE work_items SET routingWakeId = NULL, slateWakeId = NULL WHERE id = ?1",
             [work_item_id]
           )
+
+          if Keyword.get(opts, :publish_item, false),
+            do: publish_change_in_txn(txn, work_item_id)
         end
 
       [] ->
@@ -1025,6 +1055,8 @@ defmodule Tightbeam.WorkItems do
             work_item_id,
             wake.wake_id
           ])
+
+          if Txn.changes(txn) == 1, do: publish_change_in_txn(txn, work_item_id)
         end
 
       _ ->
@@ -1052,7 +1084,7 @@ defmodule Tightbeam.WorkItems do
       [[state, owner, title, routing, slate]] ->
         cond do
           state == "open" and routing == wake_id ->
-            arm_routing_in_txn(txn, item_id, owner, title)
+            arm_routing_in_txn(txn, item_id, owner, title, true)
 
           state == "open" and slate == wake_id and not open_assignments?(txn, item_id) ->
             replacement =
@@ -1069,6 +1101,8 @@ defmodule Tightbeam.WorkItems do
               item_id,
               replacement.wake_id
             ])
+
+            if Txn.changes(txn) == 1, do: publish_change_in_txn(txn, item_id)
 
           true ->
             :ok
@@ -1164,7 +1198,7 @@ defmodule Tightbeam.WorkItems do
     |> Enum.reverse()
   end
 
-  defp arm_routing_in_txn(txn, id, owner, title) do
+  defp arm_routing_in_txn(txn, id, owner, title, publish? \\ false, firehose_publish? \\ true) do
     wake =
       Wakes.schedule_in_txn(txn, %{
         session_key: Org.personal_session_key(owner),
@@ -1172,10 +1206,14 @@ defmodule Tightbeam.WorkItems do
         prompt: "route it or icebox it — work item #{id}: #{title}",
         due_at: now() + triage_deadline_ms(),
         sender_scheduled: true,
-        work_item_id: id
+        work_item_id: id,
+        firehose_publish: firehose_publish?
       })
 
     Txn.q(txn, "UPDATE work_items SET routingWakeId = ?2 WHERE id = ?1", [id, wake.wake_id])
+
+    if publish? and Txn.changes(txn) == 1, do: publish_change_in_txn(txn, id)
+
     wake
   end
 

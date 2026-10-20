@@ -16,6 +16,7 @@ defmodule Tightbeam.Assignments do
     Placement,
     Projection,
     RailRemedy,
+    StateResources,
     Supervision,
     Wakes
   }
@@ -628,6 +629,17 @@ defmodule Tightbeam.Assignments do
       )
 
       if Txn.changes(txn) != 1, do: raise(TransitionRace)
+
+      assignment =
+        StateResources.query_assignment(txn, assignment_id, %{principal: {:session, session_key}}) ||
+          raise ArgumentError, "retired assignment is missing from its committing transaction"
+
+      Tightbeam.Firehose.Publisher.committed_in_txn(
+        txn,
+        "assignment.closed",
+        assignment,
+        %{"assignmentId" => assignment_id}
+      )
 
       Txn.q(
         txn,
@@ -1665,7 +1677,8 @@ defmodule Tightbeam.Assignments do
                          "digest: Ruminate on work-item #{work_item_id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=#{call.params[:subject]} brief=#{call.params[:brief]}. When you've thought it through, re-issue the dispatch.",
                        due_at: now(),
                        rumination: true,
-                       work_item_id: work_item_id
+                       work_item_id: work_item_id,
+                       firehose_publish: false
                      })
 
                    Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
@@ -1891,6 +1904,7 @@ defmodule Tightbeam.Assignments do
         transaction_with_row_commits(
           db,
           fn txn ->
+            assignment_before = StateResources.query_assignment(txn, assignment_id, call)
             result = attest_in_txn(txn, call)
 
             cond do
@@ -1902,6 +1916,15 @@ defmodule Tightbeam.Assignments do
 
               true ->
                 :ok
+            end
+
+            if not Map.has_key?(result, :code) and not Map.get(result, :replayed, false) do
+              publish_attest_assignment_change_in_txn(
+                txn,
+                call,
+                assignment_id,
+                assignment_before
+              )
             end
 
             result
@@ -1939,6 +1962,27 @@ defmodule Tightbeam.Assignments do
 
     TransitionRace ->
       assignment_closed()
+  end
+
+  defp publish_attest_assignment_change_in_txn(txn, call, assignment_id, before) do
+    if Map.get(call, :firehose_in_txn, false) or is_function(Map.get(call, :on_assignment_change)) do
+      after_attest = StateResources.query_assignment(txn, assignment_id, call)
+
+      if is_map(before) and is_map(after_attest) and
+           StateResources.assignment(before) != StateResources.assignment(after_attest) do
+        class =
+          if after_attest.state == "closed", do: "assignment.closed", else: "assignment.opened"
+
+        Tightbeam.Firehose.Publisher.committed_in_txn(
+          txn,
+          class,
+          after_attest,
+          %{"assignmentId" => assignment_id}
+        )
+      end
+    end
+
+    :ok
   end
 
   # Per effort-checkin-v2 §Design 5 and the provenance it cites verbatim —
@@ -2466,7 +2510,9 @@ defmodule Tightbeam.Assignments do
               disposition_id: id,
               liveness_trigger: bracket_trigger
             }
-          })
+          },
+            publish_item: true
+          )
         end
 
         if key do
@@ -3850,7 +3896,9 @@ defmodule Tightbeam.Assignments do
           disposition_id: assignment_id,
           liveness_trigger: bracket_trigger
         }
-      })
+      },
+        publish_item: true
+      )
     end
 
     append_assignment_marker(

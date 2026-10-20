@@ -2641,6 +2641,15 @@ defmodule Tightbeam.AssignmentsTest do
     assert_receive {:firehose_notice, %{"class" => "attest.filed", "payload" => attest}}
     assert attest["id"] == result.attest.id
     Hub.delivered(hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "assignment.opened",
+                      "payload" => %{"id" => assignment_id, "derivedStatus" => "active"}
+                    }}
+
+    assert assignment_id == assignment.id
+    Hub.delivered(hub, self())
     refute_receive {:firehose_notice, %{"class" => "assignment.closed"}}
 
     assert {:ok, replay} = Dispatch.dispatch(ctx.db, ctx.handlers, call)

@@ -877,6 +877,7 @@ defmodule Tightbeam.Wakes do
         if Txn.changes(txn) == 1 do
           source = %{wake | state: "pending", fired_at: fired_at}
           NoticeBatcher.record_policy_in_txn(txn, source)
+          publish_change_in_txn(txn, "wake.scheduled", wake_id)
           if state == "fired", do: schedule_changed_in_txn(txn, :wake_ready)
 
           {:ok, source}
@@ -1709,6 +1710,10 @@ defmodule Tightbeam.Wakes do
       )
     end
 
+    if Map.get(input, :firehose_publish, true) do
+      publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
+    end
+
     schedule_changed_in_txn(txn, {:schedule_changed, wake.due_at})
     wake
   end
@@ -1799,6 +1804,7 @@ defmodule Tightbeam.Wakes do
             owner_user_id: obligation.owner_user_id,
             obligation_ref: obligation.id,
             wait_mode: "after-turn",
+            firehose_publish: Map.get(input, :firehose_publish, true),
             originating_turn_seq: turn_seq,
             recognition_at: now,
             recognition_path: "after-turn",
@@ -1854,6 +1860,7 @@ defmodule Tightbeam.Wakes do
           owner_user_id: obligation.owner_user_id,
           obligation_ref: obligation.id,
           wait_mode: "dependency",
+          firehose_publish: Map.get(input, :firehose_publish, true),
           predicate: evaluation.canonical,
           resolver_kind: resolver.kind,
           resolver_id: resolver.id,
@@ -3686,9 +3693,12 @@ defmodule Tightbeam.Wakes do
 
     Txn.q(
       txn,
-      "UPDATE wakes SET deliveryRule=?2 WHERE wakeId=?1 AND state='pending'",
+      "UPDATE wakes SET deliveryRule=?2 WHERE wakeId=?1 AND state='pending' AND deliveryRule IS NOT ?2",
       [wake_id, fallback_rule]
     )
+
+    if Txn.changes(txn) == 1,
+      do: publish_change_in_txn(txn, "wake.scheduled", wake_id)
 
     EventLog.lifecycle_in_txn(
       txn,
@@ -4185,6 +4195,7 @@ defmodule Tightbeam.Wakes do
 
         [row] = Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [replacement_id])
         wake = to_wake(row)
+        publish_change_in_txn(txn, "wake.scheduled", replacement_id)
         schedule_changed_in_txn(txn, {:schedule_changed, wake.due_at})
         wake
       else

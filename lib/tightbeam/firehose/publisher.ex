@@ -282,9 +282,10 @@ defmodule Tightbeam.Firehose.Publisher do
     end
   end
 
-  @doc "Queue the existing turn notice on the transaction that changed its state."
+  @doc "Queue a turn lifecycle notice on the transaction that changed its state."
   @spec turn_in_txn(Txn.t(), String.t(), integer()) :: :ok
-  def turn_in_txn(%Txn{} = txn, class, seq) when class in ~w(turn.started turn.ended) do
+  def turn_in_txn(%Txn{} = txn, class, seq)
+      when class in ~w(turn.queued turn.started turn.ended) do
     case StateResources.query_turn_in_txn(txn, seq) do
       %{} = turn ->
         committed_in_txn(txn, class, turn, %{
@@ -294,7 +295,29 @@ defmodule Tightbeam.Firehose.Publisher do
           "workItemId" => turn.job_ref
         })
 
+        publish_linked_wake_status_in_txn(txn, turn.wake_id)
+
       nil ->
+        :ok
+    end
+  end
+
+  defp publish_linked_wake_status_in_txn(_txn, wake_id) when not is_binary(wake_id), do: :ok
+
+  defp publish_linked_wake_status_in_txn(txn, wake_id) do
+    case Tightbeam.Wakes.get_in_txn(txn, wake_id) do
+      %{state: state} ->
+        class =
+          case state do
+            "pending" -> "wake.scheduled"
+            "fired" -> "wake.fired"
+            "canceled" -> "wake.canceled"
+            _ -> nil
+          end
+
+        if class, do: Tightbeam.Wakes.publish_change_in_txn(txn, class, wake_id)
+
+      _ ->
         :ok
     end
   end

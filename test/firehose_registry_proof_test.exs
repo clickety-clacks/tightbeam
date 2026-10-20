@@ -11,7 +11,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
      "assignments", "upsert", ["assignmentId"], :assignment},
     {~w(attest.filed), "attests", "upsert", ["attestId"], :attest},
     {~w(wake.scheduled wake.fired wake.canceled), "wakes", "upsert", ["wakeId"], :wake},
-    {~w(turn.started turn.ended), "turns", "upsert", ["turnSeq"], :turn},
+    {~w(turn.queued turn.started turn.ended), "turns", "upsert", ["turnSeq"], :turn},
     {~w(decision_request.opened decision_request.updated decision_request.answered decision_request.returned decision_request.ruled decision_request.consumed decision_request.withdrawn decision_request.superseded),
      "decision requests", "upsert", ["decisionRequestId"], :decision_request},
     {~w(session.spawned session.updated session.harness_changed session.retired), "sessions",
