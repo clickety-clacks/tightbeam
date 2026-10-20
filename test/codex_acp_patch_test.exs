@@ -38,4 +38,36 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
     assert patched =~ "toolCallId: record.parentToolUseId"
     assert Claude.patch_adapter_source(patched) == patched
   end
+
+  test "claude provenance hashes the exact installed adapter bundle" do
+    base = Path.join(System.tmp_dir!(), "claude-provenance-#{System.unique_integer([:positive])}")
+    node_modules = Path.join([base, "adapters", "node_modules"])
+    package = Path.join([node_modules, "@agentclientprotocol", "claude-agent-acp"])
+    binary = Path.join([node_modules, ".bin", "claude-agent-acp"])
+    bundle = Path.join([package, "dist", "acp-agent.js"])
+    source = "deployed adapter bytes"
+
+    on_exit(fn -> File.rm_rf!(base) end)
+    File.mkdir_p!(Path.dirname(binary))
+    File.mkdir_p!(Path.dirname(bundle))
+    File.write!(binary, "#!/bin/sh\n")
+    File.write!(Path.join(package, "package.json"), JSON.encode!(%{"version" => "0.73.0"}))
+    File.write!(bundle, source)
+
+    assert %{
+             package: "@agentclientprotocol/claude-agent-acp",
+             version: "0.73.0",
+             source_sha256: digest
+           } =
+             Claude.adapter_provenance(%{
+               base_dir: base,
+               host_config: %{base_dir: base, ssh: nil},
+               host_name: "testhost",
+               sh: fn _ -> flunk("local provenance must not execute a command") end
+             })
+
+    assert digest ==
+             :crypto.hash(:sha256, source)
+             |> Base.encode16(case: :lower)
+  end
 end

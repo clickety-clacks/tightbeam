@@ -1245,6 +1245,7 @@ defmodule Tightbeam.Gateway do
         completion_disposition_result(config, db, call)
       end,
       {"inspect", []} => fn call -> inspect_result(config, db, call) end,
+      {"harness-health", []} => fn call -> harness_health_result(db, call) end,
       {"cancel", ["turn.ended", "session.updated"]} => fn call -> cancel_result(db, call) end,
       {"critical", ["critical_lease.updated"]} => fn call -> critical_result(config, db, call) end,
       {"spawn", ["session.spawned"]} => fn call -> spawn_result(config, db, call) end,
@@ -5127,6 +5128,25 @@ defmodule Tightbeam.Gateway do
           end
 
         maybe_put_inspected_batch(result, db, call, caller)
+    end
+  end
+
+  defp harness_health_result(db, call) do
+    case resolve_caller(db, call.origin) do
+      nil ->
+        %{code: "unknown_caller"}
+
+      _caller ->
+        case call.params[:incident_id] do
+          incident_id when is_binary(incident_id) and incident_id != "" ->
+            case HarnessHealth.get(db, incident_id) do
+              nil -> %{code: "unknown_harness_health_incident"}
+              incident -> %{incident: incident}
+            end
+
+          _ ->
+            %{incidents: HarnessHealth.active(db)}
+        end
     end
   end
 

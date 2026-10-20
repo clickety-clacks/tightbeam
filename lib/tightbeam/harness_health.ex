@@ -34,6 +34,12 @@ defmodule Tightbeam.HarnessHealth do
     resolved_at resolution_observation_id resolved_fact_id
   )a
 
+  @credential_trace_columns ~w(
+    id observation_id captured_at phase terminal last_health initial_auth_none_ignored
+    provenance_source adapter_package adapter_version adapter_source_sha256 tightbeam_build
+    tightbeam_sha auth_signal auth_kind auth_classification auth_mapping transition_result
+  )a
+
   @ddl """
   CREATE TABLE IF NOT EXISTS harness_health_observations (
     id            TEXT PRIMARY KEY,
@@ -63,6 +69,32 @@ defmodule Tightbeam.HarnessHealth do
       (harness, host, failureClass, evidenceKind, observedAt, sessionKey);
   CREATE INDEX IF NOT EXISTS harness_health_observation_incident
     ON harness_health_observations (incidentId, observedAt, id);
+
+  CREATE TABLE IF NOT EXISTS harness_health_credential_trace (
+    id                       TEXT PRIMARY KEY,
+    observationId            TEXT NOT NULL REFERENCES harness_health_observations(id),
+    capturedAt               INTEGER NOT NULL CHECK(capturedAt >= 0),
+    phase                    TEXT NOT NULL CHECK(phase IN ('provider-observed','credential-transition')),
+    terminal                 INTEGER CHECK(terminal IN (0,1)),
+    lastHealth               TEXT CHECK(lastHealth IS NULL OR length(lastHealth) <= 64),
+    initialAuthNoneIgnored   INTEGER CHECK(initialAuthNoneIgnored IN (0,1)),
+    provenanceSource         TEXT NOT NULL CHECK(provenanceSource IN ('credential-metadata','credential-metadata-unavailable')),
+    adapterPackage           TEXT NOT NULL CHECK(length(adapterPackage) BETWEEN 1 AND 128),
+    adapterVersion           TEXT NOT NULL CHECK(length(adapterVersion) BETWEEN 1 AND 64),
+    adapterSourceSha256      TEXT NOT NULL CHECK(
+                               adapterSourceSha256 = 'unavailable' OR
+                               (length(adapterSourceSha256) = 64 AND adapterSourceSha256 NOT GLOB '*[^0-9a-f]*')
+                             ),
+    tightbeamBuild           INTEGER,
+    tightbeamSha             TEXT,
+    authSignal               TEXT NOT NULL CHECK(authSignal IN ('authStatus','account-update','other')),
+    authKind                 TEXT NOT NULL CHECK(authKind IN ('none','account','api_key','gateway','external','other')),
+    authClassification       TEXT NOT NULL CHECK(authClassification IN ('terminal','transient','unknown')),
+    authMapping              TEXT NOT NULL CHECK(length(authMapping) BETWEEN 1 AND 128),
+    transitionResult         TEXT CHECK(transitionResult IS NULL OR length(transitionResult) <= 64)
+  );
+  CREATE INDEX IF NOT EXISTS harness_health_credential_trace_observation
+    ON harness_health_credential_trace (observationId, capturedAt, id);
 
   CREATE TABLE IF NOT EXISTS harness_health_incidents (
     id                      TEXT PRIMARY KEY,
@@ -143,6 +175,18 @@ defmodule Tightbeam.HarnessHealth do
   BEFORE DELETE ON harness_health_observations
   BEGIN
     SELECT RAISE(ABORT, 'harness health observation history is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS harness_health_credential_trace_immutable_update
+  BEFORE UPDATE ON harness_health_credential_trace
+  BEGIN
+    SELECT RAISE(ABORT, 'harness health credential trace is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS harness_health_credential_trace_immutable_delete
+  BEFORE DELETE ON harness_health_credential_trace
+  BEGIN
+    SELECT RAISE(ABORT, 'harness health credential trace history is immutable');
   END;
 
   CREATE TRIGGER IF NOT EXISTS harness_health_incident_identity_immutable
@@ -441,7 +485,7 @@ defmodule Tightbeam.HarnessHealth do
   @doc "Open an auth incident immediately from a provider-authoritative invalidation."
   @spec observe_provider_invalidation(DB.server(), String.t(), String.t(), term(), keyword()) ::
           {:opened | :attached | :duplicate, map()}
-  def observe_provider_invalidation(db \\ DB, harness, host, event, opts \\ []) do
+  def observe_provider_invalidation(db \\ DB, harness, host, _event, opts \\ []) do
     observe(db, %{
       correlation_id: "provider-auth:" <> Id.uuid4(),
       harness: to_string(harness),
@@ -451,10 +495,25 @@ defmodule Tightbeam.HarnessHealth do
       session_key: nil,
       assignment_id: nil,
       observed_at: System.system_time(:millisecond),
-      cause: evidence_text(event),
+      cause: "provider auth invalidation",
       principal: Keyword.get(opts, :principal, "process:tightbeam/provider"),
+      credential_trace: Keyword.get(opts, :credential_trace),
       conn_registry: Keyword.get(opts, :conn_registry, Tightbeam.ConnRegistry)
     })
+  end
+
+  @doc "Append the redacted credential state produced by handling a provider observation."
+  @spec record_credential_transition(DB.server(), String.t(), map()) :: :ok
+  def record_credential_transition(db \\ DB, observation_id, trace) do
+    trace = normalize_credential_trace!(trace, "credential-transition")
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        insert_credential_trace(txn, observation_id, trace)
+        :ok
+      end)
+
+    :ok
   end
 
   @doc "Record failure evidence and open or attach to its incident atomically."
@@ -533,6 +592,22 @@ defmodule Tightbeam.HarnessHealth do
 
       observations = Enum.map(observations, &observation/1)
 
+      {:ok, credential_trace} =
+        DB.query(
+          db,
+          """
+          SELECT t.id,t.observationId,t.capturedAt,t.phase,t.terminal,t.lastHealth,
+                 t.initialAuthNoneIgnored,t.provenanceSource,t.adapterPackage,t.adapterVersion,
+                 t.adapterSourceSha256,t.tightbeamBuild,t.tightbeamSha,t.authSignal,t.authKind,
+                 t.authClassification,t.authMapping,t.transitionResult
+          FROM harness_health_credential_trace t
+          JOIN harness_health_observations o ON o.id=t.observationId
+          WHERE o.incidentId=?1
+          ORDER BY t.capturedAt,t.rowid
+          """,
+          [incident_id]
+        )
+
       {:ok, members} =
         DB.query(
           db,
@@ -549,6 +624,7 @@ defmodule Tightbeam.HarnessHealth do
 
       Map.merge(incident, %{
         observations: observations,
+        credentialHealthTrace: Enum.map(credential_trace, &credential_trace/1),
         affectedSessions: List.flatten(members),
         affectedAssignments: List.flatten(assignments)
       })
@@ -776,7 +852,48 @@ defmodule Tightbeam.HarnessHealth do
       ]
     )
 
+    if trace = Map.get(input, :credential_trace) do
+      insert_credential_trace(
+        txn,
+        observation_id,
+        normalize_credential_trace!(trace, "provider-observed")
+      )
+    end
+
     observation_id
+  end
+
+  defp insert_credential_trace(txn, observation_id, trace) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO harness_health_credential_trace
+        (id,observationId,capturedAt,phase,terminal,lastHealth,initialAuthNoneIgnored,
+         provenanceSource,adapterPackage,adapterVersion,adapterSourceSha256,tightbeamBuild,
+         tightbeamSha,authSignal,authKind,authClassification,authMapping,transitionResult)
+      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+      """,
+      [
+        "hct_" <> Id.uuid4(),
+        observation_id,
+        trace.captured_at,
+        trace.phase,
+        boolean_column(trace.terminal),
+        trace.last_health,
+        boolean_column(trace.initial_auth_none_ignored),
+        trace.provenance_source,
+        trace.adapter_package,
+        trace.adapter_version,
+        trace.adapter_source_sha256,
+        trace.tightbeam_build,
+        trace.tightbeam_sha,
+        trace.auth_signal,
+        trace.auth_kind,
+        trace.auth_classification,
+        trace.auth_mapping,
+        trace.transition_result
+      ]
+    )
   end
 
   defp attach_observation(txn, incident_id, observation_id) do
@@ -925,6 +1042,31 @@ defmodule Tightbeam.HarnessHealth do
 
   defp observation(row), do: Map.new(Enum.zip(@observation_columns, row))
 
+  defp credential_trace(row) do
+    @credential_trace_columns
+    |> Enum.zip(row)
+    |> Map.new()
+    |> Map.new(fn
+      {:observation_id, value} -> {:observationId, value}
+      {:captured_at, value} -> {:capturedAt, value}
+      {:last_health, value} -> {:lastHealth, value}
+      {:initial_auth_none_ignored, value} -> {:initialAuthNoneIgnored, decode_boolean(value)}
+      {:provenance_source, value} -> {:provenanceSource, value}
+      {:adapter_package, value} -> {:adapterPackage, value}
+      {:adapter_version, value} -> {:adapterVersion, value}
+      {:adapter_source_sha256, value} -> {:adapterSourceSha256, value}
+      {:tightbeam_build, value} -> {:tightbeamBuild, value}
+      {:tightbeam_sha, value} -> {:tightbeamSha, value}
+      {:auth_signal, value} -> {:authSignal, value}
+      {:auth_kind, value} -> {:authKind, value}
+      {:auth_classification, value} -> {:authClassification, value}
+      {:auth_mapping, value} -> {:authMapping, value}
+      {:transition_result, value} -> {:transitionResult, value}
+      {:terminal, value} -> {:terminal, decode_boolean(value)}
+      entry -> entry
+    end)
+  end
+
   defp incident(row) do
     @incident_columns
     |> Enum.zip(row)
@@ -968,6 +1110,90 @@ defmodule Tightbeam.HarnessHealth do
 
     input
   end
+
+  defp normalize_credential_trace!(trace, phase) when is_map(trace) do
+    adapter = Map.get(trace, :adapter, %{})
+    health = Map.get(trace, :health, %{})
+    auth = Map.get(trace, :auth, %{})
+
+    %{
+      captured_at: non_negative_integer(Map.get(trace, :captured_at)),
+      phase: phase,
+      terminal: redacted_boolean(Map.get(health, :terminal)),
+      last_health: redacted_last_health(Map.get(health, :last_health)),
+      initial_auth_none_ignored: redacted_boolean(Map.get(health, :initial_auth_none_ignored)),
+      provenance_source:
+        if(Map.get(health, :available, false),
+          do: "credential-metadata",
+          else: "credential-metadata-unavailable"
+        ),
+      adapter_package: bounded_identity(Map.get(adapter, :package), "unknown"),
+      adapter_version: bounded_identity(Map.get(adapter, :version), "unknown"),
+      adapter_source_sha256: source_digest(Map.get(adapter, :source_sha256)),
+      tightbeam_build: Map.get(adapter, :tightbeam_build),
+      tightbeam_sha: bounded_optional_identity(Map.get(adapter, :tightbeam_sha)),
+      auth_signal: enum_value(Map.get(auth, :signal), ~w(authStatus account-update), "other"),
+      auth_kind:
+        enum_value(
+          Map.get(auth, :kind),
+          ~w(none account api_key gateway external),
+          "other"
+        ),
+      auth_classification:
+        enum_value(Map.get(auth, :classification), ~w(terminal transient unknown), "unknown"),
+      auth_mapping: bounded_identity(Map.get(auth, :mapping), "unknown"),
+      transition_result:
+        enum_optional(Map.get(trace, :transition_result), ~w(ok ignored error unchanged))
+    }
+  end
+
+  defp normalize_credential_trace!(_trace, _phase),
+    do: raise(ArgumentError, "credential health trace must be a map")
+
+  defp redacted_boolean(value) when is_boolean(value), do: value
+  defp redacted_boolean(_value), do: nil
+
+  defp redacted_last_health(value)
+       when value in ["onboarded", "revoked", "no_subscription", "present_but_unverified"],
+       do: value
+
+  defp redacted_last_health(nil), do: nil
+  defp redacted_last_health(_value), do: "other"
+
+  defp source_digest(value) when is_binary(value) do
+    if Regex.match?(~r/\A[0-9a-f]{64}\z/, value), do: value, else: "unavailable"
+  end
+
+  defp source_digest(_value), do: "unavailable"
+
+  defp bounded_identity(value, fallback) when is_binary(value) do
+    value = String.trim(value)
+    if value != "" and byte_size(value) <= 128, do: value, else: fallback
+  end
+
+  defp bounded_identity(_value, fallback), do: fallback
+
+  defp bounded_optional_identity(nil), do: nil
+  defp bounded_optional_identity(value), do: bounded_identity(value, "unknown")
+
+  defp enum_value(value, allowed, fallback) do
+    value = if is_atom(value), do: Atom.to_string(value), else: value
+    if value in allowed, do: value, else: fallback
+  end
+
+  defp enum_optional(nil, _allowed), do: nil
+  defp enum_optional(value, allowed), do: enum_value(value, allowed, "error")
+
+  defp non_negative_integer(value) when is_integer(value) and value >= 0, do: value
+  defp non_negative_integer(_value), do: System.system_time(:millisecond)
+
+  defp boolean_column(true), do: 1
+  defp boolean_column(false), do: 0
+  defp boolean_column(nil), do: nil
+
+  defp decode_boolean(1), do: true
+  defp decode_boolean(0), do: false
+  defp decode_boolean(nil), do: nil
 
   defp validate_session_membership!(_txn, %{session_key: nil}), do: :ok
 

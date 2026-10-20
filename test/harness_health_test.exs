@@ -148,6 +148,74 @@ defmodule Tightbeam.HarnessHealthTest do
     assert Enum.map(incident.observations, & &1.correlation_id) == ["late", "failure-3"]
   end
 
+  test "provider incidents retain only bounded credential and adapter provenance", ctx do
+    secret = "credential-secret-that-must-not-persist"
+
+    trace = %{
+      captured_at: 1_000,
+      health: %{
+        available: true,
+        terminal: false,
+        last_health: "onboarded",
+        initial_auth_none_ignored: true,
+        credential: secret
+      },
+      adapter: %{
+        package: "@agentclientprotocol/claude-agent-acp",
+        version: "0.73.0",
+        source_sha256: String.duplicate("a", 64),
+        source: secret,
+        tightbeam_build: 2_883,
+        tightbeam_sha: "d72599c8"
+      },
+      auth: %{
+        signal: "authStatus",
+        kind: "none",
+        classification: "terminal",
+        mapping: "claude:classify_auth_event/1",
+        label: secret
+      }
+    }
+
+    assert {:opened, incident} =
+             HarnessHealth.observe_provider_invalidation(
+               ctx.db,
+               "claude",
+               "gibson",
+               %{"authStatus" => %{"kind" => "none", "label" => secret}},
+               credential_trace: trace,
+               conn_registry: :missing_harness_health_registry
+             )
+
+    assert :ok =
+             HarnessHealth.record_credential_transition(
+               ctx.db,
+               incident.observationId,
+               put_in(trace, [:health, :terminal], true)
+               |> put_in([:health, :last_health], "revoked")
+               |> Map.put(:captured_at, 1_001)
+               |> Map.put(:transition_result, "ok")
+             )
+
+    retained = HarnessHealth.get(ctx.db, incident.id)
+
+    assert [observed, transitioned] = retained.credentialHealthTrace
+    assert observed.phase == "provider-observed"
+    assert observed.terminal == false
+    assert observed.initialAuthNoneIgnored == true
+    assert observed.adapterSourceSha256 == String.duplicate("a", 64)
+    assert transitioned.phase == "credential-transition"
+    assert transitioned.terminal == true
+    assert transitioned.lastHealth == "revoked"
+    assert transitioned.transitionResult == "ok"
+
+    encoded = JSON.encode!(retained)
+    refute encoded =~ secret
+    refute encoded =~ ~s("credential":)
+    refute encoded =~ ~s("label":)
+    refute encoded =~ ~s("source":)
+  end
+
   test "authoritative evidence opens at one and the two classes never collapse", ctx do
     [first, second | _] = ctx.sessions
 
