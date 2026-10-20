@@ -550,13 +550,18 @@ defmodule Tightbeam.JobTraceTest do
   end
 
   defp attest(db, principal, assignment_id, kind, extra) do
-    Assignments.__handle__(db, "attest", %{
-      verb: "attest",
-      principal: principal,
-      origin: origin(principal),
-      session_key: nil,
-      params: Map.merge(%{assignment_id: assignment_id, kind: kind}, extra)
-    })
+    Assignments.__handle__(
+      db,
+      "attest",
+      %{
+        verb: "attest",
+        principal: principal,
+        origin: origin(principal),
+        session_key: nil,
+        params: Map.merge(%{assignment_id: assignment_id, kind: kind}, extra)
+      }
+      |> Map.put_new(:supervision_interval_ms, 1_000)
+    )
   end
 
   defp session(db, key, owner) do
