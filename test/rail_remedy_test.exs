@@ -91,22 +91,22 @@ defmodule Tightbeam.RailRemedyTest do
   end
 
   test "completion review gate stores one ordinary notice for its holder", ctx do
-    assignment = assignment(ctx, "review staffing stays outside the core")
+    assignment = assignment(ctx, "review staffing stays outside the core", "policy")
     shipped = File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
     File.write!(Path.join(ctx.base_dir, "identity/rules/completion.toml"), shipped)
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     completion = completion_call(assignment.id)
 
-    assert {:error,
-            %{reason: "remedy_fired", producer: wake_id, rule: "completion-requires-review"}} =
+    # The completion is recorded while review is pending; the card stays open.
+    assert {:ok, %{assignment: %{state: "open"}, attest: %{kind: "completion"}}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
     assert {:ok, [[session_key, prompt, consumer, origin, creator_session_key, summon]]} =
              DB.query(
                ctx.db,
-               "SELECT sessionKey,prompt,consumer,origin,creatorSessionKey,summon FROM wakes WHERE wakeId=?1",
-               [wake_id]
+               "SELECT sessionKey,prompt,consumer,origin,creatorSessionKey,summon FROM wakes WHERE assignmentId=?1 AND origin='remedy:completion-requires-review'",
+               [assignment.id]
              )
 
     assert session_key == ctx.holder.session_key

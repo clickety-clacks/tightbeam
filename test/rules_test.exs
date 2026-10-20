@@ -1561,11 +1561,6 @@ defmodule Tightbeam.RulesTest do
     assert notice.prompt ==
              "Coordinate independent review of assignment #{producer.id}; preserve current evidence and direct staffing through its accountable owner."
 
-    assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId=?1", [
-               "review-notice"
-             ])
-
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId=?1", [
                "review-notice"
@@ -1970,7 +1965,8 @@ defmodule Tightbeam.RulesTest do
     reviewer =
       session(ctx.db, "unreferenced-review-judge", "reviewer", archetype: "reviewer-code")
 
-    owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
+    _owner =
+      session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
 
     {:ok, _} =
       DB.query(
@@ -2072,12 +2068,9 @@ defmodule Tightbeam.RulesTest do
       assert producer_id == producer.id
       assert review_count(ctx.db, producer.id) == if(older_exact_review?, do: 2, else: 1)
 
-      notice_id =
-        RailRemedy.episode(ctx.db, "completion-requires-review", producer.id).producer_key
-
-      notice = Wakes.get(ctx.db, notice_id)
-      assert notice.session_key == owner.session_key
-      assert notice.assignment_id == producer.id
+      assert RailRemedy.episode(ctx.db, "completion-requires-review", producer.id) == nil
+      assert [notice] = review_gate_notices(ctx.db, producer.id)
+      assert notice.session_key == holder.session_key
     end
   end
 
