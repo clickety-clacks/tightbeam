@@ -628,24 +628,39 @@ defmodule FeatureSmoke do
       })
 
       # The code-completion guard needs matching producer verification before the
-      # review statute can route its pending completion to a reviewer.
-      verified =
-        post_as(state, holder.token, "attest", %{
-          "assignmentId" => asg_id,
-          "kind" => "verdict",
-          "verdictKind" => "verified",
-          "commitRefs" => holder.check.commit_refs,
-          "note" => holder.check.note
-        })
+      # review statute can keep its pending completion and notify the accountable owner.
+      matching_verification =
+        sqlite(
+          state,
+          "SELECT count(*) FROM (SELECT verdictKind,commitRefs FROM attests " <>
+            "WHERE assignmentId = #{sql_quote(asg_id)} AND kind = 'verdict' " <>
+            "AND bySession = #{sql_quote(holder.key)} " <>
+            "AND verdictKind IN ('verified','verification-failed') " <>
+            "ORDER BY ts DESC,rowid DESC LIMIT 1) " <>
+            "WHERE verdictKind = 'verified' AND commitRefs = " <>
+            "#{sql_quote(JSON.encode!(holder.check.commit_refs))}"
+        )
 
-      assert(
-        state,
-        not (is_map(verified) and Map.has_key?(verified, "error")),
-        "gate chain: the holder-token verified verdict failed: #{inspect(verified)}"
-      )
+      if matching_verification == "0" do
+        verified =
+          post_as(state, holder.token, "attest", %{
+            "assignmentId" => asg_id,
+            "kind" => "verdict",
+            "verdictKind" => "verified",
+            "commitRefs" => holder.check.commit_refs,
+            "note" => holder.check.note
+          })
 
-      # 1. Review gate. The statute routes review while preserving a pending
-      # completion, which remains open until the matching clean review arrives.
+        assert(
+          state,
+          not (is_map(verified) and Map.has_key?(verified, "error")),
+          "gate chain: the holder-token verified verdict failed: #{inspect(verified)}"
+        )
+      end
+
+      # 1. Review gate. The current statute records an accountable notice rather
+      # than opening an automatic remedy episode or staffing a reviewer. The
+      # completion remains pending until its owner directs a matching review.
       review_request = complete.()
 
       assert(
@@ -655,7 +670,33 @@ defmodule FeatureSmoke do
           "#{inspect(review_request)}"
       )
 
-      await_episode_status!(state, "completion-requires-review", asg_id, "live")
+      review_notice_count =
+        sqlite(
+          state,
+          "SELECT count(*) FROM wakes WHERE assignmentId = #{sql_quote(asg_id)} " <>
+            "AND origin = 'remedy:completion-requires-review'"
+        )
+
+      assert(
+        state,
+        review_notice_count == "1",
+        "gate chain: completion-requires-review should store one accountable notice, " <>
+          "found #{review_notice_count}"
+      )
+
+      review_episode_count =
+        sqlite(
+          state,
+          "SELECT count(*) FROM rail_remedy_episodes WHERE statute = " <>
+            "'completion-requires-review' AND subject = #{sql_quote(asg_id)}"
+        )
+
+      assert(
+        state,
+        review_episode_count == "0",
+        "gate chain: completion-requires-review notice should not create an automatic " <>
+          "remedy episode, found #{review_episode_count}"
+      )
 
       pending = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
 
