@@ -311,6 +311,35 @@ defmodule Tightbeam.SupervisionConsumerFixture do
     assert delivered["lastConsumer"] == %{"turn" => delivered_seq}
     assert delivered["lastIntent"] == initial["pending"]["intent"]
     assert delivered["lastSnapshot"] == initial["pending"]["snapshot"]
+
+    assert {:ok, [[repair_message_id]]} =
+             DB.query(ctx.db, "SELECT messageId FROM turns WHERE seq=?1", [delivered_seq])
+
+    assert repair_message_id == source.message_id
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM lifecycle_events WHERE kind='turn_finalize_transaction_failed' AND subject=?1",
+               ["holder:#{delivered_seq}"]
+             )
+
+    assert {:ok, [[reply_id, reply_content]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,content FROM messages WHERE sessionKey='holder' AND role='assistant' AND replyToMessageId=?1 ORDER BY seq LIMIT 1",
+               [repair_message_id]
+             )
+
+    assert is_binary(reply_content) and String.trim(reply_content) != ""
+    source_seq = source.seq
+
+    assert %{
+             turn_seq: ^source_seq,
+             reply_to_message_id: ^repair_message_id,
+             content: ^reply_content
+           } = Tightbeam.StateResources.query_message(ctx.db, reply_id)
+
     assert delivered["nextEligibleAt"] > System.system_time(:millisecond)
     assert {:ok, ^repaired} = dispatch.(call)
 
