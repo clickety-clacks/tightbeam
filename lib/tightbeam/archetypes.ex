@@ -24,7 +24,6 @@ defmodule Tightbeam.Archetypes do
           model_preferences: [Tightbeam.Model.t()],
           idle_cleanup: boolean(),
           ephemeral: boolean(),
-          owner_open_child_prod: boolean(),
           containment: %{fs: :off, network: :open},
           mcp: [
             %{
@@ -605,7 +604,6 @@ defmodule Tightbeam.Archetypes do
       model_preferences: [],
       idle_cleanup: true,
       ephemeral: false,
-      owner_open_child_prod: false,
       containment: %{fs: :off, network: :open},
       mcp: [],
       guidance: nil,
@@ -624,6 +622,8 @@ defmodule Tightbeam.Archetypes do
         "model_preferences",
         "idle_cleanup",
         "ephemeral",
+        # Shipped 0.1.9 identity manifests may still contain this retired key.
+        # Accept it for compatibility, but do not read it into archetype state.
         "owner_open_child_prod",
         "guidance",
         "mcp",
@@ -653,15 +653,9 @@ defmodule Tightbeam.Archetypes do
     end
 
     idle_cleanup = Map.get(manifest, "idle_cleanup", true)
-    owner_open_child_prod = Map.get(manifest, "owner_open_child_prod", false)
 
     unless is_boolean(idle_cleanup) do
       raise ArgumentError, "archetype idle_cleanup must be a boolean: #{path}"
-    end
-
-    unless is_boolean(owner_open_child_prod) do
-      raise ArgumentError,
-            "archetype owner_open_child_prod must be a boolean: #{path}"
     end
 
     unless is_list(skills) and Enum.all?(skills, &is_binary/1) do
@@ -722,7 +716,6 @@ defmodule Tightbeam.Archetypes do
       model_preferences: model_preferences,
       idle_cleanup: idle_cleanup,
       ephemeral: ephemeral,
-      owner_open_child_prod: owner_open_child_prod,
       containment: containment,
       defaults: defaults,
       references: references,
