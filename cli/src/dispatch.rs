@@ -955,6 +955,24 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "work-item-create", vec![], params))
         }
+        Command::WorkItemHandoff {
+            identity,
+            work_item_id,
+            title,
+            delivery_owner,
+            brief,
+        } => {
+            let mut params = Vec::new();
+            if let Some(value) = work_item_id {
+                params.push(string_field("workItemId", value));
+            }
+            if let Some(value) = title {
+                params.push(string_field("title", value));
+            }
+            params.push(string_field("deliveryOwnerSessionKey", delivery_owner));
+            params.push(string_field("brief", brief));
+            Ok(request(identity, "work-item-handoff", vec![], params))
+        }
         Command::WorkItemUpdate {
             identity,
             work_item_id,
@@ -3580,6 +3598,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::RepairAssignment { identity, .. }
         | Command::AssignmentCommitRefCorrect { identity, .. }
         | Command::WorkItemCreate { identity, .. }
+        | Command::WorkItemHandoff { identity, .. }
         | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }
@@ -4896,7 +4915,33 @@ mod tests {
     }
 
     #[test]
-    fn builds_byte_exact_work_item_bodies() {
+    fn builds_byte_exact_work_item_handoff_and_existing_work_item_bodies() {
+        assert_eq!(
+            body(&[
+                "work-item-handoff",
+                "--work-item",
+                "wi_1",
+                "--delivery-owner",
+                "agent:owner",
+                "--brief",
+                "Take delivery.",
+            ]),
+            r#"{"verb":"work-item-handoff","params":{"workItemId":"wi_1","deliveryOwnerSessionKey":"agent:owner","brief":"Take delivery."}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-handoff",
+                "--title",
+                "Ship",
+                "--delivery-owner",
+                "agent:owner",
+                "--brief",
+                "Take delivery.",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-handoff","params":{"title":"Ship","deliveryOwnerSessionKey":"agent:owner","brief":"Take delivery."}}"#
+        );
         assert_eq!(
             body(&[
                 "work-item-update",

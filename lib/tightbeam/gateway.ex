@@ -1265,6 +1265,33 @@ defmodule Tightbeam.Gateway do
           end)
         )
       end,
+      {"work-item-handoff", ["work_item.created", "work_item.updated", "wake.scheduled"]} =>
+        fn call ->
+          WorkItems.__handle__(
+            db,
+            "work-item-handoff",
+            call
+            |> Map.put(:on_work_item_change, item_change)
+            |> Map.put(:on_routing_wake_scheduled_in_txn, fn txn, wake ->
+              Tightbeam.Firehose.Publisher.committed_in_txn(
+                txn,
+                "wake.scheduled",
+                wake,
+                %{"workItemId" => wake.work_item_id}
+              )
+            end)
+            |> Map.put(:on_work_item_handoff_in_txn, fn txn, item, created? ->
+              class = if created?, do: "work_item.created", else: "work_item.updated"
+
+              Tightbeam.Firehose.Publisher.committed_in_txn(
+                txn,
+                class,
+                Tightbeam.StateResources.work_item(item),
+                %{"workItemId" => item.id}
+              )
+            end)
+          )
+        end,
       {"breathing", []} => fn call -> Tightbeam.Breathing.handle(db, call) end,
       {"work-item-get", []} => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
       {"work-item-trace", []} => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,

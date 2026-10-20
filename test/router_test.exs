@@ -185,6 +185,10 @@ defmodule Tightbeam.Wire.RouterTest do
         send(parent, {:call, call})
         %{id: "wi_test", title: call.params.title}
       end,
+      "work-item-handoff" => fn call ->
+        send(parent, {:call, call})
+        %{id: call.params[:work_item_id] || "wi_test"}
+      end,
       "work-item-get" => fn call ->
         send(parent, {:call, call})
 
@@ -2077,6 +2081,8 @@ defmodule Tightbeam.Wire.RouterTest do
 
     for {verb, params} <- [
           {"work-item-create", %{title: "Create"}},
+          {"work-item-handoff",
+           %{workItemId: "wi_test", deliveryOwnerSessionKey: "pdo-a", brief: "Take delivery."}},
           {"work-item-get", %{workItemId: "wi_test"}},
           {"work-item-trace", %{workItemId: "wi_test"}},
           {"work-item-list", %{}},
@@ -2091,7 +2097,17 @@ defmodule Tightbeam.Wire.RouterTest do
         })
 
       assert response.status == 200
-      assert_receive {:call, %{verb: ^verb, session_key: "work-item-target"}}
+
+      assert_receive {:call,
+                      %{verb: ^verb, session_key: "work-item-target", params: received_params}}
+
+      if verb == "work-item-handoff" do
+        assert received_params == %{
+                 work_item_id: "wi_test",
+                 delivery_owner_session_key: "pdo-a",
+                 brief: "Take delivery."
+               }
+      end
     end
 
     missing =

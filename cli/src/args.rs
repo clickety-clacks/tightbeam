@@ -339,6 +339,13 @@ pub enum Command {
         priority: Option<String>,
         idempotency_key: Option<String>,
     },
+    WorkItemHandoff {
+        identity: Identity,
+        work_item_id: Option<String>,
+        title: Option<String>,
+        delivery_owner: String,
+        brief: String,
+    },
     WorkItemUpdate {
         identity: Identity,
         work_item_id: String,
@@ -805,6 +812,10 @@ COMMANDS:
       File a work item. Unrouted, it becomes YOUR problem on a deadline: file
       it, then route it (assign/dispatch) or icebox it. --key makes create
       idempotent (same key returns the same item).
+  work-item-handoff (--work-item <workItemId> | --title "<title>")
+                    --delivery-owner <sessionKey> --brief "<text>"
+      Create or bind a work item, set its delivery owner, and send them the
+      brief in one operation.
   work-item-update <workItemId> [--title "<title>"] [--spec-ref <name>]
                    [--spec-sha256 <hex>] [--clear-spec-ref] [--delivery-owner <sessionKey> | --clear-delivery-owner] [--priority <0..8>]
       Patch an item's title, governing spec, delivery owner, or priority. Omitted fields
@@ -2733,6 +2744,48 @@ fn parse_with_optional_catalog(
                 idempotency_key: nonempty(flags, "key"),
             })
         }
+        "work-item-handoff" => {
+            let usage = "usage: tightbeam work-item-handoff (--work-item <workItemId> | --title \"<title>\") --delivery-owner <sessionKey> --brief \"<text>\"";
+            const ALLOWED: &[&str] = &[
+                "work-item",
+                "title",
+                "delivery-owner",
+                "brief",
+                "as",
+                "as-user",
+                "as-process",
+            ];
+
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| !ALLOWED.contains(&flag.as_str()))
+                || ["work-item", "title", "delivery-owner", "brief"]
+                    .iter()
+                    .any(|flag| parsed.missing_values.contains(*flag))
+            {
+                return Err(usage.to_owned());
+            }
+
+            let work_item_id = nonempty(flags, "work-item");
+            let title = nonempty(flags, "title");
+            if work_item_id.is_some() == title.is_some() {
+                return Err(usage.to_owned());
+            }
+
+            let delivery_owner = nonempty(flags, "delivery-owner")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "--delivery-owner must be a non-blank session key".to_owned())?;
+            let brief = nonempty(flags, "brief")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "--brief must be non-blank text".to_owned())?;
+
+            Ok(Command::WorkItemHandoff {
+                identity: identity(flags)?,
+                work_item_id,
+                title,
+                delivery_owner,
+                brief,
+            })
+        }
         "work-item-update" => {
             let metadata_usage = "usage: tightbeam work-item-update <workItemId> [--title \"...\"] [--spec-ref <name>] [--spec-sha256 <hex>] [--clear-spec-ref] [--delivery-owner <sessionKey> | --clear-delivery-owner] [--priority <0..8>]";
             let body_usage = "usage: tightbeam work-item-update <workItemId> (--body <text> | --body=<text> | --clear-body)";
@@ -3340,7 +3393,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -6192,7 +6245,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
@@ -6508,6 +6561,90 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn work_item_handoff_requires_one_selector_owner_and_brief() {
+        assert!(matches!(
+            parse(strings(&[
+                "work-item-handoff",
+                "--work-item",
+                "wi_1",
+                "--delivery-owner",
+                "agent:owner",
+                "--brief",
+                "Take delivery.",
+            ])),
+            Ok(Command::WorkItemHandoff {
+                work_item_id: Some(work_item_id),
+                title: None,
+                delivery_owner,
+                brief,
+                ..
+            }) if work_item_id == "wi_1"
+                && delivery_owner == "agent:owner"
+                && brief == "Take delivery."
+        ));
+
+        assert!(matches!(
+            parse(strings(&[
+                "work-item-handoff",
+                "--title",
+                "Ship",
+                "--delivery-owner",
+                "agent:owner",
+                "--brief",
+                "Take delivery.",
+            ])),
+            Ok(Command::WorkItemHandoff {
+                work_item_id: None,
+                title: Some(title),
+                ..
+            }) if title == "Ship"
+        ));
+
+        for args in [
+            strings(&[
+                "work-item-handoff",
+                "--delivery-owner",
+                "agent:owner",
+                "--brief",
+                "Take delivery.",
+            ]),
+            strings(&[
+                "work-item-handoff",
+                "--work-item",
+                "wi_1",
+                "--title",
+                "Ship",
+                "--delivery-owner",
+                "agent:owner",
+                "--brief",
+                "Take delivery.",
+            ]),
+            strings(&[
+                "work-item-handoff",
+                "--title",
+                "Ship",
+                "--delivery-owner",
+                "agent:owner",
+            ]),
+        ] {
+            assert!(parse(args).is_err());
+        }
+
+        assert_eq!(
+            parse(strings(&[
+                "work-item-handoff",
+                "--work-item",
+                "wi_1",
+                "--delivery-owner",
+                "agent:owner",
+                "--brief",
+                "   ",
+            ])),
+            Err("--brief must be non-blank text".to_owned())
+        );
     }
 
     #[test]
