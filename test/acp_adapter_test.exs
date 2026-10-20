@@ -3522,44 +3522,17 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Process.alive?(adapter)
   end
 
-  test "the first Claude logged-out status after a fresh subscription bank is nonterminal" do
+  test "Claude none needs provider confirmation after fresh onboarding and adapter restart" do
     owner = self()
 
     base =
-      Path.join(
-        System.tmp_dir!(),
-        "tb-claude-auth-confirm-#{System.unique_integer([:positive])}"
-      )
+      Path.join(System.tmp_dir!(), "tb-claude-auth-confirm-#{System.unique_integer([:positive])}")
 
     on_exit(fn -> File.rm_rf!(base) end)
     home = Tightbeam.Homes.home_path(base, "testhost", :claude)
-    metadata_dir = Path.join(home, ".tightbeam")
-    File.mkdir_p!(metadata_dir)
-
-    File.write!(
-      Path.join(home, ".credentials.json"),
-      JSON.encode!(%{
-        "claudeAiOauth" => %{
-          "accessToken" => "subscription-access-fixture",
-          "refreshToken" => "refresh-token-fixture",
-          "expiresAt" => System.system_time(:millisecond) + 600_000
-        }
-      })
-    )
-
-    credential_metadata_path = Path.join(metadata_dir, "credential.json")
-
-    File.write!(
-      credential_metadata_path,
-      JSON.encode!(%{
-        "provider" => "anthropic",
-        "onboarded" => true,
-        "terminal" => false,
-        "kind" => "subscription",
-        "onboarded_at_ms" => System.system_time(:millisecond),
-        "last_health" => "onboarded"
-      })
-    )
+    metadata_path = Path.join([home, ".tightbeam", "credential.json"])
+    {:ok, provider_status} = Agent.start_link(fn -> 200 end)
+    on_exit(fn -> if Process.alive?(provider_status), do: Agent.stop(provider_status) end)
 
     db = String.to_atom("claude_auth_confirm_db_#{System.unique_integer([:positive])}")
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
@@ -3568,13 +3541,28 @@ defmodule Tightbeam.Acp.AdapterTest do
     Tightbeam.Rails.load!(base)
     start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
 
-    sh = fn
-      argv ->
-        if Enum.any?(argv, &String.contains?(&1, "api.anthropic.com")) do
-          send(owner, {:unexpected_provider_probe, argv})
-        end
+    # The supplied real adapter capture reports this exact `none` envelope even
+    # for loggedIn=true without subscriptionType. HTTP status meanings are also
+    # covered by the recorded credential-live responses; only our lifecycle is
+    # synthetic here.
+    sh = fn argv ->
+      if Enum.any?(argv, &String.contains?(&1, "api.anthropic.com")) do
+        status = Agent.get(provider_status, & &1)
+        send(owner, {:provider_probe, status})
+        {JSON.encode!(%{status: status}), 0}
+      else
+        assert argv == [
+                 "env",
+                 "CLAUDE_CONFIG_DIR=#{home}",
+                 "claude",
+                 "-p",
+                 "ok",
+                 "--model",
+                 "sonnet"
+               ]
 
         {"", 0}
+      end
     end
 
     park_receiver =
@@ -3593,8 +3581,30 @@ defmodule Tightbeam.Acp.AdapterTest do
        name: credential_owner,
        base_dir: base,
        machine: "testhost",
+       sh: sh,
        park_edge: Tightbeam.CommandEdge.request_to(park_receiver)}
     )
+
+    {:ok, staging, lease} = Tightbeam.Credentials.begin_onboard(:anthropic, credential_owner)
+
+    File.write!(
+      Path.join(staging, ".credentials.json"),
+      JSON.encode!(%{
+        "claudeAiOauth" => %{
+          "accessToken" => "subscription-access-fixture",
+          "refreshToken" => "refresh-token-fixture",
+          "expiresAt" => 4_102_444_800_000
+        }
+      })
+    )
+
+    assert :ok =
+             Tightbeam.Credentials.finish_onboard(
+               :anthropic,
+               :subscription,
+               lease,
+               credential_owner
+             )
 
     placement_opts =
       Tightbeam.Placement.adapter_opts!(
@@ -3609,7 +3619,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         {:claude, "default", "testhost"}
       )
 
-    {adapter, _capture_path} =
+    {adapter, _} =
       start_adapter(
         harness: :claude,
         on_auth_event: placement_opts[:on_auth_event],
@@ -3617,20 +3627,40 @@ defmodule Tightbeam.Acp.AdapterTest do
       )
 
     assert_ready(adapter, :claude_adapter_booted)
+    none = %{"authStatus" => %{"kind" => "none", "label" => "Not logged in"}}
 
-    none = %{"authStatus" => %{"kind" => "none"}}
-    send(adapter, {:acp_notification, "_auth/status_update", none})
+    for _ <- 1..2 do
+      send(adapter, {:acp_notification, "_auth/status_update", none})
+      assert_receive {:provider_probe, 200}
+      assert Tightbeam.Credentials.status(:anthropic, credential_owner) == :onboarded
+    end
 
-    assert eventually(fn ->
-             credential_metadata_path
-             |> File.read!()
-             |> JSON.decode!()
-             |> Map.get("initial_auth_none_ignored") == true
-           end)
+    # Age/timing and one-shot allowances cannot make a restart revoke a good login.
+    metadata = metadata_path |> File.read!() |> JSON.decode!()
+    File.write!(metadata_path, JSON.encode!(Map.put(metadata, "onboarded_at_ms", 1)))
+    connection = :sys.get_state(adapter).conn
+    adapter_monitor = Process.monitor(adapter)
+    Adapter.request_close(adapter)
+    assert_receive {:DOWN, ^adapter_monitor, :process, ^adapter, :normal}
+    GenServer.stop(connection)
 
-    refute_receive :claude_credential_parked, 100
-    refute_receive {:unexpected_provider_probe, _argv}, 0
+    {restarted, _} =
+      start_adapter(
+        harness: :claude,
+        on_auth_event: placement_opts[:on_auth_event],
+        on_ready: fn -> send(owner, :claude_adapter_restarted) end
+      )
+
+    assert_ready(restarted, :claude_adapter_restarted)
+    send(restarted, {:acp_notification, "_auth/status_update", none})
+    assert_receive {:provider_probe, 200}
     assert Tightbeam.Credentials.status(:anthropic, credential_owner) == :onboarded
+
+    Agent.update(provider_status, fn _ -> 503 end)
+    send(restarted, {:acp_notification, "_auth/status_update", none})
+    assert_receive {:provider_probe, 503}
+    assert Tightbeam.Credentials.status(:anthropic, credential_owner) == :onboarded
+    refute_receive :claude_credential_parked, 100
 
     assert {:ok, [[0]]} =
              Tightbeam.DB.query(
@@ -3638,25 +3668,22 @@ defmodule Tightbeam.Acp.AdapterTest do
                "SELECT COUNT(*) FROM harness_health_observations WHERE failureClass='auth-dead'"
              )
 
-    # A later logged-out status remains terminal; the one-shot fresh-bank guard
-    # does not turn off legitimate revocation handling.
-    send(adapter, {:acp_notification, "_auth/status_update", none})
+    Agent.update(provider_status, fn _ -> 401 end)
+    send(restarted, {:acp_notification, "_auth/status_update", none})
+    assert_receive {:provider_probe, 401}
     assert_receive :claude_credential_parked
 
     assert Tightbeam.Credentials.status(:anthropic, credential_owner) ==
              {:needs_onboarding, :revoked}
 
     assert eventually(fn ->
-             case Tightbeam.DB.query(
-                    db,
-                    "SELECT COUNT(*) FROM harness_health_observations WHERE failureClass='auth-dead'"
-                  ) do
-               {:ok, [[1]]} -> true
-               _ -> false
-             end
+             Tightbeam.DB.query(
+               db,
+               "SELECT COUNT(*) FROM harness_health_observations WHERE failureClass='auth-dead'"
+             ) == {:ok, [[1]]}
            end)
 
-    assert Process.alive?(adapter)
+    assert Process.alive?(restarted)
   end
 
   test "session updates reach the subagent marker callback with harness session identity" do
