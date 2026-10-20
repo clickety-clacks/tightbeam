@@ -422,7 +422,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     assert :ok = Schema.ensure_all(second)
     assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
     trigger = object_sql(second, "trigger", "supervision_liveness_sidecar_insert_coherent")
-    assert trigger =~ "withrecursivelineage"
+    assert trigger =~ "creator.owneruserid=w.owneruserid"
     refute trigger =~ "w.creatorsessionkey=a.holderkey"
     assert trigger =~ "t.sessionkey=w.creatorsessionkey"
     assert :ok = Schema.ensure_all(second)
