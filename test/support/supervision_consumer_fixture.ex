@@ -934,20 +934,29 @@ defmodule Tightbeam.SupervisionConsumerFixture do
                  [key]
                )
 
+      reminder_state =
+        if is_binary(assignment_id) do
+          case DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id=?1", [
+                 assignment_id
+               ]) do
+            {:ok, [[encoded]]} -> JSON.decode!(encoded)
+            _ -> %{}
+          end
+        else
+          %{}
+        end
+
+      expected_intent = get_in(reminder_state, ["pending", "intent"])
+
       expected_consumer =
         cond do
           is_nil(wake_id) ->
             %{"turn" => seq}
 
           is_binary(assignment_id) ->
-            case DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id=?1", [
-                   assignment_id
-                 ]) do
-              {:ok, [[encoded]]} ->
-                case get_in(JSON.decode!(encoded), ["pending", "consumer"]) do
-                  consumer when is_map(consumer) -> consumer
-                  _ -> %{"wake" => wake_id}
-                end
+            case get_in(reminder_state, ["pending", "consumer"]) do
+              consumer when is_map(consumer) ->
+                consumer
 
               _ ->
                 %{"wake" => wake_id}
@@ -984,6 +993,7 @@ defmodule Tightbeam.SupervisionConsumerFixture do
         state = JSON.decode!(encoded)
         assert state["pending"] == nil
         assert state["lastConsumer"] == expected_consumer
+        if is_binary(expected_intent), do: assert(state["lastIntent"] == expected_intent)
 
         assert (state["nextEligibleAt"] - state["lastDeliveredAt"]) in [
                  300_000,

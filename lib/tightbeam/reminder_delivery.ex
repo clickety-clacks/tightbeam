@@ -102,8 +102,8 @@ defmodule Tightbeam.ReminderDelivery do
 
   def canceled_in_txn(_txn, _assignment, _wake), do: :no_claim
 
-  # Called only inside Gateway's successful terminal callback, after the
-  # ledger terminal CAS. The stored consumer is the authoritative epoch fence.
+  # Called inside the winning delivered terminal transaction, after the ledger
+  # terminal CAS. The stored consumer is the authoritative epoch fence.
   def delivered_in_txn(txn, turn_seq) do
     case Txn.q(
            txn,
