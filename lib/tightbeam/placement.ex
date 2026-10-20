@@ -1876,6 +1876,8 @@ defmodule Tightbeam.Placement do
   end
 
   defp persist_terminal_auth_event(db, host, module, event) do
+    # Preserve adapter-confirmed terminal evidence when parking cannot be
+    # attempted, except Claude's ambiguous `none` status which needs its probe.
     mark_result =
       try do
         Tightbeam.Credentials.mark_terminal(
@@ -1885,6 +1887,24 @@ defmodule Tightbeam.Placement do
         )
       catch
         :exit, reason -> {:error, {:credential_owner_exit, reason}}
+      end
+
+    mark_result =
+      case mark_result do
+        {:error, {:credential_owner_exit, reason}} = owner_exit ->
+          Logger.error(
+            "credential owner unavailable for #{module.id()} on #{host}: #{inspect(reason)}"
+          )
+
+          if module.credential_provider() == :anthropic and
+               match?(%{"authStatus" => %{"kind" => "none"}}, event) do
+            owner_exit
+          else
+            :confirmed_terminal_owner_exit
+          end
+
+        result ->
+          result
       end
 
     # A failed park still means confirmed invalid credentials. An ambiguous
@@ -1898,10 +1918,8 @@ defmodule Tightbeam.Placement do
           "auth status unconfirmed for #{module.id()} on #{host}: #{inspect(reason)}"
         )
 
-      {:error, {:credential_owner_exit, reason}} ->
-        Logger.error(
-          "credential owner unavailable for #{module.id()} on #{host}: #{inspect(reason)}"
-        )
+      {:error, {:credential_owner_exit, _reason}} ->
+        :ok
 
       result ->
         try do

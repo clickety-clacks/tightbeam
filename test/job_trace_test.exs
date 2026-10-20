@@ -75,14 +75,6 @@ defmodule Tightbeam.JobTraceTest do
         ('w_timed', 'owner-session', 'process:tightbeam', 'timed', 101, 'fired',
          101, 101, NULL, 'wi_trace');
 
-      INSERT INTO effort_checkin_generations
-        (assignmentId, generation, state, baseHorizonMs, multiplier, armedAt,
-         terminalSeqWatermark, holderKey, host, root, baseline, wakeId, evidence)
-      VALUES
-        ('asg_direct', 1, 'probed', 10, 1, 100, 0, 'holder', 'eezo', '/tmp',
-         '{"status":"available","observation":{"stamp":"/tmp/effort.stamp","prior":"observed","writes":0,"entries":1,"digest":"same"}}',
-         'w_condition', '{"outcome":"zero_effect"}');
-
       INSERT INTO decision_requests
         (id, kind, raiserId, ownerUserId, assignmentId, raisedAt, deadlineAt,
          statuteName, actionKey, question, context, status, decision)
@@ -90,6 +82,21 @@ defmodule Tightbeam.JobTraceTest do
         ('dr_trace', 'statute', 'user:owner', 'owner', 'asg_direct', 100, 500,
          'trace-rule', 'trace-action', 'Choose', '{}', 'ruled', 'allow');
       """)
+
+    {:ok, _rows} =
+      DB.query(
+        db,
+        """
+        INSERT INTO effort_checkin_generations
+          (assignmentId, generation, state, baseHorizonMs, multiplier, armedAt,
+           terminalSeqWatermark, holderKey, host, root, baseline, wakeId, evidence)
+        VALUES
+          ('asg_direct', 1, 'probed', 10, 1, 100, 0, 'holder', ?1, '/tmp',
+           '{"status":"available","observation":{"stamp":"/tmp/effort.stamp","prior":"observed","writes":0,"entries":1,"digest":"same"}}',
+           'w_condition', '{"outcome":"zero_effect"}')
+        """,
+        [Tightbeam.Placement.local_host_name()]
+      )
 
     Enum.each([{"asg_direct", 2}, {"asg_bad", 3}, {"asg_review", 4}], fn
       {assignment_id, opened_at} ->
@@ -543,13 +550,18 @@ defmodule Tightbeam.JobTraceTest do
   end
 
   defp attest(db, principal, assignment_id, kind, extra) do
-    Assignments.__handle__(db, "attest", %{
-      verb: "attest",
-      principal: principal,
-      origin: origin(principal),
-      session_key: nil,
-      params: Map.merge(%{assignment_id: assignment_id, kind: kind}, extra)
-    })
+    Assignments.__handle__(
+      db,
+      "attest",
+      %{
+        verb: "attest",
+        principal: principal,
+        origin: origin(principal),
+        session_key: nil,
+        params: Map.merge(%{assignment_id: assignment_id, kind: kind}, extra)
+      }
+      |> Map.put_new(:supervision_interval_ms, 1_000)
+    )
   end
 
   defp session(db, key, owner) do
@@ -562,7 +574,7 @@ defmodule Tightbeam.JobTraceTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "eezo"
+      host: Tightbeam.Placement.local_host_name()
     })
   end
 

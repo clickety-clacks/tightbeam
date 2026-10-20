@@ -514,7 +514,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
 
   for profile <- [:installed, :published] do
     @tag profile: profile
-    test "real gate chain reaches completed with #{profile} review remedy and immutable receipts",
+    test "real gate chain reaches completed with #{profile} review notice and immutable receipts",
          ctx do
       if ctx.profile == :published do
         # Current packaged completion is an accountable wake, not automatic staffing.
@@ -550,6 +550,30 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
           "g"
         )
 
+      # Completion must reach the review statute with matching code evidence already
+      # present; otherwise the earlier code-evidence guard masks the rule under test.
+      verification =
+        Driver.post_as(ctx.state, holder.token, "attest", %{
+          "assignmentId" => holder.assignment_id,
+          "kind" => "verdict",
+          "verdictKind" => "verified",
+          "commitRefs" => holder.check.commit_refs,
+          "note" => holder.check.note
+        })
+
+      assert(
+        not (is_map(verification) and Map.has_key?(verification, "error")),
+        "fixture verification failed: #{inspect(verification)}"
+      )
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='verdict' " <>
+                   "AND verdictKind='verified' AND bySession=?2 AND commitRefs=?3",
+                 [holder.assignment_id, holder.key, JSON.encode!(holder.check.commit_refs)]
+               )
+
       reviewer =
         Driver.ok!(ctx.state, "spawn", %{
           "archetype" => "reviewer-code",
@@ -578,9 +602,9 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                  ctx.db,
                  """
                  SELECT s.outcome,a.commitRefs FROM assignments s JOIN attests a ON a.assignmentId=s.id
-                 WHERE s.workItemId=?1 AND a.kind='completion'
+                 WHERE s.id=?1 AND a.kind='completion'
                  """,
-                 [wi]
+                 [holder.assignment_id]
                )
 
       assert [%{"commit" => commit, "repo" => "testhost:" <> repo}] = JSON.decode!(commit_refs)
@@ -591,8 +615,8 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
       assert {:ok, [[3]]} =
                DB.query(
                  ctx.db,
-                 "SELECT count(*) FROM attests a JOIN assignments s ON s.id=a.assignmentId WHERE s.workItemId=?1 AND a.commitRefs=?2",
-                 [wi, commit_refs]
+                 "SELECT count(*) FROM attests a JOIN assignments s ON s.id=a.assignmentId WHERE (s.id=?1 OR s.reviewsAssignmentId=?1) AND a.commitRefs=?2",
+                 [holder.assignment_id, commit_refs]
                )
     end
   end

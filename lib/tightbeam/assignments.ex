@@ -3370,7 +3370,8 @@ defmodule Tightbeam.Assignments do
             {:ok, [_ | _] = expected} ->
               if same_commit_ref_identity?(expected, review_refs), do: kind, else: nil
 
-            _ -> nil
+            _ ->
+              nil
           end
         else
           kind
