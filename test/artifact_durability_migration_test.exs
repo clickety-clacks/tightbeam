@@ -298,19 +298,17 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
   end
 
   test "AD8 the terminal stamp still refuses a pre-reparent liveness carrier", %{db: db} do
-    assert :ok = Schema.ensure_all(db)
-    assert rows(db, "SELECT shape FROM schema_stamp") == [[@successor]]
-
-    [[reparented]] =
+    [[reparented_predecessor]] =
       rows(
         db,
         "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
       )
 
-    # Reverse the reparent substitution to recover the literal pre-reparent form.
-    # Pasting a copy of that DDL here would let the two drift apart silently.
+    # Reconstruct the pre-reparent form from the checked-in predecessor carrier
+    # before boot replaces it. Pasting a copy of that DDL here would let the two
+    # drift apart silently.
     pre_reparent =
-      reparented
+      reparented_predecessor
       |> String.replace(
         "SELECT sessionKey,#{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions",
         "SELECT sessionKey,spawnedBy FROM sessions"
@@ -321,17 +319,25 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
       )
 
     # Without this the test would pass vacuously if the reversal matched nothing.
-    refute pre_reparent == reparented
+    refute pre_reparent == reparented_predecessor
+
+    assert :ok = Schema.ensure_all(db)
+    assert rows(db, "SELECT shape FROM schema_stamp") == [[@successor]]
+
+    [[successor_carrier]] =
+      rows(
+        db,
+        "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
+      )
+
+    refute successor_carrier == reparented_predecessor
 
     :ok = DB.execute(db, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
     :ok = DB.execute(db, pre_reparent)
 
-    # `ensure_supervision_liveness_v1_in_txn` resolves the EXPECTED carrier from
-    # the stamp. The new stamp was added to that branch, so the reparented form
-    # is still what this database owes. Drop the successor from the branch and
-    # the historical objects become the expectation, this stale carrier
-    # validates, and the refusal below does not happen. Skip the validation call
-    # and it does not happen either.
+    # The terminal stamp selects the current carrier. An older parent relation
+    # is no longer a supported object at this stamp and must be refused before
+    # any later migration can silently replace it.
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
     assert error.message =~ "incompatible_supervision_liveness_v1"
     assert error.message =~ "supervision_liveness_sidecar_insert_coherent"

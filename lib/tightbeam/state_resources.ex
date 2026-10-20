@@ -47,6 +47,9 @@ defmodule Tightbeam.StateResources do
   FROM messages AS m
   LEFT JOIN turns AS t
     ON t.messageId = CASE m.role WHEN 'user' THEN m.id ELSE m.replyToMessageId END
+   AND NOT EXISTS (
+     SELECT 1 FROM turn_repair_attempts AS r WHERE r.attemptSeq = t.seq
+   )
   """
 
   alias Tightbeam.{
@@ -962,10 +965,10 @@ defmodule Tightbeam.StateResources do
   end
 
   # This is the same pinned relationship the transcript reader uses: the user
-  # message owns the turn and an assistant message points back to it. The
-  # production enqueue path is the sole turn-bearing writer, so one message
-  # resolves to zero or one turn. Refuse duplicate dirt instead of selecting a
-  # row by timing or count.
+  # message owns its original turn and an assistant message points back to it.
+  # A repair attempt keeps that visible message identity, so its attempt row is
+  # not another transcript owner. Refuse other duplicate associations instead
+  # of selecting a row by timing or count.
   def query_message(source, %{key: {session_key, id}, principal: principal}) do
     detail_selection(source, "transcript messages", principal, fn txn ->
       case query_message(txn, id) do

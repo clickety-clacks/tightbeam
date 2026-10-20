@@ -795,6 +795,12 @@ defmodule Tightbeam.SessionLane do
         state.db,
         fn txn ->
           if Ledger.finish_in_txn(txn, seq, terminal, error, terminal_opts) do
+            # Reminder consumption belongs to the winning terminal transition,
+            # not the runner's optional response-record callback. The fallback
+            # terminal path applies the same fenced transition below.
+            if terminal == "delivered",
+              do: Tightbeam.ReminderDelivery.delivered_in_txn(txn, seq)
+
             recorded = if is_function(in_txn, 1), do: in_txn.(txn), else: nil
 
             route_publication =
@@ -833,6 +839,9 @@ defmodule Tightbeam.SessionLane do
             state.db,
             fn txn ->
               if Ledger.finish_in_txn(txn, seq, terminal, error, terminal_opts) do
+                if terminal == "delivered",
+                  do: Tightbeam.ReminderDelivery.delivered_in_txn(txn, seq)
+
                 recorded =
                   if not is_nil(prewrite_evidence) and is_function(in_txn, 1),
                     do: in_txn.(txn),
