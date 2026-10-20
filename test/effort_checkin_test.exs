@@ -106,6 +106,82 @@ defmodule Tightbeam.EffortCheckinTest do
     assert "assignmentId" in Enum.map(columns, &Enum.at(&1, 1))
   end
 
+  @tag :real_default_effort_checkin
+  test "the default arms a new assignment and fires after its horizon", ctx do
+    # The test environment enables check-ins globally; remove that override here.
+    Application.delete_env(:tightbeam, :effort_checkins_enabled)
+
+    {Tightbeam.Boot, production_config} =
+      Tightbeam.Application.children()
+      |> Enum.find(&match?({Tightbeam.Boot, _}, &1))
+
+    assert production_config.effort_checkins_enabled
+    refute Application.get_env(:tightbeam, :effort_checkins_enabled)
+
+    config =
+      production_config
+      |> Map.merge(Map.delete(ctx.config, :effort_checkins_enabled))
+      |> Map.delete(:effort_checkins_enabled)
+
+    ctx = %{ctx | config: config}
+
+    refute Map.has_key?(config, :effort_checkins_enabled)
+    assert EffortCheckin.enabled?(config)
+
+    assigned =
+      assignment(ctx, "assign", {:user, "h1"}, "holder", %{subject: "default check-in"})
+
+    assert is_binary(assigned.id)
+
+    assert [[1, "armed", wake_id]] =
+             rows(
+               ctx.db,
+               "SELECT generation,state,wakeId FROM effort_checkin_generations WHERE assignmentId=?1",
+               [assigned.id]
+             )
+
+    assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
+
+    assert [[armed_at, base_horizon, multiplier, due_at]] =
+             rows(
+               ctx.db,
+               """
+               SELECT g.armedAt,g.baseHorizonMs,g.multiplier,w.dueAt
+               FROM effort_checkin_generations AS g
+               JOIN wakes AS w ON w.wakeId=g.wakeId
+               WHERE g.assignmentId=?1 AND g.generation=1
+               """,
+               [assigned.id]
+             )
+
+    assert base_horizon == config.effort_checkin_horizon_ms
+    assert due_at - armed_at == base_horizon * multiplier
+
+    {Wakes, opts} =
+      config
+      |> Gateway.children_after_preflight()
+      |> Enum.find(&match?({Wakes, _}, &1))
+
+    scheduler = :effort_default_checkin_scheduler
+
+    start_supervised!(
+      {Wakes, Keyword.merge(opts, name: scheduler, tick_ms: 60_000)},
+      id: scheduler
+    )
+
+    Process.sleep(max(due_at - System.system_time(:millisecond) + 1, 1))
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert %{state: "fired"} = Wakes.get(ctx.db, wake_id)
+
+    assert [[1, "probed"], [2, "armed"]] ==
+             rows(
+               ctx.db,
+               "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+               [assigned.id]
+             )
+  end
+
   test "turning effort check-ins off leaves already-armed rows and requests inert", ctx do
     enabled = %{ctx | config: Map.put(ctx.config, :effort_checkins_enabled, true)}
 

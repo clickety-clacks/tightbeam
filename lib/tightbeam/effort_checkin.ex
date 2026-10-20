@@ -168,7 +168,7 @@ defmodule Tightbeam.EffortCheckin do
     Map.get(
       config,
       :effort_checkins_enabled,
-      Application.get_env(:tightbeam, :effort_checkins_enabled, false)
+      Application.get_env(:tightbeam, :effort_checkins_enabled, true)
     ) == true
   end
 
