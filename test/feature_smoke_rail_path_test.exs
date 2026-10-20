@@ -600,7 +600,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
       assert {:ok, [[3]]} =
                DB.query(
                  ctx.db,
-                 "SELECT count(*) FROM attests a JOIN assignments s ON s.id=a.assignmentId WHERE s.id=?1 AND a.commitRefs=?2",
+                 "SELECT count(*) FROM attests a JOIN assignments s ON s.id=a.assignmentId WHERE (s.id=?1 OR s.reviewsAssignmentId=?1) AND a.commitRefs=?2",
                  [holder.assignment_id, commit_refs]
                )
     end
