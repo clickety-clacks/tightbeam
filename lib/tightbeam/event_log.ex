@@ -57,6 +57,7 @@ defmodule Tightbeam.EventLog do
           script_exit_class: String.t() | nil,
           ref: String.t() | nil,
           identity_manifest_sha: String.t() | nil,
+          rule_trace: map() | nil,
           origin: String.t(),
           principal: String.t() | nil
         }
@@ -260,6 +261,7 @@ defmodule Tightbeam.EventLog do
         script_exit_class: decoded["script_exit_class"],
         ref: decoded["ref"],
         identity_manifest_sha: decoded["identity_manifest_sha"],
+        rule_trace: decoded["rule_trace"],
         origin: origin,
         principal: principal
       }
