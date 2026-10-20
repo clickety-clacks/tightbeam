@@ -91,6 +91,7 @@ defmodule Tightbeam.AssignmentSourceReplacementMigrationTest do
   end
 
   defp downgrade_to_receipt_cancellation_predecessor!(db) do
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_effort_holder_activity_cancellation!(db)
     Tightbeam.SchemaShapeRuntimeFixture.downgrade_notice_source_storage!(db)
 
     assert [[current_sql]] =

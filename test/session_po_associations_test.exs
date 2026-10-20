@@ -269,7 +269,7 @@ defmodule Tightbeam.SessionPoAssociationsTest do
     assert count(ctx.db, "session_po_associations") == 0
   end
 
-  test "association notice remains claimable through liveness suppression", ctx do
+  test "association notice remains a plain claimable message", ctx do
     result = set(ctx.db, {:user, "owner"}, "product-owner:one", "claimable")
     wake = Wakes.get(ctx.db, result["association"]["noticeWakeId"])
 
@@ -290,9 +290,6 @@ defmodule Tightbeam.SessionPoAssociationsTest do
 
     assert {:ok, [[seq]]} =
              DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
-
-    assert {:ok, []} =
-             DB.query(ctx.db, "SELECT 1 FROM queued_message_scopes WHERE turnSeq=?1", [seq])
 
     assert {:ok, %{seq: ^seq, prompt: prompt}} =
              Ledger.claim_next(ctx.db, "orchestrator", "association-notice")

@@ -801,14 +801,21 @@ defmodule Tightbeam.EffortCheckinTest do
              outcome: "disposition",
              disposition_kind: "decision_request_transition",
              disposition_id: first_disposition_id,
-             liveness_kind: "supervision_entitlement",
+             liveness_kind: "pending_wake",
              liveness_id: first_liveness_id,
              action_needed: 1
            } = cancellation(ctx.db, first.deadline_wake_id)
 
     assert first_source_id == first.id
     assert first_disposition_id == first.id
-    assert first_liveness_id == "#{item.id}#1"
+
+    # The assignment's own inactivity deadline is what keeps the open work live.
+    assert {:ok, [["assignment_inactivity_deadline", assignment_id]]} =
+             DB.query(ctx.db, "SELECT consumer,assignmentId FROM wakes WHERE wakeId=?1", [
+               first_liveness_id
+             ])
+
+    assert assignment_id == item.id
 
     # The agent was prodded once at the top of this silent streak; every later
     # bracket in the same streak goes straight to the owner.
@@ -1241,6 +1248,26 @@ defmodule Tightbeam.EffortCheckinTest do
     assert prod.prompt =~ "Only a qualifying unresolved dependency wait pauses the effort horizon"
     refute prod.prompt =~ "or say what is happening"
 
+    assert %{attest: %{id: activity_attest_id, kind: "progress"}} =
+             assignment(ctx, "attest", {:session, "holder"}, "holder", %{
+               assignment_id: silent.id,
+               kind: "progress",
+               note: "material work recorded"
+             })
+
+    assert Wakes.get(ctx.db, prod.wake_id).state == "canceled"
+
+    assert %{
+             requester: "tightbeam:effort-checkin",
+             reason: "superseded",
+             source_kind: "progress_attest",
+             source_id: ^activity_attest_id,
+             outcome: "no_replacement",
+             liveness_kind: nil,
+             liveness_id: nil,
+             action_needed: 0
+           } = cancellation(ctx.db, prod.wake_id)
+
     assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [
              silent.id
            ]) == [[0]]
@@ -1256,6 +1283,27 @@ defmodule Tightbeam.EffortCheckinTest do
     assert nil == fire_probe(ctx, recorded.id)
     assert silent_rearm(ctx.db, recorded.id)
     assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == recorded.id)) == []
+  end
+
+  test "assignment disposal retracts its pending effort holder prod", ctx do
+    item = work_item!(ctx.db, "effort prod disposal")
+    assigned = dispatch_for_item(ctx, {:session, "parent"}, "holder", "silent", item.id)
+
+    assert nil == fire_probe(ctx, assigned.id)
+    assert [prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assigned.id))
+    assert prod.state == "pending"
+
+    assert %{state: "closed", outcome: "revoked"} =
+             assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{
+               assignment_id: assigned.id,
+               reason: "dispose the assignment after its pending effort prompt"
+             })
+
+    assert rows(ctx.db, "SELECT state FROM assignments WHERE id=?1", [assigned.id]) == [
+             ["closed"]
+           ]
+
+    assert Wakes.get(ctx.db, prod.wake_id).state == "canceled"
   end
 
   test "artifacts count only for the card's work item and unthreaded cards have none", ctx do
@@ -1793,18 +1841,27 @@ defmodule Tightbeam.EffortCheckinTest do
     assert host == Placement.local_host_name()
   end
 
-  test "an exact effort transition cancels its deadline with absent or terminal liveness", ctx do
-    for liveness <- [:absent, :terminal], action <- ["continue", "dismiss"] do
-      assignment =
-        dispatch(ctx, {:session, "parent"}, "holder", "#{liveness} #{action}")
-
+  test "an effort decision cancels its deadline without answering holder inactivity", ctx do
+    for action <- ["continue", "dismiss"] do
+      assignment = dispatch(ctx, {:session, "parent"}, "holder", action)
       request = escalate(ctx, assignment.id)
       deadline = Wakes.get(ctx.db, request.deadline_wake_id)
 
-      case liveness do
-        :absent -> drop_supervision_liveness(ctx.db, assignment.id)
-        :terminal -> terminate_supervision_liveness(ctx.db, assignment.id)
-      end
+      assert {:ok, {:ok, %{kind: "pending_wake", id: inactivity_wake_id}}} =
+               DB.transaction(ctx.db, fn txn ->
+                 Tightbeam.Supervision.inactivity_deadline_trigger_in_txn(
+                   txn,
+                   {:assignment, assignment.id}
+                 )
+               end)
+
+      inactivity_deadline = Wakes.get(ctx.db, inactivity_wake_id)
+
+      assert %{consumer: "assignment_inactivity_deadline", state: "pending"} =
+               inactivity_deadline
+
+      assert inactivity_deadline.assignment_id == assignment.id
+      inactivity_due_at = inactivity_deadline.due_at
 
       assert %{code: "not_authorized", message: "current expecter required"} =
                EffortCheckin.rule(
@@ -1841,10 +1898,17 @@ defmodule Tightbeam.EffortCheckinTest do
                outcome: "disposition",
                disposition_kind: "decision_request_transition",
                disposition_id: ^request_id,
-               liveness_kind: nil,
-               liveness_id: nil,
-               action_needed: 0
+               liveness_kind: "pending_wake",
+               liveness_id: ^inactivity_wake_id,
+               action_needed: 1
              } = cancellation(ctx.db, deadline.wake_id)
+
+      assert %{
+               assignment_id: ^assignment_id,
+               consumer: "assignment_inactivity_deadline",
+               due_at: ^inactivity_due_at,
+               state: "pending"
+             } = Wakes.get(ctx.db, inactivity_wake_id)
     end
   end
 
@@ -1998,23 +2062,6 @@ defmodule Tightbeam.EffortCheckinTest do
     assert rows(db, "SELECT COUNT(*) FROM supervision_entitlements WHERE assignmentId=?1", [
              assignment_id
            ]) == [[0]]
-
-    :ok
-  end
-
-  defp terminate_supervision_liveness(db, assignment_id) do
-    assert {:ok, _} =
-             DB.query(
-               db,
-               "UPDATE supervision_entitlements SET state='terminus',dueAt=NULL,supervisionIntervalMs=NULL,claimClock=NULL,lastAttemptGeneration=NULL,terminusAt=9000,cause='terminus',principal='process:tightbeam' WHERE assignmentId=?1",
-               [assignment_id]
-             )
-
-    assert rows(
-             db,
-             "SELECT state,dueAt,supervisionIntervalMs,terminusAt FROM supervision_entitlements WHERE assignmentId=?1",
-             [assignment_id]
-           ) == [["terminus", nil, nil, 9000]]
 
     :ok
   end

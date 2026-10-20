@@ -22,7 +22,6 @@ defmodule Tightbeam.Archetypes do
           defaults: %{optional(:harness) => atom(), optional(:model) => Tightbeam.Model.t()},
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
           model_preferences: [Tightbeam.Model.t()],
-          idle_cleanup: boolean(),
           ephemeral: boolean(),
           containment: %{fs: :off, network: :open},
           mcp: [
@@ -602,7 +601,6 @@ defmodule Tightbeam.Archetypes do
       defaults: %{},
       references: [],
       model_preferences: [],
-      idle_cleanup: true,
       ephemeral: false,
       containment: %{fs: :off, network: :open},
       mcp: [],
@@ -620,11 +618,11 @@ defmodule Tightbeam.Archetypes do
         "defaults",
         "references",
         "model_preferences",
-        "idle_cleanup",
         "ephemeral",
-        # Shipped 0.1.9 identity manifests may still contain this retired key.
-        # Accept it for compatibility, but do not read it into archetype state.
+        # Shipped 0.1.9 identity manifests may still contain these retired keys.
+        # Accept them for compatibility, but do not read them into archetype state.
         "owner_open_child_prod",
+        "idle_cleanup",
         "guidance",
         "mcp",
         "containment"
@@ -650,12 +648,6 @@ defmodule Tightbeam.Archetypes do
 
     unless is_boolean(ephemeral) do
       raise ArgumentError, "archetype ephemeral must be a boolean: #{path}"
-    end
-
-    idle_cleanup = Map.get(manifest, "idle_cleanup", true)
-
-    unless is_boolean(idle_cleanup) do
-      raise ArgumentError, "archetype idle_cleanup must be a boolean: #{path}"
     end
 
     unless is_list(skills) and Enum.all?(skills, &is_binary/1) do
@@ -714,7 +706,6 @@ defmodule Tightbeam.Archetypes do
       skills: skills,
       where: where,
       model_preferences: model_preferences,
-      idle_cleanup: idle_cleanup,
       ephemeral: ephemeral,
       containment: containment,
       defaults: defaults,

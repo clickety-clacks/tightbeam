@@ -143,7 +143,8 @@ defmodule Tightbeam.WorkState do
           %{
             assignment: assignment,
             attests: attests(txn, assignment_id),
-            supervision: supervision(txn, assignment_id),
+            # Kept in the output shape; the per-assignment prod ledger is retired.
+            supervision: nil,
             holder: holder(txn, assignment.holderKey),
             cursor: cursor(txn, "work_state_events")
           }
@@ -325,29 +326,6 @@ defmodule Tightbeam.WorkState do
         ts: ts
       }
     end)
-  end
-
-  defp supervision(txn, assignment_id) do
-    case Txn.q(
-           txn,
-           "SELECT assignmentId, attemptCount, prodCount, deniedStreak, attestCount, lastProdAt, stalledAt, strandedAt FROM assignment_prods WHERE assignmentId = ?1",
-           [assignment_id]
-         ) do
-      [] ->
-        nil
-
-      [[id, attempts, prods, denied, attests, last_prod, stalled, stranded]] ->
-        %{
-          assignmentId: id,
-          attemptCount: attempts,
-          prodCount: prods,
-          deniedStreak: denied,
-          attestCount: attests,
-          lastProdAt: last_prod,
-          stalledAt: stalled,
-          strandedAt: stranded
-        }
-    end
   end
 
   defp holder(txn, session_key) do

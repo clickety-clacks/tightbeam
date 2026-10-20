@@ -114,13 +114,13 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 22)
   end
 
-  test "a Codex source exceeding the wrapped scalar limit stays editable without a bypass", %{
+  test "an oversized Codex source is disposed and does not block a later sibling", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 23)
   end
 
-  test "the complete Codex submission admits 1048576 scalars and holds the next scalar", %{
+  test "the complete Codex submission admits 1048576 scalars and disposes the next scalar", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 24)
@@ -160,5 +160,51 @@ defmodule Tightbeam.NoticeBatcherTest do
          tmp_dir: tmp
        } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 30)
+  end
+
+  test "prewrite retry restores every admitted source without changing its stored bytes", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 31)
+  end
+
+  test "uncertain or dispatched turns refuse prewrite restoration atomically", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 32)
+  end
+
+  test "unavailable retry provenance rolls back the whole sibling restoration", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 35)
+  end
+
+  test "a provider rejection cannot be mistaken for prewrite restoration evidence", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 38)
+  end
+
+  test "forged retry identity or carrier metadata cannot be restored", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 42)
+  end
+
+  test "ordinary sources retain retry authority across repeated prewrite failures", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 47)
+  end
+
+  test "one malformed attachment source does not block its sibling notice", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 43)
+  end
+
+  test "an oversized source is ended with a sender notice without blocking its sibling", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 44)
+  end
+
+  test "an unresolvable linked target is ended without blocking or reading its missing source", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 46)
   end
 end

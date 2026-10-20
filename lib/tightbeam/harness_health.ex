@@ -3327,6 +3327,8 @@ defmodule Tightbeam.HarnessHealth do
 
         if Txn.changes(txn) != 1, do: raise("harness other incident resolution race")
 
+        :ok = Wakes.clear_harness_health_review_notice_in_txn(txn, incident.id)
+
         EventLog.lifecycle_in_txn(
           txn,
           "harness_health_incident_resolved",
@@ -3386,6 +3388,8 @@ defmodule Tightbeam.HarnessHealth do
         "UPDATE harness_health_incidents SET state='expired',expiredAt=?2,expiryFactId=?3 WHERE id=?1 AND state='open'",
         [incident.id, now, fact_id]
       )
+
+      :ok = Wakes.clear_harness_health_review_notice_in_txn(txn, incident.id)
 
       EventLog.lifecycle_in_txn(
         txn,
@@ -4022,20 +4026,6 @@ defmodule Tightbeam.HarnessHealth do
   end
 
   @doc false
-  def batch_source_delivered_in_txn(%Txn{} = txn, source_wake_id, turn_seq)
-      when is_binary(source_wake_id) and is_integer(turn_seq) and turn_seq > 0 do
-    Txn.q(
-      txn,
-      "UPDATE harness_health_other_routes SET turnSeq=?2 WHERE noticeWakeId=?1 AND state='pending' AND turnSeq IS NULL",
-      [source_wake_id, turn_seq]
-    )
-
-    :ok
-  end
-
-  def batch_source_delivered_in_txn(%Txn{}, _source_wake_id, _turn_seq), do: :ok
-
-  @doc false
   @spec settle_other_route_in_txn(Txn.t(), integer(), String.t(), integer()) :: map() | nil
   def settle_other_route_in_txn(%Txn{} = txn, turn_seq, terminal_state, settled_at)
       when is_integer(turn_seq) do
@@ -4210,6 +4200,22 @@ defmodule Tightbeam.HarnessHealth do
   def resume_other_routes(db \\ DB) do
     publications =
       transaction_with_row_commits!(db, fn txn ->
+        # Recover a source-owned turn link after a crash between prompt delivery
+        # and the harness-route consumer's post-commit read. Delivery itself
+        # remains source-blind; the deliveredTurnSeq is the durable receipt.
+        Txn.q(
+          txn,
+          """
+          UPDATE harness_health_other_routes
+          SET turnSeq=(SELECT deliveredTurnSeq FROM wakes WHERE wakeId=noticeWakeId)
+          WHERE state='pending' AND turnSeq IS NULL AND noticeWakeId IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM wakes WHERE wakeId=noticeWakeId AND deliveredTurnSeq IS NOT NULL
+            )
+          """,
+          []
+        )
+
         marked =
           Txn.q(
             txn,
@@ -4230,10 +4236,20 @@ defmodule Tightbeam.HarnessHealth do
             end
           end)
 
+        # Unsent later rungs are not missing publications. Only recover the
+        # current rung; a terminal non-delivery explicitly advances routeOrdinal.
         fresh =
           Txn.q(
             txn,
-            "SELECT DISTINCT incidentId FROM harness_health_other_routes WHERE state='pending' AND noticeWakeId IS NULL AND turnSeq IS NULL AND settledAt IS NULL ORDER BY incidentId",
+            """
+            SELECT r.incidentId
+            FROM harness_health_other_reviews v
+            JOIN harness_health_other_routes r
+              ON r.incidentId=v.incidentId AND r.ordinal=v.routeOrdinal
+            WHERE v.state='pending' AND r.state='pending'
+              AND r.noticeWakeId IS NULL AND r.turnSeq IS NULL AND r.settledAt IS NULL
+            ORDER BY r.incidentId
+            """,
             []
           )
           |> Enum.flat_map(fn [incident_id] ->
@@ -4256,6 +4272,61 @@ defmodule Tightbeam.HarnessHealth do
 
     :ok
   end
+
+  @doc false
+  @spec reconcile_delivered_turn(DB.server(), integer()) :: :ok
+  def reconcile_delivered_turn(db \\ DB, turn_seq)
+
+  def reconcile_delivered_turn(db, turn_seq) when is_integer(turn_seq) and turn_seq > 0 do
+    publications =
+      transaction_with_row_commits!(db, fn txn ->
+        Txn.q(
+          txn,
+          """
+          UPDATE harness_health_other_routes
+          SET turnSeq=?1
+          WHERE state='pending' AND turnSeq IS NULL
+            AND noticeWakeId IN (
+              SELECT wakeId FROM wakes WHERE deliveredTurnSeq=?1
+            )
+          """,
+          [turn_seq]
+        )
+
+        Txn.q(
+          txn,
+          """
+          SELECT r.incidentId,r.ordinal,r.turnSeq,t.status
+          FROM harness_health_other_routes r
+          JOIN turns t ON t.seq=r.turnSeq
+          WHERE r.turnSeq=?1 AND r.state='pending'
+          ORDER BY r.incidentId,r.ordinal
+          """,
+          [turn_seq]
+        )
+        |> Enum.flat_map(fn [incident_id, ordinal, seq, status] ->
+          case reconcile_marked_other_route_in_txn(
+                 txn,
+                 incident_id,
+                 ordinal,
+                 seq,
+                 status,
+                 System.system_time(:millisecond)
+               ) do
+            %{kind: :other_route} = publication -> [publication]
+            _ -> []
+          end
+        end)
+      end)
+
+    Enum.each(publications, fn publication ->
+      EventLog.publish(publication.plan)
+    end)
+
+    :ok
+  end
+
+  def reconcile_delivered_turn(_db, _turn_seq), do: :ok
 
   defp reconcile_marked_other_route_in_txn(
          txn,

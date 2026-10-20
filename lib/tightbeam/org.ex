@@ -948,6 +948,8 @@ defmodule Tightbeam.Org do
   end
 
   @doc false
+  # Retirement no longer arms a supervision controller, so the interval is
+  # validated for callers but otherwise unused.
   @spec retire_in_txn(Txn.t(), String.t(), String.t(), pos_integer()) :: session()
   def retire_in_txn(%Txn{} = txn, session_key, principal, supervision_interval_ms)
       when is_binary(principal) and principal != "" and is_integer(supervision_interval_ms) and
@@ -957,12 +959,7 @@ defmodule Tightbeam.Org do
         session
 
       %{state: "active"} ->
-        retire_active_in_txn(
-          txn,
-          session_key,
-          principal,
-          supervision_interval_ms
-        )
+        retire_active_in_txn(txn, session_key, principal)
     end
   end
 
@@ -971,20 +968,8 @@ defmodule Tightbeam.Org do
           "retirement requires a non-empty principal and positive supervision interval"
   end
 
-  defp retire_active_in_txn(txn, session_key, principal, supervision_interval_ms) do
+  defp retire_active_in_txn(txn, session_key, _principal) do
     retirement_epoch = now()
-
-    case Supervision.transition_in_txn(txn, %{
-           kind: "parent_target_retired",
-           session_key: session_key,
-           retirement_epoch: retirement_epoch,
-           principal: principal,
-           supervision_interval_ms: supervision_interval_ms
-         }) do
-      outcome when outcome in [:armed, :parent_elevated, :duplicate] -> :ok
-      {:error, reason} -> raise "parent-target retirement refused: #{inspect(reason)}"
-      other -> raise "invalid parent-target retirement result: #{inspect(other)}"
-    end
 
     Txn.q(
       txn,
@@ -1003,84 +988,133 @@ defmodule Tightbeam.Org do
 
     if Txn.changes(txn) != 1, do: raise("retirement state changed before commit")
 
-    cancel_retirement_wakes_in_txn(txn, session_key)
+    readdress_retirement_notices_in_txn!(txn, session_key)
 
     session = stamp_session_change_in_txn(txn, session_key, retirement_epoch)
     publish_session_in_txn(txn, "session.retired", session)
     session
   end
 
-  defp cancel_retirement_wakes_in_txn(txn, session_key) do
+  # SN9: a pending notice to the retiring session is readdressed whatever its
+  # targetGate. Effort timers keep the earlier gated selection and handling.
+  # Inactivity deadlines and climbs are the assignment's own pending trigger,
+  # not notices; the ladder resolves their target when they fire.
+  defp readdress_retirement_notices_in_txn!(txn, session_key) do
     Txn.q(
       txn,
       """
-      SELECT w.wakeId, w.sessionKey, w.targetRole, w.reresolve, w.reresolveSeed,
-             w.reresolveRung, w.work_item_id, w.assignmentId, w.consumer
+      SELECT w.wakeId,w.targetRole,w.reresolve,w.reresolveSeed,w.reresolveRung,
+             w.work_item_id,w.assignmentId,w.consumer
       FROM wakes w
       LEFT JOIN roles r ON r.name=w.targetRole
-      WHERE w.state='pending' AND w.targetGate=1
-        AND (w.sessionKey=?1 OR r.boundSessionKey=?1)
-      ORDER BY w.createdAt, w.wakeId
+      WHERE w.state='pending' AND (w.consumer='prompt' OR w.targetGate=1)
+        AND w.consumer NOT IN ('assignment_inactivity_deadline','assignment_inactivity_climb')
+        AND ((w.targetRole IS NULL AND w.sessionKey=?1) OR r.boundSessionKey=?1)
+      ORDER BY w.createdAt,w.wakeId
       """,
       [session_key]
     )
-    |> Enum.each(fn row -> cancel_retirement_wake_in_txn!(txn, session_key, row) end)
-
-    :ok
+    |> Enum.each(fn row -> readdress_retired_notice_in_txn!(txn, session_key, row) end)
   end
 
-  defp cancel_retirement_wake_in_txn!(
+  defp readdress_retired_notice_in_txn!(
          txn,
          session_key,
-         [
-           wake_id,
-           _recorded_session_key,
-           target_role,
-           reresolve,
-           reresolve_seed,
-           reresolve_rung,
-           work_item_id,
-           assignment_id,
-           consumer
-         ]
+         [wake_id, target_role, reresolve, seed, rung, work_item_id, assignment_id, consumer]
        ) do
-    command =
-      if retirement_assignment_disposition?(txn, assignment_id, session_key) do
-        assignment_disposition_command(
-          txn,
-          assignment_id,
-          work_item_id
-        )
-      else
-        target_retirement_command(
-          txn,
-          session_key,
-          wake_id,
-          target_role,
-          reresolve,
-          reresolve_seed,
-          reresolve_rung,
-          work_item_id,
-          assignment_id,
-          consumer
-        )
-      end
-
-    {after_cancellation, command} = Map.pop(command, :after_cancellation)
-
-    if not Wakes.cancel_in_txn(txn, Map.put(command, :wake_id, wake_id)) do
-      raise "typed retirement cancellation refused for #{wake_id}"
-    end
-
-    if consumer == "effort_probe" do
-      Txn.q(
+    if retirement_assignment_disposition?(txn, assignment_id, session_key) do
+      cancel_retired_notice!(
         txn,
-        "UPDATE effort_checkin_generations SET state='canceled' WHERE wakeId=?1 AND state='armed'",
-        [wake_id]
+        wake_id,
+        consumer,
+        assignment_disposition_command(txn, work_item_id, assignment_id),
+        nil
       )
-    end
+    else
+      case retirement_replacement_target(
+             txn,
+             session_key,
+             target_role,
+             reresolve,
+             seed,
+             rung,
+             consumer
+           ) do
+        nil ->
+          outcome =
+            put_liveness_trigger(
+              %{kind: "no_replacement"},
+              retirement_liveness_trigger(txn, work_item_id, assignment_id)
+            )
 
-    finalize_retirement_replacement_in_txn!(txn, after_cancellation)
+          cancel_retired_notice!(
+            txn,
+            wake_id,
+            consumer,
+            target_retirement_command(session_key, outcome),
+            nil
+          )
+
+        replacement_target ->
+          if consumer == "prompt" and is_nil(target_role) and is_nil(reresolve) do
+            case Wakes.readdress_pending_in_txn(txn, wake_id, replacement_target) do
+              {:ok, %{wake_id: ^wake_id}} ->
+                :ok
+
+              {:error, refusal} ->
+                raise "retirement readdress refused for #{wake_id}: #{inspect(refusal)}"
+
+              other ->
+                raise "invalid retirement readdress result for #{wake_id}: #{inspect(other)}"
+            end
+          else
+            retarget_retired_notice_in_txn!(
+              txn,
+              session_key,
+              wake_id,
+              consumer,
+              replacement_target
+            )
+          end
+      end
+    end
+  end
+
+  defp retarget_retired_notice_in_txn!(txn, session_key, wake_id, consumer, replacement_target) do
+    options = if consumer == "prompt", do: [ordinary_address: true], else: []
+
+    case Wakes.retarget_in_txn(txn, wake_id, replacement_target, options) do
+      %{wake_id: replacement_wake_id} ->
+        after_cancellation =
+          case NoticeBatcher.preserve_retargeted_source_in_txn(
+                 txn,
+                 wake_id,
+                 replacement_wake_id
+               ) do
+            :not_batched ->
+              nil
+
+            {:immutable_delivery, %{delivery_wake_id: delivery_wake_id}} ->
+              {:supersede_by_carrier, replacement_wake_id, delivery_wake_id}
+
+            {:error, refusal} ->
+              raise "retirement replacement batching refused: #{inspect(refusal)}"
+          end
+
+        cancel_retired_notice!(
+          txn,
+          wake_id,
+          consumer,
+          target_retirement_command(session_key, %{
+            kind: "replacement",
+            replacement_wake_id: replacement_wake_id
+          }),
+          after_cancellation
+        )
+
+      :error ->
+        raise "retirement replacement refused for #{wake_id}"
+    end
   end
 
   defp retirement_assignment_disposition?(_txn, nil, _session_key), do: false
@@ -1099,7 +1133,7 @@ defmodule Tightbeam.Org do
     ) == [[1]]
   end
 
-  defp assignment_disposition_command(txn, assignment_id, direct_work_item_id) do
+  defp assignment_disposition_command(txn, direct_work_item_id, assignment_id) do
     outcome = %{
       kind: "disposition",
       disposition_kind: "assignment_transition",
@@ -1113,100 +1147,29 @@ defmodule Tightbeam.Org do
       outcome:
         put_liveness_trigger(
           outcome,
-          liveness_trigger_in_txn!(txn, direct_work_item_id, assignment_id)
+          retirement_liveness_trigger(txn, direct_work_item_id, assignment_id)
         )
     }
   end
 
-  defp target_retirement_command(
-         txn,
-         session_key,
-         wake_id,
-         target_role,
-         reresolve,
-         reresolve_seed,
-         reresolve_rung,
-         work_item_id,
-         assignment_id,
-         _consumer
-       ) do
-    outcome =
-      case retirement_replacement_target(
-             txn,
-             target_role,
-             reresolve,
-             reresolve_seed,
-             reresolve_rung
-           ) do
-        nil ->
-          put_liveness_trigger(
-            %{kind: "no_replacement"},
-            liveness_trigger_in_txn!(txn, work_item_id, assignment_id)
-          )
-
-        replacement_target ->
-          case Wakes.retarget_in_txn(txn, wake_id, replacement_target) do
-            %{wake_id: replacement_wake_id} ->
-              after_cancellation =
-                case NoticeBatcher.preserve_retargeted_source_in_txn(
-                       txn,
-                       wake_id,
-                       replacement_wake_id
-                     ) do
-                  :not_batched ->
-                    nil
-
-                  {:immutable_delivery, %{delivery_wake_id: delivery_wake_id}} ->
-                    {:supersede_by_carrier, replacement_wake_id, delivery_wake_id}
-
-                  {:error, refusal} ->
-                    raise "retirement replacement batching refused: #{inspect(refusal)}"
-                end
-
-              %{
-                kind: "replacement",
-                replacement_wake_id: replacement_wake_id,
-                after_cancellation: after_cancellation
-              }
-
-            :error ->
-              raise "retirement replacement refused for #{wake_id}"
-          end
-      end
-
-    {after_cancellation, outcome} = Map.pop(outcome, :after_cancellation)
-
+  defp target_retirement_command(session_key, outcome) do
     %{
       requester: %{kind: "process", id: "tightbeam:retirement"},
       reason_kind: "target_retired",
       causal_source: %{kind: "session_transition", id: session_key},
-      outcome: outcome,
-      after_cancellation: after_cancellation
+      outcome: outcome
     }
   end
 
-  defp finalize_retirement_replacement_in_txn!(_txn, nil), do: :ok
-
-  defp finalize_retirement_replacement_in_txn!(
+  defp retirement_replacement_target(
          txn,
-         {:supersede_by_carrier, replacement_wake_id, delivery_wake_id}
-       ) do
-    command = %{
-      wake_id: replacement_wake_id,
-      requester: %{kind: "process", id: "tightbeam:batcher"},
-      reason_kind: "superseded",
-      causal_source: %{kind: "wake", id: delivery_wake_id},
-      outcome: %{kind: "replacement", replacement_wake_id: delivery_wake_id}
-    }
-
-    if Wakes.cancel_in_txn(txn, command) do
-      :ok
-    else
-      raise "retirement replacement carrier supersession refused for #{replacement_wake_id}"
-    end
-  end
-
-  defp retirement_replacement_target(txn, target_role, _reresolve, _seed, _rung)
+         _session_key,
+         target_role,
+         _reresolve,
+         _seed,
+         _rung,
+         _consumer
+       )
        when is_binary(target_role) do
     case Txn.q(
            txn,
@@ -1221,12 +1184,26 @@ defmodule Tightbeam.Org do
     end
   end
 
-  defp retirement_replacement_target(txn, _role, "lineage", seed, rung)
+  defp retirement_replacement_target(txn, _session_key, _role, "lineage", seed, rung, _consumer)
        when is_binary(seed) and is_integer(rung) and rung > 0 do
     Supervision.ladder_target(txn, seed, rung)
   end
 
-  defp retirement_replacement_target(_txn, _role, _reresolve, _seed, _rung), do: nil
+  # SN9 acceptance: a direct notice goes to the nearest active ancestor, or Main.
+  defp retirement_replacement_target(txn, session_key, nil, nil, _seed, _rung, "prompt") do
+    Supervision.ladder_target(txn, session_key, 1)
+  end
+
+  defp retirement_replacement_target(
+         _txn,
+         _session_key,
+         _role,
+         _reresolve,
+         _seed,
+         _rung,
+         _consumer
+       ),
+       do: nil
 
   defp active_session_or_main(txn, bound_session_key, owner_user_id) do
     cond do
@@ -1245,21 +1222,18 @@ defmodule Tightbeam.Org do
 
   defp active_session?(txn, session_key) do
     Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active'", [session_key]) ==
-      [
-        [1]
-      ]
+      [[1]]
   end
 
-  defp liveness_trigger_in_txn!(txn, direct_work_item_id, assignment_id) do
+  defp retirement_liveness_trigger(txn, direct_work_item_id, assignment_id) do
     case primary_liveness_ref(txn, direct_work_item_id, assignment_id) do
       nil ->
         nil
 
       primary ->
-        case Supervision.liveness_trigger_in_txn(txn, primary) do
+        case Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
           {:ok, trigger} when is_map(trigger) -> trigger
-          :none -> raise "#{inspect(primary)} has no liveness trigger"
-          {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"
+          :none -> nil
         end
     end
   end
@@ -1295,6 +1269,41 @@ defmodule Tightbeam.Org do
     do: Map.put(outcome, :liveness_trigger, trigger)
 
   defp put_liveness_trigger(outcome, nil), do: outcome
+
+  defp cancel_retired_notice!(txn, wake_id, consumer, command, after_cancellation) do
+    unless Wakes.cancel_in_txn(txn, Map.put(command, :wake_id, wake_id)) do
+      raise "typed retirement cancellation refused for #{wake_id}"
+    end
+
+    if consumer == "effort_probe" do
+      Txn.q(
+        txn,
+        "UPDATE effort_checkin_generations SET state='canceled' WHERE wakeId=?1 AND state='armed'",
+        [wake_id]
+      )
+    end
+
+    finalize_retirement_replacement_in_txn!(txn, after_cancellation)
+  end
+
+  defp finalize_retirement_replacement_in_txn!(_txn, nil), do: :ok
+
+  defp finalize_retirement_replacement_in_txn!(
+         txn,
+         {:supersede_by_carrier, replacement_wake_id, delivery_wake_id}
+       ) do
+    command = %{
+      wake_id: replacement_wake_id,
+      requester: %{kind: "process", id: "tightbeam:batcher"},
+      reason_kind: "superseded",
+      causal_source: %{kind: "wake", id: delivery_wake_id},
+      outcome: %{kind: "replacement", replacement_wake_id: delivery_wake_id}
+    }
+
+    unless Wakes.cancel_in_txn(txn, command) do
+      raise "retirement replacement carrier supersession refused for #{replacement_wake_id}"
+    end
+  end
 
   @doc "Repoint a retired session to another archetype and its base identity."
   @spec repoint_retired_archetype(db(), String.t(), String.t()) ::

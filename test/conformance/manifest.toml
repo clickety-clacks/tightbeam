@@ -51,21 +51,3 @@ kind = "remedy + load-rejection"
 phase = "pending"
 blocking_phase = "P5"
 runners = ["rules_decide", "acting_layer", "load_assert"]
-
-[[class]]
-id = "C7"
-dir = "c7_turn_end_sweep"
-title = "Turn-end sweep"
-kind = "sweep"
-phase = "pending"
-blocking_phase = "P6"
-runners = ["rules_decide", "acting_layer"]
-
-[[class]]
-id = "Cap"
-dir = "capstone"
-title = "Reviewer-loop ensemble"
-kind = "capstone"
-phase = "pending"
-blocking_phase = "P7"
-runners = ["rules_decide", "acting_layer"]

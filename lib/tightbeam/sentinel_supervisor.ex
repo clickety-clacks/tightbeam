@@ -272,7 +272,8 @@ defmodule Tightbeam.SentinelSupervisor do
               origin: "process:tightbeam",
               prompt: prompt,
               due_at: System.system_time(:millisecond),
-              sender_scheduled: true
+              sender_scheduled: true,
+              obligation_ref: Wakes.sentinel_stop_notice_ref(state.host, qualified)
             })
           end)
 

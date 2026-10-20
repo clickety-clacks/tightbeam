@@ -12,11 +12,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{config: config} ->
 
     {Tightbeam.Wakes, wake_opts} = Enum.find(children, &match?({Tightbeam.Wakes, _}, &1))
 
-    {Tightbeam.Supervision, supervision_opts} =
-      Enum.find(children, &match?({Tightbeam.Supervision, _}, &1))
-
     assert Keyword.fetch!(wake_opts, :tick_ms) == wake_tick
-    assert Keyword.fetch!(supervision_opts, :sweep_ms) == 4_321
   end
 end)
 

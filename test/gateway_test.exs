@@ -1087,7 +1087,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   @tag recipient_readiness: true
-  test "Codex oversized source keeps the ready snapshot editable under a named refusal", ctx do
+  test "Codex oversized source ends while healthy notices deliver in the same drain", ctx do
     assert {:ok, []} =
              DB.query(
                ctx.db,
@@ -1101,6 +1101,21 @@ defmodule Tightbeam.GatewayTest do
     assert length(String.to_charlist(oversized_payload)) == 1_048_576
     assert byte_size(oversized_payload) == 4 * 1_048_576
 
+    sender = Org.personal_session_key("flynn")
+
+    Org.create(ctx.db, %{
+      session_key: sender,
+      display_name: "Sender",
+      kind: "main",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
     sources =
       for i <- 1..51 do
         Tightbeam.Wakes.schedule(ctx.db, %{
@@ -1112,24 +1127,45 @@ defmodule Tightbeam.GatewayTest do
         })
       end
 
-    assert NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1000,
-             conn_registry: ctx.registry,
-             lane_manager: ctx.lane
-           ) == []
+    assert [carrier] =
+             NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1000,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
 
     assert length(sources) == 51
-
-    assert Enum.all?(sources, fn wake ->
-             current = Tightbeam.Wakes.get(ctx.db, wake.wake_id)
-
-             current.state == "pending" and current.prompt == wake.prompt and
-               current.session_key == "k1" and
-               NoticeBatcher.source_refs(ctx.db, wake.wake_id) == []
-           end)
-
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='k1'")
-
     oversized_id = List.last(sources).wake_id
+    assert Tightbeam.Wakes.get(ctx.db, oversized_id).state == "canceled"
+    assert NoticeBatcher.source_refs(ctx.db, oversized_id) == []
+
+    for wake <- Enum.drop(sources, -1) do
+      current = Tightbeam.Wakes.get(ctx.db, wake.wake_id)
+      assert current.state == "fired"
+      assert current.prompt == wake.prompt
+      assert current.session_key == "k1"
+
+      assert [%{delivery_wake_id: ^carrier, member_state: "included", batch_state: "delivered"}] =
+               NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+    end
+
+    assert {:ok, [[^carrier, prompt]]} =
+             DB.query(ctx.db, "SELECT wakeId,prompt FROM turns WHERE sessionKey='k1'")
+
+    refute prompt =~ oversized_payload
+
+    assert {:ok, [["consumer_unavailable", "scheduler_delivery", "no_replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reasonKind,causalSourceKind,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [oversized_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE sessionKey=?1 AND clientMessageId=?2",
+               [sender, "wake-undeliverable:#{oversized_id}"]
+             )
 
     assert {:ok, [[detail]]} =
              DB.query(
@@ -1541,10 +1577,11 @@ defmodule Tightbeam.GatewayTest do
                  DB.query(
                    ctx.db,
                    """
-                   SELECT e.dueAt - a.openedAt, e.supervisionIntervalMs
+                   SELECT w.dueAt - a.openedAt, json_extract(w.prompt, '$.intervalMs')
                    FROM assignments a
-                   JOIN supervision_entitlements e ON e.assignmentId=a.id
-                   WHERE a.id=?1
+                   JOIN wakes w ON w.assignmentId=a.id
+                   WHERE a.id=?1 AND w.consumer='assignment_inactivity_deadline'
+                     AND w.state='pending'
                    """,
                    [assignment_id]
                  )
@@ -1557,15 +1594,15 @@ defmodule Tightbeam.GatewayTest do
                    params: %{assignment_id: assignment_id, kind: "progress"}
                  })
 
-        assert {:ok, [["assignment_open", ^expected_interval, ^expected_interval]]} =
+        assert {:ok, [[^expected_interval, ^expected_interval]]} =
                  DB.query(
                    ctx.db,
                    """
-                   SELECT e.basisKind, e.supervisionIntervalMs, e.dueAt - a.openedAt
-                   FROM supervision_entitlements e
-                   JOIN assignments a ON a.id=e.assignmentId
-                   WHERE e.assignmentId=?1
-                   ORDER BY e.generation DESC LIMIT 1
+                   SELECT dueAt - json_extract(prompt, '$.activityAt'),
+                          json_extract(prompt, '$.intervalMs')
+                   FROM wakes
+                   WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline'
+                     AND state='pending'
                    """,
                    [assignment_id]
                  )
@@ -1574,7 +1611,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   @tag cold_gateway: true, gateway_cadence: true, tmp_dir: true
-  test "wake polling and supervision child cadence are independent", %{tmp_dir: tmp} do
+  test "wake polling cadence ignores the inactivity interval", %{tmp_dir: tmp} do
     Tightbeam.GuardRuntimeFixture.run!(
       tmp,
       "live_base_gateway_cadence.exs",
@@ -2417,7 +2454,9 @@ defmodule Tightbeam.GatewayTest do
         {%{supervision_interval_ms: 4_321}, "live_base_gateway_liveness_override.exs"}
       ] do
     @tag cold_gateway: true, gateway_cadence: true, tmp_dir: true
-    test "children recovers liveness with interval #{inspect(override)}", %{tmp_dir: tmp} do
+    test "children backfills an inactivity deadline with interval #{inspect(override)}", %{
+      tmp_dir: tmp
+    } do
       Tightbeam.GuardRuntimeFixture.run!(tmp, unquote(script), "guarded-gateway-liveness: ok")
     end
   end
@@ -3353,11 +3392,12 @@ defmodule Tightbeam.GatewayTest do
            }
   end
 
-  test "process cancel-wake cancels only its own pending wakes", ctx do
+  test "sender cancel-wake retracts only its own pending notices", ctx do
     own =
       Wakes.schedule(ctx.db, %{
         session_key: "k1",
-        origin: "process:scheduler",
+        origin: "agent:role-at-send",
+        creator_session_key: "k1",
         prompt: "own wake",
         due_at: 1_000
       })
@@ -3365,7 +3405,7 @@ defmodule Tightbeam.GatewayTest do
     other =
       Wakes.schedule(ctx.db, %{
         session_key: "k1",
-        origin: "process:other",
+        origin: "session:k2",
         prompt: "other wake",
         due_at: 2_000
       })
@@ -3376,9 +3416,9 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, %{canceled: true}} =
              Dispatch.dispatch(ctx.db, handlers, %{
                verb: "wake",
-               origin: "process:scheduler",
-               principal: {:process, "scheduler"},
-               session_key: nil,
+               origin: "agent:role-after-rebind",
+               principal: {:session, "k1"},
+               session_key: "k1",
                params: %{cancel_wake_id: own.wake_id}
              })
 
@@ -3399,9 +3439,9 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, %{canceled: false}} =
              Dispatch.dispatch(ctx.db, handlers, %{
                verb: "wake",
-               origin: "process:scheduler",
-               principal: {:process, "scheduler"},
-               session_key: nil,
+               origin: "agent:role-after-rebind",
+               principal: {:session, "k1"},
+               session_key: "k1",
                params: %{cancel_wake_id: other.wake_id}
              })
 
@@ -3416,11 +3456,13 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
-  test "public cancel rolls its accepted event and carrier back with the wake transition", ctx do
+  test "public sender cancel rolls its accepted event and carrier back with the wake transition",
+       ctx do
     wake =
       Wakes.schedule(ctx.db, %{
         session_key: "k1",
-        origin: "process:scheduler",
+        origin: "agent:role-at-send",
+        creator_session_key: "k1",
         prompt: "rollback wake",
         due_at: 1_000
       })
@@ -3444,9 +3486,9 @@ defmodule Tightbeam.GatewayTest do
     assert {:error, %{code: "server_error", message: message}} =
              Dispatch.dispatch(ctx.db, handlers, %{
                verb: "wake",
-               origin: "process:scheduler",
-               principal: {:process, "scheduler"},
-               session_key: nil,
+               origin: "agent:role-after-rebind",
+               principal: {:session, "k1"},
+               session_key: "k1",
                params: %{cancel_wake_id: wake.wake_id}
              })
 
@@ -8360,7 +8402,7 @@ defmodule Tightbeam.GatewayTest do
            end)
   end
 
-  test "queued set_harness handoff excludes exact replacement QMS sources and keeps other durable order",
+  test "queued set_harness handoff preserves plain notices and excludes sender-retracted sources",
        ctx do
     ensure_global_registry()
     candidate = start_supervised!({BlockingCandidateAdapterStub, self()})
@@ -8397,52 +8439,6 @@ defmodule Tightbeam.GatewayTest do
       VALUES ('asg_handoff','coordination')
       """)
 
-    wake =
-      Wakes.schedule(ctx.db, %{
-        session_key: "k1",
-        origin: "process:tightbeam",
-        prompt: "superseded liveness notice",
-        due_at: System.system_time(:millisecond) + 60_000,
-        assignment_id: "asg_handoff",
-        consumer: "effort_probe"
-      })
-
-    assert {:ok, {:appended, "k1", suppressed_message, _opts}} =
-             DB.transaction(ctx.db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 wake.session_key,
-                 wake.origin,
-                 wake.prompt,
-                 wake_id: wake.wake_id,
-                 sender: wake.origin,
-                 device_id: "test",
-                 client_message_id: wake.wake_id,
-                 target_gate: wake
-               )
-             end)
-
-    assert {:ok, [[suppressed_seq]]} =
-             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
-
-    assert suppressed_message.seq != suppressed_seq
-
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               """
-               INSERT INTO supervision_liveness_receipts
-                 (assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt)
-               VALUES ('asg_handoff','progress','progress-1',?1,?2,2,NULL)
-               """,
-               [wake.created_at, wake.created_at + 1]
-             )
-
-    assert {:ok, [^suppressed_seq]} =
-             DB.transaction(ctx.db, fn txn ->
-               Tightbeam.QueuedMessageSuppression.suppress_before_claim_in_txn(txn, "k1")
-             end)
-
     {other_suppressed_seq, other_suppressed_message} =
       enqueue_gateway_prompt!(
         ctx.db,
@@ -8459,14 +8455,6 @@ defmodule Tightbeam.GatewayTest do
                  "queued-message-suppressed: another_reason"
                )
              end)
-
-    :ok =
-      EventLog.lifecycle(
-        ctx.db,
-        "queued_message_suppressed",
-        Integer.to_string(other_suppressed_seq),
-        JSON.encode!(%{messageKind: "liveness"})
-      )
 
     {replacement_source_seq, replacement_source_message} =
       enqueue_gateway_prompt!(
@@ -8520,6 +8508,29 @@ defmodule Tightbeam.GatewayTest do
                )
              end)
 
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "k1",
+        origin: "process:tightbeam",
+        prompt: "pending plain notice",
+        due_at: System.system_time(:millisecond),
+        assignment_id: "asg_handoff"
+      })
+
+    assert [carrier_id] =
+             Tightbeam.NoticeBatcher.recover(ctx.db, System.system_time(:millisecond),
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
+
+    assert %{delivered_turn_seq: notice_seq} = Wakes.get(ctx.db, wake.wake_id)
+
+    assert {:ok, [[^notice_seq, notice_message_id]]} =
+             DB.query(ctx.db, "SELECT seq,messageId FROM turns WHERE wakeId=?1", [carrier_id])
+
+    notice_message = Projection.get(ctx.db, notice_message_id)
+    assert notice_message.seq != notice_seq
+
     {first_seq, first_message} =
       enqueue_gateway_prompt!(ctx.db, "k1", "user:flynn", "first queued request")
 
@@ -8541,7 +8552,7 @@ defmodule Tightbeam.GatewayTest do
     assert guidance =~ "Cross-harness handoff from durable session records"
     assert guidance =~ ~s("sender":"user:flynn")
     assert guidance =~ ~s("sender":"agent:reviewer")
-    assert guidance =~ "superseded liveness notice"
+    refute guidance =~ "pending plain notice"
     refute guidance =~ "exact sender replacement source to omit"
     assert guidance =~ "other suppression reason durable context"
     assert guidance =~ "unattributed canceled durable context"
@@ -8566,7 +8577,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{ok: true, harness: "codex", engine_context: "reset"} = Task.await(task, 60_000)
     assert Org.get(ctx.db, "k1").cleared_through_seq == unattributed_canceled_message.seq
-    assert Ledger.pending_count(ctx.db, "k1") == 3
+    assert Ledger.pending_count(ctx.db, "k1") == 4
 
     assert {:ok, queued_rows} =
              DB.query(
@@ -8575,36 +8586,30 @@ defmodule Tightbeam.GatewayTest do
              )
 
     assert queued_rows == [
-             [suppressed_seq, "canceled", suppressed_message.id],
              [other_suppressed_seq, "canceled", other_suppressed_message.id],
              [replacement_source_seq, "canceled", replacement_source_message.id],
              [unattributed_canceled_seq, "canceled", unattributed_canceled_message.id],
+             [notice_seq, "queued", notice_message.id],
              [first_seq, "queued", first_message.id],
              [second_seq, "queued", second_message.id],
              [late_seq, "queued", late_message.id]
            ]
 
-    assert {:ok, [[error]]} =
-             DB.query(ctx.db, "SELECT error FROM turns WHERE seq=?1", [suppressed_seq])
-
-    assert error == "queued-message-suppressed: verified_liveness_recovery"
-
-    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
-             event.kind == "queued_message_suppressed" and
-               event.subject == Integer.to_string(suppressed_seq) and
-               JSON.decode!(event.detail)["messageKind"] == "liveness"
-           end)
+    assert {:ok, [["queued"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [notice_seq])
 
     visible_after_switch = Projection.list_after(ctx.db, "k1", nil, 100, history_agent.seq)
 
+    assert Enum.any?(visible_after_switch, &(&1.id == notice_message.id))
     assert Enum.any?(visible_after_switch, &(&1.id == first_message.id))
     assert Enum.any?(visible_after_switch, &(&1.id == second_message.id))
     assert Enum.any?(visible_after_switch, &(&1.id == late_message.id))
     assert Enum.any?(visible_after_switch, &(&1.marker && &1.marker.kind == "harness-switch"))
 
-    for expected_seq <- [first_seq, second_seq, late_seq] do
+    for expected_seq <- [notice_seq, first_seq, second_seq, late_seq] do
       assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
       assert turn.seq == expected_seq
+      if expected_seq == notice_seq, do: assert(turn.prompt =~ "pending plain notice")
 
       assert :ok =
                Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)

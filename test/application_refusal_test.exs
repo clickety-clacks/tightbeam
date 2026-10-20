@@ -22,6 +22,21 @@ defmodule Tightbeam.ApplicationRefusalTest do
   # `IO.puts(:stderr, ...)`.
   @refusal "Tight Beam cannot start because no usable harness CLI is installed"
 
+  # Compile the prod build before the boot under test, so the test's timeout
+  # measures the refusal and not a cold compile competing with the rest of the
+  # suite. The subprocess below finds the build current and only boots.
+  setup_all do
+    {out, status} =
+      System.cmd(System.find_executable("mix") || "mix", ["compile"],
+        cd: File.cwd!(),
+        env: [{"MIX_ENV", "prod"}],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, "prod compile failed:\n#{out}"
+    :ok
+  end
+
   # A PATH with a real Elixir toolchain and NO harness CLI.
   #
   # Not "the toolchain's own bindir": on this box `codex` is installed into
