@@ -110,6 +110,9 @@ defmodule Tightbeam.Rules do
     assignment.independent_verdict_kinds
     assignment.qualifying_review_verdict_kinds
   )
+  @max_traced_commit_refs 32
+  @max_traced_repo_bytes 4096
+  @max_traced_commit_bytes 256
   @name_re ~r/^[a-z0-9][a-z0-9-]*$/
   @facts %{
     "caller.origin_class" => :string,
@@ -1305,7 +1308,9 @@ defmodule Tightbeam.Rules do
           |> Map.merge(%{
             resolver_arity: 3,
             submitted_commit_refs:
-              Map.get(call.params, :commit_refs) || Map.get(call.params, "commit_refs")
+              call.params
+              |> then(&(Map.get(&1, :commit_refs) || Map.get(&1, "commit_refs")))
+              |> sanitize_traced_commit_refs()
           })
 
         {trace.resolved_fact,
@@ -1590,6 +1595,52 @@ defmodule Tightbeam.Rules do
         {Assignments.commissioned_review_authors(db, assignment.id, assignment.holder_key), cache}
     end)
   end
+
+  defp sanitize_traced_commit_refs(nil), do: nil
+
+  defp sanitize_traced_commit_refs(refs) when is_list(refs) do
+    if length(refs) <= @max_traced_commit_refs do
+      Enum.reduce_while(refs, {:ok, []}, fn ref, {:ok, sanitized} ->
+        case sanitize_traced_commit_ref(ref) do
+          {:ok, value} -> {:cont, {:ok, [value | sanitized]}}
+          :error -> {:halt, :error}
+        end
+      end)
+      |> case do
+        {:ok, sanitized} -> Enum.reverse(sanitized)
+        :error -> %{status: "invalid"}
+      end
+    else
+      %{status: "invalid"}
+    end
+  end
+
+  defp sanitize_traced_commit_refs(_refs), do: %{status: "invalid"}
+
+  defp sanitize_traced_commit_ref(ref) when is_map(ref) and map_size(ref) == 2 do
+    normalized =
+      Enum.reduce_while(ref, {:ok, %{}}, fn
+        {key, value}, {:ok, acc} when key in [:repo, "repo", :commit, "commit"] ->
+          key = if is_atom(key), do: Atom.to_string(key), else: key
+
+          if Map.has_key?(acc, key),
+            do: {:halt, :error},
+            else: {:cont, {:ok, Map.put(acc, key, value)}}
+
+        _, _acc ->
+          {:halt, :error}
+      end)
+
+    with {:ok, %{"repo" => repo, "commit" => commit}} <- normalized,
+         true <- is_binary(repo) and byte_size(repo) <= @max_traced_repo_bytes,
+         true <- is_binary(commit) and byte_size(commit) <= @max_traced_commit_bytes do
+      {:ok, %{repo: repo, commit: commit}}
+    else
+      _ -> :error
+    end
+  end
+
+  defp sanitize_traced_commit_ref(_ref), do: :error
 
   defp resolve_dispatch_assignment(db, call) do
     case {call.verb, Map.get(call.params, :work_item_id)} do

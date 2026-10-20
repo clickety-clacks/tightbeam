@@ -1063,6 +1063,27 @@ defmodule Tightbeam.RulesTest do
              "selected_verdict_kind" => "changes-requested",
              "resolved_fact" => []
            }
+
+    injected = "credential-do-not-retain"
+
+    malformed_completion =
+      put_in(completion, [:params, :commit_refs], [
+        %{
+          repo: "sirius:/srv/tightbeam",
+          commit: String.duplicate("b", 40),
+          token: injected
+        }
+      ])
+
+    assert {:error, %{rule_trace: malformed_trace} = refusal} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, malformed_completion)
+
+    assert malformed_trace.submitted_commit_refs == %{status: "invalid"}
+    refute inspect(refusal) =~ injected
+
+    assert [_, %{rule_trace: persisted_malformed}] = EventLog.rail_denials(ctx.db, 0, 10)
+    assert persisted_malformed["submitted_commit_refs"] == %{"status" => "invalid"}
+    refute JSON.encode!(persisted_malformed) =~ injected
   end
 
   test "artifact kinds fact resolves holder-recorded kinds only (A6)", ctx do
