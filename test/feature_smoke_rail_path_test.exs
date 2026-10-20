@@ -587,9 +587,9 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                  ctx.db,
                  """
                  SELECT s.outcome,a.commitRefs FROM assignments s JOIN attests a ON a.assignmentId=s.id
-                 WHERE s.workItemId=?1 AND a.kind='completion'
+                 WHERE s.id=?1 AND a.kind='completion'
                  """,
-                 [wi]
+                 [holder.assignment_id]
                )
 
       assert [%{"commit" => commit, "repo" => "testhost:" <> repo}] = JSON.decode!(commit_refs)
@@ -600,8 +600,8 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
       assert {:ok, [[3]]} =
                DB.query(
                  ctx.db,
-                 "SELECT count(*) FROM attests a JOIN assignments s ON s.id=a.assignmentId WHERE s.workItemId=?1 AND a.commitRefs=?2",
-                 [wi, commit_refs]
+                 "SELECT count(*) FROM attests a JOIN assignments s ON s.id=a.assignmentId WHERE s.id=?1 AND a.commitRefs=?2",
+                 [holder.assignment_id, commit_refs]
                )
     end
   end

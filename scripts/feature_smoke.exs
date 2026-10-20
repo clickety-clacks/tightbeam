@@ -627,9 +627,44 @@ defmodule FeatureSmoke do
             holder.check.note
       })
 
-      # 1. Review gate. Current rules notify the accountable owner; older installed
-      # rules assign the bound reviewer. Either way the denial must remain real.
-      denied!(state, "completion-requires-review", asg_id, complete)
+      # The code-completion guard needs matching producer verification before the
+      # review statute can route its pending completion to a reviewer.
+      verified =
+        post_as(state, holder.token, "attest", %{
+          "assignmentId" => asg_id,
+          "kind" => "verdict",
+          "verdictKind" => "verified",
+          "commitRefs" => holder.check.commit_refs,
+          "note" => holder.check.note
+        })
+
+      assert(
+        state,
+        not (is_map(verified) and Map.has_key?(verified, "error")),
+        "gate chain: the holder-token verified verdict failed: #{inspect(verified)}"
+      )
+
+      # 1. Review gate. The statute routes review while preserving a pending
+      # completion, which remains open until the matching clean review arrives.
+      review_request = complete.()
+
+      assert(
+        state,
+        not (is_map(review_request) and Map.has_key?(review_request, "error")),
+        "gate chain: completion-requires-review did not route the pending completion: " <>
+          "#{inspect(review_request)}"
+      )
+
+      await_episode_status!(state, "completion-requires-review", asg_id, "live")
+
+      pending = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
+
+      assert(
+        state,
+        pending["state"] == "open",
+        "gate chain: review-pending completion should leave #{asg_id} open, got " <>
+          "#{inspect(pending["state"])}"
+      )
 
       reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
 
@@ -667,12 +702,43 @@ defmodule FeatureSmoke do
         "gate chain: reviewed-clean from the #{reviewer_leg.wire_name} reviewer failed: #{inspect(v)}"
       )
 
-      # 2. Verification gate, reachable now that the review gate stopped denying.
-      denied!(state, "completion-requires-verification", asg_id, complete)
+      code_final = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
 
-      verified =
+      assert(
+        state,
+        code_final["state"] == "closed" and code_final["outcome"] == "completed",
+        "gate chain: matching code evidence and review should complete #{asg_id}, got " <>
+          "state=#{inspect(code_final["state"])} outcome=#{inspect(code_final["outcome"])}"
+      )
+
+      # Verification and artifact statutes are tested on a separate coder-held
+      # evidence assignment so their rule paths remain reachable after the code
+      # completion's review remedy has settled.
+      gate_assignment =
+        ok!(state, "assign", %{
+          "sessionKey" => holder.key,
+          "subject" => "completion verification and artifact gates #{u}",
+          "workItemId" => wi_id,
+          "effectKind" => "evidence",
+          "idempotencyKey" => "gate-evidence-#{u}"
+        })
+
+      gate_asg_id = gate_assignment["id"] || gate_assignment["assignmentId"]
+
+      complete_gate = fn ->
         post_as(state, holder.token, "attest", %{
-          "assignmentId" => asg_id,
+          "assignmentId" => gate_asg_id,
+          "kind" => "completion"
+        })
+      end
+
+      # 2. Verification gate. This assignment is not a code completion, so the
+      # code-evidence guard cannot mask the statute being exercised here.
+      denied!(state, "completion-requires-verification", gate_asg_id, complete_gate)
+
+      verified_gate =
+        post_as(state, holder.token, "attest", %{
+          "assignmentId" => gate_asg_id,
           "kind" => "verdict",
           "verdictKind" => "verified",
           "commitRefs" => holder.check.commit_refs,
@@ -681,13 +747,20 @@ defmodule FeatureSmoke do
 
       assert(
         state,
-        not (is_map(verified) and Map.has_key?(verified, "error")),
-        "gate chain: the holder-token verified verdict failed: #{inspect(verified)}"
+        not (is_map(verified_gate) and Map.has_key?(verified_gate, "error")),
+        "gate chain: the holder-token gate-assignment verification failed: " <>
+          "#{inspect(verified_gate)}"
       )
 
       # 3. The artifact gate.
-      denied!(state, "completion-requires-results-artifact", asg_id, complete)
-      await_episode_status!(state, "completion-requires-results-artifact", asg_id, "live")
+      denied!(state, "completion-requires-results-artifact", gate_asg_id, complete_gate)
+
+      await_episode_status!(
+        state,
+        "completion-requires-results-artifact",
+        gate_asg_id,
+        "live"
+      )
 
       # 4. The report, recorded BY THE OPERATOR over HTTP on the holder's own token — and
       # its WEAKER evidence class is an assertion here rather than a compromise.
@@ -740,20 +813,26 @@ defmodule FeatureSmoke do
           "the carrier proof in the other half of this group. Row: #{inspect(recorded)}"
       )
 
-      # 5. Release. The gate had denied three times; with a report on record — a WEAK one —
-      # completion passes, which is the evidence-blindness above proven end to end.
-      done = complete.()
-      final = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
+      # 5. Release. The verification and artifact gates denied in order; with a
+      # report on record — a WEAK one — completion passes.
+      done = complete_gate.()
+      final = ok!(state, "assignment-get", %{"assignmentId" => gate_asg_id})
 
       assert(
         state,
         final["state"] == "closed" and final["outcome"] == "completed",
-        "gate chain: with a report recorded, completion should close #{asg_id} as completed; " <>
+        "gate chain: with a report recorded, completion should close #{gate_asg_id} " <>
+          "as completed; " <>
           "assignment reads state=#{inspect(final["state"])} outcome=#{inspect(final["outcome"])} " <>
           "(attest returned #{inspect(done)})"
       )
 
-      await_episode_status!(state, "completion-requires-results-artifact", asg_id, "closed")
+      await_episode_status!(
+        state,
+        "completion-requires-results-artifact",
+        gate_asg_id,
+        "closed"
+      )
 
       # 6. The isolation proof. Everything above assumed the holder never acted; this is
       # where that stops being an assumption.
@@ -835,9 +914,10 @@ defmodule FeatureSmoke do
 
       pass(
         state,
-        "gate chain enforced: review(#{reviewer_leg.wire_name}) → verification → artifact " <>
-          "denied in order, released by a #{recorded["recordedTurnEvidence"]} row (gate is " <>
-          "evidence-blind, classes not spoofable), completes, episode closed — holder: " <>
+        "gate chain enforced: review(#{reviewer_leg.wire_name}) routed with matching code evidence; " <>
+          "verification → artifact denied on the coder-held evidence task, released by a " <>
+          "#{recorded["recordedTurnEvidence"]} row (gate is evidence-blind, classes not spoofable), " <>
+          "completes, episode closed — holder: " <>
           "#{materialized} turn(s) materialized, #{started} started"
       )
     after

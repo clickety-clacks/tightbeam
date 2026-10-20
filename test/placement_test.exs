@@ -1278,6 +1278,23 @@ defmodule Tightbeam.PlacementTest do
              Tightbeam.EventLog.lifecycle_events(db),
              &(&1.kind == "harness_health_auth_blocker")
            )
+
+    claude_handler =
+      Placement.adapter_opts!(config, {:claude, "default", "testhost"})[:on_auth_event]
+
+    claude_handler.(:terminal, %{"authStatus" => %{"kind" => "none"}})
+
+    refute eventually(fn ->
+             Enum.any?(HarnessHealth.active(db), fn incident ->
+               incident.failureClass == "auth-dead" and
+                 incident.harness == "claude"
+             end)
+           end)
+
+    assert match?(
+             [%{failureClass: "auth-dead", harness: "codex", host: "testhost"}],
+             HarnessHealth.active(db)
+           )
   end
 
   test "adapter_opts appends a local overlay and absent rows leave env unchanged", %{

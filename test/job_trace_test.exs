@@ -84,14 +84,6 @@ defmodule Tightbeam.JobTraceTest do
         ('w_timed', 'owner-session', 'process:tightbeam', 'timed', 101, 'fired',
          101, 101, NULL, 'wi_trace');
 
-      INSERT INTO effort_checkin_generations
-        (assignmentId, generation, state, baseHorizonMs, multiplier, armedAt,
-         terminalSeqWatermark, holderKey, host, root, baseline, wakeId, evidence)
-      VALUES
-        ('asg_direct', 1, 'probed', 10, 1, 100, 0, 'holder', 'eezo', '/tmp',
-         '{"status":"available","observation":{"stamp":"/tmp/effort.stamp","prior":"observed","writes":0,"entries":1,"digest":"same"}}',
-         'w_condition', '{"outcome":"zero_effect"}');
-
       INSERT INTO decision_requests
         (id, kind, raiserId, ownerUserId, assignmentId, raisedAt, deadlineAt,
          statuteName, actionKey, question, context, status, decision)
@@ -99,6 +91,21 @@ defmodule Tightbeam.JobTraceTest do
         ('dr_trace', 'statute', 'user:owner', 'owner', 'asg_direct', 100, 500,
          'trace-rule', 'trace-action', 'Choose', '{}', 'ruled', 'allow');
       """)
+
+    {:ok, _rows} =
+      DB.query(
+        db,
+        """
+        INSERT INTO effort_checkin_generations
+          (assignmentId, generation, state, baseHorizonMs, multiplier, armedAt,
+           terminalSeqWatermark, holderKey, host, root, baseline, wakeId, evidence)
+        VALUES
+          ('asg_direct', 1, 'probed', 10, 1, 100, 0, 'holder', ?1, '/tmp',
+           '{"status":"available","observation":{"stamp":"/tmp/effort.stamp","prior":"observed","writes":0,"entries":1,"digest":"same"}}',
+           'w_condition', '{"outcome":"zero_effect"}')
+        """,
+        [Tightbeam.Placement.local_host_name()]
+      )
 
     %{db: db}
   end
@@ -498,7 +505,7 @@ defmodule Tightbeam.JobTraceTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "eezo"
+      host: Tightbeam.Placement.local_host_name()
     })
   end
 
