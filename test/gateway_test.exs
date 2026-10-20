@@ -3672,6 +3672,16 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "R2.1-R2.3 ephemeral spawn stamps its caller without a role or work item", ctx do
+    hub = start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
+
+    :ok =
+      Tightbeam.Firehose.Hub.register(hub, self(), %{
+        mode: :all,
+        db: ctx.db,
+        user_id: "flynn",
+        is_admin: true
+      })
+
     base_dir = role_test_base("ephemeral-spawn")
     dir = Path.join([base_dir, "identity", "archetypes"])
     File.mkdir_p!(dir)
@@ -3682,14 +3692,36 @@ defmodule Tightbeam.GatewayTest do
     spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
     params = %{display_name: "Inspect", archetype: "helper", idempotency_key: "ephemeral-spawn"}
     call = %{origin: "agent:caller", session_key: nil, params: params}
-    assert %{session_key: key} = spawn.(call)
+
+    firehose_call =
+      Map.merge(call, %{
+        verb: "spawn",
+        principal: {:session, "k1"},
+        firehose_in_txn: true,
+        firehose_hub: hub
+      })
+
+    assert %{session_key: key} = spawn.(firehose_call)
+
+    notices = drain_firehose_notices(hub)
+    spawned = Enum.find(notices, &(&1["class"] == "session.spawned"))
+    assert is_map(spawned)
+    assert spawned["refs"]["sessionKey"] == key
+
+    canonical =
+      ctx.db
+      |> Tightbeam.StateResources.query_session(key)
+      |> Tightbeam.StateResources.session()
+
+    assert spawned["payload"] == canonical
     assert Tightbeam.Ephemeral.caller(ctx.db, key) == "k1"
     assert Org.get(ctx.db, key).handle == nil
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM assignments WHERE holderKey=?1", [key])
 
-    assert %{session_key: ^key} = spawn.(call)
+    assert %{session_key: ^key} = spawn.(firehose_call)
+    assert drain_firehose_notices(hub) == []
 
     assert %{code: "unknown_caller"} =
              spawn.(%{
@@ -3710,6 +3742,18 @@ defmodule Tightbeam.GatewayTest do
                call
                | params: Map.merge(params, %{idempotency_key: "bound", work_item_id: "card"})
              })
+  end
+
+  defp drain_firehose_notices(hub, acc \\ []) do
+    _ = :sys.get_state(hub)
+
+    receive do
+      {:firehose_notice, notice} ->
+        Tightbeam.Firehose.Hub.delivered(hub, self())
+        drain_firehose_notices(hub, [notice | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
   end
 
   test "spawn --name creates a bound role and role_exists rolls back the session", ctx do

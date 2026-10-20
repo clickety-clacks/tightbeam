@@ -185,6 +185,13 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
                   ]
                 )
 
+                Txn.q(txn, "UPDATE assignments SET rowVersion=rowVersion+1 WHERE id=?1", [
+                  context.assignment_id
+                ])
+
+                if Txn.changes(txn) != 1,
+                  do: raise(ArgumentError, "corrected assignment is missing from its transaction")
+
                 assignment =
                   StateResources.query_assignment(
                     txn,

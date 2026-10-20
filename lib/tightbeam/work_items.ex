@@ -961,10 +961,15 @@ defmodule Tightbeam.WorkItems do
         :ok
 
       item ->
+        projection =
+          StateResources.query_work_item(txn, work_item_id, %{
+            principal: {:user, item.ownerUserId}
+          }) || raise ArgumentError, "committed work-item projection is missing"
+
         Publisher.committed_in_txn(
           txn,
           "work_item.updated",
-          item,
+          projection,
           %{"workItemId" => work_item_id}
         )
     end
@@ -994,8 +999,12 @@ defmodule Tightbeam.WorkItems do
             [work_item_id]
           )
 
-          if Keyword.get(opts, :publish_item, false),
-            do: publish_change_in_txn(txn, work_item_id)
+          if Txn.changes(txn) == 1 do
+            stamp_version_in_txn(txn, work_item_id, now())
+
+            if Keyword.get(opts, :publish_item, false),
+              do: publish_change_in_txn(txn, work_item_id)
+          end
         end
 
       [] ->
@@ -1056,7 +1065,10 @@ defmodule Tightbeam.WorkItems do
             wake.wake_id
           ])
 
-          if Txn.changes(txn) == 1, do: publish_change_in_txn(txn, work_item_id)
+          if Txn.changes(txn) == 1 do
+            stamp_version_in_txn(txn, work_item_id, now())
+            publish_change_in_txn(txn, work_item_id)
+          end
         end
 
       _ ->
@@ -1102,7 +1114,10 @@ defmodule Tightbeam.WorkItems do
               replacement.wake_id
             ])
 
-            if Txn.changes(txn) == 1, do: publish_change_in_txn(txn, item_id)
+            if Txn.changes(txn) == 1 do
+              stamp_version_in_txn(txn, item_id, now())
+              publish_change_in_txn(txn, item_id)
+            end
 
           true ->
             :ok
@@ -1212,7 +1227,10 @@ defmodule Tightbeam.WorkItems do
 
     Txn.q(txn, "UPDATE work_items SET routingWakeId = ?2 WHERE id = ?1", [id, wake.wake_id])
 
-    if publish? and Txn.changes(txn) == 1, do: publish_change_in_txn(txn, id)
+    if Txn.changes(txn) == 1 do
+      stamp_version_in_txn(txn, id, now())
+      if publish?, do: publish_change_in_txn(txn, id)
+    end
 
     wake
   end
@@ -1445,7 +1463,7 @@ defmodule Tightbeam.WorkItems do
     Txn.q(
       txn,
       """
-      SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.openedAt, a.closedAt
+      SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.openedAt, a.rowVersion
       FROM assignments AS a
       LEFT JOIN work_items AS wi ON wi.id = a.workItemId
       WHERE (?1 = 1 OR
@@ -1455,16 +1473,13 @@ defmodule Tightbeam.WorkItems do
       """,
       [is_admin, principal_kind, principal_id]
     )
-    |> Enum.map(fn [id, work_item_id, reviews_assignment_id, opened_at, closed_at] ->
-      version =
-        StateResources.assignment(%{opened_at: opened_at, closed_at: closed_at})["rowVersion"]
-
+    |> Enum.map(fn [id, work_item_id, reviews_assignment_id, opened_at, row_version] ->
       %{
         id: id,
         work_item_id: work_item_id,
         reviews_assignment_id: reviews_assignment_id,
         opened_at: opened_at,
-        row_version: version
+        row_version: row_version
       }
     end)
   end

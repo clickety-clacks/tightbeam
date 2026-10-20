@@ -618,20 +618,28 @@ defmodule Tightbeam.Wire.Socket do
                     [] -> "default"
                   end
 
-                Org.create_in_txn(txn, %{
-                  session_key: key,
-                  display_name: "Main",
-                  kind: "main",
-                  is_built_in: true,
-                  order_index: 0,
-                  owner_user_id: user_id,
-                  origin: "user:#{user_id}",
-                  archetype: archetype,
-                  host: Tightbeam.Placement.local_host_name(),
-                  harness: defaults |> Map.fetch!(:harness) |> to_string(),
-                  provider: to_string(provider),
-                  model: Map.fetch!(defaults, :model)
-                })
+                session =
+                  Org.create_in_txn(txn, %{
+                    session_key: key,
+                    display_name: "Main",
+                    kind: "main",
+                    is_built_in: true,
+                    order_index: 0,
+                    owner_user_id: user_id,
+                    origin: "user:#{user_id}",
+                    archetype: archetype,
+                    host: Tightbeam.Placement.local_host_name(),
+                    harness: defaults |> Map.fetch!(:harness) |> to_string(),
+                    provider: to_string(provider),
+                    model: Map.fetch!(defaults, :model)
+                  })
+
+                Tightbeam.Firehose.Publisher.committed_in_txn(
+                  txn,
+                  "session.spawned",
+                  session,
+                  %{"sessionKey" => session.session_key}
+                )
             end
           end)
       rescue

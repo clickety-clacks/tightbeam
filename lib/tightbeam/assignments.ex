@@ -1969,20 +1969,45 @@ defmodule Tightbeam.Assignments do
       after_attest = StateResources.query_assignment(txn, assignment_id, call)
 
       if is_map(before) and is_map(after_attest) and
-           StateResources.assignment(before) != StateResources.assignment(after_attest) do
-        class =
-          if after_attest.state == "closed", do: "assignment.closed", else: "assignment.opened"
+           assignment_projection_without_version(before) !=
+             assignment_projection_without_version(after_attest) do
+        before_version = StateResources.assignment(before)["rowVersion"]
+        after_version = StateResources.assignment(after_attest)["rowVersion"]
 
-        Tightbeam.Firehose.Publisher.committed_in_txn(
-          txn,
-          class,
-          after_attest,
-          %{"assignmentId" => assignment_id}
-        )
+        if after_version <= before_version do
+          Txn.q(txn, "UPDATE assignments SET rowVersion=rowVersion+1 WHERE id=?1", [
+            assignment_id
+          ])
+
+          if Txn.changes(txn) != 1, do: raise(TransitionRace)
+          after_attest = StateResources.query_assignment(txn, assignment_id, call)
+
+          publish_attest_assignment_change(txn, assignment_id, after_attest)
+        else
+          publish_attest_assignment_change(txn, assignment_id, after_attest)
+        end
       end
     end
 
     :ok
+  end
+
+  defp assignment_projection_without_version(row) do
+    row
+    |> StateResources.assignment()
+    |> Map.delete("rowVersion")
+  end
+
+  defp publish_attest_assignment_change(txn, assignment_id, after_attest) do
+    class =
+      if after_attest.state == "closed", do: "assignment.closed", else: "assignment.opened"
+
+    Tightbeam.Firehose.Publisher.committed_in_txn(
+      txn,
+      class,
+      after_attest,
+      %{"assignmentId" => assignment_id}
+    )
   end
 
   # Per effort-checkin-v2 §Design 5 and the provenance it cites verbatim —

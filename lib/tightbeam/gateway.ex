@@ -7628,6 +7628,9 @@ defmodule Tightbeam.Gateway do
                         )
                       end
 
+                      :ok =
+                        Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, session)
+
                       Idempotency.put_in_txn(txn, %{
                         owner_user_id: caller.owner_user_id,
                         operation: "spawn",

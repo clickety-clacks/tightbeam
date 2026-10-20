@@ -32,7 +32,7 @@ defmodule Tightbeam.StateResources do
          t.roleRef, t.roleFallback, t.assignmentId, t.jobRef, t.model, t.thinkingLevel,
          t.modelContext, t.harness, t.replyAttention, t.status, t.owner,
          t.adapterGen, t.requestRef, t.error, t.createdAt, t.startedAt,
-         t.endedAt, t.publishedAt
+         t.endedAt, t.publishedAt, t.rowVersion
   FROM turns AS t
   """
 
@@ -535,7 +535,8 @@ defmodule Tightbeam.StateResources do
                       SELECT 1 FROM attests AS filed WHERE filed.assignmentId = a.id
                     ) THEN 'open'
                     ELSE 'active'
-                  END
+                  END,
+                  a.rowVersion
            FROM assignments AS a
            LEFT JOIN work_items AS wi ON wi.id = a.workItemId
            WHERE a.id = ?1 AND (
@@ -1466,7 +1467,8 @@ defmodule Tightbeam.StateResources do
          holder_provider,
          files,
          effect_kind,
-         derived_status
+         derived_status,
+         row_version
        ]) do
     %{
       id: id,
@@ -1491,7 +1493,8 @@ defmodule Tightbeam.StateResources do
       holder_provider: holder_provider,
       files: JSON.decode!(files),
       effect_kind: effect_kind,
-      derived_status: derived_status
+      derived_status: derived_status,
+      row_version: row_version
     }
   end
 
@@ -1566,19 +1569,7 @@ defmodule Tightbeam.StateResources do
         end)
       )
 
-    if corrections == [] do
-      item
-    else
-      base_version = if is_integer(item["rowVersion"]), do: item["rowVersion"], else: 0
-
-      correction_version =
-        corrections
-        |> Enum.map(&(Map.get(&1, :createdAt) || Map.get(&1, "createdAt")))
-        |> Enum.filter(&is_integer/1)
-        |> Enum.max(fn -> 0 end)
-
-      Map.put(item, "rowVersion", max(base_version + 1, correction_version))
-    end
+    item
   end
 
   def attest(row) do
@@ -2563,7 +2554,8 @@ defmodule Tightbeam.StateResources do
          created_at,
          started_at,
          ended_at,
-         published_at
+         published_at,
+         row_version
        ]) do
     %{
       seq: seq,
@@ -2589,7 +2581,8 @@ defmodule Tightbeam.StateResources do
       created_at: created_at,
       started_at: started_at,
       ended_at: ended_at,
-      published_at: published_at
+      published_at: published_at,
+      row_version: row_version
     }
   end
 

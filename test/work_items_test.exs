@@ -1329,11 +1329,14 @@ defmodule Tightbeam.WorkItemsTest do
     item = create(ctx, {:user, "flynn"}, %{title: "Independent"})
     assignment = assign(ctx, "holder", "work", item.id)
 
-    # The OBSERVABLE item (title/spec/owner/state — never the internal bracket
-    # wake-id columns, which a last-close does write) is untouched by closure.
+    # The observable item fields (title/spec/owner/state) stay unchanged by
+    # closure. The internal bracket wake-id columns are part of the Firehose
+    # projection, so the row version still advances when last-close writes them.
     before_item = get(ctx, {:user, "flynn"}, item.id).workItem
     _ = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call(assignment.id))
-    assert get(ctx, {:user, "flynn"}, item.id).workItem == before_item
+    after_item = get(ctx, {:user, "flynn"}, item.id).workItem
+    assert Map.drop(after_item, [:rowVersion]) == Map.drop(before_item, [:rowVersion])
+    assert after_item.rowVersion > before_item.rowVersion
 
     before_assignment = row(ctx.db, "SELECT * FROM assignments WHERE id = ?1", assignment.id)
     _ = update(ctx, {:user, "flynn"}, item.id, %{title: "Changed"})
