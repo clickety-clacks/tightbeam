@@ -305,21 +305,7 @@ defmodule Tightbeam.Firehose.Publisher do
   defp publish_linked_wake_status_in_txn(_txn, wake_id) when not is_binary(wake_id), do: :ok
 
   defp publish_linked_wake_status_in_txn(txn, wake_id) do
-    case Tightbeam.Wakes.get_in_txn(txn, wake_id) do
-      %{state: state} ->
-        class =
-          case state do
-            "pending" -> "wake.scheduled"
-            "fired" -> "wake.fired"
-            "canceled" -> "wake.canceled"
-            _ -> nil
-          end
-
-        if class, do: Tightbeam.Wakes.publish_change_in_txn(txn, class, wake_id)
-
-      _ ->
-        :ok
-    end
+    Tightbeam.Wakes.publish_delivery_change_in_txn(txn, wake_id)
   end
 
   @spec lifecycle(String.t(), map(), map()) :: :ok

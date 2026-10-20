@@ -306,6 +306,44 @@ defmodule Tightbeam.Schema do
   @o2_shape "row-driven-o2-v1-019"
   @o2_pre_liveness_shape "row-driven-o2-pre-liveness-v1-019"
   @shape "row-driven-admission-v1-019"
+
+  @wake_row_version_insert_trigger """
+  CREATE TRIGGER IF NOT EXISTS wakes_row_version_initial
+  AFTER INSERT ON wakes
+  BEGIN
+    UPDATE wakes
+    SET rowVersion=MAX(1, NEW.createdAt, COALESCE(NEW.firedAt,0), COALESCE(NEW.canceledAt,0))
+    WHERE wakeId=NEW.wakeId;
+  END;
+  """
+
+  @wake_row_version_update_trigger """
+  CREATE TRIGGER IF NOT EXISTS wakes_row_version_projected_update
+  AFTER UPDATE OF sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt,
+    firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope,
+    conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId,
+    canceledAt, targetGate, class, classElection, deliveryRule, digest, summon
+  ON wakes
+  WHEN NEW.sessionKey IS NOT OLD.sessionKey OR NEW.targetRole IS NOT OLD.targetRole OR
+    NEW.origin IS NOT OLD.origin OR NEW.prompt IS NOT OLD.prompt OR
+    NEW.consumer IS NOT OLD.consumer OR NEW.dueAt IS NOT OLD.dueAt OR
+    NEW.createdAt IS NOT OLD.createdAt OR
+    NEW.state IS NOT OLD.state OR NEW.firedAt IS NOT OLD.firedAt OR
+    NEW.reresolve IS NOT OLD.reresolve OR NEW.reresolveSeed IS NOT OLD.reresolveSeed OR
+    NEW.reresolveRung IS NOT OLD.reresolveRung OR
+    NEW.conditionKind IS NOT OLD.conditionKind OR NEW.conditionScope IS NOT OLD.conditionScope OR
+    NEW.conditionAfterId IS NOT OLD.conditionAfterId OR NEW.firedBy IS NOT OLD.firedBy OR
+    NEW.creatorSessionKey IS NOT OLD.creatorSessionKey OR
+    NEW.rumination IS NOT OLD.rumination OR NEW.work_item_id IS NOT OLD.work_item_id OR
+    NEW.assignmentId IS NOT OLD.assignmentId OR NEW.canceledAt IS NOT OLD.canceledAt OR
+    NEW.targetGate IS NOT OLD.targetGate OR NEW.class IS NOT OLD.class OR
+    NEW.classElection IS NOT OLD.classElection OR NEW.deliveryRule IS NOT OLD.deliveryRule OR
+    NEW.digest IS NOT OLD.digest OR NEW.summon IS NOT OLD.summon
+  BEGIN
+    UPDATE wakes SET rowVersion=OLD.rowVersion+1 WHERE wakeId=NEW.wakeId;
+  END;
+  """
+
   @supervision_batch_delivery_previous_trigger """
   CREATE TRIGGER IF NOT EXISTS supervision_lineage_fire_requires_sidecar
   BEFORE UPDATE OF state ON wakes
@@ -1978,6 +2016,49 @@ defmodule Tightbeam.Schema do
          end) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
+    end
+  end
+
+  @doc false
+  def ensure_wake_row_version(db) do
+    case DB.migration_transaction(db, :wake_row_version, [], [], fn txn ->
+           columns =
+             Txn.q(txn, "PRAGMA table_info(wakes)")
+             |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+           unless "rowVersion" in columns do
+             :ok =
+               Txn.exec(
+                 txn,
+                 "ALTER TABLE wakes ADD COLUMN rowVersion INTEGER NOT NULL DEFAULT 1 CHECK(rowVersion > 0)"
+               )
+
+             Txn.q(
+               txn,
+               """
+               UPDATE wakes
+               SET rowVersion=MAX(
+                 1, createdAt, COALESCE(firedAt,0), COALESCE(canceledAt,0),
+                 COALESCE((SELECT MAX(version) FROM (
+                   SELECT createdAt AS version FROM turns WHERE turns.wakeId=wakes.wakeId
+                   UNION ALL SELECT startedAt FROM turns WHERE turns.wakeId=wakes.wakeId
+                   UNION ALL SELECT endedAt FROM turns WHERE turns.wakeId=wakes.wakeId
+                 )),0)
+               )
+               """
+             )
+           end
+
+           :ok = Txn.exec(txn, @wake_row_version_insert_trigger)
+           :ok = Txn.exec(txn, @wake_row_version_update_trigger)
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "wake_row_version_migration_failed: #{Exception.message(error)}"
     end
   end
 

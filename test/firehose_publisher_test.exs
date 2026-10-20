@@ -1442,12 +1442,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert queued["refs"] == %{"turnSeq" => seq, "sessionKey" => "turn-target"}
     assert queued["payload"] == queued_row
     assert queued_row["status"] == "queued"
-    queued_version = queued_row["rowVersion"]
     session_notice = Enum.find(enqueue_notices, &(&1["class"] == "session.updated"))
     assert session_notice["payload"]["mechanicalStatus"] == "running"
     queued_wake = Enum.find(enqueue_notices, &(&1["class"] == "wake.scheduled"))
     assert queued_wake["payload"]["wakeId"] == wake.wake_id
     assert queued_wake["payload"]["deliveryStatus"] == "queued"
+    queued_wake_version = queued_wake["payload"]["rowVersion"]
 
     assert {:ok, :ok} =
              DB.transaction(db, fn txn ->
@@ -1462,8 +1462,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert %{
              "class" => "wake.fired",
-             "payload" => %{"state" => "fired", "deliveryStatus" => "queued"}
+             "payload" => %{
+               "state" => "fired",
+               "deliveryStatus" => "queued",
+               "rowVersion" => fired_wake_version
+             }
            } = receive_notice()
+
+    assert fired_wake_version > queued_wake_version
 
     assert {:ok, %{seq: ^seq, owner_lease: seq_lease}} =
              Ledger.claim_next(db, "turn-target", "lane:test")
@@ -1476,13 +1482,17 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     started = db |> StateResources.query_turn_by_seq(seq) |> StateResources.turn()
     assert started_payload == started
-    started_version = started["rowVersion"]
-    assert started_version > queued_version
 
     assert %{
              "class" => "wake.fired",
-             "payload" => %{"state" => "fired", "deliveryStatus" => "running"}
+             "payload" => %{
+               "state" => "fired",
+               "deliveryStatus" => "running",
+               "rowVersion" => started_wake_version
+             }
            } = receive_notice()
+
+    assert started_wake_version > fired_wake_version
 
     assert :ok = Ledger.stamp_adapter(db, seq, 7)
 
@@ -1502,13 +1512,17 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     ended = db |> StateResources.query_turn_by_seq(seq) |> StateResources.turn()
     assert ended_payload == ended
-    ended_version = ended["rowVersion"]
-    assert ended_version > started_version
 
     assert %{
              "class" => "wake.fired",
-             "payload" => %{"state" => "fired", "deliveryStatus" => "delivered"}
+             "payload" => %{
+               "state" => "fired",
+               "deliveryStatus" => "delivered",
+               "rowVersion" => ended_wake_version
+             }
            } = receive_notice()
+
+    assert ended_wake_version > started_wake_version
 
     assert %{
              "class" => "session.updated",
@@ -1575,6 +1589,121 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert payload["wakeId"] == wake.wake_id
     assert payload["prompt"] =~ "updated result"
+  end
+
+  test "wake versions advance for same-millisecond writes and survive a gateway restart" do
+    db = String.to_atom("firehose_wake_version_#{System.unique_integer([:positive])}")
+
+    base =
+      Path.join(System.tmp_dir!(), "firehose-wake-version-#{System.unique_integer([:positive])}")
+
+    path = Path.join(base, "state.db")
+    payload = Path.join(base, "payload")
+
+    on_exit(fn -> File.rm_rf!(base) end)
+    File.mkdir_p!(base)
+    File.mkdir_p!(Path.join(payload, "ebin"))
+    File.mkdir_p!(Path.join(payload, "priv"))
+    File.write!(Path.join(payload, "ebin/fixture.beam"), "fixture")
+    File.write!(Path.join(payload, "priv/fixture.rule"), "fixture")
+
+    {:ok, manifest} =
+      Tightbeam.LiveBaseGuard.generate_manifest(Tightbeam.LiveBasePayload.files!(payload))
+
+    File.write!(Path.join(payload, "build-manifest.json"), JSON.encode!(manifest))
+
+    start_supervised!(
+      {DB, path: path, name: db, guard_inputs: [], payload_root: payload},
+      id: db
+    )
+
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt) VALUES('versioned-wake','target','process:tightbeam','prompt',100,10)"
+             )
+
+    version = fn ->
+      db
+      |> Tightbeam.StateResources.query_wake("versioned-wake")
+      |> Tightbeam.StateResources.wake()
+      |> Map.fetch!("rowVersion")
+    end
+
+    initial = version.()
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(txn, "UPDATE wakes SET dueAt=101 WHERE wakeId='versioned-wake'")
+               :ok
+             end)
+
+    first = version.()
+    assert first > initial
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(txn, "UPDATE wakes SET dueAt=102 WHERE wakeId='versioned-wake'")
+               :ok
+             end)
+
+    second = version.()
+    assert second > first
+
+    assert :ok = stop_supervised!(db)
+
+    start_supervised!(
+      {DB, path: path, name: db, guard_inputs: [], payload_root: payload},
+      id: db
+    )
+
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(txn, "UPDATE wakes SET dueAt=103 WHERE wakeId='versioned-wake'")
+               :ok
+             end)
+
+    assert version.() > second
+  end
+
+  test "wake row-version migration backfills the last timestamp projection" do
+    db = :firehose_legacy_wake_version_db
+    start_supervised!({DB, path: ":memory:", name: db})
+
+    assert :ok =
+             DB.execute(db, """
+             CREATE TABLE wakes (
+               wakeId TEXT PRIMARY KEY, sessionKey TEXT NOT NULL, targetRole TEXT,
+               origin TEXT NOT NULL, prompt TEXT, consumer TEXT NOT NULL, dueAt INTEGER NOT NULL,
+               state TEXT NOT NULL, createdAt INTEGER NOT NULL, firedAt INTEGER,
+               reresolve TEXT, reresolveSeed TEXT, reresolveRung INTEGER,
+               conditionKind TEXT, conditionScope TEXT, conditionAfterId INTEGER,
+               firedBy TEXT, creatorSessionKey TEXT, rumination INTEGER NOT NULL DEFAULT 0,
+               work_item_id TEXT, assignmentId TEXT, canceledAt INTEGER,
+               targetGate INTEGER NOT NULL DEFAULT 1, class TEXT, classElection TEXT,
+               deliveryRule TEXT, digest INTEGER NOT NULL DEFAULT 0, summon INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE turns (wakeId TEXT, createdAt INTEGER, startedAt INTEGER, endedAt INTEGER);
+             INSERT INTO wakes(wakeId,sessionKey,origin,consumer,dueAt,state,createdAt,firedAt)
+               VALUES('legacy-wake','target','process:tightbeam','prompt',20,'fired',10,12);
+             INSERT INTO turns(wakeId,createdAt,startedAt,endedAt)
+               VALUES('legacy-wake',18,25,30);
+             """)
+
+    :ok = Tightbeam.Schema.ensure_wake_row_version(db)
+    assert {:ok, [[30]]} = DB.query(db, "SELECT rowVersion FROM wakes WHERE wakeId='legacy-wake'")
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(txn, "UPDATE wakes SET dueAt=21 WHERE wakeId='legacy-wake'")
+               :ok
+             end)
+
+    assert {:ok, [[31]]} = DB.query(db, "SELECT rowVersion FROM wakes WHERE wakeId='legacy-wake'")
   end
 
   test "wake retargeting publishes the replacement row" do
