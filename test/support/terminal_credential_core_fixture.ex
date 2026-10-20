@@ -345,7 +345,7 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
              DB.transaction(db, fn txn ->
                HarnessHealth.resolve_normal_turn_in_txn(
                  txn,
-                 %{host: "testhost", harness: "codex"},
+                 %{host: "testhost", harness: "codex", session_key: "fixture-session"},
                  %{seq: 42, session_key: "fixture-session", origin: "agent:fixture"}
                )
              end)
