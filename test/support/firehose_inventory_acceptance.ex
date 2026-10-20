@@ -247,6 +247,11 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
 
     {:ok, assignment} = Dispatch.dispatch(fixture.db, handlers, dispatch_call)
 
+    assignment_notice =
+      receive_classes(fixture.hub, %{}, MapSet.new(["message.created"]))["message.created"]
+
+    assert assignment_notice["payload"]["content"] == "[assignment opened: #{assignment.id}]"
+
     notices =
       capture_classes(fixture, notices, ["message.created"], fn ->
         {:ok, _} =
@@ -268,8 +273,8 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
           end)
       end)
 
-    notices =
-      capture_classes(fixture, notices, ["attest.filed"], fn ->
+    attest_notices =
+      capture_classes(fixture, %{}, ["attest.filed", "message.created"], fn ->
         {:ok, _result} =
           Dispatch.dispatch(fixture.db, handlers, %{
             call.("attest", %{
@@ -281,6 +286,11 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
               origin: "agent:#{main.session_key}"
           })
       end)
+
+    assert attest_notices["message.created"]["payload"]["content"] ==
+             "[progress filed on #{assignment.id}]"
+
+    notices = Map.put(notices, "attest.filed", attest_notices["attest.filed"])
 
     notices =
       capture_classes(fixture, notices, ["condition_fact.filed"], fn ->
@@ -349,6 +359,16 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
     assert "prod.fired" in Registry.observational_classes()
     assert Registry.fetch("prod.fired") == :error
 
+    # The class inventory above has one representative per Registry class.
+    # Assignment and attest writes also commit distinct transcript messages;
+    # include them in the socket model and replay proof instead of counting
+    # classes as frames or dropping legitimate messages from the expected state.
+    notices =
+      Map.merge(notices, %{
+        "assignment marker" => assignment_notice,
+        "attest marker" => attest_notices["message.created"]
+      })
+
     # This notice predates the rename and was checked against its commit-time
     # rebuild above; the final database row has since advanced one version.
     for {class, notice} <- Map.delete(notices, "session.harness_changed") do
@@ -397,6 +417,14 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
         call.("assign", %{subject: "A4 observe refetch", work_item_id: r8b_work_item})
         |> Map.merge(%{session_key: main.session_key, target_role: nil, role_fallback: false})
       )
+
+    assignment_notice =
+      receive_classes(fixture.hub, %{}, MapSet.new(["message.created"]))["message.created"]
+
+    assert assignment_notice["payload"]["content"] == "[assignment opened: #{r8b_assignment.id}]"
+    {received, ws} = Fixture.recv_change(ws)
+    assert canonical_notice(received) == assignment_notice
+    assert received["payload"] == assert_a4_fresh!(fixture, received)
 
     r8b_notices = a4_r8b_notices(fixture, main, r8b_assignment, r8b_work_item, scheduler, call)
     ws = assert_a4_observe_refetch(fixture, ws, r8b_notices)
