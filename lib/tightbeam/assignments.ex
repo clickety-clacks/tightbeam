@@ -1092,12 +1092,20 @@ defmodule Tightbeam.Assignments do
   """
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t()) :: [String.t()]
   def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key) do
+    qualifying_review_trace(db, assignment_id, assignment_holder_key).resolved_fact
+  end
+
+  @doc "Return the selected review row and the fact derived from it without changing selection."
+  @spec qualifying_review_trace(DB.server(), String.t(), String.t()) :: map()
+  def qualifying_review_trace(db, assignment_id, assignment_holder_key) do
     {:ok, rows} =
       DB.query(
         db,
         """
         WITH winning_verdict AS (
           SELECT
+            r.id AS reviewAssignmentId,
+            v.id AS reviewAttestId,
             r.holderKey AS reviewHolderKey,
             v.verdictKind AS verdictKind
           FROM attests AS v
@@ -1110,17 +1118,34 @@ defmodule Tightbeam.Assignments do
           ORDER BY v.ts DESC, v.rowid DESC
           LIMIT 1
         )
-        SELECT verdictKind
+        SELECT reviewAssignmentId, reviewAttestId, reviewHolderKey, verdictKind
         FROM winning_verdict
-        WHERE reviewHolderKey != ?2
-          AND verdictKind = 'reviewed-clean'
         """,
-        [assignment_id, assignment_holder_key]
+        [assignment_id]
       )
 
     case rows do
-      [[verdict_kind]] when is_binary(verdict_kind) -> [verdict_kind]
-      _ -> []
+      [[review_assignment_id, review_attest_id, review_holder_key, verdict_kind]] ->
+        %{
+          selected_review_assignment_id: review_assignment_id,
+          selected_review_attest_id: review_attest_id,
+          selected_review_holder_key: review_holder_key,
+          selected_verdict_kind: verdict_kind,
+          resolved_fact:
+            if(review_holder_key != assignment_holder_key and verdict_kind == "reviewed-clean",
+              do: ["reviewed-clean"],
+              else: []
+            )
+        }
+
+      [] ->
+        %{
+          selected_review_assignment_id: nil,
+          selected_review_attest_id: nil,
+          selected_review_holder_key: nil,
+          selected_verdict_kind: nil,
+          resolved_fact: []
+        }
     end
   end
 

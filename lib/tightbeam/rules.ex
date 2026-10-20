@@ -928,7 +928,7 @@ defmodule Tightbeam.Rules do
               # recurring silently on every retry. Only a declared token mapped to `deny`
               # above stays a bare deny; that one is the sensor answering.
               {:error, reason, exit_class} ->
-                malfunction(rule, call, reason, exit_class, to_close, to_consume)
+                malfunction(rule, call, reason, exit_class, cache, to_close, to_consume)
             end
 
           # The invocation context could not be resolved, so NO script was spawned — the
@@ -939,7 +939,7 @@ defmodule Tightbeam.Rules do
           # where the rest of it was cleaned out. The class no observation carried is
           # exactly what `unreported` exists to say.
           :error ->
-            malfunction(rule, call, "script_error", "unreported", to_close, to_consume)
+            malfunction(rule, call, "script_error", "unreported", cache, to_close, to_consume)
         end
     end
   end
@@ -955,13 +955,13 @@ defmodule Tightbeam.Rules do
         to_consume
       )
 
-  defp fold_effect("deny", rule, _rest, _db, call, _cache, to_close, to_consume, exit_class) do
-    error = denial_error(rule, call, "rule_denied", exit_class)
+  defp fold_effect("deny", rule, _rest, _db, call, cache, to_close, to_consume, exit_class) do
+    error = denial_error(rule, call, "rule_denied", exit_class, cache)
     {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
   end
 
-  defp fold_effect("remedy", rule, _rest, _db, call, _cache, to_close, to_consume, exit_class) do
-    error = denial_error(rule, call, "remedy_fired", exit_class)
+  defp fold_effect("remedy", rule, _rest, _db, call, cache, to_close, to_consume, exit_class) do
+    error = denial_error(rule, call, "remedy_fired", exit_class, cache)
 
     {{:remedy, rule, gated_ref(call), error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
   end
@@ -984,7 +984,7 @@ defmodule Tightbeam.Rules do
   defp fold_effect("escalate", rule, rest, db, call, cache, to_close, to_consume, exit_class) do
     ctx = %{
       question: rule.text,
-      error: denial_error(rule, call, "escalated", exit_class)
+      error: denial_error(rule, call, "escalated", exit_class, cache)
     }
 
     case Escalation.resolve(db, call, rule) do
@@ -995,7 +995,7 @@ defmodule Tightbeam.Rules do
         decide_rules(rest, db, call, cache, to_close, [ruling_id | to_consume])
 
       {:deny, error} ->
-        error = enrich_denial(error, rule, call, "rule_denied", exit_class)
+        error = enrich_denial(error, rule, call, "rule_denied", exit_class, cache)
         {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
 
       {:needs_request, dr_id} ->
@@ -1005,10 +1005,10 @@ defmodule Tightbeam.Rules do
 
   # The one shape every malfunction takes, so the two sites that reach one cannot drift:
   # the deny is byte-identical to what it always was, and the summons rides beside it.
-  defp malfunction(rule, call, reason, exit_class, to_close, to_consume) do
+  defp malfunction(rule, call, reason, exit_class, cache, to_close, to_consume) do
     ctx = %{
       question: malfunction_question(rule, reason, exit_class),
-      error: denial_error(rule, call, reason, exit_class),
+      error: denial_error(rule, call, reason, exit_class, cache),
       episode_key: exit_class
     }
 
@@ -1025,7 +1025,11 @@ defmodule Tightbeam.Rules do
   end
 
   defp denial_error(rule, call, reason, script_exit_class) do
-    %{
+    denial_error(rule, call, reason, script_exit_class, %{})
+  end
+
+  defp denial_error(rule, call, reason, script_exit_class, cache) do
+    error = %{
       code: "rule_denied",
       rule: rule.name,
       edge: edge(call),
@@ -1036,10 +1040,15 @@ defmodule Tightbeam.Rules do
       identity_manifest_sha: rule.identity_manifest_sha,
       message: "#{rule.name}: #{rule.text}"
     }
+
+    case Map.get(cache, {:rule_trace, "assignment.qualifying_review_verdict_kinds"}) do
+      nil -> error
+      trace -> Map.put(error, :rule_trace, Map.put(trace, :final_decision, "deny"))
+    end
   end
 
-  defp enrich_denial(error, rule, call, reason, script_exit_class) do
-    denial_error(rule, call, reason, script_exit_class) |> Map.merge(error)
+  defp enrich_denial(error, rule, call, reason, script_exit_class, cache) do
+    denial_error(rule, call, reason, script_exit_class, cache) |> Map.merge(error)
   end
 
   defp edge(call), do: if(Map.get(call, :edge, :verb) == :turn_end, do: "turn-end", else: "verb")
@@ -1290,11 +1299,21 @@ defmodule Tightbeam.Rules do
         {nil, cache}
 
       assignment, cache ->
-        {Assignments.qualifying_review_verdict_kinds(
-           db,
-           assignment.id,
-           assignment.holder_key
-         ), cache}
+        trace =
+          db
+          |> Assignments.qualifying_review_trace(assignment.id, assignment.holder_key)
+          |> Map.merge(%{
+            resolver_arity: 3,
+            submitted_commit_refs:
+              Map.get(call.params, :commit_refs) || Map.get(call.params, "commit_refs")
+          })
+
+        {trace.resolved_fact,
+         Map.put(
+           cache,
+           {:rule_trace, "assignment.qualifying_review_verdict_kinds"},
+           trace
+         )}
     end)
   end
 
