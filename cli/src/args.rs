@@ -1906,9 +1906,16 @@ fn parse_with_optional_catalog(
                         .to_owned(),
                 );
             }
-            if !wait && assignment_id.is_some() && !replace_queued && after_ms.is_none() {
+            if !wait
+                && assignment_id.is_some()
+                && !replace_queued
+                && after_ms.is_none()
+                && at.is_none()
+                && condition_kind.is_none()
+            {
                 return Err(
-                    "--assignment requires --predicate, --after-turn, or --after".to_owned(),
+                    "--assignment requires --predicate, --after-turn, --after, --at, or --when-fact"
+                        .to_owned(),
                 );
             }
             if predicate.is_some() && fallback_after_ms.is_none() && at.is_none() {
@@ -5378,7 +5385,10 @@ mod tests {
                 "--prompt",
                 "no trigger",
             ])),
-            Err("--assignment requires --predicate, --after-turn, or --after".to_owned())
+            Err(
+                "--assignment requires --predicate, --after-turn, --after, --at, or --when-fact"
+                    .to_owned()
+            )
         );
     }
 
@@ -5661,6 +5671,29 @@ mod tests {
                 payload: None,
             })
         );
+    }
+
+    #[test]
+    fn assignment_links_accept_scheduled_wake_forms() {
+        let triggers: [&[&str]; 3] = [
+            &["--after", "1h"],
+            &["--at", "123"],
+            &["--when-fact", "build-finished", "--fallback-after", "1h"],
+        ];
+
+        for trigger in triggers {
+            let mut args = vec!["wake", "--session", "agent:holder", "--assignment", "asg_a"];
+            args.extend_from_slice(trigger);
+            args.extend_from_slice(&["--prompt", "continue"]);
+
+            assert!(matches!(
+                parse(strings(&args)),
+                Ok(Command::Wake {
+                    assignment_id: Some(id),
+                    ..
+                }) if id == "asg_a"
+            ));
+        }
     }
 
     #[test]
