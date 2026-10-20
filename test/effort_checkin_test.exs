@@ -107,40 +107,67 @@ defmodule Tightbeam.EffortCheckinTest do
   end
 
   @tag :real_default_effort_checkin
-  test "the default arms a new assignment and fires after its horizon", ctx do
-    # The test environment enables check-ins globally; remove that override here.
+  test "the real defaults stay silent on card activity and check in after 24 hours", ctx do
+    prior_enabled = Application.fetch_env(:tightbeam, :effort_checkins_enabled)
+    prior_horizon = Application.fetch_env(:tightbeam, :effort_checkin_horizon_ms)
+
+    on_exit(fn ->
+      for {key, prior} <- [
+            {:effort_checkins_enabled, prior_enabled},
+            {:effort_checkin_horizon_ms, prior_horizon}
+          ] do
+        case prior do
+          {:ok, value} -> Application.put_env(:tightbeam, key, value)
+          :error -> Application.delete_env(:tightbeam, key)
+        end
+      end
+    end)
+
     Application.delete_env(:tightbeam, :effort_checkins_enabled)
+    Application.delete_env(:tightbeam, :effort_checkin_horizon_ms)
 
     {Tightbeam.Boot, production_config} =
       Tightbeam.Application.children()
       |> Enum.find(&match?({Tightbeam.Boot, _}, &1))
 
     assert production_config.effort_checkins_enabled
+    assert production_config.effort_checkin_horizon_ms == 86_400_000
     refute Application.get_env(:tightbeam, :effort_checkins_enabled)
+    refute Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
 
     config =
       production_config
-      |> Map.merge(Map.delete(ctx.config, :effort_checkins_enabled))
-      |> Map.delete(:effort_checkins_enabled)
+      |> Map.merge(Map.drop(ctx.config, [:effort_checkins_enabled, :effort_checkin_horizon_ms]))
+      |> Map.drop([:effort_checkins_enabled, :effort_checkin_horizon_ms])
 
     ctx = %{ctx | config: config}
 
     refute Map.has_key?(config, :effort_checkins_enabled)
+    refute Map.has_key?(config, :effort_checkin_horizon_ms)
     assert EffortCheckin.enabled?(config)
 
-    assigned =
-      assignment(ctx, "assign", {:user, "h1"}, "holder", %{subject: "default check-in"})
+    active_item = work_item!(ctx.db, "default check-in with card activity")
 
-    assert is_binary(assigned.id)
+    active =
+      dispatch_for_item(
+        ctx,
+        {:session, "parent"},
+        "holder",
+        "default check-in with card activity",
+        active_item.id
+      )
+
+    assert is_binary(active.id)
 
     assert [[1, "armed", wake_id]] =
              rows(
                ctx.db,
                "SELECT generation,state,wakeId FROM effort_checkin_generations WHERE assignmentId=?1",
-               [assigned.id]
+               [active.id]
              )
 
     assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
+    assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == active.id)) == []
 
     assert [[armed_at, base_horizon, multiplier, due_at]] =
              rows(
@@ -151,11 +178,43 @@ defmodule Tightbeam.EffortCheckinTest do
                JOIN wakes AS w ON w.wakeId=g.wakeId
                WHERE g.assignmentId=?1 AND g.generation=1
                """,
-               [assigned.id]
+               [active.id]
              )
 
-    assert base_horizon == config.effort_checkin_horizon_ms
+    assert base_horizon == 86_400_000
     assert due_at - armed_at == base_horizon * multiplier
+
+    artifact!(ctx.db, "holder", active_item.id, "/srv/work/default-activity-proof.md")
+
+    inactive_item = work_item!(ctx.db, "default check-in with no activity")
+
+    inactive =
+      dispatch_for_item(
+        ctx,
+        {:session, "parent"},
+        "holder",
+        "default check-in with no activity",
+        inactive_item.id
+      )
+
+    assert is_binary(inactive.id)
+
+    assert [[1, "armed", inactive_wake_id, inactive_armed_at, inactive_horizon, inactive_due_at]] =
+             rows(
+               ctx.db,
+               """
+               SELECT g.generation,g.state,g.wakeId,g.armedAt,g.baseHorizonMs,w.dueAt
+               FROM effort_checkin_generations AS g
+               JOIN wakes AS w ON w.wakeId=g.wakeId
+               WHERE g.assignmentId=?1 AND g.generation=1
+               """,
+               [inactive.id]
+             )
+
+    assert inactive_horizon == 86_400_000
+    assert inactive_due_at - inactive_armed_at == inactive_horizon
+    assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, inactive_wake_id)
+    assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == inactive.id)) == []
 
     {Wakes, opts} =
       config
@@ -169,17 +228,43 @@ defmodule Tightbeam.EffortCheckinTest do
       id: scheduler
     )
 
-    Process.sleep(max(due_at - System.system_time(:millisecond) + 1, 1))
+    # The persisted due time above proves the real 24-hour default. Move only
+    # the scheduler deadlines into the past to exercise the due callback quickly.
+    :ok =
+      DB.execute(ctx.db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [
+        wake_id,
+        System.system_time(:millisecond) - 1
+      ])
+
+    :ok =
+      DB.execute(ctx.db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [
+        inactive_wake_id,
+        System.system_time(:millisecond) - 1
+      ])
+
     assert :ok = Wakes.fire_due(scheduler)
 
     assert %{state: "fired"} = Wakes.get(ctx.db, wake_id)
+    assert %{state: "fired"} = Wakes.get(ctx.db, inactive_wake_id)
 
     assert [[1, "probed"], [2, "armed"]] ==
              rows(
                ctx.db,
                "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
-               [assigned.id]
+               [active.id]
              )
+
+    assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == active.id)) == []
+
+    assert [[1, "probed"], [2, "armed"]] ==
+             rows(
+               ctx.db,
+               "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+               [inactive.id]
+             )
+
+    assert [prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == inactive.id))
+    assert prod.prompt =~ "no artifacts, attests, or work-item updates"
   end
 
   test "turning effort check-ins off leaves already-armed rows and requests inert", ctx do
@@ -390,16 +475,16 @@ defmodule Tightbeam.EffortCheckinTest do
     assert retired_disposition_id == retired.id
   end
 
-  test "priority inherits from the work item, scales the four-hour window, and reprioritizes live probes",
+  test "priority inherits from the work item, scales the 24-hour window, and reprioritizes live probes",
        ctx do
     # This proof closes a card: its holder, recorded opener and work owner must
     # share the valid durable relation, unlike the suite's cross-owner setup.
     {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET ownerUserId='h1' WHERE sessionKey='holder'")
-    config = Map.put(ctx.config, :effort_checkin_horizon_ms, 14_400_000)
+    config = Map.put(ctx.config, :effort_checkin_horizon_ms, 86_400_000)
     ctx = %{ctx | config: config}
 
     horizons =
-      for {priority, expected} <- [{3, 28_800_000}, {4, 14_400_000}, {5, 7_200_000}],
+      for {priority, expected} <- [{3, 172_800_000}, {4, 86_400_000}, {5, 43_200_000}],
           into: %{} do
         item =
           WorkItems.__handle__(ctx.db, "work-item-create", %{
@@ -452,7 +537,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert updated.priority == 6
 
-    assert [[6, 3_600_000, 3_600_000]] =
+    assert [[6, 21_600_000, 21_600_000]] =
              rows(
                ctx.db,
                """
@@ -509,7 +594,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert reopened.state == "open"
 
-    assert [[2, "armed", 57_600_000, 57_600_000, reopened_root]] =
+    assert [[2, "armed", 345_600_000, 345_600_000, reopened_root]] =
              rows(
                ctx.db,
                """

@@ -33,7 +33,7 @@ defmodule Tightbeam.EffortCheckin do
 
   @origin "process:tightbeam"
   @holder_prod_marker "effort-holder-prod:"
-  @default_horizon_ms 14_400_000
+  @default_horizon_ms 86_400_000
   @default_priority 4
   @default_deadline_ms 86_400_000
 
