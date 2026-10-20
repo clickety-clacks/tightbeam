@@ -25,6 +25,7 @@ defmodule Tightbeam.Assignments do
   @completion_blocking_verdict_kinds ~w(blocked waiting)
   @completion_state_verdict_kinds @completion_blocking_verdict_kinds ++ ["cleared"]
   @review_conclusion_verdict_kinds ~w(reviewed-clean changes-requested)
+  @release_fact_match_predicate "releaseFactKind=?1 AND releaseFactScope=?2 AND releaseFactPrincipalRef=?3"
 
   defmodule TransitionRace do
     @moduledoc false
@@ -820,8 +821,7 @@ defmodule Tightbeam.Assignments do
         """
         SELECT id, assignmentId, decisionRequestId, decisionWakeId
         FROM assignment_cannot_proceed
-        WHERE state='standing' AND releaseFactKind=?1 AND releaseFactScope=?2
-          AND releaseFactPrincipalRef=?3
+        WHERE state='standing' AND #{@release_fact_match_predicate}
         ORDER BY createdAt, id
         """,
         [fact.kind, fact.scope, fact.origin]
@@ -1868,7 +1868,8 @@ defmodule Tightbeam.Assignments do
   defp attest_result(db, call) do
     with :ok <- principal_allowed(call.principal, "attest"),
          :ok <- commit_ref_filing_allowed(db, call),
-         {:ok, call} <- prepare_attest_commit_refs(db, call) do
+         {:ok, call} <- prepare_attest_commit_refs(db, call),
+         {:ok, call} <- prepare_review_reopen_arm(db, call) do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
 
@@ -2059,6 +2060,31 @@ defmodule Tightbeam.Assignments do
     end
   end
 
+  defp prepare_review_reopen_arm(
+         db,
+         %{params: %{kind: "verdict", verdict_kind: "changes-requested"}} = call
+       ) do
+    case DB.query(
+           db,
+           "SELECT reviewsAssignmentId FROM assignments WHERE id=?1",
+           [call.params[:assignment_id]]
+         ) do
+      {:ok, [[producer_id]]} when is_binary(producer_id) ->
+        config = effort_config(db, call)
+        prepared = EffortCheckin.prepare_reopen_arm(db, config, producer_id)
+
+        {:ok,
+         call
+         |> Map.put(:effort_config, config)
+         |> Map.put(:prepared_effort_arm, prepared)}
+
+      _ ->
+        {:ok, call}
+    end
+  end
+
+  defp prepare_review_reopen_arm(_db, call), do: {:ok, call}
+
   defp local_origin_path(config, holder, origin) do
     if Path.type(origin) == :absolute,
       do: origin,
@@ -2170,21 +2196,120 @@ defmodule Tightbeam.Assignments do
   defp assignment_get_result(db, call) do
     assignment_id = call.params[:assignment_id]
 
-    with :ok <- principal_allowed(call.principal, "assignment-get") do
+    with :ok <- principal_allowed(call.principal, "assignment-get"),
+         :ok <- valid_condition_fact_id(call.params[:fact_id]) do
       case DB.query(db, "SELECT #{columns()} FROM assignments WHERE id = ?1", [assignment_id]) do
         {:ok, [row]} ->
-          assignment(row)
-          |> Map.put(:reopenings, list_reopenings(db, assignment_id))
-          |> Map.put(
-            :commitRefCorrections,
-            Tightbeam.AssignmentCommitRefCorrections.list(db, assignment_id)
-          )
+          cannot_proceed = latest_cannot_proceed_for_assignment(db, assignment_id)
+
+          result =
+            assignment(row)
+            |> Map.put(:reopenings, list_reopenings(db, assignment_id))
+            |> Map.put(
+              :commitRefCorrections,
+              Tightbeam.AssignmentCommitRefCorrections.list(db, assignment_id)
+            )
+
+          result =
+            if is_map(cannot_proceed),
+              do: Map.put(result, :cannotProceed, cannot_proceed),
+              else: result
+
+          case call.params[:fact_id] do
+            nil ->
+              result
+
+            fact_id ->
+              Map.put(
+                result,
+                :releaseFactCheck,
+                release_fact_check(db, cannot_proceed, fact_id)
+              )
+          end
 
         {:ok, []} ->
           error("not_found", "unknown assignment: #{assignment_id}")
       end
     end
   end
+
+  defp latest_cannot_proceed_for_assignment(db, assignment_id) do
+    case DB.query(
+           db,
+           """
+           SELECT id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef,
+                  disposerRef, reason,
+                  releaseFactKind, releaseFactScope, releaseFactPrincipalRef, state,
+                  createdAt, settledAt, settlementKind, settlementFactId, settledBy
+           FROM assignment_cannot_proceed
+           WHERE assignmentId=?1
+           ORDER BY createdAt DESC, id DESC
+           LIMIT 1
+           """,
+           [assignment_id]
+         ) do
+      {:ok, [row]} ->
+        row
+        |> cannot_proceed()
+        |> Map.take([
+          :id,
+          :assignmentId,
+          :decisionRequestId,
+          :releaseFactKind,
+          :releaseFactScope,
+          :releaseFactPrincipalRef,
+          :state,
+          :settledAt,
+          :settlementKind,
+          :settlementFactId,
+          :settledBy
+        ])
+
+      {:ok, []} ->
+        nil
+    end
+  end
+
+  defp release_fact_check(db, cannot_proceed, fact_id) do
+    fact = ConditionFacts.by_id(db, fact_id)
+
+    predicate_matches =
+      if is_map(cannot_proceed) and is_map(fact),
+        do: release_fact_predicate_matches?(db, cannot_proceed.id, fact),
+        else: nil
+
+    %{
+      exists: not is_nil(fact),
+      fact: fact,
+      matcherPredicate: predicate_matches,
+      eligible:
+        is_map(cannot_proceed) and cannot_proceed.state == "standing" and
+          predicate_matches == true
+    }
+  end
+
+  defp release_fact_predicate_matches?(db, condition_id, fact) do
+    {:ok, [[matches]]} =
+      DB.query(
+        db,
+        """
+        SELECT EXISTS(
+          SELECT 1 FROM assignment_cannot_proceed
+          WHERE id=?4 AND #{@release_fact_match_predicate}
+        )
+        """,
+        [fact.kind, fact.scope, fact.origin, condition_id]
+      )
+
+    matches == 1
+  end
+
+  defp valid_condition_fact_id(nil), do: :ok
+
+  defp valid_condition_fact_id(fact_id) when is_integer(fact_id) and fact_id > 0, do: :ok
+
+  defp valid_condition_fact_id(_fact_id),
+    do: error("invalid", "factId must be a positive integer")
 
   defp attests_result(db, call) do
     assignment_id = call.params[:assignment_id]
@@ -2725,7 +2850,6 @@ defmodule Tightbeam.Assignments do
   end
 
   defp apply_lifecycle_attest(txn, %{params: %{kind: "progress"}}, assignment, attest, _holder) do
-    notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
     append_attest_marker(txn, attest)
     %{assignment: assignment, attest: attest}
   end
@@ -2739,7 +2863,42 @@ defmodule Tightbeam.Assignments do
        ),
        do: cannot_proceed_in_txn(txn, call, assignment, attest)
 
+  defp apply_lifecycle_attest(
+         txn,
+         %{params: %{kind: "completion"}, review_pending: true} = call,
+         assignment,
+         attest,
+         holder
+       ) do
+    case completion_review_conclusion_in_txn(txn, assignment, call.params[:commit_refs]) do
+      "reviewed-clean" ->
+        completion_call = Map.delete(call, :review_pending)
+
+        case applicable_code_completion_in_txn(txn, assignment, completion_call) do
+          :ok ->
+            close_completed_assignment_in_txn(txn, completion_call, assignment, attest, holder)
+
+          _ ->
+            append_attest_marker(txn, attest)
+            %{assignment: assignment, attest: attest}
+        end
+
+      "changes-requested" ->
+        schedule_author_review_changes_in_txn(txn, assignment, attest)
+        append_attest_marker(txn, attest)
+        %{assignment: assignment, attest: attest}
+
+      _ ->
+        append_attest_marker(txn, attest)
+        %{assignment: assignment, attest: attest}
+    end
+  end
+
   defp apply_lifecycle_attest(txn, call, assignment, attest, holder) do
+    close_completed_assignment_in_txn(txn, call, assignment, attest, holder)
+  end
+
+  defp close_completed_assignment_in_txn(txn, call, assignment, attest, holder) do
     Txn.q(
       txn,
       """
@@ -3050,6 +3209,8 @@ defmodule Tightbeam.Assignments do
                       attest_id: attest.id
                     })
 
+                  :ok = settle_reviewed_assignment_in_txn(txn, call, assignment, attest)
+
                   append_attest_marker(txn, attest)
                   result = %{assignment: assignment, attest: attest}
                   file_attest_condition_fact(txn, assignment, attest, result)
@@ -3059,6 +3220,171 @@ defmodule Tightbeam.Assignments do
                 end
             end
         end
+    end
+  end
+
+  defp settle_reviewed_assignment_in_txn(
+         _txn,
+         _call,
+         %{reviewsAssignmentId: producer_id},
+         _review_attest
+       )
+       when not is_binary(producer_id),
+       do: :ok
+
+  defp settle_reviewed_assignment_in_txn(txn, call, review_assignment, review_attest) do
+    case fetch_assignment(txn, review_assignment.reviewsAssignmentId) do
+      %{id: producer_id} = producer ->
+        case latest_completion_attest_in_txn(txn, producer_id, producer.holderKey) do
+          %{id: _completion_id} = completion ->
+            case completion_review_conclusion_in_txn(txn, producer, completion.commitRefs) do
+              "reviewed-clean" ->
+                settle_completed_assignment_after_review_in_txn(
+                  txn,
+                  call,
+                  producer,
+                  completion
+                )
+
+              "changes-requested" ->
+                reopen_completed_assignment_for_review_in_txn(
+                  txn,
+                  call,
+                  producer,
+                  review_assignment,
+                  review_attest
+                )
+
+              _ ->
+                :ok
+            end
+
+          _ ->
+            :ok
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp settle_completed_assignment_after_review_in_txn(txn, call, producer, completion) do
+    cond do
+      producer.state != "open" ->
+        :ok
+
+      true ->
+        completion_call =
+          call
+          |> Map.delete(:review_pending)
+          |> Map.put(:params, %{
+            assignment_id: producer.id,
+            kind: "completion",
+            commit_refs: completion.commitRefs
+          })
+
+        case applicable_code_completion_in_txn(txn, producer, completion_call) do
+          :ok ->
+            close_completed_assignment_in_txn(
+              txn,
+              call,
+              producer,
+              completion,
+              producer.holderKey
+            )
+
+            :ok
+
+          _ ->
+            :ok
+        end
+    end
+  end
+
+  defp reopen_completed_assignment_for_review_in_txn(
+         txn,
+         call,
+         producer,
+         review_assignment,
+         review_attest
+       ) do
+    producer =
+      if producer.state == "closed" and producer.outcome == "completed" do
+        reopen_call =
+          Map.put(
+            call,
+            :params,
+            Map.merge(call.params, %{
+              assignment_id: producer.id,
+              reason:
+                "Independent review #{review_assignment.id} requested changes on " <>
+                  "the completed assignment."
+            })
+          )
+
+        apply_reopen(txn, reopen_call, producer)
+      else
+        producer
+      end
+
+    schedule_author_review_changes_in_txn(txn, producer, review_attest)
+    :ok
+  end
+
+  defp schedule_author_review_changes_in_txn(txn, assignment, review_attest) do
+    Wakes.schedule_in_txn(txn, %{
+      session_key: assignment.holderKey,
+      origin: "remedy:completion-requires-review",
+      creator_session_key: review_attest.bySession,
+      prompt:
+        "Independent review #{review_attest.id} requested changes to assignment #{assignment.id}; " <>
+          "address the review and record the next result.",
+      due_at: now(),
+      assignment_id: assignment.id,
+      work_item_id: assignment.workItemId,
+      class: "input-needed"
+    })
+
+    :ok
+  end
+
+  defp latest_completion_attest_in_txn(txn, assignment_id, holder_key) do
+    case Txn.q(
+           txn,
+           """
+           SELECT id,assignmentId,kind,verdictKind,note,bySession,byUser,producer,
+             producerCommand,byHarness,byProvider,commitRefs,artifactId,contentSha256,
+             waitId,ts
+           FROM attests
+           WHERE assignmentId=?1 AND kind='completion' AND bySession=?2
+           ORDER BY ts DESC,rowid DESC
+           LIMIT 1
+           """,
+           [assignment_id, holder_key]
+         ) do
+      [row] -> attest(row)
+      [] -> nil
+    end
+  end
+
+  defp completion_review_conclusion_in_txn(txn, assignment, refs) do
+    case latest_review_conclusion_in_txn(txn, assignment.id) do
+      %{kind: kind, holder: review_holder, refs: review_refs}
+      when review_holder != assignment.holderKey and
+             kind in ["reviewed-clean", "changes-requested"] ->
+        if assignment.effectKind == "code" do
+          case canonical_commit_refs(refs) do
+            {:ok, [_ | _] = expected} ->
+              if same_commit_ref_identity?(expected, review_refs), do: kind, else: nil
+
+            _ -> nil
+          end
+        else
+          kind
+        end
+
+      _ ->
+        nil
     end
   end
 
@@ -4217,48 +4543,66 @@ defmodule Tightbeam.Assignments do
     review = latest_review_conclusion_in_txn(txn, assignment.id)
     verification = latest_verification_conclusion_in_txn(txn, assignment.id, assignment.holderKey)
 
-    with [_ | _] <- refs,
-         %{kind: "reviewed-clean", holder: review_holder, refs: review_refs} <- review,
-         true <- review_holder != assignment.holderKey,
-         true <- same_commit_ref_identity?(refs, review_refs),
-         %{kind: "verified", holder: assignment_holder, refs: verification_refs} <- verification,
-         true <- assignment_holder == assignment.holderKey,
-         true <- same_commit_ref_identity?(refs, verification_refs) do
+    verification_matches? =
+      case verification do
+        %{kind: "verified", holder: holder, refs: verification_refs} ->
+          holder == assignment.holderKey and
+            same_commit_ref_identity?(refs, verification_refs)
+
+        _ ->
+          false
+      end
+
+    review_matches? =
+      case review do
+        %{kind: "reviewed-clean", holder: holder, refs: review_refs} ->
+          holder != assignment.holderKey and same_commit_ref_identity?(refs, review_refs)
+
+        _ ->
+          false
+      end
+
+    if is_list(refs) and refs != [] and verification_matches? and
+         (Map.get(call, :review_pending, false) or review_matches?) do
       :ok
     else
-      _ ->
-        code_completion_evidence_error(refs, review, assignment)
+      code_completion_evidence_error(refs, review, assignment)
     end
   end
 
   defp applicable_code_completion_in_txn(_txn, _assignment, _call), do: :ok
 
-  defp code_completion_evidence_error(
-         [_ | _] = candidate_refs,
-         %{kind: "reviewed-clean", holder: review_holder, refs: review_refs},
-         %{holderKey: assignment_holder}
-       )
-       when review_holder != assignment_holder do
-    cond do
-      review_refs in [nil, []] ->
-        error(
-          "inapplicable_code_evidence",
-          "the linked independent reviewed-clean verdict is missing commitRefs for completion candidate #{format_commit_refs(candidate_refs)}; file a new independent reviewed-clean verdict for the candidate commits, then retry completion"
-        )
+  defp code_completion_evidence_error(candidate_refs, review, assignment) do
+    detail =
+      case {candidate_refs, review} do
+        {[_ | _] = refs, %{kind: "reviewed-clean", holder: review_holder, refs: review_refs}}
+        when review_holder != assignment.holderKey ->
+          cond do
+            review_refs in [nil, []] ->
+              "the linked independent reviewed-clean verdict is missing commitRefs for completion candidate #{format_commit_refs(refs)}; file a new independent reviewed-clean verdict for the candidate commits, then retry completion"
 
-      not same_commit_ref_identity?(candidate_refs, review_refs) ->
-        error(
-          "inapplicable_code_evidence",
-          "the linked independent reviewed-clean verdict commitRefs #{format_commit_refs(review_refs)} do not match completion candidate #{format_commit_refs(candidate_refs)}; file a new independent reviewed-clean verdict for the candidate commits, then retry completion"
-        )
+            not same_commit_ref_identity?(refs, review_refs) ->
+              "the linked independent reviewed-clean verdict commitRefs #{format_commit_refs(review_refs)} do not match completion candidate #{format_commit_refs(refs)}; file a new independent reviewed-clean verdict for the candidate commits, then retry completion"
 
-      true ->
-        inapplicable_code_evidence_error()
-    end
+            true ->
+              "code completion requires the latest independent clean review and holder verification to match its immutable commitRefs"
+          end
+
+        _ ->
+          "code completion requires the latest independent clean review and holder verification to match its immutable commitRefs"
+      end
+
+    latest_review =
+      case review do
+        %{kind: kind, refs: review_refs} -> "#{kind} commitRefs=#{JSON.encode!(review_refs)}"
+        nil -> "none commitRefs=null"
+      end
+
+    error(
+      "inapplicable_code_evidence",
+      "#{detail}; expected commitRefs=#{JSON.encode!(candidate_refs)}; latest linked review conclusion=#{latest_review}"
+    )
   end
-
-  defp code_completion_evidence_error(_refs, _review, _assignment),
-    do: inapplicable_code_evidence_error()
 
   defp inapplicable_code_evidence_error do
     error(
