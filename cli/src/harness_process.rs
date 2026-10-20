@@ -385,9 +385,6 @@ fn tracked_group_only(args: &[String]) -> Result<i32, String> {
         // members remain; an escaped helper alone does not select this cleanup path.
         return Ok(TRACKED_GROUP_NO_SURVIVORS_STATUS);
     }
-    if unsafe { libc::getpgrp() } == pgid {
-        return Err("harness group cleanup helper belongs to its target process group".into());
-    }
 
     // A negative PGID signals only this group; detached helpers keep their own group.
     let result = unsafe { libc::kill(-pgid, libc::SIGKILL) };
@@ -474,32 +471,13 @@ impl HarnessTarget {
     }
 
     fn confirm_exited_group_survivors(&self) -> Result<bool, String> {
-        // The recorded launch identity and boot fence the PGID. With that exact leader
-        // gone, live members still carrying the recorded PGID belong to its surviving group.
-        self.revalidate_recorded_identity()?;
+        // HarnessTarget::load authorized the launch identity. With its exact leader gone,
+        // live members still carrying the recorded PGID are its surviving process group.
         self.confirm_leader_gone()?;
 
         let snapshot = Snapshot::capture()
             .map_err(|reason| format!("harness process table unreadable: {reason}"))?;
         let members = snapshot.group_members(self.pgid);
-
-        if let Some(leader) = members.iter().find(|member| member.pid == self.pgid) {
-            if leader.start_time != self.leader_start_time {
-                return Err(format!(
-                    "process group {} no longer matches its session leader (pid reuse)",
-                    self.pgid
-                ));
-            }
-            if !leader.zombie {
-                return Err(format!(
-                    "harness session leader {} is still live during credential cleanup",
-                    self.pgid
-                ));
-            }
-        }
-
-        self.revalidate_recorded_identity()?;
-        self.confirm_leader_gone()?;
 
         Ok(members.iter().any(|member| !member.zombie))
     }
