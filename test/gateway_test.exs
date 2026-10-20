@@ -31,6 +31,8 @@ defmodule Tightbeam.GatewayTest do
     assert effects["artifact-content-fetch"] == []
     assert effects["tune"] == ["message.created", "session.updated", "session.harness_changed"]
     assert effects["repair-assignment"] == ["message.created", "session.updated"]
+    assert effects["session-reparent"] == ["session.updated"]
+    assert effects["assignment-commitref-correct"] == ["assignment.updated"]
     assert effects["session-po-set"] == ["wake.scheduled"]
 
     assert effects["wake"] == [

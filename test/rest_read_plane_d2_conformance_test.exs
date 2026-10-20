@@ -27,7 +27,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
   )
   @attest_fields ~w(
     id assignmentId kind verdictKind note bySession byUser producer producerCommand
-    byHarness byProvider commitRefs ts rowVersion
+    byHarness byProvider commitRefs artifactId contentSha256 waitId ts rowVersion
   )
   @harness_process_fields ~w(id host harness pid state createdAt resolvedAt)
 
@@ -274,7 +274,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     assert JSON.decode!(admin_session.resp_body)["items"] == []
   end
 
-  test "assignment-attests bind the parent, filter before paging, and expose no private attest links",
+  test "assignment-attests bind the parent, filter before paging, and expose stored evidence references",
        ctx do
     insert_attest(ctx, "att_d2_001", ctx.assignment.id, 1001, "progress", %{note: "first"})
     insert_attest(ctx, "att_d2_002", ctx.assignment.id, 1001, "progress", %{note: "second"})
@@ -316,9 +316,13 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
              %{"repo" => "example/repo", "commit" => "0123456789abcdef"}
            ]
 
-    refute Map.has_key?(verdict_item, "artifactId")
-    refute Map.has_key?(verdict_item, "contentSha256")
-    refute Map.has_key?(verdict_item, "waitId")
+    assert verdict_item["artifactId"] == ctx.artifact.artifact_id
+    assert verdict_item["contentSha256"] == String.duplicate("a", 64)
+    assert verdict_item["waitId"] == ctx.wake.wake_id
+
+    assert ctx.db
+           |> Tightbeam.StateResources.query_attest("att_d2_003")
+           |> Tightbeam.StateResources.attest() == verdict_item
 
     by_session = get(ctx, base <> "?bySession=#{ctx.flynn_session.session_key}")
 

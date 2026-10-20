@@ -1391,7 +1391,7 @@ defmodule Tightbeam.Gateway do
       end,
       {"attests", []} => fn call -> Assignments.__handle__(db, "attests", call) end,
       {"assignment-get", []} => fn call -> Assignments.__handle__(db, "assignment-get", call) end,
-      {"assignment-commitref-correct", []} => fn call ->
+      {"assignment-commitref-correct", ["assignment.updated"]} => fn call ->
         Tightbeam.AssignmentCommitRefCorrections.__handle__(
           db,
           "assignment-commitref-correct",
@@ -1480,7 +1480,9 @@ defmodule Tightbeam.Gateway do
       {"tune", ["message.created", "session.updated", "session.harness_changed"]} => fn call ->
         tune_result(config, db, call)
       end,
-      {"session-reparent", []} => fn call -> Tightbeam.SessionReparent.handle(db, call) end,
+      {"session-reparent", ["session.updated"]} => fn call ->
+        Tightbeam.SessionReparent.handle(db, call)
+      end,
       {"session-po-set", ["wake.scheduled"]} => fn call ->
         SessionPoAssociations.handle(db, call)
       end,

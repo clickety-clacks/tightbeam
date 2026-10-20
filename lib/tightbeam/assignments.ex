@@ -1264,7 +1264,8 @@ defmodule Tightbeam.Assignments do
     select_from = """
     SELECT att.id, att.assignmentId, att.kind, att.verdictKind, att.note,
            att.bySession, att.byUser, att.producer, att.producerCommand,
-           att.byHarness, att.byProvider, att.commitRefs, att.ts
+           att.byHarness, att.byProvider, att.commitRefs, att.ts,
+           att.artifactId, att.contentSha256, att.waitId
     FROM attests AS att
     JOIN assignments AS parent ON parent.id = att.assignmentId
     LEFT JOIN work_items AS wi ON wi.id = parent.workItemId
@@ -1305,7 +1306,8 @@ defmodule Tightbeam.Assignments do
     select_from = """
     SELECT att.id, att.assignmentId, att.kind, att.verdictKind, att.note,
            att.bySession, att.byUser, att.producer, att.producerCommand,
-           att.byHarness, att.byProvider, att.commitRefs, att.ts
+           att.byHarness, att.byProvider, att.commitRefs, att.ts,
+           att.artifactId, att.contentSha256, att.waitId
     FROM attests AS att
     JOIN assignments AS parent ON parent.id = att.assignmentId
     LEFT JOIN work_items AS wi ON wi.id = parent.workItemId
@@ -1380,7 +1382,10 @@ defmodule Tightbeam.Assignments do
          by_harness,
          by_provider,
          commit_refs,
-         ts
+         ts,
+         artifact_id,
+         content_sha256,
+         wait_id
        ]) do
     %{
       id: id,
@@ -1395,6 +1400,9 @@ defmodule Tightbeam.Assignments do
       by_harness: by_harness,
       by_provider: by_provider,
       commit_refs: if(is_binary(commit_refs), do: JSON.decode!(commit_refs), else: nil),
+      artifact_id: artifact_id,
+      content_sha256: content_sha256,
+      wait_id: wait_id,
       ts: ts
     }
   end

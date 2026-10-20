@@ -7,8 +7,8 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   @r8_groups [
     {~w(work_item.created work_item.updated work_item.iceboxed work_item.reopened work_item.closed work_item.failed),
      "work-items", "upsert", ["workItemId"], :work_item},
-    {~w(assignment.opened assignment.reopened assignment.closed), "assignments", "upsert",
-     ["assignmentId"], :assignment},
+    {~w(assignment.opened assignment.reopened assignment.closed assignment.updated),
+     "assignments", "upsert", ["assignmentId"], :assignment},
     {~w(attest.filed), "attests", "upsert", ["attestId"], :attest},
     {~w(wake.scheduled wake.fired wake.canceled), "wakes", "upsert", ["wakeId"], :wake},
     {~w(turn.started turn.ended), "turns", "upsert", ["turnSeq"], :turn},
