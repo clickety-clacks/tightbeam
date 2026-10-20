@@ -512,7 +512,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert map_size(published) == 3
 
     assert opener_notice["payload"]["content"] ==
-             "[verdict filed: tests-passed on #{assignment.id}]"
+             "[verdict filed: tests-passed on #{assignment.id}: effect matrix tests passed]"
 
     chain =
       Stream.unfold(initial_deadline, fn wake_id ->
@@ -644,9 +644,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
       assert_substrate_messages_created!(
         db,
         [
-          {"effect-dispatcher", "[verdict filed: reviewed-clean on #{review.id}]"},
-          {"effect-target", "[verdict filed: verified on #{assignment.id}]"},
-          {"effect-target", "[completion filed on #{assignment.id}]"},
+          {"effect-dispatcher",
+           "[verdict filed: reviewed-clean on #{review.id}: Synthetic review fixture]"},
+          {"effect-target",
+           "[verdict filed: verified on #{assignment.id}: effect matrix tests passed]"},
+          {"effect-target", "[completion filed on #{assignment.id}: effect matrix complete]"},
           {"effect-target", "[assignment closed: #{assignment.id} — completed]"}
         ],
         [assignment.id, review.id]
