@@ -304,7 +304,7 @@ runtime. Cleanup is conditional: keep intentional pins that the target supports.
    its conversation continues. Record the results before calling the upgrade
    successful. This checklist is not proof that an untested release works.
 
-**Recorded upgrade example (2026-09-05):** Gibson's Codex overlay was saved
+**Recorded upgrade example (2026-09-05):** A host's Codex overlay was saved
 with reported runtime version `0.153.2` and SHA-256
 `f8786262ebc0fa1337448a2977332beadec66c8d0cda0ce973c7849766d7943c`.
 The prior overlay was absent. The saved override was not activated, and no
