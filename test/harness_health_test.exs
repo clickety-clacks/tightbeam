@@ -273,6 +273,59 @@ defmodule Tightbeam.HarnessHealthTest do
     refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "other")
   end
 
+  test "other evidence validity accepts the 15-minute boundary and explains excess validity",
+       ctx do
+    at = System.system_time(:millisecond)
+    source_session = "agent:harness-health:validity-boundary"
+
+    Org.create(ctx.db, %{
+      session_key: source_session,
+      display_name: "Validity boundary",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "coder",
+      host: "test-host",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("claude-fable-5")
+    })
+
+    input = %{
+      harness: "claude",
+      host: "test-host",
+      source_session_key: source_session,
+      principal: {:session, source_session},
+      description: "bounded unclassified transport evidence",
+      evidence_mode: "exact_error",
+      observed_state: "the provider connection was unavailable",
+      exact_observed_error: "transport reset by peer",
+      exact_probe: "GET provider health endpoint",
+      recovery_condition: "a normal provider turn completes",
+      not_known_class_reason: "not one of the named failure classes",
+      observed_at: at,
+      accepted_at: at,
+      valid_until: at + 900_000,
+      world_status: "UNKNOWN",
+      redaction_confirmed: true,
+      idempotency_key: "other-validity-boundary"
+    }
+
+    assert {:opened, _opened} = HarnessHealth.observe_other(ctx.db, input)
+
+    assert {:error,
+            %{
+              code: "invalid_other_evidence",
+              message:
+                "invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
+            }} =
+             HarnessHealth.observe_other(ctx.db, %{
+               input
+               | description: "unclassified evidence beyond validity limit",
+                 valid_until: at + 900_001,
+                 idempotency_key: "other-validity-over-limit"
+             })
+  end
+
   test "public other opening deduplicates an owner main already present as an ancestor", ctx do
     [child, parent | _] = ctx.sessions
     at = System.system_time(:millisecond)
