@@ -1247,6 +1247,17 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("assignmentId", assignment_id)],
         )),
+        Command::AssignmentGet {
+            identity,
+            assignment_id,
+            fact_id,
+        } => {
+            let mut params = vec![string_field("assignmentId", assignment_id)];
+            if let Some(fact_id) = fact_id {
+                params.push(format!("\"factId\":{fact_id}"));
+            }
+            Ok(request(identity, "assignment-get", vec![], params))
+        }
         Command::Assignments {
             identity,
             target,
@@ -3586,6 +3597,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemFail { identity, .. }
         | Command::Attest { identity, .. }
         | Command::Attests { identity, .. }
+        | Command::AssignmentGet { identity, .. }
         | Command::Assignments { identity, .. }
         | Command::CancelWake { identity, .. }
         | Command::SettleTurn { identity, .. }
@@ -3812,6 +3824,28 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    #[test]
+    fn documented_work_item_body_invocation_keeps_a_prefixed_identity() {
+        let request: serde_json::Value = serde_json::from_str(&body(&[
+            "--as",
+            "coder",
+            "work-item-update",
+            "wi_1",
+            "--body",
+            "editable body",
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            request,
+            serde_json::json!({
+                "as": "coder",
+                "verb": "work-item-update",
+                "params": {"workItemId": "wi_1", "body": "editable body"}
+            })
+        );
     }
 
     #[test]
@@ -4773,6 +4807,25 @@ mod tests {
                 "flynn",
             ]),
             r#"{"asUser":"flynn","verb":"assignments","sessionKey":"s1","params":{"state":"all"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_assignment_get_bodies() {
+        assert_eq!(
+            body(&[
+                "assignment-get",
+                "assignment-example",
+                "--fact-id",
+                "42",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"assignment-get","params":{"assignmentId":"assignment-example","factId":42}}"#
+        );
+        assert_eq!(
+            body(&["assignment-get", "assignment-example"]),
+            r#"{"verb":"assignment-get","params":{"assignmentId":"assignment-example"}}"#
         );
     }
 
@@ -6366,6 +6419,26 @@ mod tests {
                 "httpStatus": 200,
                 "error": {"code": "denied", "message": "no"}
             })
+        );
+    }
+
+    #[test]
+    fn observe_other_validity_refusal_names_the_limit_for_cli_users() {
+        let (human, machine) = readings(
+            &parse_response(
+                400,
+                r#"{"error":{"code":"invalid_other_evidence","message":"invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"}}"#,
+            )
+            .unwrap_err(),
+        );
+
+        assert_eq!(
+            human,
+            "invalid_other_evidence: invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
+        );
+        assert_eq!(
+            machine["error"]["message"],
+            "invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
         );
     }
 
