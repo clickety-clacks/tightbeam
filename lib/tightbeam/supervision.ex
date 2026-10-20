@@ -286,7 +286,7 @@ defmodule Tightbeam.Supervision do
       when is_binary(assignment_id) do
     case Txn.q(
            txn,
-           "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer IN (?2,?3) AND state='pending' ORDER BY dueAt,wakeId LIMIT 1",
+           "SELECT wakeId FROM wakes INDEXED BY wakes_assignment WHERE assignmentId=?1 AND consumer IN (?2,?3) AND state='pending' ORDER BY dueAt,wakeId LIMIT 1",
            [assignment_id, @deadline_consumer, @climb_consumer]
          ) do
       [[wake_id]] when is_binary(wake_id) -> {:ok, %{kind: "pending_wake", id: wake_id}}
@@ -311,7 +311,7 @@ defmodule Tightbeam.Supervision do
       _ ->
         Txn.q(
           txn,
-          "SELECT w.wakeId FROM assignments a JOIN wakes w ON w.assignmentId=a.id WHERE a.workItemId=?1 AND a.state='open' AND w.consumer IN (?2,?3) AND w.state='pending' ORDER BY a.openedAt,a.id,w.dueAt,w.wakeId LIMIT 1",
+          "SELECT w.wakeId FROM assignments a JOIN wakes w INDEXED BY wakes_assignment ON w.assignmentId=a.id WHERE a.workItemId=?1 AND a.state='open' AND w.consumer IN (?2,?3) AND w.state='pending' ORDER BY a.openedAt,a.id,w.dueAt,w.wakeId LIMIT 1",
           [work_item_id, @deadline_consumer, @climb_consumer]
         )
         |> case do
@@ -700,10 +700,11 @@ defmodule Tightbeam.Supervision do
          interval_ms,
          due_at
        ) do
-    # The pending set is bounded by live work; an assignment's history is not.
+    # Walk this assignment's wakes newest first, stopping at its pending
+    # deadline, rather than every pending wake.
     Txn.q(
       txn,
-      "SELECT wakeId,prompt,sessionKey,work_item_id,dueAt FROM wakes INDEXED BY wakes_due WHERE state='pending' AND assignmentId=?1 AND consumer=?2 ORDER BY createdAt DESC,wakeId DESC LIMIT 1",
+      "SELECT wakeId,prompt,sessionKey,work_item_id,dueAt FROM wakes INDEXED BY wakes_assignment WHERE assignmentId=?1 AND consumer=?2 AND state='pending' ORDER BY rowid DESC LIMIT 1",
       [assignment_id, @deadline_consumer]
     )
     |> Enum.find_value(fn
@@ -824,7 +825,7 @@ defmodule Tightbeam.Supervision do
       Txn.q(
         txn,
         """
-        SELECT wakeId FROM wakes
+        SELECT wakeId FROM wakes INDEXED BY wakes_assignment
         WHERE assignmentId=?1 AND state='pending'
           AND (consumer IN (?2,?3) OR obligationRef LIKE ?4)
           AND (?5 IS NULL OR wakeId<>?5)
@@ -1134,7 +1135,7 @@ defmodule Tightbeam.Supervision do
   defp pending_deadline_wake_id(txn, assignment_id) do
     case Txn.q(
            txn,
-           "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer=?2 AND state='pending' ORDER BY dueAt,wakeId LIMIT 1",
+           "SELECT wakeId FROM wakes INDEXED BY wakes_assignment WHERE assignmentId=?1 AND consumer=?2 AND state='pending' ORDER BY dueAt,wakeId LIMIT 1",
            [assignment_id, @deadline_consumer]
          ) do
       [[wake_id]] when is_binary(wake_id) -> wake_id

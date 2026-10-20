@@ -1153,16 +1153,15 @@ defmodule Tightbeam.Wakes do
 
   defp terminal_action_note_matches?(_, _), do: false
 
-  # Walk the pending set, which live work bounds, rather than the session's
-  # whole wake history.
+  # A reminder is a pending prompt wake addressed to its recipient, so the
+  # recipient's pending prompt index holds every candidate.
   defp pending_terminal_action_reminders_for(txn, holder) do
-    after_prefix = String.replace_suffix(@terminal_action_marker, ":", ";")
-
     Txn.q(
       txn,
-      "SELECT wakeId FROM wakes INDEXED BY wakes_due WHERE state='pending' AND sessionKey=?1 " <>
+      "SELECT wakeId FROM wakes INDEXED BY idle_cleanup_wakes_pending_session " <>
+        "WHERE state='pending' AND consumer='prompt' AND sessionKey=?1 " <>
         "AND obligationRef>=?2 AND obligationRef<?3 ORDER BY rowid",
-      [holder, @terminal_action_marker, after_prefix]
+      [holder, @terminal_action_marker, source_marker_upper_bound(@terminal_action_marker)]
     )
     |> Enum.map(fn [wake_id] -> get_in_txn(txn, wake_id) end)
   end

@@ -290,14 +290,18 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, pending_deadline_plan} =
              DB.query(
                ctx.db,
-               "EXPLAIN QUERY PLAN SELECT wakeId FROM wakes INDEXED BY wakes_due " <>
-                 "WHERE state='pending' AND assignmentId=?1 AND consumer=?2 " <>
-                 "ORDER BY createdAt DESC,wakeId DESC LIMIT 1",
+               "EXPLAIN QUERY PLAN SELECT wakeId FROM wakes INDEXED BY wakes_assignment " <>
+                 "WHERE assignmentId=?1 AND consumer=?2 AND state='pending' " <>
+                 "ORDER BY rowid DESC LIMIT 1",
                ["asg_inactive", "assignment_inactivity_deadline"]
              )
 
     assert Enum.any?(pending_deadline_plan, fn [_, _, _, detail] ->
-             String.contains?(detail, "wakes_due (state=?)")
+             String.contains?(detail, "wakes_assignment (assignmentId=?)")
+           end)
+
+    refute Enum.any?(pending_deadline_plan, fn [_, _, _, detail] ->
+             String.contains?(detail, "TEMP B-TREE")
            end)
 
     assert {:ok, reopen_plan} =
@@ -364,8 +368,10 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, reminder_plan} =
              DB.query(
                ctx.db,
-               "EXPLAIN QUERY PLAN SELECT wakeId FROM wakes INDEXED BY wakes_due WHERE state='pending' " <>
-                 "AND sessionKey=?1 AND obligationRef>=?2 AND obligationRef<?3 ORDER BY rowid",
+               "EXPLAIN QUERY PLAN SELECT wakeId FROM wakes " <>
+                 "INDEXED BY idle_cleanup_wakes_pending_session " <>
+                 "WHERE state='pending' AND consumer='prompt' AND sessionKey=?1 " <>
+                 "AND obligationRef>=?2 AND obligationRef<?3 ORDER BY rowid",
                [
                  ctx.main.session_key,
                  "terminal-child-owner-action-reminder:",
@@ -374,7 +380,7 @@ defmodule Tightbeam.SupervisionTest do
              )
 
     assert Enum.any?(reminder_plan, fn [_, _, _, detail] ->
-             String.contains?(detail, "wakes_due (state=?)")
+             String.contains?(detail, "idle_cleanup_wakes_pending_session (sessionKey=?)")
            end)
   end
 
