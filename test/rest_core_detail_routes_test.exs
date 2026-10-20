@@ -333,6 +333,16 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert canceled["state"] == "canceled"
     :ok = Hub.delivered(Hub, self())
 
+    expected_reopen_marker =
+      "[assignment reopened: #{ctx.assignment.id} by user:flynn — REST parity]"
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "message.created",
+                      "payload" => %{"content" => ^expected_reopen_marker}
+                    }}
+    :ok = Hub.delivered(Hub, self())
+
     assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
     :ok = Hub.delivered(Hub, self())
 
