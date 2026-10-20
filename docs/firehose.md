@@ -35,10 +35,12 @@ boundary and no notice for that row arrived on the current subscription. If a
 close or visibility change interrupts the walk, the client discards its
 absence results and starts again from a fresh boundary.
 
-The directly applied resources need no REST reads on the normal path. The
-other normal-path reads are composed views and detail reads for resources the
-client treats as invalidation-only. For an invalidation-only resource, each
-notice costs one request to its REST detail route.
+The directly applied resources need no REST reads on the normal path. A
+client must treat notices for any resource not certified for direct
+application as invalidations, never as complete rows, and read each notice's
+key from that resource's REST detail route until it is certified. These
+per-notice detail reads and the reads for composed views are the other
+normal-path requests.
 
 After a close, the minimum request count for one rebuild is
 
