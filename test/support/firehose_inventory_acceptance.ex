@@ -373,7 +373,7 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
     # rebuild above; the final database row has since advanced one version.
     for {class, notice} <- Map.delete(notices, "session.harness_changed") do
       assert {:ok, fresh} =
-               Rebuild.fetch(fixture.db, class, notice["refs"], fixture.user_id, true)
+               Rebuild.fetch(fixture.db, notice["class"], notice["refs"], fixture.user_id, true)
 
       assert fresh == notice["payload"],
              "#{class}: fresh=#{inspect(fresh)} delivered=#{inspect(notice["payload"])}"
