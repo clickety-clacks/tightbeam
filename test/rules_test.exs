@@ -1511,8 +1511,7 @@ defmodule Tightbeam.RulesTest do
     holder = session(ctx.db, "receipt-remedy-holder", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "receipt-remedy-reviewer", "flynn", archetype: "reviewer-code")
 
-    _owner =
-      session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
+    owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
 
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
@@ -1548,12 +1547,13 @@ defmodule Tightbeam.RulesTest do
     assert completion_attest.commitRefs == refs
     assert review_count(ctx.db, producer.id) == 0
 
-    # The gate's notice is one ordinary stored notice to the holder; it starts no
-    # review-remedy episode and staffs no reviewer.
+    # The gate's notice is one ordinary stored notice to the accountable owner; it
+    # starts no review-remedy episode and staffs no reviewer.
     assert RailRemedy.episode(ctx.db, "completion-requires-review", producer.id) == nil
 
     assert [notice] = review_gate_notices(ctx.db, producer.id)
-    assert notice.session_key == holder.session_key
+    assert notice.session_key == owner.session_key
+    assert notice.owner_user_id == "flynn"
     assert notice.consumer == "prompt"
     assert notice.summon == 1
     assert notice.creator_session_key == nil
@@ -1610,8 +1610,7 @@ defmodule Tightbeam.RulesTest do
   test "shipped completion records pending release and live-mutation work", ctx do
     holder = session(ctx.db, "non-code-completion-holder", "flynn", archetype: "coder")
 
-    _owner =
-      session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
+    owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
 
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
@@ -1635,7 +1634,7 @@ defmodule Tightbeam.RulesTest do
       assert review_count(ctx.db, producer.id) == 0
 
       assert [%{session_key: session_key}] = review_gate_notices(ctx.db, producer.id)
-      assert session_key == holder.session_key
+      assert session_key == owner.session_key
     end
   end
 
@@ -1965,8 +1964,7 @@ defmodule Tightbeam.RulesTest do
     reviewer =
       session(ctx.db, "unreferenced-review-judge", "reviewer", archetype: "reviewer-code")
 
-    _owner =
-      session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
+    owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
 
     {:ok, _} =
       DB.query(
@@ -2070,7 +2068,7 @@ defmodule Tightbeam.RulesTest do
 
       assert RailRemedy.episode(ctx.db, "completion-requires-review", producer.id) == nil
       assert [notice] = review_gate_notices(ctx.db, producer.id)
-      assert notice.session_key == holder.session_key
+      assert notice.session_key == owner.session_key
     end
   end
 
@@ -4567,7 +4565,7 @@ defmodule Tightbeam.RulesTest do
       DB.query(
         db,
         """
-        SELECT sessionKey,prompt,consumer,creatorSessionKey,summon
+        SELECT sessionKey,ownerUserId,prompt,consumer,creatorSessionKey,summon
         FROM wakes
         WHERE assignmentId=?1 AND origin='remedy:completion-requires-review'
         ORDER BY createdAt,wakeId
@@ -4575,9 +4573,10 @@ defmodule Tightbeam.RulesTest do
         [producer_id]
       )
 
-    Enum.map(rows, fn [session_key, prompt, consumer, creator_session_key, summon] ->
+    Enum.map(rows, fn [session_key, owner_user_id, prompt, consumer, creator_session_key, summon] ->
       %{
         session_key: session_key,
+        owner_user_id: owner_user_id,
         prompt: prompt,
         consumer: consumer,
         creator_session_key: creator_session_key,

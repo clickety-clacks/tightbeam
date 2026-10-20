@@ -3,6 +3,7 @@ defmodule Tightbeam.RailRemedy do
 
   alias Tightbeam.{
     DB,
+    DeliveryResponsibilities,
     Dispatch,
     ErrorDiagnostic,
     EventLog,
@@ -618,39 +619,126 @@ defmodule Tightbeam.RailRemedy do
 
   defp bind_target(_db, "spawn", resolved), do: {:ok, resolved}
 
+  # The holder cannot staff its own review, so the notice goes to whoever is
+  # accountable for the assignment now rather than to the rule's bound holder.
   defp store_completion_notice(db, rule, call, context, resolved) do
-    input = %{
-      session_key: resolved.bound_session,
-      target_role: resolved.target[:target_role],
-      origin: "remedy:#{rule.name}",
-      prompt: resolved.params.prompt,
-      due_at: now(),
-      work_item_id: context.work_item_id,
-      assignment_id: context.assignment_id,
-      # The rule generated this notice; attributing it to the current actor
-      # would make the wake itself restart that assignment's inactivity clock.
-      summon: true
-    }
-
     case DB.transaction(db, fn txn ->
-           wake = Wakes.schedule_in_txn(txn, input)
+           case review_notice_recipient_in_txn(txn, context.assignment_id) do
+             {:ok, recipient} ->
+               wake =
+                 Wakes.schedule_in_txn(txn, %{
+                   session_key: recipient.session_key,
+                   origin: "remedy:#{rule.name}",
+                   prompt: resolved.params.prompt,
+                   due_at: now(),
+                   owner_user_id: recipient.owner_user_id,
+                   work_item_id: recipient.work_item_id || context.work_item_id,
+                   assignment_id: context.assignment_id,
+                   # The rule generated this notice; attributing it to the current actor
+                   # would make the wake itself restart that assignment's inactivity clock.
+                   summon: true
+                 })
 
-           EventLog.lifecycle_in_txn(
-             txn,
-             "rule_notice",
-             wake.wake_id,
-             JSON.encode!(%{rule: rule.name, principal: call.origin})
-           )
+               EventLog.lifecycle_in_txn(
+                 txn,
+                 "rule_notice",
+                 wake.wake_id,
+                 JSON.encode!(%{rule: rule.name, principal: call.origin})
+               )
 
-           wake
+               {:ok, wake}
+
+             {:error, reason} ->
+               {:error, reason}
+           end
          end) do
-      {:ok, wake} -> {:ok, wake}
+      {:ok, {:ok, wake}} -> {:ok, wake}
+      {:ok, {:error, reason}} -> {:error, reason}
       {:error, reason} -> {:error, reason}
     end
   rescue
     error -> {:error, error}
   catch
     kind, reason -> {:error, {kind, reason}}
+  end
+
+  # Delegated opener first, then the work item's current accountable recipient,
+  # the opener, and the owner's main session; the first active session owned by
+  # the assignment's owner receives the notice.
+  defp review_notice_recipient_in_txn(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT a.openedByUser,a.openedBySession,a.workItemId,
+             COALESCE(w.ownerUserId,a.openedByUser,opener.ownerUserId)
+           FROM assignments a
+           LEFT JOIN work_items w ON w.id=a.workItemId
+           LEFT JOIN sessions opener ON opener.sessionKey=a.openedBySession
+           WHERE a.id=?1
+           """,
+           [assignment_id]
+         ) do
+      [[opened_by_user, opened_by_session, work_item_id, owner]] ->
+        owned_active? = fn key ->
+          Txn.q(
+            txn,
+            "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
+            [key, owner]
+          ) == [[1]]
+        end
+
+        current =
+          if is_binary(work_item_id) do
+            DeliveryResponsibilities.current_accountable_recipient_in_txn(
+              txn,
+              work_item_id,
+              owner
+            )
+          end
+
+        opener =
+          cond do
+            is_binary(opened_by_user) and opened_by_user == owner ->
+              Org.personal_session_key(owner)
+
+            is_binary(opened_by_session) and owned_active?.(opened_by_session) ->
+              opened_by_session
+
+            true ->
+              nil
+          end
+
+        delegated_opener =
+          if is_binary(opener) and is_binary(opened_by_session) and is_binary(work_item_id) and
+               DeliveryResponsibilities.responsibility_in_txn(
+                 txn,
+                 opened_by_session,
+                 work_item_id
+               ) == "delegated",
+             do: opener
+
+        owner_main = if is_binary(owner), do: Org.personal_session_key(owner)
+
+        [delegated_opener, current, opener, owner_main]
+        |> Enum.reject(&is_nil/1)
+        |> Enum.uniq()
+        |> Enum.find(owned_active?)
+        |> case do
+          recipient when is_binary(recipient) ->
+            {:ok, %{session_key: recipient, owner_user_id: owner, work_item_id: work_item_id}}
+
+          nil ->
+            {:error,
+             %{
+               reason: :missing_accountable_owner,
+               owner_user_id: owner,
+               work_item_id: work_item_id
+             }}
+        end
+
+      _ ->
+        {:error, %{reason: :missing_assignment}}
+    end
   end
 
   defp producer_id("assign", %{id: id}, _hint), do: id
