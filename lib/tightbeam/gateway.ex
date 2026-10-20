@@ -9926,7 +9926,8 @@ defmodule Tightbeam.Gateway do
       close_result =
         AdapterCoordinator.close_adapter(
           Tightbeam.AdapterCoordinator,
-          {module.id(), "shared", machine}
+          {module.id(), "shared", machine},
+          :credential_replacement
         )
 
       case {result, close_result} do

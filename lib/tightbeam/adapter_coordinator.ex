@@ -214,8 +214,14 @@ defmodule Tightbeam.AdapterCoordinator do
   stamped against the closed process, exactly as after a crash.
   """
   @spec close_adapter(GenServer.server(), adapter_key()) :: :ok | {:error, term()}
-  def close_adapter(server \\ __MODULE__, key) do
-    GenServer.call(server, {:close_adapter, key}, 30_000)
+  def close_adapter(server \\ __MODULE__, key), do: close_adapter(server, key, :process_tree)
+
+  @doc false
+  @spec close_adapter(GenServer.server(), adapter_key(), :process_tree | :credential_replacement) ::
+          :ok | {:error, term()}
+  def close_adapter(server, key, cleanup_scope)
+      when cleanup_scope in [:process_tree, :credential_replacement] do
+    GenServer.call(server, {:close_adapter, key, cleanup_scope}, 30_000)
   catch
     :exit, reason -> {:error, {:coordinator_unavailable, reason}}
   end
@@ -454,6 +460,11 @@ defmodule Tightbeam.AdapterCoordinator do
     {:reply, result, state}
   end
 
+  def handle_call({:close_adapter, key, cleanup_scope}, _from, state) do
+    {result, state} = do_close_adapter(key, state, cleanup_scope)
+    {:reply, result, state}
+  end
+
   defp adapter_for_reply(key, context, from, state, authoritative?) do
     entry = Map.get(state.adapters, key, fresh_entry())
 
@@ -515,7 +526,9 @@ defmodule Tightbeam.AdapterCoordinator do
     {:noreply, release_slot(machine, slot, state)}
   end
 
-  defp do_close_adapter(key, state) do
+  defp do_close_adapter(key, state), do: do_close_adapter(key, state, :process_tree)
+
+  defp do_close_adapter(key, state, cleanup_scope) do
     {:ok, process_row} = Tightbeam.HarnessProcess.begin_park(state.db, key)
     state = cancel_pending_starts(key, state)
 
@@ -566,10 +579,10 @@ defmodule Tightbeam.AdapterCoordinator do
           :ok
 
         _row when exited? ->
-          Tightbeam.HarnessProcess.reconcile_key(state.db, key)
+          Tightbeam.HarnessProcess.reconcile_key(state.db, key, cleanup_scope)
 
         row ->
-          Tightbeam.HarnessProcess.park(state.db, row)
+          Tightbeam.HarnessProcess.park(state.db, row, cleanup_scope)
       end
 
     result = if reconcile_result == :already_resolved, do: :ok, else: reconcile_result

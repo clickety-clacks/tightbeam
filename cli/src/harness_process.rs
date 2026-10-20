@@ -25,6 +25,7 @@ use std::process::Command;
 
 const IDENTITY_AUTHORITY_VERSION: &str = "tightbeam-harness-identity-v2";
 const IDENTITY_AUTHORITY_SUFFIX: &str = ".authority";
+const TRACKED_GROUP_NO_SURVIVORS_STATUS: i32 = 4;
 
 pub fn session_exec(args: &[String]) -> Result<i32, String> {
     session_exec_with_mode(args, 0o600, None)
@@ -319,6 +320,13 @@ pub fn print_boot_identity() -> Result<(), String> {
 }
 
 pub fn group(args: &[String]) -> Result<i32, String> {
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--tracked-group-only")
+    {
+        return tracked_group_only(&args[1..]);
+    }
+
     if args.len() != 4 && args.len() != 5 {
         return Err(
             "usage: tightbeam harness-group <process-group-id> <identity-path> <boot-identity> <launch-id> [authority-version]"
@@ -347,6 +355,50 @@ pub fn group(args: &[String]) -> Result<i32, String> {
     match freeze_harness_tree(&target)? {
         Some(sweep) => kill_harness_tree(&target, sweep),
         None => Ok(0),
+    }
+}
+
+fn tracked_group_only(args: &[String]) -> Result<i32, String> {
+    if args.len() != 4 && args.len() != 5 {
+        return Err(
+            "usage: tightbeam harness-group --tracked-group-only <process-group-id> <identity-path> <boot-identity> <launch-id> [authority-version]"
+                .into(),
+        );
+    }
+
+    if args
+        .get(4)
+        .is_some_and(|version| version != IDENTITY_AUTHORITY_VERSION)
+    {
+        return Err("harness authority protocol version is not supported".into());
+    }
+
+    let pgid: libc::pid_t = args[0]
+        .parse::<i32>()
+        .ok()
+        .filter(|pgid| *pgid > 0)
+        .ok_or_else(|| "process group id must be a positive integer".to_string())?;
+
+    let target = HarnessTarget::load(pgid, &args[1], &args[2], &args[3])?;
+    if !target.confirm_exited_group_survivors()? {
+        // The caller keeps the original process-tree refusal when no recorded-group
+        // members remain; an escaped helper alone does not select this cleanup path.
+        return Ok(TRACKED_GROUP_NO_SURVIVORS_STATUS);
+    }
+
+    // A negative PGID signals only this group; detached helpers keep their own group.
+    let result = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    if result == 0 {
+        return Ok(0);
+    }
+
+    let error = io::Error::last_os_error();
+    if process_signal_target_gone(&error) {
+        Ok(TRACKED_GROUP_NO_SURVIVORS_STATUS)
+    } else {
+        Err(format!(
+            "process group {pgid} could not be signalled: {error}"
+        ))
     }
 }
 
@@ -414,6 +466,23 @@ impl HarnessTarget {
     /// A pgid can be reused once the leader is gone; signalling the number alone is not enough
     /// to know the process group still belongs to this launch.
     fn revalidate_authority(&self) -> Result<HarnessAuthority, String> {
+        self.revalidate_recorded_identity()?;
+        verify_session_leader_instance(self.pgid, self.leader_start_time)
+    }
+
+    fn confirm_exited_group_survivors(&self) -> Result<bool, String> {
+        // HarnessTarget::load authorized the launch identity. With its exact leader gone,
+        // live members still carrying the recorded PGID are its surviving process group.
+        self.confirm_leader_gone()?;
+
+        let snapshot = Snapshot::capture()
+            .map_err(|reason| format!("harness process table unreadable: {reason}"))?;
+        let members = snapshot.group_members(self.pgid);
+
+        Ok(members.iter().any(|member| !member.zombie))
+    }
+
+    fn revalidate_recorded_identity(&self) -> Result<(), String> {
         let recorded_start_time = authorize_group_signal(
             Path::new(&self.identity_path),
             self.pgid,
@@ -421,9 +490,33 @@ impl HarnessTarget {
             &self.launch_id,
         )?;
         if recorded_start_time != self.leader_start_time {
-            return Err("harness identity leader instance changed during cleanup".into());
+            Err("harness identity leader instance changed during cleanup".into())
+        } else {
+            Ok(())
         }
-        verify_session_leader_instance(self.pgid, self.leader_start_time)
+    }
+
+    fn confirm_leader_gone(&self) -> Result<(), String> {
+        match read_process(self.pgid) {
+            Ok(leader) if leader.start_time != self.leader_start_time => Err(format!(
+                "process group {} no longer matches its session leader (pid reuse)",
+                self.pgid
+            )),
+            Ok(leader) if leader.pgid != self.pgid => Err(format!(
+                "process group {} no longer matches its session leader (now in group {})",
+                self.pgid, leader.pgid
+            )),
+            Ok(leader) if !leader.zombie => Err(format!(
+                "harness session leader {} is still live during credential cleanup",
+                self.pgid
+            )),
+            Ok(_) => Ok(()),
+            Err(error) if process_read_target_gone(&error) => Ok(()),
+            Err(error) => Err(format!(
+                "harness session leader {} could not be verified: {error}",
+                self.pgid
+            )),
+        }
     }
 
     fn require_live_before_signal(&self) -> Result<(), String> {
