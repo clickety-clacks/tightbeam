@@ -74,6 +74,11 @@ defmodule Tightbeam.Credentials do
   def kind(provider, server \\ __MODULE__),
     do: GenServer.call(server, {:kind, provider})
 
+  @doc "Read the bounded, non-secret credential-health fields used by incident provenance."
+  @spec health_snapshot(provider(), GenServer.server()) :: map()
+  def health_snapshot(provider, server \\ __MODULE__),
+    do: GenServer.call(server, {:health_snapshot, provider})
+
   @doc """
   The recorded kind under a LOCAL base dir, without the lifecycle owner.
 
@@ -335,6 +340,29 @@ defmodule Tightbeam.Credentials do
 
   def handle_call({:kind, provider}, _from, state) do
     {:reply, credential_kind(state, provider), state}
+  end
+
+  def handle_call({:health_snapshot, provider}, _from, state) do
+    snapshot =
+      case read_metadata(state, provider) do
+        {:ok, metadata} ->
+          %{
+            available: true,
+            terminal: metadata["terminal"],
+            last_health: metadata["last_health"],
+            initial_auth_none_ignored: metadata["initial_auth_none_ignored"]
+          }
+
+        {:error, _reason} ->
+          %{
+            available: false,
+            terminal: nil,
+            last_health: nil,
+            initial_auth_none_ignored: nil
+          }
+      end
+
+    {:reply, snapshot, state}
   end
 
   def handle_call({:mark_terminal, provider, evidence}, from, state) do
