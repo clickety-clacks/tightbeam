@@ -569,8 +569,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert retired_disposition_id == retired.id
   end
 
-  test "priority inherits from the work item, scales the 24-hour window, and reprioritizes live probes",
-       ctx do
+  test "priority persists without scaling the 24-hour horizon for new and live probes", ctx do
     # This proof closes a card: its holder, recorded opener and work owner must
     # share the valid durable relation, unlike the suite's cross-owner setup.
     {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET ownerUserId='h1' WHERE sessionKey='holder'")
@@ -578,8 +577,7 @@ defmodule Tightbeam.EffortCheckinTest do
     ctx = %{ctx | config: config}
 
     horizons =
-      for {priority, expected} <- [{3, 172_800_000}, {4, 86_400_000}, {5, 43_200_000}],
-          into: %{} do
+      for priority <- [0, 3, 4, 5, 8], into: %{} do
         item =
           WorkItems.__handle__(ctx.db, "work-item-create", %{
             verb: "work-item-create",
@@ -603,7 +601,7 @@ defmodule Tightbeam.EffortCheckinTest do
                    ]
                  )
 
-        assert [[^expected, ^expected]] =
+        assert [[86_400_000, 86_400_000]] =
                  rows(
                    ctx.db,
                    """
@@ -631,7 +629,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert updated.priority == 6
 
-    assert [[6, 21_600_000, 21_600_000]] =
+    assert [[6, 86_400_000, 86_400_000]] =
              rows(
                ctx.db,
                """
@@ -688,7 +686,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert reopened.state == "open"
 
-    assert [[2, "armed", 345_600_000, 345_600_000, reopened_root]] =
+    assert [[2, "armed", 86_400_000, 86_400_000, reopened_root]] =
              rows(
                ctx.db,
                """

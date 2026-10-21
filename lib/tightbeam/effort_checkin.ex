@@ -35,7 +35,6 @@ defmodule Tightbeam.EffortCheckin do
   @origin "process:tightbeam"
   @holder_prod_marker "effort-holder-prod:"
   @default_horizon_ms 86_400_000
-  @default_priority 4
   @default_deadline_ms 86_400_000
 
   @ddl """
@@ -1125,7 +1124,7 @@ defmodule Tightbeam.EffortCheckin do
          agent_prodded
        ) do
     armed_at = now()
-    horizon = horizon_ms(txn, config, assignment_id)
+    horizon = horizon_ms(config)
 
     [[watermark]] =
       Txn.q(txn, "SELECT COALESCE(MAX(seq), 0) FROM turns WHERE sessionKey = ?1", [
@@ -1192,7 +1191,7 @@ defmodule Tightbeam.EffortCheckin do
       [work_item_id, priority]
     )
 
-    horizon = horizon_for_priority(txn, config, priority)
+    horizon = horizon_ms(config)
 
     Txn.q(
       txn,
@@ -1790,50 +1789,12 @@ defmodule Tightbeam.EffortCheckin do
   defp invalid_root,
     do: {:error, error("invalid_workdir_root", "workdirRoot must be relative and contain no ..")}
 
-  defp horizon_ms(txn, config, assignment_id) do
-    priority = assignment_priority_in_txn(txn, assignment_id)
-    horizon_for_priority(txn, config, priority)
-  end
-
-  defp horizon_for_priority(txn, config, priority) do
-    base =
-      Map.get(
-        config,
-        :effort_checkin_horizon_ms,
-        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, @default_horizon_ms)
-      )
-
-    default_priority = default_priority_in_txn(txn)
-    steps = priority - default_priority
-
-    if steps >= 0,
-      do: max(div(base, Integer.pow(2, steps)), 1),
-      else: base * Integer.pow(2, -steps)
-  end
-
-  defp assignment_priority_in_txn(txn, assignment_id) do
-    case Txn.q(
-           txn,
-           """
-           SELECT COALESCE(
-             (SELECT priority FROM assignment_priorities WHERE assignmentId=a.id),
-             (SELECT priority FROM work_item_priorities WHERE workItemId=a.workItemId),
-             CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
-           )
-           FROM assignments AS a WHERE a.id=?1
-           """,
-           [assignment_id]
-         ) do
-      [[priority]] -> priority
-      [] -> default_priority_in_txn(txn)
-    end
-  end
-
-  defp default_priority_in_txn(txn) do
-    case Txn.q(txn, "SELECT value FROM org_settings WHERE key='default-priority'") do
-      [[value]] -> String.to_integer(value)
-      [] -> @default_priority
-    end
+  defp horizon_ms(config) do
+    Map.get(
+      config,
+      :effort_checkin_horizon_ms,
+      Application.get_env(:tightbeam, :effort_checkin_horizon_ms, @default_horizon_ms)
+    )
   end
 
   defp deadline_ms(config),
