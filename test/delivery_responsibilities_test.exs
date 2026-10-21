@@ -561,7 +561,10 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
       assert message =~ item_id
       refute message =~ "human owner/admin"
 
-      if rule == "engineering-dispatch-production-needs-delivery-owner" do
+      if rule in [
+           "engineering-assign-production-needs-delivery-owner",
+           "engineering-dispatch-production-needs-delivery-owner"
+         ] do
         assert message =~ "work-item-handoff --work-item #{item_id}"
         assert message =~ "--delivery-owner <sessionKey>"
         assert message =~ "--brief"
@@ -958,7 +961,8 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
   defp assignment_handlers(db) do
     %{
       "assign" => fn call -> Assignments.__handle__(db, "assign", call) end,
-      "dispatch" => fn call -> Assignments.__handle__(db, "dispatch", call) end
+      "dispatch" => fn call -> Assignments.__handle__(db, "dispatch", call) end,
+      "work-item-handoff" => fn call -> WorkItems.__handle__(db, "work-item-handoff", call) end
     }
   end
 
