@@ -201,7 +201,30 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
 
   setup do
     db = :"firehose_direct_apply_convergence_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: ":memory:", name: db})
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "firehose-direct-apply-db-#{System.unique_integer([:positive])}"
+      )
+
+    db_path = Path.join(base, "state.db")
+    payload = Path.join(base, "payload")
+    File.mkdir_p!(Path.join(payload, "ebin"))
+    File.mkdir_p!(Path.join(payload, "priv"))
+    File.write!(Path.join(payload, "ebin/fixture.beam"), "fixture")
+    File.write!(Path.join(payload, "priv/fixture.rule"), "fixture")
+
+    {:ok, manifest} =
+      Tightbeam.LiveBaseGuard.generate_manifest(Tightbeam.LiveBasePayload.files!(payload))
+
+    File.write!(Path.join(payload, "build-manifest.json"), JSON.encode!(manifest))
+    on_exit(fn -> File.rm_rf!(base) end)
+
+    start_supervised!(
+      {DB, path: db_path, name: db, guard_inputs: [], payload_root: payload},
+      id: db
+    )
+
     :ok = Schema.ensure_all(db)
 
     {:paired, device} =
@@ -211,6 +234,11 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
         platform: nil,
         model: nil
       })
+
+    owner_user_id = device.user_id
+    _owner = Devices.set_user_admin(db, owner_user_id, false)
+    _other = Devices.add_user(db, "other", false)
+    _admin = Devices.add_user(db, "admin", true)
 
     work_root =
       Path.join(System.tmp_dir!(), "firehose-direct-apply-#{System.unique_integer([:positive])}")
@@ -237,17 +265,142 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
         model: Model.new("fable")
       })
 
+    page_session =
+      Org.create(db, %{
+        session_key: "direct-apply-page-owner",
+        display_name: "Direct apply page owner",
+        owner_user_id: owner_user_id,
+        origin: "user:#{owner_user_id}",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    other_session =
+      Org.create(db, %{
+        session_key: "direct-apply-other-owner",
+        display_name: "Direct apply other owner",
+        owner_user_id: "other",
+        origin: "user:other",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
     work_item =
       WorkItems.__handle__(db, "work-item-create", %{
         verb: "work-item-create",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:#{owner_user_id}",
+        principal: {:user, owner_user_id},
         session_key: nil,
         params: %{title: "Server-backed convergence item"}
       })
 
-    start_supervised!({Hub, name: Hub})
-    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: false})
+    page_work_item =
+      WorkItems.__handle__(db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:#{owner_user_id}",
+        principal: {:user, owner_user_id},
+        session_key: nil,
+        params: %{title: "Server-backed page item"}
+      })
+
+    other_work_item =
+      WorkItems.__handle__(db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:other",
+        principal: {:user, "other"},
+        session_key: nil,
+        params: %{title: "Server-backed private item"}
+      })
+
+    lifecycle_work_item =
+      WorkItems.__handle__(db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:#{owner_user_id}",
+        principal: {:user, owner_user_id},
+        session_key: nil,
+        params: %{title: "Server-backed reversible item"}
+      })
+
+    assignment =
+      create_assignment(db, owner_user_id, session.session_key, work_item.id, "Direct apply assignment")
+
+    page_assignment =
+      create_assignment(
+        db,
+        owner_user_id,
+        page_session.session_key,
+        page_work_item.id,
+        "Direct apply page assignment"
+      )
+
+    other_assignment =
+      create_assignment(
+        db,
+        "other",
+        other_session.session_key,
+        other_work_item.id,
+        "Direct apply private assignment"
+      )
+
+    _first_attest = create_progress_attest(db, owner_user_id, session.session_key, assignment.id)
+    _page_attest = create_progress_attest(db, owner_user_id, session.session_key, assignment.id)
+    other_attest = create_progress_attest(db, "other", other_session.session_key, other_assignment.id)
+
+    artifact =
+      create_artifact(db, session.session_key, work_item.id, "Direct apply artifact")
+
+    page_artifact =
+      create_artifact(db, session.session_key, work_item.id, "Direct apply page artifact")
+
+    other_artifact =
+      create_artifact(
+        db,
+        other_session.session_key,
+        other_work_item.id,
+        "Direct apply private artifact"
+      )
+
+    {:ok, first_turn} =
+      enqueue_turn(db, session.session_key, "direct-apply-first-turn", work_item.id, assignment.id)
+
+    {:ok, page_turn} =
+      enqueue_turn(db, session.session_key, "direct-apply-page-turn", work_item.id, assignment.id)
+
+    {:ok, other_turn} =
+      enqueue_turn(
+        db,
+        other_session.session_key,
+        "direct-apply-other-turn",
+        other_work_item.id,
+        other_assignment.id
+      )
+
+    first_wake = schedule_wake(db, session.session_key, "Direct apply first wake", work_item.id, assignment.id)
+    page_wake = schedule_wake(db, session.session_key, "Direct apply page wake", work_item.id, assignment.id)
+
+    other_wake =
+      schedule_wake(
+        db,
+        other_session.session_key,
+        "Direct apply private wake",
+        other_work_item.id,
+        other_assignment.id
+      )
+
+    start_supervised!({Hub, name: Hub}, id: Hub)
+    :ok =
+      Hub.register(Hub, self(), %{
+        mode: :all,
+        db: db,
+        user_id: owner_user_id,
+        is_admin: false
+      })
 
     router_opts = [
       db: db,
@@ -260,10 +413,30 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     ]
 
     %{
+      base: base,
+      db_path: db_path,
       db: db,
+      payload: payload,
       device: device,
+      owner_user_id: owner_user_id,
       session: session,
+      page_session: page_session,
+      other_session: other_session,
       work_item: work_item,
+      page_work_item: page_work_item,
+      other_work_item: other_work_item,
+      lifecycle_work_item: lifecycle_work_item,
+      assignment: assignment,
+      page_assignment: page_assignment,
+      other_assignment: other_assignment,
+      other_attest: other_attest,
+      artifacts: [artifact, page_artifact],
+      other_artifact: other_artifact,
+      turns: [first_turn, page_turn],
+      other_turn: other_turn,
+      wakes: [first_wake, page_wake],
+      other_wake: other_wake,
+      admin_walk?: false,
       work_root: work_root,
       router_opts: router_opts
     }
@@ -411,6 +584,29 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     )
   end
 
+  test "server rows converge through paged walks, restart, and visibility changes", ctx do
+    for resource <- [:work_items, :assignments, :attests, :artifacts, :turns, :wakes, :sessions] do
+      {client, page} = begin_walk(ctx, resource)
+      notices = mutate_resource(ctx, resource)
+      client = Enum.reduce(notices, client, &apply_notice/2)
+
+      assert Enum.reduce(notices, client, &apply_notice/2) == client,
+             "#{resource} duplicate notice changed the client model"
+
+      client = continue_walk(ctx, resource, page, client)
+      assert client == walk_model(ctx, resource),
+             "#{resource} did not converge after a notice arrived during its walk"
+
+      restart_server(ctx)
+      after_restart = mutate_resource(ctx, resource)
+      client = Enum.reduce(after_restart, client, &apply_notice/2)
+      assert client == walk_model(ctx, resource),
+             "#{resource} did not converge after the server owner restarted"
+
+      assert_visibility_converges(ctx, resource, client)
+    end
+  end
+
   defp assert_converges(ctx, class, resource, key_field, key, rest_path) do
     notice = receive_notice(class)
     payload = notice["payload"]
@@ -464,4 +660,478 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     |> put_req_header("authorization", "Bearer #{ctx.device.token}")
     |> Router.call(Router.init(ctx.router_opts))
   end
+
+  defp create_assignment(db, owner, session_key, work_item_id, subject) do
+    Assignments.__handle__(db, "assign", %{
+      verb: "assign",
+      origin: "user:#{owner}",
+      principal: {:user, owner},
+      session_key: session_key,
+      target_role: nil,
+      role_fallback: false,
+      supervision_interval_ms: 60_000,
+      params: %{subject: subject, work_item_id: work_item_id}
+    })
+  end
+
+  defp create_progress_attest(db, owner, session_key, assignment_id) do
+    result =
+      Assignments.__handle__(db, "attest", %{
+        verb: "attest",
+        origin: "agent:direct-apply-owner",
+        principal: {:session, session_key},
+        session_key: nil,
+        params: %{
+          assignment_id: assignment_id,
+          kind: "progress",
+          note: "Server-backed convergence fixture for #{owner}"
+        }
+      })
+
+    result.attest
+  end
+
+  defp create_artifact(db, session_key, work_item_id, title) do
+    Artifacts.record(db, %{
+      principal: {:session, session_key},
+      session_key: session_key,
+      params: %{
+        kind: "report",
+        title: title,
+        origin_path: "sample.md",
+        work_item_id: work_item_id
+      }
+    })
+  end
+
+  defp enqueue_turn(db, session_key, message_id, work_item_id, assignment_id) do
+    Ledger.enqueue(db, %{
+      session_key: session_key,
+      message_id: message_id,
+      origin: "user:direct-apply",
+      prompt: "Server-backed queued turn #{message_id}",
+      assignment_id: assignment_id,
+      job_ref: work_item_id
+    })
+  end
+
+  defp schedule_wake(db, session_key, prompt, work_item_id, assignment_id) do
+    Wakes.schedule(db, %{
+      session_key: session_key,
+      origin: "user:direct-apply",
+      prompt: prompt,
+      due_at: System.system_time(:millisecond) + 60_000,
+      work_item_id: work_item_id,
+      assignment_id: assignment_id
+    })
+  end
+
+  defp begin_walk(ctx, :assignments) do
+    row = rest_item!(ctx, "/api/assignments/#{ctx.assignment.id}")
+    client = model_from_rows("assignments", [row])
+    {client, %{ids: [ctx.assignment.id, ctx.page_assignment.id], detail_walk: true}}
+  end
+
+  defp begin_walk(ctx, resource) do
+    path = page_path(ctx, resource)
+    {rows, page} = fetch_page!(ctx, path, nil)
+
+    assert page_more?(page), "#{resource} fixture must span more than one REST page"
+    {model_from_rows(resource_name(resource), rows), %{path: path, page: page}}
+  end
+
+  defp continue_walk(ctx, :assignments, %{ids: ids}, client) do
+    Enum.reduce(tl(ids), client, fn assignment_id, acc ->
+      row = rest_item!(ctx, "/api/assignments/#{assignment_id}")
+      apply_upsert(acc, {"assignments", assignment_id}, row)
+    end)
+  end
+
+  defp continue_walk(ctx, resource, %{path: path, page: page}, client) do
+    cursor = page_cursor(page)
+    continue_pages(ctx, resource, path, cursor, client)
+  end
+
+  defp continue_pages(_ctx, _resource, _path, nil, client), do: client
+
+  defp continue_pages(ctx, resource, path, cursor, client) do
+    {rows, page} = fetch_page!(ctx, path, cursor)
+    client = apply_rows(client, resource_name(resource), rows)
+
+    if page_more?(page),
+      do: continue_pages(ctx, resource, path, page_cursor(page), client),
+      else: client
+  end
+
+  defp fetch_page!(ctx, path, nil) do
+    response = rest_get(ctx, path <> "?limit=1&tail=false")
+    assert response.status == 200, response.resp_body
+    body = JSON.decode!(response.resp_body)
+    {body["items"], body["page"]}
+  end
+
+  defp fetch_page!(ctx, path, cursor) do
+    response = rest_get(ctx, path <> "?limit=1&after=#{cursor}")
+    assert response.status == 200, response.resp_body
+    body = JSON.decode!(response.resp_body)
+    {body["items"], body["page"]}
+  end
+
+  defp walk_model(ctx, :assignments) do
+    [ctx.assignment.id, ctx.page_assignment.id, ctx.other_assignment.id]
+    |> Enum.flat_map(fn assignment_id ->
+      response = rest_get(ctx, "/api/assignments/#{assignment_id}")
+
+      case response.status do
+        200 -> [JSON.decode!(response.resp_body)["item"]]
+        404 -> []
+        status -> flunk("assignment detail walk returned #{status}: #{response.resp_body}")
+      end
+    end)
+    |> model_from_rows("assignments")
+  end
+
+  defp walk_model(ctx, resource) do
+    walk_paths(ctx, resource)
+    |> Enum.flat_map(&walk_path(ctx, resource, &1))
+    |> model_from_rows(resource_name(resource))
+  end
+
+  defp walk_paths(_ctx, :work_items), do: ["/api/work-items"]
+  defp walk_paths(_ctx, :attests), do: ["/api/attests"]
+  defp walk_paths(_ctx, :artifacts), do: ["/api/artifacts"]
+  defp walk_paths(_ctx, :sessions), do: ["/api/sessions"]
+
+  defp walk_paths(ctx, resource) when resource in [:turns, :wakes] do
+    sessions =
+      if ctx.admin_walk?,
+        do: [ctx.session.session_key, ctx.page_session.session_key, ctx.other_session.session_key],
+        else: [ctx.session.session_key, ctx.page_session.session_key]
+
+    Enum.map(sessions, &page_path(ctx, resource, &1))
+  end
+
+  defp walk_path(ctx, resource, path) do
+    case rest_get(ctx, path <> "?limit=1&tail=false") do
+      %{status: 200} ->
+        walk_pages(ctx, resource, path, nil)
+
+      %{status: 404} when resource in [:turns, :wakes] ->
+        []
+
+      response ->
+        flunk("#{resource} REST walk returned #{response.status}: #{response.resp_body}")
+    end
+  end
+
+  defp walk_pages(ctx, resource, path, cursor) do
+    {rows, page} = fetch_page!(ctx, path, cursor)
+
+    if page_more?(page) do
+      rows ++ walk_pages(ctx, resource, path, page_cursor(page))
+    else
+      rows
+    end
+  end
+
+  defp page_path(_ctx, :work_items), do: "/api/work-items"
+  defp page_path(_ctx, :attests), do: "/api/attests"
+  defp page_path(_ctx, :artifacts), do: "/api/artifacts"
+  defp page_path(_ctx, :sessions), do: "/api/sessions"
+  defp page_path(ctx, :turns), do: page_path(ctx, :turns, ctx.session.session_key)
+  defp page_path(ctx, :wakes), do: page_path(ctx, :wakes, ctx.session.session_key)
+  defp page_path(_ctx, :turns, session_key), do: "/api/sessions/#{session_key}/turns"
+  defp page_path(_ctx, :wakes, session_key), do: "/api/sessions/#{session_key}/wakes"
+
+  defp mutate_resource(ctx, :work_items) do
+    close_call = work_item_disposition_call(ctx, "work-item-close")
+    _closed = WorkItems.__handle__(ctx.db, "work-item-close", close_call)
+    closed =
+      receive_notice_for(
+        Hub,
+        "work_item.updated",
+        "work-items",
+        "id",
+        ctx.lifecycle_work_item.id
+      )
+
+    reopen_call = work_item_disposition_call(ctx, "work-item-reopen")
+    _reopened = WorkItems.__handle__(ctx.db, "work-item-reopen", reopen_call)
+    reopened =
+      receive_notice_for(
+        Hub,
+        "work_item.updated",
+        "work-items",
+        "id",
+        ctx.lifecycle_work_item.id
+      )
+
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-update", %{
+        verb: "work-item-update",
+        origin: "user:#{ctx.owner_user_id}",
+        principal: {:user, ctx.owner_user_id},
+        session_key: nil,
+        firehose_in_txn: true,
+        firehose_hub: Hub,
+        supervision_interval_ms: 1_000,
+        params: %{
+          work_item_id: ctx.work_item.id,
+          title: "Updated during server walk #{System.unique_integer([:positive])}"
+        }
+      })
+
+    updated = receive_notice_for(Hub, "work_item.updated", "work-items", "id", item.id)
+    [closed, reopened, updated]
+  end
+
+  defp mutate_resource(ctx, :assignments) do
+    _closed = complete_assignment(ctx, ctx.assignment.id)
+    closed = receive_notice_for(Hub, "assignment.closed", "assignments", "id", ctx.assignment.id)
+
+    _reopened = reopen_assignment(ctx, ctx.assignment.id)
+
+    reopened =
+      receive_notice_for(Hub, "assignment.reopened", "assignments", "id", ctx.assignment.id)
+
+    [closed, reopened]
+  end
+
+  defp mutate_resource(ctx, :attests) do
+    attest = create_progress_attest(ctx.db, ctx.owner_user_id, ctx.session.session_key, ctx.assignment.id)
+    [receive_notice_for(Hub, "attest.filed", "attests", "id", attest.id)]
+  end
+
+  defp mutate_resource(ctx, :artifacts) do
+    artifact = create_artifact(ctx.db, ctx.session.session_key, ctx.work_item.id, "Artifact during walk")
+
+    [
+      receive_notice_for(
+        Hub,
+        "artifact.recorded",
+        "artifacts",
+        "artifactId",
+        artifact.artifact_id
+      )
+    ]
+  end
+
+  defp mutate_resource(ctx, :turns) do
+    {:ok, seq} =
+      enqueue_turn(
+        ctx.db,
+        ctx.session.session_key,
+        "direct-apply-overlap-turn",
+        ctx.work_item.id,
+        ctx.assignment.id
+      )
+
+    [receive_notice_for(Hub, "turn.queued", "turns", "seq", seq)]
+  end
+
+  defp mutate_resource(ctx, :wakes) do
+    wake =
+      schedule_wake(
+        ctx.db,
+        ctx.session.session_key,
+        "Wake created during server walk",
+        ctx.work_item.id,
+        ctx.assignment.id
+      )
+
+    [receive_notice_for(Hub, "wake.scheduled", "wakes", "wakeId", wake.wake_id)]
+  end
+
+  defp mutate_resource(ctx, :sessions) do
+    previous_name = ctx.session.display_name
+
+    session =
+      Org.rename(
+        ctx.db,
+        ctx.session.session_key,
+        "Renamed during server walk"
+      )
+
+    renamed =
+      receive_notice_for(Hub, "session.updated", "sessions", "sessionKey", session.session_key)
+
+    _restored = Org.rename(ctx.db, session.session_key, previous_name)
+
+    restored =
+      receive_notice_for(Hub, "session.updated", "sessions", "sessionKey", session.session_key)
+
+    [renamed, restored]
+  end
+
+  defp work_item_disposition_call(ctx, verb) do
+    %{
+      verb: verb,
+      origin: "user:#{ctx.owner_user_id}",
+      principal: {:user, ctx.owner_user_id},
+      session_key: nil,
+      firehose_in_txn: true,
+      firehose_hub: Hub,
+      params: %{work_item_id: ctx.lifecycle_work_item.id}
+    }
+  end
+
+  defp complete_assignment(ctx, assignment_id) do
+    Assignments.__handle__(ctx.db, "attest", %{
+      verb: "attest",
+      origin: "agent:direct-apply-owner",
+      principal: {:session, ctx.session.session_key},
+      session_key: nil,
+      firehose_in_txn: true,
+      firehose_hub: Hub,
+      params: %{
+        assignment_id: assignment_id,
+        kind: "completion",
+        note: "Complete during server-backed convergence"
+      }
+    })
+  end
+
+  defp reopen_assignment(ctx, assignment_id) do
+    Assignments.__handle__(ctx.db, "reopen-assignment", %{
+      verb: "reopen-assignment",
+      origin: "agent:direct-apply-owner",
+      principal: {:session, ctx.session.session_key},
+      session_key: nil,
+      firehose_in_txn: true,
+      firehose_hub: Hub,
+      params: %{assignment_id: assignment_id, reason: "Continue server-backed convergence"}
+    })
+  end
+
+  defp assert_visibility_converges(ctx, :assignments, client) do
+    _ = promote_owner(ctx, true)
+    register_visibility(ctx, true)
+    visible = walk_model(%{ctx | admin_walk?: true}, :assignments)
+    assert map_size(visible) > map_size(client)
+    _ = promote_owner(ctx, false)
+    register_visibility(ctx, false)
+    restored = walk_model(%{ctx | admin_walk?: false}, :assignments)
+    assert restored == client
+  end
+
+  defp assert_visibility_converges(ctx, resource, baseline) do
+    path = page_path(ctx, resource)
+    {rows, page} = fetch_page!(ctx, path, nil)
+    partial = model_from_rows(resource_name(resource), rows)
+    cursor = page_cursor(page)
+
+    _ = promote_owner(ctx, true)
+    register_visibility(ctx, true)
+
+    if cursor do
+      response = rest_get(ctx, path <> "?limit=1&after=#{cursor}")
+      assert response.status == 400
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "invalid_cursor"
+    end
+
+    visible = walk_model(%{ctx | admin_walk?: true}, resource)
+    assert map_size(visible) > map_size(partial),
+           "#{resource} did not gain rows when the principal became an administrator"
+
+    _ = promote_owner(ctx, false)
+    register_visibility(ctx, false)
+    restored = walk_model(%{ctx | admin_walk?: false}, resource)
+    assert restored == baseline
+    refute MapSet.new(Map.keys(visible)) == MapSet.new(Map.keys(restored)),
+           "#{resource} visibility did not shrink between complete walks"
+  end
+
+  defp promote_owner(ctx, is_admin) do
+    Devices.promote_user_with_firehose(ctx.db, ctx.owner_user_id, is_admin, %{
+      verb: "promote-user",
+      origin: "user:admin",
+      principal: {:user, "admin"},
+      session_key: nil,
+      params: %{user_id: ctx.owner_user_id, is_admin: is_admin},
+      firehose_in_txn: true,
+      firehose_hub: Hub
+    })
+  end
+
+  defp register_visibility(ctx, is_admin) do
+    :ok =
+      Hub.register(Hub, self(), %{
+        mode: :all,
+        db: ctx.db,
+        user_id: ctx.owner_user_id,
+        is_admin: is_admin
+      })
+  end
+
+  defp restart_server(ctx) do
+    _ = Hub.unregister(Hub, self())
+    :ok = stop_supervised!(Hub)
+    :ok = stop_supervised!(ctx.db)
+
+    start_supervised!(
+      {DB, path: ctx.db_path, name: ctx.db, guard_inputs: [], payload_root: ctx.payload},
+      id: ctx.db
+    )
+
+    :ok = Schema.ensure_all(ctx.db)
+    start_supervised!({Hub, name: Hub}, id: Hub)
+    register_visibility(ctx, false)
+  end
+
+  defp receive_notice_for(server, class, resource, key_field, key) do
+    assert_receive {:firehose_notice, notice}
+    Hub.delivered(server, self())
+
+    if notice["class"] == class and notice["resource"] == resource and
+         notice["payload"][key_field] == key do
+      notice
+    else
+      receive_notice_for(server, class, resource, key_field, key)
+    end
+  end
+
+  defp rest_item!(ctx, path) do
+    response = rest_get(ctx, path)
+    assert response.status == 200, response.resp_body
+    JSON.decode!(response.resp_body)["item"]
+  end
+
+  defp model_from_rows(resource, rows) do
+    Enum.reduce(rows, %{}, fn row, client ->
+      apply_upsert(client, {resource, row_key(resource, row)}, row)
+    end)
+  end
+
+  defp apply_rows(client, resource, rows) do
+    Enum.reduce(rows, client, fn row, acc ->
+      apply_upsert(acc, {resource, row_key(resource, row)}, row)
+    end)
+  end
+
+  defp apply_notice(notice, client) do
+    row = notice["payload"]
+    resource = notice["resource"]
+    apply_upsert(client, {resource, row_key(resource, row)}, row)
+  end
+
+  defp row_key("work-items", row), do: row["id"]
+  defp row_key("assignments", row), do: row["id"]
+  defp row_key("attests", row), do: row["id"]
+  defp row_key("artifacts", row), do: row["artifactId"]
+  defp row_key("turns", row), do: row["seq"]
+  defp row_key("wakes", row), do: row["wakeId"]
+  defp row_key("sessions", row), do: row["sessionKey"]
+
+  defp resource_name(:work_items), do: "work-items"
+  defp resource_name(:assignments), do: "assignments"
+  defp resource_name(:attests), do: "attests"
+  defp resource_name(:artifacts), do: "artifacts"
+  defp resource_name(:turns), do: "turns"
+  defp resource_name(:wakes), do: "wakes"
+  defp resource_name(:sessions), do: "sessions"
+
+  defp page_more?(page),
+    do: Map.get(page, "after", Map.get(page, "hasMoreAfter", false))
+
+  defp page_cursor(page), do: Map.get(page, "newest") || Map.get(page, "newestCursor")
 end
