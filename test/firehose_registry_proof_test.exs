@@ -811,8 +811,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     assignments = [
       {"fixture-session-opened-assignment", "session", "fixture-session-opener",
        "fixture-session-completion"},
-      {"fixture-user-opened-assignment", "user", "fixture-user-opener",
-       "fixture-user-completion"}
+      {"fixture-user-opened-assignment", "user", "fixture-user-opener", "fixture-user-completion"}
     ]
 
     for {assignment_id, opener_kind, opener_id, completion_id} <- assignments do
@@ -871,6 +870,14 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
     on_exit(fn -> Enum.each(listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end) end)
 
+    :ok =
+      Hub.register(ctx.hub, self(), %{
+        mode: :all,
+        db: ctx.db,
+        user_id: "fixture-holder-owner",
+        is_admin: false
+      })
+
     assert {:ok, :ok} =
              DB.transaction(ctx.db, fn txn ->
                for {assignment_id, opener_kind, opener_id, _completion_id} <- assignments do
@@ -898,7 +905,12 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
                             "INSERT INTO attests " <>
                               "(id,assignmentId,kind,verdictKind,note,bySession,byUser,ts) " <>
                               "VALUES (?1,?2,'verdict','verified','Verified completion',?3,?4,3)",
-                            ["fixture-verified-#{assignment_id}", assignment_id, by_session, by_user]
+                            [
+                              "fixture-verified-#{assignment_id}",
+                              assignment_id,
+                              by_session,
+                              by_user
+                            ]
                           )
 
                  assert [] ==
