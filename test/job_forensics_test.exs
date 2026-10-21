@@ -1113,7 +1113,6 @@ defmodule Tightbeam.JobForensicsTest do
         session_key: "agent-session",
         params: %{
           prompt: "an ordinary conversational wake",
-          after_ms: 0,
           nudge: false,
           assignment_id: "asg_victim"
         }
