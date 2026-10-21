@@ -339,14 +339,22 @@ defmodule Tightbeam.HarnessHealth do
       "auth-dead" ->
         claude = Tightbeam.Harness.Claude.id()
 
-        if session.harness in [Atom.to_string(claude), claude] and
-             claude_subscription_owner?(session.host) do
-          fn ->
-            Tightbeam.Credentials.observe_auth(
-              :unfenced_401,
-              %{stage: failed_stage, classification: "unfenced-401"},
-              Tightbeam.Credentials.server(session.host)
-            )
+        if session.harness in [Atom.to_string(claude), claude] do
+          case claude_credential_kind(session.host) do
+            {:ok, :subscription} ->
+              fn ->
+                Tightbeam.Credentials.observe_auth(
+                  :unfenced_401,
+                  %{stage: failed_stage, classification: "unfenced-401"},
+                  Tightbeam.Credentials.server(session.host)
+                )
+              end
+
+            {:ok, _other_kind} ->
+              observe_turn_failure_class(txn, session, turn, failed_stage, reason, "auth-dead")
+
+            :owner_unavailable ->
+              nil
           end
         else
           observe_turn_failure_class(txn, session, turn, failed_stage, reason, "auth-dead")
@@ -357,10 +365,10 @@ defmodule Tightbeam.HarnessHealth do
     end
   end
 
-  defp claude_subscription_owner?(host) do
-    Tightbeam.Credentials.kind(:anthropic, Tightbeam.Credentials.server(host)) == :subscription
+  defp claude_credential_kind(host) do
+    {:ok, Tightbeam.Credentials.kind(:anthropic, Tightbeam.Credentials.server(host))}
   catch
-    :exit, _reason -> false
+    :exit, _reason -> :owner_unavailable
   end
 
   defp observe_turn_failure_class(txn, session, turn, failed_stage, reason, failure_class) do

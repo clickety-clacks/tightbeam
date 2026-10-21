@@ -1,7 +1,7 @@
 defmodule Tightbeam.LaneTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Ledger, EventLog, LaneManager, Placement, Schema, SessionLane}
+  alias Tightbeam.{ClaudeAuth, DB, Ledger, EventLog, LaneManager, Placement, Schema, SessionLane}
 
   setup do
     db = :"db_#{System.unique_integer([:positive])}"
@@ -128,6 +128,41 @@ defmodule Tightbeam.LaneTest do
     # init runs one reconcile pass; the committed turn must be picked up
     assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
     assert Agent.get(agent, & &1) == ["orphaned-commit"]
+  end
+
+  test "Claude admission hold delays claim and stamps the released credential instance", ctx do
+    parent = self()
+    attempt = ClaudeAuth.trigger(ctx.db, "testhost", "local-none")
+    seq = enqueue!(ctx.db, "k1", "held")
+
+    {:ok, _mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: fn turn ->
+          send(parent, {:ran, turn.seq, turn.credential_instance})
+          {:ok, %{text: "done"}}
+        end,
+        interval: 60_000,
+        name: :claude_auth_hold_lane_manager
+      )
+
+    Process.sleep(25)
+    refute_receive {:ran, ^seq, _instance}, 50
+
+    assert {:ok, [["queued"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+    assert :ok = ClaudeAuth.finish(ctx.db, attempt.attempt_id, :unknown, "synthetic-release")
+    assert :ok = SessionLane.nudge("k1")
+    assert_receive {:ran, ^seq, instance}
+    assert instance == attempt.instance_id
+
+    assert eventually(fn ->
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq]) ==
+               {:ok, [["delivered"]]}
+           end)
   end
 
   test "a crashing runner marks the turn failed and the lane drains on", ctx do

@@ -208,6 +208,9 @@ defmodule Tightbeam.AdapterCoordinator do
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
+      auth_fenced?(state, key) ->
+        {:reply, {:error, {:auth_fenced, key_name(key)}}, state}
+
       live_entry?(entry) and entry.circuit == :closed ->
         {:reply, checkout(entry), state}
 

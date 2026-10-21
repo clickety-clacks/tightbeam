@@ -362,7 +362,7 @@ defmodule Tightbeam.Credentials do
          end),
        confirmation_fence_live:
          Keyword.get(opts, :confirmation_fence_live, fn _provider -> false end),
-       confirmation_tasks: Map.new(recovered_attempts, &{&1.attempt_id, &1.instance_id})
+       confirmation_tasks: Map.new(recovered_attempts, &{&1.attempt_id, %{attempt: &1}})
      }}
   end
 
@@ -384,7 +384,7 @@ defmodule Tightbeam.Credentials do
       state =
         if attempt.started? do
           send(self(), {:run_confirmation, attempt})
-          put_in(state.confirmation_tasks[attempt.attempt_id], attempt.instance_id)
+          put_in(state.confirmation_tasks[attempt.attempt_id], %{attempt: attempt})
         else
           state
         end
@@ -578,47 +578,99 @@ defmodule Tightbeam.Credentials do
 
   @impl true
   def handle_info({:run_confirmation, attempt}, state) do
-    owner = self()
+    case state.confirmation_tasks[attempt.attempt_id] do
+      %{pid: pid} when is_pid(pid) ->
+        {:noreply, state}
 
-    {:ok, _pid} =
-      Task.start(fn ->
-        result = run_confirmation(state, attempt)
-        send(owner, {:confirmation_finished, attempt, result})
-      end)
+      nil ->
+        {:noreply, state}
 
-    {:noreply, state}
+      task ->
+        owner = self()
+
+        {pid, monitor} =
+          spawn_monitor(fn ->
+            result = run_confirmation(state, attempt)
+            send(owner, {:confirmation_finished, attempt, result})
+          end)
+
+        timer =
+          Process.send_after(
+            self(),
+            {:confirmation_deadline, attempt.attempt_id},
+            max(attempt.deadline_at - System.system_time(:millisecond), 0)
+          )
+
+        task = Map.merge(task, %{pid: pid, monitor: monitor, timer: timer})
+        {:noreply, put_in(state.confirmation_tasks[attempt.attempt_id], task)}
+    end
   end
 
   def handle_info({:confirmation_finished, attempt, {:terminal, epoch}}, state) do
-    state = update_in(state.confirmation_tasks, &Map.delete(&1, attempt.attempt_id))
-    fence_live = state.confirmation_fence_live.(:anthropic)
+    if Map.has_key?(state.confirmation_tasks, attempt.attempt_id) do
+      state = finish_confirmation_task(state, attempt.attempt_id)
+      fence_live = state.confirmation_fence_live.(:anthropic)
 
-    case ClaudeAuth.accept_terminal(
-           state.db,
-           attempt.attempt_id,
-           attempt.instance_id,
-           epoch,
-           fence_live
-         ) do
-      decision when is_binary(decision) ->
-        begin_confirmed_terminal(state, decision)
+      case ClaudeAuth.accept_terminal(
+             state.db,
+             attempt.attempt_id,
+             attempt.instance_id,
+             epoch,
+             fence_live
+           ) do
+        decision when is_binary(decision) ->
+          begin_confirmed_terminal(state, decision)
 
-      _stale ->
-        ClaudeAuth.finish(state.db, attempt.attempt_id, :stale, "lost-live-fence")
-        {:noreply, resume_credential_calls(:anthropic, state)}
+        _stale ->
+          ClaudeAuth.finish(state.db, attempt.attempt_id, :stale, "lost-live-fence")
+          {:noreply, resume_credential_calls(:anthropic, state)}
+      end
+    else
+      {:noreply, state}
     end
   end
 
   def handle_info({:confirmation_finished, attempt, result}, state) do
-    state = update_in(state.confirmation_tasks, &Map.delete(&1, attempt.attempt_id))
+    if Map.has_key?(state.confirmation_tasks, attempt.attempt_id) do
+      state = finish_confirmation_task(state, attempt.attempt_id)
 
-    case result do
-      :success -> write_auth_health(state, "service_observed", nil)
-      :unknown -> write_auth_health(state, "unconfirmed", nil)
-      _other -> :ok
+      case result do
+        :success -> write_auth_health(state, "service_observed", nil)
+        :unknown -> write_auth_health(state, "unconfirmed", nil)
+        _other -> :ok
+      end
+
+      {:noreply, resume_credential_calls(:anthropic, state)}
+    else
+      {:noreply, state}
     end
+  end
 
-    {:noreply, resume_credential_calls(:anthropic, state)}
+  def handle_info({:confirmation_deadline, attempt_id}, state) do
+    case state.confirmation_tasks[attempt_id] do
+      nil ->
+        {:noreply, state}
+
+      task ->
+        if is_pid(task[:pid]), do: Process.exit(task.pid, :kill)
+        ClaudeAuth.finish(state.db, attempt_id, :unknown, "confirmation-deadline")
+        write_auth_health(state, "unconfirmed", nil)
+        state = finish_confirmation_task(state, attempt_id)
+        {:noreply, resume_credential_calls(:anthropic, state)}
+    end
+  end
+
+  def handle_info({:DOWN, monitor, :process, _pid, reason}, state) do
+    case Enum.find(state.confirmation_tasks, fn {_attempt, task} -> task[:monitor] == monitor end) do
+      nil ->
+        {:noreply, state}
+
+      {attempt_id, _task} ->
+        ClaudeAuth.finish(state.db, attempt_id, :unknown, {:confirmation_task_exit, reason})
+        write_auth_health(state, "unconfirmed", nil)
+        state = finish_confirmation_task(state, attempt_id)
+        {:noreply, resume_credential_calls(:anthropic, state)}
+    end
   end
 
   def handle_info({:recover_terminal, decision}, state) do
@@ -1228,6 +1280,14 @@ defmodule Tightbeam.Credentials do
   end
 
   defp begin_confirmed_terminal(state, decision) do
+    if not ClaudeAuth.current_decision?(state.db, decision) do
+      {:noreply, resume_credential_calls(:anthropic, state)}
+    else
+      project_confirmed_terminal(state, decision)
+    end
+  end
+
+  defp project_confirmed_terminal(state, decision) do
     HarnessHealth.observe(state.db, %{
       correlation_id: "provider-auth-decision:#{decision}",
       harness: "claude",
@@ -1282,6 +1342,18 @@ defmodule Tightbeam.Credentials do
     error ->
       ClaudeAuth.fail_decision(state.db, decision, Exception.message(error))
       {:noreply, state}
+  end
+
+  defp finish_confirmation_task(state, attempt_id) do
+    case Map.pop(state.confirmation_tasks, attempt_id) do
+      {nil, tasks} ->
+        %{state | confirmation_tasks: tasks}
+
+      {task, tasks} ->
+        if is_reference(task[:timer]), do: Process.cancel_timer(task.timer)
+        if is_reference(task[:monitor]), do: Process.demonitor(task.monitor, [:flush])
+        %{state | confirmation_tasks: tasks}
+    end
   end
 
   defp write_auth_health(state, health, attempt) do

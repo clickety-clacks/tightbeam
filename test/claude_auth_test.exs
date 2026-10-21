@@ -17,7 +17,7 @@ defmodule Tightbeam.ClaudeAuthTest do
 
   setup do
     db = :"claude_auth_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: ":memory:", name: db})
+    start_supervised!(%{id: db, start: {DB, :start_link, [[path: ":memory:", name: db]]}})
     :ok = ClaudeAuth.ensure_schema(db)
     %{db: db, host: "gibson"}
   end
@@ -25,7 +25,7 @@ defmodule Tightbeam.ClaudeAuthTest do
   test "T1 fresh-none-live", c do
     a = ClaudeAuth.trigger(c.db, c.host, "local-none", 1)
     assert a.started?
-    assert ClaudeAuth.admission(c.db, c.host) == :held
+    assert ClaudeAuth.admission(c.db, c.host, 1) == :held
     assert {:ok, epoch} = ClaudeAuth.fence_acquired(c.db, a.attempt_id, a.instance_id)
     assert is_binary(epoch)
     assert :ok = ClaudeAuth.finish(c.db, a.attempt_id, :success, "http-2xx", 2)
@@ -166,9 +166,11 @@ defmodule Tightbeam.ClaudeAuthTest do
   end
 
   test "T14 replacement-recovery", c do
-    {_a, _epoch, _decision} = terminal_attempt(c)
+    {_a, _epoch, decision} = terminal_attempt(c)
     replacement = ClaudeAuth.activate(c.db, c.host, 10)
     assert ClaudeAuth.admission(c.db, c.host) == {:eligible, replacement}
+    refute ClaudeAuth.current_decision?(c.db, decision)
+    assert ClaudeAuth.pending_decisions(c.db, c.host) == []
 
     assert q(c.db, "SELECT state,resolution FROM claude_auth_incidents ORDER BY class") == [
              ["resolved", "credential-replaced"],
@@ -201,7 +203,7 @@ defmodule Tightbeam.ClaudeAuthTest do
 
   test "T17 direct-unfenced-401", c do
     a = ClaudeAuth.trigger(c.db, c.host, "unfenced-401", 1)
-    assert ClaudeAuth.admission(c.db, c.host) == :held
+    assert ClaudeAuth.admission(c.db, c.host, 1) == :held
     assert q(c.db, "SELECT COUNT(*) FROM claude_auth_decisions") == [[0]]
 
     assert q(c.db, "SELECT source,resultClass FROM claude_auth_observations") == [
@@ -242,11 +244,21 @@ defmodule Tightbeam.ClaudeAuthTest do
     assert {:ok, _epoch} = ClaudeAuth.fence_acquired(c.db, a.attempt_id, a.instance_id)
     assert [fresh] = ClaudeAuth.interrupted_attempts(c.db, c.host, 2)
     refute fresh == a.attempt_id
-    assert ClaudeAuth.admission(c.db, c.host) == :held
+    assert ClaudeAuth.admission(c.db, c.host, 2) == :held
 
     assert q(c.db, "SELECT state,resultClass FROM claude_auth_attempts ORDER BY triggerAt,id")
            |> List.flatten()
            |> Enum.member?("interrupted")
+  end
+
+  test "an admission hold expires from its durable deadline even if its worker vanished", c do
+    attempt = ClaudeAuth.trigger(c.db, c.host, "local-none", 1)
+    assert ClaudeAuth.admission(c.db, c.host, 10_000) == :held
+    assert ClaudeAuth.admission(c.db, c.host, 10_001) == {:eligible, attempt.instance_id}
+
+    assert q(c.db, "SELECT state,resultClass,reason FROM claude_auth_attempts") == [
+             ["unknown", "unknown", "confirmation-deadline"]
+           ]
   end
 
   test "T22 crash-after-uncommitted-401", c do
@@ -313,9 +325,13 @@ defmodule Tightbeam.ClaudeAuthTest do
       )
 
     assert :ok = Tightbeam.Credentials.observe_auth(:local_none, %{}, credentials)
-    assert_receive :fence_acquired
-    assert_receive {:provider_request, epoch}
-    assert_receive {:park, decision, [{:claude, "shared", "owner-host"}]}
+    assert_receive first
+    assert_receive second
+    assert_receive third
+
+    assert first == :fence_acquired
+    assert {:provider_request, epoch} = second
+    assert {:park, decision, [{:claude, "shared", "owner-host"}]} = third
     assert is_binary(epoch)
     assert is_binary(decision)
 
@@ -333,6 +349,167 @@ defmodule Tightbeam.ClaudeAuthTest do
     assert metadata["terminal"]
     assert metadata["last_health"] == "revoked"
     refute metadata["park_pending"]
+    refute_receive {:park, ^decision, _keys}, 50
+  end
+
+  test "credential owner restart resumes a current terminal decision exactly once" do
+    db = :"claude_auth_restart_#{System.unique_integer([:positive, :monotonic])}"
+    start_supervised!(%{id: db, start: {DB, :start_link, [[path: ":memory:", name: db]]}})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    host = "restart-host"
+    {_attempt, _epoch, decision} = terminal_attempt(%{db: db, host: host})
+    base = credential_base("restart-current")
+    owner = self()
+    {:ok, park} = ParkReceiver.start_link(owner)
+
+    {:ok, credentials} =
+      Tightbeam.Credentials.start_link(
+        name: nil,
+        db: db,
+        base_dir: base,
+        machine: host,
+        park_edge: Tightbeam.CommandEdge.request_to(park),
+        park_targets: %{anthropic: [{:claude, "shared", host}]}
+      )
+
+    assert_receive {:park, ^decision, [{:claude, "shared", ^host}]}
+
+    eventually(fn ->
+      assert q(db, "SELECT projectionState FROM claude_auth_decisions WHERE id='#{decision}'") ==
+               [
+                 ["complete"]
+               ]
+    end)
+
+    assert Process.alive?(credentials)
+    refute_receive {:park, ^decision, _keys}, 50
+  end
+
+  test "restart and direct recovery ignore a superseded instance decision" do
+    db = :"claude_auth_stale_restart_#{System.unique_integer([:positive, :monotonic])}"
+    start_supervised!(%{id: db, start: {DB, :start_link, [[path: ":memory:", name: db]]}})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    host = "replacement-host"
+    {_attempt, _epoch, decision} = terminal_attempt(%{db: db, host: host})
+    replacement = ClaudeAuth.activate(db, host, 10)
+    base = credential_base("restart-stale")
+    owner = self()
+    {:ok, park} = ParkReceiver.start_link(owner)
+
+    {:ok, credentials} =
+      Tightbeam.Credentials.start_link(
+        name: nil,
+        db: db,
+        base_dir: base,
+        machine: host,
+        park_edge: Tightbeam.CommandEdge.request_to(park),
+        park_targets: %{anthropic: [{:claude, "shared", host}]}
+      )
+
+    send(credentials, {:recover_terminal, decision})
+    refute_receive {:park, ^decision, _keys}, 100
+    assert ClaudeAuth.admission(db, host) == {:eligible, replacement}
+
+    assert {:ok, metadata} =
+             base
+             |> Path.join("auth/claude/.tightbeam/credential.json")
+             |> File.read!()
+             |> JSON.decode()
+
+    refute metadata["terminal"]
+    refute metadata["park_pending"]
+  end
+
+  test "a crashed confirmation worker releases deferred onboarding as unknown" do
+    db = :"claude_auth_crash_#{System.unique_integer([:positive, :monotonic])}"
+    start_supervised!(%{id: db, start: {DB, :start_link, [[path: ":memory:", name: db]]}})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    base = credential_base("worker-crash")
+    owner = self()
+
+    {:ok, credentials} =
+      Tightbeam.Credentials.start_link(
+        name: nil,
+        db: db,
+        base_dir: base,
+        staging_base_dir: base,
+        machine: "crash-host",
+        acquire_confirmation_fence: fn :anthropic, _attempt, _timeout ->
+          send(owner, {:confirmation_worker, self()})
+
+          receive do
+            :crash -> :invalid_fence_result
+          end
+        end
+      )
+
+    assert :ok = Tightbeam.Credentials.observe_auth(:local_none, %{}, credentials)
+    assert_receive {:confirmation_worker, worker}
+
+    onboarding =
+      Task.async(fn -> Tightbeam.Credentials.begin_onboard(:anthropic, credentials) end)
+
+    assert Task.yield(onboarding, 20) == nil
+    send(worker, :crash)
+
+    assert {:ok, staging, lease} = Task.await(onboarding, 1_000)
+    assert is_binary(staging)
+    assert is_binary(lease)
+
+    assert q(db, "SELECT state,resultClass FROM claude_auth_attempts") == [
+             ["unknown", "unknown"]
+           ]
+
+    assert match?({:eligible, _}, ClaudeAuth.admission(db, "crash-host"))
+  end
+
+  test "secret sentinel is absent from owner logs, durable rows, and metadata" do
+    import ExUnit.CaptureLog
+
+    db = :"claude_auth_sentinel_#{System.unique_integer([:positive, :monotonic])}"
+    start_supervised!(%{id: db, start: {DB, :start_link, [[path: ":memory:", name: db]]}})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    base = credential_base("sentinel")
+    sentinel = "SECRET-SENTINEL-NEVER-PERSIST"
+
+    {:ok, credentials} =
+      Tightbeam.Credentials.start_link(
+        name: nil,
+        db: db,
+        base_dir: base,
+        machine: "sentinel-host",
+        acquire_confirmation_fence: fn :anthropic, _attempt, _timeout -> {:ok, :fence} end,
+        confirm_subscription: fn :anthropic, _epoch, :fence, _timeout ->
+          {:unknown, %{credential: sentinel}}
+        end
+      )
+
+    log =
+      capture_log(fn ->
+        assert :ok =
+                 Tightbeam.Credentials.observe_auth(
+                   :unfenced_401,
+                   %{credential: sentinel, authStatus: %{kind: "none"}},
+                   credentials
+                 )
+
+        eventually(fn ->
+          assert [["unknown"]] = q(db, "SELECT state FROM claude_auth_attempts")
+        end)
+      end)
+
+    refute log =~ sentinel
+
+    for table <-
+          ~w(claude_auth_instances claude_auth_attempts claude_auth_observations claude_auth_incidents claude_auth_decisions claude_auth_parks) do
+      {:ok, rows} = DB.query(db, "SELECT * FROM #{table}")
+      refute inspect(rows) =~ sentinel
+    end
+
+    refute base
+           |> Path.join("auth/claude/.tightbeam/credential.json")
+           |> File.read!()
+           |> String.contains?(sentinel)
   end
 
   test "credential metadata stays visibly unconfirmed until confirmation succeeds" do
@@ -421,6 +598,27 @@ defmodule Tightbeam.ClaudeAuthTest do
   defp q(db, sql) do
     {:ok, rows} = DB.query(db, sql)
     rows
+  end
+
+  defp credential_base(label) do
+    base = Path.join(System.tmp_dir!(), "tb-claude-auth-#{label}-#{System.unique_integer()}")
+    metadata = Path.join([base, "auth", "claude", ".tightbeam", "credential.json"])
+    File.mkdir_p!(Path.dirname(metadata))
+    File.write!(Path.join([base, "auth", "claude", ".credentials.json"]), "synthetic\n")
+
+    File.write!(
+      metadata,
+      JSON.encode!(%{
+        "provider" => "anthropic",
+        "kind" => "subscription",
+        "onboarded" => true,
+        "terminal" => false,
+        "last_health" => "onboarded"
+      })
+    )
+
+    ExUnit.Callbacks.on_exit(fn -> File.rm_rf!(base) end)
+    base
   end
 
   defp eventually(fun, attempts \\ 50)

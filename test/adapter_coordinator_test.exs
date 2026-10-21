@@ -228,6 +228,52 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :subscription)
   end
 
+  test "Claude confirmation hold stops the managed adapter and refuses restart", ctx do
+    path = Path.join(ctx.test_dir, "auth_fence_fake.js")
+    File.write!(path, @fake)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [credential_kind: :subscription] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         name: :"auth_fence_coord_#{System.unique_integer([:positive])}"}
+      )
+
+    key = {:claude, "shared", "auth-fence-host"}
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert wait_until(fn -> AdapterCoordinator.ready?(coordinator, key) end)
+    monitor = Process.monitor(adapter)
+    attempt = Tightbeam.ClaudeAuth.trigger(ctx.db, "auth-fence-host", "local-none")
+
+    assert {:error, {:auth_fenced, "claude:shared@auth-fence-host"}} =
+             AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert :ok = AdapterCoordinator.stop_for_auth_fence(coordinator, key, attempt.attempt_id)
+    assert_receive {:DOWN, ^monitor, :process, ^adapter, :normal}, 2_000
+    refute AdapterCoordinator.ready?(coordinator, key)
+
+    assert {:error, {:auth_fenced, "claude:shared@auth-fence-host"}} =
+             AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert [event] =
+             ctx.db
+             |> EventLog.lifecycle_events()
+             |> Enum.filter(&(&1.kind == "claude_auth_fence_stop"))
+
+    assert event.detail =~ attempt.attempt_id
+    assert event.detail =~ "diagnostic=true"
+  end
+
   test "adapter boot context is captured in the coordinator before lazy adapter opts", ctx do
     owner = self()
 

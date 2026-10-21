@@ -365,15 +365,43 @@ defmodule Tightbeam.ClaudeAuth do
   end
 
   @doc "Admissions wait during a bounded attempt and fail after a terminal decision."
-  def admission(db \\ DB, host) do
+  def admission(db \\ DB, host, at \\ now()) do
     :ok = ensure_schema(db)
 
     {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT i.id, EXISTS(SELECT 1 FROM claude_auth_decisions d WHERE d.instanceId=i.id), EXISTS(SELECT 1 FROM claude_auth_attempts a WHERE a.instanceId=i.id AND a.state IN ('pending_fence','fenced')) FROM claude_auth_instances i WHERE i.host=?1 AND i.provider=?2 AND i.kind=?3 AND i.state='current'",
-        [host, @provider, @kind]
-      )
+      DB.transaction(db, fn txn ->
+        expired =
+          Txn.q(
+            txn,
+            "SELECT a.id,a.instanceId,a.epochId FROM claude_auth_attempts a JOIN claude_auth_instances i ON i.id=a.instanceId WHERE a.host=?1 AND i.state='current' AND a.state IN ('pending_fence','fenced') AND a.deadlineAt<=?2",
+            [host, at]
+          )
+
+        Enum.each(expired, fn [attempt, instance, epoch] ->
+          Txn.q(
+            txn,
+            "UPDATE claude_auth_attempts SET state='unknown',resultClass='unknown',reason='confirmation-deadline',finishedAt=?1 WHERE id=?2 AND state IN ('pending_fence','fenced')",
+            [at, attempt]
+          )
+
+          observe(
+            txn,
+            attempt,
+            instance,
+            at,
+            "confirmation",
+            "unknown",
+            epoch,
+            "confirmation-deadline"
+          )
+        end)
+
+        Txn.q(
+          txn,
+          "SELECT i.id, EXISTS(SELECT 1 FROM claude_auth_decisions d WHERE d.instanceId=i.id), EXISTS(SELECT 1 FROM claude_auth_attempts a WHERE a.instanceId=i.id AND a.state IN ('pending_fence','fenced')) FROM claude_auth_instances i WHERE i.host=?1 AND i.provider=?2 AND i.kind=?3 AND i.state='current'",
+          [host, @provider, @kind]
+        )
+      end)
 
     case rows do
       [] -> :eligible
@@ -411,11 +439,23 @@ defmodule Tightbeam.ClaudeAuth do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT d.id,d.projectionState,d.lastError FROM claude_auth_decisions d JOIN claude_auth_instances i ON i.id=d.instanceId WHERE i.host=?1 AND d.projectionState!='complete' ORDER BY d.decidedAt",
+        "SELECT d.id,d.projectionState,d.lastError FROM claude_auth_decisions d JOIN claude_auth_instances i ON i.id=d.instanceId WHERE i.host=?1 AND i.state='current' AND d.projectionState!='complete' ORDER BY d.decidedAt",
         [host]
       )
 
     Enum.map(rows, fn [id, step, error] -> %{id: id, step: step, error: error} end)
+  end
+
+  @doc "True only while a decision belongs to the current logical credential instance."
+  def current_decision?(db \\ DB, decision_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT 1 FROM claude_auth_decisions d JOIN claude_auth_instances i ON i.id=d.instanceId WHERE d.id=?1 AND i.state='current' AND d.projectionState!='complete' LIMIT 1",
+        [decision_id]
+      )
+
+    rows == [[1]]
   end
 
   defp ensure_instance_in_txn(txn, host, at) do
