@@ -4502,6 +4502,11 @@ defmodule Tightbeam.RulesTest do
   end
 
   defp insert_commit_ref_correction!(ctx, producer_id, evidence_artifact_id, refs) do
+    # Match AssignmentCommitRefCorrections.verify_ref/2: the durable control
+    # retains the verified ref-tip commit in addition to the native subject.
+    verified_refs =
+      Enum.map(refs, fn ref -> Map.put(ref, "verifiedRefCommit", ref["commit"]) end)
+
     {:ok, _} =
       DB.query(
         ctx.db,
@@ -4515,7 +4520,7 @@ defmodule Tightbeam.RulesTest do
         [
           "crc_#{Tightbeam.Id.uuid4()}",
           producer_id,
-          JSON.encode!(refs),
+          JSON.encode!(verified_refs),
           evidence_artifact_id,
           String.duplicate("a", 64)
         ]

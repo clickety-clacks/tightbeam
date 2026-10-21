@@ -2750,7 +2750,7 @@ defmodule Tightbeam.Assignments do
          ) do
       [[encoded]] ->
         with {:ok, decoded} <- JSON.decode(encoded),
-             {:ok, [_ | _] = canonical} <- canonical_native_commit_refs(decoded) do
+             {:ok, [_ | _] = canonical} <- canonical_authoritative_commit_refs(decoded) do
           {:ok, canonical}
         else
           _ -> {:error, :missing_subject_revision}
@@ -4626,6 +4626,43 @@ defmodule Tightbeam.Assignments do
   end
 
   defp canonical_native_commit_refs(_), do: :error
+
+  # The correction control records its successful ref-tip proof alongside the
+  # four fields that identify the producer subject. Keep that proof metadata
+  # admissible on the authoritative row, but never make it part of the subject
+  # compared with a reviewer's exact native commitRef claim.
+  defp canonical_authoritative_commit_refs(refs) when is_list(refs) and refs != [] do
+    refs
+    |> Enum.reduce_while({:ok, []}, fn
+      ref, {:ok, acc} when is_map(ref) ->
+        normalized = normalize_commit_ref(ref)
+        keys = Map.keys(normalized) |> Enum.sort()
+
+        if keys in [
+             ["commit", "ref", "remote", "repo"],
+             ["commit", "ref", "remote", "repo", "verifiedRefCommit"]
+           ] and valid_verified_ref_commit?(normalized) do
+          {:cont, {:ok, [Map.drop(normalized, ["verifiedRefCommit"]) | acc]}}
+        else
+          {:halt, :error}
+        end
+
+      _, _ ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, projected} -> canonical_native_commit_refs(Enum.reverse(projected))
+      :error -> :error
+    end
+  end
+
+  defp canonical_authoritative_commit_refs(_), do: :error
+
+  defp valid_verified_ref_commit?(%{"verifiedRefCommit" => commit})
+       when is_binary(commit) and byte_size(commit) in [40, 64],
+       do: Regex.match?(~r/\A[0-9a-fA-F]+\z/u, commit)
+
+  defp valid_verified_ref_commit?(ref), do: not Map.has_key?(ref, "verifiedRefCommit")
 
   defp applicable_code_completion_in_txn(_txn, _assignment, %{params: %{kind: kind}})
        when kind != "completion",

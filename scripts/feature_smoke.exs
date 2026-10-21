@@ -662,7 +662,10 @@ defmodule FeatureSmoke do
 
       review_report_name = "review-#{u}.md"
       review_report_bytes = review_note <> "\n"
-      review_report_sha = :crypto.hash(:sha256, review_report_bytes) |> Base.encode16(case: :lower)
+
+      review_report_sha =
+        :crypto.hash(:sha256, review_report_bytes) |> Base.encode16(case: :lower)
+
       reviewer_workdir = local_workdir_path(state.base_dir, reviewer_key)
       File.mkdir_p!(reviewer_workdir)
       File.write!(Path.join(reviewer_workdir, review_report_name), review_report_bytes)
@@ -679,9 +682,13 @@ defmodule FeatureSmoke do
 
       correction_id = "crc_smoke_#{u}"
 
+      verified_native_refs =
+        Enum.map(native_refs, fn ref -> Map.put(ref, "verifiedRefCommit", ref["commit"]) end)
+
       # The public correction command intentionally admits only closed historical
       # assignments. This open-card smoke fixture therefore stages its authoritative
-      # subject row directly, then exercises the report/verdict admission over HTTP.
+      # subject row directly in the five-field shape emitted by that command, then
+      # exercises the report/verdict admission over HTTP.
       sqlite(
         state,
         """
@@ -691,7 +698,7 @@ defmodule FeatureSmoke do
         VALUES (
           #{sql_quote(correction_id)},
           #{sql_quote(asg_id)},
-          #{sql_quote(JSON.encode!(native_refs))},
+          #{sql_quote(JSON.encode!(verified_native_refs))},
           'feature smoke review binding fixture',
           #{sql_quote(review_report["artifactId"])},
           'user','mike','historical_canonical_commitref_correction',
