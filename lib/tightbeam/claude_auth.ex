@@ -112,7 +112,7 @@ defmodule Tightbeam.ClaudeAuth do
   end
 
   @doc "Retain a local-none or unfenced-401 trigger and create/join one attempt."
-  def trigger(db \\ DB, host, source, at \\ now())
+  def trigger(db \\ DB, host, source, at \\ now(), diagnostic \\ nil)
       when source in ["local-none", "unfenced-401"] do
     {:ok, result} =
       DB.transaction(db, fn txn ->
@@ -120,7 +120,7 @@ defmodule Tightbeam.ClaudeAuth do
         existing = active_attempt(txn, host, instance)
         attempt = existing || new_attempt(txn, host, instance, at)
         open_incident(txn, instance, "unconfirmed", at, nil)
-        observe(txn, attempt, instance, at, source, "epoch-unproved", nil, source)
+        observe(txn, attempt, instance, at, source, "epoch-unproved", nil, diagnostic || source)
 
         %{
           attempt_id: attempt,

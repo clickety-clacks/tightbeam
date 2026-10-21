@@ -390,6 +390,10 @@ defmodule Tightbeam.ClaudeAuthTest do
     assert metadata["auth_unconfirmed"]
     refute metadata["terminal"]
 
+    assert q(db, "SELECT reason FROM claude_auth_observations") == [
+             ["probe-binding unobserved source=unknown"]
+           ]
+
     send(confirmation, :accept)
 
     eventually(fn ->

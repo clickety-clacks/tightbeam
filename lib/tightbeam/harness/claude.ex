@@ -7,9 +7,12 @@ defmodule Tightbeam.Harness.Claude do
 
   require Logger
 
-  @adapter_version "0.73.0"
+  @adapter_version "0.81.0"
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
+  @auth_status_bundle "auth-status.js"
+  @sdk_version "0.3.280"
+  @bundled_claude_version "2.1.280"
   @warm_timeout_ms 30_000
   @credential_env_vars %{
     subscription: "CLAUDE_CODE_OAUTH_TOKEN",
@@ -123,17 +126,82 @@ defmodule Tightbeam.Harness.Claude do
 
   @adapter_replacements [
     {
-      "                            case \"task_notification\":\n                                // The task settled — no further tool calls can originate\n                                // from it, so its registry entry can be dropped.\n                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;",
-      "                            case \"task_notification\": {\n                                // The task settled — emit the correlated child-termination\n                                // carrier before dropping its parent tool-use bookkeeping.\n                                const record = session.liveBackgroundTasks.get(message.task_id);\n                                if (record?.isSubagent) {\n                                    await sendUpdate({\n                                        sessionId: message.session_id,\n                                        update: {\n                                            sessionUpdate: \"tool_call_update\",\n                                            toolCallId: record.parentToolUseId,\n                                            status: \"completed\",\n                                            _meta: { claudeCode: { subagentTerminated: { taskId: message.task_id, status: \"completed\" } } },\n                                        },\n                                    });\n                                }\n                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;\n                            }"
+      "        const status = fromCliStatus(stdout);\n        if (!status) {\n            this.logger.error(\"claude auth status returned unparseable output\");\n            return undefined;\n        }",
+      "        const binding = {\n            acpVersion: \"0.81.0\",\n            sdkWrapperVersion: \"0.3.280\",\n            nativePackageVersion: \"0.3.280\",\n            bundledClaudeVersion: \"2.1.280\",\n            executableSource: process.env.CLAUDE_CODE_EXECUTABLE ? \"override\" : \"bundled\",\n            binding: \"process-observed\",\n        };\n        let shape;\n        try {\n            const parsed = JSON.parse(stdout);\n            if (parsed && typeof parsed === \"object\" && !Array.isArray(parsed))\n                shape = parsed;\n        }\n        catch {\n            // fromCliStatus owns malformed-output classification below.\n        }\n        const status = fromCliStatus(stdout);\n        if (!status) {\n            const incompletePositiveLogin = shape?.loggedIn === true &&\n                shape?.apiProvider === \"firstParty\" &&\n                !shape?.apiKeySource &&\n                !shape?.subscriptionType;\n            if (incompletePositiveLogin) {\n                this.logger.error(\"[authStatus] incomplete-positive-login \" + JSON.stringify({\n                    source: \"claude-auth-status\",\n                    loggedIn: true,\n                    providerClass: \"firstParty\",\n                    apiKeySourcePresent: false,\n                    subscriptionTypePresent: false,\n                    probeBinding: binding,\n                }));\n                return this.currentAuthStatus;\n            }\n            this.logger.error(\"claude auth status returned unparseable output\");\n            return undefined;\n        }"
     },
     {
-      "                                if (message.patch.status === \"completed\" ||\n                                    message.patch.status === \"failed\" ||\n                                    message.patch.status === \"killed\") {\n                                    session.liveBackgroundTasks.delete(message.task_id);\n                                }",
-      "                                if (message.patch.status === \"completed\" ||\n                                    message.patch.status === \"failed\" ||\n                                    message.patch.status === \"killed\") {\n                                    const record = session.liveBackgroundTasks.get(message.task_id);\n                                    if (record?.isSubagent) {\n                                        await sendUpdate({\n                                            sessionId: message.session_id,\n                                            update: {\n                                                sessionUpdate: \"tool_call_update\",\n                                                toolCallId: record.parentToolUseId,\n                                                status: message.patch.status === \"completed\" ? \"completed\" : \"failed\",\n                                                _meta: { claudeCode: { subagentTerminated: { taskId: message.task_id, status: message.patch.status } } },\n                                            },\n                                        });\n                                    }\n                                    session.liveBackgroundTasks.delete(message.task_id);\n                                }"
+      "        const merged = mergeAuthStatus(this.currentAuthStatus, status);\n        this.setAuthStatus(merged);",
+      "        const merged = mergeAuthStatus(this.currentAuthStatus, status);\n        const observed = {\n            ...merged,\n            _meta: {\n                ...(merged._meta ?? {}),\n                tightbeam: { probeBinding: binding },\n            },\n        };\n        this.setAuthStatus(observed);"
+    }
+  ]
+
+  @auth_status_replacements [
+    {
+      "    return mapAuthFields({\n        apiProvider: status.apiProvider,\n        subscriptionType: status.subscriptionType,\n        apiKeySource: status.apiKeySource,\n        email: status.email,\n        organization: status.orgName,\n    });",
+      "    if (status.loggedIn && status.apiProvider === \"firstParty\" &&\n        !status.apiKeySource && !status.subscriptionType) {\n        return undefined;\n    }\n    return mapAuthFields({\n        apiProvider: status.apiProvider,\n        subscriptionType: status.subscriptionType,\n        apiKeySource: status.apiKeySource,\n        email: status.email,\n        organization: status.orgName,\n    });"
     }
   ]
 
   @doc false
   def adapter_version, do: @adapter_version
+
+  @doc false
+  def probe_binding_provenance(process_observed: true, override_present: override?)
+      when is_boolean(override?) do
+    %{
+      acp_version: @adapter_version,
+      sdk_wrapper_version: @sdk_version,
+      native_package_version: @sdk_version,
+      bundled_claude_version: @bundled_claude_version,
+      executable_source: if(override?, do: "override", else: "bundled"),
+      binding: "process-observed"
+    }
+  end
+
+  def probe_binding_provenance(_unobserved) do
+    %{
+      acp_version: nil,
+      sdk_wrapper_version: nil,
+      native_package_version: nil,
+      bundled_claude_version: nil,
+      executable_source: "unknown",
+      binding: "unobserved"
+    }
+  end
+
+  @doc false
+  def probe_binding_from_event(%{
+        "authStatus" => %{
+          "_meta" => %{
+            "tightbeam" => %{
+              "probeBinding" => %{
+                "binding" => "process-observed",
+                "executableSource" => source
+              }
+            }
+          }
+        }
+      })
+      when source in ["bundled", "override"] do
+    probe_binding_provenance(process_observed: true, override_present: source == "override")
+  end
+
+  def probe_binding_from_event(_event), do: probe_binding_provenance(:unobserved)
+
+  @doc false
+  def probe_binding_diagnostic(event) do
+    provenance = probe_binding_from_event(event)
+
+    case provenance.binding do
+      "process-observed" ->
+        "probe-binding observed source=#{provenance.executable_source} " <>
+          "acp=#{provenance.acp_version} sdk=#{provenance.sdk_wrapper_version} " <>
+          "native=#{provenance.native_package_version} claude=#{provenance.bundled_claude_version}"
+
+      "unobserved" ->
+        "probe-binding unobserved source=unknown"
+    end
+  end
 
   @impl true
   def id, do: :claude
@@ -765,6 +833,9 @@ defmodule Tightbeam.Harness.Claude do
       adapter_bin: "claude-agent-acp",
       adapter_package: @adapter_package,
       adapter_bundle: @adapter_bundle,
+      adapter_aux_bundles: %{
+        @auth_status_bundle => Enum.map_join(@auth_status_replacements, "\n", &elem(&1, 0))
+      },
       adapter_version: @adapter_version,
       source: source,
       patched: patch_adapter_source(source),
@@ -1048,7 +1119,12 @@ defmodule Tightbeam.Harness.Claude do
   end
 
   defp patch_remote(target, path, detail) do
-    script = "node -e #{Support.shell_quote(remote_patch_script(path))}"
+    script =
+      [
+        remote_patch_script(path, @adapter_bundle, @adapter_replacements),
+        remote_patch_script(path, @auth_status_bundle, @auth_status_replacements)
+      ]
+      |> Enum.map_join(" && ", &("node -e " <> Support.shell_quote(&1)))
 
     case target.sh.(
            ["ssh" | Support.ssh_opts()] ++
@@ -1069,6 +1145,16 @@ defmodule Tightbeam.Harness.Claude do
     )
   end
 
+  @doc false
+  def patch_auth_status_source(source) do
+    Tightbeam.Harness.AdapterPatch.patch(
+      source,
+      @auth_status_replacements,
+      wire_name(),
+      @adapter_version
+    )
+  end
+
   defp patch_local(path) do
     Tightbeam.Harness.AdapterPatch.ensure!(
       path,
@@ -1078,14 +1164,23 @@ defmodule Tightbeam.Harness.Claude do
       @adapter_replacements,
       wire_name()
     )
+
+    Tightbeam.Harness.AdapterPatch.ensure!(
+      path,
+      @adapter_package,
+      @auth_status_bundle,
+      @adapter_version,
+      @auth_status_replacements,
+      wire_name()
+    )
   end
 
-  defp remote_patch_script(path) do
+  defp remote_patch_script(path, bundle, replacements) do
     Tightbeam.Harness.AdapterPatch.remote_script(
       path,
       @adapter_package,
-      @adapter_bundle,
-      @adapter_replacements,
+      bundle,
+      replacements,
       wire_name()
     )
   end

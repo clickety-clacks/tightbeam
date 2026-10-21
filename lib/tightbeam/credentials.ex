@@ -366,10 +366,19 @@ defmodule Tightbeam.Credentials do
      }}
   end
 
-  def handle_call({:observe_auth, source, _evidence}, _from, state) do
+  def handle_call({:observe_auth, source, evidence}, _from, state) do
     if state.db && credential_kind(state, :anthropic) == :subscription do
       source = if source == :local_none, do: "local-none", else: "unfenced-401"
-      attempt = ClaudeAuth.trigger(state.db, state.machine, source)
+
+      attempt =
+        ClaudeAuth.trigger(
+          state.db,
+          state.machine,
+          source,
+          System.system_time(:millisecond),
+          Tightbeam.Harness.Claude.probe_binding_diagnostic(evidence)
+        )
+
       write_auth_health(state, "unconfirmed", attempt.attempt_id)
 
       state =
