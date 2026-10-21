@@ -393,13 +393,6 @@ defmodule Tightbeam.Productions.Bubble do
             {:appended, marker} =
               Projection.append_substrate_in_txn(txn, main_key, message, :high)
 
-            Tightbeam.Firehose.Publisher.message_in_txn(
-              txn,
-              main_key,
-              marker,
-              escalation.owner_user_id
-            )
-
             {:ok, marker}
           else
             :no_stream
@@ -524,7 +517,6 @@ defmodule Tightbeam.Productions.Bubble do
             {:appended, marker} =
               Projection.append_substrate_in_txn(txn, main_key, message, :high)
 
-            Tightbeam.Firehose.Publisher.message_in_txn(txn, main_key, marker, turn.owner)
             {:ok, marker}
 
           _ ->
