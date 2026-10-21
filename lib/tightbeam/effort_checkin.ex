@@ -9,9 +9,9 @@ defmodule Tightbeam.EffortCheckin do
   elsewhere (another machine, a service, a person) is surfaced by RECORDING AN
   ARTIFACT on the card's work item.
 
-  No activity on any signal prods the AGENT first. Only continued silence at the
-  next bracket escalates to the owner's decision request. Owners get decisions,
-  not status.
+  No activity on any signal prods the AGENT first. Continued silence at the next
+  bracket opens one decision request. An unanswered request expires once after
+  24 hours; it never advances to another rung or creates a replacement deadline.
 
   A placement observation is prepared before the callback transaction for rearm
   compatibility; it never counts as activity. The transaction then CASes the
@@ -20,9 +20,9 @@ defmodule Tightbeam.EffortCheckin do
   """
 
   alias Tightbeam.{
-    CausalEvents,
     ConditionFacts,
     DB,
+    EventLog,
     Escalation,
     Org,
     Placement,
@@ -525,14 +525,10 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   @spec deadline(DB.server(), map(), Wakes.wake()) :: :ok
-  def deadline(db, config, wake) do
-    if enabled?(config) do
-      case DB.transaction(db, fn txn -> deadline_in_txn(txn, config, wake) end) do
-        {:ok, _request} -> :ok
-        {:error, error} -> raise error
-      end
-    else
-      :ok
+  def deadline(db, _config, wake) do
+    case DB.transaction(db, fn txn -> deadline_in_txn(txn, wake) end) do
+      {:ok, _request} -> :ok
+      {:error, error} -> raise error
     end
   end
 
@@ -805,99 +801,119 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  defp deadline_in_txn(txn, config, wake) do
+  defp deadline_in_txn(txn, wake) do
     case request_for_deadline(txn, wake.wake_id) do
       nil ->
         nil
 
       request ->
-        before = Escalation.raw_by_id_in_txn(txn, request.id)
-        next = advance_expecter(txn, request)
-        deadline = now() + deadline_ms(config)
-        assignment = assignment_in_txn(txn, request.assignment_id)
-        menu = menu_in_txn(txn, assignment, next)
-        context = Map.put(request.context, "actions", menu)
+        expired_at = now()
 
-        replacement =
-          Wakes.schedule_in_txn(txn, %{
-            session_key: next.session_key || Org.personal_session_key(next.user_id),
-            origin: @origin,
-            consumer: "effort_deadline",
-            due_at: deadline,
-            assignment_id: request.assignment_id
-          })
-
-        Txn.q(
-          txn,
-          """
-          UPDATE decision_requests
-          SET expecterSessionKey = ?2, expecterUserId = ?3, lineageRung = ?4,
-              deadlineAt = ?5, deadlineWakeId = ?6, options = ?7, context = ?8
-          WHERE id = ?1 AND kind = 'effort' AND status = 'open' AND deadlineWakeId = ?9
-          """,
-          [
-            request.id,
-            next.session_key,
-            next.user_id,
-            next.rung,
-            deadline,
-            replacement.wake_id,
-            JSON.encode!(menu),
-            JSON.encode!(context),
-            wake.wake_id
-          ]
-        )
-
-        if Txn.changes(txn) == 1 do
-          mark_wake_fired(txn, wake.wake_id)
-
-          # The request row is overwritten in place and the replacement deadline
-          # wake carries no rung, so the rung it advanced FROM has no other home.
-          CausalEvents.append_in_txn(txn, %{
-            kind: "effort_rung_advance",
-            assignment_id: request.assignment_id,
-            job_ref: job_ref_in_txn(txn, request.assignment_id),
-            session_key: next.session_key,
-            detail: %{
-              requestId: request.id,
-              fromRung: request.lineage_rung,
-              toRung: next.rung,
-              fromExpecter: expecter_ref(request.expecter_session_key, request.expecter_user_id),
-              toExpecter: expecter_ref(next.session_key, next.user_id)
-            }
-          })
-
-          advanced = request_for_id(txn, request.id)
-          after_row = Escalation.raw_by_id_in_txn(txn, request.id)
-          _after_row = Escalation.publish_decision_transition_in_txn(txn, before, after_row)
-          arm_notification_in_txn(txn, advanced)
-          advanced
-        else
-          winner = request_for_id(txn, request.id)
-
-          command =
-            if winner.status == "open" and winner.deadline_wake_id != replacement.wake_id do
-              %{
-                requester: %{kind: "process", id: "tightbeam:effort-checkin"},
-                reason_kind: "superseded",
-                causal_source: %{kind: "wake", id: winner.deadline_wake_id},
-                outcome: %{
-                  kind: "replacement",
-                  replacement_wake_id: winner.deadline_wake_id
-                }
-              }
-            else
-              decision_disposition_command(
-                txn,
-                winner,
-                decision_inactivity_deadline_trigger_in_txn(txn, winner.assignment_id)
-              )
-            end
-
-          cancel_pending_wake_in_txn!(txn, replacement.wake_id, command)
+        if request.deadline_at > expired_at do
           nil
+        else
+          before = Escalation.raw_by_id_in_txn(txn, request.id)
+          assignment = assignment_in_txn(txn, request.assignment_id)
+          recipient = expiry_notice_recipient_in_txn(txn, assignment.holder_key)
+
+          Txn.q(
+            txn,
+            """
+            UPDATE decision_requests
+            SET status='withdrawn', withdrawnBy=?2,
+                withdrawnReason='expired-no-decision', withdrawnAt=?3
+            WHERE id=?1 AND kind='effort' AND status='open'
+              AND deadlineWakeId=?4 AND deadlineAt<=?3
+            """,
+            [request.id, @origin, expired_at, wake.wake_id]
+          )
+
+          if Txn.changes(txn) == 1 do
+            mark_wake_fired(txn, wake.wake_id)
+
+            expired = Escalation.raw_by_id_in_txn(txn, request.id)
+            _expired = Escalation.publish_decision_transition_in_txn(txn, before, expired)
+
+            DB.record_row_commit(
+              txn,
+              decision_transition(request, "open", "withdrawn", @origin, "effort-deadline")
+            )
+
+            EventLog.lifecycle_in_txn(
+              txn,
+              "decision_request_withdrawn",
+              request.id,
+              "by=#{@origin} reason=expired-no-decision notified=#{recipient || "none"}"
+            )
+
+            schedule_expiry_notice_in_txn(txn, request, assignment, recipient, expired_at)
+            expired
+          else
+            nil
+          end
         end
     end
+  end
+
+  defp expiry_notice_recipient_in_txn(txn, holder_key) do
+    case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [holder_key]) do
+      [["active"]] ->
+        holder_key
+
+      [[_state]] ->
+        first_live_spawned_by_ancestor_in_txn(txn, holder_key)
+
+      [] ->
+        nil
+    end
+  end
+
+  defp first_live_spawned_by_ancestor_in_txn(txn, holder_key) do
+    Txn.q(
+      txn,
+      """
+      WITH RECURSIVE ancestors(sessionKey, spawnedBy, state, depth, path) AS (
+        SELECT parent.sessionKey, parent.spawnedBy, parent.state, 1,
+               '|' || parent.sessionKey || '|'
+        FROM sessions child
+        JOIN sessions parent ON parent.sessionKey=child.spawnedBy
+        WHERE child.sessionKey=?1
+        UNION ALL
+        SELECT parent.sessionKey, parent.spawnedBy, parent.state, ancestors.depth+1,
+               ancestors.path || parent.sessionKey || '|'
+        FROM sessions parent
+        JOIN ancestors ON parent.sessionKey=ancestors.spawnedBy
+        WHERE ancestors.spawnedBy IS NOT NULL
+          AND instr(ancestors.path, '|' || parent.sessionKey || '|')=0
+      )
+      SELECT sessionKey FROM ancestors WHERE state='active' ORDER BY depth LIMIT 1
+      """,
+      [holder_key]
+    )
+    |> case do
+      [[session_key]] -> session_key
+      [] -> nil
+    end
+  end
+
+  defp schedule_expiry_notice_in_txn(_txn, _request, _assignment, nil, _expired_at), do: :ok
+
+  defp schedule_expiry_notice_in_txn(txn, request, assignment, recipient, expired_at) do
+    Wakes.schedule_in_txn(txn, %{
+      session_key: recipient,
+      origin: @origin,
+      consumer: "prompt",
+      prompt:
+        "Effort check-in #{request.id} expired after 24 hours without a decision. No decision was made; refile only if this request is still needed.",
+      due_at: expired_at,
+      assignment_id: request.assignment_id,
+      work_item_id: assignment.work_item_id,
+      owner_user_id: request.owner_user_id,
+      target_gate: 1,
+      class: "fyi"
+    })
+
+    :ok
   end
 
   defp rule_in_txn(txn, config, request, action, actor, principal, fresh) do
@@ -1441,40 +1457,6 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  defp advance_expecter(_txn, %{expecter_user_id: user, lineage_rung: rung})
-       when is_binary(user) do
-    %{
-      session_key: nil,
-      user_id: user,
-      owner_user_id: user,
-      principal_user_id: user,
-      rung: rung
-    }
-  end
-
-  defp advance_expecter(txn, request) do
-    current = session_in_txn(txn, request.expecter_session_key)
-    assignment = assignment_in_txn(txn, request.assignment_id)
-
-    if current.current_parent do
-      route_session(
-        txn,
-        current.current_parent,
-        request.owner_user_id,
-        request.lineage_rung + 1,
-        assignment.holder_key
-      )
-    else
-      %{
-        session_key: nil,
-        user_id: request.owner_user_id,
-        owner_user_id: request.owner_user_id,
-        principal_user_id: request.owner_user_id,
-        rung: request.lineage_rung + 1
-      }
-    end
-  end
-
   defp route_session(txn, key, owner_user_id, rung, holder_key) do
     session = session_in_txn(txn, key)
 
@@ -1810,10 +1792,10 @@ defmodule Tightbeam.EffortCheckin do
       )
 
   defp assignment_in_txn(txn, id) do
-    [[id, holder, opened_user, opened_session]] =
+    [[id, holder, opened_user, opened_session, work_item_id]] =
       Txn.q(
         txn,
-        "SELECT id, holderKey, openedByUser, openedBySession FROM assignments WHERE id = ?1",
+        "SELECT id, holderKey, openedByUser, openedBySession, workItemId FROM assignments WHERE id = ?1",
         [id]
       )
 
@@ -1821,7 +1803,8 @@ defmodule Tightbeam.EffortCheckin do
       id: id,
       holder_key: holder,
       opened_by_user: opened_user,
-      opened_by_session: opened_session
+      opened_by_session: opened_session,
+      work_item_id: work_item_id
     }
   end
 
@@ -2045,21 +2028,6 @@ defmodule Tightbeam.EffortCheckin do
       [wake_id, now()]
     )
   end
-
-  defp job_ref_in_txn(txn, assignment_id) do
-    case Txn.q(txn, "SELECT workItemId FROM assignments WHERE id = ?1", [assignment_id]) do
-      [[job_ref]] -> job_ref
-      [] -> nil
-    end
-  end
-
-  # The expecter is a session OR a user; one ref renders either without losing
-  # which it was.
-  defp expecter_ref(session_key, _user_id) when is_binary(session_key),
-    do: "session:" <> session_key
-
-  defp expecter_ref(_session_key, user_id) when is_binary(user_id), do: "user:" <> user_id
-  defp expecter_ref(_session_key, _user_id), do: nil
 
   defp decision_transition(request, old_status, new_status, principal, verb) do
     %{

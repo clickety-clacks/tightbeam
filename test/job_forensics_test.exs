@@ -1016,7 +1016,7 @@ defmodule Tightbeam.JobForensicsTest do
     )
   end
 
-  test "proof 2: an effort rung advance records the rung and expecter it left", ctx do
+  test "proof 2: unanswered effort deadline expires without rewriting its route", ctx do
     db = ctx.db
     work_item(db, "wi_effort")
     session(db, "parent")
@@ -1044,18 +1044,21 @@ defmodule Tightbeam.JobForensicsTest do
 
     assert :ok = EffortCheckin.deadline(db, %{}, wake)
 
-    assert {:ok, [[2]]} =
-             DB.query(db, "SELECT lineageRung FROM decision_requests WHERE id = 'dr_effort'")
+    assert {:ok, [["withdrawn", "holder", 1, wake_id, "expired-no-decision"]]} =
+             DB.query(
+               db,
+               "SELECT status,expecterSessionKey,lineageRung,deadlineWakeId,withdrawnReason FROM decision_requests WHERE id = 'dr_effort'"
+             )
 
-    assert [%{kind: "effort_rung_advance"} = event] = CausalEvents.for_job(db, "wi_effort", [])
-    assert event.assignment_id == "asg_effort"
-    assert event.job_ref == "wi_effort"
-    assert event.detail["requestId"] == "dr_effort"
-    assert event.detail["fromRung"] == 1
-    assert event.detail["toRung"] == 2
-    assert event.detail["fromExpecter"] == "session:holder"
-    assert is_binary(event.detail["toExpecter"])
-    assert event.detail["toExpecter"] != event.detail["fromExpecter"]
+    assert wake_id == wake.wake_id
+    assert Wakes.get(db, wake_id).state == "fired"
+    assert CausalEvents.for_job(db, "wi_effort", []) == []
+
+    assert {:ok, [["by=process:tightbeam reason=expired-no-decision notified=holder"]]} =
+             DB.query(
+               db,
+               "SELECT detail FROM lifecycle_events WHERE kind='decision_request_withdrawn' AND subject='dr_effort'"
+             )
   end
 
   ## Proof 8 — the trace's additive types leave v1 consumers alone
