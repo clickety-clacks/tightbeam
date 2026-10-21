@@ -3929,11 +3929,7 @@ defmodule Tightbeam.SupervisionTest do
         assignment_id: "asg_1"
       })
 
-    {:ok, _} =
-      DB.query(ctx.db, "UPDATE wakes SET state='fired', firedAt=?2 WHERE wakeId=?1", [
-        delivered.wake_id,
-        0
-      ])
+    fire_condition_wake!(ctx.db, delivered.wake_id, now_ms())
 
     seq = terminal!(ctx.db, "holder")
 
@@ -3942,6 +3938,61 @@ defmodule Tightbeam.SupervisionTest do
 
     assert :continuation = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
     assert %{prodCount: 0} = Supervision.prod_state(ctx.db, "asg_1")
+  end
+
+  # A `fallback`-fired wake never resolved a fact — the owner's own exact
+  # continuation simply timed out — so it must never be mistaken for the
+  # terminal child notice a `condition` fire delivers. Preserving this means
+  # the owner's own genuine bounded fallback still gets its ordinary prod.
+  test "a fallback-fired wake (no resolved fact) leaves the generic prod matching", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+
+    timed_out =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "session:holder",
+        prompt: "no PR checks fact arrived in time",
+        due_at: 0,
+        condition_kind: "pr.checks-completed",
+        condition_scope: "gdiab/tightbeam#3",
+        assignment_id: "asg_1"
+      })
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE wakes SET state='fired', firedBy='fallback', firedAt=?2 WHERE wakeId=?1",
+        [timed_out.wake_id, now_ms()]
+      )
+
+    seq = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+  end
+
+  # A `condition` fire only covers the owner for one supervision interval
+  # after it lands — a single past notice must not gate a still-open
+  # assignment across every later evaluation forever.
+  test "a condition-fired wake older than one supervision interval no longer suppresses the generic prod",
+       ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
+
+    stale =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "session:holder",
+        prompt: "PR 4 settled long ago",
+        due_at: 0,
+        condition_kind: "pr.checks-completed",
+        condition_scope: "gdiab/tightbeam#4",
+        assignment_id: "asg_1"
+      })
+
+    fire_condition_wake!(ctx.db, stale.wake_id, now_ms() - 60_001)
+
+    seq = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
   end
 
   test "a shared harness incident suppresses only affected holders and resolution re-arms them",
@@ -4418,6 +4469,19 @@ defmodule Tightbeam.SupervisionTest do
       DB.transaction(
         db,
         &ConditionFacts.file_in_txn(&1, %{kind: kind, scope: scope, origin: "session:supervisor"})
+      )
+
+    :ok
+  end
+
+  defp now_ms, do: System.system_time(:millisecond)
+
+  defp fire_condition_wake!(db, wake_id, fired_at) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE wakes SET state='fired', firedBy='condition', firedAt=?2 WHERE wakeId=?1",
+        [wake_id, fired_at]
       )
 
     :ok
