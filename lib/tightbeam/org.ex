@@ -1014,6 +1014,13 @@ defmodule Tightbeam.Org do
         AND NOT EXISTS (
           SELECT 1 FROM harklight_entries he WHERE he.wakeId=w.wakeId
         )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM notice_batches nb
+          JOIN notice_batch_members nm ON nm.batchId=nb.batchId
+          JOIN harklight_entries he ON he.wakeId=nm.sourceWakeId
+          WHERE nb.deliveryWakeId=w.wakeId
+        )
       ORDER BY w.createdAt,w.wakeId
       """,
       [session_key]

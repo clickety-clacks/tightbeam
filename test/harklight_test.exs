@@ -227,6 +227,38 @@ defmodule Tightbeam.HarklightTest do
     assert Wakes.get(ctx.db, wake_id).session_key == ctx.recipient
   end
 
+  test "notice batching holds a retired Harklight recipient on its registered session", ctx do
+    register(ctx.db, ctx.recipient, "handle-1", "sender-1", "message-1")
+    assert {:captured, source_wake_id} = Harklight.accept_line(ctx.db, "handle-1", event_line("turn-1"))
+
+    Org.retire(ctx.db, ctx.recipient, "user:flynn", 1_000)
+
+    assert [carrier_wake_id] =
+             Tightbeam.NoticeBatcher.recover(
+               ctx.db,
+               System.system_time(:millisecond),
+               [],
+               ctx.recipient
+             )
+
+    assert %{state: "pending", session_key: recipient} = Wakes.get(ctx.db, source_wake_id)
+    assert recipient == ctx.recipient
+    assert %{state: "pending", session_key: ^recipient, digest: true} =
+             Wakes.get(ctx.db, carrier_wake_id)
+
+    assert {:ok, [["delivery_pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state FROM notice_batches WHERE deliveryWakeId=?1",
+               [carrier_wake_id]
+             )
+
+    assert Enum.count(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "harklight_recipient_unavailable")
+           ) == 1
+  end
+
   defp register(db, recipient, handle, sender_id, message_id) do
     Harklight.register(
       db,

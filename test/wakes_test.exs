@@ -140,7 +140,7 @@ defmodule Tightbeam.WakesTest do
     %{db: name, scheduler: scheduler}
   end
 
-  test "an explicit held prompt delivery remains pending for the ordinary scheduler", %{
+  test "an explicit retry keeps a pending digest carrier on the ordinary scheduler", %{
     db: db,
     scheduler: scheduler
   } do
@@ -151,7 +151,8 @@ defmodule Tightbeam.WakesTest do
         session_key: "exact-session",
         origin: "process:tightbeam",
         prompt: "retain this entry for its registered session",
-        due_at: 0
+        due_at: 0,
+        digest: true
       })
 
     start_supervised!(

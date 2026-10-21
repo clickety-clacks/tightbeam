@@ -262,40 +262,67 @@ defmodule Tightbeam.Harklight do
   end
 
   @doc false
+  def captured_wake_in_txn?(%Txn{} = txn, wake_id) when is_binary(wake_id) do
+    Txn.q(txn, "SELECT 1 FROM harklight_entries WHERE wakeId=?1", [wake_id]) == [[1]]
+  end
+
+  def captured_wake_in_txn?(%Txn{}, _wake_id), do: false
+
+  @doc false
   def prepare_delivery_in_txn(%Txn{} = txn, wake_id, session_key) do
-    case Txn.q(
-           txn,
-           "SELECT e.sessionHandle,h.recipientSessionKey,h.ownerNotifiedAt FROM harklight_entries e JOIN harklight_handles h ON h.sessionHandle=e.sessionHandle WHERE e.wakeId=?1",
-           [wake_id]
-         ) do
+    source_ids =
+      if is_binary(wake_id) do
+        [wake_id | Tightbeam.NoticeBatcher.carrier_source_ids_in_txn(txn, wake_id)]
+      else
+        []
+      end
+
+    entries =
+      Enum.flat_map(source_ids, fn source_id ->
+        Txn.q(
+          txn,
+          "SELECT e.sessionHandle,h.recipientSessionKey,h.ownerNotifiedAt FROM harklight_entries e JOIN harklight_handles h ON h.sessionHandle=e.sessionHandle WHERE e.wakeId=?1",
+          [source_id]
+        )
+      end)
+
+    case entries do
       [] ->
         :ordinary
 
-      [[handle, recipient, owner_notified_at]] when recipient == session_key ->
-        case Txn.q(txn, "SELECT state,ownerUserId FROM sessions WHERE sessionKey=?1", [recipient]) do
-          [["active", _owner]] ->
-            :deliver
+      entries ->
+        Enum.reduce(entries, {:deliver, []}, fn [handle, recipient, owner_notified_at],
+                                                {state, notices} ->
+          if recipient != session_key do
+            raise ArgumentError,
+                  "Harklight wake #{wake_id} targets #{session_key}, but handle #{handle} is bound to #{recipient}"
+          end
 
-          [[_state, owner_user_id]] ->
-            notice =
-              if is_nil(owner_notified_at) do
-                notify_owner_once_in_txn(txn, handle, recipient, owner_user_id)
-              end
+          case Txn.q(txn, "SELECT state,ownerUserId FROM sessions WHERE sessionKey=?1", [recipient]) do
+            [["active", _owner]] ->
+              {state, notices}
 
-            {:held, notice}
+            [[_state, owner_user_id]] ->
+              notice =
+                if is_nil(owner_notified_at) do
+                  notify_owner_once_in_txn(txn, handle, recipient, owner_user_id)
+                end
 
-          [] ->
-            notice =
-              if is_nil(owner_notified_at) do
-                notify_owner_once_in_txn(txn, handle, recipient, nil)
-              end
+              { :held, if(is_list(notice), do: notices ++ notice, else: notices) }
 
-            {:held, notice}
+            [] ->
+              notice =
+                if is_nil(owner_notified_at) do
+                  notify_owner_once_in_txn(txn, handle, recipient, nil)
+                end
+
+              { :held, if(is_list(notice), do: notices ++ notice, else: notices) }
+          end
+        end)
+        |> case do
+          {:deliver, _notices} -> :deliver
+          {:held, notices} -> {:held, notices}
         end
-
-      [[handle, recipient, _owner_notified_at]] ->
-        raise ArgumentError,
-              "Harklight wake #{wake_id} targets #{session_key}, but handle #{handle} is bound to #{recipient}"
     end
   end
 
