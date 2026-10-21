@@ -3297,6 +3297,7 @@ defmodule Tightbeam.GatewayTest do
     })
 
     start_supervised!({Hub, name: Hub})
+
     :ok =
       Hub.register(Hub, self(), %{
         mode: :subscribed,
@@ -4126,6 +4127,7 @@ defmodule Tightbeam.GatewayTest do
     config = gateway_config(base_dir, ctx.db, 0)
     handlers = Gateway.handlers(config)
     start_supervised!({Hub, name: Hub})
+
     :ok =
       Hub.register(Hub, self(), %{
         mode: :subscribed,
@@ -5827,6 +5829,7 @@ defmodule Tightbeam.GatewayTest do
     start_lane!(ctx.db, "k1")
 
     start_supervised!({Hub, name: Hub})
+
     :ok =
       Hub.register(Hub, self(), %{
         mode: :subscribed,
