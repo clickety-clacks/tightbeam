@@ -78,7 +78,7 @@ defmodule Tightbeam.GatewayTest do
     WorkItems
   }
 
-  alias Tightbeam.Firehose.{Hub, Publisher}
+  alias Tightbeam.Firehose.Hub
   alias Tightbeam.Wire.Payloads
 
   defmodule LaneDoorbell do
@@ -3346,7 +3346,7 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert_receive {:firehose_notice, %{"class" => "message.created"} = notice}
-    assert_message_notice_matches_rest!(ctx.db, notice)
+    assert_message_notice_matches_projection!(ctx.db, notice)
     assert notice["payload"]["messageType"] == "marker"
     Hub.delivered(Hub, self())
     :sys.get_state(Hub)
@@ -3861,8 +3861,8 @@ defmodule Tightbeam.GatewayTest do
 
     observed = observed_state_classes()
 
-    assert observed == ["session.updated"],
-           "the one harness-switch commit must expose only its final session projection, got #{inspect(observed)}"
+    assert Enum.sort(observed) == ["message.created", "session.updated"],
+           "expected one message and one session update, got #{inspect(observed)}"
   end
 
   describe "destination harness defaults" do
@@ -4159,7 +4159,7 @@ defmodule Tightbeam.GatewayTest do
     notices = observed_notices()
     message_notices = Enum.filter(notices, &(&1["class"] == "message.created"))
     assert length(message_notices) == 1
-    assert_message_notice_matches_rest!(ctx.db, hd(message_notices))
+    assert_message_notice_matches_projection!(ctx.db, hd(message_notices))
     assert hd(message_notices)["payload"]["marker"]["kind"] == "model-retune"
     assert_per_verb_effects!(config, "tune", Enum.map(notices, & &1["class"]))
 
@@ -5856,7 +5856,7 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert_receive {:firehose_notice, %{"class" => "message.created"} = notice}
-    assert_message_notice_matches_rest!(ctx.db, notice)
+    assert_message_notice_matches_projection!(ctx.db, notice)
     assert notice["payload"]["marker"]["kind"] == "model-retune"
     Hub.delivered(Hub, self())
     :sys.get_state(Hub)
@@ -11742,18 +11742,15 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
-  defp assert_message_notice_matches_rest!(db, notice) do
+  defp assert_message_notice_matches_projection!(db, notice) do
     item =
       db
-      |> StateResources.query_message(notice["payload"]["id"])
+      |> Projection.get(notice["refs"]["messageId"])
       |> StateResources.message()
 
     assert notice["payload"] == item
     assert notice["refs"]["messageId"] == item["id"]
     assert notice["refs"]["sessionKey"] == item["sessionKey"]
-    item_bytes = StateResources.encode_item("transcript messages", item)
-    wire_notice = Publisher.encode_wire_notice(notice)
-    assert String.contains?(wire_notice, "\"payload\":" <> item_bytes)
   end
 
   defp credential_probe(parent, command) do

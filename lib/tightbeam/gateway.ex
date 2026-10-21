@@ -1202,7 +1202,7 @@ defmodule Tightbeam.Gateway do
 
           Assignments.__handle__(db, "dispatch", call)
         end,
-      {"attest", ["attest.filed", "assignment.closed"]} => fn call ->
+      {"attest", ["attest.filed", "assignment.closed", "message.created"]} => fn call ->
         Assignments.__handle__(
           db,
           "attest",

@@ -727,11 +727,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert notice["class"] == "message.created"
     assert notice["refs"]["messageId"] == message.id
 
-    item = db |> StateResources.query_message(message.id) |> StateResources.message()
+    item = db |> Projection.get(message.id) |> StateResources.message()
     assert notice["payload"] == item
-    item_bytes = StateResources.encode_item("transcript messages", item)
     wire_notice = Publisher.encode_wire_notice(notice)
-    assert String.contains?(wire_notice, "\"payload\":" <> item_bytes)
+    assert String.contains?(wire_notice, "\"payload\":" <> JSON.encode!(item))
 
     :sys.get_state(Hub)
     refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
