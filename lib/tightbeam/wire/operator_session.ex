@@ -9,6 +9,15 @@ defmodule Tightbeam.Wire.OperatorSession do
     is_binary(token) and token != "" and token == deps[:cli_token]
   end
 
+  def resolve_user(db, user_id) when is_binary(user_id) and user_id != "" do
+    case Devices.user(db, user_id) do
+      nil -> {:error, "not_found"}
+      user -> {:ok, user}
+    end
+  end
+
+  def resolve_user(_db, _user_id), do: {:error, "invalid_message"}
+
   def resolve(db, %{"asUser" => user_id, "sessionKey" => session_key})
       when is_binary(user_id) and user_id != "" and is_binary(session_key) and
              session_key != "" do

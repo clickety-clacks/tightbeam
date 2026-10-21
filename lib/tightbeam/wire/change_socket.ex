@@ -188,44 +188,68 @@ defmodule Tightbeam.Wire.ChangeSocket do
   end
 
   defp authenticate_operator(message, token, state) do
-    case OperatorSession.resolve(db(state), message) do
-      {:ok, user, session} ->
-        :ok =
-          Hub.register(hub(state), self(), %{
-            mode: :filtered,
-            db: db(state),
-            user_id: user.user_id,
-            principal_kind: :user,
-            principal_id: user.user_id,
-            is_admin: user.is_admin
-          })
+    with {:ok, user} <- OperatorSession.resolve_user(db(state), message["asUser"]),
+         {:ok, selected_session_key} <- operator_selected_session(db(state), user, message) do
+      :ok =
+        Hub.register(hub(state), self(), %{
+          mode: :filtered,
+          db: db(state),
+          user_id: user.user_id,
+          principal_kind: :user,
+          principal_id: user.user_id,
+          is_admin: user.is_admin
+        })
 
-        state = %{
-          state
-          | phase: :live,
-            user_id: user.user_id,
-            principal_kind: :user,
-            principal_id: user.user_id,
-            is_admin: user.is_admin,
-            selected_session_key: session.session_key,
-            credential_digest: credential_digest(token)
-        }
+      state = %{
+        state
+        | phase: :live,
+          user_id: user.user_id,
+          principal_kind: :user,
+          principal_id: user.user_id,
+          is_admin: user.is_admin,
+          selected_session_key: selected_session_key,
+          credential_digest: credential_digest(token)
+      }
 
-        push(
-          %{
-            "type" => "auth_result",
-            "success" => true,
-            "userId" => user.user_id,
-            "isAdmin" => user.is_admin,
-            "sessionKey" => session.session_key
-          },
-          schedule_heartbeat(state)
-        )
+      auth_result = %{
+        "type" => "auth_result",
+        "success" => true,
+        "userId" => user.user_id,
+        "isAdmin" => user.is_admin
+      }
 
-      {:error, _reason} ->
-        stop_with(auth_failure("org_token_read_forbidden"), 1008, state)
+      auth_result =
+        if is_binary(selected_session_key),
+          do: Map.put(auth_result, "sessionKey", selected_session_key),
+          else: auth_result
+
+      push(
+        auth_result,
+        schedule_heartbeat(state)
+      )
+    else
+      {:error, reason} ->
+        stop_with(auth_failure(reason), 1008, state)
     end
   end
+
+  defp operator_selected_session(_db, _user, %{"sessionKey" => nil}), do: {:ok, nil}
+
+  defp operator_selected_session(_db, _user, %{} = message)
+       when not is_map_key(message, "sessionKey"), do: {:ok, nil}
+
+  defp operator_selected_session(db, user, %{"sessionKey" => session_key})
+       when is_binary(session_key) and session_key != "" do
+    case OperatorSession.resolve(db, %{
+           "asUser" => user.user_id,
+           "sessionKey" => session_key
+         }) do
+      {:ok, _resolved_user, session} -> {:ok, session.session_key}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp operator_selected_session(_db, _user, _message), do: {:error, "invalid_message"}
 
   defp subscribe(message, state) do
     id = message["subscriptionId"]
@@ -380,6 +404,15 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
           _other ->
             false
+        end
+
+      :user when is_nil(state.device_id) ->
+        with {:ok, user} <- OperatorSession.resolve_user(db(state), state.user_id),
+             true <- user.is_admin == state.is_admin,
+             token when is_binary(token) <- state.deps[:cli_token] do
+          credential_digest(token) == state.credential_digest
+        else
+          _ -> false
         end
 
       _ ->

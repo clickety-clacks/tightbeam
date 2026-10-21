@@ -1313,9 +1313,9 @@ defmodule Tightbeam.Wire.Router do
       state_error(conn, resource, 500, "projection_invalid", nil)
   end
 
-  # The operator transport supplies an explicit user for this exact history
-  # selection, using the same owner/admin resolution as its socket operations.
-  defp session_collection_principal(:org, query, conn, session_key, "transcript messages") do
+  # The operator transport supplies an explicit user for this exact session,
+  # using the same owner/admin visibility as its socket operations.
+  defp session_collection_principal(:org, query, conn, session_key, _resource) do
     case Map.get(query, "asUser", []) do
       [user_id] when user_id != "" ->
         case Tightbeam.Wire.OperatorSession.resolve(db(conn), %{
@@ -1332,7 +1332,7 @@ defmodule Tightbeam.Wire.Router do
         end
 
       [] ->
-        {:error, 403, "org_token_read_forbidden", nil}
+        {:error, 400, "invalid_message", nil}
 
       _ ->
         {:error, 400, "invalid_as_user", nil}
@@ -1378,10 +1378,6 @@ defmodule Tightbeam.Wire.Router do
             end
         end
     end
-  end
-
-  defp selected_session_principal(:org, _query) do
-    {:error, 403, "org_token_read_forbidden", nil}
   end
 
   defp selected_session_principal({:session, session_key}, query) do
