@@ -947,7 +947,7 @@ COMMANDS:
   settle-turn --session <key> --seq <turnSeq> --outcome cancel|fail
               --reason <text> --key <idempotencyKey> --as-user <adminUserId>
       Settle one proven-stale running turn. This operator-only command never
-      interrupts a live task; use cancel for a live task.
+      interrupts a live task; use cancel-turn for a live task.
 
   kungfu list
       List the kungfu bundles shipped with this Tightbeam build and each
