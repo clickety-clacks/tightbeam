@@ -1747,15 +1747,20 @@ defmodule Tightbeam.Firehose.PublisherTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn',1,1)")
+      DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('test-user',1,1)")
 
-    register_testhost(db)
+    register_hosts(db, %{
+      "testhost" => %{ssh: nil, base_dir: System.tmp_dir!(), cli_bin: nil}
+    })
 
     Org.create(db, %{
-      session_key: "retiring-wake-target",
-      display_name: "Retiring wake target",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      session_key: Org.personal_session_key("test-user"),
+      display_name: "Main",
+      kind: "main",
+      is_built_in: true,
+      adopted: true,
+      owner_user_id: "test-user",
+      origin: "user:test-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -1763,12 +1768,24 @@ defmodule Tightbeam.Firehose.PublisherTest do
       model: Tightbeam.Model.new("fable")
     })
 
-    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
+    Org.create(db, %{
+      session_key: "retiring-wake-target",
+      display_name: "Retiring wake target",
+      owner_user_id: "test-user",
+      origin: "user:test-user",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "test-user", is_admin: true})
 
     wake =
       Wakes.schedule(db, %{
         session_key: "retiring-wake-target",
-        origin: "user:flynn",
+        origin: "user:test-user",
         prompt: "readdress this pending wake",
         due_at: System.system_time(:millisecond) + 60_000
       })
@@ -1781,7 +1798,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert original_row["wakeId"] == wake.wake_id
 
     assert %{state: "retired"} =
-             Org.retire(db, "retiring-wake-target", "user:flynn", 1_000)
+             Org.retire(db, "retiring-wake-target", "user:test-user", 1_000)
 
     wake_notices =
       observed_notices()
@@ -1795,7 +1812,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
       |> StateResources.wake()
 
     assert readdressed_row == current_row
-    assert readdressed_row["sessionKey"] == Org.personal_session_key("flynn")
+    assert readdressed_row["sessionKey"] == Org.personal_session_key("test-user")
     assert readdressed_row["rowVersion"] > original_row["rowVersion"]
   end
 
