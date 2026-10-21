@@ -346,6 +346,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     :ok = DB.execute(db, "UPDATE users SET isAdmin=1 WHERE userId='test-user'")
     register_testhost(db)
+    ensure_main_session(db, "test-user")
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneStub, name: Tightbeam.LaneManager})
 
