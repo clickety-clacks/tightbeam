@@ -596,6 +596,7 @@ fn spawn_stdin_reader(tx: Sender<Input>) {
     });
 }
 
+#[cfg(test)]
 fn spawn_socket_worker(
     endpoint: Endpoint,
     session_key: String,
@@ -650,6 +651,7 @@ fn spawn_socket_worker_with_selection(
     })
 }
 
+#[cfg(test)]
 fn connect_and_read(
     endpoint: &Endpoint,
     session_key: &str,
@@ -837,6 +839,7 @@ fn connect_and_read_with_selection(
     Ok(())
 }
 
+#[cfg(test)]
 fn connect_firehose(
     endpoint: &Endpoint,
     stopped: &AtomicBool,
@@ -1074,6 +1077,7 @@ fn stage_live_event(
     }
 }
 
+#[cfg(test)]
 fn finish_snapshot(
     snapshot: Snapshot,
     pending_snapshot: &mut Option<PendingSnapshot>,
@@ -1548,6 +1552,7 @@ fn begin_snapshot_with_selection(
     });
 }
 
+#[cfg(test)]
 fn begin_snapshot_after_subscription_ready(
     frame: &Value,
     endpoint: &Endpoint,
@@ -1616,6 +1621,7 @@ fn close_failure(frame: Option<tungstenite::protocol::CloseFrame>) -> Connection
     failure
 }
 
+#[cfg(test)]
 fn load_snapshot(endpoint: &Endpoint, session_key: &str) -> Result<Snapshot, SnapshotFailure> {
     load_snapshot_with_selection(endpoint, session_key, &ReadSelection::default())
 }
