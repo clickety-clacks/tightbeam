@@ -220,14 +220,34 @@ defmodule Tightbeam.Firehose.Publisher do
       Txn.handoff(txn, Hub.destination(hub), {:publish, committed_notice(class, payload, refs)})
     else
       eligibility_refs = committed_eligibility_refs(class, payload, refs)
-      refs = attach_committed_parent_work_item_ref(txn, class, payload, refs)
-
-      Txn.handoff(
-        txn,
-        Hub.destination(hub),
-        {:committed, class, payload, refs, eligibility_refs}
-      )
+      handoff_committed_in_txn(txn, class, payload, refs, eligibility_refs, hub)
     end
+  end
+
+  @doc false
+  def committed_attest_assignment_change_in_txn(
+        %Txn{} = txn,
+        class,
+        payload,
+        refs,
+        hub \\ Hub
+      )
+      when class in ["assignment.opened", "assignment.closed"] do
+    # These side effects had no actor refs in their prior recipient check; keep
+    # actor refs on the notice for filtering without using them as a grant.
+    eligibility_refs = committed_eligibility_refs(class, payload, Map.drop(refs, @actor_ref_keys))
+
+    handoff_committed_in_txn(txn, class, payload, refs, eligibility_refs, hub)
+  end
+
+  defp handoff_committed_in_txn(txn, class, payload, refs, eligibility_refs, hub) do
+    refs = attach_committed_parent_work_item_ref(txn, class, payload, refs)
+
+    Txn.handoff(
+      txn,
+      Hub.destination(hub),
+      {:committed, class, payload, refs, eligibility_refs}
+    )
   end
 
   @doc "Capture one artifact lifecycle snapshot independently of dispatch flags."

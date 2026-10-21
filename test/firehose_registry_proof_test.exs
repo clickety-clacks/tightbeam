@@ -795,6 +795,175 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     assert Enum.any?(opener_rest_page.rows, &(&1.id == "attest-row"))
   end
 
+  test "attest-driven assignment notices preserve their pre-ref recipients", ctx do
+    assert :ok =
+             DB.execute(
+               ctx.db,
+               "INSERT INTO users (userId, isAdmin, createdAt) VALUES " <>
+                 "('fixture-work-owner', 0, 1), ('fixture-holder-owner', 0, 1), " <>
+                 "('fixture-session-opener-owner', 0, 1), ('fixture-user-opener', 0, 1)"
+             )
+
+    session!(ctx.db, "fixture-assignment-holder", "fixture-holder-owner")
+    session!(ctx.db, "fixture-session-opener", "fixture-session-opener-owner")
+    work_item!(ctx.db, "wi_fixture-recipient-check", "fixture-work-owner")
+
+    assignments = [
+      {"fixture-session-opened-assignment", "session", "fixture-session-opener",
+       "fixture-session-completion"},
+      {"fixture-user-opened-assignment", "user", "fixture-user-opener",
+       "fixture-user-completion"}
+    ]
+
+    for {assignment_id, opener_kind, opener_id, completion_id} <- assignments do
+      opener_column = if opener_kind == "session", do: "openedBySession", else: "openedByUser"
+
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO assignments " <>
+                   "(id,subject,holderKey,#{opener_column},openedAt,workItemId) " <>
+                   "VALUES (?1,'Recipient check','fixture-assignment-holder',?2,1," <>
+                   "'wi_fixture-recipient-check')",
+                 [assignment_id, opener_id]
+               )
+
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO attests(id,assignmentId,kind,bySession,ts) " <>
+                   "VALUES (?1,?2,'completion','fixture-assignment-holder',1)",
+                 [completion_id, assignment_id]
+               )
+
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE assignments SET state='closed',outcome='completed',closedAt=2," <>
+                   "closedBySession='fixture-assignment-holder',closingAttestId=?1 " <>
+                   "WHERE id=?2",
+                 [completion_id, assignment_id]
+               )
+    end
+
+    listeners = [
+      {:assignment_holder,
+       class_listener(ctx, :assignment_holder, "assignment.closed", %{
+         user_id: "fixture-holder-owner",
+         principal_kind: :session,
+         principal_id: "fixture-assignment-holder"
+       })},
+      {:work_item_owner,
+       class_listener(ctx, :work_item_owner, "assignment.closed", %{
+         user_id: "fixture-work-owner"
+       })},
+      {:session_opener,
+       class_listener(ctx, :session_opener, "assignment.closed", %{
+         user_id: "fixture-session-opener-owner",
+         principal_kind: :session,
+         principal_id: "fixture-session-opener"
+       })},
+      {:user_opener,
+       class_listener(ctx, :user_opener, "assignment.closed", %{
+         user_id: "fixture-user-opener"
+       })}
+    ]
+
+    on_exit(fn -> Enum.each(listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end) end)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               for {assignment_id, opener_kind, opener_id, _completion_id} <- assignments do
+                 opener_principal =
+                   if opener_kind == "session",
+                     do: {:session, opener_id},
+                     else: {:user, opener_id}
+
+                 origin =
+                   if opener_kind == "session",
+                     do: "agent:fixture-opener",
+                     else: "user:" <> opener_id
+
+                 call = %{principal: opener_principal}
+
+                 before = StateResources.query_assignment(txn, assignment_id, call)
+                 assert before.derived_status == "claims-done"
+
+                 by_session = if opener_kind == "session", do: opener_id, else: nil
+                 by_user = if opener_kind == "user", do: opener_id, else: nil
+
+                 assert [] ==
+                          DB.Txn.q(
+                            txn,
+                            "INSERT INTO attests " <>
+                              "(id,assignmentId,kind,verdictKind,note,bySession,byUser,ts) " <>
+                              "VALUES (?1,?2,'verdict','verified','Verified completion',?3,?4,3)",
+                            ["fixture-verified-#{assignment_id}", assignment_id, by_session, by_user]
+                          )
+
+                 assert [] ==
+                          DB.Txn.q(
+                            txn,
+                            "UPDATE assignments SET rowVersion=rowVersion+1 WHERE id=?1",
+                            [assignment_id]
+                          )
+
+                 payload =
+                   StateResources.query_assignment(txn, assignment_id, call)
+
+                 assert payload.derived_status == "verified"
+
+                 actor_refs = Publisher.actor_refs(%{origin: origin, principal: opener_principal})
+
+                 Publisher.committed_attest_assignment_change_in_txn(
+                   txn,
+                   "assignment.closed",
+                   payload,
+                   Map.put(actor_refs, "assignmentId", assignment_id),
+                   ctx.hub
+                 )
+               end
+
+               :ok
+             end)
+
+    Enum.each(listeners, fn {tag, pid} -> sync_listener(ctx.hub, pid, tag) end)
+
+    for _ <- 1..2 do
+      assert_received {:class_notice, :assignment_holder, %{"class" => "assignment.closed"}}
+    end
+
+    for _ <- 1..2 do
+      assert_received {:class_notice, :work_item_owner, %{"class" => "assignment.closed"}}
+    end
+
+    for tag <- [:session_opener, :user_opener] do
+      refute_received {:class_notice, ^tag, _notice}
+    end
+
+    first_notice = take_notice(ctx.hub)
+    second_notice = take_notice(ctx.hub)
+    notices = [first_notice, second_notice]
+
+    assert Enum.map(notices, & &1["class"]) == ["assignment.closed", "assignment.closed"]
+
+    assert Enum.map(notices, & &1["refs"]["origin"]) == [
+             "agent:fixture-opener",
+             "user:fixture-user-opener"
+           ]
+
+    assert Enum.map(notices, & &1["refs"]["principal"]) == [
+             "session:fixture-session-opener",
+             "user:fixture-user-opener"
+           ]
+
+    for notice <- notices do
+      assert notice["refs"]["sessionKey"] == "fixture-assignment-holder"
+      assert notice["refs"]["workItemId"] == "wi_fixture-recipient-check"
+      refute Map.has_key?(notice, "eligibilityRefs")
+    end
+  end
+
   test "row-reference repairs preserve spawn and role create/remove recipients", ctx do
     assert :ok =
              DB.execute(

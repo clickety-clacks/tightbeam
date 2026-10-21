@@ -2002,7 +2002,7 @@ defmodule Tightbeam.Assignments do
     class =
       if after_attest.state == "closed", do: "assignment.closed", else: "assignment.opened"
 
-    Tightbeam.Firehose.Publisher.committed_in_txn(
+    Tightbeam.Firehose.Publisher.committed_attest_assignment_change_in_txn(
       txn,
       class,
       after_attest,
