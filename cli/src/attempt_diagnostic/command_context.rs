@@ -96,6 +96,7 @@ impl CommandContext {
                 ("cli.assignment_commit_ref_correct", DispatchPath)
             }
             WorkItemCreate { .. } => ("cli.work_item_create", DispatchPath),
+            WorkItemHandoff { .. } => ("cli.work_item_handoff", DispatchPath),
             WorkItemUpdate { .. } => ("cli.work_item_update", DispatchPath),
             WorkItemGet { .. } => ("cli.work_item_get", DispatchPath),
             WorkItemTrace { .. } => ("cli.work_item_trace", DispatchPath),
@@ -330,6 +331,10 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         // guarded operation itself reports already-settled on a repeat.
         HarnessProcessSettle { .. } => WriteWithoutIdempotency,
 
+        // A handoff commits the owner change and notification together, but
+        // the command does not accept an idempotency key.
+        WorkItemHandoff { .. } => WriteWithoutIdempotency,
+
         Wake {
             idempotency_key, ..
         }
@@ -537,6 +542,34 @@ mod tests {
         let debug = format!("{context:?}");
         assert!(!debug.contains("PRIVATE_USER"));
         assert!(!debug.contains("PRIVATE_SESSION"));
+    }
+
+    #[test]
+    fn work_item_handoff_is_an_unkeyed_dispatch_write() {
+        let command = Command::WorkItemHandoff {
+            identity: Identity::User("PRIVATE_USER".into()),
+            work_item_id: Some("PRIVATE_ITEM".into()),
+            title: None,
+            delivery_owner: "PRIVATE_OWNER".into(),
+            brief: "PRIVATE_BRIEF".into(),
+        };
+        let context = CommandContext::for_command(&command).unwrap();
+        assert_eq!(
+            context
+                .operation_for_request("POST", "/agent/dispatch")
+                .unwrap()
+                .as_str(),
+            "cli.work_item_handoff"
+        );
+        assert_eq!(
+            effect(context, "POST", "/agent/dispatch"),
+            EffectContract::WriteWithoutIdempotency
+        );
+        let debug = format!("{context:?}");
+        assert!(!debug.contains("PRIVATE_USER"));
+        assert!(!debug.contains("PRIVATE_ITEM"));
+        assert!(!debug.contains("PRIVATE_OWNER"));
+        assert!(!debug.contains("PRIVATE_BRIEF"));
     }
 
     #[test]

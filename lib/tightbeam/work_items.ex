@@ -93,6 +93,7 @@ defmodule Tightbeam.WorkItems do
   def __handle__(db, "work-item-trace", call), do: trace_result(db, call)
   def __handle__(db, "work-item-list", call), do: list_result(db, call)
   def __handle__(db, "work-item-update", call), do: update_result(db, call)
+  def __handle__(db, "work-item-handoff", call), do: handoff_result(db, call)
   def __handle__(db, "work-item-icebox", call), do: dispose_result(db, call, :icebox)
   def __handle__(db, "work-item-reopen", call), do: dispose_result(db, call, :reopen)
   def __handle__(db, "work-item-close", call), do: dispose_result(db, call, :close)
@@ -249,6 +250,254 @@ defmodule Tightbeam.WorkItems do
         error ->
           error
       end
+    end
+  end
+
+  ## Handoff — item/owner change and owner wake commit as one operation
+
+  defp handoff_result(db, call) do
+    params = call.params
+
+    with :ok <- ensure_body_schema_for_use(db),
+         :ok <- handoff_principal_allowed(call.principal),
+         {:ok, mode} <- valid_handoff_input(params),
+         {:ok, item_owner} <- handoff_item_owner(db, call.principal, mode) do
+      {created_by_user, created_by_session} = creator(call.principal)
+
+      result =
+        transaction(db, fn txn ->
+          case handoff_item_in_txn(
+                 txn,
+                 call,
+                 mode,
+                 item_owner,
+                 created_by_user,
+                 created_by_session
+               ) do
+            {:error, error} ->
+              {:refused, error}
+
+            {:ok, item, created?, changed?, routing_wake} ->
+              if created? or changed? do
+                on_handoff_in_txn(call).(txn, item, created?)
+              end
+
+              wake = schedule_handoff_wake_in_txn(txn, call, item)
+
+              if is_map(wake) and is_binary(wake[:wake_id]) do
+                Publisher.committed_in_txn(
+                  txn,
+                  "wake.scheduled",
+                  wake,
+                  %{"workItemId" => item.id}
+                )
+              else
+                raise "delivery-owner handoff did not schedule its wake"
+              end
+
+              Publisher.maybe_accepted_in_txn(txn, call, %{id: item.id})
+              {:handed_off, item, created?, changed?, routing_wake}
+          end
+        end)
+
+      case result do
+        {:refused, error} ->
+          handoff_refusal(error)
+
+        {:handed_off, item, created?, changed?, routing_wake} ->
+          if created? or changed?,
+            do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
+
+          if is_map(routing_wake) do
+            best_effort(fn -> on_routing_wake_scheduled(call).(routing_wake) end)
+          end
+
+          %{
+            workItem: public_work_item(item),
+            created: created?,
+            wakeScheduled: true
+          }
+      end
+    end
+  end
+
+  defp handoff_refusal(%{code: "unknown_delivery_owner", message: message} = error),
+    do:
+      Map.put(
+        error,
+        :message,
+        message <> "; correct deliveryOwnerSessionKey to an active session"
+      )
+
+  defp handoff_refusal(%{code: "delivery_owner_unavailable", message: message} = error),
+    do: Map.put(error, :message, message <> "; choose an active delivery-owner session")
+
+  defp handoff_refusal(%{code: "ephemeral_obligation", message: message} = error),
+    do: Map.put(error, :message, message <> "; choose a persistent delivery-owner session")
+
+  defp handoff_item_owner(_db, _principal, :existing), do: {:ok, nil}
+  defp handoff_item_owner(db, principal, :new), do: resolve_owner(db, principal)
+
+  defp handoff_item_in_txn(
+         txn,
+         call,
+         :existing,
+         _item_owner,
+         _created_by_user,
+         _created_by_session
+       ) do
+    item = fetch_in_txn(txn, call.params[:work_item_id])
+
+    if is_nil(item) do
+      {:error, unknown(call.params[:work_item_id])}
+    else
+      case update_metadata_in_txn(txn, item, %{
+             delivery_owner_session_key: call.params[:delivery_owner_session_key]
+           }) do
+        {:updated, updated, changed?} -> {:ok, updated, false, changed?, nil}
+        error -> {:error, error}
+      end
+    end
+  end
+
+  defp handoff_item_in_txn(
+         txn,
+         call,
+         :new,
+         item_owner,
+         created_by_user,
+         created_by_session
+       ) do
+    params = call.params
+
+    with :ok <- valid_delivery_owner(txn, params) do
+      id = "wi_" <> Tightbeam.Id.uuid4()
+      created_in_turn_seq = running_turn_seq(txn, created_by_session)
+      priority = params[:priority] || default_priority_in_txn(txn)
+      is_bug = Map.get(params, :is_bug, false)
+      created_at = now()
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO work_items
+          (id, title, specRefName, specRefSha256, isBug, ownerUserId,
+           state, createdByUser, createdBySession, createdInTurnSeq,
+           createdContextKnown, createdAt)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, 1, ?10)
+        """,
+        [
+          id,
+          params.title,
+          params[:spec_ref_name],
+          params[:spec_ref_sha256],
+          bool_to_int(is_bug),
+          item_owner,
+          created_by_user,
+          created_by_session,
+          created_in_turn_seq,
+          created_at
+        ]
+      )
+
+      put_priority_in_txn(txn, id, priority)
+      stamp_version_in_txn(txn, id, created_at)
+      item = fetch_in_txn(txn, id)
+      item = apply_updates(txn, item, delivery_owner_update(params))
+      routing_wake = arm_routing_in_txn(txn, id, item_owner, params.title)
+      on_routing_wake_scheduled_in_txn(call).(txn, routing_wake)
+
+      {:ok, fetch_in_txn(txn, id), true, true, routing_wake}
+    else
+      error -> {:error, error}
+    end
+  end
+
+  defp schedule_handoff_wake_in_txn(txn, call, item) do
+    Wakes.schedule_in_txn(txn, %{
+      session_key: call.params[:delivery_owner_session_key],
+      origin: call.origin,
+      prompt:
+        "Delivery-owner handoff for work item #{item.id} (#{item.title}):\n\n" <>
+          call.params.brief,
+      due_at: now(),
+      sender_scheduled: true,
+      work_item_id: item.id
+    })
+  end
+
+  defp valid_handoff_input(params) do
+    mode =
+      case {Map.has_key?(params, :work_item_id), Map.has_key?(params, :title)} do
+        {true, false} -> :existing
+        {false, true} -> :new
+        _ -> nil
+      end
+
+    with mode when not is_nil(mode) <- mode,
+         :ok <- valid_handoff_reference(params, mode),
+         :ok <- valid_handoff_owner_reference(params[:delivery_owner_session_key]),
+         :ok <- valid_handoff_brief(params[:brief]),
+         :ok <- valid_handoff_item_fields(params, mode) do
+      {:ok, mode}
+    else
+      nil -> error("invalid_handoff", "supply exactly one of workItemId or title")
+      error -> error
+    end
+  end
+
+  defp valid_handoff_reference(params, :existing) do
+    case params[:work_item_id] do
+      id when is_binary(id) and byte_size(id) > 0 ->
+        if String.trim(id) == "",
+          do: error("invalid_handoff", "workItemId must be a non-blank work-item identifier"),
+          else: :ok
+
+      _ ->
+        error("invalid_handoff", "workItemId must be a non-blank work-item identifier")
+    end
+  end
+
+  defp valid_handoff_reference(params, :new), do: valid_title(params[:title])
+
+  defp valid_handoff_owner_reference(owner)
+       when is_binary(owner) and byte_size(owner) > 0 do
+    if String.trim(owner) == "",
+      do: error("invalid_delivery_owner", "deliveryOwnerSessionKey must be non-blank"),
+      else: :ok
+  end
+
+  defp valid_handoff_owner_reference(_owner),
+    do: error("invalid_delivery_owner", "deliveryOwnerSessionKey must be an active session")
+
+  defp valid_handoff_brief(brief) when is_binary(brief) do
+    if String.valid?(brief) and String.trim(brief) != "",
+      do: :ok,
+      else: error("invalid_handoff_brief", "brief must be valid non-blank UTF-8 text")
+  end
+
+  defp valid_handoff_brief(_brief),
+    do: error("invalid_handoff_brief", "brief must be valid non-blank UTF-8 text")
+
+  defp valid_handoff_item_fields(params, :existing) do
+    creation_fields = [:spec_ref_name, :spec_ref_sha256, :is_bug, :priority]
+
+    if Enum.any?(creation_fields, &Map.has_key?(params, &1)),
+      do:
+        error(
+          "invalid_handoff",
+          "specRefName, specRefSha256, isBug, and priority are only valid when creating a work item"
+        ),
+      else: :ok
+  end
+
+  defp valid_handoff_item_fields(params, :new) do
+    is_bug = Map.get(params, :is_bug, false)
+
+    with :ok <- valid_spec_ref(params[:spec_ref_name], params[:spec_ref_sha256]),
+         :ok <- valid_is_bug(is_bug),
+         :ok <- valid_priority(params[:priority]) do
+      :ok
     end
   end
 
@@ -1362,6 +1611,22 @@ defmodule Tightbeam.WorkItems do
   defp valid_idempotency_key(_),
     do: error("invalid_idempotency_key", "idempotencyKey must be text")
 
+  defp handoff_principal_allowed({:process, _}),
+    do:
+      error(
+        "process_denied",
+        "automated callers cannot hand off work items; use a user credential or session token"
+      )
+
+  defp handoff_principal_allowed(nil),
+    do:
+      error(
+        "principal_required",
+        "work-item-handoff requires a user credential or session token"
+      )
+
+  defp handoff_principal_allowed({kind, _}) when kind in [:session, :user], do: :ok
+
   defp principal_allowed({:process, _}),
     do: error("process_denied", "process principals cannot use work-item verbs")
 
@@ -1412,6 +1677,9 @@ defmodule Tightbeam.WorkItems do
 
   defp on_routing_wake_scheduled_in_txn(call),
     do: Map.get(call, :on_routing_wake_scheduled_in_txn, fn _, _ -> :ok end)
+
+  defp on_handoff_in_txn(call),
+    do: Map.get(call, :on_work_item_handoff_in_txn, fn _, _, _ -> :ok end)
 
   defp on_routing_wake_scheduled(call),
     do: Map.get(call, :on_routing_wake_scheduled, fn _ -> :ok end)

@@ -37,7 +37,7 @@ defmodule Tightbeam.Firehose.Publisher do
   }
 
   @transactional_verbs MapSet.new(
-                         ~w(ask answer return work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest revoke-assignment reopen-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire operator-ask operator-rule operator-withdraw rule effort-rule withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
+                         ~w(ask answer return work-item-create work-item-handoff work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest revoke-assignment reopen-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire operator-ask operator-rule operator-withdraw rule effort-rule withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
                        )
 
   @spec accepted(map(), term()) :: :ok
@@ -67,7 +67,7 @@ defmodule Tightbeam.Firehose.Publisher do
   end
 
   defp canonical_in_txn(txn, %{verb: verb} = call, result)
-       when verb in ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail) do
+       when verb in ~w(work-item-create work-item-handoff work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail) do
     id = result[:id] || result["id"] || call.params[:work_item_id]
     StateResources.query_work_item(txn, id, call) || result
   end

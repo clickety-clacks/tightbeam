@@ -572,6 +572,208 @@ defmodule Tightbeam.WorkItemsTest do
     end
   end
 
+  test "handoff creates or binds an item and delivers its brief without opening an assignment",
+       ctx do
+    owner = ctx.other.session_key
+    new_brief = "Take ownership of the new item."
+
+    assert {:ok, %{created: true, wakeScheduled: true, workItem: new_item}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               handoff_call({:user, "flynn"}, %{
+                 title: "New handoff",
+                 delivery_owner_session_key: owner,
+                 brief: new_brief
+               })
+             )
+
+    assert new_item.deliveryOwnerSessionKey == owner
+    assert new_item.title == "New handoff"
+
+    assert {:ok, [[^owner, new_prompt, "pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,prompt,state FROM wakes WHERE work_item_id=?1 AND prompt LIKE 'Delivery-owner handoff for work item %'",
+               [new_item.id]
+             )
+
+    assert new_prompt =~ new_brief
+
+    existing = create(ctx, {:user, "flynn"}, %{title: "Existing handoff"})
+    existing_brief = "Take ownership of the existing item."
+
+    assert {:ok, %{created: false, wakeScheduled: true, workItem: existing_item}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               handoff_call({:user, "flynn"}, %{
+                 work_item_id: existing.id,
+                 delivery_owner_session_key: owner,
+                 brief: existing_brief
+               })
+             )
+
+    assert existing_item.id == existing.id
+    assert existing_item.title == existing.title
+    assert existing_item.deliveryOwnerSessionKey == owner
+
+    assert {:ok, [[^owner, existing_prompt, "pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,prompt,state FROM wakes WHERE work_item_id=?1 AND prompt LIKE 'Delivery-owner handoff for work item %'",
+               [existing.id]
+             )
+
+    assert existing_prompt =~ existing_brief
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignments WHERE workItemId IN (?1, ?2)",
+               [new_item.id, existing.id]
+             )
+  end
+
+  test "handoff input refusals say which selector or field to correct", ctx do
+    owner = ctx.other.session_key
+
+    assert %{code: "invalid_handoff", message: selector_error} =
+             WorkItems.__handle__(
+               ctx.db,
+               "work-item-handoff",
+               handoff_call({:user, "flynn"}, %{
+                 delivery_owner_session_key: owner,
+                 brief: "A complete brief."
+               })
+             )
+
+    assert selector_error =~ "exactly one of workItemId or title"
+
+    assert %{code: "invalid_handoff", message: id_error} =
+             WorkItems.__handle__(
+               ctx.db,
+               "work-item-handoff",
+               handoff_call({:user, "flynn"}, %{
+                 work_item_id: "  ",
+                 delivery_owner_session_key: owner,
+                 brief: "A complete brief."
+               })
+             )
+
+    assert id_error =~ "workItemId must be a non-blank work-item identifier"
+
+    assert %{code: "invalid_handoff_brief", message: brief_error} =
+             WorkItems.__handle__(
+               ctx.db,
+               "work-item-handoff",
+               handoff_call({:user, "flynn"}, %{
+                 title: "New item",
+                 delivery_owner_session_key: owner,
+                 brief: "   "
+               })
+             )
+
+    assert brief_error =~ "brief must be valid non-blank UTF-8 text"
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM work_items")
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+  end
+
+  test "handoff refusals identify invalid owner input and required authority", ctx do
+    invalid_owner =
+      handoff_call({:user, "flynn"}, %{
+        title: "Invalid handoff",
+        delivery_owner_session_key: "missing-office",
+        brief: "A complete brief."
+      })
+
+    assert %{code: "unknown_delivery_owner", message: owner_error} =
+             WorkItems.__handle__(ctx.db, "work-item-handoff", invalid_owner)
+
+    assert owner_error =~ "does not exist"
+    assert owner_error =~ "correct deliveryOwnerSessionKey to an active session"
+    refute owner_error =~ "work-item-handoff"
+
+    process_call =
+      handoff_call({:process, "scheduler"}, %{
+        title: "Unauthorized handoff",
+        delivery_owner_session_key: "holder",
+        brief: "A complete brief."
+      })
+
+    assert %{code: "process_denied", message: authority_error} =
+             WorkItems.__handle__(ctx.db, "work-item-handoff", process_call)
+
+    assert authority_error =~ "automated callers cannot hand off work items"
+    assert authority_error =~ "user credential or session token"
+    refute authority_error =~ "--work-item"
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM work_items")
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+  end
+
+  test "handoff wake failure rolls back both new and existing item state", ctx do
+    existing = create(ctx, {:user, "flynn"}, %{title: "Atomic existing handoff"})
+
+    assert %{deliveryOwnerSessionKey: "holder"} =
+             update(ctx, {:user, "flynn"}, existing.id, %{
+               delivery_owner_session_key: "holder"
+             })
+
+    assert :ok =
+             DB.execute(ctx.db, """
+             CREATE TRIGGER refuse_delivery_handoff_prompt
+             BEFORE INSERT ON wakes
+             WHEN NEW.prompt LIKE 'Delivery-owner handoff for work item %'
+             BEGIN SELECT RAISE(ABORT, 'handoff prompt refused'); END
+             """)
+
+    assert {:ok, [item_before]} =
+             DB.query(
+               ctx.db,
+               "SELECT wi.*,versions.rowVersion FROM work_items wi JOIN work_item_versions versions ON versions.workItemId=wi.id WHERE wi.id=?1",
+               [existing.id]
+             )
+
+    assert {:ok, [[wakes_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+
+    assert {:error, %{code: "server_error"}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               handoff_call({:user, "flynn"}, %{
+                 title: "Rolled-back new handoff",
+                 delivery_owner_session_key: ctx.other.session_key,
+                 brief: "This handoff must leave no card or wake."
+               })
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM work_items WHERE title='Rolled-back new handoff'"
+             )
+
+    assert {:error, %{code: "server_error"}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               handoff_call({:user, "flynn"}, %{
+                 work_item_id: existing.id,
+                 delivery_owner_session_key: ctx.other.session_key,
+                 brief: "This handoff must preserve the former owner."
+               })
+             )
+
+    assert {:ok, [^item_before]} =
+             DB.query(
+               ctx.db,
+               "SELECT wi.*,versions.rowVersion FROM work_items wi JOIN work_item_versions versions ON versions.workItemId=wi.id WHERE wi.id=?1",
+               [existing.id]
+             )
+
+    assert {:ok, [[^wakes_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+  end
+
   test "Proof 1: an item created during a running turn carries that seq with known = 1; created with no running turn carries NULL with known = 1",
        ctx do
     {running_seq, owner_lease} = running_turn!(ctx.db, "holder")
@@ -1184,6 +1386,7 @@ defmodule Tightbeam.WorkItemsTest do
     do: WorkItems.__handle__(ctx.db, "work-item-list", list_call(principal))
 
   defp create_call(principal, params), do: call("work-item-create", principal, params)
+  defp handoff_call(principal, params), do: call("work-item-handoff", principal, params)
   defp get_call(principal, id), do: call("work-item-get", principal, %{work_item_id: id})
   defp list_call(principal), do: call("work-item-list", principal, %{})
 

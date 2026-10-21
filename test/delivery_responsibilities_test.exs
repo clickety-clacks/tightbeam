@@ -399,6 +399,112 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
              "pdo-a"
   end
 
+  test "dispatch refusals name the one-call handoff and that route succeeds", %{db: db} do
+    tmp =
+      Path.join(System.tmp_dir!(), "delivery-handoff-rules-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(tmp) end)
+    load_delivery_rules!(tmp)
+    handlers = assignment_handlers(db)
+
+    item =
+      WorkItems.__handle__(db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:owner",
+        principal: {:user, "owner"},
+        params: %{title: "Ownerless production intake"}
+      })
+
+    assert %{id: item_id} = item
+
+    assert {:error,
+            %{
+              code: "rule_denied",
+              rule: "engineering-dispatch-production-needs-delivery-owner",
+              message: missing_owner
+            }} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               production_call("dispatch", {:user, "owner"}, "worker-a", item_id)
+             )
+
+    assert missing_owner =~ "work-item-handoff --work-item #{item_id}"
+    assert missing_owner =~ "--delivery-owner <sessionKey>"
+    assert missing_owner =~ "--brief"
+    refute missing_owner =~ "work-item-update --delivery-owner"
+
+    handoff = fn brief ->
+      Dispatch.dispatch(db, handlers, %{
+        verb: "work-item-handoff",
+        origin: "user:owner",
+        principal: {:user, "owner"},
+        params: %{
+          work_item_id: item_id,
+          delivery_owner_session_key: "pdo-a",
+          brief: brief
+        }
+      })
+    end
+
+    first_brief = "The product office accepts this item and owns its delivery."
+
+    assert {:ok, %{created: false, wakeScheduled: true, workItem: handed_off}} =
+             handoff.(first_brief)
+
+    assert handed_off.deliveryOwnerSessionKey == "pdo-a"
+
+    assert {:ok, [["pdo-a", first_prompt]]} =
+             DB.query(
+               db,
+               "SELECT sessionKey,prompt FROM wakes WHERE work_item_id=?1 AND prompt LIKE 'Delivery-owner handoff for work item %'",
+               [item_id]
+             )
+
+    assert first_prompt =~ first_brief
+
+    assert {:error,
+            %{
+              code: "rule_denied",
+              rule: "engineering-dispatch-production-office-target-refused",
+              message: office_target
+            }} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               production_call(
+                 "dispatch",
+                 {:session, "pdo-a"},
+                 "pdo-a",
+                 item_id
+               )
+             )
+
+    assert office_target =~ "work-item-handoff"
+    assert office_target =~ "--work-item <workItemId>"
+    assert office_target =~ "--title"
+    assert office_target =~ "--delivery-owner <sessionKey>"
+    assert office_target =~ "--brief"
+    refute office_target =~ "use a genuine consultation context"
+
+    second_brief = "The office confirms its delivery plan."
+
+    assert {:ok, %{created: false, wakeScheduled: true, workItem: second_handoff}} =
+             handoff.(second_brief)
+
+    assert second_handoff.deliveryOwnerSessionKey == "pdo-a"
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM wakes WHERE work_item_id=?1 AND prompt LIKE 'Delivery-owner handoff for work item %'",
+               [item_id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT COUNT(*) FROM assignments WHERE workItemId=?1", [item_id])
+  end
+
   test "loaded engineering rules require owner and topology even with an authentic routing bracket",
        %{db: db} do
     tmp =
@@ -453,9 +559,20 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                )
 
       assert message =~ item_id
-      assert message =~ "Set the intended owner explicitly"
       refute message =~ "human owner/admin"
-      assert message =~ "work-item-update --delivery-owner"
+
+      if rule in [
+           "engineering-assign-production-needs-delivery-owner",
+           "engineering-dispatch-production-needs-delivery-owner"
+         ] do
+        assert message =~ "work-item-handoff --work-item #{item_id}"
+        assert message =~ "--delivery-owner <sessionKey>"
+        assert message =~ "--brief"
+        refute message =~ "work-item-update --delivery-owner"
+      else
+        assert message =~ "Set the intended owner explicitly"
+        assert message =~ "work-item-update --delivery-owner"
+      end
     end
 
     assert count(db, "assignments") == before
@@ -607,7 +724,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     for {verb, work_item_id, owner_ref, expected_code, expected_message} <- [
           {"assign", "wi_b1", nil, "delivery_owner_missing", "work-item-update --delivery-owner"},
           {"dispatch", "wi_b1", nil, "delivery_owner_missing",
-           "work-item-update --delivery-owner"},
+           "work-item-handoff --work-item wi_b1"},
           {"assign", "wi_a1", "session:successor-a", "delivery_owner_mismatch", "session:pdo-a"},
           {"dispatch", "wi_a1", "session:successor-a", "delivery_owner_mismatch",
            "session:pdo-a"},
@@ -844,7 +961,8 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
   defp assignment_handlers(db) do
     %{
       "assign" => fn call -> Assignments.__handle__(db, "assign", call) end,
-      "dispatch" => fn call -> Assignments.__handle__(db, "dispatch", call) end
+      "dispatch" => fn call -> Assignments.__handle__(db, "dispatch", call) end,
+      "work-item-handoff" => fn call -> WorkItems.__handle__(db, "work-item-handoff", call) end
     }
   end
 

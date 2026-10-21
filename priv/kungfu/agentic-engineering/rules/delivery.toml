@@ -47,7 +47,7 @@ deny_when = [
 [[rule]]
 name = "engineering-assign-production-needs-delivery-owner"
 verb = "assign"
-text = "Production staffing of work item {work_item_id} requires a current delivery owner. Set the intended owner explicitly with work-item-update --delivery-owner before retrying."
+text = "Production staffing of work item {work_item_id} requires a current delivery owner. Use work-item-handoff --work-item {work_item_id} --delivery-owner <sessionKey> --brief \"<brief>\" to set the intended office and deliver its brief in one call, then dispatch an implementation worker."
 edges = ["verb"]
 effect = "deny"
 deny_when = [
@@ -136,7 +136,7 @@ deny_when = [
 [[rule]]
 name = "engineering-dispatch-production-needs-delivery-owner"
 verb = "dispatch"
-text = "Production staffing of work item {work_item_id} requires a current delivery owner. Set the intended owner explicitly with work-item-update --delivery-owner before retrying."
+text = "Production staffing of work item {work_item_id} requires a current delivery owner. Use work-item-handoff --work-item {work_item_id} --delivery-owner <sessionKey> --brief \"<brief>\" to set the intended office and deliver its brief in one call, then dispatch an implementation worker."
 edges = ["verb"]
 effect = "deny"
 deny_when = [
@@ -148,7 +148,7 @@ deny_when = [
 [[rule]]
 name = "engineering-dispatch-production-office-target-refused"
 verb = "dispatch"
-text = "Production work cannot be dispatched to a PO or PDO office session. Dispatch an implementation worker or use a genuine consultation context."
+text = "Production work cannot be dispatched to a delivery-owner office as an implementation assignment. Use work-item-handoff with either --work-item <workItemId> or --title \"<title>\", plus --delivery-owner <sessionKey> and --brief \"<brief>\", to hand the work to the office in one call; staff implementation separately."
 edges = ["verb"]
 effect = "deny"
 deny_when = [
