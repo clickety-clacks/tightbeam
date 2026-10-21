@@ -160,8 +160,21 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert is_binary(assigned.id)
 
-    assert [[1, "armed", wake_id, watermark, artifact_watermark, attest_watermark,
-             work_item_watermark, armed_at, horizon, multiplier, due_at]] =
+    assert [
+             [
+               1,
+               "armed",
+               wake_id,
+               watermark,
+               artifact_watermark,
+               attest_watermark,
+               work_item_watermark,
+               armed_at,
+               horizon,
+               multiplier,
+               due_at
+             ]
+           ] =
              rows(
                ctx.db,
                """
@@ -179,20 +192,24 @@ defmodule Tightbeam.EffortCheckinTest do
     assert multiplier == 1
     assert due_at - armed_at == horizon * multiplier
     assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
+
     assert rows(
              ctx.db,
              "SELECT COUNT(*) FROM artifacts WHERE workItemId=?1 AND createdBySession=?2 AND rowid>?3",
              [item.id, "holder", artifact_watermark]
            ) == [[0]]
+
     assert rows(ctx.db, "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND rowid>?2", [
              assigned.id,
              attest_watermark
            ]) == [[0]]
+
     assert rows(
              ctx.db,
              "SELECT COUNT(*) FROM work_item_events WHERE workItemId=?1 AND id>?2 AND kind='metadata'",
              [item.id, work_item_watermark]
            ) == [[0]]
+
     assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND seq>?2", [
              "holder",
              watermark
@@ -217,6 +234,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert :ok = Wakes.fire_due(scheduler)
 
     assert %{state: "fired"} = Wakes.get(ctx.db, wake_id)
+
     assert [[1, "probed"], [2, "armed"]] ==
              rows(
                ctx.db,
@@ -257,8 +275,21 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert is_binary(assigned.id)
 
-    assert [[1, "armed", wake_id, watermark, artifact_watermark, attest_watermark,
-             work_item_watermark, armed_at, horizon, multiplier, due_at]] =
+    assert [
+             [
+               1,
+               "armed",
+               wake_id,
+               watermark,
+               artifact_watermark,
+               attest_watermark,
+               work_item_watermark,
+               armed_at,
+               horizon,
+               multiplier,
+               due_at
+             ]
+           ] =
              rows(
                ctx.db,
                """
@@ -276,20 +307,24 @@ defmodule Tightbeam.EffortCheckinTest do
     assert multiplier == 1
     assert due_at - armed_at == horizon * multiplier
     assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
+
     assert rows(
              ctx.db,
              "SELECT COUNT(*) FROM artifacts WHERE workItemId=?1 AND createdBySession=?2 AND rowid>?3",
              [item.id, "holder", artifact_watermark]
            ) == [[0]]
+
     assert rows(ctx.db, "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND rowid>?2", [
              assigned.id,
              attest_watermark
            ]) == [[0]]
+
     assert rows(
              ctx.db,
              "SELECT COUNT(*) FROM work_item_events WHERE workItemId=?1 AND id>?2 AND kind='metadata'",
              [item.id, work_item_watermark]
            ) == [[0]]
+
     assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND seq>?2", [
              "holder",
              watermark
@@ -302,6 +337,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert :ok = Wakes.fire_due(scheduler)
 
     assert %{state: "fired"} = Wakes.get(ctx.db, wake_id)
+
     assert rows(
              ctx.db,
              "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
@@ -313,6 +349,7 @@ defmodule Tightbeam.EffortCheckinTest do
              "SELECT agentProdded FROM effort_checkin_generations WHERE assignmentId=?1 AND generation=2",
              [assigned.id]
            ) == [[1]]
+
     assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [
              assigned.id
            ]) == [[0]]
