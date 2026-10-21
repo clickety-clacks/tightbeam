@@ -65,8 +65,7 @@ defmodule Tightbeam.HarklightTest do
         ctx.db,
         %{
           principal: {:session, ctx.recipient},
-          params:
-            Router.atomize_params_for_test(cli_request["verb"], cli_request["params"])
+          params: Router.atomize_params_for_test(cli_request["verb"], cli_request["params"])
         },
         start_listener: false
       )
