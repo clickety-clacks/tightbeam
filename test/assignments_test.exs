@@ -3502,6 +3502,114 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
+  test "a fired parent escalation does not block opener revocation after reparenting", ctx do
+    main = Org.personal_session_key("flynn")
+    session(ctx.db, main, "flynn")
+    session(ctx.db, "parent-a", "flynn", %{spawned_by: main})
+    session(ctx.db, "parent-b", "flynn", %{spawned_by: main})
+    session(ctx.db, "opener", "flynn", %{spawned_by: "parent-a"})
+
+    item = create_work_item(ctx, "Reparented opener disposition")
+    set_delivery_owner(ctx, item.id, "opener")
+
+    opener_work =
+      assign_call({:user, "flynn"}, "opener has continuing work", nil, item.id)
+      |> Map.put(:session_key, "opener")
+      |> then(&handle(ctx, "assign", &1))
+
+    blocked_assignment =
+      assign_call({:session, "opener"}, "blocked work", nil, item.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    blocked =
+      attest_call({:session, "holder"}, blocked_assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "awaiting the opener's disposition")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Supervision.ladder_target(ctx.db, "opener", 1) == "parent-a"
+
+    assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_deadline", opener_work.id)
+    assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_climb", opener_work.id)
+
+    assert [escalation] =
+             Enum.filter(Wakes.list_pending(ctx.db), &(&1.assignment_id == opener_work.id))
+
+    assert escalation.session_key == "parent-a"
+
+    assert {:ok, {:appended, _, _, _}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 escalation.session_key,
+                 escalation.origin,
+                 escalation.prompt,
+                 wake_id: escalation.wake_id,
+                 sender: escalation.origin,
+                 target_gate: escalation,
+                 fire_wake_in_txn: true,
+                 assignment_id: escalation.assignment_id
+               )
+             end)
+
+    assert Wakes.get(ctx.db, escalation.wake_id).state == "fired"
+
+    assert {:ok, [["parent-a"]]} =
+             DB.query(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId=?1", [
+               escalation.wake_id
+             ])
+
+    assert {:ok, [["standing"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert %{"session" => %{"currentParent" => "parent-b"}} =
+             Tightbeam.SessionReparent.handle(ctx.db, %{
+               principal: {:user, "flynn"},
+               params: %{
+                 session_key: "opener",
+                 parent_session_key: "parent-b",
+                 assignment_id: opener_work.id,
+                 idempotency_key: "reparent-after-escalation"
+               }
+             })
+
+    assert %{outcome: "revoked"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:session, "opener"}, blocked_assignment.id)
+             )
+
+    assert {:ok, [["open", "opener"]]} =
+             DB.query(ctx.db, "SELECT state,holderKey FROM assignments WHERE id=?1", [
+               opener_work.id
+             ])
+
+    assert {:ok, [["closed", "revoked", "opener"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,outcome,closedBySession FROM assignments WHERE id=?1",
+               [blocked_assignment.id]
+             )
+
+    assert Wakes.get(ctx.db, blocked.decisionWake.wake_id).state == "canceled"
+
+    assert {:ok, [["settled", "disposed", "withdrawn"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT cp.state,cp.settlementKind,dr.status
+               FROM assignment_cannot_proceed cp
+               JOIN decision_requests dr ON dr.id=cp.decisionRequestId
+               WHERE cp.id=?1
+               """,
+               [blocked.cannotProceed.id]
+             )
+  end
+
   test "terminal user alert transfers a retired session disposer to its owner", ctx do
     assignment =
       handle(ctx, "assign", assign_call({:session, "other-session"}, "dead opener alert"))
