@@ -1,9 +1,12 @@
 defmodule Tightbeam.Firehose.PublisherTest do
   use Tightbeam.TestCase, async: false
+  import Plug.Conn
+  import Plug.Test
 
   alias Tightbeam.{
     ConnRegistry,
     DB,
+    Devices,
     Dispatch,
     Escalation,
     Gateway,
@@ -16,6 +19,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
   alias Tightbeam.NoticeBatcher
   alias Tightbeam.Firehose.{Hub, Publisher}
+  alias Tightbeam.Wire.Router
 
   defmodule LaneStub do
     use GenServer
@@ -331,7 +335,16 @@ defmodule Tightbeam.Firehose.PublisherTest do
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
     :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
-    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
+
+    {:paired, completion_device} =
+      Devices.pair(db, %{
+        device_id: "firehose-completion-device",
+        claimed_name: "Flynn",
+        platform: nil,
+        model: nil
+      })
+
+    :ok = DB.execute(db, "UPDATE users SET isAdmin=1 WHERE userId='flynn'")
     register_testhost(db)
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneStub, name: Tightbeam.LaneManager})
@@ -384,6 +397,16 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     handlers = Gateway.handlers(config)
+
+    router_opts = [
+      db: db,
+      base_dir: System.tmp_dir!(),
+      handlers: handlers,
+      cli_token: "unused-completion-test-token",
+      firehose_hub: Hub,
+      model_catalog: %{},
+      session_status: fn _ -> nil end
+    ]
 
     immediate_wake = %{
       verb: "wake",
@@ -747,6 +770,18 @@ defmodule Tightbeam.Firehose.PublisherTest do
         [assignment.id, review.id]
       )
 
+    {completion_notices, _completion_message_ids} = completion_publications
+    closed_notices = Enum.filter(completion_notices, &(&1["class"] == "assignment.closed"))
+
+    assert [closed_notice] = closed_notices
+
+    closed_response =
+      rest_get("/api/assignments/#{assignment.id}", completion_device.token, router_opts)
+
+    assert closed_response.status == 200, closed_response.resp_body
+    closed_row = JSON.decode!(closed_response.resp_body)["item"]
+    assert closed_notice["payload"] == closed_row
+
     completion_effects = notice_state_classes(completion_publications)
     asynchronous_delivery = ~w(session.updated wake.fired)
 
@@ -773,14 +808,34 @@ defmodule Tightbeam.Firehose.PublisherTest do
              Dispatch.dispatch(db, handlers, reopen)
 
     assert reopened_id == assignment.id
-    {holder_notices, reopen_effects} = Map.pop(observed_state_notices(), "message.created", [])
-    assert [%{"payload" => reopen_message}] = holder_notices
-    assert reopen_message["sessionKey"] == assignment.holderKey
 
-    assert reopen_message["content"] ==
-             "[assignment reopened: #{assignment.id} by session:effect-target — continue the real assignment]"
+    reopen_publications =
+      assert_substrate_messages_created!(
+        db,
+        [
+          {
+            "effect-target",
+            "[assignment reopened: #{assignment.id} by session:effect-target — continue the real assignment]"
+          }
+        ],
+        [assignment.id, review.id]
+      )
 
-    assert_per_verb_effects!(config, "reopen-assignment", Map.keys(reopen_effects))
+    {reopen_notices, _reopen_message_ids} = reopen_publications
+    assert [reopen_notice] = Enum.filter(reopen_notices, &(&1["class"] == "assignment.reopened"))
+
+    reopened_response =
+      rest_get("/api/assignments/#{assignment.id}", completion_device.token, router_opts)
+
+    assert reopened_response.status == 200, reopened_response.resp_body
+    reopened_row = JSON.decode!(reopened_response.resp_body)["item"]
+    assert reopen_notice["payload"] == reopened_row
+    assert reopened_row["rowVersion"] > closed_row["rowVersion"]
+
+    reopen_effects = notice_state_classes(reopen_publications)
+    declared_reopen_effects = Gateway.handler_effects(config)["reopen-assignment"]
+    assert Enum.all?(reopen_effects, &(&1 in declared_reopen_effects))
+    assert "assignment.reopened" in reopen_effects
     history = Tightbeam.Assignments.list_reopenings(db, assignment.id)
     assert [%{priorOutcome: "completed", reason: "continue the real assignment"}] = history
 
@@ -2781,5 +2836,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert_receive {:firehose_notice, notice}
     Hub.delivered(Hub, self())
     notice
+  end
+
+  defp rest_get(path, token, opts) do
+    conn(:get, path)
+    |> put_req_header("authorization", "Bearer #{token}")
+    |> Router.call(Router.init(opts))
   end
 end

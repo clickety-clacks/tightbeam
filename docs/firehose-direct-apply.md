@@ -55,8 +55,16 @@ The publisher, lifecycle, artifact, session, and version-migration tests named
 in the table exercise canonical row/notice parity, lifecycle transitions,
 same-millisecond updates, persisted version sources across database reopen,
 and the client version rule.
-`test/firehose_direct_apply_test.exs` runs the DA3.5 duplicate, paged-walk,
-lifecycle reversal, restart/reconnect, turn-queued, and visibility-boundary
-cases across all seven required keys. These are candidate tests; DA3.4 still
-requires them to pass on the integrated 0.1.11 commit before any required row
-can be marked certified.
+`test/firehose_direct_apply_test.exs` has two separate kinds of evidence. Its
+generic in-test client model uses synthetic rows to exercise version ordering,
+duplicates, walk overlap, lifecycle reversal, restart, and visibility-boundary
+rules; those rows do not prove server convergence. The server-backed test
+mutates each of the seven required resources through its production write path,
+applies the emitted notice twice, and compares that row with the corresponding
+REST collection or detail response. The assignment case uses its detail route
+because this candidate exposes assignment details, not an assignment collection.
+This covers notice-to-REST row parity for one mutation per resource. It does
+not claim the full DA3.5 matrix for real server rows: concurrent paged walks,
+same-millisecond changes, reconnect between mutations, and visibility changes
+remain unexercised here. All seven rows therefore remain pending certification
+until complete DA3.5 coverage passes on the integrated 0.1.11 commit.

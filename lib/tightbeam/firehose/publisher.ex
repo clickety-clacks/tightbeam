@@ -142,18 +142,7 @@ defmodule Tightbeam.Firehose.Publisher do
     [observation_notice("verb.accepted", call)] ++ state_notices(db, call, result)
   end
 
-  defp state_notices(db, call, result) do
-    primary = List.wrap(state_notice(db, call, result))
-
-    case {call.verb, result} do
-      {"attest", %{assignment: %{state: "closed", outcome: outcome} = assignment}}
-      when outcome in ~w(completed surrendered revoked) ->
-        primary ++ [build("assignment.closed", call, assignment, &StateResources.assignment/1)]
-
-      _ ->
-        primary
-    end
-  end
+  defp state_notices(db, call, result), do: List.wrap(state_notice(db, call, result))
 
   @spec denied_notices(map(), map()) :: [map()]
   def denied_notices(call, error) do

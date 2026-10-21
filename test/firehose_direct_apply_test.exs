@@ -3,7 +3,7 @@ defmodule Tightbeam.Firehose.DirectApplyTest do
 
   @required_resources ~w(work-items assignments attests artifacts turns wakes sessions)
 
-  test "DA3.5 mutation and visibility cases converge for every required resource" do
+  test "the generic client model follows version, walk, restart, and visibility rules" do
     Enum.each(@required_resources, fn resource ->
       key = resource <> ":sample"
       opened = row(key, 40, "open", 1_000)
@@ -175,5 +175,293 @@ defmodule Tightbeam.Firehose.DirectApplyTest do
     rows = List.flatten(pages)
     client = complete_walk_apply(client, rows)
     Enum.reduce(notices, client, &apply_upsert(&2, &1))
+  end
+end
+
+defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
+  use Tightbeam.TestCase, async: false
+  import Plug.Conn
+  import Plug.Test
+
+  alias Tightbeam.{
+    Artifacts,
+    Assignments,
+    DB,
+    Devices,
+    Ledger,
+    Model,
+    Org,
+    Schema,
+    Wakes,
+    WorkItems
+  }
+
+  alias Tightbeam.Firehose.Hub
+  alias Tightbeam.Wire.Router
+
+  setup do
+    db = :"firehose_direct_apply_convergence_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Schema.ensure_all(db)
+
+    {:paired, device} =
+      Devices.pair(db, %{
+        device_id: "firehose-direct-apply-device",
+        claimed_name: "Flynn",
+        platform: nil,
+        model: nil
+      })
+
+    work_root =
+      Path.join(System.tmp_dir!(), "firehose-direct-apply-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(work_root)
+    File.write!(Path.join(work_root, "sample.md"), "server-backed artifact")
+
+    on_exit(fn -> File.rm_rf!(work_root) end)
+
+    register_hosts(db, %{
+      "testhost" => %{ssh: nil, base_dir: work_root, cli_bin: nil}
+    })
+
+    session =
+      Org.create(db, %{
+        session_key: "direct-apply-owner",
+        display_name: "Direct apply owner",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    work_item =
+      WorkItems.__handle__(db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: %{title: "Server-backed convergence item"}
+      })
+
+    start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: false})
+
+    router_opts = [
+      db: db,
+      base_dir: work_root,
+      handlers: %{},
+      cli_token: "unused-direct-apply-token",
+      firehose_hub: Hub,
+      model_catalog: %{},
+      session_status: fn _ -> nil end
+    ]
+
+    %{
+      db: db,
+      device: device,
+      session: session,
+      work_item: work_item,
+      work_root: work_root,
+      router_opts: router_opts
+    }
+  end
+
+  test "committed notices for each required resource match its REST row", ctx do
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-update", %{
+        verb: "work-item-update",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        firehose_in_txn: true,
+        firehose_hub: Hub,
+        supervision_interval_ms: 1_000,
+        params: %{work_item_id: ctx.work_item.id, title: "Updated by the server"}
+      })
+
+    assert_converges(
+      ctx,
+      "work_item.updated",
+      "work-items",
+      "id",
+      item.id,
+      "/api/work-items?limit=500&tail=true"
+    )
+
+    assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: ctx.session.session_key,
+        target_role: nil,
+        role_fallback: false,
+        firehose_in_txn: true,
+        firehose_hub: Hub,
+        supervision_interval_ms: 60_000,
+        params: %{subject: "Server-backed assignment", work_item_id: item.id}
+      })
+
+    assert_converges(
+      ctx,
+      "assignment.opened",
+      "assignments",
+      "id",
+      assignment.id,
+      "/api/assignments/#{assignment.id}"
+    )
+
+    attest_result =
+      Assignments.__handle__(ctx.db, "attest", %{
+        verb: "attest",
+        origin: "agent:direct-apply-owner",
+        principal: {:session, ctx.session.session_key},
+        session_key: nil,
+        firehose_in_txn: true,
+        firehose_hub: Hub,
+        params: %{
+          assignment_id: assignment.id,
+          kind: "progress",
+          note: "Server-backed attest"
+        }
+      })
+
+    attest_id = attest_result.attest.id
+
+    assert_converges(
+      ctx,
+      "attest.filed",
+      "attests",
+      "id",
+      attest_id,
+      "/api/assignments/#{assignment.id}/attests?limit=500&tail=true"
+    )
+
+    artifact =
+      Artifacts.record(ctx.db, %{
+        principal: {:session, ctx.session.session_key},
+        session_key: ctx.session.session_key,
+        params: %{
+          kind: "report",
+          title: "Server-backed artifact",
+          origin_path: "sample.md",
+          work_item_id: item.id
+        }
+      })
+
+    assert_converges(
+      ctx,
+      "artifact.recorded",
+      "artifacts",
+      "artifactId",
+      artifact.artifact_id,
+      "/api/artifacts?workItemId=#{item.id}&limit=500&tail=true"
+    )
+
+    assert {:ok, turn_seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: ctx.session.session_key,
+               message_id: "direct-apply-server-turn",
+               origin: "user:flynn",
+               prompt: "Server-backed queued turn",
+               assignment_id: assignment.id,
+               job_ref: item.id
+             })
+
+    assert_converges(
+      ctx,
+      "turn.queued",
+      "turns",
+      "seq",
+      turn_seq,
+      "/api/sessions/#{ctx.session.session_key}/turns?limit=500&tail=true"
+    )
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.session.session_key,
+        origin: "user:flynn",
+        prompt: "Server-backed wake",
+        due_at: System.system_time(:millisecond) + 60_000,
+        work_item_id: item.id,
+        assignment_id: assignment.id
+      })
+
+    assert_converges(
+      ctx,
+      "wake.scheduled",
+      "wakes",
+      "wakeId",
+      wake.wake_id,
+      "/api/sessions/#{ctx.session.session_key}/wakes?limit=500&tail=true"
+    )
+
+    renamed = Org.rename(ctx.db, ctx.session.session_key, "Server-backed renamed session")
+
+    assert_converges(
+      ctx,
+      "session.updated",
+      "sessions",
+      "sessionKey",
+      renamed.session_key,
+      "/api/sessions?limit=500&tail=true"
+    )
+  end
+
+  defp assert_converges(ctx, class, resource, key_field, key, rest_path) do
+    notice = receive_notice(class)
+    payload = notice["payload"]
+
+    assert notice["resource"] == resource
+    assert payload[key_field] == key
+    assert is_integer(payload["rowVersion"])
+
+    client = apply_upsert(%{}, {resource, key}, payload)
+    assert apply_upsert(client, {resource, key}, payload) == client
+
+    response =
+      rest_get(ctx, rest_path)
+
+    assert response.status == 200, response.resp_body
+    body = JSON.decode!(response.resp_body)
+
+    row =
+      case body do
+        %{"item" => item} -> item
+        %{"items" => items} -> Enum.find(items, &(&1[key_field] == key))
+      end
+
+    assert row
+    assert row == payload
+    assert client[{resource, key}] == %{row_version: row["rowVersion"], value: row}
+  end
+
+  defp apply_upsert(client, key, row) do
+    version = row["rowVersion"]
+
+    case client[key] do
+      %{row_version: held} when held >= version -> client
+      _ -> Map.put(client, key, %{row_version: version, value: row})
+    end
+  end
+
+  defp receive_notice(class) do
+    assert_receive {:firehose_notice, notice}
+    Hub.delivered(Hub, self())
+
+    if notice["class"] == class do
+      notice
+    else
+      receive_notice(class)
+    end
+  end
+
+  defp rest_get(ctx, path) do
+    conn(:get, path)
+    |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+    |> Router.call(Router.init(ctx.router_opts))
   end
 end
