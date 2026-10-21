@@ -144,6 +144,8 @@ defmodule Tightbeam.WakesTest do
     db: db,
     scheduler: scheduler
   } do
+    active_sessions!(db, ["exact-session"])
+
     wake =
       Wakes.schedule(db, %{
         session_key: "exact-session",
