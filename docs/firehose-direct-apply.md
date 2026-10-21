@@ -71,12 +71,13 @@ details, not an assignment collection.
 The server-backed matrix starts real paged REST walks, applies actual committed
 notices while each walk is held, and compares the resulting client model with a
 fresh complete walk. It replays duplicate notices for every required resource,
-checks two writes at one fixed timestamp per resource, and exercises the
-supported work-item and assignment lifecycle reversals. For each resource it
-also restarts the persisted database and Firehose Hub owners between the
-fixture's initial row and a follow-up mutation. Visibility tests promote and
-demote the reader during an incomplete walk and between complete walks, then
-compare each rebuilt model with a fresh walk. The turns case applies a real
+checks two writes at one fixed timestamp per resource, and exercises work-item
+icebox/reopen, assignment close/reopen, and wake fired/pending lifecycle
+reversals. For each resource it also restarts the persisted database and
+Firehose Hub owners between the fixture's initial row and a follow-up mutation.
+Visibility tests promote and demote the reader during an incomplete walk and
+between complete walks, then compare each rebuilt model with a fresh walk. The
+turns case applies a real
 `turn.queued` notice while the turns model is held in a paged walk and checks
 that the row remains queued in both the notice and REST snapshot.
 

@@ -160,7 +160,7 @@ defmodule Tightbeam.Ledger do
   """
   @spec enqueue_in_txn(Txn.t(), map()) :: {:ok, integer()} | {:error, :no_session}
   def enqueue_in_txn(%Txn{} = txn, attrs) do
-    now = System.system_time(:millisecond)
+    now = enqueue_time(attrs)
     session_key = Map.fetch!(attrs, :session_key)
 
     eligibility = enqueue_eligibility_in_txn(txn, session_key)
@@ -1506,5 +1506,16 @@ defmodule Tightbeam.Ledger do
       )
 
     Enum.map(rows, fn [seq] -> seq end)
+  end
+
+  if Mix.env() == :test do
+    defp enqueue_time(attrs) do
+      case Map.get(attrs, :firehose_test_at) do
+        at when is_integer(at) -> at
+        _ -> System.system_time(:millisecond)
+      end
+    end
+  else
+    defp enqueue_time(_attrs), do: System.system_time(:millisecond)
   end
 end

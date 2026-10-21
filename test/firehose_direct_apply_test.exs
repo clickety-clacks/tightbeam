@@ -188,16 +188,16 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     Assignments,
     DB,
     Devices,
+    Gateway,
     Ledger,
     Model,
     Org,
-    StateResources,
     Schema,
     Wakes,
     WorkItems
   }
 
-  alias Tightbeam.Firehose.{Hub, Publisher}
+  alias Tightbeam.Firehose.Hub
   alias Tightbeam.Wire.Router
 
   setup do
@@ -656,6 +656,77 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     end
   end
 
+  test "server wake fired-to-pending reversal converges", ctx do
+    wake =
+      schedule_wake(
+        ctx.db,
+        ctx.session.session_key,
+        "Server-backed wake lifecycle reversal",
+        ctx.work_item.id,
+        ctx.assignment.id
+      )
+
+    _scheduled = receive_notice_for(Hub, "wake.scheduled", "wakes", "wakeId", wake.wake_id)
+    client = walk_model(ctx, :wakes)
+    original = client[{"wakes", wake.wake_id}].value
+
+    # Seed a fired source so this exercises the real gateway restoration path
+    # in a later transaction, rather than an in-transaction transient state.
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1 AND state='pending'",
+                 [wake.wake_id, System.system_time(:millisecond)]
+               )
+
+               assert Tightbeam.DB.Txn.changes(txn) == 1
+               Wakes.publish_change_in_txn(txn, "wake.fired", wake.wake_id)
+             end)
+
+    fired = receive_notice_for(Hub, "wake.fired", "wakes", "wakeId", wake.wake_id)
+    assert fired["payload"]["state"] == "fired"
+    assert fired["payload"]["rowVersion"] > original["rowVersion"]
+
+    fired_client = apply_notice(fired, client)
+    assert walk_model(ctx, :wakes)[{"wakes", wake.wake_id}].value == fired["payload"]
+
+    assert_matches_fresh_walk(
+      ctx,
+      :wakes,
+      fired_client,
+      "after a wake enters the fired lifecycle"
+    )
+
+    assert {:ok, {:staged, _source}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 ctx.session.session_key,
+                 wake.origin,
+                 wake.prompt,
+                 wake_id: wake.wake_id,
+                 sender: wake.origin,
+                 target_gate: wake
+               )
+             end)
+
+    restored = Wakes.get(ctx.db, wake.wake_id)
+    assert restored.state == "pending"
+    assert is_integer(restored.fired_at)
+
+    pending = receive_notice_for(Hub, "wake.scheduled", "wakes", "wakeId", wake.wake_id)
+    assert pending["payload"]["state"] == "pending"
+    assert is_integer(pending["payload"]["firedAt"])
+    assert pending["payload"]["firedAt"] == fired["payload"]["firedAt"]
+    assert pending["payload"]["rowVersion"] > fired["payload"]["rowVersion"]
+
+    client = apply_notice(pending, client)
+
+    assert walk_model(ctx, :wakes)[{"wakes", wake.wake_id}].value == pending["payload"]
+    assert_matches_fresh_walk(ctx, :wakes, client, "after restoring a fired wake to pending")
+  end
+
   test "server rows converge after database and hub owner restart for every required resource",
        ctx do
     for resource <- [:work_items, :assignments, :attests, :artifacts, :turns, :wakes, :sessions] do
@@ -669,9 +740,11 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
   end
 
   test "same-millisecond server writes converge for every required resource", ctx do
+    occurred_at = System.system_time(:millisecond)
+
     for resource <- [:work_items, :assignments, :attests, :artifacts, :turns, :wakes, :sessions] do
       client = walk_model(ctx, resource)
-      expected = same_millisecond_mutations(ctx, resource)
+      expected = same_millisecond_mutations(ctx, resource, occurred_at)
 
       notices =
         Enum.map(expected, fn {class, resource_name, key_field, key} ->
@@ -686,6 +759,32 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
           second = second_notice["payload"]["rowVersion"]
           assert second > first, "#{resource} did not advance the same key across two writes"
         end
+      end
+
+      case resource do
+        :work_items ->
+          assert Enum.all?(notices, &(&1["payload"]["rowVersion"] >= occurred_at))
+
+        :assignments ->
+          assert hd(notices)["payload"]["closedAt"] == occurred_at
+          assert List.last(notices)["payload"]["state"] == "open"
+
+        :attests ->
+          assert Enum.all?(notices, &(&1["payload"]["ts"] == occurred_at))
+
+        :artifacts ->
+          assert Enum.all?(notices, &(&1["payload"]["createdAt"] == occurred_at))
+
+        :turns ->
+          assert Enum.all?(notices, &(&1["payload"]["createdAt"] == occurred_at))
+
+        :wakes ->
+          assert Enum.all?(notices, &(&1["payload"]["createdAt"] == occurred_at))
+
+        :sessions ->
+          [first, second] = Enum.map(notices, & &1["payload"]["updatedAt"])
+          assert first >= occurred_at
+          assert second > first
       end
 
       client = Enum.reduce(notices, client, &apply_notice/2)
@@ -797,7 +896,15 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     })
   end
 
-  defp create_progress_attest(db, owner, session_key, assignment_id, publish? \\ false) do
+  defp create_progress_attest(
+         db,
+         owner,
+         session_key,
+         assignment_id,
+         publish? \\ false,
+         occurred_at \\ nil,
+         note \\ nil
+       ) do
     call = %{
       verb: "attest",
       origin: "agent:test-session",
@@ -805,10 +912,11 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
       session_key: nil,
       firehose_in_txn: publish?,
       firehose_hub: Hub,
+      firehose_test_at: occurred_at,
       params: %{
         assignment_id: assignment_id,
         kind: "progress",
-        note: "Server-backed convergence fixture for #{owner}"
+        note: note || "Server-backed convergence fixture for #{owner}"
       }
     }
 
@@ -830,26 +938,42 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     })
   end
 
-  defp enqueue_turn(db, session_key, message_id, work_item_id, assignment_id) do
-    Ledger.enqueue(db, %{
+  defp enqueue_turn(db, session_key, message_id, work_item_id, assignment_id, occurred_at \\ nil) do
+    attrs = %{
       session_key: session_key,
       message_id: message_id,
       origin: "user:direct-apply",
       prompt: "Server-backed queued turn #{message_id}",
       assignment_id: assignment_id,
       job_ref: work_item_id
-    })
+    }
+
+    Ledger.enqueue(
+      db,
+      if(is_integer(occurred_at),
+        do: Map.put(attrs, :firehose_test_at, occurred_at),
+        else: attrs
+      )
+    )
   end
 
-  defp schedule_wake(db, session_key, prompt, work_item_id, assignment_id) do
-    Wakes.schedule(db, %{
+  defp schedule_wake(db, session_key, prompt, work_item_id, assignment_id, occurred_at \\ nil) do
+    attrs = %{
       session_key: session_key,
       origin: "user:direct-apply",
       prompt: prompt,
       due_at: System.system_time(:millisecond) + 60_000,
       work_item_id: work_item_id,
       assignment_id: assignment_id
-    })
+    }
+
+    Wakes.schedule(
+      db,
+      if(is_integer(occurred_at),
+        do: Map.put(attrs, :firehose_test_at, occurred_at),
+        else: attrs
+      )
+    )
   end
 
   defp begin_walk(ctx, :assignments) do
@@ -1124,171 +1248,117 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     [closed, reopened]
   end
 
-  defp same_millisecond_mutations(ctx, :work_items) do
-    item_id = ctx.work_item.id
-    at = System.system_time(:millisecond)
+  defp same_millisecond_mutations(ctx, :work_items, occurred_at) do
+    for title <- ["Same-millisecond work item A", "Same-millisecond work item B"] do
+      item =
+        WorkItems.__handle__(ctx.db, "work-item-update", %{
+          verb: "work-item-update",
+          origin: "user:#{ctx.owner_user_id}",
+          principal: {:user, ctx.owner_user_id},
+          session_key: nil,
+          firehose_in_txn: true,
+          firehose_hub: Hub,
+          supervision_interval_ms: 1_000,
+          firehose_test_at: occurred_at,
+          params: %{work_item_id: ctx.work_item.id, title: title}
+        })
 
-    transaction!(ctx.db, fn txn ->
-      for title <- ["Same-millisecond work item A", "Same-millisecond work item B"] do
-        Tightbeam.DB.Txn.q(txn, "UPDATE work_items SET title=?2 WHERE id=?1", [item_id, title])
+      {"work_item.updated", "work-items", "id", item.id}
+    end
+  end
 
-        Tightbeam.DB.Txn.q(
-          txn,
-          """
-          INSERT INTO work_item_versions(workItemId,rowVersion) VALUES(?1,?2)
-          ON CONFLICT(workItemId) DO UPDATE SET
-            rowVersion=MAX(excluded.rowVersion, work_item_versions.rowVersion+1)
-          """,
-          [item_id, at]
+  defp same_millisecond_mutations(ctx, :assignments, occurred_at) do
+    closed = revoke_assignment(ctx, ctx.assignment.id, occurred_at)
+    reopened = reopen_assignment(ctx, ctx.assignment.id, occurred_at)
+    assert closed.state == "closed"
+    assert reopened.state == "open"
+
+    [
+      {"assignment.closed", "assignments", "id", ctx.assignment.id},
+      {"assignment.reopened", "assignments", "id", ctx.assignment.id}
+    ]
+  end
+
+  defp same_millisecond_mutations(ctx, :attests, occurred_at) do
+    for note <- ["Same-millisecond attest A", "Same-millisecond attest B"] do
+      attest =
+        create_progress_attest(
+          ctx.db,
+          ctx.owner_user_id,
+          ctx.page_session.session_key,
+          ctx.page_assignment.id,
+          true,
+          occurred_at,
+          note
         )
 
-        :ok = WorkItems.publish_change_in_txn(txn, item_id)
-        {"work_item.updated", "work-items", "id", item_id}
-      end
-    end)
+      {"attest.filed", "attests", "id", attest.id}
+    end
   end
 
-  defp same_millisecond_mutations(ctx, :assignments) do
-    assignment_id = ctx.assignment.id
-    call = visibility_call(ctx)
+  defp same_millisecond_mutations(ctx, :artifacts, occurred_at) do
+    clock_key = {Artifacts, :test_clock}
+    prior_clock = Process.get(clock_key)
+    Process.put(clock_key, occurred_at)
 
-    transaction!(ctx.db, fn txn ->
-      for subject <- ["Same-millisecond assignment A", "Same-millisecond assignment B"] do
-        Tightbeam.DB.Txn.q(txn, "UPDATE assignments SET subject=?2 WHERE id=?1", [
-          assignment_id,
-          subject
-        ])
-
-        row = StateResources.query_assignment(txn, assignment_id, call)
-
-        :ok =
-          Publisher.committed_in_txn(txn, "assignment.opened", row, %{
-            "assignmentId" => assignment_id,
-            "sessionKey" => ctx.session.session_key
-          })
-
-        {"assignment.opened", "assignments", "id", assignment_id}
-      end
-    end)
-  end
-
-  defp same_millisecond_mutations(ctx, :attests) do
-    at = System.system_time(:millisecond)
-
-    transaction!(ctx.db, fn txn ->
-      for suffix <- ["a", "b"] do
-        id = "direct-apply-same-ms-attest-#{suffix}-#{System.unique_integer([:positive])}"
-
-        Tightbeam.DB.Txn.q(
-          txn,
-          "INSERT INTO attests(id,assignmentId,kind,bySession,ts) VALUES(?1,?2,'progress',?3,?4)",
-          [id, ctx.assignment.id, ctx.session.session_key, at]
-        )
-
-        row = StateResources.query_attest(txn, id) |> StateResources.attest()
-
-        :ok =
-          Publisher.committed_in_txn(txn, "attest.filed", row, %{
-            "assignmentId" => ctx.assignment.id
-          })
-
-        {"attest.filed", "attests", "id", id}
-      end
-    end)
-  end
-
-  defp same_millisecond_mutations(ctx, :artifacts) do
-    at = System.system_time(:millisecond)
-
-    transaction!(ctx.db, fn txn ->
-      for suffix <- ["a", "b"] do
-        id = "direct-apply-same-ms-artifact-#{suffix}-#{System.unique_integer([:positive])}"
-
-        _version = Tightbeam.Artifacts.reserve_version_in_txn(txn, id)
-
-        Tightbeam.DB.Txn.q(
-          txn,
-          """
-          INSERT INTO artifacts(
-            artifactId,kind,title,createdBySession,workItemId,originPath,state,createdAt,updatedAt
-          ) VALUES(?1,'report',?2,?3,?4,'sample.md','in-workspace',?5,?5)
-          """,
-          [
-            id,
-            "Same-millisecond artifact #{suffix}",
+    try do
+      for suffix <- ["A", "B"] do
+        artifact =
+          create_artifact(
+            ctx.db,
             ctx.session.session_key,
             ctx.work_item.id,
-            at
-          ]
-        )
+            "Same-millisecond artifact #{suffix}"
+          )
 
-        row = Tightbeam.Artifacts.canonical_in_txn(txn, id)
-
-        :ok =
-          Publisher.committed_in_txn(txn, "artifact.recorded", row, %{
-            "artifactId" => id,
-            "sessionKey" => ctx.session.session_key,
-            "workItemId" => ctx.work_item.id
-          })
-
-        {"artifact.recorded", "artifacts", "artifactId", id}
+        {"artifact.recorded", "artifacts", "artifactId", artifact.artifact_id}
       end
-    end)
+    after
+      if is_nil(prior_clock),
+        do: Process.delete(clock_key),
+        else: Process.put(clock_key, prior_clock)
+    end
   end
 
-  defp same_millisecond_mutations(ctx, :turns) do
-    at = System.system_time(:millisecond)
+  defp same_millisecond_mutations(ctx, :turns, occurred_at) do
+    for suffix <- ["a", "b"] do
+      message_id = "direct-apply-same-ms-turn-#{suffix}-#{System.unique_integer([:positive])}"
 
-    transaction!(ctx.db, fn txn ->
-      for suffix <- ["a", "b"] do
-        message_id = "direct-apply-same-ms-turn-#{suffix}-#{System.unique_integer([:positive])}"
-
-        Tightbeam.DB.Txn.q(
-          txn,
-          """
-          INSERT INTO turns(sessionKey,messageId,origin,prompt,assignmentId,jobRef,createdAt)
-          VALUES(?1,?2,'user:direct-apply','Same-millisecond queued turn',?3,?4,?5)
-          """,
-          [ctx.session.session_key, message_id, ctx.assignment.id, ctx.work_item.id, at]
+      {:ok, seq} =
+        enqueue_turn(
+          ctx.db,
+          ctx.session.session_key,
+          message_id,
+          ctx.work_item.id,
+          ctx.assignment.id,
+          occurred_at
         )
 
-        [[seq]] = Tightbeam.DB.Txn.q(txn, "SELECT last_insert_rowid()")
-        :ok = Publisher.turn_in_txn(txn, "turn.queued", seq)
-        {"turn.queued", "turns", "seq", seq}
-      end
-    end)
+      {"turn.queued", "turns", "seq", seq}
+    end
   end
 
-  defp same_millisecond_mutations(ctx, :wakes) do
-    at = System.system_time(:millisecond)
-    wake_id = ctx.wakes |> hd() |> Map.fetch!(:wake_id)
-
-    transaction!(ctx.db, fn txn ->
-      for {due_at, prompt} <- [
-            {at + 60_000, "Same-millisecond wake A"},
-            {at + 120_000, "Same-millisecond wake B"}
-          ] do
-        Tightbeam.DB.Txn.q(
-          txn,
-          "UPDATE wakes SET dueAt=?2,prompt=?3 WHERE wakeId=?1 AND state='pending'",
-          [wake_id, due_at, prompt]
+  defp same_millisecond_mutations(ctx, :wakes, occurred_at) do
+    for suffix <- ["A", "B"] do
+      wake =
+        schedule_wake(
+          ctx.db,
+          ctx.session.session_key,
+          "Same-millisecond wake #{suffix}",
+          ctx.work_item.id,
+          ctx.assignment.id,
+          occurred_at
         )
 
-        :ok = Wakes.publish_change_in_txn(txn, "wake.scheduled", wake_id)
-        {"wake.scheduled", "wakes", "wakeId", wake_id}
-      end
-    end)
+      {"wake.scheduled", "wakes", "wakeId", wake.wake_id}
+    end
   end
 
-  defp same_millisecond_mutations(ctx, :sessions) do
+  defp same_millisecond_mutations(ctx, :sessions, occurred_at) do
     session_key = ctx.session.session_key
-    at = System.system_time(:millisecond)
 
-    transaction!(ctx.db, fn txn ->
-      for {name, suffix} <- [
-            {"Same-millisecond session A", "a"},
-            {"Same-millisecond session B", "b"}
-          ] do
+    for name <- ["Same-millisecond session A", "Same-millisecond session B"] do
+      transaction!(ctx.db, fn txn ->
         {:changed, _session, _result} =
           Org.mutate_session_in_txn(
             txn,
@@ -1298,22 +1368,13 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
                 session_key,
                 name
               ])
-
-              suffix
             end,
-            at
+            occurred_at
           )
+      end)
 
-        {"session.updated", "sessions", "sessionKey", session_key}
-      end
-    end)
-  end
-
-  defp visibility_call(ctx) do
-    %{
-      principal: {:user, ctx.owner_user_id},
-      rest_principal: %{kind: "user", id: ctx.owner_user_id, is_admin: false}
-    }
+      {"session.updated", "sessions", "sessionKey", session_key}
+    end
   end
 
   defp transaction!(db, fun) do
@@ -1367,8 +1428,8 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     })
   end
 
-  defp reopen_assignment(ctx, assignment_id) do
-    Assignments.__handle__(ctx.db, "reopen-assignment", %{
+  defp reopen_assignment(ctx, assignment_id, occurred_at \\ nil) do
+    call = %{
       verb: "reopen-assignment",
       origin: "agent:test-session",
       principal: {:session, ctx.session.session_key},
@@ -1377,6 +1438,25 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
       firehose_hub: Hub,
       supervision_interval_ms: 60_000,
       params: %{assignment_id: assignment_id, reason: "Continue server-backed convergence"}
+    }
+
+    Assignments.__handle__(
+      ctx.db,
+      "reopen-assignment",
+      if(is_integer(occurred_at), do: Map.put(call, :firehose_test_at, occurred_at), else: call)
+    )
+  end
+
+  defp revoke_assignment(ctx, assignment_id, occurred_at) do
+    Assignments.__handle__(ctx.db, "revoke-assignment", %{
+      verb: "revoke-assignment",
+      origin: "user:#{ctx.owner_user_id}",
+      principal: {:user, ctx.owner_user_id},
+      session_key: nil,
+      firehose_in_txn: true,
+      firehose_hub: Hub,
+      firehose_test_at: occurred_at,
+      params: %{assignment_id: assignment_id, reason: "Close during same-millisecond convergence"}
     })
   end
 

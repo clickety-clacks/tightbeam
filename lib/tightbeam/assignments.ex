@@ -3683,7 +3683,7 @@ defmodule Tightbeam.Assignments do
 
   defp revoke_open_assignment_in_txn(txn, call, assignment_id) do
     {closed_user, closed_session} = opener(call.principal)
-    closed_at = now()
+    closed_at = event_time(call)
     revocation_id = id("rev_")
     reopening_id = current_reopening_id(txn, assignment_id)
 
@@ -3857,7 +3857,7 @@ defmodule Tightbeam.Assignments do
 
   defp apply_reopen(txn, call, assignment) do
     assignment_id = assignment.id
-    reopened_at = now()
+    reopened_at = event_time(call)
     {reopened_user, reopened_session} = opener(call.principal)
 
     Txn.q(
@@ -4207,13 +4207,14 @@ defmodule Tightbeam.Assignments do
       allow_closed: allow_closed,
       artifact_id: call.params[:artifact_id],
       content_sha256: call.params[:content_sha256],
-      wait_id: call.params[:wait_id]
+      wait_id: call.params[:wait_id],
+      firehose_test_at: call[:firehose_test_at]
     })
   end
 
   defp insert_attest_row(txn, attrs) do
     id = id("att_")
-    ts = now()
+    ts = event_time(attrs)
 
     Txn.q(
       txn,
@@ -5128,6 +5129,17 @@ defmodule Tightbeam.Assignments do
   defp id(prefix), do: prefix <> Tightbeam.Id.uuid4()
 
   defp now, do: System.system_time(:millisecond)
+
+  if Mix.env() == :test do
+    defp event_time(attrs) do
+      case Map.get(attrs, :firehose_test_at) do
+        at when is_integer(at) -> at
+        _ -> now()
+      end
+    end
+  else
+    defp event_time(_attrs), do: now()
+  end
 
   defp retirement_provenance_actor(_txn, "user:" <> user_id, _owner_user_id),
     do: {user_id, nil, nil}

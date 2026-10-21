@@ -231,6 +231,7 @@ defmodule Tightbeam.WorkItems do
             update_in_txn(
               txn,
               call.params
+              |> Map.put(:firehose_test_at, call[:firehose_test_at])
               |> Map.put(:effort_config, Map.get(call, :effort_config, %{}))
               |> Map.put(:principal, call.principal)
             )
@@ -567,7 +568,7 @@ defmodule Tightbeam.WorkItems do
         Wakes.readdress_accountability_notices_in_txn(txn, item.id)
       end
 
-      if changed?, do: stamp_version_in_txn(txn, item.id, now())
+      if changed?, do: stamp_version_in_txn(txn, item.id, event_time(params))
       {:updated, fetch_in_txn(txn, item.id), changed?}
     end
   end
@@ -597,7 +598,7 @@ defmodule Tightbeam.WorkItems do
           {:updated, fetch_in_txn(txn, item.id), false}
         else
           {updated_by_user, updated_by_session} = body_attribution(params[:principal])
-          updated_at = now()
+          updated_at = event_time(params)
 
           Txn.q(
             txn,
@@ -1782,6 +1783,17 @@ defmodule Tightbeam.WorkItems do
   end
 
   defp now, do: System.system_time(:millisecond)
+
+  if Mix.env() == :test do
+    defp event_time(params) do
+      case Map.get(params, :firehose_test_at) do
+        at when is_integer(at) -> at
+        _ -> now()
+      end
+    end
+  else
+    defp event_time(_params), do: now()
+  end
 
   # A timestamp alone repeats when two writes share one millisecond. The
   # sidecar makes the public version strict without changing product fields.

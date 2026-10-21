@@ -1517,7 +1517,7 @@ defmodule Tightbeam.Wakes do
         cursor
       end
 
-    created_at = now()
+    created_at = schedule_time(input)
     {class, class_election} = elected_class(input)
 
     {delivery_rule, due_at} = apply_delivery_policy(txn, input, class, created_at, condition_kind)
@@ -7927,4 +7927,15 @@ defmodule Tightbeam.Wakes do
   end
 
   defp now, do: System.system_time(:millisecond)
+
+  if Mix.env() == :test do
+    defp schedule_time(input) do
+      case Map.get(input, :firehose_test_at) do
+        at when is_integer(at) -> at
+        _ -> now()
+      end
+    end
+  else
+    defp schedule_time(_input), do: now()
+  end
 end
