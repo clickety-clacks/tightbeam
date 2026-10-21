@@ -130,6 +130,24 @@ defmodule Tightbeam.Wire.Router do
   @state_max_limit 500
   @d1_cursor_version 1
   @d1_resources %{
+    assignments: %{
+      resource: "assignments",
+      route: "assignments.collection",
+      filters: [],
+      order: ~w(openedAt id)
+    },
+    wakes: %{
+      resource: "wakes",
+      route: "wakes.collection",
+      filters: [],
+      order: ~w(createdAt wakeId)
+    },
+    turns: %{
+      resource: "turns",
+      route: "turns.collection",
+      filters: [],
+      order: ~w(seq)
+    },
     execution_map: %{
       resource: "execution map",
       route: "execution_map.collection",
@@ -484,6 +502,10 @@ defmodule Tightbeam.Wire.Router do
     d1_detail(conn, Map.fetch!(@d1_resources, :kungfu), name)
   end
 
+  get "/api/assignments" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :assignments))
+  end
+
   get "/api/assignments/:assignment_id" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :assignments), assignment_id)
   end
@@ -500,8 +522,16 @@ defmodule Tightbeam.Wire.Router do
     core_detail(conn, Map.fetch!(@core_detail_specs, :attests), attest_id)
   end
 
+  get "/api/wakes" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :wakes))
+  end
+
   get "/api/wakes/:wake_id" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :wakes), wake_id)
+  end
+
+  get "/api/turns" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :turns))
   end
 
   get "/api/turns/:turn_seq" do
@@ -1723,6 +1753,14 @@ defmodule Tightbeam.Wire.Router do
   defp d1_row_tuple(:execution_map, item),
     do: [Map.fetch!(item, :created_at), Map.fetch!(item, :id)]
 
+  defp d1_row_tuple(:assignments, item),
+    do: [Map.fetch!(item, "openedAt"), Map.fetch!(item, "id")]
+
+  defp d1_row_tuple(:wakes, item),
+    do: [Map.fetch!(item, "createdAt"), Map.fetch!(item, "wakeId")]
+
+  defp d1_row_tuple(:turns, item), do: [Map.fetch!(item, "seq")]
+
   defp d1_row_tuple(resource, item), do: D1Read.tuple(resource, item)
   defp d1_encode(:work_items, item), do: StateResources.encode_item("work items", item, %{})
 
@@ -1735,6 +1773,10 @@ defmodule Tightbeam.Wire.Router do
     do: StateResources.encode_item("harness processes", item, %{})
 
   defp d1_encode(:assignment_attests, item), do: StateResources.encode_item("attests", item, %{})
+
+  defp d1_encode(:assignments, item), do: StateResources.encode_item("assignments", item, %{})
+  defp d1_encode(:wakes, item), do: StateResources.encode_item("wakes", item, %{})
+  defp d1_encode(:turns, item), do: StateResources.encode_item("turns", item, %{})
 
   defp d1_encode(resource, item), do: D1Read.encode(resource, item)
 
@@ -1751,6 +1793,9 @@ defmodule Tightbeam.Wire.Router do
       case d1_resource(spec) do
         resource when resource in [:artifacts, :assignment_attests] ->
           d1_d2_collection(conn, request, boundary, principal, spec, parent_id)
+
+        resource when resource in [:assignments, :wakes, :turns] ->
+          d1_core_state_collection(conn, request, boundary, principal, spec)
 
         :decision_requests ->
           {items, page} = d1_decision_request_page(conn, request, boundary, principal, spec)
@@ -1821,6 +1866,39 @@ defmodule Tightbeam.Wire.Router do
   rescue
     _error in [ArgumentError, KeyError, MatchError] ->
       d1_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp d1_core_state_collection(conn, request, boundary, principal, spec) do
+    traced_principal = core_detail_trace_principal(conn, principal)
+
+    result =
+      case d1_resource(spec) do
+        :assignments ->
+          page =
+            StateResources.query_assignments_page(
+              db(conn),
+              traced_principal,
+              boundary,
+              request.limit
+            )
+
+          %{items: Enum.map(page.rows, &StateResources.assignment/1), flags: page.flags}
+
+        :wakes ->
+          page =
+            StateResources.query_wakes_page(db(conn), traced_principal, boundary, request.limit)
+
+          %{items: Enum.map(page.rows, &StateResources.wake/1), flags: page.flags}
+
+        :turns ->
+          page =
+            StateResources.query_turns_page(db(conn), traced_principal, boundary, request.limit)
+
+          %{items: Enum.map(page.rows, &StateResources.turn/1), flags: page.flags}
+      end
+
+    {items, page} = d1_keyset_page(result, request, principal, spec, conn)
+    d1_send(conn, 200, d1_collection_envelope(spec, items, page))
   end
 
   defp d1_d2_collection_request(query, spec) do
@@ -2491,6 +2569,19 @@ defmodule Tightbeam.Wire.Router do
     do: is_integer(created_at) and is_binary(id) and id != ""
 
   defp d1_tuple?(_tuple, :execution_map), do: false
+
+  defp d1_tuple?([opened_at, id], :assignments),
+    do: is_integer(opened_at) and is_binary(id) and id != ""
+
+  defp d1_tuple?(_tuple, :assignments), do: false
+
+  defp d1_tuple?([created_at, wake_id], :wakes),
+    do: is_integer(created_at) and is_binary(wake_id) and wake_id != ""
+
+  defp d1_tuple?(_tuple, :wakes), do: false
+
+  defp d1_tuple?([seq], :turns), do: is_integer(seq) and seq > 0
+  defp d1_tuple?(_tuple, :turns), do: false
 
   defp d1_tuple?(tuple, resource),
     do:

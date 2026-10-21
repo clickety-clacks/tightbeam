@@ -2031,6 +2031,7 @@ defmodule Tightbeam.Schema do
     :ok = ensure_idle_cleanup_runtime_indexes(db)
     :ok = ensure_rest_collection_indexes(db)
     :ok = ensure_decision_request_collection_indexes(db)
+    :ok = ensure_rest_wake_collection_indexes(db)
 
     # Batch-aware supervision guards reference notice_batches, so install them
     # only after all predecessor migrations and refusal checks have completed
@@ -3153,6 +3154,9 @@ defmodule Tightbeam.Schema do
       {"wakes_rest_session_created_order",
        "CREATE INDEX IF NOT EXISTS wakes_rest_session_created_order " <>
          "ON wakes(sessionKey, createdAt, wakeId)"},
+      {"wakes_rest_created_order",
+       "CREATE INDEX IF NOT EXISTS wakes_rest_created_order " <>
+         "ON wakes(createdAt, wakeId)"},
       {"assignments_rest_opened_order",
        "CREATE INDEX IF NOT EXISTS assignments_rest_opened_order " <>
          "ON assignments(openedAt DESC, id DESC)"},
@@ -3192,6 +3196,29 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "REST collection index migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  # This is a separate migration because existing databases may already have
+  # recorded the original REST collection indexes. Bulk wake pages need the
+  # global cursor order in addition to the per-session order above.
+  defp ensure_rest_wake_collection_indexes(db) do
+    indexes = [
+      {"wakes_rest_created_order",
+       "CREATE INDEX IF NOT EXISTS wakes_rest_created_order " <>
+         "ON wakes(createdAt, wakeId)"}
+    ]
+
+    case DB.migration_transaction(db, :rest_wake_collection_indexes, [], [], fn txn ->
+           Enum.each(indexes, fn {_name, sql} -> :ok = Txn.exec(txn, sql) end)
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "REST wake collection index migration failed: #{Exception.message(error)}"
     end
   end
 
