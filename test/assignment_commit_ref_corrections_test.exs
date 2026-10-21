@@ -8,8 +8,11 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     Gateway,
     Model,
     Org,
+    StateResources,
     WorkItems
   }
+
+  alias Tightbeam.Firehose.{Hub, Publisher}
 
   setup do
     db = :"commitref_correction_#{System.unique_integer([:positive])}"
@@ -72,6 +75,51 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     assert entry.actorRef == "po-owner"
     assert entry.cause == "historical_canonical_commitref_correction"
     assert entry.verifiedAt == correction.verifiedAt
+  end
+
+  test "a new correction publishes the current lifecycle row and replay is quiet", ctx do
+    start_supervised!({Hub, name: Hub})
+
+    :ok =
+      Hub.register(Hub, self(), %{
+        mode: :filtered,
+        db: ctx.db,
+        user_id: "owner",
+        is_admin: true
+      })
+
+    :ok =
+      Hub.subscribe(Hub, self(), "commit-ref-correction", %{"classes" => ["assignment.closed"]})
+
+    before =
+      ctx.db
+      |> StateResources.query_assignment("asg_closed", %{principal: {:user, "owner"}})
+      |> StateResources.assignment()
+
+    assert %{correction: correction} = correct(ctx, {:user, "owner"})
+
+    _sequence = Hub.sequence(Hub, self())
+
+    assert_received {:firehose_notice,
+                     %{
+                       "class" => "assignment.closed",
+                       "op" => "upsert",
+                       "refs" => %{"assignmentId" => "asg_closed"},
+                       "payload" => %{"commitRefCorrections" => [event_correction]} = payload
+                     } = notice}
+
+    assert event_correction["id"] == correction.id
+    assert event_correction["commitRefs"] == correction.commitRefs
+    assert is_integer(payload["rowVersion"])
+    assert payload["rowVersion"] > before["rowVersion"]
+    assert JSON.decode!(Publisher.encode_wire_notice(notice)) == notice
+
+    Hub.delivered(Hub, self())
+    _sequence = Hub.sequence(Hub, self())
+
+    assert %{correction: ^correction} = correct(ctx, {:user, "owner"})
+    _sequence = Hub.sequence(Hub, self())
+    refute_received {:firehose_notice, _notice}
   end
 
   test "only the accountability owner or matching product owner is authorized", ctx do

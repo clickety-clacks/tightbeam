@@ -24,6 +24,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
   }
 
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Hub
 
   # Records the doorbells one subscriber actually received, drained by a call.
   #
@@ -390,6 +391,113 @@ defmodule Tightbeam.WorkItemBracketsTest do
       end)
 
     assert is_binary(slate_wake_id(ctx.db, retire_item.id))
+  end
+
+  test "assignment transitions publish the work-item bracket references", ctx do
+    start_supervised!({Hub, name: Hub})
+
+    :ok =
+      Hub.register(Hub, self(), %{
+        mode: :filtered,
+        db: ctx.db,
+        user_id: "test-user",
+        is_admin: true
+      })
+
+    :ok =
+      Hub.subscribe(Hub, self(), "work-item-brackets", %{
+        "classes" => ["work_item.updated", "work_item.closed"]
+      })
+
+    item = create(ctx, {:user, "test-user"}, %{title: "Bracket projection"})
+    work_item_id = item.id
+
+    {:ok, assignment} =
+      disp_assign(ctx, {:user, "test-user"}, "holder", "bracket-projection", item.id)
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "work_item.updated",
+                      "payload" => %{
+                        "id" => ^work_item_id,
+                        "routingWakeId" => nil,
+                        "slateWakeId" => nil
+                      }
+                    }}
+
+    :ok = Hub.delivered(Hub, self())
+    complete(ctx, "holder", assignment.id)
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "work_item.updated",
+                      "payload" => %{
+                        "id" => ^work_item_id,
+                        "routingWakeId" => nil,
+                        "slateWakeId" => slate_id
+                      }
+                    }}
+
+    assert is_binary(slate_id)
+    :ok = Hub.delivered(Hub, self())
+
+    assert {:ok, %{ok: true}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               work_item_call("work-item-close", {:user, "test-user"}, %{work_item_id: item.id})
+             )
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "work_item.closed",
+                      "payload" => %{
+                        "id" => ^work_item_id,
+                        "state" => "closed",
+                        "routingWakeId" => nil,
+                        "slateWakeId" => nil
+                      }
+                    }}
+
+    assert Wakes.get(ctx.db, slate_id).state == "canceled"
+  end
+
+  test "holder retirement publishes the closed assignment row", ctx do
+    start_supervised!({Hub, name: Hub})
+
+    :ok =
+      Hub.register(Hub, self(), %{
+        mode: :filtered,
+        db: ctx.db,
+        user_id: "test-user",
+        is_admin: true
+      })
+
+    :ok = Hub.subscribe(Hub, self(), "retired-assignment", %{"classes" => ["assignment.closed"]})
+
+    item = create(ctx, {:user, "test-user"}, %{title: "Retiring assignment"})
+
+    {:ok, assignment} =
+      disp_assign(ctx, {:user, "test-user"}, "holder", "retiring-assignment", item.id)
+
+    assert {:ok, _} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.interrupt_for_retire_in_txn(
+                 txn,
+                 "holder",
+                 "test-user",
+                 "user:test-user"
+               )
+             end)
+
+    assert_received {:firehose_notice,
+                     %{
+                       "class" => "assignment.closed",
+                       "refs" => %{"assignmentId" => id},
+                       "payload" => %{"outcome" => "revoked", "state" => "closed"}
+                     }}
+
+    assert id == assignment.id
   end
 
   ## Proof 5 — terminal dispositions transition, cancel both brackets, refuse work, no-op, reopen.

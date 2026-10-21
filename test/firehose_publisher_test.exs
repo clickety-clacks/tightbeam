@@ -1,9 +1,12 @@
 defmodule Tightbeam.Firehose.PublisherTest do
   use Tightbeam.TestCase, async: false
+  import Plug.Conn
+  import Plug.Test
 
   alias Tightbeam.{
     ConnRegistry,
     DB,
+    Devices,
     Dispatch,
     Escalation,
     Gateway,
@@ -16,6 +19,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
   alias Tightbeam.NoticeBatcher
   alias Tightbeam.Firehose.{Hub, Publisher}
+  alias Tightbeam.Wire.Router
 
   defmodule LaneStub do
     use GenServer
@@ -55,6 +59,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
              })
 
     assert {:ok, busy_turn} = Ledger.claim_next(db, target, "lane:firehose-boundary")
+    _claim_notices = observed_classes()
 
     wake =
       Wakes.schedule(db, %{
@@ -64,7 +69,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
         due_at: 1
       })
 
-    _seed_notices = observed_classes()
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "wake.scheduled",
+                      "refs" => %{"wakeId" => wake_id}
+                    }}
+
+    assert wake_id == wake.wake_id
+    Hub.delivered(Hub, self())
     opts = [wake_id: wake.wake_id, fire_wake_in_txn: true]
 
     assert {:error, %RuntimeError{message: "rollback winning fire"}} =
@@ -83,7 +95,9 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, [[0]]} =
              DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
 
-    assert observed_classes() == []
+    refute Enum.any?(observed_notices(), fn notice ->
+             get_in(notice, ["refs", "wakeId"]) == wake.wake_id
+           end)
 
     assert {:ok, {:staged, _source}} =
              DB.transaction(
@@ -93,7 +107,17 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert NoticeBatcher.source_refs(db, wake.wake_id) == []
     assert Wakes.get(db, wake.wake_id).state == "pending"
-    assert observed_classes() == []
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "wake.scheduled",
+                      "refs" => %{"wakeId" => wake_id},
+                      "payload" => %{"state" => "pending", "firedAt" => fired_at}
+                    }}
+
+    assert wake_id == wake.wake_id
+    assert is_integer(fired_at)
+    Hub.delivered(Hub, self())
 
     assert :ok =
              Ledger.finish(db, busy_turn.seq, "delivered", nil,
@@ -158,7 +182,42 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, [[0]]} =
              DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [external.wake_id])
 
-    assert observed_classes() == []
+    external_wake_notices = observed_notices()
+    assert Enum.map(external_wake_notices, & &1["class"]) == ["wake.scheduled"]
+    external_wake_notice = hd(external_wake_notices)
+    external_wake_row = db |> StateResources.query_wake(external.wake_id) |> StateResources.wake()
+    assert external_wake_notice["refs"]["wakeId"] == external.wake_id
+    assert external_wake_notice["payload"] == external_wake_row
+    assert external_wake_row["state"] == "pending"
+    assert is_integer(external_wake_row["firedAt"])
+  end
+
+  test "transactional wake creation publishes its canonical scheduled row" do
+    db = :firehose_wake_creation_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "test-user", is_admin: true})
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "wake-target",
+        origin: "process:tightbeam",
+        prompt: "inspect this scheduled row",
+        due_at: 1
+      })
+
+    assert %{
+             "class" => "wake.scheduled",
+             "resource" => "wakes",
+             "op" => "upsert",
+             "refs" => %{"wakeId" => wake_id, "sessionKey" => "wake-target"},
+             "payload" => payload
+           } = receive_notice()
+
+    assert wake_id == wake.wake_id
+    assert payload["wakeId"] == wake.wake_id
+    assert payload["prompt"] == "inspect this scheduled row"
+    assert payload["state"] == "pending"
   end
 
   test "work-item-create emits its committed routing wake once, never on keyed replay" do
@@ -244,23 +303,28 @@ defmodule Tightbeam.Firehose.PublisherTest do
                authenticated_device_message: true
              )
 
-    assert %{
-             "class" => "session.updated",
-             "payload" => %{"mechanicalStatus" => "running", "sessionKey" => "post-target"}
-           } = receive_notice()
+    post_notices = Enum.map(1..3, fn _ -> receive_notice() end)
+
+    assert Enum.sort(Enum.map(post_notices, & &1["class"])) ==
+             Enum.sort(["turn.queued", "session.updated", "message.created"])
+
+    assert %{"payload" => %{"mechanicalStatus" => "running", "sessionKey" => "post-target"}} =
+             Enum.find(post_notices, &(&1["class"] == "session.updated"))
+
+    assert %{"payload" => %{"status" => "queued", "sessionKey" => "post-target"}} =
+             Enum.find(post_notices, &(&1["class"] == "turn.queued"))
 
     assert %{
-             "class" => "message.created",
              "payload" => %{
                "content" => "[from user:flynn]\n\nexact A1 post reproduction"
              }
-           } = receive_notice()
+           } = Enum.find(post_notices, &(&1["class"] == "message.created"))
 
     declared = Gateway.handler_effects(%{db: db})["post"]
-    observed = ["message.created", "session.updated"]
+    observed = Enum.map(post_notices, & &1["class"])
     assert_effects_match!(declared, observed)
 
-    assert_raise ArgumentError, ~r/missing=\["message.created", "session.updated"\]/, fn ->
+    assert_raise ArgumentError, ~r/missing=/, fn ->
       assert_effects_match!([], observed)
     end
   end
@@ -270,17 +334,27 @@ defmodule Tightbeam.Firehose.PublisherTest do
     scheduler = :firehose_per_verb_effect_scheduler
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
-    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "test-user", is_admin: true})
+
+    {:paired, completion_device} =
+      Devices.pair(db, %{
+        device_id: "firehose-completion-device",
+        claimed_name: "Test User",
+        platform: nil,
+        model: nil
+      })
+
+    :ok = DB.execute(db, "UPDATE users SET isAdmin=1 WHERE userId='test-user'")
     register_testhost(db)
+    ensure_main_session(db, "test-user")
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneStub, name: Tightbeam.LaneManager})
 
     Org.create(db, %{
       session_key: "effect-target",
       display_name: "Effect target",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "test-user",
+      origin: "user:test-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -291,8 +365,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
     Org.create(db, %{
       session_key: "effect-dispatcher",
       display_name: "Effect dispatcher",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "test-user",
+      origin: "user:test-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -325,10 +399,20 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     handlers = Gateway.handlers(config)
 
+    router_opts = [
+      db: db,
+      base_dir: System.tmp_dir!(),
+      handlers: handlers,
+      cli_token: "unused-completion-test-token",
+      firehose_hub: Hub,
+      model_catalog: %{},
+      session_status: fn _ -> nil end
+    ]
+
     immediate_wake = %{
       verb: "wake",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:test-user",
+      principal: {:user, "test-user"},
       session_key: "effect-target",
       params: %{prompt: "immediate effect", after_ms: 0, idempotency_key: "effect-immediate"}
     }
@@ -341,15 +425,15 @@ defmodule Tightbeam.Firehose.PublisherTest do
     pending =
       Wakes.schedule(db, %{
         session_key: "effect-target",
-        origin: "user:flynn",
+        origin: "user:test-user",
         prompt: "cancel effect",
         due_at: System.system_time(:millisecond) + 60_000
       })
 
     cancel_wake = %{
       verb: "wake",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:test-user",
+      principal: {:user, "test-user"},
       session_key: nil,
       params: %{cancel_wake_id: pending.wake_id}
     }
@@ -377,7 +461,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     _condition_wake =
       Wakes.schedule(db, %{
         session_key: "effect-target",
-        origin: "user:flynn",
+        origin: "user:test-user",
         prompt: "condition effect",
         due_at: System.system_time(:millisecond) + 60_000,
         condition_kind: "effect-ready",
@@ -386,8 +470,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     condition = %{
       verb: "condition",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:test-user",
+      principal: {:user, "test-user"},
       session_key: nil,
       params: %{kind: "effect-ready", scope: "matrix", idempotency_key: "effect-fact"}
     }
@@ -409,8 +493,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     dispatch = %{
       verb: "dispatch",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:test-user",
+      principal: {:user, "test-user"},
       session_key: "effect-target",
       target_role: nil,
       role_fallback: false,
@@ -424,14 +508,28 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     work_item_create = %{
       verb: "work-item-create",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:test-user",
+      principal: {:user, "test-user"},
       session_key: nil,
       params: %{title: "Exercise the rumination dispatch effect"}
     }
 
     assert {:ok, work_item} = Dispatch.dispatch(db, handlers, work_item_create)
     _ = observed_classes()
+
+    work_item_dispatch = %{
+      dispatch
+      | params:
+          Map.merge(dispatch.params, %{
+            subject: "Effect work-item dispatch",
+            brief: "Exercise work-item assignment publication.",
+            work_item_id: work_item.id
+          })
+    }
+
+    assert {:ok, _work_item_assignment} = Dispatch.dispatch(db, handlers, work_item_dispatch)
+    work_item_dispatch_observed = observed_state_classes()
+    _work_item_dispatched_turn = finish_next_turn!(db, "effect-target", "lane:effects")
 
     rumination_dispatch = %{
       verb: "dispatch",
@@ -458,7 +556,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
     dispatch_delivery_effects = observed_state_classes()
 
     dispatch_events =
-      dispatch_observed ++ state_classes(rumination_classes) ++ dispatch_delivery_effects
+      dispatch_observed ++
+        work_item_dispatch_observed ++
+        state_classes(rumination_classes) ++
+        dispatch_delivery_effects
 
     # The rumination's asynchronous wake delivery has its own wake.fired event;
     # the dispatch handler's declared effects describe its direct commit effects.
@@ -492,6 +593,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
                [assignment.id]
              )
 
+    assignment_before_attest =
+      db
+      |> StateResources.query_assignment(assignment.id, %{principal: {:session, "effect-target"}})
+      |> StateResources.assignment()
+
     assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
              Dispatch.dispatch(db, handlers, tests_passed)
 
@@ -509,10 +615,23 @@ defmodule Tightbeam.Firehose.PublisherTest do
       |> Map.put_new("wake.canceled", [])
 
     assert %{"attest.filed" => [_attest_notice]} = published
-    assert map_size(published) == 3
+
+    assert Enum.sort(Map.keys(published)) ==
+             ~w(assignment.opened attest.filed message.created wake.canceled wake.scheduled)
 
     assert opener_notice["payload"]["content"] ==
              "[verdict filed: tests-passed on #{assignment.id}: effect matrix tests passed]"
+
+    assert [assignment_notice] =
+             Enum.filter(verdict_notices, &(&1["class"] == "assignment.opened"))
+
+    assignment_after_attest =
+      db
+      |> StateResources.query_assignment(assignment.id, %{principal: {:session, "effect-target"}})
+      |> StateResources.assignment()
+
+    assert assignment_notice["payload"] == assignment_after_attest
+    assert assignment_after_attest["rowVersion"] > assignment_before_attest["rowVersion"]
 
     chain =
       Stream.unfold(initial_deadline, fn wake_id ->
@@ -603,13 +722,27 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     # The reviewer's opened notice is a stored message beside the transition.
     review_notices = observed_state_notices()
-    assert map_size(review_notices) == 2
 
-    assert %{"assignment.opened" => [_opened], "message.created" => [review_notice]} =
-             review_notices
+    assert %{
+             "assignment.opened" => [_opened],
+             "message.created" => [review_notice],
+             "wake.scheduled" => review_wakes
+           } = review_notices
 
     assert review_notice["payload"]["sessionKey"] == review.holderKey
     assert review_notice["payload"]["content"] == "[assignment opened: #{review.id}]"
+
+    assert review_wakes != []
+
+    for review_wake <- review_wakes do
+      assert review_wake["payload"]["assignmentId"] == review.id
+
+      assert review_wake["refs"] == %{
+               "wakeId" => review_wake["payload"]["wakeId"],
+               "sessionKey" => review.holderKey,
+               "assignmentId" => review.id
+             }
+    end
 
     clean = %{
       tests_passed
@@ -654,16 +787,54 @@ defmodule Tightbeam.Firehose.PublisherTest do
         [assignment.id, review.id]
       )
 
+    {completion_notices, _completion_message_ids} = completion_publications
+    closed_notices = Enum.filter(completion_notices, &(&1["class"] == "assignment.closed"))
+
+    assert [closed_notice] = closed_notices
+
+    assert closed_notice["refs"] == %{
+             "assignmentId" => assignment.id,
+             "sessionKey" => "effect-target",
+             "origin" => "agent:effect-target",
+             "principal" => "session:effect-target"
+           }
+
+    attest_notice =
+      Enum.find(completion_notices, fn notice ->
+        notice["class"] == "attest.filed" and
+          notice["payload"]["assignmentId"] == assignment.id and
+          notice["payload"]["kind"] == "completion"
+      end)
+
+    assert attest_notice["refs"] == %{
+             "attestId" => attest_notice["payload"]["id"],
+             "sessionKey" => "effect-target",
+             "assignmentId" => assignment.id,
+             "origin" => "agent:effect-target",
+             "principal" => "session:effect-target"
+           }
+
+    closed_response =
+      rest_get("/api/assignments/#{assignment.id}", completion_device.token, router_opts)
+
+    assert closed_response.status == 200, closed_response.resp_body
+    closed_row = JSON.decode!(closed_response.resp_body)["item"]
+    assert closed_notice["payload"] == closed_row
+
     completion_effects = notice_state_classes(completion_publications)
     asynchronous_delivery = ~w(session.updated wake.fired)
 
-    assert Enum.all?(asynchronous_delivery, &(&1 in completion_effects))
+    assert Enum.all?(asynchronous_delivery, &(&1 in completion_effects)),
+           "missing async effects: #{inspect(asynchronous_delivery -- completion_effects)}; observed: #{inspect(completion_effects)}"
 
-    assert_per_verb_effects!(
-      config,
-      "attest",
+    direct_completion_effects =
       Enum.reject(completion_effects, &(&1 in asynchronous_delivery))
-    )
+
+    declared_attest_effects = Gateway.handler_effects(config)["attest"]
+    assert Enum.all?(direct_completion_effects, &(&1 in declared_attest_effects))
+    assert "attest.filed" in direct_completion_effects
+    assert "assignment.closed" in direct_completion_effects
+    assert "turn.queued" in direct_completion_effects
 
     reopen = %{
       verb: "reopen-assignment",
@@ -677,14 +848,34 @@ defmodule Tightbeam.Firehose.PublisherTest do
              Dispatch.dispatch(db, handlers, reopen)
 
     assert reopened_id == assignment.id
-    {holder_notices, reopen_effects} = Map.pop(observed_state_notices(), "message.created", [])
-    assert [%{"payload" => reopen_message}] = holder_notices
-    assert reopen_message["sessionKey"] == assignment.holderKey
 
-    assert reopen_message["content"] ==
-             "[assignment reopened: #{assignment.id} by session:effect-target — continue the real assignment]"
+    reopen_publications =
+      assert_substrate_messages_created!(
+        db,
+        [
+          {
+            "effect-target",
+            "[assignment reopened: #{assignment.id} by session:effect-target — continue the real assignment]"
+          }
+        ],
+        [assignment.id, review.id]
+      )
 
-    assert_per_verb_effects!(config, "reopen-assignment", Map.keys(reopen_effects))
+    {reopen_notices, _reopen_message_ids} = reopen_publications
+    assert [reopen_notice] = Enum.filter(reopen_notices, &(&1["class"] == "assignment.reopened"))
+
+    reopened_response =
+      rest_get("/api/assignments/#{assignment.id}", completion_device.token, router_opts)
+
+    assert reopened_response.status == 200, reopened_response.resp_body
+    reopened_row = JSON.decode!(reopened_response.resp_body)["item"]
+    assert reopen_notice["payload"] == reopened_row
+    assert reopened_row["rowVersion"] > closed_row["rowVersion"]
+
+    reopen_effects = notice_state_classes(reopen_publications)
+    declared_reopen_effects = Gateway.handler_effects(config)["reopen-assignment"]
+    assert Enum.all?(reopen_effects, &(&1 in declared_reopen_effects))
+    assert "assignment.reopened" in reopen_effects
     history = Tightbeam.Assignments.list_reopenings(db, assignment.id)
     assert [%{priorOutcome: "completed", reason: "continue the real assignment"}] = history
 
@@ -735,16 +926,20 @@ defmodule Tightbeam.Firehose.PublisherTest do
   test "an accepted state verb emits its observation and canonical state notice" do
     call = %{
       verb: "work-item-update",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:test-user",
+      principal: {:user, "test-user"},
       session_key: nil,
-      params: %{work_item_id: "wi_1"}
+      params: %{
+        work_item_id: "work-one",
+        session_key: "caller-session",
+        assignment_id: "request-assignment"
+      }
     }
 
     result = %{
-      id: "wi_1",
+      id: "work-one",
       title: "Firehose",
-      owner_user_id: "flynn",
+      owner_user_id: "test-user",
       updated_at: 123,
       cli_token: "must-not-leak"
     }
@@ -754,17 +949,21 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert %{"class" => "verb.accepted", "op" => "observe", "refs" => refs} =
              receive_notice()
 
-    assert refs["origin"] == "user:flynn"
+    assert refs["origin"] == "user:test-user"
 
     assert %{
              "class" => "work_item.updated",
              "resource" => "work-items",
              "op" => "upsert",
-             "refs" => %{"workItemId" => "wi_1"},
+             "refs" => %{
+               "workItemId" => "work-one",
+               "origin" => "user:test-user",
+               "principal" => "user:test-user"
+             },
              "payload" => payload
            } = receive_notice()
 
-    assert payload["id"] == "wi_1"
+    assert payload["id"] == "work-one"
     assert payload["rowVersion"] == 123
     refute Map.has_key?(payload, "cliToken")
   end
@@ -1111,8 +1310,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     assert {:ok, %{status: "open"} = request} = Dispatch.dispatch(db, handlers, ask)
-    assert observed_state_classes() == ["decision_request.opened"]
-    assert Gateway.handler_effects(%{db: db})["operator-ask"] == ["decision_request.opened"]
+    assert observed_state_classes() == ["wake.scheduled", "decision_request.opened"]
+
+    assert Gateway.handler_effects(%{db: db})["operator-ask"] ==
+             ["decision_request.opened", "wake.scheduled"]
 
     assert {:ok, %{id: replay_id}} = Dispatch.dispatch(db, handlers, ask)
     assert replay_id == request.id
@@ -1175,7 +1376,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, %{status: "open"} = withdraw_request} =
              Dispatch.dispatch(db, handlers, ask_withdraw)
 
-    assert observed_state_classes() == ["decision_request.opened"]
+    assert observed_state_classes() == ["wake.scheduled", "decision_request.opened"]
 
     withdraw = %{
       verb: "operator-withdraw",
@@ -1236,7 +1437,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
           {"return", %{reason: "Need evidence"}, "returned", "decision_request.returned"}
         ] do
       assert {:ok, request} = Dispatch.dispatch(db, handlers, ask)
-      assert observed_state_classes() == ["decision_request.opened"]
+      assert observed_state_classes() == ["wake.scheduled", "decision_request.opened"]
 
       response = %{
         ask
@@ -1250,19 +1451,30 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
       notice_wake = pending_decision_notice!(db, request.id)
       assert {:ok, %{status: ^status}} = Dispatch.dispatch(db, handlers, response)
-      assert %{"class" => "verb.accepted"} = receive_notice()
-      assert_decision_notice_cleared!(db, request.id, notice_wake)
-      notice = receive_notice()
+      response_notices = Enum.map(1..4, fn _ -> receive_notice() end)
+
+      assert Enum.sort(Enum.map(response_notices, & &1["class"])) ==
+               Enum.sort(["verb.accepted", "wake.canceled", "wake.scheduled", class])
+
+      assert [%{"class" => "wake.canceled"} = cancellation] =
+               Enum.filter(response_notices, &(&1["class"] == "wake.canceled"))
+
+      assert_decision_notice_cleared!(db, request.id, notice_wake, cancellation)
+      notice = Enum.find(response_notices, &(&1["class"] == class))
       assert notice["class"] == class
       assert notice["schemaVersion"] == 2
       assert notice["resource"] == "decision requests"
       assert notice["op"] == "upsert"
-      assert notice["refs"] == %{"decisionRequestId" => request.id}
 
       canonical =
         db
         |> Tightbeam.StateResources.query_decision_request(request.id)
         |> Tightbeam.StateResources.decision_request()
+
+      assert notice["refs"] == %{
+               "decisionRequestId" => request.id,
+               "sessionKey" => canonical["raiserSessionKey"]
+             }
 
       assert notice["payload"] == canonical
       assert JSON.decode!(Publisher.encode_wire_notice(notice))["payload"] == canonical
@@ -1284,7 +1496,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     end
 
     assert {:ok, request} = Dispatch.dispatch(db, handlers, ask)
-    assert observed_state_classes() == ["decision_request.opened"]
+    assert observed_state_classes() == ["wake.scheduled", "decision_request.opened"]
 
     withdraw = %{
       ask
@@ -1302,7 +1514,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert notice["schemaVersion"] == 2
     assert notice["resource"] == "decision requests"
     assert notice["op"] == "upsert"
-    assert notice["refs"] == %{"decisionRequestId" => request.id}
+
+    assert notice["refs"] == %{
+             "decisionRequestId" => request.id,
+             "sessionKey" => notice["payload"]["raiserSessionKey"]
+           }
+
     assert notice["payload"]["status"] == "withdrawn"
     assert Escalation.raw_by_id(db, request.id).row_schema_revision == 2
   end
@@ -1327,18 +1544,65 @@ defmodule Tightbeam.Firehose.PublisherTest do
       model: Tightbeam.Model.new("fable")
     })
 
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "turn-target",
+        origin: "user:test-user",
+        prompt: "run",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    assert %{"class" => "wake.scheduled", "payload" => %{"state" => "pending"}} =
+             receive_notice()
+
     assert {:ok, seq} =
              Ledger.enqueue(db, %{
                session_key: "turn-target",
+               wake_id: wake.wake_id,
                message_id: "turn-message",
                origin: "user:flynn",
                prompt: "run"
              })
 
+    enqueue_notices = Enum.map(1..3, fn _ -> receive_notice() end)
+
+    assert Enum.sort(Enum.map(enqueue_notices, & &1["class"])) ==
+             Enum.sort(["session.updated", "turn.queued", "wake.scheduled"])
+
+    queued = Enum.find(enqueue_notices, &(&1["class"] == "turn.queued"))
+    queued_row = db |> StateResources.query_turn_by_seq(seq) |> StateResources.turn()
+    assert queued["refs"] == %{"turnSeq" => seq, "sessionKey" => "turn-target"}
+    assert queued["payload"] == queued_row
+    assert queued_row["status"] == "queued"
+    queued_version = queued_row["rowVersion"]
+    session_notice = Enum.find(enqueue_notices, &(&1["class"] == "session.updated"))
+    assert session_notice["payload"]["mechanicalStatus"] == "running"
+    queued_wake = Enum.find(enqueue_notices, &(&1["class"] == "wake.scheduled"))
+    assert queued_wake["payload"]["wakeId"] == wake.wake_id
+    assert queued_wake["payload"]["deliveryStatus"] == "queued"
+    queued_wake_version = queued_wake["payload"]["rowVersion"]
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1 AND state='pending'",
+                 [wake.wake_id, System.system_time(:millisecond)]
+               )
+
+               Wakes.publish_change_in_txn(txn, "wake.fired", wake.wake_id)
+             end)
+
     assert %{
-             "class" => "session.updated",
-             "payload" => %{"mechanicalStatus" => "running", "sessionKey" => "turn-target"}
+             "class" => "wake.fired",
+             "payload" => %{
+               "state" => "fired",
+               "deliveryStatus" => "queued",
+               "rowVersion" => fired_wake_version
+             }
            } = receive_notice()
+
+    assert fired_wake_version > queued_wake_version
 
     assert {:ok, %{seq: ^seq, owner_lease: seq_lease}} =
              Ledger.claim_next(db, "turn-target", "lane:test")
@@ -1346,21 +1610,700 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert %{
              "class" => "turn.started",
              "refs" => %{"turnSeq" => ^seq},
-             "payload" => %{"status" => "running", "seq" => ^seq}
+             "payload" => started_payload
            } = receive_notice()
+
+    started = db |> StateResources.query_turn_by_seq(seq) |> StateResources.turn()
+    assert started_payload == started
+    assert started["rowVersion"] > queued_version
+
+    assert %{
+             "class" => "wake.fired",
+             "payload" => %{
+               "state" => "fired",
+               "deliveryStatus" => "running",
+               "rowVersion" => started_wake_version
+             }
+           } = receive_notice()
+
+    assert started_wake_version > fired_wake_version
+
+    assert :ok = Ledger.stamp_adapter(db, seq, 7)
+
+    assert %{
+             "class" => "turn.started",
+             "refs" => %{"turnSeq" => ^seq},
+             "payload" => %{"adapterGen" => 7, "seq" => ^seq, "rowVersion" => adapter_version}
+           } = receive_notice()
+
+    assert adapter_version > started["rowVersion"]
 
     assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: seq_lease)
 
     assert %{
              "class" => "turn.ended",
              "refs" => %{"turnSeq" => ^seq},
-             "payload" => %{"status" => "delivered", "seq" => ^seq}
+             "payload" => ended_payload
            } = receive_notice()
+
+    ended = db |> StateResources.query_turn_by_seq(seq) |> StateResources.turn()
+    assert ended_payload == ended
+    assert ended["rowVersion"] > adapter_version
+
+    assert %{
+             "class" => "wake.fired",
+             "payload" => %{
+               "state" => "fired",
+               "deliveryStatus" => "delivered",
+               "rowVersion" => ended_wake_version
+             }
+           } = receive_notice()
+
+    assert ended_wake_version > started_wake_version
 
     assert %{
              "class" => "session.updated",
              "payload" => %{"mechanicalStatus" => "idle", "sessionKey" => "turn-target"}
            } = receive_notice()
+
+    assert :ok = Ledger.mark_published(db, seq)
+
+    assert %{
+             "class" => "turn.ended",
+             "refs" => %{"turnSeq" => ^seq},
+             "payload" => %{
+               "publishedAt" => published_at,
+               "seq" => ^seq,
+               "rowVersion" => published_version
+             }
+           } = receive_notice()
+
+    assert is_integer(published_at)
+    assert published_version > ended["rowVersion"]
+
+    assert db
+           |> StateResources.query_turn_by_seq(seq)
+           |> StateResources.turn()
+           |> Map.fetch!("rowVersion") == published_version
+  end
+
+  test "a pending wake prompt mutation publishes the canonical wake row" do
+    db = :firehose_pending_wake_update_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('test-user',1,1)")
+
+    register_testhost(db)
+
+    Org.create(db, %{
+      session_key: "wake-target",
+      display_name: "Wake target",
+      owner_user_id: "test-user",
+      origin: "user:test-user",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "test-user", is_admin: true})
+    :ok = Hub.subscribe(Hub, self(), "wake-prompt-update", %{"classes" => ["wake.scheduled"]})
+
+    wake =
+      Wakes.schedule(db, %{
+        wake_id: "ephemeral-result:firehose-test",
+        session_key: "wake-target",
+        origin: "user:test-user",
+        prompt: "original prompt",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    assert_receive {:firehose_notice, %{"class" => "wake.scheduled"}}
+    Hub.delivered(Hub, self())
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.Ephemeral.final_message_in_txn(txn, "firehose-test", "updated result")
+             end)
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "wake.scheduled",
+                      "refs" => %{"wakeId" => "ephemeral-result:firehose-test"},
+                      "payload" => payload
+                    }}
+
+    assert payload["wakeId"] == wake.wake_id
+    assert payload["prompt"] =~ "updated result"
+  end
+
+  test "wake versions advance for same-millisecond writes and survive a gateway restart" do
+    db = String.to_atom("firehose_wake_version_#{System.unique_integer([:positive])}")
+
+    base =
+      Path.join(System.tmp_dir!(), "firehose-wake-version-#{System.unique_integer([:positive])}")
+
+    path = Path.join(base, "state.db")
+    payload = Path.join(base, "payload")
+
+    on_exit(fn -> File.rm_rf!(base) end)
+    File.mkdir_p!(base)
+    File.mkdir_p!(Path.join(payload, "ebin"))
+    File.mkdir_p!(Path.join(payload, "priv"))
+    File.write!(Path.join(payload, "ebin/fixture.beam"), "fixture")
+    File.write!(Path.join(payload, "priv/fixture.rule"), "fixture")
+
+    {:ok, manifest} =
+      Tightbeam.LiveBaseGuard.generate_manifest(Tightbeam.LiveBasePayload.files!(payload))
+
+    File.write!(Path.join(payload, "build-manifest.json"), JSON.encode!(manifest))
+
+    start_supervised!(
+      {DB, path: path, name: db, guard_inputs: [], payload_root: payload},
+      id: db
+    )
+
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt) VALUES('versioned-wake','target','process:tightbeam','prompt',100,10)"
+             )
+
+    version = fn ->
+      db
+      |> Tightbeam.StateResources.query_wake("versioned-wake")
+      |> Tightbeam.StateResources.wake()
+      |> Map.fetch!("rowVersion")
+    end
+
+    initial = version.()
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(txn, "UPDATE wakes SET dueAt=101 WHERE wakeId='versioned-wake'")
+               Wakes.publish_change_in_txn(txn, "wake.scheduled", "versioned-wake")
+               :ok
+             end)
+
+    first = version.()
+    assert first > initial
+
+    assert %{"class" => "wake.scheduled", "payload" => first_payload} = receive_notice()
+    assert first_payload["rowVersion"] == first
+
+    assert first_payload ==
+             db
+             |> Tightbeam.StateResources.query_wake("versioned-wake")
+             |> Tightbeam.StateResources.wake()
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(txn, "UPDATE wakes SET dueAt=102 WHERE wakeId='versioned-wake'")
+               Wakes.publish_change_in_txn(txn, "wake.scheduled", "versioned-wake")
+               :ok
+             end)
+
+    second = version.()
+    assert second > first
+
+    assert %{"class" => "wake.scheduled", "payload" => second_payload} = receive_notice()
+    assert second_payload["rowVersion"] == second
+
+    assert second_payload ==
+             db
+             |> Tightbeam.StateResources.query_wake("versioned-wake")
+             |> Tightbeam.StateResources.wake()
+
+    assert :ok = stop_supervised!(db)
+
+    start_supervised!(
+      {DB, path: path, name: db, guard_inputs: [], payload_root: payload},
+      id: db
+    )
+
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    assert version.() == second
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(txn, "UPDATE wakes SET dueAt=103 WHERE wakeId='versioned-wake'")
+               Wakes.publish_change_in_txn(txn, "wake.scheduled", "versioned-wake")
+               :ok
+             end)
+
+    assert %{"class" => "wake.scheduled", "payload" => restarted_payload} = receive_notice()
+    assert version.() > second
+    assert restarted_payload["rowVersion"] == version.()
+
+    assert restarted_payload ==
+             db
+             |> Tightbeam.StateResources.query_wake("versioned-wake")
+             |> Tightbeam.StateResources.wake()
+  end
+
+  test "assignment versions advance through same-millisecond close and reopen and survive restart" do
+    db = String.to_atom("firehose_assignment_version_#{System.unique_integer([:positive])}")
+
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "firehose-assignment-version-#{System.unique_integer([:positive])}"
+      )
+
+    path = Path.join(base, "state.db")
+    payload = Path.join(base, "payload")
+
+    on_exit(fn -> File.rm_rf!(base) end)
+    File.mkdir_p!(Path.join(payload, "ebin"))
+    File.mkdir_p!(Path.join(payload, "priv"))
+    File.write!(Path.join(payload, "ebin/fixture.beam"), "fixture")
+    File.write!(Path.join(payload, "priv/fixture.rule"), "fixture")
+
+    {:ok, manifest} =
+      Tightbeam.LiveBaseGuard.generate_manifest(Tightbeam.LiveBasePayload.files!(payload))
+
+    File.write!(Path.join(payload, "build-manifest.json"), JSON.encode!(manifest))
+
+    start_supervised!({DB, path: path, name: db, guard_inputs: [], payload_root: payload}, id: db)
+    :ok = Tightbeam.Schema.ensure_all(db)
+    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('owner',1,1)")
+    register_hosts(db, %{"testhost" => %{ssh: nil, base_dir: System.tmp_dir!(), cli_bin: nil}})
+
+    Org.create(db, %{
+      session_key: "holder-session",
+      display_name: "Version holder",
+      owner_user_id: "owner",
+      origin: "user:owner",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "owner", is_admin: true})
+
+    assignment_id = "versioned-assignment"
+    attest_id = "versioned-close-attest"
+    holder = "holder-session"
+    principal = %{rest_principal: %{kind: "user", id: "owner", is_admin: true}}
+
+    canonical = fn source ->
+      source
+      |> StateResources.query_assignment(assignment_id, principal)
+      |> StateResources.assignment()
+    end
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,holderHarness,holderProvider) VALUES(?1,?2,?3,'owner',1000,'claude','anthropic')",
+                 [assignment_id, "version before close", holder]
+               )
+
+               row = StateResources.query_assignment(txn, assignment_id, principal)
+
+               Publisher.committed_in_txn(txn, "assignment.opened", row, %{
+                 "assignmentId" => assignment_id,
+                 "sessionKey" => holder
+               })
+
+               :ok
+             end)
+
+    opened_notice = receive_notice()
+    assert opened_notice["payload"] == canonical.(db)
+    opened_version = opened_notice["payload"]["rowVersion"]
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "INSERT INTO attests(id,assignmentId,kind,bySession,ts) VALUES(?1,?2,'completion',?3,1000)",
+                 [attest_id, assignment_id, holder]
+               )
+
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "UPDATE assignments SET state='closed',outcome='completed',closedAt=1000,closedBySession=?2,closingAttestId=?3 WHERE id=?1 AND state='open'",
+                 [assignment_id, holder, attest_id]
+               )
+
+               row = StateResources.query_assignment(txn, assignment_id, principal)
+
+               Publisher.committed_in_txn(txn, "assignment.closed", row, %{
+                 "assignmentId" => assignment_id,
+                 "sessionKey" => holder
+               })
+
+               :ok
+             end)
+
+    closed_notice = receive_notice()
+    assert closed_notice["class"] == "assignment.closed"
+    assert closed_notice["payload"] == canonical.(db)
+    closed_version = closed_notice["payload"]["rowVersion"]
+    assert closed_version > opened_version
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "INSERT INTO assignment_reopenings(assignmentId,ts,reopenedBySession,reason,priorOutcome,priorClosedAt,priorClosedBySession,priorClosingAttestId) VALUES(?1,1000,?2,'continue work','completed',1000,?2,?3)",
+                 [assignment_id, holder, attest_id]
+               )
+
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "UPDATE assignments SET state='open',outcome=NULL,closedAt=NULL,closedByUser=NULL,closedBySession=NULL,closedByProcess=NULL,closingAttestId=NULL WHERE id=?1 AND state='closed'",
+                 [assignment_id]
+               )
+
+               row = StateResources.query_assignment(txn, assignment_id, principal)
+
+               Publisher.committed_in_txn(txn, "assignment.reopened", row, %{
+                 "assignmentId" => assignment_id,
+                 "sessionKey" => holder
+               })
+
+               :ok
+             end)
+
+    reopened_notice = receive_notice()
+    assert reopened_notice["class"] == "assignment.reopened"
+    assert reopened_notice["payload"] == canonical.(db)
+    reopened_version = reopened_notice["payload"]["rowVersion"]
+    assert reopened_version > closed_version
+    closed_attest = StateResources.query_attest(db, attest_id) |> StateResources.attest()
+
+    assert :ok = stop_supervised!(db)
+    start_supervised!({DB, path: path, name: db, guard_inputs: [], payload_root: payload}, id: db)
+    :ok = Tightbeam.Schema.ensure_all(db)
+    assert canonical.(db)["rowVersion"] == reopened_version
+    assert StateResources.query_attest(db, attest_id) |> StateResources.attest() == closed_attest
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "UPDATE assignments SET subject='version after restart' WHERE id=?1",
+                 [assignment_id]
+               )
+
+               row = StateResources.query_assignment(txn, assignment_id, principal)
+
+               Publisher.committed_in_txn(txn, "assignment.opened", row, %{
+                 "assignmentId" => assignment_id,
+                 "sessionKey" => holder
+               })
+
+               :ok
+             end)
+
+    restarted_notice = receive_notice()
+    assert restarted_notice["payload"] == canonical.(db)
+    assert restarted_notice["payload"]["rowVersion"] > reopened_version
+  end
+
+  @tag :tmp_dir
+  test "work-item row versions survive restart and advance after a later mutation", %{
+    tmp_dir: tmp
+  } do
+    db = String.to_atom("firehose_work_item_version_#{System.unique_integer([:positive])}")
+    base = Path.join(tmp, "base")
+    path = Path.join(base, "state.db")
+    payload = Path.join(tmp, "payload")
+
+    File.mkdir_p!(Path.join(payload, "ebin"))
+    File.mkdir_p!(Path.join(payload, "priv"))
+    File.write!(Path.join(payload, "ebin/fixture.beam"), "fixture")
+    File.write!(Path.join(payload, "priv/fixture.rule"), "fixture")
+
+    {:ok, manifest} =
+      Tightbeam.LiveBaseGuard.generate_manifest(Tightbeam.LiveBasePayload.files!(payload))
+
+    File.write!(Path.join(payload, "build-manifest.json"), JSON.encode!(manifest))
+
+    start_supervised!({DB, path: path, name: db, guard_inputs: [], payload_root: payload}, id: db)
+    :ok = Tightbeam.Schema.ensure_all(db)
+    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('owner',0,1)")
+
+    create_call = %{
+      verb: "work-item-create",
+      origin: "user:owner",
+      principal: {:user, "owner"},
+      session_key: nil,
+      params: %{title: "Version survives restart"}
+    }
+
+    item = Tightbeam.WorkItems.__handle__(db, "work-item-create", create_call)
+    principal = %{principal: {:user, "owner"}}
+
+    canonical = fn source ->
+      source
+      |> StateResources.query_work_item(item.id, principal)
+      |> StateResources.work_item()
+    end
+
+    before_restart = canonical.(db)
+
+    assert :ok = stop_supervised!(db)
+    start_supervised!({DB, path: path, name: db, guard_inputs: [], payload_root: payload}, id: db)
+    :ok = Tightbeam.Schema.ensure_all(db)
+    assert canonical.(db) == before_restart
+
+    update_call = %{
+      create_call
+      | verb: "work-item-update",
+        params: %{work_item_id: item.id, title: "Version advances after restart"}
+    }
+
+    updated = Tightbeam.WorkItems.__handle__(db, "work-item-update", update_call)
+    after_restart = canonical.(db)
+    assert updated.title == after_restart["title"]
+    assert after_restart["title"] == "Version advances after restart"
+    assert after_restart["rowVersion"] > before_restart["rowVersion"]
+  end
+
+  @tag :tmp_dir
+  test "turn row versions survive restart and advance on a later lifecycle notice", %{
+    tmp_dir: tmp
+  } do
+    db = String.to_atom("firehose_turn_version_#{System.unique_integer([:positive])}")
+    base = Path.join(tmp, "base")
+    path = Path.join(base, "state.db")
+    payload = Path.join(tmp, "payload")
+
+    File.mkdir_p!(Path.join(payload, "ebin"))
+    File.mkdir_p!(Path.join(payload, "priv"))
+    File.write!(Path.join(payload, "ebin/fixture.beam"), "fixture")
+    File.write!(Path.join(payload, "priv/fixture.rule"), "fixture")
+
+    {:ok, manifest} =
+      Tightbeam.LiveBaseGuard.generate_manifest(Tightbeam.LiveBasePayload.files!(payload))
+
+    File.write!(Path.join(payload, "build-manifest.json"), JSON.encode!(manifest))
+
+    start_supervised!({DB, path: path, name: db, guard_inputs: [], payload_root: payload}, id: db)
+    :ok = Tightbeam.Schema.ensure_all(db)
+    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('owner',0,1)")
+    register_hosts(db, %{"testhost" => %{ssh: nil, base_dir: System.tmp_dir!(), cli_bin: nil}})
+
+    Org.create(db, %{
+      session_key: "turn-version-owner",
+      display_name: "Turn version owner",
+      owner_user_id: "owner",
+      origin: "user:owner",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    :ok =
+      Hub.register(Hub, self(), %{mode: :subscribed, db: db, user_id: "owner", is_admin: false})
+
+    :ok =
+      Hub.subscribe(Hub, self(), "turn-version", %{"classes" => ["turn.queued", "turn.ended"]})
+
+    session_key = "turn-version-owner"
+
+    assert {:ok, seq} =
+             Ledger.enqueue(db, %{
+               session_key: session_key,
+               message_id: "turn-version-message",
+               origin: "user:owner",
+               prompt: "verify durable turn version"
+             })
+
+    queued = receive_notice()
+    assert queued["class"] == "turn.queued"
+    queued_row = StateResources.query_turn_by_seq(db, seq) |> StateResources.turn()
+    assert queued["payload"] == queued_row
+
+    assert :ok = stop_supervised!(db)
+    start_supervised!({DB, path: path, name: db, guard_inputs: [], payload_root: payload}, id: db)
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    :ok =
+      Hub.register(Hub, self(), %{mode: :subscribed, db: db, user_id: "owner", is_admin: false})
+
+    :ok =
+      Hub.subscribe(Hub, self(), "turn-version", %{"classes" => ["turn.queued", "turn.ended"]})
+
+    assert StateResources.query_turn_by_seq(db, seq) |> StateResources.turn() == queued_row
+
+    assert {:ok, true} =
+             DB.transaction(db, fn txn ->
+               Ledger.cancel_queued_in_txn(txn, seq, "version restart fixture")
+             end)
+
+    ended = receive_notice()
+    ended_row = StateResources.query_turn_by_seq(db, seq) |> StateResources.turn()
+    assert ended["class"] == "turn.ended"
+    assert ended["payload"] == ended_row
+    assert ended_row["rowVersion"] > queued_row["rowVersion"]
+  end
+
+  test "wake row-version migration backfills the last timestamp projection" do
+    db = :firehose_legacy_wake_version_db
+    start_supervised!({DB, path: ":memory:", name: db})
+
+    assert :ok =
+             DB.execute(db, """
+             CREATE TABLE wakes (
+               wakeId TEXT PRIMARY KEY, sessionKey TEXT NOT NULL, targetRole TEXT,
+               origin TEXT NOT NULL, prompt TEXT, consumer TEXT NOT NULL, dueAt INTEGER NOT NULL,
+               state TEXT NOT NULL, createdAt INTEGER NOT NULL, firedAt INTEGER,
+               reresolve TEXT, reresolveSeed TEXT, reresolveRung INTEGER,
+               conditionKind TEXT, conditionScope TEXT, conditionAfterId INTEGER,
+               firedBy TEXT, creatorSessionKey TEXT, rumination INTEGER NOT NULL DEFAULT 0,
+               work_item_id TEXT, assignmentId TEXT, canceledAt INTEGER,
+               targetGate INTEGER NOT NULL DEFAULT 1, class TEXT, classElection TEXT,
+               deliveryRule TEXT, digest INTEGER NOT NULL DEFAULT 0, summon INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE turns (wakeId TEXT, createdAt INTEGER, startedAt INTEGER, endedAt INTEGER);
+             INSERT INTO wakes(wakeId,sessionKey,origin,consumer,dueAt,state,createdAt,firedAt)
+               VALUES('legacy-wake','target','process:tightbeam','prompt',20,'fired',10,12);
+             INSERT INTO turns(wakeId,createdAt,startedAt,endedAt)
+               VALUES('legacy-wake',18,25,30);
+             """)
+
+    :ok = Tightbeam.Schema.ensure_wake_row_version(db)
+    assert {:ok, [[30]]} = DB.query(db, "SELECT rowVersion FROM wakes WHERE wakeId='legacy-wake'")
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(txn, "UPDATE wakes SET dueAt=21 WHERE wakeId='legacy-wake'")
+               :ok
+             end)
+
+    assert {:ok, [[31]]} = DB.query(db, "SELECT rowVersion FROM wakes WHERE wakeId='legacy-wake'")
+  end
+
+  test "assignment and turn row-version migration backfills once and tracks projected writes" do
+    db = :firehose_legacy_direct_apply_versions_db
+    start_supervised!({DB, path: ":memory:", name: db})
+
+    assert :ok =
+             DB.execute(db, """
+             CREATE TABLE assignments (
+               id TEXT PRIMARY KEY, subject TEXT, holderKey TEXT, holderRole TEXT,
+               holderFallback INTEGER, openedByUser TEXT, openedBySession TEXT,
+               openedAt INTEGER, state TEXT, outcome TEXT, closedAt INTEGER,
+               closedByUser TEXT, closedBySession TEXT, closedByProcess TEXT,
+               closingAttestId TEXT, workItemId TEXT, reviewsAssignmentId TEXT,
+               holderHarness TEXT, holderProvider TEXT
+             );
+             CREATE TABLE assignment_reopenings (assignmentId TEXT, ts INTEGER);
+             CREATE TABLE attests (assignmentId TEXT, ts INTEGER);
+             CREATE TABLE assignment_commit_ref_corrections (assignmentId TEXT, createdAt INTEGER);
+             CREATE TABLE turns (
+               seq INTEGER PRIMARY KEY, sessionKey TEXT, messageId TEXT, wakeId TEXT,
+               origin TEXT, prompt TEXT, roleRef TEXT, roleFallback INTEGER,
+               assignmentId TEXT, jobRef TEXT, model TEXT, thinkingLevel TEXT,
+               modelContext TEXT, harness TEXT, replyAttention INTEGER, status TEXT,
+               owner TEXT, adapterGen INTEGER, requestRef TEXT, error TEXT,
+               createdAt INTEGER, startedAt INTEGER, endedAt INTEGER, publishedAt INTEGER
+             );
+             INSERT INTO assignments(id,subject,holderKey,openedAt,state)
+               VALUES('legacy-assignment','before','holder',10,'open');
+             INSERT INTO assignment_reopenings(assignmentId,ts) VALUES('legacy-assignment',30);
+             INSERT INTO attests(assignmentId,ts) VALUES('legacy-assignment',40);
+             INSERT INTO assignment_commit_ref_corrections(assignmentId,createdAt)
+               VALUES('legacy-assignment',50);
+             INSERT INTO turns(seq,sessionKey,messageId,origin,prompt,status,createdAt,publishedAt)
+               VALUES(5,'holder','message','user:fixture','prompt','delivered',60,80);
+             """)
+
+    assert :ok = Tightbeam.Schema.ensure_direct_apply_row_versions(db)
+
+    assert {:ok, [[51]]} =
+             DB.query(db, "SELECT rowVersion FROM assignments WHERE id='legacy-assignment'")
+
+    assert {:ok, [[81]]} = DB.query(db, "SELECT rowVersion FROM turns WHERE seq=5")
+
+    assert :ok = Tightbeam.Schema.ensure_direct_apply_row_versions(db)
+
+    assert {:ok, [[51]]} =
+             DB.query(db, "SELECT rowVersion FROM assignments WHERE id='legacy-assignment'")
+
+    assert {:ok, [[81]]} = DB.query(db, "SELECT rowVersion FROM turns WHERE seq=5")
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "UPDATE assignments SET subject='after' WHERE id='legacy-assignment'"
+               )
+
+               Tightbeam.DB.Txn.q(txn, "UPDATE turns SET publishedAt=81 WHERE seq=5")
+               :ok
+             end)
+
+    assert {:ok, [[52]]} =
+             DB.query(db, "SELECT rowVersion FROM assignments WHERE id='legacy-assignment'")
+
+    assert {:ok, [[82]]} = DB.query(db, "SELECT rowVersion FROM turns WHERE seq=5")
+  end
+
+  test "wake retargeting publishes the replacement row" do
+    db = :firehose_wake_retarget_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('test-user',1,1)")
+
+    register_testhost(db)
+
+    Org.create(db, %{
+      session_key: "replacement-target",
+      display_name: "Replacement target",
+      owner_user_id: "test-user",
+      origin: "user:test-user",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "test-user", is_admin: true})
+
+    source =
+      Wakes.schedule(db, %{
+        session_key: "previous-target",
+        origin: "user:test-user",
+        prompt: "keep this prompt",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    assert %{"class" => "wake.scheduled"} = receive_notice()
+
+    assert {:ok, replacement} =
+             DB.transaction(db, fn txn ->
+               Wakes.retarget_in_txn(txn, source.wake_id, "replacement-target")
+             end)
+
+    assert %{
+             "class" => "wake.scheduled",
+             "resource" => "wakes",
+             "op" => "upsert",
+             "refs" => %{"wakeId" => wake_id},
+             "payload" => %{"sessionKey" => "replacement-target", "prompt" => "keep this prompt"}
+           } = receive_notice()
+
+    assert wake_id == replacement.wake_id
   end
 
   test "concurrent transaction handoffs reach the firehose in database commit order" do
@@ -1534,6 +2477,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert lww(newer_fact, older_fact) == newer_fact
     assert lww(newer_fact, newer_fact) == newer_fact
 
+    older_assignment = %{"id" => "assignment-a", "rowVersion" => 39, "state" => "closed"}
+    held_assignment = %{"id" => "assignment-a", "rowVersion" => 40, "state" => "open"}
+    newer_assignment = %{"id" => "assignment-a", "rowVersion" => 41, "state" => "closed"}
+
+    assert lww(held_assignment, older_assignment) == held_assignment
+    assert lww(held_assignment, newer_assignment) == newer_assignment
+    assert lww(held_assignment, held_assignment) == held_assignment
+
     db = :firehose_condition_fact_identity_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
@@ -1614,6 +2565,30 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, _} = Dispatch.dispatch(db, handlers, update)
     assert observed_classes() == ["verb.accepted"]
     assert canonical.() == before
+
+    previous_version = canonical.()["rowVersion"]
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.WorkItems.arm_slate_in_txn(txn, item.id)
+             end)
+
+    assert %{"class" => "wake.scheduled"} = receive_notice()
+
+    assert %{
+             "class" => "work_item.updated",
+             "payload" =>
+               %{
+                 "id" => id,
+                 "slateWakeId" => slate_wake_id,
+                 "rowVersion" => slate_version
+               } = slate_payload
+           } = receive_notice()
+
+    assert id == item.id
+    assert is_binary(slate_wake_id)
+    assert slate_version > previous_version
+    assert slate_payload == canonical.()
   end
 
   defp message_fixture(id, seq, session_key, content) do
@@ -1637,7 +2612,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
   end
 
   defp lww(current, candidate) do
-    if candidate["rowVersion"] >= current["rowVersion"], do: candidate, else: current
+    if candidate["rowVersion"] > current["rowVersion"], do: candidate, else: current
   end
 
   defp assert_effects_match!(declared, observed) do
@@ -1668,9 +2643,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
   end
 
   defp observed_classes do
-    drain_notices()
+    observed_notices()
     |> Enum.map(& &1["class"])
   end
+
+  defp observed_notices, do: drain_notices()
 
   defp drain_notices(acc \\ []) do
     _ = :sys.get_state(Hub)
@@ -1733,10 +2710,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
       row = StateResources.query_message(db, message_id)
       assert row
       canonical = StateResources.message(row)
+      owner_session = StateResources.query_session(db, row.session_key)
 
       assert notice["refs"]["messageId"] == message_id
       assert notice["refs"]["sessionKey"] == row.session_key
-      assert notice["refs"]["ownerUserId"] == "flynn"
+      assert owner_session
+      assert notice["refs"]["ownerUserId"] == StateResources.session(owner_session)["ownerUserId"]
       assert notice["payload"] == canonical
       assert JSON.decode!(Publisher.encode_wire_notice(notice))["payload"] == canonical
 
@@ -1756,7 +2735,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
   end
 
   defp assert_batched_attest_message!(db, row, expected_assignment_ids) do
-    assert row.session_key == Org.personal_session_key("flynn")
+    owner_session = StateResources.query_session(db, row.session_key)
+    assert owner_session
+
+    assert row.session_key ==
+             Org.personal_session_key(StateResources.session(owner_session)["ownerUserId"])
+
     assert row.role == "user"
     assert row.message_type == "substrate"
     assert row.sender == "process:tightbeam"
@@ -1895,8 +2879,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
     wake_id
   end
 
-  defp assert_decision_notice_cleared!(db, request_id, wake_id) do
-    cancellation = receive_notice()
+  defp assert_decision_notice_cleared!(db, request_id, wake_id, cancellation \\ nil) do
+    cancellation = cancellation || receive_notice()
     assert cancellation["class"] == "wake.canceled"
     assert cancellation["refs"]["wakeId"] == wake_id
     assert cancellation["payload"]["state"] == "canceled"
@@ -1926,5 +2910,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert_receive {:firehose_notice, notice}
     Hub.delivered(Hub, self())
     notice
+  end
+
+  defp rest_get(path, token, opts) do
+    conn(:get, path)
+    |> put_req_header("authorization", "Bearer #{token}")
+    |> Router.call(Router.init(opts))
   end
 end
