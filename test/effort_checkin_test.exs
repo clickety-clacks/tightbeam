@@ -160,11 +160,13 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert is_binary(assigned.id)
 
-    assert [[1, "armed", wake_id, watermark, armed_at, horizon, multiplier, due_at]] =
+    assert [[1, "armed", wake_id, watermark, artifact_watermark, attest_watermark,
+             work_item_watermark, armed_at, horizon, multiplier, due_at]] =
              rows(
                ctx.db,
                """
                SELECT g.generation,g.state,g.wakeId,g.terminalSeqWatermark,
+                      g.artifactWatermark,g.attestWatermark,g.workItemWatermark,
                       g.armedAt,g.baseHorizonMs,g.multiplier,w.dueAt
                FROM effort_checkin_generations AS g
                JOIN wakes AS w ON w.wakeId=g.wakeId
@@ -177,6 +179,24 @@ defmodule Tightbeam.EffortCheckinTest do
     assert multiplier == 1
     assert due_at - armed_at == horizon * multiplier
     assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM artifacts WHERE workItemId=?1 AND createdBySession=?2 AND rowid>?3",
+             [item.id, "holder", artifact_watermark]
+           ) == [[0]]
+    assert rows(ctx.db, "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND rowid>?2", [
+             assigned.id,
+             attest_watermark
+           ]) == [[0]]
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM work_item_events WHERE workItemId=?1 AND id>?2 AND kind='metadata'",
+             [item.id, work_item_watermark]
+           ) == [[0]]
+    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND seq>?2", [
+             "holder",
+             watermark
+           ]) == [[0]]
 
     terminal_turn(ctx.db, "holder", "delivered")
 
@@ -237,11 +257,13 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert is_binary(assigned.id)
 
-    assert [[1, "armed", wake_id, watermark, armed_at, horizon, multiplier, due_at]] =
+    assert [[1, "armed", wake_id, watermark, artifact_watermark, attest_watermark,
+             work_item_watermark, armed_at, horizon, multiplier, due_at]] =
              rows(
                ctx.db,
                """
                SELECT g.generation,g.state,g.wakeId,g.terminalSeqWatermark,
+                      g.artifactWatermark,g.attestWatermark,g.workItemWatermark,
                       g.armedAt,g.baseHorizonMs,g.multiplier,w.dueAt
                FROM effort_checkin_generations AS g
                JOIN wakes AS w ON w.wakeId=g.wakeId
@@ -254,6 +276,20 @@ defmodule Tightbeam.EffortCheckinTest do
     assert multiplier == 1
     assert due_at - armed_at == horizon * multiplier
     assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM artifacts WHERE workItemId=?1 AND createdBySession=?2 AND rowid>?3",
+             [item.id, "holder", artifact_watermark]
+           ) == [[0]]
+    assert rows(ctx.db, "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND rowid>?2", [
+             assigned.id,
+             attest_watermark
+           ]) == [[0]]
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM work_item_events WHERE workItemId=?1 AND id>?2 AND kind='metadata'",
+             [item.id, work_item_watermark]
+           ) == [[0]]
     assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND seq>?2", [
              "holder",
              watermark
@@ -270,7 +306,16 @@ defmodule Tightbeam.EffortCheckinTest do
              ctx.db,
              "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
              [assigned.id]
-           ) == [[1, "probed"]]
+           ) == [[1, "probed"], [2, "armed"]]
+
+    assert rows(
+             ctx.db,
+             "SELECT agentProdded FROM effort_checkin_generations WHERE assignmentId=?1 AND generation=2",
+             [assigned.id]
+           ) == [[1]]
+    assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [
+             assigned.id
+           ]) == [[0]]
 
     assert [prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assigned.id))
     assert prod.state == "pending"
@@ -2161,8 +2206,8 @@ defmodule Tightbeam.EffortCheckinTest do
   end
 
   defp make_wake_due!(db, wake_id) do
-    :ok =
-      DB.execute(db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [
         wake_id,
         System.system_time(:millisecond) - 1
       ])
