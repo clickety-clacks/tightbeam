@@ -8,10 +8,9 @@ defmodule Tightbeam.CausalEvents do
   NECESSITY RULE (binding — this table is not a log): a kind is admitted ONLY if
   its fact is destroyed by an overwrite or has no timestamped home. The
   per-kind audit that admitted each kind below:
-  - `effort_rung_advance` — `EffortCheckin.deadline_in_txn/3` overwrites
-    expecterSessionKey, expecterUserId and lineageRung on the request row. The
-    replacement deadline wake carries no rung (it is scheduled without
-    `reresolve_rung`), so the prior rung has no other home.
+  - `effort_rung_advance` — retained for legacy rows from the former deadline
+    rotation behavior. Current effort deadline expiry withdraws the request and
+    records a lifecycle and row transition without overwriting its routing rung.
   - `prod_fired` — `assignment_prods.prodCount` is a mutable aggregate that
     resets on a typed liveness receipt, and the tier that fired lives only in
     `supervision_watermarks.pendingK`, overwritten each evaluation. The

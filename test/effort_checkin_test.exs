@@ -361,7 +361,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert length(Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assigned.id))) == 1
   end
 
-  test "turning effort check-ins off leaves already-armed rows and requests inert", ctx do
+  test "turning effort check-ins off stops probes and leaves unexpired requests untouched", ctx do
     enabled = %{ctx | config: Map.put(ctx.config, :effort_checkins_enabled, true)}
 
     assigned =
@@ -417,6 +417,37 @@ defmodule Tightbeam.EffortCheckinTest do
              "SELECT wakeId FROM wakes WHERE consumer='effort_deadline' AND assignmentId=?1",
              [assigned.id]
            ) == [[open_request.deadline_wake_id]]
+  end
+
+  test "an outstanding request still expires after check-ins are disabled", ctx do
+    enabled = %{ctx | config: Map.put(ctx.config, :effort_checkins_enabled, true)}
+
+    assigned =
+      assignment(enabled, "dispatch", {:session, "parent"}, "holder", %{
+        subject: "expiry survives check-in opt-out",
+        brief: "expiry survives check-in opt-out"
+      })
+
+    assert nil == fire_probe(enabled, assigned.id)
+    open_request = fire_probe(enabled, assigned.id)
+    disabled_config = Map.put(ctx.config, :effort_checkins_enabled, false)
+    make_request_deadline_due!(ctx.db, open_request)
+
+    assert :ok =
+             EffortCheckin.deadline(
+               ctx.db,
+               disabled_config,
+               Wakes.get(ctx.db, open_request.deadline_wake_id)
+             )
+
+    assert request(ctx.db, open_request.id).status == "withdrawn"
+
+    assert rows(ctx.db, "SELECT withdrawnReason FROM decision_requests WHERE id=?1", [
+             open_request.id
+           ]) == [["expired-no-decision"]]
+
+    assert Wakes.get(ctx.db, open_request.deadline_wake_id).state == "fired"
+    assert [%{session_key: "holder"}] = expiry_notice_wakes(ctx.db, assigned.id)
   end
 
   test "a new effort request follows corrected coordination while preserving its opener", ctx do
@@ -939,7 +970,7 @@ defmodule Tightbeam.EffortCheckinTest do
     end
   end
 
-  test "effort deadline changes publish the updated R2 decision snapshot", ctx do
+  test "effort deadline publishes terminal no-decision expiry without rearming", ctx do
     alias Tightbeam.Firehose.Hub
 
     item = dispatch(ctx, {:session, "parent"}, "holder", "updated effort")
@@ -952,11 +983,12 @@ defmodule Tightbeam.EffortCheckinTest do
     :ok = Hub.subscribe(Hub, self(), "g6-decision", %{"classes" => ["decision_request."]})
 
     old_deadline = request.deadline_wake_id
+    make_request_deadline_due!(ctx.db, request)
     assert :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, old_deadline))
     _barrier = Hub.sequence(Hub, self())
 
     assert_receive {:firehose_notice, notice}
-    assert notice["class"] == "decision_request.updated"
+    assert notice["class"] == "decision_request.withdrawn"
     assert notice["schemaVersion"] == 2
     assert notice["resource"] == "decision requests"
     assert notice["op"] == "upsert"
@@ -968,10 +1000,163 @@ defmodule Tightbeam.EffortCheckinTest do
       |> Tightbeam.StateResources.decision_request()
 
     assert notice["payload"] == canonical
-    assert canonical["deadlineWakeId"] != old_deadline
+    assert canonical["status"] == "withdrawn"
+    assert canonical["decision"] == nil
+    assert canonical["withdrawnReason"] == "expired-no-decision"
+    assert canonical["deadlineWakeId"] == old_deadline
+    assert Wakes.get(ctx.db, old_deadline).state == "fired"
+    assert expiry_notice_wakes(ctx.db, item.id) |> length() == 1
+
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM wakes WHERE consumer='effort_deadline' AND assignmentId=?1 AND state='pending'",
+             [item.id]
+           ) == [[0]]
+
     assert Escalation.raw_by_id(ctx.db, request.id).row_schema_revision == 2
     Hub.delivered(Hub, self())
     :ok = Hub.unsubscribe(Hub, self(), "g6-decision")
+  end
+
+  test "an early effort deadline does not dispose the request or its timer", ctx do
+    item = dispatch(ctx, {:session, "parent"}, "holder", "early effort deadline")
+    request = escalate(ctx, item.id)
+
+    assert :ok =
+             EffortCheckin.deadline(
+               ctx.db,
+               ctx.config,
+               Wakes.get(ctx.db, request.deadline_wake_id)
+             )
+
+    assert request(ctx.db, request.id).status == "open"
+    assert Wakes.get(ctx.db, request.deadline_wake_id).state == "pending"
+    assert expiry_notice_wakes(ctx.db, item.id) == []
+  end
+
+  test "expired effort request notifies its active holder before ancestors", ctx do
+    item = dispatch(ctx, {:session, "parent"}, "holder", "holder expiry notice")
+    request = escalate(ctx, item.id)
+    make_request_deadline_due!(ctx.db, request)
+
+    assert :ok =
+             EffortCheckin.deadline(
+               ctx.db,
+               ctx.config,
+               Wakes.get(ctx.db, request.deadline_wake_id)
+             )
+
+    assert [notice] = expiry_notice_wakes(ctx.db, item.id)
+    assert notice.session_key == "holder"
+    assert notice.assignment_id == item.id
+    assert notice.work_item_id == item.workItemId
+    assert notice.target_gate == 1
+    assert notice.prompt =~ "No decision was made"
+    assert notice.prompt =~ "refile only if this request is still needed"
+
+    assert rows(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [request.id]) == [
+             ["withdrawn"]
+           ]
+  end
+
+  test "expired effort request skips retired spawned-by ancestors", ctx do
+    item = dispatch(ctx, {:session, "parent"}, "holder", "ancestor expiry notice")
+    request = escalate(ctx, item.id)
+    grandparent = session(ctx.db, "grandparent", "h1", Placement.local_host_name())
+
+    assert :ok =
+             DB.execute(
+               ctx.db,
+               "UPDATE sessions SET spawnedBy='grandparent', state='retired' WHERE sessionKey='parent'"
+             )
+
+    assert :ok =
+             DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='holder'")
+
+    make_request_deadline_due!(ctx.db, request)
+
+    assert :ok =
+             EffortCheckin.deadline(
+               ctx.db,
+               ctx.config,
+               Wakes.get(ctx.db, request.deadline_wake_id)
+             )
+
+    assert [notice] = expiry_notice_wakes(ctx.db, item.id)
+    assert notice.session_key == grandparent.session_key
+  end
+
+  test "expired effort request logs without notifying when no spawned-by ancestor is live", ctx do
+    main_key = Org.personal_session_key("h1")
+    session(ctx.db, main_key, "h1", Placement.local_host_name(), %{kind: "main"})
+
+    item = dispatch(ctx, {:session, "parent"}, "holder", "no ancestor expiry notice")
+    request = escalate(ctx, item.id)
+
+    assert :ok =
+             DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='holder'")
+
+    assert :ok =
+             DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='parent'")
+
+    make_request_deadline_due!(ctx.db, request)
+
+    assert :ok =
+             EffortCheckin.deadline(
+               ctx.db,
+               ctx.config,
+               Wakes.get(ctx.db, request.deadline_wake_id)
+             )
+
+    assert expiry_notice_wakes(ctx.db, item.id) == []
+
+    assert rows(
+             ctx.db,
+             "SELECT detail FROM lifecycle_events WHERE kind='decision_request_withdrawn' AND subject=?1",
+             [request.id]
+           ) == [["by=process:tightbeam reason=expired-no-decision notified=none"]]
+  end
+
+  test "ruling and deadline expiry race to one terminal outcome without rearming", ctx do
+    item = dispatch(ctx, {:session, "parent"}, "holder", "raced expiry")
+    request = escalate(ctx, item.id)
+    make_request_deadline_due!(ctx.db, request)
+    deadline_wake = Wakes.get(ctx.db, request.deadline_wake_id)
+
+    ruling =
+      Task.async(fn ->
+        EffortCheckin.rule(
+          ctx.db,
+          ctx.config,
+          effort_call(request.id, "dismiss", {:session, "parent"})
+        )
+      end)
+
+    expiry = Task.async(fn -> EffortCheckin.deadline(ctx.db, ctx.config, deadline_wake) end)
+    ruling_result = Task.await(ruling)
+    assert :ok = Task.await(expiry)
+
+    final = request(ctx.db, request.id)
+    assert final.status in ["ruled", "withdrawn"]
+    assert final.deadline_wake_id == request.deadline_wake_id
+
+    case final.status do
+      "ruled" ->
+        assert ruling_result.status == "ruled"
+        assert Wakes.get(ctx.db, request.deadline_wake_id).state == "canceled"
+        assert expiry_notice_wakes(ctx.db, item.id) == []
+
+      "withdrawn" ->
+        assert ruling_result.code == "not_open"
+        assert Wakes.get(ctx.db, request.deadline_wake_id).state == "fired"
+        assert length(expiry_notice_wakes(ctx.db, item.id)) == 1
+    end
+
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM wakes WHERE consumer='effort_deadline' AND assignmentId=?1 AND state='pending'",
+             [item.id]
+           ) == [[0]]
   end
 
   test "replacing an open effort request commits superseded before opened", ctx do
@@ -1140,8 +1325,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert bracket_state(ctx.db, second_sibling.id) == "armed"
   end
 
-  test "proofs 6, 11, 12, 13: responder preference, self/user routing, deadlines and exact menu",
-       ctx do
+  test "request routing and action menus are resolved when the request opens", ctx do
     item = dispatch(ctx, {:session, "parent"}, "holder", "session opener")
     request = escalate(ctx, item.id)
 
@@ -1215,14 +1399,13 @@ defmodule Tightbeam.EffortCheckinTest do
              &(&1.id == user_request.id)
            )
 
-    old_deadline = user_request.deadline_wake_id
-    EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, old_deadline))
-    advanced = request(ctx.db, user_request.id)
-    assert advanced.expecter_user_id == "h1"
-    assert advanced.lineage_rung == user_request.lineage_rung
-    assert advanced.deadline_wake_id != old_deadline
-    EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, old_deadline))
-    assert request(ctx.db, user_request.id).deadline_wake_id == advanced.deadline_wake_id
+    assert user_request.context["actions"] == [
+             "wake",
+             "continue",
+             "dismiss",
+             "revoke-assignment",
+             "dispatch"
+           ]
 
     assert %{status: "ruled"} =
              EffortCheckin.rule(
@@ -1238,44 +1421,19 @@ defmodule Tightbeam.EffortCheckinTest do
     assert chained_request.expecter_session_key == "mid"
     assert Wakes.get(ctx.db, chained_request.deadline_wake_id).state == "pending"
 
-    EffortCheckin.deadline(
-      ctx.db,
-      ctx.config,
-      Wakes.get(ctx.db, chained_request.deadline_wake_id)
-    )
-
-    parent_rung = request(ctx.db, chained_request.id)
-    assert parent_rung.expecter_session_key == "parent"
-    assert Wakes.get(ctx.db, parent_rung.deadline_wake_id).state == "pending"
-
     assert %{status: "ruled", ruled_by: "session:mid"} =
              EffortCheckin.rule(
                ctx.db,
                ctx.config,
-               effort_call(parent_rung.id, "dismiss", {:session, "mid"})
+               effort_call(chained_request.id, "dismiss", {:session, "mid"})
              )
 
     assert %{code: "not_open"} =
              EffortCheckin.rule(
                ctx.db,
                ctx.config,
-               effort_call(parent_rung.id, "dismiss", {:session, "parent"})
+               effort_call(chained_request.id, "dismiss", {:session, "parent"})
              )
-
-    skipped = dispatch(ctx, {:session, mid.session_key}, "holder", "held chain")
-    skipped_request = escalate(ctx, skipped.id)
-
-    :ok = DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='parent'")
-
-    EffortCheckin.deadline(
-      ctx.db,
-      ctx.config,
-      Wakes.get(ctx.db, skipped_request.deadline_wake_id)
-    )
-
-    assert request(ctx.db, skipped_request.id).expecter_user_id == "h1"
-
-    :ok = DB.execute(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey='parent'")
 
     pinned = dispatch(ctx, {:session, "parent"}, "holder", "pinned")
     pinned_request = escalate(ctx, pinned.id)
@@ -1288,18 +1446,11 @@ defmodule Tightbeam.EffortCheckinTest do
              "dispatch"
            ]
 
-    # Rotate to H1, who does not own holder H2: each power is intersected independently.
-    EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, pinned_request.deadline_wake_id))
-    human = request(ctx.db, pinned_request.id)
-    assert human.expecter_user_id == "h1"
-
-    assert human.context["actions"] == ["wake", "continue", "dismiss"]
-
     assert %{status: "ruled", ruled_by: "session:parent"} =
              EffortCheckin.rule(
                ctx.db,
                ctx.config,
-               effort_call(human.id, "continue", {:session, "parent"})
+               effort_call(pinned_request.id, "continue", {:session, "parent"})
              )
 
     assert %{code: "not_authorized"} =
@@ -1307,11 +1458,11 @@ defmodule Tightbeam.EffortCheckinTest do
                assignment_id: pinned.id
              })
 
-    assert %{code: "not_open"} =
+    assert %{code: "not_authorized", message: "current expecter required"} =
              EffortCheckin.rule(
                ctx.db,
                ctx.config,
-               effort_call(human.id, "continue", {:user, "h1"})
+               effort_call(pinned_request.id, "continue", {:user, "h1"})
              )
   end
 
@@ -2273,6 +2424,33 @@ defmodule Tightbeam.EffortCheckinTest do
         wake_id,
         System.system_time(:millisecond) - 1
       ])
+  end
+
+  defp make_request_deadline_due!(db, request) do
+    due_at = System.system_time(:millisecond) - 1
+
+    {:ok, _} =
+      DB.query(db, "UPDATE decision_requests SET deadlineAt=?2 WHERE id=?1", [
+        request.id,
+        due_at
+      ])
+
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [
+        request.deadline_wake_id,
+        due_at
+      ])
+
+    :ok
+  end
+
+  defp expiry_notice_wakes(db, assignment_id) do
+    db
+    |> rows(
+      "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='prompt' AND targetGate=1 AND prompt LIKE '%expired after 24 hours%' ORDER BY rowid",
+      [assignment_id]
+    )
+    |> Enum.map(fn [wake_id] -> Wakes.get(db, wake_id) end)
   end
 
   defp dispatch(ctx, principal, holder, subject) do

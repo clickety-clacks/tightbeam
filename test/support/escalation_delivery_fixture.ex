@@ -211,16 +211,17 @@ defmodule Tightbeam.EscalationDeliveryFixture do
            ]) == [[assignment.id, job_ref(ctx.db, assignment.id)]]
   end
 
-  ## Proof 3 — effort-retarget atomicity
+  ## Proof 3 — effort-expiry atomicity
 
   defp scenario(3, ctx) do
     assignment = dispatch!(ctx)
     :ok = escalate!(ctx, assignment.id)
     before = effort_request(ctx.db)
     [notification] = notification_wakes(ctx.db)
+    make_request_deadline_due!(ctx.db, before)
 
-    # FAIL-BEFORE: the CAS, the replacement deadline wake, and the new-rung
-    # notification all roll back together.
+    # FAIL-BEFORE: request expiry, the deadline wake, and the refile notice
+    # roll back together.
     block_prompt_wakes!(ctx.db)
 
     assert_aborts!(fn ->
@@ -233,26 +234,39 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     assert unchanged.deadline_wake_id == before.deadline_wake_id
     assert Wakes.get(ctx.db, before.deadline_wake_id).state == "pending"
     assert Enum.map(notification_wakes(ctx.db), & &1.wake_id) == [notification.wake_id]
+    assert expiry_notice_wakes(ctx.db, assignment.id) == []
 
-    # PASS-AFTER: one advance, one replacement deadline wake, one prompt wake.
+    # PASS-AFTER: one terminal withdrawal, the original deadline fired, and
+    # exactly one holder prompt. No deadline is re-armed.
     unblock_prompt_wakes!(ctx.db)
     :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, before.deadline_wake_id))
-    advanced = effort_request(ctx.db)
 
-    assert advanced.lineage_rung == before.lineage_rung + 1
-    assert advanced.deadline_wake_id != before.deadline_wake_id
+    assert rows(
+             ctx.db,
+             "SELECT status,expecterSessionKey,lineageRung,deadlineWakeId,withdrawnReason FROM decision_requests WHERE id=?1",
+             [before.id]
+           ) ==
+             [
+               [
+                 "withdrawn",
+                 before.expecter_session_key,
+                 before.lineage_rung,
+                 before.deadline_wake_id,
+                 "expired-no-decision"
+               ]
+             ]
+
     assert Wakes.get(ctx.db, before.deadline_wake_id).state == "fired"
-
-    assert %{consumer: "effort_deadline", state: "pending"} =
-             Wakes.get(ctx.db, advanced.deadline_wake_id)
 
     assert count(
              ctx.db,
              "SELECT COUNT(*) FROM wakes WHERE consumer='effort_deadline' AND state='pending'"
-           ) == 1
+           ) == 0
 
-    assert [_opened, %{state: "pending", target_gate: 0} = rung] = notification_wakes(ctx.db)
-    assert rung.session_key == advanced.expecter_session_key
+    assert [_opened] = notification_wakes(ctx.db)
+
+    assert [%{state: "pending", target_gate: 1, session_key: "holder"}] =
+             expiry_notice_wakes(ctx.db, assignment.id)
   end
 
   ## Proof 4 — crash before delivery, boot recovery
@@ -573,7 +587,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     assert Enum.map(notification_wakes(ctx.db), & &1.wake_id) == after_advance
   end
 
-  ## Proof 8 — effort ladder conservation
+  ## Proof 8 — terminal expiry preserves the request's original routing fields
 
   defp scenario(8, ctx) do
     assignment = dispatch!(ctx)
@@ -584,27 +598,24 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     assert opened.lineage_rung == 0
     assert notified_rungs(ctx.db) == ["mid"]
 
-    # Rung 1 — a LIVE ancestor.
-    live = expire_rung!(ctx, opened)
-    assert live.expecter_session_key == "top"
-    assert live.expecter_user_id == nil
-    assert live.lineage_rung == 1
-    assert notified_rungs(ctx.db) == ["mid", "top"]
+    make_request_deadline_due!(ctx.db, opened)
+    :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, opened.deadline_wake_id))
 
-    # Rung 2 — the ancestor is retired, so routing SKIPS it to the owner user.
-    :ok = DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='top'")
-    skipped = expire_rung!(ctx, live)
-    assert skipped.expecter_session_key == nil
-    assert skipped.expecter_user_id == "flynn"
-    assert skipped.lineage_rung == 2
-    personal = Org.personal_session_key("flynn")
-    assert notified_rungs(ctx.db) == ["mid", "top", personal]
+    assert rows(
+             ctx.db,
+             "SELECT status,expecterSessionKey,expecterUserId,lineageRung,deadlineWakeId,withdrawnReason FROM decision_requests WHERE id=?1",
+             [opened.id]
+           ) ==
+             [["withdrawn", "mid", nil, 0, opened.deadline_wake_id, "expired-no-decision"]]
 
-    # Terminal user rung — expiry re-arms against the SAME user, same rung.
-    terminal = expire_rung!(ctx, skipped)
-    assert terminal.expecter_user_id == "flynn"
-    assert terminal.lineage_rung == 2
-    assert notified_rungs(ctx.db) == ["mid", "top", personal, personal]
+    assert Wakes.get(ctx.db, opened.deadline_wake_id).state == "fired"
+    assert notified_rungs(ctx.db) == ["mid"]
+    assert [%{session_key: "holder", target_gate: 1}] = expiry_notice_wakes(ctx.db, assignment.id)
+
+    assert count(
+             ctx.db,
+             "SELECT COUNT(*) FROM wakes WHERE consumer='effort_deadline' AND state='pending'"
+           ) == 0
   end
 
   ## Proof 9 — configured delivery dependencies only
@@ -654,8 +665,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
       {"lib/tightbeam/escalation.ex", "escalate/4"},
       {"lib/tightbeam/escalation.ex", "file_agent_request_in_txn/2"},
       {"lib/tightbeam/escalation.ex", "insert_operator_request_in_txn/7"},
-      {"lib/tightbeam/effort_checkin.ex", "open_request_in_txn/4"},
-      {"lib/tightbeam/effort_checkin.ex", "deadline_in_txn/3"}
+      {"lib/tightbeam/effort_checkin.ex", "open_request_in_txn/4"}
     ]
 
     assert Enum.sort(request_sites) == Enum.sort(decision_request_sites())
@@ -1035,27 +1045,25 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     }
   end
 
-  # One deadline expiry: the fresh interval, the single replacement deadline wake,
-  # and the single new prompt wake are asserted at every rung.
-  defp expire_rung!(ctx, request) do
-    notifications_before = length(notification_wakes(ctx.db))
-    fired_at = System.system_time(:millisecond)
-    :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, request.deadline_wake_id))
-    advanced = effort_request(ctx.db)
+  defp make_request_deadline_due!(db, request) do
+    due_at = System.system_time(:millisecond) - 1
 
-    assert advanced.deadline_wake_id != request.deadline_wake_id
-    replacement = Wakes.get(ctx.db, advanced.deadline_wake_id)
-    assert replacement.consumer == "effort_deadline"
-    assert replacement.state == "pending"
-    assert replacement.due_at >= fired_at + 86_400_000
+    {:ok, _} =
+      DB.query(db, "UPDATE decision_requests SET deadlineAt=?2 WHERE id=?1", [request.id, due_at])
 
-    assert count(
-             ctx.db,
-             "SELECT COUNT(*) FROM wakes WHERE consumer='effort_deadline' AND state='pending'"
-           ) == 1
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [request.deadline_wake_id, due_at])
 
-    assert length(notification_wakes(ctx.db)) == notifications_before + 1
-    advanced
+    :ok
+  end
+
+  defp expiry_notice_wakes(db, assignment_id) do
+    db
+    |> rows(
+      "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='prompt' AND targetGate=1 AND prompt LIKE '%expired after 24 hours%' ORDER BY rowid",
+      [assignment_id]
+    )
+    |> Enum.map(fn [wake_id] -> Wakes.get(db, wake_id) end)
   end
 
   defp notified_rungs(db) do

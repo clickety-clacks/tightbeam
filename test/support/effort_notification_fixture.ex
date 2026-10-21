@@ -148,6 +148,23 @@ defmodule Tightbeam.EffortNotificationFixture do
     request = escalate(ctx, item.id)
     assert request.deadline_wake_id != nil
 
+    notices = Enum.reject(notification_wakes(ctx.db), &(&1.wake_id == ordinary.wake_id))
+    assert length(notices) == 1
+    assert Enum.all?(notices, &(&1.assignment_id == item.id))
+
+    scheduler = drain_notifications!(ctx)
+
+    assert Enum.all?(notices, fn notice ->
+             Wakes.get(ctx.db, notice.wake_id).state == "fired" and
+               match?(
+                 [%{batch_state: "delivered"}],
+                 NoticeBatcher.source_refs(ctx.db, notice.wake_id)
+               )
+           end)
+
+    finish_queued_turns!(ctx, "holder", scheduler)
+    make_request_deadline_due!(ctx.db, request)
+
     assert :ok =
              EffortCheckin.deadline(
                ctx.db,
@@ -155,21 +172,18 @@ defmodule Tightbeam.EffortNotificationFixture do
                Wakes.get(ctx.db, request.deadline_wake_id)
              )
 
-    notices = Enum.reject(notification_wakes(ctx.db), &(&1.wake_id == ordinary.wake_id))
-    assert length(notices) == 2
-    assert Enum.all?(notices, &(&1.assignment_id == item.id))
-    drain_notifications!(ctx)
+    assert [%{state: "pending", assignment_id: assignment_id} = notice] =
+             expiry_notice_wakes(ctx.db, item.id)
 
-    [first_notice, second_notice] = notices
+    assert assignment_id == item.id
+    assert notice.session_key == "holder"
+    assert notice.prompt =~ "expired after 24 hours"
+    :ok = Wakes.fire_due(scheduler)
 
     assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
-             NoticeBatcher.source_refs(ctx.db, first_notice.wake_id)
+             NoticeBatcher.source_refs(ctx.db, notice.wake_id)
 
-    assert [%{delivery_wake_id: ^carrier_id, batch_state: "delivered"}] =
-             NoticeBatcher.source_refs(ctx.db, second_notice.wake_id)
-
-    assert Wakes.get(ctx.db, first_notice.wake_id).state == "fired"
-    assert Wakes.get(ctx.db, second_notice.wake_id).state == "fired"
+    assert Wakes.get(ctx.db, notice.wake_id).state == "fired"
 
     assert [[1]] = rows(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [carrier_id])
 
@@ -183,14 +197,6 @@ defmodule Tightbeam.EffortNotificationFixture do
 
     assert Wakes.get(ctx.db, ordinary.wake_id).state == "pending"
     assert [] == rows(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [ordinary.wake_id])
-
-    assert Enum.all?(notices, fn notice ->
-             Wakes.get(ctx.db, notice.wake_id).state == "fired" and
-               match?(
-                 [%{batch_state: "delivered"}],
-                 NoticeBatcher.source_refs(ctx.db, notice.wake_id)
-               )
-           end)
   end
 
   defp scenario(1, ctx) do
@@ -215,31 +221,42 @@ defmodule Tightbeam.EffortNotificationFixture do
 
     request = escalate(ctx, assignment.id)
     first_deadline = request.deadline_wake_id
+
+    # The open request notice and later expiry notice both retain the card's
+    # assignment/work-item attribution through the normal batching path.
+    scheduler = drain_notifications!(ctx)
+    [opened_notice] = notification_wakes(ctx.db)
+
+    assert [%{delivery_wake_id: opened_carrier, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, opened_notice.wake_id)
+
+    assert [[turn_assignment_id, turn_job_ref]] =
+             rows(ctx.db, "SELECT assignmentId, jobRef FROM turns WHERE wakeId=?1", [
+               opened_carrier
+             ])
+
+    assert turn_assignment_id == assignment.id
+    assert turn_job_ref == item.id
+
+    finish_queued_turns!(ctx, "holder", scheduler)
+    make_request_deadline_due!(ctx.db, request)
     :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, first_deadline))
 
-    # `assignmentId` on the notification wake is the carrier that replaced the
-    # deleted explicit `assignment_id`/`job_ref` delivery opts.
-    assert [assignment.id, assignment.id] ==
-             Enum.map(notification_wakes(ctx.db), & &1.assignment_id)
+    assert [%{state: "pending", session_key: "holder"} = expiry_notice] =
+             expiry_notice_wakes(ctx.db, assignment.id)
 
-    drain_notifications!(ctx)
+    :ok = Wakes.fire_due(scheduler)
 
-    # Delivery derives the SAME attribution through `wake_attribution/2` — for
-    # the agent prod that opened the bracket's first rung as well as for the two
-    # owner notifications.
-    [first_notice, second_notice] = notification_wakes(ctx.db)
+    assert [%{delivery_wake_id: expiry_carrier, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, expiry_notice.wake_id)
 
-    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
-             NoticeBatcher.source_refs(ctx.db, first_notice.wake_id)
+    assert [[expiry_assignment_id, expiry_job_ref]] =
+             rows(ctx.db, "SELECT assignmentId, jobRef FROM turns WHERE wakeId=?1", [
+               expiry_carrier
+             ])
 
-    assert [%{delivery_wake_id: ^carrier_id, batch_state: "delivered"}] =
-             NoticeBatcher.source_refs(ctx.db, second_notice.wake_id)
-
-    assert [[carrier_assignment_id, carrier_job_id]] =
-             rows(ctx.db, "SELECT assignmentId, jobRef FROM turns WHERE wakeId=?1", [carrier_id])
-
-    assert carrier_assignment_id == assignment.id
-    assert carrier_job_id == item.id
+    assert expiry_assignment_id == assignment.id
+    assert expiry_job_ref == item.id
   end
 
   defp scenario(2, ctx) do
@@ -248,7 +265,7 @@ defmodule Tightbeam.EffortNotificationFixture do
 
     item = dispatch(ctx, {:session, "parent"}, "holder", "notify durability")
 
-    # Rung one is the agent prod; the owner's request is rung two.
+    # Rung one is the agent prod; the owner's request is the next bracket.
     :ok = EffortCheckin.probe(ctx.db, ctx.config, current_wake(ctx.db, item.id))
     :ok = EffortCheckin.probe(ctx.db, ctx.config, current_wake(ctx.db, item.id))
 
@@ -259,15 +276,14 @@ defmodule Tightbeam.EffortNotificationFixture do
         [item.id]
       )
 
-    # Proof 6: the notification committed WITH the request. Nothing has been
-    # delivered — a death here still leaves the intent durable and pending.
+    # The request and its decision notification commit together, before delivery.
     assert [%{state: "pending", target_gate: 0} = opened] = notification_wakes(ctx.db)
     assert opened.prompt =~ "Effort check-in #{request_id}"
     assert Wakes.get(ctx.db, old_deadline_id).state == "pending"
     assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [opened.wake_id]) == [[0]]
     assert Enum.any?(Wakes.list_pending(ctx.db), &(&1.wake_id == opened.wake_id))
 
-    # Ordinary wake recovery surfaces it without waiting for the deadline.
+    # Ordinary wake recovery delivers the original request notice.
     scheduler = drain_notifications!(ctx)
     assert Wakes.get(ctx.db, opened.wake_id).state == "fired"
 
@@ -279,35 +295,43 @@ defmodule Tightbeam.EffortNotificationFixture do
     assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [opened_carrier]) == [[1]]
     assert Wakes.get(ctx.db, old_deadline_id).state == "pending"
 
-    # Proof 8b: the winning deadline advance commits the new rung, its
-    # replacement deadline wake, and the new-rung notification atomically.
+    finish_queued_turns!(ctx, "holder", scheduler)
+
+    make_request_deadline_due!(ctx.db, %{id: request_id, deadline_wake_id: old_deadline_id})
     :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, old_deadline_id))
-    advanced = request(ctx.db, request_id)
-    assert advanced.deadline_wake_id != old_deadline_id
-    assert Wakes.get(ctx.db, advanced.deadline_wake_id).state == "pending"
+
+    expired = request(ctx.db, request_id)
+    assert expired.status == "withdrawn"
+    assert expired.decision == nil
+    assert expired.deadline_wake_id == old_deadline_id
     assert Wakes.get(ctx.db, old_deadline_id).state == "fired"
 
-    assert [%{state: "fired"}, %{state: "pending", target_gate: 0} = rung] =
-             notification_wakes(ctx.db)
-
-    assert rung.session_key == (advanced.expecter_session_key || personal_key)
-    assert rung.prompt =~ "Effort check-in #{request_id}"
+    assert [%{state: "pending", session_key: "holder", target_gate: 1} = expiry_notice] =
+             expiry_notice_wakes(ctx.db, item.id)
 
     :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(ctx.db, rung.wake_id).state == "fired"
+    assert Wakes.get(ctx.db, expiry_notice.wake_id).state == "fired"
 
-    assert [%{delivery_wake_id: rung_carrier, batch_state: "delivered"}] =
-             NoticeBatcher.source_refs(ctx.db, rung.wake_id)
+    assert [%{delivery_wake_id: expiry_carrier, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, expiry_notice.wake_id)
 
-    assert Wakes.get(ctx.db, rung_carrier).state == "fired"
-    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [rung.wake_id]) == [[0]]
-    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [rung_carrier]) == [[1]]
+    assert Wakes.get(ctx.db, expiry_carrier).state == "fired"
 
-    # A stale deadline replay still no-ops on deadlineWakeId mismatch: no rung
-    # rotation, no third notification.
+    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [expiry_notice.wake_id]) ==
+             [[0]]
+
+    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [expiry_carrier]) == [[1]]
+
+    # Replaying the fired deadline cannot reopen the request or re-arm a timer.
     :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, old_deadline_id))
-    assert request(ctx.db, request_id).deadline_wake_id == advanced.deadline_wake_id
-    assert Enum.map(notification_wakes(ctx.db), & &1.wake_id) == [opened.wake_id, rung.wake_id]
+    assert request(ctx.db, request_id).deadline_wake_id == old_deadline_id
+    assert length(expiry_notice_wakes(ctx.db, item.id)) == 1
+
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM wakes WHERE consumer='effort_deadline' AND assignmentId=?1 AND state='pending'",
+             [item.id]
+           ) == [[0]]
   end
 
   defp dispatch(ctx, principal, holder, subject) do
@@ -433,6 +457,33 @@ defmodule Tightbeam.EffortNotificationFixture do
     |> Enum.map(fn [wake_id] -> Wakes.get(db, wake_id) end)
   end
 
+  defp make_request_deadline_due!(db, request) do
+    due_at = System.system_time(:millisecond) - 1
+
+    {:ok, _} =
+      DB.query(db, "UPDATE decision_requests SET deadlineAt=?2 WHERE id=?1", [request.id, due_at])
+
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [request.deadline_wake_id, due_at])
+
+    :ok
+  end
+
+  defp expiry_notice_wakes(db, assignment_id) do
+    db
+    |> rows(
+      """
+      SELECT w.wakeId FROM wakes w
+      WHERE w.assignmentId=?1 AND w.consumer='prompt' AND w.targetGate=1
+        AND w.prompt LIKE '%expired after 24 hours%'
+        AND NOT EXISTS (SELECT 1 FROM notice_batches b WHERE b.deliveryWakeId=w.wakeId)
+      ORDER BY w.rowid
+      """,
+      [assignment_id]
+    )
+    |> Enum.map(fn [wake_id] -> Wakes.get(db, wake_id) end)
+  end
+
   # Drain through the REAL gateway prompt-wake child: its closure, its delivery
   # config, its targetGate handling and wake attribution — not a test stand-in.
 
@@ -447,6 +498,24 @@ defmodule Tightbeam.EffortNotificationFixture do
     start_supervised!({Wakes, Keyword.merge(opts, name: name, tick_ms: 60_000)}, id: name)
     :ok = Wakes.fire_due(name)
     name
+  end
+
+  defp finish_queued_turns!(ctx, session_key, scheduler) do
+    case Ledger.claim_next(ctx.db, session_key, "effort-notification-fixture") do
+      {:ok, turn} ->
+        :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+        :ok = Wakes.fire_due(scheduler)
+        finish_queued_turns!(ctx, session_key, scheduler)
+
+      :none ->
+        :ok
+
+      :busy ->
+        flunk("cannot deliver notifications to #{session_key}: a turn is still running")
+
+      {:unclaimable, reason} ->
+        flunk("cannot deliver notifications to #{session_key}: #{inspect(reason)}")
+    end
   end
 
   defp session(db, key, owner, host, overrides \\ %{}) do

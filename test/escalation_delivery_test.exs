@@ -19,7 +19,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     Tightbeam.EscalationDeliveryFixture.run!(tmp, 2)
   end
 
-  test "proof 3: a deadline advance and its new-rung notification are one commit", %{tmp_dir: tmp} do
+  test "proof 3: terminal request expiry and its refile notice are one commit", %{tmp_dir: tmp} do
     Tightbeam.EscalationDeliveryFixture.run!(tmp, 3)
   end
 
@@ -41,7 +41,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     Tightbeam.EscalationDeliveryFixture.run!(tmp, 7)
   end
 
-  test "proof 8: every rung expiry re-arms one deadline wake and one prompt wake", %{tmp_dir: tmp} do
+  test "proof 8: terminal expiry preserves original routing and does not re-arm", %{tmp_dir: tmp} do
     Tightbeam.EscalationDeliveryFixture.run!(tmp, 8)
   end
 
