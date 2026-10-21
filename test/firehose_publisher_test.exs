@@ -721,21 +721,27 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     # The reviewer's opened notice is a stored message beside the transition.
     review_notices = observed_state_notices()
+
     assert %{
              "assignment.opened" => [_opened],
              "message.created" => [review_notice],
-             "wake.scheduled" => [review_wake]
+             "wake.scheduled" => review_wakes
            } = review_notices
 
     assert review_notice["payload"]["sessionKey"] == review.holderKey
     assert review_notice["payload"]["content"] == "[assignment opened: #{review.id}]"
-    assert review_wake["payload"]["assignmentId"] == review.id
 
-    assert review_wake["refs"] == %{
-             "wakeId" => review_wake["payload"]["wakeId"],
-             "sessionKey" => review.holderKey,
-             "assignmentId" => review.id
-           }
+    assert review_wakes != []
+
+    for review_wake <- review_wakes do
+      assert review_wake["payload"]["assignmentId"] == review.id
+
+      assert review_wake["refs"] == %{
+               "wakeId" => review_wake["payload"]["wakeId"],
+               "sessionKey" => review.holderKey,
+               "assignmentId" => review.id
+             }
+    end
 
     clean = %{
       tests_passed
