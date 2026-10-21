@@ -790,9 +790,9 @@ COMMANDS:
       Run the persistent NDJSON stdin/stdout connection for one selected session.
       Its initial snapshot includes existing wake prompts and delivery status.
       Optional --as, --as-user, or --as-process flags affect ordinary wake
-      attribution only; snapshot reads use the discovered bearer. Direct REST
-      and change-socket callers may use an organization bearer with asUser to
-      apply that user's existing read visibility.
+      attribution. With an organization bearer, --as-user also selects read
+      visibility for snapshots and the change socket; no user is selected by
+      default. Other bearer types keep their existing read principal.
 
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
