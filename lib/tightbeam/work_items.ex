@@ -322,7 +322,12 @@ defmodule Tightbeam.WorkItems do
   end
 
   defp handoff_refusal(%{code: "unknown_delivery_owner", message: message} = error),
-    do: Map.put(error, :message, message <> "; correct deliveryOwnerSessionKey to an active session")
+    do:
+      Map.put(
+        error,
+        :message,
+        message <> "; correct deliveryOwnerSessionKey to an active session"
+      )
 
   defp handoff_refusal(%{code: "delivery_owner_unavailable", message: message} = error),
     do: Map.put(error, :message, message <> "; choose an active delivery-owner session")
