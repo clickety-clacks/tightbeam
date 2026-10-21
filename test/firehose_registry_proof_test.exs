@@ -671,7 +671,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
         collection: %{
           filters: %{},
           principal: %{kind: "session", id: "sibling-holder"},
-          boundary: nil,
+          boundary: :latest,
           limit: 20
         }
       })
