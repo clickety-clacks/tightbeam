@@ -614,6 +614,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
       |> Map.put_new("wake.canceled", [])
 
     assert %{"attest.filed" => [_attest_notice]} = published
+
     assert Enum.sort(Map.keys(published)) ==
              ~w(assignment.opened attest.filed message.created wake.canceled wake.scheduled)
 
@@ -720,13 +721,21 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     # The reviewer's opened notice is a stored message beside the transition.
     review_notices = observed_state_notices()
-    assert map_size(review_notices) == 2
-
-    assert %{"assignment.opened" => [_opened], "message.created" => [review_notice]} =
-             review_notices
+    assert %{
+             "assignment.opened" => [_opened],
+             "message.created" => [review_notice],
+             "wake.scheduled" => [review_wake]
+           } = review_notices
 
     assert review_notice["payload"]["sessionKey"] == review.holderKey
     assert review_notice["payload"]["content"] == "[assignment opened: #{review.id}]"
+    assert review_wake["payload"]["assignmentId"] == review.id
+
+    assert review_wake["refs"] == %{
+             "wakeId" => review_wake["payload"]["wakeId"],
+             "sessionKey" => review.holderKey,
+             "assignmentId" => review.id
+           }
 
     clean = %{
       tests_passed
@@ -1439,7 +1448,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
       assert Enum.sort(Enum.map(response_notices, & &1["class"])) ==
                Enum.sort(["verb.accepted", "wake.canceled", "wake.scheduled", class])
 
-      assert_decision_notice_cleared!(db, request.id, notice_wake)
+      assert [%{"class" => "wake.canceled"} = cancellation] =
+               Enum.filter(response_notices, &(&1["class"] == "wake.canceled"))
+
+      assert_decision_notice_cleared!(db, request.id, notice_wake, cancellation)
       notice = Enum.find(response_notices, &(&1["class"] == class))
       assert notice["class"] == class
       assert notice["schemaVersion"] == 2
@@ -2846,8 +2858,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
     wake_id
   end
 
-  defp assert_decision_notice_cleared!(db, request_id, wake_id) do
-    cancellation = receive_notice()
+  defp assert_decision_notice_cleared!(db, request_id, wake_id, cancellation \\ nil) do
+    cancellation = cancellation || receive_notice()
     assert cancellation["class"] == "wake.canceled"
     assert cancellation["refs"]["wakeId"] == wake_id
     assert cancellation["payload"]["state"] == "canceled"
