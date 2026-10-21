@@ -823,7 +823,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
     completion_effects = notice_state_classes(completion_publications)
     asynchronous_delivery = ~w(session.updated wake.fired)
 
-    assert Enum.all?(asynchronous_delivery, &(&1 in completion_effects))
+    assert Enum.all?(asynchronous_delivery, &(&1 in completion_effects)),
+           "missing async effects: #{inspect(asynchronous_delivery -- completion_effects)}; observed: #{inspect(completion_effects)}"
 
     direct_completion_effects =
       Enum.reject(completion_effects, &(&1 in asynchronous_delivery))
@@ -2733,7 +2734,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
   end
 
   defp assert_batched_attest_message!(db, row, expected_assignment_ids) do
-    assert row.session_key == Org.personal_session_key("flynn")
+    owner_session = StateResources.query_session(db, row.session_key)
+    assert owner_session
+
+    assert row.session_key ==
+             Org.personal_session_key(StateResources.session(owner_session)["ownerUserId"])
+
     assert row.role == "user"
     assert row.message_type == "substrate"
     assert row.sender == "process:tightbeam"
