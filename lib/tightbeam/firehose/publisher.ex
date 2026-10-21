@@ -8,6 +8,7 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @actor_ref_keys ~w(origin principal)
   @parent_work_item_ref :firehose_parent_work_item_id
+  @eligibility_refs_key "eligibilityRefs"
   @secondary_ref_fields %{
     "assignments" => %{"sessionKey" => "holderKey", "workItemId" => "workItemId"},
     "attests" => %{"sessionKey" => "bySession", "assignmentId" => "assignmentId"},
@@ -172,7 +173,26 @@ defmodule Tightbeam.Firehose.Publisher do
     [observation_notice("verb.accepted", call)] ++ state_notices(db, call, result)
   end
 
-  defp state_notices(db, call, result), do: List.wrap(state_notice(db, call, result))
+  defp state_notices(db, call, result) do
+    case state_notice(db, call, result) do
+      %{} = notice -> [attach_eligibility_refs(notice, call)]
+      nil -> []
+    end
+  end
+
+  defp attach_eligibility_refs(%{"class" => class, "payload" => payload} = notice, call) do
+    {:ok, row} = Registry.fetch(class)
+
+    eligibility_refs =
+      Enum.reduce(row.primary_refs, base_refs(call), fn primary_ref, refs ->
+        Map.put(refs, primary_ref, primary_value(payload, primary_ref, call))
+      end)
+      |> Map.reject(fn {_key, value} -> is_nil(value) or value == "" end)
+
+    if eligibility_refs == notice["refs"],
+      do: notice,
+      else: Map.put(notice, @eligibility_refs_key, eligibility_refs)
+  end
 
   @spec denied_notices(map(), map()) :: [map()]
   def denied_notices(call, error) do
@@ -196,12 +216,17 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @doc false
   def committed_in_txn(%Txn{} = txn, class, payload, refs, hub) do
-    refs = attach_committed_parent_work_item_ref(txn, class, payload, refs)
-
     if class == "kungfu.updated" do
       Txn.handoff(txn, Hub.destination(hub), {:publish, committed_notice(class, payload, refs)})
     else
-      Txn.handoff(txn, Hub.destination(hub), {:committed, class, payload, refs})
+      eligibility_refs = committed_eligibility_refs(class, payload, refs)
+      refs = attach_committed_parent_work_item_ref(txn, class, payload, refs)
+
+      Txn.handoff(
+        txn,
+        Hub.destination(hub),
+        {:committed, class, payload, refs, eligibility_refs}
+      )
     end
   end
 
@@ -388,7 +413,7 @@ defmodule Tightbeam.Firehose.Publisher do
 
   def wire_notice(%{"class" => class} = notice) do
     if class in Registry.classes(),
-      do: notice,
+      do: Map.delete(notice, @eligibility_refs_key),
       else: raise(ArgumentError, "unsupported state notice")
   end
 
@@ -401,6 +426,8 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @doc false
   def encode_wire_notice(%{"class" => class, "payload" => payload} = notice, catalog) do
+    notice = wire_notice(notice)
+
     case Registry.fetch(class) do
       {:ok, %{resource: resource}} when is_map(payload) ->
         cond do
@@ -450,14 +477,7 @@ defmodule Tightbeam.Firehose.Publisher do
 
   def committed_notice(class, payload, refs) do
     {:ok, row} = Registry.fetch(class)
-
-    projection =
-      if row.serializer == :decision_request do
-        revision = payload[:row_schema_revision] || payload["rowSchemaRevision"]
-        StateResources.decision_request(%{"rowSchemaRevision" => revision, "item" => payload})
-      else
-        apply(StateResources, row.serializer, [payload])
-      end
+    projection = committed_projection(row, payload)
 
     primary_refs =
       Enum.reduce(row.primary_refs, Map.take(refs, row.primary_refs), fn primary_ref, resolved ->
@@ -489,6 +509,24 @@ defmodule Tightbeam.Firehose.Publisher do
 
     if row.serializer == :decision_request, do: Map.put(notice, "schemaVersion", 2), else: notice
   end
+
+  defp committed_eligibility_refs(class, payload, refs) do
+    {:ok, row} = Registry.fetch(class)
+    projection = committed_projection(row, payload)
+
+    Enum.reduce(row.primary_refs, refs, fn primary_ref, resolved ->
+      Map.put_new(resolved, primary_ref, projection_primary_ref(projection, primary_ref))
+    end)
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp committed_projection(%{serializer: :decision_request}, payload) do
+    revision = payload[:row_schema_revision] || payload["rowSchemaRevision"]
+    StateResources.decision_request(%{"rowSchemaRevision" => revision, "item" => payload})
+  end
+
+  defp committed_projection(%{serializer: serializer}, payload),
+    do: apply(StateResources, serializer, [payload])
 
   defp projection_primary_ref(projection, "turnSeq"),
     do: projection["turnSeq"] || projection["seq"]

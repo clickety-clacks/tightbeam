@@ -220,17 +220,43 @@ defmodule Tightbeam.Firehose.Hub do
     {:noreply, %{state | sockets: sockets}}
   end
 
+  def handle_cast({:committed, _, _, _, _}, %{shutting_down: true} = state),
+    do: {:noreply, state}
+
+  def handle_cast({:committed, class, payload, refs, eligibility_refs}, state),
+    do: {:noreply, committed_notice(state, class, payload, refs, eligibility_refs)}
+
   def handle_cast({:committed, _, _, _}, %{shutting_down: true} = state),
     do: {:noreply, state}
 
-  def handle_cast({:committed, class, payload, refs}, state)
-      when class in ~w(session.spawned session.updated session.harness_changed session.retired) do
+  def handle_cast({:committed, class, payload, refs}, state),
+    do: {:noreply, committed_notice(state, class, payload, refs, refs)}
+
+  def handle_cast({:publish, notice}, state),
+    do: {:noreply, fanout(state, notice)}
+
+  def handle_cast({:accepted, db, call, result}, state),
+    do:
+      {:noreply,
+       Enum.reduce(Publisher.accepted_notices(db, call, result), state, &fanout(&2, &1))}
+
+  def handle_cast({:denied, call, error}, state),
+    do: {:noreply, Enum.reduce(Publisher.denied_notices(call, error), state, &fanout(&2, &1))}
+
+  def handle_cast(_, state), do: {:noreply, state}
+
+  defp committed_notice(%{shutting_down: true} = state, _class, _payload, _refs, _eligibility_refs),
+    do: state
+
+  defp committed_notice(state, class, payload, refs, eligibility_refs)
+       when class in ~w(session.spawned session.updated session.harness_changed session.retired) do
     session_key = refs["sessionKey"] || payload[:session_key] || payload["sessionKey"]
     owner = refs["ownerUserId"] || payload[:owner_user_id] || payload["ownerUserId"]
 
     probe = %{
       "class" => class,
       "refs" => Map.merge(refs, %{"sessionKey" => session_key, "ownerUserId" => owner}),
+      "eligibilityRefs" => eligibility_refs,
       "payload" => %{"sessionKey" => session_key, "ownerUserId" => owner}
     }
 
@@ -255,7 +281,10 @@ defmodule Tightbeam.Firehose.Hub do
       if eligible == [] do
         state.sockets
       else
-        notice = Publisher.committed_notice(class, payload, refs)
+        notice =
+          class
+          |> Publisher.committed_notice(payload, refs)
+          |> with_eligibility_refs(eligibility_refs)
 
         Enum.reduce(eligible, state.sockets, fn {pid, socket}, sockets ->
           Map.put(
@@ -266,24 +295,21 @@ defmodule Tightbeam.Firehose.Hub do
         end)
       end
 
-    {:noreply, %{state | sockets: sockets}}
+    %{state | sockets: sockets}
   end
 
-  def handle_cast({:committed, class, payload, refs}, state),
-    do: {:noreply, fanout(state, Publisher.committed_notice(class, payload, refs))}
+  defp committed_notice(state, class, payload, refs, eligibility_refs) do
+    notice =
+      class
+      |> Publisher.committed_notice(payload, refs)
+      |> with_eligibility_refs(eligibility_refs)
 
-  def handle_cast({:publish, notice}, state),
-    do: {:noreply, fanout(state, notice)}
+    fanout(state, notice)
+  end
 
-  def handle_cast({:accepted, db, call, result}, state),
-    do:
-      {:noreply,
-       Enum.reduce(Publisher.accepted_notices(db, call, result), state, &fanout(&2, &1))}
-
-  def handle_cast({:denied, call, error}, state),
-    do: {:noreply, Enum.reduce(Publisher.denied_notices(call, error), state, &fanout(&2, &1))}
-
-  def handle_cast(_, state), do: {:noreply, state}
+  defp with_eligibility_refs(notice, refs) do
+    if refs == notice["refs"], do: notice, else: Map.put(notice, "eligibilityRefs", refs)
+  end
 
   defp fanout(%{shutting_down: true} = state, _), do: state
 
@@ -322,7 +348,7 @@ defmodule Tightbeam.Firehose.Hub do
     if frames != [] and not secret_payload?(notice["payload"]) and
          (authorized? or visible?(socket, notice)) do
       seq = if socket.mode == :all, do: socket.seq, else: List.last(frames)["seq"]
-      enqueue(%{socket | seq: seq}, pid, Enum.map(frames, &Publisher.wire_notice/1), limit)
+      enqueue(%{socket | seq: seq}, pid, frames, limit)
     else
       socket
     end
@@ -350,7 +376,7 @@ defmodule Tightbeam.Firehose.Hub do
       {{:value, frame}, queue} ->
         socket = %{socket | queue: queue, queued: socket.queued - 1}
 
-        send(pid, {:firehose_notice, frame})
+        send(pid, {:firehose_notice, Publisher.wire_notice(frame)})
         %{socket | in_flight: true}
 
       {:empty, _} ->

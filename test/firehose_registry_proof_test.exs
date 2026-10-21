@@ -8,6 +8,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     Gateway,
     Model,
     Org,
+    Roles,
     StateResources,
     StateVisibility,
     SubagentMarkers,
@@ -554,6 +555,15 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     assignment!(ctx.db, "assignment-parent-row", "holder-row", "work-parent-row")
     assignment!(ctx.db, "sibling-assignment-row", "sibling-holder", "work-parent-row")
 
+    sibling_listener =
+      class_listener(ctx, :sibling_attest, "attest.filed", %{
+        user_id: "kay",
+        principal_kind: :session,
+        principal_id: "sibling-holder"
+      })
+
+    on_exit(fn -> Process.exit(sibling_listener, :kill) end)
+
     :ok =
       Hub.register(ctx.hub, self(), %{
         mode: :all,
@@ -636,6 +646,9 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
                :ok
              end)
+
+    sync_listener(ctx.hub, sibling_listener, :sibling_attest)
+    refute_received {:class_notice, :sibling_attest, _notice}
 
     assert %{"class" => "verb.accepted"} = take_notice(ctx.hub)
 
@@ -799,6 +812,101 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
     Hub.publish(ctx.hub, attest_notice)
     assert_quiet(ctx.hub)
+  end
+
+  test "row-reference repairs preserve session-spawn and role-create recipients", ctx do
+    session!(ctx.db, "spawn-actor", "flynn")
+    session!(ctx.db, "spawn-target", "kay")
+    work_item!(ctx.db, "spawn-work-item", "flynn")
+
+    spawn_listeners = [
+      {:spawn_work_owner,
+       class_listener(ctx, :spawn_work_owner, "session.spawned", %{user_id: "flynn"})},
+      {:spawn_target,
+       class_listener(ctx, :spawn_target, "session.spawned", %{
+         user_id: "kay",
+         principal_kind: :session,
+         principal_id: "spawn-target"
+       })}
+    ]
+
+    on_exit(fn -> Enum.each(spawn_listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end) end)
+
+    session_call = %{
+      verb: "spawn",
+      origin: "agent:spawn-actor",
+      principal: {:session, "spawn-actor"},
+      session_key: "spawn-actor",
+      firehose_hub: ctx.hub,
+      params: %{work_item_id: "spawn-work-item"}
+    }
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Publisher.accepted_in_txn(txn, session_call, %{session_key: "spawn-target"})
+               :ok
+             end)
+
+    Enum.each(spawn_listeners, fn {tag, pid} -> sync_listener(ctx.hub, pid, tag) end)
+
+    assert_received {:class_notice, :spawn_work_owner,
+                     %{"class" => "session.spawned", "refs" => refs} = spawn_notice}
+
+    assert refs["sessionKey"] == "spawn-target"
+    refute Map.has_key?(refs, "workItemId")
+    refute Map.has_key?(spawn_notice, "eligibilityRefs")
+    assert_received {:class_notice, :spawn_target, %{"class" => "session.spawned"}}
+
+    Enum.each(spawn_listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end)
+
+    session!(ctx.db, "role-creator", "flynn")
+    session!(ctx.db, "role-bound-target", "kay")
+
+    role_listeners = [
+      {:role_owner,
+       class_listener(ctx, :role_owner, "role.created", %{user_id: "flynn"})},
+      {:role_creator,
+       class_listener(ctx, :role_creator, "role.created", %{
+         user_id: "flynn",
+         principal_kind: :session,
+         principal_id: "role-creator"
+       })},
+      {:role_bound_target,
+       class_listener(ctx, :role_bound_target, "role.created", %{
+         user_id: "kay",
+         principal_kind: :session,
+         principal_id: "role-bound-target"
+       })},
+      {:role_bound_owner, class_listener(ctx, :role_bound_owner, "role.created", %{user_id: "kay"})}
+    ]
+
+    on_exit(fn -> Enum.each(role_listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end) end)
+
+    role_call = %{
+      verb: "role-create",
+      origin: "agent:role-creator",
+      principal: {:session, "role-creator"},
+      session_key: "role-creator",
+      firehose_hub: ctx.hub,
+      firehose_in_txn: true,
+      params: %{name: "project:row-ref-test", bind: "role-bound-target"}
+    }
+
+    assert %{name: "project:row-ref-test"} =
+             Roles.create_with_firehose!(
+               ctx.db,
+               "project:row-ref-test",
+               "flynn",
+               "role-bound-target",
+               role_call
+             )
+
+    Enum.each(role_listeners, fn {tag, pid} -> sync_listener(ctx.hub, pid, tag) end)
+
+    assert_received {:class_notice, :role_owner, %{"class" => "role.created"}}
+    assert_received {:class_notice, :role_creator, %{"class" => "role.created"}}
+    refute_received {:class_notice, :role_bound_target, _notice}
+    refute_received {:class_notice, :role_bound_owner, _notice}
   end
 
   # Subscription matching runs first and visibility is checked only for a
@@ -1315,6 +1423,47 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   defp assert_quiet(hub) do
     _sequence = Hub.sequence(hub, self())
     refute_received {:firehose_notice, _notice}
+  end
+
+  defp class_listener(ctx, tag, class, principal) do
+    parent = self()
+
+    pid =
+      spawn(fn ->
+        registration =
+          Map.merge(%{mode: :filtered, db: ctx.db, is_admin: false}, principal)
+
+        :ok = Hub.register(ctx.hub, self(), registration)
+        :ok = Hub.subscribe(ctx.hub, self(), Atom.to_string(tag), %{"classes" => [class]})
+        send(parent, {:class_listener_ready, tag})
+        class_listener_loop(ctx.hub, parent, tag)
+      end)
+
+    assert_receive {:class_listener_ready, ^tag}
+    pid
+  end
+
+  defp class_listener_loop(hub, parent, tag) do
+    receive do
+      {:firehose_notice, notice} ->
+        Hub.delivered(hub, self())
+        send(parent, {:class_notice, tag, notice})
+        class_listener_loop(hub, parent, tag)
+
+      {:barrier, ref} ->
+        send(parent, {:class_listener_barrier, tag, ref})
+        class_listener_loop(hub, parent, tag)
+
+      :stop ->
+        Hub.unregister(hub, self())
+    end
+  end
+
+  defp sync_listener(hub, pid, tag) do
+    _sequence = Hub.sequence(hub, pid)
+    barrier = make_ref()
+    send(pid, {:barrier, barrier})
+    assert_receive {:class_listener_barrier, ^tag, ^barrier}
   end
 
   defp visibility_notices(ctx) do

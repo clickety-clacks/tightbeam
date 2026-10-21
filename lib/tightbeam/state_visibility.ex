@@ -98,7 +98,7 @@ defmodule Tightbeam.StateVisibility do
   end
 
   defp user_owned_notice_visible?(db, notice, user_id) do
-    refs = notice["refs"] || %{}
+    refs = eligibility_refs(notice)
     payload = notice["payload"] || %{}
 
     direct_owner?(refs, payload, user_id) or
@@ -517,7 +517,7 @@ defmodule Tightbeam.StateVisibility do
   end
 
   defp session_principal_notice_visible?(db, notice, session_key) do
-    refs = notice["refs"] || %{}
+    refs = eligibility_refs(notice)
     payload = notice["payload"] || %{}
     principal = %{kind: "session", id: session_key, is_admin: false}
 
@@ -565,6 +565,13 @@ defmodule Tightbeam.StateVisibility do
     do: true
 
   defp parent_work_item_filter_ref?(_notice), do: false
+
+  defp eligibility_refs(notice) do
+    case notice["eligibilityRefs"] do
+      refs when is_map(refs) -> refs
+      _ -> notice["refs"] || %{}
+    end
+  end
 
   defp session_assignment_visible?(db, assignment_id, session_key) do
     {:ok, rows} =
