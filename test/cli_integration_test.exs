@@ -1667,6 +1667,19 @@ defmodule Tightbeam.CliIntegrationTest do
 
     review_id = JSON.decode!(reviewed)["id"]
 
+    bound_verdict =
+      stage_review_verdict(ctx.db, %{
+        principal: {:session, "cli-reviewer"},
+        params: %{
+          assignment_id: review_id,
+          kind: "verdict",
+          verdict_kind: "reviewed-clean",
+          commit_refs: JSON.decode!(commit_refs)
+        }
+      })
+
+    bound_refs = JSON.encode!(bound_verdict.params.commit_refs)
+
     {_verdict, 0} =
       System.cmd(
         ctx.binary,
@@ -1677,8 +1690,12 @@ defmodule Tightbeam.CliIntegrationTest do
           "verdict",
           "--verdict",
           "reviewed-clean",
+          "--artifact",
+          bound_verdict.params.artifact_id,
+          "--sha256",
+          bound_verdict.params.content_sha256,
           "--commit-refs",
-          commit_refs
+          bound_refs
         ],
         cd: reviewer_dir,
         stderr_to_stdout: true

@@ -15,6 +15,14 @@ defmodule Tightbeam.JobTraceTest do
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
+    register_hosts(db, %{
+      "eezo" => %{
+        ssh: nil,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        cli_bin: nil
+      }
+    })
+
     :ok =
       DB.execute(
         db,
@@ -22,7 +30,7 @@ defmodule Tightbeam.JobTraceTest do
       )
 
     session(db, "holder", "owner")
-    session(db, "reviewer", "other")
+    session(db, "reviewer", "owner")
     session(db, "owner-session", "owner")
     session(db, "admin-session", "admin")
     session(db, "other-session", "other")
@@ -43,8 +51,8 @@ defmodule Tightbeam.JobTraceTest do
       VALUES ('asg_direct', 'policy'), ('asg_bad', 'policy');
 
       INSERT INTO assignments
-        (id, subject, holderKey, openedBySession, openedAt, state, reviewsAssignmentId)
-      VALUES ('asg_review', 'review', 'reviewer', 'reviewer', 4, 'open', 'asg_direct');
+        (id, subject, holderKey, openedBySession, openedAt, state, reviewsAssignmentId, workItemId)
+      VALUES ('asg_review', 'review', 'reviewer', 'reviewer', 4, 'open', 'asg_direct', 'wi_trace');
 
       INSERT INTO supervision_entitlements
         (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
@@ -479,13 +487,16 @@ defmodule Tightbeam.JobTraceTest do
   end
 
   defp attest(db, principal, assignment_id, kind, extra) do
-    Assignments.__handle__(db, "attest", %{
+    call = %{
       verb: "attest",
       principal: principal,
       origin: origin(principal),
       session_key: nil,
+      supervision_interval_ms: 1_000,
       params: Map.merge(%{assignment_id: assignment_id, kind: kind}, extra)
-    })
+    }
+
+    Assignments.__handle__(db, "attest", stage_review_verdict(db, call))
   end
 
   defp session(db, key, owner) do

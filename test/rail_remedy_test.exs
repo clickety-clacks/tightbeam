@@ -1690,7 +1690,7 @@ defmodule Tightbeam.RailRemedyTest do
     assert {:error, %{producer: review_id}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
-    verdict(ctx, review_id, "reviewed-clean")
+    insert_review_conclusion_attest(ctx, review_id, "reviewed-clean", notice_refs())
 
     assert {:allow, [{"completion-needs-review", subject, occurrence}], []} =
              Rules.decide(ctx.db, completion)
@@ -3047,6 +3047,10 @@ defmodule Tightbeam.RailRemedyTest do
 
   defp insert_review_conclusion(ctx, assignment, kind, refs) do
     review = linked_review(ctx, assignment.id, "exact notice review")
+    insert_review_conclusion_attest(ctx, review.id, kind, refs)
+  end
+
+  defp insert_review_conclusion_attest(ctx, review_id, kind, refs) do
     attest_id = "att_test_#{System.unique_integer([:positive])}"
     encoded_refs = if is_nil(refs), do: nil, else: JSON.encode!(refs)
 
@@ -3060,7 +3064,7 @@ defmodule Tightbeam.RailRemedyTest do
         """,
         [
           attest_id,
-          review.id,
+          review_id,
           kind,
           ctx.reviewer.session_key,
           encoded_refs,
@@ -3132,13 +3136,15 @@ defmodule Tightbeam.RailRemedyTest do
   end
 
   defp verdict_from(ctx, session_key, assignment_id, kind) do
-    Assignments.__handle__(ctx.db, "attest", %{
+    call = %{
       verb: "attest",
       origin: "agent:#{session_key}",
       principal: {:session, session_key},
       session_key: nil,
       params: %{assignment_id: assignment_id, kind: "verdict", verdict_kind: kind}
-    })
+    }
+
+    Assignments.__handle__(ctx.db, "attest", stage_review_verdict(ctx.db, call))
   end
 
   defp latest_rewake_target(ctx, assignment_id) do

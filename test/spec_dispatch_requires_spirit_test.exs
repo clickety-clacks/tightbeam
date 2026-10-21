@@ -164,12 +164,11 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
 
       assert {:ok, review} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
-      result =
-        Dispatch.dispatch(
-          ctx.db,
-          ctx.handlers,
-          verdict_call(ctx.owner.session_key, review.id, "changes-requested")
-        )
+      verdict =
+        verdict_call(ctx.owner.session_key, review.id, "changes-requested")
+        |> then(&stage_review_verdict(ctx.db, &1))
+
+      result = Dispatch.dispatch(ctx.db, ctx.handlers, verdict)
 
       if round < 3,
         do: assert({:ok, _} = result),
