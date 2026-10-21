@@ -549,7 +549,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   end
 
   test "transactional parent refs preserve sibling denial and opener delivery", ctx do
-    assert {:ok, []} =
+    assert :ok =
              DB.execute(
                ctx.db,
                "INSERT INTO users (userId, isAdmin, createdAt) VALUES " <>
