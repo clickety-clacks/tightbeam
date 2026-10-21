@@ -1552,28 +1552,6 @@ fn begin_snapshot_with_selection(
     });
 }
 
-#[cfg(test)]
-fn begin_snapshot_after_subscription_ready(
-    frame: &Value,
-    endpoint: &Endpoint,
-    session_key: &str,
-    generation: u64,
-    cycle: u64,
-    tx: &Sender<Worker>,
-    pending: &mut Option<PendingSnapshot>,
-) {
-    begin_snapshot_after_subscription_ready_with_selection(
-        frame,
-        endpoint,
-        session_key,
-        &ReadSelection::default(),
-        generation,
-        cycle,
-        tx,
-        pending,
-    );
-}
-
 fn begin_snapshot_after_subscription_ready_with_selection(
     frame: &Value,
     endpoint: &Endpoint,
