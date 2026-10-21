@@ -5,10 +5,12 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
   alias Tightbeam.{
     DB,
+    Dispatch,
     Gateway,
     Model,
     Org,
     Roles,
+    Rules,
     StateResources,
     StateVisibility,
     SubagentMarkers,
@@ -548,7 +550,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     assert Hub.matches?(notice, %{"classes" => ["assignment."]})
   end
 
-  test "transactional parent refs preserve sibling denial and opener delivery", ctx do
+  test "parent refs filter attest notices without changing class-only eligibility", ctx do
     assert :ok =
              DB.execute(
                ctx.db,
@@ -558,26 +560,71 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
     session!(ctx.db, "holder-row", "holder-user")
     session!(ctx.db, "sibling-holder", "sibling-user")
-    work_item!(ctx.db, "work-parent-row", "opener-user")
+    work_item!(ctx.db, "wi_parent-row", "opener-user")
 
     assignment!(
       ctx.db,
-      "assignment-parent-row",
+      "asg_parent-row",
       "holder-row",
-      "work-parent-row",
+      "wi_parent-row",
       "opener-user"
     )
 
-    assignment!(ctx.db, "sibling-assignment-row", "sibling-holder", "work-parent-row")
+    assignment!(ctx.db, "asg_sibling-row", "sibling-holder", "wi_parent-row")
 
-    sibling_listener =
-      class_listener(ctx, :sibling_attest, "attest.filed", %{
-        user_id: "sibling-user",
-        principal_kind: :session,
-        principal_id: "sibling-holder"
-      })
+    listeners = [
+      {:holder_attest,
+       class_listener(ctx, :holder_attest, "attest.filed", %{
+         user_id: "holder-user",
+         principal_kind: :session,
+         principal_id: "holder-row"
+       })},
+      {:opener_attest,
+       class_listener(ctx, :opener_attest, "attest.filed", %{user_id: "opener-user"})},
+      {:holder_decision,
+       class_listener(ctx, :holder_decision, "decision_request.", %{
+         user_id: "holder-user",
+         principal_kind: :session,
+         principal_id: "holder-row"
+       })},
+      {:opener_decision,
+       class_listener(ctx, :opener_decision, "decision_request.", %{user_id: "opener-user"})},
+      {:sibling_attest,
+       class_listener(ctx, :sibling_attest, "attest.filed", %{
+         user_id: "sibling-user",
+         principal_kind: :session,
+         principal_id: "sibling-holder"
+       })},
+      {:sibling_decision,
+       class_listener(ctx, :sibling_decision, "decision_request.", %{
+         user_id: "sibling-user",
+         principal_kind: :session,
+         principal_id: "sibling-holder"
+       })},
+      {:opener_filter,
+       filtered_listener(
+         ctx,
+         :opener_filter,
+         %{"classes" => ["attest.filed"], "workItemId" => "wi_parent-row"},
+         %{user_id: "opener-user"}
+       )},
+      {:sibling_filter,
+       filtered_listener(
+         ctx,
+         :sibling_filter,
+         %{
+           "classes" => ["attest.filed", "decision_request."],
+           "workItemId" => "wi_parent-row"
+         },
+         %{
+           user_id: "sibling-user",
+           principal_kind: :session,
+           principal_id: "sibling-holder"
+         }
+       )}
+    ]
 
-    on_exit(fn -> Process.exit(sibling_listener, :kill) end)
+    on_exit(fn -> Enum.each(listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end) end)
 
     :ok =
       Hub.register(ctx.hub, self(), %{
@@ -589,7 +636,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
     attest = %{
       id: "attest-row",
-      assignment_id: "assignment-parent-row",
+      assignment_id: "asg_parent-row",
       kind: "progress",
       verdict_kind: nil,
       note: nil,
@@ -627,12 +674,12 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
                    verb: "attest",
                    origin: "agent:holder-row",
                    principal: {:session, "holder-row"},
-                   session_key: "caller-session",
+                   session_key: "holder-row",
                    firehose_hub: ctx.hub,
                    params: %{
-                     assignment_id: "assignment-parent-row",
-                     session_key: "request-session",
-                     work_item_id: "request-work-item"
+                     assignment_id: "asg_parent-row",
+                     session_key: "holder-row",
+                     work_item_id: "wi_parent-row"
                    }
                  },
                  %{attest: attest}
@@ -645,16 +692,16 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
                    id: "request-row",
                    kind: "operator",
                    status: "open",
-                   raiser_session_key: "raising-session",
-                   assignment_id: "assignment-parent-row",
+                   raiser_session_key: "holder-row",
+                   assignment_id: "asg_parent-row",
                    row_schema_revision: 2,
                    row_version: 10
                  },
                  %{
                    "decisionRequestId" => "request-row",
-                   "sessionKey" => "caller-session",
-                   "workItemId" => "request-work-item",
-                   "assignmentId" => "request-assignment"
+                   "sessionKey" => "holder-row",
+                   "workItemId" => "wi_parent-row",
+                   "assignmentId" => "asg_parent-row"
                  },
                  ctx.hub
                )
@@ -662,8 +709,17 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
                :ok
              end)
 
-    sync_listener(ctx.hub, sibling_listener, :sibling_attest)
-    refute_received {:class_notice, :sibling_attest, _notice}
+    Enum.each(listeners, fn {tag, pid} -> sync_listener(ctx.hub, pid, tag) end)
+
+    assert_received {:class_notice, :holder_attest, %{"class" => "attest.filed"}}
+    assert_received {:class_notice, :opener_attest, %{"class" => "attest.filed"}}
+    assert_received {:class_notice, :holder_decision, %{"class" => "decision_request.opened"}}
+    assert_received {:class_notice, :opener_decision, %{"class" => "decision_request.opened"}}
+    assert_received {:class_notice, :opener_filter, %{"class" => "attest.filed"}}
+
+    for tag <- [:sibling_attest, :sibling_decision, :sibling_filter] do
+      refute_received {:class_notice, ^tag, _notice}
+    end
 
     assert %{"class" => "verb.accepted"} = take_notice(ctx.hub)
 
@@ -674,8 +730,8 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
              "refs" => %{
                "attestId" => "attest-row",
                "sessionKey" => "holder-row",
-               "workItemId" => "work-parent-row",
-               "assignmentId" => "assignment-parent-row",
+               "workItemId" => "wi_parent-row",
+               "assignmentId" => "asg_parent-row",
                "origin" => "agent:holder-row",
                "principal" => "session:holder-row"
              }
@@ -688,11 +744,21 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
              "schemaVersion" => 2,
              "refs" => %{
                "decisionRequestId" => "request-row",
-               "sessionKey" => "raising-session",
-               "workItemId" => "work-parent-row",
-               "assignmentId" => "assignment-parent-row"
+               "sessionKey" => "holder-row",
+               "workItemId" => "wi_parent-row",
+               "assignmentId" => "asg_parent-row"
              }
            } = decision_notice
+
+    assert Hub.matches?(attest_notice, %{
+             "classes" => ["attest.filed"],
+             "workItemId" => "wi_parent-row"
+           })
+
+    assert Hub.matches?(decision_notice, %{
+             "classes" => ["decision_request."],
+             "workItemId" => "wi_parent-row"
+           })
 
     rest_page =
       StateResources.query_attests(ctx.db, %{
@@ -729,120 +795,45 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       })
 
     assert Enum.any?(opener_rest_page.rows, &(&1.id == "attest-row"))
-
-    :ok =
-      Hub.register(ctx.hub, self(), %{
-        mode: :all,
-        db: ctx.db,
-        user_id: "holder-user",
-        principal_kind: :session,
-        principal_id: "holder-row",
-        is_admin: false
-      })
-
-    Hub.publish(ctx.hub, attest_notice)
-    assert %{"class" => "attest.filed"} = take_notice(ctx.hub)
-    Hub.publish(ctx.hub, decision_notice)
-    assert %{"class" => "decision_request.opened"} = take_notice(ctx.hub)
-
-    :ok =
-      Hub.register(ctx.hub, self(), %{
-        mode: :all,
-        db: ctx.db,
-        user_id: "opener-user",
-        is_admin: false
-      })
-
-    Hub.publish(ctx.hub, attest_notice)
-    assert %{"class" => "attest.filed"} = take_notice(ctx.hub)
-    Hub.publish(ctx.hub, decision_notice)
-    assert %{"class" => "decision_request.opened"} = take_notice(ctx.hub)
-
-    :ok =
-      Hub.register(ctx.hub, self(), %{
-        mode: :filtered,
-        db: ctx.db,
-        user_id: "opener-user",
-        is_admin: false
-      })
-
-    :ok =
-      Hub.subscribe(ctx.hub, self(), "parent-attest", %{
-        "classes" => ["attest.filed"],
-        "workItemId" => "work-parent-row"
-      })
-
-    assert Hub.matches?(attest_notice, %{
-             "classes" => ["attest.filed"],
-             "workItemId" => "work-parent-row"
-           })
-
-    Hub.publish(ctx.hub, attest_notice)
-
-    assert %{
-             "class" => "attest.filed",
-             "subscriptionId" => "parent-attest"
-           } = take_notice(ctx.hub)
-
-    :ok = Hub.unsubscribe(ctx.hub, self(), "parent-attest")
-
-    :ok =
-      Hub.register(ctx.hub, self(), %{
-        mode: :all,
-        db: ctx.db,
-        user_id: "sibling-user",
-        principal_kind: :session,
-        principal_id: "sibling-holder",
-        is_admin: false
-      })
-
-    assert Hub.matches?(attest_notice, %{"workItemId" => "work-parent-row"})
-    Hub.publish(ctx.hub, attest_notice)
-    assert_quiet(ctx.hub)
-
-    assert Hub.matches?(decision_notice, %{"workItemId" => "work-parent-row"})
-    Hub.publish(ctx.hub, decision_notice)
-    assert_quiet(ctx.hub)
-
-    :ok =
-      Hub.register(ctx.hub, self(), %{
-        mode: :filtered,
-        db: ctx.db,
-        user_id: "sibling-user",
-        principal_kind: :session,
-        principal_id: "sibling-holder",
-        is_admin: false
-      })
-
-    :ok =
-      Hub.subscribe(ctx.hub, self(), "sibling-parent-attest", %{
-        "classes" => ["attest.filed"],
-        "workItemId" => "work-parent-row"
-      })
-
-    assert Hub.matches?(attest_notice, %{
-             "classes" => ["attest.filed"],
-             "workItemId" => "work-parent-row"
-           })
-
-    Hub.publish(ctx.hub, attest_notice)
-    assert_quiet(ctx.hub)
   end
 
-  test "row-reference repairs preserve session-spawn and role-create recipients", ctx do
+  test "row-reference repairs preserve spawn and role create/remove recipients", ctx do
+    assert :ok =
+             DB.execute(
+               ctx.db,
+               "INSERT INTO users (userId, isAdmin, createdAt) VALUES " <>
+                 "('spawn-owner', 0, 1), ('spawn-holder', 0, 1)"
+             )
+
     session!(ctx.db, "spawn-actor", "flynn")
     session!(ctx.db, "spawn-target", "kay")
-    work_item!(ctx.db, "wi_spawn-work-item", "flynn")
+    session!(ctx.db, "spawn-work-holder", "spawn-holder")
+    work_item!(ctx.db, "wi_spawn-work-item", "spawn-owner")
+    assignment!(ctx.db, "assignment-spawn-work-item", "spawn-work-holder", "wi_spawn-work-item")
 
     spawn_listeners = [
+      {:spawn_creator,
+       class_listener(ctx, :spawn_creator, "session.spawned", %{
+         user_id: "flynn",
+         principal_kind: :session,
+         principal_id: "spawn-actor"
+       })},
       {:spawn_work_owner,
-       class_listener(ctx, :spawn_work_owner, "session.spawned", %{user_id: "flynn"})},
+       class_listener(ctx, :spawn_work_owner, "session.spawned", %{user_id: "spawn-owner"})},
+      {:spawn_work_holder,
+       class_listener(ctx, :spawn_work_holder, "session.spawned", %{
+         user_id: "spawn-holder",
+         principal_kind: :session,
+         principal_id: "spawn-work-holder"
+       })},
       {:spawn_target,
        class_listener(ctx, :spawn_target, "session.spawned", %{
          user_id: "kay",
          principal_kind: :session,
          principal_id: "spawn-target"
-       })}
+       })},
+      {:spawn_target_owner,
+       class_listener(ctx, :spawn_target_owner, "session.spawned", %{user_id: "kay"})}
     ]
 
     on_exit(fn -> Enum.each(spawn_listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end) end)
@@ -865,13 +856,18 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
     Enum.each(spawn_listeners, fn {tag, pid} -> sync_listener(ctx.hub, pid, tag) end)
 
-    assert_received {:class_notice, :spawn_work_owner,
+    assert_received {:class_notice, :spawn_creator,
                      %{"class" => "session.spawned", "refs" => refs} = spawn_notice}
 
     assert refs["sessionKey"] == "spawn-target"
+    assert refs["origin"] == "agent:spawn-actor"
+    assert refs["principal"] == "session:spawn-actor"
     refute Map.has_key?(refs, "workItemId")
     refute Map.has_key?(spawn_notice, "eligibilityRefs")
+    assert_received {:class_notice, :spawn_work_owner, %{"class" => "session.spawned"}}
+    assert_received {:class_notice, :spawn_work_holder, %{"class" => "session.spawned"}}
     assert_received {:class_notice, :spawn_target, %{"class" => "session.spawned"}}
+    assert_received {:class_notice, :spawn_target_owner, %{"class" => "session.spawned"}}
 
     Enum.each(spawn_listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end)
 
@@ -920,9 +916,141 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     Enum.each(role_listeners, fn {tag, pid} -> sync_listener(ctx.hub, pid, tag) end)
 
     assert_received {:class_notice, :role_owner, %{"class" => "role.created"}}
-    assert_received {:class_notice, :role_creator, %{"class" => "role.created"}}
+    assert_received {:class_notice, :role_creator,
+                     %{"class" => "role.created", "refs" => role_refs}}
+    assert role_refs["role"] == "project:row-ref-test"
+    assert role_refs["sessionKey"] == "role-bound-target"
+    assert role_refs["origin"] == "agent:role-creator"
+    assert role_refs["principal"] == "session:role-creator"
     refute_received {:class_notice, :role_bound_target, _notice}
     refute_received {:class_notice, :role_bound_owner, _notice}
+
+    Enum.each(role_listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end)
+
+    removed_role_name = "project:row-ref-remove-test"
+    assert %{name: ^removed_role_name} = Roles.create!(ctx.db, removed_role_name, "flynn", "role-bound-target")
+
+    remove_listeners = [
+      {:role_remover,
+       class_listener(ctx, :role_remover, "role.removed", %{
+         user_id: "flynn",
+         principal_kind: :session,
+         principal_id: "role-creator"
+       })},
+      {:removed_bound_target,
+       class_listener(ctx, :removed_bound_target, "role.removed", %{
+         user_id: "kay",
+         principal_kind: :session,
+         principal_id: "role-bound-target"
+       })},
+      {:removed_bound_owner,
+       class_listener(ctx, :removed_bound_owner, "role.removed", %{user_id: "kay"})}
+    ]
+
+    on_exit(fn -> Enum.each(remove_listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end) end)
+
+    remove_call = %{
+      verb: "role-rm",
+      origin: "agent:role-creator",
+      principal: {:session, "role-creator"},
+      session_key: "role-creator",
+      firehose_hub: ctx.hub,
+      firehose_in_txn: true,
+      params: %{name: removed_role_name}
+    }
+
+    captured_remove_call = Publisher.capture_before(ctx.db, remove_call)
+    assert :ok = Roles.rm_with_firehose(ctx.db, removed_role_name, captured_remove_call)
+
+    Enum.each(remove_listeners, fn {tag, pid} -> sync_listener(ctx.hub, pid, tag) end)
+
+    assert_received {:class_notice, :role_remover,
+                     %{"class" => "role.removed", "refs" => removed_refs}}
+    assert removed_refs["role"] == removed_role_name
+    assert removed_refs["sessionKey"] == "role-bound-target"
+    refute_received {:class_notice, :removed_bound_target, _notice}
+    refute_received {:class_notice, :removed_bound_owner, _notice}
+  end
+
+  test "attest-driven assignment notices do not grant the filer eligibility", ctx do
+    assert :ok =
+             DB.execute(
+               ctx.db,
+               "INSERT INTO users (userId, isAdmin, createdAt) VALUES " <>
+                 "('assignment-opener', 0, 1), ('assignment-filer', 0, 1)"
+             )
+
+    session!(ctx.db, "assignment-holder", "kay")
+    session!(ctx.db, "assignment-filer", "assignment-filer")
+    work_item!(ctx.db, "wi_attest-side-effect", "assignment-opener")
+
+    assignment!(
+      ctx.db,
+      "asg_attest-side-effect",
+      "assignment-holder",
+      "wi_attest-side-effect",
+      "assignment-opener"
+    )
+
+    holder_listener =
+      class_listener(ctx, :assignment_holder, "assignment.opened", %{
+        user_id: "kay",
+        principal_kind: :session,
+        principal_id: "assignment-holder"
+      })
+
+    opener_listener =
+      class_listener(ctx, :assignment_opener, "assignment.opened", %{user_id: "assignment-opener"})
+
+    filer_listener =
+      class_listener(ctx, :assignment_filer, "assignment.opened", %{
+        user_id: "assignment-filer",
+        principal_kind: :session,
+        principal_id: "assignment-filer"
+      })
+
+    listeners = [
+      {:assignment_holder, holder_listener},
+      {:assignment_opener, opener_listener},
+      {:assignment_filer, filer_listener}
+    ]
+
+    on_exit(fn -> Enum.each(listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end) end)
+
+    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000})
+    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
+
+    call = %{
+      verb: "attest",
+      origin: "agent:assignment-filer",
+      principal: {:session, "assignment-filer"},
+      session_key: "assignment-filer",
+      firehose_hub: ctx.hub,
+      params: %{
+        assignment_id: "asg_attest-side-effect",
+        kind: "verdict",
+        verdict_kind: "tests-passed"
+      }
+    }
+
+    assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
+             Dispatch.dispatch(ctx.db, handlers, call)
+
+    Enum.each(listeners, fn {tag, pid} -> sync_listener(ctx.hub, pid, tag) end)
+
+    assert_received {:class_notice, :assignment_holder,
+                     %{
+                       "class" => "assignment.opened",
+                       "payload" => %{
+                         "id" => "asg_attest-side-effect",
+                         "derivedStatus" => "active"
+                       }
+                     }}
+
+    assert_received {:class_notice, :assignment_opener,
+                     %{"class" => "assignment.opened"}}
+
+    refute_received {:class_notice, :assignment_filer, _notice}
   end
 
   # Subscription matching runs first and visibility is checked only for a
@@ -1442,6 +1570,10 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   end
 
   defp class_listener(ctx, tag, class, principal) do
+    filtered_listener(ctx, tag, %{"classes" => [class]}, principal)
+  end
+
+  defp filtered_listener(ctx, tag, filters, principal) do
     parent = self()
 
     pid =
@@ -1450,7 +1582,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
           Map.merge(%{mode: :filtered, db: ctx.db, is_admin: false}, principal)
 
         :ok = Hub.register(ctx.hub, self(), registration)
-        :ok = Hub.subscribe(ctx.hub, self(), Atom.to_string(tag), %{"classes" => [class]})
+        :ok = Hub.subscribe(ctx.hub, self(), Atom.to_string(tag), filters)
         send(parent, {:class_listener_ready, tag})
         class_listener_loop(ctx.hub, parent, tag)
       end)
