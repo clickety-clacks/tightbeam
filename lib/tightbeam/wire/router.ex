@@ -77,7 +77,8 @@ defmodule Tightbeam.Wire.Router do
                    "harness-health-resolve-other",
                    "harness-health-close-promotion",
                    "harness-health-review-other",
-                   "harness-health-evidence-other"
+                   "harness-health-evidence-other",
+                   "harklight-register"
                  ]
   @max_upload_bytes 32 * 1024 * 1024
   @state_not_found_floor_us 3_000
@@ -2923,7 +2924,8 @@ defmodule Tightbeam.Wire.Router do
                         "assignment-commitref-correct",
                         "harness-health-observe-other",
                         "harness-health-resolve-other",
-                        "harness-health-close-promotion"
+                        "harness-health-close-promotion",
+                        "harklight-register"
                       ]
 
   # PRESENCE of the field, not the type of its value. `sessionKey: null` — and a

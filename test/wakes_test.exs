@@ -140,6 +140,30 @@ defmodule Tightbeam.WakesTest do
     %{db: name, scheduler: scheduler}
   end
 
+  test "an explicit held prompt delivery remains pending for the ordinary scheduler", %{
+    db: db,
+    scheduler: scheduler
+  } do
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "exact-session",
+        origin: "process:tightbeam",
+        prompt: "retain this entry for its registered session",
+        due_at: 0
+      })
+
+    start_supervised!(
+      {Wakes,
+       db: db,
+       deliver: fn _wake -> {:retry, :recipient_unavailable} end,
+       tick_ms: 60_000,
+       name: scheduler}
+    )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+  end
+
   test "schedule persists a pending wake and public cancel follows its recorded sender", %{db: db} do
     wake =
       Wakes.schedule(db, %{
