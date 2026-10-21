@@ -198,7 +198,7 @@ defmodule Tightbeam.HarklightTest do
 
     assert Wakes.get(ctx.db, wake_id).state == "pending"
 
-    assert {:ok, {:harklight_held, nil}} =
+    assert {:ok, {:harklight_held, []}} =
              DB.transaction(ctx.db, fn txn ->
                Gateway.deliver_prompt_in_txn(
                  txn,
