@@ -86,31 +86,69 @@ defmodule Tightbeam.FailureContainmentTest do
         WS.close(ws)
         resumed = subscribe(port, device.token)
 
-        {:ok, _} =
-          DB.query(
+        :ok =
+          DB.execute(
             db,
-            """
-            INSERT INTO work_items(id,title,ownerUserId,state,createdByUser,createdAt)
-            VALUES ('wi_restart','Restart delivery',?1,'open',?1,1)
-            """,
-            [device.user_id]
+            "CREATE TABLE firehose_delivery_commits (id INTEGER PRIMARY KEY, class TEXT NOT NULL)"
           )
 
-        notice = %{
-          "class" => "work_item.updated",
-          "resource" => "work-items",
-          "op" => "upsert",
-          "occurredAt" => 1,
-          "refs" => %{"workItemId" => "wi_restart", "ownerUserId" => device.user_id},
-          "payload" => %{"id" => "wi_restart"}
-        }
+        event_types = [
+          {"work_item.updated", "work-items", "workItemId"},
+          {"assignment.opened", "assignments", "assignmentId"},
+          {"wake.scheduled", "wakes", "wakeId"}
+        ]
 
-        Firehose.Hub.publish(__MODULE__.Hub, notice)
-        assert {:ok, {:text, bytes}, _} = WS.recv(resumed, 2_000)
-        frame = JSON.decode!(bytes)
-        assert frame["class"] == "work_item.updated"
-        assert frame["payload"]["id"] == "wi_restart"
-        WS.close(resumed)
+        Enum.each(1..1_000, fn index ->
+          {class, resource, ref_name} = Enum.at(event_types, rem(index - 1, length(event_types)))
+          id = "change-#{index}"
+
+          notice = %{
+            "class" => class,
+            "resource" => resource,
+            "op" => "upsert",
+            "occurredAt" => index,
+            "refs" => %{ref_name => id, "ownerUserId" => device.user_id},
+            "payload" => %{"id" => id, "ownerUserId" => device.user_id, "rowVersion" => index}
+          }
+
+          assert {:ok, :committed} =
+                   DB.transaction(db, fn txn ->
+                     DB.Txn.q(txn, "INSERT INTO firehose_delivery_commits VALUES (?1, ?2)", [
+                       index,
+                       class
+                     ])
+
+                     DB.Txn.handoff(
+                       txn,
+                       Firehose.Hub.destination(__MODULE__.Hub),
+                       {:publish, notice}
+                     )
+
+                     :committed
+                   end)
+        end)
+
+        assert {:ok, [[1_000]]} =
+                 DB.query(db, "SELECT count(*) FROM firehose_delivery_commits")
+
+        last_ws =
+          Enum.reduce(1..1_000, resumed, fn index, ws ->
+            {class, _resource, _ref_name} =
+              Enum.at(event_types, rem(index - 1, length(event_types)))
+
+            id = "change-#{index}"
+
+            assert {:ok, {:text, bytes}, ws} = WS.recv(ws, 5_000)
+            frame = JSON.decode!(bytes)
+            assert frame["class"] == class
+            assert frame["seq"] == index
+            assert frame["payload"]["id"] == id
+            assert frame["refs"]["ownerUserId"] == device.user_id
+
+            ws
+          end)
+
+        WS.close(last_ws)
       end
 
       assert child(runtime, Bandit) == listener
