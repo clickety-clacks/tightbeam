@@ -469,7 +469,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     end)
   end
 
-  test "DA7.5 each published row class has exactly its primary and committed-row references",
+  test "DA7.5 each published class has exact row references, including role-targeted wakes",
        ctx do
     fixtures = row_reference_fixtures(ctx)
 
@@ -883,8 +883,8 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
         row_reference_fixture(
           %{
             wake_id: "wake-row",
-            session_key: "wake-target",
-            target_role: nil,
+            session_key: "stale-role-resolution",
+            target_role: "example",
             origin: "agent:writer",
             prompt: "pending work",
             consumer: "wake",
@@ -915,7 +915,6 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
           },
           %{"wakeId" => "wake-row"},
           %{
-            "sessionKey" => "wake-target",
             "workItemId" => "work-row",
             "assignmentId" => "assignment-row"
           }

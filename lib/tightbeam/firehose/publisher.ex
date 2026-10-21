@@ -751,7 +751,7 @@ defmodule Tightbeam.Firehose.Publisher do
       @secondary_ref_fields
       |> Map.get(resource, %{})
       |> Enum.reduce(%{}, fn {ref, field}, acc ->
-        case Map.get(projection, field) do
+        case secondary_ref_value(resource, ref, field, projection) do
           value when is_binary(value) and value != "" -> Map.put(acc, ref, value)
           _ -> acc
         end
@@ -759,6 +759,12 @@ defmodule Tightbeam.Firehose.Publisher do
 
     maybe_parent_work_item_ref(class, secondaries, refs)
   end
+
+  defp secondary_ref_value("wakes", "sessionKey", _field, %{"targetRole" => target_role})
+       when is_binary(target_role) and target_role != "",
+       do: nil
+
+  defp secondary_ref_value(_resource, _ref, field, projection), do: Map.get(projection, field)
 
   defp maybe_parent_work_item_ref(class, refs, source) do
     if class in [
