@@ -3828,13 +3828,16 @@ defmodule Tightbeam.Supervision do
       # the generic prod, and a FIRED one already delivered the exact terminal
       # child notice. Either way, arming another generic check would duplicate
       # wording the holder already has precisely — the unconditional recurring
-      # reminder this gate exists to suppress.
+      # reminder this gate exists to suppress. `escalation-ruled` is excluded:
+      # it is this substrate's own internal park wake for the rail's decision
+      # ladder, not an agent's own exact continuation, and its lifecycle is
+      # already governed by the escalation mechanism, not this gate.
       Txn.q(
         txn,
         """
         SELECT 1 FROM wakes
         WHERE assignmentId=?1 AND sessionKey=?2 AND state IN ('pending','fired')
-          AND conditionKind IS NOT NULL
+          AND conditionKind IS NOT NULL AND conditionKind != 'escalation-ruled'
         LIMIT 1
         """,
         [assignment_id, holder]
