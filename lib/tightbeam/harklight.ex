@@ -10,7 +10,7 @@ defmodule Tightbeam.Harklight do
   CREATE TABLE IF NOT EXISTS harklight_handles (
     sessionHandle TEXT PRIMARY KEY,
     recipientSessionKey TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('listening','complete')),
+    state TEXT NOT NULL CHECK (state IN ('listening','listener_failed','complete')),
     ownerNotifiedAt INTEGER,
     createdAt INTEGER NOT NULL,
     completedAt INTEGER
@@ -118,6 +118,25 @@ defmodule Tightbeam.Harklight do
           state == "complete" and not existing_request? ->
             {:error, "handle_complete", "a completed Harklight handle cannot be registered again"}
 
+          state == "listener_failed" ->
+            now = now()
+
+            Txn.q(
+              txn,
+              "UPDATE harklight_handles SET state='listening' WHERE sessionHandle=?1 AND state='listener_failed'",
+              [handle]
+            )
+
+            insert_request(txn, handle, sender_id, message_id, now)
+
+            {:ok,
+             %{
+               handle: handle,
+               recipient_session_key: recipient,
+               state: "listening",
+               existing: existing_request?
+             }}
+
           true ->
             insert_request(txn, handle, sender_id, message_id, now())
 
@@ -140,10 +159,64 @@ defmodule Tightbeam.Harklight do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT sessionHandle FROM harklight_handles WHERE state='listening' ORDER BY createdAt,sessionHandle"
+        "SELECT sessionHandle FROM harklight_handles WHERE state IN ('listening','listener_failed') ORDER BY createdAt,sessionHandle"
       )
 
     Enum.map(rows, fn [handle] -> handle end)
+  end
+
+  @doc false
+  def listener_started(db, handle) do
+    result =
+      DB.transaction(db, fn txn ->
+        case Txn.q(txn, "SELECT state FROM harklight_handles WHERE sessionHandle=?1", [handle]) do
+          [["listening"]] ->
+            :ok
+
+          [["listener_failed"]] ->
+            Txn.q(
+              txn,
+              "UPDATE harklight_handles SET state='listening' WHERE sessionHandle=?1 AND state='listener_failed'",
+              [handle]
+            )
+
+            :ok
+
+          [["complete"]] ->
+            {:error, :handle_complete}
+
+          [] ->
+            {:error, :unknown_handle}
+        end
+      end)
+
+    case result do
+      {:ok, :ok} -> :ok
+      {:ok, {:error, reason}} -> {:error, reason}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  @doc false
+  def listener_failed(db, handle, reason) do
+    DB.transaction(db, fn txn ->
+      Txn.q(
+        txn,
+        "UPDATE harklight_handles SET state='listener_failed' WHERE sessionHandle=?1 AND state='listening'",
+        [handle]
+      )
+
+      if Txn.changes(txn) == 1 do
+        detail = JSON.encode!(%{sessionHandle: handle, reason: inspect(reason)})
+        EventLog.lifecycle_in_txn(txn, "harklight_listener_failed", handle, detail)
+      end
+
+      :ok
+    end)
+    |> case do
+      {:ok, :ok} -> :ok
+      {:error, error} -> {:error, error}
+    end
   end
 
   @doc false
@@ -161,7 +234,7 @@ defmodule Tightbeam.Harklight do
 
   @doc false
   def capture(db, handle, event, raw_event) do
-    with {:ok, entry} <- event_identity(event) do
+    with {:ok, entry} <- event_identity(event, handle) do
       DB.transaction(db, fn txn -> capture_in_txn(txn, handle, entry, raw_event) end)
       |> case do
         {:ok, result} -> result
@@ -238,6 +311,9 @@ defmodule Tightbeam.Harklight do
 
       [[_recipient, "complete"]] ->
         {:error, :handle_complete}
+
+      [[_recipient, "listener_failed"]] ->
+        {:error, :listener_failed}
 
       [] ->
         {:error, :unknown_handle}
@@ -375,14 +451,23 @@ defmodule Tightbeam.Harklight do
     )
   end
 
-  defp event_identity(event) do
+  defp event_identity(
+         %{
+           "kind" => "event",
+           "session_handle" => event_handle,
+           "request" => request,
+           "entry" => entry
+         } = event,
+         handle
+       )
+       when event_handle == handle and is_map(request) and is_map(entry) do
     fields = %{
-      sender_id: event["sender_id"],
-      message_id: event["message_id"],
+      sender_id: request["sender_id"],
+      message_id: request["message_id"],
       event_id: event["event_id"],
-      kind: event["kind"],
-      terminal_state: event["terminal_state"],
-      author: event["author"],
+      kind: entry["kind"],
+      terminal_state: entry["terminal_state"],
+      author: entry["author"],
       request_revision: event["request_revision"],
       delivered: event["delivered"],
       acted: event["acted"]
@@ -399,6 +484,8 @@ defmodule Tightbeam.Harklight do
       {:error, :invalid_entry}
     end
   end
+
+  defp event_identity(_event, _handle), do: {:error, :invalid_entry}
 
   defp idle_line?(%{"kind" => "idle", "open_requests" => 0}), do: true
   defp idle_line?(_), do: false

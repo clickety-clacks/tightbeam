@@ -53,8 +53,7 @@ defmodule Tightbeam.HarklightTest do
        ctx do
     register(ctx.db, ctx.recipient, "handle-1", "sender-1", "message-1")
 
-    raw =
-      ~s({"sender_id":"sender-1","message_id":"message-1","event_id":"turn-1","kind":"turn","author":"person","request_revision":1,"delivered":false,"acted":false,"message":"ship it, but skip docs"})
+    raw = event_line("41", "ship it, but skip docs")
 
     assert {:captured, wake_id} = Harklight.accept_line(ctx.db, "handle-1", raw)
     wake = Wakes.get(ctx.db, wake_id)
@@ -64,12 +63,12 @@ defmodule Tightbeam.HarklightTest do
     assert wake.prompt =~ raw
 
     assert wake.prompt =~
-             "sender_id=sender-1, message_id=message-1, handle=handle-1, event_id=turn-1"
+             "sender_id=sender-1, message_id=message-1, handle=handle-1, event_id=41"
 
-    assert wake.prompt =~ "harklight-agent ack --event turn-1"
+    assert wake.prompt =~ "harklight-agent ack --event 41"
 
     assert wake.prompt =~
-             "harklight-agent reply --request message-1 --in-reply-to turn-1 --body"
+             "harklight-agent reply --request message-1 --in-reply-to 41 --body"
 
     assert wake.prompt =~ "Do not run `harklight-agent listen`"
 
@@ -82,13 +81,13 @@ defmodule Tightbeam.HarklightTest do
   test "sequential feed entries receive strictly ordered wake times", ctx do
     register(ctx.db, ctx.recipient, "handle-1", "sender-1", "message-1")
 
-    first = event_line("turn-1")
-    second = event_line("turn-2")
+    first = event_line("41")
+    second = event_line("42")
 
     assert {:captured, _} = Harklight.accept_line(ctx.db, "handle-1", first)
     assert {:captured, _} = Harklight.accept_line(ctx.db, "handle-1", second)
 
-    assert {:ok, [["turn-1", first_due], ["turn-2", second_due]]} =
+    assert {:ok, [["41", first_due], ["42", second_due]]} =
              DB.query(
                ctx.db,
                "SELECT e.eventId,w.dueAt FROM harklight_entries e JOIN wakes w ON w.wakeId=e.wakeId WHERE e.sessionHandle='handle-1' ORDER BY w.dueAt"
@@ -99,7 +98,7 @@ defmodule Tightbeam.HarklightTest do
 
   test "delivery preparation never substitutes another session", ctx do
     register(ctx.db, ctx.recipient, "handle-1", "sender-1", "message-1")
-    assert {:captured, wake_id} = Harklight.accept_line(ctx.db, "handle-1", event_line("turn-1"))
+    assert {:captured, wake_id} = Harklight.accept_line(ctx.db, "handle-1", event_line("45"))
 
     assert {:ok, :deliver} =
              DB.transaction(ctx.db, fn txn ->
@@ -123,17 +122,22 @@ defmodule Tightbeam.HarklightTest do
     register(ctx.db, ctx.recipient, "handle-1", "sender-1", "message-1")
 
     answered =
-      ~s({"sender_id":"sender-1","message_id":"message-1","event_id":"answer-1","kind":"terminal","terminal_state":"answered","author":"agent","request_revision":1,"delivered":true,"acted":false,"message":"approve"})
+      event_line("43", "approve",
+        kind: "terminal",
+        terminal_state: "answered",
+        author: "agent",
+        delivered: true
+      )
 
     assert {:captured, answered_wake_id} = Harklight.accept_line(ctx.db, "handle-1", answered)
     answered_prompt = Wakes.get(ctx.db, answered_wake_id).prompt
-    ack_at = elem(:binary.match(answered_prompt, "harklight-agent ack --event answer-1"), 0)
+    ack_at = elem(:binary.match(answered_prompt, "harklight-agent ack --event 43"), 0)
     check_at = elem(:binary.match(answered_prompt, "check whether earlier work"), 0)
     author_at = elem(:binary.match(answered_prompt, "do not treat it as Mike's choice"), 0)
 
     apply_at =
       elem(
-        :binary.match(answered_prompt, "Apply the answer carried by event answer-1 at most once"),
+        :binary.match(answered_prompt, "Apply the answer carried by event 43 at most once"),
         0
       )
 
@@ -153,7 +157,7 @@ defmodule Tightbeam.HarklightTest do
     assert answered_prompt =~ "If you cannot tell, do not apply it again"
 
     cleared =
-      ~s({"sender_id":"sender-1","message_id":"message-1","event_id":"clear-1","kind":"terminal","terminal_state":"cleared","author":"person","request_revision":1,"delivered":false,"acted":false,"message":"stop"})
+      event_line("44", "stop", kind: "terminal", terminal_state: "cleared")
 
     assert {:captured, cleared_wake_id} = Harklight.accept_line(ctx.db, "handle-1", cleared)
     cleared_prompt = Wakes.get(ctx.db, cleared_wake_id).prompt
@@ -162,10 +166,47 @@ defmodule Tightbeam.HarklightTest do
     refute cleared_prompt =~ "harklight-agent result"
   end
 
+  test "accepts the Harklight CLI event-line shape for discussion, answered, and cleared entries",
+       ctx do
+    handle = "d0e4dced-75ed-4eeb-a320-0cd95b851e11"
+    register(ctx.db, ctx.recipient, handle, "sender-1", "message-1")
+
+    discussion =
+      ~s({"acted":false,"delivered":false,"entry":{"author":"person","event_id":"17","kind":"discussion","message":"ship it, but skip docs","message_id":"message-1","request_revision":1,"sender_id":"sender-1","session_handle":"d0e4dced-75ed-4eeb-a320-0cd95b851e11"},"event_id":"17","feed_cursor":17,"kind":"event","pending_remaining":2,"request":{"message_id":"message-1","sender_id":"sender-1"},"request_revision":1,"session_handle":"d0e4dced-75ed-4eeb-a320-0cd95b851e11"})
+
+    answered =
+      ~s({"acted":false,"delivered":true,"entry":{"author":"agent","event_id":"18","kind":"terminal","message":"approve","message_id":"message-1","request_revision":2,"sender_id":"sender-1","session_handle":"d0e4dced-75ed-4eeb-a320-0cd95b851e11","terminal_state":"answered"},"event_id":"18","feed_cursor":18,"kind":"event","pending_remaining":1,"request":{"message_id":"message-1","sender_id":"sender-1"},"request_revision":2,"session_handle":"d0e4dced-75ed-4eeb-a320-0cd95b851e11"})
+
+    cleared =
+      ~s({"acted":false,"delivered":false,"entry":{"author":"person","event_id":"19","kind":"terminal","message":"stop","message_id":"message-1","request_revision":3,"sender_id":"sender-1","session_handle":"d0e4dced-75ed-4eeb-a320-0cd95b851e11","terminal_state":"cleared"},"event_id":"19","feed_cursor":19,"kind":"event","pending_remaining":0,"request":{"message_id":"message-1","sender_id":"sender-1"},"request_revision":3,"session_handle":"d0e4dced-75ed-4eeb-a320-0cd95b851e11"})
+
+    assert {:captured, discussion_wake_id} = Harklight.accept_line(ctx.db, handle, discussion)
+    assert Wakes.get(ctx.db, discussion_wake_id).prompt =~ discussion
+
+    assert Wakes.get(ctx.db, discussion_wake_id).prompt =~
+             "Entry kind: discussion; author: person"
+
+    assert {:captured, answered_wake_id} = Harklight.accept_line(ctx.db, handle, answered)
+    answered_prompt = Wakes.get(ctx.db, answered_wake_id).prompt
+    assert answered_prompt =~ "Entry kind: terminal; author: agent; request revision: 2"
+    assert answered_prompt =~ "This answer was authored by an agent"
+    assert answered_prompt =~ "Apply the answer carried by event 18 at most once"
+
+    assert {:captured, cleared_wake_id} = Harklight.accept_line(ctx.db, handle, cleared)
+    assert Wakes.get(ctx.db, cleared_wake_id).prompt =~ "Stop work on this request"
+
+    assert {:error, :invalid_entry} =
+             Harklight.accept_line(
+               ctx.db,
+               handle,
+               ~s({"sender_id":"sender-1","message_id":"message-1","event_id":"20","kind":"discussion","author":"person","request_revision":1,"delivered":false,"acted":false})
+             )
+  end
+
   test "retirement and listener completion retain the exact-session wake and notify its owner once",
        ctx do
     register(ctx.db, ctx.recipient, "handle-1", "sender-1", "message-1")
-    raw = event_line("turn-1", "private user words")
+    raw = event_line("46", "private user words")
     assert {:captured, wake_id} = Harklight.accept_line(ctx.db, "handle-1", raw)
     wake = Wakes.get(ctx.db, wake_id)
 
@@ -231,7 +272,7 @@ defmodule Tightbeam.HarklightTest do
     register(ctx.db, ctx.recipient, "handle-1", "sender-1", "message-1")
 
     assert {:captured, source_wake_id} =
-             Harklight.accept_line(ctx.db, "handle-1", event_line("turn-1"))
+             Harklight.accept_line(ctx.db, "handle-1", event_line("47"))
 
     Org.retire(ctx.db, ctx.recipient, "user:flynn", 1_000)
 
@@ -273,17 +314,42 @@ defmodule Tightbeam.HarklightTest do
     )
   end
 
-  defp event_line(event_id, message \\ "ship it") do
-    JSON.encode!(%{
-      "sender_id" => "sender-1",
-      "message_id" => "message-1",
+  defp event_line(event_id, message \\ "ship it", opts \\ []) do
+    handle = Keyword.get(opts, :handle, "handle-1")
+    kind = Keyword.get(opts, :kind, "discussion")
+    author = Keyword.get(opts, :author, "person")
+    revision = Keyword.get(opts, :revision, 1)
+    delivered = Keyword.get(opts, :delivered, false)
+    acted = Keyword.get(opts, :acted, false)
+
+    entry = %{
+      "author" => author,
       "event_id" => event_id,
-      "kind" => "turn",
-      "author" => "person",
-      "request_revision" => 1,
-      "delivered" => false,
-      "acted" => false,
-      "message" => message
+      "kind" => kind,
+      "message" => message,
+      "message_id" => "message-1",
+      "request_revision" => revision,
+      "sender_id" => "sender-1",
+      "session_handle" => handle
+    }
+
+    entry =
+      case Keyword.get(opts, :terminal_state) do
+        nil -> entry
+        terminal_state -> Map.put(entry, "terminal_state", terminal_state)
+      end
+
+    JSON.encode!(%{
+      "acted" => acted,
+      "delivered" => delivered,
+      "entry" => entry,
+      "event_id" => event_id,
+      "feed_cursor" => String.to_integer(event_id),
+      "kind" => "event",
+      "pending_remaining" => 0,
+      "request" => %{"message_id" => "message-1", "sender_id" => "sender-1"},
+      "request_revision" => revision,
+      "session_handle" => handle
     })
   end
 

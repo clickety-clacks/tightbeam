@@ -73,7 +73,7 @@ defmodule Tightbeam.Harklight.Listener do
     %{
       id: {__MODULE__, handle},
       start: {__MODULE__, :start_link, [opts]},
-      restart: :transient,
+      restart: :temporary,
       shutdown: 5_000,
       type: :worker
     }
@@ -94,22 +94,12 @@ defmodule Tightbeam.Harklight.Listener do
 
     case System.find_executable("harklight-agent") do
       nil ->
+        record_failure(db, handle, :harklight_agent_not_found)
         {:stop, :harklight_agent_not_found}
 
       executable ->
-        port =
-          Port.open({:spawn_executable, executable}, [
-            :binary,
-            :exit_status,
-            :use_stdio,
-            :hide,
-            {:args, ["listen", "--follow", "--session", handle]}
-          ])
-
-        {:ok, %{db: db, handle: handle, port: port, buffer: ""}}
+        start_listener(db, handle, executable)
     end
-  rescue
-    error -> {:stop, {:listener_start_failed, Exception.message(error)}}
   end
 
   @impl true
@@ -139,20 +129,64 @@ defmodule Tightbeam.Harklight.Listener do
   end
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
-    Logger.warning(
-      "Harklight listener for #{state.handle} exited with status #{status} before its idle entry"
-    )
-
     {:stop, {:listener_exit, status}, state}
   end
 
   @impl true
-  def terminate(_reason, %{port: port}) do
+  def terminate(reason, %{db: db, handle: handle, port: port}) do
+    if reason != :normal do
+      record_failure(db, handle, reason)
+    end
+
     if Port.info(port), do: Port.close(port)
     :ok
   end
 
   def terminate(_reason, _state), do: :ok
+
+  defp record_failure(db, handle, reason) do
+    case Tightbeam.Harklight.listener_failed(db, handle, reason) do
+      :ok ->
+        Logger.warning("Harklight listener for #{handle} stopped: #{inspect(reason)}")
+
+      {:error, failure} ->
+        Logger.error("could not record Harklight listener failure: #{inspect(failure)}")
+    end
+  end
+
+  defp start_listener(db, handle, executable) do
+    port_result =
+      try do
+        {:ok,
+         Port.open({:spawn_executable, executable}, [
+           :binary,
+           :exit_status,
+           :use_stdio,
+           :hide,
+           {:args, ["listen", "--follow", "--session", handle]}
+         ])}
+      rescue
+        error -> {:error, {:listener_start_failed, Exception.message(error)}}
+      end
+
+    case port_result do
+      {:ok, port} ->
+        case Tightbeam.Harklight.listener_started(db, handle) do
+          :ok ->
+            {:ok, %{db: db, handle: handle, port: port, buffer: ""}}
+
+          {:error, reason} ->
+            Port.close(port)
+            failure = {:listener_start_failed, reason}
+            record_failure(db, handle, failure)
+            {:stop, failure}
+        end
+
+      {:error, reason} ->
+        record_failure(db, handle, reason)
+        {:stop, reason}
+    end
+  end
 
   defp split_lines(buffer), do: split_lines(buffer, [])
 
