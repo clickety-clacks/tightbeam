@@ -3678,7 +3678,7 @@ defmodule Tightbeam.GatewayTest do
       Tightbeam.Firehose.Hub.register(hub, self(), %{
         mode: :all,
         db: ctx.db,
-        user_id: "flynn",
+        user_id: "test-user",
         is_admin: true
       })
 

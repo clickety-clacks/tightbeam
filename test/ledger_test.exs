@@ -191,7 +191,7 @@ defmodule Tightbeam.LedgerTest do
     hub = start_supervised!({Hub, name: Hub})
 
     :ok =
-      Hub.register(hub, self(), %{mode: :subscribed, db: db, user_id: "flynn", is_admin: false})
+      Hub.register(hub, self(), %{mode: :subscribed, db: db, user_id: "test-user", is_admin: false})
 
     :ok =
       Hub.subscribe(hub, self(), "turn-lifecycle", %{"classes" => ["turn.queued", "turn.started"]})
@@ -400,7 +400,7 @@ defmodule Tightbeam.LedgerTest do
       Tightbeam.Firehose.Hub.register(hub, self(), %{
         mode: :subscribed,
         db: db,
-        user_id: "flynn",
+        user_id: "test-user",
         is_admin: true
       })
 

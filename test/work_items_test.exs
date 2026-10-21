@@ -1334,7 +1334,7 @@ defmodule Tightbeam.WorkItemsTest do
     # projection, so the row version still advances when last-close writes them.
     before_item = get(ctx, {:user, "flynn"}, item.id).workItem
     _ = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call(assignment.id))
-    after_item = get(ctx, {:user, "flynn"}, item.id).workItem
+    after_item = get(ctx, {:user, "test-user"}, item.id).workItem
     assert Map.drop(after_item, [:rowVersion]) == Map.drop(before_item, [:rowVersion])
     assert after_item.rowVersion > before_item.rowVersion
 

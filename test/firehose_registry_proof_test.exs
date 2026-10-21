@@ -487,7 +487,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
             "sessionKey" => "caller-session",
             "workItemId" => "request-work-item",
             "assignmentId" => "request-assignment",
-            "ownerUserId" => "flynn"
+            "ownerUserId" => "test-user"
           }
           |> Map.drop(row.primary_refs)
           |> then(fn refs ->
@@ -503,7 +503,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
         fixture.primary_refs
         |> Map.merge(fixture.secondary_refs)
         |> Map.merge(Map.take(supplied_refs, ~w(origin principal)))
-        |> Map.merge(if(class == "message.created", do: %{"ownerUserId" => "flynn"}, else: %{}))
+        |> Map.merge(if(class == "message.created", do: %{"ownerUserId" => "test-user"}, else: %{}))
 
       assert notice["refs"] == expected_refs, "unexpected references for #{class}"
 
@@ -628,7 +628,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       Hub.register(ctx.hub, self(), %{
         mode: :all,
         db: ctx.db,
-        user_id: "flynn",
+        user_id: "test-user",
         is_admin: true
       })
 
@@ -984,7 +984,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
                  "('spawn-owner', 0, 1), ('spawn-holder', 0, 1)"
              )
 
-    session!(ctx.db, "spawn-actor", "flynn")
+    session!(ctx.db, "spawn-actor", "test-user")
     session!(ctx.db, "spawn-target", "kay")
     session!(ctx.db, "spawn-work-holder", "spawn-holder")
     work_item!(ctx.db, "wi_spawn-work-item", "spawn-owner")
@@ -993,7 +993,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     spawn_listeners = [
       {:spawn_creator,
        class_listener(ctx, :spawn_creator, "session.spawned", %{
-         user_id: "flynn",
+         user_id: "test-user",
          principal_kind: :session,
          principal_id: "spawn-actor"
        })},
@@ -1050,14 +1050,14 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
     Enum.each(spawn_listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end)
 
-    session!(ctx.db, "role-creator", "flynn")
+    session!(ctx.db, "role-creator", "test-user")
     session!(ctx.db, "role-bound-target", "kay")
 
     role_listeners = [
-      {:role_owner, class_listener(ctx, :role_owner, "role.created", %{user_id: "flynn"})},
+      {:role_owner, class_listener(ctx, :role_owner, "role.created", %{user_id: "test-user"})},
       {:role_creator,
        class_listener(ctx, :role_creator, "role.created", %{
-         user_id: "flynn",
+         user_id: "test-user",
          principal_kind: :session,
          principal_id: "role-creator"
        })},
@@ -1087,7 +1087,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
              Roles.create_with_firehose!(
                ctx.db,
                "project:row-ref-test",
-               "flynn",
+               "test-user",
                "role-bound-target",
                role_call
              )
@@ -1111,12 +1111,12 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     removed_role_name = "project:row-ref-remove-test"
 
     assert %{name: ^removed_role_name} =
-             Roles.create!(ctx.db, removed_role_name, "flynn", "role-bound-target")
+             Roles.create!(ctx.db, removed_role_name, "test-user", "role-bound-target")
 
     remove_listeners = [
       {:role_remover,
        class_listener(ctx, :role_remover, "role.removed", %{
-         user_id: "flynn",
+         user_id: "test-user",
          principal_kind: :session,
          principal_id: "role-creator"
        })},
@@ -1479,7 +1479,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
           %{
             name: "role-row",
             bound_session_key: "bound-session",
-            owner_user_id: "flynn",
+            owner_user_id: "test-user",
             created_at: 10,
             updated_at: 11,
             row_version: 11
@@ -1489,15 +1489,15 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
         ),
       user:
         row_reference_fixture(
-          %{user_id: "flynn", is_admin: false, created_at: 1, row_version: 1},
-          %{"userId" => "flynn"},
+          %{user_id: "test-user", is_admin: false, created_at: 1, row_version: 1},
+          %{"userId" => "test-user"},
           %{}
         ),
       device:
         row_reference_fixture(
           %{
             device_id: "device-row",
-            user_id: "flynn",
+            user_id: "test-user",
             claimed_name: nil,
             status: "allowlisted",
             platform: nil,
@@ -1533,8 +1533,8 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
         ),
       read_marker:
         row_reference_fixture(
-          %{user_id: "flynn", scope_key: "scope-row", marker: "message-row", updated_at: 10},
-          %{"userId" => "flynn", "scopeKey" => "scope-row"},
+          %{user_id: "test-user", scope_key: "scope-row", marker: "message-row", updated_at: 10},
+          %{"userId" => "test-user", "scopeKey" => "scope-row"},
           %{}
         ),
       message:
@@ -1655,7 +1655,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   end
 
   defp session_row_fixture(db) do
-    session!(db, "session-row", "flynn")
+    session!(db, "session-row", "test-user")
     StateResources.query_session(db, "session-row")
   end
 
@@ -1896,7 +1896,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
              )
   end
 
-  defp assignment!(db, id, holder, work_item_id, opened_by_user \\ "flynn") do
+  defp assignment!(db, id, holder, work_item_id, opened_by_user \\ "test-user") do
     assert {:ok, []} =
              DB.query(
                db,

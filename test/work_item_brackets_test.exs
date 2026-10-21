@@ -397,18 +397,18 @@ defmodule Tightbeam.WorkItemBracketsTest do
     start_supervised!({Hub, name: Hub})
 
     :ok =
-      Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "flynn", is_admin: true})
+      Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "test-user", is_admin: true})
 
     :ok =
       Hub.subscribe(Hub, self(), "work-item-brackets", %{
         "classes" => ["work_item.updated", "work_item.closed"]
       })
 
-    item = create(ctx, {:user, "flynn"}, %{title: "Bracket projection"})
+    item = create(ctx, {:user, "test-user"}, %{title: "Bracket projection"})
     work_item_id = item.id
 
     {:ok, assignment} =
-      disp_assign(ctx, {:user, "flynn"}, "holder", "bracket-projection", item.id)
+      disp_assign(ctx, {:user, "test-user"}, "holder", "bracket-projection", item.id)
 
     assert_receive {:firehose_notice,
                     %{
@@ -440,7 +440,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               work_item_call("work-item-close", {:user, "flynn"}, %{work_item_id: item.id})
+               work_item_call("work-item-close", {:user, "test-user"}, %{work_item_id: item.id})
              )
 
     assert_receive {:firehose_notice,
@@ -461,18 +461,18 @@ defmodule Tightbeam.WorkItemBracketsTest do
     start_supervised!({Hub, name: Hub})
 
     :ok =
-      Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "flynn", is_admin: true})
+      Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "test-user", is_admin: true})
 
     :ok = Hub.subscribe(Hub, self(), "retired-assignment", %{"classes" => ["assignment.closed"]})
 
-    item = create(ctx, {:user, "flynn"}, %{title: "Retiring assignment"})
+    item = create(ctx, {:user, "test-user"}, %{title: "Retiring assignment"})
 
     {:ok, assignment} =
-      disp_assign(ctx, {:user, "flynn"}, "holder", "retiring-assignment", item.id)
+      disp_assign(ctx, {:user, "test-user"}, "holder", "retiring-assignment", item.id)
 
     assert {:ok, _} =
              DB.transaction(ctx.db, fn txn ->
-               Assignments.interrupt_for_retire_in_txn(txn, "holder", "flynn", "user:flynn")
+               Assignments.interrupt_for_retire_in_txn(txn, "holder", "test-user", "user:test-user")
              end)
 
     assert_received {:firehose_notice,

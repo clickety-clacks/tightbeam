@@ -196,7 +196,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     db = :firehose_wake_creation_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "test-user", is_admin: true})
 
     wake =
       Wakes.schedule(db, %{
@@ -339,12 +339,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
     {:paired, completion_device} =
       Devices.pair(db, %{
         device_id: "firehose-completion-device",
-        claimed_name: "Flynn",
+        claimed_name: "Test User",
         platform: nil,
         model: nil
       })
 
-    :ok = DB.execute(db, "UPDATE users SET isAdmin=1 WHERE userId='flynn'")
+    :ok = DB.execute(db, "UPDATE users SET isAdmin=1 WHERE userId='test-user'")
     register_testhost(db)
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneStub, name: Tightbeam.LaneManager})
@@ -955,8 +955,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
              "op" => "upsert",
              "refs" => %{
                "workItemId" => "work-one",
-               "origin" => "user:flynn",
-               "principal" => "user:flynn"
+               "origin" => "user:test-user",
+               "principal" => "user:test-user"
              },
              "payload" => payload
            } = receive_notice()
@@ -1545,7 +1545,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     wake =
       Wakes.schedule(db, %{
         session_key: "turn-target",
-        origin: "user:flynn",
+        origin: "user:test-user",
         prompt: "run",
         due_at: System.system_time(:millisecond) + 60_000
       })
@@ -1689,14 +1689,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
     db = :firehose_pending_wake_update_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn',1,1)")
+    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('test-user',1,1)")
     register_testhost(db)
 
     Org.create(db, %{
       session_key: "wake-target",
       display_name: "Wake target",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "test-user",
+      origin: "user:test-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -1705,14 +1705,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
     })
 
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
-    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "test-user", is_admin: true})
     :ok = Hub.subscribe(Hub, self(), "wake-prompt-update", %{"classes" => ["wake.scheduled"]})
 
     wake =
       Wakes.schedule(db, %{
         wake_id: "ephemeral-result:firehose-test",
         session_key: "wake-target",
-        origin: "user:flynn",
+        origin: "user:test-user",
         prompt: "original prompt",
         due_at: System.system_time(:millisecond) + 60_000
       })
@@ -2255,14 +2255,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
     db = :firehose_wake_retarget_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn',1,1)")
+    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('test-user',1,1)")
     register_testhost(db)
 
     Org.create(db, %{
       session_key: "replacement-target",
       display_name: "Replacement target",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "test-user",
+      origin: "user:test-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -2270,12 +2270,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
       model: Tightbeam.Model.new("fable")
     })
 
-    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "test-user", is_admin: true})
 
     source =
       Wakes.schedule(db, %{
         session_key: "previous-target",
-        origin: "user:flynn",
+        origin: "user:test-user",
         prompt: "keep this prompt",
         due_at: System.system_time(:millisecond) + 60_000
       })

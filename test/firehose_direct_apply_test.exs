@@ -232,7 +232,7 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     {:paired, device} =
       Devices.pair(db, %{
         device_id: "firehose-direct-apply-device",
-        claimed_name: "Flynn",
+        claimed_name: "Test User",
         platform: nil,
         model: nil
       })
@@ -258,8 +258,8 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
       Org.create(db, %{
         session_key: "direct-apply-owner",
         display_name: "Direct apply owner",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "test-user",
+        origin: "user:test-user",
         archetype: "default",
         host: "testhost",
         harness: "claude",
@@ -478,8 +478,8 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     item =
       WorkItems.__handle__(ctx.db, "work-item-update", %{
         verb: "work-item-update",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:test-user",
+        principal: {:user, "test-user"},
         session_key: nil,
         firehose_in_txn: true,
         firehose_hub: Hub,
@@ -499,8 +499,8 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     assignment =
       Assignments.__handle__(ctx.db, "assign", %{
         verb: "assign",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:test-user",
+        principal: {:user, "test-user"},
         session_key: ctx.session.session_key,
         target_role: nil,
         role_fallback: false,
@@ -570,7 +570,7 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
              Ledger.enqueue(ctx.db, %{
                session_key: ctx.session.session_key,
                message_id: "direct-apply-server-turn",
-               origin: "user:flynn",
+               origin: "user:test-user",
                prompt: "Server-backed queued turn",
                assignment_id: assignment.id,
                job_ref: item.id
@@ -588,7 +588,7 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     wake =
       Wakes.schedule(ctx.db, %{
         session_key: ctx.session.session_key,
-        origin: "user:flynn",
+        origin: "user:test-user",
         prompt: "Server-backed wake",
         due_at: System.system_time(:millisecond) + 60_000,
         work_item_id: item.id,
