@@ -2708,10 +2708,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
       row = StateResources.query_message(db, message_id)
       assert row
       canonical = StateResources.message(row)
+      owner_session = StateResources.query_session(db, row.session_key)
 
       assert notice["refs"]["messageId"] == message_id
       assert notice["refs"]["sessionKey"] == row.session_key
-      assert notice["refs"]["ownerUserId"] == canonical["ownerUserId"]
+      assert owner_session
+      assert notice["refs"]["ownerUserId"] == StateResources.session(owner_session)["ownerUserId"]
       assert notice["payload"] == canonical
       assert JSON.decode!(Publisher.encode_wire_notice(notice))["payload"] == canonical
 
