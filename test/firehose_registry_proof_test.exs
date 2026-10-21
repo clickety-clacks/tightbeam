@@ -5,7 +5,6 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
   alias Tightbeam.{
     DB,
-    Dispatch,
     Gateway,
     Model,
     Org,
