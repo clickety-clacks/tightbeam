@@ -3,7 +3,6 @@ payload = Path.expand(payload)
 ^payload = Application.app_dir(:tightbeam) |> Path.expand()
 phase = System.fetch_env!("FIREHOSE_RESTART_PHASE")
 true = phase in ["first", "second"]
-direct_apply_matrix = System.get_env("FIREHOSE_DIRECT_APPLY_MATRIX") == "1"
 fresh = phase == "first"
 ^fresh = not File.exists?(base)
 {:ok, _} = Application.ensure_all_started(:exqlite)
@@ -119,12 +118,6 @@ if missing_executable do
   )
 end
 
-if direct_apply_matrix do
-  # Keep queued-turn projections stable while the server/client convergence
-  # case observes the queued row before any session lane starts it.
-  :persistent_term.put({Tightbeam.Application, :draining}, true)
-end
-
 {:ok, _apps} = Application.ensure_all_started(:tightbeam)
 
 {_id, bandit, _type, _modules} =
@@ -198,20 +191,6 @@ try do
         claimed_name: "Synthetic reopen"
       )
 
-    _owner_main =
-      Tightbeam.Org.create(DB, %{
-        session_key: Tightbeam.Org.personal_session_key(device.user_id),
-        display_name: "Main",
-        kind: "main",
-        owner_user_id: device.user_id,
-        origin: "user:#{device.user_id}",
-        archetype: "default",
-        harness: "fixture",
-        provider: "fixture_provider",
-        model: Model.new("fixture-model"),
-        host: "testhost"
-      })
-
     holder =
       Tightbeam.Org.create(DB, %{
         session_key: "reopen-fixture-holder",
@@ -254,19 +233,6 @@ try do
   wait = fn recur ->
     unless File.regular?(Path.join(base, phase <> "-stop")) do
       assert System.monotonic_time(:millisecond) < deadline, "controller stop deadline"
-
-      if direct_apply_matrix do
-        request = Path.join(base, phase <> "-matrix-request.json")
-        response = Path.join(base, phase <> "-matrix-response.json")
-
-        if File.regular?(request) and not File.exists?(response) do
-          action = request |> File.read!() |> JSON.decode!()
-          result = Tightbeam.FirehoseDirectApplyMatrix.execute(base, action)
-          File.rm!(request)
-          File.write!(response <> ".tmp", JSON.encode!(result))
-          File.rename!(response <> ".tmp", response)
-        end
-      end
 
       if System.get_env("FIREHOSE_REOPEN_PROOF") == "1" do
         request = Path.join(base, phase <> "-generations-request.json")

@@ -147,17 +147,10 @@ defmodule Tightbeam.Ephemeral do
   defp terminal_summary(_), do: "Helper turn failed."
 
   def final_message_in_txn(txn, key, text) when is_binary(text) do
-    Txn.q(
-      txn,
-      "UPDATE wakes SET prompt=?2 WHERE wakeId=?1 AND state='pending' AND prompt IS NOT ?2",
-      [
-        "ephemeral-result:" <> key,
-        "Ephemeral spawn result from #{key}:\n\n" <> text
-      ]
-    )
-
-    if Txn.changes(txn) == 1,
-      do: Tightbeam.Wakes.publish_change_in_txn(txn, "wake.scheduled", "ephemeral-result:" <> key)
+    Txn.q(txn, "UPDATE wakes SET prompt=?2 WHERE wakeId=?1 AND state='pending'", [
+      "ephemeral-result:" <> key,
+      "Ephemeral spawn result from #{key}:\n\n" <> text
+    ])
 
     :ok
   end

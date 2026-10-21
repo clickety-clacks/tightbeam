@@ -18,11 +18,8 @@ defmodule Tightbeam.FirehoseReadDependencyTest do
   test "B2 canonical priority preserves numeric boundaries and rejects malformed values", %{
     db: db
   } do
-    alias Tightbeam.{Org, Schema, StateResources, WorkItems}
+    alias Tightbeam.{Schema, StateResources, WorkItems}
     :ok = Schema.ensure_all(db)
-
-    {:ok, _} =
-      DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('synthetic-owner',1,1)")
 
     work =
       WorkItems.__handle__(db, "work-item-create", %{
@@ -31,60 +28,13 @@ defmodule Tightbeam.FirehoseReadDependencyTest do
       })
 
     principal = %{rest_principal: %{kind: "user", id: "synthetic-owner", is_admin: false}}
-
-    delivery_owner =
-      Org.create(db, %{
-        session_key: "projection-delivery-owner",
-        display_name: "Projection delivery owner",
-        kind: "custom",
-        owner_user_id: "synthetic-owner",
-        origin: "user:synthetic-owner",
-        archetype: "default",
-        host: "testhost",
-        harness: "codex",
-        provider: "openai",
-        model: Tightbeam.Model.new("test")
-      })
-
-    assert %{bodyUpdate: %{changed: true}} =
-             WorkItems.__handle__(db, "work-item-update", %{
-               principal: {:user, "synthetic-owner"},
-               params: %{work_item_id: work.id, body: "Projected work-item body"}
-             })
-
-    assert %{deliveryOwnerSessionKey: owner_key} =
-             WorkItems.__handle__(db, "work-item-update", %{
-               principal: {:user, "synthetic-owner"},
-               params: %{
-                 work_item_id: work.id,
-                 delivery_owner_session_key: delivery_owner.session_key
-               }
-             })
-
-    assert owner_key == delivery_owner.session_key
     row = db |> StateResources.query_work_item(work.id, principal) |> StateResources.work_item()
-
-    assert row["body"] == "Projected work-item body"
-    assert row["bodyUpdatedByUser"] == "synthetic-owner"
-    assert is_integer(row["bodyUpdatedAt"])
-    assert row["deliveryOwnerSessionKey"] == delivery_owner.session_key
-
-    page = StateResources.query_work_item_page(db, %{}, principal, :latest, 10)
-    assert Enum.any?(page.rows, &(&1.id == work.id and &1.body == "Projected work-item body"))
-
-    assert Enum.any?(
-             page.rows,
-             &(&1.id == work.id and &1.delivery_owner_session_key == owner_key)
-           )
-
-    item_bytes = StateResources.encode_item("work items", row, %{})
-    assert JSON.decode!(item_bytes) == row
 
     for priority <- [0, 4, 8] do
       item = Map.put(row, "priority", priority)
       bytes = StateResources.encode_item("work items", item, %{})
       assert JSON.decode!(bytes) == item
-      assert JSON.decode!(bytes)["priority"] == priority
+      assert bytes =~ "\"priority\":#{priority},\"rowVersion\":"
     end
 
     for priority <- [nil, "4", 4.5, -1, 9] do
