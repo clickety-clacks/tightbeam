@@ -489,6 +489,9 @@ defmodule Tightbeam.Harness.Claude do
   end
 
   @impl true
+  def classify_auth_event(%{"authStatus" => %{"kind" => "none"}}), do: :unconfirmed
+  def classify_auth_event(%{"authStatus" => %{"status" => "none"}}), do: :unconfirmed
+  def classify_auth_event(%{"authStatus" => "none"}), do: :unconfirmed
   def classify_auth_event(_event), do: :unknown
 
   @impl true

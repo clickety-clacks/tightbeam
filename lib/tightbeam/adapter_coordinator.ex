@@ -155,6 +155,13 @@ defmodule Tightbeam.AdapterCoordinator do
     :exit, reason -> {:error, {:coordinator_unavailable, reason}}
   end
 
+  @doc "Stop an idle adapter for a Claude auth currentness fence without parking it."
+  def stop_for_auth_fence(server \\ __MODULE__, key, attempt_id) do
+    GenServer.call(server, {:stop_for_auth_fence, key, attempt_id}, 5_000)
+  catch
+    :exit, reason -> {:error, {:coordinator_unavailable, reason}}
+  end
+
   @doc """
   Request planned teardown without synchronously entering the coordinator.
 
@@ -288,10 +295,18 @@ defmodule Tightbeam.AdapterCoordinator do
     {:reply, result, state}
   end
 
+  def handle_call({:stop_for_auth_fence, key, attempt_id}, _from, state) do
+    {result, state} = do_auth_fence_stop(key, attempt_id, state)
+    {:reply, result, state}
+  end
+
   defp adapter_for_reply(key, context, state, authoritative? \\ false) do
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
+      auth_fenced?(state, key) ->
+        {:reply, {:error, {:auth_fenced, key_name(key)}}, state}
+
       live_entry?(entry) and authoritative? and entry.context != normalize_context(context) ->
         case do_close_adapter(key, state) do
           {:ok, state} ->
@@ -400,6 +415,39 @@ defmodule Tightbeam.AdapterCoordinator do
     {result, state}
   end
 
+  defp do_auth_fence_stop(key, attempt_id, state) do
+    state = cancel_pending_starts(key, state, {:auth_fenced, key_name(key)})
+
+    Tightbeam.EventLog.lifecycle(
+      state.db,
+      "claude_auth_fence_stop",
+      key_name(key),
+      "attempt=#{attempt_id} diagnostic=true"
+    )
+
+    case state.adapters[key] do
+      %{pid: pid, monitor: monitor} when is_pid(pid) and is_reference(monitor) ->
+        Tightbeam.Acp.Adapter.request_close(pid)
+
+        case await_adapter_exit(monitor, pid, state.park_grace_ms) do
+          {:exited, _reason} ->
+            _ = Tightbeam.HarnessProcess.reconcile_key(state.db, key)
+            {:ok, retire_adapter(key, state)}
+
+          :grace_expired ->
+            {{:error, :adapter_stop_timeout}, state}
+        end
+
+      _ ->
+        {:ok, state}
+    end
+  end
+
+  defp auth_fenced?(state, {harness, _preset, host}) do
+    harness == Tightbeam.Harness.Claude.id() and
+      Tightbeam.ClaudeAuth.admission(state.db, host) in [:held, :terminal]
+  end
+
   # The REASON comes back, not just the fact of an exit. "Closed as asked" and
   # "was killed while we asked" are different deaths wearing the same boolean,
   # and only the reason tells them apart.
@@ -411,12 +459,14 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  defp cancel_pending_starts(key, state) do
+  defp cancel_pending_starts(key, state, error \\ nil) do
+    error = error || {:parked, key_name(key)}
+
     requests =
       Enum.reduce(state.context_requests, state.context_requests, fn
         {request_ref, %{key: ^key, monitor: monitor, purpose: {:checkout, from}}}, requests ->
           Process.demonitor(monitor, [:flush])
-          GenServer.reply(from, {:error, {:parked, key_name(key)}})
+          GenServer.reply(from, {:error, error})
           Map.delete(requests, request_ref)
 
         {request_ref, %{key: ^key, monitor: monitor}}, requests ->

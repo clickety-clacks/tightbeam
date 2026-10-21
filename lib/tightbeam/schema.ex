@@ -38,6 +38,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.HarnessProcess,
     Tightbeam.AdminProjection,
     Tightbeam.HarnessHealth,
+    Tightbeam.ClaudeAuth,
     Tightbeam.Toplines,
     Tightbeam.Premises
   ]

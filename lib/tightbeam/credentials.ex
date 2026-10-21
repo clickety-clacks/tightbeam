@@ -26,7 +26,7 @@ defmodule Tightbeam.Credentials do
 
   use GenServer
 
-  alias Tightbeam.{CommandEdge, Harness, Homes, Rails}
+  alias Tightbeam.{ClaudeAuth, CommandEdge, Harness, HarnessHealth, Homes, Rails}
   alias Tightbeam.CommandEdge.CredentialPark
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
@@ -135,6 +135,15 @@ defmodule Tightbeam.Credentials do
   @spec mark_terminal(provider(), term(), GenServer.server()) :: :ok | {:error, term()}
   def mark_terminal(provider, evidence, server \\ __MODULE__),
     do: GenServer.call(server, {:mark_terminal, provider, evidence}, :infinity)
+
+  @doc "Retain non-authoritative Claude subscription auth evidence and confirm it."
+  def observe_auth(source, evidence, server \\ __MODULE__)
+      when source in [:local_none, :unfenced_401],
+      do: GenServer.call(server, {:observe_auth, source, evidence}, :infinity)
+
+  @doc false
+  def observe_success(instance, server),
+    do: GenServer.call(server, {:observe_success, instance})
 
   @doc "Classify only pinned terminal evidence. Unknown is always non-terminal."
   @spec terminal_evidence?(provider(), term()) :: boolean()
@@ -288,10 +297,29 @@ defmodule Tightbeam.Credentials do
   @impl true
   def init(opts) do
     machine = Keyword.fetch!(opts, :machine)
+    db = Keyword.get(opts, :db)
+    if db, do: :ok = ClaudeAuth.ensure_schema(db)
+
+    interrupted = if db, do: ClaudeAuth.interrupted_attempts(db, machine), else: []
+    recoveries = if db, do: ClaudeAuth.pending_decisions(db, machine), else: []
+
+    recovered_attempts =
+      Enum.map(interrupted, fn attempt_id ->
+        %{
+          attempt_id: attempt_id,
+          instance_id: ClaudeAuth.ensure_instance(db, machine),
+          deadline_at: System.system_time(:millisecond) + 10_000
+        }
+      end)
+
+    Enum.each(recovered_attempts, &send(self(), {:run_confirmation, &1}))
+
+    Enum.each(recoveries, &send(self(), {:recover_terminal, &1.id}))
 
     {:ok,
      %{
        base_dir: Keyword.fetch!(opts, :base_dir),
+       db: db,
        staging_base_dir: Keyword.get(opts, :staging_base_dir, Keyword.fetch!(opts, :base_dir)),
        log_event: Keyword.get(opts, :log_event, fn _kind, _subject, _detail -> :ok end),
        machine: machine,
@@ -323,8 +351,48 @@ defmodule Tightbeam.Credentials do
          Keyword.get(opts, :publish_sessions, fn _payload, _transition -> :ok end),
        onboarding_lease_ms: Keyword.get(opts, :onboarding_lease_ms, 1_800_000),
        present_but_unverified: %{},
-       pending: %{}
+       pending: %{},
+       acquire_confirmation_fence:
+         Keyword.get(opts, :acquire_confirmation_fence, fn _provider, _attempt_id, _timeout ->
+           {:error, :confirmation_fence_unavailable}
+         end),
+       confirm_subscription:
+         Keyword.get(opts, :confirm_subscription, fn _provider, _epoch, _context, _timeout ->
+           {:unknown, :confirmation_unavailable}
+         end),
+       confirmation_fence_live:
+         Keyword.get(opts, :confirmation_fence_live, fn _provider -> false end),
+       confirmation_tasks: Map.new(recovered_attempts, &{&1.attempt_id, &1.instance_id})
      }}
+  end
+
+  def handle_call({:observe_auth, source, _evidence}, _from, state) do
+    if state.db && credential_kind(state, :anthropic) == :subscription do
+      source = if source == :local_none, do: "local-none", else: "unfenced-401"
+      attempt = ClaudeAuth.trigger(state.db, state.machine, source)
+      write_auth_health(state, "unconfirmed", attempt.attempt_id)
+
+      state =
+        if attempt.started? do
+          send(self(), {:run_confirmation, attempt})
+          put_in(state.confirmation_tasks[attempt.attempt_id], attempt.instance_id)
+        else
+          state
+        end
+
+      {:reply, :ok, state}
+    else
+      {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:observe_success, instance}, _from, state) do
+    case ClaudeAuth.admission(state.db, state.machine) do
+      {:eligible, ^instance} -> write_auth_health(state, "service_observed", nil)
+      _other -> :ok
+    end
+
+    {:reply, :ok, state}
   end
 
   @impl true
@@ -396,6 +464,10 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  def handle_call({:onboard, :anthropic} = request, from, state)
+      when map_size(state.confirmation_tasks) > 0,
+      do: defer_credential_call(:anthropic, request, from, state)
+
   def handle_call({:onboard, provider} = request, from, %{park_pending: pending} = state)
       when is_map_key(pending, provider) do
     defer_credential_call(provider, request, from, state)
@@ -404,6 +476,10 @@ defmodule Tightbeam.Credentials do
   def handle_call({:onboard, provider}, _from, state) do
     perform_onboard(provider, state)
   end
+
+  def handle_call({:begin_onboard, :anthropic} = request, from, state)
+      when map_size(state.confirmation_tasks) > 0,
+      do: defer_credential_call(:anthropic, request, from, state)
 
   def handle_call(
         {:begin_onboard, provider} = request,
@@ -438,6 +514,10 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  def handle_call({:finish_onboard, :anthropic, _kind, _lease} = request, from, state)
+      when map_size(state.confirmation_tasks) > 0,
+      do: defer_credential_call(:anthropic, request, from, state)
+
   def handle_call(
         {:finish_onboard, provider, _kind, _lease_id} = request,
         from,
@@ -462,6 +542,10 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  def handle_call({:cancel_onboard, :anthropic, _lease, _reason} = request, from, state)
+      when map_size(state.confirmation_tasks) > 0,
+      do: defer_credential_call(:anthropic, request, from, state)
+
   def handle_call(
         {:cancel_onboard, provider, _lease_id, _reason} = request,
         from,
@@ -484,6 +568,55 @@ defmodule Tightbeam.Credentials do
   end
 
   @impl true
+  def handle_info({:run_confirmation, attempt}, state) do
+    owner = self()
+
+    {:ok, _pid} =
+      Task.start(fn ->
+        result = run_confirmation(state, attempt)
+        send(owner, {:confirmation_finished, attempt, result})
+      end)
+
+    {:noreply, state}
+  end
+
+  def handle_info({:confirmation_finished, attempt, {:terminal, epoch}}, state) do
+    state = update_in(state.confirmation_tasks, &Map.delete(&1, attempt.attempt_id))
+    fence_live = state.confirmation_fence_live.(:anthropic)
+
+    case ClaudeAuth.accept_terminal(
+           state.db,
+           attempt.attempt_id,
+           attempt.instance_id,
+           epoch,
+           fence_live
+         ) do
+      decision when is_binary(decision) ->
+        begin_confirmed_terminal(state, decision)
+
+      _stale ->
+        ClaudeAuth.finish(state.db, attempt.attempt_id, :stale, "lost-live-fence")
+        {:noreply, resume_credential_calls(:anthropic, state)}
+    end
+  end
+
+  def handle_info({:confirmation_finished, attempt, result}, state) do
+    state = update_in(state.confirmation_tasks, &Map.delete(&1, attempt.attempt_id))
+
+    case result do
+      :success -> write_auth_health(state, "service_observed", nil)
+      :unknown -> write_auth_health(state, "unconfirmed", nil)
+      _other -> :ok
+    end
+
+    {:noreply, resume_credential_calls(:anthropic, state)}
+  end
+
+  def handle_info({:recover_terminal, decision}, state) do
+    begin_confirmed_terminal(state, decision)
+  end
+
+  @impl true
   def handle_info(message, state) when map_size(state.park_pending) > 0 do
     case CommandEdge.check_response(message, state.park_requests) do
       {:answered, provider, result, park_requests} ->
@@ -502,6 +635,8 @@ defmodule Tightbeam.Credentials do
         {:noreply, state}
     end
   end
+
+  def handle_info(_message, state), do: {:noreply, state}
 
   defp perform_onboard(_provider, %{ssh: destination} = state) when is_binary(destination) do
     {:reply, {:error, :interactive_onboarding_required_on_machine}, state}
@@ -558,6 +693,7 @@ defmodule Tightbeam.Credentials do
         case read_metadata(state, provider) do
           {:ok, metadata} ->
             write_metadata!(state, provider, Map.put(metadata, "park_pending", false))
+            if pending[:decision_id], do: ClaudeAuth.complete_park(state.db, pending.decision_id)
             publish_sessions(state, pending.captured, :terminal)
             :ok
 
@@ -1001,6 +1137,155 @@ defmodule Tightbeam.Credentials do
       "subscription_status" => Map.get(credential, :subscription_status),
       "expires_at" => Map.get(credential, :expires_at)
     })
+
+    if not is_nil(state.db) and provider == :anthropic and kind == :subscription do
+      ClaudeAuth.activate(state.db, state.machine)
+    end
+
+    :ok
+  end
+
+  defp run_confirmation(state, attempt) do
+    timeout = remaining(attempt.deadline_at, 5_000)
+
+    case bounded(
+           fn ->
+             state.acquire_confirmation_fence.(:anthropic, attempt.attempt_id, timeout)
+           end,
+           timeout
+         ) do
+      :ok ->
+        run_fenced_confirmation(state, attempt, nil)
+
+      {:ok, context} ->
+        run_fenced_confirmation(state, attempt, context)
+
+      {:error, reason} ->
+        ClaudeAuth.finish(state.db, attempt.attempt_id, :unknown, reason)
+        :unknown
+
+      :timeout ->
+        ClaudeAuth.finish(state.db, attempt.attempt_id, :unknown, "fence-timeout")
+        :unknown
+    end
+  end
+
+  defp run_fenced_confirmation(state, attempt, context) do
+    case ClaudeAuth.fence_acquired(state.db, attempt.attempt_id, attempt.instance_id) do
+      {:ok, epoch} ->
+        timeout = remaining(attempt.deadline_at, 5_000)
+
+        case bounded(
+               fn -> state.confirm_subscription.(:anthropic, epoch, context, timeout) end,
+               timeout
+             ) do
+          :accepted ->
+            ClaudeAuth.finish(state.db, attempt.attempt_id, :success, "http-2xx")
+            :success
+
+          :rejected ->
+            {:terminal, epoch}
+
+          {:unknown, reason} ->
+            ClaudeAuth.finish(state.db, attempt.attempt_id, :unknown, reason)
+            :unknown
+
+          other ->
+            ClaudeAuth.finish(state.db, attempt.attempt_id, :unknown, other)
+            :unknown
+        end
+
+      :stale ->
+        ClaudeAuth.finish(state.db, attempt.attempt_id, :stale, "lost-currentness")
+        :stale
+    end
+  end
+
+  defp bounded(fun, timeout) do
+    task = Task.async(fun)
+
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> result
+      nil -> :timeout
+      {:exit, _reason} -> {:error, :operation_failed}
+    end
+  end
+
+  defp remaining(deadline, cap) do
+    deadline
+    |> Kernel.-(System.system_time(:millisecond))
+    |> max(1)
+    |> min(cap)
+  end
+
+  defp begin_confirmed_terminal(state, decision) do
+    HarnessHealth.observe(state.db, %{
+      correlation_id: "provider-auth-decision:#{decision}",
+      harness: "claude",
+      host: state.machine,
+      failure_class: "auth-dead",
+      evidence_kind: "authoritative-provider",
+      session_key: nil,
+      assignment_id: nil,
+      observed_at: System.system_time(:millisecond),
+      cause: "fenced subscription rejection",
+      principal: "process:tightbeam/provider:anthropic"
+    })
+
+    ClaudeAuth.advance_decision(state.db, decision, "metadata")
+    captured = capture_sessions(state, :anthropic)
+    {:ok, metadata} = read_metadata(state, :anthropic)
+
+    write_metadata!(
+      state,
+      :anthropic,
+      Map.merge(metadata, %{
+        "terminal" => true,
+        "last_health" => "revoked",
+        "park_pending" => true,
+        "terminal_decision" => decision
+      })
+    )
+
+    ClaudeAuth.advance_decision(state.db, decision, "park_ownership")
+    :ok = ClaudeAuth.own_park(state.db, decision)
+
+    command = %CredentialPark{
+      provider: :anthropic,
+      machine: state.machine,
+      adapter_keys: Map.fetch!(state.park_targets, :anthropic),
+      observed_at: System.system_time(:millisecond),
+      decision_id: decision
+    }
+
+    {:pending, requests} =
+      CommandEdge.request(state.park_edge, command, :anthropic, state.park_requests)
+
+    pending = %{waiters: [], captured: captured, decision_id: decision}
+
+    {:noreply,
+     %{
+       state
+       | park_requests: requests,
+         park_pending: Map.put(state.park_pending, :anthropic, pending)
+     }}
+  rescue
+    error ->
+      ClaudeAuth.fail_decision(state.db, decision, Exception.message(error))
+      {:noreply, state}
+  end
+
+  defp write_auth_health(state, health, attempt) do
+    with {:ok, metadata} <- read_metadata(state, :anthropic) do
+      write_metadata!(
+        state,
+        :anthropic,
+        metadata
+        |> Map.put("last_health", health)
+        |> Map.put("auth_unconfirmed", health == "unconfirmed")
+        |> Map.put("confirmation_attempt", attempt)
+      )
+    end
 
     :ok
   end

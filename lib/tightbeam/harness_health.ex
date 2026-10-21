@@ -336,29 +336,55 @@ defmodule Tightbeam.HarnessHealth do
       nil ->
         nil
 
-      failure_class ->
-        assignment_id =
-          case Txn.q(txn, "SELECT assignmentId FROM turns WHERE seq=?1", [turn.seq]) do
-            [[assignment_id]] -> assignment_id
-            [] -> nil
+      "auth-dead" ->
+        claude = Tightbeam.Harness.Claude.id()
+
+        if session.harness in [Atom.to_string(claude), claude] and
+             claude_subscription_owner?(session.host) do
+          fn ->
+            Tightbeam.Credentials.observe_auth(
+              :unfenced_401,
+              %{stage: failed_stage, classification: "unfenced-401"},
+              Tightbeam.Credentials.server(session.host)
+            )
           end
+        else
+          observe_turn_failure_class(txn, session, turn, failed_stage, reason, "auth-dead")
+        end
 
-        result =
-          observe_in_txn(txn, %{
-            correlation_id: "harness-turn:#{turn.seq}:#{failure_class}",
-            harness: to_string(session.harness),
-            host: session.host,
-            failure_class: failure_class,
-            evidence_kind: "terminal-failure",
-            session_key: turn.session_key,
-            assignment_id: assignment_id,
-            observed_at: System.system_time(:millisecond),
-            cause: "stage=#{failed_stage} reason=#{evidence_text(reason)}",
-            principal: turn.origin || "process:tightbeam"
-          })
-
-        post_commit(result)
+      failure_class ->
+        observe_turn_failure_class(txn, session, turn, failed_stage, reason, failure_class)
     end
+  end
+
+  defp claude_subscription_owner?(host) do
+    Tightbeam.Credentials.kind(:anthropic, Tightbeam.Credentials.server(host)) == :subscription
+  catch
+    :exit, _reason -> false
+  end
+
+  defp observe_turn_failure_class(txn, session, turn, failed_stage, reason, failure_class) do
+    assignment_id =
+      case Txn.q(txn, "SELECT assignmentId FROM turns WHERE seq=?1", [turn.seq]) do
+        [[assignment_id]] -> assignment_id
+        [] -> nil
+      end
+
+    result =
+      observe_in_txn(txn, %{
+        correlation_id: "harness-turn:#{turn.seq}:#{failure_class}",
+        harness: to_string(session.harness),
+        host: session.host,
+        failure_class: failure_class,
+        evidence_kind: "terminal-failure",
+        session_key: turn.session_key,
+        assignment_id: assignment_id,
+        observed_at: System.system_time(:millisecond),
+        cause: "stage=#{failed_stage} reason=#{evidence_text(reason)}",
+        principal: turn.origin || "process:tightbeam"
+      })
+
+    post_commit(result)
   end
 
   @doc "Record a terminal class whose owner is the lane or boot reconciler."
