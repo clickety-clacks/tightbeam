@@ -1010,6 +1010,17 @@ defmodule Tightbeam.Org do
       WHERE w.state='pending' AND (w.consumer='prompt' OR w.targetGate=1)
         AND w.consumer NOT IN ('assignment_inactivity_deadline','assignment_inactivity_climb')
         AND ((w.targetRole IS NULL AND w.sessionKey=?1) OR r.boundSessionKey=?1)
+        -- Captured Harklight entries remain held for their exact recipient.
+        AND NOT EXISTS (
+          SELECT 1 FROM harklight_entries he WHERE he.wakeId=w.wakeId
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM notice_batches nb
+          JOIN notice_batch_members nm ON nm.batchId=nb.batchId
+          JOIN harklight_entries he ON he.wakeId=nm.sourceWakeId
+          WHERE nb.deliveryWakeId=w.wakeId
+        )
       ORDER BY w.createdAt,w.wakeId
       """,
       [session_key]

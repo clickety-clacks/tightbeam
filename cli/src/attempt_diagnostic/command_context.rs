@@ -55,6 +55,7 @@ impl CommandContext {
             CommandHelp(_) => ("cli.command_help", Catalog),
             Doctor { .. } => ("cli.doctor", CatalogAndDispatch),
             Wake { .. } => ("cli.wake", DispatchPath),
+            HarklightRegister { .. } => ("cli.harklight_register", DispatchPath),
             Condition { .. } => ("cli.condition", DispatchPath),
             HarnessHealthObserveOther { .. } => ("cli.harness_health_observe_other", DispatchPath),
             HarnessHealthResolveOther { .. } => ("cli.harness_health_resolve_other", DispatchPath),
@@ -416,6 +417,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
 
         ArtifactRecord { .. }
         | ToolCallObserved
+        | HarklightRegister { .. }
         | Tune { .. }
         | EffortRule { .. }
         | Ask { .. }
@@ -519,6 +521,32 @@ mod tests {
         assert!(!debug.contains("PRIVATE_USER"));
         assert!(!debug.contains("PRIVATE_ASSIGNMENT"));
         assert!(!debug.contains("PRIVATE_REASON"));
+    }
+
+    #[test]
+    fn harklight_registration_is_an_unkeyed_dispatch_write_without_retained_ids() {
+        let command = Command::HarklightRegister {
+            identity: Identity::Session,
+            handle: "PRIVATE_HANDLE".into(),
+            sender_id: "PRIVATE_SENDER".into(),
+            message_id: "PRIVATE_MESSAGE".into(),
+        };
+        let context = CommandContext::for_command(&command).unwrap();
+        assert_eq!(
+            context
+                .operation_for_request("POST", "/agent/dispatch")
+                .unwrap()
+                .as_str(),
+            "cli.harklight_register"
+        );
+        assert_eq!(
+            effect(context, "POST", "/agent/dispatch"),
+            EffectContract::WriteWithoutIdempotency
+        );
+        let debug = format!("{context:?}");
+        assert!(!debug.contains("PRIVATE_HANDLE"));
+        assert!(!debug.contains("PRIVATE_SENDER"));
+        assert!(!debug.contains("PRIVATE_MESSAGE"));
     }
 
     #[test]

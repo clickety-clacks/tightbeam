@@ -140,6 +140,33 @@ defmodule Tightbeam.WakesTest do
     %{db: name, scheduler: scheduler}
   end
 
+  test "an explicit retry keeps a pending digest carrier on the ordinary scheduler", %{
+    db: db,
+    scheduler: scheduler
+  } do
+    active_sessions!(db, ["exact-session"])
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "exact-session",
+        origin: "process:tightbeam",
+        prompt: "retain this entry for its registered session",
+        due_at: 0,
+        digest: true
+      })
+
+    start_supervised!(
+      {Wakes,
+       db: db,
+       deliver: fn _wake -> {:retry, :recipient_unavailable} end,
+       tick_ms: 60_000,
+       name: scheduler}
+    )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+  end
+
   test "schedule persists a pending wake and public cancel follows its recorded sender", %{db: db} do
     wake =
       Wakes.schedule(db, %{

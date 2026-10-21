@@ -339,6 +339,9 @@ defmodule Tightbeam.Gateway do
           },
           tick_ms: config.wake_tick_ms,
           name: Tightbeam.WakeScheduler},
+         {Registry, keys: :unique, name: Tightbeam.Harklight.ListenerRegistry},
+         {Tightbeam.Harklight.ListenerSupervisor, name: Tightbeam.Harklight.ListenerSupervisor},
+         {Tightbeam.Harklight.ListenerRecovery, db: db},
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
          {Tightbeam.AdapterCoordinator,
@@ -1334,6 +1337,7 @@ defmodule Tightbeam.Gateway do
       {"topline-placement-list", []} => fn call ->
         Tightbeam.Toplines.__handle__(db, "topline-placement-list", call)
       end,
+      {"harklight-register", []} => fn call -> Tightbeam.Harklight.register(db, call) end,
       {"work-item-list", []} => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
       {"work-item-update", ["work_item.updated"]} => fn call ->
         WorkItems.__handle__(
@@ -1974,6 +1978,7 @@ defmodule Tightbeam.Gateway do
           | :duplicate
           | :conflict
           | :skipped
+          | {:retry, atom()}
   def deliver_prompt(session_key, origin, prompt, opts \\ []) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
 
@@ -2008,6 +2013,7 @@ defmodule Tightbeam.Gateway do
   @spec deliver_prompt_in_txn(DB.Txn.t(), String.t(), String.t(), String.t(), keyword()) ::
           {:appended, String.t(), map(), keyword()}
           | {:staged, map()}
+          | {:harklight_held, list() | :ok | nil}
           | {:duplicate, map()}
           | {:conflict, map()}
           | :skipped
@@ -2075,6 +2081,13 @@ defmodule Tightbeam.Gateway do
   def decorate_delivery_prompt(prompt, _sender), do: prompt
 
   defp deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts) do
+    case Tightbeam.Harklight.prepare_delivery_in_txn(txn, opts[:wake_id], session_key) do
+      {:held, notice} -> {:harklight_held, notice}
+      _ -> do_deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
+    end
+  end
+
+  defp do_deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts) do
     opts = delivery_attachments_in_txn(txn, opts)
     queued_human_post_delivery? = opts[:queued_human_post_delivery] == true
 
@@ -2441,6 +2454,7 @@ defmodule Tightbeam.Gateway do
           | :duplicate
           | :conflict
           | :skipped
+          | {:retry, atom()}
   def complete_delivery(db, {:appended, actual_session_key, message, opts}) do
     registry = Keyword.get(opts, :conn_registry, Tightbeam.ConnRegistry)
     publish_message(db, actual_session_key, message, registry)
@@ -2468,6 +2482,11 @@ defmodule Tightbeam.Gateway do
 
   def complete_delivery(_db, {:staged, _wake}) do
     :queued
+  end
+
+  def complete_delivery(_db, {:harklight_held, notice}) do
+    if is_list(notice), do: EventLog.publish(notice)
+    {:retry, :harklight_recipient_unavailable}
   end
 
   def complete_delivery(_db, :skipped), do: :skipped

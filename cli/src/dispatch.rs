@@ -212,6 +212,21 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "wake", vec![target], params))
         }
+        Command::HarklightRegister {
+            identity,
+            handle,
+            sender_id,
+            message_id,
+        } => Ok(request(
+            identity,
+            "harklight-register",
+            vec![],
+            vec![
+                string_field("sessionHandle", handle),
+                string_field("senderId", sender_id),
+                string_field("messageId", message_id),
+            ],
+        )),
         Command::Condition {
             identity,
             kind,
@@ -3564,6 +3579,7 @@ fn identity_required(cwd: &Path) -> String {
 fn command_identity(command: &Command) -> Option<&Identity> {
     match command {
         Command::Wake { identity, .. }
+        | Command::HarklightRegister { identity, .. }
         | Command::Condition { identity, .. }
         | Command::HarnessHealthObserveOther { identity, .. }
         | Command::HarnessHealthResolveOther { identity, .. }
@@ -4248,6 +4264,22 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn builds_byte_exact_harklight_registration_body_without_a_target() {
+        assert_eq!(
+            body(&[
+                "harklight-register",
+                "--handle",
+                "H1",
+                "--sender-id",
+                "S1",
+                "--message-id",
+                "M1",
+            ]),
+            r#"{"verb":"harklight-register","params":{"sessionHandle":"H1","senderId":"S1","messageId":"M1"}}"#
+        );
     }
 
     #[test]
