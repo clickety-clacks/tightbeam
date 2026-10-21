@@ -2541,7 +2541,9 @@ defmodule Tightbeam.Assignments do
                 disposition_id: id,
                 liveness_trigger: bracket_trigger
               }
-            }, publish_item: true)
+            },
+            publish_item: true
+          )
         end
 
         if key do
@@ -3928,7 +3930,9 @@ defmodule Tightbeam.Assignments do
             disposition_id: assignment_id,
             liveness_trigger: bracket_trigger
           }
-        }, publish_item: true)
+        },
+        publish_item: true
+      )
     end
 
     append_assignment_marker(

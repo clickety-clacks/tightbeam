@@ -592,6 +592,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
                [assignment.id]
              )
 
+    assignment_before_attest =
+      db
+      |> StateResources.query_assignment(assignment.id, %{principal: {:session, "effect-target"}})
+      |> StateResources.assignment()
+
     assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
              Dispatch.dispatch(db, handlers, tests_passed)
 
@@ -609,10 +614,22 @@ defmodule Tightbeam.Firehose.PublisherTest do
       |> Map.put_new("wake.canceled", [])
 
     assert %{"attest.filed" => [_attest_notice]} = published
-    assert map_size(published) == 3
+    assert Enum.sort(Map.keys(published)) ==
+             ~w(assignment.opened attest.filed message.created wake.canceled wake.scheduled)
 
     assert opener_notice["payload"]["content"] ==
              "[verdict filed: tests-passed on #{assignment.id}: effect matrix tests passed]"
+
+    assert [assignment_notice] =
+             Enum.filter(verdict_notices, &(&1["class"] == "assignment.opened"))
+
+    assignment_after_attest =
+      db
+      |> StateResources.query_assignment(assignment.id, %{principal: {:session, "effect-target"}})
+      |> StateResources.assignment()
+
+    assert assignment_notice["payload"] == assignment_after_attest
+    assert assignment_after_attest["rowVersion"] > assignment_before_attest["rowVersion"]
 
     chain =
       Stream.unfold(initial_deadline, fn wake_id ->
@@ -1417,10 +1434,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
       notice_wake = pending_decision_notice!(db, request.id)
       assert {:ok, %{status: ^status}} = Dispatch.dispatch(db, handlers, response)
-      response_notices = Enum.map(1..3, fn _ -> receive_notice() end)
+      response_notices = Enum.map(1..4, fn _ -> receive_notice() end)
 
       assert Enum.sort(Enum.map(response_notices, & &1["class"])) ==
-               Enum.sort(["verb.accepted", "wake.scheduled", class])
+               Enum.sort(["verb.accepted", "wake.canceled", "wake.scheduled", class])
 
       assert_decision_notice_cleared!(db, request.id, notice_wake)
       notice = Enum.find(response_notices, &(&1["class"] == class))
