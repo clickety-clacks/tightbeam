@@ -163,7 +163,7 @@ defmodule Tightbeam.Harklight.Listener do
            :exit_status,
            :use_stdio,
            :hide,
-           {:args, ["listen", "--follow", "--session", handle]}
+           {:args, ["listen", "--follow", "--session", handle, "--controller"]}
          ])}
       rescue
         error -> {:error, {:listener_start_failed, Exception.message(error)}}

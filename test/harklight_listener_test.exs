@@ -31,6 +31,7 @@ defmodule Tightbeam.HarklightListenerTest do
   test "repeated failures for one handle leave other listeners running and record the failed handle",
        ctx do
     original_path = System.get_env("PATH")
+    original_capture_dir = System.get_env("HARKLIGHT_LISTEN_CAPTURE_DIR")
 
     directory =
       Path.join(System.tmp_dir!(), "harklight-listener-#{System.unique_integer([:positive])}")
@@ -42,6 +43,7 @@ defmodule Tightbeam.HarklightListenerTest do
       executable,
       """
       #!/bin/sh
+      printf '%s\\n' "$@" > "$HARKLIGHT_LISTEN_CAPTURE_DIR/$4.txt"
       if [ "$4" = "failing-handle" ]; then
         sleep 0.05
         exit 17
@@ -52,9 +54,17 @@ defmodule Tightbeam.HarklightListenerTest do
 
     File.chmod!(executable, 0o755)
     System.put_env("PATH", Enum.join([directory, original_path], ":"))
+    System.put_env("HARKLIGHT_LISTEN_CAPTURE_DIR", directory)
 
     on_exit(fn ->
       if original_path, do: System.put_env("PATH", original_path), else: System.delete_env("PATH")
+
+      if original_capture_dir do
+        System.put_env("HARKLIGHT_LISTEN_CAPTURE_DIR", original_capture_dir)
+      else
+        System.delete_env("HARKLIGHT_LISTEN_CAPTURE_DIR")
+      end
+
       File.rm_rf(directory)
     end)
 
@@ -67,6 +77,9 @@ defmodule Tightbeam.HarklightListenerTest do
         "healthy-handle",
         Tightbeam.Harklight.ListenerSupervisor
       )
+
+    assert read_file_when_available(Path.join(directory, "healthy-handle.txt")) ==
+             "listen\n--follow\n--session\nhealthy-handle\n--controller\n"
 
     for _attempt <- 1..4 do
       {:ok, failed_pid} =
@@ -115,6 +128,24 @@ defmodule Tightbeam.HarklightListenerTest do
     reference = Process.monitor(pid)
     assert_receive {:DOWN, ^reference, :process, ^pid, _reason}, 2_000
   end
+
+  defp read_file_when_available(path, attempts \\ 100)
+
+  defp read_file_when_available(path, attempts) when attempts > 0 do
+    case File.read(path) do
+      {:ok, contents} ->
+        contents
+
+      {:error, :enoent} ->
+        Process.sleep(10)
+        read_file_when_available(path, attempts - 1)
+
+      {:error, reason} ->
+        flunk("could not read captured Harklight CLI arguments: #{inspect(reason)}")
+    end
+  end
+
+  defp read_file_when_available(_path, 0), do: flunk("Harklight CLI arguments were not captured")
 
   defp create_session(db, session_key, display_name) do
     Org.create(db, %{
