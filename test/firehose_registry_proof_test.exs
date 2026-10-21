@@ -678,6 +678,86 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
     assert rest_page.rows == []
 
+    holder_rest_page =
+      StateResources.query_attests(ctx.db, %{
+        collection: %{
+          filters: %{},
+          principal: %{kind: "session", id: "holder-row"},
+          boundary: :latest,
+          limit: 20
+        }
+      })
+
+    assert Enum.any?(holder_rest_page.rows, &(&1.id == "attest-row"))
+
+    owner_rest_page =
+      StateResources.query_attests(ctx.db, %{
+        collection: %{
+          filters: %{},
+          principal: %{kind: "user", id: "flynn", is_admin: false},
+          boundary: :latest,
+          limit: 20
+        }
+      })
+
+    assert Enum.any?(owner_rest_page.rows, &(&1.id == "attest-row"))
+
+    :ok =
+      Hub.register(ctx.hub, self(), %{
+        mode: :all,
+        db: ctx.db,
+        user_id: "flynn",
+        principal_kind: :session,
+        principal_id: "holder-row",
+        is_admin: false
+      })
+
+    Hub.publish(ctx.hub, attest_notice)
+    assert %{"class" => "attest.filed"} = take_notice(ctx.hub)
+    Hub.publish(ctx.hub, decision_notice)
+    assert %{"class" => "decision_request.opened"} = take_notice(ctx.hub)
+
+    :ok =
+      Hub.register(ctx.hub, self(), %{
+        mode: :all,
+        db: ctx.db,
+        user_id: "flynn",
+        is_admin: false
+      })
+
+    Hub.publish(ctx.hub, attest_notice)
+    assert %{"class" => "attest.filed"} = take_notice(ctx.hub)
+    Hub.publish(ctx.hub, decision_notice)
+    assert %{"class" => "decision_request.opened"} = take_notice(ctx.hub)
+
+    :ok =
+      Hub.register(ctx.hub, self(), %{
+        mode: :filtered,
+        db: ctx.db,
+        user_id: "flynn",
+        is_admin: false
+      })
+
+    :ok =
+      Hub.subscribe(ctx.hub, self(), "parent-attest", %{
+        "classes" => ["attest.filed"],
+        "workItemId" => "work-parent-row"
+      })
+
+    assert Hub.matches?(attest_notice, %{
+             "classes" => ["attest.filed"],
+             "workItemId" => "work-parent-row"
+           })
+
+    Hub.publish(ctx.hub, attest_notice)
+
+    assert %{
+             "class" => "attest.filed",
+             "subscriptionId" => "parent-attest"
+           } = take_notice(ctx.hub)
+
+    :ok = Hub.unsubscribe(ctx.hub, self(), "parent-attest")
+
     :ok =
       Hub.register(ctx.hub, self(), %{
         mode: :all,
@@ -694,6 +774,30 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
     assert Hub.matches?(decision_notice, %{"workItemId" => "work-parent-row"})
     Hub.publish(ctx.hub, decision_notice)
+    assert_quiet(ctx.hub)
+
+    :ok =
+      Hub.register(ctx.hub, self(), %{
+        mode: :filtered,
+        db: ctx.db,
+        user_id: "kay",
+        principal_kind: :session,
+        principal_id: "sibling-holder",
+        is_admin: false
+      })
+
+    :ok =
+      Hub.subscribe(ctx.hub, self(), "sibling-parent-attest", %{
+        "classes" => ["attest.filed"],
+        "workItemId" => "work-parent-row"
+      })
+
+    assert Hub.matches?(attest_notice, %{
+             "classes" => ["attest.filed"],
+             "workItemId" => "work-parent-row"
+           })
+
+    Hub.publish(ctx.hub, attest_notice)
     assert_quiet(ctx.hub)
   end
 
