@@ -548,16 +548,31 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     assert Hub.matches?(notice, %{"classes" => ["assignment."]})
   end
 
-  test "transactional parent references preserve the existing sibling recipient set", ctx do
-    session!(ctx.db, "holder-row", "flynn")
-    session!(ctx.db, "sibling-holder", "kay")
-    work_item!(ctx.db, "work-parent-row", "flynn")
-    assignment!(ctx.db, "assignment-parent-row", "holder-row", "work-parent-row")
+  test "transactional parent refs preserve sibling denial and opener delivery", ctx do
+    assert {:ok, []} =
+             DB.execute(
+               ctx.db,
+               "INSERT INTO users (userId, isAdmin, createdAt) VALUES " <>
+                 "('holder-user', 0, 1), ('opener-user', 0, 1), ('sibling-user', 0, 1)"
+             )
+
+    session!(ctx.db, "holder-row", "holder-user")
+    session!(ctx.db, "sibling-holder", "sibling-user")
+    work_item!(ctx.db, "work-parent-row", "opener-user")
+
+    assignment!(
+      ctx.db,
+      "assignment-parent-row",
+      "holder-row",
+      "work-parent-row",
+      "opener-user"
+    )
+
     assignment!(ctx.db, "sibling-assignment-row", "sibling-holder", "work-parent-row")
 
     sibling_listener =
       class_listener(ctx, :sibling_attest, "attest.filed", %{
-        user_id: "kay",
+        user_id: "sibling-user",
         principal_kind: :session,
         principal_id: "sibling-holder"
       })
@@ -703,23 +718,23 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
     assert Enum.any?(holder_rest_page.rows, &(&1.id == "attest-row"))
 
-    owner_rest_page =
+    opener_rest_page =
       StateResources.query_attests(ctx.db, %{
         collection: %{
           filters: %{},
-          principal: %{kind: "user", id: "flynn", is_admin: false},
+          principal: %{kind: "user", id: "opener-user", is_admin: false},
           boundary: :latest,
           limit: 20
         }
       })
 
-    assert Enum.any?(owner_rest_page.rows, &(&1.id == "attest-row"))
+    assert Enum.any?(opener_rest_page.rows, &(&1.id == "attest-row"))
 
     :ok =
       Hub.register(ctx.hub, self(), %{
         mode: :all,
         db: ctx.db,
-        user_id: "flynn",
+        user_id: "holder-user",
         principal_kind: :session,
         principal_id: "holder-row",
         is_admin: false
@@ -734,7 +749,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       Hub.register(ctx.hub, self(), %{
         mode: :all,
         db: ctx.db,
-        user_id: "flynn",
+        user_id: "opener-user",
         is_admin: false
       })
 
@@ -747,7 +762,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       Hub.register(ctx.hub, self(), %{
         mode: :filtered,
         db: ctx.db,
-        user_id: "flynn",
+        user_id: "opener-user",
         is_admin: false
       })
 
@@ -775,7 +790,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       Hub.register(ctx.hub, self(), %{
         mode: :all,
         db: ctx.db,
-        user_id: "kay",
+        user_id: "sibling-user",
         principal_kind: :session,
         principal_id: "sibling-holder",
         is_admin: false
@@ -793,7 +808,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       Hub.register(ctx.hub, self(), %{
         mode: :filtered,
         db: ctx.db,
-        user_id: "kay",
+        user_id: "sibling-user",
         principal_kind: :session,
         principal_id: "sibling-holder",
         is_admin: false
@@ -1646,16 +1661,16 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
              )
   end
 
-  defp assignment!(db, id, holder, work_item_id) do
+  defp assignment!(db, id, holder, work_item_id, opened_by_user \\ "flynn") do
     assert {:ok, []} =
              DB.query(
                db,
                """
                INSERT INTO assignments
                  (id, subject, holderKey, openedByUser, openedAt, workItemId)
-               VALUES (?1, 'Firehose proof', ?2, 'flynn', 1, ?3)
+               VALUES (?1, 'Firehose proof', ?2, ?3, 1, ?4)
                """,
-               [id, holder, work_item_id]
+               [id, holder, opened_by_user, work_item_id]
              )
   end
 end
