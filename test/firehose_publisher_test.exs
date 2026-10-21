@@ -2711,7 +2711,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
       assert notice["refs"]["messageId"] == message_id
       assert notice["refs"]["sessionKey"] == row.session_key
-      assert notice["refs"]["ownerUserId"] == "flynn"
+      assert notice["refs"]["ownerUserId"] == canonical["ownerUserId"]
       assert notice["payload"] == canonical
       assert JSON.decode!(Publisher.encode_wire_notice(notice))["payload"] == canonical
 
