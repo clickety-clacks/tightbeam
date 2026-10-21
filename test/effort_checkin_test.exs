@@ -1641,8 +1641,35 @@ defmodule Tightbeam.EffortCheckinTest do
     item = dispatch(ctx, {:session, "parent"}, "holder", "broken substrate")
     :ok = DB.execute(ctx.db, "DROP TABLE artifacts")
 
+    # Make the missing-table failure independent of which statements arming
+    # happened to leave in the bounded cache.
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.clear_statement_cache(txn.conn)
+             end)
+
     # Reading a missing table as zero would fire a prod off the breakage.
     assert_raise MatchError, fn -> fire_probe(ctx, item.id) end
+
+    # The failed probe must roll back its generation/wake transition and leave
+    # both holder notifications and owner decisions untouched.
+    assert [["armed", "pending"]] ==
+             rows(
+               ctx.db,
+               """
+               SELECT g.state, w.state
+               FROM effort_checkin_generations AS g
+               JOIN wakes AS w ON w.wakeId = g.wakeId
+               WHERE g.assignmentId = ?1 AND g.generation = 1
+               """,
+               [item.id]
+             )
+
+    assert prods(ctx.db, "holder") == []
+
+    assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId = ?1", [
+             item.id
+           ]) == [[0]]
   end
 
   test "acceptance 2: an agent working only on another machine is never prodded", ctx do
