@@ -547,11 +547,12 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     assert Hub.matches?(notice, %{"classes" => ["assignment."]})
   end
 
-  test "transactional row references use the committed parent assignment", ctx do
+  test "transactional parent references preserve the existing sibling recipient set", ctx do
     session!(ctx.db, "holder-row", "flynn")
-    session!(ctx.db, "filing-session", "flynn")
+    session!(ctx.db, "sibling-holder", "kay")
     work_item!(ctx.db, "work-parent-row", "flynn")
     assignment!(ctx.db, "assignment-parent-row", "holder-row", "work-parent-row")
+    assignment!(ctx.db, "sibling-assignment-row", "sibling-holder", "work-parent-row")
 
     :ok =
       Hub.register(ctx.hub, self(), %{
@@ -567,7 +568,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       kind: "progress",
       verdict_kind: nil,
       note: nil,
-      by_session: "filing-session",
+      by_session: "holder-row",
       by_user: nil,
       producer: nil,
       producer_command: nil,
@@ -599,8 +600,8 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
                  txn,
                  %{
                    verb: "attest",
-                   origin: "agent:writer",
-                   principal: {:session, "filing-session"},
+                   origin: "agent:holder-row",
+                   principal: {:session, "holder-row"},
                    session_key: "caller-session",
                    firehose_hub: ctx.hub,
                    params: %{
@@ -638,17 +639,21 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
     assert %{"class" => "verb.accepted"} = take_notice(ctx.hub)
 
+    attest_notice = take_notice(ctx.hub)
+
     assert %{
              "class" => "attest.filed",
              "refs" => %{
                "attestId" => "attest-row",
-               "sessionKey" => "filing-session",
+               "sessionKey" => "holder-row",
                "workItemId" => "work-parent-row",
                "assignmentId" => "assignment-parent-row",
-               "origin" => "agent:writer",
-               "principal" => "session:filing-session"
+               "origin" => "agent:holder-row",
+               "principal" => "session:holder-row"
              }
-           } = take_notice(ctx.hub)
+           } = attest_notice
+
+    decision_notice = take_notice(ctx.hub)
 
     assert %{
              "class" => "decision_request.opened",
@@ -659,7 +664,37 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
                "workItemId" => "work-parent-row",
                "assignmentId" => "assignment-parent-row"
              }
-           } = take_notice(ctx.hub)
+           } = decision_notice
+
+    rest_page =
+      StateResources.query_attests(ctx.db, %{
+        collection: %{
+          filters: %{},
+          principal: %{kind: "session", id: "sibling-holder"},
+          boundary: nil,
+          limit: 20
+        }
+      })
+
+    assert rest_page.rows == []
+
+    :ok =
+      Hub.register(ctx.hub, self(), %{
+        mode: :all,
+        db: ctx.db,
+        user_id: "kay",
+        principal_kind: :session,
+        principal_id: "sibling-holder",
+        is_admin: false
+      })
+
+    assert Hub.matches?(attest_notice, %{"workItemId" => "work-parent-row"})
+    Hub.publish(ctx.hub, attest_notice)
+    assert_quiet(ctx.hub)
+
+    assert Hub.matches?(decision_notice, %{"workItemId" => "work-parent-row"})
+    Hub.publish(ctx.hub, decision_notice)
+    assert_quiet(ctx.hub)
   end
 
   # Subscription matching runs first and visibility is checked only for a

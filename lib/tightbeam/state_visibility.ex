@@ -537,7 +537,18 @@ defmodule Tightbeam.StateVisibility do
       |> Enum.any?(&(&1 == session_key))
 
     exact_principal? = refs["principal"] == "session:#{session_key}"
-    work_item_id = refs["workItemId"] || payload["workItemId"] || payload["id"]
+
+    # These resources carry a parent workItemId as a filter reference, but that
+    # relationship must not grant every session holding a sibling assignment
+    # visibility of the notice. Keep recipient eligibility tied to the existing
+    # actor and assignment references.
+    work_item_id =
+      if parent_work_item_filter_ref?(notice) do
+        nil
+      else
+        refs["workItemId"] || payload["workItemId"] || payload["id"]
+      end
+
     work_item? = is_binary(work_item_id) and work_item_visible?(db, work_item_id, principal)
 
     assignment_id = refs["assignmentId"] || payload["assignmentId"] || payload["id"]
@@ -547,6 +558,13 @@ defmodule Tightbeam.StateVisibility do
 
     exact_session? or exact_principal? or work_item? or assignment?
   end
+
+  defp parent_work_item_filter_ref?(%{"class" => "attest.filed"}), do: true
+
+  defp parent_work_item_filter_ref?(%{"class" => class}) when class in @decision_request_classes,
+    do: true
+
+  defp parent_work_item_filter_ref?(_notice), do: false
 
   defp session_assignment_visible?(db, assignment_id, session_key) do
     {:ok, rows} =
