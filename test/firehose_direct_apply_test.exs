@@ -191,16 +191,18 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     Ledger,
     Model,
     Org,
+    StateResources,
     Schema,
     Wakes,
     WorkItems
   }
 
-  alias Tightbeam.Firehose.Hub
+  alias Tightbeam.Firehose.{Hub, Publisher}
   alias Tightbeam.Wire.Router
 
   setup do
     db = :"firehose_direct_apply_convergence_#{System.unique_integer([:positive])}"
+
     base =
       Path.join(
         System.tmp_dir!(),
@@ -328,7 +330,13 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
       })
 
     assignment =
-      create_assignment(db, owner_user_id, session.session_key, work_item.id, "Direct apply assignment")
+      create_assignment(
+        db,
+        owner_user_id,
+        session.session_key,
+        work_item.id,
+        "Direct apply assignment"
+      )
 
     page_assignment =
       create_assignment(
@@ -350,7 +358,9 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
 
     _first_attest = create_progress_attest(db, owner_user_id, session.session_key, assignment.id)
     _page_attest = create_progress_attest(db, owner_user_id, session.session_key, assignment.id)
-    other_attest = create_progress_attest(db, "other", other_session.session_key, other_assignment.id)
+
+    other_attest =
+      create_progress_attest(db, "other", other_session.session_key, other_assignment.id)
 
     artifact =
       create_artifact(db, session.session_key, work_item.id, "Direct apply artifact")
@@ -367,7 +377,13 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
       )
 
     {:ok, first_turn} =
-      enqueue_turn(db, session.session_key, "direct-apply-first-turn", work_item.id, assignment.id)
+      enqueue_turn(
+        db,
+        session.session_key,
+        "direct-apply-first-turn",
+        work_item.id,
+        assignment.id
+      )
 
     {:ok, page_turn} =
       enqueue_turn(db, session.session_key, "direct-apply-page-turn", work_item.id, assignment.id)
@@ -381,8 +397,23 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
         other_assignment.id
       )
 
-    first_wake = schedule_wake(db, session.session_key, "Direct apply first wake", work_item.id, assignment.id)
-    page_wake = schedule_wake(db, session.session_key, "Direct apply page wake", work_item.id, assignment.id)
+    first_wake =
+      schedule_wake(
+        db,
+        session.session_key,
+        "Direct apply first wake",
+        work_item.id,
+        assignment.id
+      )
+
+    page_wake =
+      schedule_wake(
+        db,
+        session.session_key,
+        "Direct apply page wake",
+        work_item.id,
+        assignment.id
+      )
 
     other_wake =
       schedule_wake(
@@ -394,6 +425,7 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
       )
 
     start_supervised!({Hub, name: Hub}, id: Hub)
+
     :ok =
       Hub.register(Hub, self(), %{
         mode: :all,
@@ -490,7 +522,7 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     attest_result =
       Assignments.__handle__(ctx.db, "attest", %{
         verb: "attest",
-        origin: "agent:direct-apply-owner",
+        origin: "agent:test-session",
         principal: {:session, ctx.session.session_key},
         session_key: nil,
         firehose_in_txn: true,
@@ -584,26 +616,117 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     )
   end
 
-  test "server rows converge through paged walks, restart, and visibility changes", ctx do
+  test "server rows converge after duplicate notices for every required resource", ctx do
     for resource <- [:work_items, :assignments, :attests, :artifacts, :turns, :wakes, :sessions] do
-      {client, page} = begin_walk(ctx, resource)
+      client = walk_model(ctx, resource)
+      notices = mutate_resource(ctx, resource)
+      once = Enum.reduce(notices, client, &apply_notice/2)
+      twice = Enum.reduce(notices, once, &apply_notice/2)
+
+      assert twice == once, "#{resource} duplicate notice changed the client model"
+      assert_matches_fresh_walk(ctx, resource, twice, "after duplicate notices")
+    end
+  end
+
+  test "notices during collection and detail walks converge for every required resource", ctx do
+    for resource <- [:work_items, :assignments, :attests, :artifacts, :turns, :wakes, :sessions] do
+      {client, walk} = begin_walk(ctx, resource)
+      notices = mutate_resource(ctx, resource)
+
+      if resource == :turns do
+        assert Enum.any?(notices, &(&1["class"] == "turn.queued"))
+        assert Enum.all?(notices, &(&1["payload"]["status"] == "queued"))
+      end
+
+      client = Enum.reduce(notices, client, &apply_notice/2)
+      client = continue_walk(ctx, resource, walk, client)
+      assert_matches_fresh_walk(ctx, resource, client, "after a concurrent notice")
+    end
+  end
+
+  test "server lifecycle reversals converge for mutable work items and assignments", ctx do
+    for resource <- [:work_items, :assignments] do
+      client = walk_model(ctx, resource)
+      [closed, reopened] = reverse_lifecycle(ctx, resource)
+
+      assert reopened["payload"]["rowVersion"] > closed["payload"]["rowVersion"]
+
+      client = Enum.reduce([closed, reopened], client, &apply_notice/2)
+      assert_matches_fresh_walk(ctx, resource, client, "after lifecycle reversal")
+    end
+  end
+
+  test "server rows converge after database and hub owner restart for every required resource",
+       ctx do
+    for resource <- [:work_items, :assignments, :attests, :artifacts, :turns, :wakes, :sessions] do
+      client = walk_model(ctx, resource)
+      restart_server(ctx)
       notices = mutate_resource(ctx, resource)
       client = Enum.reduce(notices, client, &apply_notice/2)
 
-      assert Enum.reduce(notices, client, &apply_notice/2) == client,
-             "#{resource} duplicate notice changed the client model"
+      assert_matches_fresh_walk(ctx, resource, client, "after the database and hub owner restart")
+    end
+  end
 
-      client = continue_walk(ctx, resource, page, client)
-      assert client == walk_model(ctx, resource),
-             "#{resource} did not converge after a notice arrived during its walk"
+  test "same-millisecond server writes converge for every required resource", ctx do
+    for resource <- [:work_items, :assignments, :attests, :artifacts, :turns, :wakes, :sessions] do
+      client = walk_model(ctx, resource)
+      expected = same_millisecond_mutations(ctx, resource)
 
-      restart_server(ctx)
-      after_restart = mutate_resource(ctx, resource)
-      client = Enum.reduce(after_restart, client, &apply_notice/2)
-      assert client == walk_model(ctx, resource),
-             "#{resource} did not converge after the server owner restarted"
+      notices =
+        Enum.map(expected, fn {class, resource_name, key_field, key} ->
+          notice = receive_notice_for(Hub, class, resource_name, key_field, key)
+          assert is_integer(notice["payload"]["rowVersion"])
+          notice
+        end)
 
-      assert_visibility_converges(ctx, resource, client)
+      for [first_notice, second_notice] <- Enum.chunk_every(notices, 2) do
+        if notice_key(first_notice) == notice_key(second_notice) do
+          first = first_notice["payload"]["rowVersion"]
+          second = second_notice["payload"]["rowVersion"]
+          assert second > first, "#{resource} did not advance the same key across two writes"
+        end
+      end
+
+      client = Enum.reduce(notices, client, &apply_notice/2)
+
+      assert_matches_fresh_walk(ctx, resource, client, "after two same-millisecond mutations")
+    end
+  end
+
+  test "server visibility changes invalidate in-progress walks and rebuild between walks", ctx do
+    for resource <- [:work_items, :assignments, :attests, :artifacts, :turns, :wakes, :sessions] do
+      held = walk_model(ctx, resource)
+      {_partial, _walk} = begin_walk(ctx, resource)
+
+      assert %{changed: true, user: %{is_admin: true}} = promote_owner(ctx, true)
+
+      # Authorization changed while the walk was incomplete. Discard its
+      # partial absence result, update the principal boundary, and rebuild.
+      # User administration notices are intentionally visible only to admins.
+      register_visibility(ctx, true)
+      visible = walk_model(%{ctx | admin_walk?: true}, resource)
+      promoted_model = apply_complete_walk(held, visible)
+
+      assert promoted_model == visible,
+             "#{resource} did not converge after a visibility change during its walk"
+
+      assert map_size(visible) > map_size(held),
+             "#{resource} fixture must include a row hidden from the non-admin principal"
+
+      # A second visibility change occurs between complete walks. The next
+      # walk is fresh under the demoted principal and removes rows no longer
+      # visible to it.
+      assert %{changed: true, user: %{is_admin: false}} = promote_owner(ctx, false)
+      register_visibility(ctx, false)
+      restored = walk_model(%{ctx | admin_walk?: false}, resource)
+      demoted_model = apply_complete_walk(promoted_model, restored)
+
+      assert demoted_model == restored,
+             "#{resource} did not converge after a visibility change between walks"
+
+      assert restored == held,
+             "#{resource} did not return to its original complete walk after demotion"
     end
   end
 
@@ -670,23 +793,26 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
       target_role: nil,
       role_fallback: false,
       supervision_interval_ms: 60_000,
-      params: %{subject: subject, work_item_id: work_item_id}
+      params: %{subject: subject, work_item_id: work_item_id, effect_kind: "coordination"}
     })
   end
 
-  defp create_progress_attest(db, owner, session_key, assignment_id) do
-    result =
-      Assignments.__handle__(db, "attest", %{
-        verb: "attest",
-        origin: "agent:direct-apply-owner",
-        principal: {:session, session_key},
-        session_key: nil,
-        params: %{
-          assignment_id: assignment_id,
-          kind: "progress",
-          note: "Server-backed convergence fixture for #{owner}"
-        }
-      })
+  defp create_progress_attest(db, owner, session_key, assignment_id, publish? \\ false) do
+    call = %{
+      verb: "attest",
+      origin: "agent:test-session",
+      principal: {:session, session_key},
+      session_key: nil,
+      firehose_in_txn: publish?,
+      firehose_hub: Hub,
+      params: %{
+        assignment_id: assignment_id,
+        kind: "progress",
+        note: "Server-backed convergence fixture for #{owner}"
+      }
+    }
+
+    result = Assignments.__handle__(db, "attest", call)
 
     result.attest
   end
@@ -730,6 +856,15 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     row = rest_item!(ctx, "/api/assignments/#{ctx.assignment.id}")
     client = model_from_rows("assignments", [row])
     {client, %{ids: [ctx.assignment.id, ctx.page_assignment.id], detail_walk: true}}
+  end
+
+  defp begin_walk(ctx, resource) when resource in [:turns, :wakes] do
+    client = walk_model(ctx, resource)
+    path = page_path(ctx, resource)
+    {rows, page} = fetch_page!(ctx, path, nil)
+
+    assert page_more?(page), "#{resource} fixture must span more than one REST page"
+    {apply_rows(client, resource_name(resource), rows), %{path: path, page: page}}
   end
 
   defp begin_walk(ctx, resource) do
@@ -778,23 +913,27 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
   end
 
   defp walk_model(ctx, :assignments) do
-    [ctx.assignment.id, ctx.page_assignment.id, ctx.other_assignment.id]
-    |> Enum.flat_map(fn assignment_id ->
-      response = rest_get(ctx, "/api/assignments/#{assignment_id}")
+    rows =
+      [ctx.assignment.id, ctx.page_assignment.id, ctx.other_assignment.id]
+      |> Enum.flat_map(fn assignment_id ->
+        response = rest_get(ctx, "/api/assignments/#{assignment_id}")
 
-      case response.status do
-        200 -> [JSON.decode!(response.resp_body)["item"]]
-        404 -> []
-        status -> flunk("assignment detail walk returned #{status}: #{response.resp_body}")
-      end
-    end)
-    |> model_from_rows("assignments")
+        case response.status do
+          200 -> [JSON.decode!(response.resp_body)["item"]]
+          404 -> []
+          status -> flunk("assignment detail walk returned #{status}: #{response.resp_body}")
+        end
+      end)
+
+    model_from_rows("assignments", rows)
   end
 
   defp walk_model(ctx, resource) do
-    walk_paths(ctx, resource)
-    |> Enum.flat_map(&walk_path(ctx, resource, &1))
-    |> model_from_rows(resource_name(resource))
+    rows =
+      walk_paths(ctx, resource)
+      |> Enum.flat_map(&walk_path(ctx, resource, &1))
+
+    model_from_rows(resource_name(resource), rows)
   end
 
   defp walk_paths(_ctx, :work_items), do: ["/api/work-items"]
@@ -844,28 +983,6 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
   defp page_path(_ctx, :wakes, session_key), do: "/api/sessions/#{session_key}/wakes"
 
   defp mutate_resource(ctx, :work_items) do
-    close_call = work_item_disposition_call(ctx, "work-item-close")
-    _closed = WorkItems.__handle__(ctx.db, "work-item-close", close_call)
-    closed =
-      receive_notice_for(
-        Hub,
-        "work_item.updated",
-        "work-items",
-        "id",
-        ctx.lifecycle_work_item.id
-      )
-
-    reopen_call = work_item_disposition_call(ctx, "work-item-reopen")
-    _reopened = WorkItems.__handle__(ctx.db, "work-item-reopen", reopen_call)
-    reopened =
-      receive_notice_for(
-        Hub,
-        "work_item.updated",
-        "work-items",
-        "id",
-        ctx.lifecycle_work_item.id
-      )
-
     item =
       WorkItems.__handle__(ctx.db, "work-item-update", %{
         verb: "work-item-update",
@@ -882,28 +999,35 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
       })
 
     updated = receive_notice_for(Hub, "work_item.updated", "work-items", "id", item.id)
-    [closed, reopened, updated]
+    [updated]
   end
 
   defp mutate_resource(ctx, :assignments) do
-    _closed = complete_assignment(ctx, ctx.assignment.id)
+    closed_result = complete_assignment(ctx, ctx.assignment.id)
+
+    assert %{attest: %{kind: "completion"}, assignment: %{state: "closed"}} = closed_result
+
     closed = receive_notice_for(Hub, "assignment.closed", "assignments", "id", ctx.assignment.id)
 
-    _reopened = reopen_assignment(ctx, ctx.assignment.id)
-
-    reopened =
-      receive_notice_for(Hub, "assignment.reopened", "assignments", "id", ctx.assignment.id)
-
-    [closed, reopened]
+    [closed]
   end
 
   defp mutate_resource(ctx, :attests) do
-    attest = create_progress_attest(ctx.db, ctx.owner_user_id, ctx.session.session_key, ctx.assignment.id)
+    attest =
+      create_progress_attest(
+        ctx.db,
+        ctx.owner_user_id,
+        ctx.page_session.session_key,
+        ctx.page_assignment.id,
+        true
+      )
+
     [receive_notice_for(Hub, "attest.filed", "attests", "id", attest.id)]
   end
 
   defp mutate_resource(ctx, :artifacts) do
-    artifact = create_artifact(ctx.db, ctx.session.session_key, ctx.work_item.id, "Artifact during walk")
+    artifact =
+      create_artifact(ctx.db, ctx.session.session_key, ctx.work_item.id, "Artifact during walk")
 
     [
       receive_notice_for(
@@ -926,7 +1050,9 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
         ctx.assignment.id
       )
 
-    [receive_notice_for(Hub, "turn.queued", "turns", "seq", seq)]
+    notice = receive_notice_for(Hub, "turn.queued", "turns", "seq", seq)
+    assert notice["payload"]["status"] == "queued"
+    [notice]
   end
 
   defp mutate_resource(ctx, :wakes) do
@@ -943,8 +1069,6 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
   end
 
   defp mutate_resource(ctx, :sessions) do
-    previous_name = ctx.session.display_name
-
     session =
       Org.rename(
         ctx.db,
@@ -955,13 +1079,265 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     renamed =
       receive_notice_for(Hub, "session.updated", "sessions", "sessionKey", session.session_key)
 
-    _restored = Org.rename(ctx.db, session.session_key, previous_name)
-
-    restored =
-      receive_notice_for(Hub, "session.updated", "sessions", "sessionKey", session.session_key)
-
-    [renamed, restored]
+    [renamed]
   end
+
+  defp reverse_lifecycle(ctx, :work_items) do
+    icebox_call = work_item_disposition_call(ctx, "work-item-icebox")
+    assert %{ok: true} = WorkItems.__handle__(ctx.db, "work-item-icebox", icebox_call)
+
+    iceboxed =
+      receive_notice_for(
+        Hub,
+        "work_item.iceboxed",
+        "work-items",
+        "id",
+        ctx.lifecycle_work_item.id
+      )
+
+    reopen_call = work_item_disposition_call(ctx, "work-item-reopen")
+    assert %{ok: true} = WorkItems.__handle__(ctx.db, "work-item-reopen", reopen_call)
+
+    reopened =
+      receive_notice_for(
+        Hub,
+        "work_item.reopened",
+        "work-items",
+        "id",
+        ctx.lifecycle_work_item.id
+      )
+
+    [iceboxed, reopened]
+  end
+
+  defp reverse_lifecycle(ctx, :assignments) do
+    closed_result = complete_assignment(ctx, ctx.assignment.id)
+
+    assert %{attest: %{kind: "completion"}, assignment: %{state: "closed"}} = closed_result
+
+    closed = receive_notice_for(Hub, "assignment.closed", "assignments", "id", ctx.assignment.id)
+    _reopened = reopen_assignment(ctx, ctx.assignment.id)
+
+    reopened =
+      receive_notice_for(Hub, "assignment.reopened", "assignments", "id", ctx.assignment.id)
+
+    [closed, reopened]
+  end
+
+  defp same_millisecond_mutations(ctx, :work_items) do
+    item_id = ctx.work_item.id
+    at = System.system_time(:millisecond)
+
+    transaction!(ctx.db, fn txn ->
+      for title <- ["Same-millisecond work item A", "Same-millisecond work item B"] do
+        Tightbeam.DB.Txn.q(txn, "UPDATE work_items SET title=?2 WHERE id=?1", [item_id, title])
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          """
+          INSERT INTO work_item_versions(workItemId,rowVersion) VALUES(?1,?2)
+          ON CONFLICT(workItemId) DO UPDATE SET
+            rowVersion=MAX(excluded.rowVersion, work_item_versions.rowVersion+1)
+          """,
+          [item_id, at]
+        )
+
+        :ok = WorkItems.publish_change_in_txn(txn, item_id)
+        {"work_item.updated", "work-items", "id", item_id}
+      end
+    end)
+  end
+
+  defp same_millisecond_mutations(ctx, :assignments) do
+    assignment_id = ctx.assignment.id
+    call = visibility_call(ctx)
+
+    transaction!(ctx.db, fn txn ->
+      for subject <- ["Same-millisecond assignment A", "Same-millisecond assignment B"] do
+        Tightbeam.DB.Txn.q(txn, "UPDATE assignments SET subject=?2 WHERE id=?1", [
+          assignment_id,
+          subject
+        ])
+
+        row = StateResources.query_assignment(txn, assignment_id, call)
+
+        :ok =
+          Publisher.committed_in_txn(txn, "assignment.opened", row, %{
+            "assignmentId" => assignment_id,
+            "sessionKey" => ctx.session.session_key
+          })
+
+        {"assignment.opened", "assignments", "id", assignment_id}
+      end
+    end)
+  end
+
+  defp same_millisecond_mutations(ctx, :attests) do
+    at = System.system_time(:millisecond)
+
+    transaction!(ctx.db, fn txn ->
+      for suffix <- ["a", "b"] do
+        id = "direct-apply-same-ms-attest-#{suffix}-#{System.unique_integer([:positive])}"
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          "INSERT INTO attests(id,assignmentId,kind,bySession,ts) VALUES(?1,?2,'progress',?3,?4)",
+          [id, ctx.assignment.id, ctx.session.session_key, at]
+        )
+
+        row = StateResources.query_attest(txn, id) |> StateResources.attest()
+
+        :ok =
+          Publisher.committed_in_txn(txn, "attest.filed", row, %{
+            "assignmentId" => ctx.assignment.id
+          })
+
+        {"attest.filed", "attests", "id", id}
+      end
+    end)
+  end
+
+  defp same_millisecond_mutations(ctx, :artifacts) do
+    at = System.system_time(:millisecond)
+
+    transaction!(ctx.db, fn txn ->
+      for suffix <- ["a", "b"] do
+        id = "direct-apply-same-ms-artifact-#{suffix}-#{System.unique_integer([:positive])}"
+
+        _version = Tightbeam.Artifacts.reserve_version_in_txn(txn, id)
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          """
+          INSERT INTO artifacts(
+            artifactId,kind,title,createdBySession,workItemId,originPath,state,createdAt,updatedAt
+          ) VALUES(?1,'report',?2,?3,?4,'sample.md','in-workspace',?5,?5)
+          """,
+          [
+            id,
+            "Same-millisecond artifact #{suffix}",
+            ctx.session.session_key,
+            ctx.work_item.id,
+            at
+          ]
+        )
+
+        row = Tightbeam.Artifacts.canonical_in_txn(txn, id)
+
+        :ok =
+          Publisher.committed_in_txn(txn, "artifact.recorded", row, %{
+            "artifactId" => id,
+            "sessionKey" => ctx.session.session_key,
+            "workItemId" => ctx.work_item.id
+          })
+
+        {"artifact.recorded", "artifacts", "artifactId", id}
+      end
+    end)
+  end
+
+  defp same_millisecond_mutations(ctx, :turns) do
+    at = System.system_time(:millisecond)
+
+    transaction!(ctx.db, fn txn ->
+      for suffix <- ["a", "b"] do
+        message_id = "direct-apply-same-ms-turn-#{suffix}-#{System.unique_integer([:positive])}"
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          """
+          INSERT INTO turns(sessionKey,messageId,origin,prompt,assignmentId,jobRef,createdAt)
+          VALUES(?1,?2,'user:direct-apply','Same-millisecond queued turn',?3,?4,?5)
+          """,
+          [ctx.session.session_key, message_id, ctx.assignment.id, ctx.work_item.id, at]
+        )
+
+        [[seq]] = Tightbeam.DB.Txn.q(txn, "SELECT last_insert_rowid()")
+        :ok = Publisher.turn_in_txn(txn, "turn.queued", seq)
+        {"turn.queued", "turns", "seq", seq}
+      end
+    end)
+  end
+
+  defp same_millisecond_mutations(ctx, :wakes) do
+    at = System.system_time(:millisecond)
+    wake_id = ctx.wakes |> hd() |> Map.fetch!(:wake_id)
+
+    transaction!(ctx.db, fn txn ->
+      for {due_at, prompt} <- [
+            {at + 60_000, "Same-millisecond wake A"},
+            {at + 120_000, "Same-millisecond wake B"}
+          ] do
+        Tightbeam.DB.Txn.q(
+          txn,
+          "UPDATE wakes SET dueAt=?2,prompt=?3 WHERE wakeId=?1 AND state='pending'",
+          [wake_id, due_at, prompt]
+        )
+
+        :ok = Wakes.publish_change_in_txn(txn, "wake.scheduled", wake_id)
+        {"wake.scheduled", "wakes", "wakeId", wake_id}
+      end
+    end)
+  end
+
+  defp same_millisecond_mutations(ctx, :sessions) do
+    session_key = ctx.session.session_key
+    at = System.system_time(:millisecond)
+
+    transaction!(ctx.db, fn txn ->
+      for {name, suffix} <- [
+            {"Same-millisecond session A", "a"},
+            {"Same-millisecond session B", "b"}
+          ] do
+        {:changed, _session, _result} =
+          Org.mutate_session_in_txn(
+            txn,
+            session_key,
+            fn ->
+              Tightbeam.DB.Txn.q(txn, "UPDATE sessions SET displayName=?2 WHERE sessionKey=?1", [
+                session_key,
+                name
+              ])
+
+              suffix
+            end,
+            at
+          )
+
+        {"session.updated", "sessions", "sessionKey", session_key}
+      end
+    end)
+  end
+
+  defp visibility_call(ctx) do
+    %{
+      principal: {:user, ctx.owner_user_id},
+      rest_principal: %{kind: "user", id: ctx.owner_user_id, is_admin: false}
+    }
+  end
+
+  defp transaction!(db, fun) do
+    case DB.transaction(db, fun) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  defp notice_key(%{"resource" => "work-items", "payload" => row}), do: {"work-items", row["id"]}
+
+  defp notice_key(%{"resource" => "assignments", "payload" => row}),
+    do: {"assignments", row["id"]}
+
+  defp notice_key(%{"resource" => "attests", "payload" => row}), do: {"attests", row["id"]}
+
+  defp notice_key(%{"resource" => "artifacts", "payload" => row}),
+    do: {"artifacts", row["artifactId"]}
+
+  defp notice_key(%{"resource" => "turns", "payload" => row}), do: {"turns", row["seq"]}
+  defp notice_key(%{"resource" => "wakes", "payload" => row}), do: {"wakes", row["wakeId"]}
+
+  defp notice_key(%{"resource" => "sessions", "payload" => row}),
+    do: {"sessions", row["sessionKey"]}
 
   defp work_item_disposition_call(ctx, verb) do
     %{
@@ -978,7 +1354,7 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
   defp complete_assignment(ctx, assignment_id) do
     Assignments.__handle__(ctx.db, "attest", %{
       verb: "attest",
-      origin: "agent:direct-apply-owner",
+      origin: "agent:test-session",
       principal: {:session, ctx.session.session_key},
       session_key: nil,
       firehose_in_txn: true,
@@ -994,51 +1370,34 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
   defp reopen_assignment(ctx, assignment_id) do
     Assignments.__handle__(ctx.db, "reopen-assignment", %{
       verb: "reopen-assignment",
-      origin: "agent:direct-apply-owner",
+      origin: "agent:test-session",
       principal: {:session, ctx.session.session_key},
       session_key: nil,
       firehose_in_txn: true,
       firehose_hub: Hub,
+      supervision_interval_ms: 60_000,
       params: %{assignment_id: assignment_id, reason: "Continue server-backed convergence"}
     })
   end
 
-  defp assert_visibility_converges(ctx, :assignments, client) do
-    _ = promote_owner(ctx, true)
-    register_visibility(ctx, true)
-    visible = walk_model(%{ctx | admin_walk?: true}, :assignments)
-    assert map_size(visible) > map_size(client)
-    _ = promote_owner(ctx, false)
-    register_visibility(ctx, false)
-    restored = walk_model(%{ctx | admin_walk?: false}, :assignments)
-    assert restored == client
+  defp assert_matches_fresh_walk(ctx, resource, client, scenario) do
+    snapshot = walk_model(ctx, resource)
+
+    assert client == snapshot,
+           "#{resource} did not converge #{scenario}: #{inspect(model_diff(client, snapshot))}"
+
+    snapshot
   end
 
-  defp assert_visibility_converges(ctx, resource, baseline) do
-    path = page_path(ctx, resource)
-    {rows, page} = fetch_page!(ctx, path, nil)
-    partial = model_from_rows(resource_name(resource), rows)
-    cursor = page_cursor(page)
+  defp apply_complete_walk(client, snapshot) do
+    visible_keys = Map.keys(snapshot) |> MapSet.new()
 
-    _ = promote_owner(ctx, true)
-    register_visibility(ctx, true)
+    client =
+      Enum.reduce(snapshot, client, fn {key, %{value: row}}, acc ->
+        apply_upsert(acc, key, row)
+      end)
 
-    if cursor do
-      response = rest_get(ctx, path <> "?limit=1&after=#{cursor}")
-      assert response.status == 400
-      assert JSON.decode!(response.resp_body)["error"]["code"] == "invalid_cursor"
-    end
-
-    visible = walk_model(%{ctx | admin_walk?: true}, resource)
-    assert map_size(visible) > map_size(partial),
-           "#{resource} did not gain rows when the principal became an administrator"
-
-    _ = promote_owner(ctx, false)
-    register_visibility(ctx, false)
-    restored = walk_model(%{ctx | admin_walk?: false}, resource)
-    assert restored == baseline
-    refute MapSet.new(Map.keys(visible)) == MapSet.new(Map.keys(restored)),
-           "#{resource} visibility did not shrink between complete walks"
+    Map.reject(client, fn {key, _row} -> not MapSet.member?(visible_keys, key) end)
   end
 
   defp promote_owner(ctx, is_admin) do
@@ -1078,15 +1437,30 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     register_visibility(ctx, false)
   end
 
-  defp receive_notice_for(server, class, resource, key_field, key) do
-    assert_receive {:firehose_notice, notice}
-    Hub.delivered(server, self())
+  defp receive_notice_for(server, class, resource, key_field, key, skipped \\ []) do
+    receive do
+      {:firehose_notice, notice} ->
+        Hub.delivered(server, self())
 
-    if notice["class"] == class and notice["resource"] == resource and
-         notice["payload"][key_field] == key do
-      notice
-    else
-      receive_notice_for(server, class, resource, key_field, key)
+        if notice["class"] == class and notice["resource"] == resource and
+             notice["payload"][key_field] == key do
+          notice
+        else
+          receive_notice_for(
+            server,
+            class,
+            resource,
+            key_field,
+            key,
+            Enum.take([notice | skipped], 8)
+          )
+        end
+    after
+      1_000 ->
+        flunk(
+          "missing #{class} notice for #{resource} #{key_field}=#{key}; " <>
+            "last notices: #{inspect(Enum.reverse(skipped))}"
+        )
     end
   end
 
@@ -1112,6 +1486,19 @@ defmodule Tightbeam.Firehose.DirectApplyConvergenceTest do
     row = notice["payload"]
     resource = notice["resource"]
     apply_upsert(client, {resource, row_key(resource, row)}, row)
+  end
+
+  defp model_diff(client, snapshot) do
+    (Map.keys(client) ++ Map.keys(snapshot))
+    |> Enum.uniq()
+    |> Enum.reduce(%{}, fn key, diff ->
+      client_row = Map.get(client, key)
+      snapshot_row = Map.get(snapshot, key)
+
+      if client_row == snapshot_row,
+        do: diff,
+        else: Map.put(diff, key, %{client: client_row, rest: snapshot_row})
+    end)
   end
 
   defp row_key("work-items", row), do: row["id"]
