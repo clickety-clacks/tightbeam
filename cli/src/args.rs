@@ -5312,6 +5312,7 @@ mod tests {
                 "work-item-create",
                 "work-item-fail",
                 "work-item-get",
+                "work-item-handoff",
                 "work-item-update",
                 "attend",
                 "transcript",
