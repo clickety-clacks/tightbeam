@@ -916,8 +916,10 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     Enum.each(role_listeners, fn {tag, pid} -> sync_listener(ctx.hub, pid, tag) end)
 
     assert_received {:class_notice, :role_owner, %{"class" => "role.created"}}
+
     assert_received {:class_notice, :role_creator,
                      %{"class" => "role.created", "refs" => role_refs}}
+
     assert role_refs["role"] == "project:row-ref-test"
     assert role_refs["sessionKey"] == "role-bound-target"
     assert role_refs["origin"] == "agent:role-creator"
@@ -928,7 +930,9 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     Enum.each(role_listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end)
 
     removed_role_name = "project:row-ref-remove-test"
-    assert %{name: ^removed_role_name} = Roles.create!(ctx.db, removed_role_name, "flynn", "role-bound-target")
+
+    assert %{name: ^removed_role_name} =
+             Roles.create!(ctx.db, removed_role_name, "flynn", "role-bound-target")
 
     remove_listeners = [
       {:role_remover,
@@ -966,6 +970,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
     assert_received {:class_notice, :role_remover,
                      %{"class" => "role.removed", "refs" => removed_refs}}
+
     assert removed_refs["role"] == removed_role_name
     assert removed_refs["sessionKey"] == "role-bound-target"
     refute_received {:class_notice, :removed_bound_target, _notice}
@@ -1047,8 +1052,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
                        }
                      }}
 
-    assert_received {:class_notice, :assignment_opener,
-                     %{"class" => "assignment.opened"}}
+    assert_received {:class_notice, :assignment_opener, %{"class" => "assignment.opened"}}
 
     refute_received {:class_notice, :assignment_filer, _notice}
   end
