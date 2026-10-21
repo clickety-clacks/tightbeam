@@ -781,6 +781,115 @@ defmodule Tightbeam.PlacementTest do
            )
   end
 
+  test "Claude placement callback routes local none into bounded confirmation", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    unless Process.whereis(Tightbeam.TurnTaskSupervisor) do
+      start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
+    end
+
+    host = "testhost"
+    owner = self()
+    metadata = Path.join([base_dir, "auth", "claude", ".tightbeam", "credential.json"])
+    File.mkdir_p!(Path.dirname(metadata))
+    File.write!(Path.join([base_dir, "auth", "claude", ".credentials.json"]), "synthetic\n")
+
+    File.write!(
+      metadata,
+      JSON.encode!(%{"onboarded" => true, "terminal" => false, "kind" => "subscription"})
+    )
+
+    server = Credentials.server(host)
+
+    start_supervised!(%{
+      id: server,
+      start:
+        {Credentials, :start_link,
+         [
+           [
+             name: server,
+             db: db,
+             base_dir: base_dir,
+             machine: host,
+             acquire_confirmation_fence: fn :anthropic, _attempt, _timeout ->
+               send(owner, :callback_confirmation)
+               {:error, :synthetic_unavailable}
+             end
+           ]
+         ]}
+    })
+
+    assert Credentials.kind(:anthropic, server) == :subscription
+
+    handler =
+      Placement.adapter_opts(
+        %{base_dir: base_dir, db: db, cwd: "/tmp", cli_bin: Path.join(base_dir, "bin")},
+        {:claude, "shared", host}
+      )[:on_auth_event]
+
+    assert :ok = handler.(:unconfirmed, %{"authStatus" => %{"kind" => "none"}})
+    assert_receive :callback_confirmation, 1_000
+
+    assert eventually(fn ->
+             assert {:ok, [["local-none", "epoch-unproved"]]} =
+                      DB.query(
+                        db,
+                        "SELECT source,resultClass FROM claude_auth_observations ORDER BY observedAt"
+                      )
+
+             true
+           end)
+
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM claude_auth_decisions")
+  end
+
+  test "managed Claude fence drains, stops, reconciles home, and stays live", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    sup = :"placement_auth_sup_#{System.unique_integer([:positive])}"
+    start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: sup})
+
+    start_supervised!(
+      {Tightbeam.AdapterCoordinator,
+       adapter_sup: sup,
+       adapter_context: fn _ -> [] end,
+       adapter_opts: fn _, _ ->
+         [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
+       end,
+       db: db,
+       name: Tightbeam.AdapterCoordinator}
+    )
+
+    store = Path.join([base_dir, "auth", "claude"])
+    File.mkdir_p!(store)
+    File.write!(Path.join(store, ".credentials.json"), "synthetic\n")
+    attempt = Tightbeam.ClaudeAuth.trigger(db, "testhost", "local-none")
+
+    config = %{base_dir: base_dir, db: db, cwd: "/tmp", cli_bin: Path.join(base_dir, "bin")}
+
+    assert {:ok, %{home: home, target: %{host_name: "testhost"}}} =
+             Placement.acquire_claude_confirmation_fence(
+               config,
+               db,
+               "testhost",
+               attempt.attempt_id,
+               1_000
+             )
+
+    assert File.dir?(home)
+    assert File.exists?(Path.join(home, ".credentials.json"))
+    assert Placement.claude_confirmation_fence_live?(db, "testhost")
+
+    assert [event] =
+             db
+             |> Tightbeam.EventLog.lifecycle_events()
+             |> Enum.filter(&(&1.kind == "claude_auth_fence_stop"))
+
+    assert event.detail =~ attempt.attempt_id
+  end
+
   test "adapter_opts appends a local overlay and absent rows leave env unchanged", %{
     base_dir: base_dir,
     db: db

@@ -381,6 +381,16 @@ defmodule Tightbeam.Gateway do
         name: Tightbeam.Credentials.server(machine),
         base_dir: host.base_dir,
         staging_base_dir: config.base_dir,
+        db: db,
+        acquire_confirmation_fence: fn :anthropic, attempt_id, timeout ->
+          Placement.acquire_claude_confirmation_fence(config, db, machine, attempt_id, timeout)
+        end,
+        confirm_subscription: fn :anthropic, _epoch, context, timeout ->
+          Placement.confirm_claude_subscription(context, timeout)
+        end,
+        confirmation_fence_live: fn :anthropic ->
+          Placement.claude_confirmation_fence_live?(db, machine)
+        end,
         machine: machine,
         ssh: host.ssh,
         gate: fn _provider -> :ok end,
@@ -2745,7 +2755,26 @@ defmodule Tightbeam.Gateway do
                ),
              :ok <- append_assistant_messages(db, turn, echo, result) do
           record_in_txn = fn txn ->
+            if session.harness == Atom.to_string(Tightbeam.Harness.Claude.id()) and
+                 is_binary(turn[:credential_instance]) do
+              Tightbeam.ClaudeAuth.observe_success_in_txn(
+                txn,
+                session.host,
+                turn.credential_instance
+              )
+            end
+
             HarnessHealth.resolve_normal_turn_in_txn(txn, session, turn)
+
+            if session.harness == Atom.to_string(Tightbeam.Harness.Claude.id()) and
+                 is_binary(turn[:credential_instance]) do
+              fn ->
+                Tightbeam.Credentials.observe_success(
+                  turn.credential_instance,
+                  Tightbeam.Credentials.server(session.host)
+                )
+              end
+            end
           end
 
           {:ok, %{terminal_publish: terminal_publish, record_in_txn: record_in_txn}}

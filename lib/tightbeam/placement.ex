@@ -1450,43 +1450,64 @@ defmodule Tightbeam.Placement do
     db = Map.get(config, :db, DB)
 
     fn classification, event ->
-      if classification == :terminal do
-        Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
-          try do
-            HarnessHealth.observe_provider_invalidation(db, module.id(), host, event,
-              principal: "process:tightbeam/provider:#{module.credential_provider()}"
-            )
-          rescue
-            error ->
-              Logger.error(
-                "harness auth incident record failed for #{module.id()} on #{host}: " <>
-                  Exception.format(:error, error, __STACKTRACE__)
-              )
-          end
-
-          mark_result =
-            try do
-              Tightbeam.Credentials.mark_terminal(
-                module.credential_provider(),
+      case {classification, module.id()} do
+        {:unconfirmed, harness} ->
+          if harness == Tightbeam.Harness.Claude.id() do
+            Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
+              Tightbeam.Credentials.observe_auth(
+                :local_none,
                 event,
                 Tightbeam.Credentials.server(host)
               )
-            catch
-              :exit, reason -> {:error, {:credential_owner_exit, reason}}
+            end)
+          end
+
+          :ok
+
+        {:terminal, _harness} ->
+          Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
+            try do
+              HarnessHealth.observe_provider_invalidation(
+                db,
+                module.id(),
+                host,
+                event,
+                principal: "process:tightbeam/provider:#{module.credential_provider()}"
+              )
+            rescue
+              error ->
+                Logger.error(
+                  "harness auth incident record failed for #{module.id()} on #{host}: " <>
+                    Exception.format(:error, error, __STACKTRACE__)
+                )
             end
 
-          case mark_result do
-            :ok ->
-              :ok
+            mark_result =
+              try do
+                Tightbeam.Credentials.mark_terminal(
+                  module.credential_provider(),
+                  event,
+                  Tightbeam.Credentials.server(host)
+                )
+              catch
+                :exit, reason -> {:error, {:credential_owner_exit, reason}}
+              end
 
-            {:error, reason} ->
-              Logger.error(
-                "credential park failed for #{module.credential_provider()} on #{host}: #{inspect(reason)}"
-              )
-          end
-        end)
+            case mark_result do
+              :ok ->
+                :ok
 
-        :ok
+              {:error, reason} ->
+                Logger.error(
+                  "credential park failed for #{module.credential_provider()} on #{host}: #{inspect(reason)}"
+                )
+            end
+          end)
+
+          :ok
+
+        _other ->
+          :ok
       end
     end
   end
@@ -1605,6 +1626,110 @@ defmodule Tightbeam.Placement do
       }
     )
     |> Map.fetch!(:home_path)
+  end
+
+  @doc false
+  def acquire_claude_confirmation_fence(config, db, host, attempt_id, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    with :ok <- await_claude_drain(db, host, deadline),
+         :ok <-
+           Tightbeam.AdapterCoordinator.stop_for_auth_fence(
+             Tightbeam.AdapterCoordinator,
+             {Tightbeam.Harness.Claude.id(), "shared", host},
+             attempt_id
+           ) do
+      host_config = Map.fetch!(hosts_for(Map.put(config, :db, db)), host)
+      sh = Map.get(config, :sh, &system_cmd/1)
+
+      target = %{
+        base_dir: config.base_dir,
+        host_config: host_config,
+        host_name: host,
+        sh: sh,
+        sh_out: Map.get(config, :sh_out, &system_cmd_out/1)
+      }
+
+      home =
+        deliver_home(
+          Map.put(config, :db, db),
+          {Tightbeam.Harness.Claude.id(), "shared", host},
+          sh: target.sh,
+          sh_out: target.sh_out
+        )
+
+      {:ok, %{target: target, home: home}}
+    end
+  rescue
+    error -> {:error, {:reconciliation_failed, Exception.message(error)}}
+  catch
+    _kind, _reason -> {:error, :reconciliation_failed}
+  end
+
+  @doc false
+  def confirm_claude_subscription(%{target: target, home: home}, timeout_ms) do
+    case Tightbeam.Harness.Claude.credential_live?(target, home,
+           credential_kind: :subscription,
+           timeout_ms: timeout_ms,
+           transport: &Tightbeam.Harness.Support.credential_transport/2
+         ) do
+      :live -> :accepted
+      {:dead, {:http_status, 401}} -> :rejected
+      {:dead, {:http_status, 403}} -> {:unknown, "http-403"}
+      {:unknown, {:http_status, status}} -> {:unknown, "http-#{status}"}
+      {:unknown, reason} when is_atom(reason) -> {:unknown, Atom.to_string(reason)}
+      {:unknown, _reason} -> {:unknown, "transport-failure"}
+    end
+  end
+
+  def confirm_claude_subscription(_context, _timeout_ms),
+    do: {:unknown, "confirmation-context-lost"}
+
+  @doc false
+  def claude_confirmation_fence_live?(db, host) do
+    key = {Tightbeam.Harness.Claude.id(), "shared", host}
+
+    {:ok, [[running_turns]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM turns t JOIN sessions s ON s.sessionKey=t.sessionKey WHERE s.harness='claude' AND s.host=?1 AND t.status='running'",
+        [host]
+      )
+
+    {:ok, [[managed_processes]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM harness_processes WHERE adapterKey=?1 AND resolvedAt IS NULL",
+        [Tightbeam.AdapterCoordinator.key_name(key)]
+      )
+
+    running_turns == 0 and managed_processes == 0 and
+      not Tightbeam.AdapterCoordinator.ready?(Tightbeam.AdapterCoordinator, key)
+  rescue
+    _error -> false
+  catch
+    :exit, _reason -> false
+  end
+
+  defp await_claude_drain(db, host, deadline) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM turns t JOIN sessions s ON s.sessionKey=t.sessionKey WHERE s.harness='claude' AND s.host=?1 AND t.status='running'",
+        [host]
+      )
+
+    cond do
+      count == 0 ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        {:error, :drain_timeout}
+
+      true ->
+        Process.sleep(20)
+        await_claude_drain(db, host, deadline)
+    end
   end
 
   defp effective_identity_fingerprint(effective) do

@@ -4,6 +4,8 @@ cli/src/ceremonies.rs
 cli/src/dispatch.rs
 cli/src/onboard_emit.rs
 cli/src/probe.rs
+lib/tightbeam/claude_auth.ex
 lib/tightbeam/credentials.ex
 lib/tightbeam/gateway.ex
+lib/tightbeam/harness_health.ex
 lib/tightbeam/org.ex
