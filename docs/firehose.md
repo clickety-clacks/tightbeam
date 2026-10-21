@@ -47,7 +47,8 @@ After a close, the minimum request count for one rebuild is
 ```text
 sum over each modeled bulk collection: max(1, ceil(visible rows / 500))
 + one /api/execution-map/tree request, if ExecutionMap facts are shown
-+ max(1, ceil(visible Toplines / 500)) /api/toplines pages, if Toplines are shown
++ one unpaged `toplines` dispatch read, if Toplines are shown
++ one `topline` dispatch read for each of T visible Toplines, if Toplines are shown
 ```
 
 This is a lower bound. It assumes pages use `limit=500` and that no rows are
