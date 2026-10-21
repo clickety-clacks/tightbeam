@@ -92,6 +92,46 @@ defmodule Tightbeam.EffortCheckinTest do
     %{db: db, base_dir: base_dir, config: config, parent: parent, holder: holder, root: root}
   end
 
+  defp real_default_context!(ctx) do
+    prior_enabled = Application.fetch_env(:tightbeam, :effort_checkins_enabled)
+    prior_horizon = Application.fetch_env(:tightbeam, :effort_checkin_horizon_ms)
+
+    on_exit(fn ->
+      for {key, prior} <- [
+            {:effort_checkins_enabled, prior_enabled},
+            {:effort_checkin_horizon_ms, prior_horizon}
+          ] do
+        case prior do
+          {:ok, value} -> Application.put_env(:tightbeam, key, value)
+          :error -> Application.delete_env(:tightbeam, key)
+        end
+      end
+    end)
+
+    Application.delete_env(:tightbeam, :effort_checkins_enabled)
+    Application.delete_env(:tightbeam, :effort_checkin_horizon_ms)
+
+    {Tightbeam.Boot, production_config} =
+      Tightbeam.Application.children()
+      |> Enum.find(&match?({Tightbeam.Boot, _}, &1))
+
+    assert production_config.effort_checkins_enabled
+    assert production_config.effort_checkin_horizon_ms == 86_400_000
+    refute Application.get_env(:tightbeam, :effort_checkins_enabled)
+    refute Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
+
+    config =
+      production_config
+      |> Map.merge(Map.drop(ctx.config, [:effort_checkins_enabled, :effort_checkin_horizon_ms]))
+      |> Map.drop([:effort_checkins_enabled, :effort_checkin_horizon_ms])
+
+    refute Map.has_key?(config, :effort_checkins_enabled)
+    refute Map.has_key?(config, :effort_checkin_horizon_ms)
+    assert EffortCheckin.enabled?(config)
+
+    %{ctx | config: config}
+  end
+
   test "assignment opt-out retains the code and schema without arming a generation", ctx do
     disabled = %{ctx | config: Map.put(ctx.config, :effort_checkins_enabled, false)}
     assigned = assignment(disabled, "assign", {:user, "h1"}, "holder", %{subject: "no check-in"})
@@ -104,6 +144,221 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert {:ok, columns} = DB.query(ctx.db, "PRAGMA table_info(effort_checkin_generations)")
     assert "assignmentId" in Enum.map(columns, &Enum.at(&1, 1))
+  end
+
+  @tag :real_default_effort_checkin
+  test "the real default stays silent after an unassigned holder turn", ctx do
+    ctx = real_default_context!(ctx)
+    item = work_item!(ctx.db, "default check-in with holder activity")
+
+    assigned =
+      assignment(ctx, "assign", {:user, "h1"}, "holder", %{
+        subject: "default check-in with holder activity",
+        brief: "default check-in with holder activity",
+        work_item_id: item.id
+      })
+
+    assert is_binary(assigned.id)
+
+    assert [
+             [
+               1,
+               "armed",
+               wake_id,
+               watermark,
+               artifact_watermark,
+               attest_watermark,
+               work_item_watermark,
+               armed_at,
+               horizon,
+               multiplier,
+               due_at
+             ]
+           ] =
+             rows(
+               ctx.db,
+               """
+               SELECT g.generation,g.state,g.wakeId,g.terminalSeqWatermark,
+                      g.artifactWatermark,g.attestWatermark,g.workItemWatermark,
+                      g.armedAt,g.baseHorizonMs,g.multiplier,w.dueAt
+               FROM effort_checkin_generations AS g
+               JOIN wakes AS w ON w.wakeId=g.wakeId
+               WHERE g.assignmentId=?1 AND g.generation=1
+               """,
+               [assigned.id]
+             )
+
+    assert horizon == 86_400_000
+    assert multiplier == 1
+    assert due_at - armed_at == horizon * multiplier
+    assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
+
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM artifacts WHERE workItemId=?1 AND createdBySession=?2 AND rowid>?3",
+             [item.id, "holder", artifact_watermark]
+           ) == [[0]]
+
+    assert rows(ctx.db, "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND rowid>?2", [
+             assigned.id,
+             attest_watermark
+           ]) == [[0]]
+
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM work_item_events WHERE workItemId=?1 AND id>?2 AND kind='metadata'",
+             [item.id, work_item_watermark]
+           ) == [[0]]
+
+    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND seq>?2", [
+             "holder",
+             watermark
+           ]) == [[0]]
+
+    terminal_turn(ctx.db, "holder", "delivered")
+
+    assert [[nil, "delivered", turn_seq]] =
+             rows(
+               ctx.db,
+               "SELECT assignmentId,status,seq FROM turns WHERE sessionKey=?1 AND seq>?2 ORDER BY seq",
+               ["holder", watermark]
+             )
+
+    assert turn_seq > watermark
+    assert System.system_time(:millisecond) - armed_at < horizon
+
+    scheduler = start_default_checkin_scheduler!(ctx.config)
+    # The persisted wake above proves the default 24-hour deadline. Move only
+    # that deadline into the past to exercise the real due callback promptly.
+    make_wake_due!(ctx.db, wake_id)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert %{state: "fired"} = Wakes.get(ctx.db, wake_id)
+
+    assert [[1, "probed"], [2, "armed"]] ==
+             rows(
+               ctx.db,
+               "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+               [assigned.id]
+             )
+
+    assert silent_rearm(ctx.db, assigned.id)
+    assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assigned.id)) == []
+
+    assert [[rearmed_at, rearmed_horizon, rearmed_due_at]] =
+             rows(
+               ctx.db,
+               """
+               SELECT g.armedAt,g.baseHorizonMs,w.dueAt
+               FROM effort_checkin_generations AS g
+               JOIN wakes AS w ON w.wakeId=g.wakeId
+               WHERE g.assignmentId=?1 AND g.generation=2
+               """,
+               [assigned.id]
+             )
+
+    assert rearmed_horizon == horizon
+    assert rearmed_due_at - rearmed_at == horizon
+  end
+
+  @tag :real_default_effort_checkin
+  test "the real default checks in once after 24 hours without activity", ctx do
+    ctx = real_default_context!(ctx)
+    item = work_item!(ctx.db, "default check-in with no activity")
+
+    assigned =
+      assignment(ctx, "assign", {:user, "h1"}, "holder", %{
+        subject: "default check-in with no activity",
+        brief: "default check-in with no activity",
+        work_item_id: item.id
+      })
+
+    assert is_binary(assigned.id)
+
+    assert [
+             [
+               1,
+               "armed",
+               wake_id,
+               watermark,
+               artifact_watermark,
+               attest_watermark,
+               work_item_watermark,
+               armed_at,
+               horizon,
+               multiplier,
+               due_at
+             ]
+           ] =
+             rows(
+               ctx.db,
+               """
+               SELECT g.generation,g.state,g.wakeId,g.terminalSeqWatermark,
+                      g.artifactWatermark,g.attestWatermark,g.workItemWatermark,
+                      g.armedAt,g.baseHorizonMs,g.multiplier,w.dueAt
+               FROM effort_checkin_generations AS g
+               JOIN wakes AS w ON w.wakeId=g.wakeId
+               WHERE g.assignmentId=?1 AND g.generation=1
+               """,
+               [assigned.id]
+             )
+
+    assert horizon == 86_400_000
+    assert multiplier == 1
+    assert due_at - armed_at == horizon * multiplier
+    assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
+
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM artifacts WHERE workItemId=?1 AND createdBySession=?2 AND rowid>?3",
+             [item.id, "holder", artifact_watermark]
+           ) == [[0]]
+
+    assert rows(ctx.db, "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND rowid>?2", [
+             assigned.id,
+             attest_watermark
+           ]) == [[0]]
+
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM work_item_events WHERE workItemId=?1 AND id>?2 AND kind='metadata'",
+             [item.id, work_item_watermark]
+           ) == [[0]]
+
+    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND seq>?2", [
+             "holder",
+             watermark
+           ]) == [[0]]
+
+    scheduler = start_default_checkin_scheduler!(ctx.config)
+    # No holder activity occurred before the persisted 24-hour deadline.
+    # Advance only the scheduler wake to exercise its real due callback now.
+    make_wake_due!(ctx.db, wake_id)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert %{state: "fired"} = Wakes.get(ctx.db, wake_id)
+
+    assert rows(
+             ctx.db,
+             "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+             [assigned.id]
+           ) == [[1, "probed"], [2, "armed"]]
+
+    assert rows(
+             ctx.db,
+             "SELECT agentProdded FROM effort_checkin_generations WHERE assignmentId=?1 AND generation=2",
+             [assigned.id]
+           ) == [[1]]
+
+    assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [
+             assigned.id
+           ]) == [[0]]
+
+    assert [prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assigned.id))
+    assert prod.state == "pending"
+    assert prod.prompt =~ "no artifacts, attests, or work-item updates"
+    assert prod.prompt =~ "0 completed holder turns"
+    assert length(Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assigned.id))) == 1
   end
 
   test "turning effort check-ins off leaves already-armed rows and requests inert", ctx do
@@ -314,17 +569,15 @@ defmodule Tightbeam.EffortCheckinTest do
     assert retired_disposition_id == retired.id
   end
 
-  test "priority inherits from the work item, scales the four-hour window, and reprioritizes live probes",
-       ctx do
+  test "priority persists without scaling the 24-hour horizon for new and live probes", ctx do
     # This proof closes a card: its holder, recorded opener and work owner must
     # share the valid durable relation, unlike the suite's cross-owner setup.
     {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET ownerUserId='h1' WHERE sessionKey='holder'")
-    config = Map.put(ctx.config, :effort_checkin_horizon_ms, 14_400_000)
+    config = Map.put(ctx.config, :effort_checkin_horizon_ms, 86_400_000)
     ctx = %{ctx | config: config}
 
     horizons =
-      for {priority, expected} <- [{3, 28_800_000}, {4, 14_400_000}, {5, 7_200_000}],
-          into: %{} do
+      for priority <- [0, 3, 4, 5, 8], into: %{} do
         item =
           WorkItems.__handle__(ctx.db, "work-item-create", %{
             verb: "work-item-create",
@@ -348,7 +601,7 @@ defmodule Tightbeam.EffortCheckinTest do
                    ]
                  )
 
-        assert [[^expected, ^expected]] =
+        assert [[86_400_000, 86_400_000]] =
                  rows(
                    ctx.db,
                    """
@@ -376,7 +629,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert updated.priority == 6
 
-    assert [[6, 3_600_000, 3_600_000]] =
+    assert [[6, 86_400_000, 86_400_000]] =
              rows(
                ctx.db,
                """
@@ -433,7 +686,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert reopened.state == "open"
 
-    assert [[2, "armed", 57_600_000, 57_600_000, reopened_root]] =
+    assert [[2, "armed", 86_400_000, 86_400_000, reopened_root]] =
              rows(
                ctx.db,
                """
@@ -477,7 +730,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert prods(ctx.db, "holder") == []
   end
 
-  test "acceptance 4 and 5: workspace writes are not activity; a stall is not effect",
+  test "acceptance 4 and 5: workspace writes are not activity; completed turns are",
        ctx do
     # Filesystem activity is not one of the four authorized card activities.
     # A write therefore cannot hide an otherwise inactive card.
@@ -493,21 +746,7 @@ defmodule Tightbeam.EffortCheckinTest do
     request = fire_probe(ctx, modified.id)
     assert request.expecter_session_key == "parent"
 
-    # Settle only this earlier brief before the new bracket starts counting.
-    assert {:ok, older_brief} = Ledger.claim_next(ctx.db, "holder", "prior-effort-fixture")
-    modified_id = modified.id
-
-    assert {:ok, [[^modified_id]]} =
-             DB.query(ctx.db, "SELECT assignmentId FROM turns WHERE seq=?1", [older_brief.seq])
-
-    assert older_brief.prompt =~ "workspace-only activity"
-
-    assert :ok =
-             Ledger.finish(ctx.db, older_brief.seq, "delivered", nil,
-               owner_lease: older_brief.owner_lease
-             )
-
-    # A stall is turns without effect: turns are reported, never counted.
+    # Completed holder turns count even when their turn has no card link.
     stalled = dispatch(ctx, {:session, "parent"}, "holder", "stall")
     wake = current_wake(ctx.db, stalled.id)
 
@@ -517,9 +756,12 @@ defmodule Tightbeam.EffortCheckinTest do
 
     queued_turn(ctx.db, "holder")
     assert nil == fire_probe(ctx, stalled.id)
+    assert silent_rearm(ctx.db, stalled.id)
+    assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == stalled.id)) == []
 
+    assert nil == fire_probe(ctx, stalled.id)
     assert [stall_prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == stalled.id))
-    assert stall_prod.prompt =~ "3 turns taken"
+    assert stall_prod.prompt =~ "0 completed holder turns"
 
     request = fire_probe(ctx, stalled.id)
     assert request.context["outcome"] == "zero_effect"
@@ -1217,13 +1459,12 @@ defmodule Tightbeam.EffortCheckinTest do
     assert request.context["outcome"] == "zero_effect"
   end
 
-  test "acceptance 1: turns without effect prod the agent; one recorded artifact is silence",
+  test "acceptance 1: no completed turn prods; one recorded artifact is silence",
        ctx do
     item = work_item!(ctx.db, "acceptance one")
 
-    silent = dispatch_for_item(ctx, {:session, "parent"}, "holder", "turns only", item.id)
-
-    for _ <- 1..2, do: terminal_turn(ctx.db, "holder", "delivered")
+    silent =
+      dispatch_for_item(ctx, {:session, "parent"}, "holder", "no completed turns", item.id)
 
     assert nil == fire_probe(ctx, silent.id)
 
@@ -1233,7 +1474,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert prod.state == "pending"
     assert prod.prompt =~ "no artifacts, attests, or work-item updates"
     assert prod.prompt =~ "artifact-record"
-    assert prod.prompt =~ "2 turns taken"
+    assert prod.prompt =~ "0 completed holder turns"
     assert prod.prompt =~ "new material result or evidence"
     assert prod.prompt =~ "exact new blocker or refusal"
     assert prod.prompt =~ "bounded decision request"
@@ -1272,12 +1513,10 @@ defmodule Tightbeam.EffortCheckinTest do
              silent.id
            ]) == [[0]]
 
-    # The identical setup, plus one recorded artifact: the holder took the same
-    # turns, wrote nothing in the workdir, and is left alone.
+    # The identical setup, plus one recorded artifact, is left alone.
     recorded =
-      dispatch_for_item(ctx, {:session, "parent"}, "holder", "turns and an artifact", item.id)
+      dispatch_for_item(ctx, {:session, "parent"}, "holder", "artifact activity", item.id)
 
-    for _ <- 1..2, do: terminal_turn(ctx.db, "holder", "delivered")
     artifact!(ctx.db, "holder", item.id, "/srv/www/index.html")
 
     assert nil == fire_probe(ctx, recorded.id)
@@ -1337,7 +1576,7 @@ defmodule Tightbeam.EffortCheckinTest do
     item = work_item!(ctx.db, "production path")
     handlers = Gateway.handlers(ctx.config)
 
-    params = %{subject: "turns only", brief: "turns only", work_item_id: item.id}
+    params = %{subject: "no holder turn", brief: "no holder turn", work_item_id: item.id}
 
     call = %{
       verb: "dispatch",
@@ -1363,8 +1602,6 @@ defmodule Tightbeam.EffortCheckinTest do
     # bracket would have read as the holder's work.
     assert [["composition"]] =
              rows(ctx.db, "SELECT kind FROM work_item_events WHERE workItemId=?1", [item.id])
-
-    for _ <- 1..2, do: terminal_turn(ctx.db, "holder", "delivered")
 
     assert nil == fire_probe(ctx, assignment.id)
 
@@ -1404,8 +1641,35 @@ defmodule Tightbeam.EffortCheckinTest do
     item = dispatch(ctx, {:session, "parent"}, "holder", "broken substrate")
     :ok = DB.execute(ctx.db, "DROP TABLE artifacts")
 
+    # Make the missing-table failure independent of which statements arming
+    # happened to leave in the bounded cache.
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.clear_statement_cache(txn.conn)
+             end)
+
     # Reading a missing table as zero would fire a prod off the breakage.
     assert_raise MatchError, fn -> fire_probe(ctx, item.id) end
+
+    # The failed probe must roll back its generation/wake transition and leave
+    # both holder notifications and owner decisions untouched.
+    assert [["armed", "pending"]] ==
+             rows(
+               ctx.db,
+               """
+               SELECT g.state, w.state
+               FROM effort_checkin_generations AS g
+               JOIN wakes AS w ON w.wakeId = g.wakeId
+               WHERE g.assignmentId = ?1 AND g.generation = 1
+               """,
+               [item.id]
+             )
+
+    assert prods(ctx.db, "holder") == []
+
+    assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId = ?1", [
+             item.id
+           ]) == [[0]]
   end
 
   test "acceptance 2: an agent working only on another machine is never prodded", ctx do
@@ -1417,7 +1681,6 @@ defmodule Tightbeam.EffortCheckinTest do
     # every horizon's worth of it is DECLARED, which is all the substrate needs.
     for horizon <- 1..3 do
       artifact!(ctx.db, "holder", item.id, "shrdlu:/etc/nginx/sites-enabled/app.#{horizon}")
-      terminal_turn(ctx.db, "holder", "delivered")
       assert nil == fire_probe(ctx, remote.id)
       assert silent_rearm(ctx.db, remote.id, horizon + 1)
     end
@@ -1982,6 +2245,34 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert Wakes.get(ctx.db, unrelated.wake_id).state == "pending"
     assert Wakes.get(ctx.db, deadline.wake_id).state == "pending"
+  end
+
+  defp start_default_checkin_scheduler!(config) do
+    scheduler = :effort_default_checkin_scheduler
+
+    # Use the production check-in consumer with the real scheduler. Prompt
+    # delivery is outside this proof, so keep the resulting holder wake pending.
+    start_supervised!(
+      {Wakes,
+       db: config.db,
+       name: scheduler,
+       tick_ms: 60_000,
+       deliver: fn _wake -> :retry end,
+       internal_consumers: %{
+         "effort_probe" => &EffortCheckin.probe(config.db, config, &1)
+       }},
+      id: scheduler
+    )
+
+    scheduler
+  end
+
+  defp make_wake_due!(db, wake_id) do
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [
+        wake_id,
+        System.system_time(:millisecond) - 1
+      ])
   end
 
   defp dispatch(ctx, principal, holder, subject) do

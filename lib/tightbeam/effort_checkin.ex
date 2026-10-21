@@ -3,14 +3,15 @@ defmodule Tightbeam.EffortCheckin do
   Event-driven effort-without-effect brackets for assignments.
 
   EFFECT is any of, since the bracket armed: an artifact the holder recorded for
-  the assignment's work item, an attest on the assignment, or an update to that
-  work item. Turns and workspace writes are effort, never effect. Work done
+  the assignment's work item, an attest on the assignment, an update to that
+  work item, or a completed turn by the holder. A turn counts whether or not it
+  is attributed to this assignment. Workspace writes do not count. Work done
   elsewhere (another machine, a service, a person) is surfaced by RECORDING AN
   ARTIFACT on the card's work item.
 
-  Zero effect on every channel prods the AGENT first — one wake naming the three
-  channels. Only continued silence at the next bracket escalates to the owner's
-  decision request. Owners get decisions, not status.
+  No activity on any signal prods the AGENT first. Only continued silence at the
+  next bracket escalates to the owner's decision request. Owners get decisions,
+  not status.
 
   A placement observation is prepared before the callback transaction for rearm
   compatibility; it never counts as activity. The transaction then CASes the
@@ -33,8 +34,7 @@ defmodule Tightbeam.EffortCheckin do
 
   @origin "process:tightbeam"
   @holder_prod_marker "effort-holder-prod:"
-  @default_horizon_ms 14_400_000
-  @default_priority 4
+  @default_horizon_ms 86_400_000
   @default_deadline_ms 86_400_000
 
   @ddl """
@@ -168,7 +168,7 @@ defmodule Tightbeam.EffortCheckin do
     Map.get(
       config,
       :effort_checkins_enabled,
-      Application.get_env(:tightbeam, :effort_checkins_enabled, false)
+      Application.get_env(:tightbeam, :effort_checkins_enabled, true)
     ) == true
   end
 
@@ -1124,7 +1124,7 @@ defmodule Tightbeam.EffortCheckin do
          agent_prodded
        ) do
     armed_at = now()
-    horizon = horizon_ms(txn, config, assignment_id)
+    horizon = horizon_ms(config)
 
     [[watermark]] =
       Txn.q(txn, "SELECT COALESCE(MAX(seq), 0) FROM turns WHERE sessionKey = ?1", [
@@ -1191,7 +1191,7 @@ defmodule Tightbeam.EffortCheckin do
       [work_item_id, priority]
     )
 
-    horizon = horizon_for_priority(txn, config, priority)
+    horizon = horizon_ms(config)
 
     Txn.q(
       txn,
@@ -1514,8 +1514,8 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  # The three activity channels, all read in the verdict's own transaction. Turns ride
-  # along as EFFORT — they are reported, never counted as effect.
+  # Activity channels are read in the verdict's own transaction. Holder turns
+  # are session-scoped, so a completed turn can count even when it has no card link.
   defp channels(txn, generation, _inspection) do
     %{
       artifacts: artifact_updates(txn, generation),
@@ -1531,7 +1531,8 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp effect?(channels) do
-    channels.artifacts > 0 or channels.attests > 0 or channels.workItems > 0
+    channels.artifacts > 0 or channels.attests > 0 or channels.workItems > 0 or
+      channels.turns > 0
   end
 
   defp artifact_updates(txn, generation) do
@@ -1672,7 +1673,7 @@ defmodule Tightbeam.EffortCheckin do
 
   defp channel_sentence(evidence) do
     "no artifacts, attests, or work-item updates observed since " <>
-      "#{evidence.minutesSinceArmed}m ago (#{evidence.turnsSinceArmed} turns taken)."
+      "#{evidence.minutesSinceArmed}m ago (#{evidence.turnsSinceArmed} completed holder turns)."
   end
 
   defp advanced_baseline(_baseline, {:ok, _observation} = inspection), do: inspection
@@ -1788,50 +1789,12 @@ defmodule Tightbeam.EffortCheckin do
   defp invalid_root,
     do: {:error, error("invalid_workdir_root", "workdirRoot must be relative and contain no ..")}
 
-  defp horizon_ms(txn, config, assignment_id) do
-    priority = assignment_priority_in_txn(txn, assignment_id)
-    horizon_for_priority(txn, config, priority)
-  end
-
-  defp horizon_for_priority(txn, config, priority) do
-    base =
-      Map.get(
-        config,
-        :effort_checkin_horizon_ms,
-        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, @default_horizon_ms)
-      )
-
-    default_priority = default_priority_in_txn(txn)
-    steps = priority - default_priority
-
-    if steps >= 0,
-      do: max(div(base, Integer.pow(2, steps)), 1),
-      else: base * Integer.pow(2, -steps)
-  end
-
-  defp assignment_priority_in_txn(txn, assignment_id) do
-    case Txn.q(
-           txn,
-           """
-           SELECT COALESCE(
-             (SELECT priority FROM assignment_priorities WHERE assignmentId=a.id),
-             (SELECT priority FROM work_item_priorities WHERE workItemId=a.workItemId),
-             CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
-           )
-           FROM assignments AS a WHERE a.id=?1
-           """,
-           [assignment_id]
-         ) do
-      [[priority]] -> priority
-      [] -> default_priority_in_txn(txn)
-    end
-  end
-
-  defp default_priority_in_txn(txn) do
-    case Txn.q(txn, "SELECT value FROM org_settings WHERE key='default-priority'") do
-      [[value]] -> String.to_integer(value)
-      [] -> @default_priority
-    end
+  defp horizon_ms(config) do
+    Map.get(
+      config,
+      :effort_checkin_horizon_ms,
+      Application.get_env(:tightbeam, :effort_checkin_horizon_ms, @default_horizon_ms)
+    )
   end
 
   defp deadline_ms(config),
