@@ -291,7 +291,7 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
 
     assert scheduled["class"] == "wake.scheduled"
 
-    assert Enum.sort(Enum.map(cancellations, &(&1["refs"]["wakeId"])) ==
+    assert Enum.sort(Enum.map(cancellations, &(&1["refs"]["wakeId"]))) ==
              Enum.sort(Enum.map(chain, &elem(&1, 0)))
 
     for cancellation <- cancellations do
