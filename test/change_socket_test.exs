@@ -125,15 +125,62 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
                     }}
   end
 
-  test "organization bearer has no Firehose read principal", ctx do
-    {:stop, :normal, 1008, {:text, auth_bytes}, _state} =
-      inbound(%{"type" => "auth", "token" => "org-token"}, ctx.state)
+  test "organization bearer reads the Firehose as its named user", ctx do
+    {:push, {:text, auth_bytes}, state} =
+      inbound(
+        %{"type" => "auth", "token" => "org-token", "asUser" => ctx.device.user_id},
+        ctx.state
+      )
 
-    assert JSON.decode!(auth_bytes) == %{
+    auth_result = JSON.decode!(auth_bytes)
+
+    assert %{
              "type" => "auth_result",
-             "success" => false,
-             "reason" => "org_token_read_forbidden"
+             "success" => true,
+             "userId" => user_id,
+             "isAdmin" => is_admin
+           } = auth_result
+
+    assert user_id == ctx.device.user_id
+    assert is_boolean(is_admin)
+    refute Map.has_key?(auth_result, "sessionKey")
+    assert state.selected_session_key == nil
+
+    {:push, {:text, all_ready}, state} =
+      inbound(
+        %{
+          "type" => "subscribe",
+          "protocolVersion" => 2,
+          "subscriptionId" => "all",
+          "filters" => %{}
+        },
+        state
+      )
+
+    assert JSON.decode!(all_ready) == %{
+             "type" => "subscription_ready",
+             "subscriptionId" => "all"
            }
+
+    {:push, {:text, session_ready}, state} =
+      inbound(
+        %{
+          "type" => "subscribe",
+          "protocolVersion" => 2,
+          "subscriptionId" => "one-session",
+          "filters" => %{"sessionKey" => "selected-session"}
+        },
+        state
+      )
+
+    assert JSON.decode!(session_ready) == %{
+             "type" => "subscription_ready",
+             "subscriptionId" => "one-session"
+           }
+
+    {:push, {:text, heartbeat}, state} = ChangeSocket.handle_info(:firehose_heartbeat, state)
+    assert JSON.decode!(heartbeat)["type"] == "heartbeat"
+    ChangeSocket.terminate(:normal, state)
   end
 
   test "auth is in-band and subscriptions are multiplexed with conjunctive filters", ctx do

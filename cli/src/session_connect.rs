@@ -180,6 +180,44 @@ enum SnapshotEmissionError {
     Output(String),
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReadSelection {
+    as_user: Option<String>,
+}
+
+impl ReadSelection {
+    fn for_invocation(endpoint: &Endpoint, identity: &Identity) -> Self {
+        let as_user = match identity {
+            Identity::User(user) if is_org_credential(endpoint) => Some(user.clone()),
+            _ => None,
+        };
+        Self { as_user }
+    }
+
+    fn auth_frame(&self, token: &str) -> Value {
+        let mut frame = json!({"type": "auth", "token": token});
+        if let Some(user) = &self.as_user {
+            frame["asUser"] = json!(user);
+        }
+        frame
+    }
+
+    fn request_path(&self, path: &str) -> String {
+        match &self.as_user {
+            Some(user) => format!(
+                "{path}{}asUser={}",
+                if path.contains('?') { "&" } else { "?" },
+                encode_path(user)
+            ),
+            None => path.to_owned(),
+        }
+    }
+}
+
+fn is_org_credential(endpoint: &Endpoint) -> bool {
+    endpoint.token.starts_with("tbc_")
+}
+
 pub fn run(session_key: String, identity: Identity) -> Result<(), String> {
     let endpoint = match dispatch::discover() {
         Ok(endpoint) => endpoint,
@@ -188,6 +226,7 @@ pub fn run(session_key: String, identity: Identity) -> Result<(), String> {
             return Err(error);
         }
     };
+    let read_selection = ReadSelection::for_invocation(&endpoint, &identity);
     let signal_guard = SessionSignalGuard::install()?;
 
     let stopped = Arc::new(AtomicBool::new(false));
@@ -196,9 +235,10 @@ pub fn run(session_key: String, identity: Identity) -> Result<(), String> {
     let (worker_tx, worker_rx) = mpsc::channel();
 
     spawn_stdin_reader(input_tx);
-    let socket_worker = spawn_socket_worker(
+    let socket_worker = spawn_socket_worker_with_selection(
         endpoint.clone(),
         session_key.clone(),
+        read_selection.clone(),
         worker_tx.clone(),
         stopped.clone(),
         lifecycle.clone(),
@@ -271,10 +311,11 @@ pub fn run(session_key: String, identity: Identity) -> Result<(), String> {
                             }
                         }
                         "subscription_ready" => {
-                            begin_snapshot_after_subscription_ready(
+                            begin_snapshot_after_subscription_ready_with_selection(
                                 &frame,
                                 &endpoint,
                                 &session_key,
+                                &read_selection,
                                 generation,
                                 snapshot_cycle,
                                 &worker_tx,
@@ -304,9 +345,10 @@ pub fn run(session_key: String, identity: Identity) -> Result<(), String> {
                                     emit(&event_frame(generation, frame.clone()))?;
                                     ready = false;
                                     snapshot_cycle = snapshot_cycle.saturating_add(1);
-                                    begin_snapshot(
+                                    begin_snapshot_with_selection(
                                         &endpoint,
                                         &session_key,
+                                        &read_selection,
                                         generation,
                                         snapshot_cycle,
                                         &worker_tx,
@@ -370,13 +412,14 @@ pub fn run(session_key: String, identity: Identity) -> Result<(), String> {
                     }
                     if can_release_snapshot(pending_sends) {
                         if let Some((failure_cycle, error)) = completed_snapshot_failure.take() {
-                            finish_snapshot_failure(
+                            finish_snapshot_failure_with_selection(
                                 error,
                                 generation,
                                 failure_cycle,
                                 &mut pending_snapshot,
                                 &endpoint,
                                 &session_key,
+                                &read_selection,
                                 &mut snapshot_cycle,
                                 &worker_tx,
                                 &lifecycle,
@@ -386,11 +429,12 @@ pub fn run(session_key: String, identity: Identity) -> Result<(), String> {
                                 &mut output,
                             )?;
                         } else if let Some(snapshot) = completed_snapshot.take() {
-                            finish_snapshot(
+                            finish_snapshot_with_selection(
                                 snapshot,
                                 &mut pending_snapshot,
                                 &endpoint,
                                 &session_key,
+                                &read_selection,
                                 generation,
                                 &mut snapshot_cycle,
                                 &worker_tx,
@@ -425,11 +469,12 @@ pub fn run(session_key: String, identity: Identity) -> Result<(), String> {
                         SnapshotResultAdmission::Defer => {}
                         SnapshotResultAdmission::Complete(result) => match result {
                             Ok(snapshot) => {
-                                finish_snapshot(
+                                finish_snapshot_with_selection(
                                     snapshot,
                                     &mut pending_snapshot,
                                     &endpoint,
                                     &session_key,
+                                    &read_selection,
                                     generation,
                                     &mut snapshot_cycle,
                                     &worker_tx,
@@ -442,13 +487,14 @@ pub fn run(session_key: String, identity: Identity) -> Result<(), String> {
                                 )?;
                             }
                             Err(error) => {
-                                finish_snapshot_failure(
+                                finish_snapshot_failure_with_selection(
                                     error,
                                     generation,
                                     result_cycle,
                                     &mut pending_snapshot,
                                     &endpoint,
                                     &session_key,
+                                    &read_selection,
                                     &mut snapshot_cycle,
                                     &worker_tx,
                                     &lifecycle,
@@ -550,9 +596,28 @@ fn spawn_stdin_reader(tx: Sender<Input>) {
     });
 }
 
+#[cfg(test)]
 fn spawn_socket_worker(
     endpoint: Endpoint,
     session_key: String,
+    tx: Sender<Worker>,
+    stopped: Arc<AtomicBool>,
+    lifecycle: Arc<AtomicU64>,
+) -> thread::JoinHandle<()> {
+    spawn_socket_worker_with_selection(
+        endpoint,
+        session_key,
+        ReadSelection::default(),
+        tx,
+        stopped,
+        lifecycle,
+    )
+}
+
+fn spawn_socket_worker_with_selection(
+    endpoint: Endpoint,
+    session_key: String,
+    read_selection: ReadSelection,
     tx: Sender<Worker>,
     stopped: Arc<AtomicBool>,
     lifecycle: Arc<AtomicU64>,
@@ -561,9 +626,10 @@ fn spawn_socket_worker(
         let mut generation = 0u64;
         while !stopped.load(Ordering::SeqCst) {
             generation = generation.saturating_add(1);
-            let result = connect_and_read(
+            let result = connect_and_read_with_selection(
                 &endpoint,
                 &session_key,
+                &read_selection,
                 generation,
                 &tx,
                 &stopped,
@@ -585,6 +651,7 @@ fn spawn_socket_worker(
     })
 }
 
+#[cfg(test)]
 fn connect_and_read(
     endpoint: &Endpoint,
     session_key: &str,
@@ -593,7 +660,28 @@ fn connect_and_read(
     stopped: &Arc<AtomicBool>,
     lifecycle: &Arc<AtomicU64>,
 ) -> Result<(), ConnectionFailure> {
-    let (mut socket, firehose_protocol) = connect_firehose(endpoint, stopped)?;
+    connect_and_read_with_selection(
+        endpoint,
+        session_key,
+        &ReadSelection::default(),
+        generation,
+        tx,
+        stopped,
+        lifecycle,
+    )
+}
+
+fn connect_and_read_with_selection(
+    endpoint: &Endpoint,
+    session_key: &str,
+    read_selection: &ReadSelection,
+    generation: u64,
+    tx: &Sender<Worker>,
+    stopped: &Arc<AtomicBool>,
+    lifecycle: &Arc<AtomicU64>,
+) -> Result<(), ConnectionFailure> {
+    let (mut socket, firehose_protocol) =
+        connect_firehose_with_selection(endpoint, read_selection, stopped)?;
 
     let _ = set_read_timeout(socket.get_mut(), Some(Duration::from_millis(50)));
     if stopped.load(Ordering::SeqCst) {
@@ -603,7 +691,7 @@ fn connect_and_read(
 
     socket
         .send(Message::Text(
-            json!({"type": "auth", "token": endpoint.token}).to_string(),
+            read_selection.auth_frame(&endpoint.token).to_string(),
         ))
         .map_err(|_| {
             ConnectionFailure::recoverable(
@@ -694,7 +782,7 @@ fn connect_and_read(
                         || !session_change_frame_compatible(&frame))
                 {
                     close_socket_with_protocol_error(&mut socket);
-                    if let Err(error) = rebuild_session_collection(endpoint) {
+                    if let Err(error) = rebuild_session_collection(endpoint, read_selection) {
                         return Err(ConnectionFailure::fatal(&error.code, &error.message));
                     }
                     let mut error = ConnectionFailure::fatal(
@@ -751,8 +839,17 @@ fn connect_and_read(
     Ok(())
 }
 
+#[cfg(test)]
 fn connect_firehose(
     endpoint: &Endpoint,
+    stopped: &AtomicBool,
+) -> Result<(tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, u64), ConnectionFailure> {
+    connect_firehose_with_selection(endpoint, &ReadSelection::default(), stopped)
+}
+
+fn connect_firehose_with_selection(
+    endpoint: &Endpoint,
+    read_selection: &ReadSelection,
     stopped: &AtomicBool,
 ) -> Result<(tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, u64), ConnectionFailure> {
     for protocol_version in FIREHOSE_PROTOCOL_PLAN {
@@ -778,7 +875,7 @@ fn connect_firehose(
                     ));
                 }
 
-                rebuild_session_collection(endpoint)
+                rebuild_session_collection(endpoint, read_selection)
                     .map_err(|error| ConnectionFailure::fatal(&error.code, &error.message))?;
             }
             Err(_) => {
@@ -980,11 +1077,46 @@ fn stage_live_event(
     }
 }
 
+#[cfg(test)]
 fn finish_snapshot(
     snapshot: Snapshot,
     pending_snapshot: &mut Option<PendingSnapshot>,
     endpoint: &Endpoint,
     session_key: &str,
+    generation: u64,
+    snapshot_cycle: &mut u64,
+    worker_tx: &Sender<Worker>,
+    accepted_row_version: &mut u64,
+    accepted_boundary: &mut u64,
+    ready: &mut bool,
+    lifecycle: &AtomicU64,
+    signal: &AtomicI32,
+    output: &mut dyn FnMut(&Value) -> Result<(), String>,
+) -> Result<(), String> {
+    finish_snapshot_with_selection(
+        snapshot,
+        pending_snapshot,
+        endpoint,
+        session_key,
+        &ReadSelection::default(),
+        generation,
+        snapshot_cycle,
+        worker_tx,
+        accepted_row_version,
+        accepted_boundary,
+        ready,
+        lifecycle,
+        signal,
+        output,
+    )
+}
+
+fn finish_snapshot_with_selection(
+    snapshot: Snapshot,
+    pending_snapshot: &mut Option<PendingSnapshot>,
+    endpoint: &Endpoint,
+    session_key: &str,
+    read_selection: &ReadSelection,
     generation: u64,
     snapshot_cycle: &mut u64,
     worker_tx: &Sender<Worker>,
@@ -1043,9 +1175,10 @@ fn finish_snapshot(
             return Ok(());
         }
         *snapshot_cycle = snapshot_cycle.saturating_add(1);
-        begin_snapshot(
+        begin_snapshot_with_selection(
             endpoint,
             session_key,
+            read_selection,
             generation,
             *snapshot_cycle,
             worker_tx,
@@ -1249,13 +1382,14 @@ fn finish_snapshot(
     Ok(())
 }
 
-fn finish_snapshot_failure(
+fn finish_snapshot_failure_with_selection(
     error: SnapshotFailure,
     generation: u64,
     cycle: u64,
     pending_snapshot: &mut Option<PendingSnapshot>,
     endpoint: &Endpoint,
     session_key: &str,
+    read_selection: &ReadSelection,
     snapshot_cycle: &mut u64,
     worker_tx: &Sender<Worker>,
     lifecycle: &AtomicU64,
@@ -1300,9 +1434,10 @@ fn finish_snapshot_failure(
     }
     if error.retryable {
         *snapshot_cycle = cycle.saturating_add(1);
-        begin_snapshot(
+        begin_snapshot_with_selection(
             endpoint,
             session_key,
+            read_selection,
             generation,
             *snapshot_cycle,
             worker_tx,
@@ -1389,9 +1524,10 @@ fn output_snapshot_abort(
     Ok(())
 }
 
-fn begin_snapshot(
+fn begin_snapshot_with_selection(
     endpoint: &Endpoint,
     session_key: &str,
+    read_selection: &ReadSelection,
     generation: u64,
     cycle: u64,
     tx: &Sender<Worker>,
@@ -1403,10 +1539,11 @@ fn begin_snapshot(
         events: Vec::new(),
     });
     let endpoint = endpoint.clone();
+    let read_selection = read_selection.clone();
     let session_key = session_key.to_owned();
     let tx = tx.clone();
     thread::spawn(move || {
-        let result = load_snapshot(&endpoint, &session_key);
+        let result = load_snapshot_with_selection(&endpoint, &session_key, &read_selection);
         let _ = tx.send(Worker::SnapshotResult {
             generation,
             cycle,
@@ -1415,17 +1552,26 @@ fn begin_snapshot(
     });
 }
 
-fn begin_snapshot_after_subscription_ready(
+fn begin_snapshot_after_subscription_ready_with_selection(
     frame: &Value,
     endpoint: &Endpoint,
     session_key: &str,
+    read_selection: &ReadSelection,
     generation: u64,
     cycle: u64,
     tx: &Sender<Worker>,
     pending: &mut Option<PendingSnapshot>,
 ) {
     if frame.get("type").and_then(Value::as_str) == Some("subscription_ready") {
-        begin_snapshot(endpoint, session_key, generation, cycle, tx, pending);
+        begin_snapshot_with_selection(
+            endpoint,
+            session_key,
+            read_selection,
+            generation,
+            cycle,
+            tx,
+            pending,
+        );
     }
 }
 
@@ -1453,9 +1599,18 @@ fn close_failure(frame: Option<tungstenite::protocol::CloseFrame>) -> Connection
     failure
 }
 
+#[cfg(test)]
 fn load_snapshot(endpoint: &Endpoint, session_key: &str) -> Result<Snapshot, SnapshotFailure> {
+    load_snapshot_with_selection(endpoint, session_key, &ReadSelection::default())
+}
+
+fn load_snapshot_with_selection(
+    endpoint: &Endpoint,
+    session_key: &str,
+    read_selection: &ReadSelection,
+) -> Result<Snapshot, SnapshotFailure> {
     let session_path = format!("/api/sessions/{}", encode_path(session_key));
-    let first = get_json(endpoint, &session_path)?;
+    let first = get_json(endpoint, &session_path, read_selection)?;
     let session = first
         .get("item")
         .cloned()
@@ -1471,10 +1626,25 @@ fn load_snapshot(endpoint: &Endpoint, session_key: &str) -> Result<Snapshot, Sna
         .get("clearedThroughSeq")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let messages = get_collection(endpoint, &format!("{session_path}/messages"), session_key)?;
-    let wakes = get_collection(endpoint, &format!("{session_path}/wakes"), session_key)?;
-    let turns = get_collection(endpoint, &format!("{session_path}/turns"), session_key)?;
-    let second = get_json(endpoint, &session_path)?;
+    let messages = get_collection(
+        endpoint,
+        &format!("{session_path}/messages"),
+        session_key,
+        read_selection,
+    )?;
+    let wakes = get_collection(
+        endpoint,
+        &format!("{session_path}/wakes"),
+        session_key,
+        read_selection,
+    )?;
+    let turns = get_collection(
+        endpoint,
+        &format!("{session_path}/turns"),
+        session_key,
+        read_selection,
+    )?;
+    let second = get_json(endpoint, &session_path, read_selection)?;
     let second_session = second
         .get("item")
         .ok_or_else(|| snapshot_failure("projection_invalid", false))?;
@@ -1531,6 +1701,7 @@ fn get_collection(
     endpoint: &Endpoint,
     path: &str,
     session_key: &str,
+    read_selection: &ReadSelection,
 ) -> Result<Vec<Value>, SnapshotFailure> {
     let mut cursor: Option<String> = None;
     let mut items = Vec::new();
@@ -1546,7 +1717,7 @@ fn get_collection(
                 encode_path(session_key)
             ),
         };
-        let response = get_json(endpoint, &(path.to_owned() + &query))?;
+        let response = get_json(endpoint, &(path.to_owned() + &query), read_selection)?;
         let page_items = response
             .get("items")
             .and_then(Value::as_array)
@@ -1567,9 +1738,14 @@ fn get_collection(
     }
 }
 
-fn get_json(endpoint: &Endpoint, path: &str) -> Result<Value, SnapshotFailure> {
+fn get_json(
+    endpoint: &Endpoint,
+    path: &str,
+    read_selection: &ReadSelection,
+) -> Result<Value, SnapshotFailure> {
+    let path = read_selection.request_path(path);
     let call =
-        dispatch::gateway_request("GET", endpoint, path, Some(Duration::from_secs(15))).call();
+        dispatch::gateway_request("GET", endpoint, &path, Some(Duration::from_secs(15))).call();
     let (status, response) = match call {
         Ok(response) => (response.status(), response),
         Err(ureq::Error::Status(status, response)) => (status, response),
@@ -1585,13 +1761,24 @@ fn get_json(endpoint: &Endpoint, path: &str) -> Result<Value, SnapshotFailure> {
             .pointer("/error/code")
             .and_then(Value::as_str)
             .unwrap_or("auth_failed");
+        let code = if code == "invalid_message"
+            && is_org_credential(endpoint)
+            && read_selection.as_user.is_none()
+        {
+            "auth_failed"
+        } else {
+            code
+        };
         return Err(snapshot_failure(code, false));
     }
     Ok(value)
 }
 
-fn rebuild_session_collection(endpoint: &Endpoint) -> Result<Vec<Value>, SnapshotFailure> {
-    let response = get_json(endpoint, "/api/sessions")?;
+fn rebuild_session_collection(
+    endpoint: &Endpoint,
+    read_selection: &ReadSelection,
+) -> Result<Vec<Value>, SnapshotFailure> {
+    let response = get_json(endpoint, "/api/sessions", read_selection)?;
     if response.get("schemaVersion") != Some(&json!(1)) {
         return Err(snapshot_failure("projection_invalid", false));
     }
@@ -2074,6 +2261,14 @@ mod tests {
         stream: TcpStream,
         protocol_version: u64,
     ) -> (tungstenite::WebSocket<TcpStream>, Value) {
+        accept_subscribed_socket_with_as_user(stream, protocol_version, None)
+    }
+
+    fn accept_subscribed_socket_with_as_user(
+        stream: TcpStream,
+        protocol_version: u64,
+        expected_as_user: Option<&str>,
+    ) -> (tungstenite::WebSocket<TcpStream>, Value) {
         let mut socket = tungstenite::accept_hdr(
             stream,
             |request: &tungstenite::handshake::server::Request, response| {
@@ -2089,10 +2284,12 @@ mod tests {
         let Message::Text(auth) = socket.read().unwrap() else {
             panic!("expected auth request")
         };
-        assert_eq!(
-            serde_json::from_str::<Value>(&auth).unwrap()["type"],
-            "auth"
-        );
+        let auth: Value = serde_json::from_str(&auth).unwrap();
+        assert_eq!(auth["type"], "auth");
+        match expected_as_user {
+            Some(user) => assert_eq!(auth["asUser"], user),
+            None => assert!(auth.get("asUser").is_none()),
+        }
         socket
             .send(Message::Text(
                 json!({"type": "auth_result", "success": true}).to_string(),
@@ -2112,6 +2309,52 @@ mod tests {
             ))
             .unwrap();
         (socket, subscribe)
+    }
+
+    #[test]
+    fn read_selection_forwards_only_an_explicit_user_with_an_org_credential() {
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_org_test".to_owned(),
+            origin: crate::dispatch::Origin::Named,
+        };
+        let selected =
+            ReadSelection::for_invocation(&endpoint, &Identity::User("alice".to_owned()));
+        assert_eq!(selected.as_user.as_deref(), Some("alice"));
+        assert_eq!(
+            selected.auth_frame(&endpoint.token),
+            json!({"type": "auth", "token": "tbc_org_test", "asUser": "alice"})
+        );
+        assert_eq!(
+            selected.request_path("/api/sessions?limit=1"),
+            "/api/sessions?limit=1&asUser=alice"
+        );
+
+        for token in ["tbs_session_test", "tbt_device_test", "unknown"] {
+            let endpoint = Endpoint {
+                token: token.to_owned(),
+                ..endpoint.clone()
+            };
+            let selection =
+                ReadSelection::for_invocation(&endpoint, &Identity::User("alice".to_owned()));
+            assert_eq!(selection.as_user, None);
+            assert_eq!(
+                selection.auth_frame(&endpoint.token),
+                json!({"type": "auth", "token": token})
+            );
+            assert_eq!(selection.request_path("/api/sessions"), "/api/sessions");
+        }
+
+        for identity in [
+            Identity::Role("reader".to_owned()),
+            Identity::Process("reader".to_owned()),
+            Identity::Session,
+        ] {
+            assert_eq!(
+                ReadSelection::for_invocation(&endpoint, &identity).as_user,
+                None
+            );
+        }
     }
 
     fn send_frame(endpoint: Endpoint, idempotency_key: Option<&str>) -> (String, SendFailure) {
@@ -2280,6 +2523,49 @@ mod tests {
     }
 
     #[test]
+    fn organization_read_without_a_user_keeps_the_gateway_refusal_and_reports_auth_failure() {
+        for (token, expected_code) in [
+            ("tbc_org_test", "auth_failed"),
+            ("tbs_session_test", "invalid_message"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut endpoint = endpoint(&listener);
+            endpoint.token = token.to_owned();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                assert!(
+                    request
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .starts_with("GET /api/sessions/")
+                );
+                assert!(!request.lines().next().unwrap().contains("asUser="));
+                write_json_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "",
+                    r#"{"error":{"code":"invalid_message"}}"#,
+                );
+                request
+            });
+
+            let error = load_snapshot_with_selection(
+                &endpoint,
+                "agent:main/example",
+                &ReadSelection::default(),
+            )
+            .unwrap_err();
+            let request = server.join().unwrap();
+
+            assert!(!request.lines().next().unwrap().contains("asUser="));
+            assert_eq!(error.code, expected_code);
+            assert!(!error.retryable);
+        }
+    }
+
+    #[test]
     fn session_wake_redirect_keeps_the_gateway_refusal_and_does_not_follow_it() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = endpoint(&listener);
@@ -2373,6 +2659,8 @@ mod tests {
     fn protocol_426_rebuilds_before_the_single_legacy_fallback() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = endpoint(&listener);
+        let read_selection =
+            ReadSelection::for_invocation(&endpoint, &Identity::User("alice".to_owned()));
         let server = thread::spawn(move || {
             let (mut refusal, _) = listener.accept().unwrap();
             let offer = read_http_request(&mut refusal);
@@ -2396,7 +2684,8 @@ mod tests {
             drop(rebuild);
 
             let (stream, _) = listener.accept().unwrap();
-            let (mut socket, subscribe) = accept_subscribed_socket(stream, 1);
+            let (mut socket, subscribe) =
+                accept_subscribed_socket_with_as_user(stream, 1, Some("alice"));
             socket
                 .send(Message::Text(
                     json!({
@@ -2424,9 +2713,10 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let stopped = Arc::new(AtomicBool::new(false));
         let lifecycle = Arc::new(AtomicU64::new(0));
-        let result = connect_and_read(
+        let result = connect_and_read_with_selection(
             &endpoint,
             "agent:main/example",
+            &read_selection,
             1,
             &tx,
             &stopped,
@@ -2437,7 +2727,7 @@ mod tests {
         let failure = result.unwrap_err();
         assert_eq!(failure.code, "connection_lost");
         assert_eq!(failure.close_code, Some(1000));
-        assert!(rebuild_request.starts_with("GET /api/sessions HTTP/1.1"));
+        assert!(rebuild_request.starts_with("GET /api/sessions?asUser=alice HTTP/1.1"));
         assert_gateway_headers(&rebuild_request);
         assert_eq!(subscribe["protocolVersion"], 1);
 
@@ -3157,12 +3447,15 @@ mod tests {
     fn sequence_gap_and_server_restart_reconnect_then_snapshot_after_ready() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = endpoint(&listener);
+        let read_selection =
+            ReadSelection::for_invocation(&endpoint, &Identity::User("alice".to_owned()));
         let snapshot_endpoint = endpoint.clone();
         let session_key = "agent:main/example";
         let encoded_key = encode_path(session_key);
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let (mut first, first_subscribe) = accept_subscribed_socket(stream, 2);
+            let (mut first, first_subscribe) =
+                accept_subscribed_socket_with_as_user(stream, 2, Some("alice"));
             first
                 .send(Message::Text(
                     json!({
@@ -3178,7 +3471,8 @@ mod tests {
             drop(first);
 
             let (stream, _) = listener.accept().unwrap();
-            let (mut second, second_subscribe) = accept_subscribed_socket(stream, 2);
+            let (mut second, second_subscribe) =
+                accept_subscribed_socket_with_as_user(stream, 2, Some("alice"));
             second
                 .send(Message::Close(Some(tungstenite::protocol::CloseFrame {
                     code: tungstenite::protocol::frame::coding::CloseCode::Restart,
@@ -3188,12 +3482,14 @@ mod tests {
             drop(second);
 
             let (stream, _) = listener.accept().unwrap();
-            let (mut third, third_subscribe) = accept_subscribed_socket(stream, 2);
+            let (mut third, third_subscribe) =
+                accept_subscribed_socket_with_as_user(stream, 2, Some("alice"));
             let mut requests = Vec::new();
             for request_number in 0..5 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_http_request(&mut stream);
                 assert_gateway_headers(&request);
+                assert!(request.lines().next().unwrap().contains("asUser=alice"));
                 respond_to_snapshot_request(&mut stream, request_number, Vec::new());
                 requests.push(request);
             }
@@ -3211,9 +3507,10 @@ mod tests {
         let lifecycle = Arc::new(AtomicU64::new(0));
         let (tx, rx) = mpsc::channel();
         let snapshot_tx = tx.clone();
-        let worker = spawn_socket_worker(
+        let worker = spawn_socket_worker_with_selection(
             endpoint,
             session_key.to_owned(),
+            read_selection.clone(),
             tx,
             stopped.clone(),
             lifecycle.clone(),
@@ -3231,10 +3528,11 @@ mod tests {
 
         let ready = receive_subscription_ready(&rx, 3);
         let mut pending = None;
-        begin_snapshot_after_subscription_ready(
+        begin_snapshot_after_subscription_ready_with_selection(
             &json!({"type": "auth_result"}),
             &snapshot_endpoint,
             session_key,
+            &read_selection,
             3,
             9,
             &snapshot_tx,
@@ -3242,10 +3540,11 @@ mod tests {
         );
         assert!(pending.is_none());
 
-        begin_snapshot_after_subscription_ready(
+        begin_snapshot_after_subscription_ready_with_selection(
             &ready,
             &snapshot_endpoint,
             session_key,
+            &read_selection,
             3,
             9,
             &snapshot_tx,
@@ -3285,17 +3584,21 @@ mod tests {
             assert_eq!(subscribe["protocolVersion"], 2);
         }
         assert_eq!(requests.len(), 5);
-        assert!(requests[0].starts_with(&format!("GET /api/sessions/{encoded_key} HTTP/1.1")));
+        assert!(requests[0].starts_with(&format!(
+            "GET /api/sessions/{encoded_key}?asUser=alice HTTP/1.1"
+        )));
         assert!(requests[1].starts_with(&format!(
-            "GET /api/sessions/{encoded_key}/messages?sessionKey={encoded_key}&limit=500 HTTP/1.1"
+            "GET /api/sessions/{encoded_key}/messages?sessionKey={encoded_key}&limit=500&asUser=alice HTTP/1.1"
         )));
         assert!(requests[2].starts_with(&format!(
-            "GET /api/sessions/{encoded_key}/wakes?sessionKey={encoded_key}&limit=500 HTTP/1.1"
+            "GET /api/sessions/{encoded_key}/wakes?sessionKey={encoded_key}&limit=500&asUser=alice HTTP/1.1"
         )));
         assert!(requests[3].starts_with(&format!(
-            "GET /api/sessions/{encoded_key}/turns?sessionKey={encoded_key}&limit=500 HTTP/1.1"
+            "GET /api/sessions/{encoded_key}/turns?sessionKey={encoded_key}&limit=500&asUser=alice HTTP/1.1"
         )));
-        assert!(requests[4].starts_with(&format!("GET /api/sessions/{encoded_key} HTTP/1.1")));
+        assert!(requests[4].starts_with(&format!(
+            "GET /api/sessions/{encoded_key}?asUser=alice HTTP/1.1"
+        )));
         assert!(matches!(
             close,
             Message::Close(Some(frame)) if u16::from(frame.code) == 1000

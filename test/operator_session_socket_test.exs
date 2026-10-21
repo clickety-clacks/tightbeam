@@ -187,7 +187,7 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
   end
 
-  test "missing operation identity and unauthorized selected sessions cannot authenticate", ctx do
+  test "missing user identity and unauthorized selected sessions cannot authenticate", ctx do
     for path <- ["/ws", "/ws/changes?protocolVersion=2"],
         overrides <- [
           %{asUser: nil},
@@ -203,10 +203,18 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
       send_frame(socket, auth() |> Map.put(:deviceId, "browser") |> Map.merge(overrides))
       {reply, socket} = recv_frame(socket)
 
-      if path == "/ws/changes?protocolVersion=2" and overrides[:token] == ctx.selected.cli_token do
+      org_wide_identity? = Map.has_key?(overrides, :sessionKey) and is_nil(overrides.sessionKey)
+
+      if path == "/ws/changes?protocolVersion=2" and
+           (overrides[:token] == ctx.selected.cli_token or org_wide_identity?) do
         assert reply["success"] == true
         assert reply["userId"] == "reader"
-        assert reply["sessionKey"] == "selected"
+
+        if overrides[:token] == ctx.selected.cli_token do
+          assert reply["sessionKey"] == "selected"
+        else
+          refute Map.has_key?(reply, "sessionKey")
+        end
       else
         assert reply["success"] == false
       end
@@ -216,6 +224,65 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
 
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM devices")
+  end
+
+  test "organization bearer subscribes org-wide and per session with user visibility", ctx do
+    changes = connect(ctx, "/ws/changes?protocolVersion=2")
+    send_frame(changes, %{type: "auth", token: "operator-fixture", asUser: "reader"})
+    {auth_result, changes} = recv_frame(changes)
+
+    assert %{
+             "type" => "auth_result",
+             "success" => true,
+             "userId" => "reader",
+             "isAdmin" => false
+           } = auth_result
+
+    refute Map.has_key?(auth_result, "sessionKey")
+
+    send_frame(changes, %{
+      type: "subscribe",
+      protocolVersion: 2,
+      subscriptionId: "all",
+      filters: %{classes: ["session."]}
+    })
+
+    {ready, changes} = recv_frame(changes)
+    assert ready == %{"type" => "subscription_ready", "subscriptionId" => "all"}
+
+    send_frame(changes, %{
+      type: "subscribe",
+      protocolVersion: 2,
+      subscriptionId: "sibling",
+      filters: %{sessionKey: "sibling", classes: ["session."]}
+    })
+
+    {ready, changes} = recv_frame(changes)
+    assert ready == %{"type" => "subscription_ready", "subscriptionId" => "sibling"}
+
+    Hub.publish(ctx.hub, %{
+      "class" => "session.updated",
+      "refs" => %{"sessionKey" => "foreign"},
+      "payload" => %{"sessionKey" => "foreign", "rowVersion" => 1}
+    })
+
+    Hub.publish(ctx.hub, %{
+      "class" => "session.updated",
+      "refs" => %{"sessionKey" => "sibling"},
+      "payload" => %{"sessionKey" => "sibling", "rowVersion" => 1}
+    })
+
+    {all_change, changes} = recv_frame(changes)
+    assert all_change["type"] == "change"
+    assert all_change["subscriptionId"] == "all"
+    assert all_change["refs"]["sessionKey"] == "sibling"
+
+    {session_change, changes} = recv_frame(changes)
+    assert session_change["type"] == "change"
+    assert session_change["subscriptionId"] == "sibling"
+    assert session_change["refs"]["sessionKey"] == "sibling"
+
+    assert {:error, :timeout, _changes} = WS.recv(changes, 100)
   end
 
   test "ordinary post rule refusal is correlated and creates no message or ack", ctx do

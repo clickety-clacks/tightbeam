@@ -2,7 +2,20 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
   use Tightbeam.TestCase, async: false
   import Plug.Conn
   import Plug.Test
-  alias Tightbeam.{Archetypes, DB, Devices, Model, Org, Projection, Schema, StateResources}
+
+  alias Tightbeam.{
+    Archetypes,
+    DB,
+    Devices,
+    Ledger,
+    Model,
+    Org,
+    Projection,
+    Schema,
+    StateResources,
+    Wakes
+  }
+
   alias Tightbeam.Wire.Router
 
   setup do
@@ -74,7 +87,13 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
       "/api/sessions/" <> URI.encode(session.session_key, &URI.char_unreserved?/1) <> "/messages"
 
   defp read(ctx, session, query, token \\ "operator-fixture") do
-    conn(:get, path(session) <> "?" <> query)
+    read_resource(ctx, session, "messages", query, token)
+  end
+
+  defp read_resource(ctx, session, resource, query, token \\ "operator-fixture") do
+    request_path = String.replace_suffix(path(session), "messages", resource)
+
+    conn(:get, request_path <> "?" <> query)
     |> put_req_header("authorization", "Bearer " <> token)
     |> Router.call(ctx.opts)
   end
@@ -191,7 +210,7 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
 
   test "operator reads require a valid explicit user and exact authorized selection", ctx do
     append(ctx, ctx.selected, "private selected content")
-    assert_error(read(ctx, ctx.selected, ""), 403, "org_token_read_forbidden")
+    assert_error(read(ctx, ctx.selected, ""), 400, "invalid_message")
 
     for query <- ["asUser=", "asUser=owner&asUser=owner", "asUser=owner&asUser=other"] do
       assert_error(read(ctx, ctx.selected, query), 400, "invalid_as_user")
@@ -254,9 +273,26 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
     )
   end
 
-  test "session and device reads retain their identity and other collections stay closed to operator",
-       ctx do
+  test "org reads expose session collections with unchanged owner and admin visibility", ctx do
     append(ctx, ctx.selected, "ordinary reads")
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.selected.session_key,
+        origin: "user:owner",
+        prompt: "operator-visible wake",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    {:ok, _turn_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: ctx.selected.session_key,
+        message_id: "operator-history-turn",
+        origin: "user:owner",
+        prompt: "operator-visible turn",
+        wake_id: wake.wake_id
+      })
+
     assert read(ctx, ctx.selected, "", ctx.selected.cli_token).status == 200
     assert read(ctx, ctx.selected, "", ctx.owner.token).status == 200
 
@@ -266,16 +302,28 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
 
     assert_error(read(ctx, ctx.hidden, "", ctx.owner.token), 404, "not_found")
 
-    for resource <- ["wakes", "turns"] do
-      response =
-        conn(
-          :get,
-          String.replace_suffix(path(ctx.selected), "messages", resource) <> "?asUser=owner"
-        )
-        |> put_req_header("authorization", "Bearer operator-fixture")
-        |> Router.call(ctx.opts)
+    for resource <- ["messages", "wakes", "turns"] do
+      response = read_resource(ctx, ctx.selected, resource, "asUser=owner")
+      assert response.status == 200, response.resp_body
 
-      assert_error(response, 403, "org_token_read_forbidden")
+      items = JSON.decode!(response.resp_body)["items"]
+
+      expected =
+        if resource == "messages",
+          do: "ordinary reads",
+          else: "operator-visible #{String.trim_trailing(resource, "s")}"
+
+      assert Enum.any?(
+               items,
+               &(Map.get(&1, "content") == expected or Map.get(&1, "prompt") == expected)
+             )
+
+      assert_error(read_resource(ctx, ctx.hidden, resource, "asUser=owner"), 404, "not_found")
+      assert read_resource(ctx, ctx.hidden, resource, "asUser=#{ctx.admin.user_id}").status == 200
+
+      for token <- [ctx.selected.cli_token, ctx.owner.token] do
+        assert read_resource(ctx, ctx.selected, resource, "", token).status == 200
+      end
     end
   end
 end
