@@ -1741,6 +1741,64 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert payload["prompt"] =~ "updated result"
   end
 
+  test "retirement readdress publishes the pending wake's current row" do
+    db = :firehose_wake_readdress_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn',1,1)")
+
+    register_testhost(db)
+
+    Org.create(db, %{
+      session_key: "retiring-wake-target",
+      display_name: "Retiring wake target",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "retiring-wake-target",
+        origin: "user:flynn",
+        prompt: "readdress this pending wake",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    assert %{
+             "class" => "wake.scheduled",
+             "payload" => original_row
+           } = receive_notice()
+
+    assert original_row["wakeId"] == wake.wake_id
+
+    assert %{state: "retired"} =
+             Org.retire(db, "retiring-wake-target", "user:flynn", 1_000)
+
+    wake_notices =
+      observed_notices()
+      |> Enum.filter(&(get_in(&1, ["refs", "wakeId"]) == wake.wake_id))
+
+    assert [%{"class" => "wake.scheduled", "payload" => readdressed_row}] = wake_notices
+
+    current_row =
+      db
+      |> StateResources.query_wake(wake.wake_id)
+      |> StateResources.wake()
+
+    assert readdressed_row == current_row
+    assert readdressed_row["sessionKey"] == Org.personal_session_key("flynn")
+    assert readdressed_row["rowVersion"] > original_row["rowVersion"]
+  end
+
   test "wake versions advance for same-millisecond writes and survive a gateway restart" do
     db = String.to_atom("firehose_wake_version_#{System.unique_integer([:positive])}")
 

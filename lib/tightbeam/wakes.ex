@@ -3892,6 +3892,7 @@ defmodule Tightbeam.Wakes do
               case get_in_txn(txn, wake_id) do
                 %{due_at: due_at} = wake ->
                   schedule_changed_in_txn(txn, {:schedule_changed, due_at})
+                  publish_change_in_txn(txn, "wake.scheduled", wake_id)
                   {:ok, wake}
 
                 other ->
