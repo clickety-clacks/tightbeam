@@ -245,8 +245,14 @@ defmodule Tightbeam.Firehose.Hub do
 
   def handle_cast(_, state), do: {:noreply, state}
 
-  defp committed_notice(%{shutting_down: true} = state, _class, _payload, _refs, _eligibility_refs),
-    do: state
+  defp committed_notice(
+         %{shutting_down: true} = state,
+         _class,
+         _payload,
+         _refs,
+         _eligibility_refs
+       ),
+       do: state
 
   defp committed_notice(state, class, payload, refs, eligibility_refs)
        when class in ~w(session.spawned session.updated session.harness_changed session.retired) do

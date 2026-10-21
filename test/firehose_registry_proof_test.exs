@@ -817,7 +817,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   test "row-reference repairs preserve session-spawn and role-create recipients", ctx do
     session!(ctx.db, "spawn-actor", "flynn")
     session!(ctx.db, "spawn-target", "kay")
-    work_item!(ctx.db, "spawn-work-item", "flynn")
+    work_item!(ctx.db, "wi_spawn-work-item", "flynn")
 
     spawn_listeners = [
       {:spawn_work_owner,
@@ -838,12 +838,13 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       principal: {:session, "spawn-actor"},
       session_key: "spawn-actor",
       firehose_hub: ctx.hub,
-      params: %{work_item_id: "spawn-work-item"}
+      params: %{work_item_id: "wi_spawn-work-item"}
     }
 
     assert {:ok, :ok} =
              DB.transaction(ctx.db, fn txn ->
-               Publisher.accepted_in_txn(txn, session_call, %{session_key: "spawn-target"})
+               session = StateResources.query_session(txn, "spawn-target")
+               Publisher.accepted_in_txn(txn, session_call, %{session: session})
                :ok
              end)
 
@@ -863,8 +864,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     session!(ctx.db, "role-bound-target", "kay")
 
     role_listeners = [
-      {:role_owner,
-       class_listener(ctx, :role_owner, "role.created", %{user_id: "flynn"})},
+      {:role_owner, class_listener(ctx, :role_owner, "role.created", %{user_id: "flynn"})},
       {:role_creator,
        class_listener(ctx, :role_creator, "role.created", %{
          user_id: "flynn",
@@ -877,7 +877,8 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
          principal_kind: :session,
          principal_id: "role-bound-target"
        })},
-      {:role_bound_owner, class_listener(ctx, :role_bound_owner, "role.created", %{user_id: "kay"})}
+      {:role_bound_owner,
+       class_listener(ctx, :role_bound_owner, "role.created", %{user_id: "kay"})}
     ]
 
     on_exit(fn -> Enum.each(role_listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end) end)
