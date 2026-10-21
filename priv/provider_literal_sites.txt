@@ -7,5 +7,6 @@ cli/src/probe.rs
 lib/tightbeam/credentials.ex
 lib/tightbeam/gateway.ex
 lib/tightbeam/org.ex
+lib/tightbeam/placement.ex
 lib/tightbeam/schema.ex
 lib/tightbeam/terminal_credential_failure.ex
