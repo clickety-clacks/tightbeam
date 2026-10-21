@@ -481,7 +481,7 @@ defmodule Tightbeam.HarnessProcess do
         released ->
           :ok = ensure_fence(db, row.adapter_key)
 
-          case reconcile_row(db, row, "exited") do
+          case reconcile_boot_row(db, row) do
             result when result in [:ok, :settled] ->
               :ok =
                 EventLog.lifecycle(
@@ -490,10 +490,6 @@ defmodule Tightbeam.HarnessProcess do
                   row.adapter_key,
                   inspect(%{launch_id: row.launch_id})
                 )
-
-              if result == :ok do
-                :ok = complete_reconciled_park_name(db, row.adapter_key)
-              end
 
               if park_fence_exists?(db, row.adapter_key),
                 do: released,
@@ -504,20 +500,15 @@ defmodule Tightbeam.HarnessProcess do
           end
       end
 
-    {:ok, Enum.uniq(recovered ++ clear_orphan_fence_names(db))}
+    {:ok, Enum.uniq(recovered)}
   end
 
   @doc "Reconcile every unresolved launch left by an earlier coordinator."
   @spec reconcile(DB.server()) :: :ok
   def reconcile(db) do
-    :ok = clear_orphan_fences(db)
-
     Enum.each(unresolved(db), fn row ->
       :ok = ensure_fence(db, row.adapter_key)
-
-      if reconcile_row(db, row) == :ok do
-        :ok = complete_reconciled_park_name(db, row.adapter_key)
-      end
+      reconcile_boot_row(db, row)
     end)
 
     :ok
@@ -673,6 +664,159 @@ defmodule Tightbeam.HarnessProcess do
       resolved_at: resolved_at
     }
   end
+
+  defp reconcile_boot_row(db, %{os_pid: nil, process_group_id: nil} = row) do
+    case recover_boot_identity(db, row) do
+      {:ok, recovered} -> reconcile_boot_row(db, recovered)
+      {:error, reason} -> unidentified(db, row, reason)
+    end
+  end
+
+  defp reconcile_boot_row(db, row) do
+    case Tightbeam.HarnessProcess.Recovery.settle_process_snapshot_absence(
+           db,
+           row.launch_id,
+           row.adapter_key,
+           "automatic-reconcile"
+         ) do
+      {:ok, _settled} ->
+        :settled
+
+      :already_resolved ->
+        :already_resolved
+
+      {:error, reason}
+      when reason in [:process_snapshot_present, :process_identity_missing] ->
+        reconcile_row(db, row)
+
+      {:error, reason} ->
+        boot_uncertain(db, row, reason)
+    end
+  end
+
+  # Older identity files can provide numeric identities for census even when
+  # they lack the authority file needed to authorize a signal. Persisting that
+  # legacy observation lets settlement guard the exact PID and group at commit;
+  # a present process still falls through to the authority-checked cleanup.
+  defp recover_boot_identity(db, row) do
+    case read_identity(row, command_timeout_ms()) do
+      {:ok, pid, process_group_id, boot_identity, identity_token} ->
+        :ok =
+          persist_identity(
+            db,
+            row,
+            pid,
+            process_group_id,
+            boot_identity,
+            identity_token,
+            false
+          )
+
+        {:ok,
+         %{
+           row
+           | os_pid: pid,
+             process_group_id: process_group_id,
+             boot_identity: boot_identity,
+             identity_token: identity_token
+         }}
+
+      {:error, _identity_reason} ->
+        recover_identity_until(db, row, deadline(identity_wait_ms()))
+    end
+  end
+
+  defp boot_uncertain(db, row, reason) do
+    :ok =
+      EventLog.lifecycle(
+        db,
+        "harness_launch_process_state_uncertain",
+        row.adapter_key,
+        inspect(%{launch_id: row.launch_id, reason: reason})
+      )
+
+    {:ok, recorded?} =
+      DB.transaction(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          """
+          UPDATE harness_processes
+             SET state = 'kill_failed', lastError = COALESCE(lastError, ?2)
+           WHERE launchId = ?1 AND resolvedAt IS NULL
+          """,
+          [row.launch_id, inspect(reason)]
+        )
+
+        DB.Txn.changes(txn) == 1
+      end)
+
+    if recorded?, do: {:error, {:kill_failed, reason}}, else: :already_resolved
+  end
+
+  @doc false
+  @spec process_snapshot(row()) :: {:ok, map()} | {:error, term()}
+  def process_snapshot(%{ssh: nil}) do
+    case bounded_command(
+           "ps",
+           ["-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
+           command_timeout_ms()
+         ) do
+      {output, 0} -> parse_process_snapshot(output)
+      {:error, :timeout} -> {:error, :process_snapshot_timeout}
+      {output, status} -> {:error, {:process_snapshot_failed, status, one_line(output)}}
+    end
+  end
+
+  def process_snapshot(%{ssh: destination}) do
+    case bounded_command(
+           "ssh",
+           @ssh_opts ++
+             [destination, "ps", "-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
+           command_timeout_ms()
+         ) do
+      {output, 0} -> parse_process_snapshot(output)
+      {:error, :timeout} -> {:error, :process_snapshot_timeout}
+      {output, status} -> {:error, {:process_snapshot_failed, status, one_line(output)}}
+    end
+  end
+
+  defp parse_process_snapshot(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.reduce_while({:ok, %{pids: MapSet.new(), pgids: MapSet.new()}}, fn line,
+                                                                               {:ok, snapshot} ->
+      case String.split(line) do
+        [pid, pgid, stat] ->
+          with {pid, ""} when pid > 0 <- Integer.parse(pid),
+               {pgid, ""} when pgid >= 0 <- Integer.parse(pgid) do
+            if live_process_state?(stat) do
+              {:cont,
+               {:ok,
+                %{
+                  pids: MapSet.put(snapshot.pids, pid),
+                  pgids: MapSet.put(snapshot.pgids, pgid)
+                }}}
+            else
+              {:cont, {:ok, snapshot}}
+            end
+          else
+            _ -> {:halt, {:error, :process_snapshot_invalid}}
+          end
+
+        _ ->
+          {:halt, {:error, :process_snapshot_invalid}}
+      end
+    end)
+    |> then(fn
+      {:ok, %{pids: pids} = snapshot} ->
+        if MapSet.size(pids) > 0, do: {:ok, snapshot}, else: {:error, :process_snapshot_empty}
+
+      error ->
+        error
+    end)
+  end
+
+  defp live_process_state?(stat), do: String.first(stat) not in ["Z", "X", "x"]
 
   defp reconcile_row(
          db,
@@ -1511,23 +1655,6 @@ defmodule Tightbeam.HarnessProcess do
     :ok
   end
 
-  defp complete_reconciled_park_name(db, adapter_key) do
-    incident_guard = rate_limit_incident_guard(db)
-
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-        DELETE FROM harness_park_fences
-         WHERE adapterKey = ?1
-         #{incident_guard}
-        """,
-        [adapter_key]
-      )
-
-    :ok
-  end
-
   defp park_fence_exists?(db, adapter_key) do
     {:ok, [[count]]} =
       DB.query(db, "SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1", [
@@ -1535,34 +1662,6 @@ defmodule Tightbeam.HarnessProcess do
       ])
 
     count > 0
-  end
-
-  defp clear_orphan_fences(db) do
-    _released = clear_orphan_fence_names(db)
-    :ok
-  end
-
-  defp clear_orphan_fence_names(db) do
-    incident_guard = rate_limit_incident_guard(db)
-
-    {:ok, released} =
-      DB.query(
-        db,
-        """
-        DELETE FROM harness_park_fences
-         WHERE NOT EXISTS (
-           SELECT 1
-             FROM harness_processes
-            WHERE harness_processes.adapterKey = harness_park_fences.adapterKey
-              AND state IN ('launching','running','park_requested','kill_failed')
-              AND resolvedAt IS NULL
-         )
-         #{incident_guard}
-         RETURNING adapterKey
-        """
-      )
-
-    Enum.map(released, fn [adapter_key] -> adapter_key end)
   end
 
   defp rate_limit_incident_guard(db) do
@@ -1592,19 +1691,41 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp resolve(db, row, state) do
+    incident_guard = rate_limit_incident_guard(db)
+
     {:ok, resolved?} =
       DB.transaction(db, fn txn ->
         DB.Txn.q(
           txn,
           """
           UPDATE harness_processes
-             SET state = ?2, resolvedAt = ?3, lastError = NULL
+             SET state = ?2, resolvedAt = ?3
            WHERE launchId = ?1 AND resolvedAt IS NULL
           """,
           [row.launch_id, state, now()]
         )
 
-        DB.Txn.changes(txn) == 1
+        if DB.Txn.changes(txn) == 1 do
+          DB.Txn.q(
+            txn,
+            """
+            DELETE FROM harness_park_fences
+             WHERE adapterKey = ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM harness_processes
+                  WHERE adapterKey = ?1
+                    AND state IN ('launching','running','park_requested','kill_failed')
+                    AND resolvedAt IS NULL
+               )
+               #{incident_guard}
+            """,
+            [row.adapter_key]
+          )
+
+          true
+        else
+          false
+        end
       end)
 
     if resolved? do
@@ -1667,7 +1788,7 @@ defmodule Tightbeam.HarnessProcess do
           txn,
           """
           UPDATE harness_processes
-             SET state = 'kill_failed', lastError = CASE WHEN lastError LIKE '{:launch_identity_failed,%' THEN lastError ELSE ?2 END
+             SET state = 'kill_failed', lastError = COALESCE(lastError, ?2)
            WHERE launchId = ?1 AND resolvedAt IS NULL
           """,
           [row.launch_id, inspect(reason)]

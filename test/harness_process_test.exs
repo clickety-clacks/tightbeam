@@ -234,7 +234,9 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 14)
   end
 
-  test "boot reconciliation clears a fence with no unresolved launch", %{tmp_dir: tmp} do
+  test "boot reconciliation preserves an independent fence with no unresolved launch", %{
+    tmp_dir: tmp
+  } do
     Tightbeam.HarnessProcessFixture.run!(tmp, 15)
   end
 
@@ -333,6 +335,38 @@ defmodule Tightbeam.HarnessProcessTest do
 
   test "a failed park waits for a vanished leader's survivor group", %{tmp_dir: tmp} do
     Tightbeam.HarnessProcessFixture.run!(tmp, 33)
+  end
+
+  test "boot settles an absent legacy record through coordinator init and preserves history across restart",
+       %{tmp_dir: tmp} do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 35)
+  end
+
+  test "first boot censuses a recovered old-format identity without authority", %{tmp_dir: tmp} do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 36)
+  end
+
+  test "boot retries atomic terminal and fence settlement after a storage interruption",
+       %{tmp_dir: tmp} do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 37)
+  end
+
+  test "boot keeps a live pre-authority process group fenced without signalling", %{tmp_dir: tmp} do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 38)
+  end
+
+  test "boot treats missing helper capability as uncertain live state", %{tmp_dir: tmp} do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 39)
+  end
+
+  test "boot refuses a reused PID with mismatched start authority", %{tmp_dir: tmp} do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 40)
+  end
+
+  test "boot preserves uncertainty when a remote process census cannot complete", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 41)
   end
 
   defp start_process_db do
