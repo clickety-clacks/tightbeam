@@ -775,6 +775,28 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert [closed_notice] = closed_notices
 
+    assert closed_notice["refs"] == %{
+             "assignmentId" => assignment.id,
+             "sessionKey" => "effect-target",
+             "origin" => "agent:effect-target",
+             "principal" => "session:effect-target"
+           }
+
+    attest_notice =
+      Enum.find(completion_notices, fn notice ->
+        notice["class"] == "attest.filed" and
+          notice["payload"]["assignmentId"] == assignment.id and
+          notice["payload"]["kind"] == "completion"
+      end)
+
+    assert attest_notice["refs"] == %{
+             "attestId" => attest_notice["payload"]["id"],
+             "sessionKey" => "effect-target",
+             "assignmentId" => assignment.id,
+             "origin" => "agent:effect-target",
+             "principal" => "session:effect-target"
+           }
+
     closed_response =
       rest_get("/api/assignments/#{assignment.id}", completion_device.token, router_opts)
 
@@ -889,11 +911,15 @@ defmodule Tightbeam.Firehose.PublisherTest do
       origin: "user:flynn",
       principal: {:user, "flynn"},
       session_key: nil,
-      params: %{work_item_id: "wi_1"}
+      params: %{
+        work_item_id: "work-one",
+        session_key: "caller-session",
+        assignment_id: "request-assignment"
+      }
     }
 
     result = %{
-      id: "wi_1",
+      id: "work-one",
       title: "Firehose",
       owner_user_id: "flynn",
       updated_at: 123,
@@ -911,11 +937,15 @@ defmodule Tightbeam.Firehose.PublisherTest do
              "class" => "work_item.updated",
              "resource" => "work-items",
              "op" => "upsert",
-             "refs" => %{"workItemId" => "wi_1"},
+             "refs" => %{
+               "workItemId" => "work-one",
+               "origin" => "user:flynn",
+               "principal" => "user:flynn"
+             },
              "payload" => payload
            } = receive_notice()
 
-    assert payload["id"] == "wi_1"
+    assert payload["id"] == "work-one"
     assert payload["rowVersion"] == 123
     refute Map.has_key?(payload, "cliToken")
   end
@@ -1413,12 +1443,16 @@ defmodule Tightbeam.Firehose.PublisherTest do
       assert notice["schemaVersion"] == 2
       assert notice["resource"] == "decision requests"
       assert notice["op"] == "upsert"
-      assert notice["refs"] == %{"decisionRequestId" => request.id}
 
       canonical =
         db
         |> Tightbeam.StateResources.query_decision_request(request.id)
         |> Tightbeam.StateResources.decision_request()
+
+      assert notice["refs"] == %{
+               "decisionRequestId" => request.id,
+               "sessionKey" => canonical["raiserSessionKey"]
+             }
 
       assert notice["payload"] == canonical
       assert JSON.decode!(Publisher.encode_wire_notice(notice))["payload"] == canonical
@@ -1458,7 +1492,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert notice["schemaVersion"] == 2
     assert notice["resource"] == "decision requests"
     assert notice["op"] == "upsert"
-    assert notice["refs"] == %{"decisionRequestId" => request.id}
+
+    assert notice["refs"] == %{
+             "decisionRequestId" => request.id,
+             "sessionKey" => notice["payload"]["raiserSessionKey"]
+           }
+
     assert notice["payload"]["status"] == "withdrawn"
     assert Escalation.raw_by_id(db, request.id).row_schema_revision == 2
   end

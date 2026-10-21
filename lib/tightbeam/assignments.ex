@@ -1982,9 +1982,9 @@ defmodule Tightbeam.Assignments do
           if Txn.changes(txn) != 1, do: raise(TransitionRace)
           after_attest = StateResources.query_assignment(txn, assignment_id, call)
 
-          publish_attest_assignment_change(txn, assignment_id, after_attest)
+          publish_attest_assignment_change(txn, call, assignment_id, after_attest)
         else
-          publish_attest_assignment_change(txn, assignment_id, after_attest)
+          publish_attest_assignment_change(txn, call, assignment_id, after_attest)
         end
       end
     end
@@ -1998,7 +1998,7 @@ defmodule Tightbeam.Assignments do
     |> Map.delete("rowVersion")
   end
 
-  defp publish_attest_assignment_change(txn, assignment_id, after_attest) do
+  defp publish_attest_assignment_change(txn, call, assignment_id, after_attest) do
     class =
       if after_attest.state == "closed", do: "assignment.closed", else: "assignment.opened"
 
@@ -2006,7 +2006,10 @@ defmodule Tightbeam.Assignments do
       txn,
       class,
       after_attest,
-      %{"assignmentId" => assignment_id}
+      Map.merge(
+        %{"assignmentId" => assignment_id},
+        Tightbeam.Firehose.Publisher.actor_refs(call)
+      )
     )
   end
 

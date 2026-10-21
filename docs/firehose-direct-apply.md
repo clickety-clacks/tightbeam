@@ -89,3 +89,40 @@ row, and then compares the final model with a fresh complete REST walk.
 The seven required rows remain pending certification until DA3.1 to DA3.5 pass
 for each resource on the integrated 0.1.11 commit. No DA3.7 fallback is marked
 certified.
+
+## Row references and filtered subscriptions
+
+Primary references keep their existing values. A secondary `sessionKey`,
+`workItemId`, or `assignmentId` comes from the projected row or its committed
+parent assignment, as shown here. Empty or null row links are omitted. The
+mutability column describes whether a write path in this version can change
+that value.
+
+| Resource | `sessionKey` | Mutability | `workItemId` | Mutability | `assignmentId` | Mutability |
+|---|---|---|---|---|---|---|
+| Work items | Absent | — | Primary `id` | Immutable | Absent | — |
+| Assignments | `holderKey` | Immutable | Stored work-item link | Immutable | Primary `id` | Immutable |
+| Attests | Filing session, absent for a user filing | Immutable | Parent assignment's work item | Immutable | Attest assignment | Immutable |
+| Wakes | Target session, absent for a role target | Mutable | Stored work-item link | Immutable | Stored assignment link | Immutable |
+| Decision requests | Raising session, absent when none | Immutable | Linked assignment's work item | Immutable | Linked assignment, absent when none | Immutable |
+| Turns | Row `sessionKey` | Immutable | `jobRef` | Immutable | Row assignment | Immutable |
+| Messages | Primary row `sessionKey` | Immutable | Absent | — | Absent | — |
+| Artifacts | Creating session | Immutable | Stored work-item link | Immutable | Absent | — |
+| Sessions | Primary `sessionKey` | Immutable | Absent | — | Absent | — |
+| Critical state | Primary `sessionKey` | Immutable | Absent | — | Absent | — |
+| Roles | Bound session, absent when unbound | Mutable | Absent | — | Absent | — |
+| Operator ruling provenance | Primary submitting session; no notice is published at this version | Immutable | Absent | — | Absent | — |
+| Every other R8 resource | Absent | — | Absent | — | Absent | — |
+
+Filters compare the references carried by each notice literally. `origin` and
+`principal` filter by the actor of the write. They are the actor filters;
+`sessionKey` is the row's session reference when that resource has one. A
+relationship such as an opener or parent is not a filterable reference unless
+the table lists it. When a mutable reference changes, the notice carries its
+new value: a subscriber filtered by the new value receives the upsert, while
+one filtered by the old value receives no exit notice. A client that needs
+exact membership for a relationship-based slice, or needs to observe exits
+from a mutable-reference slice, subscribes by class prefix without that
+reference filter and derives membership from the payload. This version has no
+write path that changes an assignment's holder; if one is added later, its
+`sessionKey` reference follows the same literal entry and exit behavior.

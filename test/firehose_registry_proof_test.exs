@@ -2,7 +2,17 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.Firehose.{Hub, Publisher, Registry}
-  alias Tightbeam.{DB, Gateway, Model, Org, StateVisibility, SubagentMarkers, Toplines}
+
+  alias Tightbeam.{
+    DB,
+    Gateway,
+    Model,
+    Org,
+    StateResources,
+    StateVisibility,
+    SubagentMarkers,
+    Toplines
+  }
 
   @r8_groups [
     {~w(work_item.created work_item.updated work_item.iceboxed work_item.reopened work_item.closed work_item.failed),
@@ -459,6 +469,199 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     end)
   end
 
+  test "DA7.5 each published row class has exactly its primary and committed-row references",
+       ctx do
+    fixtures = row_reference_fixtures(ctx)
+
+    Enum.each(Registry.rows(), fn {class, row} ->
+      fixture = Map.fetch!(fixtures, row.serializer)
+
+      supplied_refs =
+        if class == "kungfu.updated" do
+          %{"name" => "capability-row"}
+        else
+          %{
+            "origin" => "agent:writer",
+            "principal" => "session:writer",
+            "sessionKey" => "caller-session",
+            "workItemId" => "request-work-item",
+            "assignmentId" => "request-assignment",
+            "ownerUserId" => "flynn"
+          }
+          |> Map.drop(row.primary_refs)
+          |> then(fn refs ->
+            if fixture[:parent_work_item_id],
+              do: Map.put(refs, :firehose_parent_work_item_id, fixture.parent_work_item_id),
+              else: refs
+          end)
+        end
+
+      notice = Publisher.committed_notice(class, fixture.payload, supplied_refs)
+
+      expected_refs =
+        fixture.primary_refs
+        |> Map.merge(fixture.secondary_refs)
+        |> Map.merge(Map.take(supplied_refs, ~w(origin principal)))
+        |> Map.merge(if(class == "message.created", do: %{"ownerUserId" => "flynn"}, else: %{}))
+
+      assert notice["refs"] == expected_refs, "unexpected references for #{class}"
+
+      if row.serializer == :decision_request do
+        assert notice["schemaVersion"] == 2
+      end
+    end)
+  end
+
+  test "row-reference filters are literal and relationship membership comes from the payload" do
+    row = %{
+      id: "assignment-row",
+      holderKey: "current-holder",
+      workItemId: "linked-work-item",
+      openedAt: 1,
+      state: "open"
+    }
+
+    notice =
+      Publisher.committed_notice("assignment.closed", row, %{
+        "assignmentId" => "assignment-row",
+        "sessionKey" => "writer-session",
+        "workItemId" => "request-work-item",
+        "origin" => "agent:writer",
+        "principal" => "session:writer"
+      })
+
+    assert notice["refs"] == %{
+             "assignmentId" => "assignment-row",
+             "sessionKey" => "current-holder",
+             "workItemId" => "linked-work-item",
+             "origin" => "agent:writer",
+             "principal" => "session:writer"
+           }
+
+    assert Hub.matches?(notice, %{"classes" => ["assignment."], "sessionKey" => "current-holder"})
+    assert Hub.matches?(notice, %{"workItemId" => "linked-work-item"})
+    assert Hub.matches?(notice, %{"principal" => "session:writer"})
+    refute Hub.matches?(notice, %{"sessionKey" => "prior-holder"})
+    refute Hub.matches?(notice, %{"sessionKey" => "writer-session"})
+
+    assert Hub.matches?(notice, %{"classes" => ["assignment."]})
+  end
+
+  test "transactional row references use the committed parent assignment", ctx do
+    session!(ctx.db, "holder-row", "flynn")
+    session!(ctx.db, "filing-session", "flynn")
+    work_item!(ctx.db, "work-parent-row", "flynn")
+    assignment!(ctx.db, "assignment-parent-row", "holder-row", "work-parent-row")
+
+    :ok =
+      Hub.register(ctx.hub, self(), %{
+        mode: :all,
+        db: ctx.db,
+        user_id: "flynn",
+        is_admin: true
+      })
+
+    attest = %{
+      id: "attest-row",
+      assignment_id: "assignment-parent-row",
+      kind: "progress",
+      verdict_kind: nil,
+      note: nil,
+      by_session: "filing-session",
+      by_user: nil,
+      producer: nil,
+      producer_command: nil,
+      by_harness: nil,
+      by_provider: nil,
+      commit_refs: nil,
+      artifact_id: nil,
+      content_sha256: nil,
+      wait_id: nil,
+      ts: 10
+    }
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(
+                 txn,
+                 "INSERT INTO attests(id,assignmentId,kind,note,bySession,ts) VALUES(?1,?2,?3,?4,?5,?6)",
+                 [
+                   attest.id,
+                   attest.assignment_id,
+                   attest.kind,
+                   attest.note,
+                   attest.by_session,
+                   attest.ts
+                 ]
+               )
+
+               Publisher.accepted_in_txn(
+                 txn,
+                 %{
+                   verb: "attest",
+                   origin: "agent:writer",
+                   principal: {:session, "filing-session"},
+                   session_key: "caller-session",
+                   firehose_hub: ctx.hub,
+                   params: %{
+                     assignment_id: "assignment-parent-row",
+                     session_key: "request-session",
+                     work_item_id: "request-work-item"
+                   }
+                 },
+                 %{attest: attest}
+               )
+
+               Publisher.committed_in_txn(
+                 txn,
+                 "decision_request.opened",
+                 %{
+                   id: "request-row",
+                   kind: "operator",
+                   status: "open",
+                   raiser_session_key: "raising-session",
+                   assignment_id: "assignment-parent-row",
+                   row_schema_revision: 2,
+                   row_version: 10
+                 },
+                 %{
+                   "decisionRequestId" => "request-row",
+                   "sessionKey" => "caller-session",
+                   "workItemId" => "request-work-item",
+                   "assignmentId" => "request-assignment"
+                 },
+                 ctx.hub
+               )
+
+               :ok
+             end)
+
+    assert %{"class" => "verb.accepted"} = take_notice(ctx.hub)
+
+    assert %{
+             "class" => "attest.filed",
+             "refs" => %{
+               "attestId" => "attest-row",
+               "sessionKey" => "filing-session",
+               "workItemId" => "work-parent-row",
+               "assignmentId" => "assignment-parent-row",
+               "origin" => "agent:writer",
+               "principal" => "session:filing-session"
+             }
+           } = take_notice(ctx.hub)
+
+    assert %{
+             "class" => "decision_request.opened",
+             "schemaVersion" => 2,
+             "refs" => %{
+               "decisionRequestId" => "request-row",
+               "sessionKey" => "raising-session",
+               "workItemId" => "work-parent-row",
+               "assignmentId" => "assignment-parent-row"
+             }
+           } = take_notice(ctx.hub)
+  end
+
   # Subscription matching runs first and visibility is checked only for a
   # matching row, so a hidden row may be matched but never emits a frame.
   test "A3 hidden rows are matched but emit no frame; visible rows emit one", ctx do
@@ -632,6 +835,335 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
              "refs" => refs,
              "payload" => %{"sourceVersion" => source_version}
            }
+  end
+
+  defp row_reference_fixtures(ctx) do
+    %{
+      work_item:
+        row_reference_fixture(
+          %{id: "work-row", row_version: 10},
+          %{"workItemId" => "work-row"},
+          %{}
+        ),
+      assignment:
+        row_reference_fixture(
+          %{id: "assignment-row", holderKey: "holder-row", workItemId: "work-row", openedAt: 10},
+          %{"assignmentId" => "assignment-row"},
+          %{"sessionKey" => "holder-row", "workItemId" => "work-row"}
+        ),
+      attest:
+        row_reference_fixture(
+          %{
+            id: "attest-row",
+            assignment_id: "assignment-row",
+            kind: "progress",
+            verdict_kind: nil,
+            note: nil,
+            by_session: "filing-session",
+            by_user: nil,
+            producer: nil,
+            producer_command: nil,
+            by_harness: nil,
+            by_provider: nil,
+            commit_refs: nil,
+            artifact_id: nil,
+            content_sha256: nil,
+            wait_id: nil,
+            ts: 10
+          },
+          %{"attestId" => "attest-row"},
+          %{
+            "sessionKey" => "filing-session",
+            "workItemId" => "parent-work-row",
+            "assignmentId" => "assignment-row"
+          },
+          "parent-work-row"
+        ),
+      wake:
+        row_reference_fixture(
+          %{
+            wake_id: "wake-row",
+            session_key: "wake-target",
+            target_role: nil,
+            origin: "agent:writer",
+            prompt: "pending work",
+            consumer: "wake",
+            due_at: 10,
+            state: "pending",
+            created_at: 10,
+            fired_at: nil,
+            reresolve: nil,
+            reresolve_seed: nil,
+            reresolve_rung: nil,
+            condition_kind: nil,
+            condition_scope: nil,
+            condition_after_id: nil,
+            fired_by: nil,
+            creator_session_key: nil,
+            rumination: false,
+            work_item_id: "work-row",
+            assignment_id: "assignment-row",
+            canceled_at: nil,
+            target_gate: nil,
+            class: nil,
+            class_election: nil,
+            delivery_rule: nil,
+            digest: false,
+            summon: false,
+            delivery_status: nil,
+            row_version: 10
+          },
+          %{"wakeId" => "wake-row"},
+          %{
+            "sessionKey" => "wake-target",
+            "workItemId" => "work-row",
+            "assignmentId" => "assignment-row"
+          }
+        ),
+      turn:
+        row_reference_fixture(
+          %{
+            seq: 44,
+            session_key: "turn-session",
+            message_id: nil,
+            wake_id: nil,
+            origin: "agent:writer",
+            prompt: "queued work",
+            role_ref: nil,
+            role_fallback: 0,
+            assignment_id: "assignment-row",
+            job_ref: "work-row",
+            model: nil,
+            thinking_level: nil,
+            model_context: nil,
+            harness: nil,
+            reply_attention: 0,
+            status: "queued",
+            owner: nil,
+            adapter_gen: nil,
+            request_ref: nil,
+            error: nil,
+            created_at: 10,
+            started_at: nil,
+            ended_at: nil,
+            published_at: nil,
+            row_version: 10
+          },
+          %{"turnSeq" => 44},
+          %{
+            "sessionKey" => "turn-session",
+            "workItemId" => "work-row",
+            "assignmentId" => "assignment-row"
+          }
+        ),
+      decision_request:
+        row_reference_fixture(
+          %{
+            id: "request-row",
+            kind: "operator",
+            status: "open",
+            raiser_session_key: "raising-session",
+            assignment_id: "assignment-row",
+            row_schema_revision: 2,
+            row_version: 10
+          },
+          %{"decisionRequestId" => "request-row"},
+          %{
+            "sessionKey" => "raising-session",
+            "workItemId" => "parent-work-row",
+            "assignmentId" => "assignment-row"
+          },
+          "parent-work-row"
+        ),
+      session:
+        row_reference_fixture(
+          session_row_fixture(ctx.db),
+          %{"sessionKey" => "session-row"},
+          %{}
+        ),
+      role:
+        row_reference_fixture(
+          %{
+            name: "role-row",
+            bound_session_key: "bound-session",
+            owner_user_id: "flynn",
+            created_at: 10,
+            updated_at: 11,
+            row_version: 11
+          },
+          %{"role" => "role-row"},
+          %{"sessionKey" => "bound-session"}
+        ),
+      user:
+        row_reference_fixture(
+          %{user_id: "flynn", is_admin: false, created_at: 1, row_version: 1},
+          %{"userId" => "flynn"},
+          %{}
+        ),
+      device:
+        row_reference_fixture(
+          %{
+            device_id: "device-row",
+            user_id: "flynn",
+            claimed_name: nil,
+            status: "allowlisted",
+            platform: nil,
+            model: nil,
+            created_at: 10,
+            row_version: 10
+          },
+          %{"deviceId" => "device-row"},
+          %{}
+        ),
+      artifact:
+        row_reference_fixture(
+          %{
+            artifact_id: "artifact-row",
+            kind: "spec",
+            title: "Projection fixture",
+            description: nil,
+            created_by_session: "artifact-creator",
+            work_item_id: "work-row",
+            parent_session: nil,
+            origin_path: "projection-fixture.md",
+            content_sha256: nil,
+            recorded_message_id: nil,
+            recorded_turn_evidence: "none",
+            state: "in-workspace",
+            home: nil,
+            created_at: 10,
+            updated_at: 10,
+            row_version: 10
+          },
+          %{"artifactId" => "artifact-row"},
+          %{"sessionKey" => "artifact-creator", "workItemId" => "work-row"}
+        ),
+      read_marker:
+        row_reference_fixture(
+          %{user_id: "flynn", scope_key: "scope-row", marker: "message-row", updated_at: 10},
+          %{"userId" => "flynn", "scopeKey" => "scope-row"},
+          %{}
+        ),
+      message:
+        row_reference_fixture(
+          %{
+            id: "message-row",
+            seq: 22,
+            session_key: "message-session",
+            role: "user",
+            message_type: nil,
+            content: "hello",
+            timestamp: 22,
+            sender: nil,
+            device_id: nil,
+            client_message_id: nil,
+            reply_to_message_id: nil,
+            reply_to_client_message_id: nil,
+            llm_visible_message_id: "message-row",
+            attachments: [],
+            attention_tier: 1,
+            turn_seq: nil,
+            assignment_id: nil,
+            job_ref: nil,
+            harness: nil,
+            provider: nil,
+            model: nil,
+            effort: nil,
+            context: nil,
+            row_version: 22
+          },
+          %{"messageId" => "message-row", "sessionKey" => "message-session"},
+          %{}
+        ),
+      condition_fact:
+        row_reference_fixture(
+          %{id: 7, ts: 10, kind: "type", scope: nil, origin: "agent:writer"},
+          %{"factId" => 7},
+          %{}
+        ),
+      critical_state:
+        row_reference_fixture(
+          %{
+            session_key: "critical-session",
+            reason: "active",
+            started_at: 10,
+            expires_at: 20,
+            hard_deadline: 30,
+            updated_at: 10,
+            row_version: 10
+          },
+          %{"sessionKey" => "critical-session"},
+          %{}
+        ),
+      config:
+        row_reference_fixture(
+          %{key: "config-row", value: "enabled", updated_at: 10, row_version: 10},
+          %{"key" => "config-row"},
+          %{}
+        ),
+      host_environment:
+        row_reference_fixture(
+          %{
+            host: "sample-host",
+            harness: "claude",
+            name: "setting",
+            value_present: false,
+            updated_at: 10,
+            row_version: 10
+          },
+          %{"host" => "sample-host", "harness" => "claude", "name" => "setting"},
+          %{}
+        ),
+      host:
+        row_reference_fixture(
+          %{host: "sample-host", row_version: 10},
+          %{"host" => "sample-host"},
+          %{}
+        ),
+      identity:
+        row_reference_fixture(
+          %{
+            name: "identity-row",
+            live_revision: "revision-one",
+            state: "ready",
+            session_revisions: %{},
+            staleness: [],
+            conflicts: [],
+            row_version: 10
+          },
+          %{"name" => "identity-row"},
+          %{}
+        ),
+      kungfu:
+        row_reference_fixture(
+          %{
+            name: "capability-row",
+            purpose: "Projection fixture",
+            phrases: [],
+            root_archetype: "default",
+            installed_revision: nil,
+            status: "available",
+            documents: [],
+            row_version: 10
+          },
+          %{"name" => "capability-row"},
+          %{}
+        )
+    }
+  end
+
+  defp row_reference_fixture(payload, primary_refs, secondary_refs, parent_work_item_id \\ nil) do
+    %{
+      payload: payload,
+      primary_refs: primary_refs,
+      secondary_refs: secondary_refs,
+      parent_work_item_id: parent_work_item_id
+    }
+  end
+
+  defp session_row_fixture(db) do
+    session!(db, "session-row", "flynn")
+    StateResources.query_session(db, "session-row")
   end
 
   defp take_notice(hub) do
