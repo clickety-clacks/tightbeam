@@ -298,7 +298,9 @@ defmodule Tightbeam.Harklight do
                   "Harklight wake #{wake_id} targets #{session_key}, but handle #{handle} is bound to #{recipient}"
           end
 
-          case Txn.q(txn, "SELECT state,ownerUserId FROM sessions WHERE sessionKey=?1", [recipient]) do
+          case Txn.q(txn, "SELECT state,ownerUserId FROM sessions WHERE sessionKey=?1", [
+                 recipient
+               ]) do
             [["active", _owner]] ->
               {state, notices}
 
@@ -308,7 +310,7 @@ defmodule Tightbeam.Harklight do
                   notify_owner_once_in_txn(txn, handle, recipient, owner_user_id)
                 end
 
-              { :held, if(is_list(notice), do: notices ++ notice, else: notices) }
+              {:held, if(is_list(notice), do: notices ++ notice, else: notices)}
 
             [] ->
               notice =
@@ -316,7 +318,7 @@ defmodule Tightbeam.Harklight do
                   notify_owner_once_in_txn(txn, handle, recipient, nil)
                 end
 
-              { :held, if(is_list(notice), do: notices ++ notice, else: notices) }
+              {:held, if(is_list(notice), do: notices ++ notice, else: notices)}
           end
         end)
         |> case do
