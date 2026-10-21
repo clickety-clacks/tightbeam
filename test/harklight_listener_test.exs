@@ -133,6 +133,10 @@ defmodule Tightbeam.HarklightListenerTest do
 
   defp read_file_when_available(path, attempts) when attempts > 0 do
     case File.read(path) do
+      {:ok, ""} ->
+        Process.sleep(10)
+        read_file_when_available(path, attempts - 1)
+
       {:ok, contents} ->
         contents
 
