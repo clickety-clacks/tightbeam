@@ -56,7 +56,9 @@ defmodule Tightbeam.TestCase do
           catalog_reply: 2,
           catalog_probe_harness: 1,
           ensure_all_schemas: 1,
-          ensure_main_session: 2
+          ensure_main_session: 2,
+          stage_review_verdict: 2,
+          stage_review_verdict: 3
         ]
     end
   end
@@ -156,6 +158,180 @@ defmodule Tightbeam.TestCase do
       {:ok, _entry} = Tightbeam.Placement.register_host(db, name, config)
     end)
   end
+
+  @doc "Stage the production bindings required by a linked review conclusion fixture."
+  def stage_review_verdict(db, call, opts \\ []) do
+    params = call.params
+
+    if params[:kind] == "verdict" and
+         params[:verdict_kind] in ["reviewed-clean", "changes-requested"] do
+      stage_linked_review_verdict(db, call, opts)
+    else
+      call
+    end
+  end
+
+  defp stage_linked_review_verdict(db, call, opts) do
+    assignment_id = call.params[:assignment_id]
+
+    case Tightbeam.DB.query(
+           db,
+           """
+           SELECT review.holderKey, review.reviewsAssignmentId,
+                  rs.ownerUserId, ps.ownerUserId, review.workItemId, producer.workItemId
+           FROM assignments review
+           JOIN assignments producer ON producer.id=review.reviewsAssignmentId
+           JOIN sessions rs ON rs.sessionKey=review.holderKey
+           JOIN sessions ps ON ps.sessionKey=producer.holderKey
+           WHERE review.id=?1
+           """,
+           [assignment_id]
+         ) do
+      {:ok, [[holder, producer_id, owner, owner, review_item, producer_item]]}
+      when call.principal == {:session, holder} ->
+        work_item_id = review_item || producer_item || "wi_#{Tightbeam.Id.uuid4()}"
+
+        if is_nil(review_item) and is_nil(producer_item) do
+          {:ok, _} =
+            Tightbeam.DB.query(
+              db,
+              "INSERT INTO work_items(id,title,ownerUserId,state,createdByUser,createdAt) VALUES (?1,'review binding fixture',?2,'open',?2,1)",
+              [work_item_id, owner]
+            )
+        end
+
+        {:ok, _} =
+          Tightbeam.DB.query(
+            db,
+            "UPDATE assignments SET workItemId=?1 WHERE id IN (?2,?3) AND workItemId IS NULL",
+            [work_item_id, assignment_id, producer_id]
+          )
+
+        if (is_nil(review_item) or review_item == work_item_id) and
+             (is_nil(producer_item) or producer_item == work_item_id) and
+             work_item_owned_by?(db, work_item_id, owner) do
+          bind_review_verdict(db, call, opts, holder, producer_id, owner, work_item_id)
+        else
+          call
+        end
+
+      _ ->
+        call
+    end
+  end
+
+  defp bind_review_verdict(db, call, opts, holder, producer_id, owner, work_item_id) do
+    refs =
+      case Tightbeam.DB.query(
+             db,
+             "SELECT commitRefs FROM assignment_commit_ref_corrections WHERE assignmentId=?1",
+             [producer_id]
+           ) do
+        {:ok, [[encoded]]} ->
+          JSON.decode!(encoded)
+
+        {:ok, []} ->
+          refs = call.params[:commit_refs] || opts[:commit_refs] || fixture_review_refs()
+          refs = native_fixture_refs(refs)
+          artifact_id = "art_#{System.unique_integer([:positive])}"
+
+          {:ok, _} =
+            Tightbeam.DB.query(
+              db,
+              """
+              INSERT INTO artifacts
+                (artifactId,kind,title,createdBySession,workItemId,producedByAssignmentId,
+                 originPath,contentSha256,state,createdAt,updatedAt)
+              VALUES (?1,'report','review binding evidence',?2,?3,?4,?1,?5,'in-workspace',1,1)
+              """,
+              [
+                artifact_id,
+                holder,
+                work_item_id,
+                call.params.assignment_id,
+                fixture_hash(artifact_id)
+              ]
+            )
+
+          {:ok, _} =
+            Tightbeam.DB.query(
+              db,
+              """
+              INSERT INTO assignment_commit_ref_corrections
+                (id,assignmentId,commitRefs,reason,evidenceArtifactId,actorKind,actorRef,cause,
+                 idempotencyKey,requestFingerprint,verifiedAt,createdAt)
+              VALUES (?1,?2,?3,'review binding fixture',?4,'user',?5,
+                      'historical_canonical_commitref_correction',?1,?6,1,1)
+              """,
+              [
+                "crc_#{Tightbeam.Id.uuid4()}",
+                producer_id,
+                JSON.encode!(refs),
+                artifact_id,
+                owner,
+                String.duplicate("a", 64)
+              ]
+            )
+
+          refs
+      end
+
+    report_id = "art_#{System.unique_integer([:positive])}"
+    hash = fixture_hash(report_id)
+
+    {:ok, _} =
+      Tightbeam.DB.query(
+        db,
+        """
+        INSERT INTO artifacts
+          (artifactId,kind,title,createdBySession,workItemId,producedByAssignmentId,
+           originPath,contentSha256,state,createdAt,updatedAt)
+        VALUES (?1,'report','review report fixture',?2,?3,?4,?1,?5,'in-workspace',1,1)
+        """,
+        [report_id, holder, work_item_id, call.params.assignment_id, hash]
+      )
+
+    %{
+      call
+      | params:
+          call.params
+          |> Map.put(:artifact_id, report_id)
+          |> Map.put(:content_sha256, hash)
+          |> Map.put(:commit_refs, refs)
+    }
+  end
+
+  defp work_item_owned_by?(db, work_item_id, owner) do
+    match?(
+      {:ok, [[1]]},
+      Tightbeam.DB.query(
+        db,
+        "SELECT 1 FROM work_items WHERE id=?1 AND ownerUserId=?2",
+        [work_item_id, owner]
+      )
+    )
+  end
+
+  defp native_fixture_refs(refs) do
+    Enum.map(refs, fn ref ->
+      ref = Map.new(ref, fn {key, value} -> {to_string(key), value} end)
+
+      ref
+      |> Map.put_new("remote", "test://#{ref["repo"]}")
+      |> Map.put_new("ref", "refs/heads/main")
+    end)
+  end
+
+  defp fixture_review_refs do
+    [
+      %{
+        "repo" => "#{Tightbeam.Placement.local_host_name()}:#{File.cwd!()}",
+        "commit" => String.duplicate("a", 40)
+      }
+    ]
+  end
+
+  defp fixture_hash(value), do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
 
   @doc """
   Wrap a catalog body the way the probe's shell hands it back.

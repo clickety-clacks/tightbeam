@@ -12,7 +12,7 @@ end
 defmodule Tightbeam.ConformanceSupport do
   alias Tightbeam.Model
   import ExUnit.Assertions
-  import Tightbeam.TestCase, only: [catalog_reply: 1]
+  import Tightbeam.TestCase, only: [catalog_reply: 1, stage_review_verdict: 2]
 
   alias Tightbeam.{
     Archetypes,
@@ -2908,14 +2908,22 @@ defmodule Tightbeam.ConformanceSupport do
            do: Map.put(params, :commit_refs, fixture_refs()),
            else: params
 
-      result =
-        Assignments.__handle__(db, "attest", %{
+      call =
+        %{
           verb: "attest",
           origin: origin(by),
           principal: by,
           session_key: nil,
           params: params
-        })
+        }
+
+      result =
+        if is_binary(reviews_assignment_id) and
+             attest["verdict_kind"] in ["reviewed-clean", "changes-requested"] do
+          insert_legacy_review_attest!(db, call)
+        else
+          Assignments.__handle__(db, "attest", call)
+        end
 
       refute Map.has_key?(result, :code), "failed to materialize attest: #{inspect(result)}"
     end)
@@ -3243,6 +3251,37 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp await_catalog!(_harness, 0), do: flunk("model catalog did not become fresh")
 
+  defp insert_legacy_review_attest!(db, call) do
+    {by_session, by_user} =
+      case call.principal do
+        {:session, session} -> {session, nil}
+        {:user, user} -> {nil, user}
+      end
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO attests
+          (id,assignmentId,kind,verdictKind,bySession,byUser,byHarness,byProvider,commitRefs,ts)
+        VALUES (?1,?2,'verdict',?3,?4,?5,
+                (SELECT harness FROM sessions WHERE sessionKey=?4),
+                (SELECT provider FROM sessions WHERE sessionKey=?4),?6,?7)
+        """,
+        [
+          "legacy_attest_#{Tightbeam.Id.uuid4()}",
+          call.params.assignment_id,
+          call.params.verdict_kind,
+          by_session,
+          by_user,
+          JSON.encode!(call.params.commit_refs),
+          System.system_time(:millisecond)
+        ]
+      )
+
+    %{}
+  end
+
   defp attest_verdict!(db, assignment_id, by_session, verdict_kind) do
     {:ok, [[reviews_assignment_id]]} =
       DB.query(db, "SELECT reviewsAssignmentId FROM assignments WHERE id=?1", [assignment_id])
@@ -3258,17 +3297,48 @@ defmodule Tightbeam.ConformanceSupport do
         do: Map.put(params, :commit_refs, fixture_refs()),
         else: params
 
-    result =
-      Assignments.__handle__(db, "attest", %{
+    call =
+      %{
         verb: "attest",
         origin: "agent:#{by_session}",
         principal: {:session, by_session},
         session_key: nil,
         params: params
-      })
+      }
+      |> align_fixture_review_owner(db)
+      |> then(&stage_review_verdict(db, &1))
+
+    result = Assignments.__handle__(db, "attest", call)
 
     refute Map.has_key?(result, :code)
     result
+  end
+
+  defp align_fixture_review_owner(call, db) do
+    assignment_id = call.params[:assignment_id]
+
+    if call.params[:kind] == "verdict" and
+         call.params[:verdict_kind] in ["reviewed-clean", "changes-requested"] do
+      {:ok, _} =
+        DB.query(
+          db,
+          """
+          UPDATE sessions
+          SET ownerUserId=(
+            SELECT ps.ownerUserId
+            FROM assignments review
+            JOIN assignments producer ON producer.id=review.reviewsAssignmentId
+            JOIN sessions ps ON ps.sessionKey=producer.holderKey
+            WHERE review.id=?1
+          )
+          WHERE sessionKey=(SELECT holderKey FROM assignments WHERE id=?1)
+            AND EXISTS (SELECT 1 FROM assignments WHERE id=?1 AND reviewsAssignmentId IS NOT NULL)
+          """,
+          [assignment_id]
+        )
+    end
+
+    call
   end
 
   defp revoke_assignment!(db, assignment_id) do

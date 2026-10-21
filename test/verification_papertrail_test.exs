@@ -106,12 +106,12 @@ defmodule Tightbeam.VerificationPapertrailTest do
         reviews_assignment_id: work.id
       )
 
+    verdict_call =
+      attest_call(ctx.reviewer.session_key, review.id, "verdict", "reviewed-clean")
+      |> then(&stage_review_verdict(ctx.db, &1))
+
     assert {:ok, %{attest: %{verdictKind: "reviewed-clean"}}} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               attest_call(ctx.reviewer.session_key, review.id, "verdict", "reviewed-clean")
-             )
+             Dispatch.dispatch(ctx.db, ctx.handlers, verdict_call)
 
     # The review's own document. A verdict row carries the DECISION; the note
     # field caps at 2000 characters, so the clause table and evidence — the
