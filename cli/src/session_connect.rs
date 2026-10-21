@@ -2065,7 +2065,7 @@ mod tests {
             "{request}"
         );
         assert!(
-            lower.contains("x-tightbeam-cli-version: 0.1.9\r\n"),
+            lower.contains("x-tightbeam-cli-version: 0.1.10\r\n"),
             "{request}"
         );
     }
