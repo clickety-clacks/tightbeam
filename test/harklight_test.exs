@@ -2,6 +2,7 @@ defmodule Tightbeam.HarklightTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{DB, EventLog, Gateway, Harklight, Model, Org, Projection, Wakes}
+  alias Tightbeam.Wire.Router
 
   setup do
     db = String.to_atom("harklight_db_#{System.unique_integer([:positive])}")
@@ -47,6 +48,37 @@ defmodule Tightbeam.HarklightTest do
                ctx.db,
                "SELECT recipientSessionKey,state FROM harklight_handles WHERE sessionHandle='handle-1'"
              )
+  end
+
+  test "registration accepts CLI JSON params after router atomization", ctx do
+    cli_request = %{
+      "verb" => "harklight-register",
+      "params" => %{
+        "sessionHandle" => "handle-from-cli",
+        "senderId" => "sender-from-cli",
+        "messageId" => "message-from-cli"
+      }
+    }
+
+    registration =
+      Harklight.register(
+        ctx.db,
+        %{
+          principal: {:session, ctx.recipient},
+          params:
+            Router.atomize_params_for_test(cli_request["verb"], cli_request["params"])
+        },
+        start_listener: false
+      )
+
+    assert %{
+             handle: "handle-from-cli",
+             recipient_session_key: recipient,
+             listener: "not_started",
+             existing: false
+           } = registration
+
+    assert recipient == ctx.recipient
   end
 
   test "capture preserves the printed entry and an r16 re-offer does not create another wake",

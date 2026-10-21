@@ -3526,6 +3526,7 @@ defmodule Tightbeam.Wire.Router do
     "harness-health-resolve-other" =>
       ~w(accepted_at cause correlation_id exact_probe harness host idempotency_key incident_id observed_at observed_state output_digest recovery_condition_digest recovery_satisfied redaction_confirmed session_key world_status)a,
     "harness-health-review-other" => ~w(cause idempotency_key incident_id named_class outcome)a,
+    "harklight-register" => ~w(session_handle sender_id message_id)a,
     "harness-processes" => ~w()a,
     "harness-process-settle" => ~w(launch_id adapter_key)a,
     "host-env-list" => ~w(harness host sentinel)a,
