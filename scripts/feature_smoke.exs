@@ -651,13 +651,64 @@ defmodule FeatureSmoke do
       # proves the review gate's wire/provenance behavior, not independent inference.
       # Changed bytes or output refuse; no product source review is manufactured.
       review_note = Tightbeam.FeatureSmokeTopology.review_check!(holder.check)
+      review_id = review["id"] || review["assignmentId"]
+
+      native_refs =
+        Enum.map(holder.check.commit_refs, fn ref ->
+          ref
+          |> Map.put("remote", "fixture://feature-smoke")
+          |> Map.put("ref", "refs/heads/main")
+        end)
+
+      review_report_name = "review-#{u}.md"
+      review_report_bytes = review_note <> "\n"
+      review_report_sha = :crypto.hash(:sha256, review_report_bytes) |> Base.encode16(case: :lower)
+      reviewer_workdir = local_workdir_path(state.base_dir, reviewer_key)
+      File.mkdir_p!(reviewer_workdir)
+      File.write!(Path.join(reviewer_workdir, review_report_name), review_report_bytes)
+
+      review_report =
+        ok_as!(state, reviewer_tok, "artifact-record", %{
+          "kind" => "report",
+          "title" => "review report #{u}",
+          "originPath" => review_report_name,
+          "workItemId" => wi_id,
+          "producedByAssignmentId" => review_id,
+          "contentSha256" => review_report_sha
+        })
+
+      correction_id = "crc_smoke_#{u}"
+
+      # The public correction command intentionally admits only closed historical
+      # assignments. This open-card smoke fixture therefore stages its authoritative
+      # subject row directly, then exercises the report/verdict admission over HTTP.
+      sqlite(
+        state,
+        """
+        INSERT INTO assignment_commit_ref_corrections
+          (id,assignmentId,commitRefs,reason,evidenceArtifactId,actorKind,actorRef,cause,
+           idempotencyKey,requestFingerprint,verifiedAt,createdAt)
+        VALUES (
+          #{sql_quote(correction_id)},
+          #{sql_quote(asg_id)},
+          #{sql_quote(JSON.encode!(native_refs))},
+          'feature smoke review binding fixture',
+          #{sql_quote(review_report["artifactId"])},
+          'user','mike','historical_canonical_commitref_correction',
+          #{sql_quote(correction_id)},
+          '#{String.duplicate("a", 64)}',1,1
+        )
+        """
+      )
 
       v =
         post_as(state, reviewer_tok, "attest", %{
-          "assignmentId" => review["id"] || review["assignmentId"],
+          "assignmentId" => review_id,
           "kind" => "verdict",
           "verdictKind" => "reviewed-clean",
-          "commitRefs" => holder.check.commit_refs,
+          "artifactId" => review_report["artifactId"],
+          "contentSha256" => review_report_sha,
+          "commitRefs" => native_refs,
           "note" => review_note
         })
 

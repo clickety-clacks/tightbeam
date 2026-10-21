@@ -521,7 +521,6 @@ defmodule Tightbeam.Assignments do
   def ensure_pre_cannot_proceed_schema(db) do
     :ok = DB.execute(db, @assignments_ddl)
     :ok = DB.execute(db, @pre_cannot_proceed_attests_ddl)
-    :ok = DB.execute(db, @reviewed_revisions_ddl)
     :ok = DB.execute(db, @assignment_files_ddl)
     :ok = DB.execute(db, @assignment_effects_ddl)
     :ok = DB.execute(db, @assignment_priorities_ddl)
