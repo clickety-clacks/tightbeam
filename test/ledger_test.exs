@@ -189,11 +189,33 @@ defmodule Tightbeam.LedgerTest do
     alias Tightbeam.Firehose.Hub
     :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('flynn',0,1)")
     hub = start_supervised!({Hub, name: Hub})
-    :ok = Hub.register(hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: false})
+
+    :ok =
+      Hub.register(hub, self(), %{
+        mode: :subscribed,
+        db: db,
+        user_id: "test-user",
+        is_admin: false
+      })
+
+    :ok =
+      Hub.subscribe(hub, self(), "turn-lifecycle", %{"classes" => ["turn.queued", "turn.started"]})
+
     seq = enqueue!(db, "k1", "start publication")
-    assert_receive {:firehose_notice, %{"class" => "session.updated", "payload" => session}}
-    assert session["mechanicalStatus"] == "running"
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "turn.queued",
+                      "refs" => %{"turnSeq" => ^seq},
+                      "payload" => queued
+                    }}
+
+    assert queued["status"] == "queued"
     Hub.delivered(hub, self())
+
+    assert {:ok, [["running"]]} =
+             DB.query(db, "SELECT mechanicalStatus FROM sessions WHERE sessionKey='k1'")
+
     assert {:ok, turn} = Ledger.claim_next(db, "k1", "lane")
     assert turn.seq == seq
 
@@ -377,8 +399,45 @@ defmodule Tightbeam.LedgerTest do
         owner_lease: turn.owner_lease
       )
 
+    hub = start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
+
+    :ok =
+      Tightbeam.Firehose.Hub.register(hub, self(), %{
+        mode: :subscribed,
+        db: db,
+        user_id: "test-user",
+        is_admin: true
+      })
+
+    :ok =
+      Tightbeam.Firehose.Hub.subscribe(hub, self(), "repair-turn", %{
+        "classes" => ["turn.queued", "assignment.opened", "assignment.closed"]
+      })
+
     assert {:ok, {:appended, attempt_seq, attempt_id}} =
              Ledger.repair_terminal(db, source_seq, "asg_repair", "repair-key", "agent:test")
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "turn.queued",
+                      "refs" => refs,
+                      "payload" => payload
+                    }}
+
+    assert refs["turnSeq"] == attempt_seq
+    assert refs["assignmentId"] == "asg_repair"
+
+    canonical =
+      db
+      |> Tightbeam.StateResources.query_turn_by_seq(attempt_seq)
+      |> Tightbeam.StateResources.turn()
+
+    assert payload == canonical
+    assert canonical["assignmentId"] == "asg_repair"
+    assert canonical["status"] == "queued"
+    Tightbeam.Firehose.Hub.delivered(hub, self())
+    :sys.get_state(hub)
+    refute_receive {:firehose_notice, %{"class" => "assignment." <> _}}
 
     assert {:ok, {:duplicate, ^attempt_seq, ^attempt_id}} =
              Ledger.repair_terminal(db, source_seq, "asg_repair", "repair-key", "agent:test")

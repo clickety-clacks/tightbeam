@@ -2,8 +2,33 @@ defmodule Tightbeam.Firehose.Publisher do
   @moduledoc "Post-commit translation from accepted dispatch verbs to live notices."
 
   alias Tightbeam.DB.Txn
+  alias Tightbeam.DB
   alias Tightbeam.Firehose.{Hub, Registry}
   alias Tightbeam.StateResources
+
+  @actor_ref_keys ~w(origin principal)
+  @parent_work_item_ref :firehose_parent_work_item_id
+  @eligibility_refs_key "eligibilityRefs"
+  @secondary_ref_fields %{
+    "assignments" => %{"sessionKey" => "holderKey", "workItemId" => "workItemId"},
+    "attests" => %{"sessionKey" => "bySession", "assignmentId" => "assignmentId"},
+    "wakes" => %{
+      "sessionKey" => "sessionKey",
+      "workItemId" => "workItemId",
+      "assignmentId" => "assignmentId"
+    },
+    "turns" => %{
+      "sessionKey" => "sessionKey",
+      "workItemId" => "jobRef",
+      "assignmentId" => "assignmentId"
+    },
+    "decision requests" => %{
+      "sessionKey" => "raiserSessionKey",
+      "assignmentId" => "assignmentId"
+    },
+    "artifacts" => %{"sessionKey" => "createdBySession", "workItemId" => "workItemId"},
+    "roles" => %{"sessionKey" => "boundSessionKey"}
+  }
 
   @state_verbs %{
     "work-item-create" => {"work_item.created", &StateResources.work_item/1},
@@ -59,12 +84,18 @@ defmodule Tightbeam.Firehose.Publisher do
   @doc "Queue accepted notices on the transaction that committed their state."
   @spec accepted_in_txn(Txn.t(), map(), term()) :: :ok
   def accepted_in_txn(%Txn{} = txn, call, result) do
+    result = canonical_in_txn(txn, call, result)
+    call = attach_parent_work_item_ref(txn, call, state_class(call), result)
+
     Txn.handoff(
       txn,
       Hub.destination(hub(call)),
-      {:accepted, nil, call, canonical_in_txn(txn, call, result)}
+      {:accepted, nil, call, result}
     )
   end
+
+  @doc false
+  def actor_refs(call), do: call |> base_refs() |> Map.take(@actor_ref_keys)
 
   defp canonical_in_txn(txn, %{verb: verb} = call, result)
        when verb in ~w(work-item-create work-item-handoff work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail) do
@@ -143,16 +174,24 @@ defmodule Tightbeam.Firehose.Publisher do
   end
 
   defp state_notices(db, call, result) do
-    primary = List.wrap(state_notice(db, call, result))
-
-    case {call.verb, result} do
-      {"attest", %{assignment: %{state: "closed", outcome: outcome} = assignment}}
-      when outcome in ~w(completed surrendered revoked) ->
-        primary ++ [build("assignment.closed", call, assignment, &StateResources.assignment/1)]
-
-      _ ->
-        primary
+    case state_notice(db, call, result) do
+      %{} = notice -> [attach_eligibility_refs(notice, call)]
+      nil -> []
     end
+  end
+
+  defp attach_eligibility_refs(%{"class" => class, "payload" => payload} = notice, call) do
+    {:ok, row} = Registry.fetch(class)
+
+    eligibility_refs =
+      Enum.reduce(row.primary_refs, base_refs(call), fn primary_ref, refs ->
+        Map.put(refs, primary_ref, primary_value(payload, primary_ref, call))
+      end)
+      |> Map.reject(fn {_key, value} -> is_nil(value) or value == "" end)
+
+    if eligibility_refs == notice["refs"],
+      do: notice,
+      else: Map.put(notice, @eligibility_refs_key, eligibility_refs)
   end
 
   @spec denied_notices(map(), map()) :: [map()]
@@ -180,8 +219,35 @@ defmodule Tightbeam.Firehose.Publisher do
     if class == "kungfu.updated" do
       Txn.handoff(txn, Hub.destination(hub), {:publish, committed_notice(class, payload, refs)})
     else
-      Txn.handoff(txn, Hub.destination(hub), {:committed, class, payload, refs})
+      eligibility_refs = committed_eligibility_refs(class, payload, refs)
+      handoff_committed_in_txn(txn, class, payload, refs, eligibility_refs, hub)
     end
+  end
+
+  @doc false
+  def committed_attest_assignment_change_in_txn(
+        %Txn{} = txn,
+        class,
+        payload,
+        refs,
+        hub \\ Hub
+      )
+      when class in ["assignment.opened", "assignment.closed"] do
+    # These side effects had no actor refs in their prior recipient check; keep
+    # actor refs on the notice for filtering without using them as a grant.
+    eligibility_refs = committed_eligibility_refs(class, payload, Map.drop(refs, @actor_ref_keys))
+
+    handoff_committed_in_txn(txn, class, payload, refs, eligibility_refs, hub)
+  end
+
+  defp handoff_committed_in_txn(txn, class, payload, refs, eligibility_refs, hub) do
+    refs = attach_committed_parent_work_item_ref(txn, class, payload, refs)
+
+    Txn.handoff(
+      txn,
+      Hub.destination(hub),
+      {:committed, class, payload, refs, eligibility_refs}
+    )
   end
 
   @doc "Capture one artifact lifecycle snapshot independently of dispatch flags."
@@ -282,9 +348,10 @@ defmodule Tightbeam.Firehose.Publisher do
     end
   end
 
-  @doc "Queue the existing turn notice on the transaction that changed its state."
+  @doc "Queue a turn lifecycle notice on the transaction that changed its state."
   @spec turn_in_txn(Txn.t(), String.t(), integer()) :: :ok
-  def turn_in_txn(%Txn{} = txn, class, seq) when class in ~w(turn.started turn.ended) do
+  def turn_in_txn(%Txn{} = txn, class, seq)
+      when class in ~w(turn.queued turn.started turn.ended) do
     case StateResources.query_turn_in_txn(txn, seq) do
       %{} = turn ->
         committed_in_txn(txn, class, turn, %{
@@ -294,9 +361,17 @@ defmodule Tightbeam.Firehose.Publisher do
           "workItemId" => turn.job_ref
         })
 
+        publish_linked_wake_status_in_txn(txn, turn.wake_id)
+
       nil ->
         :ok
     end
+  end
+
+  defp publish_linked_wake_status_in_txn(_txn, wake_id) when not is_binary(wake_id), do: :ok
+
+  defp publish_linked_wake_status_in_txn(txn, wake_id) do
+    Tightbeam.Wakes.publish_delivery_change_in_txn(txn, wake_id)
   end
 
   @spec lifecycle(String.t(), map(), map()) :: :ok
@@ -358,7 +433,7 @@ defmodule Tightbeam.Firehose.Publisher do
 
   def wire_notice(%{"class" => class} = notice) do
     if class in Registry.classes(),
-      do: notice,
+      do: Map.delete(notice, @eligibility_refs_key),
       else: raise(ArgumentError, "unsupported state notice")
   end
 
@@ -371,6 +446,8 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @doc false
   def encode_wire_notice(%{"class" => class, "payload" => payload} = notice, catalog) do
+    notice = wire_notice(notice)
+
     case Registry.fetch(class) do
       {:ok, %{resource: resource}} when is_map(payload) ->
         cond do
@@ -420,17 +497,10 @@ defmodule Tightbeam.Firehose.Publisher do
 
   def committed_notice(class, payload, refs) do
     {:ok, row} = Registry.fetch(class)
+    projection = committed_projection(row, payload)
 
-    projection =
-      if row.serializer == :decision_request do
-        revision = payload[:row_schema_revision] || payload["rowSchemaRevision"]
-        StateResources.decision_request(%{"rowSchemaRevision" => revision, "item" => payload})
-      else
-        apply(StateResources, row.serializer, [payload])
-      end
-
-    resolved_refs =
-      Enum.reduce(row.primary_refs, refs, fn primary_ref, resolved ->
+    primary_refs =
+      Enum.reduce(row.primary_refs, Map.take(refs, row.primary_refs), fn primary_ref, resolved ->
         Map.put_new(
           resolved,
           primary_ref,
@@ -438,6 +508,13 @@ defmodule Tightbeam.Firehose.Publisher do
         )
       end)
       |> Map.reject(fn {_key, value} -> is_nil(value) end)
+
+    resolved_refs =
+      row_refs(class, row.resource, projection, refs)
+      |> Map.merge(primary_refs)
+      |> Map.merge(Map.take(refs, @actor_ref_keys))
+      |> Map.merge(if(class == "message.created", do: Map.take(refs, ["ownerUserId"]), else: %{}))
+      |> Map.reject(fn {_key, value} -> is_nil(value) or value == "" end)
 
     require_primary_refs!(class, row.primary_refs, resolved_refs)
 
@@ -452,6 +529,24 @@ defmodule Tightbeam.Firehose.Publisher do
 
     if row.serializer == :decision_request, do: Map.put(notice, "schemaVersion", 2), else: notice
   end
+
+  defp committed_eligibility_refs(class, payload, refs) do
+    {:ok, row} = Registry.fetch(class)
+    projection = committed_projection(row, payload)
+
+    Enum.reduce(row.primary_refs, refs, fn primary_ref, resolved ->
+      Map.put_new(resolved, primary_ref, projection_primary_ref(projection, primary_ref))
+    end)
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp committed_projection(%{serializer: :decision_request}, payload) do
+    revision = payload[:row_schema_revision] || payload["rowSchemaRevision"]
+    StateResources.decision_request(%{"rowSchemaRevision" => revision, "item" => payload})
+  end
+
+  defp committed_projection(%{serializer: serializer}, payload),
+    do: apply(StateResources, serializer, [payload])
 
   defp projection_primary_ref(projection, "turnSeq"),
     do: projection["turnSeq"] || projection["seq"]
@@ -479,8 +574,13 @@ defmodule Tightbeam.Firehose.Publisher do
 
   def state_notice(db, %{verb: verb} = call, result) do
     case @state_verbs[verb] do
-      {class, serializer} -> build(class, call, canonical_result(db, call, result), serializer)
-      nil -> nil
+      {class, serializer} ->
+        result = canonical_result(db, call, result)
+        call = attach_parent_work_item_ref(db, call, class, result)
+        build(class, call, result, serializer)
+
+      nil ->
+        nil
     end
   end
 
@@ -556,7 +656,7 @@ defmodule Tightbeam.Firehose.Publisher do
   defp build(class, call, result, serializer) do
     {:ok, row} = Registry.fetch(class)
     payload = result |> unwrap(row.resource) |> serializer.()
-    refs = refs(call, payload, row.primary_refs)
+    refs = refs(class, row.resource, call, payload, row.primary_refs)
     require_primary_refs!(class, row.primary_refs, refs)
 
     %{
@@ -639,10 +739,17 @@ defmodule Tightbeam.Firehose.Publisher do
 
   defp wrapped(result, _keys), do: %{"value" => result}
 
-  defp refs(call, payload, primary_refs) do
-    Enum.reduce(primary_refs, base_refs(call), fn primary_ref, refs ->
-      Map.put(refs, primary_ref, primary_value(payload, primary_ref, call))
-    end)
+  defp refs(class, resource, call, payload, primary_refs) do
+    primary =
+      Enum.reduce(primary_refs, %{}, fn primary_ref, refs ->
+        Map.put(refs, primary_ref, primary_value(payload, primary_ref, call))
+      end)
+
+    row_refs = row_refs(class, resource, payload, call)
+
+    row_refs
+    |> Map.merge(primary)
+    |> Map.merge(actor_refs(call))
     |> Map.reject(fn {_key, value} -> is_nil(value) or value == "" end)
   end
 
@@ -696,6 +803,125 @@ defmodule Tightbeam.Firehose.Publisher do
   defp principal({kind, value}) when is_binary(value), do: "#{kind}:#{value}"
   defp principal(value) when is_binary(value), do: value
   defp principal(_value), do: nil
+
+  defp row_refs(class, resource, projection, refs) do
+    secondaries =
+      @secondary_ref_fields
+      |> Map.get(resource, %{})
+      |> Enum.reduce(%{}, fn {ref, field}, acc ->
+        case secondary_ref_value(resource, ref, field, projection) do
+          value when is_binary(value) and value != "" -> Map.put(acc, ref, value)
+          _ -> acc
+        end
+      end)
+
+    maybe_parent_work_item_ref(class, secondaries, refs)
+  end
+
+  defp secondary_ref_value("wakes", "sessionKey", _field, %{"targetRole" => target_role})
+       when is_binary(target_role) and target_role != "",
+       do: nil
+
+  defp secondary_ref_value(_resource, _ref, field, projection), do: Map.get(projection, field)
+
+  defp maybe_parent_work_item_ref(class, refs, source) do
+    if class in [
+         "attest.filed",
+         "decision_request.opened",
+         "decision_request.updated",
+         "decision_request.answered",
+         "decision_request.returned",
+         "decision_request.ruled",
+         "decision_request.consumed",
+         "decision_request.withdrawn",
+         "decision_request.superseded"
+       ] do
+      case Map.get(source, @parent_work_item_ref) do
+        value when is_binary(value) and value != "" -> Map.put(refs, "workItemId", value)
+        _ -> refs
+      end
+    else
+      refs
+    end
+  end
+
+  defp attach_parent_work_item_ref(db_or_txn, call, class, payload) do
+    if Map.has_key?(call, @parent_work_item_ref) do
+      call
+    else
+      case parent_assignment_id(class, payload)
+           |> then(&parent_work_item_id(db_or_txn, &1)) do
+        value when is_binary(value) and value != "" -> Map.put(call, @parent_work_item_ref, value)
+        _ -> call
+      end
+    end
+  end
+
+  defp attach_committed_parent_work_item_ref(txn, class, payload, refs) do
+    case parent_assignment_id(class, payload)
+         |> then(&parent_work_item_id(txn, &1)) do
+      value when is_binary(value) and value != "" -> Map.put(refs, @parent_work_item_ref, value)
+      _ -> refs
+    end
+  end
+
+  defp parent_assignment_id("attest.filed", payload) do
+    attest = Map.get(payload, :attest) || Map.get(payload, "attest") || payload
+    value(attest, :assignment_id, "assignmentId")
+  end
+
+  defp parent_assignment_id(class, payload)
+       when class in [
+              "decision_request.opened",
+              "decision_request.updated",
+              "decision_request.answered",
+              "decision_request.returned",
+              "decision_request.ruled",
+              "decision_request.consumed",
+              "decision_request.withdrawn",
+              "decision_request.superseded"
+            ] do
+    item = Map.get(payload, :item) || Map.get(payload, "item") || payload
+    value(item, :assignment_id, "assignmentId")
+  end
+
+  defp parent_assignment_id(_class, _payload), do: nil
+
+  defp parent_work_item_id(_db_or_txn, assignment_id)
+       when not is_binary(assignment_id) or assignment_id == "",
+       do: nil
+
+  defp parent_work_item_id(%Txn{} = txn, assignment_id) do
+    case Txn.q(txn, "SELECT workItemId FROM assignments WHERE id=?1", [assignment_id]) do
+      [[work_item_id]] when is_binary(work_item_id) and work_item_id != "" -> work_item_id
+      _ -> nil
+    end
+  end
+
+  defp parent_work_item_id(db, assignment_id) when not is_nil(db) do
+    case DB.query(db, "SELECT workItemId FROM assignments WHERE id=?1", [assignment_id]) do
+      {:ok, [[work_item_id]]} when is_binary(work_item_id) and work_item_id != "" -> work_item_id
+      _ -> nil
+    end
+  end
+
+  defp parent_work_item_id(_db, _assignment_id), do: nil
+
+  defp value(row, atom_key, string_key) when is_map(row),
+    do:
+      Map.get(row, atom_key) || Map.get(row, String.to_atom(string_key)) ||
+        Map.get(row, string_key)
+
+  defp value(_row, _atom_key, _string_key), do: nil
+
+  defp state_class(%{verb: verb}) do
+    case @state_verbs[verb] do
+      {class, _serializer} -> class
+      nil -> nil
+    end
+  end
+
+  defp state_class(_call), do: nil
 
   defp hub(call), do: Map.get(call, :firehose_hub, Hub)
 

@@ -620,6 +620,16 @@ defmodule Tightbeam.Wire.SocketTest do
     {:paired, device} =
       Devices.pair(ctx.db, %{device_id: "race", claimed_name: "Flynn", platform: nil, model: nil})
 
+    hub = start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
+
+    :ok =
+      Tightbeam.Firehose.Hub.register(hub, self(), %{
+        mode: :all,
+        db: ctx.db,
+        user_id: device.user_id,
+        is_admin: false
+      })
+
     proxy = :"main_seed_race_db_#{System.unique_integer([:positive])}"
     start_supervised!({MainSeedRaceDB, {proxy, ctx.db}})
     deps = %{ctx.deps | db: proxy}
@@ -649,6 +659,21 @@ defmodule Tightbeam.Wire.SocketTest do
 
     assert [%{session_key: key}] = Org.list_for_user(ctx.db, device.user_id, false)
     assert key == Org.personal_session_key(device.user_id)
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "session.spawned",
+                      "refs" => %{"sessionKey" => ^key},
+                      "payload" => payload
+                    }}
+
+    assert payload ==
+             ctx.db
+             |> Tightbeam.StateResources.query_session(key)
+             |> Tightbeam.StateResources.session()
+
+    Tightbeam.Firehose.Hub.delivered(hub, self())
+    refute_receive {:firehose_notice, _}, 0
   end
 
   test "drain filters a mid-replay push already covered by the replay window", ctx do

@@ -16,6 +16,7 @@ defmodule Tightbeam.Assignments do
     Placement,
     Projection,
     RailRemedy,
+    StateResources,
     Supervision,
     Wakes
   }
@@ -628,6 +629,17 @@ defmodule Tightbeam.Assignments do
       )
 
       if Txn.changes(txn) != 1, do: raise(TransitionRace)
+
+      assignment =
+        StateResources.query_assignment(txn, assignment_id, %{principal: {:session, session_key}}) ||
+          raise ArgumentError, "retired assignment is missing from its committing transaction"
+
+      Tightbeam.Firehose.Publisher.committed_in_txn(
+        txn,
+        "assignment.closed",
+        assignment,
+        %{"assignmentId" => assignment_id}
+      )
 
       Txn.q(
         txn,
@@ -1264,7 +1276,8 @@ defmodule Tightbeam.Assignments do
     select_from = """
     SELECT att.id, att.assignmentId, att.kind, att.verdictKind, att.note,
            att.bySession, att.byUser, att.producer, att.producerCommand,
-           att.byHarness, att.byProvider, att.commitRefs, att.ts
+           att.byHarness, att.byProvider, att.commitRefs, att.ts,
+           att.artifactId, att.contentSha256, att.waitId
     FROM attests AS att
     JOIN assignments AS parent ON parent.id = att.assignmentId
     LEFT JOIN work_items AS wi ON wi.id = parent.workItemId
@@ -1305,7 +1318,8 @@ defmodule Tightbeam.Assignments do
     select_from = """
     SELECT att.id, att.assignmentId, att.kind, att.verdictKind, att.note,
            att.bySession, att.byUser, att.producer, att.producerCommand,
-           att.byHarness, att.byProvider, att.commitRefs, att.ts
+           att.byHarness, att.byProvider, att.commitRefs, att.ts,
+           att.artifactId, att.contentSha256, att.waitId
     FROM attests AS att
     JOIN assignments AS parent ON parent.id = att.assignmentId
     LEFT JOIN work_items AS wi ON wi.id = parent.workItemId
@@ -1380,7 +1394,10 @@ defmodule Tightbeam.Assignments do
          by_harness,
          by_provider,
          commit_refs,
-         ts
+         ts,
+         artifact_id,
+         content_sha256,
+         wait_id
        ]) do
     %{
       id: id,
@@ -1395,6 +1412,9 @@ defmodule Tightbeam.Assignments do
       by_harness: by_harness,
       by_provider: by_provider,
       commit_refs: if(is_binary(commit_refs), do: JSON.decode!(commit_refs), else: nil),
+      artifact_id: artifact_id,
+      content_sha256: content_sha256,
+      wait_id: wait_id,
       ts: ts
     }
   end
@@ -1657,7 +1677,8 @@ defmodule Tightbeam.Assignments do
                          "digest: Ruminate on work-item #{work_item_id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=#{call.params[:subject]} brief=#{call.params[:brief]}. When you've thought it through, re-issue the dispatch.",
                        due_at: now(),
                        rumination: true,
-                       work_item_id: work_item_id
+                       work_item_id: work_item_id,
+                       firehose_publish: false
                      })
 
                    Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
@@ -1883,6 +1904,7 @@ defmodule Tightbeam.Assignments do
         transaction_with_row_commits(
           db,
           fn txn ->
+            assignment_before = StateResources.query_assignment(txn, assignment_id, call)
             result = attest_in_txn(txn, call)
 
             cond do
@@ -1894,6 +1916,15 @@ defmodule Tightbeam.Assignments do
 
               true ->
                 :ok
+            end
+
+            if not Map.has_key?(result, :code) and not Map.get(result, :replayed, false) do
+              publish_attest_assignment_change_in_txn(
+                txn,
+                call,
+                assignment_id,
+                assignment_before
+              )
             end
 
             result
@@ -1931,6 +1962,55 @@ defmodule Tightbeam.Assignments do
 
     TransitionRace ->
       assignment_closed()
+  end
+
+  defp publish_attest_assignment_change_in_txn(txn, call, assignment_id, before) do
+    if Map.get(call, :firehose_in_txn, false) or is_function(Map.get(call, :on_assignment_change)) do
+      after_attest = StateResources.query_assignment(txn, assignment_id, call)
+
+      if is_map(before) and is_map(after_attest) and
+           assignment_projection_without_version(before) !=
+             assignment_projection_without_version(after_attest) do
+        before_version = StateResources.assignment(before)["rowVersion"]
+        after_version = StateResources.assignment(after_attest)["rowVersion"]
+
+        if after_version <= before_version do
+          Txn.q(txn, "UPDATE assignments SET rowVersion=rowVersion+1 WHERE id=?1", [
+            assignment_id
+          ])
+
+          if Txn.changes(txn) != 1, do: raise(TransitionRace)
+          after_attest = StateResources.query_assignment(txn, assignment_id, call)
+
+          publish_attest_assignment_change(txn, call, assignment_id, after_attest)
+        else
+          publish_attest_assignment_change(txn, call, assignment_id, after_attest)
+        end
+      end
+    end
+
+    :ok
+  end
+
+  defp assignment_projection_without_version(row) do
+    row
+    |> StateResources.assignment()
+    |> Map.delete("rowVersion")
+  end
+
+  defp publish_attest_assignment_change(txn, call, assignment_id, after_attest) do
+    class =
+      if after_attest.state == "closed", do: "assignment.closed", else: "assignment.opened"
+
+    Tightbeam.Firehose.Publisher.committed_attest_assignment_change_in_txn(
+      txn,
+      class,
+      after_attest,
+      Map.merge(
+        %{"assignmentId" => assignment_id},
+        Tightbeam.Firehose.Publisher.actor_refs(call)
+      )
+    )
   end
 
   # Per effort-checkin-v2 §Design 5 and the provenance it cites verbatim —
@@ -2450,15 +2530,20 @@ defmodule Tightbeam.Assignments do
         if work_item_id do
           bracket_trigger = liveness_trigger!(txn, {:work_item, work_item_id})
 
-          Tightbeam.WorkItems.cancel_brackets_in_txn(txn, work_item_id, %{
-            causal_source: %{kind: "assignment_transition", id: id},
-            outcome: %{
-              kind: "disposition",
-              disposition_kind: "assignment_transition",
-              disposition_id: id,
-              liveness_trigger: bracket_trigger
-            }
-          })
+          Tightbeam.WorkItems.cancel_brackets_in_txn(
+            txn,
+            work_item_id,
+            %{
+              causal_source: %{kind: "assignment_transition", id: id},
+              outcome: %{
+                kind: "disposition",
+                disposition_kind: "assignment_transition",
+                disposition_id: id,
+                liveness_trigger: bracket_trigger
+              }
+            },
+            publish_item: true
+          )
         end
 
         if key do
@@ -3604,7 +3689,7 @@ defmodule Tightbeam.Assignments do
 
   defp revoke_open_assignment_in_txn(txn, call, assignment_id) do
     {closed_user, closed_session} = opener(call.principal)
-    closed_at = now()
+    closed_at = event_time(call)
     revocation_id = id("rev_")
     reopening_id = current_reopening_id(txn, assignment_id)
 
@@ -3778,7 +3863,7 @@ defmodule Tightbeam.Assignments do
 
   defp apply_reopen(txn, call, assignment) do
     assignment_id = assignment.id
-    reopened_at = now()
+    reopened_at = event_time(call)
     {reopened_user, reopened_session} = opener(call.principal)
 
     Txn.q(
@@ -3834,15 +3919,20 @@ defmodule Tightbeam.Assignments do
     if reopened.workItemId do
       bracket_trigger = liveness_trigger!(txn, {:work_item, reopened.workItemId})
 
-      Tightbeam.WorkItems.cancel_brackets_in_txn(txn, reopened.workItemId, %{
-        causal_source: %{kind: "assignment_transition", id: assignment_id},
-        outcome: %{
-          kind: "disposition",
-          disposition_kind: "assignment_transition",
-          disposition_id: assignment_id,
-          liveness_trigger: bracket_trigger
-        }
-      })
+      Tightbeam.WorkItems.cancel_brackets_in_txn(
+        txn,
+        reopened.workItemId,
+        %{
+          causal_source: %{kind: "assignment_transition", id: assignment_id},
+          outcome: %{
+            kind: "disposition",
+            disposition_kind: "assignment_transition",
+            disposition_id: assignment_id,
+            liveness_trigger: bracket_trigger
+          }
+        },
+        publish_item: true
+      )
     end
 
     append_assignment_marker(
@@ -4126,13 +4216,14 @@ defmodule Tightbeam.Assignments do
       allow_closed: allow_closed,
       artifact_id: call.params[:artifact_id],
       content_sha256: call.params[:content_sha256],
-      wait_id: call.params[:wait_id]
+      wait_id: call.params[:wait_id],
+      firehose_test_at: call[:firehose_test_at]
     })
   end
 
   defp insert_attest_row(txn, attrs) do
     id = id("att_")
-    ts = now()
+    ts = event_time(attrs)
 
     Txn.q(
       txn,
@@ -5047,6 +5138,17 @@ defmodule Tightbeam.Assignments do
   defp id(prefix), do: prefix <> Tightbeam.Id.uuid4()
 
   defp now, do: System.system_time(:millisecond)
+
+  if Mix.env() == :test do
+    defp event_time(attrs) do
+      case Map.get(attrs, :firehose_test_at) do
+        at when is_integer(at) -> at
+        _ -> now()
+      end
+    end
+  else
+    defp event_time(_attrs), do: now()
+  end
 
   defp retirement_provenance_actor(_txn, "user:" <> user_id, _owner_user_id),
     do: {user_id, nil, nil}

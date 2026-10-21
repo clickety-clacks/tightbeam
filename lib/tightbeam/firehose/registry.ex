@@ -33,6 +33,7 @@ defmodule Tightbeam.Firehose.Registry do
     {"wake.scheduled", "wakes", "upsert", "wakeId"},
     {"wake.fired", "wakes", "upsert", "wakeId"},
     {"wake.canceled", "wakes", "upsert", "wakeId"},
+    {"turn.queued", "turns", "upsert", "turnSeq"},
     {"turn.started", "turns", "upsert", "turnSeq"},
     {"turn.ended", "turns", "upsert", "turnSeq"},
     {"decision_request.opened", "decision requests", "upsert", "decisionRequestId"},

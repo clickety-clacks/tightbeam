@@ -117,6 +117,7 @@ defmodule Tightbeam.Wakes do
     dueAt      INTEGER NOT NULL,
     state      TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','fired','canceled')),
     createdAt  INTEGER NOT NULL,
+    rowVersion INTEGER NOT NULL DEFAULT 1 CHECK (rowVersion > 0),
     firedAt    INTEGER,
     reresolve  TEXT NULL CHECK (reresolve IN ('lineage')),
     reresolveSeed TEXT NULL,
@@ -262,7 +263,8 @@ defmodule Tightbeam.Wakes do
   @doc false
   @spec ensure_historical_schema(db()) :: :ok | {:error, term()}
   def ensure_historical_schema(db \\ Tightbeam.DB) do
-    with :ok <- DB.execute(db, @ddl) do
+    with :ok <- DB.execute(db, @ddl),
+         :ok <- Tightbeam.Schema.ensure_wake_row_version(db) do
       if RuleRuntime.loaded?(), do: activate_wait_recognition(db), else: :ok
     end
   end
@@ -877,6 +879,7 @@ defmodule Tightbeam.Wakes do
         if Txn.changes(txn) == 1 do
           source = %{wake | state: "pending", fired_at: fired_at}
           NoticeBatcher.record_policy_in_txn(txn, source)
+          publish_change_in_txn(txn, "wake.scheduled", wake_id)
           if state == "fired", do: schedule_changed_in_txn(txn, :wake_ready)
 
           {:ok, source}
@@ -1514,7 +1517,7 @@ defmodule Tightbeam.Wakes do
         cursor
       end
 
-    created_at = now()
+    created_at = schedule_time(input)
     {class, class_election} = elected_class(input)
 
     {delivery_rule, due_at} = apply_delivery_policy(txn, input, class, created_at, condition_kind)
@@ -1709,6 +1712,10 @@ defmodule Tightbeam.Wakes do
       )
     end
 
+    if Map.get(input, :firehose_publish, true) do
+      publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
+    end
+
     schedule_changed_in_txn(txn, {:schedule_changed, wake.due_at})
     wake
   end
@@ -1799,6 +1806,7 @@ defmodule Tightbeam.Wakes do
             owner_user_id: obligation.owner_user_id,
             obligation_ref: obligation.id,
             wait_mode: "after-turn",
+            firehose_publish: Map.get(input, :firehose_publish, true),
             originating_turn_seq: turn_seq,
             recognition_at: now,
             recognition_path: "after-turn",
@@ -1854,6 +1862,7 @@ defmodule Tightbeam.Wakes do
           owner_user_id: obligation.owner_user_id,
           obligation_ref: obligation.id,
           wait_mode: "dependency",
+          firehose_publish: Map.get(input, :firehose_publish, true),
           predicate: evaluation.canonical,
           resolver_kind: resolver.kind,
           resolver_id: resolver.id,
@@ -3686,9 +3695,12 @@ defmodule Tightbeam.Wakes do
 
     Txn.q(
       txn,
-      "UPDATE wakes SET deliveryRule=?2 WHERE wakeId=?1 AND state='pending'",
+      "UPDATE wakes SET deliveryRule=?2 WHERE wakeId=?1 AND state='pending' AND deliveryRule IS NOT ?2",
       [wake_id, fallback_rule]
     )
+
+    if Txn.changes(txn) == 1,
+      do: publish_change_in_txn(txn, "wake.scheduled", wake_id)
 
     EventLog.lifecycle_in_txn(
       txn,
@@ -3880,6 +3892,7 @@ defmodule Tightbeam.Wakes do
               case get_in_txn(txn, wake_id) do
                 %{due_at: due_at} = wake ->
                   schedule_changed_in_txn(txn, {:schedule_changed, due_at})
+                  publish_change_in_txn(txn, "wake.scheduled", wake_id)
                   {:ok, wake}
 
                 other ->
@@ -4185,6 +4198,7 @@ defmodule Tightbeam.Wakes do
 
         [row] = Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [replacement_id])
         wake = to_wake(row)
+        publish_change_in_txn(txn, "wake.scheduled", replacement_id)
         schedule_changed_in_txn(txn, {:schedule_changed, wake.due_at})
         wake
       else
@@ -5445,25 +5459,26 @@ defmodule Tightbeam.Wakes do
   end
 
   defp delivery_projection_columns do
-    ", (SELECT status FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
-      ", (SELECT createdAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
-      ", (SELECT startedAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
-      ", (SELECT endedAt FROM turns WHERE turns.wakeId=wakes.wakeId)"
+    ", (SELECT status FROM turns WHERE turns.wakeId=wakes.wakeId)"
   end
 
   defp wake_with_delivery_projection(row) do
-    {wake_columns, [status, created_at, started_at, ended_at]} = Enum.split(row, -4)
+    {wake_columns, [status]} = Enum.split(row, -1)
     wake = to_wake(wake_columns)
 
-    # Keep the existing maximum-durable-timestamp version convention, now
-    # including the row from which this additive projection is derived.
-    version =
-      [wake.created_at, wake.fired_at, wake.canceled_at, created_at, started_at, ended_at]
-      |> Enum.filter(&is_integer/1)
-      |> Enum.max()
-
-    wake |> Map.put(:delivery_status, status) |> Map.put(:row_version, version)
+    Map.put(wake, :delivery_status, status)
   end
+
+  @doc false
+  def publish_delivery_change_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
+    Txn.q(txn, "UPDATE wakes SET rowVersion=rowVersion+1 WHERE wakeId=?1", [wake_id])
+
+    if Txn.changes(txn) == 1, do: publish_change_in_txn(txn, nil, wake_id)
+
+    :ok
+  end
+
+  def publish_delivery_change_in_txn(%Txn{}, _wake_id), do: :ok
 
   @doc "Record a failed carrier's outcome in its sender's existing transcript, without a turn."
   def report_failed_delivery(db, seq) do
@@ -7521,12 +7536,19 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc false
-  def publish_change_in_txn(%Txn{} = txn, class, wake_id) do
+  def publish_change_in_txn(%Txn{} = txn, _class, wake_id) do
     case delivery_projection_in_txn(txn, wake_id) do
       nil ->
         :ok
 
-      wake ->
+      %{state: state} = wake ->
+        class =
+          case state do
+            "pending" -> "wake.scheduled"
+            "fired" -> "wake.fired"
+            "canceled" -> "wake.canceled"
+          end
+
         Tightbeam.Firehose.Publisher.committed_in_txn(
           txn,
           class,
@@ -7571,7 +7593,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp select_wake_sql(extra_columns \\ "") do
-    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon, ownerUserId, obligationRef, waitMode, predicate, resolverKind, resolverId, resolverHolder, resolverAddressee, necessity, verificationAssignmentId, verificationHolderKey, selectedPolicyName, verificationState, verificationAttestId, verificationNoticeWakeId, originatingTurnSeq, recognitionAt, recognitionPath, recognitionReason, recognitionEvidence, recognitionDisposition, recognitionTransition, deliveredTurnSeq#{extra_columns} FROM wakes"
+    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon, ownerUserId, obligationRef, waitMode, predicate, resolverKind, resolverId, resolverHolder, resolverAddressee, necessity, verificationAssignmentId, verificationHolderKey, selectedPolicyName, verificationState, verificationAttestId, verificationNoticeWakeId, originatingTurnSeq, recognitionAt, recognitionPath, recognitionReason, recognitionEvidence, recognitionDisposition, recognitionTransition, deliveredTurnSeq, rowVersion#{extra_columns} FROM wakes"
   end
 
   defp to_wake([
@@ -7625,7 +7647,8 @@ defmodule Tightbeam.Wakes do
          recognition_evidence,
          recognition_disposition,
          recognition_transition,
-         delivered_turn_seq
+         delivered_turn_seq,
+         row_version
        ]) do
     %{
       wake_id: wake_id,
@@ -7678,7 +7701,8 @@ defmodule Tightbeam.Wakes do
       recognition_evidence: decode_optional(recognition_evidence),
       recognition_disposition: recognition_disposition,
       recognition_transition: decode_optional(recognition_transition),
-      delivered_turn_seq: delivered_turn_seq
+      delivered_turn_seq: delivered_turn_seq,
+      row_version: row_version
     }
   end
 
@@ -7904,4 +7928,15 @@ defmodule Tightbeam.Wakes do
   end
 
   defp now, do: System.system_time(:millisecond)
+
+  if Mix.env() == :test do
+    defp schedule_time(input) do
+      case Map.get(input, :firehose_test_at) do
+        at when is_integer(at) -> at
+        _ -> now()
+      end
+    end
+  else
+    defp schedule_time(_input), do: now()
+  end
 end

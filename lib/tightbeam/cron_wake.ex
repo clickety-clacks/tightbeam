@@ -154,6 +154,9 @@ defmodule Tightbeam.CronWake do
 
                 Txn.q(txn, "UPDATE wakes SET dueAt=?2, firedAt=?3 WHERE wakeId=?1", [id, next, at])
 
+                if Txn.changes(txn) == 1,
+                  do: Wakes.publish_change_in_txn(txn, "wake.scheduled", id)
+
                 Wakes.schedule_changed_in_txn(txn, {:schedule_changed, next})
 
               _ ->
