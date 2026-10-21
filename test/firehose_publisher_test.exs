@@ -777,7 +777,9 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert closed_notice["refs"] == %{
              "assignmentId" => assignment.id,
-             "sessionKey" => "effect-target"
+             "sessionKey" => "effect-target",
+             "origin" => "agent:effect-target",
+             "principal" => "session:effect-target"
            }
 
     attest_notice =

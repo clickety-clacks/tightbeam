@@ -2006,8 +2006,10 @@ defmodule Tightbeam.Assignments do
       txn,
       class,
       after_attest,
-      %{"assignmentId" => assignment_id},
-      Map.get(call, :firehose_hub) || Tightbeam.Firehose.Hub
+      Map.merge(
+        %{"assignmentId" => assignment_id},
+        Tightbeam.Firehose.Publisher.actor_refs(call)
+      )
     )
   end
 

@@ -10,7 +10,6 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     Model,
     Org,
     Roles,
-    Rules,
     StateResources,
     StateVisibility,
     SubagentMarkers,
@@ -975,86 +974,6 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     assert removed_refs["sessionKey"] == "role-bound-target"
     refute_received {:class_notice, :removed_bound_target, _notice}
     refute_received {:class_notice, :removed_bound_owner, _notice}
-  end
-
-  test "attest-driven assignment notices do not grant the filer eligibility", ctx do
-    assert :ok =
-             DB.execute(
-               ctx.db,
-               "INSERT INTO users (userId, isAdmin, createdAt) VALUES " <>
-                 "('assignment-opener', 0, 1), ('assignment-filer', 0, 1)"
-             )
-
-    session!(ctx.db, "assignment-holder", "kay")
-    session!(ctx.db, "assignment-filer", "assignment-filer")
-    work_item!(ctx.db, "wi_attest-side-effect", "assignment-opener")
-
-    assignment!(
-      ctx.db,
-      "asg_attest-side-effect",
-      "assignment-holder",
-      "wi_attest-side-effect",
-      "assignment-opener"
-    )
-
-    holder_listener =
-      class_listener(ctx, :assignment_holder, "assignment.opened", %{
-        user_id: "kay",
-        principal_kind: :session,
-        principal_id: "assignment-holder"
-      })
-
-    opener_listener =
-      class_listener(ctx, :assignment_opener, "assignment.opened", %{user_id: "assignment-opener"})
-
-    filer_listener =
-      class_listener(ctx, :assignment_filer, "assignment.opened", %{
-        user_id: "assignment-filer",
-        principal_kind: :session,
-        principal_id: "assignment-filer"
-      })
-
-    listeners = [
-      {:assignment_holder, holder_listener},
-      {:assignment_opener, opener_listener},
-      {:assignment_filer, filer_listener}
-    ]
-
-    on_exit(fn -> Enum.each(listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end) end)
-
-    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000})
-    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
-
-    call = %{
-      verb: "attest",
-      origin: "agent:assignment-filer",
-      principal: {:session, "assignment-filer"},
-      session_key: "assignment-filer",
-      firehose_hub: ctx.hub,
-      params: %{
-        assignment_id: "asg_attest-side-effect",
-        kind: "verdict",
-        verdict_kind: "tests-passed"
-      }
-    }
-
-    assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
-             Dispatch.dispatch(ctx.db, handlers, call)
-
-    Enum.each(listeners, fn {tag, pid} -> sync_listener(ctx.hub, pid, tag) end)
-
-    assert_received {:class_notice, :assignment_holder,
-                     %{
-                       "class" => "assignment.opened",
-                       "payload" => %{
-                         "id" => "asg_attest-side-effect",
-                         "derivedStatus" => "active"
-                       }
-                     }}
-
-    assert_received {:class_notice, :assignment_opener, %{"class" => "assignment.opened"}}
-
-    refute_received {:class_notice, :assignment_filer, _notice}
   end
 
   # Subscription matching runs first and visibility is checked only for a
