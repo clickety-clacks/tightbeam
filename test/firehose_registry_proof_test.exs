@@ -503,7 +503,9 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
         fixture.primary_refs
         |> Map.merge(fixture.secondary_refs)
         |> Map.merge(Map.take(supplied_refs, ~w(origin principal)))
-        |> Map.merge(if(class == "message.created", do: %{"ownerUserId" => "test-user"}, else: %{}))
+        |> Map.merge(
+          if(class == "message.created", do: %{"ownerUserId" => "test-user"}, else: %{})
+        )
 
       assert notice["refs"] == expected_refs, "unexpected references for #{class}"
 

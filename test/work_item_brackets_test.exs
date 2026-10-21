@@ -397,7 +397,12 @@ defmodule Tightbeam.WorkItemBracketsTest do
     start_supervised!({Hub, name: Hub})
 
     :ok =
-      Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "test-user", is_admin: true})
+      Hub.register(Hub, self(), %{
+        mode: :filtered,
+        db: ctx.db,
+        user_id: "test-user",
+        is_admin: true
+      })
 
     :ok =
       Hub.subscribe(Hub, self(), "work-item-brackets", %{
@@ -461,7 +466,12 @@ defmodule Tightbeam.WorkItemBracketsTest do
     start_supervised!({Hub, name: Hub})
 
     :ok =
-      Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "test-user", is_admin: true})
+      Hub.register(Hub, self(), %{
+        mode: :filtered,
+        db: ctx.db,
+        user_id: "test-user",
+        is_admin: true
+      })
 
     :ok = Hub.subscribe(Hub, self(), "retired-assignment", %{"classes" => ["assignment.closed"]})
 
@@ -472,7 +482,12 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     assert {:ok, _} =
              DB.transaction(ctx.db, fn txn ->
-               Assignments.interrupt_for_retire_in_txn(txn, "holder", "test-user", "user:test-user")
+               Assignments.interrupt_for_retire_in_txn(
+                 txn,
+                 "holder",
+                 "test-user",
+                 "user:test-user"
+               )
              end)
 
     assert_received {:firehose_notice,

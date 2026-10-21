@@ -334,7 +334,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     scheduler = :firehose_per_verb_effect_scheduler
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "test-user", is_admin: true})
 
     {:paired, completion_device} =
       Devices.pair(db, %{
@@ -352,8 +352,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
     Org.create(db, %{
       session_key: "effect-target",
       display_name: "Effect target",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "test-user",
+      origin: "user:test-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -364,8 +364,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
     Org.create(db, %{
       session_key: "effect-dispatcher",
       display_name: "Effect dispatcher",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "test-user",
+      origin: "user:test-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -410,8 +410,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     immediate_wake = %{
       verb: "wake",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:test-user",
+      principal: {:user, "test-user"},
       session_key: "effect-target",
       params: %{prompt: "immediate effect", after_ms: 0, idempotency_key: "effect-immediate"}
     }
@@ -424,15 +424,15 @@ defmodule Tightbeam.Firehose.PublisherTest do
     pending =
       Wakes.schedule(db, %{
         session_key: "effect-target",
-        origin: "user:flynn",
+        origin: "user:test-user",
         prompt: "cancel effect",
         due_at: System.system_time(:millisecond) + 60_000
       })
 
     cancel_wake = %{
       verb: "wake",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:test-user",
+      principal: {:user, "test-user"},
       session_key: nil,
       params: %{cancel_wake_id: pending.wake_id}
     }
@@ -460,7 +460,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     _condition_wake =
       Wakes.schedule(db, %{
         session_key: "effect-target",
-        origin: "user:flynn",
+        origin: "user:test-user",
         prompt: "condition effect",
         due_at: System.system_time(:millisecond) + 60_000,
         condition_kind: "effect-ready",
@@ -469,8 +469,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     condition = %{
       verb: "condition",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:test-user",
+      principal: {:user, "test-user"},
       session_key: nil,
       params: %{kind: "effect-ready", scope: "matrix", idempotency_key: "effect-fact"}
     }
@@ -492,8 +492,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     dispatch = %{
       verb: "dispatch",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:test-user",
+      principal: {:user, "test-user"},
       session_key: "effect-target",
       target_role: nil,
       role_fallback: false,
@@ -507,8 +507,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     work_item_create = %{
       verb: "work-item-create",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:test-user",
+      principal: {:user, "test-user"},
       session_key: nil,
       params: %{title: "Exercise the rumination dispatch effect"}
     }
@@ -924,8 +924,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
   test "an accepted state verb emits its observation and canonical state notice" do
     call = %{
       verb: "work-item-update",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:test-user",
+      principal: {:user, "test-user"},
       session_key: nil,
       params: %{
         work_item_id: "work-one",
@@ -937,7 +937,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     result = %{
       id: "work-one",
       title: "Firehose",
-      owner_user_id: "flynn",
+      owner_user_id: "test-user",
       updated_at: 123,
       cli_token: "must-not-leak"
     }
@@ -947,7 +947,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert %{"class" => "verb.accepted", "op" => "observe", "refs" => refs} =
              receive_notice()
 
-    assert refs["origin"] == "user:flynn"
+    assert refs["origin"] == "user:test-user"
 
     assert %{
              "class" => "work_item.updated",
@@ -1689,7 +1689,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
     db = :firehose_pending_wake_update_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('test-user',1,1)")
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('test-user',1,1)")
+
     register_testhost(db)
 
     Org.create(db, %{
@@ -2255,7 +2258,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
     db = :firehose_wake_retarget_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('test-user',1,1)")
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('test-user',1,1)")
+
     register_testhost(db)
 
     Org.create(db, %{
