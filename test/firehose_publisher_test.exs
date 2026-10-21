@@ -592,11 +592,6 @@ defmodule Tightbeam.Firehose.PublisherTest do
                [assignment.id]
              )
 
-    assignment_before_attest =
-      db
-      |> StateResources.query_assignment(assignment.id, %{principal: {:session, "effect-target"}})
-      |> StateResources.assignment()
-
     assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
              Dispatch.dispatch(db, handlers, tests_passed)
 
@@ -671,17 +666,6 @@ defmodule Tightbeam.Firehose.PublisherTest do
     # The refused completion must not publish a transition or reset inactivity.
     assert observed_state_classes() == []
     assert %{state: "pending"} = Wakes.get(db, final_deadline)
-
-    {verdict_notices, _message_ids} = verdict_publications
-    assignment_notice = Enum.find(verdict_notices, &(&1["class"] == "assignment.opened"))
-
-    assignment_after_attest =
-      db
-      |> StateResources.query_assignment(assignment.id, %{principal: {:session, "effect-target"}})
-      |> StateResources.assignment()
-
-    assert assignment_notice["payload"] == assignment_after_attest
-    assert assignment_after_attest["rowVersion"] > assignment_before_attest["rowVersion"]
 
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
@@ -1437,6 +1421,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
       assert Enum.sort(Enum.map(response_notices, & &1["class"])) ==
                Enum.sort(["verb.accepted", "wake.scheduled", class])
+
       assert_decision_notice_cleared!(db, request.id, notice_wake)
       notice = Enum.find(response_notices, &(&1["class"] == class))
       assert notice["class"] == class

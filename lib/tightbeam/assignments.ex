@@ -2530,17 +2530,18 @@ defmodule Tightbeam.Assignments do
         if work_item_id do
           bracket_trigger = liveness_trigger!(txn, {:work_item, work_item_id})
 
-          Tightbeam.WorkItems.cancel_brackets_in_txn(txn, work_item_id, %{
-            causal_source: %{kind: "assignment_transition", id: id},
-            outcome: %{
-              kind: "disposition",
-              disposition_kind: "assignment_transition",
-              disposition_id: id,
-              liveness_trigger: bracket_trigger
-            }
-          },
-            publish_item: true
-          )
+          Tightbeam.WorkItems.cancel_brackets_in_txn(
+            txn,
+            work_item_id,
+            %{
+              causal_source: %{kind: "assignment_transition", id: id},
+              outcome: %{
+                kind: "disposition",
+                disposition_kind: "assignment_transition",
+                disposition_id: id,
+                liveness_trigger: bracket_trigger
+              }
+            }, publish_item: true)
         end
 
         if key do
@@ -3916,17 +3917,18 @@ defmodule Tightbeam.Assignments do
     if reopened.workItemId do
       bracket_trigger = liveness_trigger!(txn, {:work_item, reopened.workItemId})
 
-      Tightbeam.WorkItems.cancel_brackets_in_txn(txn, reopened.workItemId, %{
-        causal_source: %{kind: "assignment_transition", id: assignment_id},
-        outcome: %{
-          kind: "disposition",
-          disposition_kind: "assignment_transition",
-          disposition_id: assignment_id,
-          liveness_trigger: bracket_trigger
-        }
-      },
-        publish_item: true
-      )
+      Tightbeam.WorkItems.cancel_brackets_in_txn(
+        txn,
+        reopened.workItemId,
+        %{
+          causal_source: %{kind: "assignment_transition", id: assignment_id},
+          outcome: %{
+            kind: "disposition",
+            disposition_kind: "assignment_transition",
+            disposition_id: assignment_id,
+            liveness_trigger: bracket_trigger
+          }
+        }, publish_item: true)
     end
 
     append_assignment_marker(
