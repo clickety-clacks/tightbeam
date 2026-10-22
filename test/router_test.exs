@@ -3526,12 +3526,9 @@ defmodule Tightbeam.Wire.RouterTest do
     assert process.status == 403
     assert JSON.decode!(process.resp_body)["error"]["code"] == "identity_not_yours"
 
-    {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM events")
-    no_role = dispatch_cli(ctx, roleless.cli_token, %{verb: "inspect"})
-    assert no_role.status == 403
-    assert JSON.decode!(no_role.resp_body)["error"]["code"] == "no_role"
-    {:ok, [[after_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM events")
-    assert after_count == before_count
+    roleless_key = roleless.session_key
+    assert dispatch_cli(ctx, roleless.cli_token, %{verb: "inspect"}).status == 200
+    assert_receive {:call, %{origin: "user:flynn", principal: {:session, ^roleless_key}}}
 
     ambiguous = dispatch_cli(ctx, several.cli_token, %{verb: "inspect"})
     assert ambiguous.status == 400

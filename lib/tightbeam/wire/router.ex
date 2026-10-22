@@ -2933,12 +2933,8 @@ defmodule Tightbeam.Wire.Router do
       length(roles) == 1 ->
         {:ok, "agent:#{hd(roles)}", session_principal}
 
-      roles == [] and session.is_built_in ->
-        {:ok, "user:#{session.owner_user_id}", session_principal}
-
       roles == [] ->
-        {:error, 403, "no_role",
-         "this session holds no role; its owner must bind one, or pass --as-user #{session.owner_user_id}"}
+        {:ok, "user:#{session.owner_user_id}", session_principal}
 
       true ->
         {:error, 400, "ambiguous_identity",
