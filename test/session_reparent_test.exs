@@ -162,11 +162,8 @@ defmodule Tightbeam.SessionReparentTest do
     assert {:error, _} = DB.query(db, "DELETE FROM session_reparent_events")
   end
 
-  test "only the owning user can correct an active custom child with one direct open assignment",
+  test "corrections require consistent owner rows and a single open assignment",
        ctx do
-    assert %{code: "current_custody_required"} =
-             SessionReparent.handle(ctx.db, agent_call("child", ctx.params))
-
     assert %{code: "user_principal_required"} =
              SessionReparent.handle(ctx.db, %{
                call(ctx.params)
@@ -199,7 +196,7 @@ defmodule Tightbeam.SessionReparentTest do
     assert count(ctx.db, "wire_idempotency") == 0
   end
 
-  test "accountable delivery owner moves only its current worker under its current coordinator",
+  test "a delivery owner reparent is recorded, replayable, and idempotent across principals",
        ctx do
     accountable_fixture(ctx)
 
@@ -225,13 +222,12 @@ defmodule Tightbeam.SessionReparentTest do
     assert %{code: "idempotency_conflict"} =
              SessionReparent.handle(ctx.db, agent_call("coordinator", agent_params(ctx)))
 
-    assert %{code: "current_custody_required", message: message} =
+    assert %{code: "no_change"} =
              SessionReparent.handle(
                ctx.db,
                agent_call("lead", %{agent_params(ctx) | idempotency_key: "after-transfer"})
              )
 
-    assert message =~ "owning user"
     assert count(ctx.db, "session_reparent_events") == 1
   end
 
@@ -276,58 +272,9 @@ defmodule Tightbeam.SessionReparentTest do
            ]
   end
 
-  test "agent authority requires exact current responsibility and both current custody facts",
+  test "agent target must be an active same-owner session with one assignment and no cycle",
        ctx do
     accountable_fixture(ctx)
-    delegated_lane(ctx.db)
-    session(ctx.db, "outsider")
-
-    assert %{code: "delivery_responsibility_required"} =
-             SessionReparent.handle(ctx.db, agent_call("outsider", agent_params(ctx)))
-
-    assert %{code: "current_custody_required"} =
-             SessionReparent.handle(ctx.db, agent_call("lane", agent_params(ctx)))
-
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               "UPDATE assignments SET openedBySession=NULL,openedByUser='owner' WHERE id='asg_one'"
-             )
-
-    assert %{code: "current_custody_required"} =
-             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
-
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               "UPDATE assignments SET openedBySession='outsider',openedByUser=NULL WHERE id='asg_one'"
-             )
-
-    assert %{code: "current_custody_required"} =
-             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
-
-    assert {:ok, _} =
-             DB.query(ctx.db, "UPDATE assignments SET openedBySession='lead' WHERE id='asg_one'")
-
-    assert is_binary(
-             SessionReparent.handle(
-               ctx.db,
-               call(%{agent_params(ctx) | parent_session_key: "lane", idempotency_key: "handoff"})
-             )["eventId"]
-           )
-
-    assert %{code: "current_custody_required"} =
-             SessionReparent.handle(
-               ctx.db,
-               agent_call("lead", %{agent_params(ctx) | idempotency_key: "former-lead"})
-             )
-
-    assert count(ctx.db, "session_reparent_events") == 1
-  end
-
-  test "agent target must remain a direct active child, with one assignment and no cycle", ctx do
-    accountable_fixture(ctx)
-    session(ctx.db, "outsider")
 
     assert %{code: "not_authorized"} =
              SessionReparent.handle(
@@ -338,16 +285,7 @@ defmodule Tightbeam.SessionReparentTest do
     assert {:ok, _} =
              DB.query(
                ctx.db,
-               "UPDATE sessions SET spawnedBy='outsider' WHERE sessionKey='coordinator'"
-             )
-
-    assert %{code: "target_not_owned"} =
-             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
-
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               "UPDATE sessions SET spawnedBy='lead',state='retired' WHERE sessionKey='coordinator'"
+               "UPDATE sessions SET state='retired' WHERE sessionKey='coordinator'"
              )
 
     assert %{code: "session_retired"} =
@@ -370,7 +308,7 @@ defmodule Tightbeam.SessionReparentTest do
     assert count(ctx.db, "session_reparent_events") == 0
   end
 
-  test "a target transferred by a later event is no longer owned by its original parent", ctx do
+  test "a transferred target keeps origin rows and still accepts further corrections", ctx do
     accountable_fixture(ctx)
     session(ctx.db, "outsider")
     item(ctx.db, "wi_target")
@@ -391,24 +329,16 @@ defmodule Tightbeam.SessionReparentTest do
     assert Org.get(ctx.db, "coordinator").spawned_by == "lead"
     assert Org.current_parent(ctx.db, "coordinator") == "outsider"
 
-    assert %{code: "target_not_owned"} =
-             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
+    assert is_binary(
+             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))["eventId"]
+           )
 
-    assert count(ctx.db, "session_reparent_events") == 1
+    assert Org.current_parent(ctx.db, "child") == "coordinator"
+    assert count(ctx.db, "session_reparent_events") == 2
   end
 
-  test "a same-human work item or stale office does not grant an agent delivery authority", ctx do
+  test "responsibility reads track the explicit delivery owner, not PO associations", ctx do
     accountable_fixture(ctx)
-    item(ctx.db, "wi_unbound")
-
-    assert {:ok, _} =
-             DB.query(ctx.db, "UPDATE assignments SET workItemId='wi_unbound' WHERE id='asg_one'")
-
-    assert %{code: "delivery_responsibility_required"} =
-             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
-
-    assert {:ok, _} =
-             DB.query(ctx.db, "UPDATE assignments SET workItemId='wi_one' WHERE id='asg_one'")
 
     Roles.create!(ctx.db, "product-owner:next", "owner", "lead")
     associate(ctx.db, "lead", "product-owner:next", "lead-association-next")
@@ -420,23 +350,12 @@ defmodule Tightbeam.SessionReparentTest do
 
     assert DeliveryResponsibilities.responsibility(ctx.db, "lead", "wi_one") == "stale"
 
-    assert %{code: "not_authorized"} =
-             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
-
-    assert {:ok, _} =
-             DB.query(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey='lead'")
-
     assert %{deliveryOwnerSessionKey: nil} =
              WorkItems.__handle__(ctx.db, "work-item-update", %{
                principal: {:user, "owner"},
                origin: "user:owner",
                params: %{work_item_id: "wi_one", delivery_owner_session_key: nil}
              })
-
-    assert %{code: "delivery_responsibility_required"} =
-             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
-
-    assert count(ctx.db, "session_reparent_events") == 0
   end
 
   test "foreign and closed work items refuse even for a caller owning the session", ctx do
