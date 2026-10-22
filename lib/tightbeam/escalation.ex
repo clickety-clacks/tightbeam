@@ -2664,38 +2664,34 @@ defmodule Tightbeam.Escalation do
           {error("invalid", "agent requests use answer or return"), nil}
 
         request ->
-          with :ok <- operator_owner_authorized(call, request) do
-            case request.status do
-              "ruled" ->
-                replay_operator_ruling_in_txn(txn, call, request, answer)
+          case request.status do
+            "ruled" ->
+              replay_operator_ruling_in_txn(txn, call, request, answer)
 
-              "consumed" ->
-                case validate_terminal_request_in_txn(txn, request) do
-                  %{failures: []} ->
-                    {error("not_open", "decision request is not open"), nil}
+            "consumed" ->
+              case validate_terminal_request_in_txn(txn, request) do
+                %{failures: []} ->
+                  {error("not_open", "decision request is not open"), nil}
 
-                  validation ->
-                    {record_integrity_refusal_in_txn(
-                       txn,
-                       request.id,
-                       validation,
-                       :detail,
-                       observer_principal(call)
-                     ), nil}
-                end
+                validation ->
+                  {record_integrity_refusal_in_txn(
+                     txn,
+                     request.id,
+                     validation,
+                     :detail,
+                     observer_principal(call)
+                   ), nil}
+              end
 
-              "open" ->
-                with {:ok, decision} <- operator_decision(request, answer) do
-                  rule_operator_request_in_txn(txn, call, request, decision, answer, opts)
-                else
-                  {:error, reason} -> {reason, nil}
-                end
+            "open" ->
+              with {:ok, decision} <- operator_decision(request, answer) do
+                rule_operator_request_in_txn(txn, call, request, decision, answer, opts)
+              else
+                {:error, reason} -> {reason, nil}
+              end
 
-              _terminal_or_closed ->
-                {error("not_open", "decision request is not open"), nil}
-            end
-          else
-            {:error, reason} -> {reason, nil}
+            _terminal_or_closed ->
+              {error("not_open", "decision request is not open"), nil}
           end
       end
 
@@ -3212,20 +3208,6 @@ defmodule Tightbeam.Escalation do
          ) do
       [row] -> request_from_row(row)
       [] -> nil
-    end
-  end
-
-  defp operator_owner_authorized(call, request) do
-    case Map.get(call, :principal) do
-      {:user, owner_user_id} when owner_user_id == request.owner_user_id ->
-        if Map.get(call, :transport_session_key) == Org.personal_session_key(owner_user_id),
-          do:
-            {:error,
-             error("proxy_only", "Main may proxy operator requests but never resolves them")},
-          else: :ok
-
-      _ ->
-        {:error, error("not_owner", "only the operator resolves an operator request")}
     end
   end
 

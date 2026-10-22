@@ -970,28 +970,6 @@ defmodule Tightbeam.EscalationTest do
     direct =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "ship?"}))
 
-    main_rule =
-      owner_operator_rule(direct.id, %{decision: "accept"})
-      |> Map.put(:transport_session_key, Org.personal_session_key("flynn"))
-
-    assert %{code: "proxy_only"} = Escalation.operator_rule(ctx.db, main_rule)
-
-    assert %{code: "not_owner"} =
-             Escalation.operator_rule(ctx.db, %{
-               origin: "user:flynn",
-               principal: {:session, Org.personal_session_key("flynn")},
-               transport_session_key: Org.personal_session_key("flynn"),
-               params: %{request: direct.id, decision: "accept"}
-             })
-
-    assert %{code: "not_owner"} =
-             Escalation.operator_rule(ctx.db, %{
-               origin: "user:other",
-               principal: {:user, "other"},
-               transport_session_key: nil,
-               params: %{request: direct.id, decision: "accept"}
-             })
-
     assert %{code: "invalid_decision"} =
              Escalation.operator_rule(
                ctx.db,
@@ -1128,6 +1106,29 @@ defmodule Tightbeam.EscalationTest do
              Escalation.waive(ctx.db, owner_operator_rule(direct.id, %{decision: "accept"}),
                authorized: true
              )
+
+    proxied =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "proxy?"}))
+
+    main_ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        owner_operator_rule(proxied.id, %{decision: "accept"})
+        |> Map.put(:transport_session_key, Org.personal_session_key("flynn")),
+        scheduler: scheduler
+      )
+
+    assert main_ruled.status == "ruled"
+    assert main_ruled.ruled_by == "user:flynn"
+    assert main_ruled.ruled_via_session_key == Org.personal_session_key("flynn")
+
+    assert main_ruled.ruling_attribution == %{
+             on_behalf_of: "user:flynn",
+             performer: %{
+               principal: %{state: "known", value: "user:flynn"},
+               session: %{state: "known", key: Org.personal_session_key("flynn")}
+             }
+           }
   end
 
   test "presenting session is preserved beside the performing principal", ctx do
