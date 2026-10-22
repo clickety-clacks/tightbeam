@@ -5859,8 +5859,7 @@ defmodule Tightbeam.GatewayTest do
     assert_message_notice_matches_projection!(ctx.db, notice)
     assert notice["payload"]["messageType"] == "marker"
     assert notice["payload"]["content"] =~ "[model retune]"
-    assert notice["payload"]["content"] =~ "claude-fable-5"
-    assert notice["payload"]["content"] =~ "claude-sonnet-4-6"
+    assert notice["payload"]["content"] =~ "from fable to claude-sonnet-4-6"
     Hub.delivered(Hub, self())
     :sys.get_state(Hub)
     refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
