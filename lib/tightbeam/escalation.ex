@@ -1754,7 +1754,6 @@ defmodule Tightbeam.Escalation do
       _ ->
         with true <- Keyword.get(opts, :authorized, false),
              request when not is_nil(request) <- request,
-             false <- raiser_id(call) == request.raiser_id,
              {:ok, decision} <- resolve_decision(request, param(call, :decision)) do
           case request.status do
             status when status in ["ruled", "consumed"] and request.decision == decision ->
@@ -1775,7 +1774,6 @@ defmodule Tightbeam.Escalation do
           end
         else
           false -> error("not_owner", "admin owner required")
-          true -> error("not_owner", "raiser cannot rule its own request")
           nil -> error("not_found", "decision request not found")
           {:error, error} -> error
         end
@@ -1794,15 +1792,10 @@ defmodule Tightbeam.Escalation do
           statute_name = param(call, :statute_name) || param(call, :statute)
           target_raiser_id = if is_binary(session_key), do: "session:" <> session_key
 
-          cond do
-            not (is_binary(session_key) and is_binary(statute_name)) ->
-              error("invalid", "waive requires --request or --session with --statute")
-
-            raiser_id(call) == target_raiser_id ->
-              error("not_owner", "raiser cannot waive its own statute")
-
-            true ->
-              grant_waiver(db, target_raiser_id, statute_name, call, "preemptive", opts)
+          if is_binary(session_key) and is_binary(statute_name) do
+            grant_waiver(db, target_raiser_id, statute_name, call, "preemptive", opts)
+          else
+            error("invalid", "waive requires --request or --session with --statute")
           end
 
         %{kind: "effort"} ->
@@ -1815,9 +1808,7 @@ defmodule Tightbeam.Escalation do
           error("invalid", "agent questions are answered, not waived")
 
         request ->
-          if raiser_id(call) == request.raiser_id,
-            do: error("not_owner", "raiser cannot waive its own statute"),
-            else: grant_waiver(db, request.raiser_id, request.statute_name, call, "request", opts)
+          grant_waiver(db, request.raiser_id, request.statute_name, call, "request", opts)
       end
     else
       error("not_owner", "admin owner required")
@@ -1831,14 +1822,7 @@ defmodule Tightbeam.Escalation do
       waiver_id = param(call, :waiver_id) || param(call, :waiver)
       revoked_at = now()
 
-      {:ok, rows} =
-        DB.query(db, "SELECT raiserId FROM escalation_waivers WHERE id = ?1", [waiver_id])
-
-      if rows == [[raiser_id(call)]] do
-        error("not_owner", "raiser cannot revoke its own waiver")
-      else
-        revoke_waiver_as_owner(db, waiver_id, call.origin, revoked_at)
-      end
+      revoke_waiver_as_owner(db, waiver_id, call.origin, revoked_at)
     else
       error("not_owner", "admin owner required")
     end
