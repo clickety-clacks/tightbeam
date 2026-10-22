@@ -551,22 +551,15 @@ defmodule Tightbeam.EscalationTest do
              )
   end
 
-  test "withdrawal is raiser-only and retirement sweeps requests and waivers", ctx do
+  test "any caller may withdraw a request and retirement sweeps requests and waivers", ctx do
     call = call(ctx.raiser, %{assignment_id: "a5", kind: "completion"})
     {:decision_pending, id} = open(ctx, call, statute())
 
-    assert %{code: "not_raiser"} =
+    assert %{status: "withdrawn", withdrawn_reason: "no"} =
              Escalation.withdraw(ctx.db, %{
                origin: "user:flynn",
                principal: {:user, "flynn"},
                params: %{request_id: id, reason: "no"}
-             })
-
-    assert %{status: "withdrawn", withdrawn_reason: "changed course"} =
-             Escalation.withdraw(ctx.db, %{
-               origin: "agent:raiser",
-               principal: {:session, ctx.raiser.session_key},
-               params: %{request_id: id, reason: "changed course"}
              })
 
     {:decision_pending, fresh} = open(ctx, call, statute())
@@ -771,17 +764,10 @@ defmodule Tightbeam.EscalationTest do
     withdraw_call = put_in(call, [:params, :kind], "progress")
     {:decision_pending, withdraw_id} = open(ctx, withdraw_call, statute())
 
-    assert %{code: "not_raiser"} =
+    assert %{status: "withdrawn"} =
              Escalation.withdraw(ctx.db, %{
                origin: "user:other",
                principal: {:user, "other"},
-               params: %{request_id: withdraw_id, reason: "wrong raiser"}
-             })
-
-    assert %{status: "withdrawn"} =
-             Escalation.withdraw(ctx.db, %{
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
                params: %{request_id: withdraw_id, reason: "changed course"}
              })
 

@@ -1859,8 +1859,6 @@ defmodule Tightbeam.Escalation do
         error("invalid", "withdrawal reason is required")
 
       true ->
-        caller_raiser_id = raiser_id(call)
-
         case get_raw(db, request_id) do
           nil ->
             error("not_found", "decision request not found")
@@ -1870,9 +1868,6 @@ defmodule Tightbeam.Escalation do
 
           %{kind: "operator"} ->
             error("invalid", "operator requests require operator-withdraw")
-
-          request when request.raiser_id != caller_raiser_id ->
-            error("not_raiser", "raiser required")
 
           request ->
             if cannot_proceed_request?(request),
@@ -3190,7 +3185,7 @@ defmodule Tightbeam.Escalation do
 
   defp superseded_request_in_txn(_txn, nil, _owner_user_id, _raiser_id), do: :ok
 
-  defp superseded_request_in_txn(txn, request_id, owner_user_id, raiser_id) do
+  defp superseded_request_in_txn(txn, request_id, owner_user_id, _raiser_id) do
     case request_in_txn_optional(txn, request_id) do
       nil ->
         error("not_found", "superseded request not found")
@@ -3200,9 +3195,6 @@ defmodule Tightbeam.Escalation do
 
       %{owner_user_id: owner} when owner != owner_user_id ->
         error("not_owner", "superseded request belongs to another owner")
-
-      %{raiser_id: raiser} when raiser != raiser_id ->
-        error("not_owner", "only the same raiser can supersede a request")
 
       %{status: "open"} ->
         :ok
