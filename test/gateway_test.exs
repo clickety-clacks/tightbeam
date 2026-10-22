@@ -4160,7 +4160,7 @@ defmodule Tightbeam.GatewayTest do
     message_notices = Enum.filter(notices, &(&1["class"] == "message.created"))
     assert length(message_notices) == 1
     assert_message_notice_matches_projection!(ctx.db, hd(message_notices))
-    assert hd(message_notices)["payload"]["marker"]["kind"] == "model-retune"
+    assert hd(message_notices)["payload"]["messageType"] == "marker"
     assert_per_verb_effects!(config, "tune", Enum.map(notices, & &1["class"]))
 
     refute marker.content =~ "RETAINED",
@@ -5857,7 +5857,10 @@ defmodule Tightbeam.GatewayTest do
 
     assert_receive {:firehose_notice, %{"class" => "message.created"} = notice}
     assert_message_notice_matches_projection!(ctx.db, notice)
-    assert notice["payload"]["marker"]["kind"] == "model-retune"
+    assert notice["payload"]["messageType"] == "marker"
+    assert notice["payload"]["content"] =~ "[model retune]"
+    assert notice["payload"]["content"] =~ "claude-fable-5"
+    assert notice["payload"]["content"] =~ "claude-sonnet-4-6"
     Hub.delivered(Hub, self())
     :sys.get_state(Hub)
     refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
