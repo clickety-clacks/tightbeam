@@ -1070,8 +1070,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert dr_id in ids
 
-    # rule — as the owner; org transport (not the owner's personal session) so it
-    # is a genuine ruling, not the proxy_only refusal
+    # rule — as the owner over the org transport
     ruled =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "operator-rule",
