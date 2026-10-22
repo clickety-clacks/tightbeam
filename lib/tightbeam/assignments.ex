@@ -2148,7 +2148,7 @@ defmodule Tightbeam.Assignments do
       effort_config = effort_config(db, call)
 
       prepared_effort_arm =
-        may_prepare_reopen_effort?(db, call.principal, assignment_id) &&
+        may_prepare_reopen_effort?(db, assignment_id) &&
           EffortCheckin.prepare_reopen_arm(db, effort_config, assignment_id)
 
       call =
@@ -3573,13 +3573,6 @@ defmodule Tightbeam.Assignments do
 
       assignment ->
         cond do
-          not revoke_allowed?(txn, call.principal, assignment) ->
-            if cannot_proceed_standing_in_txn?(txn, assignment.id) do
-              error("not_authorized", "cannot-proceed revocation requires its current disposer")
-            else
-              error("not_authorized", "assignment revocation requires its opener or an admin")
-            end
-
           assignment.state != "open" ->
             with :ok <- valid_revocation_reason(call.params[:reason]) do
               if assignment.outcome == "revoked" and
@@ -3760,9 +3753,6 @@ defmodule Tightbeam.Assignments do
 
       assignment ->
         cond do
-          not reopen_allowed?(txn, call.principal, assignment) ->
-            error("not_authorized", "assignment reopen requires its opener, holder, or an admin")
-
           assignment.state == "open" ->
             error("assignment_open", "assignment #{assignment_id} is already open")
 
@@ -4063,47 +4053,9 @@ defmodule Tightbeam.Assignments do
     best_effort(fn -> Projection.append_substrate_in_txn(txn, session_key, text) end)
   end
 
-  defp revoke_allowed?(txn, {:user, user}, assignment) do
-    case cannot_proceed_disposer_ref_in_txn(txn, assignment.id) do
-      nil ->
-        assignment.openedByUser == user or
-          match?([[1]], Txn.q(txn, "SELECT isAdmin FROM users WHERE userId = ?1", [user]))
-
-      disposer_ref ->
-        disposer_ref == "user:" <> user
-    end
-  end
-
-  defp revoke_allowed?(txn, {:session, session}, assignment) do
-    case cannot_proceed_disposer_ref_in_txn(txn, assignment.id) do
-      nil -> assignment.openedBySession == session
-      disposer_ref -> disposer_ref == "session:" <> session
-    end
-  end
-
-  defp cannot_proceed_disposer_ref_in_txn(txn, assignment_id) do
-    case Txn.q(
-           txn,
-           "SELECT disposerRef FROM assignment_cannot_proceed WHERE assignmentId=?1 AND state='standing'",
-           [assignment_id]
-         ) do
-      [[disposer_ref]] -> disposer_ref
-      [] -> nil
-    end
-  end
-
-  defp reopen_allowed?(txn, {:session, session} = principal, assignment),
-    do: revoke_allowed?(txn, principal, assignment) or session == assignment.holderKey
-
-  defp reopen_allowed?(txn, principal, assignment),
-    do: revoke_allowed?(txn, principal, assignment)
-
-  defp may_prepare_reopen_effort?(db, principal, assignment_id) do
+  defp may_prepare_reopen_effort?(db, assignment_id) do
     transaction(db, fn txn ->
-      case fetch_assignment(txn, assignment_id) do
-        %{state: "closed"} = assignment -> reopen_allowed?(txn, principal, assignment)
-        _ -> false
-      end
+      match?(%{state: "closed"}, fetch_assignment(txn, assignment_id))
     end)
   end
 
