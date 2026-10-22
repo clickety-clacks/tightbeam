@@ -1042,29 +1042,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         "wakes_rest_session_created_order"
       },
       {
-        "SELECT createdAt, wakeId FROM wakes " <>
-          "ORDER BY createdAt DESC, wakeId DESC LIMIT ?",
-        [6],
-        "wakes_rest_created_order"
-      },
-      {
-        "SELECT createdAt, wakeId FROM wakes " <>
-          "WHERE (EXISTS (SELECT 1 FROM sessions AS target " <>
-          "WHERE target.sessionKey = wakes.sessionKey AND target.ownerUserId = ?) OR " <>
-          "EXISTS (SELECT 1 FROM sessions AS creator " <>
-          "WHERE creator.sessionKey = wakes.creatorSessionKey AND creator.ownerUserId = ?)) " <>
-          "ORDER BY createdAt DESC, wakeId DESC LIMIT ?",
-        ["reader", "reader", 6],
-        "wakes_rest_created_order"
-      },
-      {
-        "SELECT createdAt, wakeId FROM wakes " <>
-          "WHERE (createdAt > ? OR (createdAt = ? AND wakeId > ?)) " <>
-          "ORDER BY createdAt, wakeId LIMIT ?",
-        [1, 1, "wake_synthetic", 6],
-        "wakes_rest_created_order"
-      },
-      {
         "SELECT seq FROM messages WHERE sessionKey = ? ORDER BY seq LIMIT ?",
         ["agent:main:clawline:flynn:main", 6],
         "messages_session"

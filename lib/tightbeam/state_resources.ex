@@ -36,53 +36,6 @@ defmodule Tightbeam.StateResources do
   FROM turns AS t
   """
 
-  @assignment_select """
-  SELECT a.id, a.subject, a.holderKey, a.holderRole, a.holderFallback,
-         a.openedByUser, a.openedBySession, a.openedAt, a.state, a.outcome,
-         a.closedAt, a.closedByUser, a.closedBySession, a.closedByProcess, a.closingAttestId,
-         (SELECT r.reason FROM assignment_revocation_generations g
-          JOIN assignment_revocations r ON r.id = g.revocationId
-          WHERE g.assignmentId = a.id AND g.reopeningId IS
-            (SELECT reopening.id FROM assignment_reopenings reopening
-             WHERE reopening.assignmentId = a.id ORDER BY reopening.id DESC LIMIT 1)),
-         a.workItemId, a.reviewsAssignmentId, a.holderHarness, a.holderProvider,
-         COALESCE(
-           (SELECT json_group_array(path) FROM (
-             SELECT path FROM assignment_files
-             WHERE assignmentId = a.id ORDER BY path
-           )),
-           '[]'
-         ),
-         COALESCE(
-           (SELECT effectKind FROM assignment_effects WHERE assignmentId = a.id),
-           CASE WHEN a.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END
-         ),
-         CASE
-           WHEN a.state = 'closed' AND a.outcome IN ('surrendered','revoked') THEN 'abandoned'
-           WHEN a.state = 'closed' AND a.outcome = 'completed' AND EXISTS (
-             SELECT 1 FROM attests AS verdict
-             WHERE verdict.assignmentId = a.id AND verdict.kind = 'verdict'
-               AND verdict.verdictKind = 'verified'
-           ) THEN 'verified'
-           WHEN a.state = 'closed' AND a.outcome = 'completed' THEN 'claims-done'
-           WHEN a.state = 'open' AND (
-             SELECT state FROM sessions WHERE sessionKey = a.holderKey
-           ) = 'retired' THEN 'stranded'
-           WHEN a.state = 'open' AND NOT EXISTS (
-             SELECT 1 FROM attests AS filed WHERE filed.assignmentId = a.id
-           ) THEN 'open'
-           ELSE 'active'
-         END,
-         a.rowVersion
-  FROM assignments AS a
-  LEFT JOIN work_items AS wi ON wi.id = a.workItemId
-  """
-
-  @assignment_probe_from """
-  assignments AS a
-  LEFT JOIN work_items AS wi ON wi.id = a.workItemId
-  """
-
   @message_select """
   SELECT m.seq, m.id, m.sessionKey, m.role, m.messageType, m.content,
          m.markerKind, m.markerFrom, m.markerTo,
@@ -543,18 +496,56 @@ defmodule Tightbeam.StateResources do
     principal = Map.get(call, :rest_principal)
     trace_core_detail(principal, {:au4_visibility, "assignments"})
 
-    {visibility, visibility_params} =
-      assignment_collection_scope(%{
-        kind: principal_kind,
-        id: principal_id,
-        is_admin: is_admin
-      })
-
     case observed_query(
            db,
            principal,
-           @assignment_select <> " WHERE a.id = ? AND (" <> visibility <> ")",
-           [id | visibility_params]
+           """
+           SELECT a.id, a.subject, a.holderKey, a.holderRole, a.holderFallback,
+                  a.openedByUser, a.openedBySession, a.openedAt, a.state, a.outcome,
+                  a.closedAt, a.closedByUser, a.closedBySession, a.closedByProcess, a.closingAttestId,
+                  (SELECT r.reason FROM assignment_revocation_generations g
+                   JOIN assignment_revocations r ON r.id = g.revocationId
+                   WHERE g.assignmentId = a.id AND g.reopeningId IS
+                     (SELECT reopening.id FROM assignment_reopenings reopening
+                      WHERE reopening.assignmentId = a.id ORDER BY reopening.id DESC LIMIT 1)),
+                  a.workItemId, a.reviewsAssignmentId, a.holderHarness, a.holderProvider,
+                  COALESCE(
+                    (SELECT json_group_array(path) FROM (
+                      SELECT path FROM assignment_files
+                      WHERE assignmentId = a.id ORDER BY path
+                    )),
+                    '[]'
+                  ),
+                  COALESCE(
+                    (SELECT effectKind FROM assignment_effects WHERE assignmentId = a.id),
+                    CASE WHEN a.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END
+                  ),
+                  CASE
+                    WHEN a.state = 'closed' AND a.outcome IN ('surrendered','revoked') THEN 'abandoned'
+                    WHEN a.state = 'closed' AND a.outcome = 'completed' AND EXISTS (
+                      SELECT 1 FROM attests AS verdict
+                      WHERE verdict.assignmentId = a.id AND verdict.kind = 'verdict'
+                        AND verdict.verdictKind = 'verified'
+                    ) THEN 'verified'
+                    WHEN a.state = 'closed' AND a.outcome = 'completed' THEN 'claims-done'
+                    WHEN a.state = 'open' AND (
+                      SELECT state FROM sessions WHERE sessionKey = a.holderKey
+                    ) = 'retired' THEN 'stranded'
+                    WHEN a.state = 'open' AND NOT EXISTS (
+                      SELECT 1 FROM attests AS filed WHERE filed.assignmentId = a.id
+                    ) THEN 'open'
+                    ELSE 'active'
+                  END,
+                  a.rowVersion
+           FROM assignments AS a
+           LEFT JOIN work_items AS wi ON wi.id = a.workItemId
+           WHERE a.id = ?1 AND (
+             ?2 = 1 OR
+             (?3 = 'session' AND (a.holderKey = ?4 OR a.openedBySession = ?4)) OR
+             (?3 = 'user' AND (wi.ownerUserId = ?4 OR a.openedByUser = ?4))
+           )
+           """,
+           [id, bool_int(is_admin), principal_kind, principal_id]
          ) do
       [row] ->
         assignment_query_row(row)
@@ -568,29 +559,6 @@ defmodule Tightbeam.StateResources do
     end
   end
 
-  @doc "Return one bounded page of assignments visible to a REST principal."
-  def query_assignments_page(db, principal, boundary, limit) do
-    trace_core_detail(principal, {:au4_visibility, "assignments"})
-    {where, params} = assignment_collection_scope(principal)
-
-    with_read_transaction(db, fn txn ->
-      query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
-
-      Keyset.page(
-        query,
-        @assignment_select,
-        @assignment_probe_from,
-        where,
-        params,
-        ["a.openedAt", "a.id"],
-        boundary,
-        limit,
-        fn row -> [Enum.at(row, 7), hd(row)] end
-      )
-    end)
-    |> then(fn page -> %{rows: Enum.map(page.rows, &assignment_query_row/1), flags: page} end)
-  end
-
   def query_wake(db, %{key: id, principal: principal}) do
     detail_selection(db, "wakes", principal, &wake_projection_in_txn(&1, id))
   end
@@ -600,38 +568,6 @@ defmodule Tightbeam.StateResources do
       {:ok, wake} -> wake
       {:error, error} -> raise error
     end
-  end
-
-  @doc "Return one bounded page of wakes visible to a REST principal."
-  def query_wakes_page(db, principal, boundary, limit) do
-    trace_core_detail(principal, {:au4_visibility, "wakes"})
-    {where, params} = wake_collection_scope(principal)
-
-    with_read_transaction(db, fn txn ->
-      query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
-
-      page =
-        Keyset.page(
-          query,
-          "SELECT createdAt, wakeId FROM wakes",
-          "wakes",
-          where,
-          params,
-          ["createdAt", "wakeId"],
-          boundary,
-          limit,
-          fn [created_at, wake_id] -> [created_at, wake_id] end
-        )
-
-      %{
-        page
-        | rows:
-            Enum.map(page.rows, fn [_created_at, wake_id] ->
-              Wakes.delivery_projection_in_txn(txn, wake_id)
-            end)
-      }
-    end)
-    |> then(fn page -> %{rows: page.rows, flags: page} end)
   end
 
   defp wake_projection_in_txn(txn, id),
@@ -785,47 +721,6 @@ defmodule Tightbeam.StateResources do
       )
     end)
     |> then(fn page -> %{rows: Enum.map(page.rows, &turn_row/1), flags: page} end)
-  end
-
-  @doc "Return one bounded page of turns visible to a REST principal."
-  def query_turns_page(db, principal, boundary, limit) do
-    trace_core_detail(principal, {:au4_visibility, "turns"})
-
-    {where, params} =
-      cond do
-        principal.is_admin ->
-          {nil, []}
-
-        principal.kind == "session" ->
-          {"t.sessionKey = ?", [principal.id]}
-
-        true ->
-          {
-            "EXISTS (SELECT 1 FROM sessions AS s " <>
-              "WHERE s.sessionKey = t.sessionKey AND s.ownerUserId = ?)",
-            [principal.id]
-          }
-      end
-
-    with_read_transaction(db, fn txn ->
-      query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
-
-      page =
-        Keyset.page(
-          query,
-          @turn_select,
-          "turns AS t",
-          where,
-          params,
-          ["t.seq"],
-          boundary,
-          limit,
-          fn [seq | _] -> [seq] end
-        )
-
-      %{page | rows: Enum.map(page.rows, &turn_row/1)}
-    end)
-    |> then(fn page -> %{rows: page.rows, flags: page} end)
   end
 
   defp session_query_row([
@@ -1450,36 +1345,6 @@ defmodule Tightbeam.StateResources do
   defp detail_principal(%{principal: {:user, id}}), do: {"user", id, false}
   defp detail_principal(%{principal: {:session, id}}), do: {"session", id, false}
   defp detail_principal(%{principal: {:remedy, %{owner: id}}}), do: {"user", id, false}
-
-  defp assignment_collection_scope(%{kind: "user", is_admin: true}), do: {"1 = 1", []}
-
-  defp assignment_collection_scope(%{kind: "user", id: user_id}) do
-    {"(wi.ownerUserId = ? OR a.openedByUser = ?)", [user_id, user_id]}
-  end
-
-  defp assignment_collection_scope(%{kind: "session", id: session_key}) do
-    {"(a.holderKey = ? OR a.openedBySession = ?)", [session_key, session_key]}
-  end
-
-  defp assignment_collection_scope(_principal), do: {"0 = 1", []}
-
-  defp wake_collection_scope(%{kind: "user", is_admin: true}), do: {"1 = 1", []}
-
-  defp wake_collection_scope(%{kind: "user", id: user_id}) do
-    {
-      "(EXISTS (SELECT 1 FROM sessions AS target " <>
-        "WHERE target.sessionKey = wakes.sessionKey AND target.ownerUserId = ?) OR " <>
-        "EXISTS (SELECT 1 FROM sessions AS creator " <>
-        "WHERE creator.sessionKey = wakes.creatorSessionKey AND creator.ownerUserId = ?))",
-      [user_id, user_id]
-    }
-  end
-
-  defp wake_collection_scope(%{kind: "session", id: session_key}) do
-    {"(wakes.sessionKey = ? OR wakes.creatorSessionKey = ?)", [session_key, session_key]}
-  end
-
-  defp wake_collection_scope(_principal), do: {"0 = 1", []}
 
   defp append_work_item_filters(where, params, filters) do
     {where, params} =
