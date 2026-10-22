@@ -1310,8 +1310,8 @@ defmodule Tightbeam.AssignmentsTest do
         {assignment, _item, personal} = revocation_notice_fixture(ctx)
         principal = @notice_revoker
 
-        # Human revocation needs the corresponding human opener; admin may revoke
-        # the session-opened card under the existing authorization rule.
+        # A human-opened card targets its terminal notice at the opener's
+        # personal session, so give the human revoker a human opener.
         if principal == {:user, "flynn"} do
           {:ok, _} =
             DB.query(
@@ -2180,7 +2180,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
   end
 
-  test "Firehose revocation validates reason after authority and keeps rejected rows open", ctx do
+  test "Firehose revocation validates reason and keeps rejected rows open", ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "reason boundary"))
     missing = call("revoke-assignment", {:user, "flynn"}, nil, %{assignment_id: assignment.id})
     assert %{code: "missing_reason"} = handle(ctx, "revoke-assignment", missing)
@@ -2189,9 +2189,6 @@ defmodule Tightbeam.AssignmentsTest do
       assert %{code: "invalid_reason"} =
                handle(ctx, "revoke-assignment", put_in(missing, [:params, :reason], reason))
     end
-
-    unauthorized = %{missing | principal: {:user, "other"}, origin: "user:other"}
-    assert %{code: "not_authorized"} = handle(ctx, "revoke-assignment", unauthorized)
 
     assert handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id)).state ==
              "open"
@@ -2305,7 +2302,7 @@ defmodule Tightbeam.AssignmentsTest do
              handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
   end
 
-  test "reopen authorization and refusals preserve every durable surface", ctx do
+  test "reopen refusals preserve every durable surface", ctx do
     assignment = handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "authorization"))
 
     assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "why", "assignment_open")
@@ -2315,7 +2312,6 @@ defmodule Tightbeam.AssignmentsTest do
     assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, nil, "missing_reason")
     assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "   ", "invalid_reason")
     assert_reopen_refused!(ctx, {:process, "cron"}, assignment.id, "why", "process_denied")
-    assert_reopen_refused!(ctx, {:user, "other"}, assignment.id, "why", "not_authorized")
 
     assert %{state: "open"} =
              handle(
@@ -3278,102 +3274,6 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "cannot-proceed disposition follows a delivered dead-opener fault bubble", ctx do
-    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "bubbled disposition"))
-
-    blocked =
-      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
-      |> put_in([:params, :note], "the opener is unavailable")
-      |> then(&handle(ctx, "attest", &1))
-
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               """
-               INSERT INTO turns
-                 (sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt,endedAt)
-               VALUES
-                 (?1,'cannot-proceed-cause',?2,'process:tightbeam','parent decision',?3,
-                  'failed',1,2)
-               """,
-               [Org.personal_session_key("flynn"), blocked.decisionWake.wake_id, assignment.id]
-             )
-
-    assert {:ok, [[cause_seq]]} = DB.query(ctx.db, "SELECT last_insert_rowid()")
-
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               """
-               INSERT INTO turns
-                 (sessionKey,messageId,origin,prompt,assignmentId,status,requestRef,createdAt)
-               VALUES
-                 ('other-session','cannot-proceed-bubble','process:tightbeam','fault bubble',?1,
-                  'delivered',?2,3)
-               """,
-               [assignment.id, "bubble:#{cause_seq}"]
-             )
-
-    assert %{code: "not_authorized"} =
-             handle(
-               ctx,
-               "revoke-assignment",
-               revoke_call({:session, "other-session"}, assignment.id)
-             )
-
-    assert %{outcome: "revoked"} =
-             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
-  end
-
-  test "failed cannot-proceed bubbles do not transfer disposition authority", ctx do
-    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "failed bubble"))
-
-    blocked =
-      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
-      |> put_in([:params, :note], "the opener is unavailable")
-      |> then(&handle(ctx, "attest", &1))
-
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               """
-               INSERT INTO turns
-                 (sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt,endedAt)
-               VALUES
-                 (?1,'cannot-proceed-failed-cause',?2,'process:tightbeam','parent decision',?3,
-                  'failed',1,2)
-               """,
-               [Org.personal_session_key("flynn"), blocked.decisionWake.wake_id, assignment.id]
-             )
-
-    assert {:ok, [[cause_seq]]} = DB.query(ctx.db, "SELECT last_insert_rowid()")
-
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               """
-               INSERT INTO turns
-                 (sessionKey,messageId,origin,prompt,assignmentId,status,requestRef,createdAt,endedAt)
-               VALUES
-                 ('other-session','cannot-proceed-failed-bubble','process:tightbeam','fault bubble',
-                  ?1,'failed',?2,3,4)
-               """,
-               [assignment.id, "bubble:#{cause_seq}"]
-             )
-
-    assert %{code: "not_authorized"} =
-             handle(
-               ctx,
-               "revoke-assignment",
-               revoke_call({:session, "other-session"}, assignment.id)
-             )
-
-    assert %{outcome: "revoked"} =
-             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
-  end
-
   test "holder retirement leaves a standing cannot-proceed assignment open", ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "blocked at retirement"))
@@ -3470,7 +3370,7 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "standing cannot-proceed may be disposed only by its current disposer", ctx do
+  test "opener revocation settles a standing cannot-proceed and its decision request", ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
 
     assignment =
@@ -3489,9 +3389,6 @@ defmodule Tightbeam.AssignmentsTest do
                "attest",
                attest_call({:session, "holder"}, assignment.id, "completion")
              )
-
-    assert %{code: "not_authorized"} =
-             handle(ctx, "revoke-assignment", revoke_call({:user, "admin"}, assignment.id))
 
     assert %{outcome: "revoked"} =
              handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
@@ -5937,10 +5834,12 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.attest_count(ctx.db, assignment.id) == 1
   end
 
-  test "revoke permits admin and typed openers, denies others, and creates no attest", ctx do
+  test "revoke permits typed principals, denies process and missing principals, and creates no attest",
+       ctx do
     for {principal, opener} <- [
           {{:user, "admin"}, {:user, "flynn"}},
           {{:user, "flynn"}, {:user, "flynn"}},
+          {{:user, "other"}, {:user, "flynn"}},
           {{:session, "holder"}, {:session, "holder"}}
         ] do
       assignment = handle(ctx, "assign", assign_call(opener, inspect(principal)))
@@ -5950,9 +5849,6 @@ defmodule Tightbeam.AssignmentsTest do
     end
 
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "deny"))
-
-    assert %{code: "not_authorized"} =
-             handle(ctx, "revoke-assignment", revoke_call({:user, "other"}, assignment.id))
 
     assert %{code: "process_denied"} =
              handle(ctx, "revoke-assignment", revoke_call({:process, "x"}, assignment.id))
