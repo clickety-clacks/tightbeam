@@ -1,7 +1,7 @@
 defmodule Tightbeam.SessionReparent do
   @moduledoc "Owner correction of current topology; creation and runtime rows stay immutable."
 
-  alias Tightbeam.{DB, DeliveryResponsibilities, Idempotency, Org}
+  alias Tightbeam.{DB, Idempotency, Org}
   alias Tightbeam.DB.Txn
 
   @table_ddl """
@@ -187,8 +187,7 @@ defmodule Tightbeam.SessionReparent do
           correct_in_txn(txn, owner, child, parent, assignment, key, fingerprint, %{
             kind: "session",
             ref: "session:" <> caller,
-            cause: "delivery_owner_reparent",
-            caller: caller
+            cause: "delivery_owner_reparent"
           })
 
         _ ->
@@ -202,7 +201,7 @@ defmodule Tightbeam.SessionReparent do
 
   defp active_caller_in_txn(txn, caller) when is_binary(caller) do
     case Txn.q(txn, "SELECT ownerUserId,state FROM sessions WHERE sessionKey=?1", [caller]) do
-      [[owner, "active"]] -> {:ok, owner}
+      [[owner, _state]] -> {:ok, owner}
       _ -> {:error, "not_authorized"}
     end
   end
@@ -213,8 +212,6 @@ defmodule Tightbeam.SessionReparent do
     with {:ok, origin_parent} <- child_in_txn(txn, owner, child),
          :ok <- parent_in_txn(txn, owner, parent),
          {:ok, work_item, opener_kind, opener} <- assignment_in_txn(txn, owner, child, assignment),
-         :ok <-
-           authorize_actor(txn, actor, child, parent, assignment, work_item, opener_kind, opener),
          :ok <- acyclic(txn, parent, MapSet.new([child])) do
       previous_parent = Org.current_parent(txn, child)
       previous_coordination = current_coordination_parent(txn, assignment)
@@ -286,45 +283,6 @@ defmodule Tightbeam.SessionReparent do
       end
     else
       {:error, code} -> refusal(code)
-    end
-  end
-
-  defp authorize_actor(_txn, %{kind: "user"}, _child, _parent, _assignment, _item, _kind, _ref),
-    do: :ok
-
-  defp authorize_actor(
-         txn,
-         %{kind: "session", caller: caller},
-         child,
-         parent,
-         assignment,
-         item,
-         opener_kind,
-         opener
-       ) do
-    current_coordination = current_coordination_parent(txn, assignment)
-
-    effective_coordination =
-      if current_coordination == nil and opener_kind == "session",
-        do: opener,
-        else: session_ref(current_coordination)
-
-    cond do
-      DeliveryResponsibilities.responsibility_in_txn(txn, caller, item) not in [
-        "accountable",
-        "delegated"
-      ] ->
-        {:error, "delivery_responsibility_required"}
-
-      Org.current_parent(txn, child) != caller or
-          effective_coordination != session_ref(caller) ->
-        {:error, "current_custody_required"}
-
-      Org.current_parent(txn, parent) != caller ->
-        {:error, "target_not_owned"}
-
-      true ->
-        :ok
     end
   end
 
@@ -458,14 +416,6 @@ defmodule Tightbeam.SessionReparent do
 
   defp session_ref(nil), do: nil
   defp session_ref(key), do: "session:" <> key
-
-  defp refusal("current_custody_required" = code),
-    do: %{
-      ok: false,
-      code: code,
-      message:
-        "current worker and assignment custody must agree; ask the owning user for a topology correction"
-    }
 
   defp refusal(code), do: %{ok: false, code: code, message: code}
 end
