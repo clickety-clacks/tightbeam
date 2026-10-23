@@ -2755,6 +2755,9 @@ defmodule Tightbeam.Assignments do
 
       %{holderKey: holder} = assignment ->
         cond do
+          not match?({:session, _}, call.principal) ->
+            error("not_holder", "assignment is held by session #{holder}")
+
           assignment.state != "open" and call.params[:kind] == "cannot-proceed" ->
             cannot_proceed_closed(assignment.outcome)
 
@@ -4304,19 +4307,29 @@ defmodule Tightbeam.Assignments do
       {:ok, []} ->
         error("unknown_assignment", "unknown assignment: #{assignment_id}")
 
-      {:ok, [[_holder, state, _reviews_assignment_id]]}
-      when kind == "completion" and state != "open" ->
-        assignment_closed()
-
-      {:ok, [[_holder, "open", reviews_assignment_id]]}
-      when kind == "completion" and not is_nil(reviews_assignment_id) ->
-        error(
-          "invalid_commit_refs",
-          "commitRefs are not allowed on non-producing completion attests"
-        )
-
-      {:ok, [[_holder, state, nil]]} when kind == "verdict" ->
+      {:ok, [[holder, state, reviews_assignment_id]]} when kind == "completion" ->
         cond do
+          not match?({:session, _}, call.principal) ->
+            error("not_holder", "assignment is held by session #{holder}")
+
+          state != "open" ->
+            assignment_closed()
+
+          not is_nil(reviews_assignment_id) ->
+            error(
+              "invalid_commit_refs",
+              "commitRefs are not allowed on non-producing completion attests"
+            )
+
+          true ->
+            :ok
+        end
+
+      {:ok, [[holder, state, nil]]} when kind == "verdict" ->
+        cond do
+          not match?({:session, _}, call.principal) ->
+            error("not_holder", "assignment is held by session #{holder}")
+
           call.params[:verdict_kind] not in ["verified", "verification-failed"] ->
             error(
               "invalid_commit_refs",
