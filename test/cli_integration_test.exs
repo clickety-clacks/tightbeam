@@ -2589,7 +2589,7 @@ defmodule Tightbeam.CliIntegrationTest do
              "onBehalfOf" => "user:flynn",
              "performer" => %{
                "principal" => %{"state" => "known", "value" => "user:flynn"},
-               "session" => %{"state" => "none"}
+               "session" => %{"state" => "known", "key" => "cli-holder"}
              }
            }
 
