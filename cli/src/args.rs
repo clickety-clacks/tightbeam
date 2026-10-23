@@ -707,7 +707,7 @@ COMMANDS:
       --not-known-class <text> [--observed-at <epochMs>] --valid-until <epochMs> --world-status PROVEN|UNKNOWN
       --redaction-confirmed --key <idempotencyKey>
       exact_error requires --exact-error; probe_digest requires --output-digest.
-      --valid-until must be within 15 minutes after --observed-at (defaults to server acceptance time).
+      --valid-until must be within 3 hours after --observed-at (defaults to server acceptance time).
       UNKNOWN requires --evidence-mode exact_error.
       Admit a redacted, bounded evidence observation for a not-yet-named failure.
   harness-health-resolve-other --harness <harness> --host <host>
@@ -1623,7 +1623,7 @@ fn number_coercion(text: &str) -> f64 {
 }
 
 fn exceeds_other_validity_window(observed_at: &str, valid_until: &str) -> bool {
-    const MAX_VALIDITY_MS: f64 = 900_000.0;
+    const MAX_VALIDITY_MS: f64 = 10_800_000.0;
     let observed_at = number_coercion(observed_at);
     let valid_until = number_coercion(valid_until);
     observed_at.is_finite()
@@ -1953,7 +1953,7 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 1
                 || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
             {
-                return Err("usage: tightbeam harness-health-observe-other --harness <harness> --host <host> --source-session <session> --description <text> --evidence-mode exact_error|probe_digest [--exact-error <text> | --output-digest <sha256>] --observed-state <text> --exact-probe <text> --recovery-condition <text> --not-known-class <text> [--observed-at <ms>] --valid-until <ms> (within 15 minutes after --observed-at, which defaults to server acceptance time) --world-status PROVEN|UNKNOWN --redaction-confirmed --key <idempotencyKey> (UNKNOWN requires exact_error evidence)".to_owned());
+                return Err("usage: tightbeam harness-health-observe-other --harness <harness> --host <host> --source-session <session> --description <text> --evidence-mode exact_error|probe_digest [--exact-error <text> | --output-digest <sha256>] --observed-state <text> --exact-probe <text> --recovery-condition <text> --not-known-class <text> [--observed-at <ms>] --valid-until <ms> (within 3 hours after --observed-at, which defaults to server acceptance time) --world-status PROVEN|UNKNOWN --redaction-confirmed --key <idempotencyKey> (UNKNOWN requires exact_error evidence)".to_owned());
             }
             let evidence_mode = nonempty(flags, "evidence-mode")
                 .ok_or_else(|| "--evidence-mode is required".to_owned())?;
@@ -1986,7 +1986,7 @@ fn parse_with_optional_catalog(
                 .is_some_and(|observed_at| exceeds_other_validity_window(observed_at, &valid_until))
             {
                 return Err(
-                    "--valid-until must be no more than 15 minutes after --observed-at".to_owned(),
+                    "--valid-until must be no more than 3 hours after --observed-at".to_owned(),
                 );
             }
             if !flags.contains_key("redaction-confirmed") {
@@ -3925,7 +3925,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let valid_until_ms = observed_at_ms + 900_000;
+        let valid_until_ms = observed_at_ms + 10_800_000;
         let observed_at_value = observed_at_ms.to_string();
         let valid_until = valid_until_ms.to_string();
         let command = parse(strings(&[
@@ -3994,7 +3994,7 @@ mod tests {
             assert!(help.contains("--exact-error <text>"));
             assert!(help.contains("--output-digest <sha256>"));
             assert!(help.contains("exact_error requires --exact-error"));
-            assert!(help.contains("within 15 minutes after --observed-at"));
+            assert!(help.contains("within 3 hours after --observed-at"));
             assert!(help.contains("UNKNOWN requires --evidence-mode exact_error"));
         }
     }
@@ -4025,7 +4025,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        let valid_until = observed_at + 900_001;
+        let valid_until = observed_at + 10_800_001;
         let error = parse(strings(&[
             "harness-health-observe-other",
             "--evidence-mode",
@@ -4043,7 +4043,7 @@ mod tests {
 
         assert_eq!(
             error,
-            "--valid-until must be no more than 15 minutes after --observed-at"
+            "--valid-until must be no more than 3 hours after --observed-at"
         );
     }
 

@@ -6323,18 +6323,18 @@ mod tests {
         let (human, machine) = readings(
             &parse_response(
                 400,
-                r#"{"error":{"code":"invalid_other_evidence","message":"invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"}}"#,
+                r#"{"error":{"code":"invalid_other_evidence","message":"invalid --valid-until: must be no more than 3 hours after --observed-at (defaults to server acceptance time)"}}"#,
             )
             .unwrap_err(),
         );
 
         assert_eq!(
             human,
-            "invalid_other_evidence: invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
+            "invalid_other_evidence: invalid --valid-until: must be no more than 3 hours after --observed-at (defaults to server acceptance time)"
         );
         assert_eq!(
             machine["error"]["message"],
-            "invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
+            "invalid --valid-until: must be no more than 3 hours after --observed-at (defaults to server acceptance time)"
         );
     }
 

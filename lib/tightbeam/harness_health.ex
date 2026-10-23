@@ -43,7 +43,7 @@ defmodule Tightbeam.HarnessHealth do
   @prod_shape_consumers ["assignment_prodder"]
   @failure_evidence ~w(authoritative-provider terminal-failure)
   @evidence_window_ms 120_000
-  @other_max_validity_ms 900_000
+  @other_max_validity_ms 10_800_000
   @harness_health_schema_stamp "harness-health-other-v1-019"
   # Schema.ensure_all invokes module bootstraps before the repository's final
   # stamp is installed. HarnessHealth must not migrate at any intermediate
@@ -2777,7 +2777,7 @@ defmodule Tightbeam.HarnessHealth do
 
     if valid_until > observed_at + @other_max_validity_ms do
       raise ArgumentError,
-            "invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
+            "invalid --valid-until: must be no more than 3 hours after --observed-at (defaults to server acceptance time)"
     end
 
     unless evidence_mode in ~w(exact_error probe_digest),
