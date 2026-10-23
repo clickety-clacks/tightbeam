@@ -409,7 +409,7 @@ defmodule Tightbeam.ArchetypesTest do
     end
 
     retirement = coder.skills["repository-retirement"]
-    assert retirement =~ "An owner acts only on a direct child"
+    assert retirement =~ "any ancestor of the candidate session may also act on it"
     assert retirement =~ "all of these facts are fresh and true"
     assert retirement =~ "seven days"
     assert retirement =~ "thirty days"
