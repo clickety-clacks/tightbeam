@@ -424,7 +424,7 @@ defmodule Tightbeam.D1ReadRouteTest do
   end
 
   @tag rest_r7_encoder: true
-  test "all shared collections retain exact missing and repeated principal refusals", ctx do
+  test "all shared collections accept an implicit org read principal", ctx do
     for {path, resource} <- [
           {"/api/config", "config"},
           {"/api/host-env", "host environment"},
@@ -433,9 +433,12 @@ defmodule Tightbeam.D1ReadRouteTest do
           {"/api/identity", "identity"},
           {"/api/kungfu", "kungfu"}
         ] do
+      default = get(ctx.opts, path, "tbc_d1_route")
+      assert default.status == 200
+      assert JSON.decode!(default.resp_body)["resource"] == resource
+
       for {query, code} <- [
-            {"", "invalid_message"},
-            {"?limit=1", "invalid_message"},
+            {"?limit=1", "invalid_filter"},
             {"?asUser=", "invalid_message"},
             {"?asUser=admin&asUser=admin", "invalid_as_user"}
           ] do

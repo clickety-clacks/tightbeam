@@ -924,6 +924,8 @@ defmodule Tightbeam.ExecutionMap do
     |> Enum.map(&rest_assignment/1)
   end
 
+  defp detail_principal(%{kind: "session", id: id}), do: {"session", id, true}
+
   defp detail_principal(%{kind: kind, id: id, is_admin: is_admin}),
     do: {kind, id, is_admin}
 
@@ -978,7 +980,7 @@ defmodule Tightbeam.ExecutionMap do
       FROM turns AS t
       JOIN sessions AS s ON s.sessionKey = t.sessionKey
       WHERE (?1 = 1 OR
-             (?2 = 'session' AND t.sessionKey = ?3) OR
+             ?2 = 'session' OR
              (?2 = 'user' AND s.ownerUserId = ?3))
         AND (
           EXISTS (
@@ -986,12 +988,7 @@ defmodule Tightbeam.ExecutionMap do
             WHERE wi.id = t.jobRef AND (
               ?1 = 1 OR
               (?2 = 'user' AND wi.ownerUserId = ?3) OR
-              (?2 = 'session' AND (
-                wi.createdBySession = ?3 OR EXISTS (
-                  SELECT 1 FROM assignments AS held
-                  WHERE held.workItemId = wi.id AND held.holderKey = ?3
-                )
-              ))
+              ?2 = 'session'
             )
           )
           OR EXISTS (
@@ -1000,7 +997,7 @@ defmodule Tightbeam.ExecutionMap do
             LEFT JOIN work_items AS wi ON wi.id = a.workItemId
             WHERE a.id = t.assignmentId AND (
               ?1 = 1 OR
-              (?2 = 'session' AND (a.holderKey = ?3 OR a.openedBySession = ?3)) OR
+              ?2 = 'session' OR
               (?2 = 'user' AND (wi.ownerUserId = ?3 OR a.openedByUser = ?3))
             )
           )
@@ -1276,7 +1273,11 @@ defmodule Tightbeam.ExecutionMap do
     sessions =
       cond do
         principal.kind == "session" ->
-          List.wrap(principal_session)
+          StateResources.query_sessions(txn, %{
+            kind: "user",
+            id: principal_user_id,
+            is_admin: true
+          })
 
         principal.kind == "user" and not principal.is_admin and
             MapSet.size(referenced_session_keys) > 0 ->
