@@ -1792,8 +1792,8 @@ defmodule Tightbeam.EscalationTest do
                [direct.id, via.id]
              )
 
-    assert :ok =
-             DB.execute(
+    assert {:ok, _} =
+             DB.query(
                ctx.db,
                "UPDATE decision_requests SET ruledViaSessionKey=NULL WHERE id=?1",
                [direct.id]
