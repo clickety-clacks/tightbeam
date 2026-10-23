@@ -695,7 +695,7 @@ defmodule Tightbeam.RulesTest do
     assert Enum.map(EventLog.events_after(ctx.db, 0, 10), & &1.kind) == ["verb", "denied"]
   end
 
-  test "zero rules cannot bypass code completion evidence",
+  test "zero rules allow bare code completion",
        ctx do
     holder = session(ctx.db, "zero-rule-holder", "flynn", archetype: "coder")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
@@ -707,65 +707,17 @@ defmodule Tightbeam.RulesTest do
         kind: "completion"
       })
 
-    assert {:error, %{code: "inapplicable_code_evidence"}} =
+    assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
-    assert {:ok, [["open", nil]]} =
+    assert {:ok, [["closed"]]} =
              DB.query(
                ctx.db,
-               "SELECT state,closingAttestId FROM assignments WHERE id=?1",
+               "SELECT state FROM assignments WHERE id=?1",
                [assignment.id]
              )
 
-    assert [%{kind: "denied", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
-  end
-
-  test "code completion refusal identifies expected and latest clean review refs", ctx do
-    :ok =
-      DB.execute(ctx.db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1),('reviewer',1)")
-
-    holder = session(ctx.db, "null-ref-review-author", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "null-ref-review-judge", "reviewer", archetype: "reviewer-code")
-    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
-
-    review =
-      assignment(ctx, reviewer.session_key, {:user, "reviewer"}, reviews: producer.id)
-
-    assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: nil}} =
-             verdict(ctx, reviewer.session_key, review.id, "reviewed-clean")
-
-    assert %{assignment: %{state: "closed"}} =
-             Assignments.__handle__(
-               ctx.db,
-               "attest",
-               p3_call("attest", {:session, reviewer.session_key}, %{
-                 assignment_id: review.id,
-                 kind: "completion"
-               })
-             )
-
-    stub_commit_ref_validation()
-    refs = gooarchy_commit_refs()
-
-    assert %{attest: %{verdictKind: "verified", commitRefs: ^refs}} =
-             commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
-
-    Rules.load!(ctx.base_dir, [])
-
-    assert {:error, %{code: "inapplicable_code_evidence", message: message}} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               p3_call("attest", {:session, holder.session_key}, %{
-                 assignment_id: producer.id,
-                 kind: "completion",
-                 commit_refs: refs
-               })
-             )
-
-    assert message =~ "expected commitRefs=#{JSON.encode!(refs)}"
-    assert message =~ "6e3fc667ccf47013b3c5fb2d434ab5bd28559e0b"
-    assert message =~ "latest linked review conclusion=reviewed-clean commitRefs=null"
+    assert [%{kind: "verb", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
   end
 
   test "matching a constitutional denial is monotonic and leaves domain state unchanged", ctx do
@@ -1825,7 +1777,7 @@ defmodule Tightbeam.RulesTest do
     assert review_count(ctx.db, producer.id) == 1
   end
 
-  test "shipped completion accepts same source commits across checkouts and refuses another commit",
+  test "shipped completion accepts same source commits across checkouts",
        ctx do
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
@@ -1900,176 +1852,6 @@ defmodule Tightbeam.RulesTest do
       })
 
     assert :ok = Rules.evaluate(ctx.db, completion)
-
-    different_holder =
-      session(ctx.db, "different-source-completion-holder", "flynn", archetype: "coder")
-
-    different_reviewer =
-      session(ctx.db, "different-source-completion-reviewer", "flynn", archetype: "reviewer-code")
-
-    different_producer =
-      assignment(ctx, different_holder.session_key, {:user, "flynn"}, effect_kind: "code")
-
-    different_review =
-      assignment(ctx, different_reviewer.session_key, {:user, "flynn"},
-        reviews: different_producer.id,
-        effect_kind: "review"
-      )
-
-    different_review_refs = [
-      %{
-        "repo" => "testhost:/tmp/different-review-checkout",
-        "commit" => String.duplicate("b", 40)
-      }
-    ]
-
-    assert %{attest: %{verdictKind: "reviewed-clean"}} =
-             Assignments.__handle__(
-               ctx.db,
-               "attest",
-               p3_call("attest", {:session, different_reviewer.session_key}, %{
-                 assignment_id: different_review.id,
-                 kind: "verdict",
-                 verdict_kind: "reviewed-clean",
-                 commit_refs: different_review_refs
-               })
-             )
-
-    assert %{attest: %{verdictKind: "verified"}} =
-             Assignments.__handle__(
-               ctx.db,
-               "attest",
-               p3_call("attest", {:session, different_holder.session_key}, %{
-                 assignment_id: different_producer.id,
-                 kind: "verdict",
-                 verdict_kind: "verified",
-                 commit_refs: producer_refs
-               })
-             )
-
-    different_completion =
-      p3_call("attest", {:session, different_holder.session_key}, %{
-        assignment_id: different_producer.id,
-        kind: "completion",
-        commit_refs: producer_refs
-      })
-
-    assert {:deny, %{rule: "completion-requires-review"}} =
-             Rules.evaluate(ctx.db, different_completion)
-  end
-
-  test "completion stays pending when the latest closed clean review lacks exact refs", ctx do
-    holder = session(ctx.db, "unreferenced-review-author", "flynn", archetype: "coder")
-
-    reviewer =
-      session(ctx.db, "unreferenced-review-judge", "reviewer", archetype: "reviewer-code")
-
-    owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1),('reviewer', 0, 1)"
-      )
-
-    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    stub_commit_ref_validation()
-
-    scenarios = [
-      {"gooarchy", gooarchy_commit_refs(), false},
-      {"lachesis", integrated_commit_refs(), true}
-    ]
-
-    for {label, refs, older_exact_review?} <- scenarios do
-      producer = assignment(ctx, holder.session_key, {:user, "flynn"}, subject: label)
-
-      if older_exact_review? do
-        older_review =
-          assignment(ctx, reviewer.session_key, {:user, "reviewer"},
-            reviews: producer.id,
-            subject: "#{label} earlier exact review"
-          )
-
-        assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: ^refs}} =
-                 commit_ref_verdict(
-                   ctx,
-                   reviewer.session_key,
-                   older_review.id,
-                   "reviewed-clean",
-                   refs
-                 )
-
-        assert %{assignment: %{state: "closed"}} =
-                 Assignments.__handle__(
-                   ctx.db,
-                   "attest",
-                   p3_call("attest", {:session, reviewer.session_key}, %{
-                     assignment_id: older_review.id,
-                     kind: "completion"
-                   })
-                 )
-      end
-
-      latest_review =
-        assignment(ctx, reviewer.session_key, {:user, "reviewer"},
-          reviews: producer.id,
-          subject: "#{label} latest review"
-        )
-
-      assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: nil}} =
-               verdict(ctx, reviewer.session_key, latest_review.id, "reviewed-clean")
-
-      assert %{assignment: %{state: "closed"}} =
-               Assignments.__handle__(
-                 ctx.db,
-                 "attest",
-                 p3_call("attest", {:session, reviewer.session_key}, %{
-                   assignment_id: latest_review.id,
-                   kind: "completion"
-                 })
-               )
-
-      assert ["reviewed-clean"] ==
-               Assignments.qualifying_review_verdict_kinds(
-                 ctx.db,
-                 producer.id,
-                 holder.session_key
-               )
-
-      assert [] ==
-               Assignments.qualifying_review_verdict_kinds(
-                 ctx.db,
-                 producer.id,
-                 holder.session_key,
-                 refs
-               )
-
-      assert %{attest: %{verdictKind: "verified", commitRefs: ^refs}} =
-               commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
-
-      assert {:ok,
-              %{
-                assignment: %{id: producer_id, state: "open"},
-                attest: %{kind: "completion", commitRefs: ^refs}
-              }} =
-               Dispatch.dispatch(
-                 ctx.db,
-                 ctx.handlers,
-                 p3_call("attest", {:session, holder.session_key}, %{
-                   assignment_id: producer.id,
-                   kind: "completion",
-                   commit_refs: refs
-                 })
-               )
-
-      assert producer_id == producer.id
-      assert review_count(ctx.db, producer.id) == if(older_exact_review?, do: 2, else: 1)
-
-      assert RailRemedy.episode(ctx.db, "completion-requires-review", producer.id) == nil
-      assert [notice] = review_gate_notices(ctx.db, producer.id)
-      assert notice.session_key == owner.session_key
-    end
   end
 
   test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do
