@@ -53,7 +53,8 @@ sum over each supported collection route used by the view:
 
 This is a lower bound. It assumes pages use `limit=500` and that no rows are
 added during the walk. If a collection's walk must restart, its pages are read
-again. The global collection routes available in 0.1.11 are `/api/work-items`,
+again. For core Firehose rows, the global collection routes available in
+0.1.11 are `/api/work-items`,
 `/api/attests`, `/api/artifacts`, and `/api/sessions`. Assignments have a
 detail route and a per-assignment attests collection. Wakes and turns have
 detail routes and per-session collections; this release has no global
