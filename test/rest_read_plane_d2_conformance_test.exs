@@ -207,7 +207,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
 
     cursor = first_page["page"]["newestCursor"]
 
-    cross_principal =
+    same_owner_session =
       get(
         ctx,
         "/api/artifacts?workItemId=#{ctx.work_item.id}&limit=1&after=" <>
@@ -215,7 +215,8 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
         ctx.flynn_session.cli_token
       )
 
-    assert_error(cross_principal, 404, "artifacts", "not_found")
+    assert same_owner_session.status == 200
+    assert JSON.decode!(same_owner_session.resp_body) == JSON.decode!(next_page.resp_body)
 
     malformed_payload =
       cursor
@@ -271,7 +272,8 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
         ctx.admin_session.cli_token
       )
 
-    assert JSON.decode!(admin_session.resp_body)["items"] == []
+    assert JSON.decode!(admin_session.resp_body)["items"] ==
+             JSON.decode!(admin_user.resp_body)["items"]
   end
 
   test "assignment-attests bind the parent, filter before paging, and expose stored evidence references",
@@ -362,14 +364,17 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
 
     assert_error(parent_mismatch, 400, "attests", "invalid_cursor")
 
-    cross_principal =
+    same_owner_session =
       get(
         ctx,
         base <> "?limit=2&before=" <> URI.encode_www_form(page["page"]["oldestCursor"]),
         ctx.flynn_session.cli_token
       )
 
-    assert_error(cross_principal, 404, "attests", "not_found")
+    assert same_owner_session.status == 200
+
+    assert Enum.map(JSON.decode!(same_owner_session.resp_body)["items"], & &1["id"]) ==
+             Enum.map(JSON.decode!(before.resp_body)["items"], & &1["id"])
 
     malformed = get(ctx, base <> "?before=not-a-cursor")
     assert_error(malformed, 400, "attests", "invalid_cursor")
@@ -504,7 +509,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     assert_error(wrong_resource, 400, "attests", "invalid_cursor")
     refute Enum.any?(wrong_resource_events, &match?({:sql_query, _, _}, &1))
 
-    {wrong_principal, wrong_principal_events} =
+    {same_owner_session, _same_owner_events} =
       traced_get(
         ctx,
         "/api/artifacts?workItemId=#{work_item.id}&kind=report&after=" <>
@@ -512,8 +517,10 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
         ctx.flynn_session.cli_token
       )
 
-    assert_error(wrong_principal, 404, "artifacts", "not_found")
-    refute Enum.any?(wrong_principal_events, &match?({:sql_query, _, _}, &1))
+    assert same_owner_session.status == 200
+
+    assert Enum.map(JSON.decode!(same_owner_session.resp_body)["items"], & &1["artifactId"]) ==
+             Enum.drop(ids, 1)
 
     {malformed, malformed_events} =
       traced_get(ctx, "/api/artifacts?workItemId=#{work_item.id}&after=not-a-cursor")
@@ -545,24 +552,23 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     assert JSON.decode!(now_hidden.resp_body)["items"] == []
   end
 
-  test "artifact session visibility includes only the session holding work on its linked item",
+  test "session artifact reads include rows outside the owner's user-token view",
        ctx do
-    work_item = create_work_item(ctx.db, "other", "holder-only artifact visibility")
-    _assignment = create_assignment(ctx.db, "other", ctx.flynn_session, work_item, "holder grant")
+    work_item = create_work_item(ctx.db, "other", "session artifact visibility")
 
     artifact =
-      record_artifact(ctx.db, ctx.docs_session, work_item, "report", "Holder-only report")
+      record_artifact(ctx.db, ctx.docs_session, work_item, "report", "Unlinked report")
 
     path = "/api/artifacts?workItemId=#{work_item.id}"
 
-    holder_session = get(ctx, path, ctx.flynn_session.cli_token)
-    holder_user = get(ctx, path)
+    session_read = get(ctx, path, ctx.flynn_session.cli_token)
+    owner_user_read = get(ctx, path)
 
-    assert Enum.map(JSON.decode!(holder_session.resp_body)["items"], & &1["artifactId"]) == [
+    assert Enum.map(JSON.decode!(session_read.resp_body)["items"], & &1["artifactId"]) == [
              artifact.artifact_id
            ]
 
-    assert JSON.decode!(holder_user.resp_body)["items"] == []
+    assert JSON.decode!(owner_user_read.resp_body)["items"] == []
   end
 
   test "assignment-attest pagination uses the default and clamped limits across deleted tuple neighbors",
@@ -637,7 +643,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
              Enum.slice(ids, 3, 2)
   end
 
-  test "nested attests grant holder and opener sessions without borrowing an admin user's grant",
+  test "nested attest collections use each session owner's read visibility",
        ctx do
     work_item = create_work_item(ctx.db, "other", "attest session visibility")
 
@@ -701,7 +707,8 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
              "att_holder_session"
            ]
 
-    assert_error(admin_session, 404, "attests", "not_found")
+    assert admin_session.status == 200
+    assert JSON.decode!(admin_session.resp_body)["items"] == JSON.decode!(admin_user.resp_body)["items"]
   end
 
   test "collections use the shared query, visibility and item serializers",

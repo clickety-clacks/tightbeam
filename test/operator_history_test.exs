@@ -208,9 +208,11 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
     assert read(ctx, ctx.selected, "tail=false", ctx.owner.token) |> body() == all
   end
 
-  test "operator reads require a valid explicit user and exact authorized selection", ctx do
-    append(ctx, ctx.selected, "private selected content")
-    assert_error(read(ctx, ctx.selected, ""), 400, "invalid_message")
+  test "organization reads accept no user selection and validate explicit user filters", ctx do
+    selected_message = append(ctx, ctx.selected, "private selected content")
+    organization_read = read(ctx, ctx.selected, "")
+    assert organization_read.status == 200
+    assert Enum.map(body(organization_read)["items"], & &1["id"]) == [selected_message.id]
 
     for query <- ["asUser=", "asUser=owner&asUser=owner", "asUser=owner&asUser=other"] do
       assert_error(read(ctx, ctx.selected, query), 400, "invalid_as_user")
