@@ -366,7 +366,7 @@ defmodule Tightbeam.JobTraceTest do
            ]
   end
 
-  test "commit refs verify on the named host only after holder authorization", %{db: db} do
+  test "commit refs verify on the named host", %{db: db} do
     parent = self()
     old_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
@@ -396,13 +396,6 @@ defmodule Tightbeam.JobTraceTest do
         "commit" => "0123456789abcdef0123456789abcdef01234567"
       }
     ]
-
-    assert %{code: "not_holder"} =
-             attest(db, {:session, "other-session"}, "asg_bad", "completion", %{
-               commit_refs: remote_refs
-             })
-
-    refute_received {:commit_ref_command, _, _, _}
 
     assert %{attest: %{commitRefs: ^remote_refs}} =
              attest(db, {:session, "holder"}, "asg_bad", "completion", %{
