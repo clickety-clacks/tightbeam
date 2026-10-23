@@ -12,6 +12,7 @@ defmodule Tightbeam.Projection do
 
   alias Tightbeam.{DB, Origin}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   @type db :: GenServer.server()
 
@@ -192,14 +193,21 @@ defmodule Tightbeam.Projection do
   @spec append_substrate_in_txn(Txn.t(), String.t(), String.t(), attention()) ::
           {:appended, message()}
   def append_substrate_in_txn(%Txn{} = txn, session_key, content, attention \\ :normal) do
-    append_in_txn(txn, %{
-      session_key: session_key,
-      role: "assistant",
-      message_type: "substrate",
-      content: content,
-      sender: "process:tightbeam",
-      attention_tier: attention_tier(attention)
-    })
+    case append_in_txn(txn, %{
+           session_key: session_key,
+           role: "assistant",
+           message_type: "substrate",
+           content: content,
+           sender: "process:tightbeam",
+           attention_tier: attention_tier(attention)
+         }) do
+      {:appended, message} = appended ->
+        Publisher.message_in_txn(txn, session_key, message)
+        appended
+
+      other ->
+        other
+    end
   end
 
   @doc "The stored tier for an elected attention name."

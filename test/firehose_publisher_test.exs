@@ -691,6 +691,51 @@ defmodule Tightbeam.Firehose.PublisherTest do
     end)
   end
 
+  test "a substrate append publishes one canonical message.created after commit" do
+    db = :firehose_substrate_append_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
+    register_testhost(db)
+
+    session_key = "substrate-target"
+
+    Org.create(db, %{
+      session_key: session_key,
+      display_name: "Substrate target",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    assert {:ok, {:appended, message}} =
+             DB.transaction(db, fn txn ->
+               Projection.append_substrate_in_txn(txn, session_key, "A substrate notice")
+             end)
+
+    notice = receive_notice()
+    assert notice["class"] == "message.created"
+    assert notice["refs"]["messageId"] == message.id
+
+    item = db |> Projection.get(message.id) |> StateResources.message()
+    assert notice["payload"] == item
+    wire_notice = Publisher.encode_wire_notice(notice)
+    assert String.contains?(wire_notice, "\"payload\":" <> JSON.encode!(item))
+
+    :sys.get_state(Hub)
+    refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
+  end
+
   test "return emits the ruled decision_request.returned class" do
     db = :firehose_decision_returned_db
     start_supervised!({DB, path: ":memory:", name: db})

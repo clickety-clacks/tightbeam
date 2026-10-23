@@ -1202,7 +1202,7 @@ defmodule Tightbeam.Gateway do
 
           Assignments.__handle__(db, "dispatch", call)
         end,
-      {"attest", ["attest.filed", "assignment.closed"]} => fn call ->
+      {"attest", ["attest.filed", "assignment.closed", "message.created"]} => fn call ->
         Assignments.__handle__(
           db,
           "attest",
@@ -6728,10 +6728,18 @@ defmodule Tightbeam.Gateway do
               _ -> :ok
             end
 
-            Projection.append_marker_in_txn(
+            {:appended, marker} =
+              Projection.append_marker_in_txn(
+                txn,
+                call.session_key,
+                swap_tombstone(session, harness, model)
+              )
+
+            Tightbeam.Firehose.Publisher.message_in_txn(
               txn,
               call.session_key,
-              swap_tombstone(session, harness, model)
+              marker,
+              session.owner_user_id
             )
 
             :swapped

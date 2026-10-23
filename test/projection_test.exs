@@ -131,6 +131,11 @@ defmodule Tightbeam.ProjectionTest do
       assert message.content == "identical content", label
     end)
 
+    # Substrate appends now queue a message notice by looking up the owning session.
+    # This discriminator test uses a minimal message schema, so provide the rest of
+    # the application tables before exercising that seam.
+    :ok = Tightbeam.Schema.ensure_all(db)
+
     assert {:ok, {:appended, substrate}} =
              DB.transaction(db, fn txn ->
                Projection.append_substrate_in_txn(txn, "types", "identical content")
