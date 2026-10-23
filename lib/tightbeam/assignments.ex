@@ -4490,11 +4490,17 @@ defmodule Tightbeam.Assignments do
     verification = latest_verification_conclusion_in_txn(txn, assignment.id, assignment.holderKey)
 
     verification_qualifies? =
-      match?(%{kind: "verified", holder: holder} when holder == assignment.holderKey, verification)
+      match?(
+        %{kind: "verified", holder: holder} when holder == assignment.holderKey,
+        verification
+      )
 
     review_qualifies? =
       Map.get(call, :review_pending, false) or
-        match?(%{kind: "reviewed-clean", holder: holder} when holder != assignment.holderKey, review)
+        match?(
+          %{kind: "reviewed-clean", holder: holder} when holder != assignment.holderKey,
+          review
+        )
 
     if verification_qualifies? and review_qualifies? do
       :ok
