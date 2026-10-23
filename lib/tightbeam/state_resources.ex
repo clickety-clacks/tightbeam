@@ -546,7 +546,7 @@ defmodule Tightbeam.StateResources do
         assignment_query_row(row)
         |> Map.put(
           :commit_ref_corrections,
-          AssignmentCommitRefCorrections.list_many(db, [id]) |> Map.get(id, [])
+          Tightbeam.AssignmentCommitRefCorrections.list_many(db, [id]) |> Map.get(id, [])
         )
         |> then(&Tightbeam.Mementos.attach(db, "assignment", &1))
 
