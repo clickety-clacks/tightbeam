@@ -1456,12 +1456,14 @@ defmodule Tightbeam.EffortCheckinTest do
     request = escalate(ctx, item.id)
     assert request.expecter_user_id == "h1"
 
-    assert %{code: "not_authorized"} =
-             EffortCheckin.rule(
-               ctx.db,
-               ctx.config,
-               effort_call(request.id, "continue", {:process, "test-process"})
-             )
+    process_call = %{
+      verb: "effort-rule",
+      origin: "process:test-process",
+      principal: {:process, "test-process"},
+      params: %{request_id: request.id, action: "continue"}
+    }
+
+    assert %{code: "not_authorized"} = EffortCheckin.rule(ctx.db, ctx.config, process_call)
 
     assert %{status: "ruled", decision: "continue", ruled_by: "user:h2"} =
              EffortCheckin.rule(
