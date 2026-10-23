@@ -3209,8 +3209,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         path: "/api/host-env/#{host}/#{harness}/#{env_name}",
         notice: host_notice,
         primary_refs: %{"host" => host, "harness" => harness, "name" => env_name},
-        allowed_bearers: [ctx.token],
-        denied_bearer: owner_device.token,
+        allowed_bearers: [ctx.token, owner_device.token],
+        denied_bearer: nil,
         unknown_path: "/api/host-env/no-such-host/no-such-harness/no-such-name"
       }
     ]
@@ -3245,13 +3245,17 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       assert_error(unsupported_filter, 400, resource, "invalid_filter")
       assert_application_headers(unsupported_filter)
 
-      forbidden = get(ctx, path, row.denied_bearer)
-      unknown = get(ctx, row.unknown_path, row.denied_bearer)
-      assert_error(forbidden, 404, resource, "not_found")
+      unknown_bearer = row.denied_bearer || List.first(bearers)
+      unknown = get(ctx, row.unknown_path, unknown_bearer)
       assert_error(unknown, 404, resource, "not_found")
-      assert forbidden.resp_body == unknown.resp_body
-      assert_application_headers(forbidden)
       assert_application_headers(unknown)
+
+      if row.denied_bearer do
+        forbidden = get(ctx, path, row.denied_bearer)
+        assert_error(forbidden, 404, resource, "not_found")
+        assert forbidden.resp_body == unknown.resp_body
+        assert_application_headers(forbidden)
+      end
     end
 
     fact_item = session_fact_notice["payload"]

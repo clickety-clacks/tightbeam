@@ -463,13 +463,16 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert invalid.status == 400
     assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_filter"
 
-    hidden = get(ctx.opts, "/api/config/default-archetype", ctx.operator.token)
+    shared = get(ctx.opts, "/api/config/default-archetype", ctx.operator.token)
     missing = get(ctx.opts, "/api/config/missing", ctx.admin.token)
 
-    assert hidden.status == 404
+    assert shared.status == 200
+
+    assert shared.resp_body ==
+             get(ctx.opts, "/api/config/default-archetype", ctx.admin.token).resp_body
+
     assert missing.status == 404
-    assert hidden.resp_body == missing.resp_body
-    assert get_resp_header(hidden, "cache-control") == ["no-store"]
+    assert get_resp_header(shared, "cache-control") == ["no-store"]
     assert get_resp_header(missing, "cache-control") == ["no-store"]
   end
 
@@ -632,7 +635,9 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert hidden.status == 404
     collection = get(ctx.opts, "/api/kungfu", ctx.operator.token)
     assert collection.status == 200
-    assert JSON.decode!(collection.resp_body)["items"] == []
+
+    assert collection.resp_body ==
+             get(ctx.opts, "/api/kungfu", ctx.admin.token).resp_body
     assert get(ctx.opts, "/api/hosts", ctx.admin.token).status == 200
   end
 
@@ -688,7 +693,7 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert conn(:get, "/api/hosts/alpha") |> Router.call(ctx.opts) |> Map.fetch!(:status) == 401
 
     assert JSON.decode!(get(ctx.opts, "/api/host-env", ctx.operator.token).resp_body)["items"] ==
-             []
+             JSON.decode!(get(ctx.opts, "/api/host-env", ctx.admin.token).resp_body)["items"]
 
     harness = hd(Harness.all()).wire_name()
 
@@ -706,14 +711,17 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert is_integer(version) and version > 0
     environment = hd(D1Read.collection(ctx.db, ctx.base_dir, :host_environment, %{}))
     refs = Map.take(environment, ["host", "harness", "name"])
-    assert :forbidden == Rebuild.fetch(ctx.db, "host_env.updated", refs, "operator", false)
     assert {:ok, rebuilt} = Rebuild.fetch(ctx.db, "host_env.updated", refs, "admin", true)
+
+    assert Rebuild.fetch(ctx.db, "host_env.updated", refs, "operator", false) ==
+             {:ok, rebuilt}
+
     assert rebuilt == environment
     assert rebuilt["value"] == nil
     assert rebuilt["valuePresent"] == true
-    refute StateVisibility.config_visible?(false)
-    refute StateVisibility.user_visible?(false)
-    refute StateVisibility.host_environment_visible?(false)
+    assert StateVisibility.config_visible?(false)
+    assert StateVisibility.user_visible?(false)
+    assert StateVisibility.host_environment_visible?(false)
   end
 
   @tag :tmp_dir
