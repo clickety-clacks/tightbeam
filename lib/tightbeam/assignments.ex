@@ -2840,9 +2840,6 @@ defmodule Tightbeam.Assignments do
 
       %{holderKey: holder} = assignment ->
         cond do
-          not match?({:session, ^holder}, call.principal) ->
-            error("not_holder", "assignment is held by session #{holder}")
-
           assignment.state != "open" and call.params[:kind] == "cannot-proceed" ->
             cannot_proceed_closed(assignment.outcome)
 
@@ -2902,11 +2899,11 @@ defmodule Tightbeam.Assignments do
     attest = insert_attest(txn, call, assignment.id)
     EffortCheckin.holder_activity_in_txn(txn, assignment.id, holder, attest)
     Wakes.record_terminal_handoff_action_in_txn(txn, holder, attest)
-    result = apply_lifecycle_attest(txn, call, assignment, attest, holder)
+    result = apply_lifecycle_attest(txn, call, assignment, attest)
     file_attest_condition_fact(txn, assignment, attest, result)
   end
 
-  defp apply_lifecycle_attest(txn, %{params: %{kind: "progress"}}, assignment, attest, _holder) do
+  defp apply_lifecycle_attest(txn, %{params: %{kind: "progress"}}, assignment, attest) do
     append_attest_marker(txn, attest)
     %{assignment: assignment, attest: attest}
   end
@@ -2915,8 +2912,7 @@ defmodule Tightbeam.Assignments do
          txn,
          %{params: %{kind: "cannot-proceed"}} = call,
          assignment,
-         attest,
-         _holder
+         attest
        ),
        do: cannot_proceed_in_txn(txn, call, assignment, attest)
 
@@ -2924,13 +2920,12 @@ defmodule Tightbeam.Assignments do
          txn,
          %{params: %{kind: "completion"}, review_pending: true} = call,
          assignment,
-         attest,
-         holder
+         attest
        ) do
     case completion_review_conclusion_in_txn(txn, assignment) do
       "reviewed-clean" ->
         completion_call = Map.delete(call, :review_pending)
-        close_completed_assignment_in_txn(txn, completion_call, assignment, attest, holder)
+        close_completed_assignment_in_txn(txn, completion_call, assignment, attest)
 
       "changes-requested" ->
         schedule_author_review_changes_in_txn(txn, assignment, attest)
@@ -2943,11 +2938,11 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  defp apply_lifecycle_attest(txn, call, assignment, attest, holder) do
-    close_completed_assignment_in_txn(txn, call, assignment, attest, holder)
+  defp apply_lifecycle_attest(txn, call, assignment, attest) do
+    close_completed_assignment_in_txn(txn, call, assignment, attest)
   end
 
-  defp close_completed_assignment_in_txn(txn, call, assignment, attest, holder) do
+  defp close_completed_assignment_in_txn(txn, call, assignment, attest) do
     Txn.q(
       txn,
       """
@@ -2955,7 +2950,7 @@ defmodule Tightbeam.Assignments do
         closedBySession = ?3, closingAttestId = ?4
       WHERE id = ?1 AND state = 'open'
       """,
-      [assignment.id, attest.ts, holder, attest.id]
+      [assignment.id, attest.ts, attest.bySession, attest.id]
     )
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
@@ -3278,7 +3273,7 @@ defmodule Tightbeam.Assignments do
   defp settle_reviewed_assignment_in_txn(txn, call, review_assignment, review_attest) do
     case fetch_assignment(txn, review_assignment.reviewsAssignmentId) do
       %{id: producer_id} = producer ->
-        case latest_completion_attest_in_txn(txn, producer_id, producer.holderKey) do
+        case latest_completion_attest_in_txn(txn, producer_id) do
           %{id: _completion_id} = completion ->
             case completion_review_conclusion_in_txn(txn, producer) do
               "reviewed-clean" ->
@@ -3313,7 +3308,7 @@ defmodule Tightbeam.Assignments do
 
   defp settle_completed_assignment_after_review_in_txn(txn, call, producer, completion) do
     if producer.state == "open" do
-      close_completed_assignment_in_txn(txn, call, producer, completion, producer.holderKey)
+      close_completed_assignment_in_txn(txn, call, producer, completion)
     end
 
     :ok
@@ -3366,7 +3361,7 @@ defmodule Tightbeam.Assignments do
     :ok
   end
 
-  defp latest_completion_attest_in_txn(txn, assignment_id, holder_key) do
+  defp latest_completion_attest_in_txn(txn, assignment_id) do
     case Txn.q(
            txn,
            """
@@ -3374,11 +3369,11 @@ defmodule Tightbeam.Assignments do
              producerCommand,byHarness,byProvider,commitRefs,artifactId,contentSha256,
              waitId,ts
            FROM attests
-           WHERE assignmentId=?1 AND kind='completion' AND bySession=?2
+           WHERE assignmentId=?1 AND kind='completion'
            ORDER BY ts DESC,rowid DESC
            LIMIT 1
            """,
-           [assignment_id, holder_key]
+           [assignment_id]
          ) do
       [row] -> attest(row)
       [] -> nil
@@ -4396,10 +4391,6 @@ defmodule Tightbeam.Assignments do
       {:ok, []} ->
         error("unknown_assignment", "unknown assignment: #{assignment_id}")
 
-      {:ok, [[holder, _state, _reviews_assignment_id]]}
-      when kind == "completion" and call.principal != {:session, holder} ->
-        error("not_holder", "assignment is held by session #{holder}")
-
       {:ok, [[_holder, state, _reviews_assignment_id]]}
       when kind == "completion" and state != "open" ->
         assignment_closed()
@@ -4411,16 +4402,13 @@ defmodule Tightbeam.Assignments do
           "commitRefs are not allowed on non-producing completion attests"
         )
 
-      {:ok, [[holder, state, nil]]} when kind == "verdict" ->
+      {:ok, [[_holder, state, nil]]} when kind == "verdict" ->
         cond do
           call.params[:verdict_kind] not in ["verified", "verification-failed"] ->
             error(
               "invalid_commit_refs",
               "commitRefs on producing verdicts require verified or verification-failed"
             )
-
-          call.principal != {:session, holder} ->
-            error("not_holder", "assignment is held by session #{holder}")
 
           state != "open" ->
             assignment_closed()
