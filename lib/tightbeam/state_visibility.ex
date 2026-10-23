@@ -495,5 +495,4 @@ defmodule Tightbeam.StateVisibility do
       false
     end
   end
-
 end

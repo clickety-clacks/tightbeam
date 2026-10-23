@@ -2234,7 +2234,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     org_as_user_page = get(ctx, path <> "&asUser=flynn", "tbc_core_detail")
     assert org_as_user_page.status == 200
-    assert JSON.decode!(org_as_user_page.resp_body)["items"] == JSON.decode!(page.resp_body)["items"]
+    assert JSON.decode!(org_as_user_page.resp_body)["items"] ==
+             JSON.decode!(page.resp_body)["items"]
 
     session_as_user = get(ctx, path <> "&asUser=flynn", ctx.admin_session.cli_token)
     assert session_as_user.status == 200
@@ -3173,7 +3174,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         path: "/api/attests/#{attest_id}",
         notice: attest_notice,
         primary_refs: %{"attestId" => attest_id},
-        allowed_bearers: [owner_device.token, owner_session.cli_token, ctx.admin_session.cli_token],
+        allowed_bearers: [
+          owner_device.token,
+          owner_session.cli_token,
+          ctx.admin_session.cli_token
+        ],
         denied_bearer: nil,
         unknown_path: "/api/attests/att_g7_detail_missing"
       },
@@ -3185,7 +3190,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           "messageId" => message.id,
           "sessionKey" => owner_session.session_key
         },
-        allowed_bearers: [owner_device.token, owner_session.cli_token, ctx.admin_session.cli_token],
+        allowed_bearers: [
+          owner_device.token,
+          owner_session.cli_token,
+          ctx.admin_session.cli_token
+        ],
         denied_bearer: nil,
         unknown_path: "/api/sessions/#{owner_session.session_key}/messages/no-such-message"
       },
@@ -3194,7 +3203,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         path: "/api/facts/#{session_fact_id}",
         notice: session_fact_notice,
         primary_refs: %{"factId" => session_fact_id},
-        allowed_bearers: [owner_device.token, owner_session.cli_token, ctx.admin_session.cli_token],
+        allowed_bearers: [
+          owner_device.token,
+          owner_session.cli_token,
+          ctx.admin_session.cli_token
+        ],
         denied_bearer: nil,
         unknown_path: "/api/facts/#{session_fact_id + 1_000_000}"
       },
