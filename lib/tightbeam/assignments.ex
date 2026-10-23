@@ -4231,11 +4231,6 @@ defmodule Tightbeam.Assignments do
     refs = call.params[:commit_refs]
 
     case valid_commit_refs(db, call.params[:kind], refs) do
-      %{code: "unverifiable_commit_ref"} = error ->
-        if late_ruling_receipt?(call.params),
-          do: invalid_ruling_consumption_target(),
-          else: error
-
       :ok ->
         case canonical_commit_refs(refs) do
           {:ok, canonical} ->
