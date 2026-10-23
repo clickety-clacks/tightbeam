@@ -629,6 +629,16 @@ defmodule FeatureSmoke do
             holder.check.note
       })
 
+      ok_as!(state, holder.token, "attest", %{
+        "assignmentId" => asg_id,
+        "kind" => "verdict",
+        "verdictKind" => "tests-passed",
+        "commitRefs" => holder.check.commit_refs,
+        "note" =>
+          "Operator ran `sh #{holder.check.name}` for this disposable check; exit 0 and output " <>
+            "#{inspect(holder.check.output)}"
+      })
+
       # The static artifact gate precedes dynamic review admission.
       denied!(state, "completion-requires-results-artifact", asg_id, complete)
       await_episode_status!(state, "completion-requires-results-artifact", asg_id, "live")

@@ -730,8 +730,7 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, %{"post" => fn _ -> %{code: "constitutional"} end}, call())
 
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM domain")
-    # The handler refused before an accepted verb event could be recorded.
-    assert Enum.map(EventLog.events_after(ctx.db, 0, 10), & &1.kind) == ["denied"]
+    assert Enum.map(EventLog.events_after(ctx.db, 0, 10), & &1.kind) == ["verb", "denied"]
   end
 
   test "empty rules retain legacy code completion evidence requirements",
@@ -764,7 +763,8 @@ defmodule Tightbeam.RulesTest do
                [assignment.id]
              )
 
-    assert Enum.map(EventLog.events_after(ctx.db, 0, 10), & &1.kind) == ["verb", "denied"]
+    # The pre-handler code-evidence refusal records denial without an accepted verb event.
+    assert Enum.map(EventLog.events_after(ctx.db, 0, 10), & &1.kind) == ["denied"]
   end
 
   test "matching a constitutional denial is monotonic and leaves domain state unchanged", ctx do
@@ -3578,8 +3578,19 @@ defmodule Tightbeam.RulesTest do
       )
 
     assert fourth.id != fifth.id
-    assert notice_count(ctx.db, churn_origin) == 1
-    assert notice_count(ctx.db, fix_origin) == 1
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE origin=?1 AND work_item_id=?2",
+               [churn_origin, review_item]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE origin=?1 AND work_item_id=?2",
+               [fix_origin, fix_item]
+             )
   end
 
   test "AC6a routes unassigned agent stretches to the item coordinator once and excludes human starts",
