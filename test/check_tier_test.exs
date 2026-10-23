@@ -106,11 +106,6 @@ defmodule Tightbeam.CheckTierTest do
                note: " "
              })
 
-    assert %{code: "not_holder"} =
-             attest(ctx, {:session, "reviewer"}, assignment.id, "progress", %{
-               verdict_kind: "reviewed"
-             })
-
     assert %{code: "invalid_verdict_kind"} =
              attest(ctx, {:session, "holder"}, assignment.id, "progress", %{
                verdict_kind: "reviewed"

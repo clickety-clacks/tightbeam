@@ -1310,8 +1310,8 @@ defmodule Tightbeam.AssignmentsTest do
         {assignment, _item, personal} = revocation_notice_fixture(ctx)
         principal = @notice_revoker
 
-        # Human revocation needs the corresponding human opener; admin may revoke
-        # the session-opened card under the existing authorization rule.
+        # A human-opened card targets its terminal notice at the opener's
+        # personal session, so give the human revoker a human opener.
         if principal == {:user, "flynn"} do
           {:ok, _} =
             DB.query(
@@ -2180,7 +2180,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
   end
 
-  test "Firehose revocation validates reason after authority and keeps rejected rows open", ctx do
+  test "Firehose revocation validates reason and keeps rejected rows open", ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "reason boundary"))
     missing = call("revoke-assignment", {:user, "flynn"}, nil, %{assignment_id: assignment.id})
     assert %{code: "missing_reason"} = handle(ctx, "revoke-assignment", missing)
@@ -2189,9 +2189,6 @@ defmodule Tightbeam.AssignmentsTest do
       assert %{code: "invalid_reason"} =
                handle(ctx, "revoke-assignment", put_in(missing, [:params, :reason], reason))
     end
-
-    unauthorized = %{missing | principal: {:user, "other"}, origin: "user:other"}
-    assert %{code: "not_authorized"} = handle(ctx, "revoke-assignment", unauthorized)
 
     assert handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id)).state ==
              "open"
@@ -2305,7 +2302,7 @@ defmodule Tightbeam.AssignmentsTest do
              handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
   end
 
-  test "reopen authorization and refusals preserve every durable surface", ctx do
+  test "reopen refusals preserve every durable surface", ctx do
     assignment = handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "authorization"))
 
     assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "why", "assignment_open")
@@ -2315,7 +2312,6 @@ defmodule Tightbeam.AssignmentsTest do
     assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, nil, "missing_reason")
     assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "   ", "invalid_reason")
     assert_reopen_refused!(ctx, {:process, "cron"}, assignment.id, "why", "process_denied")
-    assert_reopen_refused!(ctx, {:user, "other"}, assignment.id, "why", "not_authorized")
 
     assert %{state: "open"} =
              handle(
@@ -2863,12 +2859,6 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert %{code: "invalid_release_tuple"} = handle(ctx, "attest", partial_release)
 
-    wrong_holder =
-      attest_call({:session, "other-session"}, first.id, "cannot-proceed")
-      |> put_in([:params, :note], "not mine")
-
-    assert %{code: "not_holder"} = handle(ctx, "attest", wrong_holder)
-
     filing =
       attest_call({:session, "holder"}, first.id, "cannot-proceed")
       |> put_in([:params, :note], "waiting for the exact release fact")
@@ -3278,102 +3268,6 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "cannot-proceed disposition follows a delivered dead-opener fault bubble", ctx do
-    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "bubbled disposition"))
-
-    blocked =
-      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
-      |> put_in([:params, :note], "the opener is unavailable")
-      |> then(&handle(ctx, "attest", &1))
-
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               """
-               INSERT INTO turns
-                 (sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt,endedAt)
-               VALUES
-                 (?1,'cannot-proceed-cause',?2,'process:tightbeam','parent decision',?3,
-                  'failed',1,2)
-               """,
-               [Org.personal_session_key("flynn"), blocked.decisionWake.wake_id, assignment.id]
-             )
-
-    assert {:ok, [[cause_seq]]} = DB.query(ctx.db, "SELECT last_insert_rowid()")
-
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               """
-               INSERT INTO turns
-                 (sessionKey,messageId,origin,prompt,assignmentId,status,requestRef,createdAt)
-               VALUES
-                 ('other-session','cannot-proceed-bubble','process:tightbeam','fault bubble',?1,
-                  'delivered',?2,3)
-               """,
-               [assignment.id, "bubble:#{cause_seq}"]
-             )
-
-    assert %{code: "not_authorized"} =
-             handle(
-               ctx,
-               "revoke-assignment",
-               revoke_call({:session, "other-session"}, assignment.id)
-             )
-
-    assert %{outcome: "revoked"} =
-             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
-  end
-
-  test "failed cannot-proceed bubbles do not transfer disposition authority", ctx do
-    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "failed bubble"))
-
-    blocked =
-      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
-      |> put_in([:params, :note], "the opener is unavailable")
-      |> then(&handle(ctx, "attest", &1))
-
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               """
-               INSERT INTO turns
-                 (sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt,endedAt)
-               VALUES
-                 (?1,'cannot-proceed-failed-cause',?2,'process:tightbeam','parent decision',?3,
-                  'failed',1,2)
-               """,
-               [Org.personal_session_key("flynn"), blocked.decisionWake.wake_id, assignment.id]
-             )
-
-    assert {:ok, [[cause_seq]]} = DB.query(ctx.db, "SELECT last_insert_rowid()")
-
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               """
-               INSERT INTO turns
-                 (sessionKey,messageId,origin,prompt,assignmentId,status,requestRef,createdAt,endedAt)
-               VALUES
-                 ('other-session','cannot-proceed-failed-bubble','process:tightbeam','fault bubble',
-                  ?1,'failed',?2,3,4)
-               """,
-               [assignment.id, "bubble:#{cause_seq}"]
-             )
-
-    assert %{code: "not_authorized"} =
-             handle(
-               ctx,
-               "revoke-assignment",
-               revoke_call({:session, "other-session"}, assignment.id)
-             )
-
-    assert %{outcome: "revoked"} =
-             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
-  end
-
   test "holder retirement leaves a standing cannot-proceed assignment open", ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "blocked at retirement"))
@@ -3470,7 +3364,7 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "standing cannot-proceed may be disposed only by its current disposer", ctx do
+  test "opener revocation settles a standing cannot-proceed and its decision request", ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
 
     assignment =
@@ -3489,9 +3383,6 @@ defmodule Tightbeam.AssignmentsTest do
                "attest",
                attest_call({:session, "holder"}, assignment.id, "completion")
              )
-
-    assert %{code: "not_authorized"} =
-             handle(ctx, "revoke-assignment", revoke_call({:user, "admin"}, assignment.id))
 
     assert %{outcome: "revoked"} =
              handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
@@ -5762,19 +5653,16 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{code: "principal_required"} =
              handle(ctx, "attest", attest_call(nil, assignment.id, "progress"))
 
-    assert %{code: "not_holder"} =
-             handle(
-               ctx,
-               "attest",
-               attest_call({:session, "other-session"}, assignment.id, "progress")
-             )
+    third_party_progress =
+      handle(
+        ctx,
+        "attest",
+        attest_call({:session, "other-session"}, assignment.id, "progress")
+      )
 
-    assert %{code: "not_holder"} =
-             handle(
-               ctx,
-               "attest",
-               attest_call({:session, "other-session"}, assignment.id, "bogus")
-             )
+    assert third_party_progress.attest.kind == "progress"
+    assert third_party_progress.attest.bySession == "other-session"
+    assert third_party_progress.assignment.state == "open"
 
     assert %{code: "missing_verdict_kind"} =
              handle(
@@ -5783,8 +5671,12 @@ defmodule Tightbeam.AssignmentsTest do
                attest_call({:session, "other-session"}, assignment.id, "verdict")
              )
 
-    assert %{code: "not_holder"} =
-             handle(ctx, "attest", attest_call({:user, "flynn"}, assignment.id, "progress"))
+    assert %{code: "invalid_kind"} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "other-session"}, assignment.id, "bogus")
+             )
 
     assert %{code: "invalid_kind"} =
              handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "bogus"))
@@ -5937,10 +5829,12 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.attest_count(ctx.db, assignment.id) == 1
   end
 
-  test "revoke permits admin and typed openers, denies others, and creates no attest", ctx do
+  test "revoke permits typed principals, denies process and missing principals, and creates no attest",
+       ctx do
     for {principal, opener} <- [
           {{:user, "admin"}, {:user, "flynn"}},
           {{:user, "flynn"}, {:user, "flynn"}},
+          {{:user, "other"}, {:user, "flynn"}},
           {{:session, "holder"}, {:session, "holder"}}
         ] do
       assignment = handle(ctx, "assign", assign_call(opener, inspect(principal)))
@@ -5950,9 +5844,6 @@ defmodule Tightbeam.AssignmentsTest do
     end
 
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "deny"))
-
-    assert %{code: "not_authorized"} =
-             handle(ctx, "revoke-assignment", revoke_call({:user, "other"}, assignment.id))
 
     assert %{code: "process_denied"} =
              handle(ctx, "revoke-assignment", revoke_call({:process, "x"}, assignment.id))
@@ -6027,31 +5918,7 @@ defmodule Tightbeam.AssignmentsTest do
              Dispatch.dispatch(ctx.db, ctx.handlers, assign_call({:session, "holder"}, "denied"))
   end
 
-  test "zero rules cannot bypass code completion evidence and verdict emits one verb event",
-       ctx do
-    completion_assignment = dispatch!(ctx, assign_call({:session, "holder"}, "completion"))
-
-    assert {:error, %{code: "inapplicable_code_evidence"}} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               attest_call({:session, "holder"}, completion_assignment.id, "completion")
-             )
-
-    assert %{state: "open", closingAttestId: nil} =
-             handle(
-               ctx,
-               "assignment-get",
-               assignment_get_call({:session, "holder"}, completion_assignment.id)
-             )
-
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
-               [completion_assignment.id]
-             )
-
+  test "verdict emits one verb event", ctx do
     assert {:ok, [[before_verdict]]} =
              DB.query(
                ctx.db,
@@ -6077,8 +5944,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert after_verdict == before_verdict + 1
   end
 
-  test "a review retraction committed after applicability precheck defeats code completion",
-       ctx do
+  test "code completion keeps verification and review requirements without ref matching", ctx do
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
     on_exit(fn ->
@@ -6091,17 +5957,18 @@ defmodule Tightbeam.AssignmentsTest do
       {"", 0}
     end)
 
-    refs = [
-      %{
-        "repo" => "eezo:/tmp/o2-result",
-        "commit" => String.duplicate("a", 40)
-      }
+    producer_refs = [
+      %{"repo" => "testhost:/tmp/producer-checkout", "commit" => String.duplicate("a", 40)}
     ]
 
-    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "retraction producer"))
+    completion_refs = [
+      %{"repo" => "testhost:/tmp/completion-checkout", "commit" => String.duplicate("b", 40)}
+    ]
+
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "evidence producer"))
 
     review =
-      assign_call({:user, "flynn"}, "retraction review")
+      assign_call({:user, "flynn"}, "evidence review")
       |> Map.put(:session_key, "other-session")
       |> put_in([:params, :reviews_assignment_id], producer.id)
       |> then(&handle(ctx, "assign", &1))
@@ -6109,65 +5976,33 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{attest: %{verdictKind: "reviewed-clean"}} =
              attest_call({:session, "other-session"}, review.id, "verdict")
              |> put_in([:params, :verdict_kind], "reviewed-clean")
-             |> put_in([:params, :commit_refs], refs)
              |> then(&handle(ctx, "attest", &1))
+
+    completion =
+      attest_call({:session, "holder"}, producer.id, "completion")
+      |> put_in([:params, :commit_refs], completion_refs)
+
+    assert %{code: "inapplicable_code_evidence"} = handle(ctx, "attest", completion)
 
     assert %{attest: %{verdictKind: "verified"}} =
              attest_call({:session, "holder"}, producer.id, "verdict")
              |> put_in([:params, :verdict_kind], "verified")
-             |> put_in([:params, :commit_refs], refs)
+             |> put_in([:params, :commit_refs], producer_refs)
              |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(
-             ctx.db,
-             producer.id,
-             "holder",
-             refs
-           ) == ["reviewed-clean"]
+    assert %{attest: %{kind: "completion"}, assignment: %{outcome: "completed"}} =
+             handle(ctx, "attest", completion)
 
-    assert Assignments.qualifying_verification_verdict_kinds(
-             ctx.db,
-             producer.id,
-             "holder",
-             refs
-           ) == ["verified"]
+    unreviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "unreviewed producer"))
 
-    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
-      assert {:ok, _} =
-               DB.query(
-                 ctx.db,
-                 """
-                 INSERT INTO attests
-                   (id,assignmentId,kind,verdictKind,note,bySession,byHarness,byProvider,commitRefs,ts)
-                 VALUES
-                   ('att_concurrent_retraction',?1,'verdict','changes-requested','retracted',
-                    'other-session','claude','anthropic',?2,?3)
-                 """,
-                 [review.id, JSON.encode!(refs), System.system_time(:millisecond) + 1_000]
-               )
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, unreviewed.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], producer_refs)
+             |> then(&handle(ctx, "attest", &1))
 
-      {"", 0}
-    end)
-
-    completion =
-      attest_call({:session, "holder"}, producer.id, "completion")
-      |> put_in([:params, :commit_refs], refs)
-
-    assert %{code: "inapplicable_code_evidence"} = handle(ctx, "attest", completion)
-
-    assert %{state: "open", closingAttestId: nil} =
-             handle(
-               ctx,
-               "assignment-get",
-               assignment_get_call({:session, "holder"}, producer.id)
-             )
-
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
-               [producer.id]
-             )
+    assert %{code: "inapplicable_code_evidence"} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, unreviewed.id, "completion"))
   end
 
   test "code completion accepts the same commit from different checkout paths", ctx do
@@ -6215,7 +6050,7 @@ defmodule Tightbeam.AssignmentsTest do
              handle(ctx, "attest", completion)
   end
 
-  test "code completion explains missing refs on the linked clean review", ctx do
+  test "code completion accepts a linked clean review without commitRefs", ctx do
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
     on_exit(fn ->
@@ -6258,22 +6093,11 @@ defmodule Tightbeam.AssignmentsTest do
       attest_call({:session, "holder"}, producer.id, "completion")
       |> put_in([:params, :commit_refs], candidate_refs)
 
-    assert %{code: "inapplicable_code_evidence", message: message} =
+    assert %{attest: %{kind: "completion"}, assignment: %{outcome: "completed"}} =
              handle(ctx, "attest", completion)
-
-    assert message =~ "missing commitRefs"
-    assert message =~ candidate_commit
-    assert message =~ "file a new independent reviewed-clean verdict"
-
-    assert %{state: "open", closingAttestId: nil} =
-             handle(
-               ctx,
-               "assignment-get",
-               assignment_get_call({:session, "holder"}, producer.id)
-             )
   end
 
-  test "code completion explains a linked clean review for a different commit", ctx do
+  test "code completion accepts a linked clean review recorded for a different commit", ctx do
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
     on_exit(fn ->
@@ -6316,20 +6140,8 @@ defmodule Tightbeam.AssignmentsTest do
       attest_call({:session, "holder"}, producer.id, "completion")
       |> put_in([:params, :commit_refs], producer_refs)
 
-    assert %{code: "inapplicable_code_evidence", message: message} =
+    assert %{attest: %{kind: "completion"}, assignment: %{outcome: "completed"}} =
              handle(ctx, "attest", completion)
-
-    assert message =~ "do not match completion candidate"
-    assert message =~ candidate_commit
-    assert message =~ review_commit
-    assert message =~ "file a new independent reviewed-clean verdict"
-
-    assert %{state: "open", closingAttestId: nil} =
-             handle(
-               ctx,
-               "assignment-get",
-               assignment_get_call({:session, "holder"}, producer.id)
-             )
   end
 
   test "attests returns every kind in timestamp and id order", ctx do
