@@ -2766,7 +2766,8 @@ defmodule Tightbeam.Assignments do
                  :ok <- valid_note(call.params[:note]),
                  :ok <- valid_cannot_proceed_reason(call.params),
                  :ok <- absent_verdict_kind(call.params[:verdict_kind]),
-                 :ok <- valid_release_tuple_for_kind(call.params) do
+                 :ok <- valid_release_tuple_for_kind(call.params),
+                 :ok <- applicable_code_completion_in_txn(txn, assignment, call) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
                  ]) != [[1]],
@@ -3222,7 +3223,10 @@ defmodule Tightbeam.Assignments do
   end
 
   defp settle_completed_assignment_after_review_in_txn(txn, call, producer, completion) do
-    if producer.state == "open" do
+    completion_call = Map.put(call, :params, %{assignment_id: producer.id, kind: "completion"})
+
+    if producer.state == "open" and
+         applicable_code_completion_in_txn(txn, producer, completion_call) == :ok do
       close_completed_assignment_in_txn(txn, call, producer, completion)
     end
 
@@ -4386,6 +4390,33 @@ defmodule Tightbeam.Assignments do
 
   defp canonical_commit_refs(_), do: :error
 
+  defp applicable_code_completion_in_txn(_txn, _assignment, %{params: %{kind: kind}})
+       when kind != "completion",
+       do: :ok
+
+  defp applicable_code_completion_in_txn(txn, %{effectKind: "code"} = assignment, call) do
+    review = latest_review_conclusion_in_txn(txn, assignment.id)
+    verification = latest_verification_conclusion_in_txn(txn, assignment.id, assignment.holderKey)
+
+    verification_qualifies? =
+      match?(%{kind: "verified", holder: holder} when holder == assignment.holderKey, verification)
+
+    review_qualifies? =
+      Map.get(call, :review_pending, false) or
+        match?(%{kind: "reviewed-clean", holder: holder} when holder != assignment.holderKey, review)
+
+    if verification_qualifies? and review_qualifies? do
+      :ok
+    else
+      error(
+        "inapplicable_code_evidence",
+        "code completion requires a holder verification and the latest independent clean review, unless review is pending"
+      )
+    end
+  end
+
+  defp applicable_code_completion_in_txn(_txn, _assignment, _call), do: :ok
+
   defp latest_review_conclusion_in_txn(txn, assignment_id) do
     case Txn.q(
            txn,
@@ -4404,6 +4435,29 @@ defmodule Tightbeam.Assignments do
          ) do
       [[kind, holder]] ->
         %{kind: kind, holder: holder}
+
+      [] ->
+        nil
+    end
+  end
+
+  defp latest_verification_conclusion_in_txn(txn, assignment_id, holder) do
+    case Txn.q(
+           txn,
+           """
+           SELECT verdictKind,bySession
+           FROM attests
+           WHERE assignmentId=?1
+             AND kind='verdict'
+             AND bySession=?2
+             AND verdictKind IN ('verified','verification-failed')
+           ORDER BY ts DESC,rowid DESC
+           LIMIT 1
+           """,
+           [assignment_id, holder]
+         ) do
+      [[kind, author]] ->
+        %{kind: kind, holder: author}
 
       [] ->
         nil

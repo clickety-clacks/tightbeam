@@ -5931,6 +5931,67 @@ defmodule Tightbeam.AssignmentsTest do
     assert after_verdict == before_verdict + 1
   end
 
+  test "code completion keeps verification and review requirements without ref matching", ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    producer_refs = [
+      %{"repo" => "testhost:/tmp/producer-checkout", "commit" => String.duplicate("a", 40)}
+    ]
+
+    completion_refs = [
+      %{"repo" => "testhost:/tmp/completion-checkout", "commit" => String.duplicate("b", 40)}
+    ]
+
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "evidence producer"))
+
+    review =
+      assign_call({:user, "flynn"}, "evidence review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> then(&handle(ctx, "attest", &1))
+
+    completion =
+      attest_call({:session, "holder"}, producer.id, "completion")
+      |> put_in([:params, :commit_refs], completion_refs)
+
+    assert %{code: "inapplicable_code_evidence"} = handle(ctx, "attest", completion)
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], producer_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{kind: "completion"}, assignment: %{outcome: "completed"}} =
+             handle(ctx, "attest", completion)
+
+    unreviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "unreviewed producer"))
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, unreviewed.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], producer_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{code: "inapplicable_code_evidence"} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, unreviewed.id, "completion"))
+  end
+
   test "code completion accepts the same commit from different checkout paths", ctx do
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
