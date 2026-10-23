@@ -892,6 +892,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   # The prior released form retained the creator-owner restriction.
   defp owner_scoped_continuation_guard!() do
     recorded = recorded_continuation_guard!()
+
     ancestry =
       ~r/AND EXISTS \(\s*WITH RECURSIVE lineage\(sessionKey,spawnedBy\) AS \(.*?SELECT 1 FROM lineage WHERE sessionKey=w.creatorSessionKey\s*\)/s
 
