@@ -782,12 +782,21 @@ defmodule Tightbeam.IdentityTest do
         ])
       )
 
-    assert status_sessions == inventory.sessions
+    assert Enum.map(status_sessions, &Map.drop(&1, [:identity_stale_reasons])) ==
+             Enum.map(inventory.sessions, &Map.drop(&1, [:identity_stale_reasons]))
+
+    assert [%{session_key: "current"}, %{session_key: "stale"} = stale_status] = status_sessions
+    assert "missing_render_stamp" in stale_status.identity_stale_reasons
+    assert "revision_mismatch" in stale_status.identity_stale_reasons
+
     assert [row] = Enum.filter(inventory.sessions, &(&1.session_key == "current"))
     assert row.identity_revision == revision
     assert row.expected_identity_revision == revision
     refute row.identity_stale
     assert row.identity_stale_reasons == []
+
+    assert [stale_inventory] = Enum.filter(inventory.sessions, &(&1.session_key == "stale"))
+    assert stale_inventory.identity_stale_reasons == ["revision_mismatch"]
 
     assert {:ok, changed} =
              DB.transaction(db, fn txn ->

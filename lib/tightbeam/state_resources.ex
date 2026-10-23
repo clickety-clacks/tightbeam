@@ -175,11 +175,11 @@ defmodule Tightbeam.StateResources do
   @item_wire_categories %{
     "work items" => %{
       strings:
-        ~w(id title specRefName specRefSha256 ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession),
-      integers: ~w(createdInTurnSeq createdAt priority rowVersion),
+        ~w(id title specRefName specRefSha256 ownerUserId deliveryOwnerSessionKey state failReason routingWakeId slateWakeId createdByUser createdBySession body bodyUpdatedByUser bodyUpdatedBySession),
+      integers: ~w(createdInTurnSeq createdAt priority bodyUpdatedAt rowVersion),
       booleans: ~w(isBug createdContextKnown),
       nullable:
-        ~w(specRefName specRefSha256 ownerUserId failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq)
+        ~w(specRefName specRefSha256 ownerUserId deliveryOwnerSessionKey failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq body bodyUpdatedByUser bodyUpdatedBySession bodyUpdatedAt)
     },
     "assignments" => %{
       strings:

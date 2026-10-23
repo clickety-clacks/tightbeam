@@ -69,6 +69,13 @@ defmodule Tightbeam.Dispatch do
     toplines topline topline-placement-list work-item-list attests assignment-get assignments inspect
     harness-health-evidence-other mementos)
 
+  # These calls may write declared mementos or evaluate legacy admission facts
+  # as part of the same transaction. Keep the selected policy stable across
+  # admission and the handler; unrelated dispatches observe the active policy
+  # at each rule evaluation.
+  @memento_policy_verbs ~w(work-item-create assign dispatch attest memento-set
+    harness-health-close-promotion)
+
   @db_transaction_diagnostic_fields ~w(
     kind operation origin phase cause reasonCause exception cleanup
   )
@@ -85,13 +92,18 @@ defmodule Tightbeam.Dispatch do
   def dispatch(db \\ Tightbeam.DB, handlers, call) do
     previous_audit = Process.delete(:tightbeam_dispatch_audit)
     previous_audited = Process.delete(:tightbeam_dispatch_audited)
-    snapshot = Rules.effective_snapshot()
 
     try do
-      Tightbeam.RuleRuntime.with_policy_snapshot(snapshot, fn ->
+      dispatch = fn ->
         :ok = Assignments.assert_request_contract!(call)
         dispatch_call(db, handlers, call)
-      end)
+      end
+
+      if Map.get(call, :verb) in @memento_policy_verbs do
+        Tightbeam.RuleRuntime.with_policy_snapshot(Rules.effective_snapshot(), dispatch)
+      else
+        dispatch.()
+      end
     rescue
       error in Tightbeam.Mementos.Refusal ->
         {:error, error.details || %{code: error.code, message: error.message}}
@@ -223,9 +235,18 @@ defmodule Tightbeam.Dispatch do
 
         if statute.name == "completion-requires-review" and verb == "attest" and
              call.params[:kind] == "completion" and review_notice_routed?(outcome) do
-          # Keep the holder's completion report while the review is pending,
-          # while still applying every other rule to the same policy snapshot.
-          dispatch_call(db, handlers, Map.put(call, :review_pending, true))
+          # The ordinary review notice is the existing completion path. Once it
+          # has been recorded, let the handler persist the same completion with
+          # its review-pending marker rather than running the rail a second time.
+          dispatch_to_handler(
+            db,
+            handlers,
+            Map.put(call, :review_pending, true),
+            verb,
+            origin,
+            principal,
+            session_key
+          )
         else
           error = remedy_error(error, outcome)
           best_effort_denial(db, verb, origin, principal, session_key, error)

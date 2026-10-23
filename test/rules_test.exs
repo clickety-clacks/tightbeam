@@ -2595,7 +2595,7 @@ defmodule Tightbeam.RulesTest do
              )
 
     rules = load_ac6a_rules(ctx)
-    assert Enum.count(rules, &String.starts_with?(&1.name, "ac6a-")) == 6
+    assert Enum.count(rules, &String.starts_with?(&1.name, "ac6a-")) == 5
 
     assert {:ok, _} =
              Ledger.enqueue(ctx.db, %{
@@ -3523,10 +3523,10 @@ defmodule Tightbeam.RulesTest do
       prior =
         assignment(ctx, fix_holder.session_key, {:user, "flynn"},
           work_item_id: fix_item,
-          mementos: [%{name: "agentic-engineering/effect-kind", value: "code"}]
+          legacy: true
         )
 
-      refs = verified_code_refs(ctx, prior, fix_holder, reviewer)
+      refs = verified_code_refs(ctx, prior, fix_holder, reviewer, mementos: false)
 
       assert %{assignment: %{state: "closed", outcome: "completed"}} =
                Assignments.__handle__(
@@ -3535,7 +3535,7 @@ defmodule Tightbeam.RulesTest do
                  p3_call("attest", {:session, fix_holder.session_key}, %{
                    assignment_id: prior.id,
                    kind: "completion",
-                   mementos: evidence_mementos(refs)
+                   commit_refs: refs
                  })
                )
     end
@@ -3545,7 +3545,7 @@ defmodule Tightbeam.RulesTest do
     fourth =
       assignment(ctx, fix_holder.session_key, {:user, "flynn"},
         work_item_id: fix_item,
-        mementos: [%{name: "agentic-engineering/effect-kind", value: "code"}]
+        legacy: true
       )
 
     assert {:ok, [[fix_target, fix_assignment, fix_work_item, fix_prompt]]} =
@@ -3564,7 +3564,7 @@ defmodule Tightbeam.RulesTest do
     fifth =
       assignment(ctx, fix_holder.session_key, {:user, "flynn"},
         work_item_id: fix_item,
-        mementos: [%{name: "agentic-engineering/effect-kind", value: "code"}]
+        legacy: true
       )
 
     assert fourth.id != fifth.id
@@ -4247,12 +4247,16 @@ defmodule Tightbeam.RulesTest do
         idempotency_key: nil,
         work_item_id: opts[:work_item_id],
         reviews_assignment_id: opts[:reviews],
-        mementos: [
-          %{
-            name: "agentic-engineering/effect-kind",
-            value: effect_kind
-          }
-        ],
+        mementos:
+          if(opts[:legacy],
+            do: [],
+            else: [
+              %{
+                name: "agentic-engineering/effect-kind",
+                value: effect_kind
+              }
+            ]
+          ),
         files: opts[:files]
       })
 
@@ -4468,7 +4472,7 @@ defmodule Tightbeam.RulesTest do
              Ledger.finish(db, claimed.seq, "delivered", nil, owner_lease: claimed.owner_lease)
   end
 
-  defp verified_code_refs(ctx, producer, holder, reviewer) do
+  defp verified_code_refs(ctx, producer, holder, reviewer, opts \\ []) do
     {sha, 0} = System.cmd("git", ["rev-parse", "HEAD"])
 
     refs = [
@@ -4493,7 +4497,7 @@ defmodule Tightbeam.RulesTest do
                    kind: "verdict",
                    verdict_kind: kind,
                    commit_refs: if(kind == "verified", do: refs, else: nil),
-                   mementos: evidence_mementos(refs)
+                   mementos: if(opts[:mementos] == false, do: [], else: evidence_mementos(refs))
                  })
                )
     end
