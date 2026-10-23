@@ -879,12 +879,19 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
       )
 
   defp current_continuation_guard!() do
-    recorded =
-      Regex.replace(
-        ~r/AND EXISTS \(SELECT 1 FROM \(SELECT t.seq AS turnSeq.*?delivery.assignmentId=w.assignmentId\)/s,
-        historical_continuation_guard!(),
-        "AND old.deliveredTurnSeq=failed.seq"
-      )
+    recorded = recorded_continuation_guard!()
+
+    ancestry =
+      ~r/AND EXISTS \(\s*WITH RECURSIVE lineage\(sessionKey,spawnedBy\) AS \(.*?SELECT 1 FROM lineage WHERE sessionKey=w.creatorSessionKey\s*\)/s
+
+    assert Regex.match?(ancestry, recorded)
+
+    Regex.replace(ancestry, recorded, "")
+  end
+
+  # The prior released form retained the creator-owner restriction.
+  defp owner_scoped_continuation_guard!() do
+    recorded = recorded_continuation_guard!()
 
     ancestry =
       ~r/AND EXISTS \(\s*WITH RECURSIVE lineage\(sessionKey,spawnedBy\) AS \(.*?SELECT 1 FROM lineage WHERE sessionKey=w.creatorSessionKey\s*\)/s
@@ -899,13 +906,11 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     """)
   end
 
-  # The released form after the ancestry restriction was removed: the creator
-  # must be a session of the wake's owner, with every other check unchanged.
-  defp owner_scoped_continuation_guard!() do
+  defp recorded_continuation_guard!() do
     Regex.replace(
-      ~r/AND EXISTS \(\s*WITH RECURSIVE lineage\(sessionKey,spawnedBy\) AS \(.*?SELECT 1 FROM lineage WHERE sessionKey=w.creatorSessionKey\s*\)/s,
-      current_continuation_guard!(),
-      "AND EXISTS (SELECT 1 FROM sessions creator WHERE creator.sessionKey=w.creatorSessionKey AND creator.ownerUserId=w.ownerUserId)"
+      ~r/AND EXISTS \(SELECT 1 FROM \(SELECT t.seq AS turnSeq.*?delivery.assignmentId=w.assignmentId\)/s,
+      historical_continuation_guard!(),
+      "AND old.deliveredTurnSeq=failed.seq"
     )
   end
 
