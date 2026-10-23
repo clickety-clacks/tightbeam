@@ -1457,7 +1457,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     owner = %{kind: "user", id: "flynn", is_admin: false}
     session = %{kind: "session", id: ctx.admin_session.session_key, is_admin: false}
     denied_user = %{kind: "user", id: "outsider", is_admin: false}
-    _outsider = outsider_device(ctx)
+    outsider = outsider_device(ctx)
     outsider_session = ensure_main_session(ctx.db, "outsider")
     other_session = %{kind: "session", id: outsider_session.session_key, is_admin: false}
 
@@ -1502,8 +1502,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       refute StateVisibility.core_detail_visible?(ctx.db, "decision requests", row, denied),
              "#{kind} admitted #{inspect(denied)}"
     end
-
-    outsider = outsider_device(ctx)
 
     for row <- decision_route_cases(ctx) do
       success = get(ctx, row.path)
