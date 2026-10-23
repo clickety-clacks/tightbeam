@@ -704,6 +704,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
            ]
 
     assert admin_session.status == 200
+
     assert JSON.decode!(admin_session.resp_body)["items"] ==
              JSON.decode!(admin_user.resp_body)["items"]
   end
