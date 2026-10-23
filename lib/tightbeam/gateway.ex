@@ -5176,7 +5176,11 @@ defmodule Tightbeam.Gateway do
           prior = prepare_law!(config, decision.record["prior_revision"], verbs)
           Rules.ensure_legacy_snapshot!(prior.policy)
           Identity.restore_policy_activation!(config.base_dir, decision)
-          Logger.warning("active policy could not be loaded; restored the compatible policy: #{Exception.message(error)}")
+
+          Logger.warning(
+            "active policy could not be loaded; restored the compatible policy: #{Exception.message(error)}"
+          )
+
           Rules.restore_compatible!(prior.policy, "rollback:" <> decision.revision)
       end
     else

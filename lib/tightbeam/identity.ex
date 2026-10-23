@@ -1811,7 +1811,8 @@ defmodule Tightbeam.Identity do
   @doc false
   def active_policy_decision!(base_dir) do
     case memento_policy_record!(identity_dir(base_dir)) do
-      %{record: %{"state" => "committed"}} = decision -> decision
+      %{record: %{"state" => "committed"}} = decision ->
+        decision
 
       _ ->
         nil

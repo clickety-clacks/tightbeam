@@ -821,6 +821,7 @@ defmodule Tightbeam.RestExecutionMapTest do
 
     [session_root] = session_map["roots"]
     assert session_root["id"] == "wi_parent"
+
     assert Enum.sort(Enum.map(session_root["children"], & &1["id"])) ==
              ~w(wi_child wi_review_child)
 

@@ -957,7 +957,9 @@ defmodule Tightbeam.MementoAdmissionTest do
        ctx do
     install_engineering_policy(ctx, "verification.toml")
     {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET archetype='coder' WHERE sessionKey='holder'")
-    item = ctx.handlers["work-item-create"].(call("work-item-create", %{title: "verification policy"}))
+
+    item =
+      ctx.handlers["work-item-create"].(call("work-item-create", %{title: "verification policy"}))
 
     Artifacts.record(ctx.db, %{
       principal: {:session, "holder"},

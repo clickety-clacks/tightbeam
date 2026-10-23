@@ -9,7 +9,13 @@ defmodule Tightbeam.MementoCutover do
 
   def prepare!([entry], snapshot) do
     raw = entry.declaration
-    keys!(raw, ~w(version effects judgments legacy_evidence_requirements inventory), "declaration")
+
+    keys!(
+      raw,
+      ~w(version effects judgments legacy_evidence_requirements inventory),
+      "declaration"
+    )
+
     unless raw["version"] === 1, do: refuse!("unsupported memento_cutover version")
     revision = snapshot.revision
 

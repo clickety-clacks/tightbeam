@@ -10864,7 +10864,9 @@ defmodule Tightbeam.GatewayTest do
     assert original_body != "captured revision"
     assert File.read!(skill) == "captured revision"
     assert Org.get(ctx.db, session.session_key).identity_revision == captured
-    assert [%{state: "pending"} | _] = Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
+
+    assert [%{state: "pending"} | _] =
+             Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
 
     assert %{
              status: "complete",

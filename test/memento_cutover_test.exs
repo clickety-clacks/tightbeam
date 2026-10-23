@@ -378,6 +378,7 @@ defmodule Tightbeam.MementoCutoverTest do
 
     DB.query(ctx.db, "UPDATE assignments SET subject='changed' WHERE id=?1", [second.id])
     assert {:ok, changed} = census(ctx)
+
     refute Enum.find(changed.effects, &(&1.id == second.id)).source_revision ==
              Enum.find(census.effects, &(&1.id == second.id)).source_revision
   end
@@ -1057,8 +1058,10 @@ defmodule Tightbeam.MementoCutoverTest do
       Rules.prepare!(ctx.base, Map.keys(ctx.handlers), revision: "incomplete-candidate")
 
     assert legacy_candidate.requested_admission_contract == %{}
+
     assert Map.drop(legacy_candidate.memento_cutover, [:identity_revision]) ==
              Map.drop(candidate.memento_cutover, [:identity_revision])
+
     assert legacy_candidate.memento_cutover.identity_revision == legacy_candidate.revision
     assert candidate.memento_cutover.identity_revision == candidate.revision
     assert Rules.active_admission_contract("attest") == "legacy"
@@ -1570,7 +1573,14 @@ defmodule Tightbeam.MementoCutoverTest do
         Org.set_identity_stamp(ctx.db, "holder", served, contract, nil)
 
         assert {:error, %{code: ^expected_error}} =
-                 attest.(producer.id, "holder", "verdict", "verified", ["document-A", "document-B"], %{})
+                 attest.(
+                   producer.id,
+                   "holder",
+                   "verdict",
+                   "verified",
+                   ["document-A", "document-B"],
+                   %{}
+                 )
 
         assert {:ok, ^history} = DB.query(ctx.db, "SELECT * FROM memento_history ORDER BY id")
         assert {:ok, [[4]]} = DB.query(ctx.db, "SELECT count(*) FROM attests")
