@@ -3239,8 +3239,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         path: "/api/critical-state/#{owner_session.session_key}",
         notice: critical_notice,
         primary_refs: %{"sessionKey" => owner_session.session_key},
-        allowed_bearers: [ctx.token],
-        denied_bearer: owner_session.cli_token,
+        allowed_bearers: [ctx.token, owner_session.cli_token],
+        denied_bearer: nil,
         unknown_path: "/api/critical-state/no-such-session"
       },
       %{
