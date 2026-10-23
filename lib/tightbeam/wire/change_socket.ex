@@ -325,14 +325,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
     end
   end
 
-  defp authorized_filters(%{principal_kind: :session, principal_id: session_key}, filters) do
-    if filters["sessionKey"] == session_key do
-      :ok
-    else
-      {:error, "sessionKey must match authenticated session"}
-    end
-  end
-
   defp authorized_filters(_state, _filters), do: :ok
 
   defp schedule_heartbeat(state) do

@@ -424,7 +424,7 @@ defmodule Tightbeam.D1ReadRouteTest do
   end
 
   @tag rest_r7_encoder: true
-  test "all shared collections retain exact missing and repeated principal refusals", ctx do
+  test "all shared collections accept an implicit org read principal", ctx do
     for {path, resource} <- [
           {"/api/config", "config"},
           {"/api/host-env", "host environment"},
@@ -433,9 +433,12 @@ defmodule Tightbeam.D1ReadRouteTest do
           {"/api/identity", "identity"},
           {"/api/kungfu", "kungfu"}
         ] do
+      default = get(ctx.opts, path, "tbc_d1_route")
+      assert default.status == 200
+      assert JSON.decode!(default.resp_body)["resource"] == resource
+
       for {query, code} <- [
-            {"", "invalid_message"},
-            {"?limit=1", "invalid_message"},
+            {"?unknown=value", "invalid_filter"},
             {"?asUser=", "invalid_message"},
             {"?asUser=admin&asUser=admin", "invalid_as_user"}
           ] do
@@ -463,13 +466,16 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert invalid.status == 400
     assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_filter"
 
-    hidden = get(ctx.opts, "/api/config/default-archetype", ctx.operator.token)
+    shared = get(ctx.opts, "/api/config/default-archetype", ctx.operator.token)
     missing = get(ctx.opts, "/api/config/missing", ctx.admin.token)
 
-    assert hidden.status == 404
+    assert shared.status == 200
+
+    assert shared.resp_body ==
+             get(ctx.opts, "/api/config/default-archetype", ctx.admin.token).resp_body
+
     assert missing.status == 404
-    assert hidden.resp_body == missing.resp_body
-    assert get_resp_header(hidden, "cache-control") == ["no-store"]
+    assert get_resp_header(shared, "cache-control") == ["no-store"]
     assert get_resp_header(missing, "cache-control") == ["no-store"]
   end
 
@@ -627,7 +633,7 @@ defmodule Tightbeam.D1ReadRouteTest do
   @tag :kungfu_protection
   test "kungfu serving preserves prior auth principal visibility and query decisions", ctx do
     assert get(ctx.opts, "/api/kungfu", "invalid").status == 401
-    assert get(ctx.opts, "/api/kungfu", "tbc_d1_route").status == 400
+    assert get(ctx.opts, "/api/kungfu", "tbc_d1_route").status == 200
     invalid = get(ctx.opts, "/api/kungfu?unknown=value", ctx.admin.token)
     assert invalid.status == 400
     assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_filter"
@@ -636,7 +642,12 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert hidden.status == 404
     collection = get(ctx.opts, "/api/kungfu", ctx.operator.token)
     assert collection.status == 200
-    assert JSON.decode!(collection.resp_body)["items"] == []
+
+    admin_collection = get(ctx.opts, "/api/kungfu", ctx.admin.token)
+
+    assert JSON.decode!(collection.resp_body)["items"] ==
+             JSON.decode!(admin_collection.resp_body)["items"]
+
     assert get(ctx.opts, "/api/hosts", ctx.admin.token).status == 200
   end
 
@@ -692,7 +703,7 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert conn(:get, "/api/hosts/alpha") |> Router.call(ctx.opts) |> Map.fetch!(:status) == 401
 
     assert JSON.decode!(get(ctx.opts, "/api/host-env", ctx.operator.token).resp_body)["items"] ==
-             []
+             JSON.decode!(get(ctx.opts, "/api/host-env", ctx.admin.token).resp_body)["items"]
 
     harness = hd(Harness.all()).wire_name()
 
@@ -710,14 +721,17 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert is_integer(version) and version > 0
     environment = hd(D1Read.collection(ctx.db, ctx.base_dir, :host_environment, %{}))
     refs = Map.take(environment, ["host", "harness", "name"])
-    assert :forbidden == Rebuild.fetch(ctx.db, "host_env.updated", refs, "operator", false)
     assert {:ok, rebuilt} = Rebuild.fetch(ctx.db, "host_env.updated", refs, "admin", true)
+
+    assert Rebuild.fetch(ctx.db, "host_env.updated", refs, "operator", false) ==
+             {:ok, rebuilt}
+
     assert rebuilt == environment
     assert rebuilt["value"] == nil
     assert rebuilt["valuePresent"] == true
-    refute StateVisibility.config_visible?(false)
-    refute StateVisibility.user_visible?(false)
-    refute StateVisibility.host_environment_visible?(false)
+    assert StateVisibility.config_visible?(false)
+    assert StateVisibility.user_visible?(false)
+    assert StateVisibility.host_environment_visible?(false)
   end
 
   @tag :tmp_dir

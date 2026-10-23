@@ -15,34 +15,12 @@ defmodule Tightbeam.StateVisibility do
   @spec visible?(DB.server(), map(), map()) :: boolean()
   @spec visible?(DB.server(), map(), String.t(), boolean()) :: boolean()
   @doc "Apply Firehose visibility for a credential-derived session principal."
-  def visible?(db, %{"class" => class, "payload" => %{"kind" => "operator"}} = notice, %{
-        kind: "session",
-        id: session_key
-      })
-      when class in @decision_request_classes and is_binary(session_key) and session_key != "" do
-    session_principal_notice_visible?(db, notice, session_key)
-  end
-
-  def visible?(db, %{"class" => class, "payload" => item}, %{
-        kind: "session",
-        id: session_key
-      })
-      when class in @decision_request_classes and is_map(item) and is_binary(session_key) and
-             session_key != "" do
-    core_detail_visible?(db, "decision requests", item, %{
-      kind: "session",
-      id: session_key,
-      is_admin: false
-    })
-  end
-
-  def visible?(_db, %{"class" => class}, %{kind: "session"})
-      when class in @decision_request_classes,
-      do: false
-
   def visible?(db, notice, %{kind: "session", id: session_key})
       when is_binary(session_key) and session_key != "" do
-    session_principal_notice_visible?(db, notice, session_key)
+    case session_read_principal(db, session_key) do
+      nil -> false
+      principal -> visible?(db, notice, principal)
+    end
   end
 
   def visible?(db, notice, %{kind: "user", id: user_id, is_admin: is_admin}),
@@ -107,28 +85,32 @@ defmodule Tightbeam.StateVisibility do
       assignment_owner?(db, refs, payload, user_id)
   end
 
-  @doc "Config is admin-only."
-  def config_visible?(is_admin), do: is_admin
+  @doc "Config is visible to every authenticated principal."
+  def config_visible?(is_admin) when is_boolean(is_admin), do: true
 
-  @doc "Host-environment metadata is admin-only."
-  def host_environment_visible?(is_admin), do: is_admin
+  @doc "Host-environment metadata is visible to every authenticated principal."
+  def host_environment_visible?(is_admin) when is_boolean(is_admin), do: true
 
   @doc "Host inventory is visible to authenticated organization users and sessions."
   def host_visible?(is_admin) when is_boolean(is_admin), do: true
 
-  @doc "User administration is admin-only."
-  def user_visible?(is_admin), do: is_admin
+  @doc "User administration state is visible to every authenticated principal."
+  def user_visible?(is_admin) when is_boolean(is_admin), do: true
 
-  @doc "Served identity publication state is admin-only."
-  def identity_visible?(is_admin), do: is_admin
+  @doc "Served identity publication state is visible to every authenticated principal."
+  def identity_visible?(is_admin) when is_boolean(is_admin), do: true
 
-  @doc "Kungfu publication state is admin-only."
-  def kungfu_visible?(is_admin), do: is_admin
+  @doc "Kungfu publication state is visible to every authenticated principal."
+  def kungfu_visible?(is_admin) when is_boolean(is_admin), do: true
 
   @doc "Apply the closed AU4 grant for one core detail row."
   def core_detail_visible?(db, resource, row, principal) do
     trace_core_detail(principal, {:au4_visibility, resource})
-    do_core_detail_visible?(db, resource, row, principal)
+
+    case normalize_session_principal(db, principal) do
+      nil -> false
+      read_principal -> do_core_detail_visible?(db, resource, row, read_principal)
+    end
   end
 
   @doc false
@@ -138,13 +120,7 @@ defmodule Tightbeam.StateVisibility do
     {"wi.ownerUserId = ?", [user_id]}
   end
 
-  def artifact_collection_scope(%{kind: "session", id: session_key}) do
-    {
-      "(a.createdBySession = ? OR wi.createdBySession = ? OR EXISTS (" <>
-        "SELECT 1 FROM assignments AS held WHERE held.workItemId = wi.id AND held.holderKey = ?))",
-      [session_key, session_key, session_key]
-    }
-  end
+  def artifact_collection_scope(%{kind: "session"}), do: {"1 = 1", []}
 
   def artifact_collection_scope(_principal), do: {"0 = 1", []}
 
@@ -187,9 +163,8 @@ defmodule Tightbeam.StateVisibility do
       %{kind: "user", id: user_id} when is_binary(user_id) and user_id != "" ->
         {"(parent.openedByUser = ? OR wi.ownerUserId = ?)", [user_id, user_id]}
 
-      %{kind: "session", id: session_key}
-      when is_binary(session_key) and session_key != "" ->
-        {"(parent.holderKey = ? OR parent.openedBySession = ?)", [session_key, session_key]}
+      %{kind: "session"} ->
+        {"1 = 1", []}
 
       _ ->
         {"0 = 1", []}
@@ -216,13 +191,10 @@ defmodule Tightbeam.StateVisibility do
           user_principal?(principal, value(row, :owner_user_id))
 
       "effort" ->
-        admin or session_principal?(principal, value(row, :expecter_session_key)) or
-          user_principal?(principal, value(row, :expecter_user_id)) or assignment_holder
+        admin or user_principal?(principal, value(row, :expecter_user_id)) or assignment_holder
 
       "agent" ->
-        admin or session_principal?(principal, value(row, :raiser_session_key)) or
-          session_principal?(principal, value(row, :expecter_session_key)) or
-          user_principal?(principal, value(row, :owner_user_id))
+        admin or user_principal?(principal, value(row, :owner_user_id))
 
       _ ->
         false
@@ -248,11 +220,6 @@ defmodule Tightbeam.StateVisibility do
       )
   end
 
-  defp do_core_detail_visible?(_db, "condition facts", row, %{kind: "session", id: session_key})
-       when is_binary(session_key) do
-    value(row, :origin) == "session:" <> session_key
-  end
-
   defp do_core_detail_visible?(db, "condition facts", row, %{kind: "user", id: user_id})
        when is_binary(user_id) do
     case value(row, :origin) do
@@ -269,16 +236,15 @@ defmodule Tightbeam.StateVisibility do
   defp do_core_detail_visible?(_db, "read markers", _row, _principal), do: false
 
   defp do_core_detail_visible?(_db, "sessions", row, principal) do
-    session_key = value(row, :session_key)
     owner_user_id = value(row, :owner_user_id)
 
-    session_principal?(principal, session_key) or user_principal?(principal, owner_user_id)
+    user_principal?(principal, owner_user_id)
   end
 
   defp do_core_detail_visible?(db, "turns", row, principal) do
     session_key = value(row, :session_key)
     owner = session_owner?(db, session_key, principal)
-    session_principal?(principal, session_key) or owner
+    owner
   end
 
   defp do_core_detail_visible?(db, "wakes", row, principal) do
@@ -287,8 +253,7 @@ defmodule Tightbeam.StateVisibility do
     target_owner = session_owner?(db, target, principal)
     creator_owner = session_owner?(db, creator, principal)
 
-    session_principal?(principal, target) or session_principal?(principal, creator) or
-      target_owner or creator_owner
+    target_owner or creator_owner
   end
 
   defp do_core_detail_visible?(db, "artifacts", row, principal) do
@@ -296,7 +261,7 @@ defmodule Tightbeam.StateVisibility do
     work_item_id = value(row, :work_item_id)
     work_item = work_item_visible?(db, work_item_id, principal)
 
-    session_principal?(principal, creator) or work_item
+    session_owner?(db, creator, principal) or work_item
   end
 
   defp do_core_detail_visible?(_db, _resource, _row, _principal), do: false
@@ -321,49 +286,61 @@ defmodule Tightbeam.StateVisibility do
 
   defp session_owner?(_db, _session_key, _principal), do: false
 
-  defp work_item_visible?(db, work_item_id, principal) do
-    {kind, id} = principal_identity(principal)
-
+  defp work_item_visible?(db, work_item_id, %{kind: "user", id: user_id}) do
     rows =
       query_rows(
         db,
         """
         SELECT 1
         FROM work_items AS wi
-        WHERE wi.id = ?1 AND (
-          (?2 = 'user' AND wi.ownerUserId = ?3) OR
-          (?2 = 'session' AND (
-            wi.createdBySession = ?3 OR EXISTS (
-              SELECT 1 FROM assignments AS held
-              WHERE held.workItemId = wi.id AND held.holderKey = ?3
-            )
-          ))
-        )
+        WHERE wi.id = ?1 AND wi.ownerUserId = ?2
         """,
-        [work_item_id, kind, id]
+        [work_item_id, user_id]
       )
 
     rows != []
   end
 
-  defp assignment_holder?(db, assignment_id, %{kind: "session", id: session_key}) do
+  defp work_item_visible?(_db, _work_item_id, _principal), do: false
+
+  defp assignment_holder?(db, assignment_id, %{kind: "user", id: user_id}) do
     rows =
-      query_rows(db, "SELECT 1 FROM assignments WHERE id = ?1 AND holderKey = ?2", [
-        assignment_id,
-        session_key
-      ])
+      query_rows(
+        db,
+        "SELECT 1 FROM assignments a JOIN sessions s ON s.sessionKey = a.holderKey " <>
+          "WHERE a.id = ?1 AND s.ownerUserId = ?2",
+        [assignment_id, user_id]
+      )
 
     rows != []
   end
 
   defp assignment_holder?(_db, _assignment_id, _principal), do: false
 
-  defp principal_identity(%{kind: kind, id: id}), do: {kind, id}
   defp principal_ref(%{kind: kind, id: id}), do: "#{kind}:#{id}"
-  defp session_principal?(%{kind: "session", id: id}, id), do: true
-  defp session_principal?(_principal, _id), do: false
   defp user_principal?(%{kind: "user", id: id}, id), do: true
   defp user_principal?(_principal, _id), do: false
+
+  defp normalize_session_principal(db, %{kind: "session", id: session_key}),
+    do: session_read_principal(db, session_key)
+
+  defp normalize_session_principal(_db, principal), do: principal
+
+  defp session_read_principal(db, session_key) when is_binary(session_key) do
+    case query_rows(
+           db,
+           "SELECT s.ownerUserId FROM sessions s WHERE s.sessionKey = ?1",
+           [session_key]
+         ) do
+      [[user_id]] when is_binary(user_id) and user_id != "" ->
+        %{kind: "user", id: user_id, is_admin: true}
+
+      _ ->
+        nil
+    end
+  end
+
+  defp session_read_principal(_db, _session_key), do: nil
 
   defp session_owner_user_id(%Txn{} = txn, session_key),
     do: Org.owner_user_id_in_txn(txn, session_key)
@@ -516,78 +493,10 @@ defmodule Tightbeam.StateVisibility do
     end
   end
 
-  defp session_principal_notice_visible?(db, notice, session_key) do
-    refs = eligibility_refs(notice)
-    payload = notice["payload"] || %{}
-    principal = %{kind: "session", id: session_key, is_admin: false}
-
-    exact_session? =
-      [
-        refs["sessionKey"],
-        refs["holderKey"],
-        refs["createdBySession"],
-        refs["bySession"],
-        refs["raiserSessionKey"],
-        payload["sessionKey"],
-        payload["holderKey"],
-        payload["createdBySession"],
-        payload["bySession"],
-        payload["raiserSessionKey"]
-      ]
-      |> Enum.any?(&(&1 == session_key))
-
-    exact_principal? = refs["principal"] == "session:#{session_key}"
-
-    # These resources carry a parent workItemId as a filter reference, but that
-    # relationship must not grant every session holding a sibling assignment
-    # visibility of the notice. Keep recipient eligibility tied to the existing
-    # actor and assignment references.
-    work_item_id =
-      if parent_work_item_filter_ref?(notice) do
-        nil
-      else
-        refs["workItemId"] || payload["workItemId"] || payload["id"]
-      end
-
-    work_item? = is_binary(work_item_id) and work_item_visible?(db, work_item_id, principal)
-
-    assignment_id = refs["assignmentId"] || payload["assignmentId"] || payload["id"]
-
-    assignment? =
-      is_binary(assignment_id) and session_assignment_visible?(db, assignment_id, session_key)
-
-    exact_session? or exact_principal? or work_item? or assignment?
-  end
-
-  defp parent_work_item_filter_ref?(%{"class" => "attest.filed"}), do: true
-
-  defp parent_work_item_filter_ref?(%{"class" => class}) when class in @decision_request_classes,
-    do: true
-
-  defp parent_work_item_filter_ref?(_notice), do: false
-
   defp eligibility_refs(notice) do
     case notice["eligibilityRefs"] do
       refs when is_map(refs) -> refs
       _ -> notice["refs"] || %{}
     end
-  end
-
-  defp session_assignment_visible?(db, assignment_id, session_key) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT 1
-        FROM assignments a
-        LEFT JOIN work_items wi ON wi.id = a.workItemId
-        WHERE a.id = ?1 AND (
-          a.holderKey = ?2 OR wi.createdBySession = ?2
-        )
-        """,
-        [assignment_id, session_key]
-      )
-
-    rows != []
   end
 end

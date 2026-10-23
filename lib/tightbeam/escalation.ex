@@ -2423,17 +2423,8 @@ defmodule Tightbeam.Escalation do
     }
   end
 
-  defp decision_request_collection_visibility(%{kind: "session", id: session_key})
-       when is_binary(session_key) and session_key != "" do
-    {
-      "(kind = 'statute' AND raiserId = ?) OR " <>
-        "(kind = 'effort' AND (expecterSessionKey = ? OR EXISTS (" <>
-        "SELECT 1 FROM assignments AS held " <>
-        "WHERE held.id = decision_requests.assignmentId AND held.holderKey = ?))) OR " <>
-        "(kind = 'agent' AND (raiserSessionKey = ? OR expecterSessionKey = ?))",
-      ["session:#{session_key}", session_key, session_key, session_key, session_key]
-    }
-  end
+  defp decision_request_collection_visibility(%{kind: "session"}),
+    do: {"kind IN ('statute', 'effort', 'agent')", []}
 
   defp decision_request_collection_visibility(_principal), do: {"0 = 1", []}
 

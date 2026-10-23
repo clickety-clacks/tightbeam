@@ -1065,8 +1065,8 @@ COMMANDS:
   harness-process settle <launch-id> --adapter-key <key>
       List the durable harness launch ledger, newest launch first.
 
-  session-diagnose --session EXACT --as-user USER [--json]
-      Read scoped process metadata without querying or changing the database.
+  session-diagnose --session EXACT [--as-user USER] [--json]
+      Read a session's process metadata without querying or changing the database.
 
   doctor [--json] [--base-dir p] [--as <role> | --as-user <userId>]
       Check the local Tightbeam installation and report its health, with each
@@ -1796,18 +1796,19 @@ fn parse_with_optional_catalog(
                     .any(|flag| !matches!(flag.as_str(), "session" | "as-user" | "json"))
             {
                 return Err(
-                    "usage: tightbeam session-diagnose --session EXACT --as-user USER [--json]"
+                    "usage: tightbeam session-diagnose --session EXACT [--as-user USER] [--json]"
                         .to_owned(),
                 );
             }
-            let user = nonempty(flags, "as-user").ok_or("session-diagnose requires --as-user")?;
             let session_key =
                 nonempty(flags, "session").ok_or("session-diagnose requires --session")?;
-            if session_key.len() > 512 || user.len() > 128 {
+            if session_key.len() > 512
+                || nonempty(flags, "as-user").is_some_and(|user| user.len() > 128)
+            {
                 return Err("diagnostic_request_limit".to_owned());
             }
             Ok(Command::SessionDiagnose {
-                identity: Identity::User(user),
+                identity: identity(flags)?,
                 session_key,
             })
         }
