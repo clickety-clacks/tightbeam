@@ -107,23 +107,23 @@ defmodule Tightbeam.StateVisibility do
       assignment_owner?(db, refs, payload, user_id)
   end
 
-  @doc "Config is admin-only."
-  def config_visible?(is_admin), do: is_admin
+  @doc "Config is visible to every authenticated principal."
+  def config_visible?(is_admin) when is_boolean(is_admin), do: true
 
-  @doc "Host-environment metadata is admin-only."
-  def host_environment_visible?(is_admin), do: is_admin
+  @doc "Host-environment metadata is visible to every authenticated principal."
+  def host_environment_visible?(is_admin) when is_boolean(is_admin), do: true
 
   @doc "Host inventory is visible to authenticated organization users and sessions."
   def host_visible?(is_admin) when is_boolean(is_admin), do: true
 
-  @doc "User administration is admin-only."
-  def user_visible?(is_admin), do: is_admin
+  @doc "User administration state is visible to every authenticated principal."
+  def user_visible?(is_admin) when is_boolean(is_admin), do: true
 
-  @doc "Served identity publication state is admin-only."
-  def identity_visible?(is_admin), do: is_admin
+  @doc "Served identity publication state is visible to every authenticated principal."
+  def identity_visible?(is_admin) when is_boolean(is_admin), do: true
 
-  @doc "Kungfu publication state is admin-only."
-  def kungfu_visible?(is_admin), do: is_admin
+  @doc "Kungfu publication state is visible to every authenticated principal."
+  def kungfu_visible?(is_admin) when is_boolean(is_admin), do: true
 
   @doc "Apply the closed AU4 grant for one core detail row."
   def core_detail_visible?(db, resource, row, principal) do
