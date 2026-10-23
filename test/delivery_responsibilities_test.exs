@@ -640,7 +640,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert {:ok, %{holderKey: "worker-a"}} = Dispatch.dispatch(db, handlers, owner_review)
 
     # Production work may target the accountable delivery owner.
-    for {verb, target} <- [{"assign", "worker-b"}, {"dispatch", "worker-c"}] do
+    for {verb, target} <- [{"assign", "successor-a"}, {"dispatch", "foreign-worker"}] do
       assert %{deliveryOwnerSessionKey: ^target} =
                set_owner(db, {:user, "owner"}, item_id, target)
 
@@ -654,11 +654,11 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     # Production work may target another available session once owner and topology are set.
     for verb <- ["assign", "dispatch"] do
-      assert {:ok, %{holderKey: "worker-d", workItemId: ^item_id}} =
+      assert {:ok, %{holderKey: "lane-b", workItemId: ^item_id}} =
                Dispatch.dispatch(
                  db,
                  handlers,
-                 production_call(verb, {:user, "owner"}, "worker-d", item_id)
+                 production_call(verb, {:user, "owner"}, "lane-b", item_id)
                )
     end
   end
