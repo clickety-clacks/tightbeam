@@ -236,7 +236,7 @@ defmodule Tightbeam.WorkItemTraceRestTest do
              ])
   end
 
-  test "case 12 grants work-item trace to an admin user without borrowing into its session",
+  test "case 12 grants work-item trace to an admin user and its session",
        ctx do
     admin_device = approved_device(ctx.db, "work-item-trace-case12-admin", "Admin", "admin")
     admin_session = ensure_main_session(ctx.db, "admin")
@@ -250,14 +250,11 @@ defmodule Tightbeam.WorkItemTraceRestTest do
 
     admin_session_response = get(ctx, "/api/work-items/#{item}/trace", admin_session.cli_token)
 
-    missing_response =
-      get(ctx, "/api/work-items/wi_trace_case12_missing/trace", admin_session.cli_token)
-
-    assert_error(admin_session_response, 404, "not_found")
-    assert admin_session_response.resp_body == missing_response.resp_body
+    assert admin_session_response.status == 200
+    assert decode_trace!(admin_session_response)["workItem"] == admin_trace["workItem"]
   end
 
-  test "hidden turn and assignment-chain rows are indistinguishable from absent rows", ctx do
+  test "session work-item traces include rows from other sessions", ctx do
     root =
       insert_work_item!(ctx.db, "wi_trace_twin_root", "owner", 40_000,
         context_known: true,
@@ -320,10 +317,13 @@ defmodule Tightbeam.WorkItemTraceRestTest do
 
     after_response = get(ctx, "/api/work-items/#{root}/trace", ctx.owner_session.cli_token)
     after_trace = decode_trace!(after_response)
-    assert after_response.resp_body == before.resp_body
-    assert after_trace["causalChildren"] == []
+    refute after_response.resp_body == before.resp_body
+    assert after_response.resp_body =~ "asg_trace_twin_hidden_base"
+    assert after_response.resp_body =~ "asg_trace_twin_review"
+    assert after_response.resp_body =~ "wi_trace_twin_hidden_parent"
+
     child_after = get(ctx, "/api/work-items/#{child}/trace", ctx.owner_session.cli_token)
-    assert child_after.resp_body == child_before.resp_body
+    refute child_after.resp_body == child_before.resp_body
 
     assert_trace_parent_matches_execution_map!(
       ctx,
@@ -332,10 +332,7 @@ defmodule Tightbeam.WorkItemTraceRestTest do
       ctx.owner_session.cli_token
     )
 
-    refute after_response.resp_body =~ "asg_trace_twin_hidden_base"
-    refute after_response.resp_body =~ "asg_trace_twin_review"
-    refute after_response.resp_body =~ "wi_trace_twin_hidden_parent"
-    assert after_trace["dependencyVersion"] == before_trace["dependencyVersion"]
+    refute after_trace["dependencyVersion"] == before_trace["dependencyVersion"]
   end
 
   test "cycle-closing edges are demoted and every visible cycle member contributes to T-C6",

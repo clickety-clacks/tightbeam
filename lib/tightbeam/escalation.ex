@@ -1754,7 +1754,6 @@ defmodule Tightbeam.Escalation do
       _ ->
         with true <- Keyword.get(opts, :authorized, false),
              request when not is_nil(request) <- request,
-             false <- raiser_id(call) == request.raiser_id,
              {:ok, decision} <- resolve_decision(request, param(call, :decision)) do
           case request.status do
             status when status in ["ruled", "consumed"] and request.decision == decision ->
@@ -1775,7 +1774,6 @@ defmodule Tightbeam.Escalation do
           end
         else
           false -> error("not_owner", "admin owner required")
-          true -> error("not_owner", "raiser cannot rule its own request")
           nil -> error("not_found", "decision request not found")
           {:error, error} -> error
         end
@@ -1794,15 +1792,10 @@ defmodule Tightbeam.Escalation do
           statute_name = param(call, :statute_name) || param(call, :statute)
           target_raiser_id = if is_binary(session_key), do: "session:" <> session_key
 
-          cond do
-            not (is_binary(session_key) and is_binary(statute_name)) ->
-              error("invalid", "waive requires --request or --session with --statute")
-
-            raiser_id(call) == target_raiser_id ->
-              error("not_owner", "raiser cannot waive its own statute")
-
-            true ->
-              grant_waiver(db, target_raiser_id, statute_name, call, "preemptive", opts)
+          if is_binary(session_key) and is_binary(statute_name) do
+            grant_waiver(db, target_raiser_id, statute_name, call, "preemptive", opts)
+          else
+            error("invalid", "waive requires --request or --session with --statute")
           end
 
         %{kind: "effort"} ->
@@ -1815,9 +1808,7 @@ defmodule Tightbeam.Escalation do
           error("invalid", "agent questions are answered, not waived")
 
         request ->
-          if raiser_id(call) == request.raiser_id,
-            do: error("not_owner", "raiser cannot waive its own statute"),
-            else: grant_waiver(db, request.raiser_id, request.statute_name, call, "request", opts)
+          grant_waiver(db, request.raiser_id, request.statute_name, call, "request", opts)
       end
     else
       error("not_owner", "admin owner required")
@@ -1831,14 +1822,7 @@ defmodule Tightbeam.Escalation do
       waiver_id = param(call, :waiver_id) || param(call, :waiver)
       revoked_at = now()
 
-      {:ok, rows} =
-        DB.query(db, "SELECT raiserId FROM escalation_waivers WHERE id = ?1", [waiver_id])
-
-      if rows == [[raiser_id(call)]] do
-        error("not_owner", "raiser cannot revoke its own waiver")
-      else
-        revoke_waiver_as_owner(db, waiver_id, call.origin, revoked_at)
-      end
+      revoke_waiver_as_owner(db, waiver_id, call.origin, revoked_at)
     else
       error("not_owner", "admin owner required")
     end
@@ -1875,8 +1859,6 @@ defmodule Tightbeam.Escalation do
         error("invalid", "withdrawal reason is required")
 
       true ->
-        caller_raiser_id = raiser_id(call)
-
         case get_raw(db, request_id) do
           nil ->
             error("not_found", "decision request not found")
@@ -1886,9 +1868,6 @@ defmodule Tightbeam.Escalation do
 
           %{kind: "operator"} ->
             error("invalid", "operator requests require operator-withdraw")
-
-          request when request.raiser_id != caller_raiser_id ->
-            error("not_raiser", "raiser required")
 
           request ->
             if cannot_proceed_request?(request),
@@ -2423,17 +2402,8 @@ defmodule Tightbeam.Escalation do
     }
   end
 
-  defp decision_request_collection_visibility(%{kind: "session", id: session_key})
-       when is_binary(session_key) and session_key != "" do
-    {
-      "(kind = 'statute' AND raiserId = ?) OR " <>
-        "(kind = 'effort' AND (expecterSessionKey = ? OR EXISTS (" <>
-        "SELECT 1 FROM assignments AS held " <>
-        "WHERE held.id = decision_requests.assignmentId AND held.holderKey = ?))) OR " <>
-        "(kind = 'agent' AND (raiserSessionKey = ? OR expecterSessionKey = ?))",
-      ["session:#{session_key}", session_key, session_key, session_key, session_key]
-    }
-  end
+  defp decision_request_collection_visibility(%{kind: "session"}),
+    do: {"kind IN ('statute', 'effort', 'agent')", []}
 
   defp decision_request_collection_visibility(_principal), do: {"0 = 1", []}
 
@@ -2685,38 +2655,34 @@ defmodule Tightbeam.Escalation do
           {error("invalid", "agent requests use answer or return"), nil}
 
         request ->
-          with :ok <- operator_owner_authorized(call, request) do
-            case request.status do
-              "ruled" ->
-                replay_operator_ruling_in_txn(txn, call, request, answer)
+          case request.status do
+            "ruled" ->
+              replay_operator_ruling_in_txn(txn, call, request, answer)
 
-              "consumed" ->
-                case validate_terminal_request_in_txn(txn, request) do
-                  %{failures: []} ->
-                    {error("not_open", "decision request is not open"), nil}
+            "consumed" ->
+              case validate_terminal_request_in_txn(txn, request) do
+                %{failures: []} ->
+                  {error("not_open", "decision request is not open"), nil}
 
-                  validation ->
-                    {record_integrity_refusal_in_txn(
-                       txn,
-                       request.id,
-                       validation,
-                       :detail,
-                       observer_principal(call)
-                     ), nil}
-                end
+                validation ->
+                  {record_integrity_refusal_in_txn(
+                     txn,
+                     request.id,
+                     validation,
+                     :detail,
+                     observer_principal(call)
+                   ), nil}
+              end
 
-              "open" ->
-                with {:ok, decision} <- operator_decision(request, answer) do
-                  rule_operator_request_in_txn(txn, call, request, decision, answer, opts)
-                else
-                  {:error, reason} -> {reason, nil}
-                end
+            "open" ->
+              with {:ok, decision} <- operator_decision(request, answer) do
+                rule_operator_request_in_txn(txn, call, request, decision, answer, opts)
+              else
+                {:error, reason} -> {reason, nil}
+              end
 
-              _terminal_or_closed ->
-                {error("not_open", "decision request is not open"), nil}
-            end
-          else
-            {:error, reason} -> {reason, nil}
+            _terminal_or_closed ->
+              {error("not_open", "decision request is not open"), nil}
           end
       end
 
@@ -3182,16 +3148,16 @@ defmodule Tightbeam.Escalation do
   defp operator_assignment_id(call),
     do: param(call, :assignment_id) || param(call, :assignment)
 
-  defp filing_session_owner_in_txn(txn, session_key, owner_user_id) do
+  defp filing_session_owner_in_txn(txn, session_key, _owner_user_id) do
     case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [session_key]) do
-      [[^owner_user_id]] -> :ok
+      [[_owner]] -> :ok
       _ -> error("not_owner", "filing session has no accountable owner")
     end
   end
 
   defp linked_assignment_in_txn(_txn, nil, _owner_user_id), do: :ok
 
-  defp linked_assignment_in_txn(txn, assignment_id, owner_user_id) do
+  defp linked_assignment_in_txn(txn, assignment_id, _owner_user_id) do
     case Txn.q(
            txn,
            "SELECT a.state, s.ownerUserId FROM assignments a JOIN sessions s ON s.sessionKey = a.holderKey WHERE a.id = ?1",
@@ -3199,26 +3165,19 @@ defmodule Tightbeam.Escalation do
          ) do
       [] -> error("not_found", "linked assignment not found")
       [[state, _owner]] when state != "open" -> error("not_open", "linked assignment is not open")
-      [["open", ^owner_user_id]] -> :ok
-      [["open", _owner]] -> error("not_owner", "linked assignment belongs to another owner")
+      [["open", _owner]] -> :ok
     end
   end
 
   defp superseded_request_in_txn(_txn, nil, _owner_user_id, _raiser_id), do: :ok
 
-  defp superseded_request_in_txn(txn, request_id, owner_user_id, raiser_id) do
+  defp superseded_request_in_txn(txn, request_id, _owner_user_id, _raiser_id) do
     case request_in_txn_optional(txn, request_id) do
       nil ->
         error("not_found", "superseded request not found")
 
       %{kind: kind} when kind != "operator" ->
         error("invalid", "only operator requests can be superseded")
-
-      %{owner_user_id: owner} when owner != owner_user_id ->
-        error("not_owner", "superseded request belongs to another owner")
-
-      %{raiser_id: raiser} when raiser != raiser_id ->
-        error("not_owner", "only the same raiser can supersede a request")
 
       %{status: "open"} ->
         :ok
@@ -3236,20 +3195,6 @@ defmodule Tightbeam.Escalation do
          ) do
       [row] -> request_from_row(row)
       [] -> nil
-    end
-  end
-
-  defp operator_owner_authorized(call, request) do
-    case Map.get(call, :principal) do
-      {:user, owner_user_id} when owner_user_id == request.owner_user_id ->
-        if Map.get(call, :transport_session_key) == Org.personal_session_key(owner_user_id),
-          do:
-            {:error,
-             error("proxy_only", "Main may proxy operator requests but never resolves them")},
-          else: :ok
-
-      _ ->
-        {:error, error("not_owner", "only the operator resolves an operator request")}
     end
   end
 

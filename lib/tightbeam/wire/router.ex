@@ -332,8 +332,15 @@ defmodule Tightbeam.Wire.Router do
 
           call =
             case {verb, principal} do
-              {"artifact-content-fetch", {kind, _}} when kind in [:user, :session] ->
-                Map.put(call, :rest_principal, state_principal_view(principal, conn))
+              {"artifact-content-fetch", {:session, session_key}} ->
+                Map.put(call, :rest_principal, %{
+                  kind: "session",
+                  id: session_key,
+                  is_admin: false
+                })
+
+              {"artifact-content-fetch", {:user, user_id}} ->
+                Map.put(call, :rest_principal, state_principal_view({:user, user_id}, conn))
 
               _ ->
                 call
@@ -1343,10 +1350,12 @@ defmodule Tightbeam.Wire.Router do
       state_error(conn, resource, 500, "projection_invalid", nil)
   end
 
-  # The operator transport supplies an explicit user for this exact session,
-  # using the same owner/admin visibility as its socket operations.
+  # Organization credentials can select a user for this session's collection.
   defp session_collection_principal(:org, query, conn, session_key, _resource) do
     case Map.get(query, "asUser", []) do
+      [] ->
+        {:ok, org_read_principal(conn), Map.delete(query, "asUser")}
+
       [user_id] when user_id != "" ->
         case Tightbeam.Wire.OperatorSession.resolve(db(conn), %{
                "asUser" => user_id,
@@ -1361,16 +1370,13 @@ defmodule Tightbeam.Wire.Router do
             {:error, 404, "not_found", nil}
         end
 
-      [] ->
-        {:error, 400, "invalid_message", nil}
-
       _ ->
         {:error, 400, "invalid_as_user", nil}
     end
   end
 
-  defp session_collection_principal(auth, query, _conn, _session_key, _resource) do
-    with {:ok, principal} <- selected_session_principal(auth, query),
+  defp session_collection_principal(auth, query, conn, _session_key, _resource) do
+    with {:ok, principal} <- selected_session_principal(auth, query, conn),
          do: {:ok, principal, query}
   end
 
@@ -1410,15 +1416,18 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
-  defp selected_session_principal({:session, session_key}, query) do
+  defp selected_session_principal({:session, session_key}, query, conn) do
     if Map.has_key?(query, "asUser") do
       {:error, 400, "invalid_as_user", nil}
     else
-      {:ok, %{kind: "session", id: session_key, is_admin: false}}
+      case Org.get(db(conn), session_key) do
+        %{owner_user_id: owner_user_id} -> {:ok, session_read_principal(owner_user_id, conn)}
+        nil -> {:error, 404, "not_found", nil}
+      end
     end
   end
 
-  defp selected_session_principal({:device, user_id, is_admin}, query) do
+  defp selected_session_principal({:device, user_id, is_admin}, query, _conn) do
     if Map.has_key?(query, "asUser") do
       {:error, 400, "invalid_as_user", nil}
     else
@@ -1547,15 +1556,15 @@ defmodule Tightbeam.Wire.Router do
 
   defp state_principal(:org, query, conn) do
     case Map.get(query, "asUser", []) do
+      [] ->
+        {:ok, org_read_principal(conn)}
+
       [user_id] when user_id != "" ->
         with {:ok, principal} <- resolve_cli_as_user(:org, user_id) do
           {:ok, state_principal_view(principal, conn)}
         end
 
       [_empty] ->
-        {:error, 400, "invalid_message", nil}
-
-      [] ->
         {:error, 400, "invalid_message", nil}
 
       _repeated ->
@@ -1566,7 +1575,7 @@ defmodule Tightbeam.Wire.Router do
   defp state_principal({:session, session}, query, conn) do
     case Map.get(query, "asUser", []) do
       [] ->
-        {:ok, %{kind: "session", id: session.session_key, is_admin: false}}
+        {:ok, session_read_principal(session.owner_user_id, conn)}
 
       [as_user] ->
         with {:ok, principal} <- resolve_cli_as_user({:session, session}, as_user) do
@@ -1598,10 +1607,48 @@ defmodule Tightbeam.Wire.Router do
     %{kind: "user", id: user_id, is_admin: is_admin}
   end
 
+  defp org_read_principal(conn) do
+    case org_admin_user_id(conn) do
+      nil -> %{kind: "user", id: "org", is_admin: true}
+      user_id -> state_user_principal(user_id, conn)
+    end
+  end
+
+  defp d1_org_read_principal(conn) do
+    case org_admin_user_id(conn) do
+      nil -> %{kind: "user", id: "org", is_admin: true}
+      user_id -> d1_user_principal(user_id, conn)
+    end
+  end
+
+  defp org_admin_user_id(conn) do
+    {:ok, rows} =
+      Tightbeam.DB.query(
+        db(conn),
+        "SELECT userId FROM users WHERE isAdmin = 1 ORDER BY createdAt, userId LIMIT 1",
+        []
+      )
+
+    case rows do
+      [[user_id]] -> user_id
+      [] -> nil
+    end
+  end
+
+  defp session_read_principal(user_id, _conn) when is_binary(user_id) and user_id != "",
+    do: %{kind: "user", id: user_id, is_admin: true}
+
+  defp session_read_principal(_user_id, _conn),
+    do: %{kind: "user", id: "org", is_admin: true}
+
   defp state_principal_view({:user, user_id}, conn), do: state_user_principal(user_id, conn)
 
-  defp state_principal_view({:session, session_key}, _conn),
-    do: %{kind: "session", id: session_key, is_admin: false}
+  defp state_principal_view({:session, session_key}, conn) do
+    case Org.get(db(conn), session_key) do
+      %{owner_user_id: owner_user_id} -> session_read_principal(owner_user_id, conn)
+      nil -> session_read_principal(nil, conn)
+    end
+  end
 
   defp resolve_cli_as_user(:org, user_id) when is_binary(user_id) and user_id != "",
     do: {:ok, {:user, user_id}}
@@ -1612,6 +1659,8 @@ defmodule Tightbeam.Wire.Router do
 
   defp resolve_cli_as_user({:session, %{owner_user_id: owner}}, _other),
     do: {:error, 403, "identity_not_yours", "this session belongs to #{owner}"}
+
+  defp resolve_cli_as_user(_auth, _empty), do: {:error, 400, "invalid_message", nil}
 
   defp decode_state_query(conn), do: decode_state_query_string(conn.query_string)
 
@@ -2362,15 +2411,15 @@ defmodule Tightbeam.Wire.Router do
 
   defp d1_principal(:org, %{"asUser" => [_]}, _conn), do: {:error, 400, "invalid_message", nil}
 
-  defp d1_principal(:org, query, _conn) when not is_map_key(query, "asUser"),
-    do: {:error, 400, "invalid_message", nil}
+  defp d1_principal(:org, query, conn) when not is_map_key(query, "asUser"),
+    do: {:ok, d1_org_read_principal(conn)}
 
   defp d1_principal(:org, _query, _conn), do: {:error, 400, "invalid_as_user", nil}
 
   defp d1_principal({:session, session}, query, conn) do
     case Map.get(query, "asUser", []) do
       [] ->
-        {:ok, %{kind: "session", id: session.session_key, is_admin: false}}
+        {:ok, session_read_principal(session.owner_user_id, conn)}
 
       [user_id] when user_id == session.owner_user_id and user_id != "" ->
         {:ok, d1_user_principal(user_id, conn)}
@@ -2910,14 +2959,11 @@ defmodule Tightbeam.Wire.Router do
         role = body["as"]
 
         case Roles.resolve(db(conn), role) do
-          {:ok, key, false} when key == session.session_key ->
+          {:ok, _session_key, false} ->
             {:ok, "agent:#{role}", session_principal}
 
           _ ->
-            held = if roles == [], do: "none", else: Enum.join(roles, ", ")
-
-            {:error, 403, "role_not_held",
-             "role #{role} is not held by this session; held roles: #{held}"}
+            {:error, 400, "invalid_message", "unknown or unbound role: #{role}"}
         end
 
       is_binary(body["asUser"]) ->
@@ -2933,12 +2979,8 @@ defmodule Tightbeam.Wire.Router do
       length(roles) == 1 ->
         {:ok, "agent:#{hd(roles)}", session_principal}
 
-      roles == [] and session.is_built_in ->
-        {:ok, "user:#{session.owner_user_id}", session_principal}
-
       roles == [] ->
-        {:error, 403, "no_role",
-         "this session holds no role; its owner must bind one, or pass --as-user #{session.owner_user_id}"}
+        {:ok, "user:#{session.owner_user_id}", session_principal}
 
       true ->
         {:error, 400, "ambiguous_identity",

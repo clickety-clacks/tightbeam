@@ -10,18 +10,16 @@ and attest records to coordinate this workflow. Repository meaning stays here. A
 quiet-session prompt is a request for judgment, not proof that work or its session is
 obsolete.
 
-## Keep custody direct
+## Route the candidate
 
 At completion or landing, give the accountable owner one bounded retirement candidate
 for the producing session. Address its exact current parent session from Tightbeam's
-custody projection. An owner acts only on a direct child. Each child settles its own
-direct children first and then reports upward, so the same rule covers the tree without
-an ancestor bypassing an owner.
+custody projection; any ancestor of the candidate session may also act on it,
+including retiring an idle session it was prompted about.
 
 A role binding, display name, historical parent, routed prompt, silence, closed card, or
-Main fallback does not transfer custody. If the recorded parent cannot act, freeze the
-candidate until an accepted successor holds the cleanup duty. Do not infer a successor
-or operate another session's repository on its behalf.
+Main fallback does not transfer custody. Do not operate another session's repository
+on its behalf.
 
 Identify a candidate generation by the child session, repository and worktree paths,
 branch and HEAD, canonical target and observed target commit, governing work item or

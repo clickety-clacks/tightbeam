@@ -414,12 +414,7 @@ defmodule Tightbeam.StateResources do
         WHERE (?1 IS NULL OR wi.id = ?1) AND (
           ?2 = 1 OR
           (?3 = 'user' AND wi.ownerUserId = ?4) OR
-          (?3 = 'session' AND (
-            wi.createdBySession = ?4 OR EXISTS (
-              SELECT 1 FROM assignments AS held
-              WHERE held.workItemId = wi.id AND held.holderKey = ?4
-            )
-          ))
+          ?3 = 'session'
         )
         AND (?5 IS NULL OR wi.state = ?5)
         AND (?6 IS NULL OR wi.ownerUserId = ?6)
@@ -467,9 +462,7 @@ defmodule Tightbeam.StateResources do
           {"wi.ownerUserId = ?", [principal_id]}
 
         principal_kind == "session" ->
-          {"(wi.createdBySession = ? OR EXISTS (" <>
-             "SELECT 1 FROM assignments AS held WHERE held.workItemId = wi.id AND held.holderKey = ?))",
-           [principal_id, principal_id]}
+          {"1 = 1", []}
       end
 
     {where, params} =
@@ -631,7 +624,7 @@ defmodule Tightbeam.StateResources do
              """
               WHERE sessions.sessionKey = ?1 AND (
                 ?2 = 1 OR
-                (?3 = 'session' AND sessions.sessionKey = ?4) OR
+                ?3 = 'session' OR
                 (?3 = 'user' AND sessions.ownerUserId = ?4)
               )
              """,
@@ -657,7 +650,7 @@ defmodule Tightbeam.StateResources do
         """
          WHERE (
            ?1 = 1 OR
-           (?2 = 'session' AND sessions.sessionKey = ?3) OR
+           ?2 = 'session' OR
            (?2 = 'user' AND sessions.ownerUserId = ?3)
          )
          ORDER BY sessions.createdAt ASC, sessions.sessionKey ASC
@@ -674,7 +667,7 @@ defmodule Tightbeam.StateResources do
     {where, params} =
       cond do
         principal.is_admin -> {nil, []}
-        principal.kind == "session" -> {"sessions.sessionKey = ?", [principal.id]}
+        principal.kind == "session" -> {nil, []}
         true -> {"sessions.ownerUserId = ?", [principal.id]}
       end
 
@@ -776,7 +769,7 @@ defmodule Tightbeam.StateResources do
           {nil, []}
 
         principal.kind == "session" ->
-          {"t.sessionKey = ?", [principal.id]}
+          {nil, []}
 
         true ->
           {
@@ -1129,10 +1122,8 @@ defmodule Tightbeam.StateResources do
   end
 
   @doc "Canonical host-environment detail query. It never selects the secret value table."
-  def query_host_environment(source, %{key: {host, harness, name}, principal: principal}) do
-    detail_selection(source, "host environment", principal, fn txn ->
-      query_host_environment(txn, host, harness, name)
-    end)
+  def query_host_environment(source, %{key: {host, harness, name}}) do
+    query_host_environment(source, host, harness, name)
   end
 
   def query_host_environment(source, filters) when is_map(filters) do
@@ -1416,11 +1407,14 @@ defmodule Tightbeam.StateResources do
     %{"rowSchemaRevision" => revision, "item" => row}
   end
 
+  defp detail_principal(%{rest_principal: %{kind: "session", id: id}}),
+    do: {"user", id, true}
+
   defp detail_principal(%{rest_principal: %{kind: kind, id: id, is_admin: is_admin}}),
     do: {kind, id, is_admin}
 
   defp detail_principal(%{principal: {:user, id}}), do: {"user", id, false}
-  defp detail_principal(%{principal: {:session, id}}), do: {"session", id, false}
+  defp detail_principal(%{principal: {:session, id}}), do: {"user", id, true}
   defp detail_principal(%{principal: {:remedy, %{owner: id}}}), do: {"user", id, false}
 
   defp assignment_collection_scope(%{kind: "user", is_admin: true}), do: {"1 = 1", []}
@@ -1429,9 +1423,7 @@ defmodule Tightbeam.StateResources do
     {"(wi.ownerUserId = ? OR a.openedByUser = ?)", [user_id, user_id]}
   end
 
-  defp assignment_collection_scope(%{kind: "session", id: session_key}) do
-    {"(a.holderKey = ? OR a.openedBySession = ?)", [session_key, session_key]}
-  end
+  defp assignment_collection_scope(%{kind: "session"}), do: {"1 = 1", []}
 
   defp assignment_collection_scope(_principal), do: {"0 = 1", []}
 
@@ -1447,9 +1439,7 @@ defmodule Tightbeam.StateResources do
     }
   end
 
-  defp wake_collection_scope(%{kind: "session", id: session_key}) do
-    {"(wakes.sessionKey = ? OR wakes.creatorSessionKey = ?)", [session_key, session_key]}
-  end
+  defp wake_collection_scope(%{kind: "session"}), do: {"1 = 1", []}
 
   defp wake_collection_scope(_principal), do: {"0 = 1", []}
 

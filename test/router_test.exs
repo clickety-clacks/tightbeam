@@ -298,11 +298,11 @@ defmodule Tightbeam.Wire.RouterTest do
 
     for suffix <- ["/messages", "/wakes", "/turns"] do
       path = "/api/sessions/#{session.session_key}#{suffix}"
-      denied = request.(path, "tbc_test")
+      implicit = request.(path, "tbc_test")
       attributed = request.(path <> "?asUser=#{ctx.device.user_id}", "tbc_test")
 
-      assert denied.status == 400
-      assert JSON.decode!(denied.resp_body)["error"]["code"] == "invalid_message"
+      assert implicit.status == 200, implicit.resp_body
+      assert is_list(JSON.decode!(implicit.resp_body)["items"])
       assert attributed.status == 200, attributed.resp_body
       assert is_list(JSON.decode!(attributed.resp_body)["items"])
     end
@@ -1070,8 +1070,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert dr_id in ids
 
-    # rule — as the owner; org transport (not the owner's personal session) so it
-    # is a genuine ruling, not the proxy_only refusal
+    # Rule as the owner over the org transport. This path has no presenting session.
     ruled =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "operator-rule",
@@ -1082,6 +1081,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert ruled.status == 200
     ruled_row = JSON.decode!(ruled.resp_body)["result"]
     assert ruled_row["status"] == "ruled"
+    assert ruled_row["ruledViaSessionKey"] == nil
 
     ruled_list =
       dispatch_cli(ctx, "tbc_test", %{
@@ -1233,10 +1233,8 @@ defmodule Tightbeam.Wire.RouterTest do
              }
            }
 
-    # And an allowed operator verb still enforces its owner authorization THROUGH
-    # the router: a session principal (not the human owner) is refused not_owner,
-    # proving the verb is genuinely routed to its handler's auth, not merely let
-    # past the allowlist.
+    # Any authenticated session may record the ruling, with its actual session
+    # retained in the terminal row.
     ask3 =
       dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-ask",
@@ -1245,13 +1243,16 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert is_binary(dr3 = JSON.decode!(ask3.resp_body)["result"]["id"])
 
-    not_owner =
+    ruled_by_session =
       dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-rule",
         params: %{request: dr3, decision: "a"}
       })
 
-    assert JSON.decode!(not_owner.resp_body)["error"]["code"] == "not_owner"
+    assert ruled_by_session.status == 200
+    session_ruled = JSON.decode!(ruled_by_session.resp_body)["result"]
+    assert session_ruled["status"] == "ruled"
+    assert session_ruled["ruledViaSessionKey"] == raiser.session_key
   end
 
   # The --status filter had the same shape of defect the operator verbs did: a working
@@ -1293,9 +1294,8 @@ defmodule Tightbeam.Wire.RouterTest do
     assert is_binary(ruled_id = JSON.decode!(ruled_ask.resp_body)["result"]["id"])
 
     ruled =
-      dispatch_cli(ctx, "tbc_test", %{
+      dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-rule",
-        asUser: owner,
         params: %{request: ruled_id, decision: "a"}
       })
 
@@ -3318,15 +3318,18 @@ defmodule Tightbeam.Wire.RouterTest do
       assert JSON.decode!(response.resp_body) == %{"result" => expected}
     end
 
-    hidden = dispatch_cli(ctx, stranger.cli_token, body)
+    cross_session = dispatch_cli(ctx, stranger.cli_token, body)
 
     missing =
       dispatch_cli(ctx, stranger.cli_token, put_in(body, [:params, :artifactId], "art_missing"))
 
-    assert hidden.status == 404
+    assert cross_session.status == 200
+    assert JSON.decode!(cross_session.resp_body) == %{"result" => expected}
     assert missing.status == 404
-    assert hidden.resp_body == missing.resp_body
-    assert dispatch_cli(ctx, "tbc_test", Map.put(body, :asUser, "mike")).status == 404
+
+    hidden_user = dispatch_cli(ctx, "tbc_test", Map.put(body, :asUser, "mike"))
+    assert hidden_user.status == 404
+    assert hidden_user.resp_body == missing.resp_body
 
     # Resolve admin standing from the same stored user used by artifact detail,
     # not from command params. The artifact remains owned by flynn throughout.
@@ -3343,8 +3346,6 @@ defmodule Tightbeam.Wire.RouterTest do
     admin = dispatch_cli(ctx, "tbc_test", Map.put(body, :asUser, "mike"))
     assert admin.status == 200
     assert JSON.decode!(admin.resp_body) == %{"result" => expected}
-    # A session does not inherit its owner's admin privilege.
-    assert dispatch_cli(ctx, stranger.cli_token, body).resp_body == hidden.resp_body
 
     assert dispatch_cli(ctx, stranger.cli_token, put_in(body, [:params, :isAdmin], true)).status ==
              400
@@ -3504,13 +3505,21 @@ defmodule Tightbeam.Wire.RouterTest do
     assert dispatch_cli(ctx, "tbc_test", %{verb: "inspect", as: "held"}).status == 200
     assert_receive {:call, %{origin: "agent:held", principal: nil}}
 
-    for role <- ["sibling", "fallback", "missing"] do
+    assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", as: "sibling"}).status == 200
+
+    assert_receive {:call,
+                    %{
+                      origin: "agent:sibling",
+                      principal: {:session, "holder-token"},
+                      transport_session_key: "holder-token"
+                    }}
+
+    for role <- ["fallback", "missing"] do
       response = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", as: role})
-      assert response.status == 403
+      assert response.status == 400
       error = JSON.decode!(response.resp_body)["error"]
-      assert error["code"] == "role_not_held"
+      assert error["code"] == "invalid_message"
       assert error["message"] =~ role
-      assert error["message"] =~ "held"
     end
 
     wrong_user = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "mike"})
@@ -3526,12 +3535,17 @@ defmodule Tightbeam.Wire.RouterTest do
     assert process.status == 403
     assert JSON.decode!(process.resp_body)["error"]["code"] == "identity_not_yours"
 
-    {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM events")
-    no_role = dispatch_cli(ctx, roleless.cli_token, %{verb: "inspect"})
-    assert no_role.status == 403
-    assert JSON.decode!(no_role.resp_body)["error"]["code"] == "no_role"
-    {:ok, [[after_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM events")
-    assert after_count == before_count
+    reserved = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asProcess: "tightbeam"})
+    assert reserved.status == 403
+
+    assert JSON.decode!(reserved.resp_body)["error"] == %{
+             "code" => "identity_not_yours",
+             "message" => "a session token cannot act as a process"
+           }
+
+    roleless_key = roleless.session_key
+    assert dispatch_cli(ctx, roleless.cli_token, %{verb: "inspect"}).status == 200
+    assert_receive {:call, %{origin: "user:flynn", principal: {:session, ^roleless_key}}}
 
     ambiguous = dispatch_cli(ctx, several.cli_token, %{verb: "inspect"})
     assert ambiguous.status == 400

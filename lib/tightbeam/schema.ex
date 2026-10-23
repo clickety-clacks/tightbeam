@@ -3888,7 +3888,8 @@ defmodule Tightbeam.Schema do
              normalize_schema_sql(previous.sql),
              normalize_schema_sql(current.sql),
              normalize_schema_sql(recorded_continuation_retry_guard(previous).sql),
-             normalize_schema_sql(owner_scoped_continuation_guard(previous).sql)
+             normalize_schema_sql(owner_scoped_continuation_guard(previous).sql),
+             normalize_schema_sql(cross_owner_continuation_guard(previous).sql)
            ],
            do: incompatible_supervision_liveness!("malformed owned object #{previous.name}")
 
@@ -3901,8 +3902,8 @@ defmodule Tightbeam.Schema do
 
   defp owner_scoped_continuation_guard(previous) do
     recorded = recorded_continuation_retry_guard(previous)
-    # Remove only the rejected ancestry relation. The creator must still be an
-    # actual session of the wake's owner; all turn/retry and row checks remain.
+    # Recognize the prior owner-scoped form so it can be replaced with the
+    # cross-owner form below; preserve its remaining turn, retry and row checks.
     ancestry =
       ~r/AND EXISTS \(\s*WITH RECURSIVE lineage\(sessionKey,spawnedBy\) AS \(.*?SELECT 1 FROM lineage WHERE sessionKey=w.creatorSessionKey\s*\)/s
 
@@ -3920,6 +3921,18 @@ defmodule Tightbeam.Schema do
     }
   end
 
+  defp cross_owner_continuation_guard(previous) do
+    recorded = recorded_continuation_retry_guard(previous)
+    # The covered assignment owns the wake; the creator's owner and ancestry
+    # do not scope a holder continuation. Keep the row and turn coherence checks.
+    ancestry =
+      ~r/AND EXISTS \(\s*WITH RECURSIVE lineage\(sessionKey,spawnedBy\) AS \(.*?SELECT 1 FROM lineage WHERE sessionKey=w.creatorSessionKey\s*\)/s
+
+    true = Regex.match?(ancestry, recorded.sql)
+
+    %{recorded | sql: Regex.replace(ancestry, recorded.sql, "")}
+  end
+
   defp migrate_continuation_retry_guard(db) do
     previous =
       Enum.find(
@@ -3927,12 +3940,13 @@ defmodule Tightbeam.Schema do
         &(&1.name == "supervision_liveness_sidecar_insert_coherent")
       )
 
-    current = owner_scoped_continuation_guard(previous)
+    current = cross_owner_continuation_guard(previous)
 
     supported = [
       previous,
       continuation_retry_guard(previous),
       recorded_continuation_retry_guard(previous),
+      owner_scoped_continuation_guard(previous),
       current
     ]
 

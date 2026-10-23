@@ -289,7 +289,7 @@ defmodule Tightbeam.TerminalDecisionA27aCaptureTest do
   end
 
   defp rule(ctx, owner, id) do
-    wire!(ctx, "tbc_terminal_a27a", "operator-rule", %{request: id, decision: "accept"},
+    wire!(ctx, ctx.raiser.cli_token, "operator-rule", %{request: id, decision: "accept"},
       as_user: owner
     )
   end

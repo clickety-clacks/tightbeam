@@ -220,7 +220,7 @@ defmodule Tightbeam.LateRulingHandoffTest do
                  verb: "operator-rule",
                  origin: "user:flynn",
                  principal: {:user, "flynn"},
-                 transport_session_key: nil,
+                 transport_session_key: ctx.raiser.session_key,
                  params: %{request: @incident_request_id, decision: "accept"}
                },
                scheduler: ctx.scheduler
@@ -491,7 +491,7 @@ defmodule Tightbeam.LateRulingHandoffTest do
                verb: "operator-rule",
                origin: "user:flynn",
                principal: {:user, "flynn"},
-               transport_session_key: nil,
+               transport_session_key: ctx.raiser.session_key,
                params: %{request: request.id, decision: "accept"}
              })
 
@@ -537,7 +537,7 @@ defmodule Tightbeam.LateRulingHandoffTest do
                  verb: "operator-rule",
                  origin: "user:flynn",
                  principal: {:user, "flynn"},
-                 transport_session_key: nil,
+                 transport_session_key: ctx.raiser.session_key,
                  params: %{request: request.id, decision: "accept"}
                },
                scheduler: ctx.scheduler

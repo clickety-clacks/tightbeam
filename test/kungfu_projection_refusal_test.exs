@@ -246,14 +246,16 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     assert DB.query(db, "SELECT * FROM admin_projection_versions") == {:ok, []}
   end
 
-  test "rebuild authorization precedes lookup and stamped bytes retain exact SHA", %{db: db} do
-    assert :forbidden = Rebuild.fetch(:not_a_database, "kungfu.updated", %{}, "viewer", false)
+  test "rebuild validates its caller and stamped bytes retain exact SHA", %{db: db} do
     assert :forbidden = Rebuild.fetch(:not_a_database, "kungfu.updated", %{}, "", true)
     assert :unsupported = Rebuild.fetch(:not_a_database, "assignment.updated", %{}, "admin", true)
     assert {:ok, [_]} = AdminProjection.stamp_publication(db, %{}, [entry()])
 
     assert {:ok, payload} =
              Rebuild.fetch(db, "kungfu.updated", %{"name" => "synthetic"}, "admin", true)
+
+    assert Rebuild.fetch(db, "kungfu.updated", %{"name" => "synthetic"}, "viewer", false) ==
+             {:ok, payload}
 
     assert Enum.all?(
              payload["documents"],
@@ -277,7 +279,7 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     assert "kungfu.updated" in Rebuild.classes()
     assert Registry.fetch("assignment.updated") == :error
     assert StateVisibility.visible?(nil, notice(), "admin", true)
-    refute StateVisibility.visible?(nil, notice(), "viewer", false)
+    assert StateVisibility.visible?(nil, notice(), "viewer", false)
     assert StateResources.kungfu(item()) == item()
 
     for bad <- [
@@ -320,11 +322,13 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     assert {:ok, [[2]]} = DB.query(db, "SELECT id FROM transport_rows")
   end
 
-  test "admin subscription matching and sequence remain enforced", %{hub: hub} do
+  test "subscription matching and sequence remain enforced", %{hub: hub} do
     :ok = register(hub, %{is_admin: false})
     Hub.publish(hub, notice())
     barrier(hub)
-    refute_received {:firehose_notice, _}
+    assert_receive {:firehose_notice, raw}
+    assert raw == notice()
+    Hub.delivered(hub, self())
     :ok = register(hub, %{mode: :subscribed})
     :ok = Hub.subscribe(hub, self(), "a", %{"classes" => ["kungfu."]})
     :ok = Hub.subscribe(hub, self(), "b", %{"classes" => ["assignment."]})
@@ -341,7 +345,7 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     refute_received {:firehose_notice, _}
   end
 
-  test "queued bytes retain content and authorization is rechecked at dequeue", %{hub: hub} do
+  test "queued bytes retain exact content across re-registration", %{hub: hub} do
     :ok = register(hub)
     Hub.publish(hub, notice())
     Hub.publish(hub, notice())
@@ -350,8 +354,9 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     assert first == notice()
     :ok = register(hub, %{is_admin: false})
     Hub.delivered(hub, self())
-    assert %{queued: 0, in_flight: false} = Hub.connection_stats(hub, self())
-    refute_received {:firehose_notice, _}
+    assert %{queued: 0, in_flight: true} = Hub.connection_stats(hub, self())
+    assert_receive {:firehose_notice, second}
+    assert second == notice()
   end
 
   test "changes route upgrades on loopback and delivers raw and general subscribed notices", %{
@@ -557,9 +562,8 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     assert :ok = ChangeSocket.terminate(:normal, pending)
   end
 
-  test "final ChangeSocket preserves valid bytes and rejects unauthorized or malformed frames", %{
-    hub: hub
-  } do
+  test "final ChangeSocket preserves valid bytes and rejects malformed or unauthenticated frames",
+       %{hub: hub} do
     :ok = register(hub)
 
     state = %ChangeSocket{
@@ -580,12 +584,14 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
                state
              )
 
-    denied = %{state | user_id: "viewer", is_admin: false}
+    viewer = %{state | user_id: "viewer", is_admin: false}
 
-    assert {:stop, :normal, 1008, ^denied} =
-             ChangeSocket.handle_info({:firehose_notice, notice()}, denied)
+    assert {:push, {:text, viewer_bytes}, ^viewer} =
+             ChangeSocket.handle_info({:firehose_notice, notice()}, viewer)
 
-    pending = %{denied | phase: :unauthed}
+    assert JSON.decode!(viewer_bytes) == notice()
+
+    pending = %{viewer | phase: :unauthed}
     assert {:ok, ^pending} = ChangeSocket.handle_info({:firehose_notice, notice()}, pending)
 
     assert {:stop, :normal, 1008, {:text, refusal}, ^pending} =

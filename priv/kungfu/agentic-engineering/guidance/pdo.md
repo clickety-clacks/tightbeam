@@ -111,7 +111,7 @@ owns no clone, branch, test job, repair or ongoing delivery duty. Preserve its
 findings in tracked durable custody outside its disposable scratch before ending
 its assignment. Once its turn has ended, reconcile its assignments, pending wakes
 and any descendant duties. With durable findings and no remaining scan or session
-obligation, its current direct parent retires that exact helper through the
+obligation, retire that exact helper through the
 supported lifecycle even while the governing product work item remains open.
 For this helper with no repository or job, the repository-retirement skill's
 commit, branch, containment and repository-removal proofs and retention clocks do

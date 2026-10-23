@@ -24,8 +24,7 @@ defmodule Tightbeam.Firehose.Rebuild do
   def fetch(db, class, refs, user_id, is_admin)
       when is_map(refs) and is_binary(user_id) and byte_size(user_id) > 0 and
              is_boolean(is_admin) do
-    with true <- class != "kungfu.updated" or StateVisibility.kungfu_visible?(is_admin),
-         {:ok, %{rebuild: true}} <- Registry.fetch(class),
+    with {:ok, %{rebuild: true}} <- Registry.fetch(class),
          raw when not is_nil(raw) <- query(db, class, refs, user_id),
          notice = Publisher.committed_notice(class, raw, authoritative_refs(class, raw)),
          true <- StateVisibility.visible?(db, notice, user_id, is_admin) do

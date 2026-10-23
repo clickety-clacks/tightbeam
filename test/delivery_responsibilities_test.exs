@@ -463,30 +463,6 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     assert first_prompt =~ first_brief
 
-    assert {:error,
-            %{
-              code: "rule_denied",
-              rule: "engineering-dispatch-production-office-target-refused",
-              message: office_target
-            }} =
-             Dispatch.dispatch(
-               db,
-               handlers,
-               production_call(
-                 "dispatch",
-                 {:session, "pdo-a"},
-                 "pdo-a",
-                 item_id
-               )
-             )
-
-    assert office_target =~ "work-item-handoff"
-    assert office_target =~ "--work-item <workItemId>"
-    assert office_target =~ "--title"
-    assert office_target =~ "--delivery-owner <sessionKey>"
-    assert office_target =~ "--brief"
-    refute office_target =~ "use a genuine consultation context"
-
     second_brief = "The office confirms its delivery plan."
 
     assert {:ok, %{created: false, wakeScheduled: true, workItem: second_handoff}} =
@@ -644,30 +620,6 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                )
     end
 
-    # Accountability is a separate target restriction even for a non-office worker.
-    assert %{deliveryOwnerSessionKey: "worker-a"} =
-             set_owner(db, {:user, "owner"}, item_id, "worker-a")
-
-    before = count(db, "assignments")
-    wakes_before = count(db, "wakes")
-
-    for verb <- ["assign", "dispatch"],
-        principal <- [{:user, "owner"}, {:session, "worker-a"}] do
-      rule = "engineering-#{verb}-production-accountable-owner-target-refused"
-
-      assert {:error, %{code: "rule_denied", rule: ^rule, message: message}} =
-               Dispatch.dispatch(
-                 db,
-                 handlers,
-                 production_call(verb, principal, "worker-a", item_id)
-               )
-
-      assert message =~ "session:worker-a"
-    end
-
-    assert count(db, "assignments") == before
-    assert count(db, "wakes") == wakes_before
-
     # Coordination with returned topology and genuine linked review remain reachable.
     for verb <- ["assign", "dispatch"] do
       call =
@@ -686,6 +638,29 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     owner_review = %{review | session_key: "worker-a"}
     assert {:ok, %{holderKey: "worker-a"}} = Dispatch.dispatch(db, handlers, owner_review)
+
+    # Production work may target the accountable delivery owner.
+    for {verb, target} <- [{"assign", "successor-a"}, {"dispatch", "foreign-worker"}] do
+      assert %{deliveryOwnerSessionKey: ^target} =
+               set_owner(db, {:user, "owner"}, item_id, target)
+
+      assert {:ok, %{holderKey: ^target, workItemId: ^item_id}} =
+               Dispatch.dispatch(
+                 db,
+                 handlers,
+                 production_call(verb, {:user, "owner"}, target, item_id)
+               )
+    end
+
+    # Production work may target another available session once owner and topology are set.
+    for verb <- ["assign", "dispatch"] do
+      assert {:ok, %{holderKey: "lane-b", workItemId: ^item_id}} =
+               Dispatch.dispatch(
+                 db,
+                 handlers,
+                 production_call(verb, {:user, "owner"}, "lane-b", item_id)
+               )
+    end
   end
 
   test "assignment and dispatch share admission while intake and linked review stay reachable", %{

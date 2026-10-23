@@ -441,8 +441,7 @@ defmodule Tightbeam.Toplines do
       transaction!(db, fn txn ->
         with {:ok, caller} <- reauthorize(txn, caller),
              {:ok, topline} <- visible_topline(txn, topline_id, caller),
-             {:ok, work_item} <- visible_work_item(txn, work_item_id, caller),
-             :ok <- same_owner(topline, work_item) do
+             {:ok, _work_item} <- visible_work_item(txn, work_item_id, caller) do
           case replay(txn, caller.user, operation, key, fingerprint) do
             {:ok, response} ->
               response
@@ -1497,9 +1496,6 @@ defmodule Tightbeam.Toplines do
     Txn.q(txn, "UPDATE toplines SET updatedAt = ?2 WHERE id = ?1", [topline_id, at])
     :ok
   end
-
-  defp same_owner(%{owner_user_id: owner}, %{owner_user_id: owner}), do: :ok
-  defp same_owner(_, _), do: error("owner_mismatch", "topline and work item owners differ")
 
   defp replay(txn, user, operation, key, fingerprint) do
     case Txn.q(

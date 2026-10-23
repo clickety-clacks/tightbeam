@@ -6,33 +6,16 @@ defmodule Tightbeam.SessionDiagnose do
   @max_response 4096
   @lane_timeout 200
 
-  # Scope is an explicit operator configuration, not a guessed session owner.
   # No DB, lane creation, adapter call or domain mutation belongs on this path.
-  def scope(encoded) when is_binary(encoded) and byte_size(encoded) <= 8192 do
-    case JSON.decode(encoded) do
-      {:ok, entries} when is_map(entries) and map_size(entries) <= 8 ->
-        if Enum.all?(entries, fn {key, owner} ->
-             is_binary(key) and byte_size(key) in 1..512 and
-               is_binary(owner) and byte_size(owner) in 1..128
-           end), do: entries, else: raise(ArgumentError, "invalid diagnostic scope")
-
-      _ ->
-        raise ArgumentError, "invalid diagnostic scope"
-    end
-  end
-
-  def scope(_), do: raise(ArgumentError, "invalid diagnostic scope")
-
   def handle(conn, deps) do
     with :ok <- authenticate(conn, deps[:cli_token]),
          :ok <- compatible(conn),
          {:ok, bytes, conn} <-
            read_body(conn, length: @max_body, read_length: @max_body, read_timeout: 500),
          {:ok, body} <- JSON.decode(bytes),
-         %{"sessionKey" => key, "asUser" => owner} <- body,
-         true <- map_size(body) == 2 and is_binary(key) and is_binary(owner),
-         true <- byte_size(key) in 1..512 and byte_size(owner) in 1..128,
-         true <- Map.get(deps[:diagnostic_scope] || %{}, key) == owner do
+         %{"sessionKey" => key} <- body,
+         true <- map_size(Map.delete(body, "asUser")) == 1 and is_binary(key),
+         true <- byte_size(key) in 1..512 do
       metadata_deps = Map.take(deps, [:db, :lane_registry])
 
       case bounded_snapshot(fn -> snapshot(key, metadata_deps) end) do
@@ -43,7 +26,6 @@ defmodule Tightbeam.SessionDiagnose do
     else
       {:error, :incompatible_cli} -> reply(conn, 426, %{error: %{code: "incompatible_cli"}})
       {:error, :unauthorized} -> reply(conn, 401, %{error: %{code: "unauthorized"}})
-      false -> reply(conn, 403, %{error: %{code: "diagnostic_scope_refused"}})
       _ -> reply(conn, 400, %{error: %{code: "invalid_diagnostic_request"}})
     end
   rescue

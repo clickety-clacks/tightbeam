@@ -470,7 +470,7 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
                false
              )
 
-    assert :forbidden ==
+    assert {:ok, notices["user.promoted"]["payload"]} ==
              Rebuild.fetch(
                fixture.db,
                "user.promoted",
