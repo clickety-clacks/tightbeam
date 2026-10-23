@@ -46,7 +46,7 @@ try do
     assert payload["rowVersion"] == version
     assert payload["valuePresent"] == present
     assert payload["value"] == nil
-    assert :forbidden == Rebuild.fetch(db, "host_env.updated", refs, "operator", false)
+    assert {:ok, ^payload} = Rebuild.fetch(db, "host_env.updated", refs, "operator", false)
     payload
   end
 
@@ -120,7 +120,7 @@ try do
     assert [^unset] = D1Read.collection(reopened, base, :host_environment, %{})
     assert ^unset = D1Read.detail(reopened, base, :host_environment, key)
     assert {:ok, ^unset} = Rebuild.fetch(reopened, "host_env.updated", refs, "admin", true)
-    assert :forbidden == Rebuild.fetch(reopened, "host_env.updated", refs, "operator", false)
+    assert {:ok, ^unset} = Rebuild.fetch(reopened, "host_env.updated", refs, "operator", false)
     assert File.read!(Path.join(base, "build-owner.json")) == marker
   after
     GenServer.stop(reopened)

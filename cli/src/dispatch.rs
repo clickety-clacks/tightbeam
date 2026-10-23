@@ -472,17 +472,16 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             identity,
             session_key,
         } => {
-            let Identity::User(user) = identity else {
-                return Err("session-diagnose requires --as-user".to_owned());
-            };
+            let mut fields = Vec::new();
+            if let Identity::User(user) = identity {
+                fields.push(string_field("asUser", user));
+            }
+            fields.push(string_field("sessionKey", session_key));
             Ok(RequestSpec {
                 attempt_context: None,
                 receipt_base_override: None,
                 path: "/agent/session-diagnose",
-                body_json: object(vec![
-                    string_field("asUser", user),
-                    string_field("sessionKey", session_key),
-                ]),
+                body_json: object(fields),
             })
         }
         Command::Spawn {
@@ -2031,7 +2030,6 @@ fn send_diagnostic_with_timeout(
         return Err(match json["error"]["code"].as_str().unwrap_or("") {
             "unauthorized"
             | "incompatible_cli"
-            | "diagnostic_scope_refused"
             | "invalid_diagnostic_request"
             | "diagnostic_snapshot_timeout"
             | "diagnostic_unavailable"
@@ -7460,6 +7458,13 @@ mod session_diagnose_tests {
         assert_eq!(
             serde_json::from_str::<Value>(&request.body_json).unwrap(),
             serde_json::json!({"asUser":"mike", "sessionKey":"seat"})
+        );
+        let bare = command(&["session-diagnose", "--session", "seat"]).unwrap();
+        let bare_request = build_request(&bare).unwrap();
+        assert_eq!(bare_request.path, "/agent/session-diagnose");
+        assert_eq!(
+            serde_json::from_str::<Value>(&bare_request.body_json).unwrap(),
+            serde_json::json!({"sessionKey":"seat"})
         );
         for args in [
             vec!["session-diagnose", "--session", "seat", "--as", "po"],

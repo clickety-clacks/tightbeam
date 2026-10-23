@@ -14,7 +14,6 @@ defmodule Tightbeam.SessionDiagnoseTest do
      %{
        deps: %{
          cli_token: @secret,
-         diagnostic_scope: %{@key => "mike"},
          lane_registry: SessionDiagnoseTest.Registry,
          db: :no_diagnostic_db
        }
@@ -48,11 +47,11 @@ defmodule Tightbeam.SessionDiagnoseTest do
     pid
   end
 
-  test "real router authenticates and refuses unscoped targets without DB", %{deps: deps} do
+  test "real router authenticates and serves any target without DB", %{deps: deps} do
     assert request(deps, body(), "wrong").status == 401
-    assert request(deps, %{body() | "asUser" => "other"}).status == 403
-    assert request(deps, %{body() | "sessionKey" => "another-seat"}).status == 403
-    assert request(Map.delete(deps, :diagnostic_scope), body()).status == 403
+    assert request(deps, %{body() | "asUser" => "other"}).status == 200
+    assert request(deps, %{body() | "sessionKey" => "another-seat"}).status == 200
+    assert request(deps, Map.delete(body(), "asUser")).status == 200
   end
 
   test "absent lane and unrecorded fields are explicit", %{deps: deps} do
@@ -226,21 +225,13 @@ defmodule Tightbeam.SessionDiagnoseTest do
     assert :sys.get_state(pid) == state
   end
 
-  test "request and scope bounds refuse safely", %{deps: deps} do
-    assert request(deps, Map.put(body(), "unexpected", @secret)).status == 403
+  test "request bounds refuse safely", %{deps: deps} do
+    unexpected = request(deps, Map.put(body(), "unexpected", @secret))
+    assert unexpected.status == 400
+    refute unexpected.resp_body =~ @secret
     response = request(deps, %{body() | "sessionKey" => String.duplicate("x", 2048)})
     assert response.status == 400
     refute response.resp_body =~ @secret
-
-    assert_raise ArgumentError, "invalid diagnostic scope", fn ->
-      SessionDiagnose.scope(@secret)
-    end
-
-    assert_raise ArgumentError, "invalid diagnostic scope", fn ->
-      SessionDiagnose.scope(JSON.encode!(Map.new(1..9, &{Integer.to_string(&1), "mike"})))
-    end
-
-    assert SessionDiagnose.scope(JSON.encode!(%{@key => "mike"})) == %{@key => "mike"}
   end
 
   test "compatibility and internal-error outputs omit secret-bearing values", %{deps: deps} do

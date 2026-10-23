@@ -27,7 +27,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     %{db: db, hub: hub, device: device, state: state}
   end
 
-  test "session bearer authenticates the exact session and cannot widen its subscription", ctx do
+  test "session bearer can subscribe to events from other sessions", ctx do
     session =
       Org.create(ctx.db, %{
         session_key: "agent:session",
@@ -71,7 +71,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     assert state.subscriptions == %{}
 
-    {:push, {:text, error}, state} =
+    {:push, {:text, ready}, state} =
       inbound(
         %{
           "type" => "subscribe",
@@ -81,27 +81,10 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
         state
       )
 
-    assert JSON.decode!(error)["message"] == "sessionKey must match authenticated session"
-    assert state.subscriptions == %{}
-
-    {:push, {:text, ready}, state} =
-      inbound(
-        %{
-          "type" => "subscribe",
-          "protocolVersion" => 2,
-          "subscriptionId" => "exact",
-          "filters" => %{"sessionKey" => "agent:session", "classes" => ["session."]},
-          "clientExtension" => %{"ignored" => true}
-        },
-        state
-      )
-
     assert JSON.decode!(ready) == %{
              "type" => "subscription_ready",
-             "subscriptionId" => "exact"
+             "subscriptionId" => "wide"
            }
-
-    assert Map.has_key?(state.subscriptions, "exact")
 
     Hub.publish(ctx.hub, %{
       "class" => "session.updated",
@@ -109,20 +92,48 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       "payload" => %{"sessionKey" => "agent:sibling", "rowVersion" => 1}
     })
 
-    refute_receive {:firehose_notice, _}, 50
-
-    Hub.publish(ctx.hub, %{
-      "class" => "session.updated",
-      "refs" => %{"sessionKey" => "agent:session"},
-      "payload" => %{"sessionKey" => "agent:session", "rowVersion" => 1}
-    })
-
     assert_receive {:firehose_notice,
                     %{
                       "type" => "change",
-                      "schemaVersion" => 2,
-                      "refs" => %{"sessionKey" => "agent:session"}
+                      "subscriptionId" => "wide",
+                      "refs" => %{"sessionKey" => "agent:sibling"}
                     }}
+
+    :ok = Hub.delivered(ctx.hub, self())
+
+    {:push, {:text, ready}, state} =
+      inbound(
+        %{
+          "type" => "subscribe",
+          "protocolVersion" => 2,
+          "subscriptionId" => "sibling",
+          "filters" => %{"sessionKey" => "agent:sibling", "classes" => ["session."]},
+          "clientExtension" => %{"ignored" => true}
+        },
+        state
+      )
+
+    assert JSON.decode!(ready) == %{
+             "type" => "subscription_ready",
+             "subscriptionId" => "sibling"
+           }
+
+    assert Map.has_key?(state.subscriptions, "sibling")
+
+    Hub.publish(ctx.hub, %{
+      "class" => "session.updated",
+      "refs" => %{"sessionKey" => "agent:sibling"},
+      "payload" => %{"sessionKey" => "agent:sibling", "rowVersion" => 2}
+    })
+
+    deliveries =
+      Enum.map(1..2, fn _ ->
+        assert_receive {:firehose_notice, notice}
+        :ok = Hub.delivered(ctx.hub, self())
+        notice["subscriptionId"]
+      end)
+
+    assert Enum.sort(deliveries) == ["sibling", "wide"]
   end
 
   test "organization bearer reads the Firehose as its named user", ctx do

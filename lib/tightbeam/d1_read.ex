@@ -36,8 +36,11 @@ defmodule Tightbeam.D1Read do
   @doc "The sole maintenance-line D1 resource catalog."
   def spec(resource), do: Map.fetch!(@resources, resource)
 
-  @doc "Administrative resources are owner-admin only; hosts are organization-visible."
-  def visible?(:hosts, _is_admin), do: true
+  @doc "Maintenance-line D1 resources are visible to every authenticated principal."
+  def visible?(resource, _is_admin)
+      when resource in [:config, :host_environment, :hosts, :users, :identity, :kungfu],
+      do: true
+
   def visible?(_resource, is_admin), do: is_admin
 
   @doc "Read a fixed-shape D1 collection from current 0.1.9 sources."
