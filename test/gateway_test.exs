@@ -10777,6 +10777,8 @@ defmodule Tightbeam.GatewayTest do
         model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
+    session_key = session.session_key
+
     Org.append_pointer(ctx.db, session.session_key, "thread-newer-revision", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
     Identity.provision_at!(base_dir, original, "coder", :codex, cwd)
