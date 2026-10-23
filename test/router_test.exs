@@ -503,8 +503,8 @@ defmodule Tightbeam.Wire.RouterTest do
         dispatch_cli(ctx, session.cli_token, %{verb: verb, asProcess: "cron", params: params})
 
       assert response.status == 403
-      assert JSON.decode!(response.resp_body)["error"]["code"] == "process_denied"
-      assert_receive {:body_auth_handler, ^verb, "process:cron", {:process, "cron"}}
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "identity_not_yours"
+      refute_receive {:body_auth_handler, _, _, _}
     end
 
     for {verb, body} <- [{"work-item-get", nil}, {"work-item-update", "denied-held-role"}] do
@@ -3399,8 +3399,14 @@ defmodule Tightbeam.Wire.RouterTest do
                       transport_session_key: "holder-token"
                     }}
 
-    assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: ""}).status == 200
-    assert_receive {:call, %{origin: "agent:held", principal: {:session, "holder-token"}}}
+    empty_user = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: ""})
+
+    assert empty_user.status == 403
+
+    assert JSON.decode!(empty_user.resp_body)["error"] == %{
+             "code" => "identity_not_yours",
+             "message" => "this session belongs to flynn"
+           }
 
     # Registering a satellite also provisions its operator endpoint over ssh; this
     # test is about the identity ladder, so the reach is stubbed and the gateway
@@ -3515,24 +3521,18 @@ defmodule Tightbeam.Wire.RouterTest do
       assert error["message"] =~ role
     end
 
-    assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "mike"}).status == 200
+    wrong_user = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "mike"})
 
-    assert_receive {:call,
-                    %{
-                      origin: "user:mike",
-                      principal: {:user, "mike"},
-                      transport_session_key: "holder-token"
-                    }}
+    assert wrong_user.status == 403
 
-    assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asProcess: "cron"}).status ==
-             200
+    assert JSON.decode!(wrong_user.resp_body)["error"] == %{
+             "code" => "identity_not_yours",
+             "message" => "this session belongs to flynn"
+           }
 
-    assert_receive {:call,
-                    %{
-                      origin: "process:cron",
-                      principal: {:process, "cron"},
-                      transport_session_key: "holder-token"
-                    }}
+    process = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asProcess: "cron"})
+    assert process.status == 403
+    assert JSON.decode!(process.resp_body)["error"]["code"] == "identity_not_yours"
 
     reserved = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asProcess: "tightbeam"})
     assert reserved.status == 403
