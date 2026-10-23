@@ -960,9 +960,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
       assert rows(ctx.db, "SELECT * FROM wakes ORDER BY wakeId", []) == before_wakes
 
-      refute ruled.expecter_user_id == "admin"
-
-      assert %{code: "not_authorized"} =
+      assert %{code: "not_open"} =
                EffortCheckin.rule(ctx.db, ctx.config, %{call | principal: {:user, "admin"}})
 
       refute_receive {:firehose_notice, _}
@@ -1338,13 +1336,6 @@ defmodule Tightbeam.EffortCheckinTest do
                effort_call(request.id, "continue", {:session, "holder"})
              )
 
-    assert %{code: "not_authorized"} =
-             EffortCheckin.rule(
-               ctx.db,
-               ctx.config,
-               %{effort_call(request.id, "continue", {:session, "parent"}) | principal: nil}
-             )
-
     assert %{code: "not_open"} =
              EffortCheckin.rule(
                ctx.db,
@@ -1383,13 +1374,6 @@ defmodule Tightbeam.EffortCheckinTest do
     user_item = dispatch(ctx, {:user, "h1"}, "holder", "user")
     user_request = escalate(ctx, user_item.id)
     assert user_request.expecter_user_id == "h1"
-
-    assert %{code: "not_authorized"} =
-             EffortCheckin.rule(
-               ctx.db,
-               ctx.config,
-               effort_call(user_request.id, "dismiss", {:user, "h2"})
-             )
 
     assert Enum.any?(
              Escalation.list(
@@ -1453,16 +1437,30 @@ defmodule Tightbeam.EffortCheckinTest do
                effort_call(pinned_request.id, "continue", {:session, "parent"})
              )
 
-    assert %{code: "not_authorized"} =
+    assert %{state: "closed", outcome: "revoked"} =
              assignment(ctx, "revoke-assignment", {:user, "h1"}, nil, %{
-               assignment_id: pinned.id
+               assignment_id: pinned.id,
+               reason: "effort disposition"
              })
 
-    assert %{code: "not_authorized", message: "current expecter required"} =
+    assert %{code: "not_open"} =
              EffortCheckin.rule(
                ctx.db,
                ctx.config,
                effort_call(pinned_request.id, "continue", {:user, "h1"})
+             )
+  end
+
+  test "any principal may rule an open effort check-in", ctx do
+    item = dispatch(ctx, {:user, "h1"}, "holder", "open ruling")
+    request = escalate(ctx, item.id)
+    assert request.expecter_user_id == "h1"
+
+    assert %{status: "ruled", decision: "continue", ruled_by: "user:h2"} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_call(request.id, "continue", {:user, "h2"})
              )
   end
 
@@ -2276,13 +2274,6 @@ defmodule Tightbeam.EffortCheckinTest do
 
       assert inactivity_deadline.assignment_id == assignment.id
       inactivity_due_at = inactivity_deadline.due_at
-
-      assert %{code: "not_authorized", message: "current expecter required"} =
-               EffortCheckin.rule(
-                 ctx.db,
-                 ctx.config,
-                 effort_call(request.id, action, {:user, "h2"})
-               )
 
       assert %{
                id: request_id,
