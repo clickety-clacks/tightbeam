@@ -108,7 +108,7 @@ defmodule Tightbeam.WorkItemsTest do
         session_key: ctx.holder.session_key,
         origin: "user:flynn",
         prompt: "Synthetic timer",
-        due_at: System.system_time(:millisecond),
+        due_at: System.system_time(:millisecond) + 60_000,
         sender_scheduled: true
       })
 
@@ -118,10 +118,18 @@ defmodule Tightbeam.WorkItemsTest do
                raise "rollback publication"
              end)
 
-    refute_receive {:firehose_notice, _}
+    source_wake_id = wake.wake_id
+
+    refute_receive {:firehose_notice,
+                    %{
+                      "class" => "wake.scheduled",
+                      "payload" => %{"wakeId" => ^source_wake_id}
+                    }}
+
     assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
     assert Tightbeam.NoticeBatcher.source_refs(ctx.db, wake.wake_id) == []
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+    assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
     assert :ok = Wakes.fire_due(scheduler)
 
     assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =

@@ -57,6 +57,10 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     Roles.create!(db, "product-owner:a", "owner", "pdo-a")
     Roles.create!(db, "product-owner:b", "owner", "pdo-b")
 
+    base = Path.join(System.tmp_dir!(), "delivery-mementos-#{System.unique_integer([:positive])}")
+    declare_mementos!(base)
+    Rules.load!(base, [], revision: "policy-fixture")
+    on_exit(fn -> File.rm_rf!(base) end)
     %{db: db}
   end
 
@@ -531,7 +535,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                  db,
                  handlers,
                  production_call(verb, principal, "worker-a", item_id)
-                 |> put_in([:params, :effect_kind], effect)
+                 |> with_effect(effect)
                )
 
       assert message =~ item_id
@@ -557,19 +561,19 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     # Real coordination and linked review still admit before the link exists.
     intake =
       production_call("assign", {:user, "owner"}, "intake-pdo", item_id)
-      |> put_in([:params, :effect_kind], "coordination")
+      |> with_effect("coordination")
 
     assert {:ok, coordination} = Dispatch.dispatch(db, handlers, intake)
 
     consultation =
       production_call("dispatch", {:user, "owner"}, "consult-po", item_id)
-      |> put_in([:params, :effect_kind], "coordination")
+      |> with_effect("coordination")
 
     assert {:ok, %{holderKey: "consult-po"}} = Dispatch.dispatch(db, handlers, consultation)
 
     review =
       production_call("assign", {:user, "owner"}, "reviewer", item_id)
-      |> put_in([:params, :effect_kind], "review")
+      |> with_effect("review")
       |> put_in([:params, :reviews_assignment_id], coordination.id)
 
     assert {:ok, %{holderKey: "reviewer"}} = Dispatch.dispatch(db, handlers, review)
@@ -578,7 +582,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
              Dispatch.dispatch(
                db,
                handlers,
-               put_in(review, [:params, :effect_kind], "coordination")
+               with_effect(review, "coordination")
              )
 
     # Existing intake assignments do not let production bypass the loaded rule.
@@ -588,7 +592,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                  db,
                  handlers,
                  production_call(verb, {:user, "owner"}, "worker-a", item_id)
-                 |> put_in([:params, :effect_kind], effect)
+                 |> with_effect(effect)
                )
     end
 
@@ -603,7 +607,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                  db,
                  handlers,
                  production_call(verb, {:user, "owner"}, "worker-a", item_id)
-                 |> put_in([:params, :effect_kind], effect)
+                 |> with_effect(effect)
                )
     end
 
@@ -616,7 +620,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                  db,
                  handlers,
                  production_call(verb, {:user, "owner"}, "worker-a", item_id)
-                 |> put_in([:params, :effect_kind], effect)
+                 |> with_effect(effect)
                )
     end
 
@@ -624,7 +628,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     for verb <- ["assign", "dispatch"] do
       call =
         production_call(verb, {:user, "owner"}, "worker-a", item_id)
-        |> put_in([:params, :effect_kind], "coordination")
+        |> with_effect("coordination")
 
       assert {:ok, %{holderKey: "worker-a"}} = Dispatch.dispatch(db, handlers, call)
 
@@ -671,11 +675,13 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     load_delivery_rules!(tmp)
     set_owner(db, {:user, "owner"}, "wi_a1", "pdo-a")
 
-    topology = assign(db, {:session, "pdo-a"}, "lane-a", "wi_a1")
+    topology = assign(db, {:session, "pdo-a"}, "intake-pdo", "wi_a1", effect_kind: "coordination")
 
     assert %{attest: %{verdictKind: "topology-decided"}} =
-             attest_verdict(db, "lane-a", topology.id, "topology-decided")
+             attest_verdict(db, "intake-pdo", topology.id, "topology-decided")
 
+    lane = assign(db, {:session, "pdo-a"}, "lane-a", "wi_a1")
+    assert is_binary(lane.id)
     handlers = assignment_handlers(db)
     before = count(db, "assignments")
     wakes_before = count(db, "wakes")
@@ -761,19 +767,24 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     set_owner(db, {:user, "owner"}, "wi_b1", "peer")
 
     intake = production_call("dispatch", {:session, "peer"}, "intake-pdo", "wi_b1")
-    intake = put_in(intake, [:params, :effect_kind], "coordination")
+    intake = with_effect(intake, "coordination")
 
     assert {:ok, %{rumination_required: true}} = Dispatch.dispatch(db, handlers, intake)
 
     consultation = production_call("dispatch", {:session, "peer"}, "consult-po", "wi_b1")
-    consultation = put_in(consultation, [:params, :effect_kind], "coordination")
+    consultation = with_effect(consultation, "coordination")
 
     assert {:ok, %{rumination_required: true}} = Dispatch.dispatch(db, handlers, consultation)
 
     producer = assign(db, {:session, "pdo-a"}, "worker-a", "wi_a1")
     producer_id = producer.id
 
-    assert %{holderKey: "reviewer", reviewsAssignmentId: ^producer_id, effectKind: "review"} =
+    assert %{
+             holderKey: "reviewer",
+             reviewsAssignmentId: ^producer_id,
+             effectKind: nil,
+             mementos: %{"agentic-engineering/effect-kind" => ["review"]}
+           } =
              assign(db, {:session, "peer"}, "reviewer", "wi_a1",
                reviews_assignment_id: producer_id,
                effect_kind: "review"
@@ -885,7 +896,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
       idempotency_key: nil,
       work_item_id: work_item_id,
       reviews_assignment_id: Keyword.get(options, :reviews_assignment_id),
-      effect_kind: Keyword.get(options, :effect_kind, "code"),
+      mementos: effect_mementos(Keyword.get(options, :effect_kind, "code")),
       files: nil
     }
 
@@ -927,7 +938,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
         idempotency_key: nil,
         work_item_id: work_item_id,
         reviews_assignment_id: nil,
-        effect_kind: "code",
+        mementos: effect_mementos("code"),
         files: nil
       }
     }
@@ -965,6 +976,18 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     })
   end
 
+  defp effect_mementos(value), do: [%{name: "agentic-engineering/effect-kind", value: value}]
+  defp with_effect(call, value), do: put_in(call, [:params, :mementos], effect_mementos(value))
+
+  defp declare_mementos!(base) do
+    File.mkdir_p!(Path.join(base, "identity/kungfu/agentic-engineering"))
+
+    File.cp!(
+      "priv/kungfu/agentic-engineering/manifest.toml",
+      Path.join(base, "identity/kungfu/agentic-engineering/manifest.toml")
+    )
+  end
+
   defp load_delivery_rules!(tmp) do
     rules_dir = Path.join([tmp, "identity", "rules"])
     File.mkdir_p!(rules_dir)
@@ -974,7 +997,8 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
       Path.join(rules_dir, "delivery.toml")
     )
 
-    Rules.load!(tmp, ["spawn", "assign", "dispatch"])
+    declare_mementos!(tmp)
+    Rules.load!(tmp, ["spawn", "assign", "dispatch"], revision: "policy-fixture")
   end
 
   defp work_item_call(principal, work_item_id) do

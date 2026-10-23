@@ -67,7 +67,7 @@ defmodule Tightbeam.Dispatch do
     decision-request host-env-list sentinel-list identity-status kungfu-list harness-processes
     role-list breathing work-item-get work-item-trace transcript execution-map execution-map-select
     toplines topline topline-placement-list work-item-list attests assignment-get assignments inspect
-    harness-health-evidence-other)
+    harness-health-evidence-other mementos)
 
   @db_transaction_diagnostic_fields ~w(
     kind operation origin phase cause reasonCause exception cleanup
@@ -87,7 +87,11 @@ defmodule Tightbeam.Dispatch do
     previous_audited = Process.delete(:tightbeam_dispatch_audited)
 
     try do
+      :ok = Assignments.assert_request_contract!(call)
       dispatch_call(db, handlers, call)
+    rescue
+      error in Tightbeam.Mementos.Refusal ->
+        {:error, error.details || %{code: error.code, message: error.message}}
     after
       if previous_audit,
         do: Process.put(:tightbeam_dispatch_audit, previous_audit),
@@ -180,6 +184,15 @@ defmodule Tightbeam.Dispatch do
   defp bracket_precheck(_db, _call, _verb), do: :proceed
 
   defp dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key, helper?) do
+    case Assignments.legacy_contract(call) do
+      :ok ->
+        :ok
+
+      error ->
+        raise Tightbeam.Mementos.Refusal, code: error.code, message: error.message, details: error
+    end
+
+    call = Tightbeam.Mementos.prepare_call!(call)
     {decision, to_close, to_consume} = Rules.decide(db, call)
 
     decision =
@@ -207,9 +220,7 @@ defmodule Tightbeam.Dispatch do
 
         if statute.name == "completion-requires-review" and verb == "attest" and
              call.params[:kind] == "completion" and review_notice_routed?(outcome) do
-          # A missing review keeps the assignment open, but it does not erase
-          # the holder's completion report. The remedy's notice is stored
-          # before the handler records it.
+          # Keep the holder's completion report while the review is pending.
           dispatch_to_handler(
             db,
             handlers,
@@ -224,6 +235,77 @@ defmodule Tightbeam.Dispatch do
           best_effort_denial(db, verb, origin, principal, session_key, error)
           {:error, error}
         end
+
+      {:escalate, statute, ctx, dr_id} ->
+        outcome =
+          case dr_id do
+            nil -> Escalation.escalate(db, call, statute, Map.put(ctx, :dr_id, nil))
+            id -> {:decision_pending, id}
+          end
+
+        best_effort_denial(db, verb, origin, principal, session_key, ctx.error)
+        outcome
+
+      # A sensor malfunction denies AND summons (§A3). The caller gets the denial it
+      # already got — never `{:decision_pending, _}` — while the escalation engine opens
+      # the request that puts a mind on the sensor. The episode key in `ctx` is what
+      # makes the one-open-request index dedupe on the CONDITION, so a retry loop cannot
+      # storm the engine. The deny is settled FIRST and the summons is `summon/4`, which
+      # cannot raise: the summons is subordinate to the deny (§B3), so an unreachable
+      # mind is a recorded gap and never a crashed call.
+      {:deny_escalate, statute, ctx} ->
+        best_effort_denial(db, verb, origin, principal, session_key, ctx.error)
+        :ok = RailEpisodes.summon(db, call, statute, Map.put(ctx, :dr_id, nil))
+        {:error, ctx.error}
+
+      :allow ->
+        consumed = Enum.map(to_consume, &{&1, Escalation.consume(db, &1, verb, origin)})
+
+        case Enum.find(consumed, fn {_id, won?} -> not won? end) do
+          nil ->
+            dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key)
+
+          {lost_id, false} ->
+            error = %{
+              code: "rule_denied",
+              rule: ruling_statute(db, lost_id),
+              edge: if(Map.get(call, :edge, :verb) == :turn_end, do: "turn-end", else: "verb"),
+              reason: "rule_denied",
+              script_exit_class: nil,
+              ref: gated_ref(call),
+              producer: nil,
+              identity_manifest_sha: Rules.active_identity_manifest_sha(),
+              message: "ruling authorization was no longer available"
+            }
+
+            best_effort_denial(db, verb, origin, principal, session_key, error)
+            {:error, error}
+        end
+    end
+  end
+
+  @doc false
+  def close_rule_effects(db, effects) do
+    Enum.each(effects, &close(db, &1))
+  end
+
+  defp apply_rule_decision(db, handlers, call, decision, to_close, to_consume) do
+    verb = Map.fetch!(call, :verb)
+    origin = Map.fetch!(call, :origin)
+    principal = Map.get(call, :principal)
+    session_key = Map.get(call, :session_key)
+    close_rule_effects(db, to_close)
+
+    case decision do
+      {:deny, error} ->
+        best_effort_denial(db, verb, origin, principal, session_key, error)
+        {:error, error}
+
+      {:remedy, statute, ref, error} ->
+        outcome = RailRemedy.fire(db, handlers, statute, ref, call)
+        error = remedy_error(error, outcome)
+        best_effort_denial(db, verb, origin, principal, session_key, error)
+        {:error, error}
 
       {:escalate, statute, ctx, dr_id} ->
         outcome =
@@ -335,15 +417,20 @@ defmodule Tightbeam.Dispatch do
           end
 
         case invoke_with_audit(handler, handler_call) do
+          {:returned, {:memento_admission, admitted_call, decision, to_close}} ->
+            apply_rule_decision(db, handlers, admitted_call, decision, to_close, [])
+
           {:returned, %{code: _} = error} ->
             # A denial's diagnostic is caller evidence, like a crash's stack below:
             # the audit row and the firehose keep the denial's existing shape.
             recorded = Map.delete(error, :diagnostic)
 
             payload =
-              if verb == "settle-turn",
-                do: outcome_payload(verb, call, {:returned, recorded}),
-                else: recorded
+              cond do
+                verb == "settle-turn" -> outcome_payload(verb, call, {:returned, recorded})
+                is_binary(recorded[:rule]) -> JSON.encode!(recorded)
+                true -> recorded
+              end
 
             :ok =
               append_event_with_handoff(

@@ -16,6 +16,7 @@ defmodule Tightbeam.RestExecutionMapTest do
     LiveBasePayload,
     Schema
   }
+
   alias Tightbeam.Firehose.Hub
   alias Tightbeam.Wire.Router
 
@@ -247,6 +248,7 @@ defmodule Tightbeam.RestExecutionMapTest do
     for seed <- 1..1_000 do
       shuffled = shuffle_execution_map_sets(shuffle_map_order(node, seed), seed)
       shuffled_child = shuffle_execution_map_sets(shuffle_map_order(child, seed), seed)
+
       shuffled_tree =
         Map.put(shuffle_execution_map_sets(shuffle_map_order(node, seed), seed), :children, [
           shuffled_child
@@ -581,6 +583,7 @@ defmodule Tightbeam.RestExecutionMapTest do
        ctx do
     visible = insert_work_item!(ctx.db, "wi_dependency_visible", "owner", 42_000)
     hidden = insert_work_item!(ctx.db, "wi_dependency_hidden", "other", 43_000)
+
     assignment =
       insert_assignment!(ctx.db, "asg_dependency_visible",
         opener_user: "owner",
@@ -606,6 +609,7 @@ defmodule Tightbeam.RestExecutionMapTest do
       assignment,
       1
     )
+
     insert_open_statute_request!(ctx.db, "dr_dependency_visible", assignment)
 
     insert_subagent_marker!(
@@ -699,7 +703,8 @@ defmodule Tightbeam.RestExecutionMapTest do
        fn -> insert_disposition_event!(ctx.db, visible, assignment) end},
       {"causal event epoch",
        fn ->
-         assert {:ok, _rows} = DB.query(ctx.db, "UPDATE causal_events_epoch SET at=at+1 WHERE id=0")
+         assert {:ok, _rows} =
+                  DB.query(ctx.db, "UPDATE causal_events_epoch SET at=at+1 WHERE id=0")
        end}
     ]
 
@@ -1243,7 +1248,9 @@ defmodule Tightbeam.RestExecutionMapTest do
 
   defp shuffle_map_order(value, seed) when is_map(value) do
     value
-    |> Enum.map(fn {key, child} -> {key, shuffle_map_order(child, :erlang.phash2({seed, key}))} end)
+    |> Enum.map(fn {key, child} ->
+      {key, shuffle_map_order(child, :erlang.phash2({seed, key}))}
+    end)
     |> Enum.sort_by(fn {key, _child} -> {:erlang.phash2({seed, key}), key} end)
     |> Map.new()
   end
@@ -1391,7 +1398,11 @@ defmodule Tightbeam.RestExecutionMapTest do
                INSERT INTO causal_events (at, jobRef, assignmentId, kind, detail)
                VALUES (1, ?1, ?2, 'disposition_transition', ?3)
                """,
-               [item_id, assignment_id, JSON.encode!(%{"fromState" => "open", "toState" => "open"})]
+               [
+                 item_id,
+                 assignment_id,
+                 JSON.encode!(%{"fromState" => "open", "toState" => "open"})
+               ]
              )
 
     :ok

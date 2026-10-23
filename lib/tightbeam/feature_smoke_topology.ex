@@ -8,18 +8,19 @@ defmodule Tightbeam.FeatureSmokeTopology do
   def prepare!(call, call_as, work_item_id, coordinator, plan, owner \\ nil) do
     key = get_in(coordinator, ["stream", "sessionKey"]) || coordinator["sessionKey"]
 
+    call.("work-item-update", %{
+      "workItemId" => work_item_id,
+      "deliveryOwnerSessionKey" => owner || key
+    })
+
     assignment =
       call.("assign", %{
         "sessionKey" => key,
         "workItemId" => work_item_id,
         "effectKind" => "coordination",
+        "mementos" => [%{"name" => "agentic-engineering/effect-kind", "value" => "coordination"}],
         "subject" => "Coordinate disposable smoke fixture: " <> plan
       })
-
-    call.("work-item-update", %{
-      "workItemId" => work_item_id,
-      "deliveryOwnerSessionKey" => owner || key
-    })
 
     call_as.(key, "attest", %{
       "assignmentId" => assignment["id"] || assignment["assignmentId"],

@@ -1318,8 +1318,8 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:ok, []} =
              DB.query(
                ctx.db,
-               "INSERT INTO artifacts(artifactId,kind,title,createdBySession,workItemId,originPath,contentSha256,state,createdAt,updatedAt) VALUES(?1,'report','reviewed report',?2,?3,'reports/public-promotion.md',?4,'in-workspace',?5,?5)",
-               [report_id, ctx.outside_session, work_item_id, report_sha, at]
+               "INSERT INTO artifacts(artifactId,kind,title,createdBySession,workItemId,originPath,contentSha256,state,createdAt,updatedAt,producedByAssignmentId) VALUES(?1,'report','reviewed report',?2,?3,'reports/public-promotion.md',?4,'in-workspace',?5,?5,?6)",
+               [report_id, ctx.outside_session, work_item_id, report_sha, at, candidate_id]
              )
 
     assert {:ok, []} =
@@ -1340,6 +1340,9 @@ defmodule Tightbeam.HarnessHealthTest do
                ]
              )
 
+    legacy_attest_id = attest_id
+    legacy_before = DB.query(ctx.db, "SELECT * FROM attests WHERE id=?1", [legacy_attest_id])
+
     unrelated_spec_id = "art_public_promotion_unrelated_spec"
 
     assert {:ok, []} =
@@ -1359,6 +1362,117 @@ defmodule Tightbeam.HarnessHealthTest do
       candidate_commit: candidate_commit,
       idempotency_key: "public-promotion-close"
     }
+
+    policy_base =
+      Path.join(System.tmp_dir!(), "promotion-policy-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(Path.join(policy_base, "identity/rules"))
+    File.mkdir_p!(Path.join(policy_base, "identity/kungfu/agentic-engineering"))
+
+    File.cp!(
+      "priv/kungfu/agentic-engineering/manifest.toml",
+      Path.join(policy_base, "identity/kungfu/agentic-engineering/manifest.toml")
+    )
+
+    File.cp!(
+      "test/fixtures/memento_promotion.toml",
+      Path.join(policy_base, "identity/rules/promotion.toml")
+    )
+
+    previous = Tightbeam.Rules.effective_snapshot()
+
+    candidate =
+      Tightbeam.Rules.prepare!(policy_base, Map.keys(handlers), revision: "promotion-policy")
+
+    active_contract =
+      Map.new(candidate.requested_admission_contract, fn {verb, contract} ->
+        {verb, contract.classification}
+      end)
+
+    :persistent_term.put(Tightbeam.Rules, %{
+      candidate
+      | active_admission_contract: active_contract
+    })
+
+    on_exit(fn ->
+      File.rm_rf!(policy_base)
+      :persistent_term.put(Tightbeam.Rules, previous)
+    end)
+
+    close = fn params ->
+      case Tightbeam.Dispatch.dispatch(ctx.db, handlers, %{
+             verb: "harness-health-close-promotion",
+             origin: "user:flynn",
+             principal: {:user, "flynn"},
+             session_key: nil,
+             params: params
+           }) do
+        {:error, error} -> error
+        {:ok, result} -> result
+      end
+    end
+
+    assert %{code: "invalid_promotion_close"} =
+             close.(%{close_params | review_attest_id: "missing-review"})
+
+    assert %{code: "rule_denied", rule: "promotion-requires-current-review"} =
+             close.(close_params)
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM harness_health_class_promotions WHERE id=?1", [
+               promotion_id
+             ])
+
+    file_review = fn judgment, values ->
+      assert %{attest: filed} =
+               Tightbeam.Assignments.__handle__(ctx.db, "attest", %{
+                 verb: "attest",
+                 origin: "agent:#{ctx.outside_session}",
+                 principal: {:session, ctx.outside_session},
+                 session_key: nil,
+                 params: %{
+                   assignment_id: review_id,
+                   kind: "verdict",
+                   verdict_kind: judgment,
+                   artifact_id: report_id,
+                   content_sha256: report_sha,
+                   mementos:
+                     Enum.map(values, &%{name: "agentic-engineering/evidence-ref", value: &1})
+                 }
+               })
+
+      filed
+    end
+
+    # A later adverse or missing/nonmatching evidence row defeats the old clean
+    # receipt; no semantic filtering can recover a prior passing judgment.
+    for {judgment, values} <- [
+          {"changes-requested", [candidate_commit]},
+          {"reviewed-clean", []},
+          {"reviewed-clean", [second_candidate_commit]}
+        ] do
+      filed = file_review.(judgment, values)
+
+      assert %{code: "rule_denied", rule: "promotion-requires-current-review"} =
+               close.(%{close_params | review_attest_id: filed.id})
+
+      assert %{code: "rule_denied"} = close.(close_params)
+    end
+
+    filed = file_review.("reviewed-clean", [second_candidate_commit, candidate_commit])
+    assert %{code: "invalid_promotion_close"} = close.(close_params)
+    attest_id = filed.id
+    close_params = %{close_params | review_attest_id: attest_id}
+
+    assert %{code: "rule_denied"} =
+             close.(
+               close_params
+               |> Map.put(:candidate_commit, String.duplicate("f", 40))
+               |> Map.put(:comparison_value, candidate_commit)
+             )
+
+    assert %{code: "invalid_promotion_close"} =
+             close.(%{close_params | candidate_commit: "not-a-commit"})
 
     assert %{code: "invalid_promotion_close", message: "invalid_promotion_close"} =
              handlers["harness-health-close-promotion"].(%{
@@ -1424,10 +1538,7 @@ defmodule Tightbeam.HarnessHealthTest do
                reviewAttestId: ^attest_id
              }
            } =
-             handlers["harness-health-close-promotion"].(%{
-               principal: {:user, "flynn"},
-               params: close_params
-             })
+             close.(close_params)
 
     assert %{ok: true, promotion: duplicate} =
              handlers["harness-health-close-promotion"].(%{
@@ -1439,6 +1550,9 @@ defmodule Tightbeam.HarnessHealthTest do
     assert duplicate["state"] == "closed"
     assert duplicate["namedClass"] == "provider-network-drift"
     assert duplicate["reviewAttestId"] == attest_id
+
+    assert DB.query(ctx.db, "SELECT * FROM attests WHERE id=?1", [legacy_attest_id]) ==
+             legacy_before
 
     assert %{code: "idempotency_conflict", message: "idempotency_conflict"} =
              handlers["harness-health-close-promotion"].(%{
@@ -1717,14 +1831,17 @@ defmodule Tightbeam.HarnessHealthTest do
     assert Enum.sort(recovered) == Enum.sort(Enum.map(running, &elem(&1, 2)))
 
     notices =
-      for _ <- 1..2 do
+      for _ <- 1..3 do
         assert_receive {:firehose_notice, notice}
         Hub.delivered(hub, self())
         notice
       end
 
     terminal_notices = Enum.filter(notices, &(&1["class"] == "turn.ended"))
-    assert length(terminal_notices) == 2
+
+    assert length(terminal_notices) == 2,
+           "expected one terminal notice per recovered turn: #{inspect(notices)}"
+
     assert Enum.sort(Enum.map(terminal_notices, & &1["refs"]["turnSeq"])) == Enum.sort(recovered)
 
     for {key, assignment, seq, _queued} <- running do
@@ -1736,7 +1853,18 @@ defmodule Tightbeam.HarnessHealthTest do
     end
 
     # Queued successors keep both sessions running: no public state or version changes.
-    assert Enum.all?(notices, &(&1["class"] == "turn.ended"))
+    assert Enum.count(notices, &(&1["class"] == "wake.scheduled")) == 1
+    assert Enum.count(notices, &(&1["class"] == "turn.ended")) == 2
+
+    assert [
+             %{
+               "payload" => %{
+                 "wakeId" => "w_health_redelivery_parent_1",
+                 "origin" => "health-redelivery-parent"
+               }
+             }
+           ] =
+             Enum.filter(notices, &(&1["class"] == "wake.scheduled"))
 
     assert Map.new(running, fn {key, _, _, _} -> {key, Org.get(ctx.db, key)} end) ==
              before_sessions

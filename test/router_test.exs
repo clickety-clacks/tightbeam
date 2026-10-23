@@ -1861,7 +1861,17 @@ defmodule Tightbeam.Wire.RouterTest do
       })
 
     shared_item = Tightbeam.StateResources.assignment(shared_row)
+    assert shared_item["effectKind"] == "code"
     assert is_binary(Tightbeam.StateResources.encode_item("assignments", shared_item, catalog))
+
+    assert_raise ArgumentError, ~r/assignments.effectKind/, fn ->
+      Tightbeam.StateResources.encode_item(
+        "assignments",
+        Map.put(shared_item, "effectKind", 123),
+        catalog
+      )
+    end
+
     assignment_detail = get_device(core_ctx, ctx.device, "/api/assignments/#{assignment.id}")
     assert assignment_detail.status == 200
 
@@ -1873,6 +1883,20 @@ defmodule Tightbeam.Wire.RouterTest do
     assert public_assignment["workItemId"] == item.id
     assert public_assignment["closedByProcess"] == nil
     assert public_assignment["closingAttestId"] == nil
+    assert public_assignment["effectKind"] == "code"
+
+    # Legacy creation supplies the 0.1.11 default, and historical typed values
+    # remain readable from that same compatibility record.
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignment_effects SET effectKind=?2 WHERE assignmentId=?1",
+               [assignment.id, "policy"]
+             )
+
+    historical = get_device(core_ctx, ctx.device, "/api/assignments/#{assignment.id}")
+    assert historical.status == 200
+    assert JSON.decode!(historical.resp_body)["item"]["effectKind"] == "policy"
 
     broken_ctx = %{
       core_ctx
@@ -3257,6 +3281,159 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert missing.status == 404
     assert JSON.decode!(missing.resp_body)["error"]["code"] == "not_found"
+  end
+
+  test "org-token clients of the same version use the pinned request contract", ctx do
+    alias Tightbeam.Rules
+    writer = create_session(ctx.db, "contract-holder", "flynn")
+    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1000})
+
+    owner = %{
+      principal: {:user, "flynn"},
+      origin: "user:flynn",
+      session_key: nil,
+      target_role: nil,
+      role_fallback: false
+    }
+
+    item =
+      handlers["work-item-create"].(
+        Map.merge(owner, %{
+          verb: "work-item-create",
+          params: %{title: "Request contract"}
+        })
+      )
+
+    assignment =
+      handlers["assign"].(
+        Map.merge(owner, %{
+          verb: "assign",
+          session_key: writer.session_key,
+          params: %{
+            subject: "Contract evidence",
+            work_item_id: item.id
+          }
+        })
+      )
+
+    File.mkdir_p!(Path.join(ctx.base_dir, "identity/kungfu/example"))
+    File.mkdir_p!(Path.join(ctx.base_dir, "identity/rules"))
+
+    File.write!(Path.join(ctx.base_dir, "identity/kungfu/example/manifest.toml"), """
+    [[mementos]]
+    name = "evidence"
+    records = ["attest"]
+    many = true
+    """)
+
+    File.write!(Path.join(ctx.base_dir, "identity/rules/contract.toml"), """
+    [[rule]]
+    name = "required-evidence"
+    verb = "attest"
+    text = "A verdict requires its declared evidence"
+    deny_when = [{fact = "attest.kind", op = "eq", value = "verdict"}]
+    require = [{fact = "call.memento.example/evidence", op = "in", value = ["expected"]}]
+    [[rule]]
+    name = "process-request-policy"
+    verb = "attest"
+    text = "A process cannot file this verdict"
+    deny_when = [{fact = "caller.origin_class", op = "eq", value = "process"}]
+    [[admission_contract]]
+    verb = "attest"
+    classification = "replacement"
+    required_rules = ["required-evidence"]
+    """)
+
+    legacy = Rules.effective_snapshot()
+    candidate = Rules.prepare!(ctx.base_dir, Map.keys(handlers), revision: "contract-candidate")
+    # Host/transport proof on a validated fixture, not a runtime activation.
+    selected = %{candidate | active_admission_contract: %{"attest" => "replacement"}}
+    :persistent_term.put(Rules, selected)
+    parent = self()
+    actual = handlers["attest"]
+
+    wrapped = fn call ->
+      send(parent, {:contract_caller, call.transport_session_key, call.principal})
+      send(parent, {:contract_attempt, call.params[:note]})
+      # A reload during the call must not change its admission contract.
+      :persistent_term.put(Rules, legacy)
+      actual.(call)
+    end
+
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, Map.put(handlers, "attest", wrapped))}
+
+    body = %{
+      verb: "attest",
+      asUser: "flynn",
+      params: %{
+        assignmentId: assignment.id,
+        kind: "verdict",
+        verdictKind: "reviewed-clean",
+        mementos: [%{name: "example/evidence", value: "expected"}]
+      }
+    }
+
+    snapshot = fn ->
+      for table <- ~w(attests memento_current memento_history assignments sessions) do
+        {:ok, rows} = DB.query(ctx.db, "SELECT * FROM " <> table)
+        {table, rows}
+      end
+    end
+
+    before = snapshot.()
+
+    for refs <- [nil, [], "obsolete"] do
+      :persistent_term.put(Rules, selected)
+      obsolete = put_in(body, [:params, :commitRefs], refs)
+      response = dispatch_cli(ctx, "tbc_test", obsolete)
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "legacy_contract_retired"
+      refute_received {:contract_caller, _, _}
+      assert snapshot.() == before
+    end
+
+    :persistent_term.put(Rules, selected)
+    process_body = body |> Map.delete(:asUser) |> Map.put(:asProcess, "batch-client")
+    obsolete_process = put_in(process_body, [:params, :commitRefs], [])
+    response = dispatch_cli(ctx, "tbc_test", obsolete_process)
+    assert JSON.decode!(response.resp_body)["error"]["code"] == "legacy_contract_retired"
+    refute_received {:contract_caller, _, _}
+    assert snapshot.() == before
+    # With the obsolete input removed, the ordinary static policy still applies.
+    process_denied = dispatch_cli(ctx, "tbc_test", process_body)
+    assert JSON.decode!(process_denied.resp_body)["error"]["code"] == "rule_denied"
+    assert snapshot.() == before
+
+    :persistent_term.put(Rules, selected)
+
+    invalid =
+      put_in(body, [:params, :mementos], [%{name: "example/evidence", value: "different"}])
+
+    refused = dispatch_cli(ctx, "tbc_test", invalid)
+    assert JSON.decode!(refused.resp_body)["error"]["code"] == "rule_denied"
+    assert snapshot.() == before
+
+    :persistent_term.put(Rules, selected)
+    accepted = dispatch_cli(ctx, "tbc_test", body)
+    assert accepted.status == 200
+    assert %{"result" => %{"attest" => attest}} = JSON.decode!(accepted.resp_body)
+    assert attest["byUser"] == "flynn"
+    assert attest["commitRefs"] == nil
+    assert_received {:contract_caller, nil, {:user, "flynn"}}
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM attests WHERE assignmentId=?1", [
+               assignment.id
+             ])
+
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM memento_history")
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [assignment.id])
+
+    # Both clients authenticated with exactly dispatch_cli's transport version;
+    # neither version nor attribution supplied an adoption record.
+    assert {:ok, sessions} = DB.query(ctx.db, "SELECT * FROM sessions")
+    assert {"sessions", sessions} in before
   end
 
   test "artifact content fetch authenticates and applies existing artifact visibility without origin paths",

@@ -354,8 +354,7 @@ defmodule Tightbeam.CheckTierTest do
         "assign",
         call("assign", {:user, "flynn"}, %{
           subject: "writing",
-          idempotency_key: nil,
-          effect_kind: "coordination"
+          idempotency_key: nil
         })
         |> Map.merge(%{session_key: "writer", target_role: nil, role_fallback: false})
       )
@@ -404,8 +403,7 @@ defmodule Tightbeam.CheckTierTest do
       "assign",
       call("assign", {:user, "flynn"}, %{
         subject: subject,
-        idempotency_key: nil,
-        effect_kind: "coordination"
+        idempotency_key: nil
       })
       |> Map.merge(%{session_key: "holder", target_role: nil, role_fallback: false})
     )

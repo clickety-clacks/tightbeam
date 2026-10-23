@@ -161,7 +161,7 @@ defmodule Tightbeam.Gateway do
     db = Map.get(config, :db, Tightbeam.DB)
     :ok = DB.assert_base_admitted!(db, config.base_dir)
     Identity.init_after_admission!(config.base_dir, db)
-    load_law!(config)
+    load_law!(Map.put(config, :db, db))
     prod_limit = Map.get(config, :prod_limit, 3)
 
     unless is_integer(prod_limit) and prod_limit >= 0 do
@@ -1249,6 +1249,8 @@ defmodule Tightbeam.Gateway do
       {"role-bind", ["role.bound"]} => fn call -> role_bind_result(db, call) end,
       {"role-rm", ["role.removed"]} => fn call -> role_rm_result(db, call) end,
       {"role-list", []} => fn _call -> role_list_result(db) end,
+      {"memento-set", []} => fn call -> Tightbeam.Mementos.__handle__(db, "memento-set", call) end,
+      {"mementos", []} => fn call -> Tightbeam.Mementos.__handle__(db, "mementos", call) end,
       {"work-item-create", ["work_item.created", "wake.scheduled"]} => fn call ->
         WorkItems.__handle__(
           db,
@@ -2012,16 +2014,35 @@ defmodule Tightbeam.Gateway do
           | {:conflict, map()}
           | :skipped
   def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
-    case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
-      nil ->
-        case NoticeBatcher.carrier_admission_in_txn(txn, opts[:wake_id]) do
-          :ready -> deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts)
-          :skipped -> :skipped
-        end
+    if disposed_prompt_wake_in_txn?(txn, opts[:wake_id]) do
+      :skipped
+    else
+      case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
+        nil ->
+          case NoticeBatcher.carrier_admission_in_txn(txn, opts[:wake_id]) do
+            :ready -> deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts)
+            :skipped -> :skipped
+          end
 
-      duplicate ->
-        duplicate
+        duplicate ->
+          duplicate
+      end
     end
+  end
+
+  defp disposed_prompt_wake_in_txn?(_txn, nil), do: false
+
+  defp disposed_prompt_wake_in_txn?(%DB.Txn{} = txn, wake_id) when is_binary(wake_id) do
+    DB.Txn.q(
+      txn,
+      """
+      SELECT 1
+      FROM wakes w LEFT JOIN assignments a ON a.id=w.assignmentId
+      WHERE w.wakeId=?1 AND w.consumer='prompt'
+        AND (w.state='canceled' OR (w.origin LIKE 'remedy:%' AND a.state='closed'))
+      """,
+      [wake_id]
+    ) == [[1]]
   end
 
   @doc false
@@ -4223,6 +4244,10 @@ defmodule Tightbeam.Gateway do
   end
 
   defp harness_session(config, db, adapter, generation, session, turn_seq) do
+    harness_session_locked(config, db, adapter, generation, session, turn_seq)
+  end
+
+  defp harness_session_locked(config, db, adapter, generation, session, turn_seq) do
     cwd = Placement.holder_workdir(config, session)
     mcp_servers = mcp_servers_for_archetype(session.archetype)
     harness = Harness.parse!(session.harness).id()
@@ -4817,24 +4842,28 @@ defmodule Tightbeam.Gateway do
 
   defp release_identity_unlearn(config, db, call, name, archetypes, prepare) do
     case Org.release_archetypes(db, archetypes, prepare, fn candidate ->
-           case AdminProjection.begin_identity_publication(
-                  db,
-                  Map.fetch!(call, :invocation_id),
-                  candidate,
-                  call.origin
-                ) do
-             {:ok, marker} ->
-               case Identity.publish_live!(config.base_dir, candidate) do
-                 {:ok, revision} ->
-                   load_law!(config)
-                   {:published, marker, revision}
+           with :ok <- preflight_identity_candidate(config, candidate) do
+             case AdminProjection.begin_identity_publication(
+                    db,
+                    Map.fetch!(call, :invocation_id),
+                    candidate,
+                    call.origin
+                  ) do
+               {:ok, marker} ->
+                 case Identity.publish_live!(config.base_dir, candidate) do
+                   {:ok, revision} ->
+                     load_law!(config)
+                     {:published, marker, revision}
 
-                 {:error, error} ->
-                   {:denied, marker, error}
-               end
+                   {:error, error} ->
+                     {:denied, marker, error}
+                 end
 
-             {:error, error} ->
-               {:marker_failed, error}
+               {:error, error} ->
+                 {:marker_failed, error}
+             end
+           else
+             {:error, error} -> {:preflight_failed, error}
            end
          end) do
       {:referenced, references} ->
@@ -4863,6 +4892,9 @@ defmodule Tightbeam.Gateway do
             )
           end)
 
+        error
+
+      {:released, {:preflight_failed, error}} ->
         error
 
       {:released, {:marker_failed, error}} ->
@@ -4902,7 +4934,8 @@ defmodule Tightbeam.Gateway do
   defp publish_identity_candidate(config, db, call, candidate, result) do
     invocation_id = Map.get(call, :invocation_id, "identity-" <> Tightbeam.Id.uuid4())
 
-    with {:ok, marker} <-
+    with :ok <- preflight_identity_candidate(config, candidate),
+         {:ok, marker} <-
            AdminProjection.begin_identity_publication(
              db,
              invocation_id,
@@ -4952,12 +4985,27 @@ defmodule Tightbeam.Gateway do
           end
       end
     else
+      {:error, %{code: code} = error} when is_binary(code) ->
+        error
+
       {:error, error} ->
         ErrorDiagnostic.put(
           %{code: "identity_marker_failed", message: Exception.message(error)},
           marker_failure(error)
         )
     end
+  end
+
+  defp preflight_identity_candidate(config, candidate) do
+    staged = prepare_law!(config, Map.fetch!(candidate, :candidate_revision))
+    Rules.ensure_legacy_snapshot!(staged.policy)
+    :ok
+  rescue
+    error in Tightbeam.Mementos.Refusal ->
+      {:error, error.details || %{code: error.code, message: error.message}}
+
+    error in ArgumentError ->
+      {:error, %{code: "policy_revision_unavailable", message: Exception.message(error)}}
   end
 
   # The transaction already consumed the stack; the exception's type is kept.
@@ -5110,14 +5158,409 @@ defmodule Tightbeam.Gateway do
 
   @doc false
   @spec load_law!(config(), Enumerable.t() | nil) :: [Rules.rule()]
-  def load_law!(config, verbs \\ nil) do
+  def load_law!(config, verbs \\ nil), do: load_law_locked!(config, verbs)
+
+  defp load_law_locked!(config, verbs) do
+    # A crash after publishing the inactive candidate but before activation
+    # leaves the marker and live ref as the recovery evidence. Restore the
+    # previous compatible publication before preparing any law.
+    Identity.recover_compatible_pair!(config.base_dir)
+    decision = Identity.active_policy_decision!(config.base_dir)
+
+    if decision do
+      try do
+        law = prepare_law!(config, decision.record["candidate_revision"], verbs)
+        Rules.install_committed!(law.policy, decision.revision)
+      rescue
+        error ->
+          prior = prepare_law!(config, decision.record["prior_revision"], verbs)
+          Rules.ensure_legacy_snapshot!(prior.policy)
+          Identity.restore_policy_activation!(config.base_dir, decision)
+          Logger.warning("active policy could not be loaded; restored the compatible policy: #{Exception.message(error)}")
+          Rules.restore_compatible!(prior.policy, "rollback:" <> decision.revision)
+      end
+    else
+      revision = Identity.live_revision!(config.base_dir)
+      staged = prepare_law!(config, revision, verbs)
+      Rules.ensure_legacy_snapshot!(staged.policy)
+      Rules.install_legacy!(staged.policy)
+    end
+  end
+
+  @doc false
+  def prepare_law!(config, revision, verbs \\ nil) do
     verbs = verbs || config |> handlers() |> Map.keys()
 
-    Identity.with_recovery_law!(config.base_dir, fn law_base, revision ->
-      Archetypes.load!(law_base)
-      Rails.load!(law_base)
-      Rules.load!(config.base_dir, verbs, law_base: law_base, revision: revision)
+    Identity.with_law_revision!(config.base_dir, revision, fn law_base, resolved ->
+      archetypes = Archetypes.prepare!(law_base)
+      rails = Rails.prepare!(law_base)
+
+      policy =
+        config.base_dir
+        |> Rules.prepare!(verbs, law_base: law_base, revision: resolved)
+        |> Map.put(:law_components, %{Archetypes => archetypes, Rails => rails})
+
+      %{revision: resolved, archetypes: archetypes, rails: rails, policy: policy}
     end)
+  end
+
+  # Retention is a recovery prerequisite, not preflight, readiness or
+  # permission to publish. The eventual coordinator must still assess the
+  # complete prepared state and callers before publication and activation.
+  @doc false
+  def retain_candidate_law!(config, candidate, _principal, verbs \\ nil) do
+    prior = Rules.effective_snapshot()
+    Rules.ensure_legacy_snapshot!(prior)
+
+    unless prior.revision == candidate.expected_prior and
+             prior.revision == Identity.live_revision!(config.base_dir) and
+             Enum.all?(active_law_components(), fn {_, value} -> not is_nil(value) end),
+           do:
+             raise(Tightbeam.Mementos.Refusal,
+               code: "policy_revision_unavailable",
+               message:
+                 "retention requires the prior compatible law to remain active and published"
+             )
+
+    _candidate = prepare_law!(config, candidate.candidate_revision, verbs)
+    Identity.retain_compatible_pair!(config.base_dir, candidate)
+  end
+
+  @inactive_law_key {__MODULE__, :inactive_law}
+
+  # This store is the loaded candidate, not an activation decision. Readback
+  # always checks the current published pointer and the still-active prior law;
+  # the final readiness assessment must repeat it under the writer fence.
+  @doc false
+  def stage_published_law!(config, verbs \\ nil), do: stage_published_law_locked!(config, verbs)
+
+  defp stage_published_law_locked!(config, verbs) do
+    prior = active_law_components()
+
+    if Enum.any?(prior, fn {_component, value} -> is_nil(value) end) do
+      raise Tightbeam.Mementos.Refusal,
+        code: "policy_revision_unavailable",
+        message: "a compatible law must be active before staging its successor"
+    end
+
+    published = Identity.live_revision!(config.base_dir)
+
+    try do
+      law = prepare_law!(config, published, verbs)
+
+      unless Identity.live_revision!(config.base_dir) == law.revision and
+               active_law_components() == prior do
+        raise Tightbeam.Mementos.Refusal,
+          code: "policy_revision_unavailable",
+          message: "published or active law changed while staging policy"
+      end
+
+      staged = %{
+        base_dir: Path.expand(config.base_dir),
+        law: law,
+        prior: prior,
+        core: law_core_identity()
+      }
+
+      :persistent_term.put(@inactive_law_key, staged)
+      staged_law_status!(config)
+    rescue
+      error ->
+        stacktrace = __STACKTRACE__
+        restore_failed_staging!(config, prior, published)
+        reraise error, stacktrace
+    end
+  end
+
+  defp restore_failed_staging!(config, prior, published) do
+    unless active_law_components() == prior do
+      raise Tightbeam.Mementos.Refusal,
+        code: "policy_revision_unavailable",
+        message: "active compatible law changed during failed staging"
+    end
+
+    case Identity.recover_compatible_pair!(config.base_dir, %{
+           expected_prior: prior[Rules].revision,
+           candidate_revision: published
+         }) do
+      :none ->
+        # Without a retained boundary this reader has no authority to move
+        # publication. The original load failure still refuses the candidate.
+        :ok
+
+      %{state: "restored"} ->
+        base = Path.expand(config.base_dir)
+
+        case :persistent_term.get(@inactive_law_key, nil) do
+          %{base_dir: ^base} ->
+            :persistent_term.erase(@inactive_law_key)
+
+          _ ->
+            :ok
+        end
+    end
+  end
+
+  @doc false
+  def staged_law_status!(config), do: staged_law_status_locked!(config)
+
+  defp staged_law_status_locked!(config) do
+    staged = staged_law!(config)
+    policy = staged.law.policy
+
+    %{
+      state: "published_inactive",
+      published_identity_revision: staged.law.revision,
+      loaded_identity_revision: policy.revision,
+      active_identity_revision: staged.prior[Rules].revision,
+      core: staged.core,
+      requested_admission_contract: policy.requested_admission_contract,
+      active_admission_contract: staged.prior[Rules].active_admission_contract,
+      rules: Enum.map(policy.rules, & &1.name) |> Enum.sort(),
+      rule_inventory: Rules.policy_rule_inventory(policy),
+      memento_cutover: Map.get(policy, :memento_cutover),
+      declarations: Map.keys(policy.declarations.names) |> Enum.sort(),
+      unavailable_verbs: Map.keys(policy.unavailable_verbs) |> Enum.sort()
+    }
+  end
+
+  @doc false
+  def staged_law!(config), do: staged_law_locked!(config)
+
+  defp staged_law_locked!(config) do
+    staged = :persistent_term.get(@inactive_law_key, nil)
+
+    unless is_map(staged) and staged.base_dir == Path.expand(config.base_dir) and
+             staged.law.revision == Identity.live_revision!(config.base_dir) and
+             staged.law.policy.revision == staged.law.revision and
+             staged.law.policy.declarations.revision == staged.law.revision and
+             active_law_components() == staged.prior and
+             staged.core == law_core_identity() do
+      raise Tightbeam.Mementos.Refusal,
+        code: "policy_revision_unavailable",
+        message:
+          "inactive policy readback is missing or no longer matches published and active law"
+    end
+
+    staged
+  rescue
+    _error in [ArgumentError, RuntimeError, KeyError] ->
+      raise Tightbeam.Mementos.Refusal,
+        code: "policy_revision_unavailable",
+        message: "inactive policy or published revision could not be read"
+  end
+
+  @preflight_law_key {__MODULE__, :preflight_law}
+
+  # Preflight is deliberately distinct from published readiness. It may check
+  # prepared records against an unpublished candidate, but never grants new
+  # admission or credits callers with adoption.
+  @doc false
+  def preflight_candidate_law!(config, candidate, principal, verbs \\ nil) do
+    case DB.transaction(config.db, fn txn ->
+           prior = Rules.effective_snapshot()
+           Rules.ensure_legacy_snapshot!(prior)
+
+           unless prior.revision == candidate.expected_prior and
+                    Identity.live_revision!(config.base_dir) == candidate.expected_prior,
+                  do:
+                    raise(Tightbeam.Mementos.Refusal,
+                      code: "policy_revision_unavailable",
+                      message: "candidate preflight requires the published compatible pair"
+                    )
+
+           law = prepare_law!(config, candidate.candidate_revision, verbs)
+           policy = Tightbeam.MementoCutover.policy_inventory!(law.policy)
+           census = Tightbeam.MementoCutover.census_in_txn!(txn, law.policy)
+
+           %{
+             phase: :candidate_preflight,
+             candidate: Map.take(candidate, [:expected_prior, :candidate_revision]),
+             core: law_core_identity(),
+             policy_inventory: policy,
+             census: census
+           }
+         end) do
+      {:ok, result} ->
+        retain_candidate_law!(config, candidate, principal, verbs)
+        :persistent_term.put(@preflight_law_key, %{base_dir: config.base_dir, result: result})
+        {:ok, result}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  # Only this internal coordinator consumes a fresh assessment. Returned
+  # readbacks and supplied inventories cannot authorize a snapshot switch.
+  @doc false
+  def activate_staged_law!(config) do
+    expected_stage = staged_law!(config)
+
+    pair = %{
+      expected_prior: expected_stage.prior[Rules].revision,
+      candidate_revision: expected_stage.law.revision
+    }
+
+    DB.fenced_transaction(
+      config.db,
+      fn txn ->
+        unless :persistent_term.get(@preflight_law_key, nil)
+               |> preflight_matches?(config, pair) do
+          raise Tightbeam.Mementos.Refusal,
+            code: "policy_revision_unavailable",
+            message: "activation requires preflight of this exact candidate and core"
+        end
+
+        assess_staged_cutover_in_txn!(config, txn)
+      end,
+      fn {staged, assessment} ->
+        unless staged == expected_stage and staged_law!(config) == staged,
+          do:
+            raise(Tightbeam.Mementos.Refusal,
+              code: "policy_revision_unavailable",
+              message: "loaded pair changed during activation assessment"
+            )
+
+        decision = Identity.commit_policy_activation!(config.base_dir, pair, assessment)
+        Rules.install_committed!(staged.law.policy, decision.revision)
+        :persistent_term.erase(@inactive_law_key)
+        :persistent_term.erase(@preflight_law_key)
+
+        %{
+          state: "active",
+          identity_revision: staged.law.revision,
+          activation_generation: decision.revision,
+          assessment: assessment
+        }
+      end,
+      fn error ->
+        restore_failed_activation!(config, expected_stage, pair)
+        error
+      end
+    )
+  end
+
+  defp preflight_matches?(%{base_dir: base, result: result}, config, pair),
+    do:
+      base == config.base_dir and result.candidate == pair and result.core == law_core_identity()
+
+  defp preflight_matches?(_, _, _), do: false
+
+  defp restore_failed_activation!(config, staged, pair) do
+    case Identity.active_policy_decision!(config.base_dir) do
+      nil ->
+        unless active_law_components() == staged.prior,
+          do:
+            raise(Tightbeam.Mementos.Refusal,
+              code: "policy_revision_unavailable",
+              message: "failed activation no longer has its prior compatible law"
+            )
+
+        Identity.recover_compatible_pair!(config.base_dir, pair)
+
+      decision ->
+        unless decision.record["prior_revision"] == pair.expected_prior and
+                 decision.record["candidate_revision"] == pair.candidate_revision,
+               do:
+                 raise(Tightbeam.Mementos.Refusal,
+                   code: "policy_revision_unavailable",
+                   message: "failed activation differs from the committed pair"
+                 )
+
+        Identity.restore_policy_activation!(config.base_dir, decision)
+        Rules.restore_compatible!(staged.prior[Rules], "rollback:" <> decision.revision)
+    end
+
+    :persistent_term.erase(@inactive_law_key)
+    :persistent_term.erase(@preflight_law_key)
+  end
+
+  # One fenced readback of loaded policy, prepared records, and the supported
+  # identity-status inventory. The complete active-session superset must have
+  # adopted the candidate; stateless clients are checked on each request. This
+  # remains checked state, not an activation token. No returned map can switch admission.
+  @doc false
+  def staged_cutover_state!(config) do
+    case DB.transaction(config.db, &assess_staged_cutover_in_txn!(config, &1)) do
+      {:ok, {staged, state}} ->
+        unless staged_law!(config) == staged do
+          raise Tightbeam.Mementos.Refusal,
+            code: "policy_revision_unavailable",
+            message: "staged law changed during cutover state assessment"
+        end
+
+        {:ok, state}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  defp assess_staged_cutover_in_txn!(config, txn) do
+    staged = staged_law!(config)
+
+    unless staged.core == law_core_identity() do
+      raise Tightbeam.Mementos.Refusal,
+        code: "policy_revision_unavailable",
+        message: "cutover assessment requires the compatible core revision"
+    end
+
+    policy_inventory = Tightbeam.MementoCutover.policy_inventory!(staged.law.policy)
+    census = Tightbeam.MementoCutover.census_in_txn!(txn, staged.law.policy)
+    callers = caller_identity_inventory_in_txn!(config, txn, staged.law.revision)
+    assert_caller_adoption!(callers, staged.law.revision)
+
+    state = %{
+      phase: :published_inactive_assessment,
+      published_identity_revision: staged.law.revision,
+      loaded_identity_revision: staged.law.policy.revision,
+      prior_identity_revision: staged.prior[Rules].revision,
+      core: staged.core,
+      policy_inventory: policy_inventory,
+      census: census,
+      caller_inventory: callers
+    }
+
+    {staged, state}
+  end
+
+  @doc false
+  def restore_staged_law!(config) do
+    staged = staged_law!(config)
+    prior = staged.prior[Rules].revision
+
+    case Identity.restore_live!(config.base_dir, %{
+           candidate_revision: staged.law.revision,
+           expected_prior: prior
+         }) do
+      {:ok, ^prior} ->
+        _ = Identity.recover_compatible_pair!(config.base_dir)
+        :persistent_term.erase(@inactive_law_key)
+        %{state: "restored", live_revision: prior, active_identity_revision: prior}
+
+      {:error, reason} ->
+        raise Tightbeam.Mementos.Refusal,
+          code: "policy_revision_unavailable",
+          message: "previous compatible publication could not be restored",
+          details: %{code: "policy_revision_unavailable", restoration: reason}
+    end
+  end
+
+  defp law_core_identity do
+    %{
+      "build" => Tightbeam.BuildStamp.build(),
+      "sha" => Tightbeam.BuildStamp.sha()
+    }
+  end
+
+  defp active_law_components do
+    policy = :persistent_term.get(Rules, nil)
+
+    case policy do
+      %{law_components: components} -> Map.put(components, Rules, policy)
+      _ -> Map.new([Archetypes, Rails, Rules], &{&1, :persistent_term.get(&1, nil)})
+    end
   end
 
   defp identity_status_result(config, db, call) do
@@ -5127,43 +5570,7 @@ defmodule Tightbeam.Gateway do
     sessions =
       db
       |> Org.list_for_user("", true)
-      |> Enum.map(fn session ->
-        harness = Harness.parse!(session.harness).id()
-        expected = complete_session_snapshot(config, session, harness, live)
-
-        reasons =
-          [
-            if(
-              is_nil(session.identity_render_contract) or
-                is_nil(session.identity_guidance_digest),
-              do: "missing_render_stamp"
-            ),
-            if(session.identity_revision != live, do: "revision_mismatch"),
-            if(
-              not is_nil(session.identity_render_contract) and
-                session.identity_render_contract != expected.render_contract,
-              do: "contract_mismatch"
-            ),
-            if(
-              not is_nil(session.identity_guidance_digest) and
-                session.identity_guidance_digest != expected.guidance_digest,
-              do: "guidance_digest_mismatch"
-            )
-          ]
-          |> Enum.reject(&is_nil/1)
-
-        %{
-          session_key: session.session_key,
-          identity_revision: session.identity_revision,
-          identity_render_contract: session.identity_render_contract,
-          identity_guidance_digest: session.identity_guidance_digest,
-          expected_identity_revision: live,
-          expected_render_contract: expected.render_contract,
-          expected_guidance_digest: expected.guidance_digest,
-          identity_stale: reasons != [],
-          identity_stale_reasons: reasons
-        }
-      end)
+      |> Enum.map(&identity_session_status(config, &1, live))
 
     guidance =
       case call.params[:archetype] do
@@ -5180,6 +5587,136 @@ defmodule Tightbeam.Gateway do
     identity
     |> Map.put(:sessions, sessions)
     |> maybe_put_guidance(guidance)
+  end
+
+  # Every active session is the authoritative superset for cutover. Stateless
+  # org-token clients have no session inventory: their adoption boundary is the
+  # active snapshot's request validation, never a reported CLI version.
+  @doc false
+  def caller_identity_inventory_in_txn!(config, %DB.Txn{} = txn, revision) do
+    unless Identity.live_revision!(config.base_dir) == revision do
+      raise Tightbeam.Mementos.Refusal,
+        code: "policy_revision_unavailable",
+        message: "published revision differs from the caller inventory target"
+    end
+
+    callers =
+      DB.Txn.q(txn, "SELECT sessionKey FROM sessions WHERE state='active' ORDER BY sessionKey")
+      |> Enum.map(fn [key] ->
+        try do
+          session = Org.get_in_txn(txn, key)
+
+          row = %{session_key: key}
+
+          {cutover_session_revision_status(session, revision), row}
+        rescue
+          error ->
+            raise Tightbeam.Mementos.Refusal,
+              code: "policy_revision_unavailable",
+              message: "caller identity cannot be read for #{key}",
+              details: %{
+                code: "policy_revision_unavailable",
+                session_key: key,
+                reason: inspect(error.__struct__)
+              }
+        end
+      end)
+
+    unless Identity.live_revision!(config.base_dir) == revision do
+      raise Tightbeam.Mementos.Refusal,
+        code: "policy_revision_unavailable",
+        message: "published revision changed during caller inventory"
+    end
+
+    {sessions, rows} = Enum.unzip(callers)
+
+    %{
+      scope: "active_sessions",
+      published_identity_revision: revision,
+      sessions: sessions,
+      session_rows: rows,
+      session_count: length(sessions),
+      stateless_callers: %{
+        scope: "org_token",
+        population: "not_individually_enumerable",
+        adoption_boundary: "same_snapshot_request_admission"
+      },
+      stale_session_keys:
+        for(session <- sessions, session.identity_stale, do: session.session_key)
+    }
+  end
+
+  defp assert_caller_adoption!(inventory, revision) do
+    blockers =
+      Enum.reject(inventory.sessions, fn session ->
+        session.identity_revision == revision and
+          session.expected_identity_revision == revision and
+          session.identity_stale == false and session.identity_stale_reasons == []
+      end)
+
+    unless blockers == [] do
+      raise Tightbeam.Mementos.Refusal,
+        code: "policy_revision_unavailable",
+        message: "active sessions have not adopted the candidate identity",
+        details: %{
+          code: "policy_revision_unavailable",
+          published_identity_revision: revision,
+          stale_session_keys: Enum.map(blockers, & &1.session_key),
+          sessions: blockers
+        }
+    end
+
+    :ok
+  end
+
+  defp identity_session_status(config, session, live) do
+    harness = Harness.parse!(session.harness).id()
+    expected = complete_session_snapshot(config, session, harness, live)
+
+    reasons =
+      [
+        if(
+          is_nil(session.identity_render_contract) or
+            is_nil(session.identity_guidance_digest),
+          do: "missing_render_stamp"
+        ),
+        if(session.identity_revision != live, do: "revision_mismatch"),
+        if(
+          not is_nil(session.identity_render_contract) and
+            session.identity_render_contract != expected.render_contract,
+          do: "contract_mismatch"
+        ),
+        if(
+          not is_nil(session.identity_guidance_digest) and
+            session.identity_guidance_digest != expected.guidance_digest,
+          do: "guidance_digest_mismatch"
+        )
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    %{
+      session_key: session.session_key,
+      identity_revision: session.identity_revision,
+      identity_render_contract: session.identity_render_contract,
+      identity_guidance_digest: session.identity_guidance_digest,
+      expected_identity_revision: live,
+      expected_render_contract: expected.render_contract,
+      expected_guidance_digest: expected.guidance_digest,
+      identity_stale: reasons != [],
+      identity_stale_reasons: reasons
+    }
+  end
+
+  defp cutover_session_revision_status(session, revision) do
+    reasons = if session.identity_revision == revision, do: [], else: ["revision_mismatch"]
+
+    %{
+      session_key: session.session_key,
+      identity_revision: session.identity_revision,
+      expected_identity_revision: revision,
+      identity_stale: reasons != [],
+      identity_stale_reasons: reasons
+    }
   end
 
   defp maybe_put_guidance(status, nil), do: status
@@ -5238,23 +5775,7 @@ defmodule Tightbeam.Gateway do
   defp identity_apply_session_result(config, db, session, revision) do
     result =
       with_session_mutation_lock(session.session_key, fn ->
-        Identity.with_live_revision_lock(config.base_dir, fn current_revision ->
-          if current_revision == revision do
-            identity_apply_session_at_revision(config, db, session, revision)
-          else
-            %{
-              session_key: session.session_key,
-              outcome: "superseded",
-              files: "not_started",
-              stamp: "not_committed",
-              prompt_enqueue: "not_attempted",
-              prompt_delivery: "not_started",
-              reread: "unconfirmed",
-              stream_update: "not_attempted",
-              current_identity_revision: current_revision
-            }
-          end
-        end)
+        identity_apply_session_at_revision(config, db, session, revision)
       end)
 
     if is_map(result),
@@ -7783,52 +8304,7 @@ defmodule Tightbeam.Gateway do
         end
 
       p[:setting] == "set_host" and is_binary(p[:host]) ->
-        case Org.get(db, call.session_key) do
-          nil ->
-            %{ok: false, code: "not_found"}
-
-          session ->
-            archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
-
-            case Placement.resolve(archetype, p.host, Placement.hosts(config.base_dir, db)) do
-              {:error, denial} ->
-                Map.put(denial, :ok, false)
-
-              {:ok, host} ->
-                harness = Harness.parse!(session.harness).id()
-
-                case Spinup.ensure_ready(
-                       config,
-                       harness,
-                       host,
-                       spinup_opts(config, db, session.harness, host, session.model)
-                     ) do
-                  {:error, denial} ->
-                    denial
-
-                  :ok ->
-                    case Placement.move_workdir(config, call.session_key, session.host, host) do
-                      :ok ->
-                        case commit_host_rearm(config, db, session, host, 8) do
-                          :ok ->
-                            %{ok: true, host: host}
-
-                          {:error, reason} ->
-                            ErrorDiagnostic.put(
-                              %{
-                                code: "workspace_move_race",
-                                message: ErrorDiagnostic.classified(reason)
-                              },
-                              ErrorDiagnostic.of(reason)
-                            )
-                        end
-
-                      {:error, message} ->
-                        %{code: "workdir_move_failed", message: message}
-                    end
-                end
-            end
-        end
+        move_session_host(config, db, call)
 
       p[:setting] == "remove_override" ->
         remove_override_result(config, db, call)
@@ -8209,7 +8685,20 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp apply_harness_change(
+  defp apply_harness_change(config, db, call, session, harness, harness_atom, model, provider) do
+    apply_harness_change_locked(
+      config,
+      db,
+      call,
+      session,
+      harness,
+      harness_atom,
+      model,
+      provider
+    )
+  end
+
+  defp apply_harness_change_locked(
          config,
          db,
          call,
@@ -8768,6 +9257,10 @@ defmodule Tightbeam.Gateway do
   end
 
   defp apply_tuned_model(config, db, session, new_ref, provider, principal) do
+    apply_tuned_model_locked(config, db, session, new_ref, provider, principal)
+  end
+
+  defp apply_tuned_model_locked(config, db, session, new_ref, provider, principal) do
     case Org.current_pointer(db, session.session_key) do
       nil ->
         prepare_initial_tuned_model(config, db, session, new_ref, provider, principal)
@@ -9576,6 +10069,10 @@ defmodule Tightbeam.Gateway do
   end
 
   defp remove_override_result(config, db, call) do
+    remove_override_locked(config, db, call)
+  end
+
+  defp remove_override_locked(config, db, call) do
     p = call.params
 
     with %{} = session <- Org.get(db, call.session_key),
@@ -10109,6 +10606,59 @@ defmodule Tightbeam.Gateway do
 
   defp describe_engine(harness, nil), do: "#{harness}"
   defp describe_engine(harness, model), do: "#{harness} (#{Model.describe(model)})"
+
+  # Workspace movement changes the caller's residence before its row commit.
+  # Retain the caller lease through both the external copy and effort rearming.
+  defp move_session_host(config, db, call) do
+    p = call.params
+
+    case Org.get(db, call.session_key) do
+      nil ->
+        %{ok: false, code: "not_found"}
+
+      session ->
+        archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
+
+        case Placement.resolve(archetype, p.host, Placement.hosts(config.base_dir, db)) do
+          {:error, denial} ->
+            Map.put(denial, :ok, false)
+
+          {:ok, host} ->
+            harness = Harness.parse!(session.harness).id()
+
+            case Spinup.ensure_ready(
+                   config,
+                   harness,
+                   host,
+                   spinup_opts(config, db, session.harness, host, session.model)
+                 ) do
+              {:error, denial} ->
+                denial
+
+              :ok ->
+                case Placement.move_workdir(config, call.session_key, session.host, host) do
+                  :ok ->
+                    case commit_host_rearm(config, db, session, host, 8) do
+                      :ok ->
+                        %{ok: true, host: host}
+
+                      {:error, reason} ->
+                        ErrorDiagnostic.put(
+                          %{
+                            code: "workspace_move_race",
+                            message: ErrorDiagnostic.classified(reason)
+                          },
+                          ErrorDiagnostic.of(reason)
+                        )
+                    end
+
+                  {:error, message} ->
+                    %{code: "workdir_move_failed", message: message}
+                end
+            end
+        end
+    end
+  end
 
   defp commit_host_rearm(_config, _db, _session, _host, 0),
     do: {:error, "holder assignments kept changing while the workspace moved"}

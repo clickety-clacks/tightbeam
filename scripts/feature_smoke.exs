@@ -34,7 +34,7 @@
 # "A REAL AGENT WALKS THE GATES" was proven in the field, not dropped. Both legs
 # did the whole lifecycle autonomously and honestly on 2026-07-30 — claude
 # 11:19:56 open → 11:20:48 verified → 11:21:02 recorded → 11:21:07 closed, codex
-# the same shape at 12:09–12:12, landing art_0f26ec21 tool-call-observed with a
+# the same shape at 12:09–12:12, landing a tool-call-observed edge with a
 # non-null edge. Driving that chain through a scripted holder is what the split
 # gives up, because a capable holder finishes it before any scripted denial can
 # fire; the shared gate-chain check retains the substrate half once per invocation,
@@ -531,15 +531,15 @@ defmodule FeatureSmoke do
   # rather than relocated. Those two field runs ARE the "a real agent walks the gates"
   # evidence, and they are stronger than the scripted version was: both holders verified
   # with grounded notes of their own, recorded over the real CLI — codex landed
-  # art_0f26ec21 `tool-call-observed` with a non-null edge, which is the R7 datum itself —
+  # `tool-call-observed` with a non-null edge, which is the R7 datum itself —
   # and completed, autonomously and honestly, on both harnesses. What remains under
   # assertion every run is the substrate half, in `check_carrier_on_real_turn/1` below,
   # which accepts the holder completing its own assignment as the legitimate outcome it is
   # rather than as a race to be suppressed.
   #
-  # What this half proves is the LAW: each statute denies while its fact is unsatisfied,
-  # in order, and the artifact releases the last one. An org carrying the eb0ea2b
-  # workaround still fails at the third denial, so falsifiability is untouched.
+  # The static artifact gate denies first. Dynamic completion then requires both
+  # independent review and holder verification over the same opaque evidence.
+  # Each refusal is correlated to the exact request and named rule.
   #
   # WHY THE HOLDER CANNOT QUIETLY LEAK INTO THIS, stated so it can be attacked rather than
   # trusted. The verification and artifact statutes both remedy by WAKING the holder, so a
@@ -611,7 +611,8 @@ defmodule FeatureSmoke do
       post_as(state, holder.token, "attest", %{
         "assignmentId" => asg_id,
         "kind" => "completion",
-        "commitRefs" => holder.check.commit_refs
+        "commitRefs" => holder.check.commit_refs,
+        "mementos" => holder.check.evidence_mementos
       })
     end
 
@@ -621,189 +622,18 @@ defmodule FeatureSmoke do
       ok_as!(state, holder.token, "attest", %{
         "assignmentId" => asg_id,
         "kind" => "verdict",
-        "verdictKind" => "tests-passed",
+        "verdictKind" => "verified",
+        "commitRefs" => holder.check.commit_refs,
         "note" =>
           "Operator-executed disposable fixture #{inspect(holder.check.commit_refs)}: " <>
             holder.check.note
       })
 
-      # The code-completion guard needs matching producer verification before the
-      # review statute can keep its pending completion and notify the accountable owner.
-      matching_verification =
-        sqlite(
-          state,
-          "SELECT count(*) FROM (SELECT verdictKind,commitRefs FROM attests " <>
-            "WHERE assignmentId = #{sql_quote(asg_id)} AND kind = 'verdict' " <>
-            "AND bySession = #{sql_quote(holder.key)} " <>
-            "AND verdictKind IN ('verified','verification-failed') " <>
-            "ORDER BY ts DESC,rowid DESC LIMIT 1) " <>
-            "WHERE verdictKind = 'verified' AND commitRefs = " <>
-            "#{sql_quote(JSON.encode!(holder.check.commit_refs))}"
-        )
+      # The static artifact gate precedes dynamic review admission.
+      denied!(state, "completion-requires-results-artifact", asg_id, complete)
+      await_episode_status!(state, "completion-requires-results-artifact", asg_id, "live")
 
-      if matching_verification == "0" do
-        verified =
-          post_as(state, holder.token, "attest", %{
-            "assignmentId" => asg_id,
-            "kind" => "verdict",
-            "verdictKind" => "verified",
-            "commitRefs" => holder.check.commit_refs,
-            "note" => holder.check.note
-          })
-
-        assert(
-          state,
-          not (is_map(verified) and Map.has_key?(verified, "error")),
-          "gate chain: the holder-token verified verdict failed: #{inspect(verified)}"
-        )
-      end
-
-      # 1. Review gate. The current statute records an accountable notice rather
-      # than opening an automatic remedy episode or staffing a reviewer. The
-      # completion remains pending until its owner directs a matching review.
-      review_request = complete.()
-
-      assert(
-        state,
-        not (is_map(review_request) and Map.has_key?(review_request, "error")),
-        "gate chain: completion-requires-review did not route the pending completion: " <>
-          "#{inspect(review_request)}"
-      )
-
-      review_notice_count =
-        sqlite(
-          state,
-          "SELECT count(*) FROM wakes WHERE assignmentId = #{sql_quote(asg_id)} " <>
-            "AND origin = 'remedy:completion-requires-review'"
-        )
-
-      assert(
-        state,
-        review_notice_count == "1",
-        "gate chain: completion-requires-review should store one accountable notice, " <>
-          "found #{review_notice_count}"
-      )
-
-      review_episode_count =
-        sqlite(
-          state,
-          "SELECT count(*) FROM rail_remedy_episodes WHERE statute = " <>
-            "'completion-requires-review' AND subject = #{sql_quote(asg_id)}"
-        )
-
-      assert(
-        state,
-        review_episode_count == "0",
-        "gate chain: completion-requires-review notice should not create an automatic " <>
-          "remedy episode, found #{review_episode_count}"
-      )
-
-      pending = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
-
-      assert(
-        state,
-        pending["state"] == "open",
-        "gate chain: review-pending completion should leave #{asg_id} open, got " <>
-          "#{inspect(pending["state"])}"
-      )
-
-      reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
-
-      review =
-        (reviews["assignments"] || reviews)
-        |> List.wrap()
-        |> Enum.find(fn a -> (a["reviewsAssignmentId"] || a["reviews"]) == asg_id end)
-
-      review =
-        review ||
-          ok!(state, "assign", %{
-            "sessionKey" => reviewer_key,
-            "workItemId" => wi_id,
-            "reviews" => asg_id,
-            "subject" => "Review exact disposable check #{holder.check.name}"
-          })
-
-      # Review the actual tiny fixture before filing its scripted conclusion. This
-      # proves the review gate's wire/provenance behavior, not independent inference.
-      # Changed bytes or output refuse; no product source review is manufactured.
-      review_note = Tightbeam.FeatureSmokeTopology.review_check!(holder.check)
-
-      v =
-        post_as(state, reviewer_tok, "attest", %{
-          "assignmentId" => review["id"] || review["assignmentId"],
-          "kind" => "verdict",
-          "verdictKind" => "reviewed-clean",
-          "commitRefs" => holder.check.commit_refs,
-          "note" => review_note
-        })
-
-      assert(
-        state,
-        not (is_map(v) and Map.has_key?(v, "error")),
-        "gate chain: reviewed-clean from the #{reviewer_leg.wire_name} reviewer failed: #{inspect(v)}"
-      )
-
-      code_final = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
-
-      assert(
-        state,
-        code_final["state"] == "closed" and code_final["outcome"] == "completed",
-        "gate chain: matching code evidence and review should complete #{asg_id}, got " <>
-          "state=#{inspect(code_final["state"])} outcome=#{inspect(code_final["outcome"])}"
-      )
-
-      # Verification and artifact statutes are tested on a separate coder-held
-      # evidence assignment so their rule paths remain reachable after the code
-      # completion's review remedy has settled.
-      gate_assignment =
-        ok!(state, "assign", %{
-          "sessionKey" => holder.key,
-          "subject" => "completion verification and artifact gates #{u}",
-          "workItemId" => wi_id,
-          "effectKind" => "evidence",
-          "idempotencyKey" => "gate-evidence-#{u}"
-        })
-
-      gate_asg_id = gate_assignment["id"] || gate_assignment["assignmentId"]
-
-      complete_gate = fn ->
-        post_as(state, holder.token, "attest", %{
-          "assignmentId" => gate_asg_id,
-          "kind" => "completion"
-        })
-      end
-
-      # 2. Verification gate. This assignment is not a code completion, so the
-      # code-evidence guard cannot mask the statute being exercised here.
-      denied!(state, "completion-requires-verification", gate_asg_id, complete_gate)
-
-      verified_gate =
-        post_as(state, holder.token, "attest", %{
-          "assignmentId" => gate_asg_id,
-          "kind" => "verdict",
-          "verdictKind" => "verified",
-          "commitRefs" => holder.check.commit_refs,
-          "note" => holder.check.note
-        })
-
-      assert(
-        state,
-        not (is_map(verified_gate) and Map.has_key?(verified_gate, "error")),
-        "gate chain: the holder-token gate-assignment verification failed: " <>
-          "#{inspect(verified_gate)}"
-      )
-
-      # 3. The artifact gate.
-      denied!(state, "completion-requires-results-artifact", gate_asg_id, complete_gate)
-
-      await_episode_status!(
-        state,
-        "completion-requires-results-artifact",
-        gate_asg_id,
-        "live"
-      )
-
-      # 4. The report, recorded BY THE OPERATOR over HTTP on the holder's own token — and
+      # The report, recorded BY THE OPERATOR over HTTP on the holder's own token — and
       # its WEAKER evidence class is an assertion here rather than a compromise.
       #
       # No hook can observe an HTTP call, so this row cannot read `tool-call-observed`.
@@ -854,15 +684,74 @@ defmodule FeatureSmoke do
           "the carrier proof in the other half of this group. Row: #{inspect(recorded)}"
       )
 
-      # 5. Release. The verification and artifact gates denied in order; with a
-      # report on record — a WEAK one — completion passes.
-      done = complete_gate.()
-      final = ok!(state, "assignment-get", %{"assignmentId" => gate_asg_id})
+      # Review gate. Current rules notify the accountable owner; the fixture variant
+      # rules assign the bound reviewer. Either way the denial must remain real.
+      denied!(state, "completion-requires-review", asg_id, complete)
+
+      reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
+
+      review =
+        (reviews["assignments"] || reviews)
+        |> List.wrap()
+        |> Enum.find(fn a -> (a["reviewsAssignmentId"] || a["reviews"]) == asg_id end)
+
+      review =
+        review ||
+          ok!(state, "assign", %{
+            "sessionKey" => reviewer_key,
+            "workItemId" => wi_id,
+            "reviews" => asg_id,
+            "subject" => "Review exact disposable check #{holder.check.name}"
+          })
+
+      # Review the actual tiny fixture before filing its scripted conclusion. This
+      # proves the review gate's wire/provenance behavior, not independent inference.
+      # Changed bytes or output refuse; no product source review is manufactured.
+      review_note = Tightbeam.FeatureSmokeTopology.review_check!(holder.check)
+
+      v =
+        post_as(state, reviewer_tok, "attest", %{
+          "assignmentId" => review["id"] || review["assignmentId"],
+          "kind" => "verdict",
+          "verdictKind" => "reviewed-clean",
+          "commitRefs" => holder.check.commit_refs,
+          "mementos" => holder.check.evidence_mementos,
+          "note" => review_note
+        })
+
+      assert(
+        state,
+        not (is_map(v) and Map.has_key?(v, "error")),
+        "gate chain: reviewed-clean from the #{reviewer_leg.wire_name} reviewer failed: #{inspect(v)}"
+      )
+
+      # Linked review alone cannot satisfy the combined holder-verification requirement.
+      denied!(state, "completion-requires-review", asg_id, complete)
+
+      verified =
+        post_as(state, holder.token, "attest", %{
+          "assignmentId" => asg_id,
+          "kind" => "verdict",
+          "verdictKind" => "verified",
+          "commitRefs" => holder.check.commit_refs,
+          "mementos" => holder.check.evidence_mementos,
+          "note" => holder.check.note
+        })
+
+      assert(
+        state,
+        not (is_map(verified) and Map.has_key?(verified, "error")),
+        "gate chain: the holder-token verified verdict failed: #{inspect(verified)}"
+      )
+
+      # With the report, holder verification and matching independent review, completion passes.
+      done = complete.()
+      final = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
 
       assert(
         state,
         final["state"] == "closed" and final["outcome"] == "completed",
-        "gate chain: with a report recorded, completion should close #{gate_asg_id} " <>
+        "gate chain: with a report recorded, completion should close #{asg_id} " <>
           "as completed; " <>
           "assignment reads state=#{inspect(final["state"])} outcome=#{inspect(final["outcome"])} " <>
           "(attest returned #{inspect(done)})"
@@ -871,7 +760,7 @@ defmodule FeatureSmoke do
       await_episode_status!(
         state,
         "completion-requires-results-artifact",
-        gate_asg_id,
+        asg_id,
         "closed"
       )
 
@@ -888,7 +777,7 @@ defmodule FeatureSmoke do
       # `startedAt` IS NOT THE LINE EITHER, and the field disproved it before it ever ran.
       # The operator's row above came back `session-concurrent`, and that class is returned
       # only when `Ledger.running_turn_message_id/2` finds a turn at `status = 'running'` —
-      # the same UPDATE that writes `startedAt`. So on the run that produced art_d968e72a a
+      # the same UPDATE that writes `startedAt`. So on that run a
       # turn was ALREADY running, and an assertion on `startedAt` would have failed a group
       # that was otherwise behaving exactly as designed.
       #
@@ -955,10 +844,9 @@ defmodule FeatureSmoke do
 
       pass(
         state,
-        "gate chain enforced: review(#{reviewer_leg.wire_name}) routed with matching code evidence; " <>
-          "verification → artifact denied on the coder-held evidence task, released by a " <>
-          "#{recorded["recordedTurnEvidence"]} row (gate is evidence-blind, classes not spoofable), " <>
-          "completes, episode closed — holder: " <>
+        "gate chain enforced: artifact → review(#{reviewer_leg.wire_name}) → holder verification " <>
+          "denied in order; #{recorded["recordedTurnEvidence"]} report accepted (artifact gate is " <>
+          "evidence-blind, classes not spoofable); matching judgments complete the card — holder: " <>
           "#{materialized} turn(s) materialized, #{started} started"
       )
     after
@@ -1193,6 +1081,8 @@ defmodule FeatureSmoke do
         "subject" => "run #{check.name} and record its output — #{subject}",
         "workItemId" => wi_id,
         "files" => [check.name],
+        "effectKind" => "code",
+        "mementos" => [%{"name" => "agentic-engineering/effect-kind", "value" => "code"}],
         "idempotencyKey" => "#{tag}as-#{u}"
       })
 
@@ -1302,6 +1192,11 @@ defmodule FeatureSmoke do
       name: name,
       path: path,
       commit_refs: refs,
+      evidence_mementos:
+        Enum.map(
+          refs,
+          &%{"name" => "agentic-engineering/evidence-ref", "value" => JSON.encode!(&1)}
+        ),
       output: output,
       source: File.read!(path),
       note:
@@ -2123,7 +2018,7 @@ defmodule FeatureSmoke do
   # Run the smoke gateway with TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=2500. The check-in
   # deadline shares this setting, and 250 is too short for the parent to rule. The child is never prompted by this probe; its unavailable/idle
   # workdir is adjudicated only by the opening user.
-  defp check_effort_without_effect(state) do
+  defp check_effort_without_effect(state, opts \\ []) do
     u = unique()
 
     parent =
@@ -2179,6 +2074,10 @@ defmodule FeatureSmoke do
       is_binary(first_id),
       "effort dispatch returned no assignment: #{inspect(first)}"
     )
+
+    if callback = Keyword.get(opts, :after_first_dispatch) do
+      callback.(%{first_id: first_id})
+    end
 
     request1 = await_effort_request!(parent_state, first_id, nil)
     request1_id = request1["id"]

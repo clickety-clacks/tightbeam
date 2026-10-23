@@ -472,6 +472,45 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     _rumination_turn = finish_next_turn!(db, "effect-dispatcher", "lane:effects")
 
+    policy_base =
+      Path.join(System.tmp_dir!(), "publisher-policy-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(Path.join(policy_base, "identity/rules"))
+    File.mkdir_p!(Path.join(policy_base, "identity/kungfu/agentic-engineering"))
+
+    File.cp!(
+      "priv/kungfu/agentic-engineering/manifest.toml",
+      Path.join(policy_base, "identity/kungfu/agentic-engineering/manifest.toml")
+    )
+
+    File.write!(Path.join(policy_base, "identity/rules/evidence.toml"), """
+    [[rule]]
+    name = "publisher-evidence-required"
+    verb = "attest"
+    effect = "deny"
+    external_producer = true
+    text = "Completion requires matching holder and independent review evidence."
+    deny_when = [{ fact = "attest.kind", op = "eq", value = "completion" }]
+    require = [
+      { fact = "assignment.latest_holder_verdict.judgment_kind", op = "eq", value = "verified" },
+      { fact = "assignment.latest_holder_verdict.has_memento.agentic-engineering/evidence-ref", op = "eq", value = true },
+      { fact = "assignment.latest_holder_verdict.memento_matches_call.agentic-engineering/evidence-ref", op = "eq", value = true },
+      { fact = "assignment.latest_linked_review.judgment_kind", op = "eq", value = "reviewed-clean" },
+      { fact = "assignment.latest_linked_review.independent", op = "eq", value = true },
+      { fact = "assignment.latest_linked_review.has_memento.agentic-engineering/evidence-ref", op = "eq", value = true },
+      { fact = "assignment.latest_linked_review.memento_matches_call.agentic-engineering/evidence-ref", op = "eq", value = true },
+    ]
+    """)
+
+    Tightbeam.Rules.load!(policy_base, Map.keys(handlers), revision: "publisher-policy")
+
+    on_exit(fn ->
+      File.rm_rf!(policy_base)
+      :persistent_term.erase(Tightbeam.Rules)
+    end)
+
+    evidence = [%{name: "agentic-engineering/evidence-ref", value: "publisher-source"}]
+
     tests_passed = %{
       verb: "attest",
       origin: "agent:effect-target",
@@ -545,7 +584,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
       origin: "agent:effect-target",
       principal: {:session, "effect-target"},
       session_key: nil,
-      params: %{assignment_id: assignment.id, kind: "completion", note: "effect matrix complete"}
+      params: %{
+        assignment_id: assignment.id,
+        kind: "completion",
+        note: "effect matrix complete",
+        mementos: evidence
+      }
     }
 
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
@@ -600,7 +644,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
           assignment_id: review.id,
           kind: "verdict",
           verdict_kind: "reviewed-clean",
-          commit_refs: refs,
+          mementos: evidence,
           note: "Synthetic review fixture"
         }
     }
@@ -611,12 +655,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
     verified =
       tests_passed
       |> put_in([:params, :verdict_kind], "verified")
-      |> put_in([:params, :commit_refs], refs)
+      |> put_in([:params, :mementos], evidence)
 
     assert {:ok, %{attest: %{verdictKind: "verified"}}} =
              Dispatch.dispatch(db, handlers, verified)
-
-    completion = put_in(completion, [:params, :commit_refs], refs)
 
     assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
              Dispatch.dispatch(db, handlers, completion)

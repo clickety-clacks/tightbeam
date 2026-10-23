@@ -9,14 +9,26 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     DeliveryResponsibilities,
     Dispatch,
     Gateway,
-    Identity,
     Roles,
     Rules,
     SessionPoAssociations,
     WorkItems
   }
 
-  setup do
+  @round_count_rule """
+    [[rule]]
+    name = "round-count-probe"
+    verb = "attest"
+    text = "synthetic fact probe: refuse after two recorded conclusions"
+    edges = ["verb"]
+    effect = "deny"
+    deny_when = [
+      { fact = "attest.kind", op = "eq", value = "verdict" },
+      { fact = "assignment.review_verdict_count", op = "gte", value = 2 },
+    ]
+  """
+
+  setup ctx do
     db = :"spirit_opportunity_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
@@ -55,11 +67,16 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
       )
 
     assert :initialized = Archetypes.init_identity!(base_dir)
-    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "flynn")
     _archetypes = Archetypes.load!(base_dir)
 
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-    rules = Rules.load!(base_dir, Map.keys(handlers))
+
+    extra_rules =
+      if Map.get(ctx, :round_count_probe, false),
+        do: [{"round-count-probe.toml", @round_count_rule}],
+        else: []
+
+    rules = Tightbeam.ShippedPolicyFixture.learn_engineering!(db, base_dir, handlers, extra_rules)
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
@@ -118,27 +135,9 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
 
   # This synthetic rule exercises the still-supported engine fact. It is test
   # policy only, not a shipped round limit or a required review workflow.
+  @tag round_count_probe: true
   test "assignment.review_verdict_count counts conclusions through the rules engine", ctx do
-    rules_dir = Path.join(ctx.base_dir, "identity/rules")
-    File.mkdir_p!(rules_dir)
-
-    File.write!(Path.join(rules_dir, "round-count-probe.toml"), """
-    [[rule]]
-    name = "round-count-probe"
-    verb = "attest"
-    text = "synthetic fact probe: refuse after two recorded conclusions"
-    edges = ["verb"]
-    effect = "deny"
-    deny_when = [
-      { fact = "attest.kind", op = "eq", value = "verdict" },
-      { fact = "assignment.review_verdict_count", op = "gte", value = 2 },
-    ]
-    """)
-
-    assert "round-count-probe" in Enum.map(
-             Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)),
-             & &1.name
-           )
+    assert "round-count-probe" in Enum.map(ctx.rules, & &1.name)
 
     item = work_item(ctx)
 
@@ -150,7 +149,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
         "evidence under review"
       )
 
-    call = put_in(call, [:params, :effect_kind], "evidence")
+    call = put_in(call, [:params, :mementos], effect_mementos("evidence"))
     assert {:ok, subject} = dispatch_after_rumination(ctx, call)
 
     for round <- 1..3 do
@@ -219,7 +218,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
         params: %{
           subject: "return topology",
           work_item_id: item.id,
-          effect_kind: "coordination"
+          mementos: effect_mementos("coordination")
         }
       })
 
@@ -258,6 +257,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
              })
   end
 
+  defp effect_mementos(value), do: [%{name: "agentic-engineering/effect-kind", value: value}]
+
   defp user_assign_call(holder_key, item_id, subject, options) do
     %{
       verb: "assign",
@@ -269,7 +270,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
       params: %{
         subject: subject,
         work_item_id: item_id,
-        effect_kind: options[:effect_kind],
+        mementos: effect_mementos(options[:effect_kind] || "code"),
         reviews_assignment_id: options[:reviews_assignment_id]
       }
     }
@@ -283,7 +284,12 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
-      params: %{subject: subject, brief: "Implement #{subject}.", work_item_id: item_id}
+      params: %{
+        subject: subject,
+        brief: "Implement #{subject}.",
+        work_item_id: item_id,
+        mementos: effect_mementos("code")
+      }
     }
   end
 

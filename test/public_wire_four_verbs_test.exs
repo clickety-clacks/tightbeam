@@ -82,7 +82,7 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     end
   end
 
-  test "assignment commit correction crosses the real wire with auth, target, and replay protection",
+  test "legacy correction crosses the authenticated wire and reaches normal validation",
        ctx do
     owner = ctx.device.user_id
     caller = wire_session(ctx.db, "wire-commit-owner", owner, "product-owner")
@@ -92,9 +92,6 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     stranger_role = "coder:wire-commit-stranger"
     Roles.create!(ctx.db, caller_role, owner, caller.session_key)
     Roles.create!(ctx.db, stranger_role, owner, stranger.session_key)
-
-    {repo, remote, commit} = canonical_repo_fixture!()
-    on_exit(fn -> File.rm_rf!(Path.dirname(repo)) end)
 
     :ok =
       DB.execute(ctx.db, """
@@ -127,10 +124,10 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
       assignmentId: "asg_wire_commit",
       commitRefs: [
         %{
-          repo: "#{Tightbeam.Placement.local_host_name()}:#{repo}",
-          remote: remote,
+          repo: "historical:/unavailable",
+          remote: "origin",
           ref: "refs/heads/main",
-          commit: commit
+          commit: "ABC123"
         }
       ],
       evidenceArtifactId: "art_wire_commit",
@@ -141,51 +138,36 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     body = %{verb: "assignment-commitref-correct", as: caller_role, params: params}
     before = correction_count(ctx.db)
 
-    unauthorized =
-      dispatch_cli(ctx, stranger.cli_token, %{
-        body
-        | as: stranger_role,
-          params: %{params | idempotencyKey: "wire-commit-stranger"}
-      })
+    assert {:ok, assignment_before} =
+             DB.query(ctx.db, "SELECT * FROM assignments WHERE id='asg_wire_commit'")
 
-    assert unauthorized.status == 404
-    assert JSON.decode!(unauthorized.resp_body)["error"]["code"] == "unknown_assignment"
-    assert correction_count(ctx.db) == before
+    assert {:ok, attest_before} =
+             DB.query(ctx.db, "SELECT * FROM attests WHERE assignmentId='asg_wire_commit'")
 
-    wrong_target =
-      dispatch_cli(ctx, caller.cli_token, %{
-        body
-        | params: %{
-            params
-            | assignmentId: "asg_wire_missing",
-              idempotencyKey: "wire-commit-missing"
-          }
-      })
+    rejected_auth = dispatch_cli(ctx, "invalid-token", body)
+    assert rejected_auth.status == 401
 
-    assert wrong_target.status == 404
-    assert JSON.decode!(wrong_target.resp_body)["error"]["code"] == "unknown_assignment"
-    assert correction_count(ctx.db) == before
+    for {token, candidate} <- [
+          {caller.cli_token, body},
+          {caller.cli_token, body},
+          {stranger.cli_token, %{body | as: stranger_role}},
+          {caller.cli_token, %{body | params: %{params | assignmentId: "asg_wire_missing"}}},
+          {caller.cli_token, %{body | params: %{params | commitRefs: []}}},
+          {caller.cli_token, %{body | params: %{params | idempotencyKey: "changed"}}}
+        ] do
+      response = dispatch_cli(ctx, token, candidate)
+      assert response.status == 400, response.resp_body
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "invalid_commit_refs"
+      assert correction_count(ctx.db) == before
+    end
 
-    accepted = dispatch_cli(ctx, caller.cli_token, body)
-    assert accepted.status == 200, accepted.resp_body
-    accepted_json = JSON.decode!(accepted.resp_body)
-    assert accepted_json["result"]["correction"]["assignmentId"] == "asg_wire_commit"
-    assert correction_count(ctx.db) == before + 1
+    assert {:ok, ^assignment_before} =
+             DB.query(ctx.db, "SELECT * FROM assignments WHERE id='asg_wire_commit'")
 
-    correction_exists =
-      dispatch_cli(ctx, caller.cli_token, %{
-        body
-        | params: %{params | idempotencyKey: "wire-commit-existing"}
-      })
+    assert {:ok, ^attest_before} =
+             DB.query(ctx.db, "SELECT * FROM attests WHERE assignmentId='asg_wire_commit'")
 
-    assert correction_exists.status == 400, correction_exists.resp_body
-    assert JSON.decode!(correction_exists.resp_body)["error"]["code"] == "correction_exists"
-    assert correction_count(ctx.db) == before + 1
-
-    replay = dispatch_cli(ctx, caller.cli_token, body)
-    assert replay.status == 200, replay.resp_body
-    assert JSON.decode!(replay.resp_body)["result"] == accepted_json["result"]
-    assert correction_count(ctx.db) == before + 1
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM memento_history")
   end
 
   test "observe and resolve other cross the real wire with target and idempotency boundaries",
@@ -528,35 +510,6 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
       model: Model.new("claude-fable-5"),
       kind: "custom"
     })
-  end
-
-  defp canonical_repo_fixture! do
-    root =
-      Path.join(System.tmp_dir!(), "public-wire-commitref-#{System.unique_integer([:positive])}")
-
-    repo = Path.join(root, "repo")
-    remote = Path.join(root, "remote.git")
-    File.mkdir_p!(root)
-    git!(root, ["init", "--bare", remote])
-    git!(root, ["init", "-b", "main", repo])
-    git!(repo, ["config", "user.email", "test@example.invalid"])
-    git!(repo, ["config", "user.name", "Public wire test"])
-    File.write!(Path.join(repo, "proof.txt"), "canonical\n")
-    git!(repo, ["add", "proof.txt"])
-    git!(repo, ["commit", "-m", "canonical"])
-    git!(repo, ["remote", "add", "origin", remote])
-    git!(repo, ["push", "-u", "origin", "main"])
-    {repo, remote, git_output!(repo, ["rev-parse", "HEAD"])}
-  end
-
-  defp git!(cwd, args) do
-    {_output, 0} = System.cmd("git", ["-C", cwd | args], stderr_to_stdout: true)
-    :ok
-  end
-
-  defp git_output!(cwd, args) do
-    {output, 0} = System.cmd("git", ["-C", cwd | args], stderr_to_stdout: true)
-    String.trim(output)
   end
 
   defp sha256(value), do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)

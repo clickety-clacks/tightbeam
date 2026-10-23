@@ -627,20 +627,21 @@ defmodule Tightbeam.ConformanceSupport do
     end
   end
 
-  defp run_rule_case(fixture, kase, handlers, base) do
+  defp run_rule_case(fixture, kase, _handlers, base) do
     {db, pid} = memory_db!()
+    handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
 
     try do
       ids = materialize_world(db, Map.get(kase, "world", %{}))
       assert_fixture_world(fixture, kase, db, ids)
       seed_script_checkout!(base, fixture, kase, db)
-      call = build_call(kase["call"], ids) |> fixture_refs_for(fixture)
+      call = build_call(kase["call"], ids)
 
       assert_rule_result(
         kase["case"],
         kase["expect"],
         expected_denial(kase),
-        Rules.evaluate(db, call),
+        evaluate_fixture_rule(db, call, fixture),
         timeout_ctx(db, fixture)
       )
 
@@ -676,13 +677,13 @@ defmodule Tightbeam.ConformanceSupport do
         ids = materialize_world(db, Map.get(phase2, "world", %{}), ids)
 
         phase2_call =
-          build_call(phase2["call"] || kase["call"], ids) |> fixture_refs_for(fixture)
+          build_call(phase2["call"] || kase["call"], ids)
 
         assert_rule_result(
           "#{kase["case"]} phase2",
           phase2["expect"] || kase["expect"],
           expected_denial(kase),
-          Rules.evaluate(db, phase2_call),
+          evaluate_fixture_rule(db, phase2_call, fixture),
           timeout_ctx(db, fixture)
         )
       end
@@ -874,7 +875,7 @@ defmodule Tightbeam.ConformanceSupport do
           Rules.load!(base, Map.keys(Gateway.handlers(%{})))
         end)
 
-      unavailable = :persistent_term.get({Rules, :unavailable_verbs})
+      unavailable = Rules.effective_snapshot().unavailable_verbs
 
       case loadset["outcome"] do
         "load-clean" ->
@@ -911,7 +912,9 @@ defmodule Tightbeam.ConformanceSupport do
           ids = materialize_world(db, Map.get(kase, "world", %{}))
           seed_script_checkout!(base, fixture, kase, db)
           call = build_call(kase["call"], ids)
-          {decision, _to_close, _to_consume} = Rules.decide(db, call)
+
+          {decision, _to_close, _to_consume} =
+            decide_fixture_rule(db, sweep_call(fixture, call), fixture)
 
           case {kase["expect"], self_wake?(db, call)} do
             {"run-remedy", _} ->
@@ -1559,8 +1562,9 @@ defmodule Tightbeam.ConformanceSupport do
                  Escalation.rule(db, escalation_rule_call(request_id, "allow"), authorized: true)
 
         {:ok, _} = DB.query(db, "UPDATE users SET isAdmin=1 WHERE userId='owner'")
-        [escalate_rule | _] = :persistent_term.get(Rules)
-        :persistent_term.put(Rules, [escalate_rule, escalate_rule])
+        snapshot = Rules.effective_snapshot()
+        [escalate_rule | _] = snapshot.rules
+        :persistent_term.put(Rules, %{snapshot | rules: [escalate_rule, escalate_rule]})
 
         assert {:error, %{code: "rule_denied", rule: rule}} =
                  Dispatch.dispatch(
@@ -1758,8 +1762,7 @@ defmodule Tightbeam.ConformanceSupport do
               idempotency_key: nil,
               reviews_assignment_id: assignment_ids[assignment["reviews"]],
               work_item_id: work_items[assignment["work_item"]],
-              files: assignment["files"],
-              effect_kind: assignment["effect_kind"] || "policy"
+              files: assignment["files"]
             }
           })
 
@@ -1774,21 +1777,11 @@ defmodule Tightbeam.ConformanceSupport do
 
       assignment_id = assignments[attest["assignment"]]
 
-      {:ok, [[reviews_assignment_id]]} =
-        DB.query(db, "SELECT reviewsAssignmentId FROM assignments WHERE id=?1", [assignment_id])
-
       params = %{
         assignment_id: assignment_id,
         kind: attest["kind"],
         verdict_kind: attest["verdict_kind"]
       }
-
-      params =
-        if attest["kind"] == "verdict" and
-             (reviews_assignment_id ||
-                attest["verdict_kind"] in ["verified", "verification-failed"]),
-           do: Map.put(params, :commit_refs, fixture_refs()),
-           else: params
 
       result =
         Assignments.__handle__(db, "attest", %{
@@ -2056,6 +2049,9 @@ defmodule Tightbeam.ConformanceSupport do
     assert status == 0, "git #{Enum.join(args, " ")} failed: #{output}"
   end
 
+  defp sweep_call(%{"class" => "C7"}, call), do: Map.put(call, :edge, :turn_end)
+  defp sweep_call(_fixture, call), do: call
+
   defp self_wake?(db, %{principal: {:session, session_key}}),
     do: Wakes.self_pending_count(db, session_key) > 0
 
@@ -2092,7 +2088,7 @@ defmodule Tightbeam.ConformanceSupport do
         target_role: nil,
         role_fallback: false,
         supervision_interval_ms: 1_000,
-        params: %{subject: subject, idempotency_key: nil, effect_kind: "policy"}
+        params: %{subject: subject, idempotency_key: nil}
       })
 
     assert is_binary(result.id)
@@ -2113,19 +2109,11 @@ defmodule Tightbeam.ConformanceSupport do
   defp await_catalog!(_harness, 0), do: flunk("model catalog did not become fresh")
 
   defp attest_verdict!(db, assignment_id, by_session, verdict_kind) do
-    {:ok, [[reviews_assignment_id]]} =
-      DB.query(db, "SELECT reviewsAssignmentId FROM assignments WHERE id=?1", [assignment_id])
-
     params = %{
       assignment_id: assignment_id,
       kind: "verdict",
       verdict_kind: verdict_kind
     }
-
-    params =
-      if reviews_assignment_id,
-        do: Map.put(params, :commit_refs, fixture_refs()),
-        else: params
 
     result =
       Assignments.__handle__(db, "attest", %{
@@ -2240,30 +2228,33 @@ defmodule Tightbeam.ConformanceSupport do
   defp atomize(list) when is_list(list), do: Enum.map(list, &atomize/1)
   defp atomize(value), do: value
 
-  defp fixture_refs_for(call, %{"class" => "C4"}) do
-    if call.verb == "attest" and call.params[:kind] == "completion",
-      do: put_in(call, [:params, :commit_refs], fixture_refs()),
-      else: call
+  defp decide_fixture_rule(db, call, fixture) do
+    if Enum.any?(fixture["rule"], &(Map.get(&1, "require", []) != [])) do
+      {:ok, decision} =
+        DB.transaction(db, fn txn ->
+          Rules.decide(txn, Map.put(call, :memento_admission, :write))
+        end)
+
+      decision
+    else
+      Rules.decide(db, call)
+    end
   end
 
-  defp fixture_refs_for(call, _fixture), do: call
+  defp evaluate_fixture_rule(db, call, %{"class" => "C4"}) do
+    # Dynamic selector predicates run at the same transaction boundary as admission.
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        Rules.evaluate(txn, Map.put(call, :memento_admission, :write))
+      end)
 
-  defp fixture_refs do
-    repo = Path.expand("..", __DIR__)
-    {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
-
-    [
-      %{
-        "repo" => "#{Placement.local_host_name()}:#{repo}",
-        "commit" => String.trim(commit)
-      }
-    ]
+    result
   end
+
+  defp evaluate_fixture_rule(db, call, _fixture), do: Rules.evaluate(db, call)
 
   defp serialize_rules(rules) do
     Enum.map_join(rules, "\n", fn rule ->
-      conditions = Enum.map_join(Map.get(rule, "deny_when", []), ",\n  ", &toml_inline/1)
-
       base = """
       [[rule]]
       name = #{toml_value(rule["name"])}
@@ -2272,13 +2263,18 @@ defmodule Tightbeam.ConformanceSupport do
       external_producer = #{toml_value(Map.get(rule, "external_producer", false))}
       #{optional_toml("edges", rule["edges"])}
       #{optional_toml("effect", rule["effect"])}
-      deny_when = [
-        #{conditions}
-      ]
+      #{serialize_conditions("deny_when", rule["deny_when"])}
+      #{serialize_conditions("require", rule["require"])}
       """
 
       base <> serialize_check(rule["check"]) <> serialize_remedy(rule["remedy"])
     end)
+  end
+
+  defp serialize_conditions(_name, conditions) when conditions in [nil, []], do: ""
+
+  defp serialize_conditions(name, conditions) do
+    name <> " = [" <> Enum.map_join(conditions, ", ", &toml_inline/1) <> "]"
   end
 
   defp serialize_check(nil), do: ""

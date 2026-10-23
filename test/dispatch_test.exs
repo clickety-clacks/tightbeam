@@ -519,7 +519,12 @@ defmodule Tightbeam.DispatchTest do
       identity_manifest_sha: "identity-sha"
     }
 
-    :persistent_term.put(Rules, [rule, rule])
+    :persistent_term.put(Rules, %{
+      Rules.effective_snapshot()
+      | rules: [rule, rule],
+        revision: "identity-sha"
+    })
+
     action_key = Escalation.digest(call)
 
     {:ok, _} =

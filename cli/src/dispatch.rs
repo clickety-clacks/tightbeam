@@ -73,6 +73,19 @@ impl Endpoint {
     }
 }
 
+fn append_mementos(params: &mut Vec<String>, entries: &[(String, String)]) {
+    if !entries.is_empty() {
+        let values: Vec<_> = entries
+            .iter()
+            .map(|(name, value)| serde_json::json!({"name": name, "value": value}))
+            .collect();
+        params.push(format!(
+            "\"mementos\":{}",
+            serde_json::to_string(&values).expect("memento strings")
+        ));
+    }
+}
+
 fn quoted(value: &str) -> String {
     serde_json::to_string(value).expect("strings are always JSON serializable")
 }
@@ -625,6 +638,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             effect_kind,
             files,
             succeeds,
+            mementos,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -653,6 +667,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = succeeds {
                 params.push(string_field("succeedsAssignmentId", value));
             }
+            append_mementos(&mut params, mementos);
             Ok(request(identity, "assign", vec![target], params))
         }
         Command::Dispatch {
@@ -665,6 +680,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             brief,
             idempotency_key,
             succeeds,
+            mementos,
         } => {
             let mut params = vec![
                 string_field("subject", subject),
@@ -685,6 +701,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = succeeds {
                 params.push(string_field("succeedsAssignmentId", value));
             }
+            append_mementos(&mut params, mementos);
             Ok(request(
                 identity,
                 "dispatch",
@@ -938,6 +955,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             spec_ref_sha256,
             priority,
             idempotency_key,
+            mementos,
         } => {
             let mut params = vec![string_field("title", title)];
             if let Some(value) = spec_ref_name {
@@ -952,6 +970,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
             }
+            append_mementos(&mut params, mementos);
             Ok(request(identity, "work-item-create", vec![], params))
         }
         Command::WorkItemHandoff {
@@ -1218,6 +1237,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             release_fact_kind,
             release_fact_scope,
             release_fact_principal_ref,
+            mementos,
         } => {
             let mut params = vec![
                 string_field("assignmentId", assignment_id),
@@ -1253,7 +1273,49 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = release_fact_principal_ref {
                 params.push(string_field("releaseFactPrincipalRef", value));
             }
+            append_mementos(&mut params, mementos);
             Ok(request(identity, "attest", vec![], params))
+        }
+        Command::MementoSet {
+            identity,
+            record,
+            name,
+            values,
+            clear,
+        } => {
+            let mut params = vec![string_field("record", record), string_field("name", name)];
+            if *clear {
+                params.push("\"clear\":true".to_owned());
+            } else {
+                params.push(format!(
+                    "\"values\":{}",
+                    serde_json::to_string(values).expect("string list")
+                ));
+            }
+            Ok(request(identity, "memento-set", vec![], params))
+        }
+        Command::Mementos {
+            identity,
+            record,
+            history,
+            name,
+            limit,
+            cursor,
+        } => {
+            let mut params = vec![string_field("record", record)];
+            if *history {
+                params.push("\"history\":true".to_owned());
+            }
+            if let Some(value) = name {
+                params.push(string_field("name", value));
+            }
+            if let Some(value) = limit {
+                params.push(format!("\"limit\":{value}"));
+            }
+            if let Some(value) = cursor {
+                params.push(string_field("cursor", value));
+            }
+            Ok(request(identity, "mementos", vec![], params))
         }
         Command::Attests {
             identity,
@@ -1646,7 +1708,7 @@ pub fn build_onboard_phase_request(
 
 /// Build a `wake --user <owner>` request carrying the onboarding sign-in prompt, so the
 /// operator who cannot see the ceremony's terminal still receives the URL+code. The wake
-/// row IS the durable record of the delivery (wi_0535922b) -- it persists in the substrate
+/// row IS the durable record of the delivery -- it persists in the substrate
 /// with the code text, the target, and timestamps.
 ///
 /// `userId` is a target field and `prompt` a param, exactly as `Command::Wake` builds them.
@@ -3613,6 +3675,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemClose { identity, .. }
         | Command::WorkItemFail { identity, .. }
         | Command::Attest { identity, .. }
+        | Command::MementoSet { identity, .. }
+        | Command::Mementos { identity, .. }
         | Command::Attests { identity, .. }
         | Command::AssignmentGet { identity, .. }
         | Command::Assignments { identity, .. }
@@ -4651,14 +4715,14 @@ mod tests {
                 "wi_1",
                 "--reviews",
                 "asg_parent",
-                "--effect-kind",
-                "policy",
+                "--memento",
+                "agentic-engineering/effect-kind=policy",
                 "--files",
                 "[\"lib/a.ex\",\"test/a_test.exs\"]",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem","workItemId":"wi_1","reviews":"asg_parent","effectKind":"policy","files":["lib/a.ex","test/a_test.exs"]}}"#
+            r#"{"asUser":"flynn","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem","workItemId":"wi_1","reviews":"asg_parent","files":["lib/a.ex","test/a_test.exs"],"mementos":[{"name":"agentic-engineering/effect-kind","value":"policy"}]}}"#
         );
         assert_eq!(
             body(&[
@@ -4671,8 +4735,8 @@ mod tests {
                 "Please ship it.",
                 "--work-item",
                 "wi_1",
-                "--effect-kind",
-                "release",
+                "--memento",
+                "agentic-engineering/effect-kind=release",
                 "--workdir-root",
                 "checkout",
                 "--key",
@@ -4680,7 +4744,7 @@ mod tests {
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","effectKind":"release","workdirRoot":"checkout","idempotencyKey":"idem"}}"#
+            r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","workdirRoot":"checkout","idempotencyKey":"idem","mementos":[{"name":"agentic-engineering/effect-kind","value":"release"}]}}"#
         );
 
         assert_eq!(
@@ -4796,22 +4860,13 @@ mod tests {
             ]),
             r#"{"as":"parent","verb":"reopen-assignment","params":{"assignmentId":"asg_1","reason":"continue work"}}"#
         );
-        assert_eq!(
-            body(&[
-                "assignment-commitref-correct",
-                "asg_1",
-                "--commit-refs",
-                r#"[{"repo":"gibson:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
-                "--evidence",
-                "art_1",
-                "--reason",
-                "canonical historical backfill",
-                "--key",
-                "backfill-1",
-                "--as",
-                "parent",
-            ]),
-            r#"{"as":"parent","verb":"assignment-commitref-correct","params":{"assignmentId":"asg_1","commitRefs":[{"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"refs/heads/main","remote":"git@example/repo","repo":"gibson:/repo"}],"reason":"canonical historical backfill","evidenceArtifactId":"art_1","idempotencyKey":"backfill-1"}}"#
+        assert!(
+            args::parse(vec![
+                "assignment-commitref-correct".to_owned(),
+                "asg_1".to_owned()
+            ])
+            .unwrap_err()
+            .starts_with("legacy_contract_retired:")
         );
         assert_eq!(
             body(&[
@@ -4903,12 +4958,12 @@ mod tests {
                 "asg_1",
                 "--kind",
                 "completion",
-                "--commit-refs",
-                r#"[{"repo":"eezo:/src/repo","commit":"abc123"}]"#,
+                "--memento",
+                "agentic-engineering/evidence-ref=result:abc123",
                 "--as",
                 "builder",
             ]),
-            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","commitRefs":[{"commit":"abc123","repo":"eezo:/src/repo"}]}}"#
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","mementos":[{"name":"agentic-engineering/evidence-ref","value":"result:abc123"}]}}"#
         );
     }
 
@@ -4940,6 +4995,94 @@ mod tests {
             ]),
             r#"{"asUser":"flynn","verb":"work-item-handoff","params":{"title":"Ship","deliveryOwnerSessionKey":"agent:owner","brief":"Take delivery."}}"#
         );
+    }
+
+    #[test]
+    fn ruling_consumed_receipt_keeps_its_target_bookkeeping() {
+        assert_eq!(
+            body(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "verdict",
+                "--verdict",
+                "ruling-consumed:00000000-0000-4000-8000-000000000000",
+                "--commit-refs",
+                r#"[{"repo":"example/repo","commit":"abc123"}]"#
+            ]),
+            r#"{"verb":"attest","params":{"assignmentId":"asg_1","kind":"verdict","verdictKind":"ruling-consumed:00000000-0000-4000-8000-000000000000","commitRefs":[{"commit":"abc123","repo":"example/repo"}]}}"#
+        );
+    }
+
+    #[test]
+    fn memento_commands_preserve_repeated_values_and_inline_order() {
+        let parsed: serde_json::Value = serde_json::from_str(&body(&[
+            "memento-set",
+            "--record",
+            "assignment:a",
+            "--name",
+            "example/opaque",
+            "--value",
+            "PR 12, merged",
+            "--value",
+            "a=b",
+            "--as-user",
+            "owner",
+        ]))
+        .unwrap();
+        assert_eq!(parsed["verb"], "memento-set");
+        assert_eq!(
+            parsed["params"]["values"],
+            serde_json::json!(["PR 12, merged", "a=b"])
+        );
+        let clear: serde_json::Value = serde_json::from_str(&body(&[
+            "memento-set",
+            "--record",
+            "assignment:a",
+            "--name",
+            "example/opaque",
+            "--clear",
+        ]))
+        .unwrap();
+        assert_eq!(clear["params"]["clear"], true);
+        assert!(clear["params"].get("values").is_none());
+        let inline: serde_json::Value = serde_json::from_str(&body(&[
+            "attest",
+            "a",
+            "--kind",
+            "verdict",
+            "--verdict",
+            "verified",
+            "--memento",
+            "example/reference=b",
+            "--memento",
+            "example/reference=a=b",
+        ]))
+        .unwrap();
+        assert_eq!(
+            inline["params"]["mementos"],
+            serde_json::json!([
+                {"name":"example/reference","value":"b"},
+                {"name":"example/reference","value":"a=b"}
+            ])
+        );
+        let page: serde_json::Value = serde_json::from_str(&body(&[
+            "mementos",
+            "--record",
+            "assignment:a",
+            "--history",
+            "--limit",
+            "25",
+            "--cursor",
+            "opaque",
+        ]))
+        .unwrap();
+        assert_eq!(page["params"]["limit"], 25);
+        assert_eq!(page["params"]["cursor"], "opaque");
+    }
+
+    #[test]
+    fn builds_byte_exact_work_item_bodies() {
         assert_eq!(
             body(&[
                 "work-item-update",

@@ -18,10 +18,11 @@ defmodule Tightbeam.GuardRuntimeFixture do
 
   # Assemble once so process-boundary tests can launch the same immutable
   # payload twice. This prepares arguments only; it starts no process or DB.
-  def prepare!(tmp, script) do
+  def prepare!(tmp, script, opts \\ []) do
     payload = Path.join(tmp, "tightbeam")
     File.mkdir_p!(payload)
-    source = Application.app_dir(:tightbeam)
+    current_source = Application.app_dir(:tightbeam)
+    source = Keyword.get(opts, :source, current_source)
     File.cp_r!(Path.join(source, "ebin"), Path.join(payload, "ebin"))
     # Dereference only the known build-root priv alias while assembling; the
     # admitted payload itself contains no symlinks and no source is modified.
@@ -45,7 +46,7 @@ defmodule Tightbeam.GuardRuntimeFixture do
     paths =
       :code.get_path()
       |> Enum.map(&List.to_string/1)
-      |> Enum.reject(&(Path.expand(&1) == Path.expand(Path.join(source, "ebin"))))
+      |> Enum.reject(&(Path.expand(&1) == Path.expand(Path.join(current_source, "ebin"))))
 
     args =
       ["--erl", "+S 2:2"] ++

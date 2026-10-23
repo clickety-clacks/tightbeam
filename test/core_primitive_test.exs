@@ -7,7 +7,7 @@ defmodule Tightbeam.CorePrimitiveTest do
     for value <- [nil, true, false] do
       assert StateResources.work_item(value) === value
       item = StateResources.work_item(%{nested: %{values: [value]}})
-      assert item == %{"nested" => %{"values" => [value]}}
+      assert item == %{"nested" => %{"values" => [value]}, "mementos" => %{}}
       assert JSON.decode!(JSON.encode!(item)) == item
     end
   end
@@ -17,7 +17,7 @@ defmodule Tightbeam.CorePrimitiveTest do
       assert StateResources.work_item(value) === value
     end
 
-    assert StateResources.work_item(%{state: :open}) == %{"state" => "open"}
+    assert StateResources.work_item(%{state: :open}) == %{"state" => "open", "mementos" => %{}}
   end
 
   test "closed encoder rejects nonnullable null and string booleans" do

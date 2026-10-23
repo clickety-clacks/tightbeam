@@ -411,6 +411,7 @@ defmodule Tightbeam.ExecutionMap do
 
     %{
       id: item.id,
+      mementos: Tightbeam.Mementos.current(world.db, "work_item", item.id),
       title: item.title,
       spec_ref_name: item.spec_ref_name,
       spec_ref_sha256: item.spec_ref_sha256,
@@ -429,7 +430,8 @@ defmodule Tightbeam.ExecutionMap do
           %{
             assignment_id: a.id,
             holder_key: a.holder_key,
-            current_coordination_parent_ref: a.current_coordination_parent_ref
+            current_coordination_parent_ref: a.current_coordination_parent_ref,
+            mementos: Tightbeam.Mementos.current(world.db, "assignment", a.id)
           }
         end),
       finished_at: finished_at(world, item),
@@ -545,7 +547,8 @@ defmodule Tightbeam.ExecutionMap do
       %{
         assignmentId: assignment.id,
         attestId: assignment.closing_attest_id,
-        commitRefs: Map.get(world.commit_refs, assignment.closing_attest_id)
+        commitRefs: Map.get(world.commit_refs, assignment.closing_attest_id),
+        mementos: Tightbeam.Mementos.current(world.db, "attest", assignment.closing_attest_id)
       }
     end)
   end
@@ -1624,47 +1627,45 @@ defmodule Tightbeam.ExecutionMap do
       (node.closing_attests
        |> Enum.sort_by(&Map.get(&1, :assignmentId))
        |> Enum.map_join(",", fn attest ->
-        exact_execution_map_keys!(
-          attest,
-          [:assignmentId, :attestId, :commitRefs],
-          "closingAttests"
-        )
+         exact_execution_map_keys!(
+           attest,
+           [:assignmentId, :attestId, :commitRefs],
+           "closingAttests"
+         )
 
-        refs =
-          case attest.commitRefs do
-            nil ->
-              "null"
+         refs =
+           case attest.commitRefs do
+             nil ->
+               "null"
 
-            rows when is_list(rows) ->
-              "[" <>
-                Enum.map_join(rows, ",", fn row ->
-                  encode_execution_map_string_object!(
-                    row,
-                    ~w(repo commit),
-                    "closingAttests.commitRefs"
-                  )
-                end) <> "]"
+             rows when is_list(rows) ->
+               "[" <>
+                 Enum.map_join(rows, ",", fn row ->
+                   encode_execution_map_string_object!(
+                     row,
+                     ~w(repo commit),
+                     "closingAttests.commitRefs"
+                   )
+                 end) <> "]"
 
-            _ ->
-              raise ArgumentError, "closingAttests.commitRefs must be an array or null"
-          end
+             _ ->
+               raise ArgumentError, "closingAttests.commitRefs must be an array or null"
+           end
 
-        "{" <>
-          execution_map_pair!(
-            "assignmentId",
-            JSON.encode!(
-              execution_map_string!(attest.assignmentId, "closingAttests.assignmentId")
-            )
-          ) <>
-          "," <>
-          execution_map_pair!(
-            "attestId",
-            JSON.encode!(
-              execution_map_string!(attest.attestId, "closingAttests.attestId")
-            )
-          ) <>
-          "," <>
-          execution_map_pair!("commitRefs", refs) <> "}"
+         "{" <>
+           execution_map_pair!(
+             "assignmentId",
+             JSON.encode!(
+               execution_map_string!(attest.assignmentId, "closingAttests.assignmentId")
+             )
+           ) <>
+           "," <>
+           execution_map_pair!(
+             "attestId",
+             JSON.encode!(execution_map_string!(attest.attestId, "closingAttests.attestId"))
+           ) <>
+           "," <>
+           execution_map_pair!("commitRefs", refs) <> "}"
        end)) <> "]"
   end
 
@@ -1686,11 +1687,11 @@ defmodule Tightbeam.ExecutionMap do
           Map.get(mind, :effort) || "", Map.get(mind, :harness) || ""}
        end)
        |> Enum.map_join(",", fn mind ->
-        execution_map_object!(
-          mind,
-          [model: "model", context: "context", effort: "effort", harness: "harness"],
-          "minds"
-        )
+         execution_map_object!(
+           mind,
+           [model: "model", context: "context", effort: "effort", harness: "harness"],
+           "minds"
+         )
        end)) <> "]"
   end
 
@@ -1856,6 +1857,7 @@ defmodule Tightbeam.ExecutionMap do
     linked = retain_acyclic(items, candidate_edges(items, items_by_id, turns_by_seq, resolved))
 
     %{
+      db: db,
       now: Map.get(call, :now) || System.system_time(:millisecond),
       caller: caller,
       cutoff: cutoff,

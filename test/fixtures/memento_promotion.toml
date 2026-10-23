@@ -1,0 +1,21 @@
+[[rule]]
+name = "promotion-requires-current-review"
+verb = "harness-health-close-promotion"
+edges = ["verb"]
+effect = "deny"
+external_producer = true
+text = "Promotion requires the latest independent clean review to include the candidate in its evidence."
+require = [
+  { fact = "call.has_comparison_value", op = "eq", value = true },
+  { fact = "assignment.latest_linked_review.present", op = "eq", value = true },
+  { fact = "assignment.latest_linked_review.has_judgment_kind", op = "eq", value = true },
+  { fact = "assignment.latest_linked_review.judgment_kind", op = "eq", value = "reviewed-clean" },
+  { fact = "assignment.latest_linked_review.independent", op = "eq", value = true },
+  { fact = "assignment.latest_linked_review.has_memento.agentic-engineering/evidence-ref", op = "eq", value = true },
+  { fact = "assignment.latest_linked_review.memento_contains_comparison_value.agentic-engineering/evidence-ref", op = "eq", value = true },
+]
+
+[[admission_contract]]
+verb = "harness-health-close-promotion"
+classification = "replacement"
+required_rules = ["promotion-requires-current-review"]

@@ -1594,7 +1594,11 @@ defmodule Tightbeam.HarnessHealth do
         {:duplicate, detail} -> {:ok, detail}
       end
     rescue
-      error in ArgumentError -> {:error, %{code: other_error_code(error), message: error.message}}
+      error in Tightbeam.Mementos.Refusal ->
+        {:error, error.admission || error.details || %{code: error.code, message: error.message}}
+
+      error in ArgumentError ->
+        {:error, %{code: other_error_code(error), message: error.message}}
     end
   end
 
@@ -1609,8 +1613,9 @@ defmodule Tightbeam.HarnessHealth do
     candidate_commit = required_string!(input, :candidate_commit)
     idempotency_key = required_string!(input, :idempotency_key)
 
-    unless valid_promoted_class?(named_class),
-      do: raise(ArgumentError, "invalid_promotion_close")
+    unless valid_promoted_class?(named_class) and
+             Regex.match?(~r/\A[0-9a-f]{40}\z/, candidate_commit),
+           do: raise(ArgumentError, "invalid_promotion_close")
 
     provenance =
       verify_promotion_provenance!(
@@ -1828,7 +1833,7 @@ defmodule Tightbeam.HarnessHealth do
           [
             "verdict",
             ^review_assignment_id,
-            "reviewed-clean",
+            verdict_kind,
             reviewer_session,
             reviewer_user,
             ^review_artifact_id,
@@ -1841,6 +1846,7 @@ defmodule Tightbeam.HarnessHealth do
             reviewer_session: reviewer_session,
             reviewer_user: reviewer_user,
             content_sha256: content_sha,
+            verdict_kind: verdict_kind,
             commit_refs: commit_refs
           }
 
@@ -1848,9 +1854,8 @@ defmodule Tightbeam.HarnessHealth do
           raise ArgumentError, "invalid_promotion_close"
       end
 
-    unless attest.content_sha256 == review.content_sha256 and
-             commit_ref_matches?(attest.commit_refs, candidate_commit),
-           do: raise(ArgumentError, "invalid_promotion_close")
+    unless attest.content_sha256 == review.content_sha256,
+      do: raise(ArgumentError, "invalid_promotion_close")
 
     candidate_work_item_id = review_work_item_id(txn, review_assignment_id)
 
@@ -1860,6 +1865,39 @@ defmodule Tightbeam.HarnessHealth do
              spec.work_item_id == candidate_work_item_id and
              review_bound_to_candidate?(txn, review_assignment_id, attest.reviewer_session),
            do: raise(ArgumentError, "invalid_promotion_close")
+
+    [[producer_id]] =
+      Txn.q(txn, "SELECT reviewsAssignmentId FROM assignments WHERE id=?1", [review_assignment_id])
+
+    principal = normalize_principal!(Map.get(input, :principal, "process:tightbeam"))
+
+    call =
+      %{
+        verb: "harness-health-close-promotion",
+        principal: principal,
+        origin: principal_text(principal),
+        session_key: nil,
+        params: input |> Map.delete(:principal) |> Map.put(:assignment_id, producer_id),
+        memento_writes: [],
+        memento_revision: Tightbeam.Mementos.declarations().revision
+      }
+      |> Tightbeam.Mementos.with_comparison!(candidate_commit)
+
+    if Tightbeam.Rules.active_admission_contract("harness-health-close-promotion") == "legacy" do
+      unless attest.verdict_kind == "reviewed-clean" and
+               commit_ref_matches?(attest.commit_refs, candidate_commit),
+             do: raise(ArgumentError, "invalid_promotion_close")
+    else
+      Tightbeam.Mementos.admit_in_txn!(txn, call)
+
+      # The artifact-bearing receipt must be the same structural judgment whose
+      # facts admitted the operation, not an older receipt beside a newer review.
+      unless match?(
+               %{id: ^review_attest_id},
+               Tightbeam.MementoJudgments.latest(txn, producer_id, "linked_review")
+             ),
+             do: raise(ArgumentError, "invalid_promotion_close")
+    end
 
     unless is_binary(first_incident) and is_binary(second_incident) and
              first_incident != second_incident and

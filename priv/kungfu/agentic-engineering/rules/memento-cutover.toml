@@ -1,0 +1,163 @@
+[[rule]]
+name = "engineering-cutover-effects"
+verb = "attest"
+edges = ["cutover"]
+text = "Evaluate the effects cutover predicate"
+deny_when = [
+  { fact = "assignment.state", op = "in", value = ["open", "closed"] },
+  { fact = "cutover.assignment.has_legacy_effect", op = "eq", value = true }
+]
+
+[[rule]]
+name = "engineering-cutover-prepared"
+verb = "attest"
+edges = ["cutover"]
+text = "Evaluate the prepared cutover predicate"
+deny_when = [
+  { fact = "call.has_memento.agentic-engineering/evidence-ref", op = "eq", value = true }
+]
+
+[[rule]]
+name = "engineering-cutover-nonholder"
+verb = "attest"
+edges = ["cutover"]
+text = "Evaluate the nonholder cutover predicate"
+deny_when = [
+  { fact = "call.has_memento.agentic-engineering/evidence-ref", op = "eq", value = false },
+  { fact = "assignment.caller_is_holder", op = "eq", value = false }
+]
+
+[[rule]]
+name = "engineering-cutover-other-kind"
+verb = "attest"
+edges = ["cutover"]
+text = "Evaluate the other kind cutover predicate"
+deny_when = [
+  { fact = "call.has_memento.agentic-engineering/evidence-ref", op = "eq", value = false },
+  { fact = "assignment.caller_is_holder", op = "eq", value = true },
+  { fact = "attest.verdict_kind", op = "not_in", value = ["reviewed-clean", "changes-requested", "verified"] }
+]
+
+[[rule]]
+name = "engineering-cutover-review"
+verb = "attest"
+edges = ["cutover"]
+text = "Evaluate the review cutover predicate"
+deny_when = [
+  { fact = "call.has_memento.agentic-engineering/evidence-ref", op = "eq", value = false },
+  { fact = "assignment.caller_is_holder", op = "eq", value = true },
+  { fact = "attest.verdict_kind", op = "in", value = ["reviewed-clean", "changes-requested"] },
+  { fact = "assignment.is_producing_card", op = "eq", value = false }
+]
+
+[[rule]]
+name = "engineering-cutover-producer-review-kind"
+verb = "attest"
+edges = ["cutover"]
+text = "Evaluate the producer review kind cutover predicate"
+deny_when = [
+  { fact = "call.has_memento.agentic-engineering/evidence-ref", op = "eq", value = false },
+  { fact = "assignment.caller_is_holder", op = "eq", value = true },
+  { fact = "attest.verdict_kind", op = "in", value = ["reviewed-clean", "changes-requested"] },
+  { fact = "assignment.is_producing_card", op = "eq", value = true }
+]
+
+[[rule]]
+name = "engineering-cutover-review-verification-kind"
+verb = "attest"
+edges = ["cutover"]
+text = "Evaluate the review verification kind cutover predicate"
+deny_when = [
+  { fact = "call.has_memento.agentic-engineering/evidence-ref", op = "eq", value = false },
+  { fact = "assignment.caller_is_holder", op = "eq", value = true },
+  { fact = "attest.verdict_kind", op = "eq", value = "verified" },
+  { fact = "assignment.is_producing_card", op = "eq", value = false }
+]
+
+[[rule]]
+name = "engineering-cutover-closed-verification"
+verb = "attest"
+edges = ["cutover"]
+text = "Evaluate the closed verification cutover predicate"
+deny_when = [
+  { fact = "call.has_memento.agentic-engineering/evidence-ref", op = "eq", value = false },
+  { fact = "assignment.caller_is_holder", op = "eq", value = true },
+  { fact = "attest.verdict_kind", op = "eq", value = "verified" },
+  { fact = "assignment.is_producing_card", op = "eq", value = true },
+  { fact = "assignment.state", op = "eq", value = "closed" }
+]
+
+[[rule]]
+name = "engineering-cutover-open-verification"
+verb = "attest"
+edges = ["cutover"]
+text = "Evaluate the open verification cutover predicate"
+deny_when = [
+  { fact = "call.has_memento.agentic-engineering/evidence-ref", op = "eq", value = false },
+  { fact = "assignment.caller_is_holder", op = "eq", value = true },
+  { fact = "attest.verdict_kind", op = "eq", value = "verified" },
+  { fact = "assignment.is_producing_card", op = "eq", value = true },
+  { fact = "assignment.state", op = "eq", value = "open" }
+]
+
+[[rule]]
+name = "engineering-cutover-linked-review-successor"
+verb = "attest"
+edges = ["cutover"]
+text = "Evaluate the linked review successor cutover predicate"
+deny_when = [
+  { fact = "assignment.state", op = "in", value = ["open", "closed"] }
+]
+require = [
+  { fact = "assignment.latest_linked_review.present", op = "eq", value = true },
+  { fact = "assignment.latest_linked_review.has_judgment_kind", op = "eq", value = true },
+  { fact = "assignment.latest_linked_review.judgment_kind", op = "eq", value = "reviewed-clean" },
+  { fact = "assignment.latest_linked_review.independent", op = "eq", value = true },
+  { fact = "assignment.latest_linked_review.has_memento.agentic-engineering/evidence-ref", op = "eq", value = true },
+  { fact = "assignment.latest_linked_review.memento_matches_cutover_requirement.agentic-engineering/evidence-ref", op = "eq", value = true }
+]
+
+[[rule]]
+name = "engineering-cutover-holder-verification-successor"
+verb = "attest"
+edges = ["cutover"]
+text = "Evaluate the holder verification successor cutover predicate"
+deny_when = [
+  { fact = "assignment.state", op = "in", value = ["open", "closed"] }
+]
+require = [
+  { fact = "assignment.latest_holder_verdict.present", op = "eq", value = true },
+  { fact = "assignment.latest_holder_verdict.has_judgment_kind", op = "eq", value = true },
+  { fact = "assignment.latest_holder_verdict.judgment_kind", op = "eq", value = "verified" },
+  { fact = "assignment.latest_holder_verdict.has_memento.agentic-engineering/evidence-ref", op = "eq", value = true },
+  { fact = "assignment.latest_holder_verdict.memento_matches_cutover_requirement.agentic-engineering/evidence-ref", op = "eq", value = true }
+]
+
+[memento_cutover]
+version = 1
+judgments = [
+  { selector = "engineering-cutover-prepared", route = "none" },
+  { selector = "engineering-cutover-nonholder", route = "none" },
+  { selector = "engineering-cutover-other-kind", route = "none" },
+  { selector = "engineering-cutover-review", route = "linked_review", successor_rule = "engineering-cutover-linked-review-successor" },
+  { selector = "engineering-cutover-producer-review-kind", route = "none" },
+  { selector = "engineering-cutover-review-verification-kind", route = "none" },
+  { selector = "engineering-cutover-closed-verification", route = "none" },
+  { selector = "engineering-cutover-open-verification", route = "holder_verification", successor_rule = "engineering-cutover-holder-verification-successor" },
+]
+
+[memento_cutover.effects]
+selector = "engineering-cutover-effects"
+mapping = [
+  { legacy_value = "code", name = "agentic-engineering/effect-kind", value = "code" },
+  { legacy_value = "policy", name = "agentic-engineering/effect-kind", value = "policy" },
+  { legacy_value = "release", name = "agentic-engineering/effect-kind", value = "release" },
+  { legacy_value = "live_mutation", name = "agentic-engineering/effect-kind", value = "live_mutation" },
+  { legacy_value = "evidence", name = "agentic-engineering/effect-kind", value = "evidence" },
+  { legacy_value = "review", name = "agentic-engineering/effect-kind", value = "review" },
+  { legacy_value = "coordination", name = "agentic-engineering/effect-kind", value = "coordination" },
+]
+
+[memento_cutover.legacy_evidence_requirements]
+version = 1
+entries = []

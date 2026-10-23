@@ -11,6 +11,45 @@ defmodule Tightbeam.RuleRuntime do
 
   @persist_key __MODULE__
 
+  @policy_key Tightbeam.Rules
+  @policy_context {__MODULE__, :policy_context}
+
+  @doc false
+  def policy_snapshot do
+    Process.get(@policy_context) ||
+      :persistent_term.get(@policy_key, %{
+        revision: nil,
+        rules: [],
+        policies: [],
+        declarations: %{revision: nil, names: %{}},
+        unavailable_verbs: %{},
+        requested_admission_contract: %{},
+        active_admission_contract: %{}
+      })
+  end
+
+  # Law selection is scoped to one evaluation or an explicit cutover assessment.
+  @doc false
+  def law_component(module, fallback) when is_function(fallback, 0) do
+    case Map.fetch(policy_snapshot(), :law_components) do
+      {:ok, components} -> Map.fetch!(components, module)
+      :error -> fallback.()
+    end
+  end
+
+  @doc false
+  def with_policy_snapshot(snapshot, fun) when is_map(snapshot) and is_function(fun, 0) do
+    previous = Process.put(@policy_context, snapshot)
+
+    try do
+      fun.()
+    after
+      if is_nil(previous),
+        do: Process.delete(@policy_context),
+        else: Process.put(@policy_context, previous)
+    end
+  end
+
   @doc false
   def install_admission(callback) when is_function(callback, 2) do
     :persistent_term.put({__MODULE__, :admission}, callback)

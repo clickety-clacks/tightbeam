@@ -226,9 +226,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
       handle(
         ctx,
         "assign",
-        assign_call({:session, "notice-parent"}, "holder", "child task", item.id,
-          effect_kind: "coordination"
-        )
+        assign_call({:session, "notice-parent"}, "holder", "child task", item.id)
       )
 
     {:ok, _} =
@@ -311,8 +309,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
           {:session, "other-parent"},
           "notice-parent",
           "additional parent work",
-          additional_item.id,
-          effect_kind: "coordination"
+          additional_item.id
         )
       )
 
@@ -781,8 +778,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
             {:session, parent_opener},
             "notice-parent",
             "parent coordination",
-            item.id,
-            effect_kind: "coordination"
+            item.id
           )
         )
       end
@@ -791,9 +787,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
       handle(
         ctx,
         "assign",
-        assign_call({:session, "notice-parent"}, "holder", "child task", item.id,
-          effect_kind: "coordination"
-        )
+        assign_call({:session, "notice-parent"}, "holder", "child task", item.id)
       )
 
     assert %{assignment: %{state: "closed"}, attest: %{kind: "completion", id: source_token}} =
@@ -963,12 +957,11 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
   defp handle(ctx, verb, call), do: WorkItems.__handle__(ctx.db, verb, %{call | verb: verb})
 
-  defp assign_call(principal, target, subject, work_item_id, opts \\ []) do
+  defp assign_call(principal, target, subject, work_item_id) do
     call("assign", principal, target, %{
       subject: subject,
       idempotency_key: nil,
-      work_item_id: work_item_id,
-      effect_kind: opts[:effect_kind]
+      work_item_id: work_item_id
     })
     |> Map.merge(%{target_role: nil, role_fallback: false})
   end

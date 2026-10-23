@@ -43,7 +43,24 @@ edges = ["row-commit"]
 effect = "notice"
 text = "A work item has reached its fourth review or fix round."
 deny_when = [
-  { fact = "work_item.fourth_round_kind", op = "ne", value = "" },
+  { fact = "work_item.fourth_round_kind", op = "eq", value = "review" },
+]
+
+[rule.notice]
+target_session = "{assignment_opener_or_coordinator_session}"
+prompt = "Work item {work_item_id} has reached its fourth {work_item_fourth_round_kind} round. Review the repeated cycle and direct the next step."
+idempotency_key = "fourth-round:{work_item_id}:{work_item_fourth_round_kind}"
+
+[[rule]]
+name = "ac6a-fourth-fix-round"
+verb = "attest"
+verbs = ["attest", "assign", "dispatch"]
+edges = ["row-commit"]
+effect = "notice"
+text = "A work item has reached its fourth review or fix round."
+deny_when = [
+  { fact = "work_item.fourth_round_kind", op = "eq", value = "fix" },
+  { fact = "assignment.memento.agentic-engineering/effect-kind", op = "in", value = ["code"] },
 ]
 
 [rule.notice]

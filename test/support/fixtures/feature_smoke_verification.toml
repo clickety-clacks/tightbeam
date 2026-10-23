@@ -8,7 +8,13 @@ text = "completion requires a verification verdict on the assignment"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
   { fact = "assignment.holder_archetype", op = "in", value = ["coder"] },
-  { fact = "assignment.verdicts", op = "not_in", value = ["verified"] },
+]
+require = [
+  { fact = "assignment.latest_holder_verdict.present", op = "eq", value = true },
+  { fact = "assignment.latest_holder_verdict.has_judgment_kind", op = "eq", value = true },
+  { fact = "assignment.latest_holder_verdict.judgment_kind", op = "in", value = ["verified"] },
+  { fact = "assignment.latest_holder_verdict.has_memento.agentic-engineering/evidence-ref", op = "eq", value = true },
+  { fact = "assignment.latest_holder_verdict.memento_matches_call.agentic-engineering/evidence-ref", op = "eq", value = true },
 ]
 [rule.remedy]
 action = "wake"

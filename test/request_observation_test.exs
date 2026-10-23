@@ -188,7 +188,6 @@ defmodule Tightbeam.RequestObservationTest do
       params: %{
         subject: "test",
         idempotency_key: "existing-key",
-        effect_kind: "code",
         files: ["lib/test.ex"]
       }
     }

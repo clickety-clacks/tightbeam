@@ -4,7 +4,7 @@ name = "holder-verdict-wins"
 phase = "pending"
 blocking_phase = "P3"
 kind = "dispatch-rule"
-source = "coordination-fabric-v1 §13 Phase 0; wi_1b0237fe wedge class"
+source = "coordination-fabric-v1 §13 Phase 0; wedge class"
 legibility = "event:denied(rule=coder-completion-needs-independent-review)"
 
 # Review judgments come from holder-filed verdict rows, never from bare card
@@ -17,5 +17,10 @@ external_producer = true
 text = "completion needs a linked reviewed-clean verdict by the review card's different-session holder"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+  { fact = "assignment.is_producing_card", op = "eq", value = true },
+]
+require = [
+  { fact = "assignment.latest_linked_review.present", op = "eq", value = true },
+  { fact = "assignment.latest_linked_review.judgment_kind", op = "in", value = ["reviewed-clean"] },
+  { fact = "assignment.latest_linked_review.independent", op = "eq", value = true },
 ]

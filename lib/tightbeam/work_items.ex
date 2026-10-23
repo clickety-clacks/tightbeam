@@ -88,7 +88,12 @@ defmodule Tightbeam.WorkItems do
   end
 
   @doc false
-  def __handle__(db, "work-item-create", call), do: create_result(db, call)
+  def __handle__(db, "work-item-create", call),
+    do:
+      Tightbeam.Mementos.protect(fn ->
+        create_result(db, Map.put(call, :verb, "work-item-create"))
+      end)
+
   def __handle__(db, "work-item-get", call), do: get_result(db, call)
   def __handle__(db, "work-item-trace", call), do: trace_result(db, call)
   def __handle__(db, "work-item-list", call), do: list_result(db, call)
@@ -119,6 +124,7 @@ defmodule Tightbeam.WorkItems do
         transaction(db, fn txn ->
           case key && idempotency_item(txn, owner, key) do
             nil ->
+              call = Tightbeam.Mementos.admit_in_txn!(txn, call)
               id = "wi_" <> Tightbeam.Id.uuid4()
               created_in_turn_seq = running_turn_seq(txn, created_by_session)
               priority = call.params[:priority] || default_priority_in_txn(txn)
@@ -147,6 +153,7 @@ defmodule Tightbeam.WorkItems do
                 ]
               )
 
+              Tightbeam.Mementos.append_inline!(txn, "work_item", id, call)
               put_priority_in_txn(txn, id, priority)
               stamp_version_in_txn(txn, id, created_at)
               routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
@@ -1533,20 +1540,28 @@ defmodule Tightbeam.WorkItems do
       {:ok, rows} =
         DB.query(db, "SELECT #{columns()} FROM work_items ORDER BY createdAt DESC, id DESC")
 
-      %{workItems: Enum.map(rows, &(work_item(&1) |> public_work_item() |> public_summary()))}
+      %{
+        workItems:
+          Enum.map(
+            rows,
+            &(Tightbeam.Mementos.attach(db, "work_item", work_item(&1))
+              |> public_work_item()
+              |> public_summary())
+          )
+      }
     end
   end
 
   defp fetch(db, id) do
     case DB.query(db, "SELECT #{columns()} FROM work_items WHERE id = ?1", [id]) do
-      {:ok, [row]} -> work_item(row)
+      {:ok, [row]} -> Tightbeam.Mementos.attach(db, "work_item", work_item(row))
       {:ok, []} -> nil
     end
   end
 
   defp fetch_in_txn(txn, id) do
     case Txn.q(txn, "SELECT #{columns()} FROM work_items WHERE id = ?1", [id]) do
-      [row] -> work_item(row)
+      [row] -> Tightbeam.Mementos.attach(txn, "work_item", work_item(row))
       [] -> nil
     end
   end

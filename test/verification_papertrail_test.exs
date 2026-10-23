@@ -15,7 +15,6 @@ defmodule Tightbeam.VerificationPapertrailTest do
     Dispatch,
     EventLog,
     Gateway,
-    Identity,
     Ledger,
     NoticeBatcher,
     Org,
@@ -39,6 +38,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
       DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
 
     holder = session(db, "vp-coder", "coder", "claude", "anthropic")
+    owner = session(db, "vp-owner", "product-owner", "codex", "openai")
     reviewer = session(db, "vp-reviewer", "reviewer-code", "codex", "openai")
     Roles.create!(db, "reviewer-code", "flynn", reviewer.session_key)
 
@@ -73,7 +73,14 @@ defmodule Tightbeam.VerificationPapertrailTest do
       :persistent_term.erase(Archetypes)
     end)
 
-    %{db: db, base_dir: base_dir, handlers: handlers, holder: holder, reviewer: reviewer}
+    %{
+      db: db,
+      base_dir: base_dir,
+      handlers: handlers,
+      holder: holder,
+      reviewer: reviewer,
+      owner: owner
+    }
   end
 
   # The statutes are NOT copied in: `learn!` performs the real shipped-bundle
@@ -81,15 +88,14 @@ defmodule Tightbeam.VerificationPapertrailTest do
   # (§7). Copying them here would pass even if learn stopped delivering
   # `rules/`.
   defp learn_engineering_rules!(ctx) do
-    assert {:ok, _revision} =
-             Identity.learn!(ctx.base_dir, "agentic-engineering", "flynn")
+    rules = Tightbeam.ShippedPolicyFixture.learn_engineering!(ctx.db, ctx.base_dir, ctx.handlers)
 
     for file <- ["engineering.toml", "verification.toml"] do
       assert File.exists?(Path.join([ctx.base_dir, "identity", "rules", file])),
              "learn did not deliver rules/#{file} into the org's identity tree"
     end
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    rules
   end
 
   defp reviewed_clean_assignment(ctx) do
@@ -99,18 +105,47 @@ defmodule Tightbeam.VerificationPapertrailTest do
         params: %{title: "papertrail #{System.unique_integer([:positive])}", is_bug: false}
       })
 
-    work = assign(ctx, ctx.holder.session_key, item.id, "implement the feature")
+    assert %{deliveryOwnerSessionKey: owner_key} =
+             WorkItems.__handle__(ctx.db, "work-item-update", %{
+               principal: {:user, "flynn"},
+               params: %{work_item_id: item.id, delivery_owner_session_key: ctx.owner.session_key}
+             })
+
+    assert owner_key == ctx.owner.session_key
+    topology = assign(ctx, owner_key, item.id, "coordination intake", effect_kind: "coordination")
+
+    for verdict <- ["topology-decided", "posture-light"] do
+      assert {:ok, %{attest: %{verdictKind: ^verdict}}} =
+               Dispatch.dispatch(
+                 ctx.db,
+                 ctx.handlers,
+                 attest_call(owner_key, topology.id, "verdict", verdict)
+               )
+    end
+
+    assert {:ok, %{assignment: %{state: "closed"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               attest_call(owner_key, topology.id, "completion")
+             )
+
+    work =
+      assign(ctx, ctx.holder.session_key, item.id, "verification papertrail",
+        effect_kind: "coordination"
+      )
 
     review =
       assign(ctx, ctx.reviewer.session_key, item.id, "review of the feature",
-        reviews_assignment_id: work.id
+        reviews_assignment_id: work.id,
+        effect_kind: "review"
       )
 
     assert {:ok, %{attest: %{verdictKind: "reviewed-clean"}}} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               attest_call(ctx.reviewer.session_key, review.id, "verdict", "reviewed-clean")
+               evidence_call(ctx.reviewer.session_key, review.id, "verdict", "reviewed-clean")
              )
 
     # The review's own document. A verdict row carries the DECISION; the note
@@ -136,44 +171,45 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
   test "A1: each remedy wake names its own missing record, in sequence", ctx do
     learn_engineering_rules!(ctx)
-    %{work: work} = reviewed_clean_assignment(ctx)
-    completion = attest_call(ctx.holder.session_key, work.id, "completion")
+    %{item: item, work: work} = reviewed_clean_assignment(ctx)
+    completion = evidence_call(ctx.holder.session_key, work.id, "completion")
 
-    # First denial: the verification verdict is missing.
-    assert {:error, %{reason: "remedy_fired", rule: @verification_rule, producer: producer}} =
+    # Static artifact admission precedes the transactional judgment check.
+    assert {:error, %{reason: "remedy_fired", rule: @artifact_rule, producer: producer}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
-    assert %{session_key: holder_key} = Wakes.get(ctx.db, producer)
-    assert holder_key == ctx.holder.session_key
-    wake = admitted_remedy!(ctx, producer)
+    artifact_wake = admitted_remedy!(ctx, producer)
+    assert artifact_wake.session_key == ctx.holder.session_key
+    assert artifact_wake.prompt =~ "no artifact is recorded on its work item"
+    assert artifact_wake.prompt =~ work.id
+    assert %{status: "live"} = RailRemedy.episode(ctx.db, @artifact_rule, work.id)
+
+    record_report_artifact(ctx, item.id, ctx.holder.session_key)
+    # Finish the actual recipient turn before the next notice leaves its queue.
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "papertrail-test")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+    assert {:error,
+            %{reason: "remedy_fired", rule: @verification_rule, producer: verification_producer}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    wake = admitted_remedy!(ctx, verification_producer)
     assert wake.session_key == ctx.holder.session_key
     assert wake.prompt =~ "no verification verdict is filed"
     assert wake.prompt =~ work.id
     assert %{status: "live"} = RailRemedy.episode(ctx.db, @verification_rule, work.id)
+    assert %{status: "closed"} = RailRemedy.episode(ctx.db, @artifact_rule, work.id)
 
-    # The holder files its own verification verdict — never blocked (the
-    # statute gates attest.kind "completion", and this is a "verdict").
     assert {:ok, %{attest: %{verdictKind: "verified"}}} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               attest_call(ctx.holder.session_key, work.id, "verdict", "verified")
+               evidence_call(ctx.holder.session_key, work.id, "verdict", "verified")
              )
 
-    # Second denial: the results artifact is missing, and the sentence says so.
-    # The first actual recipient turn must finish before the next remedy can
-    # leave the editable queue; filing a verdict alone does not end a turn.
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "papertrail-test")
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
-
-    assert {:error, %{reason: "remedy_fired", rule: @artifact_rule, producer: artifact_producer}} =
+    assert {:ok, %{assignment: %{state: "closed"}}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
-    artifact_wake = admitted_remedy!(ctx, artifact_producer)
-    assert artifact_wake.session_key == ctx.holder.session_key
-    assert artifact_wake.prompt =~ "no artifact is recorded on its work item"
-    assert %{status: "live"} = RailRemedy.episode(ctx.db, @artifact_rule, work.id)
-    # The satisfied verification statute's episode closed through maybe_close.
     assert %{status: "closed"} = RailRemedy.episode(ctx.db, @verification_rule, work.id)
   end
 
@@ -219,7 +255,12 @@ defmodule Tightbeam.VerificationPapertrailTest do
   test "A2: the complete papertrail passes and the episodes close", ctx do
     learn_engineering_rules!(ctx)
     %{item: item, work: work, review: review} = reviewed_clean_assignment(ctx)
-    completion = attest_call(ctx.holder.session_key, work.id, "completion")
+    completion = evidence_call(ctx.holder.session_key, work.id, "completion")
+
+    assert {:error, %{rule: @artifact_rule}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    record_report_artifact(ctx, item.id, ctx.holder.session_key)
 
     assert {:error, %{rule: @verification_rule}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
@@ -228,13 +269,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               attest_call(ctx.holder.session_key, work.id, "verdict", "verified")
+               evidence_call(ctx.holder.session_key, work.id, "verdict", "verified")
              )
-
-    assert {:error, %{rule: @artifact_rule}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
-
-    record_report_artifact(ctx, item.id, ctx.holder.session_key)
 
     assert {:ok, %{assignment: %{state: "closed"}}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
@@ -246,13 +282,13 @@ defmodule Tightbeam.VerificationPapertrailTest do
     assert %{status: "closed"} = RailRemedy.episode(ctx.db, @artifact_rule, work.id)
 
     # A review card is non-producing by construction, so its holder can close
-    # it without a review-of-the-review. The implementation-only verification
-    # and artifact statutes also stay out of scope.
+    # it without a review-of-the-review. Its own artifact was recorded above;
+    # the coder-only verification statute stays out of scope.
     assert {:ok, %{assignment: %{state: "closed"}}} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               attest_call(ctx.reviewer.session_key, review.id, "completion")
+               evidence_call(ctx.reviewer.session_key, review.id, "completion")
              )
 
     assert RailRemedy.episode(ctx.db, @verification_rule, review.id) == nil
@@ -261,8 +297,9 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
   test "A3: back-to-back re-attempts rewake the live episode with no new episode", ctx do
     learn_engineering_rules!(ctx)
-    %{work: work} = reviewed_clean_assignment(ctx)
-    completion = attest_call(ctx.holder.session_key, work.id, "completion")
+    %{item: item, work: work} = reviewed_clean_assignment(ctx)
+    record_report_artifact(ctx, item.id, ctx.holder.session_key)
+    completion = evidence_call(ctx.holder.session_key, work.id, "completion")
 
     assert {:error, %{rule: @verification_rule}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
@@ -388,7 +425,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
     assert File.read!(delivered) == shipped
 
-    loaded = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Gateway.load_law!(%{db: ctx.db, base_dir: ctx.base_dir}, Map.keys(ctx.handlers))
+    loaded = Rules.effective_snapshot().rules
 
     refute Enum.any?(loaded, &(&1.name == "wake-obligation-registration-authority"))
 
@@ -423,7 +461,11 @@ defmodule Tightbeam.VerificationPapertrailTest do
         subject: subject,
         work_item_id: work_item_id,
         reviews_assignment_id: opts[:reviews_assignment_id],
-        effect_kind: opts[:effect_kind] || "coordination"
+        mementos:
+          if(opts[:effect_kind],
+            do: [%{name: "agentic-engineering/effect-kind", value: opts[:effect_kind]}],
+            else: []
+          )
       }
     })
   end
@@ -435,11 +477,6 @@ defmodule Tightbeam.VerificationPapertrailTest do
         verdict -> %{assignment_id: assignment_id, kind: kind, verdict_kind: verdict}
       end
 
-    params =
-      if verdict_kind == "verified",
-        do: Map.put(params, :commit_refs, commit_refs()),
-        else: params
-
     %{
       verb: "attest",
       origin: "agent:#{session_key}",
@@ -449,16 +486,12 @@ defmodule Tightbeam.VerificationPapertrailTest do
     }
   end
 
-  defp commit_refs do
-    repo = Path.expand("..", __DIR__)
-    {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
+  defp evidence_call(session_key, assignment_id, kind, verdict_kind \\ nil) do
+    call = attest_call(session_key, assignment_id, kind, verdict_kind)
 
-    [
-      %{
-        "repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}",
-        "commit" => String.trim(commit)
-      }
-    ]
+    put_in(call, [:params, :mementos], [
+      %{name: "agentic-engineering/evidence-ref", value: "papertrail-source"}
+    ])
   end
 
   defp record_report_artifact(ctx, work_item_id, session_key) do

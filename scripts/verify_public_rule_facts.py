@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject a commit that removes a public rule fact from Tightbeam.Rules."""
+"""Reject unapproved removal of a public rule fact from Tightbeam.Rules."""
 
 import re
 import subprocess
@@ -14,6 +14,15 @@ LAST_SHIPPED_SOURCE = "e28880d6a2980c4ca5a7a983a707f83d504da960"
 # role policy in neutral runtime and was withdrawn before the 0.1.9 release.
 UNSHIPPED_WITHDRAWN_FACTS = {
     "assign.admission_context": "27f74c1a2353cdee7ded640b8142ea98bfbae0cd^"
+}
+# The mementos transition retires these typed semantics after its compatibility
+# phase. Their stored history remains readable; new policy uses declared M8/M9
+# facts. This explicit list does not exempt any other public fact.
+MEMENTO_RETIRED_FACTS = {
+    "assignment.effect_kind",
+    "assign.effect_kind",
+    "assignment.qualifying_review_verdict_kinds",
+    "assignment.qualifying_verification_verdict_kinds",
 }
 FACTS = re.compile(r'@facts %\{\n(.*?)\n  \}', re.DOTALL)
 FACT_NAME = re.compile(r'^\s*"([^"]+)"\s*=>', re.MULTILINE)
@@ -96,7 +105,7 @@ def main() -> int:
             if fact in facts
         )
     }
-    removed = sorted(previous - current - withdrawn)
+    removed = sorted(previous - current - withdrawn - MEMENTO_RETIRED_FACTS)
     if removed:
         print("public rule facts cannot be removed:", *removed, sep="\n", file=sys.stderr)
         return 1

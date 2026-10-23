@@ -636,7 +636,11 @@ defmodule Tightbeam.RailScriptTest do
   test "decide is dry and evaluate preserves its collapsing legacy contract", ctx do
     put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}))
     [loaded] = Rules.load!(ctx.base_dir, ["post"])
-    :persistent_term.put(Rules, [put_in(loaded.check.effects["pass"], "escalate")])
+
+    :persistent_term.put(Rules, %{
+      Rules.effective_snapshot()
+      | rules: [put_in(loaded.check.effects["pass"], "escalate")]
+    })
 
     assert {{:escalate, %{name: "script-escalate"}, %{question: "fixture"}, nil}, [], []} =
              Rules.decide(ctx.db, call())

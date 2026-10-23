@@ -1703,25 +1703,7 @@ defmodule Tightbeam.Escalation do
       DB.transaction_then(
         db,
         fn txn ->
-          request = request_in_txn_optional(txn, ruling_id)
-
-          Txn.q(
-            txn,
-            "UPDATE decision_requests SET status = 'consumed', consumedAt = ?2 WHERE id = ?1 AND kind = 'statute' AND status = 'ruled'",
-            [ruling_id, now()]
-          )
-
-          consumed? = Txn.changes(txn) == 1
-
-          if consumed? do
-            consumed = request_in_txn(txn, ruling_id)
-            _consumed = publish_decision_transition_in_txn(txn, request, consumed)
-          end
-
-          transition =
-            if consumed?, do: decision_transition(request, "ruled", "consumed", principal, verb)
-
-          {consumed?, List.wrap(transition)}
+          consume_transition_in_txn(txn, ruling_id, verb, principal)
         end,
         fn txn, {consumed?, transitions} ->
           Tightbeam.Wakes.row_commit_in_txn(txn, transitions)
@@ -1731,6 +1713,42 @@ defmodule Tightbeam.Escalation do
       )
 
     consumed?
+  end
+
+  @doc false
+  def consume_in_txn(%Txn{} = txn, ruling_id, verb, principal) do
+    {consumed?, transitions} = consume_transition_in_txn(txn, ruling_id, verb, principal)
+
+    if transitions != [] do
+      Tightbeam.Recognition.defer_in_txn(txn, fn db ->
+        {:ok, _} = DB.transaction(db, &Tightbeam.Wakes.row_commit_in_txn(&1, transitions))
+        :ok
+      end)
+    end
+
+    consumed?
+  end
+
+  defp consume_transition_in_txn(txn, ruling_id, verb, principal) do
+    request = request_in_txn_optional(txn, ruling_id)
+
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET status = 'consumed', consumedAt = ?2 WHERE id = ?1 AND kind = 'statute' AND status = 'ruled'",
+      [ruling_id, now()]
+    )
+
+    consumed? = Txn.changes(txn) == 1
+
+    if consumed? do
+      consumed = request_in_txn(txn, ruling_id)
+      _consumed = publish_decision_transition_in_txn(txn, request, consumed)
+    end
+
+    transition =
+      if consumed?, do: decision_transition(request, "ruled", "consumed", principal, verb)
+
+    {consumed?, List.wrap(transition)}
   end
 
   @doc "Rule one open request. `:authorized` is supplied by Gateway's admin axis."

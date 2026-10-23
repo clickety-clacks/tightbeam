@@ -151,7 +151,11 @@ defmodule Tightbeam.WakesTest do
       })
 
     assert wake.wake_id =~ ~r/^w_[0-9a-f-]{36}$/
-    assert [^wake] = Wakes.list_pending(db)
+
+    assert [%{wake_id: wake_id, state: "pending", prompt: "check the build"}] =
+             Wakes.list_pending(db)
+
+    assert wake_id == wake.wake_id
 
     caller_supplied_event = %{
       wake_id: wake.wake_id,
@@ -1429,11 +1433,15 @@ defmodule Tightbeam.WakesTest do
 
       before = parent_relation_snapshot(db)
 
-      assert {:ok, {:ok, ^wake}} =
+      assert {:ok, {:ok, replayed_wake}} =
                DB.transaction(
                  db,
                  &Wakes.admit_terminal_notification_in_txn(&1, "asg_parent_relation")
                )
+
+      assert replayed_wake.wake_id == wake.wake_id
+      assert replayed_wake.session_key == wake.session_key
+      assert replayed_wake.prompt == wake.prompt
 
       assert parent_relation_snapshot(db) == before
     end

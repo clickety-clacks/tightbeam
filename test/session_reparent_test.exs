@@ -144,7 +144,8 @@ defmodule Tightbeam.SessionReparentTest do
              %{
                assignment_id: "asg_one",
                holder_key: "child",
-               current_coordination_parent_ref: "session:" <> ctx.parent
+               current_coordination_parent_ref: "session:" <> ctx.parent,
+               mementos: %{}
              }
            ]
 
@@ -703,7 +704,6 @@ defmodule Tightbeam.SessionReparentTest do
                  idempotency_key: nil,
                  work_item_id: "wi_one",
                  reviews_assignment_id: nil,
-                 effect_kind: "coordination",
                  files: nil
                }
              })

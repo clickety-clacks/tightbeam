@@ -46,8 +46,13 @@ defmodule Tightbeam.AssignmentsTest do
     other = session(db, "other-session", "other")
     gateway_config = %{db: db, wake_tick_ms: 1_000}
     handlers = Gateway.handlers(gateway_config)
-    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
-    %{db: db, holder: holder, other: other, handlers: handlers}
+    base = Path.join(System.tmp_dir!(), "assignment-policy-#{System.unique_integer([:positive])}")
+    bundle = Path.join(base, "identity/kungfu/agentic-engineering")
+    File.mkdir_p!(bundle)
+    File.cp!("priv/kungfu/agentic-engineering/manifest.toml", Path.join(bundle, "manifest.toml"))
+    on_exit(fn -> File.rm_rf!(base) end)
+    Rules.load!(base, Map.keys(handlers), revision: "fixture")
+    %{db: db, base: base, holder: holder, other: other, handlers: handlers}
   end
 
   describe "attest notices to assignment openers" do
@@ -175,7 +180,7 @@ defmodule Tightbeam.AssignmentsTest do
 
       assignment_call =
         assign_call({:session, "holder"}, "landed card")
-        |> put_in([:params, :effect_kind], "coordination")
+        |> put_in([:params, :mementos], effect_memento("coordination"))
 
       assignment = handle(ctx, "assign", assignment_call)
       assert ConditionFacts.latest(ctx.db, "assignment-landed", assignment.id) == nil
@@ -1982,7 +1987,7 @@ defmodule Tightbeam.AssignmentsTest do
          work_item \\ nil
        ) do
     assign_call(principal, subject, nil, work_item)
-    |> put_in([:params, :effect_kind], "coordination")
+    |> put_in([:params, :mementos], effect_memento("coordination"))
   end
 
   defp terminal_notices(db) do
@@ -2357,7 +2362,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   defp reopen_fixture_call(principal, subject, key \\ nil, work_item_id \\ nil) do
     assign_call(principal, subject, key, work_item_id)
-    |> put_in([:params, :effect_kind], "coordination")
+    |> put_in([:params, :mementos], effect_memento("coordination"))
   end
 
   test "Firehose reopening crosses real Dispatch and Gateway with committed notice and refusal",
@@ -2627,6 +2632,12 @@ defmodule Tightbeam.AssignmentsTest do
     assert result.assignment.state == "open"
     assert result.attest.kind == "cannot-proceed"
 
+    assignment_projection =
+      Tightbeam.StateResources.query_assignment(ctx.db, assignment.id, call)
+      |> Tightbeam.StateResources.assignment()
+
+    assert assignment_projection["derivedStatus"] == "active"
+
     for key <- [:artifactId, :contentSha256, :waitId] do
       assert Map.has_key?(result.attest, key)
       assert result.attest[key] == nil
@@ -2637,6 +2648,15 @@ defmodule Tightbeam.AssignmentsTest do
     assert_receive {:firehose_notice, %{"class" => "attest.filed", "payload" => attest}}
     assert attest["id"] == result.attest.id
     Hub.delivered(hub, self())
+
+    assignment_id = assignment.id
+
+    refute_receive {:firehose_notice,
+                    %{
+                      "class" => "assignment.opened",
+                      "payload" => %{"id" => ^assignment_id}
+                    }}
+
     refute_receive {:firehose_notice, %{"class" => "assignment.closed"}}
 
     assert {:ok, replay} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
@@ -2665,7 +2685,6 @@ defmodule Tightbeam.AssignmentsTest do
 
     completed =
       assign_call({:user, "flynn"}, "completed assignment")
-      |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
     assert %{assignment: %{state: "closed", outcome: "completed"}} =
@@ -2685,7 +2704,6 @@ defmodule Tightbeam.AssignmentsTest do
 
     revoked =
       assign_call({:user, "flynn"}, "revoked assignment")
-      |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
     assert %{state: "closed", outcome: "revoked"} =
@@ -2701,7 +2719,6 @@ defmodule Tightbeam.AssignmentsTest do
 
     open =
       assign_call({:user, "flynn"}, "open assignment")
-      |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
     assert %{assignment: %{state: "open"}, cannotProceed: %{state: "standing"}} =
@@ -2716,7 +2733,6 @@ defmodule Tightbeam.AssignmentsTest do
 
     blocked =
       assign_call({:user, "flynn"}, "long blocked card")
-      |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
     filed =
@@ -2799,12 +2815,12 @@ defmodule Tightbeam.AssignmentsTest do
 
     first =
       assign_call({:user, "flynn"}, "first blocked card")
-      |> put_in([:params, :effect_kind], "coordination")
+      |> put_in([:params, :mementos], effect_memento("coordination"))
       |> then(&handle(ctx, "assign", &1))
 
     second =
       assign_call({:session, "holder"}, "second runnable card")
-      |> put_in([:params, :effect_kind], "coordination")
+      |> put_in([:params, :mementos], effect_memento("coordination"))
       |> then(&handle(ctx, "assign", &1))
 
     # The selector orders by openedAt, then UUID; consecutive admissions can
@@ -3038,7 +3054,6 @@ defmodule Tightbeam.AssignmentsTest do
 
     assignment =
       assign_call({:user, "flynn"}, "blocked card")
-      |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
     filed =
@@ -3091,7 +3106,7 @@ defmodule Tightbeam.AssignmentsTest do
     for blocking_kind <- ["blocked", "waiting"] do
       assignment =
         assign_call({:user, "flynn"}, "#{blocking_kind} verdict completion")
-        |> put_in([:params, :effect_kind], "coordination")
+        |> put_in([:params, :mementos], effect_memento("coordination"))
         |> then(&handle(ctx, "assign", &1))
 
       assert %{attest: %{verdictKind: ^blocking_kind}} =
@@ -3142,7 +3157,7 @@ defmodule Tightbeam.AssignmentsTest do
   test "a later blocked verdict reblocks after clearance, including timestamp ties", ctx do
     assignment =
       assign_call({:user, "flynn"}, "reblocked completion")
-      |> put_in([:params, :effect_kind], "coordination")
+      |> put_in([:params, :mementos], effect_memento("coordination"))
       |> then(&handle(ctx, "assign", &1))
 
     for verdict_kind <- ["blocked", "cleared", "waiting"] do
@@ -3178,12 +3193,12 @@ defmodule Tightbeam.AssignmentsTest do
   test "prose, unrelated verdict kinds, and another assignment cannot clear a block", ctx do
     blocked_assignment =
       assign_call({:user, "flynn"}, "blocked assignment")
-      |> put_in([:params, :effect_kind], "coordination")
+      |> put_in([:params, :mementos], effect_memento("coordination"))
       |> then(&handle(ctx, "assign", &1))
 
     other_assignment =
       assign_call({:user, "flynn"}, "other assignment")
-      |> put_in([:params, :effect_kind], "coordination")
+      |> put_in([:params, :mementos], effect_memento("coordination"))
       |> then(&handle(ctx, "assign", &1))
 
     attest_call({:session, "holder"}, blocked_assignment.id, "verdict")
@@ -3360,7 +3375,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assignment =
       assign_call({:user, "flynn"}, "opener disposition")
-      |> put_in([:params, :effect_kind], "coordination")
+      |> put_in([:params, :mementos], effect_memento("coordination"))
       |> then(&handle(ctx, "assign", &1))
 
     blocked =
@@ -4547,7 +4562,7 @@ defmodule Tightbeam.AssignmentsTest do
             work_item.id
           )
           |> Map.put(:verb, verb)
-          |> put_in([:params, :effect_kind], "code")
+          |> put_in([:params, :mementos], effect_memento("code"))
 
         assert {:error, %{code: "delivery_owner_missing"}} =
                  Dispatch.dispatch(ctx.db, ctx.handlers, call)
@@ -4584,7 +4599,7 @@ defmodule Tightbeam.AssignmentsTest do
           work_item.id
         )
         |> Map.put(:verb, verb)
-        |> put_in([:params, :effect_kind], "code")
+        |> put_in([:params, :mementos], effect_memento("code"))
 
       assert :proceed = Assignments.dispatch_precheck(ctx.db, call)
     end
@@ -4869,10 +4884,14 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "assign captures review links and immutable holder family stamps", ctx do
-    reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "producer"))
+    reviewed =
+      assign_call({:user, "flynn"}, "producer")
+      |> put_in([:params, :effect_kind], "code")
+      |> then(&handle(ctx, "assign", &1))
 
     assert reviewed.reviewsAssignmentId == nil
     assert reviewed.effectKind == "code"
+    assert reviewed.mementos == %{}
     assert reviewed.holderHarness == "claude"
     assert reviewed.holderProvider == "anthropic"
 
@@ -4889,12 +4908,13 @@ defmodule Tightbeam.AssignmentsTest do
     review_call =
       assign_call({:user, "flynn"}, "review")
       |> put_in([:params, :reviews_assignment_id], reviewed.id)
-      |> put_in([:params, :effect_kind], "policy")
+      |> put_in([:params, :mementos], effect_memento("policy"))
       |> Map.put(:session_key, "other-session")
 
     review = handle(ctx, "assign", review_call)
     assert review.reviewsAssignmentId == reviewed.id
     assert review.effectKind == "review"
+    assert review.mementos["agentic-engineering/effect-kind"] == ["policy"]
     assert review.holderHarness == "claude"
     assert review.holderProvider == "anthropic"
 
@@ -4908,51 +4928,44 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'unknown review'")
   end
 
-  test "assign and dispatch stamp valid effects while legacy rows resolve conservatively", ctx do
-    effects =
-      for kind <- ~w(code policy release live_mutation evidence review coordination), into: %{} do
-        assignment =
-          assign_call({:user, "flynn"}, "#{kind} effect")
-          |> put_in([:params, :effect_kind], kind)
-          |> then(&handle(ctx, "assign", &1))
+  test "memento effect values remain separate from the legacy effect field", ctx do
+    for value <- ~w(code policy release live_mutation evidence review coordination source) do
+      for verb <- ["assign", "dispatch"] do
+        input =
+          dispatch_call({:user, "flynn"}, "#{value} value", "work")
+          |> put_in([:params, :effect_kind], "code")
+          |> put_in([:params, :mementos], effect_memento(value))
 
-        assert assignment.effectKind == kind
-        {kind, assignment}
+        assignment = handle(ctx, verb, input)
+        assert assignment.effectKind == "code"
+        assert assignment.mementos["agentic-engineering/effect-kind"] == [value]
       end
+    end
 
-    evidence = effects["evidence"]
-
-    release_call =
-      dispatch_call({:user, "flynn"}, "release", "ship it")
-      |> put_in([:params, :effect_kind], "release")
-
-    release = handle(ctx, "dispatch", release_call)
-    assert release.effectKind == "release"
-
-    before = assignment_count(ctx.db)
-
-    invalid =
-      assign_call({:user, "flynn"}, "invalid")
-      |> put_in([:params, :effect_kind], "source")
-
-    assert %{code: "invalid_effect_kind"} = handle(ctx, "assign", invalid)
-    assert assignment_count(ctx.db) == before
-
-    review =
-      assign_call({:user, "flynn"}, "legacy review")
-      |> put_in([:params, :reviews_assignment_id], evidence.id)
-      |> Map.put(:session_key, "other-session")
-      |> then(&handle(ctx, "assign", &1))
+    legacy = handle(ctx, "assign", assign_call({:user, "flynn"}, "historical"))
 
     {:ok, _} =
-      DB.query(ctx.db, "DELETE FROM assignment_effects WHERE assignmentId IN (?1, ?2)", [
-        evidence.id,
-        review.id
-      ])
+      DB.query(ctx.db, "DELETE FROM assignment_effects WHERE assignmentId = ?1", [legacy.id])
 
-    legacy = Assignments.list(ctx.db, %{state: "all"})
-    assert Enum.find(legacy, &(&1.id == evidence.id)).effectKind == "code"
-    assert Enum.find(legacy, &(&1.id == review.id)).effectKind == "review"
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO assignment_effects (assignmentId,effectKind) VALUES (?1,'evidence')",
+        [legacy.id]
+      )
+
+    assert %{effectKind: "evidence", mementos: legacy_mementos} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, legacy.id))
+
+    assert legacy_mementos == %{}
+    before = assignment_count(ctx.db)
+
+    legacy_request =
+      assign_call({:user, "flynn"}, "legacy effect")
+      |> put_in([:params, :effect_kind], "code")
+
+    assert %{effectKind: "code"} = handle(ctx, "assign", legacy_request)
+    assert assignment_count(ctx.db) == before + 1
   end
 
   test "Proof 1: a conflicting review-assignment create is refused with review_item_conflict",
@@ -5151,7 +5164,7 @@ defmodule Tightbeam.AssignmentsTest do
     completion_target =
       assign_call({:user, "flynn"}, "outside-list completion")
       |> put_in([:params, :files], ["lib/a.ex"])
-      |> put_in([:params, :effect_kind], "coordination")
+      |> put_in([:params, :mementos], effect_memento("coordination"))
       |> then(&handle(ctx, "assign", &1))
 
     completion_call =
@@ -5229,7 +5242,7 @@ defmodule Tightbeam.AssignmentsTest do
   test "verdict attests freeze provenance and project inert producer history columns", ctx do
     assignment =
       assign_call({:user, "flynn"}, "verdict stamps")
-      |> put_in([:params, :effect_kind], "coordination")
+      |> put_in([:params, :mementos], effect_memento("coordination"))
       |> then(&handle(ctx, "assign", &1))
 
     ordinary =
@@ -5385,7 +5398,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{code: "assignment_closed"} = handle(ctx, "attest", malformed)
   end
 
-  test "qualifying review verdict follows the latest independent round across terminal state",
+  test "linked judgment follows the latest holder-authored verdict across terminal state",
        ctx do
     producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "qualifying producer"))
 
@@ -5395,39 +5408,47 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :reviews_assignment_id], producer.id)
       |> then(&handle(ctx, "assign", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+    assert Tightbeam.MementoJudgments.latest(ctx.db, producer.id, "linked_review") == nil
 
     assert %{code: "not_holder"} =
              attest_call({:session, "holder"}, review.id, "verdict")
              |> put_in([:params, :verdict_kind], "third-party")
              |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+    assert Tightbeam.MementoJudgments.latest(ctx.db, producer.id, "linked_review") == nil
 
     _ =
       attest_call({:session, "other-session"}, review.id, "verdict")
       |> put_in([:params, :verdict_kind], "reviewed-clean")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
-             "reviewed-clean"
-           ]
+    assert Tightbeam.MementoJudgments.latest(ctx.db, producer.id, "linked_review")
+           |> Map.take([:judgment_kind, :independent]) == %{
+             judgment_kind: "reviewed-clean",
+             independent: true
+           }
 
     _ =
       attest_call({:session, "other-session"}, review.id, "verdict")
       |> put_in([:params, :verdict_kind], "reviewed-clean")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
-             "reviewed-clean"
-           ]
+    assert Tightbeam.MementoJudgments.latest(ctx.db, producer.id, "linked_review")
+           |> Map.take([:judgment_kind, :independent]) == %{
+             judgment_kind: "reviewed-clean",
+             independent: true
+           }
 
     _ =
       attest_call({:session, "other-session"}, review.id, "verdict")
       |> put_in([:params, :verdict_kind], "changes-requested")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+    assert Tightbeam.MementoJudgments.latest(ctx.db, producer.id, "linked_review")
+           |> Map.take([:judgment_kind, :independent]) == %{
+             judgment_kind: "changes-requested",
+             independent: true
+           }
 
     second_review =
       assign_call({:user, "flynn"}, "second qualifying review")
@@ -5440,26 +5461,32 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :verdict_kind], "reviewed-clean")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
-             "reviewed-clean"
-           ]
+    assert Tightbeam.MementoJudgments.latest(ctx.db, producer.id, "linked_review")
+           |> Map.take([:judgment_kind, :independent]) == %{
+             judgment_kind: "reviewed-clean",
+             independent: true
+           }
 
     _ =
       attest_call({:session, "other-session"}, review.id, "verdict")
       |> put_in([:params, :verdict_kind], "reviewed-clean")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
-             "reviewed-clean"
-           ]
+    assert Tightbeam.MementoJudgments.latest(ctx.db, producer.id, "linked_review")
+           |> Map.take([:judgment_kind, :independent]) == %{
+             judgment_kind: "reviewed-clean",
+             independent: true
+           }
 
     _ =
       attest_call({:session, "other-session"}, second_review.id, "completion")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
-             "reviewed-clean"
-           ]
+    assert Tightbeam.MementoJudgments.latest(ctx.db, producer.id, "linked_review")
+           |> Map.take([:judgment_kind, :independent]) == %{
+             judgment_kind: "reviewed-clean",
+             independent: true
+           }
 
     revoked_review =
       assign_call({:user, "flynn"}, "revoked qualifying review")
@@ -5474,9 +5501,11 @@ defmodule Tightbeam.AssignmentsTest do
 
     _ = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, revoked_review.id))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
-             "reviewed-clean"
-           ]
+    assert Tightbeam.MementoJudgments.latest(ctx.db, producer.id, "linked_review")
+           |> Map.take([:judgment_kind, :independent]) == %{
+             judgment_kind: "reviewed-clean",
+             independent: true
+           }
 
     blocking_review =
       assign_call({:user, "flynn"}, "blocking latest review")
@@ -5489,10 +5518,14 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :verdict_kind], "changes-requested")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+    assert Tightbeam.MementoJudgments.latest(ctx.db, producer.id, "linked_review")
+           |> Map.take([:judgment_kind, :independent]) == %{
+             judgment_kind: "changes-requested",
+             independent: true
+           }
   end
 
-  test "qualifying review verdict uses creation order when review rounds share a timestamp",
+  test "linked judgment uses immutable row order when verdict timestamps tie",
        ctx do
     producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "tied review producer"))
 
@@ -5526,13 +5559,17 @@ defmodule Tightbeam.AssignmentsTest do
                """
              )
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+    assert Tightbeam.MementoJudgments.latest(ctx.db, producer.id, "linked_review")
+           |> Map.take([:judgment_kind, :independent]) == %{
+             judgment_kind: "changes-requested",
+             independent: true
+           }
   end
 
   test "a later revoked verdictless review cannot displace holder-reviewed-clean", ctx do
     producer =
       assign_call({:user, "flynn"}, "Surf Ace producer")
-      |> put_in([:params, :effect_kind], "policy")
+      |> put_in([:params, :mementos], effect_memento("policy"))
       |> then(&handle(ctx, "assign", &1))
 
     clean_review =
@@ -5566,9 +5603,11 @@ defmodule Tightbeam.AssignmentsTest do
         revoke_call({:user, "flynn"}, verdictless_review.id)
       )
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
-             "reviewed-clean"
-           ]
+    assert Tightbeam.MementoJudgments.latest(ctx.db, producer.id, "linked_review")
+           |> Map.take([:judgment_kind, :independent]) == %{
+             judgment_kind: "reviewed-clean",
+             independent: true
+           }
 
     completed =
       handle(ctx, "attest", attest_call({:session, "holder"}, producer.id, "completion"))
@@ -5601,23 +5640,33 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :verdict_kind], "reviewed-clean")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+    assert Tightbeam.MementoJudgments.latest(ctx.db, producer.id, "linked_review")
+           |> Map.take([:judgment_kind, :independent]) == %{
+             judgment_kind: "reviewed-clean",
+             independent: false
+           }
 
     _ =
       attest_call({:session, "other-session"}, older.id, "verdict")
       |> put_in([:params, :verdict_kind], "changes-requested")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+    assert Tightbeam.MementoJudgments.latest(ctx.db, producer.id, "linked_review")
+           |> Map.take([:judgment_kind, :independent]) == %{
+             judgment_kind: "changes-requested",
+             independent: true
+           }
 
     _ =
       attest_call({:session, "other-session"}, older.id, "verdict")
       |> put_in([:params, :verdict_kind], "reviewed-clean")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
-             "reviewed-clean"
-           ]
+    assert Tightbeam.MementoJudgments.latest(ctx.db, producer.id, "linked_review")
+           |> Map.take([:judgment_kind, :independent]) == %{
+             judgment_kind: "reviewed-clean",
+             independent: true
+           }
   end
 
   test "prefixed idempotency scopes disjoint equal user and session strings", ctx do
@@ -5635,7 +5684,7 @@ defmodule Tightbeam.AssignmentsTest do
   test "attest lifecycle, authorization precedence, and terminal race are atomic", ctx do
     assignment =
       assign_call({:session, "holder"}, "work")
-      |> put_in([:params, :effect_kind], "coordination")
+      |> put_in([:params, :mementos], effect_memento("coordination"))
       |> then(&handle(ctx, "assign", &1))
 
     assert %{code: "process_denied"} =
@@ -5700,7 +5749,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     race =
       assign_call({:session, "holder"}, "race")
-      |> put_in([:params, :effect_kind], "coordination")
+      |> put_in([:params, :mementos], effect_memento("coordination"))
       |> then(&handle(ctx, "assign", &1))
 
     complete =
@@ -5742,7 +5791,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     completed =
       assign_call({:user, "flynn"}, "completed markers")
-      |> put_in([:params, :effect_kind], "coordination")
+      |> put_in([:params, :mementos], effect_memento("coordination"))
       |> then(&handle(ctx, "assign", &1))
 
     progress_note = "Started the focused review.\nThe receipt stays readable."
@@ -5851,7 +5900,7 @@ defmodule Tightbeam.AssignmentsTest do
   test "query filters, deterministic ordering, role-resolved holder input, and open_count", ctx do
     a =
       assign_call({:user, "flynn"}, "a")
-      |> put_in([:params, :effect_kind], "coordination")
+      |> put_in([:params, :mementos], effect_memento("coordination"))
       |> then(&handle(ctx, "assign", &1))
 
     b = handle(ctx, "assign", assign_call({:user, "flynn"}, "b"))
@@ -5912,11 +5961,35 @@ defmodule Tightbeam.AssignmentsTest do
              Dispatch.dispatch(ctx.db, ctx.handlers, assign_call({:session, "holder"}, "denied"))
   end
 
-  test "verdict emits one verb event", ctx do
+  test "zero rules leave completion evidence meaning to declared policy and each attest emits one verb event",
+       ctx do
+    completion_assignment = dispatch!(ctx, assign_call({:session, "holder"}, "completion"))
+
+    assert {:ok, %{attest: %{id: completion_id}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               attest_call({:session, "holder"}, completion_assignment.id, "completion")
+             )
+
+    assert %{state: "closed", closingAttestId: ^completion_id} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:session, "holder"}, completion_assignment.id)
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
+               [completion_assignment.id]
+             )
+
     assert {:ok, [[before_verdict]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM events WHERE kind = 'verb' AND verb = 'attest'"
+               "SELECT count(*) FROM events WHERE kind='verb' AND verb='attest'"
              )
 
     verdict_assignment = dispatch!(ctx, assign_call({:session, "holder"}, "verdict event"))
@@ -5925,330 +5998,16 @@ defmodule Tightbeam.AssignmentsTest do
       attest_call({:user, "flynn"}, verdict_assignment.id, "verdict")
       |> put_in([:params, :verdict_kind], "tests-passed")
 
-    assert {:ok, %{attest: verdict}} = Dispatch.dispatch(ctx.db, ctx.handlers, verdict_call)
-
-    assert verdict.verdictKind == "tests-passed"
+    assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, verdict_call)
 
     assert {:ok, [[after_verdict]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM events WHERE kind = 'verb' AND verb = 'attest'"
+               "SELECT count(*) FROM events WHERE kind='verb' AND verb='attest'"
              )
 
     assert after_verdict == before_verdict + 1
-  end
-
-  test "code completion keeps verification and review requirements without ref matching", ctx do
-    parent = self()
-    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
-
-    on_exit(fn ->
-      if previous_runner,
-        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
-        else: Application.delete_env(:tightbeam, :commit_ref_command)
-    end)
-
-    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
-      {"", 0}
-    end)
-
-    producer_refs = [
-      %{"repo" => "testhost:/tmp/producer-checkout", "commit" => String.duplicate("a", 40)}
-    ]
-
-    completion_refs = [
-      %{"repo" => "testhost:/tmp/completion-checkout", "commit" => String.duplicate("B", 40)}
-    ]
-
-    canonical_completion_refs = [
-      %{"repo" => "testhost:/tmp/completion-checkout", "commit" => String.duplicate("b", 40)}
-    ]
-
-    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "evidence producer"))
-
-    review =
-      assign_call({:user, "flynn"}, "evidence review")
-      |> Map.put(:session_key, "other-session")
-      |> put_in([:params, :reviews_assignment_id], producer.id)
-      |> then(&handle(ctx, "assign", &1))
-
-    assert %{attest: %{verdictKind: "reviewed-clean"}} =
-             attest_call({:session, "other-session"}, review.id, "verdict")
-             |> put_in([:params, :verdict_kind], "reviewed-clean")
-             |> then(&handle(ctx, "attest", &1))
-
-    completion =
-      attest_call({:session, "holder"}, producer.id, "completion")
-      |> put_in([:params, :commit_refs], completion_refs)
-
-    assert %{code: "inapplicable_code_evidence"} = handle(ctx, "attest", completion)
-
-    assert %{attest: %{verdictKind: "verified"}} =
-             attest_call({:session, "holder"}, producer.id, "verdict")
-             |> put_in([:params, :verdict_kind], "verified")
-             |> put_in([:params, :commit_refs], producer_refs)
-             |> then(&handle(ctx, "attest", &1))
-
-    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
-      send(parent, :completion_commit_ref_lookup)
-      {"", 0}
-    end)
-
-    assert %{
-             attest: %{kind: "completion", commitRefs: ^canonical_completion_refs},
-             assignment: %{outcome: "completed"}
-           } =
-             handle(ctx, "attest", completion)
-
-    refute_received :completion_commit_ref_lookup
-
-    unreviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "unreviewed producer"))
-
-    assert %{attest: %{verdictKind: "verified"}} =
-             attest_call({:session, "holder"}, unreviewed.id, "verdict")
-             |> put_in([:params, :verdict_kind], "verified")
-             |> put_in([:params, :commit_refs], producer_refs)
-             |> then(&handle(ctx, "attest", &1))
-
-    assert %{code: "inapplicable_code_evidence"} =
-             handle(ctx, "attest", attest_call({:session, "holder"}, unreviewed.id, "completion"))
-  end
-
-  test "non-session commit-ref attestations remain refused", ctx do
-    assignment =
-      assign_call({:user, "flynn"}, "non-session evidence")
-      |> put_in([:params, :effect_kind], "code")
-      |> then(&handle(ctx, "assign", &1))
-
-    refs = [
-      %{"repo" => "testhost:/tmp/non-session-evidence", "commit" => String.duplicate("a", 40)}
-    ]
-
-    completion =
-      attest_call({:user, "flynn"}, assignment.id, "completion")
-      |> put_in([:params, :commit_refs], refs)
-
-    assert %{code: "not_holder"} = handle(ctx, "attest", completion)
-
-    verification =
-      attest_call({:user, "flynn"}, assignment.id, "verdict")
-      |> put_in([:params, :verdict_kind], "verified")
-      |> put_in([:params, :commit_refs], refs)
-
-    assert %{code: "not_holder"} = handle(ctx, "attest", verification)
-  end
-
-  test "a review retraction committed before code completion defeats code completion", ctx do
-    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
-
-    on_exit(fn ->
-      if previous_runner,
-        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
-        else: Application.delete_env(:tightbeam, :commit_ref_command)
-    end)
-
-    producer_refs = [
-      %{"repo" => "testhost:/tmp/o2-result", "commit" => String.duplicate("a", 40)}
-    ]
-
-    completion_refs = [
-      %{"repo" => "testhost:/tmp/completion-result", "commit" => String.duplicate("b", 40)}
-    ]
-
-    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "retraction producer"))
-
-    review =
-      assign_call({:user, "flynn"}, "retraction review")
-      |> Map.put(:session_key, "other-session")
-      |> put_in([:params, :reviews_assignment_id], producer.id)
-      |> then(&handle(ctx, "assign", &1))
-
-    assert %{attest: %{verdictKind: "reviewed-clean"}} =
-             attest_call({:session, "other-session"}, review.id, "verdict")
-             |> put_in([:params, :verdict_kind], "reviewed-clean")
-             |> then(&handle(ctx, "attest", &1))
-
-    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
-      assert {:ok, _} =
-               DB.query(
-                 ctx.db,
-                 """
-                 INSERT INTO attests
-                   (id,assignmentId,kind,verdictKind,note,bySession,byHarness,byProvider,ts)
-                 VALUES
-                   ('att_concurrent_retraction',?1,'verdict','changes-requested','retracted',
-                    'other-session','claude','anthropic',?2)
-                 """,
-                 [review.id, System.system_time(:millisecond) + 1_000]
-               )
-
-      {"", 0}
-    end)
-
-    assert %{attest: %{verdictKind: "verified"}} =
-             attest_call({:session, "holder"}, producer.id, "verdict")
-             |> put_in([:params, :verdict_kind], "verified")
-             |> put_in([:params, :commit_refs], producer_refs)
-             |> then(&handle(ctx, "attest", &1))
-
-    completion =
-      attest_call({:session, "holder"}, producer.id, "completion")
-      |> put_in([:params, :commit_refs], completion_refs)
-
-    assert %{code: "inapplicable_code_evidence"} = handle(ctx, "attest", completion)
-
-    assert %{state: "open", closingAttestId: nil} =
-             handle(
-               ctx,
-               "assignment-get",
-               assignment_get_call({:session, "holder"}, producer.id)
-             )
-
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
-               [producer.id]
-             )
-  end
-
-  test "code completion accepts the same commit from different checkout paths", ctx do
-    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
-
-    on_exit(fn ->
-      if previous_runner,
-        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
-        else: Application.delete_env(:tightbeam, :commit_ref_command)
-    end)
-
-    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
-      {"", 0}
-    end)
-
-    commit = String.duplicate("a", 40)
-    producer_refs = [%{"repo" => "testhost:/tmp/producer-checkout", "commit" => commit}]
-    review_refs = [%{"repo" => "testhost:/tmp/reviewer-checkout", "commit" => commit}]
-
-    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "same-commit producer"))
-
-    review =
-      assign_call({:user, "flynn"}, "same-commit review")
-      |> Map.put(:session_key, "other-session")
-      |> put_in([:params, :reviews_assignment_id], producer.id)
-      |> then(&handle(ctx, "assign", &1))
-
-    assert %{attest: %{verdictKind: "reviewed-clean"}} =
-             attest_call({:session, "other-session"}, review.id, "verdict")
-             |> put_in([:params, :verdict_kind], "reviewed-clean")
-             |> put_in([:params, :commit_refs], review_refs)
-             |> then(&handle(ctx, "attest", &1))
-
-    assert %{attest: %{verdictKind: "verified"}} =
-             attest_call({:session, "holder"}, producer.id, "verdict")
-             |> put_in([:params, :verdict_kind], "verified")
-             |> put_in([:params, :commit_refs], producer_refs)
-             |> then(&handle(ctx, "attest", &1))
-
-    completion =
-      attest_call({:session, "holder"}, producer.id, "completion")
-      |> put_in([:params, :commit_refs], producer_refs)
-
-    assert %{attest: %{kind: "completion"}, assignment: %{outcome: "completed"}} =
-             handle(ctx, "attest", completion)
-  end
-
-  test "code completion accepts a linked clean review without commitRefs", ctx do
-    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
-
-    on_exit(fn ->
-      if previous_runner,
-        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
-        else: Application.delete_env(:tightbeam, :commit_ref_command)
-    end)
-
-    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
-      {"", 0}
-    end)
-
-    candidate_commit = String.duplicate("a", 40)
-
-    candidate_refs = [
-      %{"repo" => "testhost:/tmp/producer-checkout", "commit" => candidate_commit}
-    ]
-
-    producer =
-      handle(ctx, "assign", assign_call({:user, "other"}, "missing review refs producer"))
-
-    review =
-      assign_call({:user, "other"}, "missing review refs review")
-      |> Map.put(:session_key, "other-session")
-      |> put_in([:params, :reviews_assignment_id], producer.id)
-      |> then(&handle(ctx, "assign", &1))
-
-    assert %{attest: %{verdictKind: "reviewed-clean"}} =
-             attest_call({:session, "other-session"}, review.id, "verdict")
-             |> put_in([:params, :verdict_kind], "reviewed-clean")
-             |> then(&handle(ctx, "attest", &1))
-
-    assert %{attest: %{verdictKind: "verified"}} =
-             attest_call({:session, "holder"}, producer.id, "verdict")
-             |> put_in([:params, :verdict_kind], "verified")
-             |> put_in([:params, :commit_refs], candidate_refs)
-             |> then(&handle(ctx, "attest", &1))
-
-    completion =
-      attest_call({:session, "holder"}, producer.id, "completion")
-      |> put_in([:params, :commit_refs], candidate_refs)
-
-    assert %{attest: %{kind: "completion"}, assignment: %{outcome: "completed"}} =
-             handle(ctx, "attest", completion)
-  end
-
-  test "code completion accepts a linked clean review recorded for a different commit", ctx do
-    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
-
-    on_exit(fn ->
-      if previous_runner,
-        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
-        else: Application.delete_env(:tightbeam, :commit_ref_command)
-    end)
-
-    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
-      {"", 0}
-    end)
-
-    candidate_commit = String.duplicate("a", 40)
-    review_commit = String.duplicate("b", 40)
-    producer_refs = [%{"repo" => "testhost:/tmp/producer-checkout", "commit" => candidate_commit}]
-
-    review_refs = [%{"repo" => "testhost:/tmp/reviewer-checkout", "commit" => review_commit}]
-
-    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "different-commit producer"))
-
-    review =
-      assign_call({:user, "flynn"}, "different-commit review")
-      |> Map.put(:session_key, "other-session")
-      |> put_in([:params, :reviews_assignment_id], producer.id)
-      |> then(&handle(ctx, "assign", &1))
-
-    assert %{attest: %{verdictKind: "reviewed-clean"}} =
-             attest_call({:session, "other-session"}, review.id, "verdict")
-             |> put_in([:params, :verdict_kind], "reviewed-clean")
-             |> put_in([:params, :commit_refs], review_refs)
-             |> then(&handle(ctx, "attest", &1))
-
-    assert %{attest: %{verdictKind: "verified"}} =
-             attest_call({:session, "holder"}, producer.id, "verdict")
-             |> put_in([:params, :verdict_kind], "verified")
-             |> put_in([:params, :commit_refs], producer_refs)
-             |> then(&handle(ctx, "attest", &1))
-
-    completion =
-      attest_call({:session, "holder"}, producer.id, "completion")
-      |> put_in([:params, :commit_refs], producer_refs)
-
-    assert %{attest: %{kind: "completion"}, assignment: %{outcome: "completed"}} =
-             handle(ctx, "attest", completion)
   end
 
   test "attests returns every kind in timestamp and id order", ctx do
@@ -6634,6 +6393,8 @@ defmodule Tightbeam.AssignmentsTest do
     {:ok, [[count]]} = DB.query(db, "SELECT count(*) FROM assignments")
     count
   end
+
+  defp effect_memento(value), do: [%{name: "agentic-engineering/effect-kind", value: value}]
 
   defp assign_call(principal, subject \\ "work", key \\ nil, work_item_id \\ nil) do
     call("assign", principal, "holder", %{

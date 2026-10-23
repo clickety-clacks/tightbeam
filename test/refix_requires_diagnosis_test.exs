@@ -4,12 +4,12 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
 
   alias Tightbeam.{
     Archetypes,
+    Artifacts,
     Assignments,
     DB,
     DeliveryResponsibilities,
     Dispatch,
     Gateway,
-    Identity,
     Org,
     RailRemedy,
     Roles,
@@ -58,11 +58,10 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       )
 
     assert :initialized = Archetypes.init_identity!(base_dir)
-    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "flynn")
     _archetypes = Archetypes.load!(base_dir)
 
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-    rules = Rules.load!(base_dir, Map.keys(handlers))
+    rules = Tightbeam.ShippedPolicyFixture.learn_engineering!(db, base_dir, handlers)
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
@@ -167,19 +166,44 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
         params: %{
           subject: "completed evidence",
           work_item_id: work_item_id,
-          effect_kind: "evidence"
+          mementos: effect_mementos("evidence")
         }
       })
 
-    assert assignment.effectKind == "evidence"
+    assert assignment.effectKind == nil
+    assert assignment.mementos["agentic-engineering/effect-kind"] == ["evidence"]
 
-    Assignments.__handle__(ctx.db, "attest", %{
-      verb: "attest",
-      origin: "session:#{ctx.holder.session_key}",
+    Artifacts.record(ctx.db, %{
       principal: {:session, ctx.holder.session_key},
-      session_key: nil,
-      params: %{assignment_id: assignment.id, kind: "completion"}
+      session_key: ctx.holder.session_key,
+      recorded_message_id: "msg_repair_evidence",
+      params: %{
+        kind: "report",
+        title: "prior evidence",
+        origin_path: "/tmp/prior-evidence.txt",
+        work_item_id: work_item_id
+      }
     })
+
+    for {kind, verdict} <- [{"verdict", "verified"}, {"completion", nil}] do
+      assert {:ok, result} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, %{
+                 verb: "attest",
+                 origin: "agent:#{ctx.holder.session_key}",
+                 principal: {:session, ctx.holder.session_key},
+                 session_key: nil,
+                 params: %{
+                   assignment_id: assignment.id,
+                   kind: kind,
+                   verdict_kind: verdict,
+                   mementos: [
+                     %{name: "agentic-engineering/evidence-ref", value: "prior-evidence"}
+                   ]
+                 }
+               })
+
+      if kind == "completion", do: assert(result.assignment.state == "closed")
+    end
 
     assignment
   end
@@ -211,7 +235,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
         params: %{
           subject: "return topology",
           work_item_id: item.id,
-          effect_kind: "coordination"
+          mementos: effect_mementos("coordination")
         }
       })
 
@@ -250,6 +274,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
              })
   end
 
+  defp effect_mementos(value), do: [%{name: "agentic-engineering/effect-kind", value: value}]
+
   defp dispatch_call(caller_key, holder_key, work_item_id, subject) do
     %{
       verb: "dispatch",
@@ -258,7 +284,12 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
-      params: %{subject: subject, brief: "Implement #{subject}.", work_item_id: work_item_id}
+      params: %{
+        subject: subject,
+        brief: "Implement #{subject}.",
+        work_item_id: work_item_id,
+        mementos: effect_mementos("code")
+      }
     }
   end
 

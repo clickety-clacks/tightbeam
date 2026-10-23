@@ -9,7 +9,6 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     DeliveryResponsibilities,
     Dispatch,
     Gateway,
-    Identity,
     Roles,
     Rules,
     SessionPoAssociations,
@@ -56,11 +55,10 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
       )
 
     assert :initialized = Archetypes.init_identity!(base_dir)
-    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "flynn")
     _archetypes = Archetypes.load!(base_dir)
 
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-    rules = Rules.load!(base_dir, Map.keys(handlers))
+    rules = Tightbeam.ShippedPolicyFixture.learn_engineering!(db, base_dir, handlers)
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
@@ -74,6 +72,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
       coder: coder,
       orchestrator: orchestrator,
       reviewer: reviewer,
+      po: po,
       rules: rules
     }
   end
@@ -291,22 +290,22 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
         verb: "assign",
         origin: "agent:#{ctx.orchestrator.session_key}",
         principal: {:session, ctx.orchestrator.session_key},
-        session_key: ctx.orchestrator.session_key,
+        session_key: ctx.po.session_key,
         target_role: nil,
         role_fallback: false,
         supervision_interval_ms: 1_000,
         params: %{
           subject: "return topology",
           work_item_id: item.id,
-          effect_kind: "coordination"
+          mementos: effect_mementos("coordination")
         }
       })
 
     assert %{attest: %{verdictKind: "topology-decided"}} =
              Assignments.__handle__(ctx.db, "attest", %{
                verb: "attest",
-               origin: "agent:#{ctx.orchestrator.session_key}",
-               principal: {:session, ctx.orchestrator.session_key},
+               origin: "agent:#{ctx.po.session_key}",
+               principal: {:session, ctx.po.session_key},
                params: %{
                  assignment_id: topology.id,
                  kind: "verdict",
@@ -317,11 +316,13 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     assert %{assignment: %{state: "closed"}} =
              Assignments.__handle__(ctx.db, "attest", %{
                verb: "attest",
-               origin: "agent:#{ctx.orchestrator.session_key}",
-               principal: {:session, ctx.orchestrator.session_key},
+               origin: "agent:#{ctx.po.session_key}",
+               principal: {:session, ctx.po.session_key},
                params: %{assignment_id: topology.id, kind: "completion"}
              })
   end
+
+  defp effect_mementos(value), do: [%{name: "agentic-engineering/effect-kind", value: value}]
 
   defp user_assign_call(holder_key, item_id, subject, options) do
     %{
@@ -334,7 +335,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
       params: %{
         subject: subject,
         work_item_id: item_id,
-        effect_kind: options[:effect_kind],
+        mementos: effect_mementos(options[:effect_kind] || "code"),
         reviews_assignment_id: options[:reviews_assignment_id]
       }
     }
@@ -360,7 +361,12 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
-      params: %{subject: subject, brief: "Implement #{subject}.", work_item_id: item_id}
+      params: %{
+        subject: subject,
+        brief: "Implement #{subject}.",
+        work_item_id: item_id,
+        mementos: effect_mementos("code")
+      }
     }
   end
 

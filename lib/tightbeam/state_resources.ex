@@ -128,11 +128,11 @@ defmodule Tightbeam.StateResources do
 
   @item_field_order %{
     "work items" =>
-      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority rowVersion),
+      ~w(id title specRefName specRefSha256 isBug ownerUserId deliveryOwnerSessionKey state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority body bodyUpdatedByUser bodyUpdatedBySession bodyUpdatedAt rowVersion mementos),
     "assignments" =>
-      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
+      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider files commitRefCorrections effectKind derivedStatus rowVersion mementos),
     "attests" =>
-      ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs ts rowVersion),
+      ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs artifactId contentSha256 waitId ts rowVersion mementos),
     "wakes" =>
       ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon deliveryStatus rowVersion),
     "turns" =>
@@ -187,7 +187,7 @@ defmodule Tightbeam.StateResources do
       integers: ~w(openedAt closedAt rowVersion),
       booleans: ~w(holderFallback),
       nullable:
-        ~w(holderRole openedByUser openedBySession outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider)
+        ~w(holderRole openedByUser openedBySession outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider effectKind)
     },
     "attests" => %{
       strings:
@@ -322,6 +322,9 @@ defmodule Tightbeam.StateResources do
   }
 
   @item_complex_types %{
+    {"work items", "mementos"} => :mementos,
+    {"assignments", "mementos"} => :mementos,
+    {"attests", "mementos"} => :mementos,
     {"assignments", "files"} => {:array, :string, :preserve},
     {"attests", "commitRefs"} => {:array, :commit_ref, :preserve},
     {"decision requests", "options"} => {:array, :decision_option, :preserve},
@@ -442,7 +445,7 @@ defmodule Tightbeam.StateResources do
           filters["holderKey"]
         ]
       )
-      |> Enum.map(&work_item_query_row/1)
+      |> Enum.map(&Tightbeam.Mementos.attach(db, "work_item", work_item_query_row(&1)))
 
     if is_map(selection), do: rows, else: List.first(rows)
   end
@@ -507,7 +510,11 @@ defmodule Tightbeam.StateResources do
          end) do
       {:ok, page} ->
         %{
-          rows: Enum.map(page.rows, &work_item_query_row/1),
+          rows:
+            Enum.map(
+              page.rows,
+              &Tightbeam.Mementos.attach(db, "work_item", work_item_query_row(&1))
+            ),
           has_more_before: page.has_more_before,
           has_more_after: page.has_more_after
         }
@@ -535,8 +542,16 @@ defmodule Tightbeam.StateResources do
            @assignment_select <> " WHERE a.id = ? AND (" <> visibility <> ")",
            [id | visibility_params]
          ) do
-      [row] -> assignment_query_row(row)
-      [] -> nil
+      [row] ->
+        assignment_query_row(row)
+        |> Map.put(
+          :commit_ref_corrections,
+          AssignmentCommitRefCorrections.list_many(db, [id]) |> Map.get(id, [])
+        )
+        |> then(&Tightbeam.Mementos.attach(db, "assignment", &1))
+
+      [] ->
+        nil
     end
   end
 
@@ -1037,6 +1052,7 @@ defmodule Tightbeam.StateResources do
           commit_refs: if(is_binary(commit_refs), do: JSON.decode!(commit_refs), else: nil),
           ts: ts
         }
+        |> then(&Tightbeam.Mementos.attach(db, "attest", &1))
 
       [] ->
         nil
@@ -1636,10 +1652,37 @@ defmodule Tightbeam.StateResources do
     end
   end
 
-  def work_item(row), do: public(row)
-  def assignment(row), do: public(row)
+  def work_item(row), do: row |> memento_default() |> public()
+
+  def assignment(row) do
+    row = memento_default(row)
+
+    corrections =
+      Map.get(row, :commit_ref_corrections) || Map.get(row, :commitRefCorrections) ||
+        Map.get(row, "commitRefCorrections") || []
+
+    item =
+      row
+      |> Map.drop([:commit_ref_corrections, :commitRefCorrections, "commitRefCorrections"])
+      |> public()
+      |> Map.put(
+        "commitRefCorrections",
+        Enum.map(corrections, fn correction ->
+          Map.new(correction, fn {key, value} -> {wire_key(key), public(value)} end)
+        end)
+      )
+
+    item
+  end
+
+  defp memento_default(row) when is_map(row) do
+    if Map.has_key?(row, "mementos"), do: row, else: Map.put_new(row, :mementos, %{})
+  end
+
+  defp memento_default(value), do: value
 
   def attest(row) do
+    row = memento_default(row)
     reject_public_shape_drift!(row, "attests")
     row |> public() |> closed_projection("attests")
   end
@@ -2277,6 +2320,13 @@ defmodule Tightbeam.StateResources do
     :ok
   end
 
+  defp validate_wire_value!(value, :mementos, label) when is_map(value) do
+    Enum.each(value, fn {name, values} ->
+      unless is_binary(name), do: raise(ArgumentError, "#{label} names must be strings")
+      validate_wire_value!(values, {:array, :string, :preserve}, "#{label}.#{name}")
+    end)
+  end
+
   defp validate_wire_value!(value, :json, label), do: validate_json_value!(value, label)
 
   defp validate_wire_value!(_value, _type, label),
@@ -2457,6 +2507,15 @@ defmodule Tightbeam.StateResources do
     value
     |> Enum.sort_by(&Map.fetch!(&1, "path"))
     |> encode_closed_list!(~w(path content sha256), "kungfu.documents")
+  end
+
+  defp encode_item_field(_resource, "mementos", value) do
+    "{" <>
+      (value
+       |> Enum.sort_by(&elem(&1, 0))
+       |> Enum.map_join(",", fn {name, values} ->
+         JSON.encode!(name) <> ":" <> JSON.encode!(values)
+       end)) <> "}"
   end
 
   defp encode_item_field(_resource, _field, value), do: JSON.encode!(value)

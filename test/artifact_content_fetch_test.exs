@@ -25,12 +25,12 @@ defmodule Tightbeam.ArtifactContentFetchTest do
     %{db: db, path: path, root: root, workspace: workspace}
   end
 
-  test "captured binary and empty content remain fetchable without either filesystem copy after restart",
+  test "archival keeps workspace files without capturing their content",
        ctx do
     Tightbeam.GuardRuntimeFixture.run!(
       Path.join(ctx.root, "runtime"),
       "artifact_content_fetch_runtime.exs",
-      "artifact-content-fetch-restart: ok"
+      "artifact-content-no-capture-restart: ok"
     )
   end
 

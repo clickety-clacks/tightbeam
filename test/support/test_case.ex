@@ -40,10 +40,10 @@ defmodule Tightbeam.TestCase do
 
   @persistent_keys [
     Tightbeam.Rules,
-    {Tightbeam.Rules, :policies},
     Tightbeam.RuleRuntime,
     Tightbeam.Rails,
     Tightbeam.Archetypes,
+    {Tightbeam.Gateway, :inactive_law},
     {Tightbeam.Application, :draining}
   ]
 
@@ -65,6 +65,10 @@ defmodule Tightbeam.TestCase do
     assert_hermetic_tmp!()
     snapshot = snapshot()
     on_exit(fn -> restore(snapshot) end)
+
+    # Unit fixtures start without the composition root's complete law. The
+    # saved snapshot above restores it on exit; runtime partial reloads refuse.
+    :persistent_term.erase(Tightbeam.Rules)
 
     Tightbeam.Rules.load!(
       Path.join(System.tmp_dir!(), "tightbeam-empty-rules-#{System.unique_integer([:positive])}"),

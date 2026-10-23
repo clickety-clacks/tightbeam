@@ -32,6 +32,46 @@ defmodule Tightbeam.RecognitionRetryTest do
     %{db: db, retry: :sys.get_state(db).retry}
   end
 
+  test "deferred actor work uses the reopened database owner" do
+    base = Path.join(System.tmp_dir!(), "actor-recognition-#{Tightbeam.Id.uuid4()}")
+    File.mkdir_p!(base)
+    on_exit(fn -> File.rm_rf!(base) end)
+    %{payload: payload} = Tightbeam.GuardRuntimeFixture.prepare!(base, "unused")
+
+    child =
+      Supervisor.child_spec(
+        {DB,
+         path: Path.join(base, "state.db"), name: nil, guard_inputs: [], payload_root: payload},
+        id: :actor_owner
+      )
+
+    original = start_supervised!(child)
+    :ok = Tightbeam.Schema.ensure_all(original)
+    # Schema setup can activate file-backed recognition. Stop the actual worker
+    # before admission so this test observes durable replay after owner restart.
+    retry = :persistent_term.get({Tightbeam.Recognition, original})
+    :ok = :sys.suspend(retry)
+    parent = self()
+
+    assert {:ok, :ok} =
+             DB.transaction(original, fn txn ->
+               Tightbeam.Recognition.defer_in_txn(txn, fn current_owner ->
+                 {:ok, [[1]]} = DB.query(current_owner, "SELECT 1")
+                 send(parent, {:actor_owner, current_owner})
+                 :ok
+               end)
+             end)
+
+    assert {:ok, [[1]]} = DB.query(original, "SELECT count(*) FROM pending_recognition")
+    refute_received {:actor_owner, ^original}
+    stop_supervised!(:actor_owner)
+    reopened = start_supervised!(child)
+    refute reopened == original
+    :ok = Tightbeam.Schema.ensure_all(reopened)
+    :ok = Tightbeam.Recognition.activate(reopened)
+    assert_receive {:actor_owner, ^reopened}, 2_000
+  end
+
   test "arity two returns the committed value, rolls back recognition and retries it", %{
     db: db,
     retry: retry

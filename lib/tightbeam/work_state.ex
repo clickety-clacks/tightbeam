@@ -82,7 +82,7 @@ defmodule Tightbeam.WorkState do
   @spec list(DB.server(), map()) :: %{work: [map()], cursor: non_neg_integer()}
   def list(db, filters) do
     transaction(db, fn txn ->
-      work = txn |> assignment_rows(filters) |> Enum.map(&assignment/1)
+      work = txn |> assignment_rows(filters) |> Enum.map(&project_assignment(txn, &1))
       %{work: work, cursor: cursor(txn, "work_state_events")}
     end)
   end
@@ -114,11 +114,17 @@ defmodule Tightbeam.WorkState do
                :desc
              )
 
-           {page, cursor(txn, "work_state_events")}
+           {%{
+              page
+              | rows:
+                  Enum.map(page.rows, fn row ->
+                    project_assignment(txn, List.delete_at(row, -1))
+                  end)
+            }, cursor(txn, "work_state_events")}
          end) do
       {:ok, {result, event_cursor}} ->
         %{
-          work: Enum.map(result.rows, fn row -> row |> List.delete_at(-1) |> assignment() end),
+          work: result.rows,
           has_more_before: result.has_more_before,
           has_more_after: result.has_more_after,
           cursor: event_cursor
@@ -138,7 +144,7 @@ defmodule Tightbeam.WorkState do
           nil
 
         [row] ->
-          assignment = assignment(row)
+          assignment = project_assignment(txn, row)
 
           %{
             assignment: assignment,
@@ -160,7 +166,7 @@ defmodule Tightbeam.WorkState do
         txn
         |> item_rows(filters)
         |> Enum.map(fn row ->
-          item = work_item(row)
+          item = project_work_item(txn, row)
           %{workItem: item, assignments: assignments_for_item(txn, item.id)}
         end)
 
@@ -178,7 +184,7 @@ defmodule Tightbeam.WorkState do
 
         [row] ->
           %{
-            workItem: work_item(row),
+            workItem: project_work_item(txn, row),
             assignments: assignments_for_item(txn, work_item_id),
             cursor: cursors(txn)
           }
@@ -279,7 +285,7 @@ defmodule Tightbeam.WorkState do
 
   defp assignments_for_item(txn, work_item_id) do
     Txn.q(txn, assignment_query("a.workItemId = ?1"), [work_item_id])
-    |> Enum.map(&assignment/1)
+    |> Enum.map(&project_assignment(txn, &1))
   end
 
   defp assignment_owner(txn, assignment_id) do
@@ -323,7 +329,8 @@ defmodule Tightbeam.WorkState do
         note: note,
         bySession: by_session,
         byUser: by_user,
-        ts: ts
+        ts: ts,
+        mementos: Tightbeam.Mementos.current(txn, "attest", id)
       }
     end)
   end
@@ -402,6 +409,16 @@ defmodule Tightbeam.WorkState do
         "COALESCE((SELECT priority FROM work_item_priorities p WHERE p.workItemId=work_items.id), " <>
         "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)), " <>
         "COALESCE((SELECT rowVersion FROM work_item_versions WHERE workItemId=work_items.id), createdAt)"
+
+  defp project_assignment(txn, row) do
+    record = assignment(row)
+    Map.put(record, :mementos, Tightbeam.Mementos.current(txn, "assignment", record.id))
+  end
+
+  defp project_work_item(txn, row) do
+    record = work_item(row)
+    Map.put(record, :mementos, Tightbeam.Mementos.current(txn, "work_item", record.id))
+  end
 
   defp assignment([
          id,

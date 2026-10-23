@@ -249,7 +249,7 @@ defmodule Tightbeam.JobTraceTest do
     assert %{code: "not_found"} = trace(db, {:user, "owner"}, "wi_missing")
 
     assert_keys(trace, ~w(assignments timeline workItem)a)
-    assert_keys(trace.workItem, ~w(failReason id ownerUserId state title)a)
+    assert_keys(trace.workItem, ~w(failReason id mementos ownerUserId state title)a)
 
     assert Enum.map(trace.assignments, & &1.id) == ["asg_bad", "asg_direct", "asg_review"]
     assert trace.workItem.state == "open"
@@ -258,7 +258,7 @@ defmodule Tightbeam.JobTraceTest do
     Enum.each(trace.assignments, fn assignment ->
       assert_keys(
         assignment,
-        ~w(commitRefCorrections currentCoordinationParentRef files holderKey id openerRef reviewsAssignmentId state)a
+        ~w(commitRefCorrections currentCoordinationParentRef files holderKey id mementos openerRef reviewsAssignmentId state)a
       )
     end)
 
@@ -424,6 +424,41 @@ defmodule Tightbeam.JobTraceTest do
     refute_received {:commit_ref_command, _, _, _}
   end
 
+  test "trace projects current mementos without replacing legacy evidence", %{db: db} do
+    assert %{attest: receipt} = attest(db, {:session, "holder"}, "asg_direct", "progress", %{})
+
+    for {kind, id} <- [
+          {"work_item", "wi_trace"},
+          {"assignment", "asg_direct"},
+          {"attest", receipt.id}
+        ],
+        value <- ["old", "current"] do
+      assert {:ok, :ok} =
+               DB.transaction(db, fn txn ->
+                 Tightbeam.Mementos.append_in_txn!(
+                   txn,
+                   kind,
+                   id,
+                   [{"fixture/value", [value]}],
+                   {:user, "owner"},
+                   "fixture-revision"
+                 )
+
+                 :ok
+               end)
+    end
+
+    result = trace(db, {:user, "owner"}, "wi_trace")
+    expected = %{"fixture/value" => ["current"]}
+    assert result.workItem.mementos == expected
+    assert Enum.find(result.assignments, &(&1.id == "asg_direct")).mementos == expected
+
+    assert Enum.find(result.timeline, &(&1.type == "attest" and &1.id == receipt.id)).mementos ==
+             expected
+
+    assert {:ok, [[6]]} = DB.query(db, "SELECT COUNT(*) FROM memento_history")
+  end
+
   test "equal-time numeric turn ids sort numerically", %{db: db} do
     for suffix <- 3..10 do
       assert {:ok, []} =
@@ -455,7 +490,7 @@ defmodule Tightbeam.JobTraceTest do
           ~w(assignmentId at context effort harness id jobRef model status type)a
 
         "attest" ->
-          ~w(assignmentId at commitRefs id kind type verdict)a
+          ~w(assignmentId at commitRefs id kind mementos type verdict)a
 
         "wake_scheduled" ->
           ~w(assignmentId at dueAt id type)a

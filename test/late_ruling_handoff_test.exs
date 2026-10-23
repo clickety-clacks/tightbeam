@@ -352,6 +352,20 @@ defmodule Tightbeam.LateRulingHandoffTest do
     assert replayed_receipt.contentSha256 == first_receipt.contentSha256
     assert replayed_receipt.waitId == first_receipt.waitId
 
+    # Ruling-consumed is decision bookkeeping, excluded from replacement evidence.
+    replacement_policy = %{
+      Tightbeam.Rules.effective_snapshot()
+      | active_admission_contract: %{"attest" => "replacement"}
+    }
+
+    Tightbeam.RuleRuntime.with_policy_snapshot(replacement_policy, fn ->
+      assert %{attest: replacement_receipt} =
+               Assignments.__handle__(ctx.db, "attest", receipt_call)
+
+      assert replacement_receipt.id == first_receipt.id
+      assert replacement_receipt.commitRefs == first_receipt.commitRefs
+    end)
+
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
@@ -690,8 +704,7 @@ defmodule Tightbeam.LateRulingHandoffTest do
       subject: subject,
       work_item_id: work_item_id,
       idempotency_key: opts[:key],
-      succeeds_assignment_id: opts[:succeeds],
-      effect_kind: opts[:effect_kind] || "coordination"
+      succeeds_assignment_id: opts[:succeeds]
     }
 
     Assignments.__handle__(db, "assign", %{

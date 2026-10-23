@@ -13,7 +13,7 @@ defmodule Tightbeam.GatewayTest do
     expected =
       ~w(post wake condition facts-read artifact-record artifact-get artifacts rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request approve-device deny-device revoke-device host-env-set host-env-list host-env-unset host-toolchain-set register-host update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard promote-user add-user config harness-processes role-create role-bind role-rm role-list work-item-create work-item-handoff work-item-get work-item-trace transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest attests assignment-get revoke-assignment reopen-assignment repair-assignment assignments inspect cancel critical spawn tune session-reparent session-po-set retire assignment-commitref-correct)
 
-    expected = expected ++ ~w(breathing)
+    expected = expected ++ ~w(breathing memento-set mementos)
 
     expected =
       expected ++ ~w(ask answer return read-marker-set read-marker-clear artifact-content-fetch)
@@ -294,6 +294,9 @@ defmodule Tightbeam.GatewayTest do
         60_000 -> raise "timed out waiting for queued harness switch candidate"
       end
     end
+
+    def handle_call({:knows_session?, "queued-switch-candidate"}, _from, parent),
+      do: {:reply, true, parent}
   end
 
   defmodule FailingCandidateAdapterStub do
@@ -5978,7 +5981,7 @@ defmodule Tightbeam.GatewayTest do
     assert readme =~ "tightbeam-kungfu-crafting"
     assert readme =~ "identity/archetypes"
 
-    archetypes = Archetypes.load!(base_dir)
+    archetypes = Archetypes.all()
     assert archetypes["demo-role"].skills == []
     assert Archetypes.guidance(archetypes["demo-role"]) =~ "# demo role"
 
@@ -5986,7 +5989,7 @@ defmodule Tightbeam.GatewayTest do
     assert [starter_statute] = rail_manifest["statute"]
     assert starter_statute["name"] == "demo-example"
 
-    statutes = Rails.load!(base_dir)
+    statutes = Rules.effective_snapshot().law_components[Rails]
     statute = Enum.find(statutes, &(&1.name == "demo-example"))
     assert statute.pattern == "TIGHTBEAM_KUNGFU_TEMPLATE_PLACEHOLDER_NEVER_MATCHES"
 
@@ -6110,6 +6113,48 @@ defmodule Tightbeam.GatewayTest do
                "SELECT overrides, identityName FROM sessions WHERE sessionKey = ?1",
                [session.session_key]
              )
+  end
+
+  test "override removal updates files, row and notification", ctx do
+    base_dir = role_test_base("override-removal-fence")
+    put_skill!(base_dir, "review", "# Review")
+    base = Archetypes.load!(base_dir)["default"]
+
+    {:ok, overrides} =
+      Archetypes.normalize_overrides(base_dir, base, %{
+        "skills_add" => ["review"],
+        "guidance_extra" => "Additional guidance"
+      })
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    identity_name = Placement.identity_name(config, base, overrides, :claude)
+    Org.set_identity(ctx.db, "k1", overrides, identity_name)
+    pinned = Path.join([base_dir, "identity", "pinned", identity_name, "review", "SKILL.md"])
+    File.mkdir_p!(Path.dirname(pinned))
+    File.write!(pinned, "# Pinned review")
+    tune = Gateway.handlers(config)["tune"]
+
+    call = %{
+      origin: "user:flynn",
+      session_key: "k1",
+      params: %{setting: "remove_override", guidance: true}
+    }
+
+    assert %{ok: true, identity_name: next, overrides: %{"skills_add" => ["review"]}} =
+             tune.(call)
+
+    refute next == identity_name
+    refute File.exists?(pinned)
+
+    assert File.read!(Path.join([base_dir, "identity", "pinned", next, "review", "SKILL.md"])) ==
+             "# Pinned review"
+
+    assert Org.get(ctx.db, "k1").identity_name == next
+    assert Ledger.pending_count(ctx.db, "k1") == 1
   end
 
   test "set_model moves a resident harness session before recording the selection", ctx do
@@ -7950,6 +7995,45 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, "k1").host == "testhost"
   end
 
+  test "host movement copies before changing session state", ctx do
+    base_dir = move_test_base(ctx.db, "caller-fence")
+    source = test_workdir(base_dir, "k1")
+    File.mkdir_p!(source)
+    File.write!(Path.join(source, "work.txt"), "keep")
+    parent = self()
+
+    # Control the command boundary, not remote transfer behavior: this test
+    # checks the lease while an external operation has not yet returned.
+    sh = fn command ->
+      send(parent, {:host_command, command})
+
+      if hd(command) == "rsync" do
+        send(parent, {:copy_pending, self()})
+        receive do: (:finish_copy -> :ok)
+      end
+
+      {"", 0}
+    end
+
+    tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+
+    call = %{
+      origin: "user:flynn",
+      session_key: "k1",
+      params: %{setting: "set_host", host: "worker"}
+    }
+
+    before = Org.get(ctx.db, "k1")
+
+    move = Task.async(fn -> tune.(call) end)
+    assert_receive {:copy_pending, mover}
+    assert Org.get(ctx.db, "k1") == before
+    assert File.read!(Path.join(source, "work.txt")) == "keep"
+    send(mover, :finish_copy)
+    assert %{ok: true, host: "worker"} = Task.await(move)
+    assert Org.get(ctx.db, "k1").host == "worker"
+  end
+
   test "set_host proceeds when the source workdir is missing", ctx do
     base_dir = move_test_base(ctx.db, "missing")
     parent = self()
@@ -9402,6 +9486,7 @@ defmodule Tightbeam.GatewayTest do
   test "served stamp failure after Git publication keeps marker pending until replay", ctx do
     alias Tightbeam.AdminProjection
     base_dir = role_test_base("served-stamp-replay")
+    ordinary_law_bundle_fixture!(base_dir)
     Identity.init!(base_dir)
     :ok = AdminProjection.bootstrap_served(ctx.db, base_dir)
     prior_live = Identity.live_revision!(base_dir)
@@ -9419,7 +9504,7 @@ defmodule Tightbeam.GatewayTest do
       verb: "learn",
       invocation_id: "fixture-served-stamp-replay",
       origin: "user:flynn",
-      params: %{name: "agentic-engineering"}
+      params: %{name: "ordinary-law"}
     }
 
     assert %{code: "projection_stamp_failed"} = handlers["learn"].(call)
@@ -9574,6 +9659,21 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[3]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
   end
 
+  test "learning the shipped legacy policy publishes without changing admission", ctx do
+    base_dir = role_test_base("learn-replacement")
+    Identity.init!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+    handlers = Gateway.handlers(config)
+    Gateway.load_law!(config, Map.keys(handlers))
+    result = handlers["learn"].(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+
+    assert %{state: "published", kungfu: "agentic-engineering", live_revision: revision} = result
+    assert revision == Identity.live_revision!(base_dir)
+    assert Rules.active_admission_contract("attest") == "legacy"
+    candidate = Gateway.prepare_law!(config, revision, Map.keys(handlers)).policy
+    assert candidate.requested_admission_contract == %{}
+  end
+
   test "learn and unlearn reload all law and unlearn names durable references", ctx do
     case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
       {:ok, _pid} -> :ok
@@ -9581,6 +9681,7 @@ defmodule Tightbeam.GatewayTest do
     end
 
     base_dir = role_test_base("learn-unlearn")
+    ordinary_law_bundle_fixture!(base_dir)
     Identity.init!(base_dir)
     handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
     learn = handlers["learn"]
@@ -9588,13 +9689,13 @@ defmodule Tightbeam.GatewayTest do
     repoint = handlers["identity-repoint"]
     retire = handlers["retire"]
 
-    assert %{state: "published", kungfu: "agentic-engineering", live_revision: revision} =
-             learn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+    assert %{state: "published", kungfu: "ordinary-law", live_revision: revision} =
+             learn.(%{origin: "user:flynn", params: %{name: "ordinary-law"}})
 
     assert revision == Identity.live_revision!(base_dir)
     assert Archetypes.get("coder").name == "coder"
     assert Rails.statutes?()
-    assert :persistent_term.get(Rules, []) != []
+    assert Rules.effective_snapshot().rules != []
 
     active =
       Org.create(ctx.db, %{
@@ -9631,7 +9732,7 @@ defmodule Tightbeam.GatewayTest do
              message: message,
              sessions: sessions,
              setting: nil
-           } = unlearn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+           } = unlearn.(%{origin: "user:flynn", params: %{name: "ordinary-law"}})
 
     assert message =~ active.session_key
     assert message =~ retired.session_key
@@ -9673,17 +9774,17 @@ defmodule Tightbeam.GatewayTest do
     :ok = Org.put_setting(ctx.db, "default-archetype", "coder")
 
     assert %{state: "referenced", sessions: [], setting: "coder", message: setting_message} =
-             unlearn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+             unlearn.(%{origin: "user:flynn", params: %{name: "ordinary-law"}})
 
     assert setting_message =~ "default-archetype setting: coder"
     :ok = Org.put_setting(ctx.db, "default-archetype", "default")
 
-    assert %{state: "published", kungfu: "agentic-engineering"} =
-             unlearn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+    assert %{state: "published", kungfu: "ordinary-law"} =
+             unlearn.(%{origin: "user:flynn", params: %{name: "ordinary-law"}})
 
     assert Archetypes.get("coder") == nil
     refute Rails.statutes?()
-    assert :persistent_term.get(Rules, []) == []
+    assert Rules.effective_snapshot().rules == []
   end
 
   test "kungfu list reports shipped bundles and their offer metadata",
@@ -10655,7 +10756,7 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, first.session_key).identity_revision == next
   end
 
-  test "identity apply does not write a captured revision after a newer revision publishes",
+  test "identity apply may write its captured revision after a newer revision publishes",
        ctx do
     base_dir = role_test_base("identity-apply-newer-revision")
     learn_engineering_identity!(base_dir)
@@ -10750,27 +10851,20 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, :released} = Task.yield(lock, 5_000)
 
     assert %{
-             status: "partial",
-             complete: false,
+             status: "complete",
+             complete: true,
              identity_revision: ^captured,
              target_session_keys: [session_key],
-             applied: [],
-             results: [
-               %{
-                 outcome: "superseded",
-                 files: "not_started",
-                 stamp: "not_committed",
-                 prompt_enqueue: "not_attempted",
-                 current_identity_revision: ^newer
-               }
-             ]
+             applied: [^session_key],
+             results: [%{outcome: "applied", files: "materialized", stamp: "committed"}]
            } = Task.await(apply_task, 10_000)
 
     assert session_key == session.session_key
     assert Identity.live_revision!(base_dir) == newer
-    assert File.read!(skill) == original_body
-    assert Org.get(ctx.db, session.session_key).identity_revision == original
-    assert Tightbeam.Wakes.list_for_session(ctx.db, session.session_key) == []
+    assert original_body != "captured revision"
+    assert File.read!(skill) == "captured revision"
+    assert Org.get(ctx.db, session.session_key).identity_revision == captured
+    assert [%{state: "pending"} | _] = Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
 
     assert %{
              status: "complete",
@@ -11738,6 +11832,43 @@ defmodule Tightbeam.GatewayTest do
     end)
 
     base_dir
+  end
+
+  defp ordinary_law_bundle_fixture!(base_dir) do
+    # Ordinary bundle publication still reloads all components. Replacement
+    # admission is exercised separately against the unchanged shipped bundle.
+    root = Path.join(base_dir, "bundles")
+    bundle = Path.join(root, "ordinary-law")
+    for dir <- ["archetypes", "rules", "rails"], do: File.mkdir_p!(Path.join(bundle, dir))
+
+    File.write!(
+      Path.join(bundle, "manifest.toml"),
+      ~s(root_archetype = "coder"\npurpose = "Ordinary publication fixture"\n)
+    )
+
+    File.write!(Path.join(bundle, "archetypes/coder.toml"), ~s(name = "coder"\nskills = []\n))
+
+    File.write!(Path.join(bundle, "rules/ordinary.toml"), """
+    [[rule]]
+    name = "ordinary-post"
+    verb = "post"
+    text = "predicate refused"
+    deny_when = [{fact = "caller.origin_class", op = "eq", value = "process"}]
+    """)
+
+    File.cp!(
+      "priv/kungfu/agentic-engineering/rails/engineering.toml",
+      Path.join(bundle, "rails/ordinary.toml")
+    )
+
+    previous_root = Application.get_env(:tightbeam, :kungfu_bundle_root_dir)
+    Application.put_env(:tightbeam, :kungfu_bundle_root_dir, root)
+
+    on_exit(fn ->
+      if previous_root,
+        do: Application.put_env(:tightbeam, :kungfu_bundle_root_dir, previous_root),
+        else: Application.delete_env(:tightbeam, :kungfu_bundle_root_dir)
+    end)
   end
 
   defp learn_engineering_identity!(base_dir) do

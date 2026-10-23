@@ -104,19 +104,20 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
        credential_kind: fn _ -> :subscription end}
     )
 
-    handlers =
-      Gateway.handlers(%{
-        db: db,
-        base_dir: base,
-        cwd: base,
-        wake_tick_ms: 1_000,
-        default_harness: :fixture,
-        default_model: Model.new("fixture-model"),
-        credential_status: fn provider ->
-          if provider == :fixture_provider, do: :onboarded, else: :missing
-        end,
-        credential_kind: fn _ -> :subscription end
-      })
+    gateway_config = %{
+      db: db,
+      base_dir: base,
+      cwd: base,
+      wake_tick_ms: 1_000,
+      default_harness: :fixture,
+      default_model: Model.new("fixture-model"),
+      credential_status: fn provider ->
+        if provider == :fixture_provider, do: :onboarded, else: :missing
+      end,
+      credential_kind: fn _ -> :subscription end
+    }
+
+    handlers = Gateway.handlers(gateway_config)
 
     File.mkdir_p!(Path.join(base, "identity/rules"))
 
@@ -132,13 +133,30 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
       Path.join(base, "identity/rules/delivery.toml")
     )
 
-    Rules.load!(base, Map.keys(handlers))
+    File.mkdir_p!(Path.join(base, "identity/kungfu/agentic-engineering"))
+
+    File.cp!(
+      "priv/kungfu/agentic-engineering/manifest.toml",
+      Path.join(base, "identity/kungfu/agentic-engineering/manifest.toml")
+    )
+
+    Rules.load!(base, Map.keys(handlers), revision: "smoke-fixture")
     # Real wake scheduling and atomic carrier admission; the local doorbell
     # does not execute a provider or synthesize an assistant turn.
     # Nothing calls an adapter or manufactures an inference/tool-call result.
     start_supervised!(
       {Tightbeam.Wakes,
-       db: db, name: Tightbeam.WakeScheduler, tick_ms: 25, deliver: fn _ -> :ok end}
+       db: db,
+       name: Tightbeam.WakeScheduler,
+       tick_ms: 25,
+       delivery_opts: [conn_registry: Tightbeam.ConnRegistry, lane_manager: Tightbeam.LaneManager],
+       internal_consumers: %{
+         "effort_probe" => &Tightbeam.EffortCheckin.probe(db, gateway_config, &1),
+         "effort_deadline" => &Tightbeam.EffortCheckin.deadline(db, gateway_config, &1),
+         "assignment_inactivity_deadline" => &Tightbeam.Supervision.deadline(db, &1),
+         "assignment_inactivity_climb" => &Tightbeam.Supervision.climb(db, &1)
+       },
+       deliver: fn _ -> :ok end}
     )
 
     opts = Router.init(db: db, base_dir: base, handlers: handlers, cli_token: "tbc_fixture")
@@ -168,7 +186,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
       smoke_scope: "synthetic"
     }
 
-    %{db: db, base: base, handlers: handlers, state: state}
+    %{db: db, base: base, gateway_config: gateway_config, handlers: handlers, state: state}
   end
 
   test "real script staffing, default-archetype and query paths with loaded rules", ctx do
@@ -215,7 +233,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                [dispatch_id, dispatch_holder]
              )
 
-    assert {:ok, [[owner_session, ^owner_id, "retired"]]} =
+    assert {:ok, [[delivery_owner_session, ^owner_id, "retired"]]} =
              DB.query(
                ctx.db,
                """
@@ -226,6 +244,9 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                """,
                [dispatch_work_item]
              )
+
+    personal_session = Org.personal_session_key(owner_id)
+    assert delivery_owner_session != personal_session
 
     assert {:ok, %{wake_id: terminal_source, prompt: terminal_raw}} =
              Tightbeam.Wakes.terminal_notification(%{
@@ -259,7 +280,6 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     terminal = Tightbeam.Wakes.get(ctx.db, terminal_source)
 
     assert %{
-             session_key: ^owner_session,
              prompt: ^terminal_raw,
              origin: "process:tightbeam",
              consumer: "prompt",
@@ -268,6 +288,11 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
              creator_session_key: ^dispatch_holder,
              owner_user_id: ^owner_id
            } = terminal
+
+    assert {:ok, [[^owner_id, "custom"]]} =
+             DB.query(ctx.db, "SELECT ownerUserId,kind FROM sessions WHERE sessionKey=?1", [
+               terminal.session_key
+             ])
 
     assert terminal.obligation_ref ==
              "terminal-child-owner-notification:" <> dispatch_id
@@ -278,7 +303,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                 [
                   [
                     terminal_carrier,
-                    ^owner_session,
+                    ^personal_session,
                     terminal_prompt,
                     terminal_envelope,
                     terminal_hash
@@ -331,7 +356,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                     "tightbeam:retirement",
                     "target_retired",
                     "session_transition",
-                    ^owner_session,
+                    ^personal_session,
                     "no_replacement",
                     nil,
                     nil,
@@ -372,8 +397,9 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     assert {:ok, coordination_rows} =
              DB.query(ctx.db, """
              SELECT a.id,a.subject,a.openedByUser,a.openedBySession
-             FROM assignments a JOIN assignment_effects effect ON effect.assignmentId=a.id
-             WHERE effect.effectKind='coordination'
+             FROM assignments a JOIN memento_current effect ON effect.recordId=a.id
+             WHERE effect.recordKind='assignment' AND effect.name='agentic-engineering/effect-kind'
+               AND json_extract(effect.valueJson,'$[0]')='coordination'
              """)
 
     expected_subjects =
@@ -415,7 +441,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     end
   end
 
-  test "effort fixture reaches queued dispatch but cannot claim provider-free execution", ctx do
+  test "effort fixture leaves holder dispatch queued without provider execution", ctx do
     previous = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
     Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 2_500)
 
@@ -426,18 +452,43 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     end)
 
     # Drain only the preparatory rumination through the real claim/terminal
-    # seams, explicitly canceled as fixture setup. No provider reply or model
-    # execution is fabricated. The subsequent holder dispatch stays queued.
+    # seams, explicitly canceled as fixture setup. Observe the first holder
+    # dispatch before the real smoke continues; no provider reply or model
+    # execution is fabricated.
     rumination =
       Task.async(fn ->
         drain_effort_rumination!(ctx.db, System.monotonic_time(:millisecond) + 10_000)
       end)
 
-    ExUnit.CaptureIO.capture_io(fn ->
-      assert_raise Tightbeam.FeatureSmokeDriverFixture.Failure, ~r/effort smoke timed out/, fn ->
-        Driver.check_effort_without_effect(ctx.state)
+    Driver.check_effort_without_effect(ctx.state,
+      after_first_dispatch: fn fixture ->
+        assert {:ok, [["open", nil, "queued"]]} =
+                 DB.query(
+                   ctx.db,
+                   """
+                   SELECT a.state,a.outcome,t.status FROM assignments a JOIN turns t ON t.assignmentId=a.id
+                   WHERE a.id=?1
+                   """,
+                   [fixture.first_id]
+                 )
+
+        assert {:ok, [[0]]} =
+                 DB.query(
+                   ctx.db,
+                   """
+                   SELECT count(*) FROM turn_lifecycle_events
+                   WHERE turnSeq=(SELECT seq FROM turns WHERE assignmentId=?1) AND kind='claimed'
+                   """,
+                   [fixture.first_id]
+                 )
+
+        assert {:ok, [[0]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT count(*) FROM decision_requests WHERE kind='effort'"
+                 )
       end
-    end)
+    )
 
     {source, carrier, seq} = Task.await(rumination, 1_000)
     refute source == carrier
@@ -454,18 +505,6 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                WHERE turnSeq=?1 AND kind='terminal_committed' AND outcome='canceled'
                """,
                [seq]
-             )
-
-    assert {:ok, [["open", nil, "queued"]]} =
-             DB.query(ctx.db, """
-             SELECT a.state,a.outcome,t.status FROM assignments a JOIN turns t ON t.assignmentId=a.id
-             WHERE a.subject LIKE 'effort smoke%'
-             """)
-
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT count(*) FROM decision_requests WHERE kind='effort'"
              )
   end
 
@@ -536,7 +575,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
           shipped_completion <> "\n# Re-entry twin" <> rest
         )
 
-        Rules.load!(ctx.base, Map.keys(ctx.handlers))
+        Rules.load!(ctx.base, Map.keys(ctx.handlers), revision: "smoke-fixture")
       end
 
       wi = Driver.ok!(ctx.state, "work-item-create", %{"title" => "gate-chain dry check"})["id"]
@@ -558,6 +597,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
           "kind" => "verdict",
           "verdictKind" => "verified",
           "commitRefs" => holder.check.commit_refs,
+          "mementos" => holder.check.evidence_mementos,
           "note" => holder.check.note
         })
 
@@ -569,9 +609,18 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
       assert {:ok, [[1]]} =
                DB.query(
                  ctx.db,
-                 "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='verdict' " <>
-                   "AND verdictKind='verified' AND bySession=?2 AND commitRefs=?3",
-                 [holder.assignment_id, holder.key, JSON.encode!(holder.check.commit_refs)]
+                 "SELECT count(*) FROM attests a JOIN memento_current m " <>
+                   "ON m.recordKind='attest' AND m.recordId=a.id " <>
+                   "AND m.name='agentic-engineering/evidence-ref' " <>
+                   "WHERE a.assignmentId=?1 AND a.kind='verdict' " <>
+                   "AND a.verdictKind='verified' AND a.bySession=?2 " <>
+                   "AND a.commitRefs=?4 AND m.valueJson=?3",
+                 [
+                   holder.assignment_id,
+                   holder.key,
+                   JSON.encode!(Enum.map(holder.check.evidence_mementos, & &1["value"])),
+                   JSON.encode!(holder.check.commit_refs)
+                 ]
                )
 
       reviewer =
@@ -597,26 +646,34 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
         )
       end)
 
-      assert {:ok, [["completed", commit_refs]]} =
+      assert {:ok, [["completed", nil, evidence]]} =
                DB.query(
                  ctx.db,
                  """
-                 SELECT s.outcome,a.commitRefs FROM assignments s JOIN attests a ON a.assignmentId=s.id
+                 SELECT s.outcome,a.commitRefs,m.valueJson
+                 FROM assignments s JOIN attests a ON a.assignmentId=s.id
+                 JOIN memento_current m ON m.recordKind='attest' AND m.recordId=a.id
+                   AND m.name='agentic-engineering/evidence-ref'
                  WHERE s.id=?1 AND a.kind='completion'
                  """,
                  [holder.assignment_id]
                )
 
-      assert [%{"commit" => commit, "repo" => "testhost:" <> repo}] = JSON.decode!(commit_refs)
+      assert [encoded] = JSON.decode!(evidence)
+      assert %{"commit" => commit, "repo" => "testhost:" <> repo} = JSON.decode!(encoded)
       assert byte_size(commit) == 40
-      # Retirement may release the workspace, so the durable receipts are the final proof.
       assert is_binary(repo)
 
-      assert {:ok, [[3]]} =
+      assert {:ok, [[4]]} =
                DB.query(
                  ctx.db,
-                 "SELECT count(*) FROM attests a JOIN assignments s ON s.id=a.assignmentId WHERE (s.id=?1 OR s.reviewsAssignmentId=?1) AND a.commitRefs=?2",
-                 [holder.assignment_id, commit_refs]
+                 """
+                 SELECT count(*) FROM attests a JOIN assignments s ON s.id=a.assignmentId
+                 JOIN memento_current m ON m.recordKind='attest' AND m.recordId=a.id
+                   AND m.name='agentic-engineering/evidence-ref'
+                 WHERE s.workItemId=?1 AND m.valueJson=?2 AND a.commitRefs IS NULL
+                 """,
+                 [wi, evidence]
                )
     end
   end

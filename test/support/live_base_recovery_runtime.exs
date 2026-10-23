@@ -70,6 +70,28 @@ target_session = "agent:boot-target:app"
 prompt = "boot recovered retired decision"
 """)
 
+# Boot loads the immutable published law, not this working-tree edit. Publish
+# the fixture rule so the observation still proves the required boot ordering.
+identity_dir = Path.join(base, "identity")
+prior = Tightbeam.Identity.live_revision!(base)
+
+for args <- [
+      ["add", "rules/boot-decision-recovery.toml"],
+      ["commit", "-m", "boot recovery observation"]
+    ] do
+  {_, 0} =
+    System.cmd("git", ["-c", "user.name=test", "-c", "user.email=test@example.invalid"] ++ args,
+      cd: identity_dir,
+      stderr_to_stdout: true
+    )
+end
+
+{revision, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: identity_dir)
+revision = String.trim(revision)
+
+{:ok, ^revision} =
+  Tightbeam.Identity.publish_live!(base, %{expected_prior: prior, candidate_revision: revision})
+
 :persistent_term.erase(RuleRuntime)
 
 {:ok, sup} =

@@ -31,9 +31,9 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   @r7_fields %{
     "work items" =>
-      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority rowVersion),
+      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority rowVersion mementos),
     "assignments" =>
-      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
+      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion mementos),
     "wakes" =>
       ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon deliveryStatus rowVersion),
     "turns" =>
@@ -53,7 +53,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "work items" =>
       ~w(specRefName specRefSha256 ownerUserId failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq),
     "assignments" =>
-      ~w(holderRole openedByUser openedBySession outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider),
+      ~w(holderRole openedByUser openedBySession outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider effectKind),
     "wakes" =>
       ~w(targetRole prompt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey workItemId assignmentId canceledAt class classElection deliveryRule deliveryStatus),
     "turns" =>
@@ -1897,6 +1897,13 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         field == "rowVersion" ->
           assert is_integer(value) and value > 0
 
+        field == "mementos" ->
+          assert is_map(value)
+
+          assert Enum.all?(value, fn {name, values} ->
+                   is_binary(name) and is_list(values) and Enum.all?(values, &is_binary/1)
+                 end)
+
         domain = Map.get(@enum_domains, {resource, field}) ->
           assert value in domain,
                  "#{resource}.#{field}=#{inspect(value)} is outside #{inspect(domain)}"
@@ -1974,6 +1981,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   end
 
   defp assert_populated_contract("work items", item) do
+    assert item["mementos"] == %{}
     assert item["specRefSha256"] == String.duplicate("a", 64)
     assert item["isBug"] and item["createdContextKnown"]
     assert is_integer(item["createdInTurnSeq"])
@@ -1983,6 +1991,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   end
 
   defp assert_populated_contract("assignments", item) do
+    assert item["mementos"] == %{}
+    assert item["effectKind"] == nil
     assert item["holderRole"] == "coder:core-detail"
     assert item["holderFallback"]
     assert item["holderHarness"] == "claude"

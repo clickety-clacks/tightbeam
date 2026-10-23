@@ -208,7 +208,8 @@ defmodule GuardSplitMessages do
                                 "role" => "assistant",
                                 "content" => "LATE ASSISTANT RESULT"
                               }
-                            }}, 0
+                            }},
+                           0
           after
             GenServer.stop(session_lane)
             Supervisor.stop(task_sup)

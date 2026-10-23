@@ -93,7 +93,7 @@ impl CommandContext {
             ReopenAssignment { .. } => ("cli.reopen_assignment", DispatchPath),
             RepairAssignment { .. } => ("cli.repair_assignment", DispatchPath),
             AssignmentCommitRefCorrect { .. } => {
-                ("cli.assignment_commit_ref_correct", DispatchPath)
+                ("cli.assignment_commitref_correct", DispatchPath)
             }
             WorkItemCreate { .. } => ("cli.work_item_create", DispatchPath),
             WorkItemHandoff { .. } => ("cli.work_item_handoff", DispatchPath),
@@ -115,6 +115,8 @@ impl CommandContext {
             WorkItemClose { .. } => ("cli.work_item_close", DispatchPath),
             WorkItemFail { .. } => ("cli.work_item_fail", DispatchPath),
             Attest { .. } => ("cli.attest", DispatchPath),
+            MementoSet { .. } => ("cli.memento_set", DispatchPath),
+            Mementos { .. } => ("cli.mementos", DispatchPath),
             Attests { .. } => ("cli.attests", DispatchPath),
             AssignmentGet { .. } => ("cli.assignment_get", DispatchPath),
             Assignments { .. } => ("cli.assignments", DispatchPath),
@@ -313,6 +315,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | Topline { .. }
         | DurableToplines { .. }
         | DurableTopline { .. }
+        | Mementos { .. }
         | Attests { .. }
         | AssignmentGet { .. }
         | Assignments { .. }
@@ -378,9 +381,6 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | RepairAssignment {
             idempotency_key, ..
         }
-        | AssignmentCommitRefCorrect {
-            idempotency_key, ..
-        }
         | SettleTurn {
             idempotency_key, ..
         }
@@ -390,6 +390,10 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | Learn {
             idempotency_key, ..
         } => keyed_write(Some(idempotency_key)),
+
+        AssignmentCommitRefCorrect {
+            idempotency_key, ..
+        } => keyed_write(Some(idempotency_key.as_str())),
 
         // Publication's existing key does not prove replay completion for
         // the later sentinel cleanup. Keep the wire key, but no keyed advice.
@@ -415,6 +419,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         },
 
         ArtifactRecord { .. }
+        | MementoSet { .. }
         | ToolCallObserved
         | Tune { .. }
         | EffortRule { .. }

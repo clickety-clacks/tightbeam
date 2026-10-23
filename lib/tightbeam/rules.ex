@@ -15,9 +15,7 @@ defmodule Tightbeam.Rules do
   for a caller holding no roles, and `assignment.verdicts not_in
   ["reviewed-clean"]` fires for an assignment with no verdicts. List facts are
   `caller.roles`, `assignment.verdicts`,
-  `assignment.independent_verdict_kinds`,
-  `assignment.qualifying_review_verdict_kinds`,
-  `assignment.qualifying_verification_verdict_kinds`, and
+  `assignment.independent_verdict_kinds`, and
   `assignment.artifact_kinds` (the distinct artifact kinds the assignment's
   holder recorded on its work item, in every artifact state). Assignment
   caller identity comes from the optional dispatch principal rather than the
@@ -25,7 +23,7 @@ defmodule Tightbeam.Rules do
 
   Check-tier facts are `attest.kind` (raw string on attest calls),
   `assignment.verdicts` (distinct filed verdict kinds),
-  `assignment.is_producing_card`, `assignment.effect_kind`, `assignment.state`,
+  `assignment.is_producing_card`, `assignment.state`,
   `assignment.holder_noted_verdict_kinds`, `assignment.holder_archetype`, and
   `assignment.caller_is_holder`. The assignment facts resolve from the call's
   assignmentId, or from the reviewed assignment on an assign call, and are nil
@@ -66,12 +64,12 @@ defmodule Tightbeam.Rules do
   import Bitwise
 
   @persist_key __MODULE__
-  @policy_key {__MODULE__, :policies}
   @rule_keys MapSet.new([
                "name",
                "verb",
                "verbs",
                "deny_when",
+               "require",
                "text",
                "edges",
                "check",
@@ -141,6 +139,11 @@ defmodule Tightbeam.Rules do
   @linked_review_facts ~w(
     assignment.independent_verdict_kinds
     assignment.qualifying_review_verdict_kinds
+    assignment.latest_linked_review.judgment_kind
+  )
+  @judgment_kind_facts ~w(
+    assignment.latest_holder_verdict.judgment_kind
+    assignment.latest_linked_review.judgment_kind
   )
   @name_re ~r/^[a-z0-9][a-z0-9-]*$/
   @facts %{
@@ -159,10 +162,12 @@ defmodule Tightbeam.Rules do
     "org.live_sessions_owned_by_caller" => :int,
     "caller.verb_count_24h" => :int,
     "attest.kind" => :string,
+    "attest.verdict_kind" => :string,
     "assignment.verdicts" => {:list, :string},
     "assignment.is_producing_card" => :bool,
     "assignment.effect_kind" => :string,
     "assignment.state" => :string,
+    "cutover.assignment.has_legacy_effect" => :bool,
     "assignment.outcome" => :string,
     "assignment.holder_noted_verdict_kinds" => {:list, :string},
     "assignment.independent_verdict_kinds" => {:list, :string},
@@ -338,12 +343,217 @@ defmodule Tightbeam.Rules do
   @doc "Load and validate all rule files, replacing the currently active set."
   @spec load!(String.t(), Enumerable.t()) :: [rule()]
   def load!(base_dir, valid_verbs, opts \\ []) do
+    base_dir |> prepare!(valid_verbs, opts) |> install_legacy!()
+  end
+
+  @doc false
+  def ensure_legacy_snapshot!(snapshot) do
+    if Enum.any?(snapshot.requested_admission_contract, fn {_, contract} ->
+         contract.classification == "replacement"
+       end) do
+      raise Tightbeam.Mementos.Refusal,
+        code: "policy_revision_unavailable",
+        message: "replacement policy requires staged readiness and activation"
+    end
+
+    snapshot
+  end
+
+  @doc false
+  def install_legacy!(snapshot), do: install_legacy_locked!(snapshot)
+
+  @doc false
+  def restore_compatible!(snapshot, generation) do
+    install_legacy_locked!(snapshot, generation)
+  end
+
+  defp install_legacy_locked!(snapshot, generation \\ :preserve) do
+    active = :persistent_term.get(@persist_key, %{})
+
+    snapshot =
+      case if(generation == :preserve,
+             do: Map.fetch(active, :activation_generation),
+             else: {:ok, generation}
+           ) do
+        {:ok, generation} -> Map.put(snapshot, :activation_generation, generation)
+        :error -> snapshot
+      end
+
+    components = Map.get(snapshot, :law_components)
+
+    if Map.has_key?(snapshot, :law_components) do
+      unless is_map(components) and
+               match?(
+                 {archetypes, fragments} when is_map(archetypes) and is_map(fragments),
+                 components[Tightbeam.Archetypes]
+               ) and is_list(components[Tightbeam.Rails]) and
+               map_size(components) == 2 do
+        raise Tightbeam.Mementos.Refusal,
+          code: "policy_revision_unavailable",
+          message: "complete law is missing archetypes or rails"
+      end
+    end
+
+    publish_snapshot!(snapshot)
+  end
+
+  # Called only by the cutover coordinator after its durable activation decision,
+  # or while loading that committed revision at startup. Readiness was checked
+  # before the durable decision; publishing the same revision does not rerun it.
+  @doc false
+  def install_committed!(snapshot, generation) when is_binary(generation) do
+    unless match?(
+             %{Tightbeam.Archetypes => {a, f}, Tightbeam.Rails => rails}
+             when is_map(a) and is_map(f) and is_list(rails),
+             snapshot.law_components
+           ) and map_size(snapshot.law_components) == 2 do
+      raise Tightbeam.Mementos.Refusal,
+        code: "policy_revision_unavailable",
+        message: "committed policy requires a complete law"
+    end
+
+    contracts =
+      Map.new(snapshot.requested_admission_contract, fn {verb, contract} ->
+        {verb, contract.classification}
+      end)
+
+    snapshot
+    |> Map.put(:active_admission_contract, contracts)
+    |> Map.put(:activation_generation, generation)
+    |> publish_snapshot!()
+  end
+
+  defp publish_snapshot!(snapshot) do
+    components = Map.get(snapshot, :law_components)
+    rules = snapshot.rules
+
+    RuleRuntime.install_admission(&evaluate/2)
+
+    RuleRuntime.install(%{
+      row_commit_effects: &row_commit_effects_in_txn/2,
+      resolve_notice: &resolve_notice_in_txn/3,
+      evaluate_predicate: &evaluate_predicate_in_txn/2,
+      select_policy: &select_policy_in_txn/3
+    })
+
+    # These mirrors retain standalone tooling compatibility. Runtime readers
+    # use the complete policy snapshot; publishing it last is the one boundary.
+    if components do
+      for {module, value} <- components, do: :persistent_term.put(module, value)
+    end
+
+    :persistent_term.put(@persist_key, snapshot)
+    rules
+  end
+
+  @doc false
+  def effective_snapshot, do: RuleRuntime.policy_snapshot()
+
+  defp with_snapshot(fun) do
+    RuleRuntime.with_policy_snapshot(effective_snapshot(), fun)
+  end
+
+  @doc false
+  def active_admission_contract(verb) do
+    snapshot = effective_snapshot()
+
+    case Map.get(snapshot.active_admission_contract, verb, "legacy") do
+      "legacy" ->
+        "legacy"
+
+      "replacement" ->
+        requested = Map.get(snapshot.requested_admission_contract, verb)
+
+        unless is_map(requested) and requested.classification == "replacement" and
+                 is_binary(snapshot.revision) and snapshot.revision != "" and
+                 snapshot.declarations.revision == snapshot.revision and
+                 not Map.has_key?(snapshot.unavailable_verbs, verb) and
+                 requested.required_rules != [] and
+                 Enum.all?(requested.required_rules, fn name ->
+                   Enum.any?(snapshot.rules, fn rule ->
+                     rule.name == name and rule.verb == Map.get(requested, :rule_verb, verb) and
+                       rule.edges != ["cutover"] and
+                       rule.identity_manifest_sha == snapshot.revision
+                   end)
+                 end) do
+          raise Tightbeam.Mementos.Refusal,
+            code: "policy_revision_unavailable",
+            message: "active replacement policy is incomplete for #{verb}"
+        end
+
+        "replacement"
+
+      _ ->
+        raise Tightbeam.Mementos.Refusal,
+          code: "policy_revision_unavailable",
+          message: "active admission classification is unreadable for #{verb}"
+    end
+  rescue
+    _error in [KeyError, BadMapError, FunctionClauseError] ->
+      raise Tightbeam.Mementos.Refusal,
+        code: "policy_revision_unavailable",
+        message: "active policy snapshot is unreadable for #{verb}"
+  end
+
+  @doc false
+  def policy_rule_inventory(snapshot) do
+    snapshot.rules
+    |> Enum.map(fn rule ->
+      %{
+        name: rule.name,
+        verb: rule.verb,
+        identity_revision: rule.identity_manifest_sha,
+        facts: rule |> rule_conditions() |> Enum.map(& &1.fact) |> Enum.uniq() |> Enum.sort()
+      }
+    end)
+    |> Enum.sort_by(&{&1.verb, &1.name})
+  end
+
+  @doc false
+  def prepare_revision!(base_dir, revision, valid_verbs) do
+    Tightbeam.Identity.with_law_revision!(base_dir, revision, fn law_base, resolved ->
+      prepare!(base_dir, valid_verbs, law_base: law_base, revision: resolved)
+    end)
+  end
+
+  @doc false
+  def prepare_published!(base_dir, valid_verbs) do
+    revision = Tightbeam.Identity.live_revision!(base_dir)
+    snapshot = prepare_revision!(base_dir, revision, valid_verbs)
+
+    unless Tightbeam.Identity.live_revision!(base_dir) == snapshot.revision do
+      raise Tightbeam.Mementos.Refusal,
+        code: "policy_revision_unavailable",
+        message: "published revision changed while preparing policy"
+    end
+
+    snapshot
+  end
+
+  @doc "Prepare an inactive policy candidate without changing the installed rules or declarations."
+  def prepare!(base_dir, valid_verbs, opts \\ []) do
+    law_base = Keyword.get(opts, :law_base, base_dir)
+    revision = Keyword.get(opts, :revision) || identity_manifest_sha(base_dir)
+    declarations = Tightbeam.Mementos.read_declarations!(law_base, revision)
+    previous = Process.get({__MODULE__, :preparing_unavailable}, :absent)
+
+    try do
+      Tightbeam.Mementos.with_declarations(declarations, fn ->
+        prepare_rules!(base_dir, valid_verbs, opts, revision)
+      end)
+    after
+      if previous == :absent,
+        do: Process.delete({__MODULE__, :preparing_unavailable}),
+        else: Process.put({__MODULE__, :preparing_unavailable}, previous)
+    end
+  end
+
+  defp prepare_rules!(base_dir, valid_verbs, opts, identity_manifest_sha) do
     verbs = MapSet.new(valid_verbs)
     law_base = Keyword.get(opts, :law_base, base_dir)
     revision = Keyword.get(opts, :revision)
-    identity_manifest_sha = revision || identity_manifest_sha(base_dir)
 
-    :persistent_term.put({__MODULE__, :unavailable_verbs}, %{})
+    Process.put({__MODULE__, :preparing_unavailable}, %{})
 
     entries =
       law_base
@@ -354,6 +564,9 @@ defmodule Tightbeam.Rules do
         try do
           load_file!(path, verbs, law_base, identity_manifest_sha)
         rescue
+          error in Tightbeam.Mementos.Refusal ->
+            reraise error, __STACKTRACE__
+
           error ->
             require Logger
             Logger.warning("rule file #{path} unavailable: #{Exception.message(error)}")
@@ -386,10 +599,10 @@ defmodule Tightbeam.Rules do
                   MapSet.to_list(verbs)
               end
 
-            unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+            unavailable = Process.get({__MODULE__, :preparing_unavailable})
 
-            :persistent_term.put(
-              {__MODULE__, :unavailable_verbs},
+            Process.put(
+              {__MODULE__, :preparing_unavailable},
               Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
             )
 
@@ -436,10 +649,10 @@ defmodule Tightbeam.Rules do
         if duplicates[rule.name] > 1 do
           require Logger
           Logger.warning("rule #{rule.name} unavailable: duplicate name in #{rule.source}")
-          unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+          unavailable = Process.get({__MODULE__, :preparing_unavailable})
 
-          :persistent_term.put(
-            {__MODULE__, :unavailable_verbs},
+          Process.put(
+            {__MODULE__, :preparing_unavailable},
             Map.put(unavailable, rule.verb, rule.source)
           )
 
@@ -452,10 +665,10 @@ defmodule Tightbeam.Rules do
     policies =
       Enum.reject(policies, fn policy ->
         if duplicates[policy.name] > 1 do
-          unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+          unavailable = Process.get({__MODULE__, :preparing_unavailable})
 
-          :persistent_term.put(
-            {__MODULE__, :unavailable_verbs},
+          Process.put(
+            {__MODULE__, :preparing_unavailable},
             Enum.reduce(verbs, unavailable, &Map.put(&2, &1, policy.source))
           )
 
@@ -479,10 +692,10 @@ defmodule Tightbeam.Rules do
           error ->
             require Logger
             Logger.warning("rule #{rule.name} unavailable: #{Exception.message(error)}")
-            unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+            unavailable = Process.get({__MODULE__, :preparing_unavailable})
 
-            :persistent_term.put(
-              {__MODULE__, :unavailable_verbs},
+            Process.put(
+              {__MODULE__, :preparing_unavailable},
               Map.put(unavailable, rule.verb, rule.source)
             )
 
@@ -490,26 +703,77 @@ defmodule Tightbeam.Rules do
         end
       end)
 
-    :persistent_term.put(@persist_key, rules)
-    :persistent_term.put(@policy_key, policies)
+    contracts = for {:admission_contract, contract} <- entries, do: contract
+    unavailable = Process.get({__MODULE__, :preparing_unavailable})
 
-    RuleRuntime.install_admission(&evaluate/2)
+    requested =
+      validate_admission_contracts!(contracts, rules, unavailable, identity_manifest_sha)
 
-    RuleRuntime.install(%{
-      row_commit_effects: &row_commit_effects_in_txn/2,
-      resolve_notice: &resolve_notice_in_txn/3,
-      evaluate_predicate: &evaluate_predicate_in_txn/2,
-      select_policy: &select_policy_in_txn/3
-    })
+    snapshot = %{
+      revision: identity_manifest_sha,
+      rules: rules,
+      policies: policies,
+      declarations: Tightbeam.Mementos.declarations(),
+      unavailable_verbs: unavailable,
+      requested_admission_contract: requested,
+      active_admission_contract: Map.new(requested, fn {verb, _} -> {verb, "legacy"} end)
+    }
 
-    rules
+    cutovers = for {:memento_cutover, entry} <- entries, do: entry
+    Map.put(snapshot, :memento_cutover, Tightbeam.MementoCutover.prepare!(cutovers, snapshot))
+  end
+
+  defp validate_admission_contracts!(contracts, rules, unavailable, revision) do
+    # One admission contract can govern several request surfaces that prepare
+    # its inputs. Expand that policy-owned scope before checking completeness;
+    # each surface still uses the same immutable classification and rule set.
+    contracts =
+      Enum.flat_map(contracts, fn contract ->
+        for verb <- [contract.verb | Map.get(contract, :request_verbs, [])] do
+          contract |> Map.put(:rule_verb, contract.verb) |> Map.put(:verb, verb)
+        end
+      end)
+
+    duplicates = contracts |> Enum.frequencies_by(& &1.verb)
+
+    Map.new(contracts, fn contract ->
+      if duplicates[contract.verb] != 1 do
+        raise Tightbeam.Mementos.Refusal,
+          code: "policy_revision_unavailable",
+          message: "duplicate admission contract for #{contract.verb}"
+      end
+
+      if contract.classification == "replacement" do
+        complete =
+          is_binary(revision) and revision != "" and
+            not Map.has_key?(unavailable, contract.verb) and
+            Enum.all?(contract.required_rules, fn name ->
+              Enum.any?(rules, fn rule ->
+                rule.name == name and rule.verb == contract.rule_verb and
+                  rule.edges != ["cutover"] and
+                  rule.identity_manifest_sha == revision
+              end)
+            end)
+
+        unless complete do
+          raise Tightbeam.Mementos.Refusal,
+            code: "policy_revision_unavailable",
+            message: "incomplete replacement policy for #{contract.verb}"
+        end
+      end
+
+      {contract.verb, contract}
+    end)
   end
 
   @doc "Select the bytewise-smallest matching predicate-only policy for one snapshot."
   @spec select_policy_in_txn(DB.Txn.t(), String.t(), map()) :: {:ok, map()} | :none
   def select_policy_in_txn(%DB.Txn{} = txn, purpose, context) do
-    @policy_key
-    |> :persistent_term.get([])
+    with_snapshot(fn -> select_policy_in_txn_snapshot(txn, purpose, context) end)
+  end
+
+  defp select_policy_in_txn_snapshot(%DB.Txn{} = txn, purpose, context) do
+    effective_snapshot().policies
     |> Enum.filter(&(&1.purpose == purpose))
     |> Enum.sort_by(& &1.name)
     |> Enum.find_value(:none, fn policy ->
@@ -543,14 +807,20 @@ defmodule Tightbeam.Rules do
   @doc "Return the dry statute decision and the actor-owned close/consume work."
   @spec decide(GenServer.server(), map()) :: {term(), [term()], [String.t()]}
   def decide(db, call) do
-    rules = :persistent_term.get(@persist_key, [])
-    verb = Map.fetch!(call, :verb)
+    with_snapshot(fn -> decide_snapshot(db, call) end)
+  end
+
+  defp decide_snapshot(db, call) do
+    snapshot = effective_snapshot()
+    rules = snapshot.rules
+    verb = Map.get(call, :memento_rule_verb, Map.fetch!(call, :verb))
     edge = edge(call)
 
-    case Map.get(:persistent_term.get({__MODULE__, :unavailable_verbs}, %{}), verb) do
+    case Map.get(snapshot.unavailable_verbs, verb) do
       nil ->
         rules
         |> Enum.filter(&(&1.verb == verb and edge in &1.edges))
+        |> Enum.filter(&memento_rule_phase?(&1, db, call))
         |> decide_rules(db, call, %{}, [], [])
 
       source ->
@@ -562,12 +832,38 @@ defmodule Tightbeam.Rules do
     end
   end
 
+  defp memento_rule_phase?(rule, db, call) do
+    dependent =
+      Enum.any?(rule_conditions(rule), &(not is_nil(Tightbeam.MementoFacts.type(&1.fact))))
+
+    # Only verb admission has a later host transaction. Sweeps and committed-row
+    # reactions must evaluate dynamic facts on their own edge.
+    case {db, Map.get(call, :memento_admission), call.verb, edge(call)} do
+      {_, _, _, edge} when edge != "verb" ->
+        true
+
+      {%DB.Txn{}, :host, _, _} ->
+        dependent
+
+      {%DB.Txn{}, :write, _, _} ->
+        true
+
+      {_, _, "memento-set", _} ->
+        false
+
+      {_, _, verb, _}
+      when verb in ~w(work-item-create assign dispatch attest harness-health-close-promotion) ->
+        not dependent
+
+      _ ->
+        true
+    end
+  end
+
   @doc false
   @spec active_identity_manifest_sha() :: String.t() | nil
   def active_identity_manifest_sha do
-    @persist_key
-    |> :persistent_term.get([])
-    |> Enum.find_value(& &1.identity_manifest_sha)
+    effective_snapshot().revision
   end
 
   @doc "Validate and evaluate an ad hoc predicate against one transaction snapshot."
@@ -586,6 +882,13 @@ defmodule Tightbeam.Rules do
   @doc "Evaluate one validated predicate through the common condition and fact engine."
   @spec evaluate_predicate_in_txn(DB.Txn.t(), map()) :: {:ok, map()} | {:error, map()}
   def evaluate_predicate_in_txn(%DB.Txn{} = txn, predicate) when is_map(predicate) do
+    with_snapshot(fn -> evaluate_predicate_in_txn_snapshot(txn, predicate) end)
+  end
+
+  def evaluate_predicate_in_txn(%DB.Txn{}, _predicate),
+    do: {:error, %{code: "invalid_predicate", message: "predicate must be an object"}}
+
+  defp evaluate_predicate_in_txn_snapshot(%DB.Txn{} = txn, predicate) when is_map(predicate) do
     owner_user_id = field(predicate, :owner_user_id)
     raw_conditions = field(predicate, :conditions)
     raw_bindings = field(predicate, :bindings) || %{}
@@ -646,12 +949,13 @@ defmodule Tightbeam.Rules do
     end
   end
 
-  def evaluate_predicate_in_txn(%DB.Txn{}, _predicate),
-    do: {:error, %{code: "invalid_predicate", message: "predicate must be an object"}}
-
   @doc "Evaluate loaded row-commit notice rules into effects for Wakes to record."
   @spec row_commit_effects_in_txn(DB.Txn.t(), [map()] | map()) :: [tuple()]
   def row_commit_effects_in_txn(%DB.Txn{} = txn, transitions) do
+    with_snapshot(fn -> row_commit_effects_in_txn_snapshot(txn, transitions) end)
+  end
+
+  defp row_commit_effects_in_txn_snapshot(%DB.Txn{} = txn, transitions) do
     List.wrap(transitions)
     |> Enum.flat_map(&evaluate_row_transition_in_txn(txn, &1))
   end
@@ -659,6 +963,10 @@ defmodule Tightbeam.Rules do
   @doc "Resolve a validated notice against the same transaction snapshot as its rule."
   @spec resolve_notice_in_txn(DB.Txn.t(), map(), map()) :: {:ok, map()} | {:error, term()}
   def resolve_notice_in_txn(%DB.Txn{} = txn, rule, call) do
+    with_snapshot(fn -> resolve_notice_in_txn_snapshot(txn, rule, call) end)
+  end
+
+  defp resolve_notice_in_txn_snapshot(%DB.Txn{} = txn, rule, call) do
     RailRemedy.resolve_notice(txn, rule.notice, notice_bindings(txn, call))
   end
 
@@ -943,7 +1251,7 @@ defmodule Tightbeam.Rules do
 
     domain = field(transition, :domain)
 
-    :persistent_term.get(@persist_key, [])
+    effective_snapshot().rules
     |> Enum.filter(fn rule ->
       verb in rule.verbs and "row-commit" in rule.edges and rule.effect == "notice" and
         row_domain_candidate?(rule, domain)
@@ -955,7 +1263,7 @@ defmodule Tightbeam.Rules do
           candidates =
             artifact_candidates_in_txn(
               txn,
-              rule.conditions,
+              rule_conditions(rule),
               candidate_call.predicate_bindings,
               owner
             )
@@ -963,9 +1271,10 @@ defmodule Tightbeam.Rules do
           Enum.reduce_while(candidates, [], fn candidate, [] ->
             candidate_call = Map.put(candidate_call, :artifact_candidate, candidate)
 
-            case evaluate_conditions(rule.conditions, rule, txn, candidate_call, %{}) do
+            case evaluate_rule_conditions(rule, txn, candidate_call, %{}) do
               {:match, cache} ->
-                {:halt, [{:notice, rule, candidate_call, evidence_facts(rule.conditions, cache)}]}
+                {:halt,
+                 [{:notice, rule, candidate_call, evidence_facts(rule_conditions(rule), cache)}]}
 
               {:no_match, _cache} ->
                 {:cont, []}
@@ -985,7 +1294,7 @@ defmodule Tightbeam.Rules do
   defp evaluate_row_transition_in_txn(_txn, _transition), do: []
 
   defp row_commit_candidate_calls_in_txn(txn, rule, call) do
-    flood_rule? = Enum.any?(rule.conditions, &(&1.fact == "turn.caller_queued_count"))
+    flood_rule? = Enum.any?(rule_conditions(rule), &(&1.fact == "turn.caller_queued_count"))
 
     with true <- flood_rule?,
          "queued_turn" <- row_commit_domain(call),
@@ -1014,7 +1323,7 @@ defmodule Tightbeam.Rules do
   end
 
   defp row_domain_candidate?(rule, domain) do
-    Enum.any?(rule.conditions, fn condition ->
+    Enum.any?(rule_conditions(rule), fn condition ->
       domain in RuleRuntime.predicate_row_domains(condition.fact)
     end)
   end
@@ -1253,7 +1562,11 @@ defmodule Tightbeam.Rules do
         {:error, error} -> raise ArgumentError, "#{path}: invalid TOML: #{inspect(error)}"
       end
 
-    unknown = unknown_keys(manifest, MapSet.new(["rule", "policy"]))
+    unknown =
+      unknown_keys(
+        manifest,
+        MapSet.new(["rule", "policy", "admission_contract", "memento_cutover"])
+      )
 
     if unknown != [],
       do: raise(ArgumentError, "#{path}: unknown root keys: #{Enum.join(unknown, ", ")}")
@@ -1277,10 +1590,10 @@ defmodule Tightbeam.Rules do
 
                 verb = if is_map(rule), do: Map.get(rule, "verb"), else: nil
                 affected = if MapSet.member?(valid_verbs, verb), do: [verb], else: valid_verbs
-                unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+                unavailable = Process.get({__MODULE__, :preparing_unavailable})
 
-                :persistent_term.put(
-                  {__MODULE__, :unavailable_verbs},
+                Process.put(
+                  {__MODULE__, :preparing_unavailable},
                   Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
                 )
 
@@ -1311,10 +1624,65 @@ defmodule Tightbeam.Rules do
           raise ArgumentError, "#{path}: [[policy]] must be a non-empty array of tables"
       end
 
-    if rules == [] and policies == [],
-      do: raise(ArgumentError, "#{path}: must contain one or more [[rule]] or [[policy]] tables")
+    contracts =
+      case Map.get(manifest, "admission_contract", []) do
+        entries when is_list(entries) ->
+          Enum.map(entries, fn entry ->
+            {:admission_contract, validate_admission_contract!(entry, path, valid_verbs)}
+          end)
 
-    rules ++ policies
+        _ ->
+          raise Tightbeam.Mementos.Refusal,
+            code: "policy_revision_unavailable",
+            message: "#{path}: admission_contract must be an array of tables"
+      end
+
+    cutover =
+      case Map.fetch(manifest, "memento_cutover") do
+        :error ->
+          []
+
+        {:ok, declaration} ->
+          [{:memento_cutover, %{declaration: declaration}}]
+      end
+
+    if rules == [] and policies == [] and contracts == [] and cutover == [],
+      do:
+        raise(
+          ArgumentError,
+          "#{path}: must contain one or more [[rule]], [[policy]] or [memento_cutover] tables"
+        )
+
+    rules ++ policies ++ contracts ++ cutover
+  end
+
+  defp validate_admission_contract!(entry, path, verbs) do
+    valid =
+      is_map(entry) and
+        Map.keys(entry) -- ~w(verb classification required_rules request_verbs) == [] and
+        MapSet.member?(verbs, entry["verb"]) and
+        is_list(Map.get(entry, "request_verbs", [])) and
+        Enum.all?(Map.get(entry, "request_verbs", []), &MapSet.member?(verbs, &1)) and
+        entry["verb"] not in Map.get(entry, "request_verbs", []) and
+        Enum.uniq(Map.get(entry, "request_verbs", [])) == Map.get(entry, "request_verbs", []) and
+        entry["classification"] in ~w(legacy replacement) and
+        is_list(entry["required_rules"]) and
+        Enum.all?(entry["required_rules"], &(is_binary(&1) and &1 != "")) and
+        Enum.uniq(entry["required_rules"]) == entry["required_rules"] and
+        (entry["classification"] == "legacy" or entry["required_rules"] != [])
+
+    unless valid do
+      raise Tightbeam.Mementos.Refusal,
+        code: "policy_revision_unavailable",
+        message: "#{path}: malformed admission contract"
+    end
+
+    %{
+      verb: entry["verb"],
+      classification: entry["classification"],
+      required_rules: entry["required_rules"],
+      request_verbs: Map.get(entry, "request_verbs", [])
+    }
   end
 
   defp validate_policy!(path, ordinal, policy, identity_manifest_sha) when is_map(policy) do
@@ -1333,6 +1701,10 @@ defmodule Tightbeam.Rules do
     unless purpose in @policy_purposes, do: fail.("unsupported purpose: #{inspect(purpose)}")
 
     conditions = validate_policy_conditions!(Map.get(policy, "when"), fail)
+
+    if Enum.any?(conditions, &cutover_fact?(&1.fact)),
+      do: fail.("cutover requirement matching is only valid on cutover predicates")
+
     verification = validate_policy_verification!(purpose, Map.get(policy, "verification"), fail)
 
     %{
@@ -1404,12 +1776,24 @@ defmodule Tightbeam.Rules do
     validate_tokens!(text, fail)
 
     conditions = validate_conditions!(Map.get(rule, "deny_when"), fail)
+    required = validate_conditions!(Map.get(rule, "require"), fail, "require")
     check = validate_check!(Map.get(rule, "check"), base_dir, fail)
 
-    if conditions == [] and is_nil(check),
-      do: fail.("must carry at least one of deny_when or [rule.check]")
+    if conditions == [] and required == [] and is_nil(check),
+      do: fail.("must carry at least one of deny_when, require or [rule.check]")
+
+    if required != [] and check,
+      do: fail.("require is valid only on predicate-only statutes")
 
     edges = validate_edges!(Map.get(rule, "edges", ["verb"]), verb, fail)
+
+    if edges != ["cutover"] and
+         Enum.any?(
+           conditions ++ required,
+           &cutover_fact?(&1.fact)
+         ),
+       do: fail.("cutover requirement matching is only valid on cutover predicates")
+
     verbs = validate_rule_verbs!(Map.get(rule, "verbs"), verb, edges, valid_verbs, fail)
 
     effect =
@@ -1418,9 +1802,25 @@ defmodule Tightbeam.Rules do
     if "row-commit" in edges and effect != "notice",
       do: fail.(~s(edge "row-commit" requires effect = "notice"))
 
+    if edges == ["cutover"] and
+         (not is_nil(check) or effect != "deny" or
+            Enum.any?(~w(notice remedy recurrence_suppression), &Map.has_key?(rule, &1))) do
+      fail.(~s(edge "cutover" requires a predicate without scripts or actor effects))
+    end
+
     effects = if check, do: Map.values(check.effects), else: [effect]
     notice = validate_notice!(Map.get(rule, "notice"), effect, fail)
-    remedy = validate_remedy!(Map.get(rule, "remedy"), conditions, check, effects, fail, raw_name)
+
+    remedy =
+      validate_remedy!(
+        Map.get(rule, "remedy"),
+        conditions,
+        required,
+        check,
+        effects,
+        fail,
+        raw_name
+      )
 
     recurrence_suppression =
       validate_recurrence_suppression!(Map.get(rule, "recurrence_suppression"), fail)
@@ -1437,7 +1837,7 @@ defmodule Tightbeam.Rules do
     external_producer = Map.get(rule, "external_producer", false)
     unless is_boolean(external_producer), do: fail.("external_producer must be a boolean")
 
-    if external_producer and verdict_requirements(conditions) == [],
+    if external_producer and verdict_requirements(conditions, required) == [],
       do: fail.("external_producer is valid only on a verdict-fact gate")
 
     %{
@@ -1446,6 +1846,7 @@ defmodule Tightbeam.Rules do
       verbs: verbs,
       text: String.trim(text),
       conditions: conditions,
+      required: required,
       edges: edges,
       effect: effect,
       check: check,
@@ -1490,11 +1891,12 @@ defmodule Tightbeam.Rules do
   defp validate_rule_verbs!(_verbs, _verb, _edges, _valid_verbs, fail),
     do: fail.("verbs must be a list")
 
-  defp validate_conditions!(nil, _fail), do: []
+  defp validate_conditions!(conditions, fail, label \\ "deny_when")
+  defp validate_conditions!(nil, _fail, _label), do: []
 
-  defp validate_conditions!(conditions, fail) do
+  defp validate_conditions!(conditions, fail, label) do
     unless is_list(conditions) and conditions != [] and Enum.all?(conditions, &is_map/1) do
-      fail.("deny_when must be a non-empty list of condition tables")
+      fail.("#{label} must be a non-empty list of condition tables")
     end
 
     conditions
@@ -1599,10 +2001,13 @@ defmodule Tightbeam.Rules do
 
   defp validate_edges!(edges, verb, fail) do
     unless is_list(edges) and edges != [] and
-             Enum.all?(edges, &(&1 in ~w(verb turn-end row-commit))) and
+             Enum.all?(edges, &(&1 in ~w(verb turn-end row-commit cutover))) and
              Enum.uniq(edges) == edges do
-      fail.(~s(edges must be a non-empty subset of ["verb", "turn-end", "row-commit"]))
+      fail.(~s(edges must be a non-empty subset of ["verb", "turn-end", "row-commit", "cutover"]))
     end
+
+    if "cutover" in edges and edges != ["cutover"],
+      do: fail.(~s(edge "cutover" cannot be combined with ordinary admission edges))
 
     if "turn-end" in edges and verb != "attest",
       do: fail.(~s(edge "turn-end" is legal only for verb "attest"))
@@ -1692,9 +2097,10 @@ defmodule Tightbeam.Rules do
 
   defp validate_check!(_check, _base_dir, fail), do: fail.("check must be a table")
 
-  defp validate_remedy!(nil, _conditions, _check, _effects, _fail, _name), do: nil
+  defp validate_remedy!(nil, _conditions, _required, _check, _effects, _fail, _name), do: nil
 
-  defp validate_remedy!(remedy, conditions, check, effects, fail, name) when is_map(remedy) do
+  defp validate_remedy!(remedy, conditions, required, check, effects, fail, name)
+       when is_map(remedy) do
     unknown = unknown_keys(remedy, @remedy_keys)
     if unknown != [], do: fail.("remedy has unknown keys: #{Enum.join(unknown, ", ")}")
 
@@ -1765,7 +2171,7 @@ defmodule Tightbeam.Rules do
         validate_interpolation!(field, value, fail)
     end)
 
-    requirements = verdict_requirements(conditions)
+    requirements = verdict_requirements(conditions, required)
     produces = Map.get(remedy, "produces")
 
     cond do
@@ -1813,7 +2219,7 @@ defmodule Tightbeam.Rules do
     }
   end
 
-  defp validate_remedy!(_remedy, _conditions, _check, _effects, fail, _name),
+  defp validate_remedy!(_remedy, _conditions, _required, _check, _effects, fail, _name),
     do: fail.("remedy must be a table")
 
   defp validate_interpolation!(field, value, fail) when field in @embedded_fields do
@@ -1864,6 +2270,11 @@ defmodule Tightbeam.Rules do
 
   defp valid_verdict_kind?(_kind), do: false
 
+  defp cutover_fact?(fact),
+    do:
+      fact == "cutover.assignment.has_legacy_effect" or
+        String.contains?(fact, ".memento_matches_cutover_requirement.")
+
   defp validate_condition!(condition, index, fail) do
     unknown = unknown_keys(condition, @condition_keys)
 
@@ -1886,7 +2297,7 @@ defmodule Tightbeam.Rules do
       end
     end
 
-    type = Map.get(@facts, fact)
+    type = Map.get(@facts, fact) || Tightbeam.MementoFacts.type(fact)
 
     if is_nil(type), do: fail.("condition ##{index} has unknown fact: #{inspect(fact)}")
     unless op in @operators, do: fail.("condition ##{index} has unknown op: #{inspect(op)}")
@@ -1939,10 +2350,15 @@ defmodule Tightbeam.Rules do
     |> Enum.sort()
   end
 
+  # Cutover predicates inspect prepared state; they neither deny an ordinary
+  # call nor initiate producer work. Their only consumer is the explicit census.
+  defp validate_producer_existence!(%{edges: ["cutover"]}), do: :ok
+
   defp validate_producer_existence!(%{check: check}) when not is_nil(check), do: :ok
 
   defp validate_producer_existence!(rule) do
-    Enum.each(verdict_requirements(rule.conditions), fn {fact, kinds} ->
+    Enum.each(verdict_requirements(rule.conditions, Map.get(rule, :required, [])), fn {fact,
+                                                                                       kinds} ->
       covered? = rule.external_producer or remedy_covers?(rule.remedy, fact, kinds)
 
       unless covered? do
@@ -1980,10 +2396,11 @@ defmodule Tightbeam.Rules do
   end
 
   defp provable_blocker?(candidate, remedy_rule) do
-    candidate.verb == remedy_rule.remedy.action and
+    candidate.verb == remedy_rule.remedy.action and candidate.edges != ["cutover"] and
       is_nil(candidate.remedy) and
       is_nil(candidate.check) and
       candidate.effect == "deny" and
+      Map.get(candidate, :required, []) == [] and
       candidate.conditions != [] and
       Enum.all?(candidate.conditions, &fixed_condition_true?(&1, remedy_rule.remedy))
   end
@@ -2013,7 +2430,7 @@ defmodule Tightbeam.Rules do
   # chain walk: `artifact-record` is a constitutional verb available to every
   # session, so the requirement is statically satisfiable without any producer.
   defp escaping_static_producer?(rule) do
-    verdict_requirements(rule.conditions) == [] and
+    verdict_requirements(rule.conditions, Map.get(rule, :required, [])) == [] and
       artifact_requirements(rule.conditions) != []
   end
 
@@ -2030,14 +2447,22 @@ defmodule Tightbeam.Rules do
     end)
   end
 
-  defp verdict_requirements(conditions) do
-    Enum.flat_map(conditions, fn
-      %{fact: fact, op: "not_in", value: kinds} when fact in @verdict_facts ->
-        [{fact, kinds}]
+  defp verdict_requirements(conditions, required) do
+    legacy =
+      Enum.flat_map(conditions, fn
+        %{fact: fact, op: "not_in", value: kinds} when fact in @verdict_facts ->
+          [{fact, kinds}]
 
-      _ ->
-        []
-    end)
+        _ ->
+          []
+      end)
+
+    legacy ++
+      Enum.flat_map(required, fn
+        %{fact: fact, op: "in", value: kinds} when fact in @judgment_kind_facts -> [{fact, kinds}]
+        %{fact: fact, op: "eq", value: kind} when fact in @judgment_kind_facts -> [{fact, [kind]}]
+        _ -> []
+      end)
   end
 
   defp artifact_requirements(conditions) do
@@ -2054,7 +2479,7 @@ defmodule Tightbeam.Rules do
     do: {:allow, Enum.reverse(to_close), Enum.reverse(to_consume)}
 
   defp decide_rules([rule | rest], db, call, cache, to_close, to_consume) do
-    case evaluate_conditions(rule.conditions, rule, db, call, cache) do
+    case evaluate_rule_conditions(rule, db, call, cache) do
       {:no_match, cache} ->
         decide_rules(rest, db, call, cache, maybe_close(rule, db, call, to_close), to_consume)
 
@@ -2150,7 +2575,7 @@ defmodule Tightbeam.Rules do
       )
 
   defp fold_effect("notice", rule, rest, db, call, cache, to_close, to_consume, _exit_class) do
-    evidence = evidence_facts(rule.conditions, cache)
+    evidence = evidence_facts(rule_conditions(rule), cache)
 
     decide_rules(
       rest,
@@ -2276,6 +2701,115 @@ defmodule Tightbeam.Rules do
       end
     else
       to_close
+    end
+  end
+
+  defp rule_conditions(rule), do: rule.conditions ++ Map.get(rule, :required, [])
+
+  # deny_when still defines an ANDed applicability condition. A positive
+  # requirement keeps the rule active until every required predicate matches.
+  defp evaluate_rule_conditions(rule, db, call, cache) do
+    case evaluate_conditions(rule.conditions, rule, db, call, cache) do
+      {:match, cache} ->
+        case Map.get(rule, :required, []) do
+          [] ->
+            {:match, cache}
+
+          required ->
+            case evaluate_conditions(required, rule, db, call, cache) do
+              {:match, cache} -> {:no_match, cache}
+              {:no_match, cache} -> {:match, cache}
+              error -> error
+            end
+        end
+
+      other ->
+        other
+    end
+  end
+
+  # Cutover selectors use the existing rule condition semantics, but never
+  # execute checks, waivers, remedies, notices or row effects. An unresolved
+  # fact is not permission to omit a row from the authoritative census.
+  @doc false
+  def cutover_selector_in_txn!(%DB.Txn{} = txn, name, call) do
+    snapshot = effective_snapshot()
+
+    rule =
+      case Enum.filter(snapshot.rules, &(&1.name == name)) do
+        [rule] when is_nil(rule.check) -> rule
+        _ -> raise ArgumentError, "invalid cutover selector #{name}"
+      end
+
+    unless rule.identity_manifest_sha == snapshot.revision and
+             not Map.has_key?(snapshot.unavailable_verbs, rule.verb),
+           do: raise(ArgumentError, "unavailable cutover selector #{name}")
+
+    conditions = rule_conditions(rule)
+
+    # Seed structural source presence only inside the explicit census evaluator.
+    # Host fields cannot supply it, and ordinary evaluation cannot read it.
+    initial =
+      if Enum.any?(conditions, &(&1.fact == "cutover.assignment.has_legacy_effect")) do
+        id = call.params[:assignment_id]
+
+        [[present]] =
+          DB.Txn.q(txn, "SELECT EXISTS(SELECT 1 FROM assignment_effects WHERE assignmentId=?1)", [
+            id
+          ])
+
+        %{"cutover.assignment.has_legacy_effect" => present == 1}
+      else
+        %{}
+      end
+
+    cache =
+      Enum.reduce(conditions, initial, fn condition, cache ->
+        case fetch_fact(condition.fact, txn, call, cache) do
+          {:ok, value, cache} when not is_nil(value) -> cache
+          _ -> raise ArgumentError, "unresolved cutover selector #{name} fact #{condition.fact}"
+        end
+      end)
+
+    case evaluate_rule_conditions(rule, txn, call, cache) do
+      {:match, _} -> true
+      {:no_match, _} -> false
+      {:error, fact} -> raise ArgumentError, "unresolved cutover selector #{name} fact #{fact}"
+    end
+  end
+
+  # A successor predicate is positive: both applicability and every required
+  # condition must hold. Ordinary denial non-match is insufficient (it may
+  # mean that the rule was inapplicable).
+  @doc false
+  def cutover_successor_in_txn!(%DB.Txn{} = txn, name, call, requirement \\ nil) do
+    snapshot = effective_snapshot()
+
+    rule =
+      case Enum.filter(snapshot.rules, &(&1.name == name)) do
+        [rule] when is_nil(rule.check) -> rule
+        _ -> raise ArgumentError, "invalid cutover successor rule #{name}"
+      end
+
+    unless rule.identity_manifest_sha == snapshot.revision and
+             not Map.has_key?(snapshot.unavailable_verbs, rule.verb),
+           do: raise(ArgumentError, "unavailable cutover successor rule #{name}")
+
+    conditions = rule_conditions(rule)
+
+    # Only the census supplies this independent policy operand. It is not a
+    # host-call field and ordinary evaluation never seeds this cache entry.
+    cache = %{{:cutover_requirement} => requirement}
+
+    case evaluate_conditions(conditions, rule, txn, call, cache) do
+      {:match, cache} ->
+        %{conditions: conditions, facts: Map.new(evidence_facts(conditions, cache)), cache: cache}
+
+      {:no_match, _} ->
+        raise ArgumentError, "cutover successor rule #{name} is not satisfied"
+
+      {:error, fact} ->
+        raise ArgumentError, "unresolved cutover successor rule #{name} fact #{fact}"
     end
   end
 
@@ -2456,6 +2990,9 @@ defmodule Tightbeam.Rules do
     end
   end
 
+  defp compute_fact("attest.verdict_kind", _db, call, cache),
+    do: {call.params[:verdict_kind] || "", cache}
+
   defp compute_fact("attest.kind", _db, call, cache) do
     value =
       case {call.verb, Map.get(call.params, :kind)} do
@@ -2481,10 +3018,14 @@ defmodule Tightbeam.Rules do
   end
 
   defp compute_fact("assignment.effect_kind", db, call, cache) do
-    with_dependency("$assignment", db, call, cache, fn
-      nil, cache -> {nil, cache}
-      assignment, cache -> {assignment.effect_kind, cache}
-    end)
+    if active_admission_contract(call.verb) == "legacy" do
+      with_dependency("$assignment", db, call, cache, fn
+        nil, cache -> {nil, cache}
+        assignment, cache -> {assignment.effect_kind, cache}
+      end)
+    else
+      {nil, cache}
+    end
   end
 
   defp compute_fact("assignment.state", db, call, cache) do
@@ -2534,44 +3075,52 @@ defmodule Tightbeam.Rules do
   end
 
   defp compute_fact("assignment.qualifying_review_verdict_kinds", db, call, cache) do
-    with_dependency("$assignment", db, call, cache, fn
-      nil, cache ->
-        {nil, cache}
+    if active_admission_contract(call.verb) == "legacy" do
+      with_dependency("$assignment", db, call, cache, fn
+        nil, cache ->
+          {nil, cache}
 
-      assignment, cache ->
-        kinds =
-          if assignment.effect_kind == "code" and get_in(call, [:params, :kind]) == "completion" do
-            Assignments.qualifying_review_verdict_kinds(
-              db,
-              assignment.id,
-              assignment.holder_key,
-              get_in(call, [:params, :commit_refs])
-            )
-          else
-            Assignments.qualifying_review_verdict_kinds(
-              db,
-              assignment.id,
-              assignment.holder_key
-            )
-          end
+        assignment, cache ->
+          kinds =
+            if assignment.effect_kind == "code" and get_in(call, [:params, :kind]) == "completion" do
+              Assignments.qualifying_review_verdict_kinds(
+                db,
+                assignment.id,
+                assignment.holder_key,
+                get_in(call, [:params, :commit_refs])
+              )
+            else
+              Assignments.qualifying_review_verdict_kinds(
+                db,
+                assignment.id,
+                assignment.holder_key
+              )
+            end
 
-        {kinds, cache}
-    end)
+          {kinds, cache}
+      end)
+    else
+      {nil, cache}
+    end
   end
 
   defp compute_fact("assignment.qualifying_verification_verdict_kinds", db, call, cache) do
-    with_dependency("$assignment", db, call, cache, fn
-      nil, cache ->
-        {nil, cache}
+    if active_admission_contract(call.verb) == "legacy" do
+      with_dependency("$assignment", db, call, cache, fn
+        nil, cache ->
+          {nil, cache}
 
-      assignment, cache ->
-        {Assignments.qualifying_verification_verdict_kinds(
-           db,
-           assignment.id,
-           assignment.holder_key,
-           get_in(call, [:params, :commit_refs])
-         ), cache}
-    end)
+        assignment, cache ->
+          {Assignments.qualifying_verification_verdict_kinds(
+             db,
+             assignment.id,
+             assignment.holder_key,
+             get_in(call, [:params, :commit_refs])
+           ), cache}
+      end)
+    else
+      {nil, cache}
+    end
   end
 
   defp compute_fact("assignment.artifact_kinds", db, call, cache) do
@@ -3028,7 +3577,7 @@ defmodule Tightbeam.Rules do
 
       "assignment" ->
         case fetch_fact("$assignment", db, call, cache) do
-          {:ok, %{reviews_assignment_id: nil, effect_kind: "code"}, cache} ->
+          {:ok, %{reviews_assignment_id: nil}, cache} ->
             case compute_fact("assignment.prior_completed_fix_count", db, call, cache) do
               {3, cache} -> {"fix", cache}
               {_count, cache} -> {nil, cache}
@@ -3439,8 +3988,12 @@ defmodule Tightbeam.Rules do
 
   defp compute_fact("assign.effect_kind", _db, %{verb: verb} = call, cache)
        when verb in ["assign", "dispatch"] do
-    review = if verb == "assign", do: call.params[:reviews_assignment_id]
-    {Assignments.effective_effect_kind(review, call.params[:effect_kind]), cache}
+    if active_admission_contract(verb) == "legacy" do
+      review = if verb == "assign", do: call.params[:reviews_assignment_id]
+      {Assignments.effective_effect_kind(review, call.params[:effect_kind]), cache}
+    else
+      {nil, cache}
+    end
   end
 
   defp compute_fact("assign.effect_kind", _db, _call, cache), do: {nil, cache}
@@ -3540,6 +4093,109 @@ defmodule Tightbeam.Rules do
     end)
   end
 
+  defp compute_fact("call.comparison_value", _db, call, cache),
+    do: {Tightbeam.MementoFacts.comparison_value(call), cache}
+
+  defp compute_fact("call.has_comparison_value", _db, call, cache),
+    do: {Tightbeam.MementoFacts.has_comparison_value?(call), cache}
+
+  defp compute_fact("call." <> _ = fact, _db, call, cache) do
+    {Tightbeam.MementoFacts.call_value(fact, Map.get(call, :memento_writes, [])), cache}
+  end
+
+  defp compute_fact(fact, db, call, cache) do
+    case String.split(fact, ".", parts: 3) do
+      ["assignment", selector, property]
+      when selector in ~w(latest_linked_review latest_holder_verdict) ->
+        with_dependency("$assignment", db, call, cache, fn
+          nil, cache ->
+            {nil, cache}
+
+          assignment, cache ->
+            key = {:memento_judgment, selector}
+
+            selected =
+              case Map.fetch(cache, key) do
+                {:ok, row} -> row
+                :error -> Tightbeam.MementoFacts.select(db, assignment.id, selector)
+              end
+
+            cache = Map.put(cache, key, selected)
+
+            case String.split(property, ".", parts: 2) do
+              [operator, name] ->
+                cached_memento_value(
+                  db,
+                  "attest",
+                  selected && selected.id,
+                  operator,
+                  name,
+                  call,
+                  cache
+                )
+
+              [_] ->
+                {Tightbeam.MementoFacts.judgment_value(db, selected, property, []), cache}
+            end
+        end)
+
+      ["assignment", operator, name] ->
+        with_dependency("$assignment", db, call, cache, fn
+          nil, cache ->
+            {nil, cache}
+
+          assignment, cache ->
+            cached_memento_value(db, "assignment", assignment.id, operator, name, call, cache)
+        end)
+
+      ["work_item", operator, name] ->
+        with_dependency("$work_item_id", db, call, cache, fn
+          nil, cache ->
+            {nil, cache}
+
+          id, cache ->
+            case DB.query(db, "SELECT 1 FROM work_items WHERE id=?1", [id]) do
+              {:ok, []} ->
+                {nil, cache}
+
+              {:ok, [[1]]} ->
+                cached_memento_value(db, "work_item", id, operator, name, call, cache)
+            end
+        end)
+    end
+  end
+
+  defp cached_memento_value(db, kind, id, operator, name, call, cache) do
+    key = {:memento_value, kind, id, name}
+
+    values =
+      case Map.fetch(cache, key) do
+        {:ok, values} -> values
+        :error -> if id, do: Tightbeam.Mementos.current(db, kind, id, name), else: []
+      end
+
+    value =
+      case operator do
+        "memento_matches_call" ->
+          proposed = call |> Map.get(:memento_writes, []) |> Map.new() |> Map.get(name, [])
+          Tightbeam.MementoFacts.matches?(values, proposed)
+
+        "memento_contains_comparison_value" ->
+          Tightbeam.MementoFacts.contains_comparison?(values, call)
+
+        "memento_matches_cutover_requirement" ->
+          case Map.get(cache, {:cutover_requirement}) do
+            %{name: ^name, values: expected} -> Tightbeam.MementoFacts.matches?(values, expected)
+            _ -> false
+          end
+
+        _ ->
+          Tightbeam.MementoFacts.value(operator, values)
+      end
+
+    {value, Map.put(cache, key, values)}
+  end
+
   defp resolve_dispatch_assignment(db, call) do
     case {call.verb, Map.get(call.params, :work_item_id)} do
       {"dispatch", work_item_id} when is_binary(work_item_id) ->
@@ -3608,13 +4264,13 @@ defmodule Tightbeam.Rules do
            """
            SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.holderKey, a.holderRole,
                   a.state, a.outcome, s.archetype,
-                  a.holderHarness, a.holderProvider,
-                  COALESCE(e.effectKind,
-                    CASE WHEN a.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END)
+                  COALESCE((SELECT effectKind FROM assignment_effects
+                            WHERE assignmentId = a.id),
+                           CASE WHEN a.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END),
+                  a.holderHarness, a.holderProvider
            FROM assignments a
            JOIN sessions s ON s.sessionKey = a.holderKey
            LEFT JOIN work_items wi ON wi.id = a.workItemId
-           LEFT JOIN assignment_effects e ON e.assignmentId = a.id
            #{where}
            """,
            params
@@ -3630,9 +4286,9 @@ defmodule Tightbeam.Rules do
            state,
            outcome,
            holder_archetype,
+           effect_kind,
            holder_harness,
-           holder_provider,
-           effect_kind
+           holder_provider
          ]
        ]} ->
         %{
@@ -3644,9 +4300,9 @@ defmodule Tightbeam.Rules do
           state: state,
           outcome: outcome,
           holder_archetype: holder_archetype,
+          effect_kind: effect_kind,
           holder_harness: holder_harness,
-          holder_provider: holder_provider,
-          effect_kind: effect_kind
+          holder_provider: holder_provider
         }
 
       {:ok, []} ->

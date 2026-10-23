@@ -1959,6 +1959,8 @@ defmodule Tightbeam.Schema do
     end
 
     :ok = Tightbeam.Recognition.ensure_schema(db)
+    :ok = Tightbeam.Mementos.ensure_schema(db)
+    :ok = Tightbeam.MementoJudgments.ensure_schema(db)
 
     # Built last: the notice source payload migration above rebuilds
     # notice_batch_members, which drops any index created on the old table.

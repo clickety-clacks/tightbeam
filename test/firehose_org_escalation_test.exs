@@ -198,8 +198,7 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
         supervision_interval_ms: 1_000,
         params: %{
           subject: "cannot-proceed firehose",
-          work_item_id: work.id,
-          effect_kind: "coordination"
+          work_item_id: work.id
         }
       })
 

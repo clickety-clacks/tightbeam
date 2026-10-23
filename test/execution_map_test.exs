@@ -47,7 +47,7 @@ defmodule Tightbeam.ExecutionMapTest do
   # telemetry builder reddens proof 2 rather than sliding in unreviewed.
   @node_keys Enum.sort(
                ~w(active assignments attests bracket1_armed closing_attests creation_context
-                  fail_reason fan_out finished_at id jobs minds open_decision_requests
+                  fail_reason fan_out finished_at id jobs mementos minds open_decision_requests
                   origin parent current_coordination since_progress_ms spec_ref_name spec_ref_sha256 started_at
                   state title turns)a
              )
@@ -442,6 +442,33 @@ defmodule Tightbeam.ExecutionMapTest do
 
   ## Proof 8 — terminal fields, against production writers
 
+  test "current coordination projects current assignment mementos", ctx do
+    session!(ctx.db, "s_holder", "flynn")
+    item!(ctx.db, "wi_metadata")
+    assignment!(ctx.db, "asg_metadata", work_item_id: "wi_metadata", holder: "s_holder")
+
+    for value <- ["old", "current"] do
+      assert {:ok, :ok} =
+               DB.transaction(ctx.db, fn txn ->
+                 Tightbeam.Mementos.append_in_txn!(
+                   txn,
+                   "assignment",
+                   "asg_metadata",
+                   [{"fixture/value", [value]}],
+                   {:user, "owner"},
+                   "fixture-revision"
+                 )
+
+                 :ok
+               end)
+    end
+
+    telemetry = node(roster(ctx), "wi_metadata")
+
+    assert [%{assignment_id: "asg_metadata", mementos: %{"fixture/value" => ["current"]}}] =
+             telemetry.current_coordination
+  end
+
   test "proof 8: finished_at tracks the CURRENT terminal state and closing_attests exclude revoked",
        ctx do
     session!(ctx.db, "s_holder", "flynn")
@@ -495,11 +522,43 @@ defmodule Tightbeam.ExecutionMapTest do
     close!(ctx.db, "asg_gave_up", "surrendered", "att_gave_up")
     close!(ctx.db, "asg_revoked", "revoked", nil)
 
+    for {kind, id} <- [
+          {"work_item", "wi_closes"},
+          {"assignment", "asg_done"},
+          {"attest", "att_done"}
+        ],
+        value <- ["old", "current"] do
+      assert {:ok, :ok} =
+               DB.transaction(ctx.db, fn txn ->
+                 Tightbeam.Mementos.append_in_txn!(
+                   txn,
+                   kind,
+                   id,
+                   [{"fixture/value", [value]}],
+                   {:user, "owner"},
+                   "fixture-revision"
+                 )
+
+                 :ok
+               end)
+    end
+
     telemetry = node(roster(ctx), "wi_closes")
+    assert telemetry.mementos == %{"fixture/value" => ["current"]}
 
     assert telemetry.closing_attests == [
-             %{assignmentId: "asg_done", attestId: "att_done", commitRefs: ["abc123"]},
-             %{assignmentId: "asg_gave_up", attestId: "att_gave_up", commitRefs: nil}
+             %{
+               assignmentId: "asg_done",
+               attestId: "att_done",
+               commitRefs: ["abc123"],
+               mementos: %{"fixture/value" => ["current"]}
+             },
+             %{
+               assignmentId: "asg_gave_up",
+               attestId: "att_gave_up",
+               commitRefs: nil,
+               mementos: %{}
+             }
            ]
 
     assert telemetry.assignments == %{

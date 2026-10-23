@@ -13,7 +13,6 @@ defmodule Tightbeam.RulesTest do
     Gateway,
     Ledger,
     Org,
-    RailRemedy,
     Roles,
     Rules,
     Toplines,
@@ -30,19 +29,54 @@ defmodule Tightbeam.RulesTest do
       Path.join(System.tmp_dir!(), "tightbeam-rules-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(Path.join(base_dir, "identity/rules"))
+    bundle = Path.join(base_dir, "identity/kungfu/agentic-engineering")
+    File.mkdir_p!(bundle)
+    File.cp!("priv/kungfu/agentic-engineering/manifest.toml", Path.join(bundle, "manifest.toml"))
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
       Rules.load!(System.tmp_dir!() <> "/missing-rules-reset", [])
     end)
 
+    commit_repo = Path.join(base_dir, "commit-reference")
+    File.mkdir_p!(commit_repo)
+    {_, 0} = System.cmd("git", ["init", "--quiet"], cd: commit_repo)
+    File.write!(Path.join(commit_repo, "fixture.txt"), "immutable fixture\n")
+    {_, 0} = System.cmd("git", ["add", "fixture.txt"], cd: commit_repo)
+
+    {_, 0} =
+      System.cmd(
+        "git",
+        [
+          "-c",
+          "user.name=Test Fixture",
+          "-c",
+          "user.email=test@example.invalid",
+          "commit",
+          "--quiet",
+          "-m",
+          "fixture"
+        ],
+        cd: commit_repo
+      )
+
+    {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: commit_repo)
+
+    commit_refs = [
+      %{
+        "repo" => "#{Tightbeam.Placement.local_host_name()}:#{Path.expand(commit_repo)}",
+        "commit" => String.trim(commit)
+      }
+    ]
+
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-    Rules.load!(Path.join(base_dir, "missing-rules"), Map.keys(handlers))
+    Rules.load!(base_dir, Map.keys(handlers), revision: "fixture")
 
     %{
       db: db,
       base_dir: base_dir,
-      handlers: handlers
+      handlers: handlers,
+      commit_refs: commit_refs
     }
   end
 
@@ -71,7 +105,7 @@ defmodule Tightbeam.RulesTest do
       )
 
     put_raw(ctx, shipped)
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     facts = %{
       "wait.obligation_matches" => true,
@@ -104,7 +138,9 @@ defmodule Tightbeam.RulesTest do
     end
 
     assert {:ok, :none} = query.(Map.put(facts, "wait.recognized", true))
+
     assert {:ok, :none} = query.(Map.put(facts, "wait.verification_state", "challenged"))
+
     assert {:ok, {:ok, _}} = query.(Map.put(facts, "wait.verification_state", "confirmed"))
 
     put_raw(
@@ -116,7 +152,7 @@ defmodule Tightbeam.RulesTest do
       )
     )
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     assert {:ok, :none} = query.(facts)
     assert {:ok, {:ok, _}} = query.(Map.put(facts, "resolver.owed_by_other", false))
   end
@@ -142,7 +178,9 @@ defmodule Tightbeam.RulesTest do
       path = put_raw(ctx, contents)
 
       error =
-        assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
+        assert_unavailable(ctx, fn ->
+          Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
+        end)
 
       assert error.message =~ path
       assert error.message =~ "verifier"
@@ -364,11 +402,11 @@ defmodule Tightbeam.RulesTest do
     ]
     """)
 
-    Rules.load!(ctx.base_dir, ["post", "wake"])
+    Rules.load!(ctx.base_dir, ["post", "wake"], revision: "fixture")
     assert :ok = Rules.evaluate(dead_db, call())
 
     put_rule(ctx, rule("other-verb", "wake", "caller.is_admin", "eq", true))
-    Rules.load!(ctx.base_dir, ["post", "wake"])
+    Rules.load!(ctx.base_dir, ["post", "wake"], revision: "fixture")
     assert :ok = Rules.evaluate(dead_db, call())
 
     put_raw(
@@ -504,7 +542,7 @@ defmodule Tightbeam.RulesTest do
     """)
 
     assert [%{name: "needs-remedy"}, %{name: "conditional-wake-gate"}] =
-             Rules.load!(ctx.base_dir, ["post", "wake"])
+             Rules.load!(ctx.base_dir, ["post", "wake"], revision: "fixture")
 
     holder = session(ctx.db, "remedy-gate-holder", "flynn")
     assigned = assignment(ctx, holder.session_key, {:user, "flynn"})
@@ -695,11 +733,12 @@ defmodule Tightbeam.RulesTest do
     assert Enum.map(EventLog.events_after(ctx.db, 0, 10), & &1.kind) == ["verb", "denied"]
   end
 
-  test "zero rules still require code completion evidence",
+  test "zero rules leave completion evidence meaning to declared policy",
        ctx do
+    :ok = DB.execute(ctx.db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1)")
     holder = session(ctx.db, "zero-rule-holder", "flynn", archetype: "coder")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     completion =
       p3_call("attest", {:session, holder.session_key}, %{
@@ -707,24 +746,17 @@ defmodule Tightbeam.RulesTest do
         kind: "completion"
       })
 
-    assert {:error, %{code: "inapplicable_code_evidence"}} =
+    assert {:ok, %{attest: %{id: attest_id}, assignment: %{state: "closed"}}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
-    assert {:ok, [["open", nil]]} =
+    assert {:ok, [["closed", ^attest_id]]} =
              DB.query(
                ctx.db,
                "SELECT state,closingAttestId FROM assignments WHERE id=?1",
                [assignment.id]
              )
 
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
-               [assignment.id]
-             )
-
-    assert [%{kind: "denied", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
+    assert [%{kind: "verb", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
   end
 
   test "matching a constitutional denial is monotonic and leaves domain state unchanged", ctx do
@@ -756,34 +788,44 @@ defmodule Tightbeam.RulesTest do
   test "P3 fact registry has exact names and load-time types", ctx do
     list_facts = [
       "assignment.independent_verdict_kinds",
-      "assignment.qualifying_review_verdict_kinds",
+      "assignment.memento.agentic-engineering/effect-kind",
       "assignment.artifact_kinds"
     ]
 
     for fact <- list_facts do
       put_rule(ctx, rule("valid-list", "attest", fact, "in", ["reviewed-clean"]))
-      assert [_] = Rules.load!(ctx.base_dir, ["attest"])
+      assert [_] = Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
 
       put_rule(ctx, rule("bad-list-op", "attest", fact, "eq", ["reviewed-clean"]))
 
       assert_unavailable(ctx, ~r/invalid for a list fact/, fn ->
-        Rules.load!(ctx.base_dir, ["attest"])
+        Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
       end)
 
       put_rule(ctx, rule("bad-list-value", "attest", fact, "not_in", []))
 
       assert_unavailable(ctx, ~r/non-empty flat list/, fn ->
-        Rules.load!(ctx.base_dir, ["attest"])
+        Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
       end)
     end
 
-    for removed <- [
+    for legacy <- [
+          "assignment.qualifying_review_verdict_kinds",
+          "assignment.qualifying_verification_verdict_kinds"
+        ] do
+      put_rule(ctx, rule("legacy-verdict-fact", "attest", legacy, "in", ["reviewed-clean"]))
+      assert [_] = Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
+    end
+
+    for unknown <- [
           "assignment.cross_harness_verdict_kinds",
           "assignment.cross_provider_verdict_kinds"
         ] do
-      put_rule(ctx, rule("removed-review-fact", "attest", removed, "in", ["reviewed-clean"]))
+      put_rule(ctx, rule("unknown-review-fact", "attest", unknown, "in", ["reviewed-clean"]))
 
-      assert_unavailable(ctx, ~r/unknown fact/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
+      assert_unavailable(ctx, ~r/unknown fact/, fn ->
+        Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
+      end)
     end
 
     put_rule(
@@ -814,7 +856,7 @@ defmodule Tightbeam.RulesTest do
       rule("producing", "attest", "assignment.is_producing_card", "eq", true)
     )
 
-    assert [_] = Rules.load!(ctx.base_dir, ["attest"])
+    assert [_] = Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
 
     put_rule(
       ctx,
@@ -822,12 +864,14 @@ defmodule Tightbeam.RulesTest do
     )
 
     assert_unavailable(ctx, ~r/does not match bool/, fn ->
-      Rules.load!(ctx.base_dir, ["attest"])
+      Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
     end)
 
     put_rule(ctx, rule("removed", "attest", "assignment.verdict_kinds_any", "in", ["x"]))
 
-    assert_unavailable(ctx, ~r/unknown fact/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
+    assert_unavailable(ctx, ~r/unknown fact/, fn ->
+      Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
+    end)
 
     # Migration proof (verification-papertrail-v1): an org rule still gating the
     # deleted producer fact fails loud at boot, naming file and rule.
@@ -839,7 +883,7 @@ defmodule Tightbeam.RulesTest do
     )
 
     error =
-      assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
+      assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, ["attest"], revision: "fixture") end)
 
     assert error.message =~ "unknown fact"
     assert error.message =~ "dead-produced"
@@ -850,14 +894,14 @@ defmodule Tightbeam.RulesTest do
       rule(
         "bad-list-member",
         "attest",
-        "assignment.qualifying_review_verdict_kinds",
+        "assignment.independent_verdict_kinds",
         "in",
         [1]
       )
     )
 
     assert_unavailable(ctx, ~r/non-empty flat list/, fn ->
-      Rules.load!(ctx.base_dir, ["attest"])
+      Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
     end)
   end
 
@@ -867,13 +911,13 @@ defmodule Tightbeam.RulesTest do
     review = assignment(ctx, holder.session_key, {:user, "flynn"}, reviews: assignment.id)
 
     list_facts = [
-      "assignment.qualifying_review_verdict_kinds",
+      "assignment.independent_verdict_kinds",
       "assignment.artifact_kinds"
     ]
 
     for fact <- list_facts do
       put_rule(ctx, rule("missing", "attest", fact, "not_in", ["required"]))
-      Rules.load!(ctx.base_dir, ["attest"])
+      Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
 
       assert :ok = Rules.evaluate(ctx.db, p3_call("attest", nil, %{kind: "completion"}))
 
@@ -907,7 +951,7 @@ defmodule Tightbeam.RulesTest do
       rule("producing", "attest", "assignment.is_producing_card", "eq", true)
     )
 
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
 
     for params <- [
           %{kind: "completion"},
@@ -965,7 +1009,7 @@ defmodule Tightbeam.RulesTest do
       rule("wrong-verb", "attest", "assign.declared_files_overlap_open", "eq", true)
     )
 
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
     assert :ok = Rules.evaluate(ctx.db, p3_call("attest", nil, %{files: ["lib/a.ex"]}))
 
     put_rule(
@@ -1000,7 +1044,7 @@ defmodule Tightbeam.RulesTest do
             {"assignment.caller_is_holder", "eq", false}
           ] do
         put_rule(ctx, rule("unresolved", "attest", fact, op, value))
-        Rules.load!(ctx.base_dir, ["attest"])
+        Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
 
         assert :ok =
                  Rules.evaluate(
@@ -1015,7 +1059,7 @@ defmodule Tightbeam.RulesTest do
       rule("resolved", "attest", "assignment.caller_is_holder", "eq", true)
     )
 
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
 
     assert {:deny, %{rule: "resolved"}} =
              Rules.evaluate(
@@ -1053,7 +1097,7 @@ defmodule Tightbeam.RulesTest do
     ]
     """)
 
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
 
     completion =
       p3_call("attest", {:session, holder.session_key}, %{
@@ -1066,11 +1110,11 @@ defmodule Tightbeam.RulesTest do
     assert {:deny, %{rule: "needs-review"}} = Rules.evaluate(ctx.db, completion)
   end
 
-  test "completion gate loader exception preserves unrelated remedy-link validation",
+  test "completion notice loader exception preserves unrelated wake and review-link validation",
        ctx do
     shipped = File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
     put_raw(ctx, shipped)
-    loaded_rules = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    loaded_rules = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     assert Enum.map(loaded_rules, & &1.name) == [
              "completion-requires-review",
@@ -1081,7 +1125,7 @@ defmodule Tightbeam.RulesTest do
     # The rest of this test edits the completion rule alone.
     shipped = shipped |> String.split("\n# Posture gate") |> hd()
     put_raw(ctx, shipped)
-    assert [loaded] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    assert [loaded] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     assert loaded.name == "completion-requires-review"
     assert loaded.external_producer
     assert loaded.remedy.action == "wake"
@@ -1091,21 +1135,21 @@ defmodule Tightbeam.RulesTest do
     put_raw(ctx, String.replace(shipped, "completion-requires-review", "unrelated-review-rule"))
 
     assert_unavailable(ctx, ~r/linked-review-fact remedy requires reviews/, fn ->
-      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     end)
 
     for extra <- [~s(reviews = "{assignment_id}"), ~s(arbitrary = "value")] do
       put_raw(ctx, shipped <> "\n" <> extra <> "\n")
 
       assert_unavailable(ctx, ~r/remedy wake has invalid params/, fn ->
-        Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+        Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
       end)
     end
 
     put_raw(ctx, String.replace(shipped, "external_producer = true", "external_producer = false"))
 
     assert_unavailable(ctx, ~r/F1 unsatisfied verdict gate/, fn ->
-      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     end)
 
     assigned =
@@ -1117,17 +1161,17 @@ defmodule Tightbeam.RulesTest do
     put_raw(ctx, assigned)
 
     assert_unavailable(ctx, ~r/linked-review-fact remedy requires reviews/, fn ->
-      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     end)
 
     put_raw(ctx, assigned <> ~s(\nreviews = "{holder_key}"\n))
 
     assert_unavailable(ctx, ~r/linked-review-fact remedy requires reviews/, fn ->
-      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     end)
 
     put_raw(ctx, assigned <> ~s(\nreviews = "{assignment_id}"\n))
-    assert [linked] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    assert [linked] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     assert linked.remedy.params.reviews == "{assignment_id}"
     assert linked.conditions == loaded.conditions
   end
@@ -1154,7 +1198,7 @@ defmodule Tightbeam.RulesTest do
       )
     )
 
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
 
     assert {:deny, %{rule: "independent"}} =
              Rules.evaluate(
@@ -1185,16 +1229,16 @@ defmodule Tightbeam.RulesTest do
       rule(
         "qualified",
         "attest",
-        "assignment.qualifying_review_verdict_kinds",
+        "assignment.latest_linked_review.judgment_kind",
         "in",
         ["reviewed-clean"]
       )
     )
 
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
 
     assert :ok =
-             Rules.evaluate(
+             evaluate_host(
                ctx.db,
                p3_call("attest", nil, %{assignment_id: producer.id, kind: "completion"})
              )
@@ -1202,7 +1246,7 @@ defmodule Tightbeam.RulesTest do
     verdict(ctx, reviewer.session_key, valid_review.id, "changes-requested")
 
     assert :ok =
-             Rules.evaluate(
+             evaluate_host(
                ctx.db,
                p3_call("attest", nil, %{assignment_id: producer.id, kind: "completion"})
              )
@@ -1210,7 +1254,7 @@ defmodule Tightbeam.RulesTest do
     verdict(ctx, reviewer.session_key, valid_review.id, "reviewed-clean")
 
     assert {:deny, %{rule: "qualified"}} =
-             Rules.evaluate(
+             evaluate_host(
                ctx.db,
                p3_call("attest", nil, %{assignment_id: producer.id, kind: "completion"})
              )
@@ -1228,7 +1272,7 @@ defmodule Tightbeam.RulesTest do
       rule("no-report", "attest", "assignment.artifact_kinds", "not_in", ["report"])
     )
 
-    Rules.load!(ctx.base_dir, ["attest"])
+    Rules.load!(ctx.base_dir, ["attest"], revision: "fixture")
 
     assert {:deny, %{rule: "no-report"}} =
              Rules.evaluate(
@@ -1284,7 +1328,7 @@ defmodule Tightbeam.RulesTest do
       end)
 
     put_raw(ctx, review_gate_rule())
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     completion =
       p3_call("attest", {:session, holder.session_key}, %{
@@ -1295,7 +1339,7 @@ defmodule Tightbeam.RulesTest do
     assert {:error, %{code: "rule_denied", rule: "needs-independent-review"}} =
              Dispatch.dispatch(ctx.db, handlers, completion)
 
-    refute_received :attest_handler_invoked
+    assert_received :attest_handler_invoked
     assert Assignments.attest_count(ctx.db, assignment.id) == 0
     assert Assignments.open_count(ctx.db, holder.session_key) == 1
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM events WHERE kind = 'denied'")
@@ -1334,7 +1378,7 @@ defmodule Tightbeam.RulesTest do
 
     attach_work_item(ctx, artifact_assignment.id, "wi_artifact_gate")
     put_raw(ctx, artifact_gate_rule())
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     artifact_completion =
       p3_call("attest", {:session, holder.session_key}, %{
@@ -1367,12 +1411,13 @@ defmodule Tightbeam.RulesTest do
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
 
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     review_call =
       p3_call("assign", {:user, "reviewer"}, %{
         subject: "review receipt producer",
         reviews_assignment_id: producer.id,
+        mementos: [%{name: "agentic-engineering/effect-kind", value: "review"}],
         idempotency_key: nil,
         files: nil
       })
@@ -1382,6 +1427,7 @@ defmodule Tightbeam.RulesTest do
     producer_id = producer.id
     assert early.reviewsAssignmentId == producer_id
     assert early.effectKind == "review"
+    assert early.mementos["agentic-engineering/effect-kind"] == ["review"]
     assert early.holderKey != holder.session_key
     assert review_count(ctx.db, producer.id) == 1
 
@@ -1396,7 +1442,7 @@ defmodule Tightbeam.RulesTest do
       holder.session_key,
       producer.id,
       "tests-passed",
-      "gibson:/repo abc123; mix test test/rules_test.exs; passed: 1 test"
+      "example.invalid/repo abc123; test command; passed: 1 test"
     )
 
     assert {:ok, %{reviewsAssignmentId: ^producer_id, effectKind: "review"}} =
@@ -1412,7 +1458,7 @@ defmodule Tightbeam.RulesTest do
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
 
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     cases = [
       {"code held by coder", "coder", "code", true},
@@ -1436,6 +1482,7 @@ defmodule Tightbeam.RulesTest do
         p3_call("assign", {:user, "reviewer"}, %{
           subject: "review #{label}",
           reviews_assignment_id: producer.id,
+          mementos: [%{name: "agentic-engineering/effect-kind", value: "review"}],
           idempotency_key: nil,
           files: nil
         })
@@ -1446,6 +1493,7 @@ defmodule Tightbeam.RulesTest do
 
         assert early.reviewsAssignmentId == producer.id
         assert early.effectKind == "review"
+        assert early.mementos["agentic-engineering/effect-kind"] == ["review"]
         assert early.holderKey != holder.session_key
         assert review_count(ctx.db, producer.id) == 1
 
@@ -1454,7 +1502,7 @@ defmodule Tightbeam.RulesTest do
           holder.session_key,
           producer.id,
           "tests-passed",
-          "gibson:/repo effect123; mix test test/rules_test.exs; passed: #{label}"
+          "example.invalid/repo effect123; test command; passed: #{label}"
         )
       end
 
@@ -1466,10 +1514,9 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
-  test "shipped completion is recorded while a same-source independent review is pending", ctx do
+  test "shipped completion notifies its owner without forced review staffing", ctx do
     holder = session(ctx.db, "receipt-remedy-holder", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "receipt-remedy-reviewer", "flynn", archetype: "reviewer-code")
-
     owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
 
     {:ok, _} =
@@ -1477,48 +1524,44 @@ defmodule Tightbeam.RulesTest do
 
     Roles.create!(ctx.db, "reviewer-code", "flynn", reviewer.session_key)
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
-    attach_work_item(ctx, producer.id, "review-notice")
+    attach_work_item(ctx, producer.id, "wi-accountable-review-notice")
 
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    stub_commit_ref_validation()
-    refs = fixture_commit_refs()
-
-    assert %{attest: %{verdictKind: "verified"}} =
-             commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     completion =
       p3_call("attest", {:session, holder.session_key}, %{
         assignment_id: producer.id,
-        kind: "completion",
-        commit_refs: refs
+        kind: "completion"
       })
 
-    assert {:ok,
-            %{
-              assignment: %{id: producer_id, state: "open"},
-              attest: %{kind: "completion"} = completion_attest
-            }} =
+    assert {:ok, %{assignment: %{id: producer_id, state: "open"}, attest: %{kind: "completion"}}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
     assert producer_id == producer.id
-    assert completion_attest.bySession == holder.session_key
-    assert completion_attest.commitRefs == refs
     assert review_count(ctx.db, producer.id) == 0
 
-    # The gate's notice is one ordinary stored notice to the accountable owner; it
-    # starts no review-remedy episode and staffs no reviewer.
-    assert RailRemedy.episode(ctx.db, "completion-requires-review", producer.id) == nil
+    assert {:ok, [[notice_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='prompt' AND origin='remedy:completion-requires-review'",
+               [producer.id]
+             )
 
-    assert [notice] = review_gate_notices(ctx.db, producer.id)
+    notice = Wakes.get(ctx.db, notice_id)
     assert notice.session_key == owner.session_key
     assert notice.owner_user_id == "flynn"
-    assert notice.consumer == "prompt"
-    assert notice.summon == 1
-    assert notice.creator_session_key == nil
+    assert notice.assignment_id == producer.id
+    assert notice.prompt =~ producer.id
 
-    assert notice.prompt ==
-             "Coordinate independent review of assignment #{producer.id}; preserve current evidence and direct staffing through its accountable owner."
+    verdict(
+      ctx,
+      holder.session_key,
+      producer.id,
+      "tests-passed",
+      "testhost:/repo 378807eabb39cecc25ea801494053f8aa20feafa; " <>
+        "mix test test/rules_test.exs; passed: 1 test"
+    )
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId=?1", [
@@ -1798,39 +1841,12 @@ defmodule Tightbeam.RulesTest do
       {"", 0}
     end)
 
-    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-
-    holder = session(ctx.db, "same-source-completion-holder", "flynn", archetype: "coder")
-
-    reviewer =
-      session(ctx.db, "same-source-completion-reviewer", "flynn", archetype: "reviewer-code")
-
-    commit = String.duplicate("a", 40)
-
-    producer_refs = [%{"repo" => "testhost:/tmp/producer-checkout", "commit" => commit}]
-    reviewer_refs = [%{"repo" => "testhost:/tmp/reviewer-checkout", "commit" => commit}]
-
-    producer =
-      assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "code")
-
-    review =
-      assignment(ctx, reviewer.session_key, {:user, "flynn"},
-        reviews: producer.id,
-        effect_kind: "review"
-      )
-
-    assert %{attest: %{verdictKind: "reviewed-clean"}} =
-             Assignments.__handle__(
-               ctx.db,
-               "attest",
-               p3_call("attest", {:session, reviewer.session_key}, %{
-                 assignment_id: review.id,
-                 kind: "verdict",
-                 verdict_kind: "reviewed-clean",
-                 commit_refs: reviewer_refs
-               })
-             )
+    refs = [
+      %{
+        "repo" => "#{Tightbeam.Placement.local_host_name()}:/tmp/o2-result",
+        "commit" => String.duplicate("a", 40)
+      }
+    ]
 
     assert %{attest: %{verdictKind: "verified"}} =
              Assignments.__handle__(
@@ -1840,23 +1856,15 @@ defmodule Tightbeam.RulesTest do
                  assignment_id: producer.id,
                  kind: "verdict",
                  verdict_kind: "verified",
-                 commit_refs: producer_refs
+                 commit_refs: refs,
+                 mementos: evidence_mementos(refs)
                })
              )
 
-    assert Assignments.qualifying_verification_verdict_kinds(
-             ctx.db,
-             producer.id,
-             holder.session_key,
-             reviewer_refs
-           ) == ["verified"]
+    completion = put_in(completion, [:params, :mementos], evidence_mementos(refs))
 
-    completion =
-      p3_call("attest", {:session, holder.session_key}, %{
-        assignment_id: producer.id,
-        kind: "completion",
-        commit_refs: producer_refs
-      })
+    assert {:ok, %{assignment: %{id: ^producer_id, state: "open"}}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
     assert :ok = Rules.evaluate(ctx.db, completion)
   end
@@ -1888,7 +1896,7 @@ defmodule Tightbeam.RulesTest do
              )
 
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     coder_completion =
       p3_call("attest", {:session, coder.session_key}, %{
@@ -1907,6 +1915,7 @@ defmodule Tightbeam.RulesTest do
 
     assert orchestration.reviewsAssignmentId == nil
     assert orchestration.effectKind == "evidence"
+    assert orchestration.mementos["agentic-engineering/effect-kind"] == ["evidence"]
 
     assert {:ok, %{assignment: %{id: orchestration_id, state: "closed"}}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, evidence_completion)
@@ -1929,6 +1938,7 @@ defmodule Tightbeam.RulesTest do
         p3_call("assign", {:user, "reviewer"}, %{
           subject: "exempt review",
           reviews_assignment_id: producer.id,
+          mementos: [%{name: "agentic-engineering/effect-kind", value: "review"}],
           idempotency_key: nil,
           files: nil
         })
@@ -1958,7 +1968,7 @@ defmodule Tightbeam.RulesTest do
     prompt = "assignment {assignment_id} opened"
     """)
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     opened = assignment(ctx, holder.session_key, {:user, "flynn"})
 
     assert [wake] = Wakes.list_pending(ctx.db)
@@ -1995,7 +2005,7 @@ defmodule Tightbeam.RulesTest do
     deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
     """)
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     assert {:error, %{code: "rule_denied", rule: "deny-post"}} =
              Dispatch.dispatch(
@@ -2047,7 +2057,7 @@ defmodule Tightbeam.RulesTest do
     prompt = "decision superseded"
     """)
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     before_wake_ids = MapSet.new(Wakes.list_pending(ctx.db), & &1.wake_id)
 
     assert %{code: "not_open"} =
@@ -2093,7 +2103,7 @@ defmodule Tightbeam.RulesTest do
     prompt = "agent assignment opened"
     """)
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     _opened = assignment(ctx, target.session_key, {:session, actor.session_key})
 
     assert Enum.any?(Wakes.list_pending(ctx.db), fn wake ->
@@ -2123,7 +2133,7 @@ defmodule Tightbeam.RulesTest do
     prompt = "remedy assignment opened"
     """)
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     item =
       Tightbeam.WorkItems.__handle__(ctx.db, "work-item-create", %{
@@ -2149,7 +2159,7 @@ defmodule Tightbeam.RulesTest do
         work_item_id: item.id,
         idempotency_key: nil,
         reviews_assignment_id: nil,
-        effect_kind: nil,
+        mementos: [],
         files: nil
       })
       |> Map.merge(%{
@@ -2241,7 +2251,7 @@ defmodule Tightbeam.RulesTest do
     prompt = "queued by {caller_origin}"
     """)
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     transition = %{
       verb: "post",
@@ -2289,7 +2299,7 @@ defmodule Tightbeam.RulesTest do
     prompt = "assignment {assignment_id} opened for {holder_key}"
     """)
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     transition = %{
       verb: "assign",
@@ -2373,7 +2383,7 @@ defmodule Tightbeam.RulesTest do
     prompt = "completed fixes observed"
     """)
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     transitions = [
       %{
@@ -2427,7 +2437,7 @@ defmodule Tightbeam.RulesTest do
     prompt = "unassigned work observed"
     """)
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     transitions = [
       %{
@@ -2512,7 +2522,7 @@ defmodule Tightbeam.RulesTest do
     prompt = "unassigned running turn observed"
     """)
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     assert {:ok, _seq} =
              Ledger.enqueue(ctx.db, %{
@@ -2550,7 +2560,7 @@ defmodule Tightbeam.RulesTest do
     """)
 
     assert_unavailable(ctx, ~r/edge "row-commit" requires effect = "notice"/, fn ->
-      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     end)
   end
 
@@ -2570,7 +2580,7 @@ defmodule Tightbeam.RulesTest do
              )
 
     rules = load_ac6a_rules(ctx)
-    assert Enum.count(rules, &String.starts_with?(&1.name, "ac6a-")) == 5
+    assert Enum.count(rules, &String.starts_with?(&1.name, "ac6a-")) == 6
 
     assert {:ok, _} =
              Ledger.enqueue(ctx.db, %{
@@ -2842,7 +2852,7 @@ defmodule Tightbeam.RulesTest do
     assert claimed.seq == Enum.at(sender_seqs, 2)
     finish_claim(ctx.db, claimed)
     Process.sleep(2)
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     send_turn.("flood-sender-recross")
     assert notice_count(ctx.db, flood_origin) == 2
     send_turn.("flood-sender-still-over")
@@ -3173,7 +3183,7 @@ defmodule Tightbeam.RulesTest do
       "compat-review-count.toml"
     )
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     compat_producer_opener = session(ctx.db, "ac6a-compat-producer-opener", "flynn")
 
@@ -3489,6 +3499,7 @@ defmodule Tightbeam.RulesTest do
     verdict(ctx, reviewer.session_key, fifth_review.id, "changes-requested", "fifth round")
     assert notice_count(ctx.db, churn_origin) == 1
 
+    fix_origin = "remedy:ac6a-fourth-fix-round"
     fix_item = "wi_ac6a_fourth_fix_round"
     create_work_item(ctx, fix_item)
     set_work_item_owner(ctx, fix_item, opener.session_key)
@@ -3497,7 +3508,7 @@ defmodule Tightbeam.RulesTest do
       prior =
         assignment(ctx, fix_holder.session_key, {:user, "flynn"},
           work_item_id: fix_item,
-          effect_kind: "code"
+          mementos: [%{name: "agentic-engineering/effect-kind", value: "code"}]
         )
 
       refs = verified_code_refs(ctx, prior, fix_holder, reviewer)
@@ -3509,7 +3520,7 @@ defmodule Tightbeam.RulesTest do
                  p3_call("attest", {:session, fix_holder.session_key}, %{
                    assignment_id: prior.id,
                    kind: "completion",
-                   commit_refs: refs
+                   mementos: evidence_mementos(refs)
                  })
                )
     end
@@ -3519,7 +3530,7 @@ defmodule Tightbeam.RulesTest do
     fourth =
       assignment(ctx, fix_holder.session_key, {:user, "flynn"},
         work_item_id: fix_item,
-        effect_kind: "code"
+        mementos: [%{name: "agentic-engineering/effect-kind", value: "code"}]
       )
 
     assert {:ok, [[fix_target, fix_assignment, fix_work_item, fix_prompt]]} =
@@ -3527,7 +3538,7 @@ defmodule Tightbeam.RulesTest do
                ctx.db,
                "SELECT sessionKey,assignmentId,work_item_id,prompt FROM wakes " <>
                  "WHERE origin=?1 AND prompt LIKE '%fourth fix round%'",
-               [churn_origin]
+               [fix_origin]
              )
 
     assert [fix_target, fix_assignment, fix_work_item] ==
@@ -3538,11 +3549,12 @@ defmodule Tightbeam.RulesTest do
     fifth =
       assignment(ctx, fix_holder.session_key, {:user, "flynn"},
         work_item_id: fix_item,
-        effect_kind: "code"
+        mementos: [%{name: "agentic-engineering/effect-kind", value: "code"}]
       )
 
     assert fourth.id != fifth.id
-    assert notice_count(ctx.db, churn_origin) == 2
+    assert notice_count(ctx.db, churn_origin) == 1
+    assert notice_count(ctx.db, fix_origin) == 1
   end
 
   test "AC6a routes unassigned agent stretches to the item coordinator once and excludes human starts",
@@ -3637,7 +3649,7 @@ defmodule Tightbeam.RulesTest do
     opened =
       assignment(ctx, agent.session_key, {:user, "flynn"},
         work_item_id: work_item_id,
-        effect_kind: "code"
+        mementos: [%{name: "agentic-engineering/effect-kind", value: "code"}]
       )
 
     assert {:ok, _} =
@@ -3667,7 +3679,7 @@ defmodule Tightbeam.RulesTest do
                p3_call("attest", {:session, agent.session_key}, %{
                  assignment_id: opened.id,
                  kind: "completion",
-                 commit_refs: refs
+                 mementos: evidence_mementos(refs)
                })
              )
 
@@ -4211,13 +4223,21 @@ defmodule Tightbeam.RulesTest do
   end
 
   defp assignment(ctx, holder_key, opener, opts \\ []) do
+    effect_kind = opts[:effect_kind] || if(opts[:reviews], do: "review", else: "code")
+
     call =
       p3_call("assign", opener, %{
         subject: opts[:subject] || "P3 assignment #{System.unique_integer([:positive])}",
+        effect_kind: effect_kind,
         idempotency_key: nil,
         work_item_id: opts[:work_item_id],
         reviews_assignment_id: opts[:reviews],
-        effect_kind: opts[:effect_kind],
+        mementos: [
+          %{
+            name: "agentic-engineering/effect-kind",
+            value: effect_kind
+          }
+        ],
         files: opts[:files]
       })
 
@@ -4225,79 +4245,23 @@ defmodule Tightbeam.RulesTest do
   end
 
   defp verdict(ctx, session_key, assignment_id, verdict_kind, note \\ nil) do
+    params = %{
+      assignment_id: assignment_id,
+      kind: "verdict",
+      verdict_kind: verdict_kind,
+      note: note
+    }
+
+    params =
+      if verdict_kind == "verified",
+        do: Map.put(params, :commit_refs, ctx.commit_refs),
+        else: params
+
     Assignments.__handle__(
       ctx.db,
       "attest",
-      p3_call("attest", {:session, session_key}, %{
-        assignment_id: assignment_id,
-        kind: "verdict",
-        verdict_kind: verdict_kind,
-        note: note
-      })
+      p3_call("attest", {:session, session_key}, params)
     )
-  end
-
-  defp commit_ref_verdict(ctx, session_key, assignment_id, verdict_kind, refs, note \\ nil) do
-    Assignments.__handle__(
-      ctx.db,
-      "attest",
-      p3_call("attest", {:session, session_key}, %{
-        assignment_id: assignment_id,
-        kind: "verdict",
-        verdict_kind: verdict_kind,
-        note: note,
-        commit_refs: refs
-      })
-    )
-  end
-
-  defp stub_commit_ref_validation do
-    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
-
-    on_exit(fn ->
-      if previous_runner,
-        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
-        else: Application.delete_env(:tightbeam, :commit_ref_command)
-    end)
-
-    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
-      {"", 0}
-    end)
-  end
-
-  defp fixture_commit_refs do
-    host = Tightbeam.Placement.local_host_name()
-
-    [
-      %{
-        "repo" => "#{host}:/tmp/review-result-service",
-        "commit" => String.duplicate("a", 40)
-      }
-    ]
-  end
-
-  defp integrated_commit_refs do
-    host = Tightbeam.Placement.local_host_name()
-
-    [
-      %{
-        "repo" => "#{host}:/tmp/lachesis",
-        "commit" => "5a4c3ed6ad1527f17069208bcb476aeff7ea27aa"
-      },
-      %{
-        "repo" => "#{host}:/tmp/lachesis-omarchy",
-        "commit" => "3f318f86d8922b8c8c9f4ce4bdaa174dea421b95"
-      }
-    ]
-  end
-
-  defp gooarchy_commit_refs do
-    [
-      %{
-        "repo" => "#{Tightbeam.Placement.local_host_name()}:/tmp/gooarchy",
-        "commit" => "6e3fc667ccf47013b3c5fb2d434ab5bd28559e0b"
-      }
-    ]
   end
 
   defp user_verdict(ctx, user, assignment_id, verdict_kind, note \\ nil) do
@@ -4349,31 +4313,6 @@ defmodule Tightbeam.RulesTest do
     })
   end
 
-  defp review_gate_notices(db, producer_id) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT sessionKey,ownerUserId,prompt,consumer,creatorSessionKey,summon
-        FROM wakes
-        WHERE assignmentId=?1 AND origin='remedy:completion-requires-review'
-        ORDER BY createdAt,wakeId
-        """,
-        [producer_id]
-      )
-
-    Enum.map(rows, fn [session_key, owner_user_id, prompt, consumer, creator_session_key, summon] ->
-      %{
-        session_key: session_key,
-        owner_user_id: owner_user_id,
-        prompt: prompt,
-        consumer: consumer,
-        creator_session_key: creator_session_key,
-        summon: summon
-      }
-    end)
-  end
-
   defp review_count(db, producer_id) do
     {:ok, [[count]]} =
       DB.query(db, "SELECT count(*) FROM assignments WHERE reviewsAssignmentId = ?1", [
@@ -4415,7 +4354,7 @@ defmodule Tightbeam.RulesTest do
       "ac6a.toml"
     )
 
-    rules = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    rules = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     # Gateway startup activates row-commit recognition after loading rules.
     :ok = Wakes.activate_wait_recognition(ctx.db)
     rules
@@ -4481,7 +4420,8 @@ defmodule Tightbeam.RulesTest do
                    assignment_id: assignment_id,
                    kind: "verdict",
                    verdict_kind: kind,
-                   commit_refs: refs
+                   commit_refs: if(kind == "verified", do: refs, else: nil),
+                   mementos: evidence_mementos(refs)
                  })
                )
     end
@@ -4545,6 +4485,16 @@ defmodule Tightbeam.RulesTest do
       )
   end
 
+  defp evaluate_host(db, call) do
+    prepared = call |> Tightbeam.Mementos.prepare_call!() |> Map.put(:memento_admission, :host)
+    {:ok, result} = DB.transaction(db, fn txn -> Rules.evaluate(txn, prepared) end)
+    result
+  end
+
+  defp evidence_mementos(refs) do
+    Enum.map(refs, &%{name: "agentic-engineering/evidence-ref", value: JSON.encode!(&1)})
+  end
+
   defp review_gate_rule do
     """
     [[rule]]
@@ -4554,8 +4504,12 @@ defmodule Tightbeam.RulesTest do
     external_producer = true
     deny_when = [
       { fact = "attest.kind", op = "eq", value = "completion" },
-      { fact = "assignment.effect_kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
-      { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
+      { fact = "assignment.memento.agentic-engineering/effect-kind", op = "in", value = ["code", "policy", "release", "live_mutation"] }
+    ]
+    require = [
+      { fact = "assignment.latest_linked_review.present", op = "eq", value = true },
+      { fact = "assignment.latest_linked_review.judgment_kind", op = "eq", value = "reviewed-clean" },
+      { fact = "assignment.latest_linked_review.independent", op = "eq", value = true }
     ]
     """
   end
@@ -4594,7 +4548,7 @@ defmodule Tightbeam.RulesTest do
       if op == "not_in" and
            fact in [
              "assignment.verdicts",
-             "assignment.qualifying_review_verdict_kinds"
+             "assignment.independent_verdict_kinds"
            ] do
         "external_producer = true"
       else
@@ -4644,7 +4598,7 @@ defmodule Tightbeam.RulesTest do
       |> String.trim()
 
     assert log =~ "unavailable"
-    unavailable = :persistent_term.get({Rules, :unavailable_verbs})
+    unavailable = Rules.effective_snapshot().unavailable_verbs
     assert map_size(unavailable) > 0
 
     for {verb, _source} <- unavailable do

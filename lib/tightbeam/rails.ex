@@ -119,7 +119,10 @@ defmodule Tightbeam.Rails do
   empty, valid statute set.
   """
   @spec load!(String.t()) :: [statute()]
-  def load!(base_dir) do
+  def load!(base_dir), do: base_dir |> prepare!() |> install!()
+
+  @doc false
+  def prepare!(base_dir) do
     statutes =
       base_dir
       |> Path.join("identity/rails/*.toml")
@@ -204,6 +207,11 @@ defmodule Tightbeam.Rails do
           else: statute
       end)
 
+    statutes
+  end
+
+  @doc false
+  def install!(statutes) when is_list(statutes) do
     :persistent_term.put(@persist_key, statutes)
     statutes
   end
@@ -221,7 +229,7 @@ defmodule Tightbeam.Rails do
   """
   @spec hook_settings() :: map()
   def hook_settings do
-    statutes = :persistent_term.get(@persist_key, [])
+    statutes = loaded_statutes()
 
     %{
       "hooks" => %{
@@ -240,7 +248,13 @@ defmodule Tightbeam.Rails do
   anything, a boot included.
   """
   @spec statutes?() :: boolean()
-  def statutes?, do: :persistent_term.get(@persist_key, []) != []
+  def statutes?, do: loaded_statutes() != []
+
+  defp loaded_statutes,
+    do:
+      Tightbeam.RuleRuntime.law_component(@persist_key, fn ->
+        :persistent_term.get(@persist_key, [])
+      end)
 
   @doc "The compiled PreToolUse entry for the substrate-reserved codex spawn wiring-check."
   @spec probe_entry() :: map()

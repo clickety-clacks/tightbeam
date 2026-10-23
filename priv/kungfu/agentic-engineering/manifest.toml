@@ -13,3 +13,20 @@ phrases = [
 name = "landing-watch"
 command = "sentinels/landing-watch"
 requires = ["GH_CONFIG_DIR", "LANDING_REPOS"]
+
+[[mementos]]
+name = "integration-target"
+records = ["work_item"]
+
+[[mementos]]
+name = "evidence-ref"
+records = ["attest"]
+many = true
+
+[[mementos]]
+name = "effect-kind"
+records = ["assignment"]
+
+[[mementos]]
+name = "landing-outcome"
+records = ["assignment"]

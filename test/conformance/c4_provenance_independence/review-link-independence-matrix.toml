@@ -14,5 +14,10 @@ external_producer = true
 text = "completion needs a linked reviewed-clean verdict by the review card's different-session holder"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+  { fact = "assignment.is_producing_card", op = "eq", value = true },
+]
+require = [
+  { fact = "assignment.latest_linked_review.present", op = "eq", value = true },
+  { fact = "assignment.latest_linked_review.judgment_kind", op = "in", value = ["reviewed-clean"] },
+  { fact = "assignment.latest_linked_review.independent", op = "eq", value = true },
 ]

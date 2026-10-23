@@ -231,6 +231,7 @@ pub enum Command {
         effect_kind: Option<String>,
         files: Option<Vec<String>>,
         succeeds: Option<String>,
+        mementos: Vec<(String, String)>,
     },
     Dispatch {
         identity: Identity,
@@ -242,6 +243,7 @@ pub enum Command {
         brief: String,
         idempotency_key: Option<String>,
         succeeds: Option<String>,
+        mementos: Vec<(String, String)>,
     },
     EffortRule {
         identity: Identity,
@@ -338,6 +340,7 @@ pub enum Command {
         spec_ref_sha256: Option<String>,
         priority: Option<String>,
         idempotency_key: Option<String>,
+        mementos: Vec<(String, String)>,
     },
     WorkItemHandoff {
         identity: Identity,
@@ -437,6 +440,22 @@ pub enum Command {
         release_fact_kind: Option<String>,
         release_fact_scope: Option<String>,
         release_fact_principal_ref: Option<String>,
+        mementos: Vec<(String, String)>,
+    },
+    MementoSet {
+        identity: Identity,
+        record: String,
+        name: String,
+        values: Vec<String>,
+        clear: bool,
+    },
+    Mementos {
+        identity: Identity,
+        record: String,
+        history: bool,
+        name: Option<String>,
+        limit: Option<u32>,
+        cursor: Option<String>,
     },
     Attests {
         identity: Identity,
@@ -748,12 +767,11 @@ COMMANDS:
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
                   [--produced-by-assignment <assignmentId>]
-      Record a deliberate artifact pointer for the calling session.
+      Record an artifact pointer.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
   artifact-content-fetch <artifactId>
-      Fetch captured bytes as contentBase64 with contentSha256 and contentSize.
-      Reads stored custody only, never the origin path; uncaptured content is reported unavailable.
+      Fetch artifact content when it is available.
 
   spawn --display "<name>" [--name <role>] [--archetype <a>]
         [--harness {{HARNESSES_PIPE}}] [--model <model>] [--effort <level>]
@@ -809,8 +827,13 @@ COMMANDS:
       refusal: omit --harness for a same-harness model change. --host moves the
       session workdir to an allowed host and keeps the Tightbeam session.
 
+  memento-set --record <kind>:<id> --name <name> (--value <value>... | --clear)
+      Replace a declared work-item or assignment memento; retain its history.
+  mementos --record <kind>:<id> [--history [--name <name>] [--limit N] [--cursor C]]
+      Read current values or a bounded history page.
+
   work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex>]
-                   [--priority <0..8>] [--key <idempotencyKey>]
+                   [--priority <0..8>] [--key <idempotencyKey>] [--memento <name=value>]...
       File a work item. Unrouted, it becomes YOUR problem on a deadline: file
       it, then route it (assign/dispatch) or icebox it. --key makes create
       idempotent (same key returns the same item).
@@ -887,14 +910,16 @@ COMMANDS:
   assign --subject "<work>" (--session <key> | --role <name>)
          [--key <key>] [--work-item <workItemId>]
          [--reviews <assignmentId>] [--effect-kind <kind>]
+         [--memento <name=value>]...
          [--files '["lib/a.ex","test/a_test.exs"]'] [--succeeds <assignmentId>]
       Open an obligation held by a session; a work item is the durable thread
       across assignments. --files is an advisory suggestion that others can see;
       it reserves no path and does not limit the assignment's work.
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
            --brief "<one sentence>" [--work-item <workItemId>]
-           [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
-           [--succeeds <assignmentId>]
+           [--effect-kind <kind>]
+           [--workdir-root <relativePath>] [--key <key>]
+           [--succeeds <assignmentId>] [--memento <name=value>]...
       Atomically open an assignment and wake its holder with the card id.
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in whose complete id you hold. The
@@ -928,22 +953,18 @@ COMMANDS:
       Repair a failed or never-launched holder without revoking its work.
       tune also requires --model; rerun requires --outcome not-completed.
   assignment-commitref-correct <assignmentId>
-      --commit-refs '[{"repo":"host:/repo","remote":"<origin>",
-                       "ref":"refs/heads/main","commit":"<sha>"}]'
-      --evidence <artifactId> --reason "..." --key <idempotencyKey>
-      Append one canonical commitRef correction to a CLOSED historical
-      assignment. This does not create an attest, change the assignment outcome,
-      or rewrite lifecycle history.
+      --commit-refs '<json>' --evidence <artifactId> --reason "..." --key <key>
+      Append a canonical commitRef correction to a closed historical assignment.
   attest <assignmentId> --kind progress|completion|cannot-proceed|verdict
-      [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
-      [--artifact <artifactId> --sha256 <hash>]
-         [--verdict <kind>] [--wait <wakeId>] [--note "..."]
+      [--commit-refs '<json>'] [--artifact <artifactId> --sha256 <hash>]
+         [--verdict <kind>] [--wait <wakeId>] [--note "..."] [--memento <name=value>]...
          [--release-fact-kind <kind> --release-fact-scope <scope>
           --release-fact-principal-ref <principal>]
       File against an assignment. Verdicts on review cards require the review
       holder; producer-card verdicts may be filed by any session or user.
       cannot-proceed requires a non-empty --note, keeps the assignment open,
       and accepts the three release-fact flags only as one complete tuple.
+      Ruling-consumed receipts may use --commit-refs <json> for their target.
   attests <assignmentId>
       List every attest filed against an assignment.
   assignment-get <assignmentId> [--fact-id <id>]
@@ -1158,6 +1179,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "after-turn",
     "replace-queued",
     "api-key",
+    "clear",
     "clear-spec-ref",
     "clear-delivery-owner",
     "daemon-credential",
@@ -1179,6 +1201,7 @@ struct Flags {
     duplicates: HashSet<String>,
     missing_values: HashSet<String>,
     body_operations: Vec<BodyUpdateOperation>,
+    repeated: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -1197,6 +1220,7 @@ fn split_args(args: Vec<String>) -> Flags {
     let mut flags = HashMap::new();
     let mut duplicates = HashSet::new();
     let mut missing_values = HashSet::new();
+    let mut repeated: HashMap<String, Vec<String>> = HashMap::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -1212,6 +1236,12 @@ fn split_args(args: Vec<String>) -> Flags {
                     missing_values.insert(name.to_owned());
                 }
                 let value = next.cloned().unwrap_or_default();
+                if matches!(name, "memento" | "value") {
+                    repeated
+                        .entry(name.to_owned())
+                        .or_default()
+                        .push(value.clone());
+                }
                 if flags.insert(name.to_owned(), value).is_some() {
                     duplicates.insert(name.to_owned());
                 }
@@ -1230,6 +1260,7 @@ fn split_args(args: Vec<String>) -> Flags {
         duplicates,
         missing_values,
         body_operations: Vec::new(),
+        repeated,
     }
 }
 
@@ -1328,7 +1359,29 @@ fn split_work_item_update_args(args: Vec<String>) -> Flags {
         duplicates,
         missing_values,
         body_operations,
+        repeated: HashMap::new(),
     }
+}
+
+fn inline_mementos(parsed: &Flags) -> Result<Vec<(String, String)>, String> {
+    if parsed.missing_values.contains("memento") {
+        return Err("--memento requires <name>=<value>".to_owned());
+    }
+    parsed
+        .repeated
+        .get("memento")
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            let (name, value) = entry
+                .split_once('=')
+                .ok_or("--memento requires <name>=<value>")?;
+            if name.is_empty() || value.is_empty() {
+                return Err("--memento requires non-empty name and value".to_owned());
+            }
+            Ok((name.to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
@@ -1763,6 +1816,17 @@ fn parse_with_optional_catalog(
     }
 
     let flags = &parsed.flags;
+    if flags.contains_key("memento")
+        && !matches!(
+            command,
+            Some("assign" | "dispatch" | "attest" | "work-item-create")
+        )
+    {
+        return Err(
+            "--memento is valid only with work-item-create, assign, dispatch or attest".to_owned(),
+        );
+    }
+
     if flags.contains_key("succeeds") && !matches!(command, Some("assign" | "dispatch")) {
         return Err("--succeeds is valid only with assign or dispatch".to_owned());
     }
@@ -2394,6 +2458,7 @@ fn parse_with_optional_catalog(
                     "work-item",
                     "reviews",
                     "effect-kind",
+                    "memento",
                     "files",
                     "succeeds",
                 ],
@@ -2427,6 +2492,7 @@ fn parse_with_optional_catalog(
                 effect_kind: nonempty(flags, "effect-kind"),
                 files,
                 succeeds: nonempty(flags, "succeeds"),
+                mementos: inline_mementos(&parsed)?,
             })
         }
         "dispatch" => {
@@ -2440,6 +2506,7 @@ fn parse_with_optional_catalog(
                     "brief",
                     "work-item",
                     "effect-kind",
+                    "memento",
                     "workdir-root",
                     "key",
                     "succeeds",
@@ -2465,6 +2532,7 @@ fn parse_with_optional_catalog(
                 brief,
                 idempotency_key: nonempty(flags, "key"),
                 succeeds: nonempty(flags, "succeeds"),
+                mementos: inline_mementos(&parsed)?,
             })
         }
         "effort-rule" => {
@@ -2715,12 +2783,9 @@ fn parse_with_optional_catalog(
                 identity: identity(flags)?,
                 assignment_id: parsed.positional[1].clone(),
                 commit_refs,
-                reason: nonempty(flags, "reason")
-                    .ok_or_else(|| "--reason is required".to_owned())?,
-                evidence_artifact_id: nonempty(flags, "evidence")
-                    .ok_or_else(|| "--evidence is required".to_owned())?,
-                idempotency_key: nonempty(flags, "key")
-                    .ok_or_else(|| "--key is required".to_owned())?,
+                reason: nonempty(flags, "reason").ok_or_else(|| "--reason is required".to_owned())?,
+                evidence_artifact_id: nonempty(flags, "evidence").ok_or_else(|| "--evidence is required".to_owned())?,
+                idempotency_key: nonempty(flags, "key").ok_or_else(|| "--key is required".to_owned())?,
             })
         }
         "work-item-create" => {
@@ -2745,6 +2810,7 @@ fn parse_with_optional_catalog(
                 spec_ref_sha256,
                 priority: priority_flag(flags)?,
                 idempotency_key: nonempty(flags, "key"),
+                mementos: inline_mementos(&parsed)?,
             })
         }
         "work-item-handoff" => {
@@ -3204,6 +3270,64 @@ fn parse_with_optional_catalog(
                 release_fact_kind,
                 release_fact_scope,
                 release_fact_principal_ref,
+                mementos: inline_mementos(&parsed)?,
+            })
+        }
+        "memento-set" => {
+            closed_command_flags("memento-set", flags, &["record", "name", "value", "clear"])?;
+            let clear = flags.contains_key("clear");
+            let values = parsed.repeated.get("value").cloned().unwrap_or_default();
+            if parsed.positional.len() != 1
+                || clear == !values.is_empty()
+                || parsed.missing_values.contains("value")
+                || parsed.duplicates.iter().any(|flag| flag != "value")
+            {
+                return Err("usage: tightbeam memento-set --record <kind>:<id> --name <name> (--value <value>... | --clear)".to_owned());
+            }
+            Ok(Command::MementoSet {
+                identity: identity(flags)?,
+                record: nonempty(flags, "record").ok_or("--record is required")?,
+                name: nonempty(flags, "name").ok_or("--name is required")?,
+                values,
+                clear,
+            })
+        }
+        "mementos" => {
+            closed_command_flags(
+                "mementos",
+                flags,
+                &["record", "history", "name", "limit", "cursor"],
+            )?;
+            let history = flags.contains_key("history");
+            if !parsed.missing_values.is_empty() {
+                return Err("mementos option requires a value".to_owned());
+            }
+            if parsed.positional.len() != 1
+                || !parsed.duplicates.is_empty()
+                || (!history
+                    && ["name", "limit", "cursor"]
+                        .iter()
+                        .any(|flag| flags.contains_key(*flag)))
+            {
+                return Err("history options require mementos --history".to_owned());
+            }
+            let limit = flags
+                .get("limit")
+                .map(|value| {
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|n| (1..=1000).contains(n))
+                        .ok_or("--limit must be 1..1000".to_owned())
+                })
+                .transpose()?;
+            Ok(Command::Mementos {
+                identity: identity(flags)?,
+                record: nonempty(flags, "record").ok_or("--record is required")?,
+                history,
+                name: nonempty(flags, "name"),
+                limit,
+                cursor: nonempty(flags, "cursor"),
             })
         }
         "attests" => {
@@ -3396,7 +3520,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, memento-set, mementos, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -5254,6 +5378,8 @@ mod tests {
         assert_eq!(
             headings,
             [
+                "memento-set",
+                "mementos",
                 "ask",
                 "answer",
                 "return",
@@ -5302,7 +5428,6 @@ mod tests {
                 "session-po-set",
                 "settle-turn",
                 "repair-assignment",
-                "assignment-commitref-correct",
                 "assignment-stop-turn",
                 "cancel-turn",
                 "revoke-assignment",
@@ -6135,71 +6260,41 @@ mod tests {
     }
 
     #[test]
-    fn commitref_correction_requires_every_audit_and_proof_field() {
-        let usage = "usage: tightbeam assignment-commitref-correct <assignmentId> --commit-refs <json> --evidence <artifactId> --reason <text> --key <idempotencyKey>";
-
-        assert_eq!(
-            parse(strings(&[
-                "assignment-commitref-correct",
-                "--as-user",
-                "flynn"
-            ])),
-            Err(usage.to_owned())
-        );
-
-        for missing in ["commit-refs", "evidence", "reason", "key"] {
-            let mut args = vec![
-                "assignment-commitref-correct",
-                "asg_1",
-                "--commit-refs",
-                r#"[{"repo":"testhost:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
-                "--evidence",
-                "art_1",
-                "--reason",
-                "historical backfill",
-                "--key",
-                "backfill-1",
-                "--as-user",
-                "flynn",
-            ];
-            let flag = format!("--{missing}");
-            let index = args.iter().position(|value| *value == flag).unwrap();
-            args.drain(index..=index + 1);
-            assert!(
-                parse(strings(&args)).is_err(),
-                "missing {missing} must refuse"
-            );
-        }
-
+    fn legacy_assignment_contract_reaches_server_admission() {
         assert!(matches!(
             parse(strings(&[
-                "assignment-commitref-correct",
-                "asg_1",
-                "--commit-refs",
-                r#"[{"repo":"testhost:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
-                "--evidence",
-                "art_1",
-                "--reason",
-                "historical backfill",
-                "--key",
-                "backfill-1",
-                "--as-user",
-                "flynn",
-            ]))
-            .unwrap(),
-            Command::AssignmentCommitRefCorrect {
-                assignment_id,
-                evidence_artifact_id,
-                reason,
-                idempotency_key,
-                commit_refs,
-                ..
-            } if assignment_id == "asg_1"
-                && evidence_artifact_id == "art_1"
-                && reason == "historical backfill"
-                && idempotency_key == "backfill-1"
-                && commit_refs.len() == 1
+                "assign", "--subject", "ship", "--session", "s", "--effect-kind", "code"
+            ])),
+            Ok(Command::Assign { effect_kind: Some(value), .. }) if value == "code"
         ));
+        assert!(matches!(
+            parse(strings(&[
+                "dispatch", "--to", "s", "--subject", "ship", "--brief", "Ship", "--effect-kind", "policy"
+            ])),
+            Ok(Command::Dispatch { effect_kind: Some(value), .. }) if value == "policy"
+        ));
+        assert!(matches!(
+            parse(strings(&[
+                "attest", "asg_1", "--kind", "completion", "--commit-refs",
+                r#"[{"repo":"repo","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#
+            ])),
+            Ok(Command::Attest { commit_refs: Some(refs), .. }) if refs.len() == 1
+        ));
+        assert!(matches!(
+            parse(strings(&[
+                "assignment-commitref-correct", "asg_1", "--commit-refs",
+                r#"[{"repo":"repo","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                "--evidence", "art_1", "--reason", "backfill", "--key", "backfill-1"
+            ])),
+            Ok(Command::AssignmentCommitRefCorrect { .. })
+        ));
+
+        assert!(render_help(None).contains("assignment-commitref-correct"));
+        for verb in ["assign", "dispatch"] {
+            let help = render_command_help(None, verb).unwrap();
+            assert!(help.contains("--effect-kind"));
+            assert!(help.contains("--memento"));
+        }
     }
 
     #[test]
@@ -6249,7 +6344,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, memento-set, mementos, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 

@@ -52,6 +52,35 @@ defmodule Tightbeam.PublicRuleFactCompatibilityTest do
     assert output =~ "specimen.side_fact"
   end
 
+  test "the memento retirement exception preserves protection for unrelated facts" do
+    repo =
+      Path.join(
+        System.tmp_dir!(),
+        "memento-fact-retirement-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(repo) end)
+    git!(Path.dirname(repo), ["clone", "--shared", @root, repo])
+    {output, status} = System.cmd("python3", [@verifier], cd: repo, stderr_to_stdout: true)
+    assert status == 0, output
+
+    source_path = Path.join(repo, @source)
+    original = File.read!(source_path)
+
+    removed =
+      String.replace(original, ~s(    "assignment.state" => :string,\n), "", global: false)
+
+    refute removed == original
+    File.write!(source_path, removed)
+    {output, status} = System.cmd("python3", [@verifier], cd: repo, stderr_to_stdout: true)
+    assert status == 1
+    assert output =~ "assignment.state"
+    refute output =~ "assignment.effect_kind"
+    refute output =~ "assign.effect_kind"
+    refute output =~ "assignment.qualifying_review_verdict_kinds"
+    refute output =~ "assignment.qualifying_verification_verdict_kinds"
+  end
+
   defp git!(repo, args) do
     {output, status} =
       System.cmd("git", ["-C", repo | args], stderr_to_stdout: true)

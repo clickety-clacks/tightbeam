@@ -182,6 +182,13 @@ defmodule Tightbeam.DBObservation do
   end
 
   defp send_request(server, {:db_call, envelope, {:query, sql, params}} = request, _, budget) do
+    query_request(server, request, envelope, budget, sql, params)
+  end
+
+  defp send_request(server, request, envelope, budget),
+    do: owner_request(server, request, envelope, budget)
+
+  defp query_request(server, request, envelope, budget, sql, params) do
     case Tightbeam.DB.reader(server, sql) do
       nil ->
         owner_request(server, request, envelope, budget)
@@ -200,9 +207,6 @@ defmodule Tightbeam.DBObservation do
         end
     end
   end
-
-  defp send_request(server, request, envelope, budget),
-    do: owner_request(server, request, envelope, budget)
 
   defp remaining(envelope),
     do: max(0, envelope.deadline - System.monotonic_time(:millisecond))

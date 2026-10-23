@@ -24,7 +24,7 @@ defmodule Tightbeam.Artifacts do
   through `recorded_kinds/3`, which reads neither column.
   """
 
-  alias Tightbeam.{ArtifactContent, ArtifactOrigins, DB, ErrorDiagnostic, TurnObservations}
+  alias Tightbeam.{ArtifactOrigins, DB, ErrorDiagnostic, TurnObservations}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -623,14 +623,14 @@ defmodule Tightbeam.Artifacts do
           updated_at = now()
 
           transitions =
-            Enum.map(relative_paths, fn {id, {relative, custody}} ->
-              {id, "archived", Path.join(archived_path, relative), custody}
-            end) ++ Enum.map(external, &{&1, "released", nil, nil})
+            Enum.map(relative_paths, fn {id, relative} ->
+              {id, "archived", Path.join(archived_path, relative)}
+            end) ++ Enum.map(external, &{&1, "released", nil})
 
           transitions
           |> Enum.sort_by(&elem(&1, 0))
-          |> Enum.each(fn {id, state, home, custody} ->
-            transition_in_txn(txn, id, "in-workspace", state, home, updated_at, custody)
+          |> Enum.each(fn {id, state, home} ->
+            transition_in_txn(txn, id, "in-workspace", state, home, updated_at)
           end)
       end
     end
@@ -680,8 +680,7 @@ defmodule Tightbeam.Artifacts do
     # that is not there says THAT rather than blaming the origin for it.
     ensure_workspace_available!(workspace_path)
     relative_path = archived_relative_path!(row.origin_path, workspace_path)
-    custody = custody_bytes(row, workspace_path, relative_path)
-    {Map.put(paths, row.artifact_id, {relative_path, custody}), external, errors}
+    {Map.put(paths, row.artifact_id, relative_path), external, errors}
   rescue
     error in ArgumentError ->
       if error.message == @outside_workspace do
@@ -689,35 +688,6 @@ defmodule Tightbeam.Artifacts do
       else
         {paths, external, errors ++ [error]}
       end
-  end
-
-  # Read the bytes BEFORE the workspace moves, from the same canonical path the
-  # relative path was derived from.
-  #
-  # This DECLINES custody rather than failing: it adds no error path that
-  # archival did not already have. Archival moves the workspace wholesale and
-  # never had to read an individual file, so a directory origin or an unreadable
-  # one archived fine before this function existed and still does. Making it
-  # raise instead would invent a way for retirement to fail on an artifact,
-  # which is the one thing retirement must never do.
-  #
-  # Declining is safe precisely because custody is keyed on the stored content
-  # row and not on `archived`: a row we took no bytes for claims no content and
-  # is never refused later. See `Tightbeam.ArtifactContent`.
-  defp custody_bytes(row, workspace_path, relative_path) do
-    canonical_workspace = canonical_path!(Path.expand(workspace_path))
-
-    with {:ok, bytes} <- File.read(Path.join(canonical_workspace, relative_path)),
-         digest = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower),
-         # A digest declared at filing time is a claim about these bytes. If they
-         # disagree, the origin is not the artifact that was filed: take no
-         # custody over it and leave the declared claim untouched rather than
-         # overwrite it with bytes nobody vouched for.
-         true <- not is_binary(row.content_sha256) or row.content_sha256 == digest do
-      {digest, bytes}
-    else
-      _ -> nil
-    end
   end
 
   @doc "Mark an archived artifact as released from Tightbeam custody."
@@ -750,33 +720,18 @@ defmodule Tightbeam.Artifacts do
     transition_in_txn(txn, artifact_id, "in-workspace", "archived", home, now())
   end
 
-  defp transition_in_txn(txn, id, prior, state, home, updated_at, custody \\ nil) do
+  defp transition_in_txn(txn, id, prior, state, home, updated_at) do
     case get_in_txn(txn, id) do
       %{state: ^prior} ->
         reserve_version_in_txn(txn, id)
 
-        # The stored bytes and the digest the row will be accounted by land in the
-        # same transaction as the transition that takes custody. One reserved
-        # version covers both: the durable content is part of becoming archived,
-        # not a second lifecycle event.
-        digest =
-          case custody do
-            {digest, bytes} ->
-              :ok = ArtifactContent.store_in_txn(txn, id, digest, bytes, updated_at)
-              digest
-
-            nil ->
-              nil
-          end
-
         Txn.q(
           txn,
           """
-          UPDATE artifacts SET state=?2, home=?3, updatedAt=?4,
-                 contentSha256=COALESCE(?6, contentSha256)
+          UPDATE artifacts SET state=?2, home=?3, updatedAt=?4
           WHERE artifactId=?1 AND state=?5
           """,
-          [id, state, home, updated_at, prior, digest]
+          [id, state, home, updated_at, prior]
         )
 
         if Txn.changes(txn) != 1, do: raise(ArgumentError, "artifact_transition_race")

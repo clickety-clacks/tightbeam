@@ -235,7 +235,33 @@ defmodule Tightbeam.IdentityTest do
     Application.put_env(:tightbeam, :identity_source_dir, shipped)
     base = Path.join(ctx.root, "shipped-runtime")
 
-    assert {:ok, _revision} = learn!(base, "agentic-engineering", "operator")
+    assert {:ok, revision} = learn!(base, "agentic-engineering", "operator")
+
+    refute File.exists?(Path.join(base, "identity/rules/promotion.toml"))
+
+    db = start_supervised!({Tightbeam.DB, path: ":memory:", name: nil})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    config = %{base_dir: base, db: db, wake_tick_ms: 1000}
+    candidate = Tightbeam.Gateway.prepare_law!(config, revision).policy
+    rules = candidate.rules
+    assert Enum.any?(rules, &(&1.name == "completion-requires-review"))
+    refute Enum.any?(rules, &(&1.name == "promotion-requires-current-review"))
+    assert candidate.unavailable_verbs == %{}
+    assert candidate.requested_admission_contract == %{}
+    loaded = Tightbeam.Gateway.load_law!(config)
+    assert MapSet.new(Enum.map(loaded, & &1.name)) == MapSet.new(Enum.map(rules, & &1.name))
+    assert Tightbeam.Rules.active_admission_contract("attest") == "legacy"
+
+    assert Tightbeam.Rules.effective_snapshot().revision == revision
+    declarations = candidate.declarations
+    assert declarations.revision == revision
+
+    assert Enum.sort(Map.keys(declarations.names)) == [
+             "agentic-engineering/effect-kind",
+             "agentic-engineering/evidence-ref",
+             "agentic-engineering/integration-target",
+             "agentic-engineering/landing-outcome"
+           ]
 
     engineering_rule = File.read!(Path.join(base, "identity/rules/engineering.toml"))
     refute engineering_rule =~ ~s(name = "code-review-requires-passing-tests")
@@ -691,6 +717,252 @@ defmodule Tightbeam.IdentityTest do
     assert Path.wildcard(Path.join(ctx.base, "rails/scratch/*")) == []
   end
 
+  test "strict caller inventory shares identity-status stamps and names unreadable rows", ctx do
+    alias Tightbeam.{DB, Gateway, Mementos, Org, Schema}
+    learn_test_bundle!(ctx)
+    revision = Identity.live_revision!(ctx.base)
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :ok = Schema.ensure_all(db)
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "INSERT INTO users(userId,isAdmin,createdAt) VALUES('inventory-owner',1,1)"
+             )
+
+    for {key, state} <- [{"current", "active"}, {"stale", "active"}, {"retired", "retired"}] do
+      assert {:ok, []} =
+               DB.query(
+                 db,
+                 "INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,state,createdAt,updatedAt) VALUES(?1,?1,'inventory-owner','user:inventory-owner','coder','claude','anthropic','fable',?2,1,1)",
+                 [key, state]
+               )
+    end
+
+    config = %{base_dir: ctx.base, db: db}
+    handler = Gateway.handlers(config)["identity-status"]
+
+    call = %{
+      verb: "identity-status",
+      principal: {:user, "inventory-owner"},
+      origin: "user:inventory-owner",
+      params: %{}
+    }
+
+    supported = handler.(call)
+    [current] = Enum.filter(supported.sessions, &(&1.session_key == "current"))
+
+    Org.set_identity_stamp(
+      db,
+      "current",
+      revision,
+      current.expected_render_contract,
+      current.expected_guidance_digest
+    )
+
+    assert {:ok, inventory} =
+             DB.transaction(db, fn txn ->
+               Gateway.caller_identity_inventory_in_txn!(config, txn, revision)
+             end)
+
+    assert inventory.scope == "active_sessions"
+    assert inventory.session_count == 2
+    assert inventory.stale_session_keys == ["stale"]
+    assert Enum.sort_by(handler.(call).sessions, & &1.session_key) == inventory.sessions
+    assert [row] = Enum.filter(inventory.sessions, &(&1.session_key == "current"))
+    assert row.identity_revision == revision
+    assert row.expected_identity_revision == revision
+    refute row.identity_stale
+    assert row.identity_stale_reasons == []
+
+    assert {:ok, changed} =
+             DB.transaction(db, fn txn ->
+               Gateway.caller_identity_inventory_in_txn!(config, txn, revision)
+             end)
+
+    assert changed == inventory
+
+    assert {:error, %Mementos.Refusal{code: "policy_revision_unavailable"}} =
+             DB.transaction(db, fn txn ->
+               Gateway.caller_identity_inventory_in_txn!(config, txn, "different")
+             end)
+
+    DB.query(db, "UPDATE sessions SET overrides='{' WHERE sessionKey='stale'")
+
+    assert {:error, %Mementos.Refusal{details: %{session_key: "stale"}}} =
+             DB.transaction(db, fn txn ->
+               Gateway.caller_identity_inventory_in_txn!(config, txn, revision)
+             end)
+
+    assert {:ok, [["{"]]} =
+             DB.query(db, "SELECT overrides FROM sessions WHERE sessionKey='stale'")
+  end
+
+  test "ordinary law loading uses published bytes rather than an uncommitted working tree", ctx do
+    alias Tightbeam.{Archetypes, Gateway, Rails, Rules}
+    learn_test_bundle!(ctx)
+    live = Identity.live_revision!(ctx.base)
+    config = %{base_dir: ctx.base}
+    assert [] = Gateway.load_law!(config, ["post"])
+    hooks = Rails.hook_settings()
+    assert Map.has_key?(:persistent_term.get(Archetypes) |> elem(0), "coder")
+    dir = Path.join(ctx.base, "identity")
+    File.mkdir_p!(Path.join(dir, "rules"))
+    File.write!(Path.join(dir, "rules/unpublished.toml"), "invalid unpublished rules")
+    File.write!(Path.join(dir, "archetypes/coder.toml"), "invalid unpublished archetype")
+    index = File.read!(Path.join(dir, ".git/index"))
+
+    assert [] = Gateway.load_law!(config, ["post"])
+    assert Rules.effective_snapshot().revision == live
+    assert Rules.effective_snapshot().unavailable_verbs == %{}
+    assert Map.has_key?(:persistent_term.get(Archetypes) |> elem(0), "coder")
+    assert Rails.hook_settings() == hooks
+    assert File.read!(Path.join(dir, ".git/index")) == index
+    assert File.read!(Path.join(dir, "rules/unpublished.toml")) == "invalid unpublished rules"
+    assert Path.wildcard(Path.join(ctx.base, ".identity-law-*")) == []
+  end
+
+  test "a published law reload becomes active for later calls", ctx do
+    alias Tightbeam.{Archetypes, DB, Gateway, Rails, Rules}
+    learn_test_bundle!(ctx)
+    config = %{base_dir: ctx.base}
+    Gateway.load_law!(config, ["post"])
+    prior = Rules.effective_snapshot()
+    prior_names = Archetypes.names()
+    prior_hooks = Rails.hook_settings()
+    refute Rails.statutes?()
+    assert prior.law_components[Archetypes] == :persistent_term.get(Archetypes)
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    parent = self()
+
+    admitted =
+      Task.async(fn ->
+        send(parent, :waiting_for_reload)
+        receive do: (:continue -> :ok)
+
+        assert Rules.effective_snapshot().revision == candidate
+        assert Archetypes.names() != prior_names
+        assert Archetypes.get("candidate").name == "candidate"
+        assert Rails.hook_settings() != prior_hooks
+        assert Rails.statutes?()
+
+        assert {:ok, :new_law} =
+                 DB.transaction(db, fn _ ->
+                   assert Rules.effective_snapshot().revision == candidate
+                   assert Archetypes.get("candidate").name == "candidate"
+                   assert Rails.statutes?()
+                   :new_law
+                 end)
+
+        :new_call_finished
+      end)
+
+    assert_receive :waiting_for_reload
+
+    dir = Path.join(ctx.base, "identity")
+    File.mkdir_p!(Path.join(dir, "rules"))
+    File.mkdir_p!(Path.join(dir, "rails"))
+    File.write!(Path.join(dir, "archetypes/candidate.toml"), "name = 'candidate'\nskills = []\n")
+
+    File.write!(Path.join(dir, "rails/candidate.toml"), """
+    [[statute]]
+    name = "candidate-tool-gate"
+    on = "tool-call"
+    mode = "gate"
+    tool = "Bash"
+    pattern = "candidate-forbidden"
+    text = "candidate tool gate"
+    """)
+
+    File.write!(Path.join(dir, "rules/candidate.toml"), """
+    [[rule]]
+    name = "candidate-rule"
+    verb = "post"
+    text = "candidate rule"
+    deny_when = [{fact = "caller.origin_class", op = "eq", value = "user"}]
+    """)
+
+    git!(dir, ["add", "archetypes/candidate.toml", "rails/candidate.toml", "rules/candidate.toml"])
+
+    git!(dir, ["commit", "-m", "complete candidate law"], "test")
+    candidate = git!(dir, ["rev-parse", "HEAD"])
+
+    assert {:ok, ^candidate} =
+             Identity.publish_live!(ctx.base, %{
+               candidate_revision: candidate,
+               expected_prior: prior.revision
+             })
+
+    assert [%{name: "candidate-rule"}] = Gateway.load_law!(config, ["post"])
+    current = Rules.effective_snapshot()
+    assert current.revision == candidate
+    assert Archetypes.get("candidate").name == "candidate"
+    assert Rails.statutes?()
+    refute Rails.hook_settings() == prior_hooks
+    send(admitted.pid, :continue)
+    assert :new_call_finished = Task.await(admitted)
+    assert Rules.effective_snapshot() == current
+
+    # The component mirrors are not a second runtime authority. The active law
+    # remains coherent even while standalone caches contain different bytes.
+    :persistent_term.put(Archetypes, {%{}, %{}})
+    :persistent_term.put(Rails, [])
+    assert Archetypes.get("candidate").name == "candidate"
+    assert Map.has_key?(Archetypes.all(), "candidate")
+    assert Rails.statutes?()
+
+    for install <- [fn -> Archetypes.install!({%{}, %{}}) end, fn -> Rails.install!([]) end] do
+      install.()
+      assert Rules.effective_snapshot() == current
+      assert Archetypes.get("candidate").name == "candidate"
+      assert Rails.statutes?()
+    end
+
+    assert [%{name: "candidate-rule"}] = Gateway.load_law!(config, ["post"])
+    assert :persistent_term.get(Archetypes) == current.law_components[Archetypes]
+    assert :persistent_term.get(Rails) == current.law_components[Rails]
+  end
+
+  test "an interrupted inactive publication restores the prior pair before law loading", ctx do
+    alias Tightbeam.{Gateway, Rules}
+
+    with_retained_candidate(ctx, fn config, publication, _retained ->
+      prior = publication.expected_prior
+      candidate = publication.candidate_revision
+      assert {:ok, ^candidate} = Identity.publish_live!(ctx.base, publication)
+      assert Identity.live_revision!(ctx.base) == candidate
+
+      # The next law load models a restarted gateway: it has no staged closure
+      # and must restore the durable prior/candidate pair before reading rules.
+      Gateway.load_law!(config, ["post"])
+
+      assert Identity.live_revision!(ctx.base) == prior
+      assert Rules.effective_snapshot().revision == prior
+      assert Rules.active_admission_contract("post") == "legacy"
+    end)
+  end
+
+  test "failed law preparation retains every active component and the published revision", ctx do
+    alias Tightbeam.{Archetypes, Gateway, Rails, Rules}
+    learn_test_bundle!(ctx)
+    config = %{base_dir: ctx.base}
+    Gateway.load_law!(config, ["post"])
+    prior = Identity.live_revision!(ctx.base)
+    before = Map.new([Archetypes, Rails, Rules], &{&1, :persistent_term.get(&1)})
+    dir = Path.join(ctx.base, "identity")
+    File.mkdir_p!(Path.join(dir, "kungfu/broken"))
+    File.write!(Path.join(dir, "kungfu/broken/manifest.toml"), "mementos = false\n")
+    git!(dir, ["add", "kungfu/broken/manifest.toml"])
+    git!(dir, ["commit", "-m", "invalid candidate declarations"], "test")
+    candidate = git!(dir, ["rev-parse", "HEAD"])
+
+    assert_raise ArgumentError, fn -> Gateway.prepare_law!(config, candidate, ["post"]) end
+    assert Map.new([Archetypes, Rails, Rules], &{&1, :persistent_term.get(&1)}) == before
+    assert Identity.live_revision!(ctx.base) == prior
+    assert Path.wildcard(Path.join(ctx.base, ".identity-law-*")) == []
+  end
+
   test "recovery keeps invalid published law closed and preserves the merge",
        ctx do
     alias Tightbeam.Gateway
@@ -733,9 +1005,11 @@ defmodule Tightbeam.IdentityTest do
     assert Path.wildcard(Path.join(ctx.base, ".identity-law-*")) == []
     git!(dir, ["branch", "-D", "tightbeam/live"])
 
-    assert_raise RuntimeError, ~r/git .* failed/, fn ->
-      Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
-    end
+    assert_raise ArgumentError,
+                 ~r/identity repository is missing required refs: tightbeam\/live/,
+                 fn ->
+                   Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+                 end
 
     assert File.read!(Path.join(dir, ".git/index")) == index
     assert File.read!(Path.join(dir, ".git/MERGE_HEAD")) == merge
@@ -1088,6 +1362,41 @@ defmodule Tightbeam.IdentityTest do
       {:ok, candidate} -> {:ok, publish_candidate!(candidate, base)}
       other -> other
     end
+  end
+
+  defp with_retained_candidate(ctx, fun) do
+    alias Tightbeam.Gateway
+    learn_test_bundle!(ctx)
+    config = %{base_dir: ctx.base}
+    Gateway.load_law!(config, ["post"])
+    dir = Path.join(ctx.base, "identity")
+    prior = Identity.live_revision!(ctx.base)
+    File.mkdir_p!(Path.join(dir, "rules"))
+
+    File.write!(Path.join(dir, "rules/replacement.toml"), """
+    [[rule]]
+    name = "replacement"
+    verb = "post"
+    text = "replacement policy"
+    deny_when = [{fact = "caller.origin_class", op = "eq", value = "user"}]
+    [[admission_contract]]
+    verb = "post"
+    classification = "replacement"
+    required_rules = ["replacement"]
+    [memento_cutover]
+    version = 1
+    judgments = [{selector = "replacement", route = "none"}]
+    [memento_cutover.effects]
+    selector = "replacement"
+    mapping = []
+    """)
+
+    git!(dir, ["add", "rules/replacement.toml"])
+    git!(dir, ["commit", "-m", "replacement candidate"], "test")
+    publication = %{expected_prior: prior, candidate_revision: git!(dir, ["rev-parse", "HEAD"])}
+
+    retained = Gateway.retain_candidate_law!(config, publication, "test", ["post"])
+    fun.(config, publication, retained)
   end
 
   defp publish_candidate!(candidate, base) when is_map(candidate) do

@@ -127,6 +127,15 @@ defmodule Tightbeam.RailRemedyTest do
              )
 
     assert RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id) == nil
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT id FROM assignments WHERE reviewsAssignmentId=?1", [
+               assignment.id
+             ])
+
+    # The notification leaves review staffing to the accountable owner.
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [assignment.id])
   end
 
   test "completion review notice reaches the accountable session instead of the holder", ctx do
@@ -1796,7 +1805,7 @@ defmodule Tightbeam.RailRemedyTest do
       end)
 
     assert log =~ "unavailable"
-    unavailable = :persistent_term.get({Rules, :unavailable_verbs})
+    unavailable = Rules.effective_snapshot().unavailable_verbs
     assert map_size(unavailable) > 0
 
     for {verb, _source} <- unavailable do

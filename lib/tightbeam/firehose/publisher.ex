@@ -37,7 +37,7 @@ defmodule Tightbeam.Firehose.Publisher do
   }
 
   @transactional_verbs MapSet.new(
-                         ~w(ask answer return work-item-create work-item-handoff work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest revoke-assignment reopen-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire operator-ask operator-rule operator-withdraw rule effort-rule withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
+                         ~w(ask answer return work-item-create work-item-handoff work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest revoke-assignment reopen-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire operator-ask operator-rule operator-withdraw rule effort-rule withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold memento-set)
                        )
 
   @spec accepted(map(), term()) :: :ok

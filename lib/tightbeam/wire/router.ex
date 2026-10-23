@@ -68,7 +68,7 @@ defmodule Tightbeam.Wire.Router do
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
-  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts spawn session-reparent session-po-set retire critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
+  @agent_verbs ~w(memento-set mementos ask answer return wake condition facts-read artifact-record artifact-get artifacts spawn session-reparent session-po-set retire critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
   @agent_verbs @agent_verbs ++
                  [
                    "artifact-content-fetch",
@@ -3612,6 +3612,8 @@ defmodule Tightbeam.Wire.Router do
     "revoke-device" => ~w(device_id)a,
     "deny-device" => ~w(device_id)a,
     "approve-device" => ~w(device_id user_id)a,
+    "memento-set" => ~w(record name values clear)a,
+    "mementos" => ~w(record history name limit cursor)a,
     "assignment-get" => ~w(assignment_id fact_id)a,
     "add-user" => ~w(is_admin user_id)a,
     "answer" => ~w(answer idempotency_key reason request request_id)a,
@@ -3623,13 +3625,13 @@ defmodule Tightbeam.Wire.Router do
     "ask" =>
       ~w(assignment_id context idempotency_key params question reason role session_key target user_id verb)a,
     "assign" =>
-      ~w(effect_kind files holder_key idempotency_key prompt reviews reviews_assignment_id role session_key subject succeeds_assignment_id work_item_id)a,
+      ~w(mementos effect_kind files holder_key idempotency_key prompt reviews reviews_assignment_id role session_key subject succeeds_assignment_id work_item_id)a,
     "assignment-commitref-correct" =>
       ~w(assignment_id commit_refs evidence_artifact_id idempotency_key reason)a,
     "assignments" => ~w(role session_key state)a,
     "attend" => ~w(high)a,
     "attest" =>
-      ~w(artifact_id assignment_id commit_refs content_sha256 kind note release_fact_kind release_fact_principal_ref release_fact_scope verdict_kind wait_id)a,
+      ~w(mementos artifact_id assignment_id commit_refs content_sha256 kind note release_fact_kind release_fact_principal_ref release_fact_scope verdict_kind wait_id)a,
     "attests" => ~w(assignment_id)a,
     "breathing" => ~w(target_id target_kind)a,
     "cancel" => ~w(assignment_id reason)a,
@@ -3639,7 +3641,7 @@ defmodule Tightbeam.Wire.Router do
     "decision-request" => ~w(request request_id)a,
     "decision-requests" => ~w(status)a,
     "dispatch" =>
-      ~w(brief effect_kind holder_key idempotency_key prompt session_key subject succeeds_assignment_id work_item_id workdir_root)a,
+      ~w(mementos brief effect_kind holder_key idempotency_key prompt session_key subject succeeds_assignment_id work_item_id workdir_root)a,
     "effort-rule" => ~w(action request request_id)a,
     "execution-map" => ~w(tree origin owner state spec spec_sha session quiet_over)a,
     "execution-map-select" =>
@@ -3704,7 +3706,7 @@ defmodule Tightbeam.Wire.Router do
       ~w(prompt after_ms after_turn assignment_id at cancel_wake_id class cron condition_kind condition_scope idempotency_key predicate replace_queued reresolve reresolve_rung reresolve_seed nudge)a,
     "work-item-close" => ~w(work_item_id)a,
     "work-item-create" =>
-      ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body)a,
+      ~w(mementos title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body)a,
     "work-item-fail" => ~w(reason work_item_id)a,
     "work-item-get" => ~w(work_item_id)a,
     "work-item-handoff" => ~w(work_item_id title delivery_owner_session_key brief)a,

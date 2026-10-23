@@ -52,7 +52,14 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
       File.cp!(Path.expand(source, __DIR__), Path.join(base, "identity/rules/#{name}"))
     end
 
-    rules = Rules.load!(base, Map.keys(handlers))
+    File.mkdir_p!(Path.join(base, "identity/kungfu/agentic-engineering"))
+
+    File.cp!(
+      "priv/kungfu/agentic-engineering/manifest.toml",
+      Path.join(base, "identity/kungfu/agentic-engineering/manifest.toml")
+    )
+
+    rules = Rules.load!(base, Map.keys(handlers), revision: "smoke-fixture")
     assert Enum.any?(rules, &(&1.name == "assign-worker-staffing-needs-topology"))
     assert Enum.any?(rules, &(&1.name == "dispatch-worker-staffing-needs-topology"))
 
@@ -73,6 +80,23 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
         "deliveryOwnerSessionKey" => "coordinator"
       })
 
+      posture =
+        call.("assign", %{
+          "sessionKey" => "coordinator",
+          "workItemId" => item,
+          "subject" => "Posture control for missing topology",
+          "effectKind" => "coordination",
+          "mementos" => [
+            %{"name" => "agentic-engineering/effect-kind", "value" => "coordination"}
+          ]
+        })
+
+      call_as.("coordinator", "attest", %{
+        "assignmentId" => posture["id"],
+        "kind" => "verdict",
+        "verdictKind" => "posture-light"
+      })
+
       assert_refused(ctx, item)
     end
 
@@ -89,7 +113,8 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
       assert is_binary(assigned["id"])
       assert assigned["holderKey"] == "worker"
       assert assigned["workItemId"] == wi
-      assert assigned["effectKind"] != "coordination"
+      assert assigned["effectKind"] == "code"
+      assert assigned["mementos"]["agentic-engineering/effect-kind"] == ["code"]
       readback = call.("assignment-get", %{"assignmentId" => assigned["id"]})
       assert readback["id"] == assigned["id"]
 
@@ -109,8 +134,9 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
              DB.query(
                ctx.db,
                """
-               SELECT e.effectKind,s.holderKey,a.bySession,a.note FROM assignments s
-               JOIN assignment_effects e ON e.assignmentId=s.id
+               SELECT json_extract(e.valueJson,'$[0]'),s.holderKey,a.bySession,a.note FROM assignments s
+               JOIN memento_current e ON e.recordId=s.id AND e.recordKind='assignment'
+                 AND e.name='agentic-engineering/effect-kind'
                JOIN attests a ON a.assignmentId=s.id
                WHERE s.workItemId=?1 AND a.verdictKind='topology-decided'
                """,
@@ -199,15 +225,26 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
     call = fn verb, params -> ok!(ctx, nil, verb, params) end
     wi = call.("work-item-create", %{"title" => "posture negative control"})["id"]
 
+    call.("work-item-handoff", %{
+      "workItemId" => wi,
+      "deliveryOwnerSessionKey" => Org.personal_session_key("owner"),
+      "brief" => "Give the topology fixture an accountable delivery owner."
+    })
+
     coordinator =
       call.("assign", %{
         "sessionKey" => "coordinator",
         "workItemId" => wi,
         "subject" => "fixture coordination",
-        "effectKind" => "coordination"
+        "effectKind" => "coordination",
+        "mementos" => [%{"name" => "agentic-engineering/effect-kind", "value" => "coordination"}]
       })
 
-    call.("work-item-update", %{"workItemId" => wi, "deliveryOwnerSessionKey" => "coordinator"})
+    call.("work-item-handoff", %{
+      "workItemId" => wi,
+      "deliveryOwnerSessionKey" => "coordinator",
+      "brief" => "Assign the prepared coordinator as delivery owner."
+    })
 
     ok!(ctx, "coordinator", "attest", %{
       "assignmentId" => coordinator["id"],
@@ -271,6 +308,8 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
       "sessionKey" => "worker",
       "workItemId" => wi,
       "subject" => "exercise worker staffing",
+      "effectKind" => "code",
+      "mementos" => [%{"name" => "agentic-engineering/effect-kind", "value" => "code"}],
       "brief" => "Synthetic fixture only"
     }
 

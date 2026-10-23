@@ -43,7 +43,10 @@ defmodule Tightbeam.Archetypes do
   dependent archetypes unavailable. Returns the loaded map (name => t()).
   """
   @spec load!(String.t()) :: %{optional(String.t()) => t()}
-  def load!(base_dir) do
+  def load!(base_dir), do: base_dir |> prepare!() |> install!()
+
+  @doc false
+  def prepare!(base_dir) do
     manifest_dir = Path.join([base_dir, "identity", "archetypes"])
 
     refuse_reserved_substrate_skills!(base_dir)
@@ -102,6 +105,11 @@ defmodule Tightbeam.Archetypes do
         end
       end)
 
+    {archetypes, fragments}
+  end
+
+  @doc false
+  def install!({archetypes, fragments}) when is_map(archetypes) and is_map(fragments) do
     :persistent_term.put(@persist_key, {archetypes, fragments})
     archetypes
   end
@@ -125,14 +133,22 @@ defmodule Tightbeam.Archetypes do
   @spec fragments() :: %{optional(String.t()) => String.t()}
   def fragments do
     # Before load!/1 has run (unit tests, tooling) the built-ins stand alone.
-    {_archetypes, fragments} = :persistent_term.get(@persist_key, {%{}, builtin_fragments()})
+    {_archetypes, fragments} =
+      Tightbeam.RuleRuntime.law_component(@persist_key, fn ->
+        :persistent_term.get(@persist_key, {%{}, builtin_fragments()})
+      end)
+
     fragments
   end
 
   @doc "The loaded archetype by name, or nil. Reads :persistent_term (load!/1 must have run)."
   @spec get(String.t()) :: t() | nil
   def get(name) do
-    {archetypes, _fragments} = :persistent_term.get(@persist_key)
+    {archetypes, _fragments} =
+      Tightbeam.RuleRuntime.law_component(@persist_key, fn ->
+        :persistent_term.get(@persist_key)
+      end)
+
     Map.get(archetypes, name)
   end
 
@@ -273,14 +289,22 @@ defmodule Tightbeam.Archetypes do
   @doc "The loaded archetype map (name => archetype)."
   @spec all() :: %{optional(String.t()) => t()}
   def all do
-    {archetypes, _fragments} = :persistent_term.get(@persist_key)
+    {archetypes, _fragments} =
+      Tightbeam.RuleRuntime.law_component(@persist_key, fn ->
+        :persistent_term.get(@persist_key)
+      end)
+
     archetypes
   end
 
   @doc "All loaded archetype names."
   @spec names() :: [String.t()]
   def names do
-    {archetypes, _fragments} = :persistent_term.get(@persist_key)
+    {archetypes, _fragments} =
+      Tightbeam.RuleRuntime.law_component(@persist_key, fn ->
+        :persistent_term.get(@persist_key)
+      end)
+
     archetypes |> Map.keys() |> Enum.sort()
   end
 

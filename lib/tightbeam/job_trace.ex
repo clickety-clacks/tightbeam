@@ -40,7 +40,8 @@ defmodule Tightbeam.JobTrace do
         ownerUserId: item.ownerUserId,
         state: item.state,
         failReason: item.failReason,
-        title: item.title
+        title: item.title,
+        mementos: Tightbeam.Mementos.current(db, "work_item", item.id)
       },
       assignments: assignments,
       timeline:
@@ -108,7 +109,8 @@ defmodule Tightbeam.JobTrace do
         state: state,
         files: assignment_files(db, id),
         commitRefCorrections: Tightbeam.AssignmentCommitRefCorrections.list(db, id),
-        reviewsAssignmentId: reviews
+        reviewsAssignmentId: reviews,
+        mementos: Tightbeam.Mementos.current(db, "assignment", id)
       }
     end)
   end
@@ -236,7 +238,8 @@ defmodule Tightbeam.JobTrace do
         assignmentId: assignment_id,
         kind: kind,
         verdict: verdict,
-        commitRefs: decode(commit_refs)
+        commitRefs: decode(commit_refs),
+        mementos: Tightbeam.Mementos.current(db, "attest", id)
       }
     end)
   end

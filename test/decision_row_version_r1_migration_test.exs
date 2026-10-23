@@ -265,7 +265,7 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
         target_role: nil,
         role_fallback: false,
         supervision_interval_ms: 1_000,
-        params: %{subject: "version work", work_item_id: item.id, effect_kind: "coordination"}
+        params: %{subject: "version work", work_item_id: item.id}
       })
 
     request =

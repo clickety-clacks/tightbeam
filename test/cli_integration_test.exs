@@ -7,7 +7,6 @@ defmodule Tightbeam.CliIntegrationTest do
   alias Tightbeam.{
     Assets,
     Archetypes,
-    Assignments,
     CliCompatibility,
     ConditionFacts,
     DB,
@@ -122,7 +121,10 @@ defmodule Tightbeam.CliIntegrationTest do
 
     Archetypes.load!(base_dir)
     real_handlers = Gateway.handlers(gateway_config)
-    Rules.load!(base_dir, Map.keys(real_handlers))
+    bundle = Path.join(base_dir, "identity/kungfu/agentic-engineering")
+    File.mkdir_p!(bundle)
+    File.cp!("priv/kungfu/agentic-engineering/manifest.toml", Path.join(bundle, "manifest.toml"))
+    Rules.load!(base_dir, Map.keys(real_handlers), revision: "fixture")
     test_pid = self()
 
     handlers =
@@ -197,6 +199,8 @@ defmodule Tightbeam.CliIntegrationTest do
                "existing work",
                "--effect-kind",
                "coordination",
+               "--memento",
+               "agentic-engineering/effect-kind=coordination",
                "--work-item",
                item,
                "--as-user",
@@ -439,7 +443,7 @@ defmodule Tightbeam.CliIntegrationTest do
       Path.join(ctx.base_dir, "identity/rules/verification.toml")
     )
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     registry = start_supervised!({Tightbeam.ConnRegistry, name: :d3_cli_registry})
     # Stop at the durable notification boundary; do not start an agent/provider lane.
     lane =
@@ -1333,7 +1337,7 @@ defmodule Tightbeam.CliIntegrationTest do
           "--kind",
           "verdict",
           "--verdict",
-          "tests-passed",
+          "verified",
           "--as-user",
           "flynn"
         ],
@@ -1341,7 +1345,7 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    assert verdicted =~ "tests-passed"
+    assert verdicted =~ "verified"
 
     assert_receive {:cli_call,
                     %{
@@ -1353,7 +1357,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert {:ok, [["flynn", nil]]} =
              DB.query(
                ctx.db,
-               "SELECT byUser, bySession FROM attests WHERE assignmentId = ?1 AND verdictKind = 'tests-passed'",
+               "SELECT byUser, bySession FROM attests WHERE assignmentId = ?1 AND verdictKind = 'verified'",
                [assignment_id]
              )
 
@@ -1406,6 +1410,8 @@ defmodule Tightbeam.CliIntegrationTest do
           "cli-holder",
           "--effect-kind",
           "coordination",
+          "--memento",
+          "agentic-engineering/effect-kind=coordination",
           "--key",
           "assign-cli"
         ],
@@ -1551,17 +1557,6 @@ defmodule Tightbeam.CliIntegrationTest do
     # delivering rules/.
     assert :initialized = Archetypes.init_identity!(ctx.base_dir)
 
-    assert {:ok, _revision} =
-             Tightbeam.Identity.learn!(ctx.base_dir, "agentic-engineering", "operator")
-
-    Archetypes.load!(ctx.base_dir)
-
-    for file <- ["engineering.toml", "verification.toml"] do
-      assert File.exists?(Path.join([ctx.base_dir, "identity", "rules", file])),
-             "learn did not deliver rules/#{file} into the org's identity tree"
-    end
-
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
 
@@ -1593,7 +1588,7 @@ defmodule Tightbeam.CliIntegrationTest do
         display_name: "CLI Reviewer",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "reviewer",
+        archetype: "reviewer-code",
         host: "testhost",
         harness: "codex",
         provider: "openai",
@@ -1612,6 +1607,13 @@ defmodule Tightbeam.CliIntegrationTest do
         provider: "anthropic",
         model: Model.new("fable")
       })
+
+    Tightbeam.ShippedPolicyFixture.learn_engineering!(ctx.db, ctx.base_dir, ctx.handlers)
+
+    for file <- ["engineering.toml", "verification.toml"] do
+      assert File.exists?(Path.join([ctx.base_dir, "identity", "rules", file])),
+             "learn did not deliver rules/#{file} into the org's identity tree"
+    end
 
     product_owner_dir = session_workdir!(ctx, product_owner)
 
@@ -1686,6 +1688,8 @@ defmodule Tightbeam.CliIntegrationTest do
           product_owner.session_key,
           "--effect-kind",
           "coordination",
+          "--memento",
+          "agentic-engineering/effect-kind=coordination",
           "--work-item",
           item_id,
           "--as",
@@ -1771,6 +1775,8 @@ defmodule Tightbeam.CliIntegrationTest do
           "cli-coder",
           "--effect-kind",
           "code",
+          "--memento",
+          "agentic-engineering/effect-kind=code",
           "--work-item",
           item_id,
           "--as",
@@ -1785,7 +1791,7 @@ defmodule Tightbeam.CliIntegrationTest do
     repo = Path.expand("..", __DIR__)
     {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
 
-    commit_refs =
+    evidence_ref =
       JSON.encode!([
         %{
           "repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}",
@@ -1802,7 +1808,9 @@ defmodule Tightbeam.CliIntegrationTest do
           "--kind",
           "verdict",
           "--verdict",
-          "tests-passed",
+          "verified",
+          "--commit-refs",
+          evidence_ref,
           "--note",
           "#{Tightbeam.Placement.local_host_name()}:#{repo} #{String.trim(commit)}; " <>
             "mise exec -- mix test test/cli_integration_test.exs; passed"
@@ -1853,18 +1861,16 @@ defmodule Tightbeam.CliIntegrationTest do
           "--verdict",
           "reviewed-clean",
           "--commit-refs",
-          commit_refs
+          evidence_ref,
+          "--memento",
+          "agentic-engineering/evidence-ref=" <> evidence_ref
         ],
         cd: reviewer_dir,
         stderr_to_stdout: true
       )
 
-    assert Assignments.qualifying_review_verdict_kinds(
-             ctx.db,
-             work_id,
-             "cli-coder",
-             JSON.decode!(commit_refs)
-           ) == ["reviewed-clean"]
+    selected = Tightbeam.MementoJudgments.latest(ctx.db, work_id, "linked_review")
+    assert selected.judgment_kind == "reviewed-clean"
 
     completion_args = [
       "attest",
@@ -1872,11 +1878,12 @@ defmodule Tightbeam.CliIntegrationTest do
       "--kind",
       "completion",
       "--commit-refs",
-      commit_refs
+      evidence_ref,
+      "--memento",
+      "agentic-engineering/evidence-ref=" <> evidence_ref
     ]
 
-    # A1 first denial: the completion is refused and the wake names the
-    # missing verification verdict.
+    # Static artifact admission precedes transaction-dependent judgment checks.
     {denied, denied_status} =
       System.cmd(ctx.binary, completion_args,
         cd: coder_dir,
@@ -1884,17 +1891,17 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     assert denied_status != 0
-    assert denied =~ "completion-requires-verification"
+    assert denied =~ "completion-requires-results-artifact"
 
-    assert %{status: "live", producer_key: verification_source_id} =
-             RailRemedy.episode(ctx.db, "completion-requires-verification", work_id)
+    assert %{status: "live", producer_key: artifact_source_id} =
+             RailRemedy.episode(ctx.db, "completion-requires-results-artifact", work_id)
 
-    verification_delivery =
-      assert_cli_source_delivery!(ctx.db, verification_source_id, "cli-coder")
+    artifact_delivery =
+      assert_cli_source_delivery!(ctx.db, artifact_source_id, "cli-coder")
 
-    verification_wake = verification_delivery.source
-    assert verification_wake.prompt =~ "no verification verdict is filed"
-    assert verification_wake.prompt =~ work_id
+    assert artifact_delivery.source.prompt =~ "no artifact is recorded on its work item"
+    assert artifact_delivery.source.prompt =~ work_id
+    finish_cli_delivery!(ctx.db, "cli-coder", artifact_delivery.seq)
 
     assert {:ok, [[receipt_notice_id]]} =
              DB.query(
@@ -1906,54 +1913,6 @@ defmodule Tightbeam.CliIntegrationTest do
     receipt_delivery = assert_cli_source_delivery!(ctx.db, receipt_notice_id, "cli-holder")
     assert receipt_delivery.source.prompt =~ "Attest "
     finish_cli_delivery!(ctx.db, "cli-holder", receipt_delivery.seq)
-
-    {_verified, 0} =
-      System.cmd(
-        ctx.binary,
-        [
-          "attest",
-          work_id,
-          "--kind",
-          "verdict",
-          "--verdict",
-          "verified",
-          "--commit-refs",
-          commit_refs
-        ],
-        cd: coder_dir,
-        stderr_to_stdout: true
-      )
-
-    finish_cli_delivery!(ctx.db, "cli-coder", verification_delivery.seq)
-
-    # A1 second denial: the artifact statute prods next, naming its own record.
-    {denied_again, denied_again_status} =
-      System.cmd(ctx.binary, completion_args,
-        cd: coder_dir,
-        stderr_to_stdout: true
-      )
-
-    assert denied_again_status != 0
-    assert denied_again =~ "completion-requires-results-artifact"
-
-    assert {:ok, [[verified_notice_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %' AND wakeId<>?2",
-               [work_id, receipt_notice_id]
-             )
-
-    attest_delivery = assert_cli_source_delivery!(ctx.db, verified_notice_id, "cli-holder")
-    attest_batch = Wakes.get(ctx.db, attest_delivery.carrier_id)
-    assert attest_batch.prompt =~ "Attest "
-
-    assert %{status: "live", producer_key: artifact_source_id} =
-             RailRemedy.episode(ctx.db, "completion-requires-results-artifact", work_id)
-
-    artifact_delivery = assert_cli_source_delivery!(ctx.db, artifact_source_id, "cli-coder")
-    artifact_wake = artifact_delivery.source
-    assert artifact_wake.prompt =~ "no artifact is recorded on its work item"
-    finish_cli_delivery!(ctx.db, "cli-coder", artifact_delivery.seq)
 
     # The report artifact, through the REAL CLI. This hop used to call the
     # handler directly with a `recorded_message_id` no wire client can send,
@@ -2011,6 +1970,41 @@ defmodule Tightbeam.CliIntegrationTest do
     assert recorded["recordedMessageId"] == message.id
     assert recorded["recordedTurnEvidence"] == "tool-call-observed"
 
+    # With the artifact recorded, one accountable review rule still requires
+    # the producer's latest verification to match the linked review evidence.
+    {denied_again, denied_again_status} =
+      System.cmd(ctx.binary, completion_args, cd: coder_dir, stderr_to_stdout: true)
+
+    assert denied_again_status != 0
+    assert denied_again =~ "completion-requires-review"
+
+    assert %{status: "live", producer_key: review_source_id} =
+             RailRemedy.episode(ctx.db, "completion-requires-review", work_id)
+
+    review_delivery = assert_cli_source_delivery!(ctx.db, review_source_id, "cli-holder")
+    assert review_delivery.source.assignment_id == work_id
+    assert review_delivery.source.consumer == "prompt"
+    finish_cli_delivery!(ctx.db, "cli-holder", review_delivery.seq)
+
+    {_verified, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "attest",
+          work_id,
+          "--kind",
+          "verdict",
+          "--verdict",
+          "verified",
+          "--commit-refs",
+          evidence_ref,
+          "--memento",
+          "agentic-engineering/evidence-ref=" <> evidence_ref
+        ],
+        cd: coder_dir,
+        stderr_to_stdout: true
+      )
+
     # A2: the papertrail stands — the completion passes and the episodes close.
     {completed, 0} =
       System.cmd(ctx.binary, completion_args,
@@ -2023,8 +2017,10 @@ defmodule Tightbeam.CliIntegrationTest do
     assert {:ok, [["closed", "completed"]]} =
              DB.query(ctx.db, "SELECT state, outcome FROM assignments WHERE id = ?1", [work_id])
 
+    assert :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
+
     assert %{status: "closed"} =
-             RailRemedy.episode(ctx.db, "completion-requires-verification", work_id)
+             RailRemedy.episode(ctx.db, "completion-requires-review", work_id)
 
     assert %{status: "closed"} =
              RailRemedy.episode(ctx.db, "completion-requires-results-artifact", work_id)
@@ -2066,10 +2062,147 @@ defmodule Tightbeam.CliIntegrationTest do
            } = machine_line!(refused)
   end
 
-  # Code-completion evidence remains required even when the org has no learned
-  # statutes; the refusal creates no remedy episode or wake.
-  test "real CLI requires code completion evidence on a rule-free org", ctx do
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+  test "legacy CLI contract fields reach server-side admission", ctx do
+    {created, 0} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-create", "--title", "legacy CLI contract fixture", "--as-user", "flynn"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    work_item_id = JSON.decode!(created)["id"]
+    assert_receive {:cli_call, %{verb: "work-item-create"}}
+
+    {_handoff, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "work-item-handoff",
+          "--work-item",
+          work_item_id,
+          "--delivery-owner",
+          "cli-holder",
+          "--brief",
+          "Give the legacy CLI fixture an accountable delivery owner.",
+          "--as-user",
+          "flynn"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert_receive {:cli_call, %{verb: "work-item-handoff"}}
+
+    assert {:ok, [["cli-holder"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT deliveryOwnerSessionKey FROM work_items WHERE id=?1",
+               [work_item_id]
+             )
+
+    repo = Path.expand("..", __DIR__)
+    {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
+
+    commit_refs =
+      JSON.encode!([
+        %{
+          "repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}",
+          "commit" => String.trim(commit)
+        }
+      ])
+
+    for {verb, args, expected_work_item_id} <- [
+          {"assign",
+           [
+             "assign",
+             "--subject",
+             "legacy assignment",
+             "--session",
+             "cli-worker",
+             "--effect-kind",
+             "code",
+             "--memento",
+             "agentic-engineering/effect-kind=code",
+             "--work-item",
+             work_item_id,
+             "--key",
+             "legacy-assignment"
+           ], work_item_id},
+          {"dispatch",
+           [
+             "dispatch",
+             "--to",
+             "cli-worker",
+             "--subject",
+             "legacy dispatch",
+             "--brief",
+             "Legacy dispatch",
+             "--effect-kind",
+             "code",
+             "--memento",
+             "agentic-engineering/effect-kind=code",
+             "--key",
+             "legacy-dispatch"
+           ], nil}
+        ] do
+      {output, 0} = System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+      assignment_id = JSON.decode!(output)["id"]
+
+      assert_receive {:cli_call,
+                      %{
+                        verb: ^verb,
+                        params: %{effect_kind: "code"} = params
+                      }}
+
+      assert params[:work_item_id] == expected_work_item_id
+
+      assert {:ok, [["code"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT effectKind FROM assignment_effects WHERE assignmentId=?1",
+                 [assignment_id]
+               )
+    end
+
+    for args <- [
+          [
+            "attest",
+            "missing-assignment",
+            "--kind",
+            "completion",
+            "--commit-refs",
+            commit_refs
+          ],
+          [
+            "assignment-commitref-correct",
+            "missing-assignment",
+            "--commit-refs",
+            commit_refs,
+            "--evidence",
+            "missing-artifact",
+            "--reason",
+            "legacy correction",
+            "--key",
+            "legacy-correction"
+          ]
+        ] do
+      {output, status} = System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+      assert status != 0
+      refute output =~ "legacy_contract_retired"
+    end
+
+    for verb <- ["attest", "assignment-commitref-correct"] do
+      assert_receive {:cli_call, %{verb: ^verb}}
+    end
+
+    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM assignments")
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM attests")
+    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM assignment_effects")
+  end
+
+  test "real CLI leaves completion evidence policy to learned rules", ctx do
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     coder =
       Org.create(ctx.db, %{
@@ -2104,6 +2237,10 @@ defmodule Tightbeam.CliIntegrationTest do
           "assign",
           "--subject",
           "neutral bare completion",
+          "--effect-kind",
+          "code",
+          "--memento",
+          "agentic-engineering/effect-kind=code",
           "--session",
           coder.session_key,
           "--work-item",
@@ -2117,16 +2254,19 @@ defmodule Tightbeam.CliIntegrationTest do
 
     work_id = JSON.decode!(assigned)["id"]
 
-    {denied, denied_status} =
+    {completed, status} =
       System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
         cd: coder_dir,
         stderr_to_stdout: true
       )
 
-    assert denied_status != 0
-    assert denied =~ "inapplicable_code_evidence"
+    assert status == 0
+    result = JSON.decode!(completed)
+    assert result["assignment"]["effectKind"] == "code"
+    assert result["assignment"]["mementos"]["agentic-engineering/effect-kind"] == ["code"]
+    attest_id = result["attest"]["id"]
 
-    assert {:ok, [["open", nil]]} =
+    assert {:ok, [["closed", ^attest_id]]} =
              DB.query(ctx.db, "SELECT state,closingAttestId FROM assignments WHERE id=?1", [
                work_id
              ])
@@ -2343,7 +2483,7 @@ defmodule Tightbeam.CliIntegrationTest do
       """
     )
 
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     # THE WIRE CONTRACT ITSELF, off the real Bandit socket. Asserting only on what
     # the CLI printed would leave the router free to drift to a 200, or to a

@@ -43,7 +43,7 @@ defmodule GuardMcpFallback do
 
       try do
         config = %{config | port: 0}
-        put_skill!(base, "review", "# Review")
+        put_skill!(config, "review", "# Review")
         manifest_path = Path.join([base, "identity", "archetypes", "default.toml"])
 
         identity_edit!(
@@ -70,8 +70,12 @@ defmodule GuardMcpFallback do
         identity_name = Placement.identity_name(config, archetype, overrides, :claude)
         Org.set_identity(db, "k1", overrides, identity_name)
 
-        {_archetypes, fragments} = :persistent_term.get(Archetypes)
-        :persistent_term.put(Archetypes, {%{}, fragments})
+        # Exercise missing-archetype fallback in the canonical complete-law
+        # cache; compatibility mirrors no longer define what the runner reads.
+        policy = Tightbeam.Rules.effective_snapshot()
+        {_archetypes, fragments} = policy.law_components[Archetypes]
+        components = Map.put(policy.law_components, Archetypes, {%{}, fragments})
+        :persistent_term.put(Tightbeam.Rules, %{policy | law_components: components})
         refute Archetypes.get("default")
         assert archetype.mcp != []
         assert Archetypes.builtin_default().mcp == []
@@ -153,10 +157,10 @@ defmodule GuardMcpFallback do
     end)
   end
 
-  defp put_skill!(base, name, body) do
-    Identity.init!(base)
-    identity_edit!(base, "default", {:skill, name, false}, body, "test")
-    Archetypes.load!(base)
+  defp put_skill!(config, name, body) do
+    Identity.init!(config.base_dir)
+    identity_edit!(config.base_dir, "default", {:skill, name, false}, body, "test")
+    Gateway.load_law!(config)
   end
 
   defp identity_edit!(base, archetype, target, content, author) do

@@ -368,6 +368,21 @@ defmodule Tightbeam.DB do
     end
   end
 
+  # Unlike transaction_then/3, this internal cutover seam keeps the owner
+  # occupied after the assessment commits, through the final publication. The
+  # finalizer must not call this DB recursively. It owns any external rollback;
+  # an error after commit does not undo the recorded assessment.
+  @doc false
+  def fenced_transaction(server, assess, finalize, on_error \\ &Function.identity/1)
+      when is_function(assess, 1) and is_function(finalize, 1) do
+    DBObservation.call(
+      server,
+      {:fenced_transaction, assess, finalize, on_error},
+      "db.transaction",
+      call_timeout()
+    )
+  end
+
   @doc false
   def publish_transaction(server, callback) do
     DBObservation.call(
@@ -714,12 +729,22 @@ defmodule Tightbeam.DB do
     case DBObservation.transaction_metadata(callback) do
       {:ok, envelope, original_callback} ->
         DBObservation.server(envelope, 5_000, fn ->
-          with_deadline(envelope.deadline, fn -> run.(original_callback) end, state)
+          with_deadline(
+            envelope.deadline,
+            fn -> run_observed_transaction(original_callback, run, state) end,
+            state
+          )
         end)
 
       :none ->
-        run.(callback)
+        run_observed_transaction(callback, run, state)
     end
+  end
+
+  defp run_observed_transaction(callback, run, state) do
+    run.(callback)
+  rescue
+    error in Tightbeam.Mementos.Refusal -> {:reply, {:error, error}, state}
   end
 
   defp with_deadline(deadline, fun, state) do
@@ -740,7 +765,6 @@ defmodule Tightbeam.DB do
     unless state.admission && Tightbeam.LiveBaseAdmission.canonical!(base) == state.admission.base,
       do: raise(ArgumentError, "startup requires this base's persistent DB admission")
 
-    :ok = Tightbeam.LiveBaseAdmission.validate_owned_files!(state.admission)
     {:reply, :ok, state}
   rescue
     error -> {:reply, {:error, error}, state}
@@ -924,6 +948,47 @@ defmodule Tightbeam.DB do
           )
 
         {:reply, reply, state}
+      after
+        Process.delete(row_commit_key(conn))
+      end
+    end)
+  end
+
+  def handle_call({:fenced_transaction, assess, finalize}, from, state),
+    do: handle_call({:fenced_transaction, assess, finalize, &Function.identity/1}, from, state)
+
+  def handle_call({:fenced_transaction, assess, finalize, on_error}, _from, %{conn: conn} = state) do
+    observed_transaction(assess, state, fn callback ->
+      Process.put(row_commit_key(conn), [])
+
+      try do
+        reply =
+          case commit_phase(
+                 conn,
+                 callback,
+                 fenced_archetypes(state)
+               ) do
+            {:ok, assessment} ->
+              # A deadline can expire while COMMIT is completing. Never start
+              # publication after that deadline, even though assessment persisted.
+              Txn.ensure_before_deadline(%Txn{deadline: Process.get(@deadline_key, :infinity)})
+              {:ok, finalize.(assessment)}
+
+            {:error, error} ->
+              raise error
+          end
+
+        {:reply, reply, state}
+      rescue
+        error ->
+          recovered =
+            try do
+              on_error.(error)
+            rescue
+              restoration_error -> restoration_error
+            end
+
+          {:reply, {:error, recovered}, state}
       after
         Process.delete(row_commit_key(conn))
       end

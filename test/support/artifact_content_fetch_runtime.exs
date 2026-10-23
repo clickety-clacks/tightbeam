@@ -21,9 +21,9 @@ File.mkdir_p!(workspace)
   VALUES('wi_content_fixture','Content fixture','fixture','fixture',1);
   """)
 
-expected =
+recorded =
   try do
-    recorded =
+    artifacts =
       for {filename, bytes} <- [{"binary.dat", <<0, 255, 128, 13, 10>>}, {"empty.dat", <<>>}] do
         File.write!(Path.join(workspace, filename), bytes)
 
@@ -40,7 +40,7 @@ expected =
           })
 
         assert ArtifactContent.fetch(db, artifact.artifact_id) == nil
-        {artifact, bytes}
+        {artifact, filename, bytes}
       end
 
     assert :ok =
@@ -53,23 +53,16 @@ expected =
 
     refute File.exists?(workspace)
 
-    for {artifact, bytes} <- recorded do
+    for {artifact, filename, bytes} <- artifacts do
       archived = Artifacts.get(db, artifact.artifact_id)
       assert archived.state == "archived"
       assert File.read!(archived.home) == bytes
-
-      fetched = %{
-        artifact_id: artifact.artifact_id,
-        content_sha256: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower),
-        content_size: byte_size(bytes),
-        content: bytes
-      }
-
-      assert ArtifactContent.fetch(db, artifact.artifact_id) == fetched
+      assert Path.basename(archived.home) == filename
+      assert ArtifactContent.fetch(db, artifact.artifact_id) == nil
       File.rm!(archived.home)
       assert Artifacts.release(db, artifact.artifact_id).state == "released"
-      assert ArtifactContent.fetch(db, artifact.artifact_id) == fetched
-      fetched
+      assert ArtifactContent.fetch(db, artifact.artifact_id) == nil
+      artifact.artifact_id
     end
   after
     GenServer.stop(db)
@@ -81,12 +74,12 @@ try do
   :ok = Schema.ensure_all(reopened)
   :ok = DB.assert_base_admitted!(reopened, base)
 
-  for fetched <- expected do
-    assert ArtifactContent.fetch(reopened, fetched.artifact_id) == fetched
-    assert Artifacts.get(reopened, fetched.artifact_id).state == "released"
+  for artifact_id <- recorded do
+    assert ArtifactContent.fetch(reopened, artifact_id) == nil
+    assert Artifacts.get(reopened, artifact_id).state == "released"
   end
 
-  IO.puts("artifact-content-fetch-restart: ok")
+  IO.puts("artifact-content-no-capture-restart: ok")
 after
   GenServer.stop(reopened)
 end

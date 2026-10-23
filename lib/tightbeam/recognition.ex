@@ -76,7 +76,14 @@ defmodule Tightbeam.Recognition do
 
   def record(txn, callback, result, transitions, opts) do
     id = Tightbeam.Id.uuid4()
-    module = callback |> :erlang.fun_info(:module) |> elem(1)
+
+    function =
+      case callback do
+        {:actor, function} -> function
+        function -> function
+      end
+
+    module = function |> :erlang.fun_info(:module) |> elem(1)
 
     payload =
       :erlang.term_to_binary(
@@ -97,6 +104,16 @@ defmodule Tightbeam.Recognition do
     %Pending{id: id, result: result, transitions: transitions}
   end
 
+  # Actor work admitted by a mutation must survive commit, but may not call
+  # back into the DB owner while that mutation holds its transaction.
+  @doc false
+  def defer_in_txn(%Txn{outbox_owner: db} = txn, callback) when is_function(callback, 1) do
+    pending = record(txn, {:actor, callback}, :ok, [], [])
+    Txn.q(txn, "UPDATE pending_recognition SET nextAt=?2 WHERE id=?1", [pending.id, now()])
+    Txn.handoff(txn, worker(db), :reschedule)
+    :ok
+  end
+
   def inline(db, pending, callback, opts, deadline) do
     case invoke(db, pending, callback, true, deadline) do
       {:ok, result} ->
@@ -113,6 +130,11 @@ defmodule Tightbeam.Recognition do
   end
 
   defp invoke(db, pending, callback, clear \\ true, deadline \\ nil)
+
+  # The actor receives the current owner on replay; no stopped owner's PID is
+  # captured in the durable callback. Ordinary transaction callbacks stay unchanged.
+  defp invoke(db, pending, {:actor, callback}, _clear, _deadline),
+    do: safely(fn -> {:ok, recognized_result!(callback.(db), pending.result)} end)
 
   defp invoke(db, pending, callback, clear, deadline) when is_function(callback, 2) do
     safely(fn ->

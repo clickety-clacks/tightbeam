@@ -49,6 +49,29 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config, base: base} ->
   prompt = "boot recovery closed {assignment_id}"
   """)
 
+  # Startup reads the published immutable law, not a working-tree edit.
+  identity_dir = Path.join(base, "identity")
+  prior = Tightbeam.Identity.live_revision!(base)
+
+  for args <- [["add", "rules/boot-recovery.toml"], ["commit", "-m", "boot recovery observation"]] do
+    {output, status} =
+      System.cmd("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid"] ++ args,
+        cd: identity_dir,
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, output
+  end
+
+  {revision, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: identity_dir)
+  revision = String.trim(revision)
+
+  assert {:ok, ^revision} =
+           Tightbeam.Identity.publish_live!(base, %{
+             expected_prior: prior,
+             candidate_revision: revision
+           })
+
   :persistent_term.erase(RuleRuntime)
 
   Gateway.children(

@@ -303,23 +303,6 @@ defmodule Tightbeam.Identity do
   end
 
   @doc false
-  def with_live_revision_lock(base_dir, fun) when is_function(fun, 1) do
-    init!(base_dir)
-    with_live_revision_lock_in_dir(identity_dir(base_dir), fun)
-  end
-
-  # Apply holds this lock for one target's materialization and durable stamp.
-  # Live-ref writers take the same lock so an older projection cannot write
-  # after a newer revision becomes live.
-  defp with_live_revision_lock_in_dir(identity_dir, fun) do
-    lock = {{__MODULE__, :live_revision, Path.expand(identity_dir)}, self()}
-
-    :global.trans(lock, fn ->
-      fun.(git_output!(identity_dir, ["rev-parse", @live]))
-    end)
-  end
-
-  @doc false
   def with_recovery_law!(base_dir, load) do
     dir = identity_dir(base_dir)
 
@@ -327,21 +310,28 @@ defmodule Tightbeam.Identity do
       # Recovery needs the published law, never a partially merged working tree.
       # Export one pinned revision without touching the index or merge metadata.
       revision = git_output!(dir, ["rev-parse", @live])
-      snapshot = Path.join(base_dir, ".identity-law-#{Tightbeam.Id.uuid4()}")
-      tree = Path.join(snapshot, "identity")
-
-      try do
-        File.mkdir_p!(tree)
-        File.chmod!(snapshot, 0o700)
-        env = [{"GIT_INDEX_FILE", Path.join(snapshot, "index")}]
-        export_law!(dir, ["read-tree", revision], env)
-        export_law!(dir, ["checkout-index", "--all", "--prefix=#{tree}/"], env)
-        load.(snapshot, revision)
-      after
-        File.rm_rf!(snapshot)
-      end
+      with_law_revision!(base_dir, revision, load)
     else
       load.(base_dir, nil)
+    end
+  end
+
+  @doc false
+  def with_law_revision!(base_dir, revision, load) when is_binary(revision) do
+    dir = identity_dir(base_dir)
+    revision = git_output!(dir, ["rev-parse", "--verify", revision <> "^{commit}"])
+    snapshot = Path.join(base_dir, ".identity-law-#{Tightbeam.Id.uuid4()}")
+    tree = Path.join(snapshot, "identity")
+
+    try do
+      File.mkdir_p!(tree)
+      File.chmod!(snapshot, 0o700)
+      env = [{"GIT_INDEX_FILE", Path.join(snapshot, "index")}]
+      export_law!(dir, ["read-tree", revision], env)
+      export_law!(dir, ["checkout-index", "--all", "--prefix=#{tree}/"], env)
+      load.(snapshot, revision)
+    after
+      File.rm_rf!(snapshot)
     end
   end
 
@@ -675,7 +665,10 @@ defmodule Tightbeam.Identity do
 
     case receipt_at(dir, "main", name) do
       {:ok, _receipt} ->
-        {:noop, git_output!(dir, ["rev-parse", @live])}
+        case receipt_at(dir, @live, name) do
+          {:ok, _published} -> {:noop, git_output!(dir, ["rev-parse", @live])}
+          :error -> {:ok, pending_candidate_result!(dir)}
+        end
 
       :error ->
         refuse_seed_owned_bundle_paths!(name, bundle)
@@ -700,7 +693,20 @@ defmodule Tightbeam.Identity do
   def unlearn!(base_dir, name, author) do
     init!(base_dir)
     dir = identity_dir(base_dir)
-    receipt = read_receipt!(dir, "main", name)
+
+    case receipt_at(dir, "main", name) do
+      {:ok, receipt} ->
+        prepare_unlearn!(dir, name, author, receipt)
+
+      :error ->
+        # A refused publication may already have removed the receipt from main.
+        # The published receipt still owns the pending removal and its references.
+        read_receipt!(dir, @live, name)
+        pending_candidate_result!(dir)
+    end
+  end
+
+  defp prepare_unlearn!(dir, name, author, receipt) do
     require_clean_main!(dir)
     expected_prior = git_output!(dir, ["rev-parse", @live])
 
@@ -740,7 +746,10 @@ defmodule Tightbeam.Identity do
   @doc "Bundle-owned archetype names recorded by a learned receipt."
   @spec bundle_archetype_names!(String.t(), String.t()) :: [String.t()]
   def bundle_archetype_names!(base_dir, name) do
-    bundle_archetype_names_at!(base_dir, "main", name)
+    revision =
+      if receipt_at(identity_dir(base_dir), "main", name) == :error, do: @live, else: "main"
+
+    bundle_archetype_names_at!(base_dir, revision, name)
   end
 
   @doc "Bundle-owned archetype names recorded by a learned receipt at `revision`."
@@ -819,7 +828,8 @@ defmodule Tightbeam.Identity do
       purpose: purpose,
       phrases: phrases,
       root_archetype: Map.fetch!(manifest, "root_archetype"),
-      sentinels: sentinel_declarations!(Map.get(manifest, "sentinels", []), path)
+      sentinels: sentinel_declarations!(Map.get(manifest, "sentinels", []), path),
+      mementos: Tightbeam.Mementos.declarations!(Map.get(manifest, "mementos", []), path)
     }
   end
 
@@ -1729,47 +1739,340 @@ defmodule Tightbeam.Identity do
     |> String.split("\n", trim: true)
   end
 
+  @memento_policy_ref "refs/tightbeam/memento-policy"
+
+  @doc false
+  def retain_compatible_pair!(base_dir, candidate) do
+    dir = identity_dir(base_dir)
+    prior = Map.fetch!(candidate, :expected_prior)
+    next = Map.fetch!(candidate, :candidate_revision)
+
+    validate_revision_dir!(dir, prior)
+    validate_revision_dir!(dir, next)
+
+    unless prior != next and live_revision!(base_dir) == prior do
+      policy_revision_unavailable!("retention requires the current compatible publication")
+    end
+
+    record = %{
+      "version" => 1,
+      "state" => "inactive",
+      "prior_revision" => prior,
+      "candidate_revision" => next,
+      "core" => policy_core_revision!()
+    }
+
+    case memento_policy_record!(dir) do
+      nil ->
+        write_memento_policy_record!(dir, record, nil)
+
+      %{record: ^record} = retained ->
+        retained
+
+      _ ->
+        policy_revision_unavailable!("a different compatible pair is already retained")
+    end
+  end
+
+  @doc false
+  def commit_policy_activation!(base_dir, expected, assessment) do
+    dir = identity_dir(base_dir)
+    retained = memento_policy_record!(dir)
+
+    retained_pair? =
+      case retained do
+        %{
+          record: %{
+            "state" => "inactive",
+            "prior_revision" => prior,
+            "candidate_revision" => candidate,
+            "core" => core
+          }
+        } ->
+          prior == expected.expected_prior and candidate == expected.candidate_revision and
+            core == policy_core_revision!()
+
+        _ ->
+          false
+      end
+
+    unless retained_pair? and live_revision!(base_dir) == expected.candidate_revision do
+      policy_revision_unavailable!("activation does not match the retained compatible pair")
+    end
+
+    record =
+      retained.record
+      |> Map.put("state", "committed")
+      |> Map.put("assessment", JSON.decode!(JSON.encode!(assessment)))
+
+    write_memento_policy_record!(dir, record, retained.revision)
+  end
+
+  @doc false
+  def active_policy_decision!(base_dir) do
+    case memento_policy_record!(identity_dir(base_dir)) do
+      %{record: %{"state" => "committed"}} = decision -> decision
+
+      _ ->
+        nil
+    end
+  end
+
+  @doc false
+  def restore_policy_activation!(base_dir, decision) do
+    dir = identity_dir(base_dir)
+
+    unless memento_policy_record!(dir) == decision and
+             decision.record["state"] == "committed" do
+      policy_revision_unavailable!("activation record changed before restoration")
+    end
+
+    pair = %{
+      candidate_revision: decision.record["candidate_revision"],
+      expected_prior: decision.record["prior_revision"]
+    }
+
+    case restore_live!(base_dir, pair) do
+      {:ok, _prior} ->
+        clear_memento_policy_record!(dir, decision.revision)
+        :ok
+
+      {:error, reason} ->
+        policy_revision_unavailable!(
+          "compatible publication could not be restored: #{inspect(reason)}"
+        )
+    end
+  end
+
+  @doc false
+  def recover_compatible_pair!(base_dir, expected \\ nil) do
+    dir = identity_dir(base_dir)
+
+    case memento_policy_record!(dir) do
+      nil ->
+        :none
+
+      %{record: %{"state" => "committed"}} = decision ->
+        if expected do
+          policy_revision_unavailable!(
+            "a committed activation cannot be recovered as an inactive candidate"
+          )
+        end
+
+        active_policy_decision!(base_dir) || decision
+
+      %{revision: marker, record: %{"state" => "inactive"} = record} ->
+        pair = %{
+          expected_prior: record["prior_revision"],
+          candidate_revision: record["candidate_revision"]
+        }
+
+        if expected && expected != pair do
+          :none
+        else
+          prior = pair.expected_prior
+
+          case restore_live!(base_dir, pair) do
+            {:ok, ^prior} ->
+              clear_memento_policy_record!(dir, marker)
+              %{state: "restored", live_revision: prior}
+
+            {:error, reason} ->
+              policy_revision_unavailable!(
+                "compatible publication could not be restored: #{inspect(reason)}"
+              )
+          end
+        end
+    end
+  end
+
+  defp memento_policy_record!(dir) do
+    case System.cmd("git", ["show-ref", "--verify", "--quiet", @memento_policy_ref],
+           cd: dir,
+           stderr_to_stdout: true
+         ) do
+      {_output, 1} ->
+        nil
+
+      {_output, 0} ->
+        revision = git_output!(dir, ["rev-parse", @memento_policy_ref])
+
+        record =
+          case JSON.decode(git_output!(dir, ["show", "-s", "--format=%B", revision])) do
+            {:ok, %{"version" => 1, "state" => state} = record}
+            when state in ["inactive", "committed"] ->
+              record
+
+            _ ->
+              policy_revision_unavailable!("retained compatible-pair record is unreadable")
+          end
+
+        %{revision: revision, record: record}
+
+      {output, _status} ->
+        policy_revision_unavailable!("retained compatible-pair record cannot be read: #{output}")
+    end
+  end
+
+  defp write_memento_policy_record!(dir, record, previous_revision) do
+    tree = git_output!(dir, ["rev-parse", record["candidate_revision"] <> "^{tree}"])
+
+    {output, status} =
+      System.cmd(
+        "git",
+        ["commit-tree", tree, "-m", JSON.encode!(record)],
+        cd: dir,
+        stderr_to_stdout: true,
+        env: git_env("memento-policy")
+      )
+
+    unless status == 0,
+      do: policy_revision_unavailable!("compatible-pair record could not be written: #{output}")
+
+    revision = String.trim(output)
+    expected = previous_revision || ""
+
+    case System.cmd(
+           "git",
+           ["update-ref", @memento_policy_ref, revision, expected],
+           cd: dir,
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} ->
+        %{revision: revision, record: record}
+
+      {output, _status} ->
+        policy_revision_unavailable!("compatible-pair record changed: #{output}")
+    end
+  end
+
+  defp clear_memento_policy_record!(dir, revision) do
+    case System.cmd(
+           "git",
+           ["update-ref", "-d", @memento_policy_ref, revision],
+           cd: dir,
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} ->
+        :ok
+
+      {output, _status} ->
+        policy_revision_unavailable!("compatible-pair record changed: #{output}")
+    end
+  end
+
+  defp policy_core_revision! do
+    build = Tightbeam.BuildStamp.build()
+    sha = Tightbeam.BuildStamp.sha()
+
+    if is_integer(build) and is_binary(sha) and sha != "" do
+      %{"build" => build, "sha" => sha}
+    else
+      policy_revision_unavailable!("compatible core revision is unavailable")
+    end
+  end
+
+  defp policy_revision_unavailable!(message) do
+    raise Tightbeam.Mementos.Refusal,
+      code: "policy_revision_unavailable",
+      message: message
+  end
+
   @doc "Revalidate an exact candidate commit and advance live from its expected prior OID."
   @spec publish_live!(String.t(), map()) :: {:ok, String.t()} | {:error, map()}
   def publish_live!(base_dir, candidate) do
     dir = identity_dir(base_dir)
     revision = Map.fetch!(candidate, :candidate_revision)
     expected = Map.fetch!(candidate, :expected_prior)
+
+    case memento_policy_record!(dir) do
+      nil ->
+        :ok
+
+      %{
+        record: %{
+          "state" => "inactive",
+          "prior_revision" => ^expected,
+          "candidate_revision" => ^revision
+        }
+      } ->
+        :ok
+
+      _ ->
+        policy_revision_unavailable!("publication differs from the retained compatible pair")
+    end
+
     validate_revision_dir!(dir, revision)
 
-    with_live_revision_lock_in_dir(dir, fn actual ->
-      cond do
-        actual == revision ->
-          {:ok, revision}
+    actual = git_output!(dir, ["rev-parse", @live])
 
-        actual != expected ->
-          {:error, %{code: "identity_publication_conflict", expected: expected, actual: actual}}
+    cond do
+      actual == revision ->
+        {:ok, revision}
 
-        true ->
-          case System.cmd("git", ["merge-base", "--is-ancestor", expected, revision], cd: dir) do
-            {_output, 0} ->
-              git!(dir, ["update-ref", "refs/heads/#{@live}", revision, expected])
-              {:ok, revision}
+      actual != expected ->
+        {:error, %{code: "identity_publication_conflict", expected: expected, actual: actual}}
 
-            _ ->
-              {:error, %{code: "identity_publication_non_fast_forward", expected: expected}}
-          end
-      end
-    end)
+      true ->
+        case System.cmd("git", ["merge-base", "--is-ancestor", expected, revision], cd: dir) do
+          {_output, 0} ->
+            git!(dir, ["update-ref", "refs/heads/#{@live}", revision, expected])
+            {:ok, revision}
+
+          _ ->
+            {:error, %{code: "identity_publication_non_fast_forward", expected: expected}}
+        end
+    end
+  end
+
+  @doc false
+  def restore_live!(base_dir, %{candidate_revision: published, expected_prior: prior}) do
+    dir = identity_dir(base_dir)
+    validate_revision_dir!(dir, prior)
+
+    actual = git_output!(dir, ["rev-parse", @live])
+
+    cond do
+      actual == prior ->
+        {:ok, prior}
+
+      actual != published ->
+        {:error, %{code: "policy_revision_unavailable", expected: published, actual: actual}}
+
+      true ->
+        case System.cmd(
+               "git",
+               ["update-ref", "refs/heads/#{@live}", prior, published],
+               cd: dir,
+               stderr_to_stdout: true
+             ) do
+          {_output, 0} ->
+            {:ok, prior}
+
+          {output, _status} ->
+            {:error, %{code: "policy_revision_unavailable", message: String.trim(output)}}
+        end
+    end
   end
 
   defp publish_live_unmarked!(dir) do
-    with_live_revision_lock_in_dir(dir, fn live ->
-      main = git_output!(dir, ["rev-parse", "main"])
-      validate_revision_dir!(dir, main)
+    live = git_output!(dir, ["rev-parse", @live])
+    main = git_output!(dir, ["rev-parse", "main"])
+    validate_revision_dir!(dir, main)
 
-      case System.cmd("git", ["merge-base", "--is-ancestor", live, main], cd: dir) do
-        {_output, 0} -> git!(dir, ["update-ref", "refs/heads/#{@live}", main, live])
-        _ -> raise ArgumentError, "tightbeam/live cannot fast-forward to main"
-      end
+    case System.cmd("git", ["merge-base", "--is-ancestor", live, main], cd: dir) do
+      {_output, 0} -> git!(dir, ["update-ref", "refs/heads/#{@live}", main, live])
+      _ -> raise ArgumentError, "tightbeam/live cannot fast-forward to main"
+    end
 
-      main
-    end)
+    main
+  end
+
+  defp pending_candidate_result!(dir) do
+    require_clean_main!(dir)
+    expected = git_output!(dir, ["rev-parse", @live])
+    fingerprint = validate_candidate_tree!(dir, expected)
+    candidate_result(dir, expected, fingerprint)
   end
 
   defp candidate_result(dir, expected_prior, fingerprint) do

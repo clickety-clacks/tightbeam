@@ -73,6 +73,47 @@ defmodule Tightbeam.WorkStateTest do
     assert WorkState.status(ctx.db, abandoned.id) == "abandoned"
   end
 
+  test "record projections include only current mementos across both grains and pages", ctx do
+    item = create_item(ctx, "Current metadata")
+    assignment = assign(ctx, "holder", "project metadata", item.id)
+    assert %{attest: receipt} = attest(ctx, assignment.id, "progress")
+    name = "fixture/note"
+
+    for {kind, id} <- [
+          {"work_item", item.id},
+          {"assignment", assignment.id},
+          {"attest", receipt.id}
+        ],
+        values <- [["old"], ["current"]] do
+      assert {:ok, :ok} =
+               DB.transaction(ctx.db, fn txn ->
+                 Tightbeam.Mementos.append_in_txn!(
+                   txn,
+                   kind,
+                   id,
+                   [{name, values}],
+                   {:user, "flynn"},
+                   "fixture-revision"
+                 )
+
+                 :ok
+               end)
+    end
+
+    expected = %{name => ["current"]}
+    assert [%{mementos: ^expected}] = WorkState.list(ctx.db, %{state: "all"}).work
+    assert [%{mementos: ^expected}] = WorkState.page(ctx.db, %{state: "all"}, :latest, 10).work
+    detail = WorkState.detail(ctx.db, assignment.id)
+    assert detail.assignment.mementos == expected
+    assert [%{mementos: ^expected}] = detail.attests
+
+    assert [%{workItem: %{mementos: ^expected}, assignments: [%{mementos: ^expected}]}] =
+             WorkState.list_items(ctx.db, %{}).items
+
+    assert WorkState.item_detail(ctx.db, item.id).workItem.mementos == expected
+    assert {:ok, [[6]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM memento_history")
+  end
+
   test "both grains are random-access and event tables never feed non-cursor truth", ctx do
     item = create_item(ctx, "Feature")
     linked = assign(ctx, "holder", "linked", item.id)
@@ -458,8 +499,7 @@ defmodule Tightbeam.WorkStateTest do
       supervision_interval_ms: 1_000,
       params: %{
         subject: subject,
-        work_item_id: work_item_id,
-        effect_kind: "coordination"
+        work_item_id: work_item_id
       },
       on_assignment_change: ctx.assignment_change,
       on_work_item_change: ctx.item_change
@@ -476,8 +516,7 @@ defmodule Tightbeam.WorkStateTest do
       supervision_interval_ms: 1_000,
       params: %{
         subject: subject,
-        work_item_id: work_item_id,
-        effect_kind: "coordination"
+        work_item_id: work_item_id
       }
     }
   end
@@ -497,11 +536,6 @@ defmodule Tightbeam.WorkStateTest do
 
     params = %{assignment_id: assignment_id, kind: kind, verdict_kind: verdict_kind}
 
-    params =
-      if verdict_kind == "verified",
-        do: Map.put(params, :commit_refs, commit_refs()),
-        else: params
-
     Assignments.__handle__(ctx.db, "attest", %{
       verb: "attest",
       origin: "agent:#{holder}",
@@ -510,18 +544,6 @@ defmodule Tightbeam.WorkStateTest do
       params: params,
       on_assignment_change: ctx.assignment_change
     })
-  end
-
-  defp commit_refs do
-    repo = Path.expand("..", __DIR__)
-    {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
-
-    [
-      %{
-        "repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}",
-        "commit" => String.trim(commit)
-      }
-    ]
   end
 
   defp revoke(ctx, assignment_id) do
