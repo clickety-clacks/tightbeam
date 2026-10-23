@@ -191,7 +191,9 @@ defmodule Tightbeam.JobTraceTest do
              {"asg_direct", "superseded", "replacement"},
              {"asg_direct", "obligation_disposed", "disposition"},
              {"asg_review", "superseded", "replacement"},
-             {"asg_review", "superseded", "replacement"}
+             {"asg_review", "superseded", "replacement"},
+             {"asg_bad", "superseded", "replacement"},
+             {"asg_bad", "obligation_disposed", "disposition"}
            ]
 
     Enum.each(source_cancellations, fn entry ->
@@ -400,7 +402,8 @@ defmodule Tightbeam.JobTraceTest do
     ]
 
     assert %{attest: %{commitRefs: ^remote_refs}} =
-             attest(db, {:session, "holder"}, "asg_bad", "completion", %{
+             attest(db, {:session, "holder"}, "asg_bad", "verdict", %{
+               verdict_kind: "verified",
                commit_refs: remote_refs
              })
 
@@ -408,6 +411,13 @@ defmodule Tightbeam.JobTraceTest do
     assert "git@remote-test" in args
     assert List.last(args) =~ "/srv/repo"
     assert List.last(args) =~ "0123456789abcdef0123456789abcdef01234567^{commit}"
+
+    assert %{attest: %{commitRefs: ^remote_refs}} =
+             attest(db, {:session, "holder"}, "asg_bad", "completion", %{
+               commit_refs: remote_refs
+             })
+
+    refute_received {:commit_ref_command, _, _, _}
   end
 
   test "equal-time numeric turn ids sort numerically", %{db: db} do
