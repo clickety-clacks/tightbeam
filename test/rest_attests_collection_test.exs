@@ -155,22 +155,37 @@ defmodule Tightbeam.RestAttestsCollectionTest do
     assert JSON.decode!(missing.resp_body)["items"] == []
     assert_error(get(ctx, "/api/attests?kind=unknown-kind"), 400, "attests", "invalid_filter")
 
+    expected_ids = [
+      "test_attest_opener_050",
+      "test_attest_opener_100",
+      "test_attest_holder_150",
+      "test_attest_session_opener_175",
+      "test_attest_hidden_200",
+      "test_attest_owner_300"
+    ]
+
     session_rows = get(ctx, "/api/attests", ctx.reader_session.cli_token)
 
-    assert Enum.map(JSON.decode!(session_rows.resp_body)["items"], & &1["id"]) ==
-             ["test_attest_holder_150", "test_attest_session_opener_175"]
+    assert Enum.map(JSON.decode!(session_rows.resp_body)["items"], & &1["id"]) |> Enum.sort() ==
+             Enum.sort(expected_ids)
 
     admin_session_rows = get(ctx, "/api/attests", ctx.admin_session.cli_token)
-    assert JSON.decode!(admin_session_rows.resp_body)["items"] == []
 
-    mismatched_principal =
+    assert Enum.map(JSON.decode!(admin_session_rows.resp_body)["items"], & &1["id"])
+           |> Enum.sort() ==
+             Enum.sort(expected_ids)
+
+    same_owner_session_cursor =
       get(
         ctx,
         "/api/attests?before=" <> URI.encode_www_form(page["page"]["oldestCursor"]),
         ctx.reader_session.cli_token
       )
 
-    assert_error(mismatched_principal, 404, "attests", "not_found")
+    assert same_owner_session_cursor.status == 200
+
+    assert Enum.map(JSON.decode!(same_owner_session_cursor.resp_body)["items"], & &1["id"]) ==
+             ["test_attest_opener_050"]
 
     admin_rows = get(ctx, "/api/attests?limit=20", ctx.admin_token)
     assert length(JSON.decode!(admin_rows.resp_body)["items"]) == 6
@@ -320,7 +335,7 @@ defmodule Tightbeam.RestAttestsCollectionTest do
              Enum.slice(ids, 3, 2)
   end
 
-  test "top-level cursors reject malformed, nested, changed-filter and wrong-principal reuse before lookup",
+  test "top-level cursors reject malformed, nested and changed-filter reuse but accept the owner's session",
        ctx do
     ids = attest_page_ids("test_attest_cursor_", 0, 3)
     insert_attest_rows(ctx, ctx.opener_assignment.id, ids, 15_000)
@@ -343,15 +358,17 @@ defmodule Tightbeam.RestAttestsCollectionTest do
     assert_error(changed_filter, 400, "attests", "invalid_cursor")
     refute Enum.any?(changed_filter_events, &match?({:sql_query, _, _}, &1))
 
-    {wrong_principal, wrong_principal_events} =
+    {same_owner_session, _same_owner_events} =
       traced_attests_get(
         ctx,
         top_level_path <> "&after=" <> URI.encode_www_form(cursor),
         ctx.reader_session.cli_token
       )
 
-    assert_error(wrong_principal, 404, "attests", "not_found")
-    refute Enum.any?(wrong_principal_events, &match?({:sql_query, _, _}, &1))
+    assert same_owner_session.status == 200
+
+    assert Enum.map(JSON.decode!(same_owner_session.resp_body)["items"], & &1["id"]) ==
+             Enum.drop(ids, 1)
 
     {nested_page, _nested_events} =
       traced_attests_get(
