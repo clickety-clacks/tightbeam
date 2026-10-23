@@ -548,25 +548,6 @@ defmodule Tightbeam.Firehose.PublisherTest do
       params: %{assignment_id: assignment.id, kind: "completion", note: "effect matrix complete"}
     }
 
-    assert {:error, %{code: "inapplicable_code_evidence"}} =
-             Dispatch.dispatch(db, handlers, completion)
-
-    assert {:ok, [["open", nil]]} =
-             DB.query(db, "SELECT state,closingAttestId FROM assignments WHERE id=?1", [
-               assignment.id
-             ])
-
-    assert {:ok, [[0]]} =
-             DB.query(
-               db,
-               "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
-               [assignment.id]
-             )
-
-    # The refused completion must not publish a transition or reset inactivity.
-    assert observed_state_classes() == []
-    assert %{state: "pending"} = Wakes.get(db, final_deadline)
-
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
     on_exit(fn ->

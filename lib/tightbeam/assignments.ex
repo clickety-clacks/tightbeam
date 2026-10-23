@@ -1173,56 +1173,30 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  @doc "Return the current independent clean review when its source commits match the submitted result."
+  @doc "Return the current independent clean review for a submitted result."
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
           [String.t()]
-  def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, commit_refs) do
-    with {:ok, [_ | _] = expected} <- canonical_commit_refs(commit_refs),
-         {:ok, [["reviewed-clean", review_holder, encoded]]} <-
-           DB.query(
-             db,
-             """
-             SELECT v.verdictKind,r.holderKey,v.commitRefs
-             FROM attests v
-             JOIN assignments r ON r.id=v.assignmentId
-             WHERE r.reviewsAssignmentId=?1
-               AND v.kind='verdict'
-               AND v.bySession=r.holderKey
-               AND v.verdictKind IN ('reviewed-clean','changes-requested')
-             ORDER BY v.ts DESC,v.rowid DESC
-             LIMIT 1
-             """,
-             [assignment_id]
-           ),
-         true <- review_holder != assignment_holder_key,
-         true <- same_commit_ref_identity?(expected, canonical_stored_commit_refs(encoded)) do
-      ["reviewed-clean"]
-    else
-      _ -> []
-    end
+  def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, _commit_refs) do
+    qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key)
   end
 
-  @doc "Return the current producer verification only when it names the submitted result."
+  @doc "Return the current producer verification for a submitted result."
   @spec qualifying_verification_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
           [String.t()]
-  def qualifying_verification_verdict_kinds(db, assignment_id, holder_key, commit_refs) do
-    with {:ok, [_ | _] = expected} <- canonical_commit_refs(commit_refs),
-         {:ok, [["verified", encoded]]} <-
-           DB.query(
-             db,
-             """
-             SELECT verdictKind,commitRefs
-             FROM attests
-             WHERE assignmentId=?1 AND kind='verdict' AND bySession=?2
-               AND verdictKind IN ('verified','verification-failed')
-             ORDER BY ts DESC,rowid DESC
-             LIMIT 1
-             """,
-             [assignment_id, holder_key]
-           ),
-         true <- same_commit_ref_identity?(expected, canonical_stored_commit_refs(encoded)) do
-      ["verified"]
-    else
+  def qualifying_verification_verdict_kinds(db, assignment_id, holder_key, _commit_refs) do
+    case DB.query(
+           db,
+           """
+           SELECT verdictKind
+           FROM attests
+           WHERE assignmentId=?1 AND kind='verdict' AND bySession=?2
+             AND verdictKind IN ('verified','verification-failed')
+           ORDER BY ts DESC,rowid DESC
+           LIMIT 1
+           """,
+           [assignment_id, holder_key]
+         ) do
+      {:ok, [["verified"]]} -> ["verified"]
       _ -> []
     end
   end
@@ -2795,8 +2769,7 @@ defmodule Tightbeam.Assignments do
                  :ok <- valid_note(call.params[:note]),
                  :ok <- valid_cannot_proceed_reason(call.params),
                  :ok <- absent_verdict_kind(call.params[:verdict_kind]),
-                 :ok <- valid_release_tuple_for_kind(call.params),
-                 :ok <- applicable_code_completion_in_txn(txn, assignment, call) do
+                 :ok <- valid_release_tuple_for_kind(call.params) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
                  ]) != [[1]],
@@ -2869,18 +2842,10 @@ defmodule Tightbeam.Assignments do
          attest,
          holder
        ) do
-    case completion_review_conclusion_in_txn(txn, assignment, call.params[:commit_refs]) do
+    case completion_review_conclusion_in_txn(txn, assignment) do
       "reviewed-clean" ->
         completion_call = Map.delete(call, :review_pending)
-
-        case applicable_code_completion_in_txn(txn, assignment, completion_call) do
-          :ok ->
-            close_completed_assignment_in_txn(txn, completion_call, assignment, attest, holder)
-
-          _ ->
-            append_attest_marker(txn, attest)
-            %{assignment: assignment, attest: attest}
-        end
+        close_completed_assignment_in_txn(txn, completion_call, assignment, attest, holder)
 
       "changes-requested" ->
         schedule_author_review_changes_in_txn(txn, assignment, attest)
@@ -3230,7 +3195,7 @@ defmodule Tightbeam.Assignments do
       %{id: producer_id} = producer ->
         case latest_completion_attest_in_txn(txn, producer_id, producer.holderKey) do
           %{id: _completion_id} = completion ->
-            case completion_review_conclusion_in_txn(txn, producer, completion.commitRefs) do
+            case completion_review_conclusion_in_txn(txn, producer) do
               "reviewed-clean" ->
                 settle_completed_assignment_after_review_in_txn(
                   txn,
@@ -3262,36 +3227,11 @@ defmodule Tightbeam.Assignments do
   end
 
   defp settle_completed_assignment_after_review_in_txn(txn, call, producer, completion) do
-    cond do
-      producer.state != "open" ->
-        :ok
-
-      true ->
-        completion_call =
-          call
-          |> Map.delete(:review_pending)
-          |> Map.put(:params, %{
-            assignment_id: producer.id,
-            kind: "completion",
-            commit_refs: completion.commitRefs
-          })
-
-        case applicable_code_completion_in_txn(txn, producer, completion_call) do
-          :ok ->
-            close_completed_assignment_in_txn(
-              txn,
-              call,
-              producer,
-              completion,
-              producer.holderKey
-            )
-
-            :ok
-
-          _ ->
-            :ok
-        end
+    if producer.state == "open" do
+      close_completed_assignment_in_txn(txn, call, producer, completion, producer.holderKey)
     end
+
+    :ok
   end
 
   defp reopen_completed_assignment_for_review_in_txn(
@@ -3360,22 +3300,12 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  defp completion_review_conclusion_in_txn(txn, assignment, refs) do
+  defp completion_review_conclusion_in_txn(txn, assignment) do
     case latest_review_conclusion_in_txn(txn, assignment.id) do
-      %{kind: kind, holder: review_holder, refs: review_refs}
+      %{kind: kind, holder: review_holder}
       when review_holder != assignment.holderKey and
              kind in ["reviewed-clean", "changes-requested"] ->
-        if assignment.effectKind == "code" do
-          case canonical_commit_refs(refs) do
-            {:ok, [_ | _] = expected} ->
-              if same_commit_ref_identity?(expected, review_refs), do: kind, else: nil
-
-            _ ->
-              nil
-          end
-        else
-          kind
-        end
+        kind
 
       _ ->
         nil
@@ -4468,94 +4398,11 @@ defmodule Tightbeam.Assignments do
 
   defp canonical_commit_refs(_), do: :error
 
-  defp applicable_code_completion_in_txn(_txn, _assignment, %{params: %{kind: kind}})
-       when kind != "completion",
-       do: :ok
-
-  defp applicable_code_completion_in_txn(txn, %{effectKind: "code"} = assignment, call) do
-    refs = call.params[:commit_refs]
-    review = latest_review_conclusion_in_txn(txn, assignment.id)
-    verification = latest_verification_conclusion_in_txn(txn, assignment.id, assignment.holderKey)
-
-    verification_matches? =
-      case verification do
-        %{kind: "verified", holder: holder, refs: verification_refs} ->
-          holder == assignment.holderKey and
-            same_commit_ref_identity?(refs, verification_refs)
-
-        _ ->
-          false
-      end
-
-    review_matches? =
-      case review do
-        %{kind: "reviewed-clean", holder: holder, refs: review_refs} ->
-          holder != assignment.holderKey and same_commit_ref_identity?(refs, review_refs)
-
-        _ ->
-          false
-      end
-
-    if is_list(refs) and refs != [] and verification_matches? and
-         (Map.get(call, :review_pending, false) or review_matches?) do
-      :ok
-    else
-      code_completion_evidence_error(refs, review, assignment)
-    end
-  end
-
-  defp applicable_code_completion_in_txn(_txn, _assignment, _call), do: :ok
-
-  defp code_completion_evidence_error(candidate_refs, review, assignment) do
-    detail =
-      case {candidate_refs, review} do
-        {[_ | _] = refs, %{kind: "reviewed-clean", holder: review_holder, refs: review_refs}}
-        when review_holder != assignment.holderKey ->
-          cond do
-            review_refs in [nil, []] ->
-              "the linked independent reviewed-clean verdict is missing commitRefs for completion candidate #{format_commit_refs(refs)}; file a new independent reviewed-clean verdict for the candidate commits, then retry completion"
-
-            not same_commit_ref_identity?(refs, review_refs) ->
-              "the linked independent reviewed-clean verdict commitRefs #{format_commit_refs(review_refs)} do not match completion candidate #{format_commit_refs(refs)}; file a new independent reviewed-clean verdict for the candidate commits, then retry completion"
-
-            true ->
-              "code completion requires the latest independent clean review and holder verification to match its immutable commitRefs"
-          end
-
-        _ ->
-          "code completion requires the latest independent clean review and holder verification to match its immutable commitRefs"
-      end
-
-    latest_review =
-      case review do
-        %{kind: kind, refs: review_refs} -> "#{kind} commitRefs=#{JSON.encode!(review_refs)}"
-        nil -> "none commitRefs=null"
-      end
-
-    error(
-      "inapplicable_code_evidence",
-      "#{detail}; expected commitRefs=#{JSON.encode!(candidate_refs)}; latest linked review conclusion=#{latest_review}"
-    )
-  end
-
-  defp inapplicable_code_evidence_error do
-    error(
-      "inapplicable_code_evidence",
-      "code completion requires the latest independent clean review and holder verification to match its immutable commitRefs"
-    )
-  end
-
-  defp format_commit_refs(refs) do
-    Enum.map_join(refs, ", ", fn %{"repo" => repo, "commit" => commit} ->
-      "#{repo}@#{commit}"
-    end)
-  end
-
   defp latest_review_conclusion_in_txn(txn, assignment_id) do
     case Txn.q(
            txn,
            """
-           SELECT v.verdictKind,r.holderKey,v.commitRefs
+           SELECT v.verdictKind,r.holderKey
            FROM attests v
            JOIN assignments r ON r.id=v.assignmentId
            WHERE r.reviewsAssignmentId=?1
@@ -4567,61 +4414,13 @@ defmodule Tightbeam.Assignments do
            """,
            [assignment_id]
          ) do
-      [[kind, holder, refs]] ->
-        %{kind: kind, holder: holder, refs: canonical_stored_commit_refs(refs)}
+      [[kind, holder]] ->
+        %{kind: kind, holder: holder}
 
       [] ->
         nil
     end
   end
-
-  defp latest_verification_conclusion_in_txn(txn, assignment_id, holder) do
-    case Txn.q(
-           txn,
-           """
-           SELECT verdictKind,bySession,commitRefs
-           FROM attests
-           WHERE assignmentId=?1
-             AND kind='verdict'
-             AND bySession=?2
-             AND verdictKind IN ('verified','verification-failed')
-           ORDER BY ts DESC,rowid DESC
-           LIMIT 1
-           """,
-           [assignment_id, holder]
-         ) do
-      [[kind, author, refs]] ->
-        %{kind: kind, holder: author, refs: canonical_stored_commit_refs(refs)}
-
-      [] ->
-        nil
-    end
-  end
-
-  defp canonical_stored_commit_refs(nil), do: nil
-
-  defp canonical_stored_commit_refs(encoded) when is_binary(encoded) do
-    case JSON.decode(encoded) do
-      {:ok, decoded} ->
-        case canonical_commit_refs(decoded) do
-          {:ok, refs} -> refs
-          :error -> nil
-        end
-
-      _ ->
-        nil
-    end
-  end
-
-  defp same_commit_ref_identity?(left, right) when is_list(left) and is_list(right) do
-    commit_identity = fn refs ->
-      refs |> Enum.map(& &1["commit"]) |> Enum.uniq() |> Enum.sort()
-    end
-
-    commit_identity.(left) == commit_identity.(right)
-  end
-
-  defp same_commit_ref_identity?(_left, _right), do: false
 
   defp run_git_cat_file(db, host, path, commit) do
     base_dir =

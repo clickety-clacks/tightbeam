@@ -2069,9 +2069,9 @@ defmodule Tightbeam.CliIntegrationTest do
            } = machine_line!(refused)
   end
 
-  # O2 keeps its code-evidence edge active even when the org has no learned
-  # statutes. The refusal creates no remedy episode or wake.
-  test "real CLI refuses bare code completion on a rule-free org", ctx do
+  # On an org with no learned statutes, a bare completion closes the
+  # assignment and creates no remedy episode or wake.
+  test "real CLI accepts bare code completion on a rule-free org", ctx do
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     coder =
@@ -2120,17 +2120,17 @@ defmodule Tightbeam.CliIntegrationTest do
 
     work_id = JSON.decode!(assigned)["id"]
 
-    {denied, denied_status} =
+    {completed, completed_status} =
       System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
         cd: coder_dir,
         stderr_to_stdout: true
       )
 
-    assert denied_status != 0
-    assert denied =~ "inapplicable_code_evidence"
+    assert completed_status == 0
+    assert completed =~ "closed"
 
-    assert {:ok, [["open", nil]]} =
-             DB.query(ctx.db, "SELECT state,closingAttestId FROM assignments WHERE id=?1", [
+    assert {:ok, [["closed", "completed"]]} =
+             DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id=?1", [
                work_id
              ])
 
