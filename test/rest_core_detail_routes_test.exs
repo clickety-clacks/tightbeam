@@ -400,7 +400,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     end
   end
 
-  test "session collection returns ordered canonical items limited to visible sessions", ctx do
+  test "session collection returns ordered canonical items for a session token", ctx do
     outsider_device = outsider_device(ctx)
     outsider_session = ensure_main_session(ctx.db, "outsider")
     item = StateResources.session(outsider_session)
@@ -412,13 +412,13 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     decoded_collection = JSON.decode!(collection.resp_body)
     assert decoded_collection["schemaVersion"] == 1
     assert decoded_collection["resource"] == "sessions"
-    assert decoded_collection["items"] == [item]
+    assert Enum.any?(decoded_collection["items"], &(&1["sessionKey"] == item["sessionKey"]))
     assert is_binary(decoded_collection["page"]["oldestCursor"])
     assert is_binary(decoded_collection["page"]["newestCursor"])
     assert decoded_collection["page"]["hasMoreBefore"] == false
     assert decoded_collection["page"]["hasMoreAfter"] == false
     assert collection.resp_body =~ item_bytes
-    refute collection.resp_body =~ ctx.admin_session.session_key
+    assert collection.resp_body =~ ctx.admin_session.session_key
 
     before_only_visible_session =
       get(
@@ -435,8 +435,15 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert detail.status == 200
     assert JSON.decode!(detail.resp_body)["item"] == item
 
+    sibling_detail =
+      get(ctx, "/api/sessions/#{ctx.admin_session.session_key}", outsider_session.cli_token)
+
+    assert sibling_detail.status == 200
+
     session_collection = get(ctx, "/api/sessions", outsider_session.cli_token)
-    assert JSON.decode!(session_collection.resp_body)["items"] == [item]
+    session_items = JSON.decode!(session_collection.resp_body)["items"]
+    assert Enum.any?(session_items, &(&1["sessionKey"] == item["sessionKey"]))
+    assert Enum.any?(session_items, &(&1["sessionKey"] == ctx.admin_session.session_key))
 
     admin_collection = get(ctx, "/api/sessions", ctx.admin_device.token)
     assert admin_collection.status == 200
@@ -1381,8 +1388,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       cases = [
         {path, "", 401, "auth_failed", nil, [:bearer_auth]},
         {path, "invalid-token", 401, "auth_failed", nil, [:bearer_auth]},
-        {path, "tbc_core_detail", 400, "invalid_message", nil,
-         [:bearer_auth, :query_decode, :principal_resolution]},
         {path <> "?asUser=", "tbc_core_detail", 400, "invalid_message", nil,
          [:bearer_auth, :query_decode, :principal_resolution]},
         {path <> "?asUser=flynn&asUser=flynn", "tbc_core_detail", 400, "invalid_as_user", nil,
@@ -1408,6 +1413,15 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     marker_as_session = get(ctx, "/api/read-markers/core-scope", ctx.admin_session.cli_token)
     assert_error(marker_as_session, 404, "read markers", "not_found")
     assert_application_headers(marker_as_session)
+  end
+
+  test "org token reads core details without naming a user", ctx do
+    for %{path: path, resource: resource} <- core_detail_cases(ctx) do
+      response = get(ctx, path, "tbc_core_detail")
+      assert response.status == 200, "#{path}: #{response.resp_body}"
+      assert_application_headers(response)
+      assert JSON.decode!(response.resp_body)["resource"] == resource
+    end
   end
 
   test "AC3 and AC7 trace one shared lookup, one fixed statement, one AU4 boundary, and one encoder",
@@ -1487,13 +1501,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
                StateResources.encode_item(row.resource, row.item, ctx.catalog)
 
       session = get(ctx, row.path, ctx.admin_session.cli_token)
-
-      if row.kind == :statute do
-        assert_error(session, 404, row.resource, "not_found")
-      else
-        assert session.status == 200
-      end
-
+      assert session.status == 200
       assert_application_headers(session)
 
       {forbidden, forbidden_trace} = traced_get(ctx, row.path, outsider.token)
@@ -2217,11 +2225,16 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
            ]
 
     cross_session = get(ctx, "/api/work-items?before=" <> before, ctx.admin_session.cli_token)
-    assert_error(cross_session, 404, "work items", "not_found")
+    assert cross_session.status == 200
+    assert JSON.decode!(cross_session.resp_body)["items"] == []
 
-    org_page = get(ctx, path <> "&asUser=flynn", "tbc_core_detail")
+    org_page = get(ctx, path, "tbc_core_detail")
     assert org_page.status == 200
     assert JSON.decode!(org_page.resp_body)["items"] == JSON.decode!(page.resp_body)["items"]
+
+    org_as_user_page = get(ctx, path <> "&asUser=flynn", "tbc_core_detail")
+    assert org_as_user_page.status == 200
+    assert JSON.decode!(org_as_user_page.resp_body)["items"] == JSON.decode!(page.resp_body)["items"]
 
     session_as_user = get(ctx, path <> "&asUser=flynn", ctx.admin_session.cli_token)
     assert session_as_user.status == 200
@@ -2231,7 +2244,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     for {suffix, token, status, code} <- [
           {"?unknown=x", "bad-token", 401, "auth_failed"},
-          {"", "tbc_core_detail", 400, "invalid_message"},
           {"?asUser=flynn", ctx.token, 400, "invalid_as_user"},
           {"?asUser=flynn&asUser=flynn", "tbc_core_detail", 400, "invalid_as_user"},
           {"?asUser=flynn%zz", ctx.token, 400, "malformed_query"}
@@ -3161,8 +3173,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         path: "/api/attests/#{attest_id}",
         notice: attest_notice,
         primary_refs: %{"attestId" => attest_id},
-        allowed_bearers: [owner_device.token, owner_session.cli_token],
-        denied_bearer: ctx.admin_session.cli_token,
+        allowed_bearers: [owner_device.token, owner_session.cli_token, ctx.admin_session.cli_token],
+        denied_bearer: nil,
         unknown_path: "/api/attests/att_g7_detail_missing"
       },
       %{
@@ -3173,8 +3185,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           "messageId" => message.id,
           "sessionKey" => owner_session.session_key
         },
-        allowed_bearers: [owner_device.token, owner_session.cli_token],
-        denied_bearer: ctx.admin_session.cli_token,
+        allowed_bearers: [owner_device.token, owner_session.cli_token, ctx.admin_session.cli_token],
+        denied_bearer: nil,
         unknown_path: "/api/sessions/#{owner_session.session_key}/messages/no-such-message"
       },
       %{
@@ -3182,8 +3194,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         path: "/api/facts/#{session_fact_id}",
         notice: session_fact_notice,
         primary_refs: %{"factId" => session_fact_id},
-        allowed_bearers: [owner_device.token, owner_session.cli_token],
-        denied_bearer: ctx.admin_session.cli_token,
+        allowed_bearers: [owner_device.token, owner_session.cli_token, ctx.admin_session.cli_token],
+        denied_bearer: nil,
         unknown_path: "/api/facts/#{session_fact_id + 1_000_000}"
       },
       %{

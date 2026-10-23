@@ -47,7 +47,13 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     refute StateVisibility.visible?(db, malformed_notice, "unrelated-user", false)
     refute StateVisibility.visible?(db, malformed_notice, %{kind: "session", id: "unrelated"})
 
-    for session_key <- ["effort-holder", "unrelated-holder"] do
+    for session_key <- [
+          "effort-holder",
+          "unrelated-holder",
+          "agent-asker",
+          "agent-asked",
+          "unrelated"
+        ] do
       Org.create(db, %{
         session_key: session_key,
         display_name: session_key,
@@ -82,7 +88,7 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
       notice = put_in(effort_notice, ["class"], "decision_request.#{class}")
       assert StateVisibility.visible?(db, notice, "effort-expecter", false)
       assert StateVisibility.visible?(db, notice, %{kind: "session", id: "effort-holder"})
-      refute StateVisibility.visible?(db, notice, %{kind: "session", id: "unrelated-holder"})
+      assert StateVisibility.visible?(db, notice, %{kind: "session", id: "unrelated-holder"})
       refute StateVisibility.visible?(db, notice, "unrelated-user", false)
     end
 
@@ -98,7 +104,7 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
 
     assert StateVisibility.visible?(db, agent_notice, %{kind: "session", id: "agent-asker"})
     assert StateVisibility.visible?(db, agent_notice, %{kind: "session", id: "agent-asked"})
-    refute StateVisibility.visible?(db, agent_notice, %{kind: "session", id: "unrelated"})
+    assert StateVisibility.visible?(db, agent_notice, %{kind: "session", id: "unrelated"})
     assert StateVisibility.visible?(db, agent_notice, "agent-owner", false)
     refute StateVisibility.visible?(db, agent_notice, "unrelated-user", false)
   end
@@ -112,6 +118,19 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
         display_name: "operator raiser",
         owner_user_id: "raiser-owner",
         origin: "user:raiser-owner",
+        archetype: "default",
+        host: "synthetic-host",
+        harness: "fixture",
+        provider: "fixture_provider",
+        model: Model.new("fixture-model")
+      })
+
+    _unrelated =
+      Org.create(db, %{
+        session_key: "unrelated-session",
+        display_name: "unrelated session",
+        owner_user_id: "unrelated-owner",
+        origin: "user:unrelated-owner",
         archetype: "default",
         host: "synthetic-host",
         harness: "fixture",
@@ -135,7 +154,7 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
       assert StateVisibility.visible?(db, event, "raiser-owner", false)
       refute StateVisibility.visible?(db, event, "unrelated-user", false)
       assert StateVisibility.visible?(db, event, %{kind: "session", id: raiser.session_key})
-      refute StateVisibility.visible?(db, event, %{kind: "session", id: "unrelated-session"})
+      assert StateVisibility.visible?(db, event, %{kind: "session", id: "unrelated-session"})
       assert StateVisibility.visible?(db, event, "admin", true)
     end
   end

@@ -15,7 +15,9 @@ defmodule Tightbeam.ArtifactContentFetchTest do
     :ok =
       DB.execute(db, """
       INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,createdAt,updatedAt)
-      VALUES('content-fixture','content','fixture','user:fixture','coder','fixture','fixture_provider','fixture-model',1,1);
+      VALUES
+        ('content-fixture','content','fixture','user:fixture','coder','fixture','fixture_provider','fixture-model',1,1),
+        ('unrelated','unrelated','other','user:other','coder','fixture','fixture_provider','fixture-model',1,1);
       INSERT INTO work_items(id,title,ownerUserId,createdByUser,createdAt)
       VALUES('wi_content_fixture','Content fixture','fixture','fixture',1);
       """)
@@ -60,7 +62,7 @@ defmodule Tightbeam.ArtifactContentFetchTest do
              call
              | principal: {:session, "unrelated"},
                rest_principal: %{kind: "session", id: "unrelated", is_admin: false}
-           }) == %{code: "not_found"}
+           }).code == "content_not_captured"
 
     assert handler.(%{call | principal: {:process, "fixture"}}) == %{code: "forbidden"}
     assert handler.(%{params: call.params}) == %{code: "forbidden"}

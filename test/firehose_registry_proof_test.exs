@@ -717,9 +717,10 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     assert_received {:class_notice, :opener_decision, %{"class" => "decision_request.opened"}}
     assert_received {:class_notice, :opener_filter, %{"class" => "attest.filed"}}
 
-    for tag <- [:sibling_attest, :sibling_decision, :sibling_filter] do
-      refute_received {:class_notice, ^tag, _notice}
-    end
+    assert_received {:class_notice, :sibling_attest, %{"class" => "attest.filed"}}
+    assert_received {:class_notice, :sibling_decision, %{"class" => "decision_request.opened"}}
+    assert_received {:class_notice, :sibling_filter, %{"class" => "attest.filed"}}
+    assert_received {:class_notice, :sibling_filter, %{"class" => "decision_request.opened"}}
 
     assert %{"class" => "verb.accepted"} = take_notice(ctx.hub)
 
@@ -770,7 +771,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
         }
       })
 
-    assert rest_page.rows == []
+    assert Enum.any?(rest_page.rows, &(&1.id == "attest-row"))
 
     holder_rest_page =
       StateResources.query_attests(ctx.db, %{
@@ -951,9 +952,11 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       assert_received {:class_notice, :work_item_owner, %{"class" => "assignment.closed"}}
     end
 
-    for tag <- [:session_opener, :user_opener] do
-      refute_received {:class_notice, ^tag, _notice}
+    for _ <- 1..2 do
+      assert_received {:class_notice, :session_opener, %{"class" => "assignment.closed"}}
     end
+
+    refute_received {:class_notice, :user_opener, _notice}
 
     first_notice = take_notice(ctx.hub)
     second_notice = take_notice(ctx.hub)
@@ -1105,7 +1108,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     assert role_refs["sessionKey"] == "role-bound-target"
     assert role_refs["origin"] == "agent:role-creator"
     assert role_refs["principal"] == "session:role-creator"
-    refute_received {:class_notice, :role_bound_target, _notice}
+    assert_received {:class_notice, :role_bound_target, %{"class" => "role.created"}}
     refute_received {:class_notice, :role_bound_owner, _notice}
 
     Enum.each(role_listeners, fn {_tag, pid} -> Process.exit(pid, :kill) end)
@@ -1154,7 +1157,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
     assert removed_refs["role"] == removed_role_name
     assert removed_refs["sessionKey"] == "role-bound-target"
-    refute_received {:class_notice, :removed_bound_target, _notice}
+    assert_received {:class_notice, :removed_bound_target, %{"class" => "role.removed"}}
     refute_received {:class_notice, :removed_bound_owner, _notice}
   end
 
