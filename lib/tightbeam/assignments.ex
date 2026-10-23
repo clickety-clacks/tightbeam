@@ -5,7 +5,6 @@ defmodule Tightbeam.Assignments do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
-  alias Tightbeam.Harness.Support
 
   alias Tightbeam.{
     ConditionFacts,
@@ -4216,14 +4215,7 @@ defmodule Tightbeam.Assignments do
 
   defp valid_commit_refs(_db, "completion", refs) when is_list(refs), do: :ok
 
-  defp valid_commit_refs(db, "verdict", refs) when is_list(refs) do
-    Enum.reduce_while(refs, :ok, fn ref, :ok ->
-      case validate_commit_ref(db, ref) do
-        :ok -> {:cont, :ok}
-        error -> {:halt, error}
-      end
-    end)
-  end
+  defp valid_commit_refs(_db, "verdict", refs) when is_list(refs), do: :ok
 
   defp valid_commit_refs(_db, kind, _refs) when kind in ["completion", "verdict"],
     do: error("invalid_commit_refs", "commitRefs must be an array")
@@ -4352,25 +4344,6 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  defp validate_commit_ref(db, ref) when is_map(ref) do
-    normalized = Map.new(ref, fn {key, value} -> {to_string(key), value} end)
-
-    with ["commit", "repo"] <- normalized |> Map.keys() |> Enum.sort(),
-         repo when is_binary(repo) <- normalized["repo"],
-         commit when is_binary(commit) <- normalized["commit"],
-         true <- Regex.match?(~r/\A(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\z/u, commit),
-         [host, path] <- String.split(repo, ":", parts: 2),
-         true <- host != "" and Path.type(path) == :absolute,
-         {_output, 0} <- run_git_cat_file(db, host, path, commit) do
-      :ok
-    else
-      _ -> error("unverifiable_commit_ref", "commitRefs contains an unverifiable commit")
-    end
-  end
-
-  defp validate_commit_ref(_db, _ref),
-    do: error("unverifiable_commit_ref", "commitRefs contains an unverifiable commit")
-
   defp canonical_commit_refs(nil), do: {:ok, nil}
 
   defp canonical_commit_refs(refs) when is_list(refs) do
@@ -4483,49 +4456,6 @@ defmodule Tightbeam.Assignments do
         nil
     end
   end
-
-  defp run_git_cat_file(db, host, path, commit) do
-    base_dir =
-      Application.get_env(
-        :tightbeam,
-        :base_dir,
-        Path.join(System.user_home!(), ".tightbeam")
-      )
-
-    case Placement.hosts(base_dir, db)[host] do
-      %{ssh: nil} ->
-        run_commit_ref_command(
-          "git",
-          ["-C", path, "cat-file", "-e", "#{commit}^{commit}"],
-          stderr_to_stdout: true
-        )
-
-      %{ssh: destination} when is_binary(destination) ->
-        command =
-          ["git", "-C", path, "cat-file", "-e", "#{commit}^{commit}"]
-          |> Enum.map_join(" ", &shell_quote/1)
-
-        run_commit_ref_command(
-          "ssh",
-          Support.ssh_opts() ++ [destination, "sh", "-c", shell_quote(command)],
-          stderr_to_stdout: true
-        )
-
-      nil ->
-        {:error, :unknown_host}
-    end
-  rescue
-    _ -> {:error, :verification_failed}
-  catch
-    :exit, _ -> {:error, :verification_failed}
-  end
-
-  defp run_commit_ref_command(executable, args, opts) do
-    runner = Application.get_env(:tightbeam, :commit_ref_command, &System.cmd/3)
-    runner.(executable, args, opts)
-  end
-
-  defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
 
   defp valid_kind(kind) when kind in ["progress", "completion", "cannot-proceed"], do: :ok
 

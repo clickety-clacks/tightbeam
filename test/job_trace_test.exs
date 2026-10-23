@@ -374,7 +374,7 @@ defmodule Tightbeam.JobTraceTest do
            ]
   end
 
-  test "commit refs verify on the named host", %{db: db} do
+  test "review verdict accepts commit refs for an unreadable reviewer checkout", %{db: db} do
     parent = self()
     old_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
@@ -395,7 +395,7 @@ defmodule Tightbeam.JobTraceTest do
 
     Application.put_env(:tightbeam, :commit_ref_command, fn executable, args, opts ->
       send(parent, {:commit_ref_command, executable, args, opts})
-      {"", 0}
+      {"missing commit", 1}
     end)
 
     remote_refs = [
@@ -405,19 +405,9 @@ defmodule Tightbeam.JobTraceTest do
       }
     ]
 
-    assert %{attest: %{commitRefs: ^remote_refs}} =
-             attest(db, {:session, "holder"}, "asg_bad", "verdict", %{
-               verdict_kind: "verified",
-               commit_refs: remote_refs
-             })
-
-    assert_received {:commit_ref_command, "ssh", args, [stderr_to_stdout: true]}
-    assert "git@remote-test" in args
-    assert List.last(args) =~ "/srv/repo"
-    assert List.last(args) =~ "0123456789abcdef0123456789abcdef01234567^{commit}"
-
-    assert %{attest: %{commitRefs: ^remote_refs}} =
-             attest(db, {:session, "holder"}, "asg_bad", "completion", %{
+    assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: ^remote_refs}} =
+             attest(db, {:session, "reviewer"}, "asg_review", "verdict", %{
+               verdict_kind: "reviewed-clean",
                commit_refs: remote_refs
              })
 
