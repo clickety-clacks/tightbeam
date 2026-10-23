@@ -1031,7 +1031,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
              sidecars_before
   end
 
-  test "cross-owner or incomplete registration refuses without any wake row", ctx do
+  test "wrong-target or incomplete registration refuses without any wake row", ctx do
     assignment(ctx.db, "B", "intruder")
     before = wake_count(ctx.db)
 
@@ -1050,7 +1050,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     assert wake_count(ctx.db) == before
 
-    assert {:ok, {:error, %{code: "unknown_assignment"}}} =
+    assert {:ok, {:error, %{code: "invalid_target"}}} =
              DB.transaction(ctx.db, fn txn ->
                Wakes.register_wait_in_txn(txn, %{
                  session_key: "holder",
@@ -1164,9 +1164,6 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       assert %{name: "resolver-role"} =
                Roles.create!(ctx.db, "resolver-role", "owner-a", "resolver")
 
-      assert %{name: "intruder-role"} =
-               Roles.create!(ctx.db, "intruder-role", "owner-b", "intruder")
-
       turn = running_turn(ctx.db, "resolver")
       handler = Gateway.handlers(%{db: ctx.db, wake_scheduler: ctx.scheduler})["wake"]
       shipped = File.read!("priv/kungfu/agentic-engineering/rules/verification.toml")
@@ -1201,13 +1198,6 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       assert wake.originating_turn_seq == turn.seq
       refute response.eligible
       before_count = wake_count(ctx.db)
-
-      assert %{code: "unknown_assignment"} =
-               handler.(%{
-                 call
-                 | origin: "agent:intruder-role",
-                   principal: {:session, "intruder"}
-               })
 
       assert %{code: "invalid_target"} = handler.(%{call | session_key: "verifier"})
       assert wake_count(ctx.db) == before_count
@@ -1288,7 +1278,8 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert unrelated_wait.session_key == "holder"
     assert unrelated_wait.obligation_ref == "A"
 
-    # Owner scope still uses the actual registrant's owner at the command seam.
+    # The registrant's owner does not scope registration; the wake keeps the
+    # obligation's own owner.
     assert {:ok, _} =
              DB.query(
                ctx.db,
@@ -1298,10 +1289,14 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     cross_owner = %{input | owner_user_id: "owner-b"}
     before_count = wake_count(ctx.db)
 
-    assert {:ok, {:error, %{code: "unknown_assignment"}}} =
+    assert {:ok, cross_wake} =
              DB.transaction(ctx.db, &Wakes.register_wait_in_txn(&1, cross_owner))
 
-    assert wake_count(ctx.db) == before_count
+    assert cross_wake.creator_session_key == "supervisor"
+    assert cross_wake.session_key == "holder"
+    assert cross_wake.obligation_ref == "A"
+    assert Wakes.get(ctx.db, cross_wake.wake_id).owner_user_id == "owner-a"
+    assert wake_count(ctx.db) > before_count
   end
 
   @tag persistent: true

@@ -7930,7 +7930,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{ok: true} = Task.await(cancel)
   end
 
-  test "role verbs enforce owner, admin, binding ownership, and process denials", ctx do
+  test "role verbs record mutations from any accountable caller and deny processes", ctx do
     {:pending, _} =
       Devices.pair(ctx.db, %{
         device_id: "other-device",
@@ -7962,19 +7962,19 @@ defmodule Tightbeam.GatewayTest do
       assert %{code: "denied"} = handlers[verb].(%{origin: "process:cron", params: params})
     end
 
-    assert %{code: "denied"} =
+    assert %{role: %{bound_session_key: "agent:other"}} =
              handlers["role-bind"].(%{
                origin: "user:other",
                params: %{name: "flynn-office", session_key: other.session_key}
              })
 
-    assert %{code: "denied"} =
+    assert %{role: %{owner_user_id: "other", bound_session_key: "k1"}} =
              handlers["role-create"].(%{
                origin: "user:other",
                params: %{name: "foreign-binding", bind: "k1"}
              })
 
-    assert %{code: "denied"} =
+    assert %{role: %{bound_session_key: "k1"}} =
              handlers["role-bind"].(%{
                origin: "user:other",
                params: %{name: "other-office", session_key: "k1"}

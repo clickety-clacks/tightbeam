@@ -551,22 +551,15 @@ defmodule Tightbeam.EscalationTest do
              )
   end
 
-  test "withdrawal is raiser-only and retirement sweeps requests and waivers", ctx do
+  test "any caller may withdraw a request and retirement sweeps requests and waivers", ctx do
     call = call(ctx.raiser, %{assignment_id: "a5", kind: "completion"})
     {:decision_pending, id} = open(ctx, call, statute())
 
-    assert %{code: "not_raiser"} =
+    assert %{status: "withdrawn", withdrawn_reason: "no"} =
              Escalation.withdraw(ctx.db, %{
                origin: "user:flynn",
                principal: {:user, "flynn"},
                params: %{request_id: id, reason: "no"}
-             })
-
-    assert %{status: "withdrawn", withdrawn_reason: "changed course"} =
-             Escalation.withdraw(ctx.db, %{
-               origin: "agent:raiser",
-               principal: {:session, ctx.raiser.session_key},
-               params: %{request_id: id, reason: "changed course"}
              })
 
     {:decision_pending, fresh} = open(ctx, call, statute())
@@ -771,17 +764,10 @@ defmodule Tightbeam.EscalationTest do
     withdraw_call = put_in(call, [:params, :kind], "progress")
     {:decision_pending, withdraw_id} = open(ctx, withdraw_call, statute())
 
-    assert %{code: "not_raiser"} =
+    assert %{status: "withdrawn"} =
              Escalation.withdraw(ctx.db, %{
                origin: "user:other",
                principal: {:user, "other"},
-               params: %{request_id: withdraw_id, reason: "wrong raiser"}
-             })
-
-    assert %{status: "withdrawn"} =
-             Escalation.withdraw(ctx.db, %{
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
                params: %{request_id: withdraw_id, reason: "changed course"}
              })
 
@@ -937,7 +923,7 @@ defmodule Tightbeam.EscalationTest do
            end) == 1
   end
 
-  test "operator ask validates linked assignment ownership in the winning transaction", ctx do
+  test "operator ask validates the linked assignment in the winning transaction", ctx do
     other = session(ctx.db, "other-holder", "other")
     insert_assignment!(ctx.db, "a-owned", ctx.raiser.session_key, "open")
     insert_assignment!(ctx.db, "a-foreign", other.session_key, "open")
@@ -949,7 +935,7 @@ defmodule Tightbeam.EscalationTest do
                operator_call(ctx.raiser, %{question: "owned?", assignment: "a-owned"})
              )
 
-    assert %{code: "not_owner"} =
+    assert %{assignment_id: "a-foreign"} =
              Escalation.operator_ask(
                ctx.db,
                operator_call(ctx.raiser, %{question: "foreign?", assignment: "a-foreign"})
@@ -967,7 +953,7 @@ defmodule Tightbeam.EscalationTest do
                operator_call(ctx.raiser, %{question: "missing?", assignment: "a-missing"})
              )
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[2]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'")
   end
 
@@ -983,28 +969,6 @@ defmodule Tightbeam.EscalationTest do
 
     direct =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "ship?"}))
-
-    main_rule =
-      owner_operator_rule(direct.id, %{decision: "accept"})
-      |> Map.put(:transport_session_key, Org.personal_session_key("flynn"))
-
-    assert %{code: "proxy_only"} = Escalation.operator_rule(ctx.db, main_rule)
-
-    assert %{code: "not_owner"} =
-             Escalation.operator_rule(ctx.db, %{
-               origin: "user:flynn",
-               principal: {:session, Org.personal_session_key("flynn")},
-               transport_session_key: Org.personal_session_key("flynn"),
-               params: %{request: direct.id, decision: "accept"}
-             })
-
-    assert %{code: "not_owner"} =
-             Escalation.operator_rule(ctx.db, %{
-               origin: "user:other",
-               principal: {:user, "other"},
-               transport_session_key: nil,
-               params: %{request: direct.id, decision: "accept"}
-             })
 
     assert %{code: "invalid_decision"} =
              Escalation.operator_rule(
@@ -1033,7 +997,7 @@ defmodule Tightbeam.EscalationTest do
     assert ruled.status == "ruled"
     assert ruled.decision == "accept"
     assert ruled.ruled_by == "user:flynn"
-    assert ruled.ruled_via_session_key == nil
+    assert ruled.ruled_via_session_key == "agent:raiser:app"
     assert ruled.rationale == nil
     assert ruled.consumed_at == nil
 
@@ -1041,7 +1005,7 @@ defmodule Tightbeam.EscalationTest do
              on_behalf_of: "user:flynn",
              performer: %{
                principal: %{state: "known", value: "user:flynn"},
-               session: %{state: "none"}
+               session: %{state: "known", key: "agent:raiser:app"}
              }
            }
 
@@ -1142,6 +1106,69 @@ defmodule Tightbeam.EscalationTest do
              Escalation.waive(ctx.db, owner_operator_rule(direct.id, %{decision: "accept"}),
                authorized: true
              )
+
+    owner_main =
+      Org.create(ctx.db, %{
+        session_key: Org.personal_session_key("flynn"),
+        display_name: "Owner Main",
+        kind: "main",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    proxied =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "proxy?"}))
+
+    main_ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        owner_operator_rule(proxied.id, %{decision: "accept"})
+        |> Map.put(:transport_session_key, owner_main.session_key),
+        scheduler: scheduler
+      )
+
+    assert main_ruled.status == "ruled"
+    assert main_ruled.ruled_by == "user:flynn"
+    assert main_ruled.ruled_via_session_key == owner_main.session_key
+
+    assert main_ruled.ruling_attribution == %{
+             on_behalf_of: "user:flynn",
+             performer: %{
+               principal: %{state: "known", value: "user:flynn"},
+               session: %{state: "known", key: owner_main.session_key}
+             }
+           }
+  end
+
+  test "operator rulings require a retained submitting session", ctx do
+    request =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "session required?"}))
+
+    for session_key <- [nil, "unretained-session"] do
+      no_session =
+        owner_operator_rule(request.id, %{decision: "accept"})
+        |> Map.put(:transport_session_key, session_key)
+
+      assert %{code: "operator_ruling_submitting_session_required"} =
+               Escalation.operator_rule(ctx.db, no_session)
+    end
+
+    assert Escalation.raw_by_id(ctx.db, request.id).status == "open"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1",
+               [request.id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM condition_facts WHERE scope=?1", [request.id])
   end
 
   test "presenting session is preserved beside the performing principal", ctx do
@@ -1231,7 +1258,7 @@ defmodule Tightbeam.EscalationTest do
     assert observer == "session:#{ctx.raiser.session_key}"
     refute fields =~ "integrity?"
 
-    assert shape_digest == "efa9964d4e3857fc094f9b699b19ac1feb91a30b439236e05572b483cb886403"
+    assert shape_digest == "58fc94c6274ec4e8047e864c3f190ae7136d37507128769752e9512e9d77dd97"
     assert ruled.ruling_fact_id > 0
   end
 
@@ -1765,6 +1792,13 @@ defmodule Tightbeam.EscalationTest do
                [direct.id, via.id]
              )
 
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET ruledViaSessionKey=NULL WHERE id=?1",
+               [direct.id]
+             )
+
     assert %{
              ruling_attribution: %{
                performer: %{
@@ -1998,8 +2032,7 @@ defmodule Tightbeam.EscalationTest do
     end
   end
 
-  test "operator supersede and withdraw are atomic, same-raiser, owner-scoped, and replay-safe",
-       ctx do
+  test "operator supersede and withdraw are atomic and replay-safe", ctx do
     old = Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "old?"}))
     successor = session(ctx.db, "successor", "flynn")
 
@@ -2016,18 +2049,20 @@ defmodule Tightbeam.EscalationTest do
       operator_call(successor, %{question: "steal?", supersedes: replacement.id})
       |> Map.put(:origin, "agent:other")
 
-    assert %{code: "not_owner"} = Escalation.operator_ask(ctx.db, other_origin)
+    successor_request = Escalation.operator_ask(ctx.db, other_origin)
+    assert successor_request.context["supersedes"] == replacement.id
+    assert operator_request(ctx, replacement.id).status == "superseded"
 
     raiser_withdraw = %{
-      origin: "agent:raiser",
+      origin: "agent:other",
       principal: {:session, successor.session_key},
-      params: %{request: replacement.id, reason: "  replaced elsewhere  "}
+      params: %{request: successor_request.id, reason: "  replaced elsewhere  "}
     }
 
     withdrawn = Escalation.operator_withdraw(ctx.db, raiser_withdraw)
     assert withdrawn.status == "withdrawn"
     assert withdrawn.withdrawn_reason == "replaced elsewhere"
-    assert Escalation.operator_withdraw(ctx.db, raiser_withdraw).id == replacement.id
+    assert Escalation.operator_withdraw(ctx.db, raiser_withdraw).id == successor_request.id
 
     owner_request =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "owner withdraw?"}))
@@ -2567,7 +2602,7 @@ defmodule Tightbeam.EscalationTest do
     assert {:ok, _} =
              DB.query(
                ctx.db,
-               "UPDATE decision_requests SET ruledViaPrincipal=NULL,ruledViaSessionState=NULL WHERE id=?1",
+               "UPDATE decision_requests SET ruledViaPrincipal=NULL,ruledViaSessionState=NULL,ruledViaSessionKey=NULL WHERE id=?1",
                [legacy.id]
              )
 
@@ -3565,7 +3600,7 @@ defmodule Tightbeam.EscalationTest do
       verb: "operator-rule",
       origin: "user:flynn",
       principal: {:user, "flynn"},
-      transport_session_key: nil,
+      transport_session_key: "agent:raiser:app",
       params: Map.put(params, :request, id)
     }
   end
