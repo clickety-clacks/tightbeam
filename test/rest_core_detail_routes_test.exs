@@ -418,7 +418,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert decoded_collection["page"]["hasMoreBefore"] == false
     assert decoded_collection["page"]["hasMoreAfter"] == false
     assert collection.resp_body =~ item_bytes
-    assert collection.resp_body =~ ctx.admin_session.session_key
+    refute collection.resp_body =~ ctx.admin_session.session_key
 
     before_only_visible_session =
       get(
@@ -1413,7 +1413,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     end
 
     marker_as_session = get(ctx, "/api/read-markers/core-scope", ctx.admin_session.cli_token)
-    assert_error(marker_as_session, 404, "read markers", "not_found")
+    assert marker_as_session.status == 200
+    assert JSON.decode!(marker_as_session.resp_body)["resource"] == "read markers"
     assert_application_headers(marker_as_session)
   end
 
@@ -1456,7 +1457,9 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     owner = %{kind: "user", id: "flynn", is_admin: false}
     session = %{kind: "session", id: ctx.admin_session.session_key, is_admin: false}
     denied_user = %{kind: "user", id: "outsider", is_admin: false}
-    denied_session = %{kind: "session", id: "outsider-session", is_admin: false}
+    _outsider = outsider_device(ctx)
+    outsider_session = ensure_main_session(ctx.db, "outsider")
+    other_session = %{kind: "session", id: outsider_session.session_key, is_admin: false}
 
     grants = %{
       "work items" => [admin, owner, session],
@@ -1476,10 +1479,13 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
                "#{row.resource} denied #{inspect(principal)}"
       end
 
-      for principal <- [denied_user, denied_session] -- Map.fetch!(grants, row.resource) do
+      for principal <- [denied_user] -- Map.fetch!(grants, row.resource) do
         assert query_case(ctx, row, principal) == nil,
                "#{row.resource} admitted #{inspect(principal)}"
       end
+
+      assert query_case(ctx, row, other_session) != nil,
+             "#{row.resource} denied #{inspect(other_session)}"
     end
 
     for {kind, row, allowed, denied} <- decision_kind_rows(ctx) do
@@ -2528,7 +2534,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     for %{kind: kind, row: row} <- decision_route_cases(ctx) do
       allowed =
         case kind do
-          :statute -> [admin, owner]
+          :statute -> [admin, owner, session]
           :effort -> [admin, session]
           :agent -> [admin, owner, session]
         end

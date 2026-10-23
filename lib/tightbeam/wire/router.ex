@@ -332,8 +332,15 @@ defmodule Tightbeam.Wire.Router do
 
           call =
             case {verb, principal} do
-              {"artifact-content-fetch", {kind, _}} when kind in [:user, :session] ->
-                Map.put(call, :rest_principal, state_principal_view(principal, conn))
+              {"artifact-content-fetch", {:session, session_key}} ->
+                Map.put(call, :rest_principal, %{
+                  kind: "session",
+                  id: session_key,
+                  is_admin: false
+                })
+
+              {"artifact-content-fetch", {:user, user_id}} ->
+                Map.put(call, :rest_principal, state_principal_view({:user, user_id}, conn))
 
               _ ->
                 call

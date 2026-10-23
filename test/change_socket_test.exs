@@ -99,6 +99,8 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
                       "refs" => %{"sessionKey" => "agent:sibling"}
                     }}
 
+    :ok = Hub.delivered(ctx.hub, self())
+
     {:push, {:text, ready}, state} =
       inbound(
         %{
@@ -127,6 +129,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     deliveries =
       Enum.map(1..2, fn _ ->
         assert_receive {:firehose_notice, notice}
+        :ok = Hub.delivered(ctx.hub, self())
         notice["subscriptionId"]
       end)
 
