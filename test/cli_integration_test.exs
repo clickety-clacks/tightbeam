@@ -2069,9 +2069,9 @@ defmodule Tightbeam.CliIntegrationTest do
            } = machine_line!(refused)
   end
 
-  # On an org with no learned statutes, a bare completion closes the
-  # assignment and creates no remedy episode or wake.
-  test "real CLI accepts bare code completion on a rule-free org", ctx do
+  # Code-completion evidence remains required even when the org has no learned
+  # statutes; the refusal creates no remedy episode or wake.
+  test "real CLI requires code completion evidence on a rule-free org", ctx do
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     coder =
@@ -2120,19 +2120,26 @@ defmodule Tightbeam.CliIntegrationTest do
 
     work_id = JSON.decode!(assigned)["id"]
 
-    {completed, completed_status} =
+    {denied, denied_status} =
       System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
         cd: coder_dir,
         stderr_to_stdout: true
       )
 
-    assert completed_status == 0
-    assert completed =~ "closed"
+    assert denied_status != 0
+    assert denied =~ "inapplicable_code_evidence"
 
-    assert {:ok, [["closed", "completed"]]} =
-             DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id=?1", [
+    assert {:ok, [["open", nil]]} =
+             DB.query(ctx.db, "SELECT state,closingAttestId FROM assignments WHERE id=?1", [
                work_id
              ])
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
+               [work_id]
+             )
 
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM rail_remedy_episodes", [])
 
