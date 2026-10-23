@@ -813,6 +813,7 @@ defmodule Tightbeam.RestExecutionMapTest do
       |> decode_success()
 
     session_map_bytes = JSON.encode!(session_map)
+
     for id <- ~w(wi_parent wi_child wi_review_child asg_hidden_middle asg_visible_review) do
       assert session_map_bytes =~ id
     end

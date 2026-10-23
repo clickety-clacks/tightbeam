@@ -502,5 +502,4 @@ defmodule Tightbeam.StateVisibility do
       _ -> notice["refs"] || %{}
     end
   end
-
 end
