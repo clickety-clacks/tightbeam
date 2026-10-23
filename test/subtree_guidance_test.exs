@@ -1,9 +1,9 @@
 defmodule Tightbeam.SubtreeGuidanceTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Model, Org, SubtreeGuidance, Wakes}
+  alias Tightbeam.{DB, Gateway, Model, Org, SubtreeGuidance, Wakes}
 
-  @main "agent:main:clawline:flynn:main"
+  @main "main-session"
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
@@ -16,8 +16,8 @@ defmodule Tightbeam.SubtreeGuidanceTest do
     Map.merge(
       %{
         display_name: "Session",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "test-owner",
+        origin: "user:test-owner",
         archetype: "default",
         host: "testhost",
         harness: "claude",
@@ -34,20 +34,25 @@ defmodule Tightbeam.SubtreeGuidanceTest do
 
     Org.create(
       db,
-      base(%{session_key: "coord", kind: "task", spawned_by: @main, display_name: "Coordinator"})
+      base(%{
+        session_key: "coord",
+        kind: "custom",
+        spawned_by: @main,
+        display_name: "Coordinator"
+      })
     )
 
     Org.create(
       db,
-      base(%{session_key: "worker-a", kind: "task", spawned_by: "coord", archetype: "coder"})
+      base(%{session_key: "worker-a", kind: "custom", spawned_by: "coord", archetype: "coder"})
     )
 
     Org.create(
       db,
-      base(%{session_key: "worker-b", kind: "task", spawned_by: "coord", archetype: "reviewer"})
+      base(%{session_key: "worker-b", kind: "custom", spawned_by: "coord", archetype: "reviewer"})
     )
 
-    Org.create(db, base(%{session_key: "outsider", kind: "task", spawned_by: @main}))
+    Org.create(db, base(%{session_key: "outsider", kind: "custom", spawned_by: @main}))
 
     for key <- [@main, "coord", "worker-a", "worker-b", "outsider"] do
       Org.append_pointer(db, key, "harness-#{key}", "created")
@@ -142,7 +147,7 @@ defmodule Tightbeam.SubtreeGuidanceTest do
 
     Org.create(
       db,
-      base(%{session_key: "unstarted", kind: "task", spawned_by: "coord", archetype: "coder"})
+      base(%{session_key: "unstarted", kind: "custom", spawned_by: "coord", archetype: "coder"})
     )
 
     {:ok, result} = SubtreeGuidance.set(db, "coord", "style", nil, "Write plainly.")
@@ -178,14 +183,29 @@ defmodule Tightbeam.SubtreeGuidanceTest do
     assert message =~ "style"
   end
 
-  test "entries survive the writer's retirement and never migrate", %{db: db} do
+  test "retired writer's entries stay with it and no longer reach active sessions", %{db: db} do
     tree(db)
 
     {:ok, _} = SubtreeGuidance.set(db, "coord", "style", nil, "Write plainly.")
-    Org.retire(db, "coord", "user:flynn", 60_000)
 
-    assert SubtreeGuidance.section(db, "worker-a") =~ "Write plainly."
+    result =
+      Gateway.handlers(%{db: db})["retire"].(%{
+        verb: "retire",
+        origin: "user:test-owner",
+        principal: {:user, "test-owner"},
+        session_key: "coord",
+        params: %{}
+      })
+
+    assert Enum.sort(result.retired_session_keys) == ["coord", "worker-a", "worker-b"]
+
+    for session_key <- result.retired_session_keys do
+      assert Org.get(db, session_key).state == "retired"
+    end
+
     assert {:ok, %{entries: [%{name: "style"}]}} = SubtreeGuidance.show(db, "coord")
+    assert SubtreeGuidance.section(db, @main) == nil
+    assert SubtreeGuidance.section(db, "outsider") == nil
   end
 
   test "show reports a session's own entries and its applicable section", %{db: db} do
