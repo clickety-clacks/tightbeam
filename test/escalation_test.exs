@@ -1258,7 +1258,7 @@ defmodule Tightbeam.EscalationTest do
     assert observer == "session:#{ctx.raiser.session_key}"
     refute fields =~ "integrity?"
 
-    assert shape_digest == "efa9964d4e3857fc094f9b699b19ac1feb91a30b439236e05572b483cb886403"
+    assert shape_digest == "58fc94c6274ec4e8047e864c3f190ae7136d37507128769752e9512e9d77dd97"
     assert ruled.ruling_fact_id > 0
   end
 
@@ -1790,6 +1790,13 @@ defmodule Tightbeam.EscalationTest do
                ctx.db,
                "UPDATE decision_requests SET ruledViaPrincipal=NULL,ruledViaSessionState=NULL WHERE id IN (?1,?2)",
                [direct.id, via.id]
+             )
+
+    assert :ok =
+             DB.execute(
+               ctx.db,
+               "UPDATE decision_requests SET ruledViaSessionKey=NULL WHERE id=?1",
+               [direct.id]
              )
 
     assert %{
@@ -2595,7 +2602,7 @@ defmodule Tightbeam.EscalationTest do
     assert {:ok, _} =
              DB.query(
                ctx.db,
-               "UPDATE decision_requests SET ruledViaPrincipal=NULL,ruledViaSessionState=NULL WHERE id=?1",
+               "UPDATE decision_requests SET ruledViaPrincipal=NULL,ruledViaSessionState=NULL,ruledViaSessionKey=NULL WHERE id=?1",
                [legacy.id]
              )
 
