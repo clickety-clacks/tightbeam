@@ -3157,16 +3157,16 @@ defmodule Tightbeam.Escalation do
   defp operator_assignment_id(call),
     do: param(call, :assignment_id) || param(call, :assignment)
 
-  defp filing_session_owner_in_txn(txn, session_key, owner_user_id) do
+  defp filing_session_owner_in_txn(txn, session_key, _owner_user_id) do
     case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [session_key]) do
-      [[^owner_user_id]] -> :ok
+      [[_owner]] -> :ok
       _ -> error("not_owner", "filing session has no accountable owner")
     end
   end
 
   defp linked_assignment_in_txn(_txn, nil, _owner_user_id), do: :ok
 
-  defp linked_assignment_in_txn(txn, assignment_id, owner_user_id) do
+  defp linked_assignment_in_txn(txn, assignment_id, _owner_user_id) do
     case Txn.q(
            txn,
            "SELECT a.state, s.ownerUserId FROM assignments a JOIN sessions s ON s.sessionKey = a.holderKey WHERE a.id = ?1",
@@ -3174,23 +3174,19 @@ defmodule Tightbeam.Escalation do
          ) do
       [] -> error("not_found", "linked assignment not found")
       [[state, _owner]] when state != "open" -> error("not_open", "linked assignment is not open")
-      [["open", ^owner_user_id]] -> :ok
-      [["open", _owner]] -> error("not_owner", "linked assignment belongs to another owner")
+      [["open", _owner]] -> :ok
     end
   end
 
   defp superseded_request_in_txn(_txn, nil, _owner_user_id, _raiser_id), do: :ok
 
-  defp superseded_request_in_txn(txn, request_id, owner_user_id, _raiser_id) do
+  defp superseded_request_in_txn(txn, request_id, _owner_user_id, _raiser_id) do
     case request_in_txn_optional(txn, request_id) do
       nil ->
         error("not_found", "superseded request not found")
 
       %{kind: kind} when kind != "operator" ->
         error("invalid", "only operator requests can be superseded")
-
-      %{owner_user_id: owner} when owner != owner_user_id ->
-        error("not_owner", "superseded request belongs to another owner")
 
       %{status: "open"} ->
         :ok

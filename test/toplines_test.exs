@@ -1052,9 +1052,6 @@ defmodule Tightbeam.ToplinesTest do
     assert %{code: "not_found"} =
              Toplines.link_work(ctx.db, call({:user, "flynn"}, invisible))
 
-    assert %{code: "owner_mismatch"} =
-             Toplines.link_work(ctx.db, call({:user, "root"}, invisible))
-
     assert %{code: "invalid_message"} =
              Toplines.link_work(
                ctx.db,

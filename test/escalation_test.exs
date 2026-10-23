@@ -923,7 +923,7 @@ defmodule Tightbeam.EscalationTest do
            end) == 1
   end
 
-  test "operator ask validates linked assignment ownership in the winning transaction", ctx do
+  test "operator ask validates the linked assignment in the winning transaction", ctx do
     other = session(ctx.db, "other-holder", "other")
     insert_assignment!(ctx.db, "a-owned", ctx.raiser.session_key, "open")
     insert_assignment!(ctx.db, "a-foreign", other.session_key, "open")
@@ -935,7 +935,7 @@ defmodule Tightbeam.EscalationTest do
                operator_call(ctx.raiser, %{question: "owned?", assignment: "a-owned"})
              )
 
-    assert %{code: "not_owner"} =
+    assert %{assignment_id: "a-foreign"} =
              Escalation.operator_ask(
                ctx.db,
                operator_call(ctx.raiser, %{question: "foreign?", assignment: "a-foreign"})
@@ -953,7 +953,7 @@ defmodule Tightbeam.EscalationTest do
                operator_call(ctx.raiser, %{question: "missing?", assignment: "a-missing"})
              )
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[2]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'")
   end
 
@@ -1985,8 +1985,7 @@ defmodule Tightbeam.EscalationTest do
     end
   end
 
-  test "operator supersede and withdraw are atomic, same-raiser, owner-scoped, and replay-safe",
-       ctx do
+  test "operator supersede and withdraw are atomic and replay-safe", ctx do
     old = Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "old?"}))
     successor = session(ctx.db, "successor", "flynn")
 
@@ -2003,18 +2002,20 @@ defmodule Tightbeam.EscalationTest do
       operator_call(successor, %{question: "steal?", supersedes: replacement.id})
       |> Map.put(:origin, "agent:other")
 
-    assert %{code: "not_owner"} = Escalation.operator_ask(ctx.db, other_origin)
+    successor_request = Escalation.operator_ask(ctx.db, other_origin)
+    assert successor_request.context["supersedes"] == replacement.id
+    assert operator_request(ctx, replacement.id).status == "superseded"
 
     raiser_withdraw = %{
-      origin: "agent:raiser",
+      origin: "agent:other",
       principal: {:session, successor.session_key},
-      params: %{request: replacement.id, reason: "  replaced elsewhere  "}
+      params: %{request: successor_request.id, reason: "  replaced elsewhere  "}
     }
 
     withdrawn = Escalation.operator_withdraw(ctx.db, raiser_withdraw)
     assert withdrawn.status == "withdrawn"
     assert withdrawn.withdrawn_reason == "replaced elsewhere"
-    assert Escalation.operator_withdraw(ctx.db, raiser_withdraw).id == replacement.id
+    assert Escalation.operator_withdraw(ctx.db, raiser_withdraw).id == successor_request.id
 
     owner_request =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "owner withdraw?"}))

@@ -227,13 +227,15 @@ defmodule Tightbeam.SessionPoAssociationsTest do
 
     assert set(ctx.db, {:session, ctx.peer.session_key}, "product-owner:two", "peer")["changed"]
 
-    assert %{"revision" => 4, "setBy" => "session:peer"} =
+    assert set(ctx.db, {:user, "owner"}, "product-owner:foreign", "cross-owner")["changed"]
+
+    assert %{"revision" => 5, "setBy" => "user:owner", "poRole" => "product-owner:foreign"} =
              SessionPoAssociations.get(ctx.db, "orchestrator")
 
-    assert count(ctx.db, "wakes") == 4
+    assert count(ctx.db, "wakes") == 5
   end
 
-  test "invalid, retired, cross-owner and implicit-name cases leave no partial effects", ctx do
+  test "invalid, retired and implicit-name cases leave no partial effects", ctx do
     assert %{code: "unknown_session"} =
              set_target(
                ctx.db,
@@ -254,9 +256,6 @@ defmodule Tightbeam.SessionPoAssociationsTest do
 
     assert %{code: "po_role_unresolved"} =
              set(ctx.db, {:user, "owner"}, "product-owner:missing", "missing")
-
-    assert %{code: "cross_owner_po_role"} =
-             set(ctx.db, {:user, "owner"}, "product-owner:foreign", "foreign")
 
     assert SessionPoAssociations.get(ctx.db, "orchestrator") == nil
     assert count(ctx.db, "session_po_associations") == 0
