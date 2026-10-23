@@ -170,7 +170,8 @@ defmodule Tightbeam.RestAttestsCollectionTest do
              Enum.sort(expected_ids)
 
     admin_session_rows = get(ctx, "/api/attests", ctx.admin_session.cli_token)
-    assert Enum.map(JSON.decode!(admin_session_rows.resp_body)["items"], & &1["id"]) |> Enum.sort() ==
+    assert Enum.map(JSON.decode!(admin_session_rows.resp_body)["items"], & &1["id"])
+           |> Enum.sort() ==
              Enum.sort(expected_ids)
 
     same_owner_session_cursor =
