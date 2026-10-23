@@ -555,6 +555,9 @@ defmodule Tightbeam.EffortCheckin do
       action not in ["continue", "dismiss"] ->
         error("invalid_action", "action must be continue or dismiss")
 
+      not authorized?(call.principal, request) ->
+        error("not_authorized", "current expecter required")
+
       not enabled?(config) ->
         error("disabled", "effort check-ins are disabled")
 
@@ -916,10 +919,13 @@ defmodule Tightbeam.EffortCheckin do
     :ok
   end
 
-  defp rule_in_txn(txn, config, request, action, actor, _principal, fresh) do
+  defp rule_in_txn(txn, config, request, action, actor, principal, fresh) do
     current = request_for_id(txn, request.id)
 
     cond do
+      not authorized?(principal, current) ->
+        error("not_authorized", "current expecter required")
+
       current.status == "ruled" and current.decision == action and
           current.ruled_by == actor ->
         current
@@ -1765,6 +1771,10 @@ defmodule Tightbeam.EffortCheckin do
       obligation_ref: Wakes.decision_request_notice_ref(request.id)
     })
   end
+
+  defp authorized?({:session, _key}, _request), do: true
+  defp authorized?({:user, _user}, _request), do: true
+  defp authorized?(_, _request), do: false
 
   defp actor_id({:session, key}), do: "session:" <> key
   defp actor_id({:user, user}), do: "user:" <> user

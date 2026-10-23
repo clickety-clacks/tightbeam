@@ -1451,10 +1451,17 @@ defmodule Tightbeam.EffortCheckinTest do
              )
   end
 
-  test "any principal may rule an open effort check-in", ctx do
+  test "sessions and users may rule an open effort check-in but processes cannot", ctx do
     item = dispatch(ctx, {:user, "h1"}, "holder", "open ruling")
     request = escalate(ctx, item.id)
     assert request.expecter_user_id == "h1"
+
+    assert %{code: "not_authorized"} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_call(request.id, "continue", {:process, "test-process"})
+             )
 
     assert %{status: "ruled", decision: "continue", ruled_by: "user:h2"} =
              EffortCheckin.rule(
