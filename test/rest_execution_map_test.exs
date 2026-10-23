@@ -814,8 +814,10 @@ defmodule Tightbeam.RestExecutionMapTest do
 
     session_map_bytes = JSON.encode!(session_map)
 
-    assert Enum.sort(Enum.map(session_map["roots"], & &1["id"])) ==
-             ~w(wi_child wi_parent wi_review_child)
+    [session_root] = session_map["roots"]
+    assert session_root["id"] == "wi_parent"
+    assert Enum.sort(Enum.map(session_root["children"], & &1["id"])) ==
+             ~w(wi_child wi_review_child)
 
     refute session_map_bytes =~ "asg_hidden_middle"
     refute session_map_bytes =~ "asg_visible_review"

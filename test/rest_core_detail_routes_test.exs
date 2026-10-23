@@ -1484,8 +1484,13 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
                "#{row.resource} admitted #{inspect(principal)}"
       end
 
-      assert query_case(ctx, row, other_session) != nil,
-             "#{row.resource} denied #{inspect(other_session)}"
+      if row.resource == "read markers" do
+        assert query_case(ctx, row, other_session) == nil,
+               "#{row.resource} admitted #{inspect(other_session)}"
+      else
+        assert query_case(ctx, row, other_session) != nil,
+               "#{row.resource} denied #{inspect(other_session)}"
+      end
     end
 
     for {kind, row, allowed, denied} <- decision_kind_rows(ctx) do
