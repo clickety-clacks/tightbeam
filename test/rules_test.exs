@@ -1529,16 +1529,28 @@ defmodule Tightbeam.RulesTest do
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
+    refs = ctx.commit_refs
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
+
     completion =
       p3_call("attest", {:session, holder.session_key}, %{
         assignment_id: producer.id,
-        kind: "completion"
+        kind: "completion",
+        commit_refs: refs
       })
 
-    assert {:ok, %{assignment: %{id: producer_id, state: "open"}, attest: %{kind: "completion"}}} =
+    assert {:ok,
+            %{
+              assignment: %{id: producer_id, state: "open"},
+              attest: %{kind: "completion"} = completion_attest
+            }} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
     assert producer_id == producer.id
+    assert completion_attest.bySession == holder.session_key
+    assert completion_attest.commitRefs == refs
     assert review_count(ctx.db, producer.id) == 0
 
     assert {:ok, [[notice_id]]} =
@@ -1565,7 +1577,7 @@ defmodule Tightbeam.RulesTest do
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId=?1", [
-               "review-notice"
+               "wi-accountable-review-notice"
              ])
 
     assert {:ok, review} =
@@ -1583,10 +1595,7 @@ defmodule Tightbeam.RulesTest do
 
     assert review.holderKey != holder.session_key
 
-    reviewer_refs =
-      Enum.map(refs, fn ref ->
-        Map.put(ref, "repo", "#{Tightbeam.Placement.local_host_name()}:/tmp/reviewer-result")
-      end)
+    reviewer_refs = clone_commit_refs(ctx, refs, "reviewer-result")
 
     assert %{attest: %{verdictKind: "reviewed-clean"}} =
              commit_ref_verdict(
@@ -1635,8 +1644,14 @@ defmodule Tightbeam.RulesTest do
 
       assert review_count(ctx.db, producer.id) == 0
 
-      assert [%{session_key: session_key}] = review_gate_notices(ctx.db, producer.id)
-      assert session_key == owner.session_key
+      assert {:ok, [[notice_id]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND origin='remedy:completion-requires-review'",
+                 [producer.id]
+               )
+
+      assert Wakes.get(ctx.db, notice_id).session_key == owner.session_key
     end
   end
 
@@ -1657,8 +1672,7 @@ defmodule Tightbeam.RulesTest do
     attach_work_item(ctx, producer.id, "review-change-reopen")
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    stub_commit_ref_validation()
-    refs = fixture_commit_refs()
+    refs = ctx.commit_refs
 
     assert %{attest: %{verdictKind: "verified"}} =
              commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
@@ -1787,8 +1801,7 @@ defmodule Tightbeam.RulesTest do
     review = assignment(ctx, reviewer.session_key, {:user, "reviewer"}, reviews: producer.id)
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    stub_commit_ref_validation()
-    refs = integrated_commit_refs()
+    refs = integrated_commit_refs(ctx)
 
     assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: ^refs}} =
              commit_ref_verdict(
@@ -1829,42 +1842,44 @@ defmodule Tightbeam.RulesTest do
 
   test "shipped completion accepts same source commits across checkouts",
        ctx do
-    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
-    on_exit(fn ->
-      if previous_runner,
-        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
-        else: Application.delete_env(:tightbeam, :commit_ref_command)
-    end)
+    holder = session(ctx.db, "same-source-completion-holder", "flynn", archetype: "coder")
 
-    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
-      {"", 0}
-    end)
+    reviewer =
+      session(ctx.db, "same-source-completion-reviewer", "flynn", archetype: "reviewer-code")
 
-    refs = [
-      %{
-        "repo" => "#{Tightbeam.Placement.local_host_name()}:/tmp/o2-result",
-        "commit" => String.duplicate("a", 40)
-      }
-    ]
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+    review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
+    producer_refs = ctx.commit_refs
+    reviewer_refs = clone_commit_refs(ctx, producer_refs, "same-source-reviewer")
 
-    assert %{attest: %{verdictKind: "verified"}} =
-             Assignments.__handle__(
-               ctx.db,
-               "attest",
-               p3_call("attest", {:session, holder.session_key}, %{
-                 assignment_id: producer.id,
-                 kind: "verdict",
-                 verdict_kind: "verified",
-                 commit_refs: refs,
-                 mementos: evidence_mementos(refs)
-               })
+    assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: ^reviewer_refs}} =
+             commit_ref_verdict(
+               ctx,
+               reviewer.session_key,
+               review.id,
+               "reviewed-clean",
+               reviewer_refs
              )
 
-    completion = put_in(completion, [:params, :mementos], evidence_mementos(refs))
+    assert %{attest: %{verdictKind: "verified"}} =
+             commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", producer_refs)
 
-    assert {:ok, %{assignment: %{id: ^producer_id, state: "open"}}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+    assert Assignments.qualifying_verification_verdict_kinds(
+             ctx.db,
+             producer.id,
+             holder.session_key,
+             reviewer_refs
+           ) == ["verified"]
+
+    completion =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: producer.id,
+        kind: "completion",
+        commit_refs: producer_refs
+      })
 
     assert :ok = Rules.evaluate(ctx.db, completion)
   end
@@ -4262,6 +4277,63 @@ defmodule Tightbeam.RulesTest do
       "attest",
       p3_call("attest", {:session, session_key}, params)
     )
+  end
+
+  defp commit_ref_verdict(ctx, session_key, assignment_id, verdict_kind, refs, note \\ nil) do
+    Assignments.__handle__(
+      ctx.db,
+      "attest",
+      p3_call("attest", {:session, session_key}, %{
+        assignment_id: assignment_id,
+        kind: "verdict",
+        verdict_kind: verdict_kind,
+        note: note,
+        commit_refs: refs,
+        mementos: evidence_mementos(refs)
+      })
+    )
+  end
+
+  defp clone_commit_refs(ctx, refs, checkout_name) do
+    refs
+    |> Enum.with_index()
+    |> Enum.map(fn {ref, index} ->
+      [host, source_path] = String.split(ref["repo"], ":", parts: 2)
+      checkout_path = Path.join(ctx.base_dir, "#{checkout_name}-#{index}")
+      {_, 0} = System.cmd("git", ["clone", "--quiet", source_path, checkout_path])
+      Map.put(ref, "repo", "#{host}:#{checkout_path}")
+    end)
+  end
+
+  defp integrated_commit_refs(ctx) do
+    [ref] = ctx.commit_refs
+
+    [integrated_ref] = clone_commit_refs(ctx, [ref], "integrated-review-checkout")
+    [_, checkout_path] = String.split(integrated_ref["repo"], ":", parts: 2)
+    File.write!(Path.join(checkout_path, "integrated-fixture.txt"), "integrated head\n")
+    {_, 0} = System.cmd("git", ["add", "integrated-fixture.txt"], cd: checkout_path)
+
+    {_, 0} =
+      System.cmd(
+        "git",
+        [
+          "-c",
+          "user.name=Test Fixture",
+          "-c",
+          "user.email=test@example.invalid",
+          "commit",
+          "--quiet",
+          "-m",
+          "integrated fixture"
+        ],
+        cd: checkout_path
+      )
+
+    {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: checkout_path)
+    integrated_ref = Map.put(integrated_ref, "commit", String.trim(commit))
+
+    [ref, integrated_ref]
+    |> Enum.sort_by(& &1["repo"])
   end
 
   defp user_verdict(ctx, user, assignment_id, verdict_kind, note \\ nil) do

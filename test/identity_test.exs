@@ -839,7 +839,10 @@ defmodule Tightbeam.IdentityTest do
     admitted =
       Task.async(fn ->
         send(parent, :waiting_for_reload)
-        receive do: (:continue -> :ok)
+        candidate =
+          receive do
+            {:continue, revision} -> revision
+          end
 
         assert Rules.effective_snapshot().revision == candidate
         assert Archetypes.names() != prior_names
@@ -900,7 +903,7 @@ defmodule Tightbeam.IdentityTest do
     assert Archetypes.get("candidate").name == "candidate"
     assert Rails.statutes?()
     refute Rails.hook_settings() == prior_hooks
-    send(admitted.pid, :continue)
+    send(admitted.pid, {:continue, candidate})
     assert :new_call_finished = Task.await(admitted)
     assert Rules.effective_snapshot() == current
 
