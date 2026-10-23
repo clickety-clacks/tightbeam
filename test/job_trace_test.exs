@@ -366,7 +366,7 @@ defmodule Tightbeam.JobTraceTest do
            ]
   end
 
-  test "commit refs verify on the named host only after holder authorization", %{db: db} do
+  test "commit refs verify on the named host", %{db: db} do
     parent = self()
     old_runner = Application.get_env(:tightbeam, :commit_ref_command)
 

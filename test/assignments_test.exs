@@ -5663,7 +5663,11 @@ defmodule Tightbeam.AssignmentsTest do
              )
 
     assert %{code: "invalid_kind"} =
-             handle(ctx, "attest", attest_call({:session, "other-session"}, assignment.id, "bogus"))
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "other-session"}, assignment.id, "bogus")
+             )
 
     assert %{code: "invalid_kind"} =
              handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "bogus"))

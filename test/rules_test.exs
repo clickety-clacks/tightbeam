@@ -695,7 +695,7 @@ defmodule Tightbeam.RulesTest do
     assert Enum.map(EventLog.events_after(ctx.db, 0, 10), & &1.kind) == ["verb", "denied"]
   end
 
-  test "zero rules allow bare code completion",
+  test "zero rules still require code completion evidence",
        ctx do
     holder = session(ctx.db, "zero-rule-holder", "flynn", archetype: "coder")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
@@ -707,17 +707,24 @@ defmodule Tightbeam.RulesTest do
         kind: "completion"
       })
 
-    assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
+    assert {:error, %{code: "inapplicable_code_evidence"}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
-    assert {:ok, [["closed"]]} =
+    assert {:ok, [["open", nil]]} =
              DB.query(
                ctx.db,
-               "SELECT state FROM assignments WHERE id=?1",
+               "SELECT state,closingAttestId FROM assignments WHERE id=?1",
                [assignment.id]
              )
 
-    assert [%{kind: "verb", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
+               [assignment.id]
+             )
+
+    assert [%{kind: "denied", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
   end
 
   test "matching a constitutional denial is monotonic and leaves domain state unchanged", ctx do
