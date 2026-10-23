@@ -249,7 +249,7 @@ defmodule Tightbeam.JobTraceTest do
 
     assert Enum.map(trace.assignments, & &1.id) == ["asg_bad", "asg_direct", "asg_review"]
     assert trace.workItem.state == "open"
-    assert %{state: "open"} = Enum.find(trace.assignments, &(&1.id == "asg_bad"))
+    assert %{state: "closed"} = Enum.find(trace.assignments, &(&1.id == "asg_bad"))
 
     Enum.each(trace.assignments, fn assignment ->
       assert_keys(
