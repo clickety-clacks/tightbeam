@@ -153,14 +153,16 @@ defmodule Tightbeam.JobTraceTest do
 
     :ok = DB.execute(db, "UPDATE attests SET ts = 100")
 
-    assert %{code: "unverifiable_commit_ref"} =
+    unavailable_refs = [
+      %{
+        "repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}",
+        "commit" => String.duplicate("0", 40)
+      }
+    ]
+
+    assert %{attest: %{kind: "completion", commitRefs: ^unavailable_refs}} =
              attest(db, {:session, "holder"}, "asg_bad", "completion", %{
-               commit_refs: [
-                 %{
-                   "repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}",
-                   "commit" => String.duplicate("0", 40)
-                 }
-               ]
+               commit_refs: unavailable_refs
              })
 
     # Completion stores an event report even when its personal recipient is absent.
