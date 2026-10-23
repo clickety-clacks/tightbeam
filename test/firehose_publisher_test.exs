@@ -1323,7 +1323,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
       verb: "operator-rule",
       origin: "user:flynn",
       principal: {:user, "flynn"},
-      transport_session_key: nil,
+      transport_session_key: "operator-raiser",
       session_key: nil,
       params: %{request: request.id, decision: "ship"}
     }

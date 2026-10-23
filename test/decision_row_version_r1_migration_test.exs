@@ -295,7 +295,7 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
       verb: "operator-rule",
       origin: "user:flynn",
       principal: {:user, "flynn"},
-      transport_session_key: nil,
+      transport_session_key: raiser.session_key,
       params: %{request: request.id, decision: "accept"}
     }
 

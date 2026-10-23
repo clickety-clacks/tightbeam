@@ -1070,17 +1070,35 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert dr_id in ids
 
-    # rule — as the owner over the org transport
-    ruled =
+    # Owner identity without a submitting session is refused without settling the request.
+    no_session_rule =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "operator-rule",
         asUser: owner,
         params: %{request: dr_id, decision: "ship"}
       })
 
+    assert JSON.decode!(no_session_rule.resp_body)["error"]["code"] ==
+             "operator_ruling_submitting_session_required"
+
+    assert JSON.decode!(
+             dispatch_cli(ctx, raiser.cli_token, %{
+               verb: "decision-request",
+               params: %{request: dr_id}
+             }).resp_body
+           )["result"]["decisionRequest"]["status"] == "open"
+
+    # Main and other sessions may resolve when their authenticated session is recorded.
+    ruled =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-rule",
+        params: %{request: dr_id, decision: "ship"}
+      })
+
     assert ruled.status == 200
     ruled_row = JSON.decode!(ruled.resp_body)["result"]
     assert ruled_row["status"] == "ruled"
+    assert ruled_row["ruledViaSessionKey"] == raiser.session_key
 
     ruled_list =
       dispatch_cli(ctx, "tbc_test", %{
@@ -1119,8 +1137,11 @@ defmodule Tightbeam.Wire.RouterTest do
     assert exact_row["rulingAttribution"] == %{
              "onBehalfOf" => "user:#{owner}",
              "performer" => %{
-               "principal" => %{"state" => "known", "value" => "user:#{owner}"},
-               "session" => %{"state" => "none"}
+               "principal" => %{
+                 "state" => "known",
+                 "value" => "session:#{raiser.session_key}"
+               },
+               "session" => %{"state" => "known", "key" => raiser.session_key}
              }
            }
 
@@ -1232,10 +1253,8 @@ defmodule Tightbeam.Wire.RouterTest do
              }
            }
 
-    # And an allowed operator verb still enforces its owner authorization THROUGH
-    # the router: a session principal (not the human owner) is refused not_owner,
-    # proving the verb is genuinely routed to its handler's auth, not merely let
-    # past the allowlist.
+    # Any authenticated session may record the ruling, with its actual session
+    # retained in the terminal row.
     ask3 =
       dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-ask",
@@ -1244,13 +1263,16 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert is_binary(dr3 = JSON.decode!(ask3.resp_body)["result"]["id"])
 
-    not_owner =
+    ruled_by_session =
       dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-rule",
         params: %{request: dr3, decision: "a"}
       })
 
-    assert JSON.decode!(not_owner.resp_body)["error"]["code"] == "not_owner"
+    assert ruled_by_session.status == 200
+    session_ruled = JSON.decode!(ruled_by_session.resp_body)["result"]
+    assert session_ruled["status"] == "ruled"
+    assert session_ruled["ruledViaSessionKey"] == raiser.session_key
   end
 
   # The --status filter had the same shape of defect the operator verbs did: a working
@@ -1292,9 +1314,8 @@ defmodule Tightbeam.Wire.RouterTest do
     assert is_binary(ruled_id = JSON.decode!(ruled_ask.resp_body)["result"]["id"])
 
     ruled =
-      dispatch_cli(ctx, "tbc_test", %{
+      dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-rule",
-        asUser: owner,
         params: %{request: ruled_id, decision: "a"}
       })
 

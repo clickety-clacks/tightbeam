@@ -155,7 +155,7 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
       verb: "operator-rule",
       origin: "user:flynn",
       principal: {:user, "flynn"},
-      transport_session_key: nil,
+      transport_session_key: "agent:raiser:app",
       params: Map.put(params, :request, id)
     }
   end
