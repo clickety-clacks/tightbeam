@@ -4237,7 +4237,11 @@ defmodule Tightbeam.Assignments do
             {:ok, put_in(call, [:params, :commit_refs], canonical)}
 
           :error ->
-            error("invalid_commit_refs", "commitRefs must be unique full immutable commit refs")
+            if late_ruling_receipt?(call.params) do
+              invalid_ruling_consumption_target()
+            else
+              error("invalid_commit_refs", "commitRefs must be unique full immutable commit refs")
+            end
         end
 
       error ->
