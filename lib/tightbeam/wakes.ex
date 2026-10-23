@@ -2144,14 +2144,10 @@ defmodule Tightbeam.Wakes do
            [input[:assignment_id]]
          ) do
       [[id, "open", holder_key, owner_user_id]] ->
-        if owner_user_id == input[:owner_user_id] do
-          {:ok, %{id: id, holder_key: holder_key, owner_user_id: owner_user_id}}
-        else
-          wait_error("unknown_assignment", "unknown or inaccessible open covered assignment")
-        end
+        {:ok, %{id: id, holder_key: holder_key, owner_user_id: owner_user_id}}
 
       _ ->
-        wait_error("unknown_assignment", "unknown or inaccessible open covered assignment")
+        wait_error("unknown_assignment", "unknown open covered assignment")
     end
   end
 
@@ -2260,7 +2256,7 @@ defmodule Tightbeam.Wakes do
   defp normalize_reference(_reference, _allowed, label),
     do: wait_error("invalid_predicate", "#{label} must be an object")
 
-  defp resolver_in_txn(txn, %{kind: "assignment", id: id}, owner_user_id) do
+  defp resolver_in_txn(txn, %{kind: "assignment", id: id}, _owner_user_id) do
     case Txn.q(
            txn,
            """
@@ -2270,7 +2266,7 @@ defmodule Tightbeam.Wakes do
            """,
            [id]
          ) do
-      [[state, outcome, holder_key, ^owner_user_id]] ->
+      [[state, outcome, holder_key, _owner]] ->
         {:ok,
          %{
            kind: "assignment",
@@ -2282,11 +2278,11 @@ defmodule Tightbeam.Wakes do
          }}
 
       _ ->
-        wait_error("invalid_resolver", "unknown or inaccessible assignment resolver")
+        wait_error("invalid_resolver", "unknown assignment resolver")
     end
   end
 
-  defp resolver_in_txn(txn, %{kind: "decision_request", id: id}, owner_user_id) do
+  defp resolver_in_txn(txn, %{kind: "decision_request", id: id}, _owner_user_id) do
     case Txn.q(
            txn,
            """
@@ -2295,27 +2291,27 @@ defmodule Tightbeam.Wakes do
            """,
            [id]
          ) do
-      [[status, ^owner_user_id, expecter_session, raiser_session]] ->
+      [[status, request_owner, expecter_session, raiser_session]] ->
         addressee =
           expecter_session || raiser_session ||
-            "agent:main:clawline:#{owner_user_id}:main"
+            "agent:main:clawline:#{request_owner}:main"
 
         {:ok,
          %{
            kind: "decision_request",
            id: id,
-           holder: "user:" <> owner_user_id,
+           holder: "user:" <> request_owner,
            addressee: addressee,
            terminal: status in ~w(ruled consumed withdrawn superseded),
            disposition: status
          }}
 
       _ ->
-        wait_error("invalid_resolver", "unknown or inaccessible decision request resolver")
+        wait_error("invalid_resolver", "unknown decision request resolver")
     end
   end
 
-  defp verification_assignment_in_txn(txn, %{kind: "assignment", id: id}, owner_user_id) do
+  defp verification_assignment_in_txn(txn, %{kind: "assignment", id: id}, _owner_user_id) do
     case Txn.q(
            txn,
            """
@@ -2325,11 +2321,11 @@ defmodule Tightbeam.Wakes do
            """,
            [id]
          ) do
-      [["open", holder_key, ^owner_user_id]] ->
+      [["open", holder_key, _owner]] ->
         {:ok, %{id: id, state: "open", holder_key: holder_key}}
 
       _ ->
-        wait_error("invalid_verifier", "verificationRef must name an accessible open assignment")
+        wait_error("invalid_verifier", "verificationRef must name an open assignment")
     end
   end
 
