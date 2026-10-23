@@ -5948,6 +5948,7 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "code completion keeps verification and review requirements without ref matching", ctx do
+    parent = self()
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
     on_exit(fn ->
@@ -5965,6 +5966,10 @@ defmodule Tightbeam.AssignmentsTest do
     ]
 
     completion_refs = [
+      %{"repo" => "testhost:/tmp/completion-checkout", "commit" => String.duplicate("B", 40)}
+    ]
+
+    canonical_completion_refs = [
       %{"repo" => "testhost:/tmp/completion-checkout", "commit" => String.duplicate("b", 40)}
     ]
 
@@ -5993,8 +5998,18 @@ defmodule Tightbeam.AssignmentsTest do
              |> put_in([:params, :commit_refs], producer_refs)
              |> then(&handle(ctx, "attest", &1))
 
-    assert %{attest: %{kind: "completion"}, assignment: %{outcome: "completed"}} =
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      send(parent, :completion_commit_ref_lookup)
+      {"", 0}
+    end)
+
+    assert %{
+             attest: %{kind: "completion", commitRefs: ^canonical_completion_refs},
+             assignment: %{outcome: "completed"}
+           } =
              handle(ctx, "attest", completion)
+
+    refute_received :completion_commit_ref_lookup
 
     unreviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "unreviewed producer"))
 
@@ -6032,18 +6047,13 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{code: "not_holder"} = handle(ctx, "attest", verification)
   end
 
-  test "a review retraction committed after applicability precheck defeats code completion",
-       ctx do
+  test "a review retraction committed before code completion defeats code completion", ctx do
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
     on_exit(fn ->
       if previous_runner,
         do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
         else: Application.delete_env(:tightbeam, :commit_ref_command)
-    end)
-
-    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
-      {"", 0}
     end)
 
     producer_refs = [
@@ -6067,12 +6077,6 @@ defmodule Tightbeam.AssignmentsTest do
              |> put_in([:params, :verdict_kind], "reviewed-clean")
              |> then(&handle(ctx, "attest", &1))
 
-    assert %{attest: %{verdictKind: "verified"}} =
-             attest_call({:session, "holder"}, producer.id, "verdict")
-             |> put_in([:params, :verdict_kind], "verified")
-             |> put_in([:params, :commit_refs], producer_refs)
-             |> then(&handle(ctx, "attest", &1))
-
     Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
       assert {:ok, _} =
                DB.query(
@@ -6089,6 +6093,12 @@ defmodule Tightbeam.AssignmentsTest do
 
       {"", 0}
     end)
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], producer_refs)
+             |> then(&handle(ctx, "attest", &1))
 
     completion =
       attest_call({:session, "holder"}, producer.id, "completion")
