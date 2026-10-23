@@ -154,10 +154,10 @@ defmodule Tightbeam.JobTraceTest do
     :ok = DB.execute(db, "UPDATE attests SET ts = 100")
 
     :ok =
-           DB.execute(
-             db,
-             "UPDATE assignment_effects SET effectKind='code' WHERE assignmentId='asg_bad'"
-           )
+      DB.execute(
+        db,
+        "UPDATE assignment_effects SET effectKind='code' WHERE assignmentId='asg_bad'"
+      )
 
     unavailable_refs = [
       %{
