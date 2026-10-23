@@ -6108,11 +6108,7 @@ defmodule Tightbeam.Gateway do
   defp role_mutation_allowed(_db, %{owner_user_id: nil}, _origin, _role),
     do: {:error, %{code: "denied", message: "processes cannot mutate roles"}}
 
-  defp role_mutation_allowed(db, caller, origin, role) do
-    if caller.owner_user_id == role.owner_user_id or admin_origin?(db, origin),
-      do: :ok,
-      else: {:error, %{code: "denied", message: "role owner or admin required"}}
-  end
+  defp role_mutation_allowed(_db, _caller, _origin, _role), do: :ok
 
   defp caller_for_role_mutation(db, origin) do
     case resolve_caller(db, origin) do
@@ -6121,13 +6117,10 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp binding_owner_allowed(db, origin, role, session_key) do
+  defp binding_owner_allowed(db, _origin, _role, session_key) do
     case Org.get(db, session_key) do
-      %{state: "active"} = session ->
-        if session.owner_user_id == role.owner_user_id or admin_origin?(db, origin),
-          do: :ok,
-          else:
-            {:error, %{code: "denied", message: "binding target must be owned by the role owner"}}
+      %{state: "active"} ->
+        :ok
 
       _ ->
         {:error, %{code: "unknown_session", message: "unknown active session: #{session_key}"}}
@@ -6514,18 +6507,10 @@ defmodule Tightbeam.Gateway do
     :ok
   end
 
-  defp session_mutation_allowed(db, origin, session) do
+  defp session_mutation_allowed(db, origin, _session) do
     case resolve_caller(db, origin) do
-      %{owner_user_id: owner} when owner == session.owner_user_id ->
-        :ok
-
-      %{} ->
-        if admin_origin?(db, origin),
-          do: :ok,
-          else: {:error, %{code: "denied", message: "session owner or admin required"}}
-
-      nil ->
-        {:error, %{code: "unknown_caller", message: "unknown caller"}}
+      nil -> {:error, %{code: "unknown_caller", message: "unknown caller"}}
+      %{} -> :ok
     end
   end
 

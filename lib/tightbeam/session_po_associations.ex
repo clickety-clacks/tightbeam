@@ -155,22 +155,19 @@ defmodule Tightbeam.SessionPoAssociations do
   defp authorize(_txn, _principal, _target, _owner),
     do: {:error, "not_authorized", "an authenticated user or session is required"}
 
-  defp resolvable_po_role(txn, po_role, owner) do
+  defp resolvable_po_role(txn, po_role, _owner) do
     case Txn.q(txn, "SELECT ownerUserId,boundSessionKey FROM roles WHERE name=?1", [po_role]) do
-      [[^owner, bound]] ->
-        resolved = bound || Org.personal_session_key(owner)
+      [[role_owner, bound]] ->
+        resolved = bound || Org.personal_session_key(role_owner)
 
         case Txn.q(txn, "SELECT ownerUserId,state FROM sessions WHERE sessionKey=?1", [resolved]) do
-          [[^owner, "active"]] ->
+          [[^role_owner, "active"]] ->
             :ok
 
           _ ->
             {:error, "po_role_unresolved",
              "PO role does not resolve to an active same-owner session"}
         end
-
-      [[_other_owner, _bound]] ->
-        {:error, "cross_owner_po_role", "PO role belongs to a different owner"}
 
       [] ->
         {:error, "po_role_unresolved", "PO role is not registered"}
