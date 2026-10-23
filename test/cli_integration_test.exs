@@ -2245,7 +2245,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM rail_remedy_episodes", [])
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM wakes WHERE origin LIKE 'remedy:%'",

@@ -806,6 +806,37 @@ defmodule Tightbeam.Rules do
     decide_snapshot(db, call)
   end
 
+  @doc false
+  @spec decide_after(GenServer.server(), map(), String.t()) :: {term(), [term()], [String.t()]}
+  def decide_after(db, call, rule_name) when is_binary(rule_name) do
+    snapshot = effective_snapshot()
+    verb = Map.get(call, :memento_rule_verb, Map.fetch!(call, :verb))
+    edge = edge(call)
+
+    case Map.get(snapshot.unavailable_verbs, verb) do
+      nil ->
+        rules =
+          snapshot.rules
+          |> Enum.filter(&(&1.verb == verb and edge in &1.edges))
+          |> Enum.filter(&memento_rule_phase?(&1, db, call))
+
+        case Enum.split_while(rules, &(&1.name != rule_name)) do
+          {_before, [_matched | remaining]} ->
+            decide_rules(remaining, db, call, %{}, [], [])
+
+          {_before, []} ->
+            decide_snapshot(db, call)
+        end
+
+      source ->
+        {{:deny,
+          %{
+            code: "rule_unavailable",
+            message: "#{verb} unavailable until rule #{source} is repaired"
+          }}, [], []}
+    end
+  end
+
   defp decide_snapshot(db, call) do
     snapshot = effective_snapshot()
     rules = snapshot.rules
@@ -4050,8 +4081,13 @@ defmodule Tightbeam.Rules do
   end
 
   defp compute_fact("$assignment", db, call, cache) do
+    transition_assignment_id =
+      if row_commit_domain(call) == "assignment",
+        do: field(Map.get(call, :transition, %{}), :row_id)
+
     assignment =
-      case Map.get(call.params, :assignment_id) || Map.get(call.params, "assignment_id") do
+      case Map.get(call.params, :assignment_id) || Map.get(call.params, "assignment_id") ||
+             transition_assignment_id do
         id when is_binary(id) ->
           case Map.get(call, :predicate_owner_user_id) do
             owner when is_binary(owner) ->

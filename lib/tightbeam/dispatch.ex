@@ -216,23 +216,45 @@ defmodule Tightbeam.Dispatch do
         {:error, error}
 
       {:remedy, statute, ref, error} ->
-        outcome = RailRemedy.fire(db, handlers, statute, ref, call)
-
         if statute.name == "completion-requires-review" and verb == "attest" and
-             call.params[:kind] == "completion" and review_notice_routed?(outcome) do
-          # The ordinary review notice is the existing completion path. Once it
-          # has been recorded, let the handler persist the same completion with
-          # its review-pending marker rather than running the rail a second time.
-          dispatch_to_handler(
-            db,
-            handlers,
-            Map.put(call, :review_pending, true),
-            verb,
-            origin,
-            principal,
-            session_key
-          )
+             call.params[:kind] == "completion" do
+          {pending_decision, pending_to_close, pending_to_consume} =
+            Rules.decide_after(db, call, statute.name)
+
+          case pending_decision do
+            :allow ->
+              outcome = RailRemedy.fire(db, handlers, statute, ref, call)
+
+              if review_notice_routed?(outcome) do
+                # Only after every other dispatch statute allows the completion
+                # may the ordinary review notice route it to the pending path.
+                apply_rule_decision(
+                  db,
+                  handlers,
+                  Map.put(call, :review_pending, true),
+                  :allow,
+                  pending_to_close,
+                  pending_to_consume
+                )
+              else
+                close_rule_effects(db, pending_to_close)
+                error = remedy_error(error, outcome)
+                best_effort_denial(db, verb, origin, principal, session_key, error)
+                {:error, error}
+              end
+
+            _ ->
+              apply_rule_decision(
+                db,
+                handlers,
+                call,
+                pending_decision,
+                pending_to_close,
+                pending_to_consume
+              )
+          end
         else
+          outcome = RailRemedy.fire(db, handlers, statute, ref, call)
           error = remedy_error(error, outcome)
           best_effort_denial(db, verb, origin, principal, session_key, error)
           {:error, error}

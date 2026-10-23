@@ -247,7 +247,7 @@ defmodule Tightbeam.Mementos do
     # Keep all decisions dry until every name has passed. A later refusal rolls
     # back the record and carries earlier close/notice work back to Dispatch.
     calls =
-      if(call.verb == "memento-set" or Map.get(call, :review_pending, false),
+      if(call.verb == "memento-set",
         do: [],
         else: [Map.put(call, :memento_admission, :host)]
       ) ++
