@@ -1150,7 +1150,7 @@ defmodule Tightbeam.Wakes do
 
   defp terminal_action_note_matches?(note, event) when is_binary(note) do
     case Regex.run(
-           ~r/\Acompletion-handoff-action ([^\s]+) ([^\s]+) ([^\s]+) (kept|parked|retired): (.+)\z/u,
+           ~r/\Acompletion-handoff-action ([^\s]+) ([^\s]+) ([^\s]+) (kept|parked|retired): (.+)\z/us,
            note,
            capture: :all_but_first
          ) do

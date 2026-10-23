@@ -524,6 +524,26 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
              )
   end
 
+  test "a multi-line action detail still matches the documented note shape", ctx do
+    {parent_assignment, child_assignment, root} =
+      completed_child(ctx, parent_opener: "other-parent")
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    [pending] = pending_reminders(ctx.db, root.wake_id)
+
+    detail = "kept the child for its next owner.\n\nSecond paragraph with more detail."
+    note = action_note(child_assignment.id, root, "kept", detail)
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call({:session, "notice-parent"}, parent_assignment.id, note)
+             )
+
+    assert Wakes.get(ctx.db, pending.wake_id).state == "canceled"
+  end
+
   test "the shipped parent directive appears in composed guidance for both harnesses", _ctx do
     base =
       Path.join(
