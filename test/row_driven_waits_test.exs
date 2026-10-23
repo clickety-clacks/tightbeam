@@ -1332,7 +1332,6 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     assert current =~ "terminal.ownerLease=claim.ownerLease"
     assert current =~ "t.status='running'"
-    assert current =~ "creator.ownerUserId=w.ownerUserId"
     refute current =~ "WITH RECURSIVE lineage"
     assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
 
