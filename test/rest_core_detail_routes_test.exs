@@ -1387,8 +1387,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
          [:bearer_auth, :query_decode, :principal_resolution]},
         {path <> "?asUser=flynn&asUser=flynn", "tbc_core_detail", 400, "invalid_as_user", nil,
          [:bearer_auth, :query_decode, :principal_resolution]},
-        {path <> "?asUser=mallory", ctx.admin_session.cli_token, 403, "identity_not_yours",
-         "this session belongs to flynn", [:bearer_auth, :query_decode, :principal_resolution]},
         {path <> "?asUser=flynn", nil, 400, "invalid_as_user", nil,
          [:bearer_auth, :query_decode, :principal_resolution]},
         {path <> "?asUser=flynn%zz", nil, 400, "malformed_query", nil,
@@ -2225,17 +2223,21 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert org_page.status == 200
     assert JSON.decode!(org_page.resp_body)["items"] == JSON.decode!(page.resp_body)["items"]
 
+    session_as_user = get(ctx, path <> "&asUser=flynn", ctx.admin_session.cli_token)
+    assert session_as_user.status == 200
+
+    assert JSON.decode!(session_as_user.resp_body)["items"] ==
+             JSON.decode!(page.resp_body)["items"]
+
     for {suffix, token, status, code} <- [
           {"?unknown=x", "bad-token", 401, "auth_failed"},
           {"", "tbc_core_detail", 400, "invalid_message"},
-          {"?asUser=mallory", ctx.admin_session.cli_token, 403, "identity_not_yours"},
           {"?asUser=flynn", ctx.token, 400, "invalid_as_user"},
           {"?asUser=flynn&asUser=flynn", "tbc_core_detail", 400, "invalid_as_user"},
           {"?asUser=flynn%zz", ctx.token, 400, "malformed_query"}
         ] do
       response = get(ctx, "/api/work-items" <> suffix, token)
-      message = if code == "identity_not_yours", do: "this session belongs to flynn", else: nil
-      assert_error(response, status, "work items", code, message)
+      assert_error(response, status, "work items", code)
     end
   end
 

@@ -1603,15 +1603,10 @@ defmodule Tightbeam.Wire.Router do
   defp state_principal_view({:session, session_key}, _conn),
     do: %{kind: "session", id: session_key, is_admin: false}
 
-  defp resolve_cli_as_user(:org, user_id) when is_binary(user_id) and user_id != "",
+  defp resolve_cli_as_user(_auth, user_id) when is_binary(user_id) and user_id != "",
     do: {:ok, {:user, user_id}}
 
-  defp resolve_cli_as_user({:session, %{owner_user_id: owner}}, owner)
-       when is_binary(owner) and owner != "",
-       do: {:ok, {:user, owner}}
-
-  defp resolve_cli_as_user({:session, %{owner_user_id: owner}}, _other),
-    do: {:error, 403, "identity_not_yours", "this session belongs to #{owner}"}
+  defp resolve_cli_as_user(_auth, _empty), do: {:error, 400, "invalid_message", nil}
 
   defp decode_state_query(conn), do: decode_state_query_string(conn.query_string)
 
@@ -1666,15 +1661,6 @@ defmodule Tightbeam.Wire.Router do
     remaining = deadline - System.monotonic_time(:microsecond)
 
     if remaining > 0, do: wait_for_state_not_found_floor(deadline), else: :ok
-  end
-
-  defp state_error(conn, resource, status, "identity_not_yours" = code, message) do
-    bytes =
-      "{" <>
-        ~s("schemaVersion":1,"resource":#{JSON.encode!(resource)},) <>
-        ~s("error":{"code":#{JSON.encode!(code)},"message":#{JSON.encode!(message)}}})
-
-    state_send(conn, status, bytes)
   end
 
   defp state_error(conn, resource, status, code, _message) do
@@ -2372,11 +2358,11 @@ defmodule Tightbeam.Wire.Router do
       [] ->
         {:ok, %{kind: "session", id: session.session_key, is_admin: false}}
 
-      [user_id] when user_id == session.owner_user_id and user_id != "" ->
+      [user_id] when user_id != "" ->
         {:ok, d1_user_principal(user_id, conn)}
 
-      [_user_id] ->
-        {:error, 403, "identity_not_yours", "this session belongs to #{session.owner_user_id}"}
+      [_empty] ->
+        {:error, 400, "invalid_message", nil}
 
       _repeated ->
         {:error, 400, "invalid_as_user", nil}
@@ -2876,7 +2862,7 @@ defmodule Tightbeam.Wire.Router do
       else: {:error, 400, "invalid_message", "verb not allowed: #{verb}"}
   end
 
-  defp agent_identity(%{"asProcess" => "tightbeam"}, :org, _conn) do
+  defp agent_identity(%{"asProcess" => "tightbeam"}, _auth, _conn) do
     {:error, 403, "reserved_origin", "process:tightbeam is reserved to the substrate"}
   end
 
@@ -2910,25 +2896,18 @@ defmodule Tightbeam.Wire.Router do
         role = body["as"]
 
         case Roles.resolve(db(conn), role) do
-          {:ok, key, false} when key == session.session_key ->
+          {:ok, _session_key, false} ->
             {:ok, "agent:#{role}", session_principal}
 
           _ ->
-            held = if roles == [], do: "none", else: Enum.join(roles, ", ")
-
-            {:error, 403, "role_not_held",
-             "role #{role} is not held by this session; held roles: #{held}"}
+            {:error, 400, "invalid_message", "unknown or unbound role: #{role}"}
         end
 
-      is_binary(body["asUser"]) ->
-        if body["asUser"] == session.owner_user_id do
-          {:ok, "user:#{session.owner_user_id}", {:user, session.owner_user_id}}
-        else
-          {:error, 403, "identity_not_yours", "this session belongs to #{session.owner_user_id}"}
-        end
+      is_binary(body["asUser"]) and body["asUser"] != "" ->
+        {:ok, "user:#{body["asUser"]}", {:user, body["asUser"]}}
 
       is_binary(body["asProcess"]) and body["asProcess"] != "" ->
-        {:error, 403, "identity_not_yours", "a session token cannot act as a process"}
+        {:ok, "process:#{body["asProcess"]}", {:process, body["asProcess"]}}
 
       length(roles) == 1 ->
         {:ok, "agent:#{hd(roles)}", session_principal}
