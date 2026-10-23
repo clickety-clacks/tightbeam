@@ -148,24 +148,12 @@ defmodule Tightbeam.SessionPoAssociations do
     end
   end
 
-  defp authorize(_txn, {:user, owner}, _target, owner), do: {:ok, "user:" <> owner}
+  defp authorize(_txn, {:user, user}, _target, _owner), do: {:ok, "user:" <> user}
 
-  defp authorize(txn, {:session, caller}, target, owner) do
-    with [[^owner, "active"]] <-
-           Txn.q(txn, "SELECT ownerUserId,state FROM sessions WHERE sessionKey=?1", [caller]),
-         true <- caller == target or Org.current_parent(txn, target) == caller do
-      {:ok, "session:" <> caller}
-    else
-      _ ->
-        {:error, "not_authorized",
-         "only the owner, target session, or current parent may set the addressed PO"}
-    end
-  end
+  defp authorize(_txn, {:session, caller}, _target, _owner), do: {:ok, "session:" <> caller}
 
   defp authorize(_txn, _principal, _target, _owner),
-    do:
-      {:error, "not_authorized",
-       "only the owner, target session, or current parent may set the addressed PO"}
+    do: {:error, "not_authorized", "an authenticated user or session is required"}
 
   defp resolvable_po_role(txn, po_role, owner) do
     case Txn.q(txn, "SELECT ownerUserId,boundSessionKey FROM roles WHERE name=?1", [po_role]) do
