@@ -17,23 +17,22 @@ not been established.
 If a notice is never received, the corresponding change is invisible to a
 healthy socket until the client completes another rebuild. This can happen
 when a resource publishes no notice or when the payload guard withholds one.
-For the seven directly applied resources in 0.1.11—work items, assignments,
-attests, artifacts, turns, wakes, and sessions—the release's publication
-contract covers their committed row changes. Other resources may still have
-committed changes that publish no notice; whenever they do publish an eligible
-notice, the healthy-socket guarantee above applies. The server keeps no record
-of undelivered notices and offers no replay, receipt, durable cursor, or
-delivery ledger. A detail read for an unrelated notice cannot recover a
-change whose notice never arrived. Without a client-chosen rebuild interval,
-recovery has no finite freshness bound.
+In 0.1.11, some committed row changes are not published, including a pending
+wake moving to a new delivery target during retirement or supervision. When a
+change does publish an eligible notice, the healthy-socket guarantee above
+applies. The server keeps no record of undelivered notices and offers no
+replay, receipt, durable cursor, or delivery ledger. A detail read for an
+unrelated notice cannot recover a change whose notice never arrived. Without
+a client-chosen rebuild interval, recovery has no finite freshness bound.
 
 After any socket close, or when the expected heartbeat does not arrive, a
 client reconnects, authenticates, subscribes, and rebuilds its visible state.
 It starts the subscription before the snapshot walk. A rebuild may remove a
-row by absence only when a complete walk began after a fresh subscription
-boundary and no notice for that row arrived on the current subscription. If a
-close or visibility change interrupts the walk, the client discards its
-absence results and starts again from a fresh boundary.
+row by absence only when a complete walk of the modeled collections began
+after a fresh subscription boundary and no notice for that row arrived on the
+current subscription. If a close or visibility change interrupts the walk,
+the client discards its absence results and starts again from a fresh
+boundary.
 
 The directly applied resources need no REST reads on the normal path. A
 client must treat notices for any resource not certified for direct
@@ -45,7 +44,8 @@ normal-path requests.
 After a close, the minimum request count for one rebuild is
 
 ```text
-sum over each modeled bulk collection: max(1, ceil(visible rows / 500))
+sum over each supported collection route used by the view:
+  max(1, ceil(visible rows / 500))
 + one /api/execution-map/tree request, if ExecutionMap facts are shown
 + one unpaged `toplines` dispatch read, if Toplines are shown
 + one `topline` dispatch read for each of T visible Toplines, if Toplines are shown
@@ -53,5 +53,10 @@ sum over each modeled bulk collection: max(1, ceil(visible rows / 500))
 
 This is a lower bound. It assumes pages use `limit=500` and that no rows are
 added during the walk. If a collection's walk must restart, its pages are read
-again. The direct-application view models seven bulk collections: work items,
-assignments, attests, artifacts, turns, wakes, and sessions.
+again. The global collection routes available in 0.1.11 are `/api/work-items`,
+`/api/attests`, `/api/artifacts`, and `/api/sessions`. Assignments have a
+detail route and a per-assignment attests collection. Wakes and turns have
+detail routes and per-session collections; this release has no global
+assignment, wake, or turn collection routes. A global collection walk cannot
+discover assignments; wakes and turns can be enumerated within each known
+session.
