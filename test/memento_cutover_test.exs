@@ -1520,6 +1520,7 @@ defmodule Tightbeam.MementoCutoverTest do
 
       retained = retained_policy_record!(ctx.base)
       core = retained.record["core"]
+
       assert core == %{
                "build" => Tightbeam.BuildStamp.build(),
                "sha" => Tightbeam.BuildStamp.sha()

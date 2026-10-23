@@ -768,6 +768,7 @@ defmodule Tightbeam.IdentityTest do
     assert inventory.scope == "active_sessions"
     assert inventory.session_count == 2
     assert inventory.stale_session_keys == ["stale"]
+
     status_sessions =
       handler.(call).sessions
       |> Enum.sort_by(& &1.session_key)

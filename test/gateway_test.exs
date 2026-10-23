@@ -10881,6 +10881,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert File.read!(skill) == "newer published revision"
     assert Org.get(ctx.db, session.session_key).identity_revision == newer
+
     assert Enum.any?(Tightbeam.Wakes.list_for_session(ctx.db, session.session_key), fn wake ->
              wake.state == "pending" and not MapSet.member?(prior_pending_ids, wake.wake_id)
            end)
