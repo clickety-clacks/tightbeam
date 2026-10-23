@@ -397,13 +397,6 @@ defmodule Tightbeam.JobTraceTest do
       }
     ]
 
-    assert %{code: "not_holder"} =
-             attest(db, {:session, "other-session"}, "asg_bad", "completion", %{
-               commit_refs: remote_refs
-             })
-
-    refute_received {:commit_ref_command, _, _, _}
-
     assert %{attest: %{commitRefs: ^remote_refs}} =
              attest(db, {:session, "holder"}, "asg_bad", "completion", %{
                commit_refs: remote_refs

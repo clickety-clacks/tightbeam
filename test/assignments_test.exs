@@ -2850,12 +2850,6 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert %{code: "invalid_release_tuple"} = handle(ctx, "attest", partial_release)
 
-    wrong_holder =
-      attest_call({:session, "other-session"}, first.id, "cannot-proceed")
-      |> put_in([:params, :note], "not mine")
-
-    assert %{code: "not_holder"} = handle(ctx, "attest", wrong_holder)
-
     filing =
       attest_call({:session, "holder"}, first.id, "cannot-proceed")
       |> put_in([:params, :note], "waiting for the exact release fact")
@@ -5650,19 +5644,16 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{code: "principal_required"} =
              handle(ctx, "attest", attest_call(nil, assignment.id, "progress"))
 
-    assert %{code: "not_holder"} =
-             handle(
-               ctx,
-               "attest",
-               attest_call({:session, "other-session"}, assignment.id, "progress")
-             )
+    third_party_progress =
+      handle(
+        ctx,
+        "attest",
+        attest_call({:session, "other-session"}, assignment.id, "progress")
+      )
 
-    assert %{code: "not_holder"} =
-             handle(
-               ctx,
-               "attest",
-               attest_call({:session, "other-session"}, assignment.id, "bogus")
-             )
+    assert third_party_progress.attest.kind == "progress"
+    assert third_party_progress.attest.bySession == "other-session"
+    assert third_party_progress.assignment.state == "open"
 
     assert %{code: "missing_verdict_kind"} =
              handle(
@@ -5671,8 +5662,8 @@ defmodule Tightbeam.AssignmentsTest do
                attest_call({:session, "other-session"}, assignment.id, "verdict")
              )
 
-    assert %{code: "not_holder"} =
-             handle(ctx, "attest", attest_call({:user, "flynn"}, assignment.id, "progress"))
+    assert %{code: "invalid_kind"} =
+             handle(ctx, "attest", attest_call({:session, "other-session"}, assignment.id, "bogus"))
 
     assert %{code: "invalid_kind"} =
              handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "bogus"))
