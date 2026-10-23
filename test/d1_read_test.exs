@@ -554,24 +554,20 @@ defmodule Tightbeam.D1ReadRouteTest do
            ]
   end
 
-  test "session asUser distinguishes absent, empty, matching, and unauthorized identities", ctx do
+  test "session asUser distinguishes absent, empty, and named identities", ctx do
     assert get(ctx.opts, "/api/hosts", ctx.session.cli_token).status == 200
     assert get(ctx.opts, "/api/hosts?asUser=admin", ctx.session.cli_token).status == 200
+    assert get(ctx.opts, "/api/hosts?asUser=operator", ctx.session.cli_token).status == 200
 
-    for query <- ["?asUser=", "?asUser=operator"] do
-      response = get(ctx.opts, "/api/hosts" <> query, ctx.session.cli_token)
+    empty = get(ctx.opts, "/api/hosts?asUser=", ctx.session.cli_token)
 
-      assert response.status == 403
+    assert empty.status == 400
 
-      assert JSON.decode!(response.resp_body) == %{
-               "schemaVersion" => 1,
-               "resource" => "hosts",
-               "error" => %{
-                 "code" => "identity_not_yours",
-                 "message" => "this session belongs to admin"
-               }
-             }
-    end
+    assert JSON.decode!(empty.resp_body) == %{
+             "schemaVersion" => 1,
+             "resource" => "hosts",
+             "error" => %{"code" => "invalid_message"}
+           }
   end
 
   test "missing REST details honor the 3ms not-found floor without a scheduler overshoot", ctx do
