@@ -3,7 +3,7 @@ defmodule Tightbeam.SubtreeGuidanceTest do
 
   alias Tightbeam.{DB, Gateway, Model, Org, SubtreeGuidance, Wakes}
 
-  @main "main-session"
+  @main Org.personal_session_key("test-owner")
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
