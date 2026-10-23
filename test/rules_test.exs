@@ -1655,7 +1655,7 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
-  test "changes-requested wakes and reopens the author card, then clean review closes it", ctx do
+  test "changes-requested leaves pending completion open and clean review settles it", ctx do
     holder = session(ctx.db, "review-change-author", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "review-change-judge", "reviewer", archetype: "reviewer-code")
 
@@ -1702,7 +1702,7 @@ defmodule Tightbeam.RulesTest do
     assert {:ok, [["open"]]} =
              DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [producer.id])
 
-    assert Enum.any?(Wakes.list_pending(ctx.db), fn wake ->
+    refute Enum.any?(Wakes.list_pending(ctx.db), fn wake ->
              wake.session_key == holder.session_key and wake.assignment_id == producer.id and
                wake.prompt =~ "requested changes"
            end)
@@ -1747,21 +1747,23 @@ defmodule Tightbeam.RulesTest do
                refs
              )
 
-    assert {:ok, [["open", nil, nil]]} =
+    assert {:ok, [["closed", "completed", closing_attest_id]]} =
              DB.query(
                ctx.db,
                "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
                [producer.id]
              )
 
-    assert {:ok, [[1]]} =
+    assert closing_attest_id == completion_attest.id
+
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM assignment_reopenings WHERE assignmentId=?1",
                [producer.id]
              )
 
-    assert Enum.any?(Wakes.list_pending(ctx.db), fn wake ->
+    refute Enum.any?(Wakes.list_pending(ctx.db), fn wake ->
              wake.session_key == holder.session_key and wake.assignment_id == producer.id and
                wake.prompt =~ "requested changes"
            end)

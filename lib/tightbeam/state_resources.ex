@@ -130,7 +130,7 @@ defmodule Tightbeam.StateResources do
     "work items" =>
       ~w(id title specRefName specRefSha256 isBug ownerUserId deliveryOwnerSessionKey state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority body bodyUpdatedByUser bodyUpdatedBySession bodyUpdatedAt rowVersion mementos),
     "assignments" =>
-      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider files commitRefCorrections effectKind derivedStatus rowVersion mementos),
+      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion mementos),
     "attests" =>
       ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs artifactId contentSha256 waitId ts rowVersion mementos),
     "wakes" =>
@@ -1674,23 +1674,9 @@ defmodule Tightbeam.StateResources do
 
   def assignment(row) do
     row = memento_default(row)
-
-    corrections =
-      Map.get(row, :commit_ref_corrections) || Map.get(row, :commitRefCorrections) ||
-        Map.get(row, "commitRefCorrections") || []
-
-    item =
-      row
-      |> Map.drop([:commit_ref_corrections, :commitRefCorrections, "commitRefCorrections"])
-      |> public()
-      |> Map.put(
-        "commitRefCorrections",
-        Enum.map(corrections, fn correction ->
-          Map.new(correction, fn {key, value} -> {wire_key(key), public(value)} end)
-        end)
-      )
-
-    item
+    row
+    |> Map.drop([:commit_ref_corrections, :commitRefCorrections, "commitRefCorrections"])
+    |> public()
   end
 
   defp memento_default(row) when is_map(row) do

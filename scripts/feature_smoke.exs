@@ -725,26 +725,9 @@ defmodule FeatureSmoke do
         "gate chain: reviewed-clean from the #{reviewer_leg.wire_name} reviewer failed: #{inspect(v)}"
       )
 
-      # Linked review alone cannot satisfy the combined holder-verification requirement.
-      denied!(state, "completion-requires-review", asg_id, complete)
-
-      verified =
-        post_as(state, holder.token, "attest", %{
-          "assignmentId" => asg_id,
-          "kind" => "verdict",
-          "verdictKind" => "verified",
-          "commitRefs" => holder.check.commit_refs,
-          "mementos" => holder.check.evidence_mementos,
-          "note" => holder.check.note
-        })
-
-      assert(
-        state,
-        not (is_map(verified) and Map.has_key?(verified, "error")),
-        "gate chain: the holder-token verified verdict failed: #{inspect(verified)}"
-      )
-
-      # With the report, holder verification and matching independent review, completion passes.
+      # The shipped bundle is legacy-classified here: its commitRefs and verdict
+      # facts remain the admission inputs, and the clean linked review settles the
+      # ordinary review-pending completion.
       done = complete.()
       final = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
 

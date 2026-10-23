@@ -2742,7 +2742,8 @@ defmodule Tightbeam.Assignments do
                  :ok <- valid_note(call.params[:note]),
                  :ok <- valid_cannot_proceed_reason(call.params),
                  :ok <- absent_verdict_kind(call.params[:verdict_kind]),
-                 :ok <- valid_release_tuple_for_kind(call.params) do
+                 :ok <- valid_release_tuple_for_kind(call.params),
+                 :ok <- legacy_code_completion_in_txn(txn, assignment, call) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
                  ]) != [[1]],
@@ -2794,6 +2795,14 @@ defmodule Tightbeam.Assignments do
     file_attest_condition_fact(txn, assignment, attest, result)
   end
 
+  defp legacy_code_completion_in_txn(txn, assignment, call) do
+    if Tightbeam.Rules.active_admission_contract("attest") == "legacy" do
+      applicable_code_completion_in_txn(txn, assignment, call)
+    else
+      :ok
+    end
+  end
+
   defp apply_lifecycle_attest(txn, %{params: %{kind: "progress"}}, assignment, attest) do
     append_attest_marker(txn, attest)
     %{assignment: assignment, attest: attest}
@@ -2819,7 +2828,6 @@ defmodule Tightbeam.Assignments do
         close_completed_assignment_in_txn(txn, completion_call, assignment, attest)
 
       "changes-requested" ->
-        schedule_author_review_changes_in_txn(txn, assignment, attest)
         append_attest_marker(txn, attest)
         %{assignment: assignment, attest: attest}
 
@@ -2845,21 +2853,58 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  defp schedule_author_review_changes_in_txn(txn, assignment, review_attest) do
-    Wakes.schedule_in_txn(txn, %{
-      session_key: assignment.holderKey,
-      origin: "remedy:completion-requires-review",
-      creator_session_key: review_attest.bySession,
-      prompt:
-        "Independent review #{review_attest.id} requested changes to assignment #{assignment.id}; " <>
-          "address the review and record the next result.",
-      due_at: now(),
-      assignment_id: assignment.id,
-      work_item_id: assignment.workItemId,
-      class: "input-needed"
-    })
+  defp settle_reviewed_assignment_in_txn(
+         _txn,
+         _call,
+         %{reviewsAssignmentId: producer_id},
+         _review_attest
+       )
+       when not is_binary(producer_id),
+       do: :ok
+
+  defp settle_reviewed_assignment_in_txn(txn, call, review_assignment, _review_attest) do
+    case fetch_assignment(txn, review_assignment.reviewsAssignmentId) do
+      %{id: producer_id} = producer ->
+        case latest_completion_attest_in_txn(txn, producer_id) do
+          %{id: _completion_id} = completion ->
+            if completion_review_conclusion_in_txn(txn, producer) == "reviewed-clean" and
+                 producer.state == "open" do
+              completion_call =
+                Map.put(call, :params, %{assignment_id: producer.id, kind: "completion"})
+
+              if applicable_code_completion_in_txn(txn, producer, completion_call) == :ok do
+                close_completed_assignment_in_txn(txn, call, producer, completion)
+              end
+            end
+
+          _ ->
+            :ok
+        end
+
+      _ ->
+        :ok
+    end
 
     :ok
+  end
+
+  defp latest_completion_attest_in_txn(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT id,assignmentId,kind,verdictKind,note,bySession,byUser,producer,
+             producerCommand,byHarness,byProvider,commitRefs,artifactId,contentSha256,
+             waitId,ts
+           FROM attests
+           WHERE assignmentId=?1 AND kind='completion'
+           ORDER BY ts DESC,rowid DESC
+           LIMIT 1
+           """,
+           [assignment_id]
+         ) do
+      [row] -> attest(row)
+      [] -> nil
+    end
   end
 
   defp latest_review_conclusion_in_txn(txn, assignment_id) do
@@ -3190,6 +3235,10 @@ defmodule Tightbeam.Assignments do
                       by_session: attest.bySession,
                       attest_id: attest.id
                     })
+
+                  if Tightbeam.Rules.active_admission_contract("attest") == "legacy" do
+                    :ok = settle_reviewed_assignment_in_txn(txn, call, assignment, attest)
+                  end
 
                   append_attest_marker(txn, attest)
                   result = %{assignment: assignment, attest: attest}
@@ -4337,6 +4386,62 @@ defmodule Tightbeam.Assignments do
   end
 
   defp canonical_commit_refs(_), do: :error
+
+  defp applicable_code_completion_in_txn(_txn, _assignment, %{params: %{kind: kind}})
+       when kind != "completion",
+       do: :ok
+
+  defp applicable_code_completion_in_txn(txn, %{effectKind: "code"} = assignment, call) do
+    review = latest_review_conclusion_in_txn(txn, assignment.id)
+    verification = latest_verification_conclusion_in_txn(txn, assignment.id, assignment.holderKey)
+
+    verification_qualifies? =
+      match?(
+        %{kind: "verified", holder: holder} when holder == assignment.holderKey,
+        verification
+      )
+
+    review_qualifies? =
+      Map.get(call, :review_pending, false) or
+        match?(
+          %{kind: "reviewed-clean", holder: holder} when holder != assignment.holderKey,
+          review
+        )
+
+    if verification_qualifies? and review_qualifies? do
+      :ok
+    else
+      error(
+        "inapplicable_code_evidence",
+        "code completion requires a holder verification and the latest independent clean review, unless review is pending"
+      )
+    end
+  end
+
+  defp applicable_code_completion_in_txn(_txn, _assignment, _call), do: :ok
+
+  defp latest_verification_conclusion_in_txn(txn, assignment_id, holder) do
+    case Txn.q(
+           txn,
+           """
+           SELECT verdictKind,bySession
+           FROM attests
+           WHERE assignmentId=?1
+             AND kind='verdict'
+             AND bySession=?2
+             AND verdictKind IN ('verified','verification-failed')
+           ORDER BY ts DESC,rowid DESC
+           LIMIT 1
+           """,
+           [assignment_id, holder]
+         ) do
+      [[kind, author]] ->
+        %{kind: kind, holder: author}
+
+      [] ->
+        nil
+    end
+  end
 
   defp run_git_cat_file(db, host, path, commit) do
     base_dir =

@@ -812,6 +812,13 @@ defmodule Tightbeam.MementoAdmissionTest do
 
     for _ <- 1..3 do
       a = open.("code")
+      assert %{attest: %{verdictKind: "verified"}} =
+               attest(ctx, a.id, "holder", "verdict", "verified")
+
+      review = assign(ctx, "reviewer", a.id)
+      assert %{attest: %{verdictKind: "reviewed-clean"}} =
+               attest(ctx, review.id, "reviewer", "verdict", "reviewed-clean")
+
       assert %{assignment: %{state: "closed"}} = attest(ctx, a.id, "holder", "completion")
     end
 
@@ -953,7 +960,7 @@ defmodule Tightbeam.MementoAdmissionTest do
     end
   end
 
-  test "shipped holder verification requires the selected kind and matching nonempty evidence",
+  test "shipped legacy verification requires the verdict kind rather than Memento evidence",
        ctx do
     install_engineering_policy(ctx, "verification.toml")
     {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET archetype='coder' WHERE sessionKey='holder'")
@@ -980,16 +987,9 @@ defmodule Tightbeam.MementoAdmissionTest do
              decide.()
 
     policy_verdict(ctx, producer.id, "holder", "verified", ["other"])
-
-    assert {:ok, {{:remedy, %{name: "completion-requires-verification"}, _, _}, [], []}} =
-             decide.()
-
-    policy_verdict(ctx, producer.id, "holder", "verified", ["expected"])
     assert {:ok, {:allow, [], []}} = decide.()
     policy_verdict(ctx, producer.id, "holder", "changes-requested", ["expected"])
-
-    assert {:ok, {{:remedy, %{name: "completion-requires-verification"}, _, _}, [], []}} =
-             decide.()
+    assert {:ok, {:allow, [], []}} = decide.()
   end
 
   test "completion policy refuses unresolved positive requirements while other attests remain allowed",
@@ -1411,7 +1411,7 @@ defmodule Tightbeam.MementoAdmissionTest do
   end
 
   test "closed assignment metadata is silent and attest metadata is immutable", ctx do
-    a = assign(ctx, "holder")
+    a = assign(ctx, "holder", nil, "coordination")
     result = attest(ctx, a.id, "holder", "completion")
     assert %{attest: %{kind: "completion"}, assignment: %{state: "closed"}} = result
     before = for table <- ~w(attests wakes messages), do: count(ctx, table)
@@ -1617,7 +1617,7 @@ defmodule Tightbeam.MementoAdmissionTest do
     assert MementoJudgments.latest(ctx.db, open.id, "linked_review") == nil
     assert DB.query(ctx.db, "SELECT * FROM attests WHERE id=?1", [legacy.id]) == before
 
-    closed = assign(ctx, "holder")
+    closed = assign(ctx, "holder", nil, "coordination")
     assert %{assignment: %{state: "closed"}} = attest(ctx, closed.id, "holder", "completion")
     successor = assign(ctx, "reviewer", closed.id)
     assert %{id: _} = successor

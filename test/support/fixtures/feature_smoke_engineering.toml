@@ -7,26 +7,14 @@
 [[rule]]
 name = "completion-requires-review"
 verb = "attest"
-text = "code, policy, release, and live-mutation completion needs exactly one --reviews-linked card held by a different session whose latest holder-filed verdict is reviewed-clean; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide review-session selection only"
+text = "code, policy, release, and live-mutation completion needs the most recent holder-filed review-conclusion verdict (reviewed-clean or changes-requested), pooled across all --reviews-linked cards, to be reviewed-clean on a card held by a different session; verdicts of other kinds are ignored; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide review-session selection only"
 external_producer = true
 edges = ["verb"]
 effect = "remedy"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.memento.agentic-engineering/effect-kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
-]
-require = [
-  { fact = "assignment.latest_holder_verdict.present", op = "eq", value = true },
-  { fact = "assignment.latest_holder_verdict.has_judgment_kind", op = "eq", value = true },
-  { fact = "assignment.latest_holder_verdict.judgment_kind", op = "in", value = ["verified"] },
-  { fact = "assignment.latest_holder_verdict.has_memento.agentic-engineering/evidence-ref", op = "eq", value = true },
-  { fact = "assignment.latest_holder_verdict.memento_matches_call.agentic-engineering/evidence-ref", op = "eq", value = true },
-  { fact = "assignment.latest_linked_review.present", op = "eq", value = true },
-  { fact = "assignment.latest_linked_review.has_judgment_kind", op = "eq", value = true },
-  { fact = "assignment.latest_linked_review.judgment_kind", op = "in", value = ["reviewed-clean"] },
-  { fact = "assignment.latest_linked_review.independent", op = "eq", value = true },
-  { fact = "assignment.latest_linked_review.has_memento.agentic-engineering/evidence-ref", op = "eq", value = true },
-  { fact = "assignment.latest_linked_review.memento_matches_call.agentic-engineering/evidence-ref", op = "eq", value = true },
+  { fact = "assignment.effect_kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
+  { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
 ]
 [rule.remedy]
 action = "wake"
@@ -64,14 +52,14 @@ work_item = "{work_item_id}"
 [[rule]]
 name = "code-review-requires-passing-tests"
 verb = "assign"
-text = "code review needs the code author's verification receipt: the assignment holder must file a verified verdict with the tested repository, commit, command or suite, and passing result"
+text = "code review needs the code author's passing-test receipt: the assignment holder must file a tests-passed verdict with the tested repository, commit, command or suite, and passing result"
 edges = ["verb"]
 effect = "deny"
 deny_when = [
   { fact = "assignment.is_producing_card", op = "eq", value = true },
   { fact = "assignment.state", op = "eq", value = "open" },
   { fact = "assignment.holder_archetype", op = "eq", value = "coder" },
-  { fact = "assignment.holder_noted_verdict_kinds", op = "not_in", value = ["verified"] },
+  { fact = "assignment.holder_noted_verdict_kinds", op = "not_in", value = ["tests-passed"] },
 ]
 
 # Spec-backed work is a slice of product: before its implementation

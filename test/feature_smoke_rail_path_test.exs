@@ -675,7 +675,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                  SELECT count(*) FROM attests a JOIN assignments s ON s.id=a.assignmentId
                  JOIN memento_current m ON m.recordKind='attest' AND m.recordId=a.id
                    AND m.name='agentic-engineering/evidence-ref'
-                 WHERE s.workItemId=?1 AND m.valueJson=?2 AND a.commitRefs IS NULL
+                 WHERE s.workItemId=?1 AND m.valueJson=?2 AND a.commitRefs IS NOT NULL
                  """,
                  [wi, evidence]
                )

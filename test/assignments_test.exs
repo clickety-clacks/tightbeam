@@ -6397,21 +6397,35 @@ defmodule Tightbeam.AssignmentsTest do
   defp effect_memento(value), do: [%{name: "agentic-engineering/effect-kind", value: value}]
 
   defp assign_call(principal, subject \\ "work", key \\ nil, work_item_id \\ nil) do
-    call("assign", principal, "holder", %{
+    params = %{
       subject: subject,
       idempotency_key: key,
       work_item_id: work_item_id
-    })
+    }
+
+    params =
+      if Rules.active_admission_contract("assign") == "legacy",
+        do: Map.put(params, :effect_kind, "coordination"),
+        else: params
+
+    call("assign", principal, "holder", params)
     |> Map.merge(%{target_role: nil, role_fallback: false})
   end
 
   defp dispatch_call(principal, subject, brief, key \\ nil, work_item_id \\ nil) do
-    call("dispatch", principal, "holder", %{
+    params = %{
       subject: subject,
       brief: brief,
       idempotency_key: key,
       work_item_id: work_item_id
-    })
+    }
+
+    params =
+      if Rules.active_admission_contract("dispatch") == "legacy",
+        do: Map.put(params, :effect_kind, "coordination"),
+        else: params
+
+    call("dispatch", principal, "holder", params)
     |> Map.merge(%{target_role: nil, role_fallback: false, supervision_interval_ms: 1_000})
   end
 

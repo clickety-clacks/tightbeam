@@ -1970,42 +1970,8 @@ defmodule Tightbeam.CliIntegrationTest do
     assert recorded["recordedMessageId"] == message.id
     assert recorded["recordedTurnEvidence"] == "tool-call-observed"
 
-    # With the artifact recorded, one accountable review rule still requires
-    # the producer's latest verification to match the linked review evidence.
-    {denied_again, denied_again_status} =
-      System.cmd(ctx.binary, completion_args, cd: coder_dir, stderr_to_stdout: true)
-
-    assert denied_again_status != 0
-    assert denied_again =~ "completion-requires-review"
-
-    assert %{status: "live", producer_key: review_source_id} =
-             RailRemedy.episode(ctx.db, "completion-requires-review", work_id)
-
-    review_delivery = assert_cli_source_delivery!(ctx.db, review_source_id, "cli-holder")
-    assert review_delivery.source.assignment_id == work_id
-    assert review_delivery.source.consumer == "prompt"
-    finish_cli_delivery!(ctx.db, "cli-holder", review_delivery.seq)
-
-    {_verified, 0} =
-      System.cmd(
-        ctx.binary,
-        [
-          "attest",
-          work_id,
-          "--kind",
-          "verdict",
-          "--verdict",
-          "verified",
-          "--commit-refs",
-          evidence_ref,
-          "--memento",
-          "agentic-engineering/evidence-ref=" <> evidence_ref
-        ],
-        cd: coder_dir,
-        stderr_to_stdout: true
-      )
-
-    # A2: the papertrail stands — the completion passes and the episodes close.
+    # The report releases the legacy artifact rule; the already-filed holder
+    # verification and independent clean review allow completion.
     {completed, 0} =
       System.cmd(ctx.binary, completion_args,
         cd: coder_dir,
@@ -2019,8 +1985,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
 
-    assert %{status: "closed"} =
-             RailRemedy.episode(ctx.db, "completion-requires-review", work_id)
+    assert is_nil(RailRemedy.episode(ctx.db, "completion-requires-review", work_id))
 
     assert %{status: "closed"} =
              RailRemedy.episode(ctx.db, "completion-requires-results-artifact", work_id)
@@ -2201,7 +2166,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM assignment_effects")
   end
 
-  test "real CLI leaves completion evidence policy to learned rules", ctx do
+  test "real CLI allows coordination completion without code evidence", ctx do
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     coder =
@@ -2238,9 +2203,9 @@ defmodule Tightbeam.CliIntegrationTest do
           "--subject",
           "neutral bare completion",
           "--effect-kind",
-          "code",
+          "coordination",
           "--memento",
-          "agentic-engineering/effect-kind=code",
+          "agentic-engineering/effect-kind=coordination",
           "--session",
           coder.session_key,
           "--work-item",
@@ -2262,8 +2227,8 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert status == 0
     result = JSON.decode!(completed)
-    assert result["assignment"]["effectKind"] == "code"
-    assert result["assignment"]["mementos"]["agentic-engineering/effect-kind"] == ["code"]
+    assert result["assignment"]["effectKind"] == "coordination"
+    assert result["assignment"]["mementos"]["agentic-engineering/effect-kind"] == ["coordination"]
     attest_id = result["attest"]["id"]
 
     assert {:ok, [["closed", ^attest_id]]} =
@@ -2271,7 +2236,7 @@ defmodule Tightbeam.CliIntegrationTest do
                work_id
              ])
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
@@ -2280,7 +2245,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM rail_remedy_episodes", [])
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM wakes WHERE origin LIKE 'remedy:%'",

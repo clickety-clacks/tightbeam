@@ -449,10 +449,6 @@ defmodule Tightbeam.Rules do
   @doc false
   def effective_snapshot, do: RuleRuntime.policy_snapshot()
 
-  defp with_snapshot(fun) do
-    RuleRuntime.with_policy_snapshot(effective_snapshot(), fun)
-  end
-
   @doc false
   def active_admission_contract(verb) do
     snapshot = effective_snapshot()
@@ -769,7 +765,7 @@ defmodule Tightbeam.Rules do
   @doc "Select the bytewise-smallest matching predicate-only policy for one snapshot."
   @spec select_policy_in_txn(DB.Txn.t(), String.t(), map()) :: {:ok, map()} | :none
   def select_policy_in_txn(%DB.Txn{} = txn, purpose, context) do
-    with_snapshot(fn -> select_policy_in_txn_snapshot(txn, purpose, context) end)
+    select_policy_in_txn_snapshot(txn, purpose, context)
   end
 
   defp select_policy_in_txn_snapshot(%DB.Txn{} = txn, purpose, context) do
@@ -807,7 +803,7 @@ defmodule Tightbeam.Rules do
   @doc "Return the dry statute decision and the actor-owned close/consume work."
   @spec decide(GenServer.server(), map()) :: {term(), [term()], [String.t()]}
   def decide(db, call) do
-    with_snapshot(fn -> decide_snapshot(db, call) end)
+    decide_snapshot(db, call)
   end
 
   defp decide_snapshot(db, call) do
@@ -882,7 +878,7 @@ defmodule Tightbeam.Rules do
   @doc "Evaluate one validated predicate through the common condition and fact engine."
   @spec evaluate_predicate_in_txn(DB.Txn.t(), map()) :: {:ok, map()} | {:error, map()}
   def evaluate_predicate_in_txn(%DB.Txn{} = txn, predicate) when is_map(predicate) do
-    with_snapshot(fn -> evaluate_predicate_in_txn_snapshot(txn, predicate) end)
+    evaluate_predicate_in_txn_snapshot(txn, predicate)
   end
 
   def evaluate_predicate_in_txn(%DB.Txn{}, _predicate),
@@ -952,7 +948,7 @@ defmodule Tightbeam.Rules do
   @doc "Evaluate loaded row-commit notice rules into effects for Wakes to record."
   @spec row_commit_effects_in_txn(DB.Txn.t(), [map()] | map()) :: [tuple()]
   def row_commit_effects_in_txn(%DB.Txn{} = txn, transitions) do
-    with_snapshot(fn -> row_commit_effects_in_txn_snapshot(txn, transitions) end)
+    row_commit_effects_in_txn_snapshot(txn, transitions)
   end
 
   defp row_commit_effects_in_txn_snapshot(%DB.Txn{} = txn, transitions) do
@@ -963,7 +959,7 @@ defmodule Tightbeam.Rules do
   @doc "Resolve a validated notice against the same transaction snapshot as its rule."
   @spec resolve_notice_in_txn(DB.Txn.t(), map(), map()) :: {:ok, map()} | {:error, term()}
   def resolve_notice_in_txn(%DB.Txn{} = txn, rule, call) do
-    with_snapshot(fn -> resolve_notice_in_txn_snapshot(txn, rule, call) end)
+    resolve_notice_in_txn_snapshot(txn, rule, call)
   end
 
   defp resolve_notice_in_txn_snapshot(%DB.Txn{} = txn, rule, call) do
@@ -3577,7 +3573,7 @@ defmodule Tightbeam.Rules do
 
       "assignment" ->
         case fetch_fact("$assignment", db, call, cache) do
-          {:ok, %{reviews_assignment_id: nil}, cache} ->
+          {:ok, %{reviews_assignment_id: nil, effect_kind: "code"}, cache} ->
             case compute_fact("assignment.prior_completed_fix_count", db, call, cache) do
               {3, cache} -> {"fix", cache}
               {_count, cache} -> {nil, cache}

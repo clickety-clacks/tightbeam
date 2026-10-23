@@ -1862,6 +1862,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     shared_item = Tightbeam.StateResources.assignment(shared_row)
     assert shared_item["effectKind"] == "code"
+    refute Map.has_key?(shared_item, "commitRefCorrections")
     assert is_binary(Tightbeam.StateResources.encode_item("assignments", shared_item, catalog))
 
     assert_raise ArgumentError, ~r/assignments.effectKind/, fn ->
@@ -1884,6 +1885,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert public_assignment["closedByProcess"] == nil
     assert public_assignment["closingAttestId"] == nil
     assert public_assignment["effectKind"] == "code"
+    refute Map.has_key?(public_assignment, "commitRefCorrections")
 
     # Legacy creation supplies the 0.1.11 default, and historical typed values
     # remain readable from that same compatibility record.
@@ -3283,7 +3285,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(missing.resp_body)["error"]["code"] == "not_found"
   end
 
-  test "org-token clients of the same version use the pinned request contract", ctx do
+  test "org-token clients of the same version use the declared request contract", ctx do
     alias Tightbeam.Rules
     writer = create_session(ctx.db, "contract-holder", "flynn")
     handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1000})
@@ -3344,7 +3346,6 @@ defmodule Tightbeam.Wire.RouterTest do
     required_rules = ["required-evidence"]
     """)
 
-    legacy = Rules.effective_snapshot()
     candidate = Rules.prepare!(ctx.base_dir, Map.keys(handlers), revision: "contract-candidate")
     # Host/transport proof on a validated fixture, not a runtime activation.
     selected = %{candidate | active_admission_contract: %{"attest" => "replacement"}}
@@ -3355,8 +3356,6 @@ defmodule Tightbeam.Wire.RouterTest do
     wrapped = fn call ->
       send(parent, {:contract_caller, call.transport_session_key, call.principal})
       send(parent, {:contract_attempt, call.params[:note]})
-      # A reload during the call must not change its admission contract.
-      :persistent_term.put(Rules, legacy)
       actual.(call)
     end
 

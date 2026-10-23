@@ -69,13 +69,6 @@ defmodule Tightbeam.Dispatch do
     toplines topline topline-placement-list work-item-list attests assignment-get assignments inspect
     harness-health-evidence-other mementos)
 
-  # These calls may write declared mementos or evaluate legacy admission facts
-  # as part of the same transaction. Keep the selected policy stable across
-  # admission and the handler; unrelated dispatches observe the active policy
-  # at each rule evaluation.
-  @memento_policy_verbs ~w(work-item-create assign dispatch attest memento-set
-    harness-health-close-promotion)
-
   @db_transaction_diagnostic_fields ~w(
     kind operation origin phase cause reasonCause exception cleanup
   )
@@ -94,16 +87,8 @@ defmodule Tightbeam.Dispatch do
     previous_audited = Process.delete(:tightbeam_dispatch_audited)
 
     try do
-      dispatch = fn ->
-        :ok = Assignments.assert_request_contract!(call)
-        dispatch_call(db, handlers, call)
-      end
-
-      if Map.get(call, :verb) in @memento_policy_verbs do
-        Tightbeam.RuleRuntime.with_policy_snapshot(Rules.effective_snapshot(), dispatch)
-      else
-        dispatch.()
-      end
+      :ok = Assignments.assert_request_contract!(call)
+      dispatch_call(db, handlers, call)
     rescue
       error in Tightbeam.Mementos.Refusal ->
         {:error, error.details || %{code: error.code, message: error.message}}
