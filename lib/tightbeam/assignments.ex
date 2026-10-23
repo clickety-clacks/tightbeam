@@ -2833,6 +2833,59 @@ defmodule Tightbeam.Assignments do
     close_completed_assignment_in_txn(txn, call, assignment, attest)
   end
 
+  defp completion_review_conclusion_in_txn(txn, assignment) do
+    case latest_review_conclusion_in_txn(txn, assignment.id) do
+      %{kind: kind, holder: review_holder}
+      when review_holder != assignment.holderKey and
+             kind in ["reviewed-clean", "changes-requested"] ->
+        kind
+
+      _ ->
+        nil
+    end
+  end
+
+  defp schedule_author_review_changes_in_txn(txn, assignment, review_attest) do
+    Wakes.schedule_in_txn(txn, %{
+      session_key: assignment.holderKey,
+      origin: "remedy:completion-requires-review",
+      creator_session_key: review_attest.bySession,
+      prompt:
+        "Independent review #{review_attest.id} requested changes to assignment #{assignment.id}; " <>
+          "address the review and record the next result.",
+      due_at: now(),
+      assignment_id: assignment.id,
+      work_item_id: assignment.workItemId,
+      class: "input-needed"
+    })
+
+    :ok
+  end
+
+  defp latest_review_conclusion_in_txn(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT v.verdictKind,r.holderKey
+           FROM attests v
+           JOIN assignments r ON r.id=v.assignmentId
+           WHERE r.reviewsAssignmentId=?1
+             AND v.kind='verdict'
+             AND v.bySession=r.holderKey
+             AND v.verdictKind IN ('reviewed-clean','changes-requested')
+           ORDER BY v.ts DESC,v.rowid DESC
+           LIMIT 1
+           """,
+           [assignment_id]
+         ) do
+      [[kind, holder]] ->
+        %{kind: kind, holder: holder}
+
+      [] ->
+        nil
+    end
+  end
+
   defp close_completed_assignment_in_txn(txn, call, assignment, attest) do
     Txn.q(
       txn,
