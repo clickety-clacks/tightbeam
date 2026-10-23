@@ -620,16 +620,6 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                )
     end
 
-    # Production work may target another available session once owner and topology are set.
-    for verb <- ["assign", "dispatch"] do
-      assert {:ok, %{holderKey: "pdo-b", workItemId: ^item_id}} =
-               Dispatch.dispatch(
-                 db,
-                 handlers,
-                 production_call(verb, {:user, "owner"}, "pdo-b", item_id)
-               )
-    end
-
     # Production work may target the accountable delivery owner.
     assert %{deliveryOwnerSessionKey: "worker-a"} =
              set_owner(db, {:user, "owner"}, item_id, "worker-a")
@@ -662,6 +652,16 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     owner_review = %{review | session_key: "worker-a"}
     assert {:ok, %{holderKey: "worker-a"}} = Dispatch.dispatch(db, handlers, owner_review)
+
+    # Production work may target another available session once owner and topology are set.
+    for verb <- ["assign", "dispatch"] do
+      assert {:ok, %{holderKey: "worker-b", workItemId: ^item_id}} =
+               Dispatch.dispatch(
+                 db,
+                 handlers,
+                 production_call(verb, {:user, "owner"}, "worker-b", item_id)
+               )
+    end
   end
 
   test "assignment and dispatch share admission while intake and linked review stay reachable", %{
