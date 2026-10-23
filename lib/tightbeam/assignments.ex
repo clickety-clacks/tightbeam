@@ -4214,8 +4214,9 @@ defmodule Tightbeam.Assignments do
 
   defp valid_commit_refs(_db, _kind, nil), do: :ok
 
-  defp valid_commit_refs(db, kind, refs)
-       when kind in ["completion", "verdict"] and is_list(refs) do
+  defp valid_commit_refs(_db, "completion", refs) when is_list(refs), do: :ok
+
+  defp valid_commit_refs(db, "verdict", refs) when is_list(refs) do
     Enum.reduce_while(refs, :ok, fn ref, :ok ->
       case validate_commit_ref(db, ref) do
         :ok -> {:cont, :ok}
