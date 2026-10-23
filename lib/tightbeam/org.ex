@@ -1640,12 +1640,6 @@ defmodule Tightbeam.Org do
   # none of those things.
   @doc false
   def mutate_session_in_txn(txn, session_key, mutation) do
-    mutate_session_in_txn(txn, session_key, mutation, :wall_clock)
-  end
-
-  @doc false
-  def mutate_session_in_txn(txn, session_key, mutation, occurred_at)
-      when is_integer(occurred_at) or occurred_at == :wall_clock do
     before = must_get(txn, session_key)
     result = mutation.()
     after_mutation = must_get(txn, session_key)
@@ -1653,8 +1647,7 @@ defmodule Tightbeam.Org do
     if session_projection(before) == session_projection(after_mutation) do
       {:unchanged, after_mutation, result}
     else
-      version_time = if occurred_at == :wall_clock, do: now(), else: occurred_at
-      session = stamp_session_change_in_txn(txn, session_key, version_time)
+      session = stamp_session_change_in_txn(txn, session_key, now())
 
       class =
         if before.harness == after_mutation.harness do

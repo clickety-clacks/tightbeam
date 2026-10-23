@@ -133,10 +133,7 @@ defmodule Tightbeam.EffortCheckin do
             elapsed
           ])
 
-          if Txn.changes(txn) == 1 do
-            Wakes.publish_change_in_txn(txn, "wake.scheduled", wake_id)
-            Wakes.schedule_changed_in_txn(txn, :wake_ready)
-          end
+          if Txn.changes(txn) == 1, do: Wakes.schedule_changed_in_txn(txn, :wake_ready)
 
         true ->
           :ok
@@ -1212,30 +1209,6 @@ defmodule Tightbeam.EffortCheckin do
 
     horizon = horizon_ms(config)
 
-    changed_wakes =
-      Txn.q(
-        txn,
-        """
-        SELECT w.wakeId
-        FROM wakes AS w
-        WHERE w.state='pending' AND w.dueAt != (
-          SELECT g.armedAt + (?2 * g.multiplier) + g.reliefExcludedMs
-          FROM effort_checkin_generations AS g
-          WHERE g.wakeId=w.wakeId AND g.state='armed'
-        ) AND w.wakeId IN (
-          SELECT g.wakeId
-          FROM effort_checkin_generations AS g
-          JOIN assignments AS a ON a.id=g.assignmentId
-          WHERE a.workItemId=?1 AND a.state='open' AND g.state='armed'
-            AND g.generation=(
-              SELECT MAX(g2.generation) FROM effort_checkin_generations AS g2
-              WHERE g2.assignmentId=g.assignmentId
-            )
-        )
-        """,
-        [work_item_id, horizon]
-      )
-
     Txn.q(
       txn,
       """
@@ -1258,10 +1231,6 @@ defmodule Tightbeam.EffortCheckin do
       """,
       [work_item_id, horizon]
     )
-
-    Enum.each(changed_wakes, fn [wake_id] ->
-      Wakes.publish_change_in_txn(txn, "wake.scheduled", wake_id)
-    end)
 
     Txn.q(
       txn,
@@ -2058,8 +2027,6 @@ defmodule Tightbeam.EffortCheckin do
       "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
       [wake_id, now()]
     )
-
-    if Txn.changes(txn) == 1, do: Wakes.publish_change_in_txn(txn, "wake.fired", wake_id)
   end
 
   defp decision_transition(request, old_status, new_status, principal, verb) do

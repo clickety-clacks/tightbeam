@@ -17,15 +17,15 @@ not been established.
 If a notice is never received, the corresponding change is invisible to a
 healthy socket until the client completes another rebuild. This can happen
 when a resource publishes no notice or when the payload guard withholds one.
-For the seven directly applied resources in 0.1.11—work items, assignments,
-attests, artifacts, turns, wakes, and sessions—the release's publication
-contract covers their committed row changes. Other resources may still have
-committed changes that publish no notice; whenever they do publish an eligible
-notice, the healthy-socket guarantee above applies. The server keeps no record
-of undelivered notices and offers no replay, receipt, durable cursor, or
-delivery ledger. A detail read for an unrelated notice cannot recover a
-change whose notice never arrived. Without a client-chosen rebuild interval,
-recovery has no finite freshness bound.
+For the seven resources in 0.1.11—work items, assignments, attests, artifacts,
+turns, wakes, and sessions—published notices are invalidations rather than
+complete rows. The stream does not guarantee a notice for every committed row
+change. Other resources may also have committed changes that publish no notice;
+whenever they do publish an eligible notice, the healthy-socket guarantee
+above applies. The server keeps no record of undelivered notices and offers no
+replay, receipt, durable cursor, or delivery ledger. A detail read for an
+unrelated notice cannot recover a change whose notice never arrived. Without a
+client-chosen rebuild interval, recovery has no finite freshness bound.
 
 After any socket close, or when the expected heartbeat does not arrive, a
 client reconnects, authenticates, subscribes, and rebuilds its visible state.
@@ -35,12 +35,12 @@ boundary and no notice for that row arrived on the current subscription. If a
 close or visibility change interrupts the walk, the client discards its
 absence results and starts again from a fresh boundary.
 
-The directly applied resources need no REST reads on the normal path. A
-client must treat notices for any resource not certified for direct
-application as invalidations, never as complete rows, and read each notice's
-key from that resource's REST detail route until it is certified. These
-per-notice detail reads and the reads for composed views are the other
-normal-path requests.
+A client must treat notices for these seven resources as invalidations, never
+as complete rows, and read each notice's key from the corresponding REST
+detail route to obtain current state. For any resource with a separate
+direct-application contract, follow that contract; otherwise, treat its
+notices as invalidations and read the detail route. These per-notice detail
+reads and the reads for composed views are the normal-path requests.
 
 After a close, the minimum request count for one rebuild is
 
@@ -53,5 +53,5 @@ sum over each modeled bulk collection: max(1, ceil(visible rows / 500))
 
 This is a lower bound. It assumes pages use `limit=500` and that no rows are
 added during the walk. If a collection's walk must restart, its pages are read
-again. The direct-application view models seven bulk collections: work items,
+again. The rebuild view models seven bulk collections: work items,
 assignments, attests, artifacts, turns, wakes, and sessions.

@@ -8,9 +8,8 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
   commit when Tightbeam verified it.
   """
 
-  alias Tightbeam.{DB, Placement, StateResources}
+  alias Tightbeam.{DB, Placement}
   alias Tightbeam.DB.Txn
-  alias Tightbeam.Firehose.Publisher
   alias Tightbeam.Harness.Support
 
   @cause "historical_canonical_commitref_correction"
@@ -183,34 +182,6 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
                     verified_at,
                     created_at
                   ]
-                )
-
-                Txn.q(txn, "UPDATE assignments SET rowVersion=rowVersion+1 WHERE id=?1", [
-                  context.assignment_id
-                ])
-
-                if Txn.changes(txn) != 1,
-                  do: raise(ArgumentError, "corrected assignment is missing from its transaction")
-
-                assignment =
-                  StateResources.query_assignment(
-                    txn,
-                    context.assignment_id,
-                    Map.put(call, :principal, {:user, context.owner_user_id})
-                  ) ||
-                    raise ArgumentError,
-                          "corrected assignment is missing from its committing transaction"
-
-                class =
-                  if assignment.state == "closed",
-                    do: "assignment.closed",
-                    else: "assignment.opened"
-
-                Publisher.committed_in_txn(
-                  txn,
-                  class,
-                  assignment,
-                  %{"assignmentId" => context.assignment_id}
                 )
 
                 %{correction: fetch!(txn, id)}

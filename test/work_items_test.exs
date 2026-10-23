@@ -112,9 +112,6 @@ defmodule Tightbeam.WorkItemsTest do
         sender_scheduled: true
       })
 
-    assert_receive {:firehose_notice, %{"class" => "wake.scheduled"}}
-    Hub.delivered(hub, self())
-
     assert {:error, %RuntimeError{message: "rollback publication"}} =
              DB.transaction(ctx.db, fn txn ->
                Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
@@ -133,11 +130,6 @@ defmodule Tightbeam.WorkItemsTest do
     assert carrier_id != wake.wake_id
     assert %{digest: true, state: "fired"} = Wakes.get(ctx.db, carrier_id)
     assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
-
-    assert_receive {:firehose_notice,
-                    %{"class" => "wake.scheduled", "payload" => %{"wakeId" => ^carrier_id}}}
-
-    Hub.delivered(hub, self())
 
     assert {:ok, [[actual_session, "queued", message_id, content]]} =
              DB.query(
@@ -166,31 +158,6 @@ defmodule Tightbeam.WorkItemsTest do
     assert session_payload["sessionKey"] == ctx.holder.session_key
     assert session_payload["ownerUserId"] == "flynn"
     assert session_payload["mechanicalStatus"] == "running"
-    Hub.delivered(hub, self())
-
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "turn.queued",
-                      "refs" => %{"sessionKey" => session_key},
-                      "payload" => %{"status" => "queued", "wakeId" => ^carrier_id}
-                    }}
-
-    assert session_key == ctx.holder.session_key
-    Hub.delivered(hub, self())
-
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "wake.scheduled",
-                      "refs" => %{"wakeId" => ^carrier_id},
-                      "payload" => %{"state" => "pending", "deliveryStatus" => "queued"}
-                    }}
-
-    Hub.delivered(hub, self())
-
-    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => source_payload}}
-    assert source_payload["wakeId"] == wake.wake_id
-    assert source_payload["digest"] == false
-    assert source_payload["state"] == "fired"
     Hub.delivered(hub, self())
 
     assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => payload}}
@@ -1329,14 +1296,11 @@ defmodule Tightbeam.WorkItemsTest do
     item = create(ctx, {:user, "flynn"}, %{title: "Independent"})
     assignment = assign(ctx, "holder", "work", item.id)
 
-    # The observable item fields (title/spec/owner/state) stay unchanged by
-    # closure. The internal bracket wake-id columns are part of the Firehose
-    # projection, so the row version still advances when last-close writes them.
+    # The OBSERVABLE item (title/spec/owner/state — never the internal bracket
+    # wake-id columns, which a last-close does write) is untouched by closure.
     before_item = get(ctx, {:user, "flynn"}, item.id).workItem
     _ = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call(assignment.id))
-    after_item = get(ctx, {:user, "test-user"}, item.id).workItem
-    assert Map.drop(after_item, [:rowVersion]) == Map.drop(before_item, [:rowVersion])
-    assert after_item.rowVersion > before_item.rowVersion
+    assert get(ctx, {:user, "flynn"}, item.id).workItem == before_item
 
     before_assignment = row(ctx.db, "SELECT * FROM assignments WHERE id = ?1", assignment.id)
     _ = update(ctx, {:user, "flynn"}, item.id, %{title: "Changed"})

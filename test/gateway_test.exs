@@ -27,51 +27,10 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.sort(Map.keys(handlers)) == Enum.sort(expected)
     assert Enum.sort(Map.keys(effects)) == Enum.sort(expected)
     assert Enum.all?(Map.values(handlers), &is_function(&1, 1))
-    assert "assignment.reopened" in effects["reopen-assignment"]
-    assert "work_item.updated" in effects["reopen-assignment"]
-    assert "wake.scheduled" in effects["ask"]
-    assert "wake.scheduled" in effects["answer"]
-    assert "wake.scheduled" in effects["return"]
-    assert "wake.scheduled" in effects["assign"]
-    assert "turn.queued" in effects["post"]
-    assert "turn.queued" in effects["wake"]
-    assert "turn.queued" in effects["condition"]
-    assert "turn.queued" in effects["dispatch"]
-    assert "wake.canceled" in effects["assign"]
-    assert "work_item.updated" in effects["assign"]
-    assert "wake.canceled" in effects["reopen-assignment"]
-    assert "wake.scheduled" in effects["reopen-assignment"]
-    assert "wake.scheduled" in effects["work-item-update"]
-    assert "wake.canceled" in effects["work-item-close"]
-    assert "wake.canceled" in effects["work-item-icebox"]
-    assert "wake.scheduled" in effects["work-item-reopen"]
-    assert effects["attend"] == ["turn.started"]
-    assert "assignment.opened" in effects["attest"]
-    assert "turn.queued" in effects["attest"]
-    assert "decision_request.opened" in effects["attest"]
-    assert "decision_request.withdrawn" in effects["attest"]
-    assert "decision_request.superseded" in effects["attest"]
-
-    assert effects["retire"] == [
-             "session.retired",
-             "wake.scheduled",
-             "wake.canceled",
-             "turn.ended",
-             "assignment.closed",
-             "decision_request.withdrawn",
-             "decision_request.superseded",
-             "work_item.updated"
-           ]
-
-    assert "work_item.updated" in effects["attest"]
-    assert "work_item.updated" in effects["revoke-assignment"]
-    assert "wake.scheduled" in effects["revoke-assignment"]
-    assert "wake.canceled" in effects["revoke-assignment"]
+    assert effects["reopen-assignment"] == ["assignment.reopened"]
     assert effects["artifact-content-fetch"] == []
     assert effects["tune"] == ["message.created", "session.updated", "session.harness_changed"]
-    assert effects["repair-assignment"] == ["message.created", "session.updated", "turn.queued"]
-    assert effects["session-reparent"] == ["session.updated"]
-    assert effects["assignment-commitref-correct"] == ["assignment.closed"]
+    assert effects["repair-assignment"] == ["message.created", "session.updated"]
     assert effects["session-po-set"] == ["wake.scheduled"]
 
     assert effects["wake"] == [
@@ -79,8 +38,7 @@ defmodule Tightbeam.GatewayTest do
              "wake.canceled",
              "wake.fired",
              "message.created",
-             "session.updated",
-             "turn.queued"
+             "session.updated"
            ]
 
     assert effects["cancel"] == ["turn.ended", "session.updated"]
@@ -3672,16 +3630,6 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "R2.1-R2.3 ephemeral spawn stamps its caller without a role or work item", ctx do
-    hub = start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
-
-    :ok =
-      Tightbeam.Firehose.Hub.register(hub, self(), %{
-        mode: :all,
-        db: ctx.db,
-        user_id: "test-user",
-        is_admin: true
-      })
-
     base_dir = role_test_base("ephemeral-spawn")
     dir = Path.join([base_dir, "identity", "archetypes"])
     File.mkdir_p!(dir)
@@ -3692,36 +3640,14 @@ defmodule Tightbeam.GatewayTest do
     spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
     params = %{display_name: "Inspect", archetype: "helper", idempotency_key: "ephemeral-spawn"}
     call = %{origin: "agent:caller", session_key: nil, params: params}
-
-    firehose_call =
-      Map.merge(call, %{
-        verb: "spawn",
-        principal: {:session, "k1"},
-        firehose_in_txn: true,
-        firehose_hub: hub
-      })
-
-    assert %{session_key: key} = spawn.(firehose_call)
-
-    notices = drain_firehose_notices(hub)
-    spawned = Enum.find(notices, &(&1["class"] == "session.spawned"))
-    assert is_map(spawned)
-    assert spawned["refs"]["sessionKey"] == key
-
-    canonical =
-      ctx.db
-      |> Tightbeam.StateResources.query_session(key)
-      |> Tightbeam.StateResources.session()
-
-    assert spawned["payload"] == canonical
+    assert %{session_key: key} = spawn.(call)
     assert Tightbeam.Ephemeral.caller(ctx.db, key) == "k1"
     assert Org.get(ctx.db, key).handle == nil
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM assignments WHERE holderKey=?1", [key])
 
-    assert %{session_key: ^key} = spawn.(firehose_call)
-    assert drain_firehose_notices(hub) == []
+    assert %{session_key: ^key} = spawn.(call)
 
     assert %{code: "unknown_caller"} =
              spawn.(%{
@@ -3742,18 +3668,6 @@ defmodule Tightbeam.GatewayTest do
                call
                | params: Map.merge(params, %{idempotency_key: "bound", work_item_id: "card"})
              })
-  end
-
-  defp drain_firehose_notices(hub, acc \\ []) do
-    _ = :sys.get_state(hub)
-
-    receive do
-      {:firehose_notice, notice} ->
-        Tightbeam.Firehose.Hub.delivered(hub, self())
-        drain_firehose_notices(hub, [notice | acc])
-    after
-      0 -> Enum.reverse(acc)
-    end
   end
 
   test "spawn --name creates a bound role and role_exists rolls back the session", ctx do

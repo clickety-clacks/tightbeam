@@ -274,23 +274,17 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     assert {:ok, [[^expected_cancellations]]} =
              DB.query(db, "SELECT COUNT(*) FROM wake_cancellations")
 
-    # The decision notice, its wake, and each activity replacement's canceled
-    # and scheduled wakes share one commit; relative order is not contractual.
+    # The decision notice and the cancellations share one commit; their
+    # relative order is not part of the contract.
     published =
-      for _ <- 1..(2 * length(chain) + 2) do
+      for _ <- 0..length(chain) do
         assert_receive {:firehose_notice, published}
         Hub.delivered(hub, self())
         published
       end
 
-    {[notice], wake_notices} =
+    {[notice], cancellations} =
       Enum.split_with(published, &(&1["class"] == "decision_request.opened"))
-
-    {scheduled, cancellations} =
-      Enum.split_with(wake_notices, &(&1["class"] == "wake.scheduled"))
-
-    assert length(scheduled) == length(chain) + 1
-    assert Enum.all?(scheduled, &(&1["class"] == "wake.scheduled"))
 
     assert Enum.sort(Enum.map(cancellations, & &1["refs"]["wakeId"])) ==
              Enum.sort(Enum.map(chain, &elem(&1, 0)))
@@ -303,14 +297,7 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     assert notice["schemaVersion"] == 2
     assert notice["resource"] == "decision requests"
     assert notice["op"] == "upsert"
-
-    assert notice["refs"] == %{
-             "decisionRequestId" => request.id,
-             "sessionKey" => holder.session_key,
-             "workItemId" => work.id,
-             "assignmentId" => assignment.id
-           }
-
+    assert notice["refs"] == %{"decisionRequestId" => request.id}
     assert notice["payload"] == Tightbeam.StateResources.decision_request(request)
 
     Hub.delivered(hub, self())

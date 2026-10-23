@@ -149,16 +149,7 @@ defmodule Tightbeam.WorkItems do
 
               put_priority_in_txn(txn, id, priority)
               stamp_version_in_txn(txn, id, created_at)
-
-              routing_wake =
-                arm_routing_in_txn(
-                  txn,
-                  id,
-                  owner,
-                  call.params.title,
-                  false,
-                  not is_function(Map.get(call, :on_routing_wake_scheduled_in_txn))
-                )
+              routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
 
               if key do
                 Txn.q(
@@ -231,7 +222,6 @@ defmodule Tightbeam.WorkItems do
             update_in_txn(
               txn,
               call.params
-              |> Map.put(:firehose_test_at, call[:firehose_test_at])
               |> Map.put(:effort_config, Map.get(call, :effort_config, %{}))
               |> Map.put(:principal, call.principal)
             )
@@ -568,7 +558,7 @@ defmodule Tightbeam.WorkItems do
         Wakes.readdress_accountability_notices_in_txn(txn, item.id)
       end
 
-      if changed?, do: stamp_version_in_txn(txn, item.id, event_time(params))
+      if changed?, do: stamp_version_in_txn(txn, item.id, now())
       {:updated, fetch_in_txn(txn, item.id), changed?}
     end
   end
@@ -598,7 +588,7 @@ defmodule Tightbeam.WorkItems do
           {:updated, fetch_in_txn(txn, item.id), false}
         else
           {updated_by_user, updated_by_session} = body_attribution(params[:principal])
-          updated_at = event_time(params)
+          updated_at = now()
 
           Txn.q(
             txn,
@@ -867,8 +857,6 @@ defmodule Tightbeam.WorkItems do
               })
             end
 
-            disposed = fetch_in_txn(txn, id)
-
             {:disposed, disposed, true, item.state}
         end
     end
@@ -955,30 +943,9 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
-  @doc false
-  def publish_change_in_txn(%Txn{} = txn, work_item_id) do
-    case fetch_in_txn(txn, work_item_id) do
-      nil ->
-        :ok
-
-      item ->
-        projection =
-          StateResources.query_work_item(txn, work_item_id, %{
-            principal: {:user, item.ownerUserId}
-          }) || raise ArgumentError, "committed work-item projection is missing"
-
-        Publisher.committed_in_txn(
-          txn,
-          "work_item.updated",
-          projection,
-          %{"workItemId" => work_item_id}
-        )
-    end
-  end
-
   @doc "Cancel both bracket wakes through one typed transition and clear their ids."
   @spec cancel_brackets_in_txn(Txn.t(), String.t(), map()) :: :ok
-  def cancel_brackets_in_txn(%Txn{} = txn, work_item_id, transition, opts \\ []) do
+  def cancel_brackets_in_txn(%Txn{} = txn, work_item_id, transition) do
     case Txn.q(
            txn,
            "SELECT routingWakeId, slateWakeId FROM work_items WHERE id = ?1",
@@ -999,13 +966,6 @@ defmodule Tightbeam.WorkItems do
             "UPDATE work_items SET routingWakeId = NULL, slateWakeId = NULL WHERE id = ?1",
             [work_item_id]
           )
-
-          if Txn.changes(txn) == 1 do
-            stamp_version_in_txn(txn, work_item_id, now())
-
-            if Keyword.get(opts, :publish_item, false),
-              do: publish_change_in_txn(txn, work_item_id)
-          end
         end
 
       [] ->
@@ -1065,11 +1025,6 @@ defmodule Tightbeam.WorkItems do
             work_item_id,
             wake.wake_id
           ])
-
-          if Txn.changes(txn) == 1 do
-            stamp_version_in_txn(txn, work_item_id, now())
-            publish_change_in_txn(txn, work_item_id)
-          end
         end
 
       _ ->
@@ -1097,7 +1052,7 @@ defmodule Tightbeam.WorkItems do
       [[state, owner, title, routing, slate]] ->
         cond do
           state == "open" and routing == wake_id ->
-            arm_routing_in_txn(txn, item_id, owner, title, true)
+            arm_routing_in_txn(txn, item_id, owner, title)
 
           state == "open" and slate == wake_id and not open_assignments?(txn, item_id) ->
             replacement =
@@ -1114,11 +1069,6 @@ defmodule Tightbeam.WorkItems do
               item_id,
               replacement.wake_id
             ])
-
-            if Txn.changes(txn) == 1 do
-              stamp_version_in_txn(txn, item_id, now())
-              publish_change_in_txn(txn, item_id)
-            end
 
           true ->
             :ok
@@ -1214,7 +1164,7 @@ defmodule Tightbeam.WorkItems do
     |> Enum.reverse()
   end
 
-  defp arm_routing_in_txn(txn, id, owner, title, publish? \\ false, firehose_publish? \\ true) do
+  defp arm_routing_in_txn(txn, id, owner, title) do
     wake =
       Wakes.schedule_in_txn(txn, %{
         session_key: Org.personal_session_key(owner),
@@ -1222,17 +1172,10 @@ defmodule Tightbeam.WorkItems do
         prompt: "route it or icebox it — work item #{id}: #{title}",
         due_at: now() + triage_deadline_ms(),
         sender_scheduled: true,
-        work_item_id: id,
-        firehose_publish: firehose_publish?
+        work_item_id: id
       })
 
     Txn.q(txn, "UPDATE work_items SET routingWakeId = ?2 WHERE id = ?1", [id, wake.wake_id])
-
-    if Txn.changes(txn) == 1 do
-      stamp_version_in_txn(txn, id, now())
-      if publish?, do: publish_change_in_txn(txn, id)
-    end
-
     wake
   end
 
@@ -1464,7 +1407,7 @@ defmodule Tightbeam.WorkItems do
     Txn.q(
       txn,
       """
-      SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.openedAt, a.rowVersion
+      SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.openedAt, a.closedAt
       FROM assignments AS a
       LEFT JOIN work_items AS wi ON wi.id = a.workItemId
       WHERE (?1 = 1 OR
@@ -1474,13 +1417,16 @@ defmodule Tightbeam.WorkItems do
       """,
       [is_admin, principal_kind, principal_id]
     )
-    |> Enum.map(fn [id, work_item_id, reviews_assignment_id, opened_at, row_version] ->
+    |> Enum.map(fn [id, work_item_id, reviews_assignment_id, opened_at, closed_at] ->
+      version =
+        StateResources.assignment(%{opened_at: opened_at, closed_at: closed_at})["rowVersion"]
+
       %{
         id: id,
         work_item_id: work_item_id,
         reviews_assignment_id: reviews_assignment_id,
         opened_at: opened_at,
-        row_version: row_version
+        row_version: version
       }
     end)
   end
@@ -1783,17 +1729,6 @@ defmodule Tightbeam.WorkItems do
   end
 
   defp now, do: System.system_time(:millisecond)
-
-  if Mix.env() == :test do
-    defp event_time(params) do
-      case Map.get(params, :firehose_test_at) do
-        at when is_integer(at) -> at
-        _ -> now()
-      end
-    end
-  else
-    defp event_time(_params), do: now()
-  end
 
   # A timestamp alone repeats when two writes share one millisecond. The
   # sidecar makes the public version strict without changing product fields.

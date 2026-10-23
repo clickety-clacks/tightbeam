@@ -55,7 +55,6 @@ second =
   })
 
 assert second["session"]["previousCurrentParent"] == "parent"
-persisted_version = Org.get(db, "child").updated_at
 :ok = GenServer.stop(db)
 {:ok, reopened} = DB.start_link(opts)
 
@@ -63,7 +62,6 @@ try do
   :ok = Schema.ensure_all(reopened)
   assert Org.current_parent(reopened, "child") == "next"
   assert Org.get(reopened, "child").spawned_by == nil
-  assert Org.get(reopened, "child").updated_at == persisted_version
   assert SessionReparent.current_coordination_parent(reopened, "assignment") == "next"
   assert SessionReparent.handle(reopened, call) == first
   assert {:ok, [[2]]} = DB.query(reopened, "SELECT COUNT(*) FROM session_reparent_events")
@@ -73,16 +71,6 @@ try do
              reopened,
              "SELECT openedByUser,holderKey,state FROM assignments WHERE id='assignment'"
            )
-
-  third =
-    SessionReparent.handle(reopened, %{
-      call
-      | params: %{call.params | parent_session_key: "parent", idempotency_key: "third"}
-    })
-
-  assert is_binary(third["eventId"])
-  assert Org.get(reopened, "child").updated_at > persisted_version
-  assert {:ok, [[3]]} = DB.query(reopened, "SELECT COUNT(*) FROM session_reparent_events")
 
   IO.puts("reparent-reopen: ok")
 after

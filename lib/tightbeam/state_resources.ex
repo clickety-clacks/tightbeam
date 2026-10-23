@@ -32,7 +32,7 @@ defmodule Tightbeam.StateResources do
          t.roleRef, t.roleFallback, t.assignmentId, t.jobRef, t.model, t.thinkingLevel,
          t.modelContext, t.harness, t.replyAttention, t.status, t.owner,
          t.adapterGen, t.requestRef, t.error, t.createdAt, t.startedAt,
-         t.endedAt, t.publishedAt, t.rowVersion
+         t.endedAt, t.publishedAt
   FROM turns AS t
   """
 
@@ -72,8 +72,7 @@ defmodule Tightbeam.StateResources do
              SELECT 1 FROM attests AS filed WHERE filed.assignmentId = a.id
            ) THEN 'open'
            ELSE 'active'
-         END,
-         a.rowVersion
+         END
   FROM assignments AS a
   LEFT JOIN work_items AS wi ON wi.id = a.workItemId
   """
@@ -101,7 +100,6 @@ defmodule Tightbeam.StateResources do
 
   alias Tightbeam.{
     AdminProjection,
-    AssignmentCommitRefCorrections,
     Artifacts,
     Assignments,
     DB,
@@ -130,11 +128,11 @@ defmodule Tightbeam.StateResources do
 
   @item_field_order %{
     "work items" =>
-      ~w(id title specRefName specRefSha256 isBug ownerUserId deliveryOwnerSessionKey state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority body bodyUpdatedByUser bodyUpdatedBySession bodyUpdatedAt rowVersion),
+      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority rowVersion),
     "assignments" =>
-      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider files commitRefCorrections effectKind derivedStatus rowVersion),
+      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
     "attests" =>
-      ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs artifactId contentSha256 waitId ts rowVersion),
+      ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs ts rowVersion),
     "wakes" =>
       ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon deliveryStatus rowVersion),
     "turns" =>
@@ -177,11 +175,11 @@ defmodule Tightbeam.StateResources do
   @item_wire_categories %{
     "work items" => %{
       strings:
-        ~w(id title specRefName specRefSha256 ownerUserId deliveryOwnerSessionKey state failReason routingWakeId slateWakeId createdByUser createdBySession body bodyUpdatedByUser bodyUpdatedBySession),
-      integers: ~w(createdInTurnSeq createdAt priority bodyUpdatedAt rowVersion),
+        ~w(id title specRefName specRefSha256 ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession),
+      integers: ~w(createdInTurnSeq createdAt priority rowVersion),
       booleans: ~w(isBug createdContextKnown),
       nullable:
-        ~w(specRefName specRefSha256 ownerUserId deliveryOwnerSessionKey failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq body bodyUpdatedByUser bodyUpdatedBySession bodyUpdatedAt)
+        ~w(specRefName specRefSha256 ownerUserId failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq)
     },
     "assignments" => %{
       strings:
@@ -193,11 +191,11 @@ defmodule Tightbeam.StateResources do
     },
     "attests" => %{
       strings:
-        ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider artifactId contentSha256 waitId),
+        ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider),
       integers: ~w(ts rowVersion),
       booleans: [],
       nullable:
-        ~w(verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs artifactId contentSha256 waitId)
+        ~w(verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs)
     },
     "wakes" => %{
       strings:
@@ -325,8 +323,6 @@ defmodule Tightbeam.StateResources do
 
   @item_complex_types %{
     {"assignments", "files"} => {:array, :string, :preserve},
-    {"assignments", "commitRefCorrections"} =>
-      {:array, :assignment_commit_ref_correction, :preserve},
     {"attests", "commitRefs"} => {:array, :commit_ref, :preserve},
     {"decision requests", "options"} => {:array, :decision_option, :preserve},
     {"decision requests", "context"} => :json,
@@ -411,12 +407,7 @@ defmodule Tightbeam.StateResources do
                CASE WHEN p.workItemId IS NULL THEN
                  CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
                ELSE p.priority END,
-               COALESCE(v.rowVersion, wi.createdAt),
-               wi.deliveryOwnerSessionKey,
-               (SELECT body FROM work_item_bodies b WHERE b.workItemId = wi.id),
-               (SELECT updatedByUser FROM work_item_bodies b WHERE b.workItemId = wi.id),
-               (SELECT updatedBySession FROM work_item_bodies b WHERE b.workItemId = wi.id),
-               (SELECT updatedAt FROM work_item_bodies b WHERE b.workItemId = wi.id)
+               COALESCE(v.rowVersion, wi.createdAt)
         FROM work_items AS wi
         LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
         LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id
@@ -496,12 +487,7 @@ defmodule Tightbeam.StateResources do
            CASE WHEN p.workItemId IS NULL THEN
              CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
            ELSE p.priority END,
-           COALESCE(v.rowVersion, wi.createdAt),
-           wi.deliveryOwnerSessionKey,
-           (SELECT body FROM work_item_bodies b WHERE b.workItemId = wi.id),
-           (SELECT updatedByUser FROM work_item_bodies b WHERE b.workItemId = wi.id),
-           (SELECT updatedBySession FROM work_item_bodies b WHERE b.workItemId = wi.id),
-           (SELECT updatedAt FROM work_item_bodies b WHERE b.workItemId = wi.id)
+           COALESCE(v.rowVersion, wi.createdAt)
     FROM work_items AS wi
     LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
     LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id
@@ -556,15 +542,8 @@ defmodule Tightbeam.StateResources do
            @assignment_select <> " WHERE a.id = ? AND (" <> visibility <> ")",
            [id | visibility_params]
          ) do
-      [row] ->
-        assignment_query_row(row)
-        |> Map.put(
-          :commit_ref_corrections,
-          AssignmentCommitRefCorrections.list_many(db, [id]) |> Map.get(id, [])
-        )
-
-      [] ->
-        nil
+      [row] -> assignment_query_row(row)
+      [] -> nil
     end
   end
 
@@ -1026,8 +1005,7 @@ defmodule Tightbeam.StateResources do
         db,
         """
         SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser,
-               producer, producerCommand, byHarness, byProvider, commitRefs,
-               artifactId, contentSha256, waitId, ts
+               producer, producerCommand, byHarness, byProvider, commitRefs, ts
         FROM attests WHERE id = ?1
         """,
         [id]
@@ -1048,9 +1026,6 @@ defmodule Tightbeam.StateResources do
           by_harness,
           by_provider,
           commit_refs,
-          artifact_id,
-          content_sha256,
-          wait_id,
           ts
         ]
       ] ->
@@ -1067,9 +1042,6 @@ defmodule Tightbeam.StateResources do
           by_harness: by_harness,
           by_provider: by_provider,
           commit_refs: if(is_binary(commit_refs), do: JSON.decode!(commit_refs), else: nil),
-          artifact_id: artifact_id,
-          content_sha256: content_sha256,
-          wait_id: wait_id,
           ts: ts
         }
 
@@ -1546,12 +1518,7 @@ defmodule Tightbeam.StateResources do
          created_context_known,
          created_at,
          priority,
-         row_version,
-         delivery_owner_session_key,
-         body,
-         body_updated_by_user,
-         body_updated_by_session,
-         body_updated_at
+         row_version
        ]) do
     %{
       id: id,
@@ -1570,11 +1537,6 @@ defmodule Tightbeam.StateResources do
       created_context_known: created_context_known == 1,
       created_at: created_at,
       priority: priority,
-      delivery_owner_session_key: delivery_owner_session_key,
-      body: body,
-      body_updated_by_user: body_updated_by_user,
-      body_updated_by_session: body_updated_by_session,
-      body_updated_at: body_updated_at,
       row_version: row_version
     }
   end
@@ -1602,8 +1564,7 @@ defmodule Tightbeam.StateResources do
          holder_provider,
          files,
          effect_kind,
-         derived_status,
-         row_version
+         derived_status
        ]) do
     %{
       id: id,
@@ -1628,8 +1589,7 @@ defmodule Tightbeam.StateResources do
       holder_provider: holder_provider,
       files: JSON.decode!(files),
       effect_kind: effect_kind,
-      derived_status: derived_status,
-      row_version: row_version
+      derived_status: derived_status
     }
   end
 
@@ -1687,25 +1647,7 @@ defmodule Tightbeam.StateResources do
   end
 
   def work_item(row), do: public(row)
-
-  def assignment(row) do
-    corrections =
-      Map.get(row, :commit_ref_corrections) || Map.get(row, :commitRefCorrections) ||
-        Map.get(row, "commitRefCorrections") || []
-
-    item =
-      row
-      |> Map.drop([:commit_ref_corrections, :commitRefCorrections, "commitRefCorrections"])
-      |> public()
-      |> Map.put(
-        "commitRefCorrections",
-        Enum.map(corrections, fn correction ->
-          Map.new(correction, fn {key, value} -> {wire_key(key), public(value)} end)
-        end)
-      )
-
-    item
-  end
+  def assignment(row), do: public(row)
 
   def attest(row) do
     reject_public_shape_drift!(row, "attests")
@@ -2325,40 +2267,6 @@ defmodule Tightbeam.StateResources do
     validate_closed_wire_object!(value, %{"repo" => :string, "commit" => :string}, label)
   end
 
-  defp validate_wire_value!(value, :corrected_commit_ref, label) do
-    validate_closed_wire_object!(
-      value,
-      %{
-        "repo" => :string,
-        "remote" => :string,
-        "ref" => :string,
-        "commit" => :string,
-        "verifiedRefCommit" => :string
-      },
-      label
-    )
-  end
-
-  defp validate_wire_value!(value, :assignment_commit_ref_correction, label) do
-    validate_closed_wire_object!(
-      value,
-      %{
-        "id" => :string,
-        "assignmentId" => :string,
-        "commitRefs" => {:array, :corrected_commit_ref, :preserve},
-        "reason" => :string,
-        "evidenceArtifactId" => :string,
-        "actorKind" => {:enum, ~w(user session)},
-        "actorRef" => :string,
-        "cause" => :string,
-        "idempotencyKey" => :string,
-        "verifiedAt" => :integer,
-        "createdAt" => :integer
-      },
-      label
-    )
-  end
-
   defp validate_wire_value!(value, :decision_option, label) do
     validate_closed_wire_object!(value, %{"label" => :string}, label)
   end
@@ -2532,44 +2440,6 @@ defmodule Tightbeam.StateResources do
     encode_closed_list!(value, ~w(repo commit), "attests.commitRefs")
   end
 
-  defp encode_item_field("assignments", "commitRefCorrections", value) do
-    value
-    |> Enum.map_join(",", &encode_assignment_commit_ref_correction!/1)
-    |> then(&("[" <> &1 <> "]"))
-  end
-
-  defp encode_assignment_commit_ref_correction!(correction) when is_map(correction) do
-    fields =
-      ~w(id assignmentId commitRefs reason evidenceArtifactId actorKind actorRef cause idempotencyKey verifiedAt createdAt)
-
-    unless Enum.sort(Map.keys(correction)) == Enum.sort(fields) do
-      raise ArgumentError, "assignments.commitRefCorrections has an extra or missing field"
-    end
-
-    encoded =
-      Enum.map_join(fields, ",", fn field ->
-        value = Map.fetch!(correction, field)
-
-        encoded_value =
-          if field == "commitRefs" do
-            encode_closed_list!(
-              value,
-              ~w(repo remote ref commit verifiedRefCommit),
-              "assignments.commitRefCorrections.commitRefs"
-            )
-          else
-            JSON.encode!(value)
-          end
-
-        JSON.encode!(field) <> ":" <> encoded_value
-      end)
-
-    "{" <> encoded <> "}"
-  end
-
-  defp encode_assignment_commit_ref_correction!(_correction),
-    do: raise(ArgumentError, "assignments.commitRefCorrections must contain objects")
-
   defp encode_item_field("decision requests", "options", value) do
     encode_closed_list!(value, ~w(label), "decision requests.options")
   end
@@ -2689,8 +2559,7 @@ defmodule Tightbeam.StateResources do
          created_at,
          started_at,
          ended_at,
-         published_at,
-         row_version
+         published_at
        ]) do
     %{
       seq: seq,
@@ -2716,8 +2585,7 @@ defmodule Tightbeam.StateResources do
       created_at: created_at,
       started_at: started_at,
       ended_at: ended_at,
-      published_at: published_at,
-      row_version: row_version
+      published_at: published_at
     }
   end
 
