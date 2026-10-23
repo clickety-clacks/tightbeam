@@ -756,6 +756,67 @@ defmodule Tightbeam.GatewayTest do
     assert Path.dirname(reopened_effort_root) == Path.join(base_dir, "work")
   end
 
+  test "assignment lifecycle markers publish one message.created event each", ctx do
+    ensure_global_registry()
+    start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(Hub, self())
+
+    base_dir = role_test_base("assignment-message-publication")
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:wake_tick_ms, 1_234)
+      |> Map.put(:effort_checkin_horizon_ms, 123)
+
+    handlers = Gateway.handlers(config)
+    effects = Gateway.handler_effects(config)
+
+    for verb <- ["assign", "revoke-assignment", "reopen-assignment", "retire"] do
+      assert "message.created" in effects[verb]
+    end
+
+    common = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: "k1",
+      target_role: nil,
+      role_fallback: false
+    }
+
+    assert %{id: assignment_id} =
+             handlers["assign"].(
+               Map.merge(common, %{
+                 verb: "assign",
+                 params: %{subject: "publish assignment lifecycle marker"}
+               })
+             )
+
+    assert_one_message_created!(ctx.db, "[assignment opened: #{assignment_id}]")
+
+    assert %{state: "closed"} =
+             handlers["revoke-assignment"].(
+               Map.merge(common, %{
+                 verb: "revoke-assignment",
+                 params: %{assignment_id: assignment_id, reason: "test revocation"}
+               })
+             )
+
+    assert_one_message_created!(ctx.db, "[assignment revoked: #{assignment_id}]")
+
+    assert %{state: "open"} =
+             handlers["reopen-assignment"].(
+               Map.merge(common, %{
+                 verb: "reopen-assignment",
+                 params: %{assignment_id: assignment_id, reason: "test reopening"}
+               })
+             )
+
+    assert_one_message_created!(
+      ctx.db,
+      "[assignment reopened: #{assignment_id} by user:flynn — test reopening]"
+    )
+  end
+
   test "retire refuses built-in mains — the fallback target is permanent", ctx do
     handlers =
       Gateway.handlers(%{
@@ -806,6 +867,9 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
+    start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(Hub, self())
+
     root = create_session(ctx.db, "cascade-root", "flynn")
     child = create_session(ctx.db, "cascade-child", "flynn", root.session_key)
     grandchild = create_session(ctx.db, "cascade-grandchild", "flynn", child.session_key)
@@ -819,12 +883,14 @@ defmodule Tightbeam.GatewayTest do
 
     parent = self()
 
-    handlers =
-      Gateway.handlers(%{
-        db: ctx.db,
-        wake_tick_ms: 1_000,
-        on_retired: fn key -> send(parent, {:retired, key}) end
-      })
+    config = %{
+      db: ctx.db,
+      wake_tick_ms: 1_000,
+      on_retired: fn key -> send(parent, {:retired, key}) end
+    }
+
+    handlers = Gateway.handlers(config)
+    assert "message.created" in Gateway.handler_effects(config)["retire"]
 
     result =
       handlers["retire"].(%{
@@ -833,6 +899,8 @@ defmodule Tightbeam.GatewayTest do
         session_key: root.session_key,
         params: %{}
       })
+
+    assert_one_message_created!(ctx.db, "[assignment interrupted by retire: asg_retire]")
 
     assert result.retired_session_keys == [
              grandchild.session_key,
@@ -11753,6 +11821,19 @@ defmodule Tightbeam.GatewayTest do
     assert notice["payload"] == item
     assert notice["refs"]["messageId"] == item["id"]
     assert notice["refs"]["sessionKey"] == item["sessionKey"]
+  end
+
+  defp assert_one_message_created!(db, expected_content) do
+    message_notices =
+      observed_notices()
+      |> Enum.filter(&(&1["class"] == "message.created"))
+
+    assert length(message_notices) == 1,
+           "expected one message.created notice, got #{inspect(message_notices)}"
+
+    [notice] = message_notices
+    assert_message_notice_matches_projection!(db, notice)
+    assert notice["payload"]["content"] == expected_content
   end
 
   defp credential_probe(parent, command) do

@@ -1178,7 +1178,7 @@ defmodule Tightbeam.Gateway do
       {"work-item-boundary", ["work_item.boundary_declared"]} => fn call ->
         WorkItems.__handle__(db, "work-item-boundary", call)
       end,
-      {"assign", ["assignment.opened"]} => fn call ->
+      {"assign", ["assignment.opened", "message.created"]} => fn call ->
         call =
           call
           |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
@@ -1216,14 +1216,14 @@ defmodule Tightbeam.Gateway do
       end,
       {"attests", []} => fn call -> Assignments.__handle__(db, "attests", call) end,
       {"assignment-get", []} => fn call -> Assignments.__handle__(db, "assignment-get", call) end,
-      {"revoke-assignment", ["assignment.closed"]} => fn call ->
+      {"revoke-assignment", ["assignment.closed", "message.created"]} => fn call ->
         Assignments.__handle__(
           db,
           "revoke-assignment",
           Map.put(call, :on_assignment_change, assignment_change)
         )
       end,
-      {"reopen-assignment", ["assignment.reopened"]} => fn call ->
+      {"reopen-assignment", ["assignment.reopened", "message.created"]} => fn call ->
         Assignments.__handle__(
           db,
           "reopen-assignment",
@@ -1251,7 +1251,7 @@ defmodule Tightbeam.Gateway do
       {"tune", ["message.created", "session.updated"]} => fn call ->
         tune_result(config, db, call)
       end,
-      {"retire", ["session.retired", "wake.scheduled"]} => fn call ->
+      {"retire", ["session.retired", "wake.scheduled", "message.created"]} => fn call ->
         retire_result(config, db, call)
       end
     }

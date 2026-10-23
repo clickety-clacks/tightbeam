@@ -1,7 +1,7 @@
 defmodule Tightbeam.Firehose.PublisherTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConnRegistry, DB, Dispatch, Gateway, Ledger, Org, Projection, Rules}
+  alias Tightbeam.{ConnRegistry, DB, Dispatch, EventLog, Gateway, Ledger, Org, Projection, Rules}
   alias Tightbeam.{StateResources, Wakes}
   alias Tightbeam.Firehose.{Hub, Publisher, Registry}
 
@@ -404,6 +404,18 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
              Dispatch.dispatch(db, handlers, tests_passed)
 
+    verdict_message_notices =
+      observed_notices()
+      |> Enum.filter(&(&1["class"] == "message.created"))
+
+    assert length(verdict_message_notices) == 1
+
+    [verdict_notice] = verdict_message_notices
+    assert_message_notice_matches_projection!(db, verdict_notice)
+
+    assert verdict_notice["payload"]["content"] ==
+             "[verdict filed: tests-passed on #{assignment.id}]"
+
     completion = %{
       verb: "attest",
       origin: "agent:effect-target",
@@ -415,7 +427,25 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
              Dispatch.dispatch(db, handlers, completion)
 
-    assert_per_verb_effects!(config, "attest", observed_state_classes())
+    completion_notices = observed_notices()
+
+    completion_message_notices =
+      Enum.filter(completion_notices, &(&1["class"] == "message.created"))
+
+    assert length(completion_message_notices) == 2
+
+    Enum.each(completion_message_notices, &assert_message_notice_matches_projection!(db, &1))
+
+    assert Enum.map(completion_message_notices, & &1["payload"]["content"]) == [
+             "[completion filed on #{assignment.id}]",
+             "[assignment closed: #{assignment.id} — completed]"
+           ]
+
+    assert_per_verb_effects!(
+      config,
+      "attest",
+      state_classes(Enum.map(completion_notices, & &1["class"]))
+    )
   end
 
   test "a raised state handler emits denied and never accepted state effects" do
@@ -733,6 +763,50 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert String.contains?(wire_notice, "\"payload\":" <> JSON.encode!(item))
 
     :sys.get_state(Hub)
+    refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
+  end
+
+  test "an EventLog notice publishes one message.created for its transcript marker" do
+    db = :firehose_event_log_notice_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
+    main = register_testhost(db)
+
+    case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
+    _ = observed_classes()
+
+    assert :ok =
+             EventLog.notice(db, "firehose_test", "event-log", nil,
+               audience: {:session, main.session_key},
+               message: "event log transcript marker",
+               attention: :normal
+             )
+
+    assert %{
+             "class" => "message.created",
+             "refs" => %{"messageId" => message_id, "sessionKey" => session_key},
+             "payload" => %{"content" => "event log transcript marker"}
+           } = receive_notice()
+
+    assert session_key == main.session_key
+    assert %{
+             id: ^message_id,
+             session_key: ^session_key,
+             content: "event log transcript marker"
+           } = Projection.get(db, message_id)
+
+    _ = :sys.get_state(Hub)
     refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
   end
 
@@ -1129,6 +1203,25 @@ defmodule Tightbeam.Firehose.PublisherTest do
     after
       0 -> Enum.reverse(acc)
     end
+  end
+
+  defp observed_notices(acc \\ []) do
+    _ = :sys.get_state(Hub)
+
+    receive do
+      {:firehose_notice, notice} ->
+        Hub.delivered(Hub, self())
+        observed_notices([notice | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp assert_message_notice_matches_projection!(db, notice) do
+    message = Projection.get(db, notice["refs"]["messageId"])
+    assert notice["class"] == "message.created"
+    assert notice["payload"] == StateResources.message(message)
+    assert notice["refs"]["sessionKey"] == message.session_key
   end
 
   defp observed_state_classes do

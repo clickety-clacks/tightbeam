@@ -9,9 +9,13 @@ defmodule Tightbeam.Productions.BubbleTest do
     HarnessHealth,
     Ledger,
     Model,
-    Org
+    Org,
+    Projection,
+    StateResources,
+    Supervision
   }
 
+  alias Tightbeam.Firehose.Hub
   alias Tightbeam.Productions.Bubble
 
   defmodule LaneDoorbell do
@@ -386,7 +390,11 @@ defmodule Tightbeam.Productions.BubbleTest do
     :ok =
       Ledger.finish(ctx.db, top.seq, "failed", "quota exhausted", owner_lease: top.owner_lease)
 
+    start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(Hub, self())
+
     :ok = Bubble.recognize_terminal(ctx.db, top.seq)
+    assert_one_message_created!(ctx.db, ctx.main.session_key)
 
     assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
 
@@ -406,6 +414,62 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     assert [[_, ref, _, _, _]] = notice_turn(ctx.db, "supervisor")
     assert ref == "bubble:#{cause_seq}", "no second notice while the alert stands"
+  end
+
+  test "patrol exhaustion publishes one owner alert transcript event", ctx do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('other', 0, 'admin_add', 1)"
+      )
+
+    inactive_parent =
+      Org.create(ctx.db, %{
+        session_key: "inactive-patrol-parent",
+        display_name: "Inactive patrol parent",
+        kind: "custom",
+        owner_user_id: "other",
+        origin: "user:other",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    _ = Org.set_operational_parent(ctx.db, ctx.holder.session_key, inactive_parent.session_key)
+
+    :ok =
+      DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        inactive_parent.session_key
+      ])
+
+    start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(Hub, self())
+
+    for n <- 1..6 do
+      message_id = "patrol-failure-#{n}"
+
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: ctx.holder.session_key,
+          message_id: message_id,
+          origin: "user:flynn",
+          prompt: "patrol failure #{n}"
+        })
+
+      {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "patrol-test")
+
+      :ok =
+        Ledger.finish(ctx.db, seq, "failed", "provider failure #{n}",
+          owner_lease: turn.owner_lease
+        )
+
+      assert :ok = Supervision.classify_terminal(ctx.db, seq)
+    end
+
+    assert_one_message_created!(ctx.db, ctx.main.session_key)
+    assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
   end
 
   test "a canceled notice climbs — the underlying fault remains untold", ctx do
@@ -664,5 +728,38 @@ defmodule Tightbeam.Productions.BubbleTest do
                session_key: nil,
                params: %{assignment_id: assignment.id, reason: "terminal disposition"}
              })
+  end
+
+  defp assert_one_message_created!(db, session_key) do
+    message_notices =
+      observed_notices()
+      |> Enum.filter(&(&1["class"] == "message.created"))
+
+    assert length(message_notices) == 1,
+           "expected one message.created notice, got #{inspect(message_notices)}"
+
+    [notice] = message_notices
+    message_id = notice["refs"]["messageId"]
+    assert notice["refs"]["sessionKey"] == session_key
+
+    message = Projection.get(db, message_id)
+    assert message.session_key == session_key
+    assert notice["payload"] == StateResources.message(message)
+    assert message.message_type == "substrate"
+
+    _ = :sys.get_state(Hub)
+    refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
+  end
+
+  defp observed_notices(acc \\ []) do
+    _ = :sys.get_state(Hub)
+
+    receive do
+      {:firehose_notice, notice} ->
+        Hub.delivered(Hub, self())
+        observed_notices([notice | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
   end
 end
