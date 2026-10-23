@@ -85,10 +85,13 @@ defmodule Tightbeam.Dispatch do
   def dispatch(db \\ Tightbeam.DB, handlers, call) do
     previous_audit = Process.delete(:tightbeam_dispatch_audit)
     previous_audited = Process.delete(:tightbeam_dispatch_audited)
+    snapshot = Rules.effective_snapshot()
 
     try do
-      :ok = Assignments.assert_request_contract!(call)
-      dispatch_call(db, handlers, call)
+      Tightbeam.RuleRuntime.with_policy_snapshot(snapshot, fn ->
+        :ok = Assignments.assert_request_contract!(call)
+        dispatch_call(db, handlers, call)
+      end)
     rescue
       error in Tightbeam.Mementos.Refusal ->
         {:error, error.details || %{code: error.code, message: error.message}}
@@ -220,16 +223,9 @@ defmodule Tightbeam.Dispatch do
 
         if statute.name == "completion-requires-review" and verb == "attest" and
              call.params[:kind] == "completion" and review_notice_routed?(outcome) do
-          # Keep the holder's completion report while the review is pending.
-          dispatch_to_handler(
-            db,
-            handlers,
-            Map.put(call, :review_pending, true),
-            verb,
-            origin,
-            principal,
-            session_key
-          )
+          # Keep the holder's completion report while the review is pending,
+          # while still applying every other rule to the same policy snapshot.
+          dispatch_call(db, handlers, Map.put(call, :review_pending, true))
         else
           error = remedy_error(error, outcome)
           best_effort_denial(db, verb, origin, principal, session_key, error)

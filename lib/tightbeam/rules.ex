@@ -820,6 +820,7 @@ defmodule Tightbeam.Rules do
       nil ->
         rules
         |> Enum.filter(&(&1.verb == verb and edge in &1.edges))
+        |> Enum.reject(&review_pending_rule?(&1, call))
         |> Enum.filter(&memento_rule_phase?(&1, db, call))
         |> decide_rules(db, call, %{}, [], [])
 
@@ -831,6 +832,12 @@ defmodule Tightbeam.Rules do
           }}, [], []}
     end
   end
+
+  defp review_pending_rule?(%{name: "completion-requires-review"}, %{review_pending: true}) do
+    true
+  end
+
+  defp review_pending_rule?(_rule, _call), do: false
 
   defp memento_rule_phase?(rule, db, call) do
     dependent =

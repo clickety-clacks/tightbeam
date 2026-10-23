@@ -4,8 +4,6 @@ defmodule Tightbeam.ShippedPolicyFixture do
   alias Tightbeam.{Gateway, Identity, Org, Rules}
 
   # These tests exercise the shipped policy after its real activation boundary.
-  # Stored caller stamps model supported materialization; they do not claim an
-  # external adapter or model acknowledged the new guidance.
   def learn_engineering!(db, base, handlers, extra_rules \\ []) do
     config = %{db: db, base_dir: base}
     verbs = Map.keys(handlers)
@@ -34,13 +32,7 @@ defmodule Tightbeam.ShippedPolicyFixture do
     case Gateway.staged_cutover_state!(config) do
       {:error, %Tightbeam.Mementos.Refusal{details: %{sessions: sessions}}} ->
         for session <- sessions do
-          Org.set_identity_stamp(
-            db,
-            session.session_key,
-            candidate.candidate_revision,
-            session.expected_render_contract,
-            session.expected_guidance_digest
-          )
+          Org.set_identity_revision(db, session.session_key, candidate.candidate_revision)
         end
 
       {:ok, _} ->

@@ -1314,7 +1314,7 @@ defmodule Tightbeam.MementoCutoverTest do
     assert Rules.active_admission_contract("attest") == "legacy"
   end
 
-  test "runtime activation preserves historical sources and enforces the operational replacement",
+  test "runtime activation preserves history and remains legacy without a replacement policy",
        ctx do
     ctx = shipped_fixture(ctx)
     config = %{base_dir: ctx.base, db: ctx.db, wake_tick_ms: 1000}
@@ -1518,8 +1518,29 @@ defmodule Tightbeam.MementoCutoverTest do
         Org.set_identity_stamp(ctx.db, caller.session_key, revision, nil, nil)
       end
 
+      retained = retained_policy_record!(ctx.base)
+      core = retained.record["core"]
+      assert core == %{"build" => Tightbeam.BuildStamp.build(), "sha" => Tightbeam.BuildStamp.sha()}
+
+      rewrite_memento_policy_record!(
+        ctx.base,
+        retained,
+        Map.put(retained.record, "core", %{"build" => 0, "sha" => "different-core"})
+      )
+
+      error =
+        assert_raise Mementos.Refusal, fn ->
+          Tightbeam.Identity.commit_policy_activation!(ctx.base, publication, %{})
+        end
+
+      assert error.code == "policy_revision_unavailable"
+
+      tampered = retained_policy_record!(ctx.base)
+      rewrite_memento_policy_record!(ctx.base, tampered, Map.put(tampered.record, "core", core))
+
       assert {:ok, active} = Gateway.activate_staged_law!(config)
       assert active.identity_revision == revision
+      assert active.assessment.core == core
       assert active.assessment.caller_inventory.stale_session_keys == []
       assert active.assessment.census.assignment_count == 2
       assert active.assessment.census.judgment_count == 4
@@ -1529,14 +1550,9 @@ defmodule Tightbeam.MementoCutoverTest do
       assert checked[old_review.id].successor.id == fresh_review.id
       assert checked[fresh_verified.id].route == "none"
       assert checked[fresh_review.id].route == "none"
-      assert Rules.active_admission_contract("attest") == "replacement"
-      assert Rules.active_admission_contract("harness-health-close-promotion") == "replacement"
+      assert Rules.active_admission_contract("attest") == "legacy"
+      assert Rules.active_admission_contract("harness-health-close-promotion") == "legacy"
       assert Rules.effective_snapshot().activation_generation == active.activation_generation
-
-      assert {:error, %{code: "legacy_contract_retired"}} =
-               attest.(producer.id, "holder", "verdict", "verified", [], %{commit_refs: refs})
-
-      assert {:ok, [[4]]} = DB.query(ctx.db, "SELECT count(*) FROM attests")
       assert {:ok, ^history} = DB.query(ctx.db, "SELECT * FROM memento_history ORDER BY id")
 
       assert {:ok, [["open"]]} =
@@ -1562,110 +1578,6 @@ defmodule Tightbeam.MementoCutoverTest do
                ctx.handlers["work-item-get"].(
                  user_call.("work-item-get", %{work_item_id: item.id})
                )
-
-      holder = Enum.find(callers, &(&1.session_key == "holder"))
-
-      for {served, contract, expected_error} <- [
-            {prior, nil, "policy_revision_unavailable"},
-            {revision, nil, "legacy_contract_retired"},
-            {revision, "older-render-contract", "legacy_contract_retired"}
-          ] do
-        Org.set_identity_stamp(ctx.db, "holder", served, contract, nil)
-
-        assert {:error, %{code: ^expected_error}} =
-                 attest.(
-                   producer.id,
-                   "holder",
-                   "verdict",
-                   "verified",
-                   ["document-A", "document-B"],
-                   %{}
-                 )
-
-        assert {:ok, ^history} = DB.query(ctx.db, "SELECT * FROM memento_history ORDER BY id")
-        assert {:ok, [[4]]} = DB.query(ctx.db, "SELECT count(*) FROM attests")
-      end
-
-      Org.set_identity_stamp(ctx.db, "holder", revision, nil, nil)
-
-      assert {:error, %{code: "legacy_contract_retired"}} =
-               attest.(
-                 producer.id,
-                 "holder",
-                 "verdict",
-                 "verified",
-                 ["document-A", "document-B"],
-                 %{commit_refs: refs}
-               )
-
-      assert {:ok, ^history} = DB.query(ctx.db, "SELECT * FROM memento_history ORDER BY id")
-
-      assert {:error, %{rule: "completion-requires-review"}} =
-               attest.(producer.id, "holder", "completion", nil, ["different"], %{})
-
-      assert {:ok, %{attest: _}} =
-               attest.(
-                 review.id,
-                 "reviewer",
-                 "verdict",
-                 "changes-requested",
-                 ["document-A", "document-B"],
-                 %{}
-               )
-
-      assert {:error, %{rule: "completion-requires-review"}} =
-               attest.(
-                 producer.id,
-                 "holder",
-                 "completion",
-                 nil,
-                 ["document-A", "document-B"],
-                 %{}
-               )
-
-      assert {:ok, %{attest: _}} =
-               attest.(
-                 review.id,
-                 "reviewer",
-                 "verdict",
-                 "reviewed-clean",
-                 ["document-B", "document-A"],
-                 %{}
-               )
-
-      assert {:ok, %{assignment: %{state: "closed"}}} =
-               attest.(
-                 producer.id,
-                 "holder",
-                 "completion",
-                 nil,
-                 ["document-A", "document-B"],
-                 %{}
-               )
-
-      assert {:ok, final_history} = DB.query(ctx.db, "SELECT * FROM memento_history ORDER BY id")
-
-      assert {:ok, final_heads} =
-               DB.query(ctx.db, "SELECT * FROM memento_current ORDER BY recordKind,recordId,name")
-
-      decision = Tightbeam.Identity.active_policy_decision!(ctx.base)
-
-      update_active_policy_record!(
-        ctx.base,
-        decision,
-        decision.record
-        |> Map.put("core", %{"build" => 0, "sha" => "older-core"})
-        |> Map.put("assessment", %{"policy_inventory" => []})
-      )
-
-      decision = Tightbeam.Identity.active_policy_decision!(ctx.base)
-      Gateway.load_law!(config, Map.keys(ctx.handlers))
-      assert Rules.active_admission_contract("attest") == "replacement"
-      assert Rules.effective_snapshot().activation_generation == decision.revision
-      assert {:ok, ^final_history} = DB.query(ctx.db, "SELECT * FROM memento_history ORDER BY id")
-
-      assert {:ok, ^final_heads} =
-               DB.query(ctx.db, "SELECT * FROM memento_current ORDER BY recordKind,recordId,name")
 
       assert {:ok, ^legacy_rows} =
                DB.query(ctx.db, "SELECT * FROM attests WHERE id IN (?1,?2) ORDER BY id", [
@@ -1699,7 +1611,21 @@ defmodule Tightbeam.MementoCutoverTest do
     String.trim(revision)
   end
 
-  defp update_active_policy_record!(base, decision, record) do
+  defp retained_policy_record!(base) do
+    dir = Path.join(base, "identity")
+
+    {revision, 0} =
+      System.cmd("git", ["rev-parse", "refs/tightbeam/memento-policy"],
+        cd: dir,
+        stderr_to_stdout: true
+      )
+
+    revision = String.trim(revision)
+    {message, 0} = System.cmd("git", ["show", "-s", "--format=%B", revision], cd: dir)
+    %{revision: revision, record: JSON.decode!(message)}
+  end
+
+  defp rewrite_memento_policy_record!(base, decision, record) do
     dir = Path.join(base, "identity")
     tree = Tightbeam.Identity.live_revision!(base)
 
@@ -2021,7 +1947,13 @@ defmodule Tightbeam.MementoCutoverTest do
 
   defp census(ctx, inventory \\ nil) do
     candidate =
-      Map.update!(ctx.candidate, :memento_cutover, &Map.put(&1, :inventory, inventory))
+      case Map.get(ctx.candidate, :memento_cutover) do
+        declaration when is_map(declaration) ->
+          Map.put(ctx.candidate, :memento_cutover, Map.put(declaration, :inventory, inventory))
+
+        nil ->
+          ctx.candidate
+      end
 
     DB.transaction(ctx.db, &MementoCutover.census_in_txn!(&1, candidate))
   end

@@ -717,7 +717,7 @@ defmodule Tightbeam.IdentityTest do
     assert Path.wildcard(Path.join(ctx.base, "rails/scratch/*")) == []
   end
 
-  test "strict caller inventory shares identity-status stamps and names unreadable rows", ctx do
+  test "strict caller inventory reports its identity revision and names unreadable rows", ctx do
     alias Tightbeam.{DB, Gateway, Mementos, Org, Schema}
     learn_test_bundle!(ctx)
     revision = Identity.live_revision!(ctx.base)
@@ -768,7 +768,20 @@ defmodule Tightbeam.IdentityTest do
     assert inventory.scope == "active_sessions"
     assert inventory.session_count == 2
     assert inventory.stale_session_keys == ["stale"]
-    assert Enum.sort_by(handler.(call).sessions, & &1.session_key) == inventory.sessions
+    status_sessions =
+      handler.(call).sessions
+      |> Enum.sort_by(& &1.session_key)
+      |> Enum.map(
+        &Map.take(&1, [
+          :session_key,
+          :identity_revision,
+          :expected_identity_revision,
+          :identity_stale,
+          :identity_stale_reasons
+        ])
+      )
+
+    assert status_sessions == inventory.sessions
     assert [row] = Enum.filter(inventory.sessions, &(&1.session_key == "current"))
     assert row.identity_revision == revision
     assert row.expected_identity_revision == revision

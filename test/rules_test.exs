@@ -1627,7 +1627,7 @@ defmodule Tightbeam.RulesTest do
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
 
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
 
     for effect_kind <- ["release", "live_mutation"] do
       producer = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: effect_kind)
@@ -1671,7 +1671,7 @@ defmodule Tightbeam.RulesTest do
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
     attach_work_item(ctx, producer.id, "review-change-reopen")
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     refs = ctx.commit_refs
 
     assert %{attest: %{verdictKind: "verified"}} =
@@ -1800,7 +1800,7 @@ defmodule Tightbeam.RulesTest do
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
     review = assignment(ctx, reviewer.session_key, {:user, "reviewer"}, reviews: producer.id)
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "fixture")
     refs = integrated_commit_refs(ctx)
 
     assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: ^refs}} =

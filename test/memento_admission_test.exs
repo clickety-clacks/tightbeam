@@ -973,7 +973,7 @@ defmodule Tightbeam.MementoAdmissionTest do
     })
 
     producer = engineering_assignment(ctx, item.id)
-    input = engineering_completion(ctx, producer.id, ["expected"], :legacy)
+    input = engineering_completion(ctx, producer.id, ["expected"], :host)
     decide = fn -> DB.transaction(ctx.db, &Rules.decide(&1, input)) end
 
     assert {:ok, {{:remedy, %{name: "completion-requires-verification"}, _, _}, [], []}} =

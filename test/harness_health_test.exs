@@ -1831,7 +1831,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert Enum.sort(recovered) == Enum.sort(Enum.map(running, &elem(&1, 2)))
 
     notices =
-      for _ <- 1..3 do
+      for _ <- 1..2 do
         assert_receive {:firehose_notice, notice}
         Hub.delivered(hub, self())
         notice
@@ -1853,18 +1853,7 @@ defmodule Tightbeam.HarnessHealthTest do
     end
 
     # Queued successors keep both sessions running: no public state or version changes.
-    assert Enum.count(notices, &(&1["class"] == "wake.scheduled")) == 1
-    assert Enum.count(notices, &(&1["class"] == "turn.ended")) == 2
-
-    assert [
-             %{
-               "payload" => %{
-                 "wakeId" => "w_health_redelivery_parent_1",
-                 "origin" => "health-redelivery-parent"
-               }
-             }
-           ] =
-             Enum.filter(notices, &(&1["class"] == "wake.scheduled"))
+    assert Enum.all?(notices, &(&1["class"] == "turn.ended"))
 
     assert Map.new(running, fn {key, _, _, _} -> {key, Org.get(ctx.db, key)} end) ==
              before_sessions

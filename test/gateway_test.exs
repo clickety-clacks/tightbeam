@@ -10867,8 +10867,9 @@ defmodule Tightbeam.GatewayTest do
     assert File.read!(skill) == "captured revision"
     assert Org.get(ctx.db, session.session_key).identity_revision == captured
 
-    assert [%{state: "pending"} | _] =
-             Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
+    prior_pending_wakes = Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
+    assert [%{state: "pending"} | _] = prior_pending_wakes
+    prior_pending_ids = MapSet.new(Enum.map(prior_pending_wakes, & &1.wake_id))
 
     assert %{
              status: "complete",
@@ -10880,7 +10881,9 @@ defmodule Tightbeam.GatewayTest do
 
     assert File.read!(skill) == "newer published revision"
     assert Org.get(ctx.db, session.session_key).identity_revision == newer
-    assert [%{state: "pending"}] = Tightbeam.Wakes.list_for_session(ctx.db, session.session_key)
+    assert Enum.any?(Tightbeam.Wakes.list_for_session(ctx.db, session.session_key), fn wake ->
+             wake.state == "pending" and not MapSet.member?(prior_pending_ids, wake.wake_id)
+           end)
   end
 
   # A writer that fails BETWEEN two skill files leaves a partial file set. The

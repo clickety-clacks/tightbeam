@@ -299,11 +299,13 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
 
     case terminal.state do
       "fired" ->
+        terminal_session_key = terminal.session_key
+
         assert {:ok,
                 [
                   [
                     terminal_carrier,
-                    ^personal_session,
+                    ^terminal_session_key,
                     terminal_prompt,
                     terminal_envelope,
                     terminal_hash
@@ -646,7 +648,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
         )
       end)
 
-      assert {:ok, [["completed", nil, evidence]]} =
+      assert {:ok, [["completed", encoded_refs, evidence]]} =
                DB.query(
                  ctx.db,
                  """
@@ -658,6 +660,8 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                  """,
                  [holder.assignment_id]
                )
+
+      assert JSON.decode!(encoded_refs) == holder.check.commit_refs
 
       assert [encoded] = JSON.decode!(evidence)
       assert %{"commit" => commit, "repo" => "testhost:" <> repo} = JSON.decode!(encoded)

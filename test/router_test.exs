@@ -3477,11 +3477,25 @@ defmodule Tightbeam.Wire.RouterTest do
     archived = Tightbeam.Artifacts.get(ctx.db, artifact.artifact_id)
     File.rm!(archived.home)
     assert Tightbeam.Artifacts.release(ctx.db, artifact.artifact_id).state == "released"
+
+    digest = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.ArtifactContent.store_in_txn(
+                 txn,
+                 artifact.artifact_id,
+                 digest,
+                 bytes,
+                 System.system_time(:millisecond)
+               )
+             end)
+
     body = %{verb: "artifact-content-fetch", params: %{artifactId: artifact.artifact_id}}
 
     expected = %{
       "artifactId" => artifact.artifact_id,
-      "contentSha256" => Base.encode16(:crypto.hash(:sha256, bytes), case: :lower),
+      "contentSha256" => digest,
       "contentSize" => byte_size(bytes),
       "contentBase64" => Base.encode64(bytes)
     }

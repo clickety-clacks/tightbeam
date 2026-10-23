@@ -410,7 +410,11 @@ defmodule Tightbeam.StateResources do
                CASE WHEN p.workItemId IS NULL THEN
                  CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
                ELSE p.priority END,
-               COALESCE(v.rowVersion, wi.createdAt)
+               COALESCE(v.rowVersion, wi.createdAt), wi.deliveryOwnerSessionKey,
+               (SELECT body FROM work_item_bodies b WHERE b.workItemId = wi.id),
+               (SELECT updatedByUser FROM work_item_bodies b WHERE b.workItemId = wi.id),
+               (SELECT updatedBySession FROM work_item_bodies b WHERE b.workItemId = wi.id),
+               (SELECT updatedAt FROM work_item_bodies b WHERE b.workItemId = wi.id)
         FROM work_items AS wi
         LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
         LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id
@@ -483,7 +487,11 @@ defmodule Tightbeam.StateResources do
            CASE WHEN p.workItemId IS NULL THEN
              CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
            ELSE p.priority END,
-           COALESCE(v.rowVersion, wi.createdAt)
+           COALESCE(v.rowVersion, wi.createdAt), wi.deliveryOwnerSessionKey,
+           (SELECT body FROM work_item_bodies b WHERE b.workItemId = wi.id),
+           (SELECT updatedByUser FROM work_item_bodies b WHERE b.workItemId = wi.id),
+           (SELECT updatedBySession FROM work_item_bodies b WHERE b.workItemId = wi.id),
+           (SELECT updatedAt FROM work_item_bodies b WHERE b.workItemId = wi.id)
     FROM work_items AS wi
     LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
     LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id
@@ -1524,7 +1532,12 @@ defmodule Tightbeam.StateResources do
          created_context_known,
          created_at,
          priority,
-         row_version
+         row_version,
+         delivery_owner_session_key,
+         body,
+         body_updated_by_user,
+         body_updated_by_session,
+         body_updated_at
        ]) do
     %{
       id: id,
@@ -1543,7 +1556,12 @@ defmodule Tightbeam.StateResources do
       created_context_known: created_context_known == 1,
       created_at: created_at,
       priority: priority,
-      row_version: row_version
+      row_version: row_version,
+      delivery_owner_session_key: delivery_owner_session_key,
+      body: body,
+      body_updated_by_user: body_updated_by_user,
+      body_updated_by_session: body_updated_by_session,
+      body_updated_at: body_updated_at
     }
   end
 
