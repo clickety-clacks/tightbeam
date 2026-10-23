@@ -2554,7 +2554,7 @@ defmodule Tightbeam.CliIntegrationTest do
       Escalation.operator_rule(ctx.db, %{
         origin: "user:flynn",
         principal: {:user, "flynn"},
-        transport_session_key: nil,
+        transport_session_key: ctx.session.session_key,
         params: %{request: request.id, decision: "ship"}
       })
 
