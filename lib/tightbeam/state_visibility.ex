@@ -191,13 +191,10 @@ defmodule Tightbeam.StateVisibility do
           user_principal?(principal, value(row, :owner_user_id))
 
       "effort" ->
-        admin or session_owner?(db, value(row, :expecter_session_key), principal) or
-          user_principal?(principal, value(row, :expecter_user_id)) or assignment_holder
+        admin or user_principal?(principal, value(row, :expecter_user_id)) or assignment_holder
 
       "agent" ->
-        admin or session_owner?(db, value(row, :raiser_session_key), principal) or
-          session_owner?(db, value(row, :expecter_session_key), principal) or
-          user_principal?(principal, value(row, :owner_user_id))
+        admin or user_principal?(principal, value(row, :owner_user_id))
 
       _ ->
         false
