@@ -304,7 +304,7 @@ defmodule Tightbeam.HarnessHealthTest do
       not_known_class_reason: "not one of the named failure classes",
       observed_at: at,
       accepted_at: at,
-      valid_until: at + 900_000,
+      valid_until: at + 10_800_000,
       world_status: "UNKNOWN",
       redaction_confirmed: true,
       idempotency_key: "other-validity-boundary"
@@ -316,12 +316,12 @@ defmodule Tightbeam.HarnessHealthTest do
             %{
               code: "invalid_other_evidence",
               message:
-                "invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
+                "invalid --valid-until: must be no more than 3 hours after --observed-at (defaults to server acceptance time)"
             }} =
              HarnessHealth.observe_other(ctx.db, %{
                input
                | description: "unclassified evidence beyond validity limit",
-                 valid_until: at + 900_001,
+                 valid_until: at + 10_800_001,
                  idempotency_key: "other-validity-over-limit"
              })
   end
