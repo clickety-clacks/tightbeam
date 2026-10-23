@@ -997,7 +997,7 @@ defmodule Tightbeam.EscalationTest do
     assert ruled.status == "ruled"
     assert ruled.decision == "accept"
     assert ruled.ruled_by == "user:flynn"
-    assert ruled.ruled_via_session_key == "agent:raiser:app"
+    assert ruled.ruled_via_session_key == nil
     assert ruled.rationale == nil
     assert ruled.consumed_at == nil
 
@@ -1005,7 +1005,7 @@ defmodule Tightbeam.EscalationTest do
              on_behalf_of: "user:flynn",
              performer: %{
                principal: %{state: "known", value: "user:flynn"},
-               session: %{state: "known", key: "agent:raiser:app"}
+               session: %{state: "none"}
              }
            }
 
@@ -1145,32 +1145,6 @@ defmodule Tightbeam.EscalationTest do
            }
   end
 
-  test "operator rulings require a retained submitting session", ctx do
-    request =
-      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "session required?"}))
-
-    for session_key <- [nil, "unretained-session"] do
-      no_session =
-        owner_operator_rule(request.id, %{decision: "accept"})
-        |> Map.put(:transport_session_key, session_key)
-
-      assert %{code: "operator_ruling_submitting_session_required"} =
-               Escalation.operator_rule(ctx.db, no_session)
-    end
-
-    assert Escalation.raw_by_id(ctx.db, request.id).status == "open"
-
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1",
-               [request.id]
-             )
-
-    assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM condition_facts WHERE scope=?1", [request.id])
-  end
-
   test "presenting session is preserved beside the performing principal", ctx do
     request =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "relay?"}))
@@ -1258,7 +1232,7 @@ defmodule Tightbeam.EscalationTest do
     assert observer == "session:#{ctx.raiser.session_key}"
     refute fields =~ "integrity?"
 
-    assert shape_digest == "58fc94c6274ec4e8047e864c3f190ae7136d37507128769752e9512e9d77dd97"
+    assert shape_digest == "efa9964d4e3857fc094f9b699b19ac1feb91a30b439236e05572b483cb886403"
     assert ruled.ruling_fact_id > 0
   end
 
@@ -1790,13 +1764,6 @@ defmodule Tightbeam.EscalationTest do
                ctx.db,
                "UPDATE decision_requests SET ruledViaPrincipal=NULL,ruledViaSessionState=NULL WHERE id IN (?1,?2)",
                [direct.id, via.id]
-             )
-
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               "UPDATE decision_requests SET ruledViaSessionKey=NULL WHERE id=?1",
-               [direct.id]
              )
 
     assert %{
@@ -3600,7 +3567,7 @@ defmodule Tightbeam.EscalationTest do
       verb: "operator-rule",
       origin: "user:flynn",
       principal: {:user, "flynn"},
-      transport_session_key: "agent:raiser:app",
+      transport_session_key: nil,
       params: Map.put(params, :request, id)
     }
   end

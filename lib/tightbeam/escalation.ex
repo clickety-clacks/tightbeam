@@ -2684,17 +2684,10 @@ defmodule Tightbeam.Escalation do
               end
 
             "open" ->
-              if submitting_session_in_txn?(txn, call) do
-                with {:ok, decision} <- operator_decision(request, answer) do
-                  rule_operator_request_in_txn(txn, call, request, decision, answer, opts)
-                else
-                  {:error, reason} -> {reason, nil}
-                end
+              with {:ok, decision} <- operator_decision(request, answer) do
+                rule_operator_request_in_txn(txn, call, request, decision, answer, opts)
               else
-                {error(
-                   "operator_ruling_submitting_session_required",
-                   "a real submitting session is required to record an operator ruling"
-                 ), nil}
+                {:error, reason} -> {reason, nil}
               end
 
             _terminal_or_closed ->
@@ -2709,16 +2702,6 @@ defmodule Tightbeam.Escalation do
     end
 
     {result, fact_id}
-  end
-
-  defp submitting_session_in_txn?(txn, call) do
-    case Map.get(call, :transport_session_key) do
-      key when is_binary(key) and key != "" ->
-        Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [key]) == [[1]]
-
-      _ ->
-        false
-    end
   end
 
   defp replay_operator_ruling_in_txn(txn, call, request, answer) do
