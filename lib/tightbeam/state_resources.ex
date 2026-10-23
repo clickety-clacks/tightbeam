@@ -1122,10 +1122,8 @@ defmodule Tightbeam.StateResources do
   end
 
   @doc "Canonical host-environment detail query. It never selects the secret value table."
-  def query_host_environment(source, %{key: {host, harness, name}, principal: principal}) do
-    detail_selection(source, "host environment", principal, fn txn ->
-      query_host_environment(txn, host, harness, name)
-    end)
+  def query_host_environment(source, %{key: {host, harness, name}}) do
+    query_host_environment(source, host, harness, name)
   end
 
   def query_host_environment(source, filters) when is_map(filters) do
