@@ -620,20 +620,6 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                )
     end
 
-    # Production work may target the accountable delivery owner.
-    assert %{deliveryOwnerSessionKey: "worker-a"} =
-             set_owner(db, {:user, "owner"}, item_id, "worker-a")
-
-    for verb <- ["assign", "dispatch"],
-        principal <- [{:user, "owner"}, {:session, "worker-a"}] do
-      assert {:ok, %{holderKey: "worker-a", workItemId: ^item_id}} =
-               Dispatch.dispatch(
-                 db,
-                 handlers,
-                 production_call(verb, principal, "worker-a", item_id)
-               )
-    end
-
     # Coordination with returned topology and genuine linked review remain reachable.
     for verb <- ["assign", "dispatch"] do
       call =
@@ -653,13 +639,26 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     owner_review = %{review | session_key: "worker-a"}
     assert {:ok, %{holderKey: "worker-a"}} = Dispatch.dispatch(db, handlers, owner_review)
 
-    # Production work may target another available session once owner and topology are set.
-    for verb <- ["assign", "dispatch"] do
-      assert {:ok, %{holderKey: "worker-b", workItemId: ^item_id}} =
+    # Production work may target the accountable delivery owner.
+    for {verb, target} <- [{"assign", "worker-b"}, {"dispatch", "worker-c"}] do
+      assert %{deliveryOwnerSessionKey: ^target} =
+               set_owner(db, {:user, "owner"}, item_id, target)
+
+      assert {:ok, %{holderKey: ^target, workItemId: ^item_id}} =
                Dispatch.dispatch(
                  db,
                  handlers,
-                 production_call(verb, {:user, "owner"}, "worker-b", item_id)
+                 production_call(verb, {:user, "owner"}, target, item_id)
+               )
+    end
+
+    # Production work may target another available session once owner and topology are set.
+    for verb <- ["assign", "dispatch"] do
+      assert {:ok, %{holderKey: "worker-d", workItemId: ^item_id}} =
+               Dispatch.dispatch(
+                 db,
+                 handlers,
+                 production_call(verb, {:user, "owner"}, "worker-d", item_id)
                )
     end
   end
