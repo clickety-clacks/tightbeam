@@ -730,7 +730,8 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, %{"post" => fn _ -> %{code: "constitutional"} end}, call())
 
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM domain")
-    assert Enum.map(EventLog.events_after(ctx.db, 0, 10), & &1.kind) == ["verb", "denied"]
+    # The handler refused before an accepted verb event could be recorded.
+    assert Enum.map(EventLog.events_after(ctx.db, 0, 10), & &1.kind) == ["denied"]
   end
 
   test "empty rules retain legacy code completion evidence requirements",
@@ -3523,7 +3524,7 @@ defmodule Tightbeam.RulesTest do
     verdict(ctx, reviewer.session_key, fifth_review.id, "changes-requested", "fifth round")
     assert notice_count(ctx.db, churn_origin) == 1
 
-    fix_origin = "remedy:ac6a-fourth-fix-round"
+    fix_origin = "remedy:ac6a-fourth-review-or-fix-round"
     fix_item = "wi_ac6a_fourth_fix_round"
     create_work_item(ctx, fix_item)
     set_work_item_owner(ctx, fix_item, opener.session_key)
@@ -3561,8 +3562,8 @@ defmodule Tightbeam.RulesTest do
              DB.query(
                ctx.db,
                "SELECT sessionKey,assignmentId,work_item_id,prompt FROM wakes " <>
-                 "WHERE origin=?1 AND prompt LIKE '%fourth fix round%'",
-               [fix_origin]
+                 "WHERE origin=?1 AND work_item_id=?2 AND prompt LIKE '%fourth fix round%'",
+               [fix_origin, fix_item]
              )
 
     assert [fix_target, fix_assignment, fix_work_item] ==

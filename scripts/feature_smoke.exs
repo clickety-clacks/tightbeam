@@ -684,9 +684,46 @@ defmodule FeatureSmoke do
           "the carrier proof in the other half of this group. Row: #{inspect(recorded)}"
       )
 
-      # Review gate. Current rules notify the accountable owner; the fixture variant
-      # rules assign the bound reviewer. Either way the denial must remain real.
-      denied!(state, "completion-requires-review", asg_id, complete)
+      # The shipped bundle is legacy-classified here: after the report exists,
+      # completion is recorded as review-pending and the ordinary notice routes
+      # the review. It must leave the assignment open until a clean linked review.
+      pending = complete.()
+
+      assert(
+        state,
+        is_map(pending) and not Map.has_key?(pending, "error"),
+        "gate chain: review-pending completion should be accepted, got #{inspect(pending)}"
+      )
+
+      pending_assignment = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
+
+      assert(
+        state,
+        pending_assignment["state"] == "open" and pending_assignment["outcome"] == nil,
+        "gate chain: review-pending completion must leave #{asg_id} open until review; " <>
+          "assignment reads state=#{inspect(pending_assignment["state"])} " <>
+          "outcome=#{inspect(pending_assignment["outcome"])}"
+      )
+
+      assert(
+        state,
+        sqlite(
+          state,
+          "SELECT count(*) FROM attests WHERE assignmentId=#{sql_quote(asg_id)} " <>
+            "AND kind='completion'"
+        ) == "1",
+        "gate chain: accepted review-pending completion was not preserved as an attest"
+      )
+
+      assert(
+        state,
+        sqlite(
+          state,
+          "SELECT count(*) FROM wakes WHERE origin='remedy:completion-requires-review' " <>
+            "AND assignmentId=#{sql_quote(asg_id)}"
+        ) == "1",
+        "gate chain: review-pending completion did not leave its ordinary review notice"
+      )
 
       reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
 
@@ -725,19 +762,16 @@ defmodule FeatureSmoke do
         "gate chain: reviewed-clean from the #{reviewer_leg.wire_name} reviewer failed: #{inspect(v)}"
       )
 
-      # The shipped bundle is legacy-classified here: its commitRefs and verdict
-      # facts remain the admission inputs, and the clean linked review settles the
-      # ordinary review-pending completion.
-      done = complete.()
+      # The clean linked review settles the earlier review-pending completion.
       final = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
 
       assert(
         state,
         final["state"] == "closed" and final["outcome"] == "completed",
         "gate chain: with a report recorded, completion should close #{asg_id} " <>
-          "as completed; " <>
+          "as completed after the clean review; " <>
           "assignment reads state=#{inspect(final["state"])} outcome=#{inspect(final["outcome"])} " <>
-          "(attest returned #{inspect(done)})"
+          "(review attest returned #{inspect(v)})"
       )
 
       await_episode_status!(

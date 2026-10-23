@@ -3988,7 +3988,7 @@ defmodule Tightbeam.Rules do
 
   defp row_commit_domain(call) do
     if Map.get(call, :edge) == :row_commit do
-      field(Map.get(call, :transition, %{}), :domain)
+      field(Map.get(call, :transition) || %{}, :domain)
     else
       nil
     end
@@ -4081,9 +4081,11 @@ defmodule Tightbeam.Rules do
   end
 
   defp compute_fact("$assignment", db, call, cache) do
+    transition = Map.get(call, :transition) || %{}
+
     transition_assignment_id =
       if row_commit_domain(call) == "assignment",
-        do: field(Map.get(call, :transition, %{}), :row_id)
+        do: field(transition, :row_id)
 
     assignment =
       case Map.get(call.params, :assignment_id) || Map.get(call.params, "assignment_id") ||

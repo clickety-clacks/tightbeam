@@ -826,10 +826,13 @@ defmodule Tightbeam.MementoAdmissionTest do
 
     assert %{id: _} = open.("coordination")
 
+    fix_origin = "remedy:ac6a-fourth-review-or-fix-round"
+
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM wakes WHERE origin='remedy:ac6a-fourth-fix-round'"
+               "SELECT count(*) FROM wakes WHERE origin=?1 AND work_item_id=?2",
+               [fix_origin, item.id]
              )
 
     assert %{id: code_id} = open.("code")
@@ -837,7 +840,8 @@ defmodule Tightbeam.MementoAdmissionTest do
     assert {:ok, [[^code_id]]} =
              DB.query(
                ctx.db,
-               "SELECT assignmentId FROM wakes WHERE origin='remedy:ac6a-fourth-fix-round'"
+               "SELECT assignmentId FROM wakes WHERE origin=?1 AND work_item_id=?2",
+               [fix_origin, item.id]
              )
   end
 
@@ -1106,6 +1110,7 @@ defmodule Tightbeam.MementoAdmissionTest do
       end)
 
     :persistent_term.put(Rules, %{candidate | active_admission_contract: active_contract})
+    :ok = Tightbeam.Wakes.activate_wait_recognition(ctx.db)
     on_exit(fn -> :persistent_term.put(Rules, previous) end)
     assert candidate.rules != []
     candidate.rules
