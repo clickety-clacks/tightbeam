@@ -257,7 +257,7 @@ defmodule Tightbeam.RestExecutionMapTest do
     end
   end
 
-  test "case 12 grants all ExecutionMap modes to an admin user without borrowing into its session",
+  test "case 12 grants all ExecutionMap modes to a session principal across the organization",
        ctx do
     admin_device = approved_device(ctx.db, "execution-map-case12-admin", "Admin", "admin")
     admin_session = ensure_main_session(ctx.db, "admin")
@@ -289,29 +289,29 @@ defmodule Tightbeam.RestExecutionMapTest do
       get(ctx, "/api/execution-map", admin_session.cli_token)
       |> assert_execution_map_response(~w(items page))
 
-    assert admin_session_flat["items"] == []
+    assert Enum.map(admin_session_flat["items"], & &1["id"]) == [item]
 
     admin_session_tree =
       get(ctx, "/api/execution-map/tree", admin_session.cli_token)
       |> assert_execution_map_response(~w(roots))
 
-    assert admin_session_tree["roots"] == []
+    assert Enum.map(admin_session_tree["roots"], & &1["id"]) == [item]
 
-    assert_error(
-      get(ctx, "/api/execution-map/subtrees/#{item}", admin_session.cli_token),
-      404,
-      "not_found"
-    )
+    admin_session_subtree =
+      get(ctx, "/api/execution-map/subtrees/#{item}", admin_session.cli_token)
+      |> assert_execution_map_response(~w(roots))
 
-    assert_error(
+    assert Enum.map(admin_session_subtree["roots"], & &1["id"]) == [item]
+
+    admin_session_assignments =
       get(
         ctx,
         "/api/execution-map/assignments?assignmentId=#{assignment}",
         admin_session.cli_token
-      ),
-      404,
-      "not_found"
-    )
+      )
+      |> assert_execution_map_response(~w(items noItem))
+
+    assert Enum.map(admin_session_assignments["items"], & &1["id"]) == [item]
   end
 
   test "case 16 emits only the allowlisted ExecutionMap fields for adversarial source values",
@@ -565,7 +565,7 @@ defmodule Tightbeam.RestExecutionMapTest do
     )
 
     after_session = get(ctx, filtered_tree_path, session_bearer)
-    assert response_signature(after_session) == response_signature(before_session)
+    refute response_signature(after_session) == response_signature(before_session)
 
     session_nodes_after =
       execution_map_tree_node_bytes(ctx, %{
@@ -814,9 +814,11 @@ defmodule Tightbeam.RestExecutionMapTest do
 
     session_map_bytes = JSON.encode!(session_map)
 
-    for id <- ~w(wi_parent wi_child wi_review_child asg_hidden_middle asg_visible_review) do
-      assert session_map_bytes =~ id
-    end
+    assert Enum.sort(Enum.map(session_map["roots"], & &1["id"])) ==
+             ~w(wi_child wi_parent wi_review_child)
+
+    refute session_map_bytes =~ "asg_hidden_middle"
+    refute session_map_bytes =~ "asg_visible_review"
 
     {owner_response, owner_events} = traced_get(ctx, "/api/execution-map", ctx.token)
     owner_map = decode_success(owner_response)
@@ -1093,14 +1095,14 @@ defmodule Tightbeam.RestExecutionMapTest do
 
     assert_error(changed_filter, 400, "invalid_cursor")
 
-    wrong_principal =
+    same_owner_session =
       get(
         ctx,
         "/api/execution-map?state=open&after=" <> URI.encode_www_form(filtered_cursor),
         ctx.owner_session.cli_token
       )
 
-    assert_error(wrong_principal, 404, "not_found")
+    assert same_owner_session.status == 200
 
     malformed_tuple =
       payload

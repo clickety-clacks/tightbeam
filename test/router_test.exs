@@ -298,11 +298,11 @@ defmodule Tightbeam.Wire.RouterTest do
 
     for suffix <- ["/messages", "/wakes", "/turns"] do
       path = "/api/sessions/#{session.session_key}#{suffix}"
-      denied = request.(path, "tbc_test")
+      implicit = request.(path, "tbc_test")
       attributed = request.(path <> "?asUser=#{ctx.device.user_id}", "tbc_test")
 
-      assert denied.status == 400
-      assert JSON.decode!(denied.resp_body)["error"]["code"] == "invalid_message"
+      assert implicit.status == 200, implicit.resp_body
+      assert is_list(JSON.decode!(implicit.resp_body)["items"])
       assert attributed.status == 200, attributed.resp_body
       assert is_list(JSON.decode!(attributed.resp_body)["items"])
     end

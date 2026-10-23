@@ -438,7 +438,7 @@ defmodule Tightbeam.D1ReadRouteTest do
       assert JSON.decode!(default.resp_body)["resource"] == resource
 
       for {query, code} <- [
-            {"?limit=1", "invalid_filter"},
+            {"?unknown=value", "invalid_filter"},
             {"?asUser=", "invalid_message"},
             {"?asUser=admin&asUser=admin", "invalid_as_user"}
           ] do
@@ -633,7 +633,7 @@ defmodule Tightbeam.D1ReadRouteTest do
   @tag :kungfu_protection
   test "kungfu serving preserves prior auth principal visibility and query decisions", ctx do
     assert get(ctx.opts, "/api/kungfu", "invalid").status == 401
-    assert get(ctx.opts, "/api/kungfu", "tbc_d1_route").status == 400
+    assert get(ctx.opts, "/api/kungfu", "tbc_d1_route").status == 200
     invalid = get(ctx.opts, "/api/kungfu?unknown=value", ctx.admin.token)
     assert invalid.status == 400
     assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_filter"
