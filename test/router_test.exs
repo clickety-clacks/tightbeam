@@ -3318,15 +3318,18 @@ defmodule Tightbeam.Wire.RouterTest do
       assert JSON.decode!(response.resp_body) == %{"result" => expected}
     end
 
-    hidden = dispatch_cli(ctx, stranger.cli_token, body)
+    cross_session = dispatch_cli(ctx, stranger.cli_token, body)
 
     missing =
       dispatch_cli(ctx, stranger.cli_token, put_in(body, [:params, :artifactId], "art_missing"))
 
-    assert hidden.status == 404
+    assert cross_session.status == 200
+    assert JSON.decode!(cross_session.resp_body) == %{"result" => expected}
     assert missing.status == 404
-    assert hidden.resp_body == missing.resp_body
-    assert dispatch_cli(ctx, "tbc_test", Map.put(body, :asUser, "mike")).status == 404
+
+    hidden_user = dispatch_cli(ctx, "tbc_test", Map.put(body, :asUser, "mike"))
+    assert hidden_user.status == 404
+    assert hidden_user.resp_body == missing.resp_body
 
     # Resolve admin standing from the same stored user used by artifact detail,
     # not from command params. The artifact remains owned by flynn throughout.

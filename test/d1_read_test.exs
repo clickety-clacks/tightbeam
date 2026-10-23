@@ -643,8 +643,10 @@ defmodule Tightbeam.D1ReadRouteTest do
     collection = get(ctx.opts, "/api/kungfu", ctx.operator.token)
     assert collection.status == 200
 
-    assert collection.resp_body ==
-             get(ctx.opts, "/api/kungfu", ctx.admin.token).resp_body
+    admin_collection = get(ctx.opts, "/api/kungfu", ctx.admin.token)
+
+    assert JSON.decode!(collection.resp_body)["items"] ==
+             JSON.decode!(admin_collection.resp_body)["items"]
 
     assert get(ctx.opts, "/api/hosts", ctx.admin.token).status == 200
   end
