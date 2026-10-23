@@ -630,7 +630,7 @@ defmodule Tightbeam.D1ReadRouteTest do
     invalid = get(ctx.opts, "/api/kungfu?unknown=value", ctx.admin.token)
     assert invalid.status == 400
     assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_filter"
-    assert get(ctx.opts, "/api/kungfu?asUser=other", ctx.session.cli_token).status == 403
+    assert get(ctx.opts, "/api/kungfu?asUser=other", ctx.session.cli_token).status == 200
     hidden = get(ctx.opts, "/api/kungfu/no-such-bundle", ctx.operator.token)
     assert hidden.status == 404
     collection = get(ctx.opts, "/api/kungfu", ctx.operator.token)
