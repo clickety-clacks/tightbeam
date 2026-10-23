@@ -160,7 +160,10 @@ defmodule Tightbeam.JobTraceTest do
       }
     ]
 
-    assert %{attest: %{kind: "completion", commitRefs: ^unavailable_refs}} =
+    assert %{
+             attest:
+               %{kind: "completion", commitRefs: ^unavailable_refs} = bad_completion
+           } =
              attest(db, {:session, "holder"}, "asg_bad", "completion", %{
                commit_refs: unavailable_refs
              })
@@ -309,45 +312,16 @@ defmodule Tightbeam.JobTraceTest do
 
     # The unavailable recipient is recorded by the real delivery attempt.
     # The trace keeps the exact immutable completion notice identity.
-    assert {:ok, [[canceled_at, wake_rowid]]} =
-             DB.query(
-               db,
-               "SELECT canceledAt, rowid FROM wakes WHERE wakeId=?1 AND assignmentId='asg_direct' AND state='canceled'",
-               [notice_id]
-             )
-
-    assert is_integer(canceled_at) and canceled_at >= completion.ts
+    terminal_notice_cancellations =
+      [
+        terminal_notice_cancellation(db, "asg_direct", completion),
+        terminal_notice_cancellation(db, "asg_bad", bad_completion)
+      ]
+      |> Enum.sort_by(& &1.seqTiebreak)
 
     # Exact equality also excludes private prompt, attest and transcript fields.
     assert Enum.filter(trace.timeline, &(&1.type == "wake_canceled")) ==
-             source_cancellations ++
-               [
-                 %{
-                   assignmentId: "asg_direct",
-                   at: canceled_at,
-                   id: notice_id,
-                   reason: nil,
-                   seqTiebreak: wake_rowid,
-                   type: "wake_canceled",
-                   provenanceStatus: "proven",
-                   schedulingOrigin: "process:tightbeam",
-                   requesterKind: "process",
-                   requesterId: "tightbeam:wake-scheduler",
-                   reasonKind: "target_unresolvable",
-                   causalSourceKind: "scheduler_delivery",
-                   causalSourceId: notice_id,
-                   outcomeKind: "no_replacement",
-                   replacementWakeId: nil,
-                   dispositionKind: nil,
-                   dispositionId: nil,
-                   primaryWorkKind: nil,
-                   primaryWorkId: nil,
-                   workImpactKind: "no_linked_work",
-                   livenessTriggerKind: nil,
-                   livenessTriggerId: nil,
-                   actionNeeded: false
-                 }
-               ]
+             source_cancellations ++ terminal_notice_cancellations
 
     refute Enum.any?(trace.timeline, &(&1.type in ["marker", "disposition"]))
 
@@ -552,6 +526,52 @@ defmodule Tightbeam.JobTraceTest do
       session_key: nil,
       params: %{work_item_id: id}
     })
+  end
+
+  defp terminal_notice_cancellation(db, assignment_id, completion) do
+    notice_digest =
+      :crypto.hash(
+        :sha256,
+        JSON.encode!(["terminal-child-owner-notification", "attest", completion.id])
+      )
+      |> Base.encode16(case: :lower)
+
+    notice_id = "w_terminal_" <> notice_digest
+
+    assert {:ok, [[canceled_at, wake_rowid]]} =
+             DB.query(
+               db,
+               "SELECT canceledAt, rowid FROM wakes WHERE wakeId=?1 AND assignmentId=?2 AND state='canceled'",
+               [notice_id, assignment_id]
+             )
+
+    assert is_integer(canceled_at) and canceled_at >= completion.ts
+
+    %{
+      assignmentId: assignment_id,
+      at: canceled_at,
+      id: notice_id,
+      reason: nil,
+      seqTiebreak: wake_rowid,
+      type: "wake_canceled",
+      provenanceStatus: "proven",
+      schedulingOrigin: "process:tightbeam",
+      requesterKind: "process",
+      requesterId: "tightbeam:wake-scheduler",
+      reasonKind: "target_unresolvable",
+      causalSourceKind: "scheduler_delivery",
+      causalSourceId: notice_id,
+      outcomeKind: "no_replacement",
+      replacementWakeId: nil,
+      dispositionKind: nil,
+      dispositionId: nil,
+      primaryWorkKind: nil,
+      primaryWorkId: nil,
+      workImpactKind: "no_linked_work",
+      livenessTriggerKind: nil,
+      livenessTriggerId: nil,
+      actionNeeded: false
+    }
   end
 
   defp attest(db, principal, assignment_id, kind, extra) do
