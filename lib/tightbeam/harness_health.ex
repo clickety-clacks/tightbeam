@@ -1103,6 +1103,8 @@ defmodule Tightbeam.HarnessHealth do
             [] -> nil
           end
 
+        observed_at = System.system_time(:millisecond)
+
         result =
           observe_in_txn(txn, %{
             correlation_id: "harness-turn:#{turn.seq}:#{failure_class}",
@@ -1112,7 +1114,7 @@ defmodule Tightbeam.HarnessHealth do
             evidence_kind: "terminal-failure",
             session_key: turn.session_key,
             assignment_id: assignment_id,
-            observed_at: System.system_time(:millisecond),
+            observed_at: observed_at,
             cause: "stage=#{failed_stage} reason=#{evidence_text(reason)}",
             principal: turn.origin || "process:tightbeam"
           })
@@ -1128,6 +1130,8 @@ defmodule Tightbeam.HarnessHealth do
           turn.seq,
           redelivery_failure_class
         )
+
+        Tightbeam.RateLimitReset.schedule_in_txn(txn, session, result, reason, observed_at)
 
         post_commit(result)
     end

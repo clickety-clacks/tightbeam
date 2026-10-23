@@ -28,6 +28,7 @@ defmodule Tightbeam.RateLimitResetTest do
   test "a reset at the observation time is due immediately" do
     at = ~U[2026-10-23 01:30:00Z]
     assert reset("1:30am UTC", at) == millis(at)
+    assert reset("1:30am UTC", ~U[2026-10-23 01:30:45Z]) == millis(at)
   end
 
   test "only typed limits with an understood reset supply a deadline" do
