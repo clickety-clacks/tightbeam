@@ -1674,6 +1674,7 @@ defmodule Tightbeam.StateResources do
 
   def assignment(row) do
     row = memento_default(row)
+
     row
     |> Map.drop([:commit_ref_corrections, :commitRefCorrections, "commitRefCorrections"])
     |> public()

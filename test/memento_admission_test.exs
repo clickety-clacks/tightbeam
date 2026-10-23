@@ -812,10 +812,12 @@ defmodule Tightbeam.MementoAdmissionTest do
 
     for _ <- 1..3 do
       a = open.("code")
+
       assert %{attest: %{verdictKind: "verified"}} =
                attest(ctx, a.id, "holder", "verdict", "verified")
 
       review = assign(ctx, "reviewer", a.id)
+
       assert %{attest: %{verdictKind: "reviewed-clean"}} =
                attest(ctx, review.id, "reviewer", "verdict", "reviewed-clean")
 
