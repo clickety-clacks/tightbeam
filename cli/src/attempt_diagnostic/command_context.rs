@@ -121,6 +121,9 @@ impl CommandContext {
             CancelWake { .. } => ("cli.cancel_wake", DispatchPath),
             SettleTurn { .. } => ("cli.settle_turn", Requests::VersionAndDispatch),
             IdentityEdit { .. } => ("cli.identity_edit", DispatchPath),
+            SubtreeGuidanceSet { .. } => ("cli.subtree_guidance_set", DispatchPath),
+            SubtreeGuidanceWithdraw { .. } => ("cli.subtree_guidance_withdraw", DispatchPath),
+            SubtreeGuidanceShow { .. } => ("cli.subtree_guidance_show", DispatchPath),
             IdentityStatus { .. } => ("cli.identity_status", DispatchPath),
             IdentityRelearn { .. } => ("cli.identity_relearn", DispatchPath),
             IdentityRepoint { .. } => ("cli.identity_repoint", DispatchPath),
@@ -317,6 +320,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | AssignmentGet { .. }
         | Assignments { .. }
         | IdentityStatus { .. }
+        | SubtreeGuidanceShow { .. }
         | KungfuList { .. }
         | KungfuSetup { .. }
         | SentinelList { .. }
@@ -438,6 +442,8 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | CancelWake { .. }
         | IdentityRepoint { .. }
         | IdentityApply { .. }
+        | SubtreeGuidanceSet { .. }
+        | SubtreeGuidanceWithdraw { .. }
         | Onboard { .. }
         | AddUser { .. }
         | ConfigSet { .. }

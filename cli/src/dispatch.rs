@@ -1344,6 +1344,39 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "identity-edit", vec![], params))
         }
+        Command::SubtreeGuidanceSet {
+            identity,
+            name,
+            archetypes,
+            text,
+        } => {
+            let mut params = vec![string_field("name", name), string_field("text", text)];
+            if let Some(value) = archetypes {
+                params.push(format!(
+                    "\"archetypes\":{}",
+                    serde_json::to_string(value).expect("strings are JSON serializable")
+                ));
+            }
+            Ok(request(identity, "subtree-guidance-set", vec![], params))
+        }
+        Command::SubtreeGuidanceWithdraw { identity, name } => Ok(request(
+            identity,
+            "subtree-guidance-withdraw",
+            vec![],
+            vec![string_field("name", name)],
+        )),
+        Command::SubtreeGuidanceShow {
+            identity,
+            session_key,
+        } => Ok(request(
+            identity,
+            "subtree-guidance-show",
+            vec![],
+            session_key
+                .as_ref()
+                .map(|value| vec![string_field("sessionKey", value)])
+                .unwrap_or_default(),
+        )),
         Command::IdentityStatus {
             identity,
             archetype,
@@ -3621,6 +3654,9 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::CancelWake { identity, .. }
         | Command::SettleTurn { identity, .. }
         | Command::IdentityEdit { identity, .. }
+        | Command::SubtreeGuidanceSet { identity, .. }
+        | Command::SubtreeGuidanceWithdraw { identity, .. }
+        | Command::SubtreeGuidanceShow { identity, .. }
         | Command::IdentityStatus { identity, .. }
         | Command::IdentityRelearn { identity, .. }
         | Command::IdentityRepoint { identity, .. }
