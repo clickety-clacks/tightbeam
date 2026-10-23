@@ -2925,7 +2925,7 @@ defmodule Tightbeam.Wire.Router do
       else: {:error, 400, "invalid_message", "verb not allowed: #{verb}"}
   end
 
-  defp agent_identity(%{"asProcess" => "tightbeam"}, _auth, _conn) do
+  defp agent_identity(%{"asProcess" => "tightbeam"}, :org, _conn) do
     {:error, 403, "reserved_origin", "process:tightbeam is reserved to the substrate"}
   end
 
