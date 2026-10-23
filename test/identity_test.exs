@@ -839,6 +839,7 @@ defmodule Tightbeam.IdentityTest do
     admitted =
       Task.async(fn ->
         send(parent, :waiting_for_reload)
+
         candidate =
           receive do
             {:continue, revision} -> revision
