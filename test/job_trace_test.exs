@@ -153,14 +153,22 @@ defmodule Tightbeam.JobTraceTest do
 
     :ok = DB.execute(db, "UPDATE attests SET ts = 100")
 
-    assert %{code: "unverifiable_commit_ref"} =
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE assignment_effects SET effectKind='code' WHERE assignmentId='asg_bad'"
+      )
+
+    unavailable_refs = [
+      %{
+        "repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}",
+        "commit" => String.duplicate("0", 40)
+      }
+    ]
+
+    assert %{code: "inapplicable_code_evidence"} =
              attest(db, {:session, "holder"}, "asg_bad", "completion", %{
-               commit_refs: [
-                 %{
-                   "repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}",
-                   "commit" => String.duplicate("0", 40)
-                 }
-               ]
+               commit_refs: unavailable_refs
              })
 
     # Completion stores an event report even when its personal recipient is absent.
@@ -398,7 +406,8 @@ defmodule Tightbeam.JobTraceTest do
     ]
 
     assert %{attest: %{commitRefs: ^remote_refs}} =
-             attest(db, {:session, "holder"}, "asg_bad", "completion", %{
+             attest(db, {:session, "holder"}, "asg_bad", "verdict", %{
+               verdict_kind: "verified",
                commit_refs: remote_refs
              })
 
@@ -406,6 +415,13 @@ defmodule Tightbeam.JobTraceTest do
     assert "git@remote-test" in args
     assert List.last(args) =~ "/srv/repo"
     assert List.last(args) =~ "0123456789abcdef0123456789abcdef01234567^{commit}"
+
+    assert %{attest: %{commitRefs: ^remote_refs}} =
+             attest(db, {:session, "holder"}, "asg_bad", "completion", %{
+               commit_refs: remote_refs
+             })
+
+    refute_received {:commit_ref_command, _, _, _}
   end
 
   test "equal-time numeric turn ids sort numerically", %{db: db} do
