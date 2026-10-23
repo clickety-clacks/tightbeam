@@ -69,8 +69,7 @@ defmodule Tightbeam.SubtreeGuidanceTest do
   test "an entry applies to descendants in scope and never to the writer", %{db: db} do
     tree(db)
 
-    {:ok, result} = SubtreeGuidance.set(db, "coord", "style", nil, "Write plainly.")
-    assert result.replaced == false
+    {:ok, _} = SubtreeGuidance.set(db, "coord", "style", nil, "Write plainly.")
 
     assert SubtreeGuidance.section(db, "worker-a") =~ "Write plainly."
     assert SubtreeGuidance.section(db, "worker-b") =~ "Write plainly."
@@ -114,8 +113,7 @@ defmodule Tightbeam.SubtreeGuidanceTest do
 
     {:ok, _} = SubtreeGuidance.set(db, "coord", "style", nil, "Old text.")
     {:ok, result} = SubtreeGuidance.set(db, "coord", "style", ["coder"], "New text.")
-
-    assert result.replaced == true
+    refute Map.has_key?(result, :replaced)
     section = SubtreeGuidance.section(db, "worker-a")
     assert section =~ "New text."
     refute section =~ "Old text."
@@ -216,6 +214,8 @@ defmodule Tightbeam.SubtreeGuidanceTest do
 
     assert {:ok, shown} = SubtreeGuidance.show(db, "coord")
     assert [%{name: "style", archetypes: ["coder"], text: "Coder rule."}] = shown.entries
+    refute Map.has_key?(hd(shown.entries), :created_at)
+    refute Map.has_key?(hd(shown.entries), :updated_at)
     assert shown.section =~ "Org-wide rule."
     refute shown.section =~ "Coder rule."
 

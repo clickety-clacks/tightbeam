@@ -46,8 +46,6 @@ defmodule Tightbeam.SubtreeGuidance do
          :ok <- validate_text(text) do
       {:ok, result} =
         DB.transaction(db, fn txn ->
-          replaced = entry_exists?(txn, writer_key, name)
-
           pushed =
             push_around_change_in_txn(txn, writer_key, fn ->
               upsert_entry(txn, writer_key, name, archetypes, text)
@@ -59,7 +57,6 @@ defmodule Tightbeam.SubtreeGuidance do
              name: name,
              scope: scope_text(archetypes),
              archetypes: archetypes,
-             replaced: replaced,
              pushed_to: pushed
            }}
         end)
@@ -129,9 +126,7 @@ defmodule Tightbeam.SubtreeGuidance do
                  name: entry.name,
                  scope: scope_text(entry.archetypes),
                  archetypes: entry.archetypes,
-                 text: entry.text,
-                 created_at: entry.created_at,
-                 updated_at: entry.updated_at
+                 text: entry.text
                }
              end),
            section: section(db, session_key)
@@ -174,22 +169,16 @@ defmodule Tightbeam.SubtreeGuidance do
   defp scope_matches?(nil, _archetype), do: true
   defp scope_matches?(archetypes, archetype), do: archetype in archetypes
 
-  # Ancestors as {session_key, distance}, distance 1 = parent, cycle-guarded.
+  # Ancestors as {session_key, distance}, distance 1 = parent.
   defp ancestors(source, session_key),
-    do: walk_up(source, session_key, MapSet.new([session_key]), 1, [])
+    do: walk_up(source, session_key, 1, [])
 
-  defp walk_up(source, key, seen, distance, acc) do
+  defp walk_up(source, key, distance, acc) do
     sql = "SELECT #{Org.topology_parent_sql("s")} FROM sessions s WHERE s.sessionKey=?1"
 
     case q(source, sql, [key]) do
       [[parent]] when is_binary(parent) ->
-        if MapSet.member?(seen, parent) do
-          Enum.reverse(acc)
-        else
-          walk_up(source, parent, MapSet.put(seen, parent), distance + 1, [
-            {parent, distance} | acc
-          ])
-        end
+        walk_up(source, parent, distance + 1, [{parent, distance} | acc])
 
       _rootless_or_missing ->
         Enum.reverse(acc)
@@ -291,14 +280,13 @@ defmodule Tightbeam.SubtreeGuidance do
     |> Enum.filter(&Org.current_pointer_snapshot_in_txn(txn, &1))
   end
 
-  defp descendant?(parents, key, writer_key), do: ancestor_of?(parents, key, writer_key, 0)
+  defp descendant?(parents, key, writer_key), do: ancestor_of?(parents, key, writer_key)
 
-  # steps bounds the walk at the session count, so a parent cycle terminates.
-  defp ancestor_of?(parents, key, writer_key, steps) do
+  defp ancestor_of?(parents, key, writer_key) do
     case Map.get(parents, key) do
       nil -> false
       ^writer_key -> true
-      parent -> steps < map_size(parents) and ancestor_of?(parents, parent, writer_key, steps + 1)
+      parent -> ancestor_of?(parents, parent, writer_key)
     end
   end
 
@@ -334,18 +322,16 @@ defmodule Tightbeam.SubtreeGuidance do
     source
     |> q(
       """
-      SELECT name, archetypes, text, createdAt, updatedAt
+      SELECT name, archetypes, text
       FROM subtree_guidance_entries WHERE writerSessionKey=?1 ORDER BY name
       """,
       [writer_key]
     )
-    |> Enum.map(fn [name, archetypes, text, created_at, updated_at] ->
+    |> Enum.map(fn [name, archetypes, text] ->
       %{
         name: name,
         archetypes: decode_archetypes(archetypes),
-        text: text,
-        created_at: created_at,
-        updated_at: updated_at
+        text: text
       }
     end)
   end
