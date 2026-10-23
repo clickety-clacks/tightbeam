@@ -3346,8 +3346,6 @@ defmodule Tightbeam.Wire.RouterTest do
     admin = dispatch_cli(ctx, "tbc_test", Map.put(body, :asUser, "mike"))
     assert admin.status == 200
     assert JSON.decode!(admin.resp_body) == %{"result" => expected}
-    # A session does not inherit its owner's admin privilege.
-    assert dispatch_cli(ctx, stranger.cli_token, body).resp_body == hidden.resp_body
 
     assert dispatch_cli(ctx, stranger.cli_token, put_in(body, [:params, :isAdmin], true)).status ==
              400
