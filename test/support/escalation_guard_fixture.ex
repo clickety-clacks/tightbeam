@@ -50,7 +50,7 @@ defmodule Tightbeam.EscalationGuardFixture do
 
           Escalation.operator_rule(
             db,
-            owner_operator_rule(request.id, %{decision: "accept"}),
+            owner_operator_rule(request.id, %{decision: "accept"}, raiser.session_key),
             transaction_step_hook: hook
           )
         end)
@@ -86,7 +86,7 @@ defmodule Tightbeam.EscalationGuardFixture do
       assert_raise RuntimeError, "fixture after schedule", fn ->
         Escalation.operator_rule(
           db,
-          owner_operator_rule(rollback.id, %{decision: "accept"}),
+          owner_operator_rule(rollback.id, %{decision: "accept"}, raiser.session_key),
           transaction_step_hook: {:raise, :after_schedule, "fixture after schedule"}
         )
       end
@@ -111,7 +111,7 @@ defmodule Tightbeam.EscalationGuardFixture do
 
     Escalation.operator_rule(
       first,
-      owner_operator_rule(request.id, %{decision: "accept"})
+      owner_operator_rule(request.id, %{decision: "accept"}, raiser.session_key)
     )
 
     assert {:ok, _} =
@@ -134,7 +134,7 @@ defmodule Tightbeam.EscalationGuardFixture do
     assert %{code: "decision_request_integrity_invalid"} =
              Escalation.operator_rule(
                first,
-               owner_operator_rule(request.id, %{decision: "accept"})
+               owner_operator_rule(request.id, %{decision: "accept"}, raiser.session_key)
              )
 
     assert :ok = GenServer.stop(first_pid)
@@ -156,7 +156,7 @@ defmodule Tightbeam.EscalationGuardFixture do
       assert %{code: "decision_request_integrity_invalid"} =
                Escalation.operator_rule(
                  second,
-                 owner_operator_rule(request.id, %{decision: "accept"})
+                 owner_operator_rule(request.id, %{decision: "accept"}, raiser.session_key)
                )
 
       assert {:ok, [[1, "list", ~s(["rulingLifecycleEvent"])]]} =
@@ -205,12 +205,12 @@ defmodule Tightbeam.EscalationGuardFixture do
     }
   end
 
-  defp owner_operator_rule(id, params) do
+  defp owner_operator_rule(id, params, submitting_session_key) do
     %{
       verb: "operator-rule",
       origin: "user:flynn",
       principal: {:user, "flynn"},
-      transport_session_key: nil,
+      transport_session_key: submitting_session_key,
       params: Map.put(params, :request, id)
     }
   end

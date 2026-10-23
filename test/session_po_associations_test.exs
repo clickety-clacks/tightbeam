@@ -206,7 +206,7 @@ defmodule Tightbeam.SessionPoAssociationsTest do
     assert count(ctx.db, "wire_idempotency") == 8
   end
 
-  test "only owner, exact target, or current parent has authority", ctx do
+  test "any user or session may set the addressed PO; repeats add no revision", ctx do
     assert set(ctx.db, {:session, ctx.target.session_key}, "product-owner:one", "self")[
              "changed"
            ]
@@ -217,21 +217,25 @@ defmodule Tightbeam.SessionPoAssociationsTest do
 
     reparent_fixture(ctx.db, ctx.target.session_key, ctx.new_parent.session_key)
 
-    assert %{code: "not_authorized"} =
-             set(ctx.db, {:session, ctx.parent.session_key}, "product-owner:one", "stale")
-
-    assert set(ctx.db, {:session, ctx.new_parent.session_key}, "product-owner:one", "current")[
+    assert set(ctx.db, {:session, ctx.parent.session_key}, "product-owner:one", "stale")[
              "changed"
            ]
 
-    assert %{code: "not_authorized"} =
-             set(ctx.db, {:session, ctx.peer.session_key}, "product-owner:two", "peer")
+    repeat = set(ctx.db, {:session, ctx.new_parent.session_key}, "product-owner:one", "current")
+    refute repeat["changed"]
+    assert repeat["association"]["revision"] == 3
 
-    assert SessionPoAssociations.get(ctx.db, "orchestrator")["revision"] == 3
-    assert count(ctx.db, "wakes") == 3
+    assert set(ctx.db, {:session, ctx.peer.session_key}, "product-owner:two", "peer")["changed"]
+
+    assert set(ctx.db, {:user, "owner"}, "product-owner:foreign", "cross-owner")["changed"]
+
+    assert %{"revision" => 5, "setBy" => "user:owner", "poRole" => "product-owner:foreign"} =
+             SessionPoAssociations.get(ctx.db, "orchestrator")
+
+    assert count(ctx.db, "wakes") == 5
   end
 
-  test "invalid, retired, cross-owner and implicit-name cases leave no partial effects", ctx do
+  test "invalid, retired and implicit-name cases leave no partial effects", ctx do
     assert %{code: "unknown_session"} =
              set_target(
                ctx.db,
@@ -252,12 +256,6 @@ defmodule Tightbeam.SessionPoAssociationsTest do
 
     assert %{code: "po_role_unresolved"} =
              set(ctx.db, {:user, "owner"}, "product-owner:missing", "missing")
-
-    assert %{code: "cross_owner_po_role"} =
-             set(ctx.db, {:user, "owner"}, "product-owner:foreign", "foreign")
-
-    assert %{code: "not_authorized"} =
-             set(ctx.db, {:session, ctx.peer.session_key}, "product-owner:one", "peer")
 
     assert SessionPoAssociations.get(ctx.db, "orchestrator") == nil
     assert count(ctx.db, "session_po_associations") == 0

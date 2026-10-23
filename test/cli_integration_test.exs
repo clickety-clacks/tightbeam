@@ -217,15 +217,12 @@ defmodule Tightbeam.CliIntegrationTest do
       "wire-reparent"
     ]
 
-    {refused, status} = run.(args)
-    assert status != 0
-    assert refused =~ "current_custody_required"
-    assert {corrected, 0} = run.(args ++ ["--as-user", "flynn"])
+    assert {corrected, 0} = run.(args)
     result = JSON.decode!(corrected)
     assert result["session"]["currentParent"] == "cli-worker"
     assert result["session"]["originParent"] == nil
-    assert_receive {:cli_call, %{verb: "session-reparent", principal: {:user, "flynn"}}}
-    assert {retried, 0} = run.(args ++ ["--as-user", "flynn"])
+    assert_receive {:cli_call, %{verb: "session-reparent", principal: {:session, "cli-holder"}}}
+    assert {retried, 0} = run.(args)
     assert JSON.decode!(retried) == result
 
     assert {:ok, [[nil]]} =
@@ -2564,7 +2561,7 @@ defmodule Tightbeam.CliIntegrationTest do
       Escalation.operator_rule(ctx.db, %{
         origin: "user:flynn",
         principal: {:user, "flynn"},
-        transport_session_key: nil,
+        transport_session_key: ctx.session.session_key,
         params: %{request: request.id, decision: "ship"}
       })
 
@@ -2599,7 +2596,7 @@ defmodule Tightbeam.CliIntegrationTest do
              "onBehalfOf" => "user:flynn",
              "performer" => %{
                "principal" => %{"state" => "known", "value" => "user:flynn"},
-               "session" => %{"state" => "none"}
+               "session" => %{"state" => "known", "key" => "cli-holder"}
              }
            }
 

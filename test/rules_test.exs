@@ -3801,7 +3801,7 @@ defmodule Tightbeam.RulesTest do
                verb: "operator-rule",
                origin: "user:flynn",
                principal: {:user, "flynn"},
-               transport_session_key: nil,
+               transport_session_key: no_context.session_key,
                params: %{request: request_id, decision: "accept"}
              })
 
