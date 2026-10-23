@@ -40,7 +40,7 @@ defmodule Tightbeam.JobTraceTest do
         ('asg_bad', 'invalid ref', 'holder', 'owner', 3, 'open', 'wi_trace');
 
       INSERT INTO assignment_effects (assignmentId, effectKind)
-      VALUES ('asg_direct', 'policy'), ('asg_bad', 'code');
+      VALUES ('asg_direct', 'policy'), ('asg_bad', 'policy');
 
       INSERT INTO assignments
         (id, subject, holderKey, openedBySession, openedAt, state, reviewsAssignmentId)
@@ -152,6 +152,12 @@ defmodule Tightbeam.JobTraceTest do
              })
 
     :ok = DB.execute(db, "UPDATE attests SET ts = 100")
+
+    :ok =
+           DB.execute(
+             db,
+             "UPDATE assignment_effects SET effectKind='code' WHERE assignmentId='asg_bad'"
+           )
 
     unavailable_refs = [
       %{
