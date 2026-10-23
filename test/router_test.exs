@@ -3537,6 +3537,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     reserved = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asProcess: "tightbeam"})
     assert reserved.status == 403
+
     assert JSON.decode!(reserved.resp_body)["error"] == %{
              "code" => "identity_not_yours",
              "message" => "a session token cannot act as a process"
