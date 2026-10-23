@@ -2234,6 +2234,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     org_as_user_page = get(ctx, path <> "&asUser=flynn", "tbc_core_detail")
     assert org_as_user_page.status == 200
+
     assert JSON.decode!(org_as_user_page.resp_body)["items"] ==
              JSON.decode!(page.resp_body)["items"]
 
