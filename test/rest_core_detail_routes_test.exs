@@ -3248,8 +3248,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         path: "/api/host-env/#{host}/#{harness}/#{env_name}",
         notice: host_notice,
         primary_refs: %{"host" => host, "harness" => harness, "name" => env_name},
-        allowed_bearers: [ctx.token, owner_device.token],
-        denied_bearer: nil,
+        allowed_bearers: [ctx.token, owner_session.cli_token],
+        denied_bearer: owner_device.token,
         unknown_path: "/api/host-env/no-such-host/no-such-harness/no-such-name"
       }
     ]
