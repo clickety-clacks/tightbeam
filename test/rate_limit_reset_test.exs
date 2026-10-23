@@ -31,6 +31,46 @@ defmodule Tightbeam.RateLimitResetTest do
     assert reset("1:30am UTC", ~U[2026-10-23 01:30:45Z]) == millis(at)
   end
 
+  test "captured named-zone session and weekly reset formats convert to UTC" do
+    for {message, observed, expected} <- [
+          {"You've hit your session limit · resets 6:30pm (America/Los_Angeles)",
+           ~U[2026-10-22 22:22:00Z], ~U[2026-10-23 01:30:00Z]},
+          {"You've hit your weekly limit · resets Oct 23, 5pm (America/Los_Angeles)",
+           ~U[2026-10-21 18:35:00Z], ~U[2026-10-24 00:00:00Z]},
+          {"You've hit your weekly limit · resets Oct 23, 8pm (America/New_York)",
+           ~U[2026-10-21 18:35:00Z], ~U[2026-10-24 00:00:00Z]},
+          {"You've hit your weekly limit · resets Sep 21 at 11pm (America/Los_Angeles)",
+           ~U[2026-09-20 10:00:00Z], ~U[2026-09-22 06:00:00Z]}
+        ] do
+      assert RateLimitReset.from_error(
+               %{"data" => %{"errorKind" => "rate_limit"}, "message" => message},
+               millis(observed)
+             ) == millis(expected)
+    end
+  end
+
+  test "named-zone conversion uses local dates and seasonal offsets" do
+    assert reset("11pm (America/Los_Angeles)", ~U[2026-10-23 01:00:00Z]) ==
+             millis(~U[2026-10-23 06:00:00Z])
+
+    assert reset("Dec 31 at 11pm (America/Los_Angeles)", ~U[2027-01-01 01:00:00Z]) ==
+             millis(~U[2027-01-01 07:00:00Z])
+
+    assert reset("6:30pm (America/Los_Angeles)", ~U[2026-01-22 22:22:00Z]) ==
+             millis(~U[2026-01-23 02:30:00Z])
+  end
+
+  test "repeated clock times choose the next occurrence and nonexistent times keep the hold" do
+    assert reset("1:30am (America/Los_Angeles)", ~U[2026-11-01 08:00:00Z]) ==
+             millis(~U[2026-11-01 08:30:00Z])
+
+    assert reset("1:30am (America/Los_Angeles)", ~U[2026-11-01 08:45:00Z]) ==
+             millis(~U[2026-11-01 09:30:00Z])
+
+    assert reset("2:30am (America/Los_Angeles)", ~U[2026-03-08 08:00:00Z]) == nil
+    assert reset("1:30am (Unknown/Zone)", ~U[2026-10-22 21:19:00Z]) == nil
+  end
+
   test "only typed limits with an understood reset supply a deadline" do
     at = millis(~U[2026-10-22 21:19:00Z])
     message = "You've hit your session limit · resets 1:30am UTC"

@@ -16,7 +16,6 @@ defmodule Tightbeam.RateLimitReleaseTest do
 
   @key {:claude, "shared", "testhost"}
   @past DateTime.to_unix(~U[2025-08-14 23:00:00Z], :millisecond)
-  @past_reset DateTime.to_unix(~U[2025-08-15 00:00:00Z], :millisecond)
   @error %{
     "code" => -32_603,
     "data" => %{"errorKind" => "rate_limit"},
@@ -78,8 +77,14 @@ defmodule Tightbeam.RateLimitReleaseTest do
 
   test "an overdue reset recovered on scheduler boot releases queued lanes without claiming success",
        %{db: db} do
-    {incident, wake} = observe_reset(db, "old-limit", @error, @past)
-    assert wake.due_at == @past_reset
+    error = %{
+      @error
+      | "message" => "You've hit your weekly limit · resets Sep 21 at 11pm (America/Los_Angeles)"
+    }
+
+    observed = DateTime.to_unix(~U[2025-09-20 10:00:00Z], :millisecond)
+    {incident, wake} = observe_reset(db, "old-limit", error, observed)
+    assert wake.due_at == DateTime.to_unix(~U[2025-09-22 06:00:00Z], :millisecond)
     assert HarnessProcess.parked?(db, @key)
     parent = self()
     start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})

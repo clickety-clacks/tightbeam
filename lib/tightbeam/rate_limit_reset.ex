@@ -120,7 +120,7 @@ defmodule Tightbeam.RateLimitReset do
   defp adapter_key(harness, host), do: {Harness.parse!(harness).id(), "shared", host}
 
   @months ~w(jan feb mar apr may jun jul aug sep oct nov dec)
-  @reset ~r/\bresets\s+(?:(?<month>[A-Za-z]{3})\s+(?<day>\d{1,2}),\s*)?(?<hour>\d{1,2})(?::(?<minute>\d{2}))?\s*(?<period>am|pm)\s*(?:\(UTC\)|UTC)(?![A-Za-z])/i
+  @reset ~r/\bresets\s+(?:(?<month>[A-Za-z]{3})\s+(?<day>\d{1,2})(?:,\s*|\s+at\s+))?(?<hour>\d{1,2})(?::(?<minute>\d{2}))?\s*(?<period>am|pm)\s*(?<zone>\([A-Za-z0-9_+\/-]+\)|UTC)(?![A-Za-z])/i
 
   # The reset text belongs to a typed terminal provider error. Assistant
   # output that happens to quote a limit message is not recovery evidence.
@@ -137,8 +137,11 @@ defmodule Tightbeam.RateLimitReset do
   defp reset_at(fields, observed) do
     hour = String.to_integer(fields["hour"])
     minute = if fields["minute"] == "", do: 0, else: String.to_integer(fields["minute"])
+    zone = fields["zone"] |> String.trim_leading("(") |> String.trim_trailing(")")
+    zone = if String.upcase(zone) == "UTC", do: "Etc/UTC", else: zone
 
-    if hour in 1..12 and minute in 0..59 do
+    with true <- hour in 1..12 and minute in 0..59,
+         {:ok, local_observed} <- DateTime.shift_zone(observed, zone, Tz.TimeZoneDatabase) do
       hour = rem(hour, 12) + if(String.downcase(fields["period"]) == "pm", do: 12, else: 0)
       time = Time.new!(hour, minute, 0)
       # Provider text has minute precision. An error received during that
@@ -146,13 +149,37 @@ defmodule Tightbeam.RateLimitReset do
       observed_minute = div(DateTime.to_unix(observed), 60) * 60
 
       fields
-      |> dates(DateTime.to_date(observed))
-      |> Enum.map(&DateTime.new!(&1, time, "Etc/UTC"))
-      |> Enum.find(&(DateTime.to_unix(&1) >= observed_minute))
-      |> case do
-        nil -> nil
-        reset -> DateTime.to_unix(reset, :millisecond)
-      end
+      |> dates(DateTime.to_date(local_observed))
+      |> Enum.reduce_while(nil, fn date, nil ->
+        case DateTime.new(date, time, zone, Tz.TimeZoneDatabase) do
+          {:ok, reset} ->
+            next_reset([reset], observed_minute)
+
+          {:ambiguous, first, second} ->
+            # During a repeated hour, use the next occurrence of the stated
+            # clock time, including the second occurrence if the first passed.
+            next_reset([first, second], observed_minute)
+
+          {:gap, _before_gap, after_gap} ->
+            # A future nonexistent local time does not identify a deadline.
+            # Keep the hold rather than inventing a reset after the clock jump.
+            if DateTime.to_unix(after_gap) >= observed_minute,
+              do: {:halt, nil},
+              else: {:cont, nil}
+
+          {:error, _} ->
+            {:halt, nil}
+        end
+      end)
+    else
+      _ -> nil
+    end
+  end
+
+  defp next_reset(resets, observed_minute) do
+    case Enum.find(resets, &(DateTime.to_unix(&1) >= observed_minute)) do
+      nil -> {:cont, nil}
+      reset -> {:halt, DateTime.to_unix(reset, :millisecond)}
     end
   end
 
