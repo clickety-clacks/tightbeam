@@ -178,8 +178,8 @@ owner assignment for the same work item, one of two ways and never neither.
 
 Carry it: open an integration assignment against a staffed role and name the line in its
 subject. No row holds a release line and no verb binds one; the assignment you open, with the
-line named in its subject, is the whole record. The default is each currently supported
-integration line — open one integration assignment per line unless the card says otherwise.
+line named in its subject, is the whole record. The default is both active lines, `0.1.9` and
+`main` (the 0.2.0 line) — open one integration assignment per line unless the card says otherwise.
 
 Or record why you cannot: file a `progress` attest that states the exact reason the work is not
 carried now and names the principal who must clear it. A card that pins a single line or
