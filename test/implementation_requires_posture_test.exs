@@ -41,7 +41,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
 
     coder = session(db, "posture-coder", "coder", "codex", "openai")
     orchestrator = session(db, "posture-orchestrator", "orchestrator", "codex", "openai")
-    reviewer = session
+    reviewer = session(db, "posture-reviewer", "reviewer-spec", "claude", "anthropic")
 
     start_supervised!(
       {Wakes,
@@ -255,7 +255,10 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     item = work_item(ctx)
 
     assert {:ok, review} =
-             Dispatch.dispatch
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               assign_call(ctx.reviewer.session_key, item.id, "review the spec")
              )
 
     assert review.subject == "review the spec"

@@ -24,7 +24,7 @@ defmodule Tightbeam.JobTraceTest do
     Enum.each(~w(owner admin other), &ensure_main_session(db, &1))
 
     session(db, "holder", "owner")
-    session
+    session(db, "reviewer", "other")
     session(db, "owner-session", "owner")
     session(db, "admin-session", "admin")
     session(db, "other-session", "other")
@@ -144,7 +144,10 @@ defmodule Tightbeam.JobTraceTest do
              })
 
     assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: ^commit_refs}} =
-             attest
+             attest(db, {:session, "reviewer"}, "asg_review", "verdict", %{
+               verdict_kind: "reviewed-clean",
+               commit_refs: commit_refs
+             })
 
     assert %{code: "invalid_commit_refs"} =
              attest(db, {:session, "holder"}, "asg_bad", "verdict", %{
@@ -153,10 +156,14 @@ defmodule Tightbeam.JobTraceTest do
              })
 
     assert %{code: "invalid_commit_refs"} =
-             attest
+             attest(db, {:session, "reviewer"}, "asg_review", "completion", %{
+               commit_refs: commit_refs
+             })
 
     assert %{attest: %{verdictKind: "changes-requested"}} =
-             attest
+             attest(db, {:session, "reviewer"}, "asg_review", "verdict", %{
+               verdict_kind: "changes-requested"
+             })
 
     :ok = DB.execute(db, "UPDATE attests SET ts = 100")
 

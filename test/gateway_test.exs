@@ -4260,7 +4260,19 @@ defmodule Tightbeam.GatewayTest do
     spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
 
     created =
-      spawn.
+      spawn.(%{
+        verb: "spawn",
+        origin: "remedy:hire-reviewer",
+        principal: {:remedy, %{statute: "hire-reviewer", action: "spawn", owner: "operator"}},
+        session_key: nil,
+        params: %{
+          display_name: "Remedy Reviewer",
+          handle: "remedy-reviewer",
+          harness: "codex",
+          provider: "openai",
+          model: "gpt-5.6-example"
+        }
+      })
 
     assert is_binary(created.session_key)
     assert Org.get(ctx.db, created.session_key).owner_user_id == "operator"

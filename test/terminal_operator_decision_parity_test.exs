@@ -627,9 +627,9 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
   end
 
   test "an unrelated sibling session cannot borrow owner visibility", ctx do
-    reviewer = session
+    reviewer = session(ctx.db, "reviewer", "operator")
     request = invalid_without_event(ctx, "sibling private?")
-    reviewer_call = ask_call
+    reviewer_call = ask_call(reviewer, %{})
 
     assert Escalation.get(ctx.db, reviewer_call, request.id, owner_user_id: "operator") == nil
 

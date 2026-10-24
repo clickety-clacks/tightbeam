@@ -104,10 +104,15 @@ defmodule Tightbeam.VerificationPapertrailTest do
     work = assign(ctx, ctx.holder.session_key, item.id, "implement the feature")
 
     review =
-      assign
+      assign(ctx, ctx.reviewer.session_key, item.id, "review of the feature",
+        reviews_assignment_id: work.id
+      )
 
     assert {:ok, %{attest: %{verdictKind: "reviewed-clean"}}} =
-             Dispatch.dispatch
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               attest_call(ctx.reviewer.session_key, review.id, "verdict", "reviewed-clean")
              )
 
     # The review's own document. A verdict row carries the DECISION; the note
@@ -116,7 +121,14 @@ defmodule Tightbeam.VerificationPapertrailTest do
     # school requires it of reviewers exactly as it does of coders, so the
     # papertrail fixture records one rather than modelling a reviewer that
     # drops its own analysis.
-    Artifacts.record, "papertrail-review.md"),
+    Artifacts.record(ctx.db, %{
+      principal: {:session, ctx.reviewer.session_key},
+      session_key: ctx.reviewer.session_key,
+      recorded_message_id: "msg_papertrail_review",
+      params: %{
+        kind: "report",
+        title: "review clause table",
+        origin_path: Path.join(System.tmp_dir!(), "papertrail-review.md"),
         work_item_id: item.id
       }
     })
@@ -194,7 +206,10 @@ defmodule Tightbeam.VerificationPapertrailTest do
     # it without a review-of-the-review. The implementation-only verification
     # and artifact statutes also stay out of scope.
     assert {:ok, %{assignment: %{state: "closed"}}} =
-             Dispatch.dispatch
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               attest_call(ctx.reviewer.session_key, review.id, "completion")
              )
 
     assert RailRemedy.episode(ctx.db, @verification_rule, review.id) == nil

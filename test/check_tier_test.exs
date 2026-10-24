@@ -26,7 +26,7 @@ defmodule Tightbeam.CheckTierTest do
     Enum.each(~w(operator other), &ensure_main_session(db, &1))
 
     holder = session(db, "holder", "operator", "coder")
-    reviewer = session
+    reviewer = session(db, "reviewer", "other", "reviewer")
     base_dir = Path.join(System.tmp_dir!(), "check-tier-#{System.unique_integer([:positive])}")
     File.mkdir_p!(Path.join(base_dir, "identity/rules"))
     on_exit(fn -> File.rm_rf!(base_dir) end)
@@ -90,21 +90,28 @@ defmodule Tightbeam.CheckTierTest do
     assert %{code: "principal_required"} = verdict(ctx, nil, assignment.id, "reviewed")
 
     assert %{code: "unknown_assignment"} =
-             attest
+             attest(ctx, {:session, "reviewer"}, "missing", "verdict", %{})
 
     assert %{code: "missing_verdict_kind"} =
-             attest
+             attest(ctx, {:session, "reviewer"}, assignment.id, "verdict", %{})
 
     for malformed <- ["Bad", "-bad", "bad_thing", String.duplicate("a", 65), 1] do
       assert %{code: "invalid_verdict_kind"} =
-               attest
+               attest(ctx, {:session, "reviewer"}, assignment.id, "verdict", %{
+                 verdict_kind: malformed
+               })
     end
 
     assert %{code: "invalid_note"} =
-             attest
+             attest(ctx, {:session, "reviewer"}, assignment.id, "verdict", %{
+               verdict_kind: "reviewed",
+               note: " "
+             })
 
     assert %{code: "not_holder"} =
-             attest
+             attest(ctx, {:session, "reviewer"}, assignment.id, "progress", %{
+               verdict_kind: "reviewed"
+             })
 
     assert %{code: "invalid_verdict_kind"} =
              attest(ctx, {:session, "holder"}, assignment.id, "progress", %{
@@ -115,7 +122,9 @@ defmodule Tightbeam.CheckTierTest do
     attest(ctx, {:session, "holder"}, closed.id, "completion")
 
     assert %{code: "assignment_closed"} =
-             attest
+             attest(ctx, {:session, "reviewer"}, closed.id, "verdict", %{
+               verdict_kind: "Bad"
+             })
 
     assert %{code: "assignment_closed"} =
              attest(ctx, {:session, "holder"}, closed.id, "progress", %{
@@ -128,14 +137,14 @@ defmodule Tightbeam.CheckTierTest do
     assert %{outcome: "revoked"} = revoke(ctx, revoked_first.id)
 
     assert %{code: "assignment_closed"} =
-             verdict
+             verdict(ctx, {:session, "reviewer"}, revoked_first.id, "reviewed")
 
     assert Assignments.verdict_kinds(ctx.db, revoked_first.id) == []
 
     verdict_first = assign(ctx, "verdict first")
 
     assert %{attest: %{kind: "verdict"}} =
-             verdict
+             verdict(ctx, {:session, "reviewer"}, verdict_first.id, "reviewed")
 
     assert %{outcome: "revoked"} = revoke(ctx, verdict_first.id)
     assert Assignments.verdict_kinds(ctx.db, verdict_first.id) == ["reviewed"]
@@ -150,7 +159,7 @@ defmodule Tightbeam.CheckTierTest do
       DB.query(ctx.db, "UPDATE attests SET ts = 7 WHERE assignmentId = ?1", [assignment.id])
 
     expected = Enum.sort([first.attest.id, second.attest.id])
-    assert %{attests: rows} = query_attests
+    assert %{attests: rows} = query_attests(ctx, {:session, "reviewer"}, assignment.id)
     assert Enum.map(rows, & &1.id) == expected
     assert Enum.all?(rows, &Map.has_key?(&1, :verdictKind))
     assert %{attests: [_ | _]} = query_attests(ctx, {:user, "operator"}, assignment.id)
@@ -240,7 +249,7 @@ defmodule Tightbeam.CheckTierTest do
       {"assignment.caller_is_holder", "eq", true,
        call("attest", {:session, "holder"}, %{assignment_id: assignment.id}), true},
       {"assignment.caller_is_holder", "eq", false,
-       call, true},
+       call("attest", {:session, "reviewer"}, %{assignment_id: assignment.id}), true},
       {"assignment.caller_is_holder", "eq", false,
        call("attest", {:user, "operator"}, %{assignment_id: assignment.id}), true},
       {"assignment.caller_is_holder", "eq", false,
@@ -262,7 +271,7 @@ defmodule Tightbeam.CheckTierTest do
     Rules.load!(ctx.base_dir, ["attest"])
     assert :ok = Rules.evaluate(ctx.db, without_principal)
 
-    verdict
+    verdict(ctx, {:session, "reviewer"}, assignment.id, "reviewed")
     verdict(ctx, {:user, "operator"}, assignment.id, "reviewed")
     assert Assignments.verdict_kinds(ctx.db, assignment.id) == ["reviewed"]
   end
@@ -392,7 +401,7 @@ defmodule Tightbeam.CheckTierTest do
     assert Assignments.open_count(ctx.db, "holder") == 1
 
     assert %{attest: %{kind: "verdict"}} =
-             verdict
+             verdict(ctx, {:session, "reviewer"}, assignment.id, "reviewed")
 
     assert Assignments.attest_count(ctx.db, assignment.id) == 1
     assert Assignments.open_count(ctx.db, "holder") == 1
@@ -463,7 +472,7 @@ defmodule Tightbeam.CheckTierTest do
       archetype: archetype,
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("example-model"),
+      model: Model.new("fable"),
       host: "test-host"
     })
   end

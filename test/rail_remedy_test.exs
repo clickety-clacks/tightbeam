@@ -650,7 +650,7 @@ defmodule Tightbeam.RailRemedyTest do
           """
           INSERT INTO rail_remedy_episodes
             (statute, subject, status, producerKey, occurrence, rewakeCount, claimToken, openedAt)
-          VALUES
+          VALUES (?1, ?2, 'live', 'reviewer-session', 1, 0, ?1, ?3)
           """,
           [statute, assignment.id, now]
         )
@@ -782,7 +782,7 @@ defmodule Tightbeam.RailRemedyTest do
 
   test "unbound role and token fail closed without dispatch", ctx do
     assignment = assignment(ctx, "unbound")
-    :ok = Roles.rm
+    :ok = Roles.rm(ctx.db, "reviewer")
     load_review_gate(ctx)
 
     assert {:error, %{reason: "remedy_fired", producer: nil}} =
@@ -1295,11 +1295,24 @@ defmodule Tightbeam.RailRemedyTest do
   end
 
   defp linked_review(ctx, assignment_id, subject) do
-    Assignments.__handle__
+    Assignments.__handle__(ctx.db, "assign", %{
+      verb: "assign",
+      origin: "user:operator",
+      principal: {:user, "operator"},
+      session_key: ctx.reviewer.session_key,
+      target_role: nil,
+      role_fallback: false,
+      supervision_interval_ms: 1_000,
+      params: %{
+        subject: subject,
+        reviews_assignment_id: assignment_id,
+        idempotency_key: nil
+      }
+    })
   end
 
   defp verdict(ctx, assignment_id, kind) do
-    verdict_from
+    verdict_from(ctx, ctx.reviewer.session_key, assignment_id, kind)
   end
 
   defp verdict_from(ctx, session_key, assignment_id, kind) do

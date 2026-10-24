@@ -111,9 +111,9 @@ defmodule Tightbeam.ConformanceSupport do
     {"C6", "multi-statute-episode-closure"} =>
       ~w(satisfied-statute-closes-own-episode unsatisfied-statute-remains-live whole-fold-allow-consumes-rulings closure-legible),
     {"C6", "iterate-rewake-target"} =>
-      ~w,
+      ~w(changes-requested-rewakes-author no-verdict-rewakes-reviewer required-fact-closes-without-wake rewake-legible),
     {"C6", "unbound-reviewer-remedy"} =>
-      ~w,
+      ~w(owner-main-fallback-refuses-loudly unknown-role-refuses-loudly bound-reviewer-dispatches unbound-is-legible),
     {"C6", "note-digest-exclusion"} =>
       ~w(note-change-dedupes-same-action idempotency-key-change-dedupes material-change-gets-distinct-digest digest-dedupe-legible),
     {"C7", "scheduled-wake-suppression"} =>
@@ -610,8 +610,10 @@ defmodule Tightbeam.ConformanceSupport do
       # but it names them, so a SIXTH capstone fixture fails to match loudly
       # instead of silently inheriting a contract that never covers it.
       {"Cap", _, name}
-      when name in ~w ->
-        run_capstone_contracts,
+      when name in ~w(capstone-reviewer-loop capstone-yagni-judge capstone-spec-review
+                      capstone-tests-before-success capstone-real-run-before-ship) ->
+        run_capstone_contracts(
+          find.("Cap", "capstone-reviewer-loop"),
           find.("Cap", "capstone-yagni-judge"),
           find.("Cap", "capstone-spec-review"),
           find.("Cap", "capstone-tests-before-success"),
@@ -2040,7 +2042,7 @@ defmodule Tightbeam.ConformanceSupport do
 
       assert review_effect_count(db, original) == 1
 
-      attest_verdict!
+      attest_verdict!(db, original, "reviewer-session", "reviewed-clean")
       assert {:ok, _} = Dispatch.dispatch(db, handlers, call)
       assert %{status: "closed"} = RailRemedy.episode(db, fixture_rule_name(fixture), original)
 
@@ -2845,7 +2847,7 @@ defmodule Tightbeam.ConformanceSupport do
         assert review_effect_count(db, assignment_id) == 1
 
         if iterate? do
-          attest_verdict!
+          attest_verdict!(db, review_id, "reviewer-session", "changes-requested")
 
           assert {:error, %{reason: "remedy_fired", producer: ^review_id}} =
                    Dispatch.dispatch(db, handlers, call)
@@ -2853,7 +2855,7 @@ defmodule Tightbeam.ConformanceSupport do
           assert Enum.any?(Wakes.list_pending(db), &(&1.session_key == "holder"))
         end
 
-        attest_verdict!
+        attest_verdict!(db, review_id, "reviewer-session", verdict_kind)
         assert {:ok, _} = Dispatch.dispatch(db, handlers, call)
 
         assert %{status: "closed"} =
@@ -2905,7 +2907,9 @@ defmodule Tightbeam.ConformanceSupport do
           unbound_world =
             missing["world"]
             |> Map.put("roles", [])
-            |> Map.put)
+            |> Map.put(
+              "sessions",
+              Enum.reject(missing["world"]["sessions"], &(&1["key"] == "reviewer-session"))
             )
 
           ids = materialize_world(db, unbound_world)
@@ -3168,7 +3172,7 @@ defmodule Tightbeam.ConformanceSupport do
             assert review_effect_count(db, assignment_id) == 1
 
           :wake ->
-            assert Enum.any?(Wakes.list_pending(db), &)
+            assert Enum.any?(Wakes.list_pending(db), &(&1.session_key == "reviewer-session"))
 
           :spawn ->
             assert %{harness: "codex", model: %Model{family: "test"}} = Org.get(db, producer)
@@ -4566,7 +4570,8 @@ defmodule Tightbeam.ConformanceTest do
   end
 
   test "Cap reviewer, judge, tests, and real-run loops compose dispatch, producer, and sweep actors" do
-    Corpus.run_capstone_contracts,
+    Corpus.run_capstone_contracts(
+      fixture!("Cap", "capstone-reviewer-loop"),
       fixture!("Cap", "capstone-yagni-judge"),
       fixture!("Cap", "capstone-spec-review"),
       fixture!("Cap", "capstone-tests-before-success"),
@@ -4613,7 +4618,8 @@ defmodule Tightbeam.ConformanceTest do
   end
 
   test "loader rejects empty complex worlds" do
-    with_corpus_copy
+    with_corpus_copy(fn root ->
+      path = Path.join(root, "capstone/capstone-reviewer-loop.cases.jsonl")
 
       [first | rest] =
         path

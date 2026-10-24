@@ -1211,17 +1211,31 @@ defmodule Tightbeam.DeliverableContractTest do
     card =
       create_card(ctx, fixture.title)
 
-    session
+    session(ctx.db, "reviewer", "other")
 
     spirit =
-      assign_to
+      assign_to(
+        ctx,
+        card.id,
+        "Review REST D3 CLI direct-GET migration and legacy read removal for product spirit",
+        false,
+        "reviewer",
+        effect_kind: "evidence"
+      )
 
     assert %{attest: %{verdictKind: "spirit-approved"}} =
-             Assignments.__handle__
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               call("attest", {:session, "reviewer"}, nil, %{
+                 assignment_id: spirit.id,
+                 kind: "verdict",
+                 verdict_kind: "spirit-approved"
+               })
              )
 
     assert %{assignment: %{state: "closed"}} =
-             complete_as
+             complete_as(ctx, spirit.id, "spirit review complete", nil, "reviewer")
 
     assignment =
       assign(
@@ -1232,24 +1246,44 @@ defmodule Tightbeam.DeliverableContractTest do
       )
 
     first_review =
-      assign_to
+      assign_to(ctx, nil, "Review the first exact D3 specification", false, "reviewer",
+        reviews_assignment_id: assignment.id,
+        effect_kind: "review"
+      )
 
     assert %{attest: %{verdictKind: "changes-requested"}} =
-             Assignments.__handle__
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               call("attest", {:session, "reviewer"}, nil, %{
+                 assignment_id: first_review.id,
+                 kind: "verdict",
+                 verdict_kind: "changes-requested"
+               })
              )
 
     assert %{assignment: %{state: "closed"}} =
-             complete_as
+             complete_as(ctx, first_review.id, nil, nil, "reviewer")
 
     clean_review =
-      assign_to
+      assign_to(ctx, nil, "Review the exact D3 successor", false, "reviewer",
+        reviews_assignment_id: assignment.id,
+        effect_kind: "review"
+      )
 
     assert %{attest: %{verdictKind: "reviewed-clean"}} =
-             Assignments.__handle__
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               call("attest", {:session, "reviewer"}, nil, %{
+                 assignment_id: clean_review.id,
+                 kind: "verdict",
+                 verdict_kind: "reviewed-clean"
+               })
              )
 
     assert %{assignment: %{state: "closed"}} =
-             complete_as
+             complete_as(ctx, clean_review.id, nil, nil, "reviewer")
 
     artifact =
       Artifacts.record(ctx.db, %{

@@ -240,10 +240,18 @@ defmodule Tightbeam.ConditionFactsTest do
 
   test "reserved kinds are substrate-only and condition filing is idempotent", ctx do
     assert {:error, %{code: "reserved_kind"}} =
-             ConditionFacts.file
+             ConditionFacts.file(ctx.db, ctx.scheduler, %{
+               kind: "quota-recovered",
+               scope: "codex:model",
+               origin: "process:ci"
+             })
 
     allowed =
-      ConditionFacts.file
+      ConditionFacts.file(ctx.db, ctx.scheduler, %{
+        kind: "quota-recovered",
+        scope: "codex:model",
+        origin: "process:automation"
+      })
 
     assert allowed.kind == "quota-recovered"
 
