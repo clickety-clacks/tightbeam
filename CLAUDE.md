@@ -27,10 +27,10 @@ CULTURE = kungfu (domain). See the coordination fabric design.
    rules small and boring, and put a mind above them.
 5. **Interruption or information?** Shape WHEN attention is spent, never WHAT
    is recorded. An optimization that loses rows is wrong, full stop.
-6. **Which layer?** Mentions the domain → culture. A deployment can sanely
-   configure it → not physics. Judgment content → never physics.
+6. **Which layer?** Mentions the domain → culture. An organization could sanely
+   reshape it → not physics. Judgment content → never physics.
 7. **Decimation test.** Stop any one session, or the gateway, mid-flight: does
-   the system degrade to a topology that already works?
+   the organization degrade to a topology that already works?
 8. **Is the discipline a bone yet?** Anything agents must remember to do every
    time is a deterministic reflex waiting to be extracted. Inverse holds:
    anything requiring judgment every time must never be extracted.
@@ -63,7 +63,7 @@ coordination fabric and product overview describe supported behavior.
   the app-server subcommand). Delivery: the `CODEX_CONFIG` env JSON on codex-acp is
   spread into every thread/start config map. PreToolUse fires for shell/unified_exec
   (tool name "Bash", full command text) and deny actually blocks — verified at
-  rust-v0.145.0. See shared specs permission-seam-spike.md.
+  rust-v0.145.0.
 
 ## Report dirt, never accommodate it
 

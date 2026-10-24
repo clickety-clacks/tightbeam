@@ -192,9 +192,8 @@ on 2026-07-25:
    turn and an explicitly reasoning-provoking turn each produced the full
    frame sequence with ZERO `agent_progress` frames, claude-agent-acp having
    sent no thought chunk. The user-visible consequence — an unlabeled
-   indicator during ordinary conversation — is a CLIENT presentation concern
-   (clawline `docs/notes/typing-label-local-fallback.md`), not a substrate
-   defect and not a driver assertion.
+   indicator during ordinary conversation — is a client presentation concern,
+   not a substrate defect or a driver assertion.
 4. [auto: J1] Post a message that provokes tool use ("run `uname -a` and tell me what
    it says").
    PASS: progress label shows a tool title during the turn; assistant bubble

@@ -55,10 +55,8 @@ jobs:
       - name: Public rule facts never shrink
         run: python3 scripts/verify_public_rule_facts.py
 
-      # ONE pinned BEAM for every platform. erlef/setup-beam does support macOS
-      # runners (OTP 25-29 on macOS-14/15/26) — the earlier "linux and windows
-      # A version difference cannot be told apart from a platform difference, so
-      # both jobs run the versions development and the hosts run.
+      # Pin the same BEAM versions on every platform so toolchain differences do
+      # not obscure platform-specific failures.
       - name: Install BEAM (pinned, every platform)
         uses: erlef/setup-beam@v1
         with:
@@ -118,12 +116,9 @@ jobs:
         working-directory: cli
         run: cargo build --release
 
-      # Make the runner's containment environment VISIBLE. Three fleet hosts at one
-      # kernel version are not the platform gate; this job is. When a Landlock grant
-      # behaves differently here than on the fleet, this prints the OS release, the
-      # Landlock ABI, and a right-by-right grant trace for a directory and a device
-      # node — so the cause is read from the runner's own output, not guessed from a
-      # kernel number. Never fails the job; it only reports.
+      # Report the CI worker's operating-system release, Landlock ABI, and grant
+      # trace when diagnosing containment differences. This diagnostic never fails
+      # the job.
       - name: Containment environment (diagnostic)
         if: matrix.name == 'linux'
         run: |
