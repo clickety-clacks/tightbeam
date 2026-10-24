@@ -389,11 +389,11 @@ defmodule Tightbeam.Escalation do
                                                global: false
                                              )
   @current_decision_row_version_trigger String.replace(
-                                         @decision_row_version_trigger,
-                                         "CREATE TRIGGER ",
-                                         "CREATE TRIGGER IF NOT EXISTS ",
-                                         global: false
-                                       )
+                                          @decision_row_version_trigger,
+                                          "CREATE TRIGGER ",
+                                          "CREATE TRIGGER IF NOT EXISTS ",
+                                          global: false
+                                        )
 
   @current_ddl String.replace(
                  @ddl,
