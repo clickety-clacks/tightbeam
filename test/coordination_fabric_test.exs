@@ -3592,7 +3592,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   test "concurrent exact answer retries converge on one terminal write", %{db: db} do
     seed_session(db, "agent:coder", "operator")
     seed_session(db, "agent:po", "operator")
-    seed_session
+    seed_session(db, "agent:reviewer", "outsider")
 
     assert {:ok, %{decision_request: request}} =
              ask(db, "agent:coder", "agent:po", "ship now?")
@@ -3611,13 +3611,26 @@ defmodule Tightbeam.CoordinationFabricTest do
         end
 
         wait.(wait)
-        answer
+        answer(db, {:session, "agent:reviewer"}, request.id, "ship behind the flag")
       end)
     end
 
     outcomes = [answer_once.(), answer_once.()] |> Task.await_many(5_000)
 
-    assert Enum.all?
+    assert Enum.all?(outcomes, fn
+             {:ok,
+              %{
+                decision_request: %{
+                  status: "answered",
+                  answer: "ship behind the flag",
+                  answered_by: "session:agent:reviewer"
+                }
+              }} ->
+               true
+
+             _ ->
+               false
+           end)
 
     assert [_one_notice] = wakes_for(db, "agent:coder")
 
@@ -3726,7 +3739,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     seed_session(db, "agent:po", "operator")
     # Owned by operator too, same as coder — but neither asker, asked, nor the
     # owner acting AS itself.
-    seed_session
+    seed_session(db, "agent:reviewer", "operator")
     seed_session(db, "agent:bob-app", "bob")
 
     assert {:ok, %{decision_request: request}} =
@@ -3735,7 +3748,8 @@ defmodule Tightbeam.CoordinationFabricTest do
     # `owner_user_id: "operator"` is exactly what the gateway resolves for ANY of
     # operator's sessions (`decision-requests`'s `caller.owner_user_id`) — so this
     # reproduces, at the call site `Escalation.list/get` actually see, what an
-    # unrelated sibling session's call looks like. Before the fix, the `ownerUserId` branch fired for this session
+    # unrelated sibling session's call looks like (Sol xhigh review, finding
+    # 3). Before the fix, the `ownerUserId` branch fired for this session
     # exactly as it does for the owner acting as a user principal.
     reviewer_call = %{
       origin: "agent:reviewer",
@@ -3747,14 +3761,15 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert Escalation.get(db, reviewer_call, request.id, owner_user_id: "operator") == nil
 
     assert {:ok, %{decision_request: exact}} =
-             verb
+             verb(db, {:session, "agent:reviewer"}, "decision-request", %{request: request.id})
 
     assert exact.id == request.id
     assert exact.question == request.question
     assert exact.context == request.context
 
     assert {:error, %{code: "not_found"}} =
-             verb
+             verb(db, {:session, "agent:reviewer"}, "decision-request", %{
+               request: String.slice(request.id, 0, 12)
              })
 
     assert {:error, %{code: "not_found"}} =
@@ -3770,7 +3785,10 @@ defmodule Tightbeam.CoordinationFabricTest do
              answer(db, {:process, "ci"}, request.id, "processes gain no standing")
 
     assert {:error, %{code: "invalid"}} =
-             verb
+             verb(db, {:session, "agent:reviewer"}, "effort-rule", %{
+               request: request.id,
+               action: "continue"
+             })
 
     statute_id = "dr_exact_hidden_statute"
 
@@ -3782,10 +3800,13 @@ defmodule Tightbeam.CoordinationFabricTest do
       )
 
     assert {:error, %{code: "not_found"}} =
-             verb
+             verb(db, {:session, "agent:reviewer"}, "decision-request", %{request: statute_id})
 
     assert {:error, %{code: "not_found"}} =
-             verb
+             verb(db, {:session, "agent:reviewer"}, "effort-rule", %{
+               request: statute_id,
+               action: "continue"
+             })
 
     effort_id = "dr_exact_effort"
 
@@ -3797,7 +3818,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       )
 
     assert {:ok, %{decision_request: effort}} =
-             verb
+             verb(db, {:session, "agent:reviewer"}, "decision-request", %{request: effort_id})
 
     assert effort.id == effort_id
     assert effort.kind == "effort"
