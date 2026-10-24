@@ -23,9 +23,9 @@ defmodule Tightbeam.Harness.Claude do
   # this set must fail rather than silently becoming a different model. The offered
   # set can depend on the configured home, so the catalog filter remains injectable.
 
-  @adapter_selectable_models ~w(default sonnet opus haiku example-model claude-sonnet-5
-                                claude-opus-4-8 claude-haiku-4-5-20251001 claude-example-5
-                                claude-opus-5 claude-example-5-1 claude-example-5-1[1m])
+  @adapter_selectable_models ~w(default sonnet opus haiku fable claude-sonnet-5
+                                claude-opus-4-8 claude-haiku-4-5-20251001 claude-fable-5
+                                claude-opus-5 claude-fable-5-1 claude-fable-5-1[1m])
 
   @doc """
   Model values this adapter version accepts at `session/set_config_option`.
@@ -190,8 +190,8 @@ defmodule Tightbeam.Harness.Claude do
         "haiku" => "claude-haiku-4-5-20251001",
         "opus" => "claude-opus-4-8",
         "opus[1m]" => "claude-opus-4-8[1m]",
-        "example-model" => "claude-example-5-1",
-        "example-model[1m]" => "claude-example-5-1[1m]"
+        "fable" => "claude-fable-5-1",
+        "fable[1m]" => "claude-fable-5-1[1m]"
       },
       canonical_model_prefixes: ["claude-"]
     }
@@ -261,7 +261,7 @@ defmodule Tightbeam.Harness.Claude do
   # One real turn, so the harness asks the server what this account may use and caches the
   # answer where its own picker reads it. Cold, Claude Code offers four aliases; after a
   # single run its `additionalModelOptionsCache` carries the account's extras -- measured:
-  # `claude-example-5[1m]` appears only after the home has been used once.
+  # `claude-fable-5[1m]` appears only after the home has been used once.
   #
   # `-p` with a trivial prompt because the CHEAPEST real turn is the point: we are not
   # checking the answer, only that the harness has spoken to the server once. Failure is
@@ -877,7 +877,7 @@ defmodule Tightbeam.Harness.Claude do
   end
 
   # ONE entry per vendor model, carrying the efforts it offers. The vendor's id
-  # may itself name a context variant (`claude-example-5[1m]`), which is parsed
+  # may itself name a context variant (`claude-fable-5[1m]`), which is parsed
   # into its own field here rather than being mistaken for one of our efforts.
   defp entry_for(model, id, effort_names, capabilities) do
     identity = Model.parse_ref(id)

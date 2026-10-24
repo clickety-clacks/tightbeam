@@ -1019,7 +1019,7 @@ defmodule Tightbeam.Schema do
   exists in an OLDER shape: it adds no column, so the first query naming one
   dies as an accidental `no such column`, and a column added by hand would be
   worse — `sessions.model` from before the structured identity holds packed
-  values like `claude-example-5[1m]`, which this build would read as a FAMILY.
+  values like `claude-fable-5[1m]`, which this build would read as a FAMILY.
   A wrong answer, from data that was right when it was written.
 
   So the shape is STAMPED at creation and CHECKED here, per the house rule: a
@@ -2473,7 +2473,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database predates the structured model identity (#{@shape}).
 
         Its `sessions` table carries no shape stamp, so its `model` column holds
-        PACKED identifiers — `claude-example-5[1m]` meaning a 1M-context model —
+        PACKED identifiers — `claude-fable-5[1m]` meaning a 1M-context model —
         and `thinkingLevel`/`modelContext` were never written. This build reads
         those three columns as separate fields, so it would take the whole
         packed string as the model's family and silently run the wrong model.

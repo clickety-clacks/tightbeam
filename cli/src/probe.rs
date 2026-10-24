@@ -1069,13 +1069,13 @@ fn platform_limits(platform: &str) -> Vec<&'static str> {
         vec![
             "environ is ptrace-gated; other-user and protected processes are unreadable",
             "procfs may hide processes entirely",
-            "markers are spooexample env content",
+            "markers are spoofable env content",
         ]
     } else {
         vec![
             "env visible only for same-euid processes; platform binaries may hide it even own-user",
             "ps flattens argv and env; marker position is indistinguishable",
-            "markers are spooexample argv or env content",
+            "markers are spoofable argv or env content",
         ]
     }
 }
@@ -2545,7 +2545,7 @@ mod tests {
     "platform_limits": [
       "environ is ptrace-gated; other-user and protected processes are unreadable",
       "procfs may hide processes entirely",
-      "markers are spooexample env content"
+      "markers are spoofable env content"
     ],
     "notes": []
   }
@@ -2719,7 +2719,7 @@ mod tests {
     "platform_limits": [
       "environ is ptrace-gated; other-user and protected processes are unreadable",
       "procfs may hide processes entirely",
-      "markers are spooexample env content"
+      "markers are spoofable env content"
     ],
     "notes": [
       "ps etime timed out"

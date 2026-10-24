@@ -34,11 +34,11 @@ defmodule Tightbeam.Harness.Codex do
   # the adapter, `initialize`, `session/new`, then confirm each candidate with
   # `session/set_config_option {configId: "model"}`. Update this table and
   # `@adapter_version` together.
-  @adapter_selectable_models ~w(gpt-5.6-example)
+  @adapter_selectable_models ~w(gpt-5.6-sol)
 
   # The gate probe's own model, as fields — it crosses the adapter seam like any
   # other selection.
-  @probe_model %Tightbeam.Model{family: "gpt-5.6-example", effort: "medium", context: nil}
+  @probe_model %Tightbeam.Model{family: "gpt-5.6-sol", effort: "medium", context: nil}
 
   @adapter_bundle "index.js"
   @adapter_replacements [
@@ -93,7 +93,7 @@ defmodule Tightbeam.Harness.Codex do
   def credential_env_vars, do: []
 
   @impl true
-  def default_model, do: Tightbeam.Model.new("gpt-5.6-example", effort: "medium")
+  def default_model, do: Tightbeam.Model.new("gpt-5.6-sol", effort: "medium")
 
   @impl true
   def install_package, do: "@agentclientprotocol/codex-acp"

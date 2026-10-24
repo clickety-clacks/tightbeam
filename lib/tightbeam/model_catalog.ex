@@ -30,7 +30,7 @@ defmodule Tightbeam.ModelCatalog do
   @type key :: {host :: String.t(), harness :: String.t()}
   @typedoc """
   One vendor model on one host, as fields. `family` and `context` are the
-  vendor's (`claude-example-5`, `1m`); `efforts` is what Tightbeam may ask of it.
+  vendor's (`claude-fable-5`, `1m`); `efforts` is what Tightbeam may ask of it.
   Capabilities live here rather than folded into an identity.
   """
   @type entry :: %{

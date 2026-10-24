@@ -1465,7 +1465,7 @@ defmodule Tightbeam.Acp.Adapter do
   defp public_model_from_label(option) do
     label = Enum.join([option["name"], option["description"]], " ")
 
-    case Regex.run(~r/\b(opus|sonnet|haiku|example-model)\s+(\d+)(?:[. -](\d+))?/i, label) do
+    case Regex.run(~r/\b(opus|sonnet|haiku|fable)\s+(\d+)(?:[. -](\d+))?/i, label) do
       [_, family, major, minor] when minor not in [nil, ""] ->
         Model.new("claude-#{String.downcase(family)}-#{major}-#{minor}")
 
