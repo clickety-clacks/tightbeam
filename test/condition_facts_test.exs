@@ -250,7 +250,7 @@ defmodule Tightbeam.ConditionFactsTest do
       ConditionFacts.file(ctx.db, ctx.scheduler, %{
         kind: "quota-recovered",
         scope: "codex:sol",
-        origin: "process:automation"
+        origin: "process:tightbeam"
       })
 
     assert allowed.kind == "quota-recovered"

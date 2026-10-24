@@ -12,7 +12,7 @@ defmodule Tightbeam.Stall410Test do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',0,'admin_add',1),('other',0,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('sample-user',0,'admin_add',1),('other',0,'admin_add',1)"
       )
 
     example_session = session(db, Org.personal_session_key("sample-user"), "sample-user")
@@ -293,7 +293,7 @@ defmodule Tightbeam.Stall410Test do
 
         Txn.q(
           txn,
-          "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES (?1,'terminal close fixture',?2,'operator',?3,'open',?4)",
+          "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES (?1,'terminal close fixture',?2,'sample-user',?3,'open',?4)",
           [assignment_id, holder, ts, work_item_id]
         )
 

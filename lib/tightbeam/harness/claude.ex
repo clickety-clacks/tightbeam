@@ -22,6 +22,8 @@ defmodule Tightbeam.Harness.Claude do
   # Keep this list aligned with the values it can select. Requested models outside
   # this set must fail rather than silently becoming a different model. The offered
   # set can depend on the configured home, so the catalog filter remains injectable.
+  # Codex model selection is also kind-scoped: the API-key catalog may offer platform
+  # ids that its adapter refuses (-32602), so keep its adapter-selectability guard.
 
   @adapter_selectable_models ~w(default sonnet opus haiku fable claude-sonnet-5
                                 claude-opus-4-8 claude-haiku-4-5-20251001 claude-fable-5

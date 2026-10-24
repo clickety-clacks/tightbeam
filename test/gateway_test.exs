@@ -4270,7 +4270,7 @@ defmodule Tightbeam.GatewayTest do
           handle: "remedy-reviewer",
           harness: "codex",
           provider: "openai",
-          model: "gpt-5.6-example",
+          model: "gpt-5.6-sol",
           idempotency_key: "rail-dispatch:hire-reviewer:subject:1"
         }
       })
