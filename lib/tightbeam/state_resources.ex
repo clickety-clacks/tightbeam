@@ -594,19 +594,6 @@ defmodule Tightbeam.StateResources do
       :return_reason,
       :returned_at
     ])
-    |> Map.put(:row_version, decision_request_version(row))
-  end
-
-  defp decision_request_version(row) do
-    [
-      row.answered_at,
-      row.withdrawn_at,
-      row.consumed_at,
-      row.ruled_at,
-      row.raised_at
-    ]
-    |> Enum.filter(&is_integer/1)
-    |> Enum.max()
   end
 
   defp detail_principal(%{rest_principal: %{kind: kind, id: id, is_admin: is_admin}}),
@@ -1699,7 +1686,7 @@ defmodule Tightbeam.StateResources do
   end
 
   defp decision_request_projection(row) do
-    row_version = value(row, :row_version) || decision_request_version(row)
+    row_version = value(row, :row_version)
     stored_options = value(row, :options)
 
     unless is_integer(row_version) and row_version > 0 do
