@@ -158,6 +158,21 @@ defmodule Tightbeam.DecisionRowVersionTest do
         end
 
       assert error.message =~ "rowVersion is projection_invalid"
+
+      terminal_row =
+        Map.merge(row, %{
+          status: "ruled",
+          decision: "accept",
+          ruled_by: "user:flynn",
+          ruled_at: 10
+        })
+
+      terminal_error =
+        assert_raise ArgumentError, fn ->
+          StateResources.decision_request(terminal_row)
+        end
+
+      assert terminal_error.message =~ "rowVersion is projection_invalid"
     end
 
     row = Escalation.raw_by_id(db, id) |> Map.delete(:row_version)
@@ -168,6 +183,21 @@ defmodule Tightbeam.DecisionRowVersionTest do
       end
 
     assert error.message =~ "rowVersion is projection_invalid"
+
+    terminal_row =
+      Map.merge(row, %{
+        status: "ruled",
+        decision: "accept",
+        ruled_by: "user:flynn",
+        ruled_at: 10
+      })
+
+    terminal_error =
+      assert_raise ArgumentError, fn ->
+        StateResources.decision_request(terminal_row)
+      end
+
+    assert terminal_error.message =~ "rowVersion is projection_invalid"
   end
 
   test "v20 artifact migration still stops at v21 before the decision version step", %{db: db} do

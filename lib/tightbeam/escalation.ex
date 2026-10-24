@@ -287,7 +287,16 @@ defmodule Tightbeam.Escalation do
   returnedBy, returnReason, returnedAt
   """
 
-  @request_columns String.trim(@pre_version_request_columns) <> ", rowVersion"
+  @request_columns """
+  id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
+  expecterSessionKey, expecterUserId, lineageRung, effortGeneration, deadlineWakeId,
+  raisedAt, deadlineAt,
+  statuteName, actionKey, question, options, context, status, decision, rationale,
+  ruledBy, ruledViaSessionKey, ruledViaPrincipal, ruledViaSessionState,
+  ruledAt, rulingFactId, consumedAt, parkWakeId, withdrawnBy,
+  withdrawnReason, withdrawnAt, askedOfRole, answer, answeredBy, answeredAt,
+  returnedBy, returnReason, returnedAt, rowVersion
+  """
 
   @versioned_decision_request_ddl String.replace(
                                     @decision_request_ddl,
@@ -3365,6 +3374,12 @@ defmodule Tightbeam.Escalation do
   @doc false
   @spec terminal_operator_projection(map()) :: map()
   def terminal_operator_projection(request) do
+    row_version = Map.get(request, :row_version)
+
+    unless is_integer(row_version) and row_version > 0 do
+      raise ArgumentError, "decision request rowVersion is projection_invalid"
+    end
+
     %{
       id: request.id,
       kind: request.kind,
@@ -3384,6 +3399,7 @@ defmodule Tightbeam.Escalation do
       ruled_at: request.ruled_at,
       ruling_fact_id: request.ruling_fact_id,
       consumed_at: request.consumed_at,
+      row_version: row_version,
       ruling_attribution: operator_ruling_attribution(request)
     }
   end
