@@ -2028,6 +2028,7 @@ defmodule Tightbeam.Escalation do
     request_in_txn_optional: "any",
     migrate_terminal_operator_decision_v1_in_txn: "any",
     migrate_ruled_decision_integrity_v1_in_txn: "any",
+    migrate_decision_row_version_v1_in_txn: "any",
     preflight_ruled_decision_integrity_in_txn: "any",
     # DELEGATE: no SQL literal of its own — reaches one of the entries above
     # by a local call. `answer/2`/`return_request/2`/`ask/2`/`rule/3`/`waive/3`/`withdraw/2`/

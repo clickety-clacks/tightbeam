@@ -197,10 +197,10 @@ defmodule Tightbeam.DecisionRowVersionTest do
                INSERT INTO decision_requests
                  (id, kind, raiserId, raiserSessionKey, ownerUserId, actionKey,
                   raisedAt, deadlineAt, question, options, context, status)
-               VALUES (?1, 'operator', 'session:raiser', 'raiser', 'owner', 'action',
+               VALUES (?1, 'operator', 'session:raiser', 'raiser', 'owner', ?2,
                        10, 20, 'question', '[]', '{}', 'open')
                """,
-               [id]
+               [id, "action:#{id}"]
              )
 
     id
