@@ -1304,7 +1304,9 @@ defmodule Tightbeam.AdminProjectionTest do
     handler = Tightbeam.Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["identity-edit"]
     invocation = "identity-pending-conflict"
     identity_dir = Path.join(ctx.base_dir, "identity")
-    candidate = Identity.edit!(ctx.base_dir, "default", :guidance, "candidate\n", "user:sample-user")
+
+    candidate =
+      Identity.edit!(ctx.base_dir, "default", :guidance, "candidate\n", "user:sample-user")
 
     assert {:ok, %{state: "pending"}} =
              AdminProjection.begin_identity_publication(

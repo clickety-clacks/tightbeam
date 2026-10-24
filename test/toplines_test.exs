@@ -99,7 +99,9 @@ defmodule Tightbeam.ToplinesTest do
   test "membership episodes retain reasons, attribution, history, and keyed replay", ctx do
     work_item!(ctx.db, "wi_release", "sample-user")
 
-    create_call = call({:user, "sample-user"}, %{title: "Release", idempotency_key: "create"}, 100)
+    create_call =
+      call({:user, "sample-user"}, %{title: "Release", idempotency_key: "create"}, 100)
+
     first_create = Toplines.create(ctx.db, create_call)
     assert first_create == Toplines.create(ctx.db, create_call)
     topline_id = first_create.topline.id
@@ -265,7 +267,11 @@ defmodule Tightbeam.ToplinesTest do
     topline =
       Toplines.create(
         ctx.db,
-        call({:user, "sample-user"}, %{title: "Reference race", idempotency_key: "race-create"}, 20)
+        call(
+          {:user, "sample-user"},
+          %{title: "Reference race", idempotency_key: "race-create"},
+          20
+        )
       ).topline
 
     Toplines.link_work(
@@ -365,7 +371,11 @@ defmodule Tightbeam.ToplinesTest do
     closed =
       Toplines.close(
         ctx.db,
-        call({:user, "sample-user"}, %{topline_id: id, reason: "done", idempotency_key: "close"}, 13)
+        call(
+          {:user, "sample-user"},
+          %{topline_id: id, reason: "done", idempotency_key: "close"},
+          13
+        )
       )
 
     assert closed.topline.state == "closed"
@@ -726,7 +736,9 @@ defmodule Tightbeam.ToplinesTest do
       )
     )
 
-    [before] = Toplines.query_public(ctx.db, %{principal: {:user, "sample-user"}, state: ["open"]})
+    [before] =
+      Toplines.query_public(ctx.db, %{principal: {:user, "sample-user"}, state: ["open"]})
+
     before_item = Toplines.public_item(before)
     assert [%{workItemTitle: "Work wi_mutation"}] = before_item.workMemberships
 
@@ -990,7 +1002,9 @@ defmodule Tightbeam.ToplinesTest do
     work_item!(ctx.db, "wi_map", "sample-user")
 
     roster_call = read_call({:user, "sample-user"}) |> Map.put(:now, 9_000_000)
-    detail_call = read_call({:user, "sample-user"}, %{under: "wi_map"}) |> Map.put(:now, 9_000_000)
+
+    detail_call =
+      read_call({:user, "sample-user"}, %{under: "wi_map"}) |> Map.put(:now, 9_000_000)
 
     assert JSON.encode!(Toplines.roster(ctx.db, roster_call)) ==
              JSON.encode!(ExecutionMap.roster(ctx.db, roster_call))

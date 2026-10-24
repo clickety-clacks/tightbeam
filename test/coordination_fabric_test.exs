@@ -4041,7 +4041,8 @@ defmodule Tightbeam.CoordinationFabricTest do
     do: verb(db, principal, "withdraw", %{request: request_id, reason: reason})
 
   defp attests(db, assignment_id, params),
-    do: verb(db, {:user, "sample-user"}, "attests", Map.put(params, :assignment_id, assignment_id))
+    do:
+      verb(db, {:user, "sample-user"}, "attests", Map.put(params, :assignment_id, assignment_id))
 
   defp execution_map(db, params), do: verb(db, {:user, "sample-user"}, "execution-map", params)
 

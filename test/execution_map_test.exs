@@ -999,7 +999,12 @@ defmodule Tightbeam.ExecutionMapTest do
     for verb <-
           ~w(toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list) do
       response =
-        post_dispatch(opts, %{verb: verb, asUser: "sample-user", sessionKey: "s_real", params: %{}})
+        post_dispatch(opts, %{
+          verb: verb,
+          asUser: "sample-user",
+          sessionKey: "s_real",
+          params: %{}
+        })
 
       assert response.status == 400
 

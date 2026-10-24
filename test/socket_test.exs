@@ -734,7 +734,12 @@ defmodule Tightbeam.Wire.SocketTest do
 
   test "concurrent first auths converge on one personal main stream", ctx do
     {:paired, device} =
-      claim_org(ctx.db, %{device_id: "race", claimed_name: "Sample User", platform: nil, model: nil})
+      claim_org(ctx.db, %{
+        device_id: "race",
+        claimed_name: "Sample User",
+        platform: nil,
+        model: nil
+      })
 
     proxy = :"main_seed_race_db_#{System.unique_integer([:positive])}"
     start_supervised!({MainSeedRaceDB, {proxy, ctx.db}})

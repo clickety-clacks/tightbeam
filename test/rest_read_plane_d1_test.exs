@@ -284,8 +284,8 @@ defmodule Tightbeam.RestReadPlaneD1Test do
        "tbc_rest_d1", 200, nil},
       {"org missing asUser", "/api/config", "tbc_rest_d1", 400, "invalid_message"},
       {"org empty asUser", "/api/config?asUser=", "tbc_rest_d1", 400, "invalid_message"},
-      {"org repeated asUser", "/api/config?asUser=sample-user&asUser=sample-user", "tbc_rest_d1", 400,
-       "invalid_as_user"},
+      {"org repeated asUser", "/api/config?asUser=sample-user&asUser=sample-user", "tbc_rest_d1",
+       400, "invalid_as_user"},
       {"session absent asUser stays a session", "/api/hosts", ctx.admin_session.cli_token, 200,
        nil},
       {"session empty asUser", "/api/hosts?asUser=", ctx.admin_session.cli_token, 403,
@@ -337,8 +337,8 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     assert get(ctx, "/api/host-env/alpha-host", ctx.admin_device.token).status == 404
 
     parity_cases = [
-      {"org known", "/api/hosts?asUser=sample-user", "tbc_rest_d1", %{"asUser" => "sample-user"}, 200,
-       nil},
+      {"org known", "/api/hosts?asUser=sample-user", "tbc_rest_d1", %{"asUser" => "sample-user"},
+       200, nil},
       {"org unknown", "/api/hosts?asUser=unknown-user", "tbc_rest_d1",
        %{"asUser" => "unknown-user"}, 200, nil},
       {"org empty", "/api/hosts?asUser=", "tbc_rest_d1", %{"asUser" => ""}, 400,
@@ -535,7 +535,8 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     assert malformed.status == 400
     assert JSON.decode!(malformed.resp_body)["error"]["code"] == "invalid_cursor"
 
-    {:ok, _rows} = DB.query(ctx.db, "UPDATE users SET isAdmin = 0 WHERE userId = 'sample-user'", [])
+    {:ok, _rows} =
+      DB.query(ctx.db, "UPDATE users SET isAdmin = 0 WHERE userId = 'sample-user'", [])
 
     now_hidden =
       get(

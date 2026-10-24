@@ -26,7 +26,9 @@ defmodule Tightbeam.RolesTest do
              Roles.create!(db, "review:lead", "sample-user", active.session_key)
 
     assert {:error, %{code: "role_exists"}} = Roles.create!(db, "builder", "sample-user", nil)
-    assert {:error, %{code: "invalid_role_name"}} = Roles.create!(db, "Bad_Name", "sample-user", nil)
+
+    assert {:error, %{code: "invalid_role_name"}} =
+             Roles.create!(db, "Bad_Name", "sample-user", nil)
 
     assert {:error, %{code: "invalid_role_name", message: agent_message}} =
              Roles.create!(db, "agent:reserved", "sample-user", nil)

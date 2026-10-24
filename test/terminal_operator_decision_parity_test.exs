@@ -1274,7 +1274,9 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                }
              }
            } =
-             Escalation.get(ctx.db, rule_call(known.id, %{}), known.id, owner_user_id: "sample-user")
+             Escalation.get(ctx.db, rule_call(known.id, %{}), known.id,
+               owner_user_id: "sample-user"
+             )
 
     assert %{
              ruling_attribution: %{

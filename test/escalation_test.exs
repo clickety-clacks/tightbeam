@@ -273,7 +273,11 @@ defmodule Tightbeam.EscalationTest do
     waiver =
       Escalation.waive(
         ctx.db,
-        %{origin: "user:sample-user", principal: {:user, "sample-user"}, params: %{request_id: first}},
+        %{
+          origin: "user:sample-user",
+          principal: {:user, "sample-user"},
+          params: %{request_id: first}
+        },
         authorized: true,
         scheduler: ctx.scheduler
       )

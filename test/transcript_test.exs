@@ -332,13 +332,28 @@ defmodule Tightbeam.TranscriptTest do
       %{verb: "transcript", asUser: "sample-user", userId: "sample-user"},
       %{verb: "transcript", asUser: "sample-user", role: "whatever"},
       # Null, and carrying otherwise-valid params so nothing else could refuse it.
-      %{verb: "transcript", asUser: "sample-user", sessionKey: nil, params: %{sessionKey: "owned"}},
+      %{
+        verb: "transcript",
+        asUser: "sample-user",
+        sessionKey: nil,
+        params: %{sessionKey: "owned"}
+      },
       %{verb: "transcript", asUser: "sample-user", target: nil, params: %{sessionKey: "owned"}},
       %{verb: "transcript", asUser: "sample-user", role: nil, params: %{sessionKey: "owned"}},
       %{verb: "transcript", asUser: "sample-user", userId: nil, params: %{sessionKey: "owned"}},
       # A number, a boolean and an object — the same gap as null.
-      %{verb: "transcript", asUser: "sample-user", sessionKey: 42, params: %{sessionKey: "owned"}},
-      %{verb: "transcript", asUser: "sample-user", sessionKey: true, params: %{sessionKey: "owned"}},
+      %{
+        verb: "transcript",
+        asUser: "sample-user",
+        sessionKey: 42,
+        params: %{sessionKey: "owned"}
+      },
+      %{
+        verb: "transcript",
+        asUser: "sample-user",
+        sessionKey: true,
+        params: %{sessionKey: "owned"}
+      },
       %{
         verb: "transcript",
         asUser: "sample-user",

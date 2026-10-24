@@ -220,7 +220,9 @@ defmodule Tightbeam.WorkItemsTest do
     assert %{code: "unknown_work_item"} = update(ctx, {:user, "sample-user"}, "missing", %{})
 
     unpinned = create(ctx, {:user, "sample-user"}, %{title: "Original"})
-    assert %{code: "invalid_title"} = update(ctx, {:user, "sample-user"}, unpinned.id, %{title: " "})
+
+    assert %{code: "invalid_title"} =
+             update(ctx, {:user, "sample-user"}, unpinned.id, %{title: " "})
 
     assert %{code: "invalid_spec_ref"} =
              update(ctx, {:user, "sample-user"}, unpinned.id, %{spec_ref_name: "spec.md"})

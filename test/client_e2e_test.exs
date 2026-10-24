@@ -1804,7 +1804,10 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "posting with a malformed id is refused on the wire, not silently dropped", ctx do
       {:ok, %{token: token}} =
-        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-bad-id", claimed_name: "Sample User")
+        SimClient.pair("127.0.0.1", ctx.port,
+          device_id: "sim-bad-id",
+          claimed_name: "Sample User"
+        )
 
       {:ok, client} = SimClient.connect("127.0.0.1", ctx.port, token, device_id: "sim-bad-id")
       watermark = SimClient.mark(client)

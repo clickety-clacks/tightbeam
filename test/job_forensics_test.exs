@@ -256,7 +256,9 @@ defmodule Tightbeam.JobForensicsTest do
     session(db, "k1")
 
     # Path 1: an origin-guarded authenticated requester.
-    a = Wakes.schedule(db, %{session_key: "k1", origin: "user:sample-user", prompt: "a", due_at: 1})
+    a =
+      Wakes.schedule(db, %{session_key: "k1", origin: "user:sample-user", prompt: "a", due_at: 1})
+
     assert public_cancel(db, a.wake_id, "user:sample-user", %{kind: "user", id: "sample-user"})
     assert is_integer(Wakes.get(db, a.wake_id).canceled_at)
 
@@ -283,7 +285,9 @@ defmodule Tightbeam.JobForensicsTest do
     assert is_integer(Wakes.get(db, b.wake_id).canceled_at)
 
     # A refused cancel stamps nothing.
-    c = Wakes.schedule(db, %{session_key: "k1", origin: "user:sample-user", prompt: "c", due_at: 1})
+    c =
+      Wakes.schedule(db, %{session_key: "k1", origin: "user:sample-user", prompt: "c", due_at: 1})
+
     refute public_cancel(db, c.wake_id, "user:someone-else", %{kind: "user", id: "sample-user"})
     assert is_nil(Wakes.get(db, c.wake_id).canceled_at)
     assert Wakes.get(db, c.wake_id).state == "pending"
@@ -506,7 +510,12 @@ defmodule Tightbeam.JobForensicsTest do
       })
 
     assert %{canceled: true} =
-             cancel_via_gateway(db, cancel_first.wake_id, "user:sample-user", {:user, "sample-user"})
+             cancel_via_gateway(
+               db,
+               cancel_first.wake_id,
+               "user:sample-user",
+               {:user, "sample-user"}
+             )
 
     assert :ok = Wakes.fire_due(scheduler)
     cancel_first_id = cancel_first.wake_id
@@ -530,7 +539,12 @@ defmodule Tightbeam.JobForensicsTest do
     assert fire_id == fire_first.wake_id
 
     assert %{canceled: false} =
-             cancel_via_gateway(db, fire_first.wake_id, "user:sample-user", {:user, "sample-user"})
+             cancel_via_gateway(
+               db,
+               fire_first.wake_id,
+               "user:sample-user",
+               {:user, "sample-user"}
+             )
 
     fire_timeline = trace(db, "wi_fire_first").timeline
     assert Enum.count(fire_timeline, &(&1.type == "wake_fired")) == 1

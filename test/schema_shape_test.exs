@@ -159,7 +159,10 @@ defmodule Tightbeam.SchemaShapeTest do
     assert_principal_duty_shape(db)
 
     assert {:ok,
-            [[direct_id, "sample-user", "direct", nil], [relayed_id, "sample-user", "relayed", source]]} =
+            [
+              [direct_id, "sample-user", "direct", nil],
+              [relayed_id, "sample-user", "relayed", source]
+            ]} =
              DB.query(
                db,
                "SELECT workItemId,sourceUserId,sourceKind,sourceSessionKey FROM work_item_sources ORDER BY sourceKind"

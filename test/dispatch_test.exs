@@ -17,7 +17,13 @@ defmodule Tightbeam.DispatchTest do
 
   test "success returns result and appends one verb event", %{db: db} do
     handlers = %{"post" => fn call -> %{echoed: call.params} end}
-    call = %{verb: "post", origin: "user:sample-user", session_key: "s1", params: %{content: "hi"}}
+
+    call = %{
+      verb: "post",
+      origin: "user:sample-user",
+      session_key: "s1",
+      params: %{content: "hi"}
+    }
 
     assert {:ok, %{echoed: %{content: "hi"}}} = Dispatch.dispatch(db, handlers, call)
 

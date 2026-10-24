@@ -35,7 +35,8 @@ defmodule Tightbeam.OriginTest do
   end
 
   test "an origin outside the class set classifies substrate and warns once" do
-    log = capture_log(fn -> assert Origin.started_by("sample-user:sample-user") == "substrate" end)
+    log =
+      capture_log(fn -> assert Origin.started_by("sample-user:sample-user") == "substrate" end)
 
     # The warning is per-node, so this file may or may not be the one that
     # spends it. What is total is the classification: never nil, never a raise.

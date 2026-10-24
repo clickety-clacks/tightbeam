@@ -141,7 +141,12 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
         scheduler: ctx.scheduler
       )
 
-    assert %{status: "ruled", decision: "accept", ruled_by: "user:sample-user", ruled_at: ruled_at} =
+    assert %{
+             status: "ruled",
+             decision: "accept",
+             ruled_by: "user:sample-user",
+             ruled_at: ruled_at
+           } =
              ruled
 
     assert is_integer(ruled_at)
