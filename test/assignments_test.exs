@@ -1579,7 +1579,6 @@ defmodule Tightbeam.AssignmentsTest do
           review.id,
           "the requested changes landed; this round owes a fresh verdict"
         )
-      )
 
     assert reopened.state == "open"
 
@@ -1811,7 +1810,6 @@ defmodule Tightbeam.AssignmentsTest do
           review.id,
           "the reviewer needs to correct the verdict"
         )
-      )
       )
 
     assert reopened.state == "open"
