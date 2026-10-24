@@ -4262,7 +4262,7 @@ mod tests {
         assert!(matches!(
             parse_with_catalog(strings(&[
                 "assimilate",
-                "flynn@host",
+                "example@host",
                 "--as-user",
                 "operator",
             ]), &catalog),
