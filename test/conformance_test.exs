@@ -127,7 +127,7 @@ defmodule Tightbeam.ConformanceSupport do
     {"C7", "sweep-never-consumes"} =>
       ~w(sweep-allow-leaves-ruling-ruled verb-edge-consumes-exactly-once no-consume-legible),
     {"Cap", "capstone-reviewer-loop"} =>
-      ~w,
+      ~w(missing-review-dispatch-remedy changes-requested-iterates-author commissioned-clean-review-releases idle-pre-review-sweep-runs-remedy unbound-reviewer-refuses-loudly loop-legible-no-teardown-claim),
     {"Cap", "capstone-tests-before-success"} =>
       ~w(behind-main-script-denies reconciled-missing-tests-denies produced-tests-release idle-sweep-reobligates tests-loop-legible),
     {"Cap", "capstone-real-run-before-ship"} =>
