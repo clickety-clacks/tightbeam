@@ -54,7 +54,7 @@ defmodule Tightbeam.DecisionRowVersionTest do
     assert row_version(fresh, "fresh-decision") == 1
 
     upgraded = :"decision_row_version_upgraded_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: ":memory:", name: upgraded})
+    start_supervised!({DB, path: ":memory:", name: upgraded}, id: upgraded)
     :ok = Schema.ensure_all(upgraded)
     insert_operator(upgraded, "existing-decision")
     downgrade_to_v21(upgraded)
