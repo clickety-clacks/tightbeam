@@ -1709,6 +1709,9 @@ defmodule Tightbeam.CoordinationFabricTest do
       ],
       migrate_ruled_decision_integrity_v1_in_txn: [
         {"lib/tightbeam/schema.ex", "upgrade_ruled_decision_integrity_v1/1"}
+      ],
+      migrate_decision_row_version_v1_in_txn: [
+        {"lib/tightbeam/schema.ex", "upgrade_decision_row_version_v1/1"}
       ]
     }
 
