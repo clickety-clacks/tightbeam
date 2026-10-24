@@ -81,7 +81,7 @@
       "commitRefs": [
         {
           "commit": "64408a93190c31ca992af22c28a6726c8687c65f",
-          "repo": "gibson:/home/mike/.tightbeam/work/6d71188ccbbc/tightbeam-specs-review-rest-d3"
+          "repo": "build-host:/home/mike/.tightbeam/work/6d71188ccbbc/tightbeam-specs-review-rest-d3"
         }
       ]
     },
@@ -93,7 +93,7 @@
       "commitRefs": [
         {
           "commit": "85ae5ecb126d54cf7759b4ce37d9459fd7bd0f0f",
-          "repo": "gibson:/home/mike/.tightbeam/work/6d71188ccbbc/tightbeam-specs-review-rest-d3-85ae5e"
+          "repo": "build-host:/home/mike/.tightbeam/work/6d71188ccbbc/tightbeam-specs-review-rest-d3-85ae5e"
         }
       ]
     },
@@ -106,7 +106,7 @@
       "commitRefs": [
         {
           "commit": "85ae5ecb126d54cf7759b4ce37d9459fd7bd0f0f",
-          "repo": "gibson:/home/mike/.tightbeam/work/58b746f82786/tightbeam-specs"
+          "repo": "build-host:/home/mike/.tightbeam/work/58b746f82786/tightbeam-specs"
         }
       ]
     }

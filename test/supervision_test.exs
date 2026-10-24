@@ -3855,7 +3855,7 @@ defmodule Tightbeam.SupervisionTest do
 
     # The rung is REFUNDED: schedule claimed prodCount 1, the suppressed fire
     # voided it. Without this, suppressed prods consume the ladder and a
-    # blocked holder gets escalated over — the SMOKE 42 shrdlu finding.
+    # blocked holder gets escalated over — the SMOKE 42 linux-runner finding.
     assert %{prodCount: 0} = Supervision.prod_state(ctx.db, "asg_1")
 
     # An agent's own wake to the SAME blocked session still delivers — the
@@ -4363,7 +4363,7 @@ defmodule Tightbeam.SupervisionTest do
   defp open_rate_limit_incident!(ctx) do
     first = %{
       harness: "claude",
-      host: "eezo",
+      host: "mac-runner",
       failure_class: "rate-limit-dead",
       evidence_kind: "terminal-failure",
       session_key: ctx.holder.session_key,
@@ -4388,12 +4388,12 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   defp resolve_rate_limit_incident!(ctx, terminal_seq) do
-    :ok = HarnessProcess.complete_park(ctx.db, {:claude, "shared", "eezo"})
+    :ok = HarnessProcess.complete_park(ctx.db, {:claude, "shared", "mac-runner"})
 
     assert {:resolved, _} =
              HarnessHealth.resolve(ctx.db, %{
                harness: "claude",
-               host: "eezo",
+               host: "mac-runner",
                failure_class: "rate-limit-dead",
                session_key: ctx.holder.session_key,
                assignment_id: "asg_1",
@@ -4410,7 +4410,7 @@ defmodule Tightbeam.SupervisionTest do
     assert {:opened, _} =
              HarnessHealth.observe(ctx.db, %{
                harness: "claude",
-               host: "eezo",
+               host: "mac-runner",
                failure_class: failure_class,
                evidence_kind: "authoritative-provider",
                session_key: ctx.holder.session_key,
@@ -4426,13 +4426,13 @@ defmodule Tightbeam.SupervisionTest do
 
   defp resolve_harness_incident!(ctx, failure_class, index) do
     if failure_class == "rate-limit-dead" do
-      :ok = HarnessProcess.complete_park(ctx.db, {:claude, "shared", "eezo"})
+      :ok = HarnessProcess.complete_park(ctx.db, {:claude, "shared", "mac-runner"})
     end
 
     assert {:resolved, _} =
              HarnessHealth.resolve(ctx.db, %{
                harness: "claude",
-               host: "eezo",
+               host: "mac-runner",
                failure_class: failure_class,
                session_key: ctx.holder.session_key,
                assignment_id: "asg_1",
@@ -4588,7 +4588,7 @@ defmodule Tightbeam.SupervisionTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "eezo"
+      host: "mac-runner"
     })
   end
 

@@ -26,7 +26,7 @@ defmodule Tightbeam.Application do
       config = production_config()
 
       # ONE refusal is quiet here, and it is the one that was asked for: a first run
-      # with no registered harness CLI on PATH (task #23 — measured on shrdlu from the
+      # with no registered harness CLI on PATH (task #23 — measured on linux-runner from the
       # npm tarball, the most ordinary first-run state there is).
       #
       # This used to also wrap `start_tree/1` in a try/rescue naming two more refusals,
@@ -80,7 +80,7 @@ defmodule Tightbeam.Application do
   # Returning `{:error, _}` from `start/2` is correct OTP, and under `mix run` it reads
   # fine. In a RELEASE it does not: the app is permanent, so application_controller
   # escalates the failed start into "Kernel pid terminated", an {exit,terminating,...}
-  # stacktrace, and an `erl_crash.dump` in the install directory. Measured on shrdlu from
+  # stacktrace, and an `erl_crash.dump` in the install directory. Measured on linux-runner from
   # the npm tarball with no harness CLI on PATH — the most ordinary first-run state there
   # is ("I installed tightbeam before I installed claude") presented as a kernel panic.
   #
@@ -124,7 +124,7 @@ defmodule Tightbeam.Application do
       # org is a moment that never arrives: you cannot spawn until you have
       # onboarded, onboarding VERIFIES by starting a runtime, and that runtime
       # needs the adapter only a spawn would have installed. Circular, and every
-      # fresh install hit it — gibson twice, on both providers, surfacing as
+      # fresh install hit it — build-host twice, on both providers, surfacing as
       # `harness command could not be executed: No such file or directory`
       # (Flynn, 2026-08-04). Boot printed the npm command as a "manual
       # fallback"; the only change is that we run it instead of describing it.

@@ -3,7 +3,7 @@
 // Boots the real adapter with the real home, reads the offered model set from
 // session/new configOptions, then confirms claude-opus-5 via set_config_option.
 // Exit 0 + "ACCEPTED" when the grant serves opus-5; exit 1 + refusal otherwise.
-// Run on gibson: CLAUDE_CONFIG_DIR=/home/mike/.tightbeam/homes/gibson/claude \
+// Run on build-host: CLAUDE_CONFIG_DIR=/home/mike/.tightbeam/homes/build-host/claude \
 //   node probe-opus5.mjs
 import { spawn } from "node:child_process";
 

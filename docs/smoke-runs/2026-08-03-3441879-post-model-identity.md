@@ -1,6 +1,6 @@
 # e2e run — 2026-08-03 @ ca91436 (post model-identity merge)
 
-Operator: Claude (overnight, unattended) · Scope: eezo local tiers + one linux negative.
+Operator: Claude (overnight, unattended) · Scope: mac-runner local tiers + one linux negative.
 Trigger: Flynn — "get finished what you can and then run through the e2e. iterate until
 clean" — the first full run after `model-identity` merged to main (3441879).
 
@@ -8,14 +8,14 @@ clean" — the first full run after `model-identity` merged to main (3441879).
 
 | tier | verdict | note |
 |---|---|---|
-| T1 suites | PASS | mix 1241 + 9 doctests, cargo 205, zero failures, eezo AND shrdlu |
+| T1 suites | PASS | mix 1241 + 9 doctests, cargo 205, zero failures, mac-runner AND linux-runner |
 | T2a feature smoke | PASS | 26 checks, both legs, full parity |
-| T2b client journeys | PASS | RUN VERDICT PASS, claude@eezo + codex@eezo |
+| T2b client journeys | PASS | RUN VERDICT PASS, claude@mac-runner + codex@mac-runner |
 | T0 V0 neutral seed | PASS | learn/unlearn round-trips to exactly the seed |
 | T0 V3 ambient login | PASS | the open question is answered — see below |
 | T4 soak | FAIL | 58 kills, 29/29 recovered; A1+A3 fail on missing RECORDS |
 | T3c N3 | PASS | boot refuses by name, binds no port |
-| T3a/T3b/N1/N2 | SKIP (named) | shrdlu holds no codex credential; interactive onboarding needs Flynn |
+| T3a/T3b/N1/N2 | SKIP (named) | linux-runner holds no codex credential; interactive onboarding needs Flynn |
 
 **Run verdict: INCOMPLETE(scope)** — honest partial. T3's placement journeys never ran,
 so satellite placement is UNPROVEN against this build. That is a scope gap, not a pass.
@@ -91,26 +91,26 @@ map should be updated or it will keep reading as a failure to future walkers.
 
 **V3 ambient login: PASS**, and this was the open question: does the product SAY the
 credentials are separate, or report "no credential" while `claude` works fine two commands
-away? Both ambient stores are present on eezo. The fresh org borrowed neither, and boot
+away? Both ambient stores are present on mac-runner. The fresh org borrowed neither, and boot
 says so unprompted:
 
-> Tightbeam has no credential for anthropic on eezo. It does not use or import your normal
+> Tightbeam has no credential for anthropic on mac-runner. It does not use or import your normal
 > claude CLI login; Tightbeam keeps its own credential under `<base>/auth`.
-> Run on eezo: `tightbeam onboard anthropic --as-user <userId>`
+> Run on mac-runner: `tightbeam onboard anthropic --as-user <userId>`
 
 It names the isolation, the path, and the command. A first-run user cannot mistake it for
 a bug. The adapter gap reads equally well.
 
 ## T3 — what blocks it
 
-`shrdlu` has no codex credential, and the runbook is explicit that the gateway needs its
+`linux-runner` has no codex credential, and the runbook is explicit that the gateway needs its
 own onboarding for the leg's harness. Onboarding is interactive device auth. Copying from
-eezo is forbidden (SATELLITE.md). So T3a/T3b/N1/N2 are blocked on one human step:
+mac-runner is forbidden (SATELLITE.md). So T3a/T3b/N1/N2 are blocked on one human step:
 
-    # on shrdlu
+    # on linux-runner
     tightbeam onboard openai --as-user <id>
 
-Preconditions otherwise hold: `clu@eurisko` reachable with codex auth and node v22.22.2,
+Preconditions otherwise hold: `clu@remote-host` reachable with codex auth and node v22.22.2,
 `clu@eliza` reachable, merged main checked out at `~/src/tb-main-gate`, port 12100 free.
 
 **N3 ran and passed.** Gateway booted from a PATH with no harness CLI: refuses by name,

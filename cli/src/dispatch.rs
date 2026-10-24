@@ -3221,13 +3221,13 @@ mod tests {
                 "--context",
                 "1m",
                 "--host",
-                "eezo",
+                "mac-runner",
                 "--key",
                 "k1",
                 "--as-user",
                 "flynn"
             ]),
-            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","effort":"high","context":"1m","handle":"reviewer","host":"eezo"}}"#
+            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","effort":"high","context":"1m","handle":"reviewer","host":"mac-runner"}}"#
         );
 
         // A flag NAMED but left empty is a real selection — "the vendor's
@@ -3524,11 +3524,11 @@ mod tests {
                 "--kind",
                 "completion",
                 "--commit-refs",
-                r#"[{"repo":"eezo:/src/repo","commit":"abc123"}]"#,
+                r#"[{"repo":"mac-runner:/src/repo","commit":"abc123"}]"#,
                 "--as",
                 "builder",
             ]),
-            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","commitRefs":[{"commit":"abc123","repo":"eezo:/src/repo"}]}}"#
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","commitRefs":[{"commit":"abc123","repo":"mac-runner:/src/repo"}]}}"#
         );
     }
 
@@ -3910,39 +3910,39 @@ mod tests {
             body(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "build-host",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR=example",
                 "--as",
                 "operator",
             ]),
-            r#"{"as":"operator","verb":"host-env-set","params":{"host":"gibson","harness":"claude","name":"EXAMPLE_OVERLAY_VAR","value":"example"}}"#
+            r#"{"as":"operator","verb":"host-env-set","params":{"host":"build-host","harness":"claude","name":"EXAMPLE_OVERLAY_VAR","value":"example"}}"#
         );
         assert_eq!(
             body(&[
                 "host-env-list",
                 "--host",
-                "gibson",
+                "build-host",
                 "--harness",
                 "claude",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"host-env-list","params":{"host":"gibson","harness":"claude"}}"#
+            r#"{"asUser":"flynn","verb":"host-env-list","params":{"host":"build-host","harness":"claude"}}"#
         );
         assert_eq!(
             body(&[
                 "host-env-unset",
                 "--host",
-                "gibson",
+                "build-host",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"host-env-unset","params":{"host":"gibson","harness":"claude","name":"EXAMPLE_OVERLAY_VAR"}}"#
+            r#"{"asUser":"flynn","verb":"host-env-unset","params":{"host":"build-host","harness":"claude","name":"EXAMPLE_OVERLAY_VAR"}}"#
         );
     }
 
@@ -4131,7 +4131,7 @@ mod tests {
             })
         );
 
-        // The shrdlu failure, as a test: with TIGHTBEAM_BASE_DIR naming the org --
+        // The linux-runner failure, as a test: with TIGHTBEAM_BASE_DIR naming the org --
         // the variable the README documents and both service units set -- discovery
         // must read THAT gateway.json. It read ~/.tightbeam's instead, so `tightbeam
         // onboard` dialled a pre-existing org's port while its own gateway served
@@ -4218,7 +4218,7 @@ mod tests {
 
     // RECORDED REALITY, not a chosen fixture: `Placement.provision_endpoint` writes
     // TIGHTBEAM_ADVERTISED_URL verbatim, and that value is the WEBSOCKET url -- in
-    // production, `ws://shrdlu:11373`. This base is the root of an HTTP path
+    // production, `ws://linux-runner:11373`. This base is the root of an HTTP path
     // (`/agent/dispatch`), and the http client rejects the scheme outright with
     // "Unknown Scheme: unknown scheme 'ws'", so every satellite ceremony died on the
     // one url a real gateway ever writes. The sibling fixtures above hardcode
@@ -4426,11 +4426,11 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("tightbeam_cli_session_ws_{unique}"));
         let cases = [
-            ("ws", "ws://gibson:11373", "http://gibson:11373"),
-            ("wss", "wss://gibson:11373", "https://gibson:11373"),
+            ("ws", "ws://build-host:11373", "http://build-host:11373"),
+            ("wss", "wss://build-host:11373", "https://build-host:11373"),
             // http and https are already the dispatch scheme and pass through whole.
-            ("http", "http://gibson:11373", "http://gibson:11373"),
-            ("https", "https://gibson:11373", "https://gibson:11373"),
+            ("http", "http://build-host:11373", "http://build-host:11373"),
+            ("https", "https://build-host:11373", "https://build-host:11373"),
         ];
         for (name, written, expected) in cases {
             let dir = root.join(name);

@@ -2027,7 +2027,7 @@ defmodule Tightbeam.Wire.RouterTest do
       with_handler(ctx.opts, "spawn", fn _call ->
         Placement.workdir_path(
           %{base_dir: ctx.base_dir, db: ctx.db},
-          %{session_key: "vanished-session", host: "eurisko", harness: "codex"}
+          %{session_key: "vanished-session", host: "remote-host", harness: "codex"}
         )
       end)
 
@@ -2049,7 +2049,7 @@ defmodule Tightbeam.Wire.RouterTest do
              "error" => %{
                "code" => "unknown_host",
                "message" =>
-                 "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> --name eurisko --as-user <adminUserId>"
+                 "host remote-host is not configured for codex; run tightbeam assimilate <ssh-dest> --name remote-host --as-user <adminUserId>"
              }
            }
   end

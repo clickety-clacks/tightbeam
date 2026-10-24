@@ -294,24 +294,24 @@ defmodule Tightbeam.ConditionFactsTest do
     assert {:error, %{code: "reserved_kind"}} =
              ConditionFacts.file(ctx.db, ctx.scheduler, %{
                kind: "credential-present",
-               scope: "gibson:anthropic",
+               scope: "build-host:anthropic",
                origin: "agent:someone"
              })
 
     filed =
       ConditionFacts.file(ctx.db, ctx.scheduler, %{
         kind: "credential-present",
-        scope: "gibson:anthropic",
+        scope: "build-host:anthropic",
         origin: "process:tightbeam"
       })
 
     assert filed.kind == "credential-present"
-    assert filed.scope == "gibson:anthropic"
+    assert filed.scope == "build-host:anthropic"
 
     # It is an occurrence, not a standing pair: asking standing?/3 of it is a
     # category error, so it must not have been mistaken for a retractable flag.
     assert_raise KeyError, fn ->
-      ConditionFacts.standing?(ctx.db, "credential-present", "gibson:anthropic")
+      ConditionFacts.standing?(ctx.db, "credential-present", "build-host:anthropic")
     end
   end
 
@@ -638,27 +638,27 @@ defmodule Tightbeam.ConditionFactsTest do
   end
 
   test "shared harness health keeps auth and rate-limit standing states distinct", ctx do
-    scope = ConditionFacts.harness_scope("claude", "gibson")
-    assert scope == JSON.encode!(["claude", "gibson"])
+    scope = ConditionFacts.harness_scope("claude", "build-host")
+    assert scope == JSON.encode!(["claude", "build-host"])
 
     assert {:ok, %{kind: "harness-auth-dead", scope: ^scope}} =
              DB.transaction(ctx.db, fn txn ->
                ConditionFacts.file_harness_health_in_txn(
                  txn,
                  "claude",
-                 "gibson",
+                 "build-host",
                  "auth-dead",
                  :assert
                )
              end)
 
-    assert ConditionFacts.harness_unavailable?(ctx.db, "claude", "gibson")
-    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "auth-dead")
+    assert ConditionFacts.harness_unavailable?(ctx.db, "claude", "build-host")
+    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "build-host", "auth-dead")
 
     refute ConditionFacts.harness_failure_standing?(
              ctx.db,
              "claude",
-             "gibson",
+             "build-host",
              "rate-limit-dead"
            )
 
@@ -667,7 +667,7 @@ defmodule Tightbeam.ConditionFactsTest do
                ConditionFacts.file_harness_health_in_txn(
                  txn,
                  "claude",
-                 "gibson",
+                 "build-host",
                  "rate-limit-dead",
                  :assert
                )
@@ -678,21 +678,21 @@ defmodule Tightbeam.ConditionFactsTest do
                ConditionFacts.file_harness_health_in_txn(
                  txn,
                  "claude",
-                 "gibson",
+                 "build-host",
                  "auth-dead",
                  :retract
                )
              end)
 
-    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "auth-dead")
-    assert ConditionFacts.harness_unavailable?(ctx.db, "claude", "gibson")
+    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "build-host", "auth-dead")
+    assert ConditionFacts.harness_unavailable?(ctx.db, "claude", "build-host")
   end
 
   test "only the substrate may file reserved harness health facts", ctx do
     assert {:error, %{code: "reserved_kind"}} =
              ConditionFacts.file(ctx.db, ctx.scheduler, %{
                kind: "harness-auth-dead",
-               scope: ConditionFacts.harness_scope("claude", "gibson"),
+               scope: ConditionFacts.harness_scope("claude", "build-host"),
                origin: "agent:observer"
              })
   end

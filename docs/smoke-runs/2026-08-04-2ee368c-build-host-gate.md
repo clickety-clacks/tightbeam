@@ -1,14 +1,14 @@
-# e2e run — 2026-08-04 @ 2ee368c (the Gibson gate)
+# e2e run — 2026-08-04 @ 2ee368c (the build-host gate)
 
 Operator: Claude (overnight, unattended) · Trigger: Flynn — "do whatever else is needed
-to get to gibson. i'm going to bed so you have all night to fix whatever."
+to get to build-host. i'm going to bed so you have all night to fix whatever."
 
 ## Verdicts
 
 | tier | verdict | note |
 |---|---|---|
-| T1 suites, eezo | PASS | mix 1319 + 9 doctests, cargo 214, zero failures |
-| T1 suites, shrdlu (GATING) | PASS | mix 1317 + 9 doctests, cargo 214, zero failures, at 8556caa |
+| T1 suites, mac-runner | PASS | mix 1319 + 9 doctests, cargo 214, zero failures |
+| T1 suites, linux-runner (GATING) | PASS | mix 1317 + 9 doctests, cargo 214, zero failures, at 8556caa |
 | T4 soak, 60 min | **PASS** | A1–A5 all green. 29 kills, 29 recovered, 250 loads, 0 load errors, 0 unexpected exits |
 | Release runtime (npm) | PASS | installed from the tarball, booted READY, and **ran a real turn** |
 | Code review | 4 rounds, cleared | 9 blocking findings across the npm/boot work, all confirmed and fixed |
@@ -134,7 +134,7 @@ are in ROADMAP.
 
 ## The npm release, proven by using it
 
-Flynn's ruling stands: no special docs or tools for Gibson — install per the README like
+Flynn's ruling stands: no special docs or tools for build-host — install per the README like
 any other user. So the README now documents the release-package path beside the source
 build, with prerequisites split between them (the package drops Elixir, Rust, Hex/rebar
 and the C toolchain; it still needs node, git and a harness CLI).
@@ -144,7 +144,7 @@ Proven end to end on this box, from the built tarball only:
     npm install -g ./tightbeam-0.1.0-darwin-aarch64.tgz
     tightbeam --version                → 0.1.0
     tightbeam-gateway                  → seeds identity, creates state.db,
-                                         "READY: claude on eezo can run turns"
+                                         "READY: claude on mac-runner can run turns"
     tightbeam spawn / wake             → assistant reply: "RELEASE RUNTIME OK"
 
 That last line is the one that mattered: a real turn, through the bundled ERTS, with no
@@ -160,13 +160,13 @@ root manifest, and no checkout can supply a compiled runtime.
 
 The release takes a fixed Erlang node name, so a second instance dies with
 
-    Protocol 'inet_tcp': the name tightbeam_gateway@eezo seems to be in use by
+    Protocol 'inet_tcp': the name tightbeam_gateway@mac-runner seems to be in use by
     another Erlang node
 
 which names neither Tightbeam, nor the port, nor the base dir, nor the other instance. I
-hit it because my own earlier probe was still running. Not a Gibson blocker — Gibson runs
+hit it because my own earlier probe was still running. Not a build-host blocker — build-host runs
 one — but it is a T-CONSPICUOUS defect on precisely the path a second tenant hits, which
-is the TARS shape. In ROADMAP.
+is the mac-host shape. In ROADMAP.
 
 ## Rails
 
@@ -210,7 +210,7 @@ steps toward confidence were wrong.
 What measurement does support, taken afterwards: node's `fetch` to that endpoint really
 does fail intermittently from this box — 2 ETIMEDOUT in 400 attempts, each completing in
 ~282ms — while curl over IPv4 never failed once. The host advertises an IPv6 address,
-node resolves both families, and IPv6 egress to it is dead from eezo. That ~282ms sits
+node resolves both families, and IPv6 egress to it is dead from mac-runner. That ~282ms sits
 close enough to node's 250ms happy-eyeballs attempt timeout to be worth naming, but the
 controlled test was INCONCLUSIVE — 400 attempts with family autoselection on gave 2
 failures, 400 with it off gave 0, and 2 versus 0 is not a result. It is in the record as

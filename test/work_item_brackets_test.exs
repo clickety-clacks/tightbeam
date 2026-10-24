@@ -64,7 +64,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "eezo" => %{
+      "mac-runner" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -1104,7 +1104,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "eezo"
+      host: "mac-runner"
     })
   end
 end

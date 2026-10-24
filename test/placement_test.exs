@@ -119,9 +119,9 @@ defmodule Tightbeam.PlacementTest do
     assert Placement.resolve(archetype, "work-1", hosts) == {:ok, "work-1"}
 
     assert {:error, %{code: "host_not_allowed", message: message}} =
-             Placement.resolve(archetype, "tars", hosts)
+             Placement.resolve(archetype, "mac-host", hosts)
 
-    assert message =~ "tars"
+    assert message =~ "mac-host"
     assert message =~ "work-1, work-2"
 
     assert {:error, %{code: "unknown_host", message: unknown}} =
@@ -169,12 +169,12 @@ defmodule Tightbeam.PlacementTest do
     db: db
   } do
     register_hosts(db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/tightbeam", cli_bin: nil}
+      "remote-host" => %{ssh: "remote-host", base_dir: "/srv/tightbeam", cli_bin: nil}
     })
 
     session = %{
       session_key: "remote-session",
-      host: "eurisko",
+      host: "remote-host",
       harness: "claude",
       cli_token: "secret"
     }
@@ -182,7 +182,7 @@ defmodule Tightbeam.PlacementTest do
     remote_workdir = Placement.workdir_path(%{base_dir: base_dir, db: db}, session)
     assert String.starts_with?(remote_workdir, "/srv/tightbeam/work/")
 
-    :ok = DB.execute(db, "DELETE FROM hosts WHERE name='eurisko'")
+    :ok = DB.execute(db, "DELETE FROM hosts WHERE name='remote-host'")
 
     {error, stacktrace} =
       try do
@@ -193,10 +193,10 @@ defmodule Tightbeam.PlacementTest do
       end
 
     assert error.code == "unknown_host"
-    assert error.host == "eurisko"
+    assert error.host == "remote-host"
     assert error.harness == "claude"
-    assert error.message =~ "host eurisko is not configured for claude"
-    assert error.message =~ "tightbeam assimilate <ssh-dest> --name eurisko"
+    assert error.message =~ "host remote-host is not configured for claude"
+    assert error.message =~ "tightbeam assimilate <ssh-dest> --name remote-host"
     assert {Placement, :workdir_path, 2, _location} = Enum.at(stacktrace, 1)
     refute File.exists?(Path.join(base_dir, "work"))
   end
@@ -206,17 +206,17 @@ defmodule Tightbeam.PlacementTest do
     db: db
   } do
     register_hosts(db, %{
-      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/tightbeam", cli_bin: nil}
+      "remote-host" => %{ssh: "remote-host", base_dir: "/srv/tightbeam", cli_bin: nil}
     })
 
     session = %{
       session_key: "remote-holder",
-      host: "eurisko",
+      host: "remote-host",
       harness: "codex",
       cli_token: "secret"
     }
 
-    :ok = DB.execute(db, "DELETE FROM hosts WHERE name='eurisko'")
+    :ok = DB.execute(db, "DELETE FROM hosts WHERE name='remote-host'")
 
     {error, stacktrace} =
       try do
@@ -227,10 +227,10 @@ defmodule Tightbeam.PlacementTest do
       end
 
     assert error.code == "unknown_host"
-    assert error.host == "eurisko"
+    assert error.host == "remote-host"
     assert error.harness == "codex"
-    assert error.message =~ "host eurisko is not configured for codex"
-    assert error.message =~ "tightbeam assimilate <ssh-dest> --name eurisko"
+    assert error.message =~ "host remote-host is not configured for codex"
+    assert error.message =~ "tightbeam assimilate <ssh-dest> --name remote-host"
     assert {Placement, :holder_workdir, 2, _location} = Enum.at(stacktrace, 1)
     refute File.exists?(Path.join(base_dir, "work"))
   end
@@ -241,14 +241,14 @@ defmodule Tightbeam.PlacementTest do
   } do
     session = %{
       session_key: "vanished-materialization",
-      host: "eurisko",
+      host: "remote-host",
       harness: "codex",
       cli_token: "secret"
     }
 
     expected =
-      "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> " <>
-        "--name eurisko --as-user <adminUserId>"
+      "host remote-host is not configured for codex; run tightbeam assimilate <ssh-dest> " <>
+        "--name remote-host --as-user <adminUserId>"
 
     error =
       assert_raise Placement.Refusal, fn ->
@@ -267,11 +267,11 @@ defmodule Tightbeam.PlacementTest do
     base_dir: base_dir,
     db: db
   } do
-    session = %{session_key: "vanished-effort", host: "eurisko", harness: "claude"}
+    session = %{session_key: "vanished-effort", host: "remote-host", harness: "claude"}
 
     expected =
-      "host eurisko is not configured for claude; run tightbeam assimilate <ssh-dest> " <>
-        "--name eurisko --as-user <adminUserId>"
+      "host remote-host is not configured for claude; run tightbeam assimilate <ssh-dest> " <>
+        "--name remote-host --as-user <adminUserId>"
 
     error =
       assert_raise Placement.Refusal, fn ->
@@ -857,7 +857,7 @@ defmodule Tightbeam.PlacementTest do
   test "an overlay is isolated by both host and harness", %{base_dir: base_dir, db: db} do
     Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
 
-    for host <- ["gibson", "other-host"] do
+    for host <- ["build-host", "other-host"] do
       assert {:ok, _} =
                Placement.register_host(db, host, %{
                  ssh: host,
@@ -869,7 +869,7 @@ defmodule Tightbeam.PlacementTest do
     assert {:ok, _row} =
              Placement.set_env_overlay(
                db,
-               "gibson",
+               "build-host",
                "claude",
                "EXAMPLE_OVERLAY_VAR",
                "isolated",
@@ -892,8 +892,8 @@ defmodule Tightbeam.PlacementTest do
       sh: sh
     }
 
-    gibson_claude = Placement.adapter_opts(config, {:claude, "default", "gibson"})[:cmd]
-    gibson_codex = Placement.adapter_opts(config, {:codex, "default", "gibson"})[:cmd]
+    gibson_claude = Placement.adapter_opts(config, {:claude, "default", "build-host"})[:cmd]
+    gibson_codex = Placement.adapter_opts(config, {:codex, "default", "build-host"})[:cmd]
     other_claude = Placement.adapter_opts(config, {:claude, "default", "other-host"})[:cmd]
 
     assert "EXAMPLE_OVERLAY_VAR='isolated'" in gibson_claude

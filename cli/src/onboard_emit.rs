@@ -340,7 +340,7 @@ mod tests {
         };
         let line = structured_line(
             "openai",
-            "shrdlu",
+            "linux-runner",
             &deliverable,
             Some("w_1"),
             Some("/w/onboard-delivery-openai-1.json"),
@@ -349,7 +349,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid json");
         let d = &parsed["onboardingDelivery"];
         assert_eq!(d["provider"], "openai");
-        assert_eq!(d["machine"], "shrdlu");
+        assert_eq!(d["machine"], "linux-runner");
         assert_eq!(d["kind"], "device_code");
         assert_eq!(d["url"], "https://auth.openai.com/codex/device");
         assert_eq!(d["code"], "VG6S-L35ON");
@@ -362,7 +362,7 @@ mod tests {
         let deliverable = Deliverable::SignInUrl {
             url: "https://claude.ai/oauth/authorize?x=1".to_owned(),
         };
-        let line = structured_line("anthropic", "shrdlu", &deliverable, None, None);
+        let line = structured_line("anthropic", "linux-runner", &deliverable, None, None);
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid json");
         let d = &parsed["onboardingDelivery"];
         assert_eq!(d["kind"], "paste_back");
@@ -382,7 +382,7 @@ mod tests {
         };
         let file = delivery_file_json(
             "openai",
-            "shrdlu",
+            "linux-runner",
             &deliverable,
             1000,
             Some(901_000),
@@ -406,7 +406,7 @@ mod tests {
         let notified = Notified::NotNotified {
             reason: "gateway did not supply ownerUserId".to_owned(),
         };
-        let file = delivery_file_json("anthropic", "shrdlu", &deliverable, 5, None, &notified);
+        let file = delivery_file_json("anthropic", "linux-runner", &deliverable, 5, None, &notified);
         let parsed: serde_json::Value = serde_json::from_str(&file).expect("valid json");
         let n = &parsed["onboardingDelivery"]["notification"];
         assert_eq!(n["notified"], false);

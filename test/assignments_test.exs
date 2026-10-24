@@ -25,7 +25,7 @@ defmodule Tightbeam.AssignmentsTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "eezo" => %{
+      "mac-runner" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -2449,7 +2449,7 @@ defmodule Tightbeam.AssignmentsTest do
     refute Map.has_key?(notice["payload"], "priority")
 
     catalog = %{
-      {"eezo", "claude"} => [
+      {"mac-runner", "claude"} => [
         %{family: "fable", context: "1m", efforts: ["medium"], provider: :anthropic}
       ]
     }
@@ -2496,7 +2496,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "completion and historical surrender notices use the exact shared assignment bytes", ctx do
     catalog = %{
-      {"eezo", "claude"} => [
+      {"mac-runner", "claude"} => [
         %{family: "fable", context: "1m", efforts: ["medium"], provider: :anthropic}
       ]
     }
@@ -3810,7 +3810,7 @@ defmodule Tightbeam.AssignmentsTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "eezo"
+      host: "mac-runner"
     }
 
     Org.create(db, Map.merge(input, overrides))

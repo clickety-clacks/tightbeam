@@ -138,7 +138,7 @@ defmodule Tightbeam.ReadinessTest do
   end
 
   test "a ready install with NO service manager says so — the install is not finished", ctx do
-    # The gap that cost a production host its uptime and its crash log (gibson,
+    # The gap that cost a production host its uptime and its crash log (build-host,
     # 2026-08-05): a gateway running foreground in tmux does not survive a
     # reboot, and its `tee` log truncates on restart, so the run you need after
     # a crash is destroyed by the restart. READY is exactly when an operator
@@ -332,7 +332,7 @@ defmodule Tightbeam.ReadinessTest do
 
     archetypes = %{
       "default" => %{name: "default", where: ["testhost"]},
-      "recon" => %{name: "recon", where: ["eezo", "racter"]}
+      "recon" => %{name: "recon", where: ["mac-runner", "remote-runner"]}
     }
 
     lines =
@@ -342,8 +342,8 @@ defmodule Tightbeam.ReadinessTest do
 
     line = Enum.find(lines, &(&1 =~ "archetype recon"))
     assert line, "the dangling archetype must be named"
-    assert line =~ "eezo"
-    assert line =~ "racter"
+    assert line =~ "mac-runner"
+    assert line =~ "remote-runner"
     assert line =~ "cannot be placed"
     refute Enum.any?(lines, &(&1 =~ "archetype default"))
   end
@@ -354,7 +354,7 @@ defmodule Tightbeam.ReadinessTest do
     catalog = catalog!(%{})
 
     archetypes = %{
-      "mixed" => %{name: "mixed", where: ["testhost", "eezo"]},
+      "mixed" => %{name: "mixed", where: ["testhost", "mac-runner"]},
       "roamer" => %{name: "roamer", where: ["*"]}
     }
 
@@ -462,7 +462,7 @@ defmodule Tightbeam.ReadinessTest do
   ## Executability is a distinct axis (O5/I6), and the pre-expiry absence is named (O7/I8)
 
   # AC5, the real fail-before: with the vendor CLI installed but unable to
-  # execute (the gibson codex-as-`.js`-without-node incident), boot said only
+  # execute (the build-host codex-as-`.js`-without-node incident), boot said only
   # "Tightbeam has no credential for openai" — true and useless, since onboarding
   # a credential cannot start a binary that cannot run. Readiness must name the
   # EXECUTABILITY gap and must NOT lead with the credential remedy.

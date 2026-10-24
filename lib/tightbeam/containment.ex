@@ -46,7 +46,7 @@ defmodule Tightbeam.Containment do
   # silently widened rail profiles by
   # `/private/tmp`; on linux it granted `/dev`, and `/dev/shm` is world-writable tmpfs —
   # a DURABLE write channel outside the scratch root, surviving the scratch rm_rf. Proven
-  # on shrdlu: a rail script under a real rail profile wrote /dev/shm and returned PASS.
+  # on linux-runner: a rail script under a real rail profile wrote /dev/shm and returned PASS.
   #
   # `/dev/null` is granted deliberately and is the only fixed grant: `>/dev/null` is in
   # shipped conformance rail scripts (c5_script_guards), so the need is measured rather

@@ -1236,7 +1236,7 @@ defmodule Tightbeam.ModelCatalogTest do
       {local, :fresh} = ModelCatalog.get(@host, "claude", catalog)
       refute Enum.any?(local, &(&1.family == "satellite-only"))
 
-      # The eurisko method: the credential is read by the shell ON the owning
+      # The remote-host method: the credential is read by the shell ON the owning
       # host, so no byte of it is in the argv, and each script says so literally.
       # The shell variable is `credential`, not `token`: this file holds whichever
       # KIND the host was onboarded on.
@@ -1553,11 +1553,11 @@ defmodule Tightbeam.ModelCatalogTest do
 
       # Only selectable models survive, and the fixture's refused ones are gone.
       assert "claude-haiku-4-5-20251001" in families
-      # Re-measured 2026-08-06 on gibson (production grant): a pin-probed home
+      # Re-measured 2026-08-06 on build-host (production grant): a pin-probed home
       # offered and accepted claude-opus-5 and it answered a live prompt — the
       # earlier REJECTED row was the default-pin vocabulary, not the grant.
       assert "claude-opus-5" in families
-      # Re-measured 2026-08-05 on gibson (CLI 2.1.221, production grant):
+      # Re-measured 2026-08-05 on build-host (CLI 2.1.221, production grant):
       # fable answers a real prompt; the July REJECTED row was one
       # environment's snapshot. Fable is now offered.
       assert "claude-fable-5" in families
@@ -1786,7 +1786,7 @@ defmodule Tightbeam.ModelCatalogTest do
       assert_receive {:fetch_started, 2}, 2_000
     end
 
-    # The eezo production repro (orchestrator, 2026-08-06): a CLEAN one-shot
+    # The mac-runner production repro (orchestrator, 2026-08-06): a CLEAN one-shot
     # ceremony, yet placement refused with `:in_progress` MINUTES after `status`
     # read onboarded. `credential_status/2` returns `:in_progress` only while the
     # onboarding lease stands (credentials.ex), and `finish_onboard` clears the

@@ -1,13 +1,13 @@
 # Test-host runbook — smoke on the real operator account
 
-How the production-install smoke runs on shrdlu, tars, and any other real test host.
+How the production-install smoke runs on linux-runner, mac-host, and any other real test host.
 This is **test setup**, not part of any customer procedure, and it must never be
 confused with one.
 
 ## The rule: run as the account that will really run it
 
-**Run the smoke under the intended permanent service/operator account.** On shrdlu
-that is **`clu`**; on tars it is **`mike`**. Not a purpose-made account.
+**Run the smoke under the intended permanent service/operator account.** On linux-runner
+that is **`clu`**; on mac-host it is **`mike`**. Not a purpose-made account.
 
 This is not convenience — it is the only way the test measures the thing that
 ships. Tightbeam installs as a **system service** (see
@@ -127,7 +127,7 @@ functional and system test sequence against that installation; the install is th
 thing the rest of the run is performed on, so tearing it down ends the run early
 and destroys the only environment those tests have. Uninstall is not a product
 proof and is not a smoke gate (Flynn, 2026-07-28). Earlier revisions of this
-runbook required it as phase 4, which is why a working shrdlu install came within
+runbook required it as phase 4, which is why a working linux-runner install came within
 one step of being deleted while functional coverage was still outstanding.
 
 Clean only **temporary test artifacts that are not part of the installed
@@ -144,7 +144,7 @@ box to tidy up breaks unrelated work; if you want provenance on record, record i
 rather than acting on it. If provenance is ambiguous, **report it and leave it**.
 
 **Confirm unrelated state survived** — the operator account, its own credentials,
-and every unrelated service. On shrdlu that means openclaw-gateway,
+and every unrelated service. On linux-runner that means openclaw-gateway,
 subspace-daemon, postgresql and docker still `active`.
 
 **Never delete or reset the operator account.** There is no account teardown.
@@ -156,15 +156,15 @@ instruction — that is a deliberate, separately-authorized step, not this one.
 
 ## Host-specific notes
 
-- **shrdlu** — linux gateway testing, operator account `clu`. Runs unrelated
+- **linux-runner** — linux gateway testing, operator account `clu`. Runs unrelated
   workloads (openclaw-gateway, subspace-daemon, postgresql@16, docker) that must
   be verified `active` before and after. Reboots are permitted when the operator
   has confirmed nothing in flight matters.
-- **tars** — macOS gateway testing, operator account `mike`. Sanctioned for gateway
+- **mac-host** — macOS gateway testing, operator account `mike`. Sanctioned for gateway
   testing by the topology assignment, but **no CLU development artifacts**: keep
   everything inside the run's `base_dir` and clean up after.
-- **eurisko / eliza** — linux satellites, freely reinstallable.
-- **gibson** — production. NOT a test host. Nothing installs there until shrdlu and
-  tars have passed the full sequence. It runs a **llama-server** inference service
+- **remote-host / eliza** — linux satellites, freely reinstallable.
+- **build-host** — production. NOT a test host. Nothing installs there until linux-runner and
+  mac-host have passed the full sequence. It runs a **llama-server** inference service
   on the GPU that must never be disturbed.
 - Reachable over the tailnet; see the environment map for addresses.

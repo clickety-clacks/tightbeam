@@ -391,7 +391,7 @@ flag, accepted). Also introduced proper boolean flags in the arg parser
 (fixes latent --demote arg-swallowing). Review: contract-faithful; quoted-
 heredoc shim correct; argv-only exec throughout. Gate outside sol's sandbox:
 tsc clean, 84/84 TS tests pass, help entry verified, dry-run smoke against
-a REAL remote (tars) emitted the exact command sequence. TS repo commit
+a REAL remote (mac-host) emitted the exact command sequence. TS repo commit
 89c3063 (repo is local-only; no remote configured).
 
 ## where wildcard (Fable)
@@ -520,15 +520,15 @@ graceful path is an optimization, the crash path remains the guarantee.
 SIGTERM (kill <pid>) triggers it; kill -9 skips it by nature, covered by
 recovery + terminal publisher. Deploy SOP: plain kill, wait for exit, start.
 
-## Smoke run #1 — sim (eezo) vs BEAM gateway on SHRDLU (Fable)
+## Smoke run #1 — sim (mac-runner) vs BEAM gateway on linux-runner (Fable)
 
 First execution of docs/SMOKE.md, and the first fully cross-machine
-deployment: gateway + adapter + agent shell on shrdlu (Ubuntu x86_64,
-Erlang/Elixir via mise), driven by the real Clawline iOS client in the eezo
+deployment: gateway + adapter + agent shell on linux-runner (Ubuntu x86_64,
+Erlang/Elixir via mise), driven by the real Clawline iOS client in the mac-runner
 simulator. Gateway @ dc7a788+; client build Jul 15.
 
 PASS: §0 pair/first-user-admin; §1 converse + tool use (assistant quoted
-"Linux shrdlu 6.8.0-134-generic" — the agent's hands demonstrably on the
+"Linux linux-runner 6.8.0-134-generic" — the agent's hands demonstrably on the
 work machine); §2 spawn (org-shape discovery incl archetypes/hosts/models)
 + rename + retire (soft; messages survive); §3 cancel mid-turn (verb path;
 this client build has no stop control — ⌥); §4 queueing ONE/TWO/THREE in
@@ -548,7 +548,7 @@ Findings for follow-up:
   snapshot cadence); frames verified by tests. Sim autocorrect mangles
   typed commands ("uname"→"inane" — which the agent then correctly ran and
   reported as not found, inadvertently proving tool execution).
-- OTP 28.0.2 on shrdlu logs a "use 28.1+" warning at boot — upgrade when
+- OTP 28.0.2 on linux-runner logs a "use 28.1+" warning at boot — upgrade when
   convenient. pgrep-based process watching self-matches; use port/pid.
 
 Correction to smoke run #1: the "client silently drops posts while socket
@@ -733,7 +733,7 @@ E2E assembly probe (Flynn: "you tested in a new session that these skills
 and guidance are assembled correctly and tested custom sample skills and
 guidance fragments?"). Authored operator material: custom fragment with a
 RECURSIVE #include (probe-fragment → probe-inner), a custom skill TREE via
-skill-put (probe-subject + probe-subject/technique, both pushed to tars),
+skill-put (probe-subject + probe-subject/technique, both pushed to mac-host),
 and a probe.toml archetype electing [probe-subject, tightbeam-skills] with
 #include in its [guidance]. Restart → spawn fresh "Assembly Probe" session
 → quiz. ALL PASS: both fragment markers quoted from context (recursive
@@ -742,29 +742,29 @@ nested tree file read from inside the home and its marker quoted. Home
 bytes confirmed both markers; skills dir linked exactly the elected two.
 Observation: the harness surfaces its OWN built-in skill set (init,
 review, security-review, deep-research, ...) alongside ours — harness-
-native, NOT a leak of eezo's personal ~/.claude skills (none of those
-appeared). Probe artifacts fully cleaned after (retire, rm skill w/ tars
+native, NOT a leak of mac-runner's personal ~/.claude skills (none of those
+appeared). Probe artifacts fully cleaned after (retire, rm skill w/ mac-host
 push, fragments+toml deleted, restart).
 
-Rails v1 shipped and live-fired on SHRDLU (per Flynn: testing belongs
+Rails v1 shipped and live-fired on linux-runner (per Flynn: testing belongs
 there, not on mike:main). Build: sol (gpt-5.6-sol high) against
 shared/specs/tightbeam/rails-v1-implementation.md — one dispatch, all six
 authorized files, gate green in well under the ceiling; review found one
 defect IN THE SPEC (byte-pinned stop_hook_active guard assumed compact
 JSON — a vendor formatting change would have left turns unable to end;
-guard made whitespace-tolerant in code/tests/spec). Shrdlu verification:
+guard made whitespace-tolerant in code/tests/spec). linux-runner verification:
 fresh gateway + statutes.toml; claude home settings.json carries both
 hooks byte-correct; CLAUDE.md and codex AGENTS.md carry Standing law;
 codex gets no settings.json. Native claude -p inside the projected home:
 UserPromptSubmit injection CONFIRMED in the user turn (model quoted
 "[standing law: announce-new-work] ..." verbatim, named the mechanism);
 Stop hook bounced once, model addressed ticket-on-done, turn ENDED (loop
-guard released). Bonus: [turn failed] markers fired on shrdlu too. Found
-in the wild again: shrdlu's harvested smoke-era claude creds are DEAD —
+guard released). Bonus: [turn failed] markers fired on linux-runner too. Found
+in the wild again: linux-runner's harvested smoke-era claude creds are DEAD —
 the leftover smoke gateways rotated the lineage (the rotation war,
 sighting #2); ACP turns failed with auth-masked "Invalid value for config
-option model" until a transient env token was used. Shrdlu needs the
-setup ceremony before becoming a real host. All my shrdlu test gateways
+option model" until a transient env token was used. linux-runner needs the
+setup ceremony before becoming a real host. All my linux-runner test gateways
 stopped after the run.
 
 RAILS CORRECTED PER FLYNN — THE INVARIANT. On seeing the remind tier:
@@ -784,15 +784,15 @@ execution. Pinned torture test caught a real bug: backslash must be
 escaped first or \$HOME in a pattern expands at hook runtime. Invariant
 test pins guidance byte-identical with/without statutes.
 
-SHRDLU LIVE FIRE, the proof: model with --dangerously-skip-permissions
+linux-runner LIVE FIRE, the proof: model with --dangerously-skip-permissions
 ordered to run `git reset --hard HEAD` — the RUNTIME refused it
 (PreToolUse exit 2), the model received "[gate: no-history-rewrites]..."
 as the denial reason and reported "The command was refused by a pre-tool
 hook, not by me"; git status then ran normally; the repo was untouched.
 Deterministic enforcement, no inference in the loop. 115 tests.
 
-REMOTE PLACEMENT VALIDATED (loopback satellite — Flynn: tars is not a code
-blocker). Scratch gateway on eezo placing a session on "loopsat" (ssh to
+REMOTE PLACEMENT VALIDATED (loopback satellite — Flynn: mac-host is not a code
+blocker). Scratch gateway on mac-runner placing a session on "loopsat" (ssh to
 self, distinct base_dir): home staged+rsync'd, skills replica synced, auth
 linked, adapter ssh-wrapped, satellite token env expanded remotely, turn
 DELIVERED from the satellite workdir with the satellite home's identity.
@@ -810,7 +810,7 @@ completed on opus to keep vendor flakiness out of the machinery verdict.
 
 CODEX ONBOARDED + FIRST CODEX LEG (Flynn provided the grant). Login driven
 headlessly: codex login's localhost:1455 callback reverse-tunneled to
-serenity's browser (ssh -R); grant landed in the org store (auth.json,
+test-mac-host's browser (ssh -R); grant landed in the org store (auth.json,
 0600); discovered codex login --device-auth exists (hidden from --help) —
 matrix corrected, codex onboarding now ✅ headless. First codex session
 through the entire system: spawn (gpt-5.6-sol[medium]) → turn DELIVERED —

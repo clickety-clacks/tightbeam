@@ -14,7 +14,7 @@
 //! explicitly unspecified and the two platforms do not agree. A C probe that ignores
 //! SIGCHLD, `exec`s itself, then forks a child that exits and calls `waitpid`:
 //!
-//!   * linux (shrdlu, 6.x): ignore SURVIVED the exec, and `waitpid` found NO SUCH CHILD —
+//!   * linux (linux-runner, 6.x): ignore SURVIVED the exec, and `waitpid` found NO SUCH CHILD —
 //!     the kernel had already reaped it. This test is red here without the fix, in the
 //!     harshest possible form: every rail check, not merely a timing-out one, ends in the
 //!     script-error band because the wrapper never has a child to wait for.

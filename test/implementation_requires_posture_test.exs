@@ -24,7 +24,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "eezo" => %{
+      "mac-runner" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -86,7 +86,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
       archetype: archetype,
       harness: harness,
       provider: provider,
-      host: "eezo",
+      host: "mac-runner",
       model: Model.new("sonnet", effort: "medium"),
       spawned_by: nil,
       is_built_in: false

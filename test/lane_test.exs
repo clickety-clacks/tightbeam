@@ -178,8 +178,8 @@ defmodule Tightbeam.LaneTest do
     seq = enqueue!(ctx.db, "k1", "vanished host")
 
     expected =
-      "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> " <>
-        "--name eurisko --as-user <adminUserId>"
+      "host remote-host is not configured for codex; run tightbeam assimilate <ssh-dest> " <>
+        "--name remote-host --as-user <adminUserId>"
 
     {:ok, _mgr} =
       LaneManager.start_link(
@@ -189,7 +189,7 @@ defmodule Tightbeam.LaneTest do
         runner: fn _turn ->
           raise Placement.Refusal,
             code: "unknown_host",
-            host: "eurisko",
+            host: "remote-host",
             harness: "codex",
             message: expected
         end,

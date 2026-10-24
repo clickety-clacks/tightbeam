@@ -1197,7 +1197,7 @@ defmodule Tightbeam.RulesTest do
       holder.session_key,
       producer.id,
       "tests-passed",
-      "gibson:/repo abc123; mix test test/rules_test.exs; passed: 1 test"
+      "build-host:/repo abc123; mix test test/rules_test.exs; passed: 1 test"
     )
 
     assert {:ok, %{reviewsAssignmentId: ^producer_id, effectKind: "review"}} =

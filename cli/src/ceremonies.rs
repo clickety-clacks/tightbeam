@@ -2207,7 +2207,7 @@ mod tests {
             401,
             "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\
              \"message\":\"Invalid bearer token\"}}",
-            "shrdlu",
+            "linux-runner",
         );
 
         assert!(message.contains("Invalid bearer token"), "{message}");
@@ -2216,7 +2216,7 @@ mod tests {
         // Must not read as a subscription problem: `onboard` classifies the cancel
         // phase off that exact phrase, and a rejected paste is not that.
         assert!(!message.contains("no subscription"), "{message}");
-        assert!(message.contains("shrdlu"), "{message}");
+        assert!(message.contains("linux-runner"), "{message}");
         assert!(
             message.contains("Nothing was banked"),
             "the api-key path's promise, verbatim: {message}"
@@ -2236,7 +2236,7 @@ mod tests {
     /// authorization re-authorizing something that was never broken.
     #[test]
     fn an_unreachable_provider_is_not_a_verdict_on_the_token() {
-        let message = unvalidated_setup_token("dns error: failed to lookup address", "shrdlu");
+        let message = unvalidated_setup_token("dns error: failed to lookup address", "linux-runner");
 
         assert!(message.contains("could not reach anthropic"), "{message}");
         assert!(message.contains("NOT validated"), "{message}");
@@ -2250,7 +2250,7 @@ mod tests {
 
     #[test]
     fn an_api_key_network_timeout_is_not_reported_as_lease_expiry_or_rejection() {
-        let message = unvalidated_api_key("openai", "network operation timed out", "shrdlu");
+        let message = unvalidated_api_key("openai", "network operation timed out", "linux-runner");
 
         assert!(message.contains("could not reach openai"), "{message}");
         assert!(message.contains("timed out"), "{message}");
@@ -2342,7 +2342,7 @@ mod tests {
     fn a_ceremony_outliving_its_lease_is_killed_with_its_whole_group() {
         // The stub forks a GRANDCHILD and records its pid, so this asserts the whole group
         // died rather than just the process we spawned. A wrapper that killed only its
-        // direct child would leave the grandchild behind -- which is the eurisko orphan's
+        // direct child would leave the grandchild behind -- which is the remote-host orphan's
         // exact shape: `script` gone, `claude setup-token` still running.
         let marker = std::env::temp_dir().join(format!(
             "tightbeam-ceremony-watchdog-{}-{:?}",
@@ -2748,7 +2748,7 @@ mod tests {
             identity: &Identity::User("mike".to_owned()),
             send: &send,
             provider: "openai",
-            machine: Some("shrdlu"),
+            machine: Some("linux-runner"),
             owner_user_id: Some("mike".to_owned()),
         };
 
@@ -2858,7 +2858,7 @@ mod tests {
             identity: &Identity::User("mike".to_owned()),
             send: &send,
             provider: "openai",
-            machine: Some("shrdlu"),
+            machine: Some("linux-runner"),
             owner_user_id: Some("mike".to_owned()),
         };
 
@@ -2944,7 +2944,7 @@ mod tests {
             identity: &Identity::User("mike".to_owned()),
             send: &|_, _, _| panic!("a ceremony that emitted nothing must send no wake"),
             provider: "openai",
-            machine: Some("shrdlu"),
+            machine: Some("linux-runner"),
             owner_user_id: Some("mike".to_owned()),
         };
 
@@ -3062,7 +3062,7 @@ mod tests {
             identity: &Identity::User("mike".to_owned()),
             send: &send,
             provider: "openai",
-            machine: Some("shrdlu"),
+            machine: Some("linux-runner"),
             owner_user_id: Some("mike".to_owned()),
         };
         let deliverable = Deliverable::DeviceCode {
@@ -3070,7 +3070,7 @@ mod tests {
             code: "VG6S-L35ON".to_owned(),
         };
 
-        let notified = notify_operator(&ceremony, &deliverable, "shrdlu");
+        let notified = notify_operator(&ceremony, &deliverable, "linux-runner");
 
         assert_eq!(
             notified,
@@ -3106,14 +3106,14 @@ mod tests {
             identity: &Identity::Session,
             send: &send,
             provider: "openai",
-            machine: Some("shrdlu"),
+            machine: Some("linux-runner"),
             owner_user_id: None,
         };
         let deliverable = Deliverable::SignInUrl {
             url: "https://claude.ai/oauth/authorize".to_owned(),
         };
 
-        let notified = notify_operator(&ceremony, &deliverable, "shrdlu");
+        let notified = notify_operator(&ceremony, &deliverable, "linux-runner");
 
         match notified {
             Notified::NotNotified { reason } => assert!(reason.contains("ownerUserId"), "{reason}"),
@@ -4048,7 +4048,7 @@ mod tests {
 
     #[test]
     fn staging_path_reads_the_wire_shape_the_gateway_actually_sends() {
-        // Verbatim from a live gateway on shrdlu (2026-07-27), captured off the wire
+        // Verbatim from a live gateway on linux-runner (2026-07-27), captured off the wire
         // during the production-install smoke. Every response key is lower-camelCase
         // because router.ex camelizes atom keys on the way out.
         let ready: serde_json::Value = serde_json::from_str(
@@ -4144,17 +4144,17 @@ mod tests {
             let reason = require_on_path(
                 binary,
                 &empty,
-                &preflight::missing_harness_cli(binary, harness, "eurisko", &empty),
+                &preflight::missing_harness_cli(binary, harness, "remote-host", &empty),
             )
             .unwrap_err();
             assert!(reason.contains(binary), "{reason}");
-            assert!(reason.contains("eurisko"), "{reason}");
+            assert!(reason.contains("remote-host"), "{reason}");
             assert!(
                 reason.contains(&empty),
                 "the PATH searched must be shown: {reason}"
             );
             assert!(
-                reason.contains(&format!("Install {binary} on eurisko and re-run")),
+                reason.contains(&format!("Install {binary} on remote-host and re-run")),
                 "{reason}"
             );
             assert!(

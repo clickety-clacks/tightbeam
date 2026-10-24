@@ -228,8 +228,8 @@ never scored as an [E] failure. Do not correct the agent mid-run; let it finish 
 record the whole path it took. An agent that reaches for ssh on M4 has told us the
 product's own path was not visible from where it was standing.
 
-> **Known gap — the live hypothesis this probe exists to check.** The shrdlu run
-> (run record `2026-07-28-91901ff-shrdlu-prod-service.md` in
+> **Known gap — the live hypothesis this probe exists to check.** The linux-runner run
+> (run record `2026-07-28-91901ff-linux-runner-prod-service.md` in
 > `~/shared-workspace/tightbeam_ex/smoke-runs/`, step 29) found
 > **zero** occurrences of `wake --user`, `wake --role` or `[from …]` in the probe
 > session's composed guidance. Reading the source, that is the shape of composition,
@@ -269,7 +269,7 @@ product's own path was not visible from where it was standing.
 > "tagged `[from role:notetaker]`, run `wake --role notetaker`", but `role:` is not an
 > origin class: `wire/payloads.ex:13-14` fixes the closed set as `user:<id>`,
 > `agent:<handle>`, `process:<name>`, and the live stamp is `[from agent:…]`
-> (shrdlu step 29 observed `[from agent:probe-office]`). An agent following the manual
+> (linux-runner step 29 observed `[from agent:probe-office]`). An agent following the manual
 > literally would be looking for a tag that never appears. Whether the manual or the
 > wire contract is wrong is not this runbook's call — file it.
 

@@ -242,7 +242,7 @@ defmodule Tightbeam.SubagentMarkersTest do
       ctx.db,
       ctx.scheduler,
       harness,
-      "eezo",
+      "mac-runner",
       sid,
       update
     )
@@ -274,7 +274,7 @@ defmodule Tightbeam.SubagentMarkersTest do
         owner_user_id: "flynn",
         origin: "user:flynn",
         archetype: "default",
-        host: "eezo",
+        host: "mac-runner",
         harness: harness,
         provider: provider,
         model: Model.new("fixture")

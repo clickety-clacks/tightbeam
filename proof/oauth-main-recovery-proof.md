@@ -59,7 +59,7 @@ wake, `w_3161047e-f57f-4027-a985-157b1bb2720c`, with:
 
 The stored and delivered prompt was unchanged:
 
-> The OAuth token for openai on gibson was refreshed. Read the manifests for every installed or learned Kung Fu. Read each manifest's declared main archetype. Find live agents with those archetypes. Notify each that the OAuth token was refreshed, and require each to inspect and resume any stalled agent graph.
+> The OAuth token for openai on build-host was refreshed. Read the manifests for every installed or learned Kung Fu. Read each manifest's declared main archetype. Find live agents with those archetypes. Notify each that the OAuth token was refreshed, and require each to inspect and resume any stalled agent graph.
 
 ## Real Main-turn proof
 

@@ -544,7 +544,7 @@ defmodule Tightbeam.WorkItemsTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "eezo"
+      host: "mac-runner"
     })
   end
 end

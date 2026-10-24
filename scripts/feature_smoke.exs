@@ -18,7 +18,7 @@
 #
 # A narrowed run needs a model only for the legs it selected, which is what makes
 # one leg affordable rather than merely shorter. It also reports INCOMPLETE(parity)
-# by design and proves nothing about the leg it skipped, so the gibson gate still
+# by design and proves nothing about the leg it skipped, so the build-host gate still
 # wants both legs green (artifact-carrier-proposal-v1 §7.3); the filter is for
 # answering one leg's question quickly, not for satisfying the gate.
 #
@@ -43,7 +43,7 @@
 # verification statutes (completion-requires-verification,
 # completion-requires-results-artifact) AND a `coder` archetype that admits this
 # host. Rules load once at gateway BOOT, so an org whose law changed under a
-# running gateway must be rebooted before the run. On shrdlu that means the
+# running gateway must be rebooted before the run. On linux-runner that means the
 # eb0ea2b org-law workaround must be REVERTED first: with it installed the
 # artifact statute never denies and the gate-chain group fails at its third
 # denial, which is exactly what keeps that leg falsifiable.
@@ -1054,7 +1054,7 @@ defmodule FeatureSmoke do
   #
   # THE HOST IS PINNED, and the seed depends on it. `Placement.resolve/3` reads a nil host
   # as "first of archetype.where" unless the archetype grants `["*"]`, and the shipped coder
-  # archetype is `where = ["eezo", "racter"]` — so an unpinned spawn on any other gateway
+  # archetype is `where = ["mac-runner", "remote-runner"]` — so an unpinned spawn on any other gateway
   # places the holder on a DIFFERENT machine while the seed is written locally. Where an
   # org's coder archetype does not admit this host the spawn is refused `host_not_allowed`
   # by name, which is the right failure: about the org's law, not about a file that

@@ -346,7 +346,7 @@ defmodule Tightbeam.Readiness do
   # XPC_SERVICE_NAME). Foreground means no restart after a reboot and, worse, no
   # log — a foreground launcher usually redirects with `tee`, which truncates on
   # restart, so the run you need after a crash is destroyed by the restart.
-  # Measured on gibson 2026-08-05: the host rebooted, the gateway stayed down
+  # Measured on build-host 2026-08-05: the host rebooted, the gateway stayed down
   # until noticed by hand, and the crash log had already been overwritten.
   #
   # A line, not a refusal: running in the foreground is exactly right while
@@ -423,7 +423,7 @@ defmodule Tightbeam.Readiness do
   end
 
   # The executability gap the vendor CLI cannot cover. `:not_found` (not on PATH)
-  # and `{:exec_failed, _}` (on PATH but will not run — the gibson
+  # and `{:exec_failed, _}` (on PATH but will not run — the build-host
   # codex-as-`.js`-without-node incident) are both executability failures a
   # credential cannot fix; naming them here is O5's whole point.
   defp binary_line(%{binary: :runnable}), do: nil

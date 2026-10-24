@@ -11,7 +11,7 @@ defmodule Tightbeam.Placement do
   before any DB exists. The gateway's own machine is under its
   REAL hostname (`local_host_name/0`; ssh: nil) — never under an indexical
   like "local", because the org's vocabulary must match the operator's
-  ("spawn on eezo" has to resolve on eezo, including on eezo itself). Which
+  ("spawn on mac-runner" has to resolve on mac-runner, including on mac-runner itself). Which
   machine is local is carried by `ssh: nil`, not by a special name. Host
   names are what archetype `where` lists and session rows refer to; the ssh
   destination is how to reach one. WHY a host set contains what it does is

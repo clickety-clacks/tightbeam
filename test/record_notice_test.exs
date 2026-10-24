@@ -168,7 +168,7 @@ defmodule Tightbeam.RecordNoticeTest do
 
   test "an ambient audience lands in the named owner's main session", ctx do
     :ok =
-      EventLog.notice(ctx.db, "endpoint_not_provisioned", "eurisko", "ssh refused",
+      EventLog.notice(ctx.db, "endpoint_not_provisioned", "remote-host", "ssh refused",
         audience: {:ambient, "flynn"},
         attention: :low,
         message: "[host unreachable]\n\neurisko did not answer.",
@@ -176,7 +176,7 @@ defmodule Tightbeam.RecordNoticeTest do
       )
 
     assert [marker] = Projection.list_after(ctx.db, ctx.main, nil, 10)
-    assert marker.content =~ "eurisko did not answer"
+    assert marker.content =~ "remote-host did not answer"
     assert Projection.list_after(ctx.db, "work", nil, 10) == []
   end
 

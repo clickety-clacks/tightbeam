@@ -932,7 +932,7 @@ mod tests {
     ///
     /// The child outlives the shot by a wide margin ON PURPOSE. If the signal lands after
     /// the child has already exited, this test passes for the wrong reason -- a false PASS,
-    /// not a flake, which is the worse failure because it is silent. eezo runs near load 44
+    /// not a flake, which is the worse failure because it is silent. mac-runner runs near load 44
     /// with parallel lanes going, so a scheduler delay of a second is ordinary; five seconds
     /// of headroom in a test that already re-execs in isolation costs nothing worth having.
     #[test]
