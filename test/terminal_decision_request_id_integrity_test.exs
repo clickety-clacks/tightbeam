@@ -254,6 +254,7 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
              DB.query(ctx.db, "SELECT shape FROM schema_stamp")
 
     assert :ok = Schema.ensure_all(ctx.db)
+
     assert {:ok, [["coordination-fabric-v1-phase1-v22"]]} =
              DB.query(ctx.db, "SELECT shape FROM schema_stamp")
 
