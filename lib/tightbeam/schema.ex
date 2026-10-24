@@ -48,11 +48,9 @@ defmodule Tightbeam.Schema do
   #
   # TWO LINES CARRIED THIS PHASE TO DIFFERENT NAMES, and this stamp is where
   # they merge. Wave 1 (wakes classes/delivery, seams ①/②) stamped
-  # `coordination-fabric-classes-v1` then `-v2` (`classElection` gained
-  # `'batcher'`, Sol xhigh review round 2 finding 2). Wave 2 (the agent
+  # `coordination-fabric-classes-v1` then `-v2`. Wave 2 (the agent
   # question arm, seams ③/④) stamped `coordination-fabric-v1-phase1` then
-  # `-v2` (`decision_requests.deadlineAt` went from `NOT NULL` to nullable,
-  # Sol xhigh review round 2 finding 2 on THAT delta). Neither name ever
+  # `-v2`. Neither name ever
   # described the OTHER line's DDL, so neither could serve the merged tree —
   # this is a THIRD, brand-new name covering the union of both waves' schema
   # (`wakes`'s class/delivery columns AND `decision_requests`'s agent arm),
@@ -60,8 +58,7 @@ defmodule Tightbeam.Schema do
   # both histories at merge time).
   #
   # `decision_requests.deadlineAt` went from `NOT NULL` to nullable at
-  # `coordination-fabric-v1-phase1-v2` (2026-08-13, Sol xhigh review round 2,
-  # finding 2 on that delta) — the agent arm's CHECK grew an explicit
+  # `coordination-fabric-v1-phase1-v2` — the agent arm's CHECK grew an explicit
   # `deadlineAt IS NULL` requirement (finding 1 of round 1 on the same
   # delta), and the stamp bumped for the same reason wave 1's did.
   #
@@ -72,7 +69,7 @@ defmodule Tightbeam.Schema do
   # read or write this build makes against the NEW columns/constraints would
   # die on a raw, unnamed SQLite error instead of a refusal that names what
   # changed. Refuse, name it, and let the database be recreated.
-  # Mike's 2026-08-22 decision-reader return ruling adds the `returned`
+  # user's 2026-08-22 decision-reader return ruling adds the `returned`
   # disposition and three audit columns to `decision_requests`. SQLite cannot
   # widen the existing status/arm CHECKs or add those columns through
   # `CREATE TABLE IF NOT EXISTS`, so a v3 database must refuse by name rather
@@ -1022,7 +1019,7 @@ defmodule Tightbeam.Schema do
   exists in an OLDER shape: it adds no column, so the first query naming one
   dies as an accidental `no such column`, and a column added by hand would be
   worse — `sessions.model` from before the structured identity holds packed
-  values like `claude-fable-5[1m]`, which this build would read as a FAMILY.
+  values like `claude-example-5[1m]`, which this build would read as a FAMILY.
   A wrong answer, from data that was right when it was written.
 
   So the shape is STAMPED at creation and CHECKED here, per the house rule: a
@@ -2476,7 +2473,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database predates the structured model identity (#{@shape}).
 
         Its `sessions` table carries no shape stamp, so its `model` column holds
-        PACKED identifiers — `claude-fable-5[1m]` meaning a 1M-context model —
+        PACKED identifiers — `claude-example-5[1m]` meaning a 1M-context model —
         and `thinkingLevel`/`modelContext` were never written. This build reads
         those three columns as separate fields, so it would take the whole
         packed string as the model's family and silently run the wrong model.

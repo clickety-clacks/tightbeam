@@ -2,7 +2,7 @@
 # a REAL claude adapter: DB + Ledger + reconciler + SessionLane + Acp.Adapter.
 # No wire, no client — the E1 exit criterion (supervised prompt round-trip).
 #
-# Run on mac-runner:  mix run scripts/e1_first_light.exs
+# Run on test-host:  mix run scripts/e1_first_light.exs
 # Uses the TS repo's installed claude adapter binary + real ~/.claude creds.
 
 alias Tightbeam.{DB, Ledger, EventLog, SessionLane, LaneManager}
@@ -75,12 +75,12 @@ end
   )
 
 # Enqueue a turn (as a client post would) and let the reconciler/lane run it.
-session_key = "agent:main:clawline:flynn:main"
+session_key = "agent:main:clawline:operator:main"
 {:ok, seq} =
   Ledger.enqueue(%{
     session_key: session_key,
     message_id: "s_e1_1",
-    origin: "user:flynn",
+    origin: "user:operator",
     prompt: "Reply with exactly: ELIXIR FIRST LIGHT"
   })
 

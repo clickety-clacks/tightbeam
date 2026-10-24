@@ -181,7 +181,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
       ## Working set (capsules)
 
       #{Enum.map_join(refs, "\n", &"- **#{&1}** — capsule")}
-      - [Flynn: confirm the set — add/drop as needed]
+      - [user: confirm the set — add/drop as needed]
 
       ## Activity
 

@@ -38,10 +38,10 @@ defmodule Tightbeam.Wire.SeamTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1)"
       )
 
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "operator")
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-wire-seam-#{System.unique_integer([:positive])}")
@@ -75,13 +75,13 @@ defmodule Tightbeam.Wire.SeamTest do
   end
 
   test "assign --reviews lands the review link on the row", ctx do
-    producer = create_session(ctx.db, "producer", "flynn")
-    reviewer = create_session(ctx.db, "reviewer", "flynn")
+    producer = create_session(ctx.db, "producer", "operator")
+    reviewer = create_session
 
     ok!(
       dispatch_cli(ctx, "tbc_wire_seam", %{
         verb: "assign",
-        asUser: "flynn",
+        asUser: "operator",
         sessionKey: producer.session_key,
         params: %{subject: "fix the seam"}
       })
@@ -89,13 +89,7 @@ defmodule Tightbeam.Wire.SeamTest do
 
     produced = assignment_id(ctx.db, "fix the seam")
 
-    ok!(
-      dispatch_cli(ctx, "tbc_wire_seam", %{
-        verb: "assign",
-        asUser: "flynn",
-        sessionKey: reviewer.session_key,
-        params: %{subject: "review the fix", reviews: produced}
-      })
+    ok!
     )
 
     {:ok, [[link]]} =
@@ -112,15 +106,10 @@ defmodule Tightbeam.Wire.SeamTest do
     # The handler's existing UnknownReviewTarget check is unreachable while the
     # param is dropped, so a typo'd id used to open an ordinary unlinked
     # assignment. Reaching the refusal is itself proof the id arrives.
-    reviewer = create_session(ctx.db, "reviewer", "flynn")
+    reviewer = create_session
 
     response =
-      dispatch_cli(ctx, "tbc_wire_seam", %{
-        verb: "assign",
-        asUser: "flynn",
-        sessionKey: reviewer.session_key,
-        params: %{subject: "review a ghost", reviews: "asg_never_existed"}
-      })
+      dispatch_cli
 
     assert JSON.decode!(response.resp_body)["error"]["code"] == "unknown_review_target"
     assert assignment_id(ctx.db, "review a ghost") == nil
@@ -149,8 +138,8 @@ defmodule Tightbeam.Wire.SeamTest do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("fable"),
-      host: "mac-runner"
+      model: Model.new("example-model"),
+      host: "test-host"
     })
   end
 

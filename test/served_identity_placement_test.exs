@@ -13,8 +13,8 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
     old_local = Application.get_env(:tightbeam, :local_host_name)
     old_url = Application.get_env(:tightbeam, :advertised_url)
 
-    Application.put_env(:tightbeam, :local_host_name, "mac-runner")
-    Application.put_env(:tightbeam, :advertised_url, "http://mac-runner:4321")
+    Application.put_env(:tightbeam, :local_host_name, "test-host")
+    Application.put_env(:tightbeam, :advertised_url, "http://test-host:4321")
 
     register_hosts(db, %{
       "worker" => %{ssh: "agent@worker", base_dir: "/srv/tightbeam", cli_bin: "/srv/bin"}
@@ -200,7 +200,7 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
     config = %{base_dir: ctx.base, db: ctx.db, cwd: "/work", cli_bin: "/bin"}
 
     for _index <- 1..20 do
-      opts = Placement.adapter_opts(config, {:claude, "shared", "mac-runner"})
+      opts = Placement.adapter_opts(config, {:claude, "shared", "test-host"})
       assert Enum.any?(opts[:env], fn {name, _} -> name == "CLAUDE_CONFIG_DIR" end)
       refute Enum.any?(opts[:env], fn {name, _} -> name == "CLAUDE_CODE_OAUTH_TOKEN" end)
       refute inspect(opts) =~ "sk-ant-oat01-shared"

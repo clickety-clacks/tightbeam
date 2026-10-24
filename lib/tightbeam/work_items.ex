@@ -22,7 +22,7 @@ defmodule Tightbeam.WorkItems do
 
   @origin "process:tightbeam"
   @default_triage_deadline_ms 86_400_000
-  @principal_user_id "mike"
+  @principal_user_id "operator"
 
   defmodule CancellationRefused do
     @moduledoc false
@@ -301,7 +301,7 @@ defmodule Tightbeam.WorkItems do
             txn,
             "work_item_deprioritized",
             item.id,
-            "behind=#{behind.id} pickupAt=#{pickup_at} source=mike",
+            "behind=#{behind.id} pickupAt=#{pickup_at} source=operator",
             audience: {:ambient, @principal_user_id},
             message: "#{item.id} is parked behind #{behind.id}; pickup by #{pickup_at}.",
             attention: :low
@@ -339,7 +339,7 @@ defmodule Tightbeam.WorkItems do
                    item.ownerUserId,
                    %{
                      question: "Which priority wins: #{item.id} or #{behind.id}?",
-                     note: "Stall 4.10 explicit deprioritization of Mike-sourced work.",
+                     note: "Stall 4.10 explicit deprioritization of user-sourced work.",
                      options: [%{"label" => item.id}, %{"label" => behind.id}],
                      assignment_id: nil,
                      supersedes: nil,
@@ -511,8 +511,8 @@ defmodule Tightbeam.WorkItems do
 
       _ ->
         error(
-          "not_mike_sourced",
-          "Stall 4.10 applies only to a work item directly opened by Mike or relayed from Mike's session"
+          "not_example_sourced",
+          "Stall 4.10 applies only to a work item directly opened by user or relayed from user's session"
         )
     end
   end

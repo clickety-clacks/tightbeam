@@ -90,7 +90,7 @@ defmodule Tightbeam.Acp.Adapter do
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: opts[:name])
 
   @doc """
-  Create a fresh harness session, model applied (fable-trap rule), rooted at
+  Create a fresh harness session, model applied (model-pin rule), rooted at
   `cwd` — the SESSION's isolated workdir, never a shared/operator directory
   (harnesses load project-level instruction files walking up from cwd; an
   un-isolated cwd leaks the operator's own guidance and files into the
@@ -1177,7 +1177,7 @@ defmodule Tightbeam.Acp.Adapter do
   defp normalize_trace_result({:error, reason}), do: {:error, reason}
   defp normalize_trace_result(other), do: {:error, {:invalid_trace_callback_result, other}}
 
-  ## Model application (the fable-trap rule)
+  ## Model application (the model-pin rule)
 
   defp establish_new_session_model(state, sid, %Model{} = model, _result, request_timeout),
     do: apply_model_to_session(state, sid, model, request_timeout)
@@ -1465,7 +1465,7 @@ defmodule Tightbeam.Acp.Adapter do
   defp public_model_from_label(option) do
     label = Enum.join([option["name"], option["description"]], " ")
 
-    case Regex.run(~r/\b(opus|sonnet|haiku|fable)\s+(\d+)(?:[. -](\d+))?/i, label) do
+    case Regex.run(~r/\b(opus|sonnet|haiku|example-model)\s+(\d+)(?:[. -](\d+))?/i, label) do
       [_, family, major, minor] when minor not in [nil, ""] ->
         Model.new("claude-#{String.downcase(family)}-#{major}-#{minor}")
 

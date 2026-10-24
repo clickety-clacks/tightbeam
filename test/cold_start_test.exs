@@ -9,7 +9,7 @@ defmodule Tightbeam.ColdStartTest do
     host: "testhost",
     harness: :claude,
     provider: :anthropic,
-    model: Model.new("fable")
+    model: Model.new("example-model")
   }
 
   setup do

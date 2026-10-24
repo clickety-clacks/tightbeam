@@ -67,54 +67,54 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 1, 'admin_add', 1)"
       )
 
-    main_key = Org.personal_session_key("flynn")
+    main_key = Org.personal_session_key("operator")
 
     Org.create(db, %{
       session_key: main_key,
       display_name: "Main",
       kind: "main",
       is_built_in: true,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       archetype: "default",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("fable")
+      model: Model.new("example-model")
     })
 
     session =
       Org.create(db, %{
         session_key: "cli-holder",
         display_name: "CLI Holder",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "default",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("fable")
+        model: Model.new("example-model")
       })
 
-    Roles.create!(db, "cli-holder", "flynn", session.session_key)
+    Roles.create!(db, "cli-holder", "operator", session.session_key)
 
     worker =
       Org.create(db, %{
         session_key: "cli-worker",
         display_name: "CLI Worker",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "default",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("fable")
+        model: Model.new("example-model")
       })
 
-    Roles.create!(db, "cli-worker", "flynn", worker.session_key)
+    Roles.create!(db, "cli-worker", "operator", worker.session_key)
 
     gateway_config = %{
       db: db,
@@ -194,7 +194,7 @@ defmodule Tightbeam.CliIntegrationTest do
   end
 
   test "A22 real completion smoke delivers both notices and retains from the exact parent", ctx do
-    main_key = Org.personal_session_key("flynn")
+    main_key = Org.personal_session_key("operator")
 
     parent =
       completion_session!(ctx.db, "a22-parent", main_key)
@@ -316,7 +316,7 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    {owner_read, 0} = completion_notices_as_user(ctx, "flynn")
+    {owner_read, 0} = completion_notices_as_user(ctx, "operator")
     {admin_read, 0} = completion_notices_as_user(ctx, "a22-admin")
 
     for body <- [parent_read, report_read, child_read, owner_read, admin_read] do
@@ -536,14 +536,14 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {_listed_as_owner, 0} =
-      System.cmd(ctx.binary, ["list", "--as-user", "flynn"],
+      System.cmd(ctx.binary, ["list", "--as-user", "operator"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
 
-    assert_receive {:cli_call, %{origin: "user:flynn", principal: {:user, "flynn"}}}
+    assert_receive {:cli_call, %{origin: "user:operator", principal: {:user, "operator"}}}
 
-    Org.retire(ctx.db, ctx.session.session_key, "user:flynn", 1_000)
+    Org.retire(ctx.db, ctx.session.session_key, "user:operator", 1_000)
     {refused, 1} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
     assert refused =~ "auth_failed"
   end
@@ -569,7 +569,7 @@ defmodule Tightbeam.CliIntegrationTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("fable")
+      model: Model.new("example-model")
     })
 
     other =
@@ -582,7 +582,7 @@ defmodule Tightbeam.CliIntegrationTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("fable")
+        model: Model.new("example-model")
       })
 
     Roles.create!(ctx.db, "cli-other", "other", other.session_key)
@@ -616,7 +616,7 @@ defmodule Tightbeam.CliIntegrationTest do
           "--verdict",
           "tests-passed",
           "--as-user",
-          "flynn"
+          "operator"
         ],
         cd: ctx.workdir,
         stderr_to_stdout: true
@@ -627,11 +627,11 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call,
                     %{
                       verb: "attest",
-                      origin: "user:flynn",
-                      principal: {:user, "flynn"}
+                      origin: "user:operator",
+                      principal: {:user, "operator"}
                     }}
 
-    assert {:ok, [["flynn", nil]]} =
+    assert {:ok, [["operator", nil]]} =
              DB.query(
                ctx.db,
                "SELECT byUser, bySession FROM attests WHERE assignmentId = ?1 AND verdictKind = 'tests-passed'",
@@ -647,7 +647,7 @@ defmodule Tightbeam.CliIntegrationTest do
           "--reason",
           "operator cleanup",
           "--as-user",
-          "flynn"
+          "operator"
         ],
         cd: ctx.workdir,
         stderr_to_stdout: true
@@ -658,8 +658,8 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call,
                     %{
                       verb: "revoke-assignment",
-                      origin: "user:flynn",
-                      principal: {:user, "flynn"}
+                      origin: "user:operator",
+                      principal: {:user, "operator"}
                     }}
 
     assert {:ok, [["closed", "revoked"]]} =
@@ -854,37 +854,28 @@ defmodule Tightbeam.CliIntegrationTest do
       Org.create(ctx.db, %{
         session_key: "cli-coder",
         display_name: "CLI Coder",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "coder",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("fable")
+        model: Model.new("example-model")
       })
 
     reviewer =
-      Org.create(ctx.db, %{
-        session_key: "cli-reviewer",
-        display_name: "CLI Reviewer",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "reviewer",
-        host: "testhost",
-        harness: "codex",
-        provider: "openai",
-        model: Model.new("test")
+      Org.create
       })
 
-    Roles.create!(ctx.db, "cli-coder", "flynn", coder.session_key)
-    Roles.create!(ctx.db, "cli-reviewer", "flynn", reviewer.session_key)
+    Roles.create!(ctx.db, "cli-coder", "operator", coder.session_key)
+    Roles.create!
     coder_dir = session_workdir!(ctx, coder)
-    reviewer_dir = session_workdir!(ctx, reviewer)
+    reviewer_dir = session_workdir!
 
     {created, 0} =
       System.cmd(
         ctx.binary,
-        ["work-item-create", "--title", "papertrail e2e", "--as-user", "flynn"],
+        ["work-item-create", "--title", "papertrail e2e", "--as-user", "operator"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -897,8 +888,8 @@ defmodule Tightbeam.CliIntegrationTest do
       Org.create(ctx.db, %{
         session_key: "cli-orchestrator",
         display_name: "CLI Orchestrator",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "orchestrator",
         host: "testhost",
         harness: "codex",
@@ -906,7 +897,7 @@ defmodule Tightbeam.CliIntegrationTest do
         model: Model.new("test")
       })
 
-    Roles.create!(ctx.db, "cli-orchestrator", "flynn", orchestrator.session_key)
+    Roles.create!(ctx.db, "cli-orchestrator", "operator", orchestrator.session_key)
 
     {slice, 0} =
       System.cmd(
@@ -920,7 +911,7 @@ defmodule Tightbeam.CliIntegrationTest do
           "--work-item",
           item_id,
           "--as-user",
-          "flynn"
+          "operator"
         ],
         cd: ctx.workdir,
         stderr_to_stdout: true
@@ -941,7 +932,7 @@ defmodule Tightbeam.CliIntegrationTest do
           "--note",
           "e2e: the input is the spec",
           "--as-user",
-          "flynn"
+          "operator"
         ],
         cd: ctx.workdir,
         stderr_to_stdout: true
@@ -959,7 +950,7 @@ defmodule Tightbeam.CliIntegrationTest do
           "--work-item",
           item_id,
           "--as-user",
-          "flynn"
+          "operator"
         ],
         cd: ctx.workdir,
         stderr_to_stdout: true
@@ -994,24 +985,7 @@ defmodule Tightbeam.CliIntegrationTest do
     # The router aliases it to `:reviews_assignment_id` now, so the bypass that
     # stood in for it is gone.
     {reviewed, 0} =
-      System.cmd(
-        ctx.binary,
-        [
-          "assign",
-          "--subject",
-          "review of the feature",
-          "--session",
-          "cli-reviewer",
-          "--work-item",
-          item_id,
-          "--reviews",
-          work_id,
-          "--as-user",
-          "flynn"
-        ],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
+      System.cmd
 
     # The link is what the CLI is on trial for here: an assignment that came back
     # without it would still parse, and would still be a silently dropped edge.
@@ -1085,7 +1059,7 @@ defmodule Tightbeam.CliIntegrationTest do
       Ledger.enqueue(ctx.db, %{
         session_key: "cli-coder",
         message_id: message.id,
-        origin: "user:flynn",
+        origin: "user:operator",
         prompt: "write up the verification results"
       })
 
@@ -1148,22 +1122,22 @@ defmodule Tightbeam.CliIntegrationTest do
       Org.create(ctx.db, %{
         session_key: "cli-neutral-coder",
         display_name: "Neutral Coder",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "coder",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("fable")
+        model: Model.new("example-model")
       })
 
-    Roles.create!(ctx.db, coder.session_key, "flynn", coder.session_key)
+    Roles.create!(ctx.db, coder.session_key, "operator", coder.session_key)
     coder_dir = session_workdir!(ctx, coder)
 
     {created, 0} =
       System.cmd(
         ctx.binary,
-        ["work-item-create", "--title", "neutral e2e", "--as-user", "flynn"],
+        ["work-item-create", "--title", "neutral e2e", "--as-user", "operator"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -1182,7 +1156,7 @@ defmodule Tightbeam.CliIntegrationTest do
           "--work-item",
           item_id,
           "--as-user",
-          "flynn"
+          "operator"
         ],
         cd: ctx.workdir,
         stderr_to_stdout: true
@@ -1216,7 +1190,7 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_hookgate', 'hook gate', 'flynn', 'flynn', 1)"
+        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_hookgate', 'hook gate', 'operator', 'operator', 1)"
       )
 
     coder_dir = session_workdir!(ctx, ctx.session)
@@ -1232,7 +1206,7 @@ defmodule Tightbeam.CliIntegrationTest do
       Ledger.enqueue(ctx.db, %{
         session_key: ctx.session.session_key,
         message_id: message.id,
-        origin: "user:flynn",
+        origin: "user:operator",
         prompt: "build it"
       })
 
@@ -1318,18 +1292,18 @@ defmodule Tightbeam.CliIntegrationTest do
       Org.create(db, %{
         session_key: session_key,
         display_name: session_key,
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         spawned_by: parent_session_key,
         operational_parent: parent_session_key,
         archetype: "default",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("fable")
+        model: Model.new("example-model")
       })
 
-    Roles.create!(db, session_key, "flynn", session.session_key)
+    Roles.create!(db, session_key, "operator", session.session_key)
     session
   end
 
@@ -1421,18 +1395,18 @@ defmodule Tightbeam.CliIntegrationTest do
                )
     end
 
-    common.("dr_00000000-0000-4000-8000-000000000001", "flynn", ctx.session.session_key, "open")
+    common.("dr_00000000-0000-4000-8000-000000000001", "operator", ctx.session.session_key, "open")
 
     common.(
       "dr_00000000-0000-4000-8000-000000000003",
-      "flynn",
+      "operator",
       ctx.session.session_key,
       "withdrawn"
     )
 
     common.(
       "dr_00000000-0000-4000-8000-000000000004",
-      "flynn",
+      "operator",
       ctx.session.session_key,
       "superseded"
     )
@@ -1440,18 +1414,18 @@ defmodule Tightbeam.CliIntegrationTest do
     assert {:ok, _} =
              DB.query(
                ctx.db,
-               "UPDATE decision_requests SET withdrawnBy='user:flynn',withdrawnReason='capture complete',withdrawnAt=?2 WHERE id=?1",
+               "UPDATE decision_requests SET withdrawnBy='user:operator',withdrawnReason='capture complete',withdrawnAt=?2 WHERE id=?1",
                ["dr_00000000-0000-4000-8000-000000000003", now + 20]
              )
 
-    common.("dr_00000000-0000-4000-8000-000000000005", "flynn", ctx.session.session_key, "open")
-    common.("dr_00000000-0000-4000-8000-000000000002", "flynn", ctx.session.session_key, "open")
-    common.("dr_00000000-0000-4000-8000-000000000007", "flynn", ctx.session.session_key, "open")
+    common.("dr_00000000-0000-4000-8000-000000000005", "operator", ctx.session.session_key, "open")
+    common.("dr_00000000-0000-4000-8000-000000000002", "operator", ctx.session.session_key, "open")
+    common.("dr_00000000-0000-4000-8000-000000000007", "operator", ctx.session.session_key, "open")
 
     assert {:ok, _} =
              DB.query(
                ctx.db,
-               "UPDATE decision_requests SET status='ruled',decision='accept',rationale=NULL,ruledBy='user:flynn',ruledViaPrincipal='user:flynn',ruledViaSessionState='none',ruledAt=?2,rulingFactId=90000 WHERE id=?1",
+               "UPDATE decision_requests SET status='ruled',decision='accept',rationale=NULL,ruledBy='user:operator',ruledViaPrincipal='user:operator',ruledViaSessionState='none',ruledAt=?2,rulingFactId=90000 WHERE id=?1",
                ["dr_00000000-0000-4000-8000-000000000005", now + 100]
              )
 
@@ -1468,7 +1442,7 @@ defmodule Tightbeam.CliIntegrationTest do
       assert {:ok, _} =
                DB.query(
                  ctx.db,
-                 "UPDATE decision_requests SET status=?2,decision='accept',rationale='captured',ruledBy='user:flynn',ruledViaPrincipal='user:flynn',ruledViaSessionState='none',ruledAt=?3,rulingFactId=?4,consumedAt=?5 WHERE id=?1",
+                 "UPDATE decision_requests SET status=?2,decision='accept',rationale='captured',ruledBy='user:operator',ruledViaPrincipal='user:operator',ruledViaSessionState='none',ruledAt=?3,rulingFactId=?4,consumedAt=?5 WHERE id=?1",
                  [id, status, ruled_at, fact_id, consumed_at]
                )
     end
@@ -1527,7 +1501,7 @@ defmodule Tightbeam.CliIntegrationTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("fable")
+        model: Model.new("example-model")
       })
 
     common.(
@@ -1650,7 +1624,7 @@ defmodule Tightbeam.CliIntegrationTest do
        ctx do
     continue_request =
       open_effort_request(ctx, "continue",
-        expecter_session_key: Org.personal_session_key("flynn")
+        expecter_session_key: Org.personal_session_key("operator")
       )
 
     worker_dir = session_workdir!(ctx, ctx.worker)
@@ -1893,8 +1867,8 @@ defmodule Tightbeam.CliIntegrationTest do
                INSERT INTO decision_requests
                  (id,kind,raiserId,raiserSessionKey,ownerUserId,expecterSessionKey,
                   expecterUserId,raisedAt,question,context,status)
-               VALUES (?1,'agent','session:cli-holder','cli-holder','flynn','cli-holder',
-                       'flynn',?2,'Which path?','{}','open')
+               VALUES (?1,'agent','session:cli-holder','cli-holder','operator','cli-holder',
+                       'operator',?2,'Which path?','{}','open')
                """,
                [agent_id, now]
              )
@@ -1953,7 +1927,7 @@ defmodule Tightbeam.CliIntegrationTest do
               }
             }} =
              raw_agent_dispatch(ctx, ctx.worker.cli_token, %{
-               "asUser" => "flynn",
+               "asUser" => "operator",
                "verb" => "effort-rule",
                "params" => %{"request" => effort_id, "action" => "continue"}
              })
@@ -2317,7 +2291,7 @@ defmodule Tightbeam.CliIntegrationTest do
         INSERT INTO decision_requests
           (id, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName, actionKey,
            question, context, status)
-        VALUES (?1, 'process:tightbeam', 'flynn', ?2, ?3,
+        VALUES (?1, 'process:tightbeam', 'operator', ?2, ?3,
                 'configured-client-retrieval', ?4, 'Continue?', '{}', 'open')
         """,
         [request_id, now, now + 60_000, request_id]
@@ -2326,7 +2300,7 @@ defmodule Tightbeam.CliIntegrationTest do
     {requests, 0} =
       System.cmd(
         ctx.binary,
-        ["decision-requests", "--status", "open", "--as-user", "flynn"],
+        ["decision-requests", "--status", "open", "--as-user", "operator"],
         cd: ctx.outside,
         stderr_to_stdout: true,
         env: [
@@ -2342,7 +2316,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call,
                     %{
                       verb: "decision-requests",
-                      principal: {:user, "flynn"},
+                      principal: {:user, "operator"},
                       params: %{status: "open"}
                     }}
   end
@@ -2637,7 +2611,7 @@ defmodule Tightbeam.CliIntegrationTest do
     :ok =
       DB.execute(
         ctx.db,
-        "INSERT INTO turns (sessionKey,messageId,origin,prompt,status,adapterGen,createdAt,startedAt) VALUES ('cli-holder','m_breathing','user:flynn','work','running',4,10,11)"
+        "INSERT INTO turns (sessionKey,messageId,origin,prompt,status,adapterGen,createdAt,startedAt) VALUES ('cli-holder','m_breathing','user:operator','work','running',4,10,11)"
       )
 
     {output, 0} =
@@ -2707,7 +2681,7 @@ defmodule Tightbeam.CliIntegrationTest do
                INSERT INTO decision_requests
                  (id,kind,raiserId,raiserSessionKey,ownerUserId,expecterSessionKey,
                   expecterUserId,raisedAt,question,context,status)
-               VALUES (?1,'agent','session:cli-holder','cli-holder','flynn',?2,?3,?4,
+               VALUES (?1,'agent','session:cli-holder','cli-holder','operator',?2,?3,?4,
                        'Which path?','{}','open')
                """,
                [request_id, expecter_session_key, expecter_user_id, now]
@@ -2813,7 +2787,7 @@ defmodule Tightbeam.CliIntegrationTest do
           (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
            expecterUserId, lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
            question, options, context, status)
-        VALUES (?1, 'effort', 'process:tightbeam', 'flynn', ?2, ?3, ?4,
+        VALUES (?1, 'effort', 'process:tightbeam', 'operator', ?2, ?3, ?4,
                 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open')
         """,
         [

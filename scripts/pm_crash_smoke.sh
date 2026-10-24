@@ -63,7 +63,7 @@ await "bubble notice delivered by LIVE parent" \
 
 echo "43 bubble: parent ran the notice on live claude"
 
-ALERT=$(sq "SELECT COUNT(*) FROM condition_facts WHERE kind='user-alerted' AND scope='flynn'")
+ALERT=$(sq "SELECT COUNT(*) FROM condition_facts WHERE kind='user-alerted' AND scope='operator'")
 [ "$ALERT" = "0" ] || { echo "43 FAIL: user alerted although the parent acted"; exit 1; }
 
 echo "43 PASS: crash -> failed_unknown -> notice -> live parent delivered -> no alert"

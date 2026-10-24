@@ -3,11 +3,11 @@
 // Boots the real adapter with the real home, reads the offered model set from
 // session/new configOptions, then confirms claude-opus-5 via set_config_option.
 // Exit 0 + "ACCEPTED" when the grant serves opus-5; exit 1 + refusal otherwise.
-// Run on build-host: CLAUDE_CONFIG_DIR=/home/mike/.tightbeam/homes/build-host/claude \
+// Run with the projected Claude configuration available: CLAUDE_CONFIG_DIR=$HOME/.tightbeam/homes/<host>/claude \
 //   node probe-opus5.mjs
 import { spawn } from "node:child_process";
 
-const adapter = spawn("node", ["/home/mike/.tightbeam/adapters/node_modules/.bin/claude-agent-acp"], {
+const adapter = spawn("node", ["claude-agent-acp"], {
   stdio: ["pipe", "pipe", "inherit"],
   env: { ...process.env },
 });

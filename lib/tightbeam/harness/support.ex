@@ -368,7 +368,7 @@ defmodule Tightbeam.Harness.Support do
       if railed? and profile.railed_probe do
         Keyword.merge(plan,
           probe_cwd: Path.join(base, "work/gate-probe"),
-          probe_model: Tightbeam.Model.new("gpt-5.6-sol", effort: "medium")
+          probe_model: Tightbeam.Model.new("gpt-5.6-example", effort: "medium")
         )
       else
         plan

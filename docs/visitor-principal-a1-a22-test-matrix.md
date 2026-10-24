@@ -4,11 +4,9 @@ Use this matrix to prevent a partial implementation from being reported as the
 visitor-principal product. Treat every row as required before product
 completion.
 
-The authority is `visitor-principal-v3.md` at tightbeam-specs commit
-`9fed0adef203904ef44e9252cd0c5b4b8f6c6a70`, content SHA-256
-`03fe3dd000a920be82c17e1a4246ef9e0482edfd7b8cffda125a94ab4ec1c32c`.
+This matrix tracks acceptance coverage for the visitor-principal feature.
 
-| Acceptance case | Exact title | Automated status on Card 1 | Test location |
+| Acceptance case | Exact title | Automated status for the initial release | Test location |
 |---|---|---|---|
 | A1 | Checked current-main attribution | Required; not implemented | — |
 | A2 | External intermediary attribution | Required; not implemented | — |
@@ -27,13 +25,13 @@ The authority is `visitor-principal-v3.md` at tightbeam-specs commit
 | A15 | Broker authority and pending limit | Required; not implemented | — |
 | A16 | Known-denial audit and public absence | Required; not implemented | — |
 | A17 | Wire, discovery, and secret input | Required; not implemented | — |
-| A18 | Keyring restart, backup, and missing-key refusal | Automated for Card 1 keyring initialization, pre-migration loading across the current lawful schema predecessor chain, post-migration locking, typed database-key references, restart, pair restore, deterministic retry/authentication, missing-half refusal, filesystem safety, and secret non-disclosure. Visitor routes remain absent until later cards. | `cli/src/visitor.rs`, `cli/tests/visitor_keyring.rs`, `test/visitor_keyring_test.exs` |
+| A18 | Keyring restart, backup, and missing-key refusal | Automated for initial release keyring initialization, pre-migration loading across the current lawful schema predecessor chain, post-migration locking, typed database-key references, restart, pair restore, deterministic retry/authentication, missing-half refusal, filesystem safety, and secret non-disclosure. Visitor routes remain absent until later releases. | `cli/src/visitor.rs`, `cli/tests/visitor_keyring.rs`, `test/visitor_keyring_test.exs` |
 | A19 | Scoped operation collisions | Required; not implemented | — |
 | A20 | Terminal transition closure | Required; not implemented | — |
 | A21 | Realized intermediary collision cannot recur | Required; not implemented | — |
 | A22 | Known-scope admission and audit-growth bound | Required; not implemented | — |
 
-Card 1 does not add visitor tables, migration stamps, routes, admission,
+initial release does not add visitor tables, migration stamps, routes, admission,
 origin, domain, or audit behavior. Do not change a non-A18 row to automated
 until a test executes that exact acceptance case. Do not report product
 completion until every row is automated and green.

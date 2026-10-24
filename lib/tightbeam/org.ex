@@ -1643,8 +1643,8 @@ defmodule Tightbeam.Org do
   @doc """
   The canonical personal-session key for a user (Clawline wire format).
 
-      iex> Tightbeam.Org.personal_session_key("flynn")
-      "agent:main:clawline:flynn:main"
+      iex> Tightbeam.Org.personal_session_key("operator")
+      "agent:main:clawline:operator:main"
   """
   @spec personal_session_key(String.t()) :: String.t()
   def personal_session_key(user_id), do: "agent:main:clawline:#{user_id}:main"

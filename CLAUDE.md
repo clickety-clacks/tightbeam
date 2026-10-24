@@ -1,34 +1,15 @@
-# tightbeam_ex — agent notes
-
-## THIS LINE: main = the 0.2 fabric program (flipped 2026-08-12)
-
-The pre-flip tip lives on branch 0.1.x — the maintenance line the live org
-patches. THE GIT PROCESS ON THIS LINE (intent restated by Mike, 2026-08-22 —
-decisions ledger): NO DOOR means NO PR CEREMONY — nothing else. It
-assumes your branch is READY TO MERGE and the tests PASS. Work on your
-own branch in your own workspace; when the full verification gate is
-GREEN on your branch, merge to main — no PR, no review theater, just a
-clean merge of finished work. Main is never worked in directly, and a
-red suite is never merged; "pre-existing failure" is not a pass, it is a
-stop — fix it or surface it to the owner before anything merges. And the mirror rule at the START of work (Mike, 2026-08-22): branch
-only FROM a green main — never start work on a red base, where your own
-breakage and inherited breakage are indistinguishable; if main is red,
-fixing it comes first. Review
-evidence lands in the specs repo first. If your assignment card names a different integration branch,
-the card wins. If you are a 0.1.x-org agent reading this: your line is
-0.1.x and this checkout is the wrong one — do not push here. Fixes cross
-0.1.x -> main by cherry-pick election only, Mike-authorized.
+# tightbeam_ex — contributor notes
 
 ## THE PHILOSOPHY GATE — run it before you design, again before you ship
 
-Tightbeam is agent-first: agents run the org; the substrate records truth,
-prods, and executes named org-authored law — it NEVER judges and NEVER seizes
-(adjudication deletion ruling, 2026-08-05, shared specs tightbeam-decisions.md).
+Tightbeam coordinates agents; the substrate records activity, delivers
+notifications, and applies configured rules without making judgments or taking
+control of user decisions.
 Every spec and every change answers these ten. A "no" is a FINDING to report,
 not a style nit — the "hey, that's not what we're about" moment is this list
 doing its job. Layer vocabulary: PHYSICS = substrate mechanism (invariant,
-judgment-free); ANATOMY = neutral seed (shipped shape, org-reshapeable);
-CULTURE = kungfu (domain). See shared specs coordination-fabric-v1.md.
+judgment-free); ANATOMY = neutral seed (shipped shape, configurable);
+CULTURE = kungfu (domain). See the coordination fabric design.
 
 1. **Who judges?** If the substrate is making a judgment call, move it to an
    agent or delete it. The substrate owes truth, a named failure, and a record
@@ -46,10 +27,10 @@ CULTURE = kungfu (domain). See shared specs coordination-fabric-v1.md.
    rules small and boring, and put a mind above them.
 5. **Interruption or information?** Shape WHEN attention is spent, never WHAT
    is recorded. An optimization that loses rows is wrong, full stop.
-6. **Which layer?** Mentions the domain → culture. An org could sanely
-   reshape it → not physics. Judgment content → never physics.
-7. **Decimation test.** Kill any one session, or the gateway, mid-flight: does
-   the org degrade to a topology that already works?
+6. **Which layer?** Mentions the domain → culture. A deployment can sanely
+   configure it → not physics. Judgment content → never physics.
+7. **Decimation test.** Stop any one session, or the gateway, mid-flight: does
+   the system degrade to a topology that already works?
 8. **Is the discipline a bone yet?** Anything agents must remember to do every
    time is a deterministic reflex waiting to be extracted. Inverse holds:
    anything requiring judgment every time must never be extracted.
@@ -59,21 +40,10 @@ CULTURE = kungfu (domain). See shared specs coordination-fabric-v1.md.
     compress to one load-bearing sentence consistent with the nine above, be
     suspicious of the mechanism.
 
-## WHERE THE SPECS LIVE (read before designing anything)
+## Product specifications
 
-The project specifications live in the `clickety-clacks/tightbeam-specs`
-repository. For 0.2 work start with:
-- `v0.2-program-2026-08-12.md` — the program: rulings, staffing, phases,
-  election ledgers, org-pause state. The record of every decision.
-- `coordination-fabric-v1.md` — the design authority for the fabric.
-- `0.2-build-ledger.md` — one entry per landing on main; review evidence
-  goes there BEFORE the push.
-- `0.2-orchestrator-handoff.md` — full context transfer incl. environment
-  map and working norms. Read it before doing ANY 0.2 program work.
-- `tightbeam.md` — the spec hub for the wider corpus; `tightbeam-decisions.md`
-  — the decisions ledger.
-Coordinate 0.2 work through its active delivery lead rather than starting a
-duplicate effort.
+Use the current product specifications when making design decisions. The
+coordination fabric and product overview describe supported behavior.
 
 ## ACP / harness facts (for anyone touching the adapter layer)
 

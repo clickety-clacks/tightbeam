@@ -53,7 +53,7 @@ defmodule Tightbeam.CredentialKindsTest do
 
   describe "the credential store records the kind" do
     test "an API key banks with the kind recorded and no expiry", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "mac-runner")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(staging, ".credentials.json"), "sk-ant-api03-staged")
@@ -79,7 +79,7 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "a subscription banks with its kind and keeps its expiry", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "mac-runner")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
 
@@ -103,7 +103,7 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "no credential is its own state, not a kind", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "mac-runner")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
 
       assert Credentials.kind(:anthropic, server) == :none
       assert Credentials.kind(:openai, server) == :none
@@ -111,7 +111,7 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "both providers on one host can hold different kinds", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "mac-runner")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
 
       {:ok, claude_staging, claude_lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(claude_staging, ".credentials.json"), "sk-ant-api03-staged")
@@ -299,7 +299,7 @@ defmodule Tightbeam.CredentialKindsTest do
 
       sh = fn command ->
         send(owner, {:codex_probe, Enum.join(command, " ")})
-        {~s({"data":[{"id":"gpt-5.6-sol","object":"model"}]}) <> "\n200", 0}
+        {~s({"data":[{"id":"gpt-5.6-example","object":"model"}]}) <> "\n200", 0}
       end
 
       assert {:ok, [entry]} =
@@ -323,8 +323,8 @@ defmodule Tightbeam.CredentialKindsTest do
 
       # The platform route answers with bare ids: no display name, no effort
       # tiers, no context window. The catalog says so rather than inventing them.
-      assert entry.family == "gpt-5.6-sol"
-      assert entry.display_name == "gpt-5.6-sol"
+      assert entry.family == "gpt-5.6-example"
+      assert entry.display_name == "gpt-5.6-example"
       assert entry.efforts == []
       assert entry.max_input_tokens == nil
       assert entry.provider == :openai
@@ -333,7 +333,7 @@ defmodule Tightbeam.CredentialKindsTest do
     # Recorded reality, the #89/#99 api-key exercise (2026-07-28): the platform
     # route listed 125 bare ids; codex-acp REFUSED the platform id
     # `gpt-5.1-codex` at session/set_config_option (-32602 Invalid params) and
-    # ACCEPTED `gpt-5.6-sol`, which ran a real turn on the same adapter+auth.
+    # ACCEPTED `gpt-5.6-example`, which ran a real turn on the same adapter+auth.
     # The fixture is that payload's shape trimmed to those two adjudicated ids.
     test "an api-key codex catalog withholds platform ids the adapter refuses", ctx do
       stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"sk-proj-selectable"}))
@@ -348,7 +348,7 @@ defmodule Tightbeam.CredentialKindsTest do
 
       # The catalog must not advertise what the adapter will refuse: spawns
       # validated against `gpt-5.1-codex` and then -32602'd at model apply.
-      assert Enum.map(entries, & &1.family) == ["gpt-5.6-sol"]
+      assert Enum.map(entries, & &1.family) == ["gpt-5.6-example"]
     end
 
     test "the injectable seam lifts the api-key selectable pin", ctx do
@@ -362,7 +362,7 @@ defmodule Tightbeam.CredentialKindsTest do
                  options: %{sh: sh, codex_selectable_models: :all}
                })
 
-      assert Enum.map(entries, & &1.family) == ["gpt-5.1-codex", "gpt-5.6-sol"]
+      assert Enum.map(entries, & &1.family) == ["gpt-5.1-codex", "gpt-5.6-example"]
     end
 
     test "the subscription catalog is not filtered by the api-key pin", ctx do
@@ -460,11 +460,11 @@ defmodule Tightbeam.CredentialKindsTest do
       assert Credentials.kind(:anthropic, Credentials) == :api_key
     end
 
-    # wi_0535922b: the begin reply names the OWNER user so the CLI can wake that
+    # wi_00000000-0000-4000-8000-000000000106: the begin reply names the OWNER user so the CLI can wake that
     # user with the sign-in URL+code a session-run ceremony would otherwise trap
     # on a pty nobody watches. Only the begin "ready" reply carries it; a caller
     # with an owner (a user or agent origin) resolves, a process origin does not.
-    test "the begin reply carries ownerUserId for the operator wake (wi_0535922b)", ctx do
+    test "the begin reply carries ownerUserId for the operator wake (wi_00000000-0000-4000-8000-000000000106)", ctx do
       :ok = Tightbeam.Devices.ensure_schema(ctx.db)
 
       {:ok, _rows} =
@@ -559,9 +559,9 @@ defmodule Tightbeam.CredentialKindsTest do
         send(owner, {:probe, script})
 
         if String.contains?(script, "api.openai.com") do
-          {~s({"data":[{"id":"gpt-5.6-sol","object":"model"}]}) <> "\n200", 0}
+          {~s({"data":[{"id":"gpt-5.6-example","object":"model"}]}) <> "\n200", 0}
         else
-          {~s({"models":[{"slug":"gpt-5.6-sol","display_name":"GPT-5.6 Sol","supported_reasoning_levels":[{"effort":"medium"}]}]}) <>
+          {~s <>
              "\n200 0.145.0", 0}
         end
       end
@@ -588,8 +588,8 @@ defmodule Tightbeam.CredentialKindsTest do
                {sat, _} = ModelCatalog.get("satellite", "codex", catalog)
                {gw, _} = ModelCatalog.get(local_host(), "codex", catalog)
 
-               Enum.map(sat, &{&1.family, &1.efforts}) == [{"gpt-5.6-sol", []}] and
-                 Enum.map(gw, &{&1.family, &1.efforts}) == [{"gpt-5.6-sol", ["medium"]}]
+               Enum.map(sat, &{&1.family, &1.efforts}) == [{"gpt-5.6-example", []}] and
+                 Enum.map(gw, &{&1.family, &1.efforts}) == [{"gpt-5.6-example", ["medium"]}]
              end)
 
       probes = drain_probes([])

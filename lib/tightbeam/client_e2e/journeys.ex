@@ -350,7 +350,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
           )
 
         # DELIBERATE KEEP, do not generalize from it. This reads like the J8
-        # content assertion Flynn removed, but it is a PLACEMENT proof — the same
+        # content assertion user removed, but it is a PLACEMENT proof — the same
         # shape as satellite S3's nonce file. Only a tool that really ran on THIS
         # host can produce this host's `uname -s`, so the text is evidence that
         # the turn executed where the substrate placed it, not evidence that the
@@ -1785,7 +1785,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
   WHAT IS NOT HERE: the reply's CONTENT. Whether the agent obeyed the prompt's
   instruction is agent EFFECTIVENESS, which evals own; e2e tests substrate
-  FUNCTIONALITY (Flynn, 2026-07-26, after run a888f9b row 16 failed the claude
+  FUNCTIONALITY (user, 2026-07-26, after run a888f9b row 16 failed the claude
   leg on reply text while every substrate oracle held). A competent agent that
   answers the wake differently must still pass every leg above.
 

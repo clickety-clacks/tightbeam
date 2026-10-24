@@ -21,7 +21,7 @@ DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 # A mix release names its node after the RELEASE, so every instance on a machine
 # claimed `tightbeam_gateway@<host>` and the second one refused to boot with
 #
-#   Protocol 'inet_tcp': the name tightbeam_gateway@mac-runner seems to be in use by
+#   Protocol 'inet_tcp': the name tightbeam_gateway@test-host seems to be in use by
 #   another Erlang node
 #
 # — a message naming no port, no base dir, and nothing an operator would connect to

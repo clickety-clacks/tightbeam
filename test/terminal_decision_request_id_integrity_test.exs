@@ -22,8 +22,8 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
     scheduler = :"terminal_request_id_scheduler_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = ensure_all_schemas(db)
-    ensure_main_session(db, "flynn")
-    raiser = session(db, "raiser", "flynn")
+    ensure_main_session(db, "operator")
+    raiser = session(db, "raiser", "operator")
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})
 
@@ -102,7 +102,7 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
     owner_call = owner_operator_rule(corrupt_id, %{})
 
     detail = Escalation.get(ctx.db, owner_call, corrupt_id)
-    listed = Escalation.list(ctx.db, owner_call, "ruled", owner_user_id: "flynn")
+    listed = Escalation.list(ctx.db, owner_call, "ruled", owner_user_id: "operator")
 
     replay =
       Escalation.operator_rule(
@@ -141,7 +141,7 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
         scheduler: ctx.scheduler
       )
 
-    assert %{status: "ruled", decision: "accept", ruled_by: "user:flynn", ruled_at: ruled_at} =
+    assert %{status: "ruled", decision: "accept", ruled_by: "user:operator", ruled_at: ruled_at} =
              ruled
 
     assert is_integer(ruled_at)
@@ -204,7 +204,7 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
         kind: "operator",
         status: "ruled",
         decision: "   ",
-        ruled_by: "user:flynn",
+        ruled_by: "user:operator",
         ruled_at: ruled_at
       })
     end
@@ -212,7 +212,7 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
     for refusal <- [
           Escalation.get(ctx.db, owner_operator_rule(request.id, %{}), request.id),
           Escalation.list(ctx.db, owner_operator_rule(request.id, %{}), "ruled",
-            owner_user_id: "flynn"
+            owner_user_id: "operator"
           ),
           Escalation.operator_rule(
             ctx.db,
@@ -271,7 +271,7 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("fable")
+      model: Model.new("example-model")
     })
   end
 
@@ -288,8 +288,8 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
   defp owner_operator_rule(id, params) do
     %{
       verb: "operator-rule",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       transport_session_key: nil,
       params: Map.put(params, :request, id)
     }

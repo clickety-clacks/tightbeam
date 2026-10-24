@@ -51,19 +51,19 @@ defmodule Tightbeam.ConditionFactsTest do
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "operator")
 
     session =
       Org.create(db, %{
         session_key: "agent:condition:app",
         display_name: "Condition target",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "default",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("fable")
+        model: Model.new("example-model")
       })
 
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
@@ -240,18 +240,10 @@ defmodule Tightbeam.ConditionFactsTest do
 
   test "reserved kinds are substrate-only and condition filing is idempotent", ctx do
     assert {:error, %{code: "reserved_kind"}} =
-             ConditionFacts.file(ctx.db, ctx.scheduler, %{
-               kind: "quota-recovered",
-               scope: "codex:sol",
-               origin: "process:ci"
-             })
+             ConditionFacts.file
 
     allowed =
-      ConditionFacts.file(ctx.db, ctx.scheduler, %{
-        kind: "quota-recovered",
-        scope: "codex:sol",
-        origin: "process:tightbeam"
-      })
+      ConditionFacts.file
 
     assert allowed.kind == "quota-recovered"
 
@@ -282,7 +274,7 @@ defmodule Tightbeam.ConditionFactsTest do
     assert filed == condition_handler.(call)
 
     assert condition_handler.(%{
-             origin: "user:flynn",
+             origin: "user:operator",
              params: %{kind: "escalation-ruled"}
            }).code == "reserved_kind"
   end
@@ -294,24 +286,24 @@ defmodule Tightbeam.ConditionFactsTest do
     assert {:error, %{code: "reserved_kind"}} =
              ConditionFacts.file(ctx.db, ctx.scheduler, %{
                kind: "credential-present",
-               scope: "build-host:anthropic",
+               scope: "test-host:anthropic",
                origin: "agent:someone"
              })
 
     filed =
       ConditionFacts.file(ctx.db, ctx.scheduler, %{
         kind: "credential-present",
-        scope: "build-host:anthropic",
+        scope: "test-host:anthropic",
         origin: "process:tightbeam"
       })
 
     assert filed.kind == "credential-present"
-    assert filed.scope == "build-host:anthropic"
+    assert filed.scope == "test-host:anthropic"
 
     # It is an occurrence, not a standing pair: asking standing?/3 of it is a
     # category error, so it must not have been mistaken for a retractable flag.
     assert_raise KeyError, fn ->
-      ConditionFacts.standing?(ctx.db, "credential-present", "build-host:anthropic")
+      ConditionFacts.standing?(ctx.db, "credential-present", "test-host:anthropic")
     end
   end
 
@@ -320,7 +312,7 @@ defmodule Tightbeam.ConditionFactsTest do
       ConditionFacts.file(ctx.db, ctx.scheduler, %{
         kind: "tour-given",
         scope: "agent:first:app",
-        origin: "user:flynn"
+        origin: "user:operator"
       })
 
     second =
@@ -339,7 +331,7 @@ defmodule Tightbeam.ConditionFactsTest do
                ts: first.ts,
                kind: "tour-given",
                scope: "agent:first:app",
-               origin: "user:flynn"
+               origin: "user:operator"
              }
            }
 
@@ -360,7 +352,7 @@ defmodule Tightbeam.ConditionFactsTest do
     ConditionFacts.file(ctx.db, ctx.scheduler, %{
       kind: "build-green",
       scope: "staging",
-      origin: "user:flynn"
+      origin: "user:operator"
     })
 
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, wake.wake_id)
@@ -376,7 +368,7 @@ defmodule Tightbeam.ConditionFactsTest do
     ConditionFacts.file(ctx.db, ctx.scheduler, %{
       kind: "release-ready",
       scope: "prod",
-      origin: "user:flynn"
+      origin: "user:operator"
     })
 
     assert Wakes.get(ctx.db, first.wake_id).state == "fired"
@@ -542,13 +534,13 @@ defmodule Tightbeam.ConditionFactsTest do
         Org.create(ctx.db, %{
           session_key: "agent:race:#{index}",
           display_name: "Race target #{index}",
-          owner_user_id: "flynn",
-          origin: "user:flynn",
+          owner_user_id: "operator",
+          origin: "user:operator",
           archetype: "default",
           host: "testhost",
           harness: "claude",
           provider: "anthropic",
-          model: Model.new("fable")
+          model: Model.new("example-model")
         })
 
       race =
@@ -561,7 +553,7 @@ defmodule Tightbeam.ConditionFactsTest do
         )
 
       fire = Task.async(fn -> Wakes.fire_due(ctx.scheduler) end)
-      retire = Task.async(fn -> Org.retire(ctx.db, target.session_key, "user:flynn", 1_000) end)
+      retire = Task.async(fn -> Org.retire(ctx.db, target.session_key, "user:operator", 1_000) end)
       assert :ok = Task.await(fire)
       assert %{state: "retired"} = Task.await(retire)
 
@@ -638,27 +630,27 @@ defmodule Tightbeam.ConditionFactsTest do
   end
 
   test "shared harness health keeps auth and rate-limit standing states distinct", ctx do
-    scope = ConditionFacts.harness_scope("claude", "build-host")
-    assert scope == JSON.encode!(["claude", "build-host"])
+    scope = ConditionFacts.harness_scope("claude", "test-host")
+    assert scope == JSON.encode!(["claude", "test-host"])
 
     assert {:ok, %{kind: "harness-auth-dead", scope: ^scope}} =
              DB.transaction(ctx.db, fn txn ->
                ConditionFacts.file_harness_health_in_txn(
                  txn,
                  "claude",
-                 "build-host",
+                 "test-host",
                  "auth-dead",
                  :assert
                )
              end)
 
-    assert ConditionFacts.harness_unavailable?(ctx.db, "claude", "build-host")
-    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "build-host", "auth-dead")
+    assert ConditionFacts.harness_unavailable?(ctx.db, "claude", "test-host")
+    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "test-host", "auth-dead")
 
     refute ConditionFacts.harness_failure_standing?(
              ctx.db,
              "claude",
-             "build-host",
+             "test-host",
              "rate-limit-dead"
            )
 
@@ -667,7 +659,7 @@ defmodule Tightbeam.ConditionFactsTest do
                ConditionFacts.file_harness_health_in_txn(
                  txn,
                  "claude",
-                 "build-host",
+                 "test-host",
                  "rate-limit-dead",
                  :assert
                )
@@ -678,21 +670,21 @@ defmodule Tightbeam.ConditionFactsTest do
                ConditionFacts.file_harness_health_in_txn(
                  txn,
                  "claude",
-                 "build-host",
+                 "test-host",
                  "auth-dead",
                  :retract
                )
              end)
 
-    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "build-host", "auth-dead")
-    assert ConditionFacts.harness_unavailable?(ctx.db, "claude", "build-host")
+    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "test-host", "auth-dead")
+    assert ConditionFacts.harness_unavailable?(ctx.db, "claude", "test-host")
   end
 
   test "only the substrate may file reserved harness health facts", ctx do
     assert {:error, %{code: "reserved_kind"}} =
              ConditionFacts.file(ctx.db, ctx.scheduler, %{
                kind: "harness-auth-dead",
-               scope: ConditionFacts.harness_scope("claude", "build-host"),
+               scope: ConditionFacts.harness_scope("claude", "test-host"),
                origin: "agent:observer"
              })
   end
@@ -779,29 +771,29 @@ defmodule Tightbeam.ConditionFactsTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
+        "INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1)"
       )
 
     caller =
       Org.create(ctx.db, %{
         session_key: "agent:creator:app",
         display_name: "Wake creator",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "default",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("fable")
+        model: Model.new("example-model")
       })
 
-    Roles.create!(ctx.db, "creator", "flynn", caller.session_key)
+    Roles.create!(ctx.db, "creator", "operator", caller.session_key)
 
     work_item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
         verb: "work-item-create",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:operator",
+        principal: {:user, "operator"},
         session_key: nil,
         params: %{title: "Wake carrier proof"}
       })
@@ -809,8 +801,8 @@ defmodule Tightbeam.ConditionFactsTest do
     assignment =
       Assignments.__handle__(ctx.db, "assign", %{
         verb: "assign",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:operator",
+        principal: {:user, "operator"},
         session_key: caller.session_key,
         target_role: nil,
         role_fallback: false,
@@ -827,14 +819,14 @@ defmodule Tightbeam.ConditionFactsTest do
         session_key: caller.session_key,
         role: "user",
         content: "schedule the follow-up",
-        sender: "user:flynn"
+        sender: "user:operator"
       })
 
     {:ok, turn_seq} =
       Ledger.enqueue(ctx.db, %{
         session_key: caller.session_key,
         message_id: message.id,
-        origin: "user:flynn",
+        origin: "user:operator",
         prompt: "schedule the follow-up",
         assignment_id: assignment.id,
         job_ref: work_item.id

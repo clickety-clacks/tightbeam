@@ -11,7 +11,7 @@ defmodule Tightbeam.EventLogTest do
   end
 
   test "verb events append and tail in order; kind is constrained", %{db: db} do
-    :ok = EventLog.append_event(db, "verb", "post", "user:flynn", "k1", %{a: 1})
+    :ok = EventLog.append_event(db, "verb", "post", "user:operator", "k1", %{a: 1})
 
     :ok =
       EventLog.append_event(
@@ -49,17 +49,17 @@ defmodule Tightbeam.EventLogTest do
                  txn,
                  "verb",
                  "wake",
-                 "user:mike",
+                 "user:operator",
                  nil,
                  %{cancel_wake_id: "w_public", canceled: true},
-                 {:user, "mike"},
+                 {:user, "operator"},
                  12_345
                )
              end)
 
     assert is_integer(event_id) and event_id > 0
 
-    assert {:ok, [[^event_id, 12_345, "verb", "wake", "user:mike", "user:mike", nil, payload]]} =
+    assert {:ok, [[^event_id, 12_345, "verb", "wake", "user:operator", "user:operator", nil, payload]]} =
              DB.query(
                db,
                "SELECT id,ts,kind,verb,origin,principal,sessionKey,payload FROM events"
@@ -76,10 +76,10 @@ defmodule Tightbeam.EventLogTest do
                  txn,
                  "verb",
                  "wake",
-                 "user:mike",
+                 "user:operator",
                  nil,
                  %{cancel_wake_id: "w_rolled_back", canceled: true},
-                 {:user, "mike"},
+                 {:user, "operator"},
                  12_346
                )
 

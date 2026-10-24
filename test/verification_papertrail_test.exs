@@ -36,14 +36,14 @@ defmodule Tightbeam.VerificationPapertrailTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 1, 'admin_add', 1)"
       )
 
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "operator")
 
     holder = session(db, "vp-coder", "coder", "claude", "anthropic")
-    reviewer = session(db, "vp-reviewer", "reviewer-code", "codex", "openai")
-    Roles.create!(db, "reviewer-code", "flynn", reviewer.session_key)
+    reviewer = session
+    Roles.create!
 
     test_pid = self()
 
@@ -84,7 +84,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
   # `rules/`.
   defp learn_engineering_rules!(ctx) do
     assert {:ok, _revision} =
-             Identity.learn!(ctx.base_dir, "agentic-engineering", "flynn")
+             Identity.learn!(ctx.base_dir, "agentic-engineering", "operator")
 
     for file <- ["engineering.toml", "verification.toml"] do
       assert File.exists?(Path.join([ctx.base_dir, "identity", "rules", file])),
@@ -97,22 +97,17 @@ defmodule Tightbeam.VerificationPapertrailTest do
   defp reviewed_clean_assignment(ctx) do
     item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
-        principal: {:user, "flynn"},
+        principal: {:user, "operator"},
         params: %{title: "papertrail #{System.unique_integer([:positive])}", is_bug: false}
       })
 
     work = assign(ctx, ctx.holder.session_key, item.id, "implement the feature")
 
     review =
-      assign(ctx, ctx.reviewer.session_key, item.id, "review of the feature",
-        reviews_assignment_id: work.id
-      )
+      assign
 
     assert {:ok, %{attest: %{verdictKind: "reviewed-clean"}}} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               attest_call(ctx.reviewer.session_key, review.id, "verdict", "reviewed-clean")
+             Dispatch.dispatch
              )
 
     # The review's own document. A verdict row carries the DECISION; the note
@@ -121,14 +116,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
     # school requires it of reviewers exactly as it does of coders, so the
     # papertrail fixture records one rather than modelling a reviewer that
     # drops its own analysis.
-    Artifacts.record(ctx.db, %{
-      principal: {:session, ctx.reviewer.session_key},
-      session_key: ctx.reviewer.session_key,
-      recorded_message_id: "msg_papertrail_review",
-      params: %{
-        kind: "report",
-        title: "review clause table",
-        origin_path: Path.join(System.tmp_dir!(), "papertrail-review.md"),
+    Artifacts.record, "papertrail-review.md"),
         work_item_id: item.id
       }
     })
@@ -206,10 +194,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
     # it without a review-of-the-review. The implementation-only verification
     # and artifact statutes also stay out of scope.
     assert {:ok, %{assignment: %{state: "closed"}}} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               attest_call(ctx.reviewer.session_key, review.id, "completion")
+             Dispatch.dispatch
              )
 
     assert RailRemedy.episode(ctx.db, @verification_rule, review.id) == nil
@@ -267,7 +252,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
     item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
-        principal: {:user, "flynn"},
+        principal: {:user, "operator"},
         params: %{title: "escalation gate", is_bug: false}
       })
 
@@ -280,7 +265,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
                attest_call(ctx.holder.session_key, work.id, "completion")
              )
 
-    assert {:ok, [["open", "flynn"]]} =
+    assert {:ok, [["open", "operator"]]} =
              DB.query(
                ctx.db,
                "SELECT status, ownerUserId FROM decision_requests WHERE id = ?1",
@@ -303,7 +288,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
     item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
-        principal: {:user, "flynn"},
+        principal: {:user, "operator"},
         params: %{title: "neutral work", is_bug: false}
       })
 
@@ -371,8 +356,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
   defp assign(ctx, holder_key, work_item_id, subject, opts \\ []) do
     Assignments.__handle__(ctx.db, "assign", %{
       verb: "assign",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
@@ -430,10 +415,10 @@ defmodule Tightbeam.VerificationPapertrailTest do
       session_key: key,
       display_name: key,
       kind: "custom",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       archetype: archetype,
-      host: "mac-runner",
+      host: "test-host",
       harness: harness,
       provider: provider,
       model: Model.new("test")

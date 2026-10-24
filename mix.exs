@@ -17,7 +17,7 @@ defmodule Tightbeam.MixProject do
     ]
   end
 
-  # The npm-installable gateway (Flynn rulings 2026-08-03: one package carrying CLI and
+  # The npm-installable gateway (user rulings 2026-08-03: one package carrying CLI and
   # gateway so the version handshake holds by construction; mix release bundled
   # per-platform; no registry until a real release).
   #

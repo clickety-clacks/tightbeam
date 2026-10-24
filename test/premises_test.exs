@@ -371,7 +371,7 @@ defmodule Tightbeam.PremisesTest do
           claim_id: claim_id,
           purpose: "dr-raise",
           checked_at: @now,
-          runner: "host:mac-runner",
+          runner: "host:test-host",
           verifier_version: "gitref-1"
         },
         Map.new(overrides)
@@ -387,7 +387,7 @@ defmodule Tightbeam.PremisesTest do
       INSERT INTO premise_checks
         (checkId, claimId, purpose, result, observedSourceVersion, checkedAt,
          runner, verifierVersion, errorClass)
-      VALUES (?1,?2,'dr-raise',?3,?4,1,'host:mac-runner','gitref-1',?5)
+      VALUES (?1,?2,'dr-raise',?3,?4,1,'host:test-host','gitref-1',?5)
       """,
       [
         "pck_raw_#{System.unique_integer([:positive])}",

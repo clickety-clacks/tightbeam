@@ -733,7 +733,7 @@ defmodule Tightbeam.ExecutionMap do
       attests_by_assignment: attests_by_assignment(db),
       commit_refs: commit_refs(db),
       markers_by_assignment: markers_by_assignment(db),
-      # STATUTE+EFFORT only (Sol xhigh review round 2, finding 1):
+      # STATUTE+EFFORT only:
       # `Escalation.open_counts_by_assignment/1` is now the sole owner of this
       # query. Agent questions gate nothing (fabric §10) and are not tallied.
       open_requests: Escalation.open_counts_by_assignment(db),
@@ -1119,8 +1119,7 @@ defmodule Tightbeam.ExecutionMap do
 
   # `false` is not an id: an exhausted page must hand back an explicit `nil`
   # cursor, the same ID-or-null shape every other page carries, never a
-  # boolean a client could round-trip back in as `--after` (Sol xhigh review,
-  # finding 6).
+  # boolean a client could round-trip back in as `--after`.
   defp next_after([]), do: nil
   defp next_after(selected), do: List.last(selected).id
 

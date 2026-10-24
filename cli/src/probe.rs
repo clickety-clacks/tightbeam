@@ -1069,13 +1069,13 @@ fn platform_limits(platform: &str) -> Vec<&'static str> {
         vec![
             "environ is ptrace-gated; other-user and protected processes are unreadable",
             "procfs may hide processes entirely",
-            "markers are spoofable env content",
+            "markers are spooexample env content",
         ]
     } else {
         vec![
             "env visible only for same-euid processes; platform binaries may hide it even own-user",
             "ps flattens argv and env; marker position is indistinguishable",
-            "markers are spoofable argv or env content",
+            "markers are spooexample argv or env content",
         ]
     }
 }
@@ -1947,7 +1947,7 @@ mod tests {
     #[test]
     fn marker_codec_and_raw_policy() {
         let value = token_fields(Some(b"tb1-cmVzaWRlbnRAZWV6bw"));
-        assert_eq!(value.lineage.as_deref(), Some("resident@mac-runner"));
+        assert_eq!(value.lineage.as_deref(), Some("resident@test-host"));
         assert_eq!(
             value.raw_b64.as_deref(),
             Some("dGIxLWNtVnphV1JsYm5SQVpXVjZidw==")
@@ -2003,7 +2003,7 @@ mod tests {
     }
 
     #[test]
-    fn darwin_rows_distinguish_spoofable_marker_and_unmarked_adapter_evidence() {
+    fn darwin_rows_distinguish_spooexample_marker_and_unmarked_adapter_evidence() {
         let (rows, unparseable_rows) = parse_darwin_pass1(
             b"7 node TIGHTBEAM_LINEAGE=tb1-YUBi\n\
               8 codex-acp\n",
@@ -2462,7 +2462,7 @@ mod tests {
             pid: 7,
             ppid: Some(1),
             pgid: Some(7),
-            lineage: Some("resident@mac-runner".to_owned()),
+            lineage: Some("resident@test-host".to_owned()),
             lineage_raw: Some("tb1-cmVzaWRlbnRAZWV6bw".to_owned()),
             lineage_raw_b64: Some("dGIxLWNtVnphV1JsYm5SQVpXVjZidw==".to_owned()),
             evidence: "environ_exact",
@@ -2545,7 +2545,7 @@ mod tests {
     "platform_limits": [
       "environ is ptrace-gated; other-user and protected processes are unreadable",
       "procfs may hide processes entirely",
-      "markers are spoofable env content"
+      "markers are spooexample env content"
     ],
     "notes": []
   }
@@ -2595,7 +2595,7 @@ mod tests {
             raw,
             10_000,
             7,
-            "mac-runner".into(),
+            "test-host".into(),
             BaseDir {
                 path: "/srv/tightbeam".into(),
                 status: "present",
@@ -2613,7 +2613,7 @@ mod tests {
   "collection_ms": 7,
   "cold_start": null,
   "host": {
-    "hostname": "mac-runner",
+    "hostname": "test-host",
     "platform": "linux",
     "probe_version": "PROBE_VERSION"
   },
@@ -2719,7 +2719,7 @@ mod tests {
     "platform_limits": [
       "environ is ptrace-gated; other-user and protected processes are unreadable",
       "procfs may hide processes entirely",
-      "markers are spoofable env content"
+      "markers are spooexample env content"
     ],
     "notes": [
       "ps etime timed out"

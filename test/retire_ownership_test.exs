@@ -7,7 +7,7 @@ defmodule Tightbeam.RetireOwnershipTest do
   the guidance tightbeam SHIPS tells agents to do exactly that
   (`priv/guidance/operating-manual.md`, orchestrator guidance).
 
-  Admin is deliberately NOT granted cross-owner retire: Flynn's ruling is that
+  Admin is deliberately NOT granted cross-owner retire: user's ruling is that
   admin's role is approving newly registered devices, so widening it here would
   put authority in a role that does not mean that — even though
   `session_mutation_allowed/3` happens to grant admins for other mutations.
@@ -35,14 +35,14 @@ defmodule Tightbeam.RetireOwnershipTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1),('kay', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1),('kay', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
       )
 
-    Enum.each(~w(flynn kay root), &ensure_main_session(db, &1))
+    Enum.each(~w(operator kay root), &ensure_main_session(db, &1))
 
-    # An ordinary spawned agent: a session holding a role, owned by flynn.
-    session!(db, "agent:worker:app", "flynn")
-    Roles.create!(db, "worker", "flynn", "agent:worker:app")
+    # An ordinary spawned agent: a session holding a role, owned by operator.
+    session!(db, "agent:worker:app", "operator")
+    Roles.create!(db, "worker", "operator", "agent:worker:app")
 
     %{
       db: db,
@@ -51,7 +51,7 @@ defmodule Tightbeam.RetireOwnershipTest do
   end
 
   test "a role-origin agent retires a session its own owner owns", ctx do
-    session!(ctx.db, "target", "flynn")
+    session!(ctx.db, "target", "operator")
 
     # THE BUG: this returned %{code: "not_found"} for every agent origin.
     assert %{deleted_session_key: "target", retired_session_keys: ["target"]} =
@@ -72,14 +72,14 @@ defmodule Tightbeam.RetireOwnershipTest do
   test "admin is NOT granted cross-owner retire", ctx do
     session!(ctx.db, "kays-other", "kay")
 
-    # Flynn's ruling: admin approves devices; it is not a cross-owner mutation
+    # user's ruling: admin approves devices; it is not a cross-owner mutation
     # grant. This asserts the authority was NOT widened while fixing the bug.
     assert %{code: "not_found"} = retire(ctx, "user:root", {:user, "root"}, "kays-other")
     assert Org.get(ctx.db, "kays-other").state == "active"
   end
 
   test "a process origin still gets not_found", ctx do
-    session!(ctx.db, "process-target", "flynn")
+    session!(ctx.db, "process-target", "operator")
 
     # `resolve_caller/2` gives a process a nil owner, and ownerUserId is NOT NULL,
     # so the fall-through to not_found is by construction rather than by guard.
@@ -88,14 +88,14 @@ defmodule Tightbeam.RetireOwnershipTest do
   end
 
   test "an unknown origin still gets not_found", ctx do
-    session!(ctx.db, "unknown-target", "flynn")
+    session!(ctx.db, "unknown-target", "operator")
 
     assert %{code: "not_found"} = retire(ctx, "agent:no-such-role", nil, "unknown-target")
     assert Org.get(ctx.db, "unknown-target").state == "active"
   end
 
   test "the idempotency key is scoped to the resolved user, not the origin string", ctx do
-    session!(ctx.db, "idem-target", "flynn")
+    session!(ctx.db, "idem-target", "operator")
 
     assert %{deleted_session_key: "idem-target"} =
              retire(ctx, "agent:worker", {:session, "agent:worker:app"}, "idem-target", "key-1")
@@ -105,17 +105,17 @@ defmodule Tightbeam.RetireOwnershipTest do
     {:ok, rows} =
       DB.query(ctx.db, "SELECT ownerUserId FROM wire_idempotency WHERE idempotencyKey = 'key-1'")
 
-    assert rows == [["flynn"]]
+    assert rows == [["operator"]]
     refute rows == [["agent:worker"]]
 
     # And the replay returns the original answer rather than retiring again.
     assert %{deleted_session_key: "idem-target"} =
-             retire(ctx, "user:flynn", {:user, "flynn"}, "idem-target", "key-1")
+             retire(ctx, "user:operator", {:user, "operator"}, "idem-target", "key-1")
   end
 
   test "the effort menu offers retire exactly when the handler would authorize it", ctx do
-    # A holder owned by flynn, dispatched by a SESSION rung also owned by flynn.
-    session!(ctx.db, "holder", "flynn", spawned_by: "agent:worker:app")
+    # A holder owned by operator, dispatched by a SESSION rung also owned by operator.
+    session!(ctx.db, "holder", "operator", spawned_by: "agent:worker:app")
 
     assignment =
       Assignments.__handle__(ctx.db, "dispatch", %{
@@ -135,8 +135,8 @@ defmodule Tightbeam.RetireOwnershipTest do
     session_rung = %{
       session_key: "agent:worker:app",
       user_id: nil,
-      owner_user_id: "flynn",
-      principal_user_id: "flynn",
+      owner_user_id: "operator",
+      principal_user_id: "operator",
       rung: 0
     }
 
@@ -160,7 +160,7 @@ defmodule Tightbeam.RetireOwnershipTest do
       session_key: "agent:worker:app",
       user_id: nil,
       owner_user_id: "kay",
-      principal_user_id: "flynn",
+      principal_user_id: "operator",
       rung: 0
     }
 
@@ -182,7 +182,7 @@ defmodule Tightbeam.RetireOwnershipTest do
       end)
 
     refute "retire" in foreign_menu
-    assert %{code: "not_found"} = retire(ctx, "user:flynn", {:user, "flynn"}, "kays-holder")
+    assert %{code: "not_found"} = retire(ctx, "user:operator", {:user, "operator"}, "kays-holder")
   end
 
   ## Helpers
@@ -214,7 +214,7 @@ defmodule Tightbeam.RetireOwnershipTest do
           host: "testhost",
           harness: "claude",
           provider: "anthropic",
-          model: Model.new("fable")
+          model: Model.new("example-model")
         },
         Map.new(opts)
       )

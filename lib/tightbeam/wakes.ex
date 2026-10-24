@@ -102,10 +102,9 @@ defmodule Tightbeam.Wakes do
     -- (§5); this column is the proof it never overwrote a sender. A digest
     -- CARRIER is attributed 'batcher' — it was built by the batcher, not
     -- elected by any sender or the classifier, and claiming 'sender' here
-    -- would be an untrue audit fact (Sol xhigh review, finding 7). Members
+    -- would be an untrue audit fact. Members
     -- keep their own true election; only the carrier row uses this value.
-    -- `'batcher'` is a SHAPE change (schema.ex's `@shape` bumped to
-    -- `coordination-fabric-classes-v2`, Sol xhigh review round 2, finding 2):
+    -- `'batcher'` is a SHAPE change:
     -- `CREATE TABLE IF NOT EXISTS` cannot widen this CHECK on a table that
     -- already exists, so a database from the OLD shape is refused by name
     -- rather than dying on a raw CHECK violation at the first carrier insert.
@@ -647,8 +646,7 @@ defmodule Tightbeam.Wakes do
   # is how every wake predating the fabric keeps behaving exactly as it did.
   #
   # A DIGEST CARRIER is neither of those: the batcher built the row, so
-  # `classify/1`'s "sender" stamp would be a false audit fact (Sol xhigh
-  # review, finding 7) — checked first because `:digest` always carries
+  # `classify/1`'s "sender" stamp would be a false audit fact — checked first because `:digest` always carries
   # `:class` too and would otherwise be read as a sender election.
   defp elected_class(input) do
     cond do
@@ -680,8 +678,7 @@ defmodule Tightbeam.Wakes do
       Map.get(input, :digest, false) ->
         {Map.get(input, :delivery_rule, @digest_rule), Map.fetch!(input, :due_at)}
 
-      # THE CLASS CHECK PRECEDES THE INHIBITION BRANCH (Sol xhigh review,
-      # finding 1). `immediate` and `bypass` classes were never the batcher's
+      # THE CLASS CHECK PRECEDES THE INHIBITION BRANCH. `immediate` and `bypass` classes were never the batcher's
       # to hold in the first place — §7: algedonic "bypasses every bone...
       # never batched, never digested, never triaged" — so there is nothing
       # for `batcher-inhibited` to name here. A sender's own --after/--at on
@@ -893,8 +890,7 @@ defmodule Tightbeam.Wakes do
   # never destroy WHAT the sender elected or what the row IS. The INSERT
   # above now carries all five columns verbatim.
   #
-  # `deliveryRule`/`dueAt` are carried VERBATIM too, and deliberately (Sol
-  # xhigh review round 2, finding 1 — Invariant 3): the CEILING anchors on
+  # `deliveryRule`/`dueAt` are carried VERBATIM too, and deliberately: the CEILING anchors on
   # the wake's own CREATION, never on when it happened to get retargeted.
   # `created_at + ceiling_ms`, computed against the RETARGET moment, was
   # this function's first draft and it was wrong — it RESTARTS the ceiling,
@@ -1874,8 +1870,7 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc """
-  Recent digest carriers targeting a session, regardless of pending state (O5
-  follow-up; F9, Sol xhigh review). `list_pending/1` is scoped to PENDING
+  Recent digest carriers targeting a session, regardless of pending state. `list_pending/1` is scoped to PENDING
   work, and a delivered carrier is not that — it already fired. But its own
   wake id is the only sanctioned key into `digest_members/2`, and the
   delivered digest MESSAGE that ordinarily names it (`digest_prompt/3`) stops
@@ -1928,7 +1923,7 @@ defmodule Tightbeam.Wakes do
   Count pending wakes targeting a session that were durably created by that
   same session.
 
-  HELD CLASSED MEMBERS DO NOT COUNT (Sol xhigh review, finding 8). A row still
+  HELD CLASSED MEMBERS DO NOT COUNT. A row still
   waiting on the batcher (`digest = 0` under `deliveryRule = digest_rule`) is
   not a queued continuation supervision can rely on — it may not actually
   reach the session for up to a class ceiling's worth of time. Counting it
@@ -1983,8 +1978,7 @@ defmodule Tightbeam.Wakes do
     * the class ceiling — which is the member's own `dueAt`, so an idle session
       that never takes another turn still has its digest materialize one.
 
-  ELIGIBILITY AND MEMBERSHIP ARE ONE TRANSACTIONALLY COHERENT SNAPSHOT (Sol
-  xhigh review, finding 2). There is no outer "is this group due" query whose
+  ELIGIBILITY AND MEMBERSHIP ARE ONE TRANSACTIONALLY COHERENT SNAPSHOT. There is no outer "is this group due" query whose
   answer the transaction later trusts: each member's OWN ceiling and OWN
   filing time are re-read and re-judged from the SAME snapshot the transaction
   uses to select members, so a wake filed after another member's boundary or
@@ -1993,7 +1987,7 @@ defmodule Tightbeam.Wakes do
   per member (finding 4): a member with no named reason is left pending, never
   materialized under an empty `trigger=`.
 
-  SOURCE ROWS ARE PRESERVED (Law 2, wi_1100e078's title). A member is consumed
+  SOURCE ROWS ARE PRESERVED (Law 2, wi_00000000-0000-4000-8000-000000000107's title). A member is consumed
   through the typed cancellation seam as `superseded` with the digest named as
   its REPLACEMENT — the same shape re-resolution already uses. Its prompt, its
   sender, its class and its election all stay on the row; the digest-member
@@ -2057,8 +2051,7 @@ defmodule Tightbeam.Wakes do
     kind, reason -> file_materialization_failure(db, group_key, inspect({kind, reason}))
   end
 
-  # SIGNED LIKE THE SUCCESS PATH (Sol xhigh review, finding 3 — §8
-  # legibility): `wake_digest_materialized` names `rule=` alongside its
+  # SIGNED LIKE THE SUCCESS PATH: `wake_digest_materialized` names `rule=` alongside its
   # target/class/trigger, and a FAILURE is exactly the row an agent most
   # needs to know which reflex to inhibit — `@digest_rule` names the batcher
   # revision that was attempting this materialization when it failed, not
@@ -2180,12 +2173,12 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  # A member's OWN eligibility (Sol xhigh review, finding 2): its own class
+  # A member's OWN eligibility: its own class
   # ceiling, or a turn of the target's own that ended STRICTLY AFTER THIS
   # member's own filing time — never another member's ceiling or another
   # member's boundary.
   #
-  # STRICT `>`, not `>=` (Sol xhigh review round 2, finding 1): timestamps
+  # STRICT `>`, not `>=`: timestamps
   # here are millisecond-resolution wall-clock reads. A wake filed in the
   # SAME millisecond a turn ended is not provably filed BEFORE that turn's
   # end — the ordering is ambiguous, and ambiguous is not "the boundary
@@ -2219,9 +2212,7 @@ defmodule Tightbeam.Wakes do
     {class, target_label, carrier_fields, pinned_owner} = carrier_shape(txn, group_key)
     {work_item_id, assignment_id} = shared_work(members)
 
-    # MINTED HERE, not left to `schedule_in_txn`'s default (O5 follow-up: Sol
-    # xhigh review, finding 2 — `digest-members` needs a wake id no agent
-    # could otherwise discover). Minting it before the prompt is built is
+    # MINTED HERE, not left to `schedule_in_txn`'s default. Minting it before the prompt is built is
     # what lets the delivered digest sign itself with its OWN id.
     carrier_wake_id = "w_" <> Tightbeam.Id.uuid4()
 
@@ -2279,16 +2270,14 @@ defmodule Tightbeam.Wakes do
     digest.wake_id
   end
 
-  # PIN THE PAST (specs roles-registry-v1.md:31 — Sol xhigh review round 2):
+  # PIN THE PAST:
   # a role carrier's authority fact is decided HERE, once, in the SAME
   # transaction as the carrier itself, and never re-derived from a live role
   # lookup later. `nil` for a session group (there is no role to pin; the
   # carrier's own `sessionKey` already IS the pinned fact, durably, since
   # sessions are never hard-deleted).
   #
-  # `URI.encode_www_form/1` (Sol xhigh review round 3 — the same convention
-  # `client_e2e/sim_client.ex` already uses for embedding an opaque value in
-  # a `key=value` text field): a user id is opaque text, not a token — a raw
+  # `URI.encode_www_form/1`: a user id is opaque text, not a token — a raw
   # `ownerUserId=#{owner}` was LOSSY for one containing a space, and lossy in
   # a way that transfers authority: "alice bob" pinned and read back as
   # bare "alice" would hand the OLD carrier's audit to a real user named
@@ -2390,7 +2379,7 @@ defmodule Tightbeam.Wakes do
   The audit that proves zero information loss: a digest that named a member it
   did not carry, or carried one it did not name, is visible here as a mismatch.
 
-  PROVENANCE-TOTAL (Sol xhigh review, finding 6). Matching only
+  PROVENANCE-TOTAL. Matching only
   `replacementWakeId`/`reasonKind`/`outcomeKind` proves a row was superseded
   BY SOMETHING naming this carrier as its replacement — not that the BATCHER
   carried it. The join also binds `requesterId` to the batcher and
@@ -2466,13 +2455,12 @@ defmodule Tightbeam.Wakes do
           COALESCE(SUM(CASE WHEN t.wakeId IS NOT NULL THEN 1 ELSE 0 END), 0),
           COALESCE(SUM(CASE WHEN w.class IS NOT NULL THEN 1 ELSE 0 END), 0),
           -- §11.1's numerator: ALL non-summon, non-algedonic wake-materialized
-          -- turns, CLASSED OR NOT (Sol xhigh review, finding 5). `w.class IS
+          -- turns, CLASSED OR NOT. `w.class IS
           -- NOT NULL` excluded legacy unclassed wake turns entirely, undercounting
           -- the share this query exists to measure — a wake-materialized turn
           -- counts here whether or not the fabric ever stamped it.
           --
-          -- `w.wakeId IS NOT NULL` — not `t.wakeId IS NOT NULL` (Sol xhigh
-          -- review round 2, finding 3): the LEFT JOIN's `w.*` columns are also
+          -- `w.wakeId IS NOT NULL` — not `t.wakeId IS NOT NULL`: the LEFT JOIN's `w.*` columns are also
           -- NULL when `t.wakeId` names a wake that does not exist (a dangling
           -- reference), and a naive `COALESCE(w.class, '') <> 'algedonic'`
           -- treats a JOIN MISS exactly like a real unclassed wake — counting

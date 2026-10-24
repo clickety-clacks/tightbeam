@@ -120,14 +120,8 @@ defmodule Tightbeam.Application do
     Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
       # THE GATEWAY INSTALLS ITS OWN ADAPTERS, before it judges readiness.
       #
-      # This used to be deferred to "the next session spawn", which on a fresh
-      # org is a moment that never arrives: you cannot spawn until you have
-      # onboarded, onboarding VERIFIES by starting a runtime, and that runtime
-      # needs the adapter only a spawn would have installed. Circular, and every
-      # fresh install hit it — build-host twice, on both providers, surfacing as
-      # `harness command could not be executed: No such file or directory`
-      # (Flynn, 2026-08-04). Boot printed the npm command as a "manual
-      # fallback"; the only change is that we run it instead of describing it.
+      # Install adapters before onboarding, because onboarding verifies a runtime
+      # and therefore needs the adapter to be present already.
       #
       # In the readiness task, not inline: a cold npm install is minutes and boot
       # must not block on the network. Failures log and never stop the gateway —
@@ -186,11 +180,11 @@ defmodule Tightbeam.Application do
   # `default_model` was the literal claude-sonnet-5, whatever harness that
   # implied. A codex-only machine therefore placed its first turn on a harness
   # it had never installed, with a model it cannot run, and refused naming a
-  # vendor the operator never chose (Flynn, 2026-08-04: "what if i'm a codex
+  # vendor the operator never chose (user, 2026-08-04: "what if i'm a codex
   # only user"). The first repair special-cased exactly one INSTALLED binary,
   # but a tester with BOTH CLIs on PATH and ONLY codex onboarded still fell to
   # registry-order claude + claude-sonnet-5 — a dead default whose first turn
-  # cannot run (mike repro 2026-08-06, wi_24028d10). Installed is not runnable;
+  # cannot run (operator repro 2026-08-06, wi_00000000-0000-4000-8000-000000000104). Installed is not runnable;
   # installed-AND-onboarded is. Onboarded-ness is read synchronously from disk
   # here (Credentials.kind_at), before the async catalog exists.
   #
@@ -241,10 +235,10 @@ defmodule Tightbeam.Application do
     %{
       base_dir: Application.get_env(:tightbeam, :base_dir, default_base_dir()),
       cwd: Application.get_env(:tightbeam, :cwd, File.cwd!()),
-      # 11373: the Expanse's 1373 colonized worlds, plus one for Earth (Flynn's
+      # 11373: the Expanse's 1373 colonized worlds, plus one for Earth (user's
       # port, agreed at project start). The code defaulted to 4321 long after the
       # convention settled, so a bare `tightbeam-gateway` boot landed on a port no
-      # client dials — Flynn's first clawline connect to a fresh production install
+      # client dials — user's first clawline connect to a fresh production install
       # failed exactly there (2026-08-04). The default IS the convention now.
       port: Application.get_env(:tightbeam, :port, 11_373),
       default_harness: Tightbeam.Harness.default().id(),

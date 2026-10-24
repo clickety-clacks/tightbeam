@@ -64,7 +64,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "mac-runner" => %{
+      "test-host" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -74,13 +74,13 @@ defmodule Tightbeam.WorkItemBracketsTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1), ('dana', 0, 'admin_add', 1), ('eve', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 1, 'admin_add', 1), ('dana', 0, 'admin_add', 1), ('eve', 0, 'admin_add', 1)"
       )
 
     # Owners are always users; bracket wakes target the owner's personal session.
-    flynn_main = session(db, Org.personal_session_key("flynn"), "flynn")
+    example_main = session(db, Org.personal_session_key("operator"), "operator")
     _dana_main = session(db, Org.personal_session_key("dana"), "dana")
-    holder = session(db, "holder", "flynn")
+    holder = session(db, "holder", "operator")
     dsession = session(db, "dsession", "dana")
 
     base = Path.join(System.tmp_dir!(), "tb-brackets-#{System.unique_integer([:positive])}")
@@ -92,7 +92,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     %{
       db: db,
       handlers: handlers,
-      flynn_main: flynn_main,
+      example_main: example_main,
       holder: holder,
       dsession: dsession
     }
@@ -101,24 +101,24 @@ defmodule Tightbeam.WorkItemBracketsTest do
   ## Proof 1 — create arms bracket 1; keyed replay returns the original, arms nothing.
 
   test "Proof 1: create (keyed and keyless) arms bracket 1; keyed replay is inert", ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Route me"})
+    item = create(ctx, {:user, "operator"}, %{title: "Route me"})
     assert item.state == "open"
-    assert item.ownerUserId == "flynn"
+    assert item.ownerUserId == "operator"
 
     routing = routing_wake_id(ctx.db, item.id)
     assert is_binary(routing)
     wake = Wakes.get(ctx.db, routing)
     assert wake.consumer == "prompt"
-    assert wake.session_key == Org.personal_session_key("flynn")
+    assert wake.session_key == Org.personal_session_key("operator")
     assert wake.work_item_id == item.id
     assert wake.prompt =~ "route it or icebox it"
     assert item_wake_count(ctx.db, item.id) == 1
 
-    keyed = create(ctx, {:user, "flynn"}, %{title: "Keyed", idempotency_key: "kc"})
+    keyed = create(ctx, {:user, "operator"}, %{title: "Keyed", idempotency_key: "kc"})
     original_routing = routing_wake_id(ctx.db, keyed.id)
     assert is_binary(original_routing)
 
-    replay = create(ctx, {:user, "flynn"}, %{title: "Different title", idempotency_key: "kc"})
+    replay = create(ctx, {:user, "operator"}, %{title: "Different title", idempotency_key: "kc"})
     assert replay.id == keyed.id
     # Replay arms NOTHING new: same routing wake, still exactly one pending wake.
     assert routing_wake_id(ctx.db, keyed.id) == original_routing
@@ -130,9 +130,9 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   test "Proof 2: first assign and first dispatch each cancel bracket 1 and persist workItemId",
        ctx do
-    a_item = create(ctx, {:user, "flynn"}, %{title: "Assign path"})
+    a_item = create(ctx, {:user, "operator"}, %{title: "Assign path"})
     a_routing = routing_wake_id(ctx.db, a_item.id)
-    {:ok, assignment} = disp_assign(ctx, {:user, "flynn"}, "holder", "work", a_item.id)
+    {:ok, assignment} = disp_assign(ctx, {:user, "operator"}, "holder", "work", a_item.id)
     assert assignment.workItemId == a_item.id
     assert routing_wake_id(ctx.db, a_item.id) == nil
     assert Wakes.get(ctx.db, a_routing).state == "canceled"
@@ -158,9 +158,9 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert assignment_work_item == a_item.id
     assert entitlement_id == "#{assignment.id}#1"
 
-    d_item = create(ctx, {:user, "flynn"}, %{title: "Dispatch path"})
+    d_item = create(ctx, {:user, "operator"}, %{title: "Dispatch path"})
     d_routing = routing_wake_id(ctx.db, d_item.id)
-    {:ok, dispatched} = disp_dispatch(ctx, {:user, "flynn"}, "holder", "work", d_item.id)
+    {:ok, dispatched} = disp_dispatch(ctx, {:user, "operator"}, "holder", "work", d_item.id)
     assert dispatched.workItemId == d_item.id
     assert routing_wake_id(ctx.db, d_item.id) == nil
     assert Wakes.get(ctx.db, d_routing).state == "canceled"
@@ -168,7 +168,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
   end
 
   test "typed bracket refusal rolls back the caller transaction", ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Refused bracket"})
+    item = create(ctx, {:user, "operator"}, %{title: "Refused bracket"})
     routing = routing_wake_id(ctx.db, item.id)
 
     assert {:error, %WorkItems.CancellationRefused{wake_id: ^routing}} =
@@ -188,11 +188,11 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   test "linked assign and dispatch roll back the complete accepted bundle", ctx do
     for {verb, dispatch_fun} <- [
-          {"assign", &disp_assign(&1, {:user, "flynn"}, "holder", &2, &3)},
-          {"dispatch", &disp_dispatch(&1, {:user, "flynn"}, "holder", &2, &3)}
+          {"assign", &disp_assign(&1, {:user, "operator"}, "holder", &2, &3)},
+          {"dispatch", &disp_dispatch(&1, {:user, "operator"}, "holder", &2, &3)}
         ] do
       subject = "forced #{verb} rollback"
-      item = create(ctx, {:user, "flynn"}, %{title: subject})
+      item = create(ctx, {:user, "operator"}, %{title: subject})
       routing = routing_wake_id(ctx.db, item.id)
 
       :ok =
@@ -237,11 +237,11 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   test "linked assign and dispatch roll back the complete bundle when event append fails", ctx do
     for {verb, dispatch_fun} <- [
-          {"assign", &disp_assign(&1, {:user, "flynn"}, "holder", &2, &3)},
-          {"dispatch", &disp_dispatch(&1, {:user, "flynn"}, "holder", &2, &3)}
+          {"assign", &disp_assign(&1, {:user, "operator"}, "holder", &2, &3)},
+          {"dispatch", &disp_dispatch(&1, {:user, "operator"}, "holder", &2, &3)}
         ] do
       subject = "forced #{verb} event rollback"
-      item = create(ctx, {:user, "flynn"}, %{title: subject})
+      item = create(ctx, {:user, "operator"}, %{title: subject})
       routing = routing_wake_id(ctx.db, item.id)
 
       :ok =
@@ -290,7 +290,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
   ## Proof 3 — bracket-1 fire re-arms; icebox cancels and stops the nag.
 
   test "Proof 3: an ignored bracket-1 wake re-arms on fire; icebox stops the nag", ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Nagged"})
+    item = create(ctx, {:user, "operator"}, %{title: "Nagged"})
     old = routing_wake_id(ctx.db, item.id)
 
     deliver_bracket_wake(ctx.db, Wakes.get(ctx.db, old))
@@ -302,12 +302,12 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     # One nag turn was delivered to the owner's personal session.
     assert Enum.any?(
-             Projection.list_after(ctx.db, Org.personal_session_key("flynn"), nil, 10),
+             Projection.list_after(ctx.db, Org.personal_session_key("operator"), nil, 10),
              &(&1.content =~ "route it or icebox it")
            )
 
     assert %{ok: true, workItem: %{state: "iceboxed"}} =
-             dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id)
+             dispose(ctx, "work-item-icebox", {:user, "operator"}, item.id)
 
     assert routing_wake_id(ctx.db, item.id) == nil
     assert Wakes.get(ctx.db, new).state == "canceled"
@@ -336,8 +336,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   test "Proof 4: every close path arms bracket 2 durably; next assign cancels; re-arms", ctx do
     # Completion path + the full assign/cancel/re-arm cycle.
-    item = create(ctx, {:user, "flynn"}, %{title: "Slate"})
-    {:ok, a} = disp_assign(ctx, {:user, "flynn"}, "holder", "w", item.id)
+    item = create(ctx, {:user, "operator"}, %{title: "Slate"})
+    {:ok, a} = disp_assign(ctx, {:user, "operator"}, "holder", "w", item.id)
     complete(ctx, "holder", a.id)
 
     slate = slate_wake_id(ctx.db, item.id)
@@ -345,10 +345,10 @@ defmodule Tightbeam.WorkItemBracketsTest do
     wake = Wakes.get(ctx.db, slate)
     # Durable row (survives a crash between commit and any delivery — no callback).
     assert wake.state == "pending"
-    assert wake.session_key == Org.personal_session_key("flynn")
+    assert wake.session_key == Org.personal_session_key("operator")
     assert wake.prompt =~ "slate clear"
 
-    {:ok, a2} = disp_assign(ctx, {:user, "flynn"}, "holder", "w2", item.id)
+    {:ok, a2} = disp_assign(ctx, {:user, "operator"}, "holder", "w2", item.id)
     assert a2.workItemId == item.id
     assert slate_wake_id(ctx.db, item.id) == nil
     assert Wakes.get(ctx.db, slate).state == "canceled"
@@ -359,29 +359,29 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert slate2 != slate
 
     # cannot-proceed keeps the assignment open, so it must not arm a slate wake.
-    blocked_item = create(ctx, {:user, "flynn"}, %{title: "Blocked"})
-    {:ok, blocked} = disp_assign(ctx, {:user, "flynn"}, "holder", "blocked", blocked_item.id)
+    blocked_item = create(ctx, {:user, "operator"}, %{title: "Blocked"})
+    {:ok, blocked} = disp_assign(ctx, {:user, "operator"}, "holder", "blocked", blocked_item.id)
     cannot_proceed(ctx, "holder", blocked.id)
     assert slate_wake_id(ctx.db, blocked_item.id) == nil
 
     # Revoke path.
-    revoke_item = create(ctx, {:user, "flynn"}, %{title: "Revoked"})
-    {:ok, ra} = disp_assign(ctx, {:user, "flynn"}, "holder", "rw", revoke_item.id)
+    revoke_item = create(ctx, {:user, "operator"}, %{title: "Revoked"})
+    {:ok, ra} = disp_assign(ctx, {:user, "operator"}, "holder", "rw", revoke_item.id)
     revoke(ctx, ra.id)
     assert is_binary(slate_wake_id(ctx.db, revoke_item.id))
 
     # Retire-strand path (interrupt_for_retire closes the strand's open assignments).
-    strand_holder = session(ctx.db, "strand-holder", "flynn")
-    retire_item = create(ctx, {:user, "flynn"}, %{title: "Stranded"})
-    {:ok, _ta} = disp_assign(ctx, {:user, "flynn"}, "strand-holder", "tw", retire_item.id)
+    strand_holder = session(ctx.db, "strand-holder", "operator")
+    retire_item = create(ctx, {:user, "operator"}, %{title: "Stranded"})
+    {:ok, _ta} = disp_assign(ctx, {:user, "operator"}, "strand-holder", "tw", retire_item.id)
 
     {:ok, _} =
       DB.transaction(ctx.db, fn txn ->
         Assignments.interrupt_for_retire_in_txn(
           txn,
           strand_holder.session_key,
-          "flynn",
-          "user:flynn"
+          "operator",
+          "user:operator"
         )
       end)
 
@@ -392,14 +392,14 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   test "Proof 5: dispositions transition, cancel both brackets, refuse work, no-op, reopen",
        ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Disposed"})
-    {:ok, a} = disp_assign(ctx, {:user, "flynn"}, "holder", "w", item.id)
+    item = create(ctx, {:user, "operator"}, %{title: "Disposed"})
+    {:ok, a} = disp_assign(ctx, {:user, "operator"}, "holder", "w", item.id)
     complete(ctx, "holder", a.id)
     slate = slate_wake_id(ctx.db, item.id)
     assert is_binary(slate)
 
     assert %{ok: true, workItem: %{state: "iceboxed"}} =
-             dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id)
+             dispose(ctx, "work-item-icebox", {:user, "operator"}, item.id)
 
     # Cancels BOTH brackets (slate wake canceled, both ids cleared).
     assert Wakes.get(ctx.db, slate).state == "canceled"
@@ -408,36 +408,36 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     # Refuses assign/dispatch afterward (terminal guard).
     assert {:error, %{code: "work_item_not_open"}} =
-             disp_assign(ctx, {:user, "flynn"}, "holder", "again", item.id)
+             disp_assign(ctx, {:user, "operator"}, "holder", "again", item.id)
 
     # Same-state disposition is a no-op success.
     assert %{ok: true, workItem: %{state: "iceboxed"}} =
-             dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id)
+             dispose(ctx, "work-item-icebox", {:user, "operator"}, item.id)
 
     # Reopen re-arms bracket 1.
     assert %{ok: true, workItem: %{state: "open"}} =
-             dispose(ctx, "work-item-reopen", {:user, "flynn"}, item.id)
+             dispose(ctx, "work-item-reopen", {:user, "operator"}, item.id)
 
     reopened_routing = routing_wake_id(ctx.db, item.id)
     assert is_binary(reopened_routing)
     assert Wakes.get(ctx.db, reopened_routing).state == "pending"
 
     # close and fail transition and refuse too.
-    close_item = create(ctx, {:user, "flynn"}, %{title: "Closeable"})
+    close_item = create(ctx, {:user, "operator"}, %{title: "Closeable"})
 
     assert %{ok: true, workItem: %{state: "closed"}} =
-             dispose(ctx, "work-item-close", {:user, "flynn"}, close_item.id)
+             dispose(ctx, "work-item-close", {:user, "operator"}, close_item.id)
 
     assert {:error, %{code: "work_item_not_open"}} =
-             disp_assign(ctx, {:user, "flynn"}, "holder", "x", close_item.id)
+             disp_assign(ctx, {:user, "operator"}, "holder", "x", close_item.id)
 
-    fail_item = create(ctx, {:user, "flynn"}, %{title: "Failable"})
+    fail_item = create(ctx, {:user, "operator"}, %{title: "Failable"})
 
     assert %{ok: true, workItem: %{state: "failed"}} =
-             dispose(ctx, "work-item-fail", {:user, "flynn"}, fail_item.id)
+             dispose(ctx, "work-item-fail", {:user, "operator"}, fail_item.id)
 
     assert {:error, %{code: "work_item_not_open"}} =
-             disp_assign(ctx, {:user, "flynn"}, "holder", "x", fail_item.id)
+             disp_assign(ctx, {:user, "operator"}, "holder", "x", fail_item.id)
   end
 
   ## Disposition authority — owner-or-admin, resolved through the session's user.
@@ -450,7 +450,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert %{code: "not_authorized"} =
              dispose(ctx, "work-item-close", {:session, "dsession"}, eves_item.id)
 
-    # "holder" is owned by flynn, who is admin — an admin session (not the owner)
+    # "holder" is owned by operator, who is admin — an admin session (not the owner)
     # disposes it. Before the fix this was wrongly refused (session != owner).
     assert %{ok: true, workItem: %{state: "closed"}} =
              dispose(ctx, "work-item-close", {:session, "holder"}, eves_item.id)
@@ -480,8 +480,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   test "Proof 7: a dispatched assignment closes through effort-cancel and slate-arm together",
        ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Coexist"})
-    {:ok, d} = disp_dispatch(ctx, {:user, "flynn"}, "holder", "w", item.id)
+    item = create(ctx, {:user, "operator"}, %{title: "Coexist"})
+    {:ok, d} = disp_dispatch(ctx, {:user, "operator"}, "holder", "w", item.id)
 
     assert effort_state(ctx.db, d.id) == "armed"
 
@@ -496,18 +496,18 @@ defmodule Tightbeam.WorkItemBracketsTest do
   ## Proof 8 — feature_smoke journey.
 
   test "Proof 9: create -> nag -> dispatch cancels -> revoke arms slate -> fail disposes", ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Journey"})
+    item = create(ctx, {:user, "operator"}, %{title: "Journey"})
 
     # Idle past the triage horizon: the routing wake fires and re-nags.
     deliver_bracket_wake(ctx.db, Wakes.get(ctx.db, routing_wake_id(ctx.db, item.id)))
 
     assert Enum.any?(
-             Projection.list_after(ctx.db, Org.personal_session_key("flynn"), nil, 10),
+             Projection.list_after(ctx.db, Org.personal_session_key("operator"), nil, 10),
              &(&1.content =~ "route it or icebox it")
            )
 
     # Dispatch cancels bracket 1.
-    {:ok, d} = disp_dispatch(ctx, {:user, "flynn"}, "holder", "ship", item.id)
+    {:ok, d} = disp_dispatch(ctx, {:user, "operator"}, "holder", "ship", item.id)
     assert routing_wake_id(ctx.db, item.id) == nil
 
     # Revoke (last close) arms the slate wake, which then arrives.
@@ -517,13 +517,13 @@ defmodule Tightbeam.WorkItemBracketsTest do
     deliver_bracket_wake(ctx.db, Wakes.get(ctx.db, slate))
 
     assert Enum.any?(
-             Projection.list_after(ctx.db, Org.personal_session_key("flynn"), nil, 10),
+             Projection.list_after(ctx.db, Org.personal_session_key("operator"), nil, 10),
              &(&1.content =~ "slate clear")
            )
 
     # work-item-fail disposes and cancels bracket 2.
     assert %{ok: true, workItem: %{state: "failed", failReason: "shipped elsewhere"}} =
-             dispose(ctx, "work-item-fail", {:user, "flynn"}, item.id, %{
+             dispose(ctx, "work-item-fail", {:user, "operator"}, item.id, %{
                reason: "shipped elsewhere"
              })
 
@@ -534,19 +534,19 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   test "Proof 10: a keyed dispatch replay returns the original across any workItemId, even disposed",
        ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Replay"})
-    other = create(ctx, {:user, "flynn"}, %{title: "Other"})
+    item = create(ctx, {:user, "operator"}, %{title: "Replay"})
+    other = create(ctx, {:user, "operator"}, %{title: "Other"})
 
-    {:ok, orig} = disp_dispatch(ctx, {:user, "flynn"}, "holder", "ship", item.id, key: "dk")
+    {:ok, orig} = disp_dispatch(ctx, {:user, "operator"}, "holder", "ship", item.id, key: "dk")
     assert orig.workItemId == item.id
 
     # Dispose the item since — the replay must still succeed (no terminal-guard eval).
     revoke(ctx, orig.id)
-    dispose(ctx, "work-item-fail", {:user, "flynn"}, item.id)
+    dispose(ctx, "work-item-fail", {:user, "operator"}, item.id)
 
     for work_item_id <- [item.id, other.id, nil, "wi_unknown"] do
       assert {:ok, replay} =
-               disp_dispatch(ctx, {:user, "flynn"}, "holder", "ship", work_item_id, key: "dk")
+               disp_dispatch(ctx, {:user, "operator"}, "holder", "ship", work_item_id, key: "dk")
 
       assert replay.id == orig.id
       assert replay.workItemId == item.id
@@ -557,8 +557,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
   end
 
   test "Proof 10 (added): a keyed assign replay through Dispatch is statute-inert", ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Assign replay"})
-    {:ok, orig} = disp_assign(ctx, {:user, "flynn"}, "holder", "seed", item.id, key: "ak")
+    item = create(ctx, {:user, "operator"}, %{title: "Assign replay"})
+    {:ok, orig} = disp_assign(ctx, {:user, "operator"}, "holder", "seed", item.id, key: "ak")
     assert orig.workItemId == item.id
 
     # Install a statute that Rules.decide WOULD deny a user-origin assign under.
@@ -575,12 +575,12 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     # The statute is live: a fresh (non-replay) assign is denied by the rail.
     assert {:error, %{code: "rule_denied"}} =
-             disp_assign(ctx, {:user, "flynn"}, "holder", "fresh", item.id)
+             disp_assign(ctx, {:user, "operator"}, "holder", "fresh", item.id)
 
     # The keyed replay short-circuits ABOVE the rail: the original assignment
     # returns untouched and no remedy episode is filed (statute inertness).
     assert {:ok, replay} =
-             disp_assign(ctx, {:user, "flynn"}, "holder", "ignored", item.id, key: "ak")
+             disp_assign(ctx, {:user, "operator"}, "holder", "ignored", item.id, key: "ak")
 
     assert replay.id == orig.id
     assert replay.workItemId == item.id
@@ -590,11 +590,11 @@ defmodule Tightbeam.WorkItemBracketsTest do
   ## Proof 11 — disposition-while-open is refused with a legible error.
 
   test "Proof 11: icebox/close/fail are refused while any assignment is open", ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Busy"})
-    {:ok, _a} = disp_assign(ctx, {:user, "flynn"}, "holder", "w", item.id)
+    item = create(ctx, {:user, "operator"}, %{title: "Busy"})
+    {:ok, _a} = disp_assign(ctx, {:user, "operator"}, "holder", "w", item.id)
 
     for verb <- ["work-item-icebox", "work-item-close", "work-item-fail"] do
-      assert %{code: "assignments_open"} = dispose(ctx, verb, {:user, "flynn"}, item.id)
+      assert %{code: "assignments_open"} = dispose(ctx, verb, {:user, "operator"}, item.id)
     end
   end
 
@@ -602,30 +602,30 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   test "Proof 13: work-item-fail --reason persists and surfaces; icebox/close leave it NULL",
        ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Reasoned"})
+    item = create(ctx, {:user, "operator"}, %{title: "Reasoned"})
 
     assert %{workItem: %{failReason: "cannot repro"}} =
-             dispose(ctx, "work-item-fail", {:user, "flynn"}, item.id, %{reason: "cannot repro"})
+             dispose(ctx, "work-item-fail", {:user, "operator"}, item.id, %{reason: "cannot repro"})
 
     assert get(ctx, item.id).workItem.failReason == "cannot repro"
     assert Enum.find(list(ctx).workItems, &(&1.id == item.id)).failReason == "cannot repro"
     assert WorkState.item_detail(ctx.db, item.id).workItem.failReason == "cannot repro"
 
-    closed = create(ctx, {:user, "flynn"}, %{title: "Closed"})
+    closed = create(ctx, {:user, "operator"}, %{title: "Closed"})
 
     assert %{workItem: %{failReason: nil}} =
-             dispose(ctx, "work-item-close", {:user, "flynn"}, closed.id)
+             dispose(ctx, "work-item-close", {:user, "operator"}, closed.id)
 
-    iceboxed = create(ctx, {:user, "flynn"}, %{title: "Iced"})
+    iceboxed = create(ctx, {:user, "operator"}, %{title: "Iced"})
 
     assert %{workItem: %{failReason: nil}} =
-             dispose(ctx, "work-item-icebox", {:user, "flynn"}, iceboxed.id)
+             dispose(ctx, "work-item-icebox", {:user, "operator"}, iceboxed.id)
   end
 
   ## Proof 14 — response shapes carry owner/state/failReason; never wake ids.
 
   test "Proof 14: every response object exposes owner/state/failReason and hides wake ids", ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Shaped"})
+    item = create(ctx, {:user, "operator"}, %{title: "Shaped"})
 
     objects = [
       item,
@@ -644,7 +644,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
       refute Map.has_key?(object, :slateWakeId)
     end
 
-    disposition = dispose(ctx, "work-item-close", {:user, "flynn"}, item.id)
+    disposition = dispose(ctx, "work-item-close", {:user, "operator"}, item.id)
     assert %{ok: true, workItem: work_item} = disposition
     assert map_size(disposition) == 2
     refute Map.has_key?(disposition.workItem, :routingWakeId)
@@ -652,28 +652,28 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     # A same-state no-op returns the same ok envelope and changes nothing.
     assert %{ok: true, workItem: %{state: "closed"}} =
-             dispose(ctx, "work-item-close", {:user, "flynn"}, item.id)
+             dispose(ctx, "work-item-close", {:user, "operator"}, item.id)
   end
 
   ## Proof 15 — create doorbell: one on a real create, zero on a keyed replay.
 
   test "Proof 15: an actual create publishes to the owner's board (unassigned); replay is silent",
        ctx do
-    flynn = observe("flynn")
+    operator = observe("operator")
     eve = observe("eve")
 
     # An UNASSIGNED item has no holders: the doorbell must still reach its owner.
-    item = create(ctx, {:user, "flynn"}, %{title: "Doorbell", idempotency_key: "dk"})
+    item = create(ctx, {:user, "operator"}, %{title: "Doorbell", idempotency_key: "dk"})
     assert doorbell_count(ctx.db, item.id) == 1
-    assert [%{"type" => "work_item_event", "kind" => "metadata"}] = Observer.drain(flynn)
+    assert [%{"type" => "work_item_event", "kind" => "metadata"}] = Observer.drain(operator)
     assert Observer.drain(eve) == []
 
-    replay = create(ctx, {:user, "flynn"}, %{title: "Doorbell", idempotency_key: "dk"})
+    replay = create(ctx, {:user, "operator"}, %{title: "Doorbell", idempotency_key: "dk"})
     assert replay.id == item.id
     assert doorbell_count(ctx.db, item.id) == 1
-    assert Observer.drain(flynn) == []
+    assert Observer.drain(operator) == []
 
-    assert item.id in item_ids(WorkState.list_items(ctx.db, %{owner_user_id: "flynn"}))
+    assert item.id in item_ids(WorkState.list_items(ctx.db, %{owner_user_id: "operator"}))
     refute item.id in item_ids(WorkState.list_items(ctx.db, %{owner_user_id: "eve"}))
   end
 
@@ -681,13 +681,13 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   test "Proof 16: through Dispatch, a disposition landing between the guards aborts the insert",
        ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Raced"})
+    item = create(ctx, {:user, "operator"}, %{title: "Raced"})
 
     # The pre-statute guard (Dispatch precheck) will read this open state and proceed.
     assert WorkItems.state_for(ctx.db, item.id) == "open"
 
     call =
-      assign_call({:user, "flynn"}, "holder", "w", item.id)
+      assign_call({:user, "operator"}, "holder", "w", item.id)
       |> Map.put(:on_work_item_interlock, fn txn ->
         # A genuine disposition (close) commits AFTER the pre-statute guard read
         # but BEFORE the insert — the same mechanics work-item-close applies
@@ -730,8 +730,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
   ## Proof 17 — bracket-2 slate re-arm on fire.
 
   test "Proof 17: an ignored slate wake re-arms itself at the next horizon", ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Slate re-arm"})
-    {:ok, a} = disp_assign(ctx, {:user, "flynn"}, "holder", "w", item.id)
+    item = create(ctx, {:user, "operator"}, %{title: "Slate re-arm"})
+    {:ok, a} = disp_assign(ctx, {:user, "operator"}, "holder", "w", item.id)
     complete(ctx, "holder", a.id)
 
     slate = slate_wake_id(ctx.db, item.id)
@@ -762,29 +762,29 @@ defmodule Tightbeam.WorkItemBracketsTest do
   ## Proof 19 — disposition doorbells fire on real transitions, stay silent on no-ops.
 
   test "Proof 19: each real disposition emits a doorbell; a same-state no-op emits none", ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Doorbells"})
+    item = create(ctx, {:user, "operator"}, %{title: "Doorbells"})
     base = doorbell_count(ctx.db, item.id)
 
     # A disposition on an UNASSIGNED item still reaches the owner's board.
-    flynn = observe("flynn")
-    dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id)
+    operator = observe("operator")
+    dispose(ctx, "work-item-icebox", {:user, "operator"}, item.id)
     assert doorbell_count(ctx.db, item.id) == base + 1
-    assert [%{"type" => "work_item_event", "kind" => "metadata"}] = Observer.drain(flynn)
+    assert [%{"type" => "work_item_event", "kind" => "metadata"}] = Observer.drain(operator)
 
     # Same-state no-op: no doorbell, no publish.
-    dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id)
+    dispose(ctx, "work-item-icebox", {:user, "operator"}, item.id)
     assert doorbell_count(ctx.db, item.id) == base + 1
-    assert Observer.drain(flynn) == []
+    assert Observer.drain(operator) == []
 
-    dispose(ctx, "work-item-reopen", {:user, "flynn"}, item.id)
+    dispose(ctx, "work-item-reopen", {:user, "operator"}, item.id)
     assert doorbell_count(ctx.db, item.id) == base + 2
 
-    dispose(ctx, "work-item-close", {:user, "flynn"}, item.id)
+    dispose(ctx, "work-item-close", {:user, "operator"}, item.id)
     assert doorbell_count(ctx.db, item.id) == base + 3
 
-    fail_item = create(ctx, {:user, "flynn"}, %{title: "Failing"})
+    fail_item = create(ctx, {:user, "operator"}, %{title: "Failing"})
     fail_base = doorbell_count(ctx.db, fail_item.id)
-    dispose(ctx, "work-item-fail", {:user, "flynn"}, fail_item.id)
+    dispose(ctx, "work-item-fail", {:user, "operator"}, fail_item.id)
     assert doorbell_count(ctx.db, fail_item.id) == fail_base + 1
   end
 
@@ -825,7 +825,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
             Txn.q(
               txn,
-              "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES (?1,'terminal close fixture','holder','flynn',?2,'open',?3)",
+              "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES (?1,'terminal close fixture','holder','operator',?2,'open',?3)",
               [assignment_id, ts, work_item_id]
             )
 
@@ -871,16 +871,16 @@ defmodule Tightbeam.WorkItemBracketsTest do
   defp get(ctx, id),
     do:
       ctx.handlers["work-item-get"].(
-        work_item_call("work-item-get", {:user, "flynn"}, %{work_item_id: id})
+        work_item_call("work-item-get", {:user, "operator"}, %{work_item_id: id})
       )
 
   defp list(ctx),
-    do: ctx.handlers["work-item-list"].(work_item_call("work-item-list", {:user, "flynn"}, %{}))
+    do: ctx.handlers["work-item-list"].(work_item_call("work-item-list", {:user, "operator"}, %{}))
 
   defp update(ctx, id, patch),
     do:
       ctx.handlers["work-item-update"].(
-        work_item_call("work-item-update", {:user, "flynn"}, Map.put(patch, :work_item_id, id))
+        work_item_call("work-item-update", {:user, "operator"}, Map.put(patch, :work_item_id, id))
       )
 
   defp work_item_call(verb, principal, params) do
@@ -966,8 +966,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
   defp revoke(ctx, assignment_id) do
     Assignments.__handle__(ctx.db, "revoke-assignment", %{
       verb: "revoke-assignment",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: nil,
       params: %{assignment_id: assignment_id, reason: "test revocation"}
     })
@@ -1103,8 +1103,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("fable"),
-      host: "mac-runner"
+      model: Model.new("example-model"),
+      host: "test-host"
     })
   end
 end

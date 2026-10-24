@@ -177,7 +177,7 @@ defmodule Tightbeam.ConnRegistry do
         deliver.(e.pid, payload)
       end
 
-    # No one listening → say so and move on (Flynn ruling 2026-08-04: "if
+    # No one listening → say so and move on (user ruling 2026-08-04: "if
     # there's no one listening simply log it"). Normal whenever agents work
     # unwatched, hence debug; the row is stored and replay serves it.
     if recipients == [] do

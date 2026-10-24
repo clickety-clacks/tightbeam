@@ -31,7 +31,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',1,'admin_add',1)"
       )
 
     register_testhost(db)
@@ -40,8 +40,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     call = %{
       verb: "work-item-create",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: nil,
       params: %{title: "Route this", idempotency_key: "firehose-create"}
     }
@@ -81,7 +81,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',1,'admin_add',1)"
       )
 
     register_testhost(db)
@@ -89,8 +89,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     call = %{
       verb: "work-item-create",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: nil,
       params: %{title: "Priority parity", priority: 4}
     }
@@ -141,7 +141,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',1,'admin_add',1)"
       )
 
     register_testhost(db)
@@ -151,24 +151,24 @@ defmodule Tightbeam.Firehose.PublisherTest do
     Org.create(db, %{
       session_key: "post-target",
       display_name: "Post target",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       archetype: "default",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Tightbeam.Model.new("fable")
+      model: Tightbeam.Model.new("example-model")
     })
 
     assert :appended =
              Gateway.deliver_prompt(
                "post-target",
-               "user:flynn",
+               "user:operator",
                "exact A1 post reproduction",
                db: db,
                conn_registry: registry,
                lane_manager: lane,
-               sender: "user:flynn",
+               sender: "user:operator",
                device_id: "device-1",
                client_message_id: "client-message-1",
                authenticated_device_message: true
@@ -202,7 +202,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',1,'admin_add',1)"
       )
 
     register_testhost(db)
@@ -212,25 +212,25 @@ defmodule Tightbeam.Firehose.PublisherTest do
     Org.create(db, %{
       session_key: "effect-target",
       display_name: "Effect target",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       archetype: "default",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Tightbeam.Model.new("fable")
+      model: Tightbeam.Model.new("example-model")
     })
 
     Org.create(db, %{
       session_key: "effect-dispatcher",
       display_name: "Effect dispatcher",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       archetype: "default",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Tightbeam.Model.new("fable")
+      model: Tightbeam.Model.new("example-model")
     })
 
     start_supervised!(
@@ -260,8 +260,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     immediate_wake = %{
       verb: "wake",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: "effect-target",
       params: %{prompt: "immediate effect", after_ms: 0, idempotency_key: "effect-immediate"}
     }
@@ -273,15 +273,15 @@ defmodule Tightbeam.Firehose.PublisherTest do
     pending =
       Wakes.schedule(db, %{
         session_key: "effect-target",
-        origin: "user:flynn",
+        origin: "user:operator",
         prompt: "cancel effect",
         due_at: System.system_time(:millisecond) + 60_000
       })
 
     cancel_wake = %{
       verb: "wake",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: nil,
       params: %{cancel_wake_id: pending.wake_id}
     }
@@ -309,7 +309,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     _condition_wake =
       Wakes.schedule(db, %{
         session_key: "effect-target",
-        origin: "user:flynn",
+        origin: "user:operator",
         prompt: "condition effect",
         due_at: System.system_time(:millisecond) + 60_000,
         condition_kind: "effect-ready",
@@ -318,8 +318,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     condition = %{
       verb: "condition",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: nil,
       params: %{kind: "effect-ready", scope: "matrix", idempotency_key: "effect-fact"}
     }
@@ -339,8 +339,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     dispatch = %{
       verb: "dispatch",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: "effect-target",
       target_role: nil,
       role_fallback: false,
@@ -352,8 +352,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     work_item_create = %{
       verb: "work-item-create",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: nil,
       params: %{title: "Exercise the rumination dispatch effect"}
     }
@@ -425,8 +425,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     call = %{
       verb: "work-item-create",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: nil,
       params: %{title: "Will raise"}
     }
@@ -453,7 +453,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',1,'admin_add',1)"
       )
 
     register_testhost(db)
@@ -462,13 +462,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
       Org.create(db, %{
         session_key: key,
         display_name: name,
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "default",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Tightbeam.Model.new("fable")
+        model: Tightbeam.Model.new("example-model")
       })
     end
 
@@ -530,7 +530,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
         INSERT INTO decision_requests
           (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,lineageRung,
            effortGeneration,deadlineWakeId,raisedAt,deadlineAt,question,options,context,status)
-        VALUES (?1,'effort','process:tightbeam','flynn',?2,'effect-holder',1,?3,?4,?5,?6,
+        VALUES (?1,'effort','process:tightbeam','operator',?2,'effect-holder',1,?3,?4,?5,?6,
                 'Continue or dismiss?','["continue","dismiss"]','{"actions":["continue","dismiss"]}','open')
         """,
         [request_id, assignment.id, generation, deadline.wake_id, now, now + 60_000]
@@ -570,8 +570,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
   test "an accepted state verb emits its observation and canonical state notice" do
     call = %{
       verb: "work-item-update",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: nil,
       params: %{work_item_id: "wi_1"}
     }
@@ -579,7 +579,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     result = %{
       id: "wi_1",
       title: "Firehose",
-      owner_user_id: "flynn",
+      owner_user_id: "operator",
       updated_at: 123,
       cli_token: "must-not-leak"
     }
@@ -589,7 +589,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert %{"class" => "verb.accepted", "op" => "observe", "refs" => refs} =
              receive_notice()
 
-    assert refs["origin"] == "user:flynn"
+    assert refs["origin"] == "user:operator"
 
     assert %{
              "class" => "work_item.updated",
@@ -607,7 +607,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
   test "unmapped reads emit only the observational verb notice" do
     assert :ok =
              Publisher.accepted(
-               %{verb: "assignments", origin: "user:flynn", params: %{}},
+               %{verb: "assignments", origin: "user:operator", params: %{}},
                %{assignments: []}
              )
 
@@ -620,7 +620,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
              Publisher.committed(
                "message.created",
                %{id: "s_1", seq: 9, session_key: "agent:one", content: "hello"},
-               %{"ownerUserId" => "flynn", "sessionKey" => "agent:one"}
+               %{"ownerUserId" => "operator", "sessionKey" => "agent:one"}
              )
 
     assert %{
@@ -644,7 +644,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
       {"substrate", %{role: "assistant", sender: "process:scheduler"}, "substrate"},
       {"marker", %{role: "assistant", sender: "process:tightbeam", message_type: "marker"},
        "marker"},
-      {"human", %{role: "user", sender: "user:flynn"}, nil},
+      {"human", %{role: "user", sender: "user:operator"}, nil},
       {"historical", %{role: "assistant", sender: nil}, nil}
     ]
 
@@ -660,7 +660,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
                      })
                    )
 
-                 :ok = Publisher.message_in_txn(txn, "message-types", message, "flynn")
+                 :ok = Publisher.message_in_txn(txn, "message-types", message, "operator")
                  {:appended, message}
                end)
 
@@ -699,7 +699,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',1,'admin_add',1)"
       )
 
     register_testhost(db)
@@ -709,13 +709,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
     Org.create(db, %{
       session_key: session_key,
       display_name: "Substrate target",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       archetype: "default",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Tightbeam.Model.new("fable")
+      model: Tightbeam.Model.new("example-model")
     })
 
     assert {:ok, {:appended, message}} =
@@ -744,7 +744,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',1,'admin_add',1)"
       )
 
     register_testhost(db)
@@ -753,13 +753,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
       Org.create(db, %{
         session_key: session_key,
         display_name: session_key,
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "default",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Tightbeam.Model.new("fable")
+        model: Tightbeam.Model.new("example-model")
       })
     end)
 
@@ -804,7 +804,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',1,'admin_add',1)"
       )
 
     register_testhost(db)
@@ -813,13 +813,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
       Org.create(db, %{
         session_key: session_key,
         display_name: session_key,
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "default",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Tightbeam.Model.new("fable")
+        model: Tightbeam.Model.new("example-model")
       })
     end)
 
@@ -884,7 +884,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',1,'admin_add',1)"
       )
 
     register_testhost(db)
@@ -892,20 +892,20 @@ defmodule Tightbeam.Firehose.PublisherTest do
     Org.create(db, %{
       session_key: "turn-target",
       display_name: "Turn target",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       archetype: "default",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Tightbeam.Model.new("fable")
+      model: Tightbeam.Model.new("example-model")
     })
 
     assert {:ok, seq} =
              Ledger.enqueue(db, %{
                session_key: "turn-target",
                message_id: "turn-message",
-               origin: "user:flynn",
+               origin: "user:operator",
                prompt: "run"
              })
 
@@ -1023,15 +1023,15 @@ defmodule Tightbeam.Firehose.PublisherTest do
     {:ok, _} =
       Tightbeam.DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',1,'admin_add',1)"
       )
 
-    %{name: "worker"} = Tightbeam.Roles.create!(db, "worker", "flynn", nil)
+    %{name: "worker"} = Tightbeam.Roles.create!(db, "worker", "operator", nil)
 
     call = %{
       verb: "role-rm",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       params: %{name: "worker"}
     }
 
@@ -1045,7 +1045,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
              "class" => "role.removed",
              "op" => "delete",
              "refs" => %{"role" => "worker"},
-             "payload" => %{"role" => "worker", "ownerUserId" => "flynn"}
+             "payload" => %{"role" => "worker", "ownerUserId" => "operator"}
            } = receive_notice()
   end
 
@@ -1146,18 +1146,18 @@ defmodule Tightbeam.Firehose.PublisherTest do
     })
 
     Org.create(db, %{
-      session_key: Org.personal_session_key("flynn"),
+      session_key: Org.personal_session_key("operator"),
       display_name: "Main",
       kind: "main",
       is_built_in: true,
       adopted: true,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       archetype: "default",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Tightbeam.Model.new("fable")
+      model: Tightbeam.Model.new("example-model")
     })
   end
 

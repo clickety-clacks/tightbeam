@@ -28,10 +28,10 @@ defmodule Tightbeam.FailedTurnIntentTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 1, 'admin_add', 1)"
       )
 
-    main = session(db, Org.personal_session_key("flynn"), nil, true)
+    main = session(db, Org.personal_session_key("operator"), nil, true)
     parent = session(db, "parent", main.session_key)
     child = session(db, "child", parent.session_key)
 
@@ -256,7 +256,7 @@ defmodule Tightbeam.FailedTurnIntentTest do
                [request_ref]
              )
 
-    assert main_key == Org.personal_session_key("flynn")
+    assert main_key == Org.personal_session_key("operator")
 
     assert {:ok, []} =
              DB.query(ctx.db, "SELECT 1 FROM patrol_failure_streaks WHERE sessionKey='parent'")
@@ -320,13 +320,13 @@ defmodule Tightbeam.FailedTurnIntentTest do
       session_key: key,
       display_name: key,
       kind: if(built_in?, do: "main", else: "custom"),
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
       host: "testhost",
-      model: Model.new("fable"),
+      model: Model.new("example-model"),
       spawned_by: parent,
       operational_parent: parent,
       is_built_in: built_in?

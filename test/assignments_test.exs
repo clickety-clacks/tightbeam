@@ -25,7 +25,7 @@ defmodule Tightbeam.AssignmentsTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "mac-runner" => %{
+      "test-host" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -35,12 +35,12 @@ defmodule Tightbeam.AssignmentsTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('admin', 1, 'admin_add', 1), ('flynn', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('admin', 1, 'admin_add', 1), ('operator', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1)"
       )
 
-    Enum.each(~w(admin flynn other), &ensure_main_session(db, &1))
+    Enum.each(~w(admin operator other), &ensure_main_session(db, &1))
 
-    holder = session(db, "holder", "flynn")
+    holder = session(db, "holder", "operator")
     other = session(db, "other-session", "other")
     gateway_config = %{db: db, wake_tick_ms: 1_000}
     handlers = Gateway.handlers(gateway_config)
@@ -53,15 +53,15 @@ defmodule Tightbeam.AssignmentsTest do
       "INSERT INTO assignments (id, subject, holderKey, holderRole, holderFallback, openedByUser, openedBySession, openedAt, state, outcome, closedAt, closedByUser, closedBySession, closingAttestId) VALUES "
 
     invalid = [
-      "('a1','x','holder',NULL,1,'flynn',NULL,1,'open',NULL,NULL,NULL,NULL,NULL)",
+      "('a1','x','holder',NULL,1,'operator',NULL,1,'open',NULL,NULL,NULL,NULL,NULL)",
       "('a2','x','holder',NULL,0,NULL,NULL,1,'open',NULL,NULL,NULL,NULL,NULL)",
-      "('a3','x','holder',NULL,0,'flynn','holder',1,'open',NULL,NULL,NULL,NULL,NULL)",
-      "('a4','x','holder',NULL,0,'flynn',NULL,1,'open','revoked',NULL,NULL,NULL,NULL)",
-      "('a5','x','holder',NULL,0,'flynn',NULL,1,'closed',NULL,2,'flynn',NULL,NULL)",
-      "('a6','x','holder',NULL,0,'flynn',NULL,1,'closed','revoked',NULL,'flynn',NULL,NULL)",
-      "('a7','x','holder',NULL,0,'flynn',NULL,1,'closed','revoked',2,NULL,NULL,NULL)",
-      "('a8','x','holder',NULL,0,'flynn',NULL,1,'closed','revoked',2,'flynn','holder',NULL)",
-      "('a9','x','holder',NULL,0,'flynn',NULL,1,'closed','completed',2,'flynn',NULL,NULL)"
+      "('a3','x','holder',NULL,0,'operator','holder',1,'open',NULL,NULL,NULL,NULL,NULL)",
+      "('a4','x','holder',NULL,0,'operator',NULL,1,'open','revoked',NULL,NULL,NULL,NULL)",
+      "('a5','x','holder',NULL,0,'operator',NULL,1,'closed',NULL,2,'operator',NULL,NULL)",
+      "('a6','x','holder',NULL,0,'operator',NULL,1,'closed','revoked',NULL,'operator',NULL,NULL)",
+      "('a7','x','holder',NULL,0,'operator',NULL,1,'closed','revoked',2,NULL,NULL,NULL)",
+      "('a8','x','holder',NULL,0,'operator',NULL,1,'closed','revoked',2,'operator','holder',NULL)",
+      "('a9','x','holder',NULL,0,'operator',NULL,1,'closed','completed',2,'operator',NULL,NULL)"
     ]
 
     Enum.each(invalid, fn values ->
@@ -75,7 +75,7 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(
                db,
                base <>
-                 "('a10','x','holder',NULL,0,'flynn',NULL,1,'closed','revoked',2,'flynn',NULL,NULL)"
+                 "('a10','x','holder',NULL,0,'operator',NULL,1,'closed','revoked',2,'operator',NULL,NULL)"
              )
 
     assert trigger_error =~ "revoked assignment requires revocation provenance"
@@ -106,7 +106,7 @@ defmodule Tightbeam.AssignmentsTest do
     Application.put_env(:tightbeam, :max_verdict_kind_len, 3)
     Application.put_env(:tightbeam, :max_idem_key_len, 3)
 
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "four", "four"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "four", "four"))
     assert assignment.subject == "four"
 
     progress =
@@ -117,7 +117,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert progress.attest.note == "four"
 
     verdict =
-      attest_call({:user, "flynn"}, assignment.id, "verdict")
+      attest_call({:user, "operator"}, assignment.id, "verdict")
       |> put_in([:params, :verdict_kind], "four")
       |> then(&handle(ctx, "attest", &1))
 
@@ -127,7 +127,7 @@ defmodule Tightbeam.AssignmentsTest do
              handle(
                ctx,
                "assign",
-               assign_call({:user, "flynn"}, String.duplicate(" ", 2000) <> "x")
+               assign_call({:user, "operator"}, String.duplicate(" ", 2000) <> "x")
              )
 
     assert %{code: "invalid_note"} =
@@ -136,7 +136,7 @@ defmodule Tightbeam.AssignmentsTest do
              |> then(&handle(ctx, "attest", &1))
 
     assert %{code: "invalid_verdict_kind"} =
-             attest_call({:user, "flynn"}, assignment.id, "verdict")
+             attest_call({:user, "operator"}, assignment.id, "verdict")
              |> put_in([:params, :verdict_kind], String.duplicate("x", 65))
              |> then(&handle(ctx, "attest", &1))
   end
@@ -144,26 +144,26 @@ defmodule Tightbeam.AssignmentsTest do
   test "assign validates principals, input, liveness, opener typing, and idempotent races", ctx do
     assert %{code: "process_denied"} = handle(ctx, "assign", assign_call({:process, "cron"}))
     assert %{code: "principal_required"} = handle(ctx, "assign", assign_call(nil))
-    assert %{code: "invalid_subject"} = handle(ctx, "assign", assign_call({:user, "flynn"}, " "))
+    assert %{code: "invalid_subject"} = handle(ctx, "assign", assign_call({:user, "operator"}, " "))
 
     assert %{code: "invalid_subject"} =
-             handle(ctx, "assign", assign_call({:user, "flynn"}, String.duplicate("x", 2001)))
+             handle(ctx, "assign", assign_call({:user, "operator"}, String.duplicate("x", 2001)))
 
     assert %{code: "invalid_idempotency_key"} =
-             handle(ctx, "assign", assign_call({:user, "flynn"}, "x", " "))
+             handle(ctx, "assign", assign_call({:user, "operator"}, "x", " "))
 
     assert %{code: "invalid_idempotency_key"} =
              handle(
                ctx,
                "assign",
-               assign_call({:user, "flynn"}, "x", String.duplicate("k", 201))
+               assign_call({:user, "operator"}, "x", String.duplicate("k", 201))
              )
 
     baseline = assignment_count(ctx.db)
 
     for interval <- [nil, 0, -1] do
       call =
-        Map.put(assign_call({:user, "flynn"}, "no interval"), :supervision_interval_ms, interval)
+        Map.put(assign_call({:user, "operator"}, "no interval"), :supervision_interval_ms, interval)
 
       assert %{code: "invalid_supervision_interval"} =
                Assignments.__handle__(ctx.db, "assign", call)
@@ -171,8 +171,8 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert assignment_count(ctx.db) == baseline
 
-    user_opened = handle(ctx, "assign", assign_call({:user, "flynn"}, "user work"))
-    assert user_opened.openedByUser == "flynn"
+    user_opened = handle(ctx, "assign", assign_call({:user, "operator"}, "user work"))
+    assert user_opened.openedByUser == "operator"
     assert user_opened.openedBySession == nil
     assert user_opened.workItemId == nil
 
@@ -185,7 +185,7 @@ defmodule Tightbeam.AssignmentsTest do
                 "assignment_open",
                 user_assignment_id,
                 "assignment_open",
-                "user:flynn",
+                "user:operator",
                 1_000
               ]
             ]} =
@@ -203,7 +203,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert session_opened.openedByUser == nil
 
     role_call =
-      assign_call({:user, "flynn"}, "role work")
+      assign_call({:user, "operator"}, "role work")
       |> Map.merge(%{target_role: "builder", role_fallback: true})
 
     role_opened = handle(ctx, "assign", role_call)
@@ -213,9 +213,9 @@ defmodule Tightbeam.AssignmentsTest do
     Org.retire(ctx.db, "other-session", "user:other", 1_000)
 
     assert %{code: "session_retired"} =
-             handle(ctx, "assign", %{assign_call({:user, "flynn"}) | session_key: "other-session"})
+             handle(ctx, "assign", %{assign_call({:user, "operator"}) | session_key: "other-session"})
 
-    call = assign_call({:user, "flynn"}, "once", "same-key")
+    call = assign_call({:user, "operator"}, "once", "same-key")
     tasks = for _ <- 1..2, do: Task.async(fn -> handle(ctx, "assign", call) end)
     [one, two] = Task.await_many(tasks)
     assert one.id == two.id
@@ -228,7 +228,7 @@ defmodule Tightbeam.AssignmentsTest do
     baseline = assignment_count(ctx.db)
 
     raw_call =
-      assign_call({:user, "flynn"}, "Gateway will attach interval")
+      assign_call({:user, "operator"}, "Gateway will attach interval")
       |> Map.delete(:supervision_interval_ms)
 
     assert :proceed = Assignments.dispatch_precheck(ctx.db, raw_call)
@@ -249,7 +249,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "same-assignment public cancellation and progress do not re-drive a forced due entitlement",
        ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "liveness re-drive"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "liveness re-drive"))
 
     canceled =
       Wakes.schedule(ctx.db, %{
@@ -292,7 +292,7 @@ defmodule Tightbeam.AssignmentsTest do
       Ledger.enqueue(ctx.db, %{
         session_key: "holder",
         message_id: "m_liveness_re_drive",
-        origin: "user:flynn",
+        origin: "user:operator",
         prompt: "finish the assignment",
         assignment_id: assignment.id
       })
@@ -344,14 +344,14 @@ defmodule Tightbeam.AssignmentsTest do
       handle(
         ctx,
         "work-item-create",
-        work_item_call("work-item-create", {:user, "flynn"}, %{title: "Dispatch trace"})
+        work_item_call("work-item-create", {:user, "operator"}, %{title: "Dispatch trace"})
       )
 
     assignment =
       handle(
         ctx,
         "dispatch",
-        dispatch_call({:user, "flynn"}, "ship it", "Please ship it.", nil, work_item.id)
+        dispatch_call({:user, "operator"}, "ship it", "Please ship it.", nil, work_item.id)
       )
 
     assert assignment.subject == "ship it"
@@ -378,7 +378,7 @@ defmodule Tightbeam.AssignmentsTest do
       handle(
         ctx,
         "work-item-create",
-        work_item_call("work-item-create", {:user, "flynn"}, %{title: "Rumination rail"})
+        work_item_call("work-item-create", {:user, "operator"}, %{title: "Rumination rail"})
       )
 
     call =
@@ -413,7 +413,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert Enum.any?(pending, fn w ->
              not w.rumination and w.work_item_id == work_item.id and
-               w.session_key == Org.personal_session_key("flynn")
+               w.session_key == Org.personal_session_key("operator")
            end)
 
     assert wake.session_key == "other-session"
@@ -464,7 +464,7 @@ defmodule Tightbeam.AssignmentsTest do
         ctx,
         "dispatch",
         dispatch_call(
-          {:user, "flynn"},
+          {:user, "operator"},
           "user dispatch",
           "Dispatch immediately.",
           nil,
@@ -513,10 +513,10 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "review and file declarations are assign-only inputs", ctx do
-    reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "reviewed"))
+    reviewed = handle(ctx, "assign", assign_call({:user, "operator"}, "reviewed"))
 
     call =
-      dispatch_call({:user, "flynn"}, "dispatch", "Do the work.")
+      dispatch_call({:user, "operator"}, "dispatch", "Do the work.")
       |> put_in([:params, :reviews_assignment_id], reviewed.id)
       |> put_in([:params, :files], ["lib/ignored.ex"])
       |> Map.put(:on_work_item_change, fn _, _ -> send(self(), :work_item_change) end)
@@ -534,7 +534,7 @@ defmodule Tightbeam.AssignmentsTest do
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               dispatch_call({:user, "flynn"}, "rollback", "Wake now.")
+               dispatch_call({:user, "operator"}, "rollback", "Wake now.")
              )
 
     assert message =~ "no such table: turns"
@@ -556,7 +556,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "assignment-get returns the full assignment row (plus reopening history) or not_found",
        ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "fetch me"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "fetch me"))
 
     # `assignment-get` carries every field `assign` returned, plus an empty
     # `reopenings` list for a card that was never reopened.
@@ -580,39 +580,39 @@ defmodule Tightbeam.AssignmentsTest do
       handle(
         ctx,
         "work-item-create",
-        work_item_call("work-item-create", {:user, "flynn"}, %{title: "First"})
+        work_item_call("work-item-create", {:user, "operator"}, %{title: "First"})
       )
 
     second =
       handle(
         ctx,
         "work-item-create",
-        work_item_call("work-item-create", {:user, "flynn"}, %{title: "Second"})
+        work_item_call("work-item-create", {:user, "operator"}, %{title: "Second"})
       )
 
     prefix = String.slice(first.id, 0, 12)
 
     linked =
-      handle(ctx, "assign", assign_call({:user, "flynn"}, "linked", "work-key", prefix))
+      handle(ctx, "assign", assign_call({:user, "operator"}, "linked", "work-key", prefix))
 
     assert linked.workItemId == first.id
 
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES (?1, 'competitor', 'flynn', 'flynn', 3)",
+        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES (?1, 'competitor', 'operator', 'operator', 3)",
         [prefix <> "competitor"]
       )
 
     replay_after_ambiguity =
-      handle(ctx, "assign", assign_call({:user, "flynn"}, "ignored", "work-key", prefix))
+      handle(ctx, "assign", assign_call({:user, "operator"}, "ignored", "work-key", prefix))
 
     assert replay_after_ambiguity.id == linked.id
     assert replay_after_ambiguity.workItemId == first.id
 
     for work_item_id <- [second.id, nil, "wi_missing"] do
       replay =
-        handle(ctx, "assign", assign_call({:user, "flynn"}, "ignored", "work-key", work_item_id))
+        handle(ctx, "assign", assign_call({:user, "operator"}, "ignored", "work-key", work_item_id))
 
       assert replay.id == linked.id
       assert replay.workItemId == first.id
@@ -622,7 +622,7 @@ defmodule Tightbeam.AssignmentsTest do
              handle(
                ctx,
                "assign",
-               assign_call({:user, "flynn"}, "not inserted", nil, "wi_missing")
+               assign_call({:user, "operator"}, "not inserted", nil, "wi_missing")
              )
 
     assert {:ok, [[0]]} =
@@ -630,7 +630,7 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "assign captures review links and immutable holder family stamps", ctx do
-    reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "producer"))
+    reviewed = handle(ctx, "assign", assign_call({:user, "operator"}, "producer"))
 
     assert reviewed.reviewsAssignmentId == nil
     assert reviewed.effectKind == "code"
@@ -648,7 +648,7 @@ defmodule Tightbeam.AssignmentsTest do
              |> Enum.find(&(&1.id == reviewed.id))
 
     review_call =
-      assign_call({:user, "flynn"}, "review")
+      assign_call({:user, "operator"}, "review")
       |> put_in([:params, :reviews_assignment_id], String.slice(reviewed.id, 0, 12))
       |> put_in([:params, :effect_kind], "policy")
       |> Map.put(:session_key, "other-session")
@@ -660,7 +660,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert review.holderProvider == "anthropic"
 
     unknown =
-      assign_call({:user, "flynn"}, "unknown review")
+      assign_call({:user, "operator"}, "unknown review")
       |> put_in([:params, :reviews_assignment_id], "asg_missing")
 
     assert %{code: "unknown_review_target"} = handle(ctx, "assign", unknown)
@@ -670,10 +670,10 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "public assignment references resolve canonically and refusals have no effects", ctx do
-    lifecycle = handle(ctx, "assign", assign_call({:user, "flynn"}, "prefix lifecycle"))
+    lifecycle = handle(ctx, "assign", assign_call({:user, "operator"}, "prefix lifecycle"))
     lifecycle_prefix = String.slice(lifecycle.id, 0, 12)
 
-    revoked = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, lifecycle_prefix))
+    revoked = handle(ctx, "revoke-assignment", revoke_call({:user, "operator"}, lifecycle_prefix))
     assert revoked.id == lifecycle.id
     assert revoked.state == "closed"
 
@@ -681,13 +681,13 @@ defmodule Tightbeam.AssignmentsTest do
       handle(
         ctx,
         "reopen-assignment",
-        reopen_call({:user, "flynn"}, lifecycle_prefix, "prefix proof")
+        reopen_call({:user, "operator"}, lifecycle_prefix, "prefix proof")
       )
 
     assert reopened.id == lifecycle.id
     assert reopened.state == "open"
 
-    attested = handle(ctx, "assign", assign_call({:user, "flynn"}, "prefix attest"))
+    attested = handle(ctx, "assign", assign_call({:user, "operator"}, "prefix attest"))
     attest_prefix = String.slice(attested.id, 0, 12)
 
     assert %{attest: %{assignmentId: assignment_id}} =
@@ -715,13 +715,13 @@ defmodule Tightbeam.AssignmentsTest do
     before = snapshot.()
 
     ambiguous_call =
-      revoke_call({:user, "flynn"}, "asg_")
+      revoke_call({:user, "operator"}, "asg_")
       |> Map.put(:on_assignment_change, fn _, _ -> send(self(), :unexpected_callback) end)
 
     assert %{code: "ambiguous_id"} = handle(ctx, "revoke-assignment", ambiguous_call)
 
     assert %{code: "unknown_assignment"} =
-             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, "asg_missing"))
+             handle(ctx, "revoke-assignment", revoke_call({:user, "operator"}, "asg_missing"))
 
     assert snapshot.() == before
     refute_received :unexpected_callback
@@ -731,7 +731,7 @@ defmodule Tightbeam.AssignmentsTest do
     effects =
       for kind <- ~w(code policy release live_mutation evidence review coordination), into: %{} do
         assignment =
-          assign_call({:user, "flynn"}, "#{kind} effect")
+          assign_call({:user, "operator"}, "#{kind} effect")
           |> put_in([:params, :effect_kind], kind)
           |> then(&handle(ctx, "assign", &1))
 
@@ -742,7 +742,7 @@ defmodule Tightbeam.AssignmentsTest do
     evidence = effects["evidence"]
 
     release_call =
-      dispatch_call({:user, "flynn"}, "release", "ship it")
+      dispatch_call({:user, "operator"}, "release", "ship it")
       |> put_in([:params, :effect_kind], "release")
 
     release = handle(ctx, "dispatch", release_call)
@@ -751,14 +751,14 @@ defmodule Tightbeam.AssignmentsTest do
     before = assignment_count(ctx.db)
 
     invalid =
-      assign_call({:user, "flynn"}, "invalid")
+      assign_call({:user, "operator"}, "invalid")
       |> put_in([:params, :effect_kind], "source")
 
     assert %{code: "invalid_effect_kind"} = handle(ctx, "assign", invalid)
     assert assignment_count(ctx.db) == before
 
     review =
-      assign_call({:user, "flynn"}, "legacy review")
+      assign_call({:user, "operator"}, "legacy review")
       |> put_in([:params, :reviews_assignment_id], evidence.id)
       |> Map.put(:session_key, "other-session")
       |> then(&handle(ctx, "assign", &1))
@@ -780,10 +780,10 @@ defmodule Tightbeam.AssignmentsTest do
     second_item = create_work_item(ctx, "Conflicting item")
 
     reviewed =
-      handle(ctx, "assign", assign_call({:user, "flynn"}, "reviewed", nil, first_item.id))
+      handle(ctx, "assign", assign_call({:user, "operator"}, "reviewed", nil, first_item.id))
 
     conflict =
-      assign_call({:user, "flynn"}, "conflicting review", nil, second_item.id)
+      assign_call({:user, "operator"}, "conflicting review", nil, second_item.id)
       |> put_in([:params, :reviews_assignment_id], reviewed.id)
 
     assert %{
@@ -801,15 +801,15 @@ defmodule Tightbeam.AssignmentsTest do
   test "Proof 2: a review assignment cannot itself be reviewed",
        ctx do
     item = create_work_item(ctx, "Review boundary")
-    reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "base", nil, item.id))
+    reviewed = handle(ctx, "assign", assign_call({:user, "operator"}, "base", nil, item.id))
 
     first_review =
-      assign_call({:user, "flynn"}, "first review")
+      assign_call({:user, "operator"}, "first review")
       |> put_in([:params, :reviews_assignment_id], reviewed.id)
       |> then(&handle(ctx, "assign", &1))
 
     nested_review =
-      assign_call({:user, "flynn"}, "second review")
+      assign_call({:user, "operator"}, "second review")
       |> put_in([:params, :reviews_assignment_id], first_review.id)
       |> then(&handle(ctx, "assign", &1))
 
@@ -827,8 +827,8 @@ defmodule Tightbeam.AssignmentsTest do
     trace =
       Tightbeam.WorkItems.__handle__(ctx.db, "work-item-trace", %{
         verb: "work-item-trace",
-        principal: {:user, "flynn"},
-        origin: "user:flynn",
+        principal: {:user, "operator"},
+        origin: "user:operator",
         session_key: nil,
         params: %{work_item_id: item.id}
       })
@@ -840,7 +840,7 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "Proof 3: an assignment with neither key resolves to NONE", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "unlinked"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "unlinked"))
 
     assert assignment.workItemId == nil
     assert assignment.reviewsAssignmentId == nil
@@ -850,19 +850,19 @@ defmodule Tightbeam.AssignmentsTest do
   test "Proof 4: DIRECT consumers stay unchanged: revoke-loop membership is direct and client snapshots are byte-identical",
        ctx do
     item = create_work_item(ctx, "Direct lifecycle")
-    reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "owned", nil, item.id))
+    reviewed = handle(ctx, "assign", assign_call({:user, "operator"}, "owned", nil, item.id))
 
     before_get =
       handle(
         ctx,
         "work-item-get",
-        work_item_call("work-item-get", {:user, "flynn"}, %{work_item_id: item.id})
+        work_item_call("work-item-get", {:user, "operator"}, %{work_item_id: item.id})
       )
 
     before_snapshot = ctx.db |> WorkState.item_detail(item.id) |> JSON.encode!()
 
     review =
-      assign_call({:user, "flynn"}, "story-only review")
+      assign_call({:user, "operator"}, "story-only review")
       |> put_in([:params, :reviews_assignment_id], reviewed.id)
       |> then(&handle(ctx, "assign", &1))
 
@@ -870,7 +870,7 @@ defmodule Tightbeam.AssignmentsTest do
       handle(
         ctx,
         "work-item-get",
-        work_item_call("work-item-get", {:user, "flynn"}, %{work_item_id: item.id})
+        work_item_call("work-item-get", {:user, "operator"}, %{work_item_id: item.id})
       )
 
     assert Enum.map(after_get.assignments, & &1.id) == [reviewed.id]
@@ -883,7 +883,7 @@ defmodule Tightbeam.AssignmentsTest do
     paths = ["lib/a.ex", "lib/b.ex", "lib/a.ex", "../kept", "/absolute/kept"]
 
     first =
-      assign_call({:user, "flynn"}, "files")
+      assign_call({:user, "operator"}, "files")
       |> put_in([:params, :files], paths)
       |> then(&handle(ctx, "assign", &1))
 
@@ -896,7 +896,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.open_assignments_touching(ctx.db, []) == []
 
     overlapping =
-      assign_call({:user, "flynn"}, "overlap")
+      assign_call({:user, "operator"}, "overlap")
       |> put_in([:params, :files], ["lib/a.ex"])
       |> then(&handle(ctx, "assign", &1))
 
@@ -907,7 +907,7 @@ defmodule Tightbeam.AssignmentsTest do
              Enum.sort([first.id, overlapping.id])
 
     malformed =
-      assign_call({:user, "flynn"}, "malformed")
+      assign_call({:user, "operator"}, "malformed")
       |> put_in([:params, :files], ["ok", " "])
 
     assert %{code: "invalid_files"} = handle(ctx, "assign", malformed)
@@ -915,11 +915,11 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'malformed'")
 
-    no_files = handle(ctx, "assign", assign_call({:user, "flynn"}, "no files"))
+    no_files = handle(ctx, "assign", assign_call({:user, "operator"}, "no files"))
     assert Assignments.declared_files(ctx.db, no_files.id) == []
 
     empty_files =
-      assign_call({:user, "flynn"}, "empty files")
+      assign_call({:user, "operator"}, "empty files")
       |> put_in([:params, :files], [])
       |> then(&handle(ctx, "assign", &1))
 
@@ -928,7 +928,7 @@ defmodule Tightbeam.AssignmentsTest do
     # The substrate cannot know whether bootstrap context is stale or incomplete.
     # Persisting either shape must not turn the suggestion into a work barrier.
     incomplete =
-      assign_call({:user, "flynn"}, "incomplete files")
+      assign_call({:user, "operator"}, "incomplete files")
       |> put_in([:params, :files], ["likely-but-not-complete.ex"])
       |> then(&handle(ctx, "assign", &1))
 
@@ -936,7 +936,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     disjoint =
       for {subject, path} <- [{"disjoint one", "one"}, {"disjoint two", "two"}] do
-        assign_call({:user, "flynn"}, subject)
+        assign_call({:user, "operator"}, subject)
         |> put_in([:params, :files], [path])
         |> then(&handle(ctx, "assign", &1))
       end
@@ -946,7 +946,7 @@ defmodule Tightbeam.AssignmentsTest do
     concurrent =
       for subject <- ["race one", "race two"] do
         Task.async(fn ->
-          assign_call({:user, "flynn"}, subject)
+          assign_call({:user, "operator"}, subject)
           |> put_in([:params, :files], ["same-race-path"])
           |> then(&handle(ctx, "assign", &1))
         end)
@@ -964,7 +964,7 @@ defmodule Tightbeam.AssignmentsTest do
     _closed = handle(ctx, "attest", attest_call({:session, "holder"}, first.id, "completion"))
 
     after_close =
-      assign_call({:user, "flynn"}, "after close")
+      assign_call({:user, "operator"}, "after close")
       |> put_in([:params, :files], ["lib/a.ex"])
       |> then(&handle(ctx, "assign", &1))
 
@@ -982,20 +982,20 @@ defmodule Tightbeam.AssignmentsTest do
     item = create_work_item(ctx, "Assignment file projection")
 
     assignment =
-      assign_call({:user, "flynn"}, "project files", nil, item.id)
+      assign_call({:user, "operator"}, "project files", nil, item.id)
       |> put_in([:params, :files], paths)
       |> then(&handle(ctx, "assign", &1))
 
     %{assignments: assignments} =
-      handle(ctx, "assignments", query_call({:user, "flynn"}, "open", "holder"))
+      handle(ctx, "assignments", query_call({:user, "operator"}, "open", "holder"))
 
     readback = Enum.find(assignments, &(&1.id == assignment.id))
 
     trace =
       Tightbeam.WorkItems.__handle__(ctx.db, "work-item-trace", %{
         verb: "work-item-trace",
-        principal: {:user, "flynn"},
-        origin: "user:flynn",
+        principal: {:user, "operator"},
+        origin: "user:operator",
         session_key: nil,
         params: %{work_item_id: item.id}
       })
@@ -1008,7 +1008,7 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "verdict attests freeze provenance and project inert producer history columns", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "verdict stamps"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "verdict stamps"))
 
     ordinary =
       handle(ctx, "attest", %{
@@ -1025,7 +1025,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     user_verdict =
       handle(ctx, "attest", %{
-        attest_call({:user, "flynn"}, assignment.id, "verdict")
+        attest_call({:user, "operator"}, assignment.id, "verdict")
         | params: %{assignment_id: assignment.id, kind: "verdict", verdict_kind: "user-ruling"}
       })
 
@@ -1042,10 +1042,10 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "commissioned review authors enforce the full review-link predicate", ctx do
     third = session(ctx.db, "third-session", "other", %{harness: "codex", provider: "openai"})
-    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "producer assignment"))
+    producer = handle(ctx, "assign", assign_call({:user, "operator"}, "producer assignment"))
 
     valid_review =
-      assign_call({:user, "flynn"}, "valid review")
+      assign_call({:user, "operator"}, "valid review")
       |> Map.put(:session_key, third.session_key)
       |> put_in([:params, :reviews_assignment_id], producer.id)
       |> then(&handle(ctx, "assign", &1))
@@ -1055,10 +1055,10 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :verdict_kind], "reviewed-clean")
       |> then(&handle(ctx, "attest", &1))
 
-    wrong_producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "other producer"))
+    wrong_producer = handle(ctx, "assign", assign_call({:user, "operator"}, "other producer"))
 
     wrong_review =
-      assign_call({:user, "flynn"}, "wrong-link review")
+      assign_call({:user, "operator"}, "wrong-link review")
       |> Map.put(:session_key, third.session_key)
       |> put_in([:params, :reviews_assignment_id], wrong_producer.id)
       |> then(&handle(ctx, "assign", &1))
@@ -1081,7 +1081,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{code: "not_holder"} = handle(ctx, "attest", third_party)
 
     user =
-      attest_call({:user, "flynn"}, valid_review.id, "verdict")
+      attest_call({:user, "operator"}, valid_review.id, "verdict")
       |> put_in([:params, :verdict_kind], "user-verdict")
 
     assert %{code: "not_holder"} = handle(ctx, "attest", user)
@@ -1113,10 +1113,10 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "linked review verdicts require the holder before syntax validation", ctx do
-    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "guard producer"))
+    producer = handle(ctx, "assign", assign_call({:user, "operator"}, "guard producer"))
 
     review =
-      assign_call({:user, "flynn"}, "guard review")
+      assign_call({:user, "operator"}, "guard review")
       |> Map.put(:session_key, "other-session")
       |> put_in([:params, :reviews_assignment_id], producer.id)
       |> then(&handle(ctx, "assign", &1))
@@ -1135,8 +1135,8 @@ defmodule Tightbeam.AssignmentsTest do
     for {principal, verdict_kind} <- [
           {{:session, "holder"}, "reviewed-clean"},
           {{:session, "holder"}, "changes-requested"},
-          {{:user, "flynn"}, "reviewed-clean"},
-          {{:user, "flynn"}, "Bad"}
+          {{:user, "operator"}, "reviewed-clean"},
+          {{:user, "operator"}, "Bad"}
         ] do
       denied =
         attest_call(principal, review.id, "verdict")
@@ -1165,10 +1165,10 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "qualifying review verdict follows the latest independent round across terminal state",
        ctx do
-    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "qualifying producer"))
+    producer = handle(ctx, "assign", assign_call({:user, "operator"}, "qualifying producer"))
 
     review =
-      assign_call({:user, "flynn"}, "qualifying review")
+      assign_call({:user, "operator"}, "qualifying review")
       |> Map.put(:session_key, "other-session")
       |> put_in([:params, :reviews_assignment_id], producer.id)
       |> then(&handle(ctx, "assign", &1))
@@ -1208,7 +1208,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
 
     second_review =
-      assign_call({:user, "flynn"}, "second qualifying review")
+      assign_call({:user, "operator"}, "second qualifying review")
       |> Map.put(:session_key, "other-session")
       |> put_in([:params, :reviews_assignment_id], producer.id)
       |> then(&handle(ctx, "assign", &1))
@@ -1240,7 +1240,7 @@ defmodule Tightbeam.AssignmentsTest do
            ]
 
     revoked_review =
-      assign_call({:user, "flynn"}, "revoked qualifying review")
+      assign_call({:user, "operator"}, "revoked qualifying review")
       |> Map.put(:session_key, "other-session")
       |> put_in([:params, :reviews_assignment_id], producer.id)
       |> then(&handle(ctx, "assign", &1))
@@ -1250,14 +1250,14 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :verdict_kind], "reviewed-clean")
       |> then(&handle(ctx, "attest", &1))
 
-    _ = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, revoked_review.id))
+    _ = handle(ctx, "revoke-assignment", revoke_call({:user, "operator"}, revoked_review.id))
 
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
              "reviewed-clean"
            ]
 
     blocking_review =
-      assign_call({:user, "flynn"}, "blocking latest review")
+      assign_call({:user, "operator"}, "blocking latest review")
       |> Map.put(:session_key, "other-session")
       |> put_in([:params, :reviews_assignment_id], producer.id)
       |> then(&handle(ctx, "assign", &1))
@@ -1272,7 +1272,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "qualifying review verdict uses creation order when review rounds share a timestamp",
        ctx do
-    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "tied review producer"))
+    producer = handle(ctx, "assign", assign_call({:user, "operator"}, "tied review producer"))
 
     assert {:ok, _} =
              DB.query(
@@ -1282,9 +1282,9 @@ defmodule Tightbeam.AssignmentsTest do
                  (id, subject, holderKey, holderFallback, openedByUser, openedAt,
                   reviewsAssignmentId, holderHarness, holderProvider)
                VALUES
-                 ('zzzz_older_review', 'older review', 'other-session', 0, 'flynn', 42,
+                 ('zzzz_older_review', 'older review', 'other-session', 0, 'operator', 42,
                   ?1, 'claude', 'anthropic'),
-                 ('aaaa_newer_review', 'newer review', 'other-session', 0, 'flynn', 42,
+                 ('aaaa_newer_review', 'newer review', 'other-session', 0, 'operator', 42,
                   ?1, 'claude', 'anthropic')
                """,
                [producer.id]
@@ -1307,15 +1307,15 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
   end
 
-  # The wi_1b0237fe wedge CLASS (fabric §13 Phase 0). A review round that carries
+  # The wi_00000000-0000-4000-8000-000000000109 wedge CLASS (fabric §13 Phase 0). A review round that carries
   # no holder-filed verdict carries no judgment, so it may not displace one — and
   # a card CLOSED without a verdict never can carry one, which is what left the
   # producer with no lawful exit.
   test "a verdictless later review round never displaces the standing holder verdict", ctx do
-    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "wedge producer"))
+    producer = handle(ctx, "assign", assign_call({:user, "operator"}, "wedge producer"))
 
     review =
-      assign_call({:user, "flynn"}, "wedge review")
+      assign_call({:user, "operator"}, "wedge review")
       |> Map.put(:session_key, "other-session")
       |> put_in([:params, :reviews_assignment_id], producer.id)
       |> then(&handle(ctx, "assign", &1))
@@ -1332,7 +1332,7 @@ defmodule Tightbeam.AssignmentsTest do
            ]
 
     verdictless =
-      assign_call({:user, "flynn"}, "verdictless round")
+      assign_call({:user, "operator"}, "verdictless round")
       |> Map.put(:session_key, "other-session")
       |> put_in([:params, :reviews_assignment_id], producer.id)
       |> then(&handle(ctx, "assign", &1))
@@ -1358,10 +1358,10 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "a self-held later review round still disqualifies after the wedge fix", ctx do
-    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "laundering producer"))
+    producer = handle(ctx, "assign", assign_call({:user, "operator"}, "laundering producer"))
 
     independent =
-      assign_call({:user, "flynn"}, "independent review")
+      assign_call({:user, "operator"}, "independent review")
       |> Map.put(:session_key, "other-session")
       |> put_in([:params, :reviews_assignment_id], producer.id)
       |> then(&handle(ctx, "assign", &1))
@@ -1376,7 +1376,7 @@ defmodule Tightbeam.AssignmentsTest do
            ]
 
     self_held =
-      assign_call({:user, "flynn"}, "self review")
+      assign_call({:user, "operator"}, "self review")
       |> put_in([:params, :reviews_assignment_id], producer.id)
       |> then(&handle(ctx, "assign", &1))
 
@@ -1389,19 +1389,19 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "reopen-assignment is the agent-reachable exit from a closed card", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "reopen me"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "reopen me"))
 
-    assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "why", "assignment_open")
+    assert_reopen_refused!(ctx, {:user, "operator"}, assignment.id, "why", "assignment_open")
 
     closed = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
     assert closed.assignment.state == "closed"
 
-    assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, nil, "missing_reason")
-    assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "   ", "invalid_reason")
+    assert_reopen_refused!(ctx, {:user, "operator"}, assignment.id, nil, "missing_reason")
+    assert_reopen_refused!(ctx, {:user, "operator"}, assignment.id, "   ", "invalid_reason")
 
     # unknown_assignment has no row to snapshot, so it stays a plain assertion.
     assert %{code: "unknown_assignment"} =
-             handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, "asg_missing", "why"))
+             handle(ctx, "reopen-assignment", reopen_call({:user, "operator"}, "asg_missing", "why"))
 
     assert_reopen_refused!(
       ctx,
@@ -1423,7 +1423,7 @@ defmodule Tightbeam.AssignmentsTest do
       handle(
         ctx,
         "reopen-assignment",
-        reopen_call({:user, "flynn"}, assignment.id, "the verdict this card owes was wrong")
+        reopen_call({:user, "operator"}, assignment.id, "the verdict this card owes was wrong")
       )
 
     assert %{state: "open", outcome: nil, closedAt: nil, closingAttestId: nil} = reopened
@@ -1437,7 +1437,7 @@ defmodule Tightbeam.AssignmentsTest do
                 nil,
                 "holder",
                 attest_id,
-                "flynn",
+                "operator",
                 nil,
                 "the verdict this card owes was wrong"
               ]
@@ -1463,7 +1463,7 @@ defmodule Tightbeam.AssignmentsTest do
                [assignment.id]
              )
 
-    assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "why", "assignment_open")
+    assert_reopen_refused!(ctx, {:user, "operator"}, assignment.id, "why", "assignment_open")
 
     # And the point of the whole exercise: the holder can file again.
     assert %{attest: %{kind: "completion"}} =
@@ -1473,13 +1473,13 @@ defmodule Tightbeam.AssignmentsTest do
     assert marker_contents(ctx.db, "holder")
            |> Enum.any?(
              &(&1 ==
-                 "[assignment reopened: #{assignment.id} by user:flynn — the verdict this card owes was wrong]")
+                 "[assignment reopened: #{assignment.id} by user:operator — the verdict this card owes was wrong]")
            )
 
     # `assignment-get` surfaces the same papertrail through the read path.
-    got = handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+    got = handle(ctx, "assignment-get", assignment_get_call({:user, "operator"}, assignment.id))
     assert [reopening] = got.reopenings
-    assert reopening.reopenedByUser == "flynn"
+    assert reopening.reopenedByUser == "operator"
     assert reopening.reopenedBySession == nil
     assert reopening.reason == "the verdict this card owes was wrong"
     assert reopening.priorOutcome == "completed"
@@ -1503,7 +1503,7 @@ defmodule Tightbeam.AssignmentsTest do
     item = create_work_item(ctx, "terminal item")
 
     carded =
-      assign_call({:user, "flynn"}, "item card", nil, item.id)
+      assign_call({:user, "operator"}, "item card", nil, item.id)
       |> then(&handle(ctx, "assign", &1))
 
     _ = handle(ctx, "attest", attest_call({:session, "holder"}, carded.id, "completion"))
@@ -1512,28 +1512,28 @@ defmodule Tightbeam.AssignmentsTest do
       handle(
         ctx,
         "work-item-fail",
-        work_item_call("work-item-fail", {:user, "flynn"}, %{
+        work_item_call("work-item-fail", {:user, "operator"}, %{
           work_item_id: item.id,
           reason: "terminal fixture"
         })
       )
 
-    assert_reopen_refused!(ctx, {:user, "flynn"}, carded.id, "why", "work_item_not_open")
+    assert_reopen_refused!(ctx, {:user, "operator"}, carded.id, "why", "work_item_not_open")
 
     first =
-      assign_call({:user, "flynn"}, "first file card")
+      assign_call({:user, "operator"}, "first file card")
       |> put_in([:params, :files], ["/tmp/p0-collision"])
       |> then(&handle(ctx, "assign", &1))
 
     _ = handle(ctx, "attest", attest_call({:session, "holder"}, first.id, "completion"))
 
     second =
-      assign_call({:user, "flynn"}, "second file card")
+      assign_call({:user, "operator"}, "second file card")
       |> put_in([:params, :files], ["/tmp/p0-collision"])
       |> then(&handle(ctx, "assign", &1))
 
     reopened =
-      handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, first.id, "why"))
+      handle(ctx, "reopen-assignment", reopen_call({:user, "operator"}, first.id, "why"))
 
     assert reopened.state == "open"
 
@@ -1543,7 +1543,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   # Fabric §13 Phase 0 exit: the wedge CLASS is exercisable by an AGENT — no
   # admin, no database console. Every principal below is a session.
-  test "an agent walks the wi_1b0237fe wedge class out through reopen-assignment", ctx do
+  test "an agent walks the wi_00000000-0000-4000-8000-000000000109 wedge class out through reopen-assignment", ctx do
     producer = handle(ctx, "assign", assign_call({:session, "holder"}, "wedged producer"))
 
     review =
@@ -1593,13 +1593,13 @@ defmodule Tightbeam.AssignmentsTest do
            ]
   end
 
-  # Sol xhigh review, finding 1: the CTE must order verdict-carrying rounds by
+  # : the CTE must order verdict-carrying rounds by
   # the RECENCY OF THE LATEST VERDICT, not by when the round was opened. r1
   # opens and closes first; r2 opens later and files the standing
   # changes-requested; only then is r1 reopened and files a newer
   # reviewed-clean. Before the fix, `r.openedAt DESC` kept selecting r2 forever
   # — the newest verdict could never win against an older round.
-  test "reopen lets an older round's newer verdict outrank a younger round's older one (Sol xhigh review, finding 1)",
+  test "reopen lets an older round's newer verdict outrank a younger round's older one",
        ctx do
     producer = handle(ctx, "assign", assign_call({:session, "holder"}, "displacement producer"))
 
@@ -1651,14 +1651,14 @@ defmodule Tightbeam.AssignmentsTest do
            ]
   end
 
-  # Sol xhigh review round 2: the reverse direction of finding 1, and on the
+  # : the reverse direction of finding 1, and on the
   # SAME card rather than across two. Reopening lets one round carry more than
   # one verdict over its life, so "which round governs" and "which verdict on
   # that round governs" must come from the SAME row, not two independently
   # computed answers that happen to agree today. File reviewed-clean, close,
   # reopen, then file a NEWER changes-requested on the very same round — the
   # latest verdict must win WITHIN the card too, not just across cards.
-  test "a newer changes-requested on a reopened card outranks its own earlier reviewed-clean (Sol xhigh review round 2)",
+  test "a newer changes-requested on a reopened card outranks its own earlier reviewed-clean",
        ctx do
     producer = handle(ctx, "assign", assign_call({:session, "holder"}, "same-card producer"))
 
@@ -1702,7 +1702,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
   end
 
-  # Sol xhigh review, Minimality section: an untested boundary the review
+  # , Minimality section: an untested boundary the review
   # itself named — an earlier INDEPENDENT reviewed-clean followed by a later
   # SELF-HELD, verdictless round. Completion was denied before the shipped
   # diff (the self-held round, being newest by openedAt, won the old selection
@@ -1710,7 +1710,7 @@ defmodule Tightbeam.AssignmentsTest do
   # verdictless self-held round no longer qualifies as a candidate at all, so
   # it cannot displace — and cannot launder — the earlier independent verdict).
   # Pinned here as intended behavior, not incidental.
-  test "an independent reviewed-clean survives a later self-held verdictless round (Sol xhigh review, Minimality)",
+  test "an independent reviewed-clean survives a later self-held verdictless round",
        ctx do
     producer = handle(ctx, "assign", assign_call({:session, "holder"}, "minimality producer"))
 
@@ -1744,7 +1744,7 @@ defmodule Tightbeam.AssignmentsTest do
            ]
   end
 
-  test "an installed rule can inhibit reopen-assignment (Sol xhigh review, finding 2)", ctx do
+  test "an installed rule can inhibit reopen-assignment", ctx do
     assignment = dispatch!(ctx, assign_call({:session, "holder"}, "rule-inhibited"))
 
     dispatch!(
@@ -1782,13 +1782,13 @@ defmodule Tightbeam.AssignmentsTest do
     assert reopen_mutation_snapshot(ctx.db, assignment.id) == before
   end
 
-  # Sol xhigh review, finding 3: opener-or-admin left the holder — the mind
+  # : opener-or-admin left the holder — the mind
   # that owes the replacement verdict — with no independent exit unless they
   # also happened to be the opener. `lead` opens the card; `reviewer` holds it.
-  test "the holder has an independent reopen exit distinct from the opener (Sol xhigh review, finding 3)",
+  test "the holder has an independent reopen exit distinct from the opener",
        ctx do
     review =
-      call("assign", {:user, "flynn"}, "other-session", %{
+      call("assign", {:user, "operator"}, "other-session", %{
         subject: "opener-is-not-holder review",
         idempotency_key: nil,
         work_item_id: nil
@@ -1803,20 +1803,13 @@ defmodule Tightbeam.AssignmentsTest do
     assert_reopen_refused!(ctx, {:user, "other"}, review.id, "why", "not_authorized")
 
     reopened =
-      handle(
-        ctx,
-        "reopen-assignment",
-        reopen_call(
-          {:session, "other-session"},
-          review.id,
-          "the reviewer needs to correct the verdict"
-        )
+      handle
       )
 
     assert reopened.state == "open"
   end
 
-  test "reason length validation counts Unicode code points, matching the CHECK (Sol xhigh review, finding 5)",
+  test "reason length validation counts Unicode code points, matching the CHECK",
        ctx do
     assignment = handle(ctx, "assign", assign_call({:session, "holder"}, "unicode reason"))
 
@@ -1883,7 +1876,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "cannot-proceed is holder-only, idempotent, pauses one card, and releases on its exact fact",
        ctx do
-    first = handle(ctx, "assign", assign_call({:user, "flynn"}, "first blocked card"))
+    first = handle(ctx, "assign", assign_call({:user, "operator"}, "first blocked card"))
     second = handle(ctx, "assign", assign_call({:session, "holder"}, "second runnable card"))
 
     missing_reason = attest_call({:session, "holder"}, first.id, "cannot-proceed")
@@ -1910,7 +1903,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert replay.cannotProceed.id == filed.cannotProceed.id
     assert Assignments.attest_count(ctx.db, first.id) == 1
     assert filed.decisionRequest.assignment_id == first.id
-    assert filed.decisionRequest.expecter_session_key == Org.personal_session_key("flynn")
+    assert filed.decisionRequest.expecter_session_key == Org.personal_session_key("operator")
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -2013,7 +2006,7 @@ defmodule Tightbeam.AssignmentsTest do
                [terminal_block.cannotProceed.id]
              )
 
-    disposed = handle(ctx, "assign", assign_call({:user, "flynn"}, "opener disposition"))
+    disposed = handle(ctx, "assign", assign_call({:user, "operator"}, "opener disposition"))
 
     disposed_block =
       attest_call({:session, "holder"}, disposed.id, "cannot-proceed")
@@ -2024,14 +2017,14 @@ defmodule Tightbeam.AssignmentsTest do
              handle(ctx, "revoke-assignment", revoke_call({:user, "admin"}, disposed.id))
 
     revoked =
-      handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, disposed.id))
+      handle(ctx, "revoke-assignment", revoke_call({:user, "operator"}, disposed.id))
 
     assert revoked.outcome == "revoked"
     assert Wakes.get(ctx.db, disposed_block.decisionWake.wake_id).state == "canceled"
   end
 
   test "cannot-proceed disposition follows an existing dead-opener fault bubble", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "bubbled disposition"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "bubbled disposition"))
 
     blocked =
       attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
@@ -2048,7 +2041,7 @@ defmodule Tightbeam.AssignmentsTest do
                  (?1,'cannot-proceed-cause',?2,'process:tightbeam','parent decision',?3,
                   'failed',1,2)
                """,
-               [Org.personal_session_key("flynn"), blocked.decisionWake.wake_id, assignment.id]
+               [Org.personal_session_key("operator"), blocked.decisionWake.wake_id, assignment.id]
              )
 
     assert {:ok, [[cause_seq]]} = DB.query(ctx.db, "SELECT last_insert_rowid()")
@@ -2067,7 +2060,7 @@ defmodule Tightbeam.AssignmentsTest do
              )
 
     assert %{code: "not_authorized"} =
-             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+             handle(ctx, "revoke-assignment", revoke_call({:user, "operator"}, assignment.id))
 
     assert %{outcome: "revoked"} =
              handle(
@@ -2078,7 +2071,7 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "failed cannot-proceed bubble recipients gain no disposition authority", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "failed bubble"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "failed bubble"))
 
     blocked =
       attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
@@ -2095,7 +2088,7 @@ defmodule Tightbeam.AssignmentsTest do
                  (?1,'cannot-proceed-failed-cause',?2,'process:tightbeam','parent decision',?3,
                   'failed',1,2)
                """,
-               [Org.personal_session_key("flynn"), blocked.decisionWake.wake_id, assignment.id]
+               [Org.personal_session_key("operator"), blocked.decisionWake.wake_id, assignment.id]
              )
 
     assert {:ok, [[cause_seq]]} = DB.query(ctx.db, "SELECT last_insert_rowid()")
@@ -2121,11 +2114,11 @@ defmodule Tightbeam.AssignmentsTest do
              )
 
     assert %{outcome: "revoked"} =
-             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+             handle(ctx, "revoke-assignment", revoke_call({:user, "operator"}, assignment.id))
   end
 
   test "holder retirement leaves a standing cannot-proceed assignment with its disposer", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "blocked at retirement"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "blocked at retirement"))
 
     blocked =
       attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
@@ -2137,8 +2130,8 @@ defmodule Tightbeam.AssignmentsTest do
                Assignments.interrupt_for_retire_in_txn(
                  txn,
                  "holder",
-                 "flynn",
-                 "user:flynn"
+                 "operator",
+                 "user:operator"
                )
              end)
 
@@ -2147,7 +2140,7 @@ defmodule Tightbeam.AssignmentsTest do
                assignment.id
              ])
 
-    assert {:ok, [["standing", "user:flynn"]]} =
+    assert {:ok, [["standing", "user:operator"]]} =
              DB.query(
                ctx.db,
                "SELECT state,disposerRef FROM assignment_cannot_proceed WHERE id=?1",
@@ -2163,14 +2156,14 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "a release fact that wins an overlapping revoke leaves no revoke side effects", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "release race"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "release race"))
 
     blocked =
       attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
       |> put_in([:params, :note], "wait for release")
       |> put_in([:params, :release_fact_kind], "dependency-ready")
       |> put_in([:params, :release_fact_scope], assignment.id)
-      |> put_in([:params, :release_fact_principal_ref], "user:flynn")
+      |> put_in([:params, :release_fact_principal_ref], "user:operator")
       |> then(&handle(ctx, "attest", &1))
 
     parent = self()
@@ -2182,7 +2175,7 @@ defmodule Tightbeam.AssignmentsTest do
             ConditionFacts.file_in_txn(txn, %{
               kind: "dependency-ready",
               scope: assignment.id,
-              origin: "user:flynn"
+              origin: "user:operator"
             })
 
           send(parent, {:fact_written_inside_transaction, self()})
@@ -2198,7 +2191,7 @@ defmodule Tightbeam.AssignmentsTest do
     revoke_task =
       Task.async(fn ->
         send(parent, :revoke_started_during_fact_transaction)
-        handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+        handle(ctx, "revoke-assignment", revoke_call({:user, "operator"}, assignment.id))
       end)
 
     assert_receive :revoke_started_during_fact_transaction
@@ -2226,13 +2219,13 @@ defmodule Tightbeam.AssignmentsTest do
              )
 
     assert %{code: "cannot_proceed_released"} =
-             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+             handle(ctx, "revoke-assignment", revoke_call({:user, "operator"}, assignment.id))
 
     assert %{outcome: "revoked"} =
              handle(
                ctx,
                "revoke-assignment",
-               revoke_call({:user, "flynn"}, assignment.id)
+               revoke_call({:user, "operator"}, assignment.id)
                |> put_in([:params, :reason], "later ordinary revocation")
              )
   end
@@ -2268,16 +2261,16 @@ defmodule Tightbeam.AssignmentsTest do
              handle(ctx, "revoke-assignment", revoke_call({:user, "other"}, assignment.id))
   end
 
-  test "reopen-assignment repairs a revoked card (Sol xhigh review, finding 7)", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "revoke then repair"))
-    revoked = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+  test "reopen-assignment repairs a revoked card", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "revoke then repair"))
+    revoked = handle(ctx, "revoke-assignment", revoke_call({:user, "operator"}, assignment.id))
     assert revoked.outcome == "revoked"
 
     reopened =
       handle(
         ctx,
         "reopen-assignment",
-        reopen_call({:user, "flynn"}, assignment.id, "the revocation was a mistake")
+        reopen_call({:user, "operator"}, assignment.id, "the revocation was a mistake")
       )
 
     assert reopened.state == "open"
@@ -2303,12 +2296,12 @@ defmodule Tightbeam.AssignmentsTest do
              handle(
                ctx,
                "revoke-assignment",
-               revoke_call({:user, "flynn"}, assignment.id)
+               revoke_call({:user, "operator"}, assignment.id)
                |> put_in([:params, :reason], "second revocation")
              )
 
     assert %{revocationReason: "second revocation"} =
-             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+             handle(ctx, "assignment-get", assignment_get_call({:user, "operator"}, assignment.id))
 
     assert {:ok, [[2, "second revocation", "test revocation"]]} =
              DB.query(
@@ -2327,7 +2320,7 @@ defmodule Tightbeam.AssignmentsTest do
       handle(
         ctx,
         "assign",
-        assign_call({:user, "flynn"}, "generation identity")
+        assign_call({:user, "operator"}, "generation identity")
         |> put_in([:params, :files], [
           "lib/tightbeam/state_resources.ex",
           "test/assignments_test.exs"
@@ -2340,7 +2333,7 @@ defmodule Tightbeam.AssignmentsTest do
              handle(
                ctx,
                "revoke-assignment",
-               revoke_call({:user, "flynn"}, assignment.id)
+               revoke_call({:user, "operator"}, assignment.id)
                |> put_in([:params, :reason], "first reason")
              )
 
@@ -2355,7 +2348,7 @@ defmodule Tightbeam.AssignmentsTest do
              handle(
                ctx,
                "reopen-assignment",
-               reopen_call({:user, "flynn"}, assignment.id, "the first close was mistaken")
+               reopen_call({:user, "operator"}, assignment.id, "the first close was mistaken")
              )
 
     # The first immutable row has the same actor and timestamp as the target
@@ -2366,7 +2359,7 @@ defmodule Tightbeam.AssignmentsTest do
                ctx.db,
                """
                UPDATE assignments
-               SET state='closed', outcome='revoked', closedAt=?2, closedByUser='flynn'
+               SET state='closed', outcome='revoked', closedAt=?2, closedByUser='operator'
                WHERE id=?1
                """,
                [assignment.id, closed_at]
@@ -2389,7 +2382,7 @@ defmodule Tightbeam.AssignmentsTest do
                """
                INSERT INTO assignment_revocations
                  (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
-               VALUES (?1, ?2, ?3, 'flynn', NULL, 'second reason')
+               VALUES (?1, ?2, ?3, 'operator', NULL, 'second reason')
                """,
                [second_id, assignment.id, closed_at]
              )
@@ -2410,7 +2403,7 @@ defmodule Tightbeam.AssignmentsTest do
                ctx.db,
                """
                UPDATE assignments
-               SET state='closed', outcome='revoked', closedAt=?2, closedByUser='flynn'
+               SET state='closed', outcome='revoked', closedAt=?2, closedByUser='operator'
                WHERE id=?1
                """,
                [assignment.id, closed_at]
@@ -2418,7 +2411,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert %{revocationReason: "second reason"} =
              current =
-             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+             handle(ctx, "assignment-get", assignment_get_call({:user, "operator"}, assignment.id))
 
     assert %{assignment: %{revocationReason: "second reason"}} =
              WorkState.detail(ctx.db, assignment.id)
@@ -2426,7 +2419,7 @@ defmodule Tightbeam.AssignmentsTest do
     notice =
       Tightbeam.Firehose.Publisher.state_notice(
         ctx.db,
-        call("revoke-assignment", {:user, "flynn"}, nil, %{assignment_id: assignment.id}),
+        call("revoke-assignment", {:user, "operator"}, nil, %{assignment_id: assignment.id}),
         current
       )
 
@@ -2449,8 +2442,8 @@ defmodule Tightbeam.AssignmentsTest do
     refute Map.has_key?(notice["payload"], "priority")
 
     catalog = %{
-      {"mac-runner", "claude"} => [
-        %{family: "fable", context: "1m", efforts: ["medium"], provider: :anthropic}
+      {"test-host", "claude"} => [
+        %{family: "example-model", context: "1m", efforts: ["medium"], provider: :anthropic}
       ]
     }
 
@@ -2465,7 +2458,7 @@ defmodule Tightbeam.AssignmentsTest do
              handle(
                ctx,
                "revoke-assignment",
-               call("revoke-assignment", {:user, "flynn"}, nil, %{
+               call("revoke-assignment", {:user, "operator"}, nil, %{
                  assignment_id: assignment.id,
                  reason: "second reason"
                })
@@ -2496,8 +2489,8 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "completion and historical surrender notices use the exact shared assignment bytes", ctx do
     catalog = %{
-      {"mac-runner", "claude"} => [
-        %{family: "fable", context: "1m", efforts: ["medium"], provider: :anthropic}
+      {"test-host", "claude"} => [
+        %{family: "example-model", context: "1m", efforts: ["medium"], provider: :anthropic}
       ]
     }
 
@@ -2536,7 +2529,7 @@ defmodule Tightbeam.AssignmentsTest do
       handle(
         ctx,
         "assign",
-        assign_call({:user, "flynn"}, "completion assignment projection")
+        assign_call({:user, "operator"}, "completion assignment projection")
         |> put_in([:params, :files], [
           "lib/tightbeam/firehose/publisher.ex",
           "test/assignments_test.exs"
@@ -2551,7 +2544,7 @@ defmodule Tightbeam.AssignmentsTest do
       handle(
         ctx,
         "assign",
-        assign_call({:user, "flynn"}, "historical surrender assignment projection")
+        assign_call({:user, "operator"}, "historical surrender assignment projection")
         |> put_in([:params, :files], [
           "lib/tightbeam/firehose/publisher.ex",
           "test/assignments_test.exs"
@@ -2587,10 +2580,10 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "generation upgrade replaces the predecessor tuple trigger before a reopened close", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "upgrade generation"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "upgrade generation"))
 
     assert %{outcome: "revoked"} =
-             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+             handle(ctx, "revoke-assignment", revoke_call({:user, "operator"}, assignment.id))
 
     assert {:ok, [[closed_at]]} =
              DB.query(
@@ -2603,7 +2596,7 @@ defmodule Tightbeam.AssignmentsTest do
              handle(
                ctx,
                "reopen-assignment",
-               reopen_call({:user, "flynn"}, assignment.id, "upgrade needs a new generation")
+               reopen_call({:user, "operator"}, assignment.id, "upgrade needs a new generation")
              )
 
     # Simulate the exact predecessor: no generation table and the former
@@ -2638,7 +2631,7 @@ defmodule Tightbeam.AssignmentsTest do
                ctx.db,
                """
                UPDATE assignments
-               SET state='closed', outcome='revoked', closedAt=?2, closedByUser='flynn'
+               SET state='closed', outcome='revoked', closedAt=?2, closedByUser='operator'
                WHERE id=?1
                """,
                [assignment.id, closed_at]
@@ -2848,7 +2841,7 @@ defmodule Tightbeam.AssignmentsTest do
              )
 
     assert %{code: "not_holder"} =
-             handle(ctx, "attest", attest_call({:user, "flynn"}, assignment.id, "progress"))
+             handle(ctx, "attest", attest_call({:user, "operator"}, assignment.id, "progress"))
 
     assert %{code: "invalid_kind"} =
              handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "bogus"))
@@ -2917,7 +2910,7 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "work lifecycle markers land in the actor transcript with exact event text", ctx do
-    completed = handle(ctx, "assign", assign_call({:user, "flynn"}, "completed markers"))
+    completed = handle(ctx, "assign", assign_call({:user, "operator"}, "completed markers"))
 
     progress =
       handle(ctx, "attest", attest_call({:session, "holder"}, completed.id, "progress"))
@@ -2931,7 +2924,7 @@ defmodule Tightbeam.AssignmentsTest do
     marker_count_before_user_verdict = length(marker_contents(ctx.db, "holder"))
 
     user_verdict_call =
-      attest_call({:user, "flynn"}, completed.id, "verdict")
+      attest_call({:user, "operator"}, completed.id, "verdict")
       |> put_in([:params, :verdict_kind], "user-ruling")
 
     user_verdict = handle(ctx, "attest", user_verdict_call)
@@ -2941,15 +2934,15 @@ defmodule Tightbeam.AssignmentsTest do
     completion =
       handle(ctx, "attest", attest_call({:session, "holder"}, completed.id, "completion"))
 
-    paused = handle(ctx, "assign", assign_call({:user, "flynn"}, "cannot-proceed markers"))
+    paused = handle(ctx, "assign", assign_call({:user, "operator"}, "cannot-proceed markers"))
 
     cannot_proceed =
       attest_call({:session, "holder"}, paused.id, "cannot-proceed")
       |> put_in([:params, :note], "needs input")
       |> then(&handle(ctx, "attest", &1))
 
-    revoked = handle(ctx, "assign", assign_call({:user, "flynn"}, "revoke markers"))
-    revocation = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, revoked.id))
+    revoked = handle(ctx, "assign", assign_call({:user, "operator"}, "revoke markers"))
+    revocation = handle(ctx, "revoke-assignment", revoke_call({:user, "operator"}, revoked.id))
 
     assert marker_contents(ctx.db, "holder") == [
              "[assignment opened: #{completed.id}]",
@@ -2965,7 +2958,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert progress.attest.kind == "progress"
     assert verdict.attest.verdictKind == "reviewed-clean"
-    assert user_verdict.attest.byUser == "flynn"
+    assert user_verdict.attest.byUser == "operator"
     assert completion.assignment.outcome == "completed"
     assert completion.assignment.closingAttestId == completion.attest.id
     assert cannot_proceed.assignment.state == "open"
@@ -2979,7 +2972,7 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "a marker insert failure does not fail the underlying attest", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "marker failure"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "marker failure"))
     :ok = DB.execute(ctx.db, "DROP TABLE messages")
 
     result =
@@ -2992,8 +2985,8 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "revoke permits admin and typed openers, denies others, and creates no attest", ctx do
     for {principal, opener} <- [
-          {{:user, "admin"}, {:user, "flynn"}},
-          {{:user, "flynn"}, {:user, "flynn"}},
+          {{:user, "admin"}, {:user, "operator"}},
+          {{:user, "operator"}, {:user, "operator"}},
           {{:session, "holder"}, {:session, "holder"}}
         ] do
       assignment = handle(ctx, "assign", assign_call(opener, inspect(principal)))
@@ -3002,7 +2995,7 @@ defmodule Tightbeam.AssignmentsTest do
       assert revoked.closingAttestId == nil
     end
 
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "deny"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "deny"))
 
     assert %{code: "not_authorized"} =
              handle(ctx, "revoke-assignment", revoke_call({:user, "other"}, assignment.id))
@@ -3017,7 +3010,7 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "revocation requires one durable bounded reason and projects its provenance", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "reason required"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "reason required"))
 
     for params <- [
           %{assignment_id: assignment.id},
@@ -3032,14 +3025,14 @@ defmodule Tightbeam.AssignmentsTest do
                handle(
                  ctx,
                  "revoke-assignment",
-                 call("revoke-assignment", {:user, "flynn"}, nil, params)
+                 call("revoke-assignment", {:user, "operator"}, nil, params)
                )
 
       assert code in ["missing_reason", "invalid_reason"]
     end
 
     assert %{state: "open", revocationReason: nil} =
-             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+             handle(ctx, "assignment-get", assignment_get_call({:user, "operator"}, assignment.id))
 
     assert {:ok, [[0]]} =
              DB.query(
@@ -3057,7 +3050,7 @@ defmodule Tightbeam.AssignmentsTest do
                  """
                  INSERT INTO assignment_revocations
                    (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
-                 VALUES (?1, ?2, 1, 'flynn', NULL, ?3)
+                 VALUES (?1, ?2, 1, 'operator', NULL, ?3)
                  """,
                  ["revocation-whitespace-#{suffix}", assignment.id, reason]
                )
@@ -3067,25 +3060,25 @@ defmodule Tightbeam.AssignmentsTest do
       handle(
         ctx,
         "revoke-assignment",
-        call("revoke-assignment", {:user, "flynn"}, nil, %{
+        call("revoke-assignment", {:user, "operator"}, nil, %{
           assignment_id: assignment.id,
           reason: "the work moved to its replacement"
         })
       )
 
     assert revoked.revocationReason == "the work moved to its replacement"
-    assert revoked.closedByUser == "flynn"
+    assert revoked.closedByUser == "operator"
 
     assert %{revocationReason: "the work moved to its replacement"} =
-             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+             handle(ctx, "assignment-get", assignment_get_call({:user, "operator"}, assignment.id))
 
     assert %{
              "class" => "assignment.closed",
-             "payload" => %{"closedByUser" => "flynn", "outcome" => "revoked"} = payload
+             "payload" => %{"closedByUser" => "operator", "outcome" => "revoked"} = payload
            } =
              Tightbeam.Firehose.Publisher.state_notice(
                ctx.db,
-               call("revoke-assignment", {:user, "flynn"}, nil, %{assignment_id: assignment.id}),
+               call("revoke-assignment", {:user, "operator"}, nil, %{assignment_id: assignment.id}),
                revoked
              )
 
@@ -3093,7 +3086,7 @@ defmodule Tightbeam.AssignmentsTest do
     refute Map.has_key?(payload, "revocationReason")
     refute Map.has_key?(payload, "priority")
 
-    assert {:ok, [["flynn", nil, closed_at, "the work moved to its replacement"]]} =
+    assert {:ok, [["operator", nil, closed_at, "the work moved to its replacement"]]} =
              DB.query(
                ctx.db,
                "SELECT revokedByUser, revokedBySession, revokedAt, reason FROM assignment_revocations WHERE assignmentId = ?1",
@@ -3106,7 +3099,7 @@ defmodule Tightbeam.AssignmentsTest do
       handle(
         ctx,
         "revoke-assignment",
-        call("revoke-assignment", {:user, "flynn"}, nil, %{
+        call("revoke-assignment", {:user, "operator"}, nil, %{
           assignment_id: assignment.id,
           reason: "the work moved to its replacement"
         })
@@ -3115,7 +3108,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert replayed.id == assignment.id
     assert replayed.revocationReason == "the work moved to its replacement"
 
-    admin_revoked = handle(ctx, "assign", assign_call({:user, "flynn"}, "admin revocation"))
+    admin_revoked = handle(ctx, "assign", assign_call({:user, "operator"}, "admin revocation"))
 
     assert %{closedByUser: "admin"} =
              handle(
@@ -3128,14 +3121,14 @@ defmodule Tightbeam.AssignmentsTest do
              handle(
                ctx,
                "revoke-assignment",
-               revoke_call({:user, "flynn"}, admin_revoked.id)
+               revoke_call({:user, "operator"}, admin_revoked.id)
              )
 
     assert %{code: "assignment_closed"} =
              handle(
                ctx,
                "revoke-assignment",
-               call("revoke-assignment", {:user, "flynn"}, nil, %{
+               call("revoke-assignment", {:user, "operator"}, nil, %{
                  assignment_id: assignment.id,
                  reason: "a conflicting reason"
                })
@@ -3162,17 +3155,17 @@ defmodule Tightbeam.AssignmentsTest do
                INSERT INTO assignments
                  (id, subject, holderKey, holderFallback, openedByUser, openedAt, state, outcome,
                   closedAt, closedByUser)
-               VALUES ('asg_legacy_reason', 'legacy', 'holder', 0, 'flynn', 1, 'closed', 'revoked', 2, 'flynn')
+               VALUES ('asg_legacy_reason', 'legacy', 'holder', 0, 'operator', 1, 'closed', 'revoked', 2, 'operator')
                """
              )
 
     :ok = Assignments.ensure_schema(ctx.db)
 
-    assert %{revocationReason: "legacy_unknown", closedByUser: "flynn", closedAt: 2} =
+    assert %{revocationReason: "legacy_unknown", closedByUser: "operator", closedAt: 2} =
              handle(
                ctx,
                "assignment-get",
-               assignment_get_call({:user, "flynn"}, "asg_legacy_reason")
+               assignment_get_call({:user, "operator"}, "asg_legacy_reason")
              )
 
     assert {:ok, [["legacy:asg_legacy_reason:2", nil]]} =
@@ -3187,13 +3180,13 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "schema restart preserves one recorded revocation reason without a legacy sentinel", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "restart provenance"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "restart provenance"))
 
     assert %{outcome: "revoked", revocationReason: "recorded reason"} =
              handle(
                ctx,
                "revoke-assignment",
-               revoke_call({:user, "flynn"}, assignment.id)
+               revoke_call({:user, "operator"}, assignment.id)
                |> put_in([:params, :reason], "recorded reason")
              )
 
@@ -3211,14 +3204,14 @@ defmodule Tightbeam.AssignmentsTest do
              )
 
     assert %{revocationReason: "recorded reason"} =
-             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+             handle(ctx, "assignment-get", assignment_get_call({:user, "operator"}, assignment.id))
   end
 
   test "revocation replay emits no second state callback or accepted handoff", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "replay notices"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "replay notices"))
 
     call =
-      revoke_call({:user, "flynn"}, assignment.id)
+      revoke_call({:user, "operator"}, assignment.id)
       |> Map.merge(%{
         firehose_in_txn: true,
         firehose_hub: self(),
@@ -3236,15 +3229,15 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "retirement attributes revocation provenance to the acting session", ctx do
-    caller = session(ctx.db, "agent:retirement-caller", "flynn")
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "retirement actor"))
+    caller = session(ctx.db, "agent:retirement-caller", "operator")
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "retirement actor"))
 
     assert {:ok, [_]} =
              DB.transaction(ctx.db, fn txn ->
                Assignments.interrupt_for_retire_in_txn(
                  txn,
                  "holder",
-                 "flynn",
+                 "operator",
                  caller.session_key
                )
              end)
@@ -3268,10 +3261,10 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "revocation provenance cannot be rewritten or deleted", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "immutable provenance"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "immutable provenance"))
 
     assert %{outcome: "revoked"} =
-             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+             handle(ctx, "revoke-assignment", revoke_call({:user, "operator"}, assignment.id))
 
     assert {:error, %DB.Error{message: update_error}} =
              DB.query(
@@ -3321,14 +3314,14 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "process retirement refuses rather than attributing the holder owner", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "recovery provenance"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "recovery provenance"))
 
     assert {:error, %ArgumentError{message: message}} =
              DB.transaction(ctx.db, fn txn ->
                Assignments.interrupt_for_retire_in_txn(
                  txn,
                  "holder",
-                 "flynn",
+                 "operator",
                  "process:tightbeam"
                )
              end)
@@ -3348,7 +3341,7 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "upgrade rebuilds revocation provenance with the Unicode whitespace constraint", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "upgrade reason"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "upgrade reason"))
 
     :ok = DB.execute(ctx.db, "DROP TRIGGER assignments_revocation_reason_required")
     :ok = DB.execute(ctx.db, "DROP TABLE assignment_revocation_generations")
@@ -3379,14 +3372,14 @@ defmodule Tightbeam.AssignmentsTest do
                """
                INSERT INTO assignment_revocations
                  (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
-               VALUES ('revocation-pre-upgrade', ?1, 42, 'flynn', NULL, 'superseded')
+               VALUES ('revocation-pre-upgrade', ?1, 42, 'operator', NULL, 'superseded')
                """,
                [assignment.id]
              )
 
     assert :ok = Assignments.ensure_schema(ctx.db)
 
-    assert {:ok, [["superseded", 42, "flynn", nil]]} =
+    assert {:ok, [["superseded", 42, "operator", nil]]} =
              DB.query(
                ctx.db,
                """
@@ -3409,7 +3402,7 @@ defmodule Tightbeam.AssignmentsTest do
                ctx.db,
                """
                UPDATE assignments
-               SET state='closed', outcome='revoked', closedAt=43, closedByUser='flynn'
+               SET state='closed', outcome='revoked', closedAt=43, closedByUser='operator'
                WHERE id=?1
                """,
                [assignment.id]
@@ -3450,7 +3443,7 @@ defmodule Tightbeam.AssignmentsTest do
                  """
                  INSERT INTO assignment_revocations
                    (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
-                 VALUES (?1, ?2, 43, 'flynn', NULL, ?3)
+                 VALUES (?1, ?2, 43, 'operator', NULL, ?3)
                  """,
                  [
                    "revocation-upgrade-whitespace-#{code_point}",
@@ -3488,8 +3481,8 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "query filters, deterministic ordering, role-resolved holder input, and open_count", ctx do
-    a = handle(ctx, "assign", assign_call({:user, "flynn"}, "a"))
-    b = handle(ctx, "assign", assign_call({:user, "flynn"}, "b"))
+    a = handle(ctx, "assign", assign_call({:user, "operator"}, "a"))
+    b = handle(ctx, "assign", assign_call({:user, "operator"}, "b"))
     _ = handle(ctx, "attest", attest_call({:session, "holder"}, a.id, "completion"))
     {:ok, _} = DB.query(ctx.db, "UPDATE assignments SET openedAt = 99")
 
@@ -3502,10 +3495,10 @@ defmodule Tightbeam.AssignmentsTest do
              [b.id]
 
     assert %{assignments: [_]} =
-             handle(ctx, "assignments", query_call({:user, "flynn"}, "open", "holder"))
+             handle(ctx, "assignments", query_call({:user, "operator"}, "open", "holder"))
 
     assert %{code: "invalid_state_filter"} =
-             handle(ctx, "assignments", query_call({:user, "flynn"}, "bad", nil))
+             handle(ctx, "assignments", query_call({:user, "operator"}, "bad", nil))
 
     assert %{code: "process_denied"} =
              handle(ctx, "assignments", query_call({:process, "x"}, "bad", nil))
@@ -3570,7 +3563,7 @@ defmodule Tightbeam.AssignmentsTest do
     verdict_assignment = dispatch!(ctx, assign_call({:session, "holder"}, "verdict event"))
 
     verdict_call =
-      attest_call({:user, "flynn"}, verdict_assignment.id, "verdict")
+      attest_call({:user, "operator"}, verdict_assignment.id, "verdict")
       |> put_in([:params, :verdict_kind], "tests-passed")
 
     assert {:ok, %{attest: verdict}} =
@@ -3588,7 +3581,7 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "attests returns every kind in timestamp and id order", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "all attests"))
+    assignment = handle(ctx, "assign", assign_call({:user, "operator"}, "all attests"))
 
     {:ok, _} =
       DB.query(
@@ -3600,7 +3593,7 @@ defmodule Tightbeam.AssignmentsTest do
           ('att_progress', ?1, 'progress', NULL, NULL, 'holder', NULL, 30),
           ('att_completion', ?1, 'completion', NULL, NULL, 'holder', NULL, 20),
           ('att_surrender', ?1, 'surrender', NULL, NULL, 'holder', NULL, 20),
-          ('att_verdict', ?1, 'verdict', 'reviewed-clean', NULL, NULL, 'flynn', 10)
+          ('att_verdict', ?1, 'verdict', 'reviewed-clean', NULL, NULL, 'operator', 10)
         """,
         [assignment.id]
       )
@@ -3609,7 +3602,7 @@ defmodule Tightbeam.AssignmentsTest do
              handle(
                ctx,
                "attests",
-               call("attests", {:user, "flynn"}, nil, %{assignment_id: assignment.id})
+               call("attests", {:user, "operator"}, nil, %{assignment_id: assignment.id})
              )
 
     assert Enum.map(attests, &{&1.kind, &1.ts, &1.id}) == [
@@ -3665,7 +3658,7 @@ defmodule Tightbeam.AssignmentsTest do
     handle(
       ctx,
       "work-item-create",
-      work_item_call("work-item-create", {:user, "flynn"}, %{title: title})
+      work_item_call("work-item-create", {:user, "operator"}, %{title: title})
     )
   end
 
@@ -3691,7 +3684,7 @@ defmodule Tightbeam.AssignmentsTest do
     count
   end
 
-  # Sol xhigh review, finding 7: a refusal that returns the right code but still
+  # : a refusal that returns the right code but still
   # mutated the row, the reopenings papertrail, or supervision would pass every
   # assertion that checked only the returned code. This snapshots all three
   # durable surfaces a reopen touches and pins them unchanged across a refusal.
@@ -3809,8 +3802,8 @@ defmodule Tightbeam.AssignmentsTest do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("fable"),
-      host: "mac-runner"
+      model: Model.new("example-model"),
+      host: "test-host"
     }
 
     Org.create(db, Map.merge(input, overrides))

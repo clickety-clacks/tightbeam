@@ -1,6 +1,6 @@
 # ONE-SHOT API-KEY EVIDENCE CAPTURE.
 #
-# Flynn's constraint on the keys this reads is BINDING: one models-list call per
+# user's constraint on the keys this reads is BINDING: one models-list call per
 # key, total, for the whole lane. No retries. No other use -- not in CI, not in
 # the suite, not in the smoke, not for a convenience check. This script is the
 # ONLY thing that may spend that budget, and it enforces the budget itself
@@ -138,7 +138,7 @@ defmodule CaptureApiKeyEvidence do
       path,
       JSON.encode!(%{
         "recorded_at" => Date.to_iso8601(Date.utc_today()),
-        "budget" => "one-shot capture under Flynn's API-key budget",
+        "budget" => "one-shot capture under user's API-key budget",
         "request" => %{
           "method" => "GET",
           "url" => to_string(url(provider)),

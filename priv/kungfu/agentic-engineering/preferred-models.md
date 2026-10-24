@@ -8,7 +8,7 @@ whoever wrote it. There is no separate policy table.
 <!-- machine-read: mix tightbeam.catalog.diff parses each capsule id from the
      leading "- **<id>**" of these bullets; keep that shape when editing. -->
 
-- **claude-fable-5**: deepest judgment and breadth; load-bearing rulings, adversarial
+- **claude-example-5**: deepest judgment and breadth; load-bearing rulings, adversarial
   whole-system review, wisdom-level authoring. Expensive; reserve for what needs it.
 - **claude-opus-4-8**: strong general reasoning and composition; coordination,
   drafting under rulings, reviewing another model's code.
@@ -16,7 +16,7 @@ whoever wrote it. There is no separate policy table.
   analysis; the org default. Not for adversarial depth.
 - **claude-haiku-4-5-20251001** (nickname: haiku): fast and cheap classification,
   extraction, and mechanical transforms. Never judgment.
-- **gpt-5.6-sol**: the implementer. Focused greenfield goals with invariants stated
+- **gpt-5.6-example**: the implementer. Focused greenfield goals with invariants stated
   up front; adversarial spec review at high effort. Pauses on underspecification
   (virtue). Never orchestrates; stalls on rework-in-place.
 - **gpt-5.3-codex-spark**: utility intelligence. Summarization and
@@ -34,20 +34,20 @@ capsule; `tightbeam list` shows the live legal forms.
 
 | Activity                                        | Wants                              | Minds, in order (blocked if none)                                                |
 | ----------------------------------------------- | ---------------------------------- | -------------------------------------------------------------------------------- |
-| Product ownership / spirit discovery            | reframing, long-horizon judgment   | fable[high], opus[xhigh]                                                         |
+| Product ownership / spirit discovery            | reframing, long-horizon judgment   | example-model[high], opus[xhigh]                                                         |
 | Spec drafting (under rulings)                   | faithful composition               | opus[high], sonnet[high]                                                         |
-| Spec adversarial review                         | hostile depth, hole-hunting        | sol[xhigh] (xhigh whole-lattice), fable[high], opus[high]                        |
-| Orchestration (flow, dispatch, tracking)        | reliability, judgment-on-facts     | fable[high]; fable when contested, sol[high]                                     |
-| Implementation — NEW patterns, critical code, tough bugs | architectural judgment while coding | opus[high], fable[high] when load-bearing |
-| Implementation — straightforward, well-specced, well-bounded goal | precision, pause-on-gap | sol[medium], sonnet[high] |
-| Implementation — established patterns (the default once a pattern exists) | faithful extension | sol[medium], sonnet[high] |
-| Code review of a review-required effect         | independent judgment + rigor       | opus[high], fable[high], sol[high]                                                |
-| Recon / investigation                           | evidence discipline, cheap breadth | sol[high], opus[high]                                                            |
+| Spec adversarial review                         | hostile depth, hole-hunting        | gpt-5.6-example[xhigh] (xhigh whole-lattice), example-model[high], opus[high]                        |
+| Orchestration (flow, dispatch, tracking)        | reliability, judgment-on-facts     | example-model[high]; example-model when contested, gpt-5.6-example[high]                                     |
+| Implementation — NEW patterns, critical code, tough bugs | architectural judgment while coding | opus[high], example-model[high] when load-bearing |
+| Implementation — straightforward, well-specced, well-bounded goal | precision, pause-on-gap | gpt-5.6-example[medium], sonnet[high] |
+| Implementation — established patterns (the default once a pattern exists) | faithful extension | gpt-5.6-example[medium], sonnet[high] |
+| Code review of a review-required effect         | independent judgment + rigor       | opus[high], example-model[high], gpt-5.6-example[high]                                                |
+| Recon / investigation                           | evidence discipline, cheap breadth | gpt-5.6-example[high], opus[high]                                                            |
 | Mechanical sweeps (renames, fixtures)           | speed                              | terra[low], sonnet[low], any                                                     |
 | General user conversation (default agent)        | breadth, warmth, cheap to idle      | sonnet[medium], opus[medium]                                                     |
-| Onboarding / discovery conversations             | judgment about people, reframing    | fable[high], opus[high], sol[low]                                                |
+| Onboarding / discovery conversations             | judgment about people, reframing    | example-model[high], opus[high], gpt-5.6-example[low]                                                |
 | Failure classification, log triage               | fast pattern matching               | luna[high], haiku, sonnet[low], any                                              |
-| Guidance / law authoring                         | wisdom-grade writing                | fable[high], opus[high], sol[xhigh]                                             |
+| Guidance / law authoring                         | wisdom-grade writing                | example-model[high], opus[high], gpt-5.6-example[xhigh]                                             |
 
 For code review, independence means a fresh session with the capability required by
 the effect. A same-model, same-provider, or same-harness reviewer-code session remains qualified

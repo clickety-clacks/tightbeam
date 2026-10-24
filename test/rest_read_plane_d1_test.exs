@@ -64,18 +64,18 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     {:paired, admin_device} =
       claim_org(db, %{
         device_id: "admin-device",
-        claimed_name: "Flynn",
+        claimed_name: "user",
         platform: nil,
         model: nil
       })
 
-    admin_session = ensure_main_session(db, "flynn")
+    admin_session = ensure_main_session(db, "operator")
     Devices.add_user(db, "operator", false)
 
     {:pending, _pending} =
       Devices.pair(db, %{
         device_id: "operator-device",
-        claimed_name: "Operator",
+        claimed_name: "user",
         platform: nil,
         model: nil
       })
@@ -113,7 +113,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
                  harness,
                  name,
                  "host-environment-secret",
-                 "user:flynn"
+                 "user:operator"
                )
     end
 
@@ -164,10 +164,10 @@ defmodule Tightbeam.RestReadPlaneD1Test do
        :host_environment},
       {"hosts.collection", "hosts", "/api/hosts", "/api/hosts/alpha-host",
        StateResources.query_host(ctx.db, "alpha-host"), :host},
-      {"users.collection", "users", "/api/users", "/api/users/flynn",
-       StateResources.query_user(ctx.db, "flynn"), :user},
+      {"users.collection", "users", "/api/users", "/api/users/operator",
+       StateResources.query_user(ctx.db, "operator"), :user},
       {"identity.collection", "identity", "/api/identity", "/api/identity/served",
-       hydrated_identity!(ctx.db, "served", {:user, "flynn"}), :identity},
+       hydrated_identity!(ctx.db, "served", {:user, "operator"}), :identity},
       {"kungfu.collection", "kungfu", "/api/kungfu", "/api/kungfu/#{kungfu_name}",
        StateResources.query_kungfu(ctx.db, kungfu_name), :kungfu}
     ]
@@ -221,7 +221,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
        "/api/host-env?host=alpha-host&harness=#{ctx.harness}&name=ALPHA_ENV",
        %{"host" => "alpha-host", "harness" => ctx.harness, "name" => "ALPHA_ENV"}},
       {"host.registered", "hosts", "/api/hosts/alpha-host", %{"host" => "alpha-host"}},
-      {"user.promoted", "users", "/api/users/flynn", %{"userId" => "flynn"}},
+      {"user.promoted", "users", "/api/users/operator", %{"userId" => "operator"}},
       {"identity.updated", "identity", "/api/identity/served", %{"name" => "served"}},
       {"kungfu.updated", "kungfu", "/api/kungfu/#{kungfu_name}", %{"name" => kungfu_name}}
     ]
@@ -236,7 +236,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
           %{"items" => [item]} -> item
         end
 
-      assert {:ok, rebuilt_item} = Rebuild.fetch(ctx.db, class, refs, "flynn", true)
+      assert {:ok, rebuilt_item} = Rebuild.fetch(ctx.db, class, refs, "operator", true)
       assert rest_item == rebuilt_item, class
 
       item_bytes = StateResources.encode_item(resource, rebuilt_item, ctx.catalog)
@@ -279,22 +279,22 @@ defmodule Tightbeam.RestReadPlaneD1Test do
 
   test "bearer classes and transport-only asUser preserve dispatch principal semantics", ctx do
     cases = [
-      {"org known admin", "/api/config?asUser=flynn", "tbc_rest_d1", 200, nil},
+      {"org known admin", "/api/config?asUser=operator", "tbc_rest_d1", 200, nil},
       {"org unknown user remains a user principal", "/api/hosts?asUser=unknown-user",
        "tbc_rest_d1", 200, nil},
       {"org missing asUser", "/api/config", "tbc_rest_d1", 400, "invalid_message"},
       {"org empty asUser", "/api/config?asUser=", "tbc_rest_d1", 400, "invalid_message"},
-      {"org repeated asUser", "/api/config?asUser=flynn&asUser=flynn", "tbc_rest_d1", 400,
+      {"org repeated asUser", "/api/config?asUser=operator&asUser=operator", "tbc_rest_d1", 400,
        "invalid_as_user"},
       {"session absent asUser stays a session", "/api/hosts", ctx.admin_session.cli_token, 200,
        nil},
       {"session empty asUser", "/api/hosts?asUser=", ctx.admin_session.cli_token, 403,
        "identity_not_yours"},
-      {"session matching asUser becomes the owner user", "/api/config?asUser=flynn",
+      {"session matching asUser becomes the owner user", "/api/config?asUser=operator",
        ctx.admin_session.cli_token, 200, nil},
       {"session mismatching asUser", "/api/config?asUser=operator", ctx.admin_session.cli_token,
        403, "identity_not_yours"},
-      {"device asUser is invalid", "/api/config?asUser=flynn", ctx.admin_device.token, 400,
+      {"device asUser is invalid", "/api/config?asUser=operator", ctx.admin_device.token, 400,
        "invalid_as_user"},
       {"invalid bearer", "/api/config", "wrong", 401, "auth_failed"}
     ]
@@ -312,14 +312,14 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     mismatch = get(ctx, "/api/config?asUser=operator", ctx.admin_session.cli_token)
 
     assert mismatch.resp_body ==
-             ~s({"schemaVersion":1,"resource":"config","error":{"code":"identity_not_yours","message":"this session belongs to flynn"}})
+             ~s({"schemaVersion":1,"resource":"config","error":{"code":"identity_not_yours","message":"this session belongs to operator"}})
 
     empty = get(ctx, "/api/hosts?asUser=", ctx.admin_session.cli_token)
 
     assert empty.resp_body ==
-             ~s({"schemaVersion":1,"resource":"hosts","error":{"code":"identity_not_yours","message":"this session belongs to flynn"}})
+             ~s({"schemaVersion":1,"resource":"hosts","error":{"code":"identity_not_yours","message":"this session belongs to operator"}})
 
-    malformed = get(ctx, "/api/config?asUser=flynn%zz", "tbc_rest_d1")
+    malformed = get(ctx, "/api/config?asUser=operator%zz", "tbc_rest_d1")
     assert malformed.status == 400
     assert JSON.decode!(malformed.resp_body)["error"]["code"] == "malformed_query"
 
@@ -337,7 +337,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     assert get(ctx, "/api/host-env/alpha-host", ctx.admin_device.token).status == 404
 
     parity_cases = [
-      {"org known", "/api/hosts?asUser=flynn", "tbc_rest_d1", %{"asUser" => "flynn"}, 200, nil},
+      {"org known", "/api/hosts?asUser=operator", "tbc_rest_d1", %{"asUser" => "operator"}, 200, nil},
       {"org unknown", "/api/hosts?asUser=unknown-user", "tbc_rest_d1",
        %{"asUser" => "unknown-user"}, 200, nil},
       {"org empty", "/api/hosts?asUser=", "tbc_rest_d1", %{"asUser" => ""}, 400,
@@ -346,8 +346,8 @@ defmodule Tightbeam.RestReadPlaneD1Test do
       {"session absent", "/api/hosts", ctx.admin_session.cli_token, %{}, 200, nil},
       {"session empty", "/api/hosts?asUser=", ctx.admin_session.cli_token, %{"asUser" => ""}, 403,
        "identity_not_yours"},
-      {"session matching", "/api/hosts?asUser=flynn", ctx.admin_session.cli_token,
-       %{"asUser" => "flynn"}, 200, nil},
+      {"session matching", "/api/hosts?asUser=operator", ctx.admin_session.cli_token,
+       %{"asUser" => "operator"}, 200, nil},
       {"session mismatching", "/api/hosts?asUser=operator", ctx.admin_session.cli_token,
        %{"asUser" => "operator"}, 403, "identity_not_yours"}
     ]
@@ -370,7 +370,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
 
     assert JSON.decode!(empty_dispatch.resp_body)["error"] == %{
              "code" => "identity_not_yours",
-             "message" => "this session belongs to flynn"
+             "message" => "this session belongs to operator"
            }
   end
 
@@ -455,7 +455,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     assert payload["resource"] == "users"
     assert payload["direction"] == "before"
     assert payload["principalKind"] == "user"
-    assert payload["principalId"] == "flynn"
+    assert payload["principalId"] == "operator"
     assert payload["tuple"] == [424_242, "cursor-b"]
     assert encode_cursor_payload(payload) == boundary
     refute String.contains?(boundary, ".")
@@ -534,7 +534,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     assert malformed.status == 400
     assert JSON.decode!(malformed.resp_body)["error"]["code"] == "invalid_cursor"
 
-    {:ok, _rows} = DB.query(ctx.db, "UPDATE users SET isAdmin = 0 WHERE userId = 'flynn'", [])
+    {:ok, _rows} = DB.query(ctx.db, "UPDATE users SET isAdmin = 0 WHERE userId = 'operator'", [])
 
     now_hidden =
       get(

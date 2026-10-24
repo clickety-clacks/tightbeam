@@ -7,7 +7,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
   @session_fields ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion)
   @catalog %{
     {"testhost", "claude"} => [
-      %{family: "fable", context: nil, efforts: [], provider: :anthropic}
+      %{family: "example-model", context: nil, efforts: [], provider: :anthropic}
     ]
   }
 
@@ -20,21 +20,21 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',1,'admin_add',1)"
       )
 
     register_hosts(db, %{
       "testhost" => %{ssh: nil, base_dir: System.tmp_dir!(), cli_bin: nil}
     })
 
-    main = create_session(db, Org.personal_session_key("flynn"), "Main", kind: "main")
+    main = create_session(db, Org.personal_session_key("operator"), "Main", kind: "main")
     worker = create_session(db, "a6-worker", "A6 worker", operational_parent: main.session_key)
 
     :ok =
       Hub.register(Hub, self(), %{
         mode: :subscribed,
         db: db,
-        user_id: "flynn",
+        user_id: "operator",
         is_admin: false
       })
 
@@ -97,7 +97,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     item = StateResources.session(query_row)
 
     assert MapSet.new(Map.keys(item)) == MapSet.new(@session_fields)
-    assert item["model"] == "fable"
+    assert item["model"] == "example-model"
     assert item["thinkingLevel"] == nil
     assert item["modelContext"] == nil
     assert is_integer(item["rowVersion"])
@@ -122,7 +122,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
       assert StateResources.encode_item("sessions", randomized, @catalog) == expected_bytes
     end
 
-    owner = %{kind: "user", id: "flynn", is_admin: false}
+    owner = %{kind: "user", id: "operator", is_admin: false}
     target = %{kind: "session", id: ctx.worker.session_key, is_admin: false}
     denied_user = %{kind: "user", id: "mallory", is_admin: false}
     denied_session = %{kind: "session", id: "other-session", is_admin: false}
@@ -190,8 +190,8 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
         ctx.db,
         %{
           verb: "spawn",
-          origin: "user:flynn",
-          principal: {:user, "flynn"},
+          origin: "user:operator",
+          principal: {:user, "operator"},
           session_key: session.session_key,
           params: %{}
         },
@@ -204,7 +204,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     updated = receive_notice()
     updated_item = canonical_session(ctx.db, session.session_key)
 
-    retired_row = Org.retire(ctx.db, session.session_key, "user:flynn", 1_000)
+    retired_row = Org.retire(ctx.db, session.session_key, "user:operator", 1_000)
 
     retired =
       Publisher.committed_notice("session.retired", retired_row, %{
@@ -255,7 +255,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
       Hub.register(Hub, self(), %{
         mode: :subscribed,
         db: ctx.db,
-        user_id: "flynn",
+        user_id: "operator",
         is_admin: false
       })
 
@@ -274,7 +274,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
       Hub.register(Hub, self(), %{
         mode: :subscribed,
         db: ctx.db,
-        user_id: "flynn",
+        user_id: "operator",
         is_admin: false
       })
 
@@ -329,7 +329,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
         Projection.append(ctx.db, %{
           session_key: ctx.worker.session_key,
           role: "user",
-          sender: "user:flynn",
+          sender: "user:operator",
           content: content
         })
     end
@@ -349,7 +349,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
                  txn,
                  ctx.worker.session_key,
                  {before.model, before.harness},
-                 {Model.new("gpt-5.6-sol"), "codex", "openai"},
+                 {Model.new("gpt-5.6-example"), "codex", "openai"},
                  cleared_through: max_seq
                )
              end)
@@ -414,15 +414,15 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
       kind: Keyword.get(opts, :kind, "custom"),
       is_built_in: Keyword.get(opts, :kind) == "main",
       adopted: true,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       operational_parent: Keyword.get(opts, :operational_parent),
       archetype: "default",
       overrides: Keyword.get(opts, :overrides),
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("fable")
+      model: Model.new("example-model")
     })
   end
 

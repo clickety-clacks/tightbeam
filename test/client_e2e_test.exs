@@ -71,7 +71,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "a preflight row is an automated row: its failure fails the leg" do
       leg =
-        Scorecard.add(%Leg{harness: "claude", host: "mac-runner"}, [
+        Scorecard.add(%Leg{harness: "claude", host: "test-host"}, [
           Scorecard.fail("P1", "auth claude", "OAuth session expired"),
           Scorecard.pass("3", "converse", journey: "J1")
         ])
@@ -90,7 +90,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "a leg of only manual rows is INCOMPLETE, never a pass" do
       leg =
-        Scorecard.add(%Leg{harness: "claude", host: "mac-runner"}, [
+        Scorecard.add(%Leg{harness: "claude", host: "test-host"}, [
           Scorecard.manual("16", "wakes", "not driven")
         ])
 
@@ -112,7 +112,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "a fail outranks an incomplete" do
       leg =
-        Scorecard.add(%Leg{harness: "codex", host: "mac-runner"}, [
+        Scorecard.add(%Leg{harness: "codex", host: "test-host"}, [
           Scorecard.incomplete("13b", "model change", "no second model", journey: "J6"),
           Scorecard.fail("3", "converse", "no assistant reply", journey: "J1")
         ])
@@ -133,11 +133,11 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "the run verdict is the worst leg verdict" do
-      good = Scorecard.add(%Leg{harness: "claude", host: "mac-runner"}, Scorecard.pass("3", "converse"))
+      good = Scorecard.add(%Leg{harness: "claude", host: "test-host"}, Scorecard.pass("3", "converse"))
 
       bad =
         Scorecard.add(
-          %Leg{harness: "codex", host: "mac-runner"},
+          %Leg{harness: "codex", host: "test-host"},
           Scorecard.fail("3", "converse", "no reply")
         )
 
@@ -1375,7 +1375,7 @@ defmodule Tightbeam.ClientE2ETest do
       preflight =
         Scorecard.incomplete("P-codex", "auth codex", "credential liveness unknown: :timeout")
 
-      leg = ClientE2E.blocked_leg("codex", "mac-runner", preflight)
+      leg = ClientE2E.blocked_leg("codex", "test-host", preflight)
 
       assert match?({:incomplete, [_preflight | _blocked]}, Scorecard.leg_verdict(leg))
 
@@ -1560,8 +1560,8 @@ defmodule Tightbeam.ClientE2ETest do
   describe "the client's session-status decode contract" do
     test "a full payload has no gaps" do
       assert Journeys.decode_contract_gaps(%{
-               "sessionKey" => "agent:main:user:flynn",
-               "display" => %{"model" => "fable"},
+               "sessionKey" => "agent:main:user:operator",
+               "display" => %{"model" => "example-model"},
                "run" => %{"state" => "idle"},
                "capabilities" => %{}
              }) == []
@@ -1569,8 +1569,8 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "each field the Swift decoder requires is reported by name when missing" do
       full = %{
-        "sessionKey" => "agent:main:user:flynn",
-        "display" => %{"model" => "fable"},
+        "sessionKey" => "agent:main:user:operator",
+        "display" => %{"model" => "example-model"},
         "run" => %{"state" => "idle"},
         "capabilities" => %{}
       }
@@ -1783,7 +1783,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "J0 passes: the wire pairs, authenticates, seeds Main and syncs", ctx do
       {:ok, %{token: token}} =
-        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "Flynn")
+        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "user")
 
       {:ok, client} = SimClient.connect("127.0.0.1", ctx.port, token, device_id: "sim-j0")
 
@@ -1803,7 +1803,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "posting with a malformed id is refused on the wire, not silently dropped", ctx do
       {:ok, %{token: token}} =
-        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-bad-id", claimed_name: "Flynn")
+        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-bad-id", claimed_name: "user")
 
       {:ok, client} = SimClient.connect("127.0.0.1", ctx.port, token, device_id: "sim-bad-id")
       watermark = SimClient.mark(client)
@@ -1836,7 +1836,7 @@ defmodule Tightbeam.ClientE2ETest do
       client: client,
       main_key: nil,
       gateway: nil,
-      leg: %{harness: "claude", host: "testhost", model: "fable"},
+      leg: %{harness: "claude", host: "testhost", model: "example-model"},
       turn_wait_ms: 10_000,
       settle_ms: 250
     }
@@ -1876,7 +1876,7 @@ defmodule Tightbeam.ClientE2ETest do
           host: "testhost",
           harness: :claude,
           provider: fn -> :anthropic end,
-          model: Model.new("fable")
+          model: Model.new("example-model")
         }
       )
 

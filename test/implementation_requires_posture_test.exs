@@ -13,7 +13,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     WorkItems
   }
 
-  # The posture gate (Mike, 2026-08-31): implementation runs under a posture the
+  # The posture gate (user, 2026-08-31): implementation runs under a posture the
   # orchestrator rules on receiving the slice, heavy or light, filed as a verdict on
   # a card on the work item. These tests prove the two rails refuse to open a coder
   # card without that verdict, on assign and on dispatch alike, that the verdict
@@ -24,7 +24,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "mac-runner" => %{
+      "test-host" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -34,14 +34,14 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 1, 'admin_add', 1)"
       )
 
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "operator")
 
     coder = session(db, "posture-coder", "coder", "codex", "openai")
     orchestrator = session(db, "posture-orchestrator", "orchestrator", "codex", "openai")
-    reviewer = session(db, "posture-reviewer", "reviewer-spec", "claude", "anthropic")
+    reviewer = session
 
     start_supervised!(
       {Wakes,
@@ -55,7 +55,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
       )
 
     assert :initialized = Archetypes.init_identity!(base_dir)
-    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "flynn")
+    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "operator")
     _archetypes = Archetypes.load!(base_dir)
 
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
@@ -81,12 +81,12 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     Tightbeam.Org.create(db, %{
       session_key: key,
       display_name: key,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       archetype: archetype,
       harness: harness,
       provider: provider,
-      host: "mac-runner",
+      host: "test-host",
       model: Model.new("sonnet", effort: "medium"),
       spawned_by: nil,
       is_built_in: false
@@ -95,7 +95,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
 
   defp work_item(ctx) do
     WorkItems.__handle__(ctx.db, "work-item-create", %{
-      principal: {:user, "flynn"},
+      principal: {:user, "operator"},
       params: %{title: "Posture subject #{System.unique_integer([:positive])}"}
     })
   end
@@ -103,8 +103,8 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
   defp assign_call(holder_key, item_id, subject) do
     %{
       verb: "assign",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
@@ -115,8 +115,8 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
   defp dispatch_call(holder_key, item_id, subject) do
     %{
       verb: "dispatch",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
@@ -255,10 +255,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     item = work_item(ctx)
 
     assert {:ok, review} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               assign_call(ctx.reviewer.session_key, item.id, "review the spec")
+             Dispatch.dispatch
              )
 
     assert review.subject == "review the spec"

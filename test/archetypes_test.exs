@@ -172,7 +172,7 @@ defmodule Tightbeam.ArchetypesTest do
 
       pre_learn = body |> String.split("## AFTER LEARNING A KUNGFU", parts: 2) |> hd()
 
-      # BOUNDED BY DESIGN (reviewer-ruled): this catches CARELESSNESS, not an adversary.
+      # BOUNDED BY DESIGN: this catches CARELESSNESS, not an adversary.
       # Paraphrases get through ("ask a delivery specialist to take ownership") and that
       # residual is acceptable. What is NOT acceptable is blocking honest text, and a
       # hand-built verb list did exactly that: "spawn a product" rejected "spawn a
@@ -228,7 +228,7 @@ defmodule Tightbeam.ArchetypesTest do
     end
 
     Identity.init!(ctx.base_dir)
-    assert {:ok, _revision} = learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+    assert {:ok, _revision} = learn!(ctx.base_dir, "agentic-engineering", "user:operator")
     revision = Identity.live_revision!(ctx.base_dir)
 
     for role <- ~w(product-owner orchestrator), harness <- [:codex, :claude] do
@@ -244,12 +244,12 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
 
     loaded = Archetypes.load!(ctx.base_dir)
 
     assert Map.keys(loaded) |> Enum.sort() ==
-             ~w(avasarala coder default exec miller orchestrator product-owner recon reviewer-code reviewer-spec spec-writer)
+             ~w
 
     assert loaded["product-owner"].skills == [
              "worktree-session",
@@ -258,22 +258,18 @@ defmodule Tightbeam.ArchetypesTest do
              "human-communication"
            ]
 
-    for role <- ~w(coder orchestrator product-owner recon reviewer-code reviewer-spec spec-writer) do
+    for role <- ~w do
       assert "worktree-session" in loaded[role].skills
     end
 
-    refute Map.has_key?(loaded, "reviewer")
+    refute Map.has_key?
 
-    for role <- ~w(reviewer-code reviewer-spec) do
+    for role <- ~w do
       refute Enum.any?(loaded[role].skills, &String.starts_with?(&1, "review"))
       refute "spec-conformance" in loaded[role].skills
     end
 
-    refute File.exists?(
-             Application.app_dir(
-               :tightbeam,
-               "priv/kungfu/agentic-engineering/archetypes/reviewer.toml"
-             )
+    refute File.exists?
            )
 
     for skill <- ~w(reviewing-code reviewing-specs) do
@@ -356,7 +352,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
 
     revision = Identity.live_revision!(ctx.base_dir)
 
@@ -387,11 +383,11 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
 
     revision = Identity.live_revision!(ctx.base_dir)
 
-    for role <- ~w(coder orchestrator product-owner recon reviewer-code reviewer-spec spec-writer) do
+    for role <- ~w do
       worktree_skill =
         Identity.snapshot_at!(ctx.base_dir, revision, role, :codex).skills["worktree-session"]
 
@@ -520,11 +516,11 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
 
     revision = Identity.live_revision!(ctx.base_dir)
 
-    for role <- ~w(reviewer-code reviewer-spec) do
+    for role <- ~w do
       guidance = Identity.snapshot_at!(ctx.base_dir, revision, role, :codex).guidance
 
       assert guidance =~ "The verdict note has a 2,000-character cap"
@@ -554,7 +550,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
 
     loaded = Archetypes.load!(ctx.base_dir)
     revision = Identity.live_revision!(ctx.base_dir)
@@ -587,7 +583,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
 
     loaded = Archetypes.load!(ctx.base_dir)
     revision = Identity.live_revision!(ctx.base_dir)
@@ -650,7 +646,7 @@ defmodule Tightbeam.ArchetypesTest do
   test "kungfu scaffold rejects every invalid name class before identity mutation", ctx do
     for name <- ["", "-demo", "Demo", "demo_name", "demo--name", "demo-"] do
       assert_raise ArgumentError, ~r/invalid kungfu name/, fn ->
-        scaffold_kungfu!(ctx.base_dir, name, "A useful capability.", "user:flynn")
+        scaffold_kungfu!(ctx.base_dir, name, "A useful capability.", "user:operator")
       end
 
       refute File.exists?(Path.join(ctx.base_dir, "identity/.git"))
@@ -660,7 +656,7 @@ defmodule Tightbeam.ArchetypesTest do
   test "kungfu scaffold requires purpose before identity mutation", ctx do
     for purpose <- [nil, "", "  "] do
       assert_raise ArgumentError, "kungfu purpose is required", fn ->
-        scaffold_kungfu!(ctx.base_dir, "demo", purpose, "user:flynn")
+        scaffold_kungfu!(ctx.base_dir, "demo", purpose, "user:operator")
       end
 
       refute File.exists?(Path.join(ctx.base_dir, "identity/.git"))
@@ -687,7 +683,7 @@ defmodule Tightbeam.ArchetypesTest do
                        base_dir,
                        name,
                        "A useful capability.",
-                       "user:flynn"
+                       "user:operator"
                      )
                    end
 
@@ -706,7 +702,7 @@ defmodule Tightbeam.ArchetypesTest do
         ctx.base_dir,
         "demo",
         ~s(Help teams turn "ideas" into shipped work.\nKeep it accountable.),
-        "user:flynn"
+        "user:operator"
       )
 
     identity_dir = Path.join(ctx.base_dir, "identity")
@@ -717,7 +713,7 @@ defmodule Tightbeam.ArchetypesTest do
              git!(identity_dir, ["rev-parse", "tightbeam/live"])
 
     assert git!(identity_dir, ["log", "-1", "--format=%s|%an"]) ==
-             "kungfu-scaffold: demo|user:flynn"
+             "kungfu-scaffold: demo|user:operator"
 
     assert Archetypes.load!(ctx.base_dir)["demo-role"].skills == []
   end
@@ -740,7 +736,7 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
-  # Stored selections hold FIELDS. A preference written as `"claude-fable-5[1m]"`
+  # Stored selections hold FIELDS. A preference written as `"claude-example-5[1m]"`
   # is refused by name rather than split here — splitting is the guess that read
   # a vendor context window as one of our reasoning levels and lost the model.
   test "archetype defaults and model preferences are fields, and packed strings are refused",
@@ -751,31 +747,31 @@ defmodule Tightbeam.ArchetypesTest do
     name = "prefs"
 
     [defaults]
-    model = "claude-fable-5"
+    model = "claude-example-5"
     effort = "high"
     context = "1m"
 
     [[model_preferences]]
-    model = "claude-fable-5"
+    model = "claude-example-5"
     effort = "high"
 
     [[model_preferences]]
-    model = "gpt-5.6-sol"
+    model = "gpt-5.6-example"
     """)
 
     archetype = Archetypes.load!(ctx.base_dir)["prefs"]
 
     assert archetype.defaults[:model] ==
-             Tightbeam.Model.new("claude-fable-5", effort: "high", context: "1m")
+             Tightbeam.Model.new("claude-example-5", effort: "high", context: "1m")
 
     assert archetype.model_preferences == [
-             Tightbeam.Model.new("claude-fable-5", effort: "high"),
-             Tightbeam.Model.new("gpt-5.6-sol")
+             Tightbeam.Model.new("claude-example-5", effort: "high"),
+             Tightbeam.Model.new("gpt-5.6-example")
            ]
 
     File.write!(path, """
     name = "prefs"
-    model_preferences = ["claude-fable-5[1m]"]
+    model_preferences = ["claude-example-5[1m]"]
     """)
 
     assert_raise ArgumentError, ~r/is a packed string; a preference is fields/, fn ->
@@ -797,7 +793,7 @@ defmodule Tightbeam.ArchetypesTest do
   test "where wildcard must stand alone and where must be non-empty", ctx do
     path = Path.join(manifests_dir!(ctx.base_dir), "bad.toml")
 
-    File.write!(path, "name = \"bad\"\nwhere = [\"*\", \"mac-runner\"]\n")
+    File.write!(path, "name = \"bad\"\nwhere = [\"*\", \"test-host\"]\n")
 
     assert_raise ArgumentError, ~r/must be the only element/, fn ->
       Archetypes.load!(ctx.base_dir)

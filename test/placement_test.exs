@@ -447,7 +447,7 @@ defmodule Tightbeam.PlacementTest do
              Placement.provision_endpoint(
                base_dir,
                Placement.local_host_name(),
-               %{ssh: "clu@#{Placement.local_host_name()}", base_dir: "/remote/tb"},
+               %{ssh: "remote-user@#{Placement.local_host_name()}", base_dir: "/remote/tb"},
                sh: fn command -> flunk("unexpected command: #{inspect(command)}") end
              )
 
@@ -461,21 +461,21 @@ defmodule Tightbeam.PlacementTest do
              Placement.provision_endpoint(
                base_dir,
                "worker",
-               %{ssh: "clu@worker", base_dir: "~/.tightbeam"},
+               %{ssh: "remote-user@worker", base_dir: "~/.tightbeam"},
                sh: sh
              )
 
     assert_receive {:sh, mkdir}
-    assert mkdir == ["ssh"] ++ ssh_opts() ++ ["clu@worker", "mkdir", "-p", "~/.tightbeam"]
+    assert mkdir == ["ssh"] ++ ssh_opts() ++ ["remote-user@worker", "mkdir", "-p", "~/.tightbeam"]
     assert_receive {:sh, rsync}
-    assert List.last(rsync) == "clu@worker:~/.tightbeam/"
+    assert List.last(rsync) == "remote-user@worker:~/.tightbeam/"
     refute File.exists?(Path.join([base_dir, "staging", "gateway-files", "worker"]))
 
     assert_raise RuntimeError, ~r/command failed/, fn ->
       Placement.provision_endpoint(
         base_dir,
         "worker",
-        %{ssh: "clu@worker", base_dir: "/remote/tb"},
+        %{ssh: "remote-user@worker", base_dir: "/remote/tb"},
         sh: fn _ -> {"", 255} end
       )
     end
@@ -715,7 +715,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: Model.new("fable"),
+      default_model: Model.new("example-model"),
       sh: fn command ->
         send(parent, {:unexpected_sh, command})
         {"", 0}
@@ -790,7 +790,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: Model.new("fable")
+      default_model: Model.new("example-model")
     }
 
     baseline = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
@@ -842,7 +842,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: Model.new("fable"),
+      default_model: Model.new("example-model"),
       sh: sh
     }
 
@@ -857,7 +857,7 @@ defmodule Tightbeam.PlacementTest do
   test "an overlay is isolated by both host and harness", %{base_dir: base_dir, db: db} do
     Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
 
-    for host <- ["build-host", "other-host"] do
+    for host <- ["test-host", "other-host"] do
       assert {:ok, _} =
                Placement.register_host(db, host, %{
                  ssh: host,
@@ -869,7 +869,7 @@ defmodule Tightbeam.PlacementTest do
     assert {:ok, _row} =
              Placement.set_env_overlay(
                db,
-               "build-host",
+               "test-host",
                "claude",
                "EXAMPLE_OVERLAY_VAR",
                "isolated",
@@ -888,16 +888,16 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: Model.new("fable"),
+      default_model: Model.new("example-model"),
       sh: sh
     }
 
-    gibson_claude = Placement.adapter_opts(config, {:claude, "default", "build-host"})[:cmd]
-    gibson_codex = Placement.adapter_opts(config, {:codex, "default", "build-host"})[:cmd]
+    test_host_claude = Placement.adapter_opts(config, {:claude, "default", "test-host"})[:cmd]
+    test_host_codex = Placement.adapter_opts(config, {:codex, "default", "test-host"})[:cmd]
     other_claude = Placement.adapter_opts(config, {:claude, "default", "other-host"})[:cmd]
 
-    assert "EXAMPLE_OVERLAY_VAR='isolated'" in gibson_claude
-    refute Enum.any?(gibson_codex, &String.starts_with?(&1, "EXAMPLE_OVERLAY_VAR="))
+    assert "EXAMPLE_OVERLAY_VAR='isolated'" in test_host_claude
+    refute Enum.any?(test_host_codex, &String.starts_with?(&1, "EXAMPLE_OVERLAY_VAR="))
     refute Enum.any?(other_claude, &String.starts_with?(&1, "EXAMPLE_OVERLAY_VAR="))
   end
 
@@ -920,7 +920,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: cli_bin,
-      default_model: Model.new("fable")
+      default_model: Model.new("example-model")
     }
 
     opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
@@ -928,7 +928,7 @@ defmodule Tightbeam.PlacementTest do
     assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
     refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
     assert opts[:probe_cwd] == probe_cwd
-    assert opts[:probe_model] == Model.new("gpt-5.6-sol", effort: "medium")
+    assert opts[:probe_model] == Model.new("gpt-5.6-example", effort: "medium")
     refute opts[:probe_model] == config.default_model
     refute File.exists?(Path.join(probe_cwd, "stale"))
 
@@ -956,7 +956,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: Model.new("fable")
+      default_model: Model.new("example-model")
     }
 
     # A subscription credential reaches the harness as a FILE in its home, never as an
@@ -997,7 +997,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: Model.new("fable"),
+      default_model: Model.new("example-model"),
       sh: sh
     }
 
@@ -1069,14 +1069,14 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: Model.new("fable"),
+      default_model: Model.new("example-model"),
       sh: sh
     }
 
     opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
     assert ~s(CODEX_CONFIG='{"bypass_hook_trust":true}') in opts[:cmd]
     assert opts[:probe_cwd] == "/srv/tb/work/gate-probe"
-    assert opts[:probe_model] == Model.new("gpt-5.6-sol", effort: "medium")
+    assert opts[:probe_model] == Model.new("gpt-5.6-example", effort: "medium")
 
     assert Enum.any?(collect_remote_gate_commands([]), fn command ->
              List.last(command) == "/srv/tb/work/gate-probe" and "rm" in command and
@@ -1111,7 +1111,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: Model.new("fable")
+      default_model: Model.new("example-model")
     }
 
     opts = Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
@@ -1131,7 +1131,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      default_model: Model.new("fable")
+      default_model: Model.new("example-model")
     }
 
     home = Placement.deliver_home(config, {:codex, "default", "testhost"})
@@ -1158,7 +1158,7 @@ defmodule Tightbeam.PlacementTest do
            }
   end
 
-  # wi_263814d3 — accepted-then-dead: the claude adapter's offered/accepted model
+  # wi_00000000-0000-4000-8000-000000000102 — accepted-then-dead: the claude adapter's offered/accepted model
   # set follows the projected home's settings.json "model" pin (proven live —
   # scripts/probe-opus5.mjs + scripts/probe-reread.mjs: a session/new re-reads the
   # pin, so a home pinned to model X offers+accepts X and refuses everything

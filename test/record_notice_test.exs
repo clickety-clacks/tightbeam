@@ -1,6 +1,6 @@
 defmodule Tightbeam.RecordNoticeTest do
   @moduledoc """
-  Proofs for `EventLog.notice/5` (Flynn rulings 2026-08-03).
+  Proofs for `EventLog.notice/5` (user rulings 2026-08-03).
 
   The bias being corrected: `[adapter recovered]` reached the chat while
   `adapter_down` reached a table no client reads. A notice is ONE call that
@@ -27,26 +27,26 @@ defmodule Tightbeam.RecordNoticeTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1)"
       )
 
-    create_session(db, Org.personal_session_key("flynn"), "Main")
+    create_session(db, Org.personal_session_key("operator"), "Main")
     create_session(db, "work", "Work")
 
-    %{db: db, registry: registry, main: Org.personal_session_key("flynn")}
+    %{db: db, registry: registry, main: Org.personal_session_key("operator")}
   end
 
   defp create_session(db, session_key, display_name) do
     Org.create(db, %{
       session_key: session_key,
       display_name: display_name,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       archetype: "default",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("claude-fable-5")
+      model: Model.new("claude-example-5")
     })
   end
 
@@ -54,7 +54,7 @@ defmodule Tightbeam.RecordNoticeTest do
     {:ok, ref, _replaced} =
       ConnRegistry.register(registry, %{
         pid: self(),
-        user_id: "flynn",
+        user_id: "operator",
         device_id: device_id,
         is_admin: false,
         subscriptions: MapSet.new(["chat"])
@@ -121,7 +121,7 @@ defmodule Tightbeam.RecordNoticeTest do
     assert frame["attentionTier"] == 0
   end
 
-  ## Flynn ruling 2: no session is a log line, never a mailbox
+  ## user ruling 2: no session is a log line, never a mailbox
 
   test "an audience with no session is logged and nothing is conjured for it", ctx do
     log =
@@ -148,7 +148,7 @@ defmodule Tightbeam.RecordNoticeTest do
   end
 
   test "a retired session is not an audience", ctx do
-    Org.retire(ctx.db, "work", "user:flynn", 1_000)
+    Org.retire(ctx.db, "work", "user:operator", 1_000)
 
     capture_log(fn ->
       :ok =
@@ -169,9 +169,9 @@ defmodule Tightbeam.RecordNoticeTest do
   test "an ambient audience lands in the named owner's main session", ctx do
     :ok =
       EventLog.notice(ctx.db, "endpoint_not_provisioned", "remote-host", "ssh refused",
-        audience: {:ambient, "flynn"},
+        audience: {:ambient, "operator"},
         attention: :low,
-        message: "[host unreachable]\n\neurisko did not answer.",
+        message: "[host unreachable]\n\ntest host did not answer.",
         conn_registry: ctx.registry
       )
 

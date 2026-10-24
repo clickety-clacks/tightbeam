@@ -70,10 +70,10 @@ defmodule Tightbeam.ModelCatalogTest do
 
     # ONE entry per vendor model. The effort tiers are a PROPERTY of the entry,
     # not five identities — an identity is a family and a context variant.
-    assert Enum.map(codex, & &1.family) == ["gpt-5.6-sol"]
+    assert Enum.map(codex, & &1.family) == ["gpt-5.6-example"]
 
-    codex_sol = Enum.find(codex, &(&1.family == "gpt-5.6-sol"))
-    assert codex_sol.display_name == "GPT-5.6-Sol"
+    codex_sol = Enum.find(codex, &(&1.family == "gpt-5.6-example"))
+    assert codex_sol.display_name == "GPT-5.6-Example"
     assert codex_sol.max_input_tokens == 272_000
     assert codex_sol.efforts == ["low", "medium", "high", "xhigh", "max", "ultra"]
 
@@ -88,7 +88,7 @@ defmodule Tightbeam.ModelCatalogTest do
   end
 
   # THE DEFECT, at the catalog. Anthropic spells a context-window variant
-  # `claude-fable-5[1m]`; Tightbeam used to spell a reasoning level the same
+  # `claude-example-5[1m]`; Tightbeam used to spell a reasoning level the same
   # way. The catalog read the vendor's bracket as ours — it stripped `[1m]`,
   # discarded that it existed, and re-attached our five effort levels — so the
   # 1M-context model silently ceased to exist and no operator could ask for it.
@@ -97,8 +97,8 @@ defmodule Tightbeam.ModelCatalogTest do
       {:ok,
        JSON.encode!(%{
          "data" => [
-           context_variant_model("claude-fable-5"),
-           context_variant_model("claude-fable-5[1m]")
+           context_variant_model("claude-example-5"),
+           context_variant_model("claude-example-5[1m]")
          ]
        })}
     end
@@ -108,8 +108,8 @@ defmodule Tightbeam.ModelCatalogTest do
     {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
 
     assert Enum.map(claude, &{&1.family, &1.context}) == [
-             {"claude-fable-5", nil},
-             {"claude-fable-5", "1m"}
+             {"claude-example-5", nil},
+             {"claude-example-5", "1m"}
            ]
 
     # The context variant carries OUR efforts, and `1m` is not one of them.
@@ -120,7 +120,7 @@ defmodule Tightbeam.ModelCatalogTest do
              ModelCatalog.route(
                @host,
                "claude",
-               Model.new("claude-fable-5", context: "1m", effort: "high"),
+               Model.new("claude-example-5", context: "1m", effort: "high"),
                catalog
              )
 
@@ -129,7 +129,7 @@ defmodule Tightbeam.ModelCatalogTest do
              ModelCatalog.route(
                @host,
                "claude",
-               Model.new("claude-fable-5", effort: "high"),
+               Model.new("claude-example-5", effort: "high"),
                catalog
              )
 
@@ -139,7 +139,7 @@ defmodule Tightbeam.ModelCatalogTest do
              ModelCatalog.route(
                @host,
                "claude",
-               Model.new("claude-fable-5", effort: "1m"),
+               Model.new("claude-example-5", effort: "1m"),
                catalog
              )
   end
@@ -148,7 +148,7 @@ defmodule Tightbeam.ModelCatalogTest do
     %{
       "type" => "model",
       "id" => id,
-      "display_name" => "Claude Fable 5",
+      "display_name" => "Claude Example Model 5",
       "max_input_tokens" => 1_000_000,
       "capabilities" => %{
         "effort" => %{
@@ -829,7 +829,7 @@ defmodule Tightbeam.ModelCatalogTest do
                ModelCatalog.route(
                  @host,
                  "codex",
-                 Model.new("gpt-5.6-sol", effort: "medium"),
+                 Model.new("gpt-5.6-example", effort: "medium"),
                  catalog
                )
 
@@ -837,7 +837,7 @@ defmodule Tightbeam.ModelCatalogTest do
       # after validation — the lookup that could not represent a miss and raised.
       assert routed.harness == "codex"
       assert routed.provider == "openai"
-      assert routed.entry.family == "gpt-5.6-sol"
+      assert routed.entry.family == "gpt-5.6-example"
     end
 
     test "a tiered model named with NO tier needs an effort, and says which", ctx do
@@ -845,7 +845,7 @@ defmodule Tightbeam.ModelCatalogTest do
       await_fresh(catalog, "codex")
 
       assert {:error, %Unroutable{cause: :needs_effort} = unroutable} =
-               ModelCatalog.route(@host, "codex", Model.new("gpt-5.6-sol"), catalog)
+               ModelCatalog.route(@host, "codex", Model.new("gpt-5.6-example"), catalog)
 
       message = Unroutable.message(unroutable)
       assert message =~ "has effort tiers"
@@ -866,7 +866,7 @@ defmodule Tightbeam.ModelCatalogTest do
                ModelCatalog.route(
                  @host,
                  "codex",
-                 Model.new("gpt-5.6-sol", effort: "unobtainium"),
+                 Model.new("gpt-5.6-example", effort: "unobtainium"),
                  catalog
                )
 
@@ -903,7 +903,7 @@ defmodule Tightbeam.ModelCatalogTest do
 
       message = Unroutable.message(unroutable)
       assert message =~ ~s("no-such-model" is not offered by codex on host testhost)
-      assert message =~ "offered: gpt-5.6-sol"
+      assert message =~ "offered: gpt-5.6-example"
       assert Unroutable.code(unroutable) == "model_unavailable"
       refute message =~ "effort tiers"
     end
@@ -943,7 +943,7 @@ defmodule Tightbeam.ModelCatalogTest do
         cause: :no_catalog,
         host: "testhost",
         harness: "codex",
-        selection: Model.new("gpt-5.6-sol", effort: "medium"),
+        selection: Model.new("gpt-5.6-example", effort: "medium"),
         health: [{"codex", {:unavailable, {:empty_catalog_for_client_version, "0.99.0"}}}]
       }
 
@@ -960,7 +960,7 @@ defmodule Tightbeam.ModelCatalogTest do
       await_fresh(catalog, "codex")
 
       assert {:ok, %{harness: "codex"}} =
-               ModelCatalog.route(@host, Model.new("gpt-5.6-sol", effort: "medium"), catalog)
+               ModelCatalog.route(@host, Model.new("gpt-5.6-example", effort: "medium"), catalog)
 
       assert {:ok, %{harness: "claude"}} =
                ModelCatalog.route(@host, Model.new("claude-opus-5", effort: "high"), catalog)
@@ -1506,13 +1506,13 @@ defmodule Tightbeam.ModelCatalogTest do
   # Task #41. The catalog must not advertise a model the adapter will refuse, and no
   # substitution may be smuggled in at the only place a mapping could live.
   describe "claude selectable-model pin" do
-    test "keeps Fable 5.1 default and 1m vendor identities", ctx do
+    test "keeps Example Model 5.1 default and 1m vendor identities", ctx do
       fetch = fn "/v1/models?limit=100", _headers ->
         {:ok,
          JSON.encode!(%{
            "data" => [
-             context_variant_model("claude-fable-5-1"),
-             context_variant_model("claude-fable-5-1[1m]"),
+             context_variant_model("claude-example-5-1"),
+             context_variant_model("claude-example-5-1[1m]"),
              context_variant_model("claude-sonnet-4-6")
            ]
          })}
@@ -1528,15 +1528,15 @@ defmodule Tightbeam.ModelCatalogTest do
       {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
 
       assert Enum.map(claude, &{&1.family, &1.context}) == [
-               {"claude-fable-5-1", nil},
-               {"claude-fable-5-1", "1m"}
+               {"claude-example-5-1", nil},
+               {"claude-example-5-1", "1m"}
              ]
 
-      assert {:ok, %{entry: %{family: "claude-fable-5-1", context: "1m"}}} =
+      assert {:ok, %{entry: %{family: "claude-example-5-1", context: "1m"}}} =
                ModelCatalog.route(
                  @host,
                  "claude",
-                 Model.new("claude-fable-5-1", context: "1m", effort: "high"),
+                 Model.new("claude-example-5-1", context: "1m", effort: "high"),
                  catalog
                )
     end
@@ -1553,14 +1553,10 @@ defmodule Tightbeam.ModelCatalogTest do
 
       # Only selectable models survive, and the fixture's refused ones are gone.
       assert "claude-haiku-4-5-20251001" in families
-      # Re-measured 2026-08-06 on build-host (production grant): a pin-probed home
-      # offered and accepted claude-opus-5 and it answered a live prompt — the
-      # earlier REJECTED row was the default-pin vocabulary, not the grant.
+      # The configured home offers Opus 5, so it remains in the derived catalog.
       assert "claude-opus-5" in families
-      # Re-measured 2026-08-05 on build-host (CLI 2.1.221, production grant):
-      # fable answers a real prompt; the July REJECTED row was one
-      # environment's snapshot. Fable is now offered.
-      assert "claude-fable-5" in families
+      # Example Model is offered by this configured home.
+      assert "claude-example-5" in families
       refute "claude-sonnet-4-6" in families
 
       assert Enum.all?(families, &(&1 in Tightbeam.Harness.Claude.adapter_selectable_models())),
@@ -1589,10 +1585,10 @@ defmodule Tightbeam.ModelCatalogTest do
     #
     # It also pins the rule that made the two suffix vocabularies collide: a
     # bracket in a VENDOR identifier is a context variant, never one of our
-    # reasoning levels. Read as an effort, `claude-fable-5[1m]` would lose its
+    # reasoning levels. Read as an effort, `claude-example-5[1m]` would lose its
     # 1M window and send `1m` to the effort control.
     test "the vendor ref transform splits context, never effort, and never rewrites the model" do
-      for refused <- ~w(claude-fable-5 claude-opus-5 fable) do
+      for refused <- ~w(claude-example-5 claude-opus-5 example-model) do
         assert Model.parse_ref(refused) == Model.new(refused),
                "#{refused} was rewritten — a substitution has been introduced"
 
@@ -1786,7 +1782,7 @@ defmodule Tightbeam.ModelCatalogTest do
       assert_receive {:fetch_started, 2}, 2_000
     end
 
-    # The mac-runner production repro (orchestrator, 2026-08-06): a CLEAN one-shot
+    # The test-host production repro (orchestrator, 2026-08-06): a CLEAN one-shot
     # ceremony, yet placement refused with `:in_progress` MINUTES after `status`
     # read onboarded. `credential_status/2` returns `:in_progress` only while the
     # onboarding lease stands (credentials.ex), and `finish_onboard` clears the

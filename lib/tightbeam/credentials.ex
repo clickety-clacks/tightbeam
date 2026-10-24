@@ -846,7 +846,7 @@ defmodule Tightbeam.Credentials do
   end
 
   # A FAILED ONBOARDING LEAVES THE ORG FAILED — it never restores the previous
-  # credential. Ruled by Mike 2026-08-14 after the credential-swap incident:
+  # credential. Ruled by user 2026-08-14 after the credential-swap incident:
   # "we have no business adding security ON TOP of codex or claude logins."
   #
   # The substrate stores what the operator gave it and reports what the vendor
@@ -867,7 +867,7 @@ defmodule Tightbeam.Credentials do
   # ACCEPTED COST, explicitly: a bad login can now displace a working
   # credential. That is recoverable by signing in again, and it is honest.
   # ORDER IS THE INVARIANT: the durable not-onboarded marker commits BEFORE the
-  # credential is installed (Sol xhigh review, blocking 1 and 2). Installing
+  # credential is installed. Installing
   # first leaves two windows in which the PRIOR credential's `onboarded: true`
   # metadata outlives it and comes to describe the new, never-activated
   # candidate — so a restarted gateway reads the org healthy on a credential
@@ -948,7 +948,7 @@ defmodule Tightbeam.Credentials do
   # pre-activation marker's "credential activation has not committed", which
   # `finish_staged_onboard/4` committed before anything was installed. That is
   # less specific than the vendor's own words — a known, accepted degradation
-  # (Sol xhigh review, important 1) — but it still fails closed, which is the
+  # — but it still fails closed, which is the
   # property that matters. The verbatim reason reaches the caller in the
   # returned compound error either way.
   defp failed_finish(state, provider, kind, failure) do

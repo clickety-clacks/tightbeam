@@ -382,7 +382,7 @@ defmodule Tightbeam.LaneTest do
     assert {:ok, %{seq: ^seq1, message_id: "m_hang"}} =
              SessionLane.cancel_current("k1",
                cause: "cancel-request",
-               principal: "user:flynn"
+               principal: "user:operator"
              )
 
     assert_receive {:terminal, "k1", ^seq1}
@@ -395,7 +395,7 @@ defmodule Tightbeam.LaneTest do
     {:ok, [[status]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq = ?1", [seq1])
     assert status == "canceled"
 
-    assert {:ok, [["canceled", "cancel-request", "user:flynn"]]} =
+    assert {:ok, [["canceled", "cancel-request", "user:operator"]]} =
              DB.query(
                ctx.db,
                """
@@ -460,7 +460,7 @@ defmodule Tightbeam.LaneTest do
     :ok =
       DB.execute(ctx.db, """
         INSERT INTO turns (sessionKey, messageId, origin, prompt, createdAt)
-        VALUES ('agent:main:clawline:flynn:main', 'm_orphan', 'process:tightbeam',
+        VALUES ('agent:main:clawline:operator:main', 'm_orphan', 'process:tightbeam',
                 'an orphan prompt', 1)
       """)
 

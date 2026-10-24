@@ -19,7 +19,7 @@ from `<base_dir>/gateway.json`).
 
 This runbook is a MATRIX, not a list: one full pass PER HARNESS the org
 supports (today: claude on `claude-sonnet-5` at effort `medium`, codex on
-`gpt-5.6-sol` at effort `medium`), using a
+`gpt-5.6-example` at effort `medium`), using a
 session of that harness for every step. A smoke run's verdict is
 INCOMPLETE — not passed — until every harness leg has run or been WAIVED by
 name with the blocker stated (e.g. "codex leg waived: no codex grant in the
@@ -45,7 +45,7 @@ Per-harness annotations for the existing sections:
 - §1 step 4 (tool use): [divergent] — codex tool titles/progress vocabulary
   differ; PASS is still "progress label during turn, output reported".
 - §6 step 13 (model picker/footer): [divergent] — codex refs are
-  `gpt-5.6-sol[low..xhigh]`, `gpt-5.6-luna[medium]`.
+  `gpt-5.6-example[low..xhigh]`, `gpt-5.6-luna[medium]`.
 - §9 rails (17–24): [divergent]. Claude asserts hooks in `settings.json`;
   codex asserts `hooks.json` with the org entries plus the trailing
   `tightbeam-probe` entry, still NO `settings.json` in the codex home.
@@ -150,14 +150,14 @@ on 2026-07-25:
   ```sh
   TIGHTBEAM_BASE_DIR=~/.tightbeam-beam \
   TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5' TIGHTBEAM_SMOKE_EFFORT_CLAUDE='medium' \
-  TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
+  TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-example' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
   mix run --no-start scripts/feature_smoke.exs
   ```
 
   The claude model must be one the ADAPTER accepts, which is a narrower set than the
-  derived catalog — `fable` and `claude-fable-5` are both refused, and a refusal fails
+  derived catalog — `example-model` and `claude-example-5` are both refused, and a refusal fails
   the model apply on every `session/new` and `session/load`. The recipe above used to
-  say `fable`; every real run on record used `claude-sonnet-5` at effort `medium`
+  say `example-model`; every real run on record used `claude-sonnet-5` at effort `medium`
   instead, which is why the stale value was never caught. The accepted list and how to
   re-probe it live in the note above `@adapter_selectable_models` in
   `lib/tightbeam/harness/claude.ex`.
@@ -328,9 +328,7 @@ the same facade `tb wake` posts. Step 16b is J8's scheduled variant.
 
 ## Recording results — the scorecard
 
-Every run produces a SCORECARD. Run records live outside the repo, in
-`~/shared-workspace/tightbeam_ex/smoke-runs/`: copy `TEMPLATE.md` there to
-`<date>-<short-sha>.md` and fill it in — one column per
+Every run produces a scorecard — one column per
 {harness x host} leg, one row per step (P1..P3, 1..33), each cell
 PASS / FAIL(note) / WAIVED(blocker) / N/A[harness-only]. The scorecard also
 carries a copy of the harness-support matrix's rows with a verified?
@@ -431,38 +429,38 @@ the literal syntax will not run as written — reach the verbs through dispatch.
     BOTH --role and --user fails "exactly one of"; the retired single
     `target` param fails naming the three fields.
     PASS: all five behave exactly so.
-26. [manual] Unstaffed office: `role create probe-office`, then `wake --role probe-office`.
+26. [manual] Unstaffed office: `role create example-role`, then `wake --role example-role`.
     PASS: message lands in the role OWNER's Main; the turn row has
-    roleRef='probe-office' AND roleFallback=1. DB is the check — fallback
+    roleRef='example-role' AND roleFallback=1. DB is the check — fallback
     is recorded, never disguised.
-27. [manual] Staffed office: `role bind probe-office <sessionKey of this leg's
+27. [manual] Staffed office: `role bind example-role <sessionKey of this leg's
     smoke session>`, wake again.
     PASS: delivered to the bound session; turn row roleFallback=0.
-28. [manual] Late binding: `wake probe-office --after 30s`, then IMMEDIATELY
-    `role bind probe-office <a different session>`. Wait for fire.
+28. [manual] Late binding: `wake example-role --after 30s`, then IMMEDIATELY
+    `role bind example-role <a different session>`. Wait for fire.
     PASS: delivered to the NEW binding (the one at fire time, not at
     schedule time); turn row records the role and the new key.
 29. [manual] Reply spelling round trip: from the bound session, have the agent
     reply to a role-stamped message per its Comms guidance.
     PASS: for `[from agent:X]` the agent runs `wake --role X`; for
     `[from user:Y]` it runs `wake --user Y` — typed flags, no 404s.
-30. [manual] Deleted office: `role rm probe-office`, then `wake --role probe-office`.
-    PASS: named error ("unknown role: probe-office") — the name errors by
+30. [manual] Deleted office: `role rm example-role`, then `wake --role example-role`.
+    PASS: named error ("unknown role: example-role") — the name errors by
     name, never silently reroutes. A wake SCHEDULED before the rm and
     firing after it produces a `wake_unresolved` lifecycle row and no
     delivery.
 31. [manual] Permanence of Mains: attempt `retire <admin's Main key>`.
     PASS: refused with "main sessions are permanent" — the fallback
     target cannot be destroyed; Main remains active.
-32. [manual] Spawn sugar atomicity: `spawn --display X --name probe-office` while
+32. [manual] Spawn sugar atomicity: `spawn --display X --name example-role` while
     that role still exists.
     PASS: the spawn FAILS with role_exists and NO session row was
     created. Then with a fresh name: session + role both exist, role
     bound to the new session.
-33. [manual] Acting-as requires the office: `wake <target> --as probe-office` from
+33. [manual] Acting-as requires the office: `wake <target> --as example-role` from
     a context where the role is unbound.
     PASS: refused ("unknown or unbound role"); after binding, the same
-    call succeeds and the delivered stamp reads `[from agent:probe-office]`.
+    call succeeds and the delivered stamp reads `[from agent:example-role]`.
 
 ## 11. Production machine (facts, prodding, fault bubble)
 

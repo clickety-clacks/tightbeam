@@ -14,7 +14,7 @@ defmodule Tightbeam.ArtifactsTest do
     :ok = Placement.ensure_schema(db)
     :ok = Artifacts.ensure_schema(db)
 
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "operator")
     parent = session(db, "parent", nil)
     child = session(db, "child", parent.session_key)
     seed_work_items(db)
@@ -304,7 +304,7 @@ defmodule Tightbeam.ArtifactsTest do
            }
 
     assert handlers["artifact-record"].(%{
-             principal: {:user, "flynn"},
+             principal: {:user, "operator"},
              session_key: nil,
              params: call.params
            }) == %{
@@ -332,7 +332,7 @@ defmodule Tightbeam.ArtifactsTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_prefix_alpha', 'alpha', 'flynn', 'flynn', 2)"
+        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_prefix_alpha', 'alpha', 'operator', 'operator', 2)"
       )
 
     call = %{
@@ -356,7 +356,7 @@ defmodule Tightbeam.ArtifactsTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_prefix_beta', 'beta', 'flynn', 'flynn', 3)"
+        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_prefix_beta', 'beta', 'operator', 'operator', 3)"
       )
 
     {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM artifacts")
@@ -851,7 +851,7 @@ defmodule Tightbeam.ArtifactsTest do
           """
           INSERT INTO work_items
             (id, title, ownerUserId, createdByUser, createdBySession, createdAt)
-          VALUES (?1, ?1, 'flynn', 'flynn', NULL, 1)
+          VALUES (?1, ?1, 'operator', 'operator', NULL, 1)
           """,
           [id]
         )
@@ -881,7 +881,7 @@ defmodule Tightbeam.ArtifactsTest do
       Ledger.enqueue(db, %{
         session_key: session_key,
         message_id: "msg_#{session_key}",
-        origin: "user:flynn",
+        origin: "user:operator",
         prompt: "record the artifact"
       })
 
@@ -893,15 +893,15 @@ defmodule Tightbeam.ArtifactsTest do
     Org.create(db, %{
       session_key: key,
       display_name: key,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       spawned_by: spawned_by,
       operational_parent: spawned_by,
       archetype: "default",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("fable")
+      model: Model.new("example-model")
     })
   end
 end

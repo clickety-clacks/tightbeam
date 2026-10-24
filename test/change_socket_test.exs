@@ -13,7 +13,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     {:paired, device} =
-      claim_org(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+      claim_org(db, %{device_id: "d1", claimed_name: "user", platform: nil, model: nil})
 
     {:ok, state} =
       ChangeSocket.init(%{db: db, firehose_hub: hub, firehose_heartbeat_ms: 60_000})
@@ -25,7 +25,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     {:push, {:text, auth_bytes}, state} =
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
 
-    assert %{"type" => "auth_result", "success" => true, "userId" => "flynn"} =
+    assert %{"type" => "auth_result", "success" => true, "userId" => "operator"} =
              JSON.decode!(auth_bytes)
 
     {:push, {:text, _ready}, state} =
@@ -55,8 +55,8 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       "resource" => "work-items",
       "op" => "upsert",
       "occurredAt" => 1,
-      "refs" => %{"workItemId" => "wi_1", "ownerUserId" => "flynn"},
-      "payload" => %{"id" => "wi_1", "ownerUserId" => "flynn", "rowVersion" => 1}
+      "refs" => %{"workItemId" => "wi_1", "ownerUserId" => "operator"},
+      "payload" => %{"id" => "wi_1", "ownerUserId" => "operator", "rowVersion" => 1}
     }
 
     Hub.publish(ctx.hub, notice)
@@ -130,7 +130,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     retirement = %{
       "class" => "session.retired",
       "refs" => %{"sessionKey" => "agent:worker"},
-      "payload" => %{"sessionKey" => "agent:worker", "ownerUserId" => "flynn"}
+      "payload" => %{"sessionKey" => "agent:worker", "ownerUserId" => "operator"}
     }
 
     Hub.publish(ctx.hub, retirement)
@@ -271,11 +271,11 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
   test "condition facts share owner visibility and critical state is admin-only", ctx do
     fact = %{
       "class" => "condition_fact.filed",
-      "refs" => %{"principal" => "user:flynn"},
-      "payload" => %{"factId" => 1, "origin" => "user:flynn"}
+      "refs" => %{"principal" => "user:operator"},
+      "payload" => %{"factId" => 1, "origin" => "user:operator"}
     }
 
-    assert Tightbeam.StateVisibility.visible?(ctx.db, fact, "flynn", false)
+    assert Tightbeam.StateVisibility.visible?(ctx.db, fact, "operator", false)
     refute Tightbeam.StateVisibility.visible?(ctx.db, fact, "other", false)
 
     critical = %{
@@ -284,8 +284,8 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       "payload" => %{"sessionKey" => "agent:worker"}
     }
 
-    assert Tightbeam.StateVisibility.visible?(ctx.db, critical, "flynn", true)
-    refute Tightbeam.StateVisibility.visible?(ctx.db, critical, "flynn", false)
+    assert Tightbeam.StateVisibility.visible?(ctx.db, critical, "operator", true)
+    refute Tightbeam.StateVisibility.visible?(ctx.db, critical, "operator", false)
   end
 
   defp inbound(payload, state),
@@ -312,8 +312,8 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       "resource" => "work-items",
       "op" => "upsert",
       "occurredAt" => 1,
-      "refs" => %{"workItemId" => id, "ownerUserId" => "flynn"},
-      "payload" => %{"id" => id, "ownerUserId" => "flynn", "rowVersion" => 1}
+      "refs" => %{"workItemId" => id, "ownerUserId" => "operator"},
+      "payload" => %{"id" => id, "ownerUserId" => "operator", "rowVersion" => 1}
     }
   end
 end

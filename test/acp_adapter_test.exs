@@ -51,16 +51,16 @@ defmodule Tightbeam.Acp.AdapterTest do
   end
 
   # The defect this refactor exists to fix, in one assertion. A vendor
-  # identifier whose bracket is a CONTEXT WINDOW (`claude-fable-5[1m]`) must
+  # identifier whose bracket is a CONTEXT WINDOW (`claude-example-5[1m]`) must
   # reach the harness intact; before the seam knew the difference it parsed the
-  # bracket as one of OUR reasoning levels, sent `claude-fable-5` as the model
+  # bracket as one of OUR reasoning levels, sent `claude-example-5` as the model
   # and `1m` as the effort, and the 1M-context model was unreachable.
   test "a vendor context variant crosses the adapter seam without loss" do
     {adapter, capture_path} = start_adapter()
 
-    fable_1m = Model.new("claude-fable-5", context: "1m", effort: "high")
+    example_1m = Model.new("claude-example-5", context: "1m", effort: "high")
 
-    assert :ok = Adapter.apply_model(adapter, "sess-1", fable_1m)
+    assert :ok = Adapter.apply_model(adapter, "sess-1", example_1m)
 
     config = fn id ->
       capture_path
@@ -69,10 +69,10 @@ defmodule Tightbeam.Acp.AdapterTest do
       |> Enum.map(& &1["value"])
     end
 
-    assert config.("model") == ["claude-fable-5[1m]"]
+    assert config.("model") == ["claude-example-5[1m]"]
     assert config.("effort") == ["high"]
 
-    assert {:ok, %Model{family: "claude-fable-5", context: "1m", effort: "high"}} =
+    assert {:ok, %Model{family: "claude-example-5", context: "1m", effort: "high"}} =
              Adapter.current_model(adapter, "sess-1")
   end
 
@@ -147,8 +147,8 @@ defmodule Tightbeam.Acp.AdapterTest do
   const efforts = {};
   const offeredModels = {};
   const defaultOfferedModels = [
-    "default", "opus[1m]", "claude-fable-5[1m]", "sonnet", "haiku",
-    "gpt-old", "gpt-new", "gpt-blocking", "gpt-5.6-sol"
+    "default", "opus[1m]", "claude-example-5[1m]", "sonnet", "haiku",
+    "gpt-old", "gpt-new", "gpt-blocking", "gpt-5.6-example"
   ];
   const publicModelOption = (value) => {
     const opus5Vocabulary = failMode === "canonical-opus5-alias" || failMode === "opus-alias-drift";
@@ -161,8 +161,8 @@ defmodule Tightbeam.Acp.AdapterTest do
         return { value, name: "Sonnet", description: "Sonnet 5" };
       case "haiku":
         return { value, name: "Haiku", description: "Haiku 4.5" };
-      case "claude-fable-5[1m]":
-        return { value, name: "Fable", description: "Fable 5 with 1M context" };
+      case "claude-example-5[1m]":
+        return { value, name: "Example Model", description: "Example Model 5 with 1M context" };
       default:
         return { value, name: value };
     }
@@ -428,7 +428,7 @@ defmodule Tightbeam.Acp.AdapterTest do
           |> Keyword.put(:probe_cwd, Keyword.get(opts, :probe_cwd, "/tmp/gate-probe"))
           |> Keyword.put(
             :probe_model,
-            Keyword.get(opts, :probe_model, Model.new("gpt-5.6-sol", effort: "medium"))
+            Keyword.get(opts, :probe_model, Model.new("gpt-5.6-example", effort: "medium"))
           )
         else
           adapter_opts
@@ -1260,11 +1260,11 @@ defmodule Tightbeam.Acp.AdapterTest do
     {adapter, _capture} = start_adapter(harness: :claude, fail_mode: "model-refusal")
 
     assert {:error, %{"message" => "Invalid value for config option model"}} =
-             Adapter.new_session(adapter, Model.new("fable"), "/tmp", [], "guidance")
+             Adapter.new_session(adapter, Model.new("example-model"), "/tmp", [], "guidance")
 
     assert {:error,
             {:model_apply_failed, %{"message" => "Invalid value for config option model"}}} =
-             Adapter.load_session(adapter, "sess-1", Model.new("fable"), "/tmp", [], "guidance")
+             Adapter.load_session(adapter, "sess-1", Model.new("example-model"), "/tmp", [], "guidance")
 
     refute Adapter.knows_session?(adapter, "sess-1")
 
@@ -1649,7 +1649,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     db = :"auth_callback_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "operator")
     Tightbeam.Archetypes.load!(base)
     Tightbeam.Rails.load!(base)
 
@@ -1755,7 +1755,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     db = :"subagent_callback_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "operator")
 
     Tightbeam.Archetypes.load!(base)
     Tightbeam.Rails.load!(base)
@@ -1765,8 +1765,8 @@ defmodule Tightbeam.Acp.AdapterTest do
       Tightbeam.Org.create(db, %{
         session_key: "parent",
         display_name: "parent",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "default",
         host: "testhost",
         harness: "codex",
@@ -1780,7 +1780,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       Tightbeam.Ledger.enqueue(db, %{
         session_key: session.session_key,
         message_id: "message-running",
-        origin: "user:flynn",
+        origin: "user:operator",
         prompt: "run",
         assignment_id: "assignment-running"
       })
@@ -1864,7 +1864,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     db = :"subagent_failure_db_#{System.unique_integer([:positive])}"
     db_pid = start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "operator")
 
     Tightbeam.Archetypes.load!(base)
     Tightbeam.Rails.load!(base)
@@ -1874,8 +1874,8 @@ defmodule Tightbeam.Acp.AdapterTest do
       Tightbeam.Org.create(db, %{
         session_key: "parent",
         display_name: "parent",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "default",
         host: "testhost",
         harness: "codex",

@@ -1,9 +1,7 @@
-# Where specs live (mike, 2026-08-21; org-local)
+# Product design documents
 
-The spec commons is the tightbeam-specs repo (github clickety-clacks/tightbeam-specs;
-build-host checkout ~/src/tightbeam-specs). A spec is durable ONLY there. Your workdir is
-scratch, not a git checkout: bytes there die with the session, and an artifact row is a
-pointer plus a hash, never custody of the content. When you produce or materially revise
-a spec, land it in the specs repo in the same motion you file the artifact. If your seat
-cannot push, say so in the attest — name the exact path and sha256 and ask for a landing;
-do not call a spec done while its only copy sits in scratch.
+The product design documents are maintained in version control. Your workdir is
+scratch, not a git checkout: bytes there may be temporary, and a recorded
+artifact points to content by its hash. When you produce or materially revise a
+design document, keep the durable copy with the product materials. If you cannot
+update that copy, state the exact path and hash and request that it be added.

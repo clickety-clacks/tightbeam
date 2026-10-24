@@ -31,7 +31,7 @@ IO.puts("[l0-smoke] sample codex refs:  #{inspect(Enum.map(Enum.take(x_entries, 
 # Validation semantics (the gate a spawn passes through):
 host = Tightbeam.Placement.local_host_name()
 default_ref = Tightbeam.Model.new("claude-sonnet-5", effort: "medium")  # the canonical default
-dead_ref = Tightbeam.Model.new("claude-fable-5")   # bare ref for a with-efforts model: dead
+dead_ref = Tightbeam.Model.new("claude-example-5")   # bare ref for a with-efforts model: dead
 bogus = ModelCatalog.route(host, "claude", Tightbeam.Model.new("definitely-not-a-real-model-xyz"), :smoke_cat)
 default_present = ModelCatalog.route(host, "claude", default_ref, :smoke_cat)
 dead = ModelCatalog.route(host, "claude", dead_ref, :smoke_cat)

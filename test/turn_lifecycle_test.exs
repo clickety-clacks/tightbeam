@@ -12,14 +12,14 @@ defmodule Tightbeam.TurnLifecycleTest do
     :ok =
       DB.execute(db, """
       INSERT INTO users (userId, isAdmin, creationKind, createdAt)
-      VALUES ('flynn', 0, 'admin_add', 1), ('kay', 0, 'admin_add', 1), ('root', 1, 'admin_add', 1);
+      VALUES ('operator', 0, 'admin_add', 1), ('kay', 0, 'admin_add', 1), ('root', 1, 'admin_add', 1);
 
       INSERT INTO sessions
         (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin, operationalParent,
          archetype, identityName, harness, provider, model, thinkingLevel, modelContext,
          createdAt, updatedAt)
       VALUES
-        ('k1', 'Flynn session', 'main', 1, 'flynn', 'user:flynn', 'k1',
+        ('k1', 'user session', 'main', 1, 'operator', 'user:operator', 'k1',
          'default', 'default', 'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL,
          1, 1),
         ('k2', 'Kay session', 'main', 1, 'kay', 'user:kay', 'k2',
@@ -81,7 +81,7 @@ defmodule Tightbeam.TurnLifecycleTest do
     assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: lease)
     assert :ok = Ledger.mark_published(db, seq)
 
-    trace = read(db, "k1", seq, {:user, "flynn"})
+    trace = read(db, "k1", seq, {:user, "operator"})
 
     assert Enum.map(trace.events, & &1.event_key) == [
              "accepted",
@@ -166,7 +166,7 @@ defmodule Tightbeam.TurnLifecycleTest do
     assert :ok = TurnLifecycle.append(db, seq, progress)
     assert :duplicate = TurnLifecycle.append(db, seq, Map.put(progress, :at, 1_234))
 
-    assert Enum.count(read(db, "k1", seq, {:user, "flynn"}).events) == 4
+    assert Enum.count(read(db, "k1", seq, {:user, "operator"}).events) == 4
   end
 
   test "owner leases fence stale callbacks and terminal commit is absorbing", %{db: db} do
@@ -200,7 +200,7 @@ defmodule Tightbeam.TurnLifecycleTest do
              Ledger.finish(db, seq, "canceled", nil,
                owner_lease: lease,
                cause: "cancel-request",
-               principal: "user:flynn"
+               principal: "user:operator"
              )
 
     late =
@@ -215,7 +215,7 @@ defmodule Tightbeam.TurnLifecycleTest do
 
     terminal =
       Enum.filter(
-        read(db, "k1", seq, {:user, "flynn"}).events,
+        read(db, "k1", seq, {:user, "operator"}).events,
         &(&1.kind == "terminal_committed")
       )
 
@@ -246,7 +246,7 @@ defmodule Tightbeam.TurnLifecycleTest do
   test "owner and admin can read; foreign, mismatched, and unknown look identical", %{db: db} do
     seq = enqueue!(db, "authorization")
 
-    assert %{turn: %{seq: ^seq}} = read(db, "k1", seq, {:user, "flynn"})
+    assert %{turn: %{seq: ^seq}} = read(db, "k1", seq, {:user, "operator"})
     assert %{turn: %{seq: ^seq}} = read(db, "k1", seq, {:user, "root"})
     assert %{turn: %{seq: ^seq}} = read(db, "k1", seq, {:session, "k1"})
 
@@ -263,7 +263,7 @@ defmodule Tightbeam.TurnLifecycleTest do
 
   test "the Gateway exposes the same owner-scoped turn-trace read", %{db: db} do
     seq = enqueue!(db, "gateway read")
-    call = %{params: %{session_key: "k1", turn_seq: seq}, principal: {:user, "flynn"}}
+    call = %{params: %{session_key: "k1", turn_seq: seq}, principal: {:user, "operator"}}
 
     assert Gateway.handlers(%{db: db})["turn-trace"].(call) == TurnLifecycle.read(db, call)
   end
@@ -277,7 +277,7 @@ defmodule Tightbeam.TurnLifecycleTest do
           txn,
           """
           INSERT INTO turns (sessionKey, messageId, origin, prompt, status, createdAt)
-          VALUES ('k1', 'legacy-message', 'user:flynn', 'old prompt', 'delivered', 1)
+          VALUES ('k1', 'legacy-message', 'user:operator', 'old prompt', 'delivered', 1)
           """
         )
 
@@ -286,7 +286,7 @@ defmodule Tightbeam.TurnLifecycleTest do
       end)
 
     assert :ok = TurnLifecycle.ensure_schema(db)
-    trace = read(db, "k1", seq, {:user, "flynn"})
+    trace = read(db, "k1", seq, {:user, "operator"})
     assert trace.turn.legacy
     assert trace.events == []
     assert :legacy = TurnLifecycle.append(db, seq, event("late", "claimed"))
@@ -303,12 +303,12 @@ defmodule Tightbeam.TurnLifecycleTest do
 
     :ok =
       DB.execute(db, """
-      INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1);
+      INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1);
       INSERT INTO sessions
         (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin, operationalParent,
          archetype, identityName, harness, provider, model, thinkingLevel, modelContext,
          createdAt, updatedAt)
-      VALUES ('restart', 'Restart', 'main', 1, 'flynn', 'user:flynn', 'restart',
+      VALUES ('restart', 'Restart', 'main', 1, 'operator', 'user:operator', 'restart',
               'default', 'default', 'claude', 'anthropic', 'claude-sonnet-5', 'medium',
               NULL, 1, 1);
       """)
@@ -317,7 +317,7 @@ defmodule Tightbeam.TurnLifecycleTest do
       Ledger.enqueue(db, %{
         session_key: "restart",
         message_id: "restart-message",
-        origin: "user:flynn",
+        origin: "user:operator",
         prompt: "not retained"
       })
 
@@ -345,7 +345,7 @@ defmodule Tightbeam.TurnLifecycleTest do
     GenServer.stop(first_owner)
 
     {:ok, second_owner} = DB.start_link(path: path, name: db)
-    trace = read(db, "restart", seq, {:user, "flynn"})
+    trace = read(db, "restart", seq, {:user, "operator"})
 
     assert Enum.map(trace.events, & &1.producer_event_id) == [
              "ledger:accepted",
@@ -403,8 +403,8 @@ defmodule Tightbeam.TurnLifecycleTest do
                         Ledger.enqueue_in_txn(txn, %{
                           session_key: "k1",
                           message_id: "rollback-message",
-                          origin: "user:flynn",
-                          principal: "user:flynn",
+                          origin: "user:operator",
+                          principal: "user:operator",
                           prompt: "must roll back"
                         })
 
@@ -427,7 +427,7 @@ defmodule Tightbeam.TurnLifecycleTest do
         prompt: "not traced"
       })
 
-    [accepted] = read(db, "k1", seq, {:user, "flynn"}).events
+    [accepted] = read(db, "k1", seq, {:user, "operator"}).events
     assert accepted.principal == "session:k1"
     assert accepted.detail["authenticatedCaller"] == "session:k1"
     assert accepted.detail["origin"] == "agent:product-owner"
@@ -439,7 +439,7 @@ defmodule Tightbeam.TurnLifecycleTest do
         session_key: "k1",
         message_id: "m_#{System.unique_integer([:positive])}",
         client_message_id: "client-safe-id",
-        origin: "user:flynn",
+        origin: "user:operator",
         prompt: prompt
       })
 

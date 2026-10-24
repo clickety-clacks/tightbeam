@@ -29,14 +29,14 @@ defmodule Tightbeam.RailRemedyTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1)"
       )
 
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "operator")
 
-    holder = session(db, "holder", "flynn", "claude", "coder")
-    reviewer = session(db, "reviewer-session", "flynn", "claude", "reviewer")
-    Roles.create!(db, "reviewer", "flynn", reviewer.session_key)
+    holder = session(db, "holder", "operator", "claude", "coder")
+    reviewer = session
+    Roles.create!
 
     # Canonicalize the tmp base: Darwin's System.tmp_dir!/0 sits under the /var
     # symlink (/var -> /private/var), and Containment.rail_profile/1 (the rail scratch
@@ -98,7 +98,7 @@ defmodule Tightbeam.RailRemedyTest do
 
     review = assignment_row(ctx.db, review_id)
     assert review.reviewsAssignmentId == assignment.id
-    assert review.openedByUser == "flynn"
+    assert review.openedByUser == "operator"
     assert review.openedBySession == nil
 
     assert {:ok, [[principal]]} =
@@ -150,7 +150,7 @@ defmodule Tightbeam.RailRemedyTest do
       verb: "assign",
       origin: "remedy:completion-needs-review",
       principal:
-        {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "flynn"}},
+        {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "operator"}},
       session_key: ctx.reviewer.session_key,
       target_role: "reviewer",
       role_fallback: false,
@@ -423,7 +423,7 @@ defmodule Tightbeam.RailRemedyTest do
     assert %{session_key: ^producer} =
              Idempotency.get(
                ctx.db,
-               "flynn",
+               "operator",
                "spawn",
                "rail-dispatch:spawn-remedy:#{assignment.id}:1"
              )
@@ -440,7 +440,7 @@ defmodule Tightbeam.RailRemedyTest do
           spawn.(%{
             verb: "spawn",
             origin: "remedy:spawn-race",
-            principal: {:remedy, %{statute: "spawn-race", action: "spawn", owner: "flynn"}},
+            principal: {:remedy, %{statute: "spawn-race", action: "spawn", owner: "operator"}},
             session_key: nil,
             params: %{
               display_name: "Unconstrained Racer",
@@ -479,7 +479,7 @@ defmodule Tightbeam.RailRemedyTest do
 
     assert %{session_key: ^producer} = Wakes.get(ctx.db, first_wake_id)
 
-    Org.retire(ctx.db, producer, "user:flynn", 1_000)
+    Org.retire(ctx.db, producer, "user:operator", 1_000)
 
     assert {:error, %{producer: ^producer}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
@@ -650,7 +650,7 @@ defmodule Tightbeam.RailRemedyTest do
           """
           INSERT INTO rail_remedy_episodes
             (statute, subject, status, producerKey, occurrence, rewakeCount, claimToken, openedAt)
-          VALUES (?1, ?2, 'live', 'reviewer-session', 1, 0, ?1, ?3)
+          VALUES
           """,
           [statute, assignment.id, now]
         )
@@ -782,7 +782,7 @@ defmodule Tightbeam.RailRemedyTest do
 
   test "unbound role and token fail closed without dispatch", ctx do
     assignment = assignment(ctx, "unbound")
-    :ok = Roles.rm(ctx.db, "reviewer")
+    :ok = Roles.rm
     load_review_gate(ctx)
 
     assert {:error, %{reason: "remedy_fired", producer: nil}} =
@@ -806,7 +806,7 @@ defmodule Tightbeam.RailRemedyTest do
 
   test "assign remedy principal is rejected by every non-assign assignment verb", ctx do
     principal =
-      {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "flynn"}}
+      {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "operator"}}
 
     expected = %{
       code: "process_denied",
@@ -1274,8 +1274,8 @@ defmodule Tightbeam.RailRemedyTest do
 
     Assignments.__handle__(ctx.db, "assign", %{
       verb: "assign",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: ctx.holder.session_key,
       target_role: nil,
       role_fallback: false,
@@ -1287,32 +1287,19 @@ defmodule Tightbeam.RailRemedyTest do
   defp work_item(ctx, title) do
     WorkItems.__handle__(ctx.db, "work-item-create", %{
       verb: "work-item-create",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: nil,
       params: %{title: title}
     })
   end
 
   defp linked_review(ctx, assignment_id, subject) do
-    Assignments.__handle__(ctx.db, "assign", %{
-      verb: "assign",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
-      session_key: ctx.reviewer.session_key,
-      target_role: nil,
-      role_fallback: false,
-      supervision_interval_ms: 1_000,
-      params: %{
-        subject: subject,
-        reviews_assignment_id: assignment_id,
-        idempotency_key: nil
-      }
-    })
+    Assignments.__handle__
   end
 
   defp verdict(ctx, assignment_id, kind) do
-    verdict_from(ctx, ctx.reviewer.session_key, assignment_id, kind)
+    verdict_from
   end
 
   defp verdict_from(ctx, session_key, assignment_id, kind) do
@@ -1347,8 +1334,8 @@ defmodule Tightbeam.RailRemedyTest do
   defp revoke(ctx, assignment_id) do
     Assignments.__handle__(ctx.db, "revoke-assignment", %{
       verb: "revoke-assignment",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: nil,
       params: %{assignment_id: assignment_id, reason: "test revocation"}
     })
@@ -1366,7 +1353,7 @@ defmodule Tightbeam.RailRemedyTest do
 
   defp assignment_row(db, id) do
     Assignments.__handle__(db, "assignment-get", %{
-      principal: {:user, "flynn"},
+      principal: {:user, "operator"},
       params: %{assignment_id: id}
     })
   end

@@ -146,30 +146,24 @@ defmodule Tightbeam.HarnessSeamTest do
              )
   end
 
-  # Task #41 (Flynn: "hard code it and leave a note"). The claude adapter accepts a
+  # Task #41 (user: "hard code it and leave a note"). The claude adapter accepts a
   # NARROWER model vocabulary than the derived catalog, and every substitution for a
   # refused model is a silent downgrade — `claude-opus-5` -> `opus` delivers Opus 4.8,
-  # and `claude-fable-5` has no equivalent at all. This pins the recorded table AND the
+  # and `claude-example-5` has no equivalent at all. This pins the recorded table AND the
   # rule that no substitution is smuggled in later: a request the adapter refuses must
   # fail, not quietly become a different model.
   test "the recorded claude model vocabulary never substitutes a refused model" do
     selectable = Tightbeam.Harness.Claude.adapter_selectable_models()
 
-    # Recorded live 2026-07-26 (claude CLI 2.1.220 / claude-agent-acp 0.59.0);
-    # fable added 2026-08-05 after a live re-measurement on build-host (CLI 2.1.221,
-    # the production grant) answered a real prompt on claude-fable-5 — the July
-    # REJECTED row was one environment's snapshot, not an account property.
+    # The offered model set depends on the configured home; the catalog must
+    # remain aligned with values the adapter can select.
     assert Enum.sort(selectable) ==
-             Enum.sort(~w(default sonnet opus haiku fable claude-sonnet-5 claude-opus-4-8
-                          claude-haiku-4-5-20251001 claude-fable-5 claude-opus-5
-                          claude-fable-5-1 claude-fable-5-1[1m]))
+             Enum.sort(~w(default sonnet opus haiku example-model claude-sonnet-5 claude-opus-4-8
+                          claude-haiku-4-5-20251001 claude-example-5 claude-opus-5
+                          claude-example-5-1 claude-example-5-1[1m]))
 
-    # Values the adapter REFUSES must never appear here — listing one would make the
-    # gateway offer a model the adapter cannot select. Fable left this list
-    # 2026-08-05: measured answering a real prompt on build-host with the production
-    # grant, so the July refusal was environmental, not categorical. Opus 5 left
-    # 2026-08-06 the same way: pin-probed offered+accepted and answered a live
-    # prompt on build-host with the production grant.
+    # Values the adapter refuses must never appear here, or the gateway could
+    # offer a model the adapter cannot select.
     for refused <- ~w(claude-opus-4-7 claude-sonnet-4-6
                       claude-opus-4-6 claude-opus-4-5-20251101 claude-sonnet-4-5-20250929
                       claude-opus-4-1-20250805) do
@@ -199,11 +193,11 @@ defmodule Tightbeam.HarnessSeamTest do
     refute source =~ "divergence is structurally unlikely"
   end
 
-  test "claude 0.73.0 aliases select Fable 5.1 at both context widths" do
+  test "claude 0.73.0 aliases select Example Model 5.1 at both context widths" do
     config = Tightbeam.Harness.Claude.session_config(%{}, "guidance")
 
-    assert config.model_option_aliases["fable"] == "claude-fable-5-1"
-    assert config.model_option_aliases["fable[1m]"] == "claude-fable-5-1[1m]"
+    assert config.model_option_aliases["example-model"] == "claude-example-5-1"
+    assert config.model_option_aliases["example-model[1m]"] == "claude-example-5-1[1m]"
     assert Tightbeam.Harness.Claude.adapter_version() == "0.73.0"
   end
 end

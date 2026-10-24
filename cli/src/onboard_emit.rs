@@ -1,4 +1,4 @@
-//! Machine-readable emission of onboarding sign-in deliverables (wi_0535922b).
+//! Machine-readable emission of onboarding sign-in deliverables (wi_00000000-0000-4000-8000-000000000106).
 //!
 //! Interactive onboarding is INCOMPLETE until the operator holds the sign-in URL and, for
 //! the device-code providers, the one-time code (ceremony-lifecycle-v1.md, "The definition
@@ -48,7 +48,7 @@ impl Deliverable {
 /// unmistakable amid the vendor's human passthrough text.
 ///
 /// `wake_id` is the operator-wake identity -- the wake row IS the durable record of this
-/// delivery (wi_0535922b). `delivery_file` is the path to the local 0600 copy. Both are
+/// delivery (wi_00000000-0000-4000-8000-000000000106). `delivery_file` is the path to the local 0600 copy. Both are
 /// threaded through so the machine-readable line points a relay at where the delivery landed.
 pub(crate) fn structured_line(
     provider: &str,
@@ -377,7 +377,7 @@ mod tests {
             code: "VG6S-L35ON".to_owned(),
         };
         let notified = Notified::Waked {
-            user_id: "mike".to_owned(),
+            user_id: "operator".to_owned(),
             wake_id: Some("w_1".to_owned()),
         };
         let file = delivery_file_json(
@@ -394,7 +394,7 @@ mod tests {
         assert_eq!(d["mintedAtMs"], 1000);
         assert_eq!(d["expiresAtMs"], 901_000);
         assert_eq!(d["notification"]["notified"], true);
-        assert_eq!(d["notification"]["userId"], "mike");
+        assert_eq!(d["notification"]["userId"], "operator");
         assert_eq!(d["notification"]["wakeId"], "w_1");
     }
 

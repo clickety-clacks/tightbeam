@@ -68,7 +68,7 @@ defmodule Tightbeam.AdminProjectionTest do
     {:paired, _device} =
       claim_org(db, %{
         device_id: "admin-projection-device",
-        claimed_name: "flynn",
+        claimed_name: "operator",
         platform: nil,
         model: nil
       })
@@ -106,7 +106,7 @@ defmodule Tightbeam.AdminProjectionTest do
                harness,
                "SAFE_ADMIN_TEST",
                "never-on-the-wire",
-               "user:flynn",
+               "user:operator",
                firehose_call("host-env-set", %{})
              )
 
@@ -308,7 +308,7 @@ defmodule Tightbeam.AdminProjectionTest do
                harness,
                "M1_COLLECTION_SECRET",
                host_environment_secret,
-               "user:flynn",
+               "user:operator",
                firehose_call("host-env-set", %{})
              )
 
@@ -552,7 +552,7 @@ defmodule Tightbeam.AdminProjectionTest do
   test "identity metadata lookups use the same canonical statement for known forbidden and unknown names",
        ctx do
     proxy = start_supervised!({QuerySpyDB, db: ctx.db})
-    admin = principal_binding("flynn", true)
+    admin = principal_binding("operator", true)
     forbidden = principal_binding("operator", false)
 
     assert {:ok, known_descriptor} =
@@ -596,7 +596,7 @@ defmodule Tightbeam.AdminProjectionTest do
        ctx do
     proxy = start_supervised!({QuerySpyDB, db: ctx.db})
     hidden = principal_binding("operator", false)
-    visible = principal_binding("flynn", true)
+    visible = principal_binding("operator", true)
 
     assert public_identity_or_absent(proxy, "served", hidden, false) == :absent
     assert public_identity_or_absent(proxy, "missing-identity", hidden, false) == :absent
@@ -634,7 +634,7 @@ defmodule Tightbeam.AdminProjectionTest do
   test "identity hydration rejects wrong principals and request bindings before database access",
        ctx do
     proxy = start_supervised!({QuerySpyDB, db: ctx.db})
-    admin = principal_binding("flynn", true)
+    admin = principal_binding("operator", true)
     request_binding = make_ref()
 
     assert {:ok, descriptor} =
@@ -668,12 +668,12 @@ defmodule Tightbeam.AdminProjectionTest do
     assert {:error, :invalid_identity_descriptor} =
              StateResources.query_identity(
                proxy,
-               {:metadata, "served", request_binding, "user:flynn"}
+               {:metadata, "served", request_binding, "user:operator"}
              )
 
     assert [] = QuerySpyDB.queries(proxy)
 
-    admin = principal_binding("flynn", true)
+    admin = principal_binding("operator", true)
 
     assert {:ok, descriptor} =
              StateResources.query_identity(proxy, {:metadata, "served", request_binding, admin})
@@ -688,7 +688,7 @@ defmodule Tightbeam.AdminProjectionTest do
     assert {:error, :invalid_identity_descriptor} =
              StateResources.query_identity(
                proxy,
-               {:hydrate, descriptor, request_binding, "user:flynn"}
+               {:hydrate, descriptor, request_binding, "user:operator"}
              )
 
     assert [{_metadata_sql, _metadata_params}] = QuerySpyDB.queries(proxy)
@@ -697,7 +697,7 @@ defmodule Tightbeam.AdminProjectionTest do
   test "identity descriptors stay reusable only inside the open operation and close before replay",
        ctx do
     proxy = start_supervised!({QuerySpyDB, db: ctx.db})
-    principal = principal_binding("flynn", true)
+    principal = principal_binding("operator", true)
     request_binding = make_ref()
 
     assert {:ok, descriptor} =
@@ -736,7 +736,7 @@ defmodule Tightbeam.AdminProjectionTest do
     call = firehose_call("identity-edit", %{})
     entries = AdminProjection.served_entries(ctx.db, ctx.base_dir)
     identity = Enum.find(entries, &(&1.resource == "identity"))
-    principal = principal_binding("flynn", true)
+    principal = principal_binding("operator", true)
     request_binding = make_ref()
 
     assert {:ok, descriptor} =
@@ -760,9 +760,9 @@ defmodule Tightbeam.AdminProjectionTest do
 
   test "identity-status binds org role calls to one resolved principal across a stale retry",
        ctx do
-    create_session!(ctx.db, "agent:identity-role-primary", "flynn")
+    create_session!(ctx.db, "agent:identity-role-primary", "operator")
     create_session!(ctx.db, "agent:identity-role-rebound", "operator")
-    Roles.create!(ctx.db, "identity-reviewer", "flynn", "agent:identity-role-primary")
+    Roles.create!
 
     call = firehose_call("identity-edit", %{})
     entries = AdminProjection.served_entries(ctx.db, ctx.base_dir)
@@ -781,7 +781,7 @@ defmodule Tightbeam.AdminProjectionTest do
              should_fire = Agent.get_and_update(hook_state, fn fired -> {not fired, true} end)
 
              if should_fire do
-               assert :ok = Roles.bind(ctx.db, "identity-reviewer", "agent:identity-role-rebound")
+               assert :ok = Roles.bind
                assert {:ok, [_item]} = AdminProjection.stamp_publication(ctx.db, call, [changed])
                send(parent, :role_retry_rebound)
              end
@@ -790,11 +790,7 @@ defmodule Tightbeam.AdminProjectionTest do
       )
 
     actual =
-      Gateway.handlers(%{db: proxy, base_dir: ctx.base_dir})["identity-status"].(%{
-        origin: "agent:identity-reviewer",
-        principal: nil,
-        params: %{}
-      })
+      Gateway.handlers(%{db: proxy, base_dir: ctx.base_dir})["identity-status"].
 
     assert_receive :role_retry_rebound
     assert actual.identity == StateResources.identity(hydrated_identity!(ctx.db, "served"))
@@ -830,7 +826,7 @@ defmodule Tightbeam.AdminProjectionTest do
              should_fire = Agent.get_and_update(hook_state, fn fired -> {not fired, true} end)
 
              if should_fire do
-               Devices.set_user_admin(ctx.db, "flynn", false)
+               Devices.set_user_admin(ctx.db, "operator", false)
                assert {:ok, [_item]} = AdminProjection.stamp_publication(ctx.db, call, [changed])
                send(parent, :visibility_lost_before_retry)
              end
@@ -840,7 +836,7 @@ defmodule Tightbeam.AdminProjectionTest do
 
     actual =
       Gateway.handlers(%{db: proxy, base_dir: ctx.base_dir})["identity-status"].(%{
-        origin: "user:flynn",
+        origin: "user:operator",
         principal: nil,
         params: %{}
       })
@@ -859,7 +855,7 @@ defmodule Tightbeam.AdminProjectionTest do
   end
 
   test "identity-status preserves the served identity through the staged query seam", ctx do
-    call = %{origin: "user:flynn", params: %{}}
+    call = %{origin: "user:operator", params: %{}}
 
     expected = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["identity-status"].(call)
 
@@ -965,7 +961,7 @@ defmodule Tightbeam.AdminProjectionTest do
                harness,
                "ROTATING_SECRET",
                "first-secret",
-               "user:flynn",
+               "user:operator",
                call
              )
 
@@ -981,7 +977,7 @@ defmodule Tightbeam.AdminProjectionTest do
                harness,
                "ROTATING_SECRET",
                "first-secret",
-               "user:flynn",
+               "user:operator",
                call
              )
 
@@ -1038,7 +1034,7 @@ defmodule Tightbeam.AdminProjectionTest do
                harness,
                "ROTATING_SECRET",
                "second-secret",
-               "user:flynn",
+               "user:operator",
                call
              )
 
@@ -1234,7 +1230,7 @@ defmodule Tightbeam.AdminProjectionTest do
           "default",
           :guidance,
           "# recovered #{suffix}\n",
-          "user:flynn"
+          "user:operator"
         )
 
       assert {:ok, %{state: "pending"}} =
@@ -1242,7 +1238,7 @@ defmodule Tightbeam.AdminProjectionTest do
                  ctx.db,
                  invocation,
                  candidate,
-                 "user:flynn"
+                 "user:operator"
                )
 
       if move_first?,
@@ -1304,14 +1300,14 @@ defmodule Tightbeam.AdminProjectionTest do
     handler = Tightbeam.Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["identity-edit"]
     invocation = "identity-pending-conflict"
     identity_dir = Path.join(ctx.base_dir, "identity")
-    candidate = Identity.edit!(ctx.base_dir, "default", :guidance, "candidate\n", "user:flynn")
+    candidate = Identity.edit!(ctx.base_dir, "default", :guidance, "candidate\n", "user:operator")
 
     assert {:ok, %{state: "pending"}} =
              AdminProjection.begin_identity_publication(
                ctx.db,
                invocation,
                candidate,
-               "user:flynn"
+               "user:operator"
              )
 
     divergent =
@@ -1377,15 +1373,15 @@ defmodule Tightbeam.AdminProjectionTest do
       Org.create(ctx.db, %{
         session_key: key,
         display_name: key,
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "default",
         identity_name: "default",
         identity_revision: live,
         host: "local",
         harness: "codex",
         provider: "openai",
-        model: Model.new("gpt-5.6-sol", effort: "medium")
+        model: Model.new("gpt-5.6-example", effort: "medium")
       })
 
       if stamp do
@@ -1431,7 +1427,7 @@ defmodule Tightbeam.AdminProjectionTest do
                harness,
                "REBUILD_SECRET",
                "never rebuild this value",
-               "user:flynn",
+               "user:operator",
                firehose_call("host-env-set", %{})
              )
 
@@ -1569,7 +1565,7 @@ defmodule Tightbeam.AdminProjectionTest do
                harness,
                "SECRET_INJECTION",
                "host-environment-secret-12345678",
-               "user:flynn",
+               "user:operator",
                firehose_call("host-env-set", %{})
              )
 
@@ -1609,7 +1605,7 @@ defmodule Tightbeam.AdminProjectionTest do
     File.write!(Path.join(source, "intake.md"), "non-allowlisted\n")
 
     Application.put_env(:tightbeam, :identity_source_dir, source)
-    assert {:ok, _revision} = Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+    assert {:ok, _revision} = Identity.learn!(ctx.base_dir, "agentic-engineering", "user:operator")
 
     identity_dir = Path.join(ctx.base_dir, "identity")
 
@@ -1675,8 +1671,8 @@ defmodule Tightbeam.AdminProjectionTest do
   defp firehose_call(verb, params) do
     %{
       verb: verb,
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: nil,
       params: params,
       firehose_in_txn: true
@@ -1727,7 +1723,7 @@ defmodule Tightbeam.AdminProjectionTest do
 
   defp hydrated_identity!(db, name) do
     request_binding = make_ref()
-    principal_binding = principal_binding("flynn", true)
+    principal_binding = principal_binding("operator", true)
 
     try do
       assert {:ok, descriptor} =
@@ -1773,7 +1769,7 @@ defmodule Tightbeam.AdminProjectionTest do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: Tightbeam.Model.new("fable"),
+      model: Tightbeam.Model.new("example-model"),
       host: "testhost"
     })
   end

@@ -512,8 +512,8 @@ defmodule Tightbeam.CommandEdgeTest do
   test "credential parks carry inert adapter keys for one captured machine" do
     command = %CredentialPark{
       provider: :openai,
-      machine: "mac-runner",
-      adapter_keys: [{:codex, "shared", "mac-runner"}],
+      machine: "test-host",
+      adapter_keys: [{:codex, "shared", "test-host"}],
       observed_at: 123
     }
 

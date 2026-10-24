@@ -50,7 +50,7 @@ gateway derives identity from that credential, which is the path a real agent ta
 IS a wake-with-prompt. So the two paths this runbook exercises are **immediate wake**
 (a direct message) and **scheduled wake** (`--after` / `--at`), not post-vs-wake.
 
-> **OPEN QUESTION (Q1).** Flynn asked for "post and wake paths". If an agent-facing
+> **OPEN QUESTION (Q1).** user asked for "post and wake paths". If an agent-facing
 > `post` is intended to exist, that is a product gap to file — this runbook covers
 > what the code offers and does not invent a second surface.
 
@@ -172,7 +172,7 @@ So this row carries one substrate check and an **affordance probe** — can an a
 *find* what we shipped, without being told.
 
 > **RESOLVED (was Q2).** Isolation between two satellites is deliberately **not** the
-> property under test. Flynn's ruling: it does not matter whether an agent could find
+> property under test. user's ruling: it does not matter whether an agent could find
 > some other way to reach a peer — what matters is that our way is easy and
 > conspicuous enough that it never burns tokens inventing one. The gateway-down
 > negative check that used to sit here is **withdrawn**; proving absence of a direct
@@ -228,50 +228,8 @@ never scored as an [E] failure. Do not correct the agent mid-run; let it finish 
 record the whole path it took. An agent that reaches for ssh on M4 has told us the
 product's own path was not visible from where it was standing.
 
-> **Known gap — the live hypothesis this probe exists to check.** The linux-runner run
-> (run record `2026-07-28-91901ff-linux-runner-prod-service.md` in
-> `~/shared-workspace/tightbeam_ex/smoke-runs/`, step 29) found
-> **zero** occurrences of `wake --user`, `wake --role` or `[from …]` in the probe
-> session's composed guidance. Reading the source, that is the shape of composition,
-> not a packaging accident:
->
-> - The reply spelling **is** written down in `priv/guidance/operating-manual.md:31-32`
->   — but that fragment reaches an agent only if its archetype `#include`s
->   `operating-manual.md`, and **no shipped archetype does**
->   (`priv/kungfu/agentic-engineering/archetypes/*.toml`).
->   `Identity.snapshot_at!` (`lib/tightbeam/identity.ex:119-125`) composes the
->   archetype's own guidance plus `operating-model.md` — a *different* document, about
->   the served-identity seam, which never mentions wake.
-> - The `default` archetype elects **no skills at all**
->   (`priv/kungfu/agentic-engineering/archetypes/default.toml`), so a default-archetype
->   agent carries neither `tightbeam-dispatching` nor any bundle skill.
-> - `tightbeam-dispatching` (`priv/skills/tightbeam-dispatching/SKILL.md:11`) teaches
->   the **dispatch** wake, `tightbeam wake --role <name> --prompt "…"`. It never
->   mentions `--user` and never mentions the `[from …]` stamp — it is not where an
->   agent learns to *reply*.
-> - `wake --user <id>` appears only in bundle skills (`feature-cycle` SKILL.md:26,68;
->   `spec-handoff`:17,47; `unblocking`:36), elected by the orchestrator and spec-writer
->   archetypes and no others.
->
-> But the affordance is **not** absent from the product: `tightbeam help` carries it
-> prominently, under IDENTITY, before any command
-> (`cli/src/args.rs:265-300`) — *"To reply to [from user:mike], use wake --user mike;
-> to reply to [from agent:notetaker], use wake --role notetaker. [from process:x]
-> cannot be woken."* — and a malformed wake answers `usage: tightbeam wake exactly one
-> of --session <key>, --role <name>, --user <id> --prompt ...` (`cli/src/args.rs:749`).
->
-> So the sharp question this probe asks is: **does the agent think to run `tightbeam
-> help`?** One command away is either conspicuous or invisible, and only the cold ask
-> settles it. **Record the archetype every probe session carries** — discoverability is
-> archetype-dependent, and a result without the archetype is unreadable.
->
-> **OPEN — inconsistent origin spelling.** `operating-manual.md:32` instructs
-> "tagged `[from role:notetaker]`, run `wake --role notetaker`", but `role:` is not an
-> origin class: `wire/payloads.ex:13-14` fixes the closed set as `user:<id>`,
-> `agent:<handle>`, `process:<name>`, and the live stamp is `[from agent:…]`
-> (linux-runner step 29 observed `[from agent:probe-office]`). An agent following the manual
-> literally would be looking for a tag that never appears. Whether the manual or the
-> wire contract is wrong is not this runbook's call — file it.
+The CLI help describes how to reply to user and agent messages. This procedure
+checks that behavior in a fresh session and records any discoverability issue.
 
 ## Cross-harness
 
@@ -298,15 +256,14 @@ VERIFIED(reason) / BLOCKED(blocker).
 
 Retire the probe sessions (soft delete; rows and messages remain, by design) and
 remove the probe roles. **Do not** uninstall the gateway or de-assimilate the
-satellite: both are retained per `docs/TEST-HOSTS.md` §5. Remove only temporary
+satellite: both are retained for later runs. Remove only temporary
 artifacts outside the base dirs. Re-verify unrelated workloads active on every
 participating host.
 
 ## Scorecard
 
-`~/shared-workspace/tightbeam_ex/smoke-runs/<date>-<short-sha>-inter-node-comms.md`
-(run records live outside the repo). One row per {placement ×
-harness-pair × path}, columns for A–E. Header carries gateway commit, every
+One row per {placement × harness-pair × path}, columns for A–E. Header carries
+the gateway commit and participating hosts,
 participating host and its role, the **archetype and model each probe session
 carried** (§E is unreadable without them), and which cells were waived.
 

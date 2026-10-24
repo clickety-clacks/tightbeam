@@ -32,7 +32,7 @@ The tenets in the spec decide all arguments; this file only maps the code.
                      guarantee; doorbells are optimization
     acp/conn.ex      adapter Port owner; ndjson; async request protocol;
                      orphan quiescence signal
-    acp/adapter.ex   harness session layer; fable-trap model rule
+    acp/adapter.ex   harness session layer; model-pin rule
     application.ex   the tree; boot.ex the one-shot; id.ex shared ids
 
 ## The turn pipeline (the one flow to understand)

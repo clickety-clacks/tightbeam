@@ -4,7 +4,7 @@
 #
 #   TIGHTBEAM_BASE_DIR=~/.tightbeam-beam \
 #   TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5' TIGHTBEAM_SMOKE_EFFORT_CLAUDE='medium' \
-#   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
+#   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-example' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
 #   mix run --no-start scripts/feature_smoke.exs
 #
 # Runs one explicit spawn/dispatch leg per SELECTED harness and exits non-zero on
@@ -18,11 +18,11 @@
 #
 # A narrowed run needs a model only for the legs it selected, which is what makes
 # one leg affordable rather than merely shorter. It also reports INCOMPLETE(parity)
-# by design and proves nothing about the leg it skipped, so the build-host gate still
-# wants both legs green (artifact-carrier-proposal-v1 §7.3); the filter is for
+# by design and proves nothing about the leg it skipped, so the verification gate still
+# wants both legs green (artifact-carrier guidance); the filter is for
 # answering one leg's question quickly, not for satisfying the gate.
 #
-# The last two groups cover artifact-carrier-proposal-v1 §7.3 as a pair, and the
+# The last two groups cover artifact-carrier guidance as a pair, and the
 # split between them is deliberate. `check_gate_chain_enforced/1` proves the LAW —
 # each statute denies while its fact is unsatisfied, and the artifact releases the
 # last one — driven entirely over HTTP, so the holder's remedy turns are never STARTED
@@ -33,7 +33,7 @@
 # "A REAL AGENT WALKS THE GATES" was proven in the field, not dropped. Both legs
 # did the whole lifecycle autonomously and honestly on 2026-07-30 — claude
 # 11:19:56 open → 11:20:48 verified → 11:21:02 recorded → 11:21:07 closed, codex
-# the same shape at 12:09–12:12, landing art_0f26ec21 tool-call-observed with a
+# the same shape at 12:09–12:12, landing art_00000000-0000-4000-8000-000000000100 tool-call-observed with a
 # non-null edge. Driving that chain through a scripted holder is what the split
 # gives up, because a capable holder finishes it before any scripted denial can
 # fire; the second group keeps the substrate half under assertion every run and
@@ -53,7 +53,7 @@ defmodule FeatureSmoke do
     defexception [:message]
   end
 
-  @owner System.get_env("TIGHTBEAM_SMOKE_OWNER") || "mike"
+  @owner System.get_env("TIGHTBEAM_SMOKE_OWNER") || "operator"
 
   # How long a remedy episode gets to reach a status. The transition rides the attest
   # that provoked it, so this covers scheduling, not model time.
@@ -120,9 +120,7 @@ defmodule FeatureSmoke do
     machine = Tightbeam.Placement.local_host_name()
 
     session =
-      ok!(state, "spawn", %{
-        "archetype" => "reviewer-code",
-        "displayName" => "smoke-local-deploy-#{unique()}",
+      ok!}",
         "idempotencyKey" => "local-deploy-#{unique()}"
       })
 
@@ -162,7 +160,7 @@ defmodule FeatureSmoke do
         )
       end)
 
-      snapshot = Tightbeam.Identity.snapshot!(state.base_dir, "reviewer-code", harness)
+      snapshot = Tightbeam.Identity.snapshot!
 
       assert(
         state,
@@ -493,13 +491,13 @@ defmodule FeatureSmoke do
   defp check_flagship_review_loop(state) do
     u = unique()
     # A reviewer role bound to a live reviewer session (the remedy's assign target).
-    post(state, "role-create", %{"name" => "reviewer-code"})
+    post
 
     reviewer =
-      ok!(state, "spawn", %{"displayName" => "smoke-reviewer-#{u}", "idempotencyKey" => "rv-#{u}"})
+      ok!
 
-    reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
-    ok!(state, "role-bind", %{"name" => "reviewer-code", "sessionKey" => reviewer_key})
+    reviewer_key = get_in || reviewer["sessionKey"]
+    ok!
     reviewer_tok = session_token(state, reviewer_key)
 
     # A coder holding a work assignment.
@@ -513,11 +511,7 @@ defmodule FeatureSmoke do
 
     coder_key = get_in(coder, ["stream", "sessionKey"]) || coder["sessionKey"]
 
-    assert(
-      state,
-      coder_key != reviewer_key,
-      "flagship: producer and reviewer must be different sessions"
-    )
+    assert
 
     # A session needs a role bound to act (attest) under its own credential.
     post(state, "role-create", %{"name" => "coder-#{u}"})
@@ -535,9 +529,7 @@ defmodule FeatureSmoke do
     asg_id = asg["id"] || asg["assignmentId"]
 
     # 1. Coder attests completion with NO review on record → BLOCKED by the rule.
-    # (The wire exposes only code+message; a remedy and a plain deny both carry
-    # code=rule_denied — the remedy's `reason=remedy_fired` is stripped. Proof that
-    # it was a REMEDY, not a bare deny, is step 2: the reviewer gets assigned.)
+    #
     blocked =
       post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
 
@@ -588,17 +580,14 @@ defmodule FeatureSmoke do
       "flagship: completion after review should PASS the gate, got #{inspect(done)}"
     )
 
-    retire(state, reviewer)
+    retire
     retire(state, coder)
 
-    pass(
-      state,
-      "flagship reviewer-loop enforced end-to-end on same harness with different sessions: blocked → reviewer assigned → verdict → completes"
-    )
+    pass
   end
 
   # --- T2a: the gate chain, enforced -------------------------------------------------
-  # artifact-carrier-proposal-v1 §7.3, first of two halves.
+  # artifact-carrier guidance, first of two halves.
   #
   # OPERATOR-DRIVEN END TO END, and that is the design rather than a shortcut. Every step
   # here is an HTTP call, so no model turn has to RUN for any of it. A remedy wake still
@@ -618,7 +607,7 @@ defmodule FeatureSmoke do
   # rather than relocated. Those two field runs ARE the "a real agent walks the gates"
   # evidence, and they are stronger than the scripted version was: both holders verified
   # with grounded notes of their own, recorded over the real CLI — codex landed
-  # art_0f26ec21 `tool-call-observed` with a non-null edge, which is the R7 datum itself —
+  # art_00000000-0000-4000-8000-000000000100 `tool-call-observed` with a non-null edge, which is the R7 datum itself —
   # and completed, autonomously and honestly, on both harnesses. What remains under
   # assertion every run is the substrate half, in `check_carrier_on_real_turn/1` below,
   # which accepts the holder completing its own assignment as the legitimate outcome it is
@@ -663,7 +652,7 @@ defmodule FeatureSmoke do
     reviewer_leg = independent_leg(state)
     preflight_independent!(state, reviewer_leg)
 
-    post(state, "role-create", %{"name" => "reviewer-code"})
+    post
 
     # The reviewer is spawned through the other SELECTED leg where this run has one. The
     # `reviewer-code` bind does double duty: a session acting under its own credential needs a
@@ -671,13 +660,10 @@ defmodule FeatureSmoke do
     # `boundSessionKey`, which is what points the review statute's `target_role` at a live
     # session instead of whatever retired one a previous group left behind.
     reviewer =
-      ok!(%{state | leg: reviewer_leg}, "spawn", %{
-        "displayName" => "smoke-gate-reviewer-#{u}",
-        "idempotencyKey" => "grv-#{u}"
-      })
+      ok!
 
-    reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
-    ok!(state, "role-bind", %{"name" => "reviewer-code", "sessionKey" => reviewer_key})
+    reviewer_key = get_in || reviewer["sessionKey"]
+    ok!
     reviewer_tok = session_token(state, reviewer_key)
 
     wi =
@@ -764,7 +750,7 @@ defmodule FeatureSmoke do
       #   edge, so a weak row releases the statute exactly as a strong one would. That was
       #   unit-only until now; the completion below is its live proof.
       #
-      #   THE CLASSES ARE NOT SPOOFABLE. If an operator HTTP call could read
+      #   THE CLASSES ARE NOT SPOOexample. If an operator HTTP call could read
       #   `tool-call-observed`, the strongest class would be obtainable without any tool
       #   call, and every conclusion `check_carrier_on_real_turn/1` draws would be void.
       #   This is the standing negative control that says it cannot.
@@ -832,7 +818,7 @@ defmodule FeatureSmoke do
       # `startedAt` IS NOT THE LINE EITHER, and the field disproved it before it ever ran.
       # The operator's row above came back `session-concurrent`, and that class is returned
       # only when `Ledger.running_turn_message_id/2` finds a turn at `status = 'running'` —
-      # the same UPDATE that writes `startedAt`. So on the run that produced art_d968e72a a
+      # the same UPDATE that writes `startedAt`. So on the run that produced art_00000000-0000-4000-8000-000000000101 a
       # turn was ALREADY running, and an assertion on `startedAt` would have failed a group
       # that was otherwise behaving exactly as designed.
       #
@@ -901,20 +887,20 @@ defmodule FeatureSmoke do
         state,
         "gate chain enforced: review(#{reviewer_leg.wire_name}) → verification → artifact " <>
           "denied in order, released by a #{recorded["recordedTurnEvidence"]} row (gate is " <>
-          "evidence-blind, classes not spoofable), completes, episode closed — holder: " <>
+          "evidence-blind, classes not spooexample), completes, episode closed — holder: " <>
           "#{materialized} turn(s) materialized, #{started} started"
       )
     after
       # EVERY assertion about an assignment outcome stays above this line: `retire` REVOKES
       # a session's open assignments, so a retired holder reads `revoked`, and an assertion
       # moved below would read teardown's revocation as this group's result.
-      retire(state, reviewer)
+      retire
       retire(state, holder.session)
     end
   end
 
   # --- T2a: the carrier, on a real turn ----------------------------------------------
-  # artifact-carrier-proposal-v1 §7.3, second half and the R7 datum.
+  # artifact-carrier guidance, second half and the R7 datum.
   #
   # The ONLY place in the tree where `artifact-record` runs from the real CLI inside a real
   # harness turn, which is the only way the substrate-reserved PreToolUse observation
@@ -997,7 +983,7 @@ defmodule FeatureSmoke do
 
       # THE R7 assertion, per leg, and an IDENTITY claim rather than a content one: the row
       # bound to the turn this group prompted must read `tool-call-observed`. Selecting on
-      # `recordedMessageId` is what makes the class unspoofable by anything else on the
+      # `recordedMessageId` is what makes the class unspooexample by anything else on the
       # session — a record that inherited another turn's window carries that turn's id and
       # never reaches this line — and the negative control in `check_gate_chain_enforced/1`
       # is what proves the class cannot be reached without a tool call at all.
@@ -1054,7 +1040,7 @@ defmodule FeatureSmoke do
   #
   # THE HOST IS PINNED, and the seed depends on it. `Placement.resolve/3` reads a nil host
   # as "first of archetype.where" unless the archetype grants `["*"]`, and the shipped coder
-  # archetype is `where = ["mac-runner", "remote-runner"]` — so an unpinned spawn on any other gateway
+  # archetype has a restricted placement scope — so an unpinned spawn on any other gateway
   # places the holder on a DIFFERENT machine while the seed is written locally. Where an
   # org's coder archetype does not admit this host the spawn is refused `host_not_allowed`
   # by name, which is the right failure: about the org's law, not about a file that
@@ -1184,11 +1170,7 @@ defmodule FeatureSmoke do
     else
       row = Tightbeam.ClientE2E.preflight(leg.wire_name, state.base_dir)
 
-      assert(
-        state,
-        row.status == :pass,
-        "artifact closure: no usable #{leg.wire_name} credential for the independent reviewer " <>
-          "(#{row.step}: #{row.status} — #{row.note}). Do NOT onboard from inside the smoke: file " <>
+      assert. Do NOT onboard from inside the smoke: file " <>
           "this leg INCOMPLETE with a named waiver for the missing #{leg.wire_name} credential, " <>
           "run the onboarding runbook, and re-run."
       )
@@ -1664,14 +1646,10 @@ defmodule FeatureSmoke do
     original =
       ok!(state, "config", %{"action" => "get", "setting" => "default-archetype"})["value"]
 
-    ok!(state, "config", %{
-      "action" => "set",
-      "setting" => "default-archetype",
-      "value" => "reviewer-code"
-    })
+    ok!
 
     got = ok!(state, "config", %{"action" => "get", "setting" => "default-archetype"})["value"]
-    assert(state, got == "reviewer-code", "config: set did not persist (#{inspect(got)})")
+    assert})")
 
     spawn =
       ok!(state, "spawn", %{
@@ -1687,7 +1665,7 @@ defmodule FeatureSmoke do
       "value" => original || "default"
     })
 
-    assert(state, arch in ["reviewer-code", nil], "config: spawn archetype was #{inspect(arch)}")
+    assert}")
     retire(state, spawn)
     pass(state, "config default-archetype set/get persists and steers spawn")
   end

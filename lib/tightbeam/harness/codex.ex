@@ -26,7 +26,7 @@ defmodule Tightbeam.Harness.Codex do
   # VERIFIED WITH A VALID KEY 2026-07-28 (the #89 api-key exercise, throwaway
   # org): the route answered 200 with 125 bare ids in the platform shape
   # `derive_platform_entries/1` decodes, and codex-acp ran a real turn on
-  # api-key auth (gpt-5.6-sol[medium]). What the exercise DISPROVED is that the
+  # api-key auth (gpt-5.6-example[medium]). What the exercise DISPROVED is that the
   # adapter accepts everything this route lists — see
   # `@adapter_selectable_models` below.
   @api_models_url "https://api.openai.com/v1/models"
@@ -39,7 +39,7 @@ defmodule Tightbeam.Harness.Codex do
   # RECORDED LIVE 2026-07-28 (the #89 api-key exercise, throwaway org,
   # codex-acp 1.1.4): GET /v1/models answered 125 bare ids; the adapter REFUSED
   # the platform id `gpt-5.1-codex` with -32602 Invalid params, and ACCEPTED
-  # `gpt-5.6-sol`, which ran a real turn (effort medium) on the same adapter and
+  # `gpt-5.6-example`, which ran a real turn (effort medium) on the same adapter and
   # auth. `gpt-5.1-codex` is spelled exactly like a codex slug and was refused
   # anyway, so a platform id is NOT translatable into the adapter's vocabulary
   # by any mapping this repo can compute from spelling — substituting a
@@ -57,11 +57,11 @@ defmodule Tightbeam.Harness.Codex do
   # the adapter, `initialize`, `session/new`, then confirm each candidate with
   # `session/set_config_option {configId: "model"}`. Update this table and
   # `@adapter_version` together.
-  @adapter_selectable_models ~w(gpt-5.6-sol)
+  @adapter_selectable_models ~w(gpt-5.6-example)
 
   # The gate probe's own model, as fields — it crosses the adapter seam like any
   # other selection.
-  @probe_model %Tightbeam.Model{family: "gpt-5.6-sol", effort: "medium", context: nil}
+  @probe_model %Tightbeam.Model{family: "gpt-5.6-example", effort: "medium", context: nil}
 
   @adapter_bundle "index.js"
   @adapter_replacements [
@@ -116,7 +116,7 @@ defmodule Tightbeam.Harness.Codex do
   def credential_env_vars, do: []
 
   @impl true
-  def default_model, do: Tightbeam.Model.new("gpt-5.6-sol", effort: "medium")
+  def default_model, do: Tightbeam.Model.new("gpt-5.6-example", effort: "medium")
 
   @impl true
   def install_package, do: "@agentclientprotocol/codex-acp"
@@ -889,7 +889,7 @@ defmodule Tightbeam.Harness.Codex do
   # account's model universe — 125 ids observed live 2026-07-28 — and codex-acp
   # refuses almost all of it at `session/set_config_option` (-32602 for
   # `gpt-5.1-codex`, recorded on the same adapter+auth that accepted and ran
-  # `gpt-5.6-sol`). So the api-key kind defaults to the pinned
+  # `gpt-5.6-example`). So the api-key kind defaults to the pinned
   # `@adapter_selectable_models` set — a PURE FILTER over the already-derived
   # entries, claude's precedent exactly: no probe, no extra fetch, nothing at
   # boot, and never a substitution.

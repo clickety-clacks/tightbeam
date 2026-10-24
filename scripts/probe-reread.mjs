@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Re-read probe — establishes the mechanism the home-pin durable fix relies on
-// (wi_263814d3): a LIVE, long-lived claude-agent-acp adapter RE-READS its home's
+// (wi_00000000-0000-4000-8000-000000000102): a LIVE, long-lived claude-agent-acp adapter RE-READS its home's
 // model pin at every session/new, so re-pinning the shared home to a session's
 // resolved model BEFORE that session's session/new (or session/load) makes the
 // adapter offer and accept it — without an adapter restart. This is WHY
@@ -32,7 +32,7 @@ pin("claude-sonnet-5");
 
 const adapter = spawn(
   "node",
-  ["/home/mike/.tightbeam/adapters/node_modules/.bin/claude-agent-acp"],
+  ["claude-agent-acp"],
   { stdio: ["pipe", "pipe", "inherit"], env: { ...process.env, CLAUDE_CONFIG_DIR: HOME } }
 );
 let buf = "", id = 0;

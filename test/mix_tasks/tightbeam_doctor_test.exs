@@ -135,7 +135,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     inputs =
       ctx.inputs
       |> put(:default_harness, :codex)
-      |> put(:default_model, Tightbeam.Model.new("gpt-5.6-sol", effort: "medium"))
+      |> put(:default_model, Tightbeam.Model.new("gpt-5.6-example", effort: "medium"))
 
     {0, report} = Doctor.evaluate(catalog, inputs)
     failed = find(report, "harness_auth:claude")
@@ -348,7 +348,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
   end
 
   # AC5, doctor's half: an installed-but-unrunnable harness (on PATH but fails to
-  # execute — the build-host codex-as-`.js`-without-node incident) must have its
+  # execute — a script-based CLI whose interpreter is unavailable) must have its
   # EXECUTABILITY gap named as its own row, distinct from the credential axis —
   # doctor is O5's REFERENCE three-way taxonomy that readiness reflects, so it must
   # not collapse an unrunnable harness into "merely no credential." Regression

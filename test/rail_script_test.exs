@@ -43,7 +43,7 @@ defmodule Tightbeam.RailScriptTest do
     :ok = Wakes.ensure_schema(db)
     :ok = Placement.ensure_schema(db)
 
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "operator")
 
     {tmp, 0} = System.cmd("/bin/realpath", [System.tmp_dir!()])
 
@@ -71,13 +71,13 @@ defmodule Tightbeam.RailScriptTest do
       Org.create(db, %{
         session_key: "rail-holder",
         display_name: "Rail holder",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "coder",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("fable")
+        model: Model.new("example-model")
       })
 
     on_exit(fn ->
@@ -160,7 +160,7 @@ defmodule Tightbeam.RailScriptTest do
       call()
       |> Map.put(
         :principal,
-        {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "flynn"}}
+        {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "operator"}}
       )
 
     assert {:ok, "pass", "returned"} =
@@ -439,13 +439,13 @@ defmodule Tightbeam.RailScriptTest do
       Org.create(ctx.db, %{
         session_key: "remote-rail-holder",
         display_name: "Remote rail holder",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "coder",
         host: "remote-testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("fable")
+        model: Model.new("example-model")
       })
 
     expected_workdir =
@@ -611,8 +611,8 @@ defmodule Tightbeam.RailScriptTest do
              Escalation.rule(
                ctx.db,
                %{
-                 origin: "user:flynn",
-                 principal: {:user, "flynn"},
+                 origin: "user:operator",
+                 principal: {:user, "operator"},
                  params: %{request_id: id, decision: "allow"}
                },
                authorized: true
@@ -676,8 +676,8 @@ defmodule Tightbeam.RailScriptTest do
     assert denial.reason == "rule_denied"
     assert denial.script_exit_class == "returned"
     assert denial.ref == "w1"
-    assert denial.origin == "user:flynn"
-    assert denial.principal == "user:flynn"
+    assert denial.origin == "user:operator"
+    assert denial.principal == "user:operator"
   end
 
   test "every non-pass exit class denies dispatch with the named legibility payload", ctx do
@@ -714,7 +714,7 @@ defmodule Tightbeam.RailScriptTest do
     assert Enum.count(events, &(&1.kind == "decision_request_opened")) == 4
   end
 
-  # Flynn's ruling (§A3, 2026-07-29): "no sensor malfunction silently decides against
+  # user's ruling (§A3, 2026-07-29): "no sensor malfunction silently decides against
   # work." The two halves pull in opposite directions, so both are asserted: the denial
   # the caller receives is the one it received before the ruling, AND a decision request
   # now names the statute behind it.
@@ -1176,8 +1176,8 @@ defmodule Tightbeam.RailScriptTest do
              Escalation.rule(
                ctx.db,
                %{
-                 origin: "user:flynn",
-                 principal: {:user, "flynn"},
+                 origin: "user:operator",
+                 principal: {:user, "operator"},
                  params: %{request_id: id, decision: "allow"}
                },
                authorized: true
@@ -1363,8 +1363,8 @@ defmodule Tightbeam.RailScriptTest do
              Escalation.rule(
                ctx.db,
                %{
-                 origin: "user:flynn",
-                 principal: {:user, "flynn"},
+                 origin: "user:operator",
+                 principal: {:user, "operator"},
                  params: %{request_id: id, decision: "allow"}
                },
                authorized: true
@@ -1444,8 +1444,8 @@ defmodule Tightbeam.RailScriptTest do
       Escalation.rule(
         ctx.db,
         %{
-          origin: "user:flynn",
-          principal: {:user, "flynn"},
+          origin: "user:operator",
+          principal: {:user, "operator"},
           params: %{request_id: id, decision: "allow"}
         },
         authorized: true
@@ -1560,8 +1560,8 @@ defmodule Tightbeam.RailScriptTest do
              Escalation.rule(
                ctx.db,
                %{
-                 origin: "user:flynn",
-                 principal: {:user, "flynn"},
+                 origin: "user:operator",
+                 principal: {:user, "operator"},
                  params: %{request_id: id, decision: "allow"}
                },
                authorized: true
@@ -1733,8 +1733,8 @@ defmodule Tightbeam.RailScriptTest do
   defp call(params \\ %{}) do
     %{
       verb: "post",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: nil,
       params: params
     }

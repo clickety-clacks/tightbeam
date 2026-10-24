@@ -8,9 +8,9 @@ defmodule Tightbeam.ToplinesRailsTest do
     db = :toplines_rails_
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    insert_user!(db, "flynn")
+    insert_user!(db, "operator")
     insert_user!(db, "kay")
-    insert_work_item!(db, "wi_one", "flynn")
+    insert_work_item!(db, "wi_one", "operator")
     insert_work_item!(db, "wi_two", "kay")
 
     :ok =
@@ -19,7 +19,7 @@ defmodule Tightbeam.ToplinesRailsTest do
         """
         INSERT INTO wakes
           (wakeId, sessionKey, origin, prompt, consumer, dueAt, state, createdAt)
-        VALUES ('w_one', 'agent:main:clawline:flynn:main', 'test',
+        VALUES ('w_one', 'agent:main:clawline:operator:main', 'test',
                 'Choose placement', 'prompt', 10, 'pending', 10);
         INSERT INTO causal_events (seq, at, jobRef, kind, detail)
           VALUES (100, 10, 'wi_one', 'disposition_transition', '{}'),
@@ -67,7 +67,7 @@ defmodule Tightbeam.ToplinesRailsTest do
       assert_rejected(
         db,
         "topline_work_memberships",
-        Map.merge(membership_row("tlm_invalid", "tl_one", "wi_one", "flynn"), overrides)
+        Map.merge(membership_row("tlm_invalid", "tl_one", "wi_one", "operator"), overrides)
       )
     end)
   end
@@ -195,7 +195,7 @@ defmodule Tightbeam.ToplinesRailsTest do
         sourceCausalEventSeq: 100,
         state: "linked",
         resolutionActorKind: "user",
-        resolutionActorRef: "flynn",
+        resolutionActorRef: "operator",
         resolutionReason: "placed",
         resolvedAt: 11
       })
@@ -210,7 +210,7 @@ defmodule Tightbeam.ToplinesRailsTest do
         sourceCausalEventSeq: 100,
         state: "linked",
         resolutionActorKind: "user",
-        resolutionActorRef: "flynn",
+        resolutionActorRef: "operator",
         resolutionReason: "placed",
         resolvedAt: 11
       })
@@ -275,7 +275,7 @@ defmodule Tightbeam.ToplinesRailsTest do
   test "AC71 rejects both possible owner values for a cross-owner membership", %{db: db} do
     insert!(db, "toplines", topline_row("tl_one"))
 
-    for owner <- ["flynn", "kay"] do
+    for owner <- ["operator", "kay"] do
       assert_rejected(
         db,
         "topline_work_memberships",
@@ -285,15 +285,15 @@ defmodule Tightbeam.ToplinesRailsTest do
   end
 
   test "AC72 rejects a Concern tag without same-Topline active membership", %{db: db} do
-    insert_work_item!(db, "wi_three", "flynn")
+    insert_work_item!(db, "wi_three", "operator")
     insert!(db, "toplines", topline_row("tl_one"))
-    insert!(db, "toplines", %{topline_row("tl_two") | ownerUserId: "flynn"})
+    insert!(db, "toplines", %{topline_row("tl_two") | ownerUserId: "operator"})
     insert!(db, "topline_concerns", concern_row("tlc_one", "tl_one"))
 
     insert!(
       db,
       "topline_work_memberships",
-      membership_row("tlm_two", "tl_two", "wi_three", "flynn")
+      membership_row("tlm_two", "tl_two", "wi_three", "operator")
     )
 
     assert_rejected(
@@ -309,7 +309,7 @@ defmodule Tightbeam.ToplinesRailsTest do
     insert!(
       db,
       "topline_work_memberships",
-      membership_row(membership_id, topline_id, "wi_one", "flynn")
+      membership_row(membership_id, topline_id, "wi_one", "operator")
     )
 
     insert!(db, "topline_concerns", concern_row(concern_id, topline_id))
@@ -318,11 +318,11 @@ defmodule Tightbeam.ToplinesRailsTest do
   defp topline_row(id) do
     %{
       id: id,
-      ownerUserId: "flynn",
+      ownerUserId: "operator",
       title: "Intent",
       state: "open",
       createdActorKind: "user",
-      createdActorRef: "flynn",
+      createdActorRef: "operator",
       createdAt: 10,
       updatedAt: 10,
       closedAt: nil
@@ -351,7 +351,7 @@ defmodule Tightbeam.ToplinesRailsTest do
       %{
         unlinkReason: "split",
         unlinkedActorKind: "user",
-        unlinkedActorRef: "flynn",
+        unlinkedActorRef: "operator",
         unlinkedAt: 20
       },
       overrides
@@ -364,7 +364,7 @@ defmodule Tightbeam.ToplinesRailsTest do
       toplineId: topline_id,
       title: "Risk",
       createdActorKind: "user",
-      createdActorRef: "flynn",
+      createdActorRef: "operator",
       createdAt: 10
     }
   end
@@ -376,7 +376,7 @@ defmodule Tightbeam.ToplinesRailsTest do
       workItemId: work_item_id,
       tagReason: "addresses risk",
       taggedActorKind: "user",
-      taggedActorRef: "flynn",
+      taggedActorRef: "operator",
       taggedAt: 10
     }
   end
@@ -385,14 +385,14 @@ defmodule Tightbeam.ToplinesRailsTest do
     %{
       id: id,
       workItemId: "wi_one",
-      ownerUserId: "flynn",
+      ownerUserId: "operator",
       cause: "created",
       causeRef: "wi_one",
       sourceCausalEventSeq: nil,
       resolutionCausalEventSeq: nil,
       historyCausalSeq: 0,
       openedActorKind: "user",
-      openedActorRef: "flynn",
+      openedActorRef: "operator",
       state: "pending",
       openedAt: 10,
       dueAt: 10,
@@ -409,7 +409,7 @@ defmodule Tightbeam.ToplinesRailsTest do
       %{
         state: state,
         resolutionActorKind: "user",
-        resolutionActorRef: "flynn",
+        resolutionActorRef: "operator",
         resolutionReason: "placed",
         resolvedAt: 20
       },
@@ -425,7 +425,7 @@ defmodule Tightbeam.ToplinesRailsTest do
       membershipId: nil,
       concernId: nil,
       actorKind: "user",
-      actorRef: "flynn",
+      actorRef: "operator",
       reason: nil,
       eventAt: 10,
       detail: ~s({"title":"Intent"})
