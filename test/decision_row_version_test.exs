@@ -174,7 +174,10 @@ defmodule Tightbeam.DecisionRowVersionTest do
     insert_operator(db, "row-version-v20-upgrade")
     downgrade_to_v21(db)
     assert :ok = DB.execute(db, "ALTER TABLE artifacts DROP COLUMN contentSha256Verified")
-    assert {:ok, []} = DB.query(db, "UPDATE schema_stamp SET shape=?1", ["coordination-fabric-v1-phase1-v20"])
+    assert {:ok, []} =
+             DB.query(db, "UPDATE schema_stamp SET shape=?1", [
+               "coordination-fabric-v1-phase1-v20"
+             ])
 
     assert :ok = Schema.upgrade_artifact_digest_integrity_v1(db)
     assert {:ok, [[@v21]]} = DB.query(db, "SELECT shape FROM schema_stamp")

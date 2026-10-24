@@ -377,23 +377,23 @@ defmodule Tightbeam.Escalation do
   """
 
   @current_versioned_terminal_insert_trigger String.replace(
-                                                @versioned_terminal_insert_trigger,
-                                                "CREATE TRIGGER ",
-                                                "CREATE TRIGGER IF NOT EXISTS ",
-                                                global: false
-                                              )
+                                               @versioned_terminal_insert_trigger,
+                                               "CREATE TRIGGER ",
+                                               "CREATE TRIGGER IF NOT EXISTS ",
+                                               global: false
+                                             )
   @current_versioned_terminal_update_trigger String.replace(
-                                                @versioned_terminal_update_trigger,
-                                                "CREATE TRIGGER ",
-                                                "CREATE TRIGGER IF NOT EXISTS ",
-                                                global: false
-                                              )
+                                               @versioned_terminal_update_trigger,
+                                               "CREATE TRIGGER ",
+                                               "CREATE TRIGGER IF NOT EXISTS ",
+                                               global: false
+                                             )
   @current_decision_row_version_trigger String.replace(
-                                    @decision_row_version_trigger,
-                                    "CREATE TRIGGER ",
-                                    "CREATE TRIGGER IF NOT EXISTS ",
-                                    global: false
-                                  )
+                                         @decision_row_version_trigger,
+                                         "CREATE TRIGGER ",
+                                         "CREATE TRIGGER IF NOT EXISTS ",
+                                         global: false
+                                       )
 
   @current_ddl String.replace(
                  @ddl,
@@ -588,7 +588,9 @@ defmodule Tightbeam.Escalation do
 
   defp preflight_ruled_decision_integrity_in_txn(txn) do
     txn
-    |> Txn.q("SELECT #{@pre_version_request_columns} FROM decision_requests WHERE status = 'ruled'")
+    |> Txn.q(
+      "SELECT #{@pre_version_request_columns} FROM decision_requests WHERE status = 'ruled'"
+    )
     |> Enum.each(fn row ->
       request = request_from_row(row)
 
