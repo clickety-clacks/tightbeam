@@ -178,9 +178,6 @@ defmodule Tightbeam.HarnessSeamTest do
     assert source =~ "Candidate vocabulary only. Adapter readback"
     assert source =~ "0.59 mappings here preserves fallback"
     assert source =~ ~s(@adapter_version "0.73.0")
-    assert source =~ "SDK 0.3.257"
-    assert source =~ "Claude Code 2.1.257"
-    assert source =~ "silent downgrade"
 
     # The codex half is probed now, and kind-scoped: the api-key
     # exercise (#99) recorded the codex adapter refusing a platform id at

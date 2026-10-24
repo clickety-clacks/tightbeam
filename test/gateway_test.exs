@@ -4271,7 +4271,7 @@ defmodule Tightbeam.GatewayTest do
           harness: "codex",
           provider: "openai",
           model: "gpt-5.6-example",
-          idempotency_key: "synthetic-remedy-spawn"
+          idempotency_key: "rail-dispatch:hire-reviewer:subject:1"
         }
       })
 
@@ -5057,10 +5057,10 @@ defmodule Tightbeam.GatewayTest do
         model: nil
       })
 
-    assert %{is_admin: false} = Devices.user(ctx.db, "non-admin-user")
+    assert %{is_admin: false} = Devices.user(ctx.db, "non-admin")
 
-    non_admin = create_session(ctx.db, "non-admin-session", "non-admin-user")
-    Roles.create!(ctx.db, "sample-role", "non-admin-user", non_admin.session_key)
+    non_admin = create_session(ctx.db, "non-admin-session", "non-admin")
+    Roles.create!(ctx.db, "sample-role", "non-admin", non_admin.session_key)
 
     assert %{host_environment: %{"valuePresent" => true}, changed: true} =
              handlers["host-env-set"].(%{

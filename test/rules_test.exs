@@ -344,6 +344,8 @@ defmodule Tightbeam.RulesTest do
 
   test "caller facts cover origin, admin, multi-role, unbound, retired, and malformed cases",
        ctx do
+    ensure_users(ctx.db, ["admin-user"])
+
     {:pending, _} =
       Devices.pair(ctx.db, %{
         device_id: "d2",
