@@ -429,16 +429,16 @@ defmodule Tightbeam.SchemaShapeTest do
          actionKey,question,options,context,status,decision,ruledBy,ruledAt,
          rulingFactId,consumedAt)
       VALUES
-        ('dr_00000000-0000-4000-8000-000000000004','sample-user','agent:raiser','agent:raiser:legacy','sample-user',1,2,
+        ('dr_00000000-0000-4000-8000-000000000004','operator','agent:raiser','agent:raiser:legacy','sample-user',1,2,
          'legacy-complete','legacy complete','[{"label":"accept"}]','{}','ruled','accept',
          'user:sample-user',11,11,NULL),
-        ('dr_00000000-0000-4000-8000-000000000002','sample-user','agent:raiser','agent:raiser:legacy','sample-user',1,2,
+        ('dr_00000000-0000-4000-8000-000000000002','operator','agent:raiser','agent:raiser:legacy','sample-user',1,2,
          'legacy-missing-fact-id','legacy missing fact id','[{"label":"accept"}]','{}','ruled','accept',
          'user:sample-user',12,NULL,NULL),
-        ('dr_00000000-0000-4000-8000-000000000003','sample-user','agent:raiser','agent:raiser:legacy','sample-user',1,2,
+        ('dr_00000000-0000-4000-8000-000000000003','operator','agent:raiser','agent:raiser:legacy','sample-user',1,2,
          'legacy-missing-fact','legacy missing fact','[{"label":"accept"}]','{}','ruled','accept',
          'user:sample-user',14,999,NULL),
-        ('dr_00000000-0000-4000-8000-000000000001','sample-user','agent:raiser','agent:raiser:legacy','sample-user',1,2,
+        ('dr_00000000-0000-4000-8000-000000000001','operator','agent:raiser','agent:raiser:legacy','sample-user',1,2,
          'legacy-consumed','legacy consumed','[{"label":"accept"}]','{}','consumed','accept',
          'user:sample-user',13,13,13);
       DROP TABLE IF EXISTS decision_request_integrity_evidence;

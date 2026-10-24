@@ -81,7 +81,7 @@ defmodule Tightbeam.HarnessHealthTest do
       owner_user_id: "sample-user",
       origin: "user:sample-user",
       archetype: "coder",
-      host: "test-host",
+      host: "secondary-test-host",
       harness: "claude",
       provider: "anthropic",
       model: Model.new("claude-fable-5"),
@@ -425,7 +425,7 @@ defmodule Tightbeam.HarnessHealthTest do
       observed_at: 20,
       correlation_id: "normal-turn-20",
       cause: "normal turn delivered",
-      principal: "process:tightbeam"
+      principal: "process:automation"
     }
 
     assert {:resolved, resolved} = HarnessHealth.resolve(ctx.db, resolution)
@@ -488,7 +488,7 @@ defmodule Tightbeam.HarnessHealthTest do
       observed_at: 10,
       correlation_id: "wrong-membership",
       cause: "terminal recovery-chain failure",
-      principal: "process:tightbeam"
+      principal: "process:automation"
     }
 
     assert_raise ArgumentError,

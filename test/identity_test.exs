@@ -299,7 +299,7 @@ defmodule Tightbeam.IdentityTest do
     activity_table = File.read!(Path.join(shipped, "preferred-models.md"))
 
     assert :crypto.hash(:sha256, activity_table) |> Base.encode16(case: :lower) ==
-             "cb83022d922c887ada0ea035d33436a226daaec1f0c38109799076952a82d423"
+             "fc5e9fb10dc529a3945a19eda6262d23d420e123ce34d0c9a39003cdad29c9c0"
 
     refute File.exists?(Path.join(guidance_dir, "model-policy.md"))
 
@@ -893,7 +893,7 @@ defmodule Tightbeam.IdentityTest do
     assert edit!(ctx.base, "coder", :guidance, "no-identity-edit", "user:sample-user")
 
     assert git!(dir, ["log", "-1", "--format=%an <%ae>", "main"]) ==
-             "user:sample-user <user-sample-user@example.invalid>"
+             "user:sample-user <user-sample-user@tightbeam.local>"
 
     File.write!(Path.join(ctx.source, "guidance/new.md"), "new-source")
 

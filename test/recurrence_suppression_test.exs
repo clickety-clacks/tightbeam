@@ -11,10 +11,10 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind, createdAt) VALUES ('operator', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId,isAdmin,creationKind, createdAt) VALUES ('sample-user', 1, 'admin_add', 1)"
       )
 
-    main = session(db, "agent:main:clawline:operator:main", nil, "main")
+    main = session(db, "agent:main:clawline:sample-user:main", nil, "main")
     parent = session(db, "parent", main.session_key, "custom")
     target = session(db, "target", parent.session_key, "custom")
 

@@ -823,7 +823,7 @@ defmodule Tightbeam.Wire.RouterTest do
     response =
       conn(
         :patch,
-        "/api/streams/agent%253Amain%253Aclawline%253Aexample%253Amain%2520s_request_path",
+        "/api/streams/agent%253Amain%253Aclawline%253Asample-user%253Amain%2520s_request_path",
         JSON.encode!(%{"displayName" => "Renamed"})
       )
       |> put_req_header("authorization", "Bearer #{ctx.device.token}")
@@ -846,7 +846,7 @@ defmodule Tightbeam.Wire.RouterTest do
     response =
       conn(
         :delete,
-        "/api/streams/agent%253Amain%253Aclawline%253Aexample%253Amain%2520s_request_path",
+        "/api/streams/agent%253Amain%253Aclawline%253Asample-user%253Amain%2520s_request_path",
         JSON.encode!(%{})
       )
       |> put_req_header("authorization", "Bearer #{ctx.device.token}")
@@ -1141,19 +1141,19 @@ defmodule Tightbeam.Wire.RouterTest do
   test "typed target grammar distinguishes keys, users, and roles without unions", ctx do
     {:pending, _device} =
       Devices.pair(ctx.db, %{
-        device_id: "operator-device",
-        claimed_name: "Sample User",
+        device_id: "target-user-device",
+        claimed_name: "Target User",
         platform: nil,
         model: nil
       })
 
-    main_key = Org.personal_session_key("sample-user")
+    main_key = Org.personal_session_key("target-user")
 
     Org.create(ctx.db, %{
       session_key: main_key,
       display_name: "Main",
-      owner_user_id: "sample-user",
-      origin: "user:sample-user",
+      owner_user_id: "target-user",
+      origin: "user:target-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -1161,13 +1161,13 @@ defmodule Tightbeam.Wire.RouterTest do
       model: Model.new("fable")
     })
 
-    assert dispatch_wake(ctx, %{"userId" => "sample-user"}).status == 200
+    assert dispatch_wake(ctx, %{"userId" => "target-user"}).status == 200
     assert_receive {:call, %{verb: "wake", session_key: ^main_key, target_role: nil}}
 
-    # The type is the FIELD: "sample-user" as a role is a role lookup, never a user.
-    bare_user = dispatch_wake(ctx, %{"role" => "sample-user"})
+    # The type is the FIELD: "target-user" as a role is a role lookup, never a user.
+    bare_user = dispatch_wake(ctx, %{"role" => "target-user"})
     assert bare_user.status == 404
-    assert JSON.decode!(bare_user.resp_body)["error"]["message"] == "unknown role: operator"
+    assert JSON.decode!(bare_user.resp_body)["error"]["message"] == "unknown role: target-user"
 
     unknown_user = dispatch_wake(ctx, %{"userId" => "missing"})
     assert unknown_user.status == 404
@@ -1177,7 +1177,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert retired.status == 400
     assert JSON.decode!(retired.resp_body)["error"]["message"] =~ ~s("target" is retired)
 
-    union = dispatch_wake(ctx, %{"role" => "x", "userId" => "sample-user"})
+    union = dispatch_wake(ctx, %{"role" => "x", "userId" => "target-user"})
     assert union.status == 400
 
     assert JSON.decode!(union.resp_body)["error"]["message"] ==
@@ -1187,8 +1187,8 @@ defmodule Tightbeam.Wire.RouterTest do
       Org.create(ctx.db, %{
         session_key: "agent:direct",
         display_name: "Direct",
-        owner_user_id: "sample-user",
-        origin: "user:sample-user",
+        owner_user_id: "target-user",
+        origin: "user:target-user",
         archetype: "default",
         host: "testhost",
         harness: "claude",
@@ -1206,8 +1206,8 @@ defmodule Tightbeam.Wire.RouterTest do
     Org.create(ctx.db, %{
       session_key: "role-session",
       display_name: "Role holder",
-      owner_user_id: "sample-user",
-      origin: "user:sample-user",
+      owner_user_id: "target-user",
+      origin: "user:target-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -1215,16 +1215,16 @@ defmodule Tightbeam.Wire.RouterTest do
       model: Model.new("fable")
     })
 
-    Roles.create!(ctx.db, "sample-user", "sample-user", "role-session")
-    Roles.create!(ctx.db, "fallback", "sample-user", nil)
+    Roles.create!(ctx.db, "target-user", "target-user", "role-session")
+    Roles.create!(ctx.db, "fallback", "target-user", nil)
 
-    assert dispatch_wake(ctx, %{"role" => "sample-user"}).status == 200
+    assert dispatch_wake(ctx, %{"role" => "target-user"}).status == 200
 
     assert_receive {:call,
                     %{
                       verb: "wake",
                       session_key: "role-session",
-                      target_role: "sample-user",
+                      target_role: "target-user",
                       role_fallback: false
                     }}
 
@@ -1690,7 +1690,7 @@ defmodule Tightbeam.Wire.RouterTest do
     end
 
     wrong_user =
-      dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "sample-user"})
+      dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "other-user"})
 
     assert wrong_user.status == 403
 

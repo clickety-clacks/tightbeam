@@ -175,8 +175,8 @@ defmodule Tightbeam.HarnessSeamTest do
 
     # The note is the load-bearing half — it must carry the version it was probed at.
     source = File.read!(Path.join(File.cwd!(), "lib/tightbeam/harness/claude.ex"))
-    assert source =~ "claude CLI 2.1.220"
-    assert source =~ "claude-agent-acp 0.59.0"
+    assert source =~ "Candidate vocabulary only. Adapter readback"
+    assert source =~ "0.59 mappings here preserves fallback"
     assert source =~ ~s(@adapter_version "0.73.0")
     assert source =~ "SDK 0.3.257"
     assert source =~ "Claude Code 2.1.257"

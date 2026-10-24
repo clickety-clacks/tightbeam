@@ -242,14 +242,14 @@ defmodule Tightbeam.ConditionFactsTest do
     assert {:error, %{code: "reserved_kind"}} =
              ConditionFacts.file(ctx.db, ctx.scheduler, %{
                kind: "quota-recovered",
-               scope: "codex:model",
+               scope: "codex:sol",
                origin: "process:ci"
              })
 
     allowed =
       ConditionFacts.file(ctx.db, ctx.scheduler, %{
         kind: "quota-recovered",
-        scope: "codex:model",
+        scope: "codex:sol",
         origin: "process:automation"
       })
 

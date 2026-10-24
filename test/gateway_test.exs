@@ -4270,7 +4270,8 @@ defmodule Tightbeam.GatewayTest do
           handle: "remedy-reviewer",
           harness: "codex",
           provider: "openai",
-          model: "gpt-5.6-example"
+          model: "gpt-5.6-example",
+          idempotency_key: "synthetic-remedy-spawn"
         }
       })
 
@@ -5050,16 +5051,16 @@ defmodule Tightbeam.GatewayTest do
 
     {:pending, _operator_device} =
       Devices.pair(ctx.db, %{
-        device_id: "sample-user-device",
-        claimed_name: "Sample User",
+        device_id: "non-admin-device",
+        claimed_name: "Non Admin",
         platform: nil,
         model: nil
       })
 
-    assert %{is_admin: false} = Devices.user(ctx.db, "operator")
+    assert %{is_admin: false} = Devices.user(ctx.db, "non-admin-user")
 
-    operator = create_session(ctx.db, "operator-session", "operator")
-    Roles.create!(ctx.db, "operator", "operator", operator.session_key)
+    non_admin = create_session(ctx.db, "non-admin-session", "non-admin-user")
+    Roles.create!(ctx.db, "sample-role", "non-admin-user", non_admin.session_key)
 
     assert %{host_environment: %{"valuePresent" => true}, changed: true} =
              handlers["host-env-set"].(%{
@@ -5074,7 +5075,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{code: "forbidden", message: "admin required"} =
              handlers["host-env-set"].(%{
-               origin: "agent:operator",
+               origin: "agent:sample-role",
                params: %{
                  host: host,
                  harness: "claude",
@@ -5085,13 +5086,13 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{code: "forbidden", message: "admin required"} =
              handlers["host-env-unset"].(%{
-               origin: "agent:operator",
+               origin: "agent:sample-role",
                params: %{host: host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR"}
              })
 
     assert %{code: "forbidden", message: "admin required"} =
              handlers["host-env-list"].(%{
-               origin: "agent:operator",
+               origin: "agent:sample-role",
                params: %{host: host, harness: "claude"}
              })
   end

@@ -171,7 +171,7 @@ defmodule Tightbeam.RecordNoticeTest do
       EventLog.notice(ctx.db, "endpoint_not_provisioned", "remote-host", "ssh refused",
         audience: {:ambient, "sample-user"},
         attention: :low,
-        message: "[host unreachable]\n\ntest host did not answer.",
+        message: "[host unreachable]\n\nremote-host did not answer.",
         conn_registry: ctx.registry
       )
 

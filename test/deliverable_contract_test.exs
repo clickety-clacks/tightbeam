@@ -2199,7 +2199,7 @@ defmodule Tightbeam.DeliverableContractTest do
       assert is_binary(source)
 
       assert :crypto.hash(:sha256, source) |> Base.encode16(case: :lower) ==
-               "cbaa8a3f2aabde64e20cb372be343f8d583d08219a6e95d92d73ad7e93de008a"
+               "b93d96b63190e561a07328b6f4726fd13a58de0a53cbb37742c0bcb46f03960d"
 
       renamed =
         String.replace(

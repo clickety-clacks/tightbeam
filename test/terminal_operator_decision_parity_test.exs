@@ -520,7 +520,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
     assert {:error, %DB.Error{message: insert_message}} =
              DB.query(
                ctx.db,
-               "INSERT INTO decision_requests (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,actionKey,question,options,context,status,decision,ruledBy,ruledAt,rulingFactId) VALUES ('dr_incomplete_insert','sample-user','agent:raiser','agent:raiser:app','sample-user',1,2,'insert','insert?','[{\"label\":\"accept\"}]','{}','ruled','accept','user:sample-user',1,1)"
+               "INSERT INTO decision_requests (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,actionKey,question,options,context,status,decision,ruledBy,ruledAt,rulingFactId) VALUES ('dr_incomplete_insert','operator','agent:raiser','agent:raiser:app','sample-user',1,2,'insert','insert?','[{\"label\":\"accept\"}]','{}','ruled','accept','user:sample-user',1,1)"
              )
 
     assert insert_message =~ "decision_request_integrity_invalid"

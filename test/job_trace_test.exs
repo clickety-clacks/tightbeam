@@ -43,7 +43,7 @@ defmodule Tightbeam.JobTraceTest do
 
       INSERT INTO assignments
         (id, subject, holderKey, openedBySession, openedAt, state, reviewsAssignmentId)
-      VALUES;
+      VALUES ('asg_review', 'review', 'reviewer', 'reviewer', 4, 'open', 'asg_direct');
 
       INSERT INTO supervision_entitlements
         (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
