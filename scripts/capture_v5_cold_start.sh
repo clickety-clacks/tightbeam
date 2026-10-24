@@ -9,7 +9,7 @@ trap 'test -d "$CAPTURE" && rm -rf "$CAPTURE"' EXIT HUP INT TERM
 git clone --no-local "$SOURCE" "$CAPTURE/source"
 git -C "$CAPTURE/source" checkout --detach d00e06aea578d711e608637d38a97872487df15e
 
-(cd "$CAPTURE/source" && /home/mike/.cargo/bin/cargo build --release --manifest-path cli/Cargo.toml)
+(cd "$CAPTURE/source" && $HOME/.cargo/bin/cargo build --release --manifest-path cli/Cargo.toml)
 (cd "$CAPTURE/source" && mise exec -- mix deps.get)
 (cd "$CAPTURE/source" && env MIX_ENV=prod mise exec -- mix release)
 
@@ -18,7 +18,7 @@ mkdir -p "$CAPTURE/empty" "$CAPTURE/healthy" "$CAPTURE/user-only" \
 
 RELEASE="$CAPTURE/source/_build/prod/rel/tightbeam_gateway/bin/tightbeam_gateway"
 CLI="$CAPTURE/source/cli/target/release/tightbeam"
-CAPTURE_PATH="$CAPTURE/source/priv/harness_cli:/home/mike/.local/bin:/usr/local/bin:/usr/bin:/bin"
+CAPTURE_PATH="$CAPTURE/source/priv/harness_cli:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
 release_command() {
   env -u RELEASE_BOOT_SCRIPT -u RELEASE_BOOT_SCRIPT_CLEAN -u RELEASE_COMMAND \

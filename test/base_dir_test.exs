@@ -58,8 +58,8 @@ defmodule Tightbeam.BaseDirTest do
     #
     # It scans `lib/` only, and that limit cost us: the CLI had THREE more resolvers
     # in Rust, none of them reading TIGHTBEAM_BASE_DIR, and this assertion could not
-    # see them. The shrdlu smoke found them one commit later, when `tightbeam
-    # onboard` dispatched to an unrelated org. The Rust half of the invariant lives
+    # see them. A later integration check found them when `tightbeam onboard`
+    # dispatched to a different gateway. The Rust half of the invariant lives
     # where it can see — `cli/src/base_dir.rs`, `exactly_one_resolver_exists_in_the_cli`
     # — and both halves must agree on precedence, empty strings included.
     readers =

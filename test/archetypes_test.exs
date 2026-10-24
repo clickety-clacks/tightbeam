@@ -172,7 +172,7 @@ defmodule Tightbeam.ArchetypesTest do
 
       pre_learn = body |> String.split("## AFTER LEARNING A KUNGFU", parts: 2) |> hd()
 
-      # BOUNDED BY DESIGN (reviewer-ruled): this catches CARELESSNESS, not an adversary.
+      # BOUNDED BY DESIGN: this catches CARELESSNESS, not an adversary.
       # Paraphrases get through ("ask a delivery specialist to take ownership") and that
       # residual is acceptable. What is NOT acceptable is blocking honest text, and a
       # hand-built verb list did exactly that: "spawn a product" rejected "spawn a
@@ -228,7 +228,7 @@ defmodule Tightbeam.ArchetypesTest do
     end
 
     Identity.init!(ctx.base_dir)
-    assert {:ok, _revision} = learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+    assert {:ok, _revision} = learn!(ctx.base_dir, "agentic-engineering", "user:operator")
     revision = Identity.live_revision!(ctx.base_dir)
 
     for role <- ~w(product-owner orchestrator), harness <- [:codex, :claude] do
@@ -244,7 +244,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
 
     loaded = Archetypes.load!(ctx.base_dir)
 
@@ -356,7 +356,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
 
     revision = Identity.live_revision!(ctx.base_dir)
 
@@ -387,7 +387,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
 
     revision = Identity.live_revision!(ctx.base_dir)
 
@@ -520,7 +520,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
 
     revision = Identity.live_revision!(ctx.base_dir)
 
@@ -554,7 +554,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
 
     loaded = Archetypes.load!(ctx.base_dir)
     revision = Identity.live_revision!(ctx.base_dir)
@@ -587,7 +587,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
 
     loaded = Archetypes.load!(ctx.base_dir)
     revision = Identity.live_revision!(ctx.base_dir)
@@ -650,7 +650,7 @@ defmodule Tightbeam.ArchetypesTest do
   test "kungfu scaffold rejects every invalid name class before identity mutation", ctx do
     for name <- ["", "-demo", "Demo", "demo_name", "demo--name", "demo-"] do
       assert_raise ArgumentError, ~r/invalid kungfu name/, fn ->
-        scaffold_kungfu!(ctx.base_dir, name, "A useful capability.", "user:flynn")
+        scaffold_kungfu!(ctx.base_dir, name, "A useful capability.", "user:operator")
       end
 
       refute File.exists?(Path.join(ctx.base_dir, "identity/.git"))
@@ -660,7 +660,7 @@ defmodule Tightbeam.ArchetypesTest do
   test "kungfu scaffold requires purpose before identity mutation", ctx do
     for purpose <- [nil, "", "  "] do
       assert_raise ArgumentError, "kungfu purpose is required", fn ->
-        scaffold_kungfu!(ctx.base_dir, "demo", purpose, "user:flynn")
+        scaffold_kungfu!(ctx.base_dir, "demo", purpose, "user:operator")
       end
 
       refute File.exists?(Path.join(ctx.base_dir, "identity/.git"))
@@ -687,7 +687,7 @@ defmodule Tightbeam.ArchetypesTest do
                        base_dir,
                        name,
                        "A useful capability.",
-                       "user:flynn"
+                       "user:operator"
                      )
                    end
 
@@ -706,7 +706,7 @@ defmodule Tightbeam.ArchetypesTest do
         ctx.base_dir,
         "demo",
         ~s(Help teams turn "ideas" into shipped work.\nKeep it accountable.),
-        "user:flynn"
+        "user:operator"
       )
 
     identity_dir = Path.join(ctx.base_dir, "identity")
@@ -717,7 +717,7 @@ defmodule Tightbeam.ArchetypesTest do
              git!(identity_dir, ["rev-parse", "tightbeam/live"])
 
     assert git!(identity_dir, ["log", "-1", "--format=%s|%an"]) ==
-             "kungfu-scaffold: demo|user:flynn"
+             "kungfu-scaffold: demo|user:operator"
 
     assert Archetypes.load!(ctx.base_dir)["demo-role"].skills == []
   end
@@ -797,7 +797,7 @@ defmodule Tightbeam.ArchetypesTest do
   test "where wildcard must stand alone and where must be non-empty", ctx do
     path = Path.join(manifests_dir!(ctx.base_dir), "bad.toml")
 
-    File.write!(path, "name = \"bad\"\nwhere = [\"*\", \"eezo\"]\n")
+    File.write!(path, "name = \"bad\"\nwhere = [\"*\", \"test-host\"]\n")
 
     assert_raise ArgumentError, ~r/must be the only element/, fn ->
       Archetypes.load!(ctx.base_dir)

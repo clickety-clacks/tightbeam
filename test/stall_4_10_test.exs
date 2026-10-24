@@ -12,38 +12,38 @@ defmodule Tightbeam.Stall410Test do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('mike',0,'admin_add',1),('other',0,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',0,'admin_add',1),('other',0,'admin_add',1)"
       )
 
-    mike_session = session(db, Org.personal_session_key("mike"), "mike")
+    example_session = session(db, Org.personal_session_key("operator"), "operator")
     _other_session = session(db, Org.personal_session_key("other"), "other")
-    %{db: db, mike_session: mike_session}
+    %{db: db, example_session: example_session}
   end
 
-  test "direct and relayed Mike provenance qualify; another user's item does not", ctx do
-    direct = create(ctx.db, {:user, "mike"}, "direct")
-    relayed = create(ctx.db, {:session, ctx.mike_session.session_key}, "relayed")
+  test "direct and relayed user provenance qualify; another user's item does not", ctx do
+    direct = create(ctx.db, {:user, "operator"}, "direct")
+    relayed = create(ctx.db, {:session, ctx.example_session.session_key}, "relayed")
     other = create(ctx.db, {:user, "other"}, "other")
-    behind = create(ctx.db, {:user, "mike"}, "behind")
+    behind = create(ctx.db, {:user, "operator"}, "behind")
 
-    assert %{mode: "notice"} = deprioritize(ctx.db, {:user, "mike"}, direct.id, behind.id, "d1")
-    assert %{mode: "notice"} = deprioritize(ctx.db, {:user, "mike"}, relayed.id, behind.id, "d2")
+    assert %{mode: "notice"} = deprioritize(ctx.db, {:user, "operator"}, direct.id, behind.id, "d1")
+    assert %{mode: "notice"} = deprioritize(ctx.db, {:user, "operator"}, relayed.id, behind.id, "d2")
 
-    assert %{code: "not_mike_sourced"} =
+    assert %{code: "not_example_sourced"} =
              deprioritize(ctx.db, {:user, "other"}, other.id, other.id, "o1")
 
     assert {:ok, [[4]]} = DB.query(ctx.db, "SELECT count(*) FROM work_item_sources")
   end
 
   test "notice is exactly once on keyed replay and wrong owner cannot file it", ctx do
-    item = create(ctx.db, {:user, "mike"}, "item")
-    behind = create(ctx.db, {:user, "mike"}, "behind")
+    item = create(ctx.db, {:user, "operator"}, "item")
+    behind = create(ctx.db, {:user, "operator"}, "behind")
 
-    first = deprioritize(ctx.db, {:user, "mike"}, item.id, behind.id, "same")
+    first = deprioritize(ctx.db, {:user, "operator"}, item.id, behind.id, "same")
     assert %{mode: "notice"} = first
 
     assert %{replayed: true, mode: "notice"} =
-             deprioritize(ctx.db, {:user, "mike"}, item.id, behind.id, "same")
+             deprioritize(ctx.db, {:user, "operator"}, item.id, behind.id, "same")
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -57,14 +57,14 @@ defmodule Tightbeam.Stall410Test do
   end
 
   test "owner session can ask which named priority wins", ctx do
-    item = create(ctx.db, {:user, "mike"}, "item")
-    behind = create(ctx.db, {:user, "mike"}, "behind")
+    item = create(ctx.db, {:user, "operator"}, "item")
+    behind = create(ctx.db, {:user, "operator"}, "behind")
 
     assert %{mode: "decision_request", decisionRequest: %{kind: "operator"} = request} =
              WorkItems.__handle__(
                ctx.db,
                "work-item-deprioritize",
-               call({:session, ctx.mike_session.session_key}, %{
+               call({:session, ctx.example_session.session_key}, %{
                  work_item_id: item.id,
                  behind_work_item_id: behind.id,
                  mode: :ask,
@@ -79,7 +79,7 @@ defmodule Tightbeam.Stall410Test do
              WorkItems.__handle__(
                ctx.db,
                "work-item-deprioritize",
-               call({:session, ctx.mike_session.session_key}, %{
+               call({:session, ctx.example_session.session_key}, %{
                  work_item_id: item.id,
                  behind_work_item_id: behind.id,
                  mode: :ask,
@@ -89,7 +89,7 @@ defmodule Tightbeam.Stall410Test do
   end
 
   test "moving a boundary rearms it and only the current generation escalates", ctx do
-    item = create(ctx.db, {:user, "mike"}, "goal")
+    item = create(ctx.db, {:user, "operator"}, "goal")
     first = boundary(ctx.db, item.id, "design ready", 1000, "b1")
     second = boundary(ctx.db, item.id, "implementation ready", 1000, "b2")
     assert second.generation == first.generation + 1
@@ -124,7 +124,7 @@ defmodule Tightbeam.Stall410Test do
           {"work-item-icebox", "iceboxed", %{}},
           {"work-item-fail", "failed", %{reason: "no longer viable"}}
         ] do
-      item = create(ctx.db, {:user, "mike"}, "#{target} goal")
+      item = create(ctx.db, {:user, "operator"}, "#{target} goal")
       horizon = boundary(ctx.db, item.id, "#{target} boundary", 1_000, "#{target}-horizon")
       params = maybe_add_completion_fixture(ctx.db, verb, item.id, params)
 
@@ -132,7 +132,7 @@ defmodule Tightbeam.Stall410Test do
                WorkItems.__handle__(
                  ctx.db,
                  verb,
-                 call({:user, "mike"}, Map.put(params, :work_item_id, item.id))
+                 call({:user, "operator"}, Map.put(params, :work_item_id, item.id))
                )
 
       assert {:ok, [["canceled", nil]]} =
@@ -173,7 +173,7 @@ defmodule Tightbeam.Stall410Test do
 
   test "terminal delivery race orders preserve true prior escalation and reject late replay",
        ctx do
-    delivered_first = create(ctx.db, {:user, "mike"}, "delivered first")
+    delivered_first = create(ctx.db, {:user, "operator"}, "delivered first")
     first_horizon = boundary(ctx.db, delivered_first.id, "first", 1_000, "race-first")
 
     {:ok, :ok} =
@@ -187,7 +187,7 @@ defmodule Tightbeam.Stall410Test do
              WorkItems.__handle__(
                ctx.db,
                "work-item-close",
-               call({:user, "mike"}, %{
+               call({:user, "operator"}, %{
                  work_item_id: delivered_first.id,
                  completion_attest_id: completion_fixture!(ctx.db, delivered_first.id)
                })
@@ -207,14 +207,14 @@ defmodule Tightbeam.Stall410Test do
                [delivered_first.id]
              )
 
-    terminal_first = create(ctx.db, {:user, "mike"}, "terminal first")
+    terminal_first = create(ctx.db, {:user, "operator"}, "terminal first")
     second_horizon = boundary(ctx.db, terminal_first.id, "second", 1_000, "race-second")
 
     assert %{ok: true} =
              WorkItems.__handle__(
                ctx.db,
                "work-item-close",
-               call({:user, "mike"}, %{
+               call({:user, "operator"}, %{
                  work_item_id: terminal_first.id,
                  completion_attest_id: completion_fixture!(ctx.db, terminal_first.id)
                })
@@ -266,7 +266,7 @@ defmodule Tightbeam.Stall410Test do
       WorkItems.__handle__(
         db,
         "work-item-boundary",
-        call({:user, "mike"}, %{
+        call({:user, "operator"}, %{
           work_item_id: item,
           boundary: boundary,
           horizon_ms: horizon,
@@ -285,12 +285,12 @@ defmodule Tightbeam.Stall410Test do
         suffix = Tightbeam.Id.uuid4()
         assignment_id = "asg_" <> suffix
         attest_id = "att_" <> suffix
-        holder = Org.personal_session_key("mike")
+        holder = Org.personal_session_key("operator")
         ts = System.system_time(:millisecond)
 
         Txn.q(
           txn,
-          "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES (?1,'terminal close fixture',?2,'mike',?3,'open',?4)",
+          "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES (?1,'terminal close fixture',?2,'operator',?3,'open',?4)",
           [assignment_id, holder, ts, work_item_id]
         )
 
@@ -344,8 +344,8 @@ defmodule Tightbeam.Stall410Test do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("fable"),
-      host: "eezo"
+      model: Model.new("example-model"),
+      host: "test-host"
     })
   end
 end

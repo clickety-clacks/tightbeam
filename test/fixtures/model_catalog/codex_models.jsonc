@@ -2,13 +2,13 @@
 // chatgpt.com/backend-api/codex/models?client_version=0.145.0 (codex-cli 0.145.0).
 // Byte-identical to the 2026-07-25 capture of ~/.codex/models_cache.json, which is
 // what established that the cache was only ever a copy of this answer. Real
-// gpt-5.6-sol row trimmed to consumed fields.
+// gpt-5.6-example row trimmed to consumed fields.
 // Right-sizing: assert only consumed fields and relied-on invariants; additive unconsumed fields must not fail.
 {
   "models": [
     {
-      "slug": "gpt-5.6-sol",
-      "display_name": "GPT-5.6-Sol",
+      "slug": "gpt-5.6-example",
+      "display_name": "GPT-5.6-Example",
       "supported_reasoning_levels": [
         {
           "effort": "low",

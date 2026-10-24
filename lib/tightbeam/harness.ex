@@ -42,10 +42,8 @@ defmodule Tightbeam.Harness do
   @doc """
   The model a fresh org runs on this harness when nobody has chosen one.
 
-  A CONSTANT in the boot path used to name claude-sonnet-5 whatever harness was
-  in play, so a codex-only box defaulted to a model its harness cannot run and
-  failed on the first turn naming a vendor the operator never installed
-  (Flynn, 2026-08-04). Each harness names its own.
+  Each harness supplies its own default model so a system with only one configured
+  provider does not select a model belonging to another provider.
   """
   @callback default_model() :: Tightbeam.Model.t()
   @callback install_package() :: binary()
@@ -74,7 +72,7 @@ defmodule Tightbeam.Harness do
 
   Some harnesses learn what an account is entitled to only by ASKING the server, and cache
   the answer in their own home. Claude Code does: its extra model options -- a 1M-context
-  Opus, Fable -- arrive in `additionalModelOptionsCache` on first use and are absent from a
+  Opus, Example Model -- arrive in `additionalModelOptionsCache` on first use and are absent from a
   cold home, so a catalog derived before anything has run reports a subset and reports it as
   the truth.
 

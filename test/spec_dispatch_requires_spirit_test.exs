@@ -15,10 +15,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     WorkItems
   }
 
-  # The adjudication postmortem's wiring fix (spec production-machine-v1 era,
-  # decisions ledger 2026-08-05): an 11-round spec pipeline ran
-  # spec->review->implementation with no product-owner edge to cross. This
-  # statute creates the edge; these tests prove it summons and releases, and
+  # This rule requires spec-backed work to receive product-owner review before
+  # implementation. These tests prove it summons and releases, and
   # that unspecced work never crosses it.
   setup do
     db = :"spirit_gate_db_#{System.unique_integer([:positive])}"
@@ -26,7 +24,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "eezo" => %{
+      "test-host" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -36,15 +34,15 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 1, 'admin_add', 1)"
       )
 
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "operator")
 
     holder = session(db, "impl-holder", "coder", "claude", "anthropic")
     owner = session(db, "po-holder", "product-owner", "codex", "openai")
     orchestrator = session(db, "slice-orchestrator", "orchestrator", "codex", "openai")
-    Roles.create!(db, "product-owner", "flynn", owner.session_key)
+    Roles.create!(db, "product-owner", "operator", owner.session_key)
 
     start_supervised!(
       {Wakes,
@@ -55,7 +53,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
       Path.join(System.tmp_dir!(), "tightbeam-spirit-gate-#{System.unique_integer([:positive])}")
 
     assert :initialized = Archetypes.init_identity!(base_dir)
-    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "flynn")
+    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "operator")
     _archetypes = Archetypes.load!(base_dir)
 
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
@@ -82,12 +80,12 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     Tightbeam.Org.create(db, %{
       session_key: key,
       display_name: key,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       archetype: archetype,
       harness: harness,
       provider: provider,
-      host: "eezo",
+      host: "test-host",
       model: Model.new("sonnet", effort: "medium"),
       spawned_by: nil,
       is_built_in: false
@@ -108,7 +106,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
 
     item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
-        principal: {:user, "flynn"},
+        principal: {:user, "operator"},
         params: params
       })
 
@@ -124,8 +122,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     {:ok, slice} =
       Dispatch.dispatch(ctx.db, ctx.handlers, %{
         verb: "assign",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:operator",
+        principal: {:user, "operator"},
         session_key: ctx.orchestrator.session_key,
         target_role: nil,
         role_fallback: false,
@@ -145,8 +143,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
   defp dispatch_call(holder_key, item_id, subject) do
     %{
       verb: "dispatch",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
@@ -202,8 +200,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     {:ok, spirit} =
       Dispatch.dispatch(ctx.db, ctx.handlers, %{
         verb: "assign",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:operator",
+        principal: {:user, "operator"},
         session_key: ctx.owner.session_key,
         target_role: nil,
         role_fallback: false,
@@ -259,8 +257,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     review_call = fn n ->
       %{
         verb: "assign",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:operator",
+        principal: {:user, "operator"},
         session_key: ctx.owner.session_key,
         target_role: nil,
         role_fallback: false,
@@ -338,8 +336,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     review_call = fn n ->
       %{
         verb: "assign",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:operator",
+        principal: {:user, "operator"},
         session_key: ctx.owner.session_key,
         target_role: nil,
         role_fallback: false,
@@ -455,8 +453,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     review_call = fn n ->
       %{
         verb: "assign",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:operator",
+        principal: {:user, "operator"},
         session_key: ctx.owner.session_key,
         target_role: nil,
         role_fallback: false,

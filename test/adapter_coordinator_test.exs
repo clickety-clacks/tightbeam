@@ -176,13 +176,13 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert {:ok, ^recovery_adapter, 6} = AdapterCoordinator.adapter_for(coordinator, key)
   end
 
-  # THE INCIDENT TEST (2026-08-14). A latched circuit vetoed the credential
+  # A latched circuit vetoed the credential
   # lifecycle's own start call, so an operator installing a WORKING credential
   # was refused by a verdict about the credential they were replacing -- and the
   # onboarding ceremony read that refusal as "this credential is bad". Recovery
   # required restarting the gateway to wipe the in-memory latch.
   #
-  # SCOPE, stated so it is not read for more than it proves (Sol xhigh): this is
+  # SCOPE, stated so it is not read for more than it proves: this is
   # a coordinator-level ADMISSION regression. It proves the latched circuit no
   # longer refuses the authoritative caller, and that ordinary checkouts are
   # still refused. It does not exercise start_provider_runtime, credential
@@ -826,7 +826,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     Task.await(second)
   end
 
-  ## Task #14 — the guard covers the ACTION, not the RECORD
+  ## The guard covers the action, not the record
 
   test "a death absorbed by a replacement is recorded and told, but restarts nothing", ctx do
     key = {:claude, "shared", "testhost"}
@@ -1059,21 +1059,21 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1)"
       )
 
-    session_key = "agent:main:clawline:flynn:main"
+    session_key = "agent:main:clawline:operator:main"
 
     Tightbeam.Org.create(db, %{
       session_key: session_key,
       display_name: "Main",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       archetype: "default",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Tightbeam.Model.new("claude-fable-5")
+      model: Tightbeam.Model.new("claude-example-5")
     })
 
     session_key
@@ -1084,7 +1084,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       Tightbeam.Ledger.enqueue(db, %{
         session_key: session_key,
         message_id: "m_#{System.unique_integer([:positive])}",
-        origin: "user:flynn",
+        origin: "user:operator",
         prompt: "do the thing"
       })
 

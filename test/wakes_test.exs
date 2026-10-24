@@ -187,28 +187,28 @@ defmodule Tightbeam.WakesTest do
       DB.execute(
         db,
         """
-        INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1);
+        INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 1, 'admin_add', 1);
         INSERT INTO sessions
           (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
            operationalParent, archetype, harness,
            provider, model, host, state, createdAt, updatedAt)
         VALUES
-          ('agent:main:clawline:flynn:main', 'Main', 'main', 1, 'flynn', 'user:flynn',
-           'agent:main:clawline:flynn:main', 'default', 'claude',
-           'anthropic', 'fable', 'eezo', 'active', 1, 1),
-          ('retiring', 'retiring', 'custom', 0, 'flynn', 'user:flynn',
-           'agent:main:clawline:flynn:main', 'default', 'claude',
-           'anthropic', 'fable', 'eezo', 'active', 1, 1),
-          ('replacement', 'replacement', 'custom', 0, 'flynn', 'user:flynn',
-           'agent:main:clawline:flynn:main', 'default', 'claude', 'anthropic',
-           'fable', 'eezo', 'active', 1, 1);
+          ('agent:main:clawline:operator:main', 'Main', 'main', 1, 'operator', 'user:operator',
+           'agent:main:clawline:operator:main', 'default', 'claude',
+           'anthropic', 'example-model', 'sixth-host', 'active', 1, 1),
+          ('retiring', 'retiring', 'custom', 0, 'operator', 'user:operator',
+           'agent:main:clawline:operator:main', 'default', 'claude',
+           'anthropic', 'example-model', 'sixth-host', 'active', 1, 1),
+          ('replacement', 'replacement', 'custom', 0, 'operator', 'user:operator',
+           'agent:main:clawline:operator:main', 'default', 'claude', 'anthropic',
+           'example-model', 'sixth-host', 'active', 1, 1);
         INSERT INTO work_items
           (id, title, ownerUserId, state, createdByUser, createdAt)
-        VALUES ('wi_retarget', 'Retarget work', 'flynn', 'open', 'flynn', 1);
+        VALUES ('wi_retarget', 'Retarget work', 'operator', 'open', 'operator', 1);
         INSERT INTO assignments
           (id, subject, holderKey, openedByUser, openedAt, workItemId)
         VALUES
-          ('asg_retarget', 'retarget me', 'retiring', 'flynn', 1,
+          ('asg_retarget', 'retarget me', 'retiring', 'operator', 1,
            'wi_retarget');
         INSERT INTO supervision_entitlements
           (assignmentId, generation, dueAt, state, lastAttemptGeneration,
@@ -257,7 +257,7 @@ defmodule Tightbeam.WakesTest do
         INSERT INTO turns
           (sessionKey,messageId,origin,prompt,assignmentId,status,createdAt,endedAt)
         VALUES
-          ('retiring','root-retarget','user:flynn','root','asg_retarget','delivered',1,2)
+          ('retiring','root-retarget','user:operator','root','asg_retarget','delivered',1,2)
         """
       )
 
@@ -364,10 +364,7 @@ defmodule Tightbeam.WakesTest do
     # Backdate the original's filing time deep into its own ceiling window —
     # 3h59m into a 4h `fyi` ceiling — so a restarted ceiling (retarget-moment
     # + ceiling_ms) is provably DIFFERENT from the preserved one, not a
-    # coincidental match (Sol xhigh review round 2, finding 1: Invariant 3 —
-    # the ceiling anchors on the wake's own creation, never on when it
-    # happened to get retargeted; recomputing it here would let this `fyi`
-    # land at 7h59m, a straight §7 violation).
+    # coincidental match.
     ceiling = Wakes.delivery_policy("fyi").ceiling_ms
     original_created_at = 1000
     original_due_at = original_created_at + ceiling - 60_000
@@ -467,12 +464,12 @@ defmodule Tightbeam.WakesTest do
   end
 
   defp active_sessions!(db, keys) do
-    main = "agent:main:clawline:flynn:main"
+    main = "agent:main:clawline:operator:main"
 
     values =
       keys
       |> Enum.map(fn key ->
-        "('#{key}', '#{key}', 'flynn', 'user:flynn', '#{main}', 'default', 'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1)"
+        "('#{key}', '#{key}', 'operator', 'user:operator', '#{main}', 'default', 'claude', 'anthropic', 'example-model', 'test-host', 'active', 1, 1)"
       end)
       |> Enum.join(",\n")
 
@@ -480,14 +477,14 @@ defmodule Tightbeam.WakesTest do
       DB.execute(
         db,
         """
-        INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1);
+        INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 1, 'admin_add', 1);
         INSERT OR IGNORE INTO sessions
           (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
            operationalParent, archetype, harness, provider, model, host, state,
            createdAt, updatedAt)
         VALUES
-          ('#{main}', 'Main', 'main', 1, 'flynn', 'user:flynn', '#{main}',
-           'default', 'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1);
+          ('#{main}', 'Main', 'main', 1, 'operator', 'user:operator', '#{main}',
+           'default', 'claude', 'anthropic', 'example-model', 'test-host', 'active', 1, 1);
         INSERT INTO sessions
           (sessionKey, displayName, ownerUserId, origin, operationalParent,
            archetype, harness, provider, model, host, state, createdAt, updatedAt)

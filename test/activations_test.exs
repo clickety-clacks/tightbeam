@@ -842,8 +842,8 @@ defmodule Tightbeam.ActivationsTest do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("fable"),
-      host: "eezo"
+      model: Model.new("example-model"),
+      host: "test-host"
     })
   end
 end

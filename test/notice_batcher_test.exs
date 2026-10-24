@@ -40,7 +40,7 @@ defmodule Tightbeam.NoticeBatcherTest do
     user =
       Wakes.schedule(db, %{
         session_key: "agent:recipient",
-        origin: "user:mike",
+        origin: "user:operator",
         prompt: "human message",
         due_at: 0,
         class: "fyi"
@@ -800,7 +800,7 @@ defmodule Tightbeam.NoticeBatcherTest do
       archetype: "coder",
       harness: "claude",
       provider: "anthropic",
-      model: Tightbeam.Model.new("fable"),
+      model: Tightbeam.Model.new("example-model"),
       host: Tightbeam.Placement.local_host_name()
     })
 

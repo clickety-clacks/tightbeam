@@ -71,8 +71,8 @@ deny_when = [
 # engine anchors on an existing assignment, and a spec item's FIRST dispatch
 # has none — and per the subtraction doctrine, teaching the engine a new
 # anchor loses to naming the missing paper and letting a mind fetch it.
-# Born from the adjudication postmortem: an 11-round spec pipeline ran
-# spec->review->implementation with no product-owner edge to cross.
+# This rule ensures spec-backed work receives a product-owner spirit verdict
+# before implementation dispatch.
 [[rule]]
 name = "spec-dispatch-requires-spirit"
 verb = "dispatch"
@@ -85,7 +85,7 @@ deny_when = [
   { fact = "work_item.verdict_kinds", op = "not_in", value = ["spirit-approved"] },
 ]
 
-# Posture gate (org ruling, 2026-08-31). Every piece of implementation work runs under
+# Every piece of implementation work runs under
 # one of two postures, ruled by its orchestrator on receiving the slice: HEAVY (a
 # new feature, an architectural change, new infrastructure: full spec cycle) or
 # LIGHT (an adjudicated fix, a straightforward bug, an augmentation within the

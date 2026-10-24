@@ -210,9 +210,9 @@ defmodule Tightbeam.ToplinesSchemaTest do
           jobRef TEXT,
           detail TEXT NOT NULL
         );
-        INSERT INTO users (userId) VALUES ('mike');
+        INSERT INTO users (userId) VALUES ('operator');
         INSERT INTO work_items (id, title, ownerUserId, state)
-          VALUES ('wi_one', 'Work', 'mike', 'open');
+          VALUES ('wi_one', 'Work', 'operator', 'open');
         """
       )
   end
@@ -230,7 +230,7 @@ defmodule Tightbeam.ToplinesSchemaTest do
       INSERT INTO toplines
         (id, ownerUserId, title, state, createdActorKind, createdActorRef,
          createdAt, updatedAt, closedAt)
-      VALUES (?1, 'mike', ?2, 'open', 'user', 'mike', 1, 1, NULL)
+      VALUES (?1, 'operator', ?2, 'open', 'user', 'operator', 1, 1, NULL)
       """,
       ["tl_#{System.unique_integer([:positive])}", title]
     )

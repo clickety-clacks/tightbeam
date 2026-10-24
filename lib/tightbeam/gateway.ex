@@ -347,10 +347,8 @@ defmodule Tightbeam.Gateway do
   @doc """
   Check harness and identity readiness before the production store is created.
 
-  Returns WHICH harnesses are installed, not merely that one is: the defaults a
-  fresh org runs on are derived from what the box actually has, and throwing
-  that away is why a codex-only machine defaulted to claude and claude-sonnet-5
-  (Flynn, 2026-08-04).
+  Returns which harnesses are installed: defaults for a fresh organization are
+  derived from the available providers.
   """
   @spec preflight(config()) :: {:ok, [atom()]} | {:error, {:no_harness_cli, String.t()}}
   def preflight(config) do
@@ -556,11 +554,8 @@ defmodule Tightbeam.Gateway do
         # a codex installed as a `.js` with a `#!/usr/bin/env node` shebang, on a
         # box where node is not on the default PATH, was INSTALLED and
         # UNRUNNABLE and boot said nothing. The org then reported it as merely
-        # un-onboarded, and the truth surfaced during OAuth as
-        # `{:provider_runtime_start_failed, %{failed: [%{reason: :degraded}]}}`
-        # — a credential written to disk and a verification that could never
-        # pass (Flynn, gibson, 2026-08-04). Present and runnable are two
-        # different facts; probing both and reporting one is the house defect.
+        # un-onboarded, obscuring the runtime failure. Present and runnable are
+        # different facts; probe both and report each result.
         for {harness, {:error, reason}} <- results do
           Logger.warning(
             "harness #{harness} is installed but CANNOT RUN: " <>
@@ -2623,8 +2618,8 @@ defmodule Tightbeam.Gateway do
     # source checkout builds it under cli/target. Knowing only the source path
     # meant every release install seeded a wrapper pointing at a directory that
     # does not exist there, telling a toolchain-free customer to run cargo:
-    # found by BOTH first-install agents, macOS and linux, within minutes of
-    # each other (2026-08-04). Not a fallback between implementations — both
+    # found by first-install agents on macOS and Linux. Not a fallback between
+    # implementations — both
     # candidates are the same binary, differing only in who compiled it.
     candidates =
       case System.get_env("RELEASE_ROOT") do
@@ -2756,8 +2751,7 @@ defmodule Tightbeam.Gateway do
           {:error, {failed_stage, reason}} ->
             # A FAILED TURN FAILS. It does not freeze the session behind a
             # ruling. Adjudication — episodes, holds, an escalation ladder, a
-            # `tightbeam adjudicate` verb — was deleted 2026-08-05 (Flynn: "why
-            # is the substrate making a model selection?"), because model choice
+            # `tightbeam adjudicate` verb — was removed because model choice
             # is judgment and judgment belongs to inference, not to a substrate
             # mechanism. The pattern spec said exactly that in its first
             # paragraph and the implementation contradicted it anyway.
@@ -2768,11 +2762,8 @@ defmodule Tightbeam.Gateway do
             # event). An agent reading the applicable activity table decides what to do
             # about it — retry elsewhere, spawn something else, or refuse.
             #
-            # What this replaced was not merely excess: the hold healed into
-            # itself. Clearing it resumed the turn, the turn re-hit the same
-            # condition, and it re-raised — gibson livelocked Flynn's session
-            # behind a ruling whose only documented exit, `tightbeam adjudicate`,
-            # was parsed in args.rs and never routed in dispatch.rs.
+            # Recording the stage and underlying reason makes the failure
+            # diagnosable without hiding it behind a generic terminal message.
             # The refusal replaces the SENTENCE, never the evidence. `reason` is
             # what the user reads; `raw_reason` and `failed_stage` are what the
             # record keeps, because the sentence is a flattening and the next
@@ -2809,7 +2800,7 @@ defmodule Tightbeam.Gateway do
             failure_publish = fn _terminal ->
               # THE ERROR MUST REACH THE CHAT. Every failed turn gets the marker
               # now; the adjudication path used to skip it because the brief was
-              # its message, and a failure that lost its brief showed Flynn
+              # its message, and a failure that lost its brief showed user
               # "agent progress interrupted" with no reason attached.
               append_turn_failed_marker(db, turn.session_key, error_sentence(public_reason))
 
@@ -2841,11 +2832,8 @@ defmodule Tightbeam.Gateway do
             # state cannot disagree. It runs only when the finish WON, which is
             # what stops a double-finish from double-recording.
             #
-            # The stage is the load-bearing half. Gibson's first production
-            # touch was misdiagnosed three times because "the turn failed" was
-            # all the durable evidence there was: a checkout fault, a mid-engine
-            # fault and a prompt-dispatch fault all read identically after the
-            # fact.
+            # Recording the stage distinguishes checkout, engine, and prompt
+            # dispatch failures that otherwise share the same terminal state.
             record_in_txn = fn txn ->
               detail =
                 try do
@@ -3437,11 +3425,11 @@ defmodule Tightbeam.Gateway do
           with_home_pin_lock(harness, session.host, fn ->
             # Pin the shared home to THIS session's model, then session/new,
             # ATOMICALLY per adapter. The harness re-reads its projected home at
-            # every session/new (proven live, wi_263814d3), so pinning the
+            # every session/new, so pinning the
             # selected model here is what makes the adapter offer and accept it —
             # acceptance tracks selection, killing accepted-then-dead for spawn.
             # The lock keeps a concurrent session's pin from clobbering ours in
-            # the window before the adapter reads the file (asg_6508eff5).
+            # the window before the adapter reads the file.
             pin_home_to_session_model(config, session, harness)
 
             with {:ok, sid} <-
@@ -3480,7 +3468,7 @@ defmodule Tightbeam.Gateway do
                 # session's model is offered and accepted rather than dying on an
                 # org-default pin. Held across the load (and its new-session
                 # fallback) so no concurrent session re-pins the shared home mid
-                # provision (asg_6508eff5).
+                # provision.
                 pin_home_to_session_model(config, session, harness)
 
                 AdapterCoordinator.with_load_slot(
@@ -3563,7 +3551,7 @@ defmodule Tightbeam.Gateway do
 
   # Re-pin the shared {harness, host} home to the session's resolved model so the
   # harness adapter offers and accepts it at the next session/new or session/load
-  # (both re-read the projected home — proven live, wi_263814d3). Called only on
+  # (both re-read the projected home). Called only on
   # the two branches that push a fresh model to the adapter (create,
   # resume-after-adapter-loss), never the resident-turn common path, so most
   # turns pay nothing. Idempotent when the model is unchanged: the home reconcile
@@ -4587,7 +4575,7 @@ defmodule Tightbeam.Gateway do
   defp onboarding_caller(db, call), do: resolve_caller(db, call.origin)
 
   # The begin reply carries the OWNER user id so the CLI can wake THAT user with the
-  # sign-in URL+code the ceremony is about to surface (wi_0535922b). An onboarding run
+  # sign-in URL+code the ceremony is about to surface. An onboarding run
   # in a session no operator watches must deliver its URL+code out of band, and the
   # gateway is the only party that knows whose org this is. Added ONLY to the begin
   # "ready" reply; finish/cancel and every error map pass through untouched. An origin
@@ -5073,7 +5061,7 @@ defmodule Tightbeam.Gateway do
           |> Enum.filter(&MapSet.member?(keys, &1.session_key))
           |> Enum.map(&inspect_wake(db, &1, principal))
 
-        # F9 (Sol xhigh review): the sanctioned discovery path for a digest
+        # F9: the sanctioned discovery path for a digest
         # carrier's OWN wake id, surviving a cross-harness barrier that hides
         # the delivered digest message which would ordinarily carry it.
         # `wakes` above is scoped to PENDING work and a delivered carrier is
@@ -5999,7 +5987,7 @@ defmodule Tightbeam.Gateway do
     %{stream: db |> Org.get(session_key) |> Payloads.stream_session(), session_key: session_key}
   end
 
-  # THE CLOSED PARAMETER SURFACE FOR TUNE (F6, Sol xhigh review). The CLI's own
+  # THE CLOSED PARAMETER SURFACE FOR TUNE. The CLI's own
   # `tune` flag set is closed (cli/src/args.rs `ALLOWED`) so a caller who
   # mistypes `--modle` learns immediately rather than switching a session to a
   # destination default it never asked for. Raw `/agent/dispatch` has no such
@@ -6054,7 +6042,7 @@ defmodule Tightbeam.Gateway do
   defp tune_dispatch(config, db, call, p) do
     cond do
       p[:setting] == "rename" and is_binary(p[:display_name]) ->
-        # F3 (Sol xhigh review): every tune mutation passes the same
+        # F3: every tune mutation passes the same
         # owner-or-admin gate `set_harness`/`set_model` already do. This was
         # the pre-existing hole a role-token caller could drive with its own
         # `sessionKey` swapped for a victim's — legacy since before this
@@ -6161,7 +6149,7 @@ defmodule Tightbeam.Gateway do
           {:ok, session} ->
             # A RELATIVE election: new_ref is DERIVED from the snapshot's
             # model, so the snapshot model is part of the election and must
-            # still hold at commit (Sol round 4, blocking). set_model is
+            # still hold at commit. set_model is
             # absolute -- the caller named their target -- so it passes no
             # basis and tolerates concurrent effort tweaks.
             new_ref = %{session.model | effort: p.reasoningLevel}
@@ -6175,7 +6163,7 @@ defmodule Tightbeam.Gateway do
 
   # THE LIVE ENGINE SWITCH.
   #
-  # ADJUDICATION BOUNDARY (v0.2 program §4): this runs because a CALLER named a
+  # ADJUDICATION BOUNDARY: this runs because a CALLER named a
   # harness on this request, and for no other reason. The substrate never
   # initiates a switch, never walks a preference list looking for a better
   # engine, and never holds a session pending someone's model decision. A
@@ -6212,8 +6200,7 @@ defmodule Tightbeam.Gateway do
       # preflight, catalog, credential, readiness — before the boundary below
       # is taken, and commit a competing write in the pause. That is the exact
       # window the stale-election preconditions exist for; without the seam
-      # the interleaving cannot be built deterministically from outside (Sol
-      # round 2, important 4). BEFORE the boundary, necessarily: inside it the
+      # the interleaving cannot be built deterministically from outside. BEFORE the boundary, necessarily: inside it the
       # pause would hold the per-session lock the competing request needs.
       # Absent in production.
       case Map.get(call, :on_tune_elected) do
@@ -6283,7 +6270,7 @@ defmodule Tightbeam.Gateway do
   defp repair_tune_authorized?(_db, _call, _session), do: false
 
   # THE CALLER'S IDENTITY IS WHAT THE ROUTER ALREADY PROVED, not a fresh
-  # re-resolution of `call.origin`'s role name (F8, Sol xhigh review). A role
+  # re-resolution of `call.origin`'s role name. A role
   # can be REBOUND to a different session between the router's authentication
   # and this check; `resolve_caller/2` re-reading `"agent:<role>"` at THIS
   # moment would authorize whoever holds the role NOW for a request the
@@ -6432,7 +6419,7 @@ defmodule Tightbeam.Gateway do
   # this request's validation and its commit (a concurrent tune or set_host won
   # the race). Nothing was applied and nothing was re-derived on the caller's
   # behalf: re-run the command so the election happens against the session as
-  # it now is (Sol round 2, blocking 1/3).
+  # it now is.
   defp stale_election_error do
     %{
       ok: false,
@@ -6450,8 +6437,7 @@ defmodule Tightbeam.Gateway do
   # to the newly selected model. A brand-new session carries no risk of
   # silently discarding a caller's OWN prior election, which is the harm
   # `compose_tune_model_selection/3` below exists to prevent — that function,
-  # not this one, is TUNE's (Sol xhigh review, live-switch finding 2; scoped
-  # here to the verb the finding's scenarios and diff actually cover).
+  # not this one, is TUNE's.
   defp compose_model_selection(host, harness, current, %Model{effort: nil} = selected) do
     case efforts_for(host, harness, selected) do
       [] -> selected
@@ -6495,7 +6481,7 @@ defmodule Tightbeam.Gateway do
   # `--context` qualifies a model, so a context with no model to qualify gets
   # the more specific refusal instead of the generic "you must name a model".
   # FIELDS ARE NEVER PACKED ACROSS THE ENGINE BOUNDARY, and the server owns
-  # that contract — not the CLI (Sol round 2, important 5). Raw-dispatch and
+  # that contract — not the CLI. Raw-dispatch and
   # device callers reach the gateway directly, and a packed ref like
   # "model[effort]" or the vendor "[1m]" would smuggle an effort or context
   # election past the typed fields on a cross-harness switch. Scoped to
@@ -6555,7 +6541,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # F6 (Sol xhigh review): a malformed field is a DIFFERENT fact than an
+  # F6: a malformed field is a DIFFERENT fact than an
   # absent one, and must be named as what it is rather than falling through
   # to `model_required`/`context_requires_model` and reading as a caller who
   # simply named nothing.
@@ -6604,7 +6590,7 @@ defmodule Tightbeam.Gateway do
   # shared home at session/new|load, and the pin is now session-varying, so
   # without this lock two sessions with different models provisioning on one host
   # clobber each other's pin before the adapter reads it — reintroducing
-  # accepted-then-dead as a race (asg_6508eff5). Session mutation locks are keyed
+  # accepted-then-dead as a race. Session mutation locks are keyed
   # by session_key and lanes are one-per-session, so they do NOT cover this
   # cross-session shared resource. Only the create/resume-after-loss branches
   # take this lock; the resident-turn common path holds no pin and never blocks.
@@ -6633,7 +6619,7 @@ defmodule Tightbeam.Gateway do
        ) do
     deliver_opts = if config[:sh], do: [sh: config.sh], else: []
 
-    # THE SERIALIZATION DOMAIN (Sol xhigh review, live-switch findings 1/4/5).
+    # THE SERIALIZATION DOMAIN.
     # The fresh same-harness check, the pending-turn count, the engine swap,
     # the history barrier, and its tombstone are ONE transaction — not five
     # separate calls to the single-writer `DB` owner. `DB` processes one
@@ -6671,7 +6657,7 @@ defmodule Tightbeam.Gateway do
           fresh.harness == harness ->
             {:refused, :same_harness}
 
-          # THE ELECTION'S SNAPSHOT MUST STILL HOLD (Sol round 2, blocking 3).
+          # THE ELECTION'S SNAPSHOT MUST STILL HOLD.
           # Everything decided before this transaction — credential preflight,
           # catalog resolution, Spinup.ensure_ready, the home pin — was decided
           # against `session.host`. The transaction serializes WRITES, but it
@@ -6782,8 +6768,7 @@ defmodule Tightbeam.Gateway do
       {:ok, :swapped} ->
         # Pin the shared home to the model this session now runs on the new
         # harness, not the org default, so the next turn's session/new offers
-        # and accepts it (wi_263814d3). AFTER the commit, deliberately (Sol
-        # round 2, blocking 2): the pin used to run ahead of the transaction
+        # and accepts it. AFTER the commit, deliberately: the pin used to run ahead of the transaction
         # on the theory that a refused swap made it "wasted work, never a
         # wrong result" — false for two RACING swaps electing DIFFERENT
         # models. The loser re-pinned the shared home to its model and was
@@ -6823,7 +6808,7 @@ defmodule Tightbeam.Gateway do
 
   # A live model-switch on a RESIDENT session used to hit set_config_option, which
   # cannot re-read the projected home, so the harness refused any model its offered set
-  # did not already hold (mike's opus-5 picker-pain) and the raw refusal reached the
+  # did not already hold (operator's opus-5 picker-pain) and the raw refusal reached the
   # client as `inspect(reason)` term soup. The fix (apply_tuned_model's resident
   # branch) forks the conversation, resolves the requested canonical model
   # through that fork's offered alias vocabulary, and verifies the readback
@@ -6898,7 +6883,7 @@ defmodule Tightbeam.Gateway do
       # the record to correct. It still earns its marker, on the same rule as
       # the resident path: the session's model changed, and the transcript is
       # where an agent reads that it did. ONE transaction for both, same as
-      # the resident branch (Sol round 2, important 6): a set_model that
+      # the resident branch: a set_model that
       # commits without its marker is the silent substitution the marker
       # exists to prevent, and a crash between two separate writes produced
       # exactly that. The same transaction also holds the stale-election
@@ -7058,7 +7043,7 @@ defmodule Tightbeam.Gateway do
   # A RELATIVE election (set_reasoning derives its target from the snapshot's
   # model) carries that model as its BASIS: if the recorded family or context
   # no longer matches it at commit, the derivation is stale and committing it
-  # would silently revert a concurrent set_model (Sol round 4, blocking).
+  # would silently revert a concurrent set_model.
   # Effort is excluded on purpose -- concurrent effort-only changes are
   # last-writer-wins, and comparing it would refuse legitimate races.
   defp stale_basis?(nil, _record_model), do: false
@@ -7096,7 +7081,7 @@ defmodule Tightbeam.Gateway do
         {record_model, record_harness, record_host} =
           read_recorded_model(txn, session.session_key)
 
-        # THE ELECTION'S SNAPSHOT MUST STILL HOLD (Sol rounds 2-3). BOTH axes:
+        # THE ELECTION'S SNAPSHOT MUST STILL HOLD. BOTH axes:
         # this model was validated against `session.harness`'s catalog ON
         # `session.host`, and the fork was built with that host's placement,
         # guidance and cwd. A harness switch OR a set_host committing in
@@ -7294,7 +7279,7 @@ defmodule Tightbeam.Gateway do
   # function, so the r4.2 discipline lives in exactly one place: onboarding is named
   # ONLY for reasons onboarding can actually fix (missing/expired/revoked). A transient
   # server outage says retry (NOT onboard), an unsupported plan says onboarding won't help.
-  # This replaces the two divergent seams the incident exposed: the spawn seam OVER-named
+  # This replaces two divergent seams: the spawn seam OVER-named
   # (every reason -> "run onboard") and the turn seam UNDER-named (only `:missing`), so an
   # expired/transient turn got a raw error or a misdirect instead of an actionable remedy.
   #
@@ -7782,13 +7767,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # PIN THE PAST, NEVER READ THE PRESENT (specs roles-registry-v1.md:31 —
-  # Sol xhigh review round 2, finding: a LIVE `Roles.get/2` at read time
-  # bound audit authority to a deletable, name-reusable row. After
-  # `role-rm`, `Roles.get/2` returns nil and denied EVERYONE, admin
-  # included; after delete-then-recreate under a different owner, the same
-  # live lookup silently handed the NEW owner read access to the OLD
-  # carrier's members — a fact that was never true).
+  # PIN THE PAST, NEVER READ THE PRESENT.
   #
   # A carrier whose `sessionKey` resolves through `Org.get/2` was pinned to
   # a REAL session at materialization (O2's `carrier_shape/2` puts it there
@@ -7816,7 +7795,7 @@ defmodule Tightbeam.Gateway do
   # reached): the deny-on-nil case never precedes the admin check.
   #
   # `URI.decode_www_form/1` reverses `Wakes`'s `pinned_owner_field/1`
-  # (Sol xhigh review round 3): the raw text was LOSSY for a user id
+  #: the raw text was LOSSY for a user id
   # containing a space — "alice bob" pinned and captured back by `\S+` as
   # bare "alice" would transfer the OLD carrier's audit to a real user named
   # "alice." Decoding here is what makes the round trip exact regardless of
@@ -8742,9 +8721,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # THE INDICATOR IS DERIVED, NEVER NARRATED (Flynn's rule, 2026-08-04: "once a
-  # message of any type is delivered and there are no more pending messages, that
-  # typing indicator should be cleared"). One deterministic fact decides it — does
+  # THE INDICATOR IS DERIVED, NEVER NARRATED. One deterministic fact decides it — does
   # this session have a turn in 'queued' or 'running'? — read from the ledger, the
   # single-writer table every transition already funnels through. Every emission
   # recomputes from that truth; no site asserts its own opinion, so no site can

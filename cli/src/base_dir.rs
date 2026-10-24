@@ -5,10 +5,8 @@
 //! resolved; the CLI READS it from the base dir it resolves. If the two disagree,
 //! the CLI talks to a gateway the operator did not install — or to none at all.
 //!
-//! They did disagree. `Tightbeam.BaseDir` unified four Elixir resolvers on
-//! 2026-07-27 and stopped there, because its invariant test scans `lib/` and the
-//! CLI is structurally outside its reach. There were three more here, all of them
-//! reading `TIGHTBEAM_HOME` and none of them reading `TIGHTBEAM_BASE_DIR` at all:
+//! The CLI has additional callers beyond those covered by the library's resolver
+//! checks. Each must use the same precedence, including the following paths:
 //!
 //!   * `dispatch::gateway_config_path` — endpoint discovery
 //!   * `probe::resolve_base_dir` — `tightbeam doctor` / containment census
@@ -17,11 +15,8 @@
 //! So with `TIGHTBEAM_BASE_DIR` set — which is what the README documents, and
 //! what the systemd unit and LaunchDaemon in it both set — the CLI read
 //! `~/.tightbeam/gateway.json`: not its own gateway, but whatever unrelated org
-//! happened to live at the default path. Found on shrdlu, 2026-07-27, by the
-//! production-install smoke: `tightbeam onboard anthropic` dialled port 4321 from
-//! a pre-existing org while its own gateway was serving on 11373. Nothing was
-//! listening there, so it failed loudly by luck; had that org been up, onboarding
-//! would have banked a credential into a stranger's org and reported success.
+//! happened to live at the default path. When base-directory resolution differs,
+//! an onboarding command can contact a different gateway than the one intended.
 //!
 //! Precedence, matching `Tightbeam.BaseDir` exactly:
 //!

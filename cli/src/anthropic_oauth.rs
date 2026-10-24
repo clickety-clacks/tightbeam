@@ -5,9 +5,9 @@
 //! operator's own login. Measured against the same adapter, same version, minutes apart:
 //!
 //!   setup-token credential : default, sonnet, opus, haiku
-//!   operator's own login   : default, opus[1m], claude-fable-5[1m], sonnet, haiku
+//!   operator's own login   : default, opus[1m], claude-example-5[1m], sonnet, haiku
 //!
-//! `fable` and `claude-fable-5` are refused outright under the setup-token credential and
+//! `example-model` and `claude-example-5` are refused outright under the setup-token credential and
 //! accepted under the operator's. So onboarding a host through the vendor's supported
 //! command silently downgrades it, and nothing in the flow says so. That is the defect this
 //! module exists to fix, and it cannot be fixed by asking `setup-token` more nicely --

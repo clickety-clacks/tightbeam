@@ -1,0 +1,204 @@
+{
+  "provenance": {
+    "capturedAt": "example fixture",
+    "workItemId": "wi_00000000-0000-4000-8000-000000000001",
+    "commands": [
+      "tightbeam work-item-get <work-item-id>",
+      "tightbeam work-item-trace <work-item-id>",
+      "tightbeam attests <assignment-id>"
+    ],
+    "selection": "Example record graph with assignment effects, review links, completion claims, and an ordered terminal timeline."
+  },
+  "workItem": {
+    "createdAt": 1787638374003,
+    "createdBySession": "agent:example:main",
+    "createdByUser": null,
+    "failReason": null,
+    "id": "wi_00000000-0000-4000-8000-000000000001",
+    "isBug": false,
+    "ownerUserId": "example-owner",
+    "specRefName": "example-spec.md",
+    "specRefSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "state": "closed",
+    "title": "Example API migration specification"
+  },
+  "assignments": [
+    {
+      "id": "asg_00000000-0000-4000-8000-000000000001",
+      "effectKind": "evidence",
+      "workItemId": "wi_00000000-0000-4000-8000-000000000001",
+      "reviewsAssignmentId": null,
+      "closingAttestId": "att_00000000-0000-4000-8000-000000000101",
+      "outcome": "completed",
+      "state": "closed",
+      "subject": "Prepare an example product specification for an API migration. Preserve existing request semantics and define the required verification."
+    },
+    {
+      "id": "asg_00000000-0000-4000-8000-000000000002",
+      "effectKind": "policy",
+      "subject": "Prepare an example product specification for an API migration. Preserve existing request semantics and define the required verification.",
+      "workItemId": "wi_00000000-0000-4000-8000-000000000001",
+      "reviewsAssignmentId": null,
+      "closingAttestId": "att_00000000-0000-4000-8000-000000000004",
+      "outcome": "completed",
+      "state": "closed"
+    },
+    {
+      "id": "asg_00000000-0000-4000-8000-000000000003",
+      "effectKind": "review",
+      "workItemId": "wi_00000000-0000-4000-8000-000000000001",
+      "reviewsAssignmentId": "asg_00000000-0000-4000-8000-000000000002",
+      "closingAttestId": "att_00000000-0000-4000-8000-000000000100",
+      "outcome": "completed",
+      "state": "closed",
+      "subject": "Prepare an example product specification for an API migration. Preserve existing request semantics and define the required verification."
+    },
+    {
+      "id": "asg_00000000-0000-4000-8000-000000000004",
+      "effectKind": "review",
+      "workItemId": "wi_00000000-0000-4000-8000-000000000001",
+      "reviewsAssignmentId": "asg_00000000-0000-4000-8000-000000000002",
+      "closingAttestId": "att_00000000-0000-4000-8000-000000000102",
+      "outcome": "completed",
+      "state": "closed",
+      "subject": "Prepare an example product specification for an API migration. Preserve existing request semantics and define the required verification."
+    }
+  ],
+  "attests": [
+    {
+      "assignmentId": "asg_00000000-0000-4000-8000-000000000001",
+      "id": "att_00000000-0000-4000-8000-000000000001",
+      "kind": "verdict",
+      "verdictKind": "spirit-approved",
+      "note": "Example review or completion record for the API migration specification.",
+      "commitRefs": null
+    },
+    {
+      "assignmentId": "asg_00000000-0000-4000-8000-000000000003",
+      "id": "att_00000000-0000-4000-8000-000000000002",
+      "kind": "verdict",
+      "verdictKind": "changes-requested",
+      "commitRefs": [
+        {
+          "commit": "fc2d1e824ccf5e4e4761ba06928cb4a2d7a47602",
+          "repo": null
+        }
+      ],
+      "note": "Example review or completion record for the API migration specification."
+    },
+    {
+      "assignmentId": "asg_00000000-0000-4000-8000-000000000004",
+      "id": "att_00000000-0000-4000-8000-000000000003",
+      "kind": "verdict",
+      "verdictKind": "reviewed-clean",
+      "commitRefs": [
+        {
+          "commit": "fc2d1e824ccf5e4e4761ba06928cb4a2d7a47602",
+          "repo": null
+        }
+      ],
+      "note": "Example review or completion record for the API migration specification."
+    },
+    {
+      "assignmentId": "asg_00000000-0000-4000-8000-000000000002",
+      "id": "att_00000000-0000-4000-8000-000000000004",
+      "kind": "completion",
+      "verdictKind": null,
+      "note": "Example review or completion record for the API migration specification.",
+      "commitRefs": [
+        {
+          "commit": "fc2d1e824ccf5e4e4761ba06928cb4a2d7a47602",
+          "repo": null
+        }
+      ]
+    }
+  ],
+  "trace": {
+    "workItem": {
+      "failReason": null,
+      "id": "wi_00000000-0000-4000-8000-000000000001",
+      "ownerUserId": "example-owner",
+      "state": "closed",
+      "title": "Example API migration specification"
+    },
+    "assignments": [
+      {
+        "id": "asg_00000000-0000-4000-8000-000000000004",
+        "reviewsAssignmentId": "asg_00000000-0000-4000-8000-000000000002",
+        "state": "closed"
+      },
+      {
+        "id": "asg_00000000-0000-4000-8000-000000000002",
+        "reviewsAssignmentId": null,
+        "state": "closed"
+      },
+      {
+        "id": "asg_00000000-0000-4000-8000-000000000001",
+        "reviewsAssignmentId": null,
+        "state": "closed"
+      },
+      {
+        "id": "asg_00000000-0000-4000-8000-000000000003",
+        "reviewsAssignmentId": "asg_00000000-0000-4000-8000-000000000002",
+        "state": "closed"
+      }
+    ],
+    "terminalTimeline": [
+      {
+        "assignmentId": "asg_00000000-0000-4000-8000-000000000001",
+        "id": "att_00000000-0000-4000-8000-000000000001",
+        "kind": "verdict",
+        "type": "attest",
+        "verdict": "spirit-approved"
+      },
+      {
+        "assignmentId": "asg_00000000-0000-4000-8000-000000000001",
+        "id": "att_00000000-0000-4000-8000-000000000101",
+        "kind": "completion",
+        "type": "attest",
+        "verdict": null
+      },
+      {
+        "assignmentId": "asg_00000000-0000-4000-8000-000000000003",
+        "id": "att_00000000-0000-4000-8000-000000000002",
+        "kind": "verdict",
+        "type": "attest",
+        "verdict": "changes-requested"
+      },
+      {
+        "assignmentId": "asg_00000000-0000-4000-8000-000000000003",
+        "id": "att_00000000-0000-4000-8000-000000000100",
+        "kind": "completion",
+        "type": "attest",
+        "verdict": null
+      },
+      {
+        "assignmentId": "asg_00000000-0000-4000-8000-000000000004",
+        "id": "att_00000000-0000-4000-8000-000000000003",
+        "kind": "verdict",
+        "type": "attest",
+        "verdict": "reviewed-clean"
+      },
+      {
+        "assignmentId": "asg_00000000-0000-4000-8000-000000000004",
+        "id": "att_00000000-0000-4000-8000-000000000102",
+        "kind": "completion",
+        "type": "attest",
+        "verdict": null
+      },
+      {
+        "assignmentId": "asg_00000000-0000-4000-8000-000000000002",
+        "id": "att_00000000-0000-4000-8000-000000000004",
+        "kind": "completion",
+        "type": "attest",
+        "verdict": null
+      },
+      {
+        "assignmentId": null,
+        "id": "ce:12839",
+        "kind": "disposition_transition",
+        "type": "causal_event"
+      }
+    ]
+  }
+}

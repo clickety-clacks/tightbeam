@@ -96,7 +96,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
     assert count(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE status='open'") == 1
 
-    owner_session = Org.personal_session_key("flynn")
+    owner_session = Org.personal_session_key("operator")
 
     assert [
              %{
@@ -241,7 +241,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
              Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
 
     [wake] = notification_wakes(ctx.db)
-    owner_session = Org.personal_session_key("flynn")
+    owner_session = Org.personal_session_key("operator")
 
     # FAIL-BEFORE: two failure modes, neither of which may consume the wake.
     for {tag, failure} <- [
@@ -276,7 +276,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
              Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
 
     assert [wake] = notification_wakes(ctx.db)
-    owner_session = Org.personal_session_key("flynn")
+    owner_session = Org.personal_session_key("operator")
 
     drain!(ctx)
 
@@ -378,7 +378,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     # A retired ancestor remains in the graph but is skipped as a wake target.
     :ok = DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='top'")
     :ok = EffortCheckin.probe(ctx.db, ctx.config, bracket_wake(ctx.db, assignment.id))
-    personal = Org.personal_session_key("flynn")
+    personal = Org.personal_session_key("operator")
     assert notified_rungs(ctx.db, assignment.id) == ["holder", "mid", personal]
 
     assert count(
@@ -434,9 +434,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
   test "proof 10: every request site arms in-transaction and every turn sink is enumerated" do
     # Every production `decision_requests` insert/retarget site, and the
     # in-transaction prompt arm each one owes. All five now live in
-    # `escalation.ex` (Sol xhigh review round 2, finding 1: every production
-    # read AND write of `decision_requests` is centralized behind named,
-    # kind-classified functions there) — `EffortCheckin`'s two request sites
+    # `escalation.ex` — `EffortCheckin`'s two request sites
     # moved from `open_request_in_txn/4`/`deadline_in_txn/3` to
     # `effort_insert_in_txn/2`/`effort_update_generation_in_txn/4`, which now
     # own their own notification arm too (`effort_notification_in_txn/2`,
@@ -653,7 +651,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     {:paired, _device} =
       claim_org(db, %{
         device_id: "delivery-device",
-        claimed_name: "flynn",
+        claimed_name: "operator",
         platform: nil,
         model: nil
       })
@@ -667,20 +665,20 @@ defmodule Tightbeam.EscalationDeliveryTest do
   end
 
   defp create_session(db, key, host, spawned_by \\ nil) do
-    main? = key == Org.personal_session_key("flynn")
+    main? = key == Org.personal_session_key("operator")
 
     Org.create(db, %{
       session_key: key,
       display_name: key,
       kind: if(main?, do: "main", else: "custom"),
       is_built_in: main?,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "operator",
+      origin: "user:operator",
       archetype: "default",
       host: host,
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("claude-fable-5"),
+      model: Model.new("claude-example-5"),
       spawned_by: spawned_by,
       operational_parent: spawned_by
     })
@@ -692,7 +690,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
       cwd: base_dir,
       port: 0,
       default_harness: :claude,
-      default_model: Model.new("claude-fable-5"),
+      default_model: Model.new("claude-example-5"),
       max_live_sessions_per_user: 50,
       wake_tick_ms: 60_000,
       onboarding_lease_ms: 1_800_000,
@@ -726,8 +724,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
     item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
         verb: "work-item-create",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:operator",
+        principal: {:user, "operator"},
         session_key: nil,
         params: %{title: "Delivery trace"}
       })

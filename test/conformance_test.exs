@@ -68,7 +68,7 @@ defmodule Tightbeam.ConformanceSupport do
     # applies, or it says no by name. There is no third word — no "queued", no
     # "applied at the next boundary", no "switched to the nearest available" —
     # because each of those would be the substrate deciding something on the
-    # caller's behalf (v0.2 program §4). Enumerated so adding one would have to
+    # caller's behalf. Enumerated so adding one would have to
     # be written down here first.
     "live-switch" => ~w(refuse pass)
   }
@@ -127,7 +127,7 @@ defmodule Tightbeam.ConformanceSupport do
     {"C7", "sweep-never-consumes"} =>
       ~w(sweep-allow-leaves-ruling-ruled verb-edge-consumes-exactly-once no-consume-legible),
     {"Cap", "capstone-reviewer-loop"} =>
-      ~w(missing-review-dispatch-remedy changes-requested-iterates-author commissioned-clean-review-releases idle-pre-review-sweep-runs-remedy unbound-reviewer-refuses-loudly loop-legible-no-teardown-claim),
+      ~w,
     {"Cap", "capstone-tests-before-success"} =>
       ~w(behind-main-script-denies reconciled-missing-tests-denies produced-tests-release idle-sweep-reobligates tests-loop-legible),
     {"Cap", "capstone-real-run-before-ship"} =>
@@ -244,7 +244,7 @@ defmodule Tightbeam.ConformanceSupport do
   defp applicable_runners("harness-gate", runners),
     do: Enum.filter(runners, &(&1 == "compiled_hook_grep"))
 
-  # F10 (Sol xhigh review): NO CATCH-ALL. Every fixture `kind` this manifest
+  # F10: NO CATCH-ALL. Every fixture `kind` this manifest
   # actually uses has its own clause above; a kind that matches none of them
   # — a typo, or a future kind nobody wired a runner for — must run NOTHING
   # and fail loudly (`runners != []` at the call site), not fall back to
@@ -821,7 +821,7 @@ defmodule Tightbeam.ConformanceSupport do
   # The rule NAME cannot tell a genuine denial from a load-induced one: a rail script that
   # blows its budget denies under the SAME rule with reason `script_timeout`, so a case
   # asserting only the name went green while proving nothing about the mechanism it names
-  # (task #38's residual class). The `script_return` a fixture already declares determines
+  # (the residual class). The `script_return` a fixture already declares determines
   # the reason its mechanism must produce, so both are pinned and a timeout reads RED.
   defp expected_denial(kase), do: {kase["reason"], deny_reason(kase["script_return"])}
 
@@ -1407,9 +1407,7 @@ defmodule Tightbeam.ConformanceSupport do
 
     # NO DEFAULT LIMIT. Every row the assignment carries. And, since neither
     # `--after` nor `--limit` was named, the response carries ONLY `attests`
-    # — no `next_after`/`has_more_after` paging vocabulary added (Sol xhigh
-    # review, finding 8: those keys are PAGING vocabulary, and a caller that
-    # never asked to page must see zero payload change).
+    # — no `next_after`/`has_more_after` paging vocabulary added.
     assert length(page.attests) == length(Map.get(kase["world"], "attests"))
     assert page == %{attests: page.attests}
   end
@@ -1633,8 +1631,7 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp assert_overlap_observation(_fixture, _db, _call, _overlap?), do: :ok
 
-  # `reopen-assignment`'s own conformance exercise (Sol xhigh review, finding
-  # 4). `holder-verdict-wins` calls only `attest`; this fixture routes
+  # `reopen-assignment`'s own conformance exercise. `holder-verdict-wins` calls only `attest`; this fixture routes
   # `reopen-assignment` itself through `Dispatch.dispatch/3` — the same
   # chokepoint the wire router uses, which is also what puts the verb through
   # `Rules.decide`. The case named `earlier-verdict-round-displaces-…`
@@ -3574,7 +3571,7 @@ defmodule Tightbeam.ConformanceSupport do
         provider: session["provider"] || "anthropic",
         model:
           Model.from_params(session) ||
-            Model.new("fable"),
+            Model.new("example-model"),
         host: session["host"] || Placement.local_host_name()
       })
 
@@ -4292,30 +4289,30 @@ defmodule Tightbeam.ConformanceTest do
     # loadset twin; producer-backed-gate was replaced 1:1 by
     # artifact-backed-gate. The ten exact-mechanism skips are untouched.
     #
-    # Deleting adjudication (2026-08-05) removed one more: C7's
+    # C7's
     # adjudication-hold-order, whose whole subject was a hold freezing the
     # turn-end shift. The shift itself is unchanged minus that first slot.
     #
-    # Fabric §13 Phase 0 (2026-08-13) adds one: C4's holder-verdict-wins, which
-    # pins review-round selection against the wi_1b0237fe wedge class. It is a
+    # The coordination contract adds C4's holder-verdict-wins, which
+    # pins review-round selection against the wedge class. It is a
     # pending C4 dispatch-rule fixture with its own cases, so it lands in the
     # active and activated counts, not in the exact-mechanism skips.
     #
-    # Sol xhigh review, finding 4 (2026-08-13) adds a second: C4's
+    # adds a second C4 case:
     # reopen-assignment-repair, which routes `reopen-assignment` itself
     # through the dispatch chokepoint (holder-verdict-wins only ever calls
     # `attest`) and exercises the defining displacement shape. It is also a
     # pending C4 fixture with its own named runner clause, not a catch-all.
     #
-    # Phase 1 of the coordination fabric (2026-08-13) adds the C8 class and two
+    # The coordination contract adds the C8 class and two
     # GREEN fixtures — class-delivery-policy and class-election-and-skew. Green
     # on both axes, so they raise the total and the active count and leave the
     # ACTIVATED counts alone: those measure fixtures still waiting on a
     # mechanism, and this mechanism ships on this branch.
-    # Second wave (2026-08-13) adds two more GREEN C8 fixtures —
+    # Two additional GREEN C8 fixtures cover
     # agent-question-carrier (seam ③) and read-cursors (seam ④) — on the same
     # both-axes rule as the first two.
-    # The live engine switch (2026-08-14) adds the C9 class and one GREEN
+    # The live engine switch adds the C9 class and one GREEN
     # fixture, live-engine-switch. Green on both axes, so it raises the total
     # and the active count and leaves the ACTIVATED counts alone. The class is
     # green too, so it adds no class registration either.
@@ -4374,7 +4371,7 @@ defmodule Tightbeam.ConformanceTest do
     end)
 
     # 52 since C4/holder-verdict-wins joined the corpus (fabric §13 Phase 0); 53
-    # since C4/reopen-assignment-repair joined it (Sol xhigh review, finding 4).
+    # since C4/reopen-assignment-repair joined it.
     assert Enum.count(entries, &(&1.scope == "fixture")) == 53
 
     assert %{

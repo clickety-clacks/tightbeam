@@ -13,20 +13,16 @@ const SCRIPT_ERROR: i32 = 10;
 const SCRIPT_TIMEOUT: i32 = 20;
 const CONTAINED_REFUSED: i32 = 30;
 
-// WHAT CONTAINMENT IS FOR: keeping agents ON THE RAILS. It is not a defence against a
-// malicious agent and it is not a security boundary. A circumvention that requires an
-// agent to be deliberately hostile is explicitly out of scope — a standing product
-// ruling, not a per-change default. Weigh a hardening by whether it keeps honest work
-// inside its lines (parity, correctness, legibility) and decline it when the only story
-// that reaches it is malice. Reviewers do not hold this frame and will raise
-// security-shaped findings by default; that alone does not make them work.
+// WHAT CONTAINMENT IS FOR: keeping ordinary execution within its configured limits. It
+// is not a defence against deliberately hostile code and is not a security boundary.
+// Changes to containment should preserve correctness and make execution outcomes legible.
 //
 // Containment is per-OS; the bands above are not. `probe.rs` puts its per-OS collectors
 // behind one seam (`collect_linux` / `collect_darwin`) and this follows that shape, at
 // compile time rather than runtime because the mechanisms are syscalls rather than data.
 // Every arm applies real containment or refuses — there is no unconfined arm, and a
 // platform with no named mechanism fails to compile rather than running a script loose.
-// See shared specs tightbeam-containment.md.
+// The product's containment contract applies consistently across supported platforms.
 
 struct RailExecArgs {
     profile: String,

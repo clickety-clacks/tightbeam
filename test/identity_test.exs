@@ -119,7 +119,7 @@ defmodule Tightbeam.IdentityTest do
 
   # Work-custody pin: operating-model.md is composed into EVERY archetype, so
   # the custody rail reaches every session including learned-kungfu archetypes.
-  # The forensic reason it exists (2026-08-18): retirement deletes a workdir
+  # Retirement deletes a workdir
   # unless it holds registered in-workspace artifacts, so undeclared work is
   # destroyed silently and attests that cite raw workdir paths point at bytes
   # nobody owns — 7 of 10 paths cited over one day were already gone. Pin the
@@ -850,15 +850,13 @@ defmodule Tightbeam.IdentityTest do
   # merge commit for want of a committer and the empty conflict list was read as one.
   # Nothing proved that fix, so CI could not have caught it coming back.
   #
-  # Both write paths are covered, because both supply their own committer and both
-  # are reachable on such a host: `edit!` was observed on shrdlu committing cleanly
-  # as `user:flynn <user-flynn@tightbeam.local>` with no host identity present, and
-  # that observation was the only evidence it worked.
+  # Both write paths are covered because each supplies its own committer and can
+  # operate when no host identity is configured.
   test "relearn and edit both commit on a host with no git identity at all", ctx do
     # `useConfigOnly` is what makes this a real bare host rather than a tidied one.
     # Emptying the config is not enough: git falls back to GUESSING an identity from
     # the passwd entry and the hostname, so a machine with no configured identity
-    # still commits -- as "Mike Manzano <mike@eezo…>" here. That fallback is what
+    # still commits -- as "Test User <user@test-host.invalid>" here. That fallback is what
     # made this environment untestable by simply clearing config, and it is off on
     # a fresh satellite, where the commit genuinely has nowhere to get a committer.
     bare_config = Path.join(ctx.root, "bare-gitconfig")
@@ -892,10 +890,10 @@ defmodule Tightbeam.IdentityTest do
     {_, 0} = System.cmd("git", ["-C", dir, "reset", "scratch.md"], stderr_to_stdout: true)
     File.rm!(Path.join(dir, "scratch.md"))
 
-    assert edit!(ctx.base, "coder", :guidance, "no-identity-edit", "user:flynn")
+    assert edit!(ctx.base, "coder", :guidance, "no-identity-edit", "user:operator")
 
     assert git!(dir, ["log", "-1", "--format=%an <%ae>", "main"]) ==
-             "user:flynn <user-flynn@tightbeam.local>"
+             "user:operator <user-operator@example.invalid>"
 
     File.write!(Path.join(ctx.source, "guidance/new.md"), "new-source")
 

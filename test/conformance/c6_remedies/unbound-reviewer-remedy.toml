@@ -5,7 +5,7 @@ phase = "pending"
 blocking_phase = "P5"
 kind = "remedy"
 source = "mechanism lattice loud target resolution"
-legibility = "event:denied(reason=unbound,rule=unbound-reviewer-remedy)"
+legibility = "event:denied"
 [[fixture.rule]]
 name = "unbound-reviewer-remedy"
 verb = "attest"

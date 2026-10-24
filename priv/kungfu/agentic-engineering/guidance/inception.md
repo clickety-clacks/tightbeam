@@ -15,7 +15,7 @@ The flow:
    decision-request's own conversation anchor arrives with its build card), and
    the request closes on charter ratification — the interview is a bounded
    decision request, never an open-ended correspondence.
-3. **The output is a spirit charter** — a document in the org's spec commons,
+3. **The output is a spirit charter** — a document in the product's specification set,
    recorded via `artifact-record` and bound to the product's work items via
    spec-ref (`--spec-ref <name> --spec-sha256 <hex>`), so every card names the
    exact charter text it serves. Template below.

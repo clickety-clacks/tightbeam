@@ -3,7 +3,7 @@ name: tightbeam-skills
 description: Manage the served identity skill library through the identity seam.
 ---
 
-You can manage this org's skill library — the shared body of on-demand
+You can manage the organization's skill library — the shared body of on-demand
 knowledge every archetype elects from. This is the complete procedure;
 no source-diving, no guessing.
 

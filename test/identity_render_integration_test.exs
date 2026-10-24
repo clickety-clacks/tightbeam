@@ -19,13 +19,13 @@ defmodule Tightbeam.IdentityRenderIntegrationTest do
     expected = git!(dir, ["rev-parse", "tightbeam/live"])
 
     specs = File.read!(Path.join(@fixture_root, "specs-home.md"))
-    dev = File.read!(Path.join(@fixture_root, "dev-on-gibson.md"))
+    dev = File.read!(Path.join(@fixture_root, "development-environment.md"))
     File.write!(Path.join(guidance, "specs-home.md"), specs)
-    File.write!(Path.join(guidance, "dev-on-gibson.md"), dev)
+    File.write!(Path.join(guidance, "development-environment.md"), dev)
 
     File.write!(
       Path.join(guidance, "operating-model.md"),
-      "model-before\n#include \"dev-on-gibson.md\"\nmodel-after\n"
+      "model-before\n#include \"development-environment.md\"\nmodel-after\n"
     )
 
     File.write!(

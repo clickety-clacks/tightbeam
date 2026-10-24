@@ -418,10 +418,8 @@ defmodule Tightbeam.Soak do
     # The port the gateway served from BEFORE the signal. A gateway kill has recovered
     # only when a DIFFERENT gateway is answering: a shutting-down gateway keeps serving
     # until it finishes, so `version_ok` alone cannot tell "my replacement is up" from
-    # "the process I just signalled has not finished dying". Measured 2026-08-04: a
-    # SIGTERM under load took 91s to exit, the 60s await gave up WITHOUT restarting, the
-    # doomed gateway answered version in 12ms, the row scored recovered=true — and the
-    # run then fired its remaining 27 kills at a closed socket for 53 minutes.
+    # "the process I just signalled has not finished dying". A slow shutdown must not
+    # be counted as recovery or allow later kills to target a closed socket.
     pre_kill_gateway = state.gateway
 
     {action_ok?, detail, state} = execute_kill(kind, state)
@@ -464,10 +462,8 @@ defmodule Tightbeam.Soak do
   # the session leader `tightbeam harness-exec` exec'd into. Selecting it out of
   # the process tree by its argv instead ALSO matches that launcher, which forks,
   # waits, and carries the very same argv — and killing the launcher kills
-  # nothing. That is what the 2026-08-03 soak did: 6 of its 8 "adapter kills"
-  # took the launcher, the adapter kept delivering turns on an unchanged
-  # generation, and A3 then charged the substrate with 6 unrecorded deaths that
-  # had never happened. Asking the ledger kills the process A3 is asking about.
+  # nothing. Select the adapter process from the recorded process ledger so the
+  # signal targets the process whose behavior is being measured.
   defp execute_kill(:adapter_sigkill, state) do
     with [_ | _] = pids <- recorded_adapter_pids(state),
          [_ | _] = pids <- Enum.filter(pids, &adapter_pid?/1),
@@ -543,7 +539,8 @@ defmodule Tightbeam.Soak do
       # The signal landed and the gateway did not exit in time. Its eventual exit is
       # ATTRIBUTABLE to this kill, so mark it expected: otherwise `drain_gateway_output/1`
       # would see the death on a later tick and score it against the product as a
-      # spontaneous crash. Measured on 2026-08-04: a SIGTERM took 91s against a 60s await.
+      # spontaneous crash. A timeout keeps the expected late exit attributable
+      # to this signal.
       {:error, reason, state} ->
         {false, reason, %{state | expected_late_exit: state.gateway}}
 

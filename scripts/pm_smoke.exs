@@ -40,14 +40,14 @@ db = Tightbeam.DB
 base = System.get_env("TIGHTBEAM_BASE_DIR") || raise("export TIGHTBEAM_BASE_DIR")
 IO.puts("SMOKE boot: application started, base=#{base}")
 
-{:ok, _} = DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
+{:ok, _} = DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('operator', 1, 1)")
 
 mk = fn key, spawned_by, built_in ->
   Org.create(db, %{
     session_key: key,
     display_name: key,
-    owner_user_id: "flynn",
-    origin: "user:flynn",
+    owner_user_id: "operator",
+    origin: "user:operator",
     archetype: "default",
     harness: "claude",
     provider: "anthropic",
@@ -58,7 +58,7 @@ mk = fn key, spawned_by, built_in ->
   })
 end
 
-main = mk.(Org.personal_session_key("flynn"), nil, true)
+main = mk.(Org.personal_session_key("operator"), nil, true)
 _sup_s = mk.("smoke:sup", main.session_key, false)
 _child = mk.("smoke:child", "smoke:sup", false)
 IO.puts("SMOKE lineage: #{main.session_key} <- smoke:sup <- smoke:child")
@@ -66,7 +66,7 @@ IO.puts("SMOKE lineage: #{main.session_key} <- smoke:sup <- smoke:child")
 # 1. The cause: a real prompt into the child; the lane claims it and the
 #    engine fails it (no adapter, no credential — the production failure).
 :appended =
-  Gateway.deliver_prompt("smoke:child", "user:flynn", "hello from the smoke", db: db)
+  Gateway.deliver_prompt("smoke:child", "user:operator", "hello from the smoke", db: db)
 
 cause_seq =
   PmSmoke.await(
@@ -124,7 +124,7 @@ IO.puts("SMOKE 3 climb reached #{main.session_key}")
 
 PmSmoke.await(
   fn ->
-    if ConditionFacts.standing?(db, "user-alerted", "flynn"), do: {:ok, true}, else: :retry
+    if ConditionFacts.standing?(db, "user-alerted", "operator"), do: {:ok, true}, else: :retry
   end,
   "user-alerted stands"
 )
@@ -137,10 +137,10 @@ PmSmoke.await(
   )
 
 PmSmoke.assert!(String.contains?(alert, "smoke:child"), "alert names the child")
-IO.puts("SMOKE 4 terminal alert in main stream; user-alerted standing for flynn")
+IO.puts("SMOKE 4 terminal alert in main stream; user-alerted standing for operator")
 
 # 5. Suppression: a fresh failure does not re-climb while the alert stands.
-:appended = Gateway.deliver_prompt("smoke:child", "user:flynn", "again", db: db)
+:appended = Gateway.deliver_prompt("smoke:child", "user:operator", "again", db: db)
 
 PmSmoke.await(
   fn ->
@@ -198,10 +198,10 @@ allowed =
 PmSmoke.assert!(match?(%{fact_id: _}, allowed), "lineage assert accepted")
 IO.puts("SMOKE 6 verb seams: substrate refused, self denied, parent accepted")
 
-# 7. Retraction: a delivered turn under flynn clears the alert. The fixture
+# 7. Retraction: a delivered turn under operator clears the alert. The fixture
 #    harness cannot deliver here, so exercise the same path the lane takes:
 #    finish a queued turn as delivered and recognize it.
-:appended = Gateway.deliver_prompt("smoke:sup", "user:flynn", "capacity probe", db: db)
+:appended = Gateway.deliver_prompt("smoke:sup", "user:operator", "capacity probe", db: db)
 
 probe_seq =
   PmSmoke.await(
@@ -226,7 +226,7 @@ probe_seq =
 :ok = Tightbeam.Productions.Bubble.recognize_terminal(db, probe_seq)
 
 PmSmoke.assert!(
-  not ConditionFacts.standing?(db, "user-alerted", "flynn"),
+  not ConditionFacts.standing?(db, "user-alerted", "operator"),
   "delivered turn cleared the alert"
 )
 
@@ -234,8 +234,8 @@ IO.puts("SMOKE 7 retraction: delivered turn cleared user-alerted")
 
 # 8. RETIRE: a queued notice canceled by a real retire still climbs — the
 #    fault remains untold, and cancellation of the MESSENGER is not a ruling
-#    on the fault. Second owner so flynn's standing state can't interfere.
-{:ok, _} = DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('kay', 0, 1)")
+#    on the fault. Second owner so operator's standing state can't interfere.
+{:ok, _} = DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('other', 0, 1)")
 
 mk_owned = fn key, owner, spawned_by, built_in ->
   Org.create(db, %{
@@ -253,49 +253,49 @@ mk_owned = fn key, owner, spawned_by, built_in ->
   })
 end
 
-kay_main = mk_owned.(Org.personal_session_key("kay"), "kay", nil, true)
-_kay_sup = mk_owned.("kay:sup", "kay", kay_main.session_key, false)
-_kay_child = mk_owned.("kay:child", "kay", "kay:sup", false)
+other_main = mk_owned.(Org.personal_session_key("other"), "other", nil, true)
+_other_sup = mk_owned.("other:sup", "other", other_main.session_key, false)
+_other_child = mk_owned.("other:child", "other", "other:sup", false)
 
-:appended = Gateway.deliver_prompt("kay:child", "user:kay", "doomed work", db: db)
+:appended = Gateway.deliver_prompt("other:child", "user:other", "doomed work", db: db)
 
-kay_cause =
+other_cause =
   PmSmoke.await(
     fn ->
       case PmSmoke.q!(
              db,
-             "SELECT seq FROM turns WHERE sessionKey='kay:child' AND status IN ('failed','failed_unknown')"
+             "SELECT seq FROM turns WHERE sessionKey='other:child' AND status IN ('failed','failed_unknown')"
            ) do
         [[seq]] -> {:ok, seq}
         _ -> :retry
       end
     end,
-    "kay cause fails"
+    "other cause fails"
   )
 
-# The notice lands queued in kay:sup; retire kay:sup THROUGH THE REAL VERB
+# The notice lands queued in other:sup; retire other:sup THROUGH THE REAL VERB
 # before its lane can fail it, so the cancel path — not the failure path —
 # is what continues the climb. Race-tolerant: if the lane failed it first,
 # the climb continued anyway and the observation below still holds.
 PmSmoke.await(
   fn ->
-    case PmSmoke.q!(db, "SELECT seq FROM turns WHERE sessionKey='kay:sup' AND requestRef=?1", [
-           "bubble:#{kay_cause}"
+    case PmSmoke.q!(db, "SELECT seq FROM turns WHERE sessionKey='other:sup' AND requestRef=?1", [
+           "bubble:#{other_cause}"
          ]) do
       [[_]] -> {:ok, true}
       _ -> :retry
     end
   end,
-  "kay notice enqueued"
+  "other notice enqueued"
 )
 
 handlers = Gateway.handlers(%{db: db})
 
 retire_result =
   handlers["retire"].(%{
-    origin: "user:kay",
-    principal: {:user, "kay"},
-    session_key: "kay:sup",
+    origin: "user:other",
+    principal: {:user, "other"},
+    session_key: "other:sup",
     params: %{reason: "smoke retire"}
   })
 
@@ -303,12 +303,12 @@ IO.puts("SMOKE 8a retire verb: #{inspect(Map.take(retire_result, [:ok, :retired,
 
 PmSmoke.await(
   fn ->
-    if ConditionFacts.standing?(db, "user-alerted", "kay"), do: {:ok, true}, else: :retry
+    if ConditionFacts.standing?(db, "user-alerted", "other"), do: {:ok, true}, else: :retry
   end,
-  "kay climb survives retire and alerts"
+  "other climb survives retire and alerts"
 )
 
-IO.puts("SMOKE 8 canceled-messenger climb: kay alerted despite retired rung")
+IO.puts("SMOKE 8 canceled-messenger climb: other alerted despite retired rung")
 
 # 9. PROD SUPPRESSION, live: an open assignment prods on terminal; a standing
 #    work-blocked stops the production matching; retraction resumes it.
@@ -317,7 +317,7 @@ IO.puts("SMOKE 8 canceled-messenger climb: kay alerted despite retired rung")
     db,
     """
     INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt, state)
-    VALUES ('asg_smoke', 'smoke assignment', 'smoke:sup', 'flynn', 1, 'open')
+    VALUES ('asg_smoke', 'smoke assignment', 'smoke:sup', 'operator', 1, 'open')
     """
   )
 

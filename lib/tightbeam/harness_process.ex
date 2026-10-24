@@ -363,7 +363,7 @@ defmodule Tightbeam.HarnessProcess do
     result
   end
 
-  @doc "Operator-facing launch ledger, newest first."
+  @doc "user-facing launch ledger, newest first."
   @spec list(DB.server()) :: [row()]
   def list(db \\ DB) do
     :ok = ensure_schema(db)
@@ -423,7 +423,7 @@ defmodule Tightbeam.HarnessProcess do
   # pid may be reused by an unrelated process — the refusal is right) but the
   # refusal was recorded as kill_failed, which fences the key forever: a
   # machine reboot whose only job was recovery permanently disabled the
-  # harness (gibson, 2026-08-05, fence standing since the morning's restart).
+  # harness indefinitely after a reboot.
   #
   # LOCAL rows only: a remote row's boot identity belongs to the REMOTE
   # machine, and comparing it to ours would resolve a possibly-live process.

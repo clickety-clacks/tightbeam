@@ -18,96 +18,10 @@ defmodule Tightbeam.Harness.Claude do
 
   @api_base "https://api.anthropic.com"
 
-  # NOTE FOR FUTURE AGENTS — the claude model vocabulary is NARROWER than the catalog.
-  #
-  # The derived catalog for claude comes from the Anthropic API (`fetch_catalog/1` hits
-  # `/v1/models`), which currently lists 11 models. The claude ACP adapter's
-  # `session/set_config_option {configId: "model"}` accepts only TEN values, and the
-  # adapter seam renders the identity verbatim — family plus the vendor's context variant,
-  # with our effort on its own config option — so there is NO translation layer to fix. A model
-  # the adapter refuses fails the apply, which runs after EVERY `session/new` and every
-  # `session/load` (never-trust-the-advertised-model), so it recurs on resume, not just
-  # spawn.
-  #
-  # RECORDED LIVE 2026-07-26 against: claude CLI 2.1.220, claude-agent-acp 0.59.0,
-  # @anthropic-ai/claude-agent-sdk 0.3.207. Probe each value with
-  # `session/set_config_option` before trusting this table — it WILL rot, because the
-  # accepted set is whatever the installed CLI currently offers.
-  #
-  #   ACCEPTED  alias `default`  -> Sonnet 5      (same as `sonnet`)
-  #   ACCEPTED  alias `sonnet`   -> Sonnet 5
-  #   ACCEPTED  alias `opus`     -> Opus 4.8      (NOT Opus 5 — see below)
-  #   ACCEPTED  alias `haiku`    -> Haiku 4.5
-  #   ACCEPTED  id `claude-sonnet-5`
-  #   ACCEPTED  id `claude-opus-4-8`
-  #   ACCEPTED  id `claude-haiku-4-5-20251001`
-  #   ACCEPTED  alias `fable` / id `claude-fable-5`  (re-measured 2026-08-05; July
-  #             refusal was environmental — the projected-home pin offers it)
-  #   ACCEPTED  id `claude-opus-5`  (re-measured 2026-08-06; the REJECTED row below
-  #             measured the DEFAULT-PIN vocabulary, not the grant — a pin-probed
-  #             home offered+accepted it and a live prompt answered as Opus 5)
-  #   REJECTED  claude-opus-4-7, claude-sonnet-4-6, claude-opus-4-6,
-  #             claude-opus-4-5-20251101, claude-sonnet-4-5-20250929,
-  #             claude-opus-4-1-20250805
-  #
-  # The accepted ids were EXACTLY the models the aliases resolved to until the pin
-  # lesson (fable, then opus-5) showed the offered set follows the HOME PIN. So
-  # this is not an API-vs-CLI version lag that a mapping table can paper over: the
-  # adapter only accepts the models it is presently offering, by either name.
-  #
-  # WHY THERE IS NO SUBSTITUTION MAP HERE, deliberately: every candidate substitution is
-  # a silent downgrade. `claude-opus-5` -> `opus` delivers Opus 4.8, a different and
-  # older model. `claude-fable-5` has NO equivalent on this adapter version at all.
-  # Mapping either would make a request appear to succeed while delivering something
-  # else, which is the one outcome worse than failing. If a requested claude model is not
-  # in the ACCEPTED list above, it must fail and say so — do not quietly rewrite it.
-  #
-  # WHEN THIS ROTS (a new alias appears, or an accepted value stops being accepted):
-  # re-probe the adapter rather than editing from a changelog. Boot
-  # `node <adapters>/claude-agent-acp`, `initialize`, `session/new`, then read the
-  # `model` entry of the returned `configOptions` for the offered set, and confirm each
-  # candidate with `session/set_config_option`. Update this table and the version stamp
-  # together.
-  #
-  # ALSO GRANT- AND HOME-DEPENDENT, not only version-dependent. A smoke run recorded
-  # opus-5 and fable-5 "refused on this grant", and JOURNAL.md:804 records the offered
-  # list changing with the home's `settings.json` and the session cwd. So this table
-  # pins THREE things at once, and a different account may legitimately accept more.
-  # That is why the set is injectable (`claude_selectable_models` in the catalog's
-  # options, `:all` to disable) rather than only editable here.
-  #
-  # ON CODEX, kind-scoped: the shared-source argument holds only for the
-  # SUBSCRIPTION kind, whose catalog comes from the same account endpoint the
-  # CLI itself consults (codex.ex). The API-KEY kind derives from the platform
-  # route — the account's whole model universe — and the 2026-07-28 api-key
-  # exercise (#99) proved live that codex-acp refuses platform ids at
-  # set_config_option (-32602 for `gpt-5.1-codex`) while accepting codex-native
-  # slugs (`gpt-5.6-sol` ran a real turn). Codex's api-key catalog now carries
-  # its own `@adapter_selectable_models` guard on this precedent.
-  # RE-MEASURED 2026-08-05 on gibson (claude CLI 2.1.221, the production grant):
-  # `claude -p --model claude-fable-5` answered a real prompt — the 2026-07-26
-  # REJECTED row for fable was one environment's snapshot, not a property of the
-  # account or the CLI (Flynn was literally talking to Fable while this table
-  # said his account could not). The offered list is environment-dependent
-  # (JOURNAL.md:804); the projected-home model pin (ops-hardening-v1 §3) is what
-  # makes it deterministic. Keep re-probing per the note above before trusting
-  # any row here, in either direction.
-  # RE-MEASURED 2026-08-06 on gibson (adapter 0.59.0, the production grant):
-  # a pin-probe home (settings.json model=claude-opus-5) OFFERED and ACCEPTED
-  # claude-opus-5, and a live prompt through the production adapter+credential
-  # answered as Opus 5 — the 2026-07-26 REJECTED row for opus-5 was, like
-  # fable's, one environment's snapshot ("refused on this grant" measured a
-  # default-pin vocabulary, not the grant; the operator's own picker offered
-  # Opus 5 all along). Same lesson, second occurrence: re-probe from a second
-  # vantage before trusting any row here, in either direction.
-  # UPGRADED 2026-09-01 on gibson to claude-agent-acp 0.73.0 / SDK 0.3.257 /
-  # bundled Claude Code 2.1.257. This version offers and accepts claude-fable-5-1
-  # plus its 1M-context variant.
-  # Its public picker still exposes aliases, but their meaning changed: opus[1m]
-  # now identifies Opus 5. Tightbeam therefore tries a requested canonical id
-  # first and treats this table only as fallback candidates. The selected
-  # configOption's public currentValue plus init-derived name/description is the
-  # switch-time authority; a real next-turn modelUsage probe is the release gate.
+  # The adapter accepts a narrower set of model values than the derived catalog.
+  # Keep this list aligned with the values it can select. Requested models outside
+  # this set must fail rather than silently becoming a different model. The offered
+  # set can depend on the configured home, so the catalog filter remains injectable.
 
   @adapter_selectable_models ~w(default sonnet opus haiku fable claude-sonnet-5
                                 claude-opus-4-8 claude-haiku-4-5-20251001 claude-fable-5
@@ -289,14 +203,10 @@ defmodule Tightbeam.Harness.Claude do
 
   @impl true
   def reconcile_home(target, home, desired) do
-    # THE FABLE FIX (ops-hardening-v1 §3): claude's offered-model list is
-    # environment-dependent — the same home and auth offers fable at a cwd whose
-    # settings file pins it and not at a bare one (JOURNAL.md:804) — so every
-    # projected home pins the org's default model, making the offered list
-    # deterministic. Harness-owned, because WHICH config key means "model" and
-    # how a model is spelled there is this harness's business and nobody
-    # else's (the seam scan enforces exactly that). Merged with the rails hooks
-    # because both land in the same file; either side may be absent.
+    # MODEL PINNING: the offered-model list depends on the configured home.
+    # Pinning the default in each projected home makes the list deterministic.
+    # The harness owns this setting because it defines the model config key and
+    # spelling. Merge it with the rails hooks because either setting may be absent.
     #
     # Hash consequence: homes regenerate once on the deploy that first carries
     # this (identity change — context-reset markers will show; expected).
@@ -445,9 +355,8 @@ defmodule Tightbeam.Harness.Claude do
       // leaves `code` UNDEFINED on the outer error and puts the real reason -- ENOTFOUND,
       // ECONNRESET, UND_ERR_CONNECT_TIMEOUT, a TLS failure -- in `error.cause`. So the
       // fallback always won, and a refusal that exists to report dirt named none of it.
-      // Measured 2026-08-04: a client-e2e leg blocked twice at two SHAs on
-      // `{:transport_exit, 70, "fetch failed"}` with a credential proven live by a 200
-      // from this same endpoint, and the message could not say which transport failed.
+      // A transport error must retain its underlying cause so a refusal names
+      // the actual network failure.
       const cause = error.cause;
       process.stderr.write(
         [cause && cause.code, cause && cause.message, error.code, error.message]
@@ -580,9 +489,8 @@ defmodule Tightbeam.Harness.Claude do
     end
   end
 
-  # Both kinds read the SAME route; only the header differs. Recorded live
-  # 2026-07-28 with deliberately invalid credentials, which is what pins the two
-  # names apart: `x-api-key` answers 401 "API key is invalid." while
+  # Both kinds read the SAME route; only the header differs: `x-api-key` answers
+  # 401 "API key is invalid." while
   # `Authorization: Bearer` answers 401 "Invalid bearer token" -- two distinct
   # code paths on one route, so the header is not interchangeable.
   #
@@ -633,34 +541,19 @@ defmodule Tightbeam.Harness.Claude do
     end
   end
 
-  # The catalog must not advertise what the adapter will refuse. A PURE FILTER over
-  # the already-derived entries — no probe, no extra fetch, nothing at boot; the
-  # journal records this path being reverted once for adding live I/O, so it stays
-  # a filter. Effort suffixes are preserved: only the base ref is matched.
-  #
-  # This is a PIN, and it pins three things at once — the CLI version, the grant
-  # (a smoke run recorded opus-5 "refused on this grant"), and any model pins in
-  # the projected home's settings.json. When claude ships a version that accepts
-  # more, or a different grant offers more, THE TABLE is what to re-probe and
-  # update; nothing here discovers it. See the note on @adapter_selectable_models.
-  # Injectable through the same `state.options` seam as claude_fetch/codex_read/
-  # credential_status, for two reasons: a test must be able to exercise catalog
-  # derivation without being coupled to this table, and an operator on a DIFFERENT
-  # GRANT (the accepted set is grant-dependent — a smoke run recorded opus-5
-  # "refused on this grant") must be able to lift the ceiling without editing code.
-  # `:all` disables the filter entirely.
+  # Filter the derived catalog using the values this adapter can select. This
+  # path performs no probe or extra fetch. Effort suffixes are preserved: only
+  # the base model reference is matched. The accepted set can vary with the
+  # adapter configuration, so the filter is injectable for tests and alternate
+  # configurations. `:all` disables it.
   # What the adapter will actually accept, asked of the harness rather than remembered.
   #
-  # The static list alone is a frozen snapshot of somebody's entitlements, and it starved:
-  # the API stopped returning the concrete ids in it, so the intersection went empty and a
-  # correctly onboarded claude reported ZERO models. The account's real extras -- a
-  # 1M-context Opus, Fable -- live in the harness's own `additionalModelOptionsCache`, which
-  # Claude Code fills from the server on first use. That is why onboarding warms the home:
-  # cold, this reads nothing and the catalog is a subset; warmed, it reads what the account
-  # actually has.
+  # The static list provides a baseline. A configured home may expose additional
+  # models through its `additionalModelOptionsCache`, populated on first use.
+  # Warming the home lets the catalog include those values.
   #
-  # The static aliases stay as the floor. They are SDK aliases rather than account
-  # entitlements, so they are true for every account and cost nothing to keep.
+  # Static aliases remain available as the baseline because they are provided by
+  # the adapter rather than by account-specific entitlements.
   #
   # Remote homes are not read here -- that needs the ssh path -- so a satellite falls back to
   # the floor until someone teaches this to read over ssh. Stated rather than silent: the

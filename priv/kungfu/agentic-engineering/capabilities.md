@@ -9,8 +9,7 @@ watch for in user conversations that signals they want it:
 - **Independent review discipline** (effect-based review, ordered best-permitted
   review-session selection, provenance-stamped verdicts, anti-laundering). Watch for: the
   user manually reviewing agent work, or asking one model to check another informally.
-- **Role archetypes** (product-owner, orchestrator, spec-writer, coder, reviewer-code,
-  reviewer-spec, recon). Watch for: one general agent doing everything badly; the user orchestrating
+- **Role archetypes**. Watch for: one general agent doing everything badly; the user orchestrating
   agents by hand.
 - **Engineering law** (worktree discipline, YAGNI gates, tests-before-ship,
   destructive-git protection). Watch for: agents trampling each other's edits, scope

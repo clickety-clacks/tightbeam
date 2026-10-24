@@ -16,10 +16,10 @@ defmodule Tightbeam.AssetsTest do
   end
 
   test "put/get roundtrip records owner and writes bytes to disk", ctx do
-    row = Assets.put(ctx.db, ctx.base_dir, "flynn", "image/png", "pic.png", "hello-bytes")
+    row = Assets.put(ctx.db, ctx.base_dir, "operator", "image/png", "pic.png", "hello-bytes")
 
     assert row.asset_id =~ ~r/^a_[0-9a-f-]{36}$/
-    assert row.owner_user_id == "flynn"
+    assert row.owner_user_id == "operator"
     assert row.mime_type == "image/png"
     assert row.filename == "pic.png"
     assert row.size == 11

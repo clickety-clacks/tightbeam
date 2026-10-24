@@ -133,7 +133,7 @@ pub enum ActivationCommand {
 pub enum TuneControl {
     /// A different HARNESS. The engine changes, so the engine's conversation
     /// cannot come with it — Tightbeam's session, role, work, and graph
-    /// position do. `model` is REQUIRED (v0.2 program §4: the substrate
+    /// position do. `model` is REQUIRED (the substrate
     /// never elects) — the SOURCE model and its effort tier are never
     /// inherited across the boundary either, because a tier is vocabulary
     /// the destination may not have, so an omitted `--effort` on a model
@@ -622,10 +622,10 @@ IDENTITY (optional inside a session workdir; otherwise required):
   --as <role>          act as a role you currently hold. Use this when YOU (an
                        agent) run the command. The role must be bound to your
                        active session.
-                       To reply to [from user:mike], use wake --user mike; to
+                       To reply to [from user:operator], use wake --user operator; to
                        reply to [from agent:notetaker], use wake --role
                        notetaker. [from process:x] cannot be woken.
-  --as-user <userId>   act as a human user (e.g. "flynn"). Use this for
+  --as-user <userId>   act as a human user (e.g. "operator"). Use this for
                        operator/admin actions or when no agent identity applies.
   --as-process <name>  act as automation (cron, CI, a webhook — e.g.
                        "cron"). Processes may wake, cancel-wake, and file
@@ -802,20 +802,20 @@ COMMANDS:
       concurrency, not proven causality — every node states its own
       epistemic status (linked, from_turn, no_turn_observed, unrecorded).
       No percentages and no completion estimates: the rows do not support them.
-        tightbeam execution-map --origin user --state open --as-user flynn
+        tightbeam execution-map --origin user --state open --as-user operator
       --after/--limit page the FLAT roster on a stable (createdAt, id) cursor;
       the response carries nextAfter and hasMoreAfter. They bound the RESPONSE,
       not the gateway's work — the reader still computes telemetry over every
       item you can see. They are refused with --tree, because a forest has no
       page boundary that is not also a wrong answer.
-        tightbeam execution-map --quiet-over 2h --as-user flynn
-        tightbeam execution-map --limit 25 --after wi_abc123 --as-user flynn
+        tightbeam execution-map --quiet-over 2h --as-user operator
+        tightbeam execution-map --limit 25 --after wi_abc123 --as-user operator
   execution-map-select (--under <workItemId> [roster filters] | --assignments <id,...>)
       --under walks one item's causal subtree (the anchor plus its visible
       linked descendants). --assignments names an explicit assignment set and
       reports the items they resolve to; an assignment belonging to no item
       comes back in noItem rather than being silently dropped.
-        tightbeam execution-map-select --under wi_abc123 --as-user flynn
+        tightbeam execution-map-select --under wi_abc123 --as-user operator
   toplines [--state open|closed|all]
       List your visible durable Toplines.
   topline <toplineId> [--history]
@@ -837,13 +837,13 @@ COMMANDS:
       algedonic alarm or a deliberate summon, against all its turns. Counts
       rows and names no threshold; a window with no turns reports a null
       share, not zero.
-        tightbeam coordination-share --session agent:po --from 1 --to 2 --as-user flynn
+        tightbeam coordination-share --session agent:po --from 1 --to 2 --as-user operator
   digest-members <wakeId>
       Every source wake a digest carries, oldest first — the C4/acceptance-2
       audit as a status question, answerable from rows. Refuses by name if
       the id is unknown, is not a digest carrier, or names a carrier you
       cannot see — the same not_found either way.
-        tightbeam digest-members w_abc123 --as-user flynn
+        tightbeam digest-members w_abc123 --as-user operator
   work-item-icebox <workItemId>
       Shelve an unstaffed item (open → iceboxed). Requires zero open
       assignments; work-item-reopen resumes it.
@@ -935,7 +935,7 @@ COMMANDS:
       long one. --after <attestId> resumes strictly after the attest you name,
       so you can walk a long trail without re-reading it; the response carries
       nextAfter and hasMoreAfter to drive the next call.
-        tightbeam attests as_abc --limit 50 --as-user flynn
+        tightbeam attests as_abc --limit 50 --as-user operator
   assignments [--session <key> | --role <name>] [--state open|closed|all]
       List assignments (open by default).
 
@@ -1023,7 +1023,7 @@ COMMANDS:
       transit between machines; run `tightbeam onboard` independently on
       the assimilated host.
       After: add the host to an archetype's `where`.
-        tightbeam assimilate work-1.local --as-user flynn
+        tightbeam assimilate work-1.local --as-user operator
 
 DISCOVERY: the CLI walks up from cwd for .tightbeam-session first, then uses
   TIGHTBEAM_URL + TIGHTBEAM_TOKEN, then
@@ -1167,8 +1167,8 @@ const TUNE_USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harn
 /// TIGHTBEAM'S FIELDS ARE NEVER PACKED INTO ONE STRING.
 ///
 /// `--model`, `--effort`, and `--context` are separate flags for a reason:
-/// Tightbeam once spelled a reasoning tier `gpt-5.6-sol[high]`, colliding with
-/// the vendor's own context-variant syntax (`claude-fable-5[1m]`), and a
+/// Tightbeam once spelled a reasoning tier `gpt-5.6-example[high]`, colliding with
+/// the vendor's own context-variant syntax (`claude-example-5[1m]`), and a
 /// catalog read the vendor's bracket as ours — the 1M-context model silently
 /// ceased to exist.
 ///
@@ -1177,7 +1177,7 @@ const TUNE_USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harn
 /// (`low`/`medium`/`high`/`xhigh`/`max`). That list already went stale once —
 /// the reviewed catalog offers `ultra` too (`test/model_catalog_test.exs`) —
 /// and a fixed vocabulary can never keep up with a PER-MODEL catalog this
-/// binary does not always carry at parse time (F7, Sol xhigh review). So the
+/// binary does not always carry at parse time. So the
 /// check no longer inspects what is inside the brackets at all: ANY bracketed
 /// suffix on `--model` is packed form and is refused, naming where the field
 /// actually belongs. A caller who wants a vendor context variant passes it as
@@ -2136,7 +2136,7 @@ fn parse_with_optional_catalog(
                 }
             }
 
-            // THE SUBSTRATE NEVER ELECTS (v0.2 program §4). A harness swap
+            // THE SUBSTRATE NEVER ELECTS. A harness swap
             // re-engines the mind answering a session; the CLI does not let
             // that request leave with no model named and trust the far side
             // to pick one, the same way it does not let `--context` (a
@@ -3325,10 +3325,10 @@ mod tests {
                 "--decision",
                 "retain",
                 "--as-user",
-                "flynn",
+                "operator",
             ])),
             Ok(Command::CompletionDisposition {
-                identity: Identity::User("flynn".to_owned()),
+                identity: Identity::User("operator".to_owned()),
                 completion_id: "cn_1".to_owned(),
                 decision: "retain".to_owned(),
             })
@@ -3343,7 +3343,7 @@ mod tests {
                 "--report-to",
                 "report",
                 "--as-user",
-                "flynn",
+                "operator",
             ])),
             Ok(Command::Assign {
                 report_to: Some(value),
@@ -3356,7 +3356,7 @@ mod tests {
                 "--status",
                 "closed",
                 "--as-user",
-                "flynn",
+                "operator",
             ])),
             Err("--status must be open or all".to_owned())
         );
@@ -3390,7 +3390,7 @@ mod tests {
                 "--decision",
                 "delete",
                 "--as-user",
-                "flynn",
+                "operator",
             ])),
             Err("--decision must be retain, park, or retire".to_owned())
         );
@@ -3473,9 +3473,9 @@ mod tests {
     #[test]
     fn harness_process_operator_command_lists_launches() {
         assert_eq!(
-            parse(strings(&["harness-process", "list", "--as-user", "flynn"])),
+            parse(strings(&["harness-process", "list", "--as-user", "operator"])),
             Ok(Command::HarnessProcesses {
-                identity: Identity::User("flynn".to_owned()),
+                identity: Identity::User("operator".to_owned()),
             })
         );
     }
@@ -3486,7 +3486,7 @@ mod tests {
             parse(strings(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "test-host",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR=value=with=equals",
@@ -3495,7 +3495,7 @@ mod tests {
             ])),
             Ok(Command::HostEnvSet {
                 identity: Identity::Role("operator".to_owned()),
-                host: "gibson".to_owned(),
+                host: "test-host".to_owned(),
                 harness: "claude".to_owned(),
                 name: "EXAMPLE_OVERLAY_VAR".to_owned(),
                 value: "value=with=equals".to_owned(),
@@ -3506,15 +3506,15 @@ mod tests {
             parse(strings(&[
                 "host-env-list",
                 "--host",
-                "gibson",
+                "test-host",
                 "--harness",
                 "claude",
                 "--as-user",
-                "flynn",
+                "operator",
             ])),
             Ok(Command::HostEnvList {
-                identity: Identity::User("flynn".to_owned()),
-                host: Some("gibson".to_owned()),
+                identity: Identity::User("operator".to_owned()),
+                host: Some("test-host".to_owned()),
                 harness: Some("claude".to_owned()),
             })
         );
@@ -3523,16 +3523,16 @@ mod tests {
             parse(strings(&[
                 "host-env-unset",
                 "--host",
-                "gibson",
+                "test-host",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR",
                 "--as-user",
-                "flynn",
+                "operator",
             ])),
             Ok(Command::HostEnvUnset {
-                identity: Identity::User("flynn".to_owned()),
-                host: "gibson".to_owned(),
+                identity: Identity::User("operator".to_owned()),
+                host: "test-host".to_owned(),
                 harness: "claude".to_owned(),
                 name: "EXAMPLE_OVERLAY_VAR".to_owned(),
             })
@@ -3546,13 +3546,13 @@ mod tests {
             strings(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "test-host",
                 "EXAMPLE_OVERLAY_VAR=value",
             ]),
             strings(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "test-host",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR",
@@ -3659,10 +3659,10 @@ mod tests {
                 "onboard",
                 "fixture-provider",
                 "--as-user",
-                "flynn"
+                "operator"
             ])),
             Ok(Command::Onboard {
-                identity: Identity::User("flynn".to_owned()),
+                identity: Identity::User("operator".to_owned()),
                 provider: "fixture-provider".to_owned(),
                 api_key: false,
             })
@@ -3672,9 +3672,9 @@ mod tests {
     #[test]
     fn update_clients_is_an_admin_fleet_ceremony() {
         assert_eq!(
-            parse(strings(&["update-clients", "--as-user", "flynn"])),
+            parse(strings(&["update-clients", "--as-user", "operator"])),
             Ok(Command::UpdateClients {
-                as_user: "flynn".to_owned()
+                as_user: "operator".to_owned()
             })
         );
         assert_eq!(
@@ -3691,10 +3691,10 @@ mod tests {
                 "guest",
                 "--admin",
                 "--as-user",
-                "flynn"
+                "operator"
             ])),
             Ok(Command::AddUser {
-                identity: Identity::User("flynn".to_owned()),
+                identity: Identity::User("operator".to_owned()),
                 user_id: "guest".to_owned(),
                 admin: true
             })
@@ -3745,25 +3745,25 @@ mod tests {
                 "--harness",
                 "codex",
                 "--model",
-                "gpt-5.6-sol",
+                "gpt-5.6-example",
                 "--effort",
                 "high",
                 "--as-user",
-                "flynn",
+                "operator",
             ]),
             Ok(Command::Tune {
-                identity: Identity::User("flynn".to_owned()),
+                identity: Identity::User("operator".to_owned()),
                 session_key: "s_1".to_owned(),
                 control: TuneControl::Harness {
                     harness: "codex".to_owned(),
-                    model: "gpt-5.6-sol".to_owned(),
+                    model: "gpt-5.6-example".to_owned(),
                     effort: Some(Some("high".to_owned())),
                     context: None,
                 },
             })
         );
 
-        // A harness switch with NO model is REFUSED (v0.2 program §4): the
+        // A harness switch with NO model is REFUSED: the
         // substrate does not compose the destination's own default, and the
         // CLI does not invent one either — it does not know what the
         // destination host offers, and inventing one is the whole failure
@@ -3776,7 +3776,7 @@ mod tests {
                 "--harness",
                 "codex",
                 "--as-user",
-                "flynn"
+                "operator"
             ]),
             Err(
                 "--harness requires --model: the substrate does not choose one \
@@ -3798,7 +3798,7 @@ mod tests {
                 "--context",
                 "1m",
                 "--as-user",
-                "flynn"
+                "operator"
             ]),
             Err(
                 "--context qualifies a --model; name one, or drop --context \
@@ -3814,17 +3814,17 @@ mod tests {
                 "--session",
                 "s_1",
                 "--model",
-                "claude-fable-5",
+                "claude-example-5",
                 "--context",
                 "1m",
                 "--as-user",
-                "flynn",
+                "operator",
             ]),
             Ok(Command::Tune {
-                identity: Identity::User("flynn".to_owned()),
+                identity: Identity::User("operator".to_owned()),
                 session_key: "s_1".to_owned(),
                 control: TuneControl::Model {
-                    model: "claude-fable-5".to_owned(),
+                    model: "claude-example-5".to_owned(),
                     effort: None,
                     context: Some(Some("1m".to_owned())),
                 },
@@ -3840,10 +3840,10 @@ mod tests {
                 "--effort",
                 "xhigh",
                 "--as-user",
-                "flynn"
+                "operator"
             ]),
             Ok(Command::Tune {
-                identity: Identity::User("flynn".to_owned()),
+                identity: Identity::User("operator".to_owned()),
                 session_key: "s_1".to_owned(),
                 control: TuneControl::Effort("xhigh".to_owned()),
             })
@@ -3858,17 +3858,17 @@ mod tests {
                 "--session",
                 "s_1",
                 "--model",
-                "claude-fable-5",
+                "claude-example-5",
                 "--context",
                 "",
                 "--as-user",
-                "flynn",
+                "operator",
             ]),
             Ok(Command::Tune {
-                identity: Identity::User("flynn".to_owned()),
+                identity: Identity::User("operator".to_owned()),
                 session_key: "s_1".to_owned(),
                 control: TuneControl::Model {
-                    model: "claude-fable-5".to_owned(),
+                    model: "claude-example-5".to_owned(),
                     effort: None,
                     context: Some(None),
                 },
@@ -3886,9 +3886,9 @@ mod tests {
                 "--session",
                 "s_1",
                 "--model",
-                "gpt-5.6-sol[high]",
+                "gpt-5.6-example[high]",
                 "--as-user",
-                "flynn",
+                "operator",
             ]),
             Err(
                 "--model must not carry a bracketed suffix; pass --effort or --context \
@@ -3897,7 +3897,7 @@ mod tests {
             )
         );
 
-        // F7 (Sol xhigh review): the VENDOR's context variant in the same
+        // F7: the VENDOR's context variant in the same
         // syntax is ALSO refused now — a hardcoded list of Tightbeam's own
         // tier words already went stale once (the catalog offers `ultra`
         // too), and a per-model catalog is not always available to check
@@ -3910,9 +3910,9 @@ mod tests {
                 "--session",
                 "s_1",
                 "--model",
-                "claude-fable-5[1m]",
+                "claude-example-5[1m]",
                 "--as-user",
-                "flynn",
+                "operator",
             ]),
             Err(
                 "--model must not carry a bracketed suffix; pass --effort or --context \
@@ -3931,7 +3931,7 @@ mod tests {
                 "--harness",
                 "gemini",
                 "--as-user",
-                "flynn"
+                "operator"
             ]),
             Err("unsupported harness: gemini".to_owned())
         );
@@ -3947,7 +3947,7 @@ mod tests {
                 "--context",
                 "1m",
                 "--as-user",
-                "flynn"
+                "operator"
             ]),
             Err(
                 "--context qualifies a --model; name one, or drop --context \
@@ -3958,18 +3958,17 @@ mod tests {
 
         // No control named at all.
         assert_eq!(
-            tune(&["tune", "--session", "s_1", "--as-user", "flynn"]),
+            tune(&["tune", "--session", "s_1", "--as-user", "operator"]),
             Err(TUNE_USAGE.to_owned())
         );
 
         // No session named.
         assert_eq!(
-            tune(&["tune", "--model", "claude-fable-5", "--as-user", "flynn"]),
+            tune(&["tune", "--model", "claude-example-5", "--as-user", "operator"]),
             Err(TUNE_USAGE.to_owned())
         );
 
-        // A live switch names ONE session. Re-engining "whoever holds
-        // reviewer" is a different act and is not spelled here.
+        // This command does not support role-targeted model changes.
         assert_eq!(
             tune(&[
                 "tune",
@@ -3978,7 +3977,7 @@ mod tests {
                 "--model",
                 "m",
                 "--as-user",
-                "flynn"
+                "operator"
             ]),
             Err(TUNE_USAGE.to_owned())
         );
@@ -3994,9 +3993,9 @@ mod tests {
                 "--harness",
                 "codex",
                 "--modle",
-                "gpt-5.6-sol",
+                "gpt-5.6-example",
                 "--as-user",
-                "flynn",
+                "operator",
             ]),
             Err(TUNE_USAGE.to_owned())
         );
@@ -4012,7 +4011,7 @@ mod tests {
                     flag.as_str(),
                     "",
                     "--as-user",
-                    "flynn",
+                    "operator",
                 ]),
                 Err(format!("--{name} requires a non-empty value"))
             );
@@ -4168,7 +4167,7 @@ mod tests {
                 "assignment",
                 "asg_1",
                 "--as-user",
-                "flynn"
+                "operator"
             ])),
             Ok(Command::Breathing {
                 target_kind,
@@ -4178,16 +4177,16 @@ mod tests {
         ));
 
         for args in [
-            strings(&["breathing", "session", "--as-user", "flynn"]),
+            strings(&["breathing", "session", "--as-user", "operator"]),
             strings(&[
                 "breathing",
                 "work-item",
                 "wi_1",
                 "extra",
                 "--as-user",
-                "flynn",
+                "operator",
             ]),
-            strings(&["breathing", "attest", "att_1", "--as-user", "flynn"]),
+            strings(&["breathing", "attest", "att_1", "--as-user", "operator"]),
         ] {
             assert_eq!(
                 parse(args),
@@ -4234,7 +4233,7 @@ mod tests {
                 "--model",
                 "fixture-model",
                 "--as-user",
-                "flynn",
+                "operator",
             ]), &catalog),
             Ok(Command::Spawn {
                 harness: Some(ref harness),
@@ -4253,7 +4252,7 @@ mod tests {
                     "--harness",
                     "codex",
                     "--as-user",
-                    "flynn",
+                    "operator",
                 ]),
                 &catalog
             ),
@@ -4263,9 +4262,9 @@ mod tests {
         assert!(matches!(
             parse_with_catalog(strings(&[
                 "assimilate",
-                "flynn@host",
+                "example@host",
                 "--as-user",
-                "flynn",
+                "operator",
             ]), &catalog),
             Ok(Command::Assimilate(AssimilateArgs { harnesses, catalog: parsed_catalog, .. }))
                 if harnesses == vec!["fixture".to_owned()]
@@ -4281,7 +4280,7 @@ mod tests {
     fn assignment_selection_refuses_every_roster_filter() {
         for (flag, value) in [
             ("origin", "user"),
-            ("owner", "flynn"),
+            ("owner", "operator"),
             ("state", "closed"),
             ("quiet-over", "2h"),
             ("spec", "topline-map-v1"),
@@ -4295,7 +4294,7 @@ mod tests {
                 &format!("--{flag}"),
                 value,
                 "--as-user",
-                "flynn",
+                "operator",
             ]))
             .expect_err(&format!("--{flag} must be refused in assignment mode"));
 
@@ -4316,14 +4315,14 @@ mod tests {
             "--assignments",
             "asg_a,asg_b",
             "--as-user",
-            "flynn",
+            "operator",
         ]))
         .expect("bare assignment selection parses");
 
         assert_eq!(
             command,
             Command::Topline {
-                identity: Identity::User("flynn".to_owned()),
+                identity: Identity::User("operator".to_owned()),
                 selection: ToplineSelection::Assignments(vec![
                     "asg_a".to_owned(),
                     "asg_b".to_owned()
@@ -4368,7 +4367,7 @@ mod tests {
             "--origin",
             "user",
             "--as-user",
-            "flynn",
+            "operator",
         ]))
         .expect("--under with filters parses");
 
@@ -4672,7 +4671,7 @@ mod tests {
             })
         );
         assert_eq!(
-            parse(strings(&["list", "--as", "coder", "--as-user", "flynn"])),
+            parse(strings(&["list", "--as", "coder", "--as-user", "operator"])),
             Err("identity flags are mutually exclusive: pass exactly one of --as, --as-user, or --as-process".to_owned())
         );
     }
@@ -4695,7 +4694,7 @@ mod tests {
     #[test]
     fn requires_exactly_one_wake_target_and_session_only_retire() {
         for args in [
-            strings(&["wake", "--prompt", "hello", "--as-user", "flynn"]),
+            strings(&["wake", "--prompt", "hello", "--as-user", "operator"]),
             strings(&[
                 "wake",
                 "--session",
@@ -4705,15 +4704,15 @@ mod tests {
                 "--prompt",
                 "hello",
                 "--as-user",
-                "flynn",
+                "operator",
             ]),
         ] {
             assert!(parse(args).unwrap_err().contains("exactly one of"));
         }
         for args in [
-            strings(&["retire", "s", "--as-user", "flynn"]),
-            strings(&["retire", "--role", "r", "--as-user", "flynn"]),
-            strings(&["retire", "--user", "u", "--as-user", "flynn"]),
+            strings(&["retire", "s", "--as-user", "operator"]),
+            strings(&["retire", "--role", "r", "--as-user", "operator"]),
+            strings(&["retire", "--user", "u", "--as-user", "operator"]),
         ] {
             assert_eq!(
                 parse(args),
@@ -4727,9 +4726,9 @@ mod tests {
     #[test]
     fn reopen_assignment_requires_an_id_and_a_reason() {
         for args in [
-            strings(&["reopen-assignment", "--as-user", "flynn"]),
-            strings(&["reopen-assignment", "asg_1", "asg_2", "--as-user", "flynn"]),
-            strings(&["reopen-assignment", "asg_1", "--as-user", "flynn"]),
+            strings(&["reopen-assignment", "--as-user", "operator"]),
+            strings(&["reopen-assignment", "asg_1", "asg_2", "--as-user", "operator"]),
+            strings(&["reopen-assignment", "asg_1", "--as-user", "operator"]),
         ] {
             assert_eq!(
                 parse(args),
@@ -4746,7 +4745,7 @@ mod tests {
                 "--reason",
                 "stale verdict",
                 "--as-user",
-                "flynn",
+                "operator",
             ]))
             .unwrap(),
             Command::ReopenAssignment {
@@ -4768,7 +4767,7 @@ mod tests {
                 "--reason",
                 "second",
                 "--as-user",
-                "flynn",
+                "operator",
             ])),
             Err("usage: tightbeam revoke-assignment <assignmentId> --reason \"...\"".to_owned())
         );
@@ -4777,7 +4776,7 @@ mod tests {
     #[test]
     fn unknown_command_matches_reference_text() {
         assert_eq!(
-            parse(strings(&["frobnicate", "--as-user", "flynn"])),
+            parse(strings(&["frobnicate", "--as-user", "operator"])),
             Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, breathing, attend, transcript, turn-trace, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process".to_owned())
         );
     }
@@ -4822,10 +4821,10 @@ mod tests {
                 "--rationale",
                 "dependency first",
                 "--as-user",
-                "mike",
+                "operator",
             ])),
             Ok(Command::OperatorRule {
-                identity: Identity::User("mike".to_owned()),
+                identity: Identity::User("operator".to_owned()),
                 request_id: "dr_1".to_owned(),
                 decision: None,
                 response: Some("ship after 013".to_owned()),
@@ -4909,10 +4908,10 @@ mod tests {
                 "--seq",
                 "17",
                 "--as-user",
-                "flynn",
+                "operator",
             ])),
             Ok(Command::TurnTrace {
-                identity: Identity::User("flynn".to_owned()),
+                identity: Identity::User("operator".to_owned()),
                 session: "agent:coder:x s_1".to_owned(),
                 seq: "17".to_owned(),
             })
@@ -4924,7 +4923,7 @@ mod tests {
                 "--seq",
                 "17",
                 "--as-user",
-                "flynn"
+                "operator"
             ])),
             Err("turn-trace requires --session <key>".to_owned())
         );
@@ -5034,7 +5033,7 @@ mod tests {
                 "--session",
                 "agent:writer:app",
                 "--as-user",
-                "flynn",
+                "operator",
             ]))
             .is_ok()
         );
@@ -5046,7 +5045,7 @@ mod tests {
                     &format!("--{unsupported}"),
                     "value",
                     "--as-user",
-                    "flynn",
+                    "operator",
                 ])),
                 Err(
                     "usage: tightbeam artifacts [--work-item <workItemId>] [--session <key>]"
@@ -5066,7 +5065,7 @@ mod tests {
                 "--spec-ref",
                 "spec.md",
                 "--as-user",
-                "flynn",
+                "operator",
             ]))
             .unwrap_err()
             .contains("supplied together")
@@ -5079,7 +5078,7 @@ mod tests {
                 "--spec-sha256",
                 "abc",
                 "--as-user",
-                "flynn",
+                "operator",
             ])),
             Ok(Command::WorkItemUpdate {
                 work_item_id,
@@ -5103,7 +5102,7 @@ mod tests {
                 "--priority",
                 "6",
                 "--as-user",
-                "flynn",
+                "operator",
             ])),
             Ok(Command::WorkItemUpdate {
                 work_item_id,
@@ -5128,7 +5127,7 @@ mod tests {
                 "--spec-ref",
                 "spec.md",
                 "--as-user",
-                "flynn",
+                "operator",
             ]))
             .unwrap_err()
             .contains("conflicts")
@@ -5141,7 +5140,7 @@ mod tests {
                 "--is-bug",
                 "true",
                 "--as-user",
-                "flynn",
+                "operator",
             ]))
             .unwrap_err()
             .starts_with("usage: tightbeam work-item-update")
@@ -5154,7 +5153,7 @@ mod tests {
                 "--kind",
                 "verdict",
                 "--as-user",
-                "flynn",
+                "operator",
             ])),
             Err("--verdict is required when --kind is verdict".to_owned())
         );
@@ -5167,7 +5166,7 @@ mod tests {
                 "--verdict",
                 "reviewed",
                 "--as-user",
-                "flynn",
+                "operator",
             ])),
             Err("--verdict is only valid when --kind is verdict".to_owned())
         );
@@ -5282,12 +5281,12 @@ mod tests {
                     "--name",
                     "reviewer",
                     "--host",
-                    "eezo",
+                    "test-host",
                     "--as-user",
-                    "flynn",
+                    "operator",
                 ]),
                 Command::Spawn {
-                    identity: Identity::User("flynn".to_owned()),
+                    identity: Identity::User("operator".to_owned()),
                     display_name: "Worker".to_owned(),
                     idempotency_key: "k".to_owned(),
                     archetype: Some("worker".to_owned()),
@@ -5296,7 +5295,7 @@ mod tests {
                     effort: Some(Some("high".to_owned())),
                     context: Some(Some("1m".to_owned())),
                     handle: Some("reviewer".to_owned()),
-                    host: Some("eezo".to_owned()),
+                    host: Some("test-host".to_owned()),
                 },
             ),
             (
@@ -5337,9 +5336,9 @@ mod tests {
             ),
             (strings(&["identity", "current"]), Command::IdentityCurrent),
             (
-                strings(&["identity", "status", "coder", "--as-user", "flynn"]),
+                strings(&["identity", "status", "coder", "--as-user", "operator"]),
                 Command::IdentityStatus {
-                    identity: Identity::User("flynn".to_owned()),
+                    identity: Identity::User("operator".to_owned()),
                     archetype: Some("coder".to_owned()),
                 },
             ),
@@ -5353,10 +5352,10 @@ mod tests {
                     "--file".to_owned(),
                     skill_path.clone(),
                     "--as-user".to_owned(),
-                    "flynn".to_owned(),
+                    "operator".to_owned(),
                 ],
                 Command::IdentityEdit {
-                    identity: Identity::User("flynn".to_owned()),
+                    identity: Identity::User("operator".to_owned()),
                     archetype: "coder".to_owned(),
                     manifest: false,
                     skill: Some("swift".to_owned()),
@@ -5365,9 +5364,9 @@ mod tests {
                 },
             ),
             (
-                strings(&["identity", "apply", "--all", "--as-user", "flynn"]),
+                strings(&["identity", "apply", "--all", "--as-user", "operator"]),
                 Command::IdentityApply {
-                    identity: Identity::User("flynn".to_owned()),
+                    identity: Identity::User("operator".to_owned()),
                     session_key: None,
                     all: true,
                 },
@@ -5379,38 +5378,38 @@ mod tests {
                     "agent:retired",
                     "default",
                     "--as-user",
-                    "flynn",
+                    "operator",
                 ]),
                 Command::IdentityRepoint {
-                    identity: Identity::User("flynn".to_owned()),
+                    identity: Identity::User("operator".to_owned()),
                     session_key: "agent:retired".to_owned(),
                     archetype: "default".to_owned(),
                 },
             ),
             (
-                strings(&["kungfu", "list", "--as-user", "flynn"]),
+                strings(&["kungfu", "list", "--as-user", "operator"]),
                 Command::KungfuList {
-                    identity: Identity::User("flynn".to_owned()),
+                    identity: Identity::User("operator".to_owned()),
                 },
             ),
             (
-                strings(&["learn", "agentic-engineering", "--as-user", "flynn"]),
+                strings(&["learn", "agentic-engineering", "--as-user", "operator"]),
                 Command::Learn {
-                    identity: Identity::User("flynn".to_owned()),
+                    identity: Identity::User("operator".to_owned()),
                     name: "agentic-engineering".to_owned(),
                 },
             ),
             (
-                strings(&["unlearn", "agentic-engineering", "--as-user", "flynn"]),
+                strings(&["unlearn", "agentic-engineering", "--as-user", "operator"]),
                 Command::Unlearn {
-                    identity: Identity::User("flynn".to_owned()),
+                    identity: Identity::User("operator".to_owned()),
                     name: "agentic-engineering".to_owned(),
                 },
             ),
             (
-                strings(&["onboard", "openai", "--as-user", "flynn"]),
+                strings(&["onboard", "openai", "--as-user", "operator"]),
                 Command::Onboard {
-                    identity: Identity::User("flynn".to_owned()),
+                    identity: Identity::User("operator".to_owned()),
                     provider: "openai".to_owned(),
                     api_key: false,
                 },
@@ -5418,7 +5417,7 @@ mod tests {
             (
                 strings(&[
                     "assimilate",
-                    "flynn@host",
+                    "operator@host",
                     "--name",
                     "host",
                     "--base-dir",
@@ -5427,11 +5426,11 @@ mod tests {
                     "codex",
                     "--dry-run",
                     "--as-user",
-                    "flynn",
+                    "operator",
                 ]),
                 Command::Assimilate(AssimilateArgs {
-                    ssh_dest: "flynn@host".to_owned(),
-                    as_user: "flynn".to_owned(),
+                    ssh_dest: "operator@host".to_owned(),
+                    as_user: "operator".to_owned(),
                     name: Some("host".to_owned()),
                     base_dir: "/srv/tightbeam".to_owned(),
                     harnesses: vec!["codex".to_owned()],
@@ -5467,7 +5466,7 @@ mod tests {
             "--file".to_owned(),
             skill_path.display().to_string(),
             "--as-user".to_owned(),
-            "flynn".to_owned(),
+            "operator".to_owned(),
         ])
         .unwrap();
         fs::remove_file(skill_path).unwrap();
@@ -5490,18 +5489,18 @@ mod tests {
                 "--bogus",
                 "ignored",
                 "--as-user",
-                "flynn",
+                "operator",
             ]),
-            strings(&["toplines", "--tree", "--as-user", "flynn"]),
+            strings(&["toplines", "--tree", "--as-user", "operator"]),
             strings(&[
                 "topline",
                 "tl_probe",
                 "--under",
                 "wi_probe",
                 "--as-user",
-                "flynn",
+                "operator",
             ]),
-            strings(&["topline-placement-list", "--history", "--as-user", "flynn"]),
+            strings(&["topline-placement-list", "--history", "--as-user", "operator"]),
         ] {
             assert!(parse(args).unwrap_err().contains("does not accept"));
         }

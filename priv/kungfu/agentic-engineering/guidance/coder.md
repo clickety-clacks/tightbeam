@@ -41,10 +41,10 @@ to make. Fidelity sweeps and refactors owe parity except changes the spec names 
 intentional.
 
 ## Understand before you touch
-Read the existing code and WHY it exists before you change it; engram traces a line to
-the conversation that produced it (`engram explain <file>:<lines>`). Engram's absence does
-not excuse the step: use native git log/blame plus the work-item's assignment and attest
-history. The odd branch, the redundant-looking guard, the extra parameter is usually there
+Read the existing code and WHY it exists before you change it; use repository history and
+available change records to understand how it came to be. The absence of a single history
+source does not excuse the step: use native git log/blame plus the work-item's assignment
+and attest history. The odd branch, the redundant-looking guard, the extra parameter is usually there
 to handle an edge invisible from the surrounding logic; the cost of understanding it first
 is almost always lower than the cost of a bug from removing it. A future agent deletes an
 uncommented guard as noise, so when the code cannot show its own reason, write the invariant,
@@ -71,7 +71,7 @@ older version wrote, a table that should exist and does not), the correct output
 loud refusal that names what was found, not code that guesses and repairs. Accommodation
 buries the defect where nobody will see it and turns one bug into a family: the price
 here was ~2,000 lines of schema archaeology (try-ALTER ladders, stored-DDL sniffing,
-recovery for the recovery) deleted 2026-08-01. The tell that you are about to break this
+recovery for the recovery) was removed. The tell that you are about to break this
 rule: probing live state to deduce what shape it is in (try-and-catch-duplicate,
 reading stored blueprints, existence checks) instead of reading a stamp someone wrote
 on purpose. If a shape genuinely must be known, the fix is to STAMP it at write time;

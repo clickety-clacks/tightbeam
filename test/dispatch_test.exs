@@ -17,11 +17,11 @@ defmodule Tightbeam.DispatchTest do
 
   test "success returns result and appends one verb event", %{db: db} do
     handlers = %{"post" => fn call -> %{echoed: call.params} end}
-    call = %{verb: "post", origin: "user:flynn", session_key: "s1", params: %{content: "hi"}}
+    call = %{verb: "post", origin: "user:operator", session_key: "s1", params: %{content: "hi"}}
 
     assert {:ok, %{echoed: %{content: "hi"}}} = Dispatch.dispatch(db, handlers, call)
 
-    assert [%{kind: "verb", verb: "post", origin: "user:flynn", session_key: "s1"}] =
+    assert [%{kind: "verb", verb: "post", origin: "user:operator", session_key: "s1"}] =
              EventLog.events_after(db, 0, 10)
   end
 
@@ -30,8 +30,8 @@ defmodule Tightbeam.DispatchTest do
   } do
     call = %{
       verb: "cancel-wake",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: "s1",
       params: %{wake_id: "wake-1"}
     }
@@ -45,10 +45,10 @@ defmodule Tightbeam.DispatchTest do
                 txn,
                 "verb",
                 "cancel-wake",
-                "user:flynn",
+                "user:operator",
                 "s1",
                 %{canceled: true},
-                {:user, "flynn"},
+                {:user, "operator"},
                 1
               )
 
@@ -70,7 +70,7 @@ defmodule Tightbeam.DispatchTest do
   test "only the exact transactional accepted result bypasses the ordinary append", %{db: db} do
     call = %{
       verb: "cancel-wake",
-      origin: "user:flynn",
+      origin: "user:operator",
       session_key: "s1",
       params: %{wake_id: "wake-1"}
     }
@@ -85,7 +85,7 @@ defmodule Tightbeam.DispatchTest do
 
   test "onboarding lease identities are returned but not written to the event log", %{db: db} do
     result = %{status: "ready", staging_path: "/tmp/onboard", lease_id: "lease-secret"}
-    call = %{verb: "onboard", origin: "user:flynn", session_key: nil, params: %{}}
+    call = %{verb: "onboard", origin: "user:operator", session_key: nil, params: %{}}
 
     assert {:ok, ^result} = Dispatch.dispatch(db, %{"onboard" => fn _call -> result end}, call)
 
@@ -125,8 +125,8 @@ defmodule Tightbeam.DispatchTest do
   test "ruling CAS loss emits a queryable E1 denial", %{db: db} do
     call = %{
       verb: "post",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: nil,
       params: %{assignment_id: "a-cas"}
     }
@@ -152,8 +152,8 @@ defmodule Tightbeam.DispatchTest do
         INSERT INTO decision_requests
           (id, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName, actionKey,
            question, context, status, decision, ruledBy, ruledAt)
-        VALUES ('dr_cas', 'user:flynn', 'flynn', 1, 2, 'cas-rule', ?1,
-                'owner approval required', '{}', 'ruled', 'allow', 'user:flynn', 2)
+        VALUES ('dr_cas', 'user:operator', 'operator', 1, 2, 'cas-rule', ?1,
+                'owner approval required', '{}', 'ruled', 'allow', 'user:operator', 2)
         """,
         [action_key]
       )

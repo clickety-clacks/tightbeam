@@ -71,7 +71,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "a preflight row is an automated row: its failure fails the leg" do
       leg =
-        Scorecard.add(%Leg{harness: "claude", host: "eezo"}, [
+        Scorecard.add(%Leg{harness: "claude", host: "test-host"}, [
           Scorecard.fail("P1", "auth claude", "OAuth session expired"),
           Scorecard.pass("3", "converse", journey: "J1")
         ])
@@ -90,7 +90,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "a leg of only manual rows is INCOMPLETE, never a pass" do
       leg =
-        Scorecard.add(%Leg{harness: "claude", host: "eezo"}, [
+        Scorecard.add(%Leg{harness: "claude", host: "test-host"}, [
           Scorecard.manual("16", "wakes", "not driven")
         ])
 
@@ -112,7 +112,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "a fail outranks an incomplete" do
       leg =
-        Scorecard.add(%Leg{harness: "codex", host: "eezo"}, [
+        Scorecard.add(%Leg{harness: "codex", host: "test-host"}, [
           Scorecard.incomplete("13b", "model change", "no second model", journey: "J6"),
           Scorecard.fail("3", "converse", "no assistant reply", journey: "J1")
         ])
@@ -133,11 +133,11 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "the run verdict is the worst leg verdict" do
-      good = Scorecard.add(%Leg{harness: "claude", host: "eezo"}, Scorecard.pass("3", "converse"))
+      good = Scorecard.add(%Leg{harness: "claude", host: "test-host"}, Scorecard.pass("3", "converse"))
 
       bad =
         Scorecard.add(
-          %Leg{harness: "codex", host: "eezo"},
+          %Leg{harness: "codex", host: "test-host"},
           Scorecard.fail("3", "converse", "no reply")
         )
 
@@ -641,8 +641,8 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "REGRESSION: a lane whose reply commits LAST is not a delivery failure" do
-      # The field case (codex leg, 2026-08-04): B's trivial turn took 20.4s
-      # against Main's 12.6s, so B's reply committed 8.2s after Main's turn had
+      # One run had B's trivial turn take longer than Main's, so B's reply
+      # committed after Main's turn had
       # already ended — publish->arrival measured 0ms on all three frames. The
       # old rule asked only whether B's bubble preceded Main's and reported "a
       # delayed client frame", blaming the wire for which prompt the model
@@ -665,7 +665,7 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "out-of-order ARRIVAL with truthful seqs is not a defect" do
-      # The contract change (ruled 2026-08-04): delivery is a hint, the store is
+      # The contract is that delivery is a hint and the store is
       # truth, and ConnRegistry no longer filters — so frames may arrive in an
       # order the store never committed, carrying the seq that lets the client
       # settle them. Main's store committed done(1) -> slow(2); the frames
@@ -1375,7 +1375,7 @@ defmodule Tightbeam.ClientE2ETest do
       preflight =
         Scorecard.incomplete("P-codex", "auth codex", "credential liveness unknown: :timeout")
 
-      leg = ClientE2E.blocked_leg("codex", "eezo", preflight)
+      leg = ClientE2E.blocked_leg("codex", "test-host", preflight)
 
       assert match?({:incomplete, [_preflight | _blocked]}, Scorecard.leg_verdict(leg))
 
@@ -1560,8 +1560,8 @@ defmodule Tightbeam.ClientE2ETest do
   describe "the client's session-status decode contract" do
     test "a full payload has no gaps" do
       assert Journeys.decode_contract_gaps(%{
-               "sessionKey" => "agent:main:user:flynn",
-               "display" => %{"model" => "fable"},
+               "sessionKey" => "agent:main:user:operator",
+               "display" => %{"model" => "example-model"},
                "run" => %{"state" => "idle"},
                "capabilities" => %{}
              }) == []
@@ -1569,8 +1569,8 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "each field the Swift decoder requires is reported by name when missing" do
       full = %{
-        "sessionKey" => "agent:main:user:flynn",
-        "display" => %{"model" => "fable"},
+        "sessionKey" => "agent:main:user:operator",
+        "display" => %{"model" => "example-model"},
         "run" => %{"state" => "idle"},
         "capabilities" => %{}
       }
@@ -1783,7 +1783,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "J0 passes: the wire pairs, authenticates, seeds Main and syncs", ctx do
       {:ok, %{token: token}} =
-        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "Flynn")
+        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "user")
 
       {:ok, client} = SimClient.connect("127.0.0.1", ctx.port, token, device_id: "sim-j0")
 
@@ -1803,7 +1803,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "posting with a malformed id is refused on the wire, not silently dropped", ctx do
       {:ok, %{token: token}} =
-        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-bad-id", claimed_name: "Flynn")
+        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-bad-id", claimed_name: "user")
 
       {:ok, client} = SimClient.connect("127.0.0.1", ctx.port, token, device_id: "sim-bad-id")
       watermark = SimClient.mark(client)
@@ -1836,7 +1836,7 @@ defmodule Tightbeam.ClientE2ETest do
       client: client,
       main_key: nil,
       gateway: nil,
-      leg: %{harness: "claude", host: "testhost", model: "fable"},
+      leg: %{harness: "claude", host: "testhost", model: "example-model"},
       turn_wait_ms: 10_000,
       settle_ms: 250
     }
@@ -1876,7 +1876,7 @@ defmodule Tightbeam.ClientE2ETest do
           host: "testhost",
           harness: :claude,
           provider: fn -> :anthropic end,
-          model: Model.new("fable")
+          model: Model.new("example-model")
         }
       )
 

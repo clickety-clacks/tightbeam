@@ -43,7 +43,7 @@ defmodule Tightbeam.RailScriptTest do
     :ok = Wakes.ensure_schema(db)
     :ok = Placement.ensure_schema(db)
 
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "operator")
 
     {tmp, 0} = System.cmd("/bin/realpath", [System.tmp_dir!()])
 
@@ -71,13 +71,13 @@ defmodule Tightbeam.RailScriptTest do
       Org.create(db, %{
         session_key: "rail-holder",
         display_name: "Rail holder",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "coder",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("fable")
+        model: Model.new("example-model")
       })
 
     on_exit(fn ->
@@ -160,7 +160,7 @@ defmodule Tightbeam.RailScriptTest do
       call()
       |> Map.put(
         :principal,
-        {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "flynn"}}
+        {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "operator"}}
       )
 
     assert {:ok, "pass", "returned"} =
@@ -177,7 +177,7 @@ defmodule Tightbeam.RailScriptTest do
   # when it genuinely times out — which is what locked the two origins together in the
   # record. Same subject, and now the proof they are distinguishable: the reason is
   # identical because both really are timeouts, and the class differs because only one of
-  # them was reported by the wrapper (task #43).
+  # them was reported by the wrapper.
   test "BEAM backstop closes a wrapper that outlives its timeout", ctx do
     wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
     File.write!(wrapper, "#!/bin/sh\nexec /bin/sleep 30\n")
@@ -209,7 +209,7 @@ defmodule Tightbeam.RailScriptTest do
   # to apply. Each of the paths below reaches a deny WITHOUT the observation, and each
   # used to record the value the observation would have carried — so a fabricated
   # `error:1` was byte-identical to a script that really did exit 1, and the invariant
-  # "every failure names itself" could not be checked by anything (task #43).
+  # "every failure names itself" could not be checked by anything.
   #
   # The `reason` column is deliberately unchanged from what each path recorded before.
   test "a deny reached without an observation is classed unreported, not fabricated", ctx do
@@ -267,7 +267,7 @@ defmodule Tightbeam.RailScriptTest do
   # Reached in production when the DB process is down: `invocation_context` calls
   # `Org.get`, which exits `:noproc`. Nothing was spawned and nothing was observed, and
   # the row that would have recorded it cannot be written either — so the returned class
-  # is the only place this can be said (task #43).
+  # is the only place this can be said.
   test "a substrate exit is classed unreported, like a substrate raise", ctx do
     stop_supervised!(Tightbeam.DB)
 
@@ -282,7 +282,7 @@ defmodule Tightbeam.RailScriptTest do
   end
 
   # The recorded duration cannot locate a `script_timeout` in either timeout window, so
-  # no timing rule can name the layer (task #38).
+  # no timing rule can name the layer.
   #
   # `RailScript.run/5` measures with `System.monotonic_time` in the CALLING BEAM process
   # (rail_script.ex:13 and :27), while the wrapper is an OS process that keeps running on
@@ -294,7 +294,7 @@ defmodule Tightbeam.RailScriptTest do
   # backstop. The `+2_000` gap at rail_script.ex:166 is fixed in the CODE; the MEASUREMENT
   # is not, so the two windows overlap.
   #
-  # Task #43 recorded the fact that DOES separate them, so this test now carries both
+  # The observed distinction is recorded here, so this test carries both
   # halves: the duration still misleads, and the exit class still reads binary-enforced
   # under exactly that inflation. A discriminator that survives the condition which broke
   # the timing rule is the point — if someone rebuilds the layer claim on top of the
@@ -439,13 +439,13 @@ defmodule Tightbeam.RailScriptTest do
       Org.create(ctx.db, %{
         session_key: "remote-rail-holder",
         display_name: "Remote rail holder",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "operator",
+        origin: "user:operator",
         archetype: "coder",
         host: "remote-testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("fable")
+        model: Model.new("example-model")
       })
 
     expected_workdir =
@@ -461,7 +461,7 @@ defmodule Tightbeam.RailScriptTest do
     refute File.exists?(expected_workdir)
 
     # The class used to be `error:1` — a child exit for a child that was never spawned,
-    # and the same string a script that really exits 1 produces (task #43).
+    # and the same string a script that really exits 1 produces.
     assert {:error, "script_error", "unreported"} =
              RailScript.run(
                ctx.db,
@@ -611,8 +611,8 @@ defmodule Tightbeam.RailScriptTest do
              Escalation.rule(
                ctx.db,
                %{
-                 origin: "user:flynn",
-                 principal: {:user, "flynn"},
+                 origin: "user:operator",
+                 principal: {:user, "operator"},
                  params: %{request_id: id, decision: "allow"}
                },
                authorized: true
@@ -676,8 +676,8 @@ defmodule Tightbeam.RailScriptTest do
     assert denial.reason == "rule_denied"
     assert denial.script_exit_class == "returned"
     assert denial.ref == "w1"
-    assert denial.origin == "user:flynn"
-    assert denial.principal == "user:flynn"
+    assert denial.origin == "user:operator"
+    assert denial.principal == "user:operator"
   end
 
   test "every non-pass exit class denies dispatch with the named legibility payload", ctx do
@@ -714,7 +714,7 @@ defmodule Tightbeam.RailScriptTest do
     assert Enum.count(events, &(&1.kind == "decision_request_opened")) == 4
   end
 
-  # Flynn's ruling (§A3, 2026-07-29): "no sensor malfunction silently decides against
+  # The contract requires that no sensor malfunction silently decide against
   # work." The two halves pull in opposite directions, so both are asserted: the denial
   # the caller receives is the one it received before the ruling, AND a decision request
   # now names the statute behind it.
@@ -933,7 +933,7 @@ defmodule Tightbeam.RailScriptTest do
   # The malfunction that never reached the engine: the invocation context could not be
   # resolved, so NO script was spawned — the third `unreported` row of §A3's table. It
   # recorded `error:1`, a child exit asserted for a child that never existed and
-  # byte-identical to a script that really did exit 1. That is task #43's fabrication,
+  # byte-identical to a script that really did exit 1. That is a fabricated result,
   # surviving here because it sits a level above `rail_script.ex` where the rest of it
   # was cleaned out.
   test "an unresolvable invocation context records unreported, never a fabricated exit", ctx do
@@ -1176,8 +1176,8 @@ defmodule Tightbeam.RailScriptTest do
              Escalation.rule(
                ctx.db,
                %{
-                 origin: "user:flynn",
-                 principal: {:user, "flynn"},
+                 origin: "user:operator",
+                 principal: {:user, "operator"},
                  params: %{request_id: id, decision: "allow"}
                },
                authorized: true
@@ -1363,8 +1363,8 @@ defmodule Tightbeam.RailScriptTest do
              Escalation.rule(
                ctx.db,
                %{
-                 origin: "user:flynn",
-                 principal: {:user, "flynn"},
+                 origin: "user:operator",
+                 principal: {:user, "operator"},
                  params: %{request_id: id, decision: "allow"}
                },
                authorized: true
@@ -1444,8 +1444,8 @@ defmodule Tightbeam.RailScriptTest do
       Escalation.rule(
         ctx.db,
         %{
-          origin: "user:flynn",
-          principal: {:user, "flynn"},
+          origin: "user:operator",
+          principal: {:user, "operator"},
           params: %{request_id: id, decision: "allow"}
         },
         authorized: true
@@ -1560,8 +1560,8 @@ defmodule Tightbeam.RailScriptTest do
              Escalation.rule(
                ctx.db,
                %{
-                 origin: "user:flynn",
-                 principal: {:user, "flynn"},
+                 origin: "user:operator",
+                 principal: {:user, "operator"},
                  params: %{request_id: id, decision: "allow"}
                },
                authorized: true
@@ -1641,8 +1641,8 @@ defmodule Tightbeam.RailScriptTest do
       # proves — and then self-exits after 5s. A test that returns while its
       # fixture is still alive hands those seconds to whoever runs next: with
       # random test order on a slow runner, that was the suite-end census,
-      # which correctly refused to call the run green (CI macOS, run
-      # 30944574943). The fixture is this test's; waiting for it is too.
+      # which correctly refused to call the run green. The fixture is this
+      # test's; waiting for it is too.
       deadline = System.monotonic_time(:millisecond) + 8_000
 
       wait_for_exit = fn wait ->
@@ -1670,7 +1670,7 @@ defmodule Tightbeam.RailScriptTest do
     # parses `tightbeam rail-exec child exit: <N>` off wrapper stderr and has no way to
     # disagree with it, so a made-up line there was undetectable by construction. The
     # `cli` suite asserts the binary's bytes; this asserts what the substrate ends up
-    # recording, with the real binary in the path (task #43).
+    # recording, with the real binary in the path.
     test "a check whose input never arrived records unreported, not a child exit", ctx do
       wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
       File.cp!(@release_binary, wrapper)
@@ -1733,8 +1733,8 @@ defmodule Tightbeam.RailScriptTest do
   defp call(params \\ %{}) do
     %{
       verb: "post",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:operator",
+      principal: {:user, "operator"},
       session_key: nil,
       params: params
     }

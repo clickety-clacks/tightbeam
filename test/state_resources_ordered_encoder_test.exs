@@ -235,7 +235,7 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
         "class" => "user.added",
         "op" => "upsert",
         "occurredAt" => 1,
-        "refs" => %{"userId" => "flynn"},
+        "refs" => %{"userId" => "operator"},
         "payload" => invalid
       })
     end
@@ -372,7 +372,7 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     projection =
       StateResources.device(%{
         device_id: "device-canonical",
-        user_id: "flynn",
+        user_id: "operator",
         claimed_name: "Canonical device",
         status: "allowlisted",
         is_admin: true,

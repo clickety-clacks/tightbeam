@@ -9,26 +9,11 @@ defmodule Tightbeam.Harness.Codex do
 
   @adapter_version "1.1.4"
   @adapter_package "codex-acp"
-  # Two routes, one per credential kind, because they are two different accounts'
-  # worth of entitlement expressed two different ways.
-  #
-  # SUBSCRIPTION — recorded live 2026-07-28 against codex-cli 0.145.0. The
-  # platform route is CLOSED to a ChatGPT token: 403, missing scope
-  # `api.model.read`. Do not "fix" this to the obvious URL.
+  # Subscription and API-key credentials use different catalog routes.
   @models_url "https://chatgpt.com/backend-api/codex/models"
 
-  # API KEY — the platform route, which the subscription token was refused for by
-  # name. Recorded 2026-07-28 with a deliberately invalid key: 401
-  # `invalid_api_key`, an AUTHENTICATION failure, not the subscription token's
-  # 403 authorization failure. That contrast is the evidence the route treats API
-  # keys as first-class.
-  #
-  # VERIFIED WITH A VALID KEY 2026-07-28 (the #89 api-key exercise, throwaway
-  # org): the route answered 200 with 125 bare ids in the platform shape
-  # `derive_platform_entries/1` decodes, and codex-acp ran a real turn on
-  # api-key auth (gpt-5.6-sol[medium]). What the exercise DISPROVED is that the
-  # adapter accepts everything this route lists — see
-  # `@adapter_selectable_models` below.
+  # The platform route requires API-key authentication and returns the public
+  # platform catalog shape, which `derive_platform_entries/1` decodes.
   @api_models_url "https://api.openai.com/v1/models"
 
   # Model values codex-acp @adapter_version accepts at `session/set_config_option
@@ -36,16 +21,8 @@ defmodule Tightbeam.Harness.Codex do
   # the platform route lists the account's whole model universe and the adapter
   # accepts almost none of it.
   #
-  # RECORDED LIVE 2026-07-28 (the #89 api-key exercise, throwaway org,
-  # codex-acp 1.1.4): GET /v1/models answered 125 bare ids; the adapter REFUSED
-  # the platform id `gpt-5.1-codex` with -32602 Invalid params, and ACCEPTED
-  # `gpt-5.6-sol`, which ran a real turn (effort medium) on the same adapter and
-  # auth. `gpt-5.1-codex` is spelled exactly like a codex slug and was refused
-  # anyway, so a platform id is NOT translatable into the adapter's vocabulary
-  # by any mapping this repo can compute from spelling — substituting a
-  # near-miss would be the silent-downgrade `harness/claude.ex` refuses. Hence a
-  # FILTER to the demonstrably-selectable set, claude's `@adapter_selectable_models`
-  # precedent exactly.
+  # The platform route can return models that the adapter refuses. Filter to
+  # the adapter's selectable set; never substitute a similar-looking model id.
   #
   # Injectable (`codex_selectable_models` in the catalog's options, `:all` to
   # disable): the accepted set is the ADAPTER VERSION's, and an operator on a
@@ -491,8 +468,8 @@ defmodule Tightbeam.Harness.Codex do
     |> classify_extraction(kind, auth)
   end
 
-  # Codex owns `auth.json` and rewrites it IN PLACE as it rotates (established
-  # empirically 2026-07-28: the inode survives a forced rotation, so the store's
+  # Codex owns `auth.json` and rewrites it IN PLACE as it rotates. The inode
+  # survives rotation, so the store's
   # symlink stays coherent). This probe is a second, read-only reader of that
   # file, so a read can land mid-rewrite and see torn JSON. That is a RETRYABLE
   # accident of timing, not a verdict on the grant — the next refresh reads a
@@ -858,8 +835,7 @@ defmodule Tightbeam.Harness.Codex do
   # nothing here knows what efforts the model offers, and inventing tiers would
   # advertise a control that does not work.
   #
-  # OBSERVED LIVE 2026-07-28 (the #89 api-key exercise): 125 entries in exactly
-  # this shape, bare ids under "data".
+  # This route returns bare model ids under "data".
   defp derive_platform_entries(models) do
     Enum.reduce_while(models, {:ok, []}, fn
       %{"id" => id}, {:ok, entries} when is_binary(id) and id != "" ->
@@ -884,12 +860,9 @@ defmodule Tightbeam.Harness.Codex do
     end)
   end
 
-  # The catalog must not advertise what the adapter will refuse (#99, the #41
-  # problem's codex/api-key edition). The platform route returns the whole
-  # account's model universe — 125 ids observed live 2026-07-28 — and codex-acp
-  # refuses almost all of it at `session/set_config_option` (-32602 for
-  # `gpt-5.1-codex`, recorded on the same adapter+auth that accepted and ran
-  # `gpt-5.6-sol`). So the api-key kind defaults to the pinned
+  # The catalog must not advertise what the adapter will refuse. The platform
+  # route may return model ids the adapter rejects, so the api-key kind defaults
+  # to the pinned
   # `@adapter_selectable_models` set — a PURE FILTER over the already-derived
   # entries, claude's precedent exactly: no probe, no extra fetch, nothing at
   # boot, and never a substitution.

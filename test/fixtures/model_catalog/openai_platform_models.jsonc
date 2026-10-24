@@ -3,7 +3,7 @@
 // under "data" — no display name, no reasoning levels, no context window.
 // Trimmed to the two ids the exercise adjudicated live: codex-acp REFUSED
 // `gpt-5.1-codex` at session/set_config_option (-32602 Invalid params) and
-// ACCEPTED `gpt-5.6-sol`, which ran a real turn on the same adapter+auth.
+// ACCEPTED `gpt-5.6-example`, which ran a real turn on the same adapter+auth.
 // Right-sizing: assert only consumed fields and relied-on invariants; additive unconsumed fields must not fail.
 {
   "data": [
@@ -12,7 +12,7 @@
       "object": "model"
     },
     {
-      "id": "gpt-5.6-sol",
+      "id": "gpt-5.6-example",
       "object": "model"
     }
   ]

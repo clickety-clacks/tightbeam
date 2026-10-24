@@ -19,7 +19,7 @@ section is the complete procedure.
 1b. Cross-architecture satellites. The ceremony installs the CLI by
    shipping its own running binary, gated on identical target triples: a
    satellite whose OS/CPU differs from the control node SKIPS the CLI
-   step with a warning (wi_c729ca10 tracks the product fix; the warning's
+   step with a warning; the warning's
    "build for <target> and re-run" hint does not work from the control
    node — re-running still ships the control node's binary). Build on the
    satellite instead: copy the repo's cli/ source over (rsync), run

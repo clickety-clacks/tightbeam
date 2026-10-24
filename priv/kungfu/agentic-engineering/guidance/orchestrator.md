@@ -254,9 +254,9 @@ allocated resources are untouched, no re-slot is implied, carry on." That senten
 is the whole saving; a producer told only the new SHA assumes the worst and
 recomposes.
 
-The four cases when a base moves, including a move that is not a fast-forward, are
-worked in landing-serializer-kit.md in the specs repo; do not restate them here. The
-limit is honest: this removes the collision, not its cost. A verdict still binds to
+The landing procedure defines the four cases when a base moves, including a move that
+is not a fast-forward; do not restate them here. The limit is honest: this removes the
+collision, not its cost. A verdict still binds to
 an exact commit, so a lane that genuinely must rebase into changed files still pays
 a full cycle, and the protocol holds by agreement, not by a lock.
 

@@ -30,7 +30,7 @@ fn bank_captured_hollow_anthropic(base_dir: &std::path::Path) {
         .unwrap(),
     )
     .unwrap();
-    // Captured from the real hollow Claude credential that caused the incident. Keep the
+    // Captured from an empty Claude credential fixture. Keep the
     // surrounding vendor fields so this exercises the banked response shape, not a toy object.
     let captured = serde_json::json!({
         "claudeAiOauth": {

@@ -1844,7 +1844,7 @@ defmodule Tightbeam.Wire.Router do
         {:ok, value} when is_nil(value) or value == "" ->
           Map.put(params, String.to_existing_atom(key), nil)
 
-        # F6 (Sol xhigh review): a value this seam does not know how to read
+        # F6: a value this seam does not know how to read
         # (a number, a bool, an object) is NOT a field value it silently
         # discards. Dropping it here used to hand the gateway a params map
         # indistinguishable from "the caller named nothing", which activated

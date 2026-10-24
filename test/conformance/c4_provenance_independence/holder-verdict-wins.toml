@@ -4,7 +4,7 @@ name = "holder-verdict-wins"
 phase = "pending"
 blocking_phase = "P3"
 kind = "dispatch-rule"
-source = "coordination-fabric-v1 §13 Phase 0; wi_1b0237fe wedge class"
+source = "Product contract for assignment review-round selection"
 legibility = "event:denied(rule=coder-completion-needs-independent-review)"
 
 # The wedge CLASS, pinned. Review-round selection is anchored on the rounds that

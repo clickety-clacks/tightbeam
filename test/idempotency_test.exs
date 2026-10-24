@@ -12,22 +12,22 @@ defmodule Tightbeam.IdempotencyTest do
 
   test "stores and resolves a result in owner-operation-key scope", %{db: db} do
     row = %{
-      owner_user_id: "flynn",
+      owner_user_id: "operator",
       operation: "spawn",
       idempotency_key: "request-1",
       session_key: "session-1"
     }
 
-    assert Idempotency.get(db, "flynn", "spawn", "request-1") == nil
+    assert Idempotency.get(db, "operator", "spawn", "request-1") == nil
     assert :ok = Idempotency.put(db, row)
-    assert Idempotency.get(db, "flynn", "spawn", "request-1") == row
-    assert Idempotency.get(db, "flynn", "retire", "request-1") == nil
+    assert Idempotency.get(db, "operator", "spawn", "request-1") == row
+    assert Idempotency.get(db, "operator", "retire", "request-1") == nil
     assert Idempotency.get(db, "other", "spawn", "request-1") == nil
   end
 
   test "duplicate scope is rejected and operation is constrained", %{db: db} do
     row = %{
-      owner_user_id: "flynn",
+      owner_user_id: "operator",
       operation: "retire",
       idempotency_key: "request-1",
       session_key: "session-1"
@@ -45,7 +45,7 @@ defmodule Tightbeam.IdempotencyTest do
   test "fresh DDL accepts condition", %{db: db} do
     assert :ok =
              Idempotency.put(db, %{
-               owner_user_id: "user:flynn",
+               owner_user_id: "user:operator",
                operation: "condition",
                idempotency_key: "new",
                session_key: "1"

@@ -59,7 +59,7 @@ defmodule Tightbeam.RulesTransportTest do
       end)
 
     {:paired, device} =
-      claim_org(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+      claim_org(db, %{device_id: "d1", claimed_name: "user", platform: nil, model: nil})
 
     main = Org.get(db, Org.personal_session_key(device.user_id))
 
@@ -73,7 +73,7 @@ defmodule Tightbeam.RulesTransportTest do
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("fable")
+        model: Model.new("example-model")
       })
 
     Roles.create!(db, "operator", device.user_id, actor.session_key)
@@ -100,7 +100,7 @@ defmodule Tightbeam.RulesTransportTest do
         host: "testhost",
         harness: :claude,
         provider: :anthropic,
-        model: Model.new("fable")
+        model: Model.new("example-model")
       },
       ping_interval_ms: 60_000,
       pong_timeout_ms: 60_000

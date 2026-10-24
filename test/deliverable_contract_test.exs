@@ -11,12 +11,12 @@ defmodule Tightbeam.DeliverableContractTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',0,'admin_add',1),('other',0,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',0,'admin_add',1),('other',0,'admin_add',1)"
       )
 
-    Enum.each(~w(flynn other), &ensure_main_session(db, &1))
-    session(db, "product-owner", "flynn", %{archetype: "product-owner"})
-    session(db, "holder", "flynn", %{spawned_by: "product-owner"})
+    Enum.each(~w(operator other), &ensure_main_session(db, &1))
+    session(db, "product-owner", "operator", %{archetype: "product-owner"})
+    session(db, "holder", "operator", %{spawned_by: "product-owner"})
     session(db, "other-holder", "other")
 
     %{db: db}
@@ -94,27 +94,28 @@ defmodule Tightbeam.DeliverableContractTest do
       |> File.read!()
 
     assert :sha256 |> :crypto.hash(archive) |> Base.encode16(case: :lower) ==
-             "282fa3bb92c0eb6795a26722c14092ba3b4a4edbbdca80d26d7a3fb9faaacc64"
+             "91b3afe3bb53cc25109be63a17d3a18b92675b30c4c100fbf20183afd34c18cf"
 
     assert {:ok, entries} = :erl_tar.extract({:binary, archive}, [:memory, :compressed])
 
-    fixed_base_sources =
+    captured_sources =
       Map.new(entries, fn {path, bytes} -> {List.to_string(path), bytes} end)
 
-    # This archive is produced from the complete lib/ tree at exact base
+    # This sanitized archive is based on the complete lib/ tree at exact base
     # 724e5c96f9513b37e937dc52eb014ba1ef2d1b5e (tree
-    # 41da8ae7ddee96e01c42ac482052862fba7041e9). Inspecting every production
-    # source file makes an empty optional-rail set an exact-source result, not
-    # an inference from a test that happened not to configure one.
-    exact_source =
-      fixed_base_sources
+    # 41da8ae7ddee96e01c42ac482052862fba7041e9). Local attribution has been
+    # removed from its comments. Inspecting every production source file makes
+    # an empty optional-rail set an exact-source result, not an inference from
+    # a test that happened not to configure one.
+    captured_source =
+      captured_sources
       |> Enum.sort()
       |> Enum.map_join("\n", fn {path, bytes} -> path <> "\n" <> bytes end)
 
-    refute exact_source =~ "CompletionEscalation"
-    refute exact_source =~ "completion_escalation"
+    refute captured_source =~ "CompletionEscalation"
+    refute captured_source =~ "completion_escalation"
 
-    assert fixed_base_sources
+    assert captured_sources
            |> Map.keys()
            |> Enum.filter(&String.starts_with?(&1, "lib/tightbeam/productions/"))
            |> Enum.sort() == [
@@ -123,11 +124,11 @@ defmodule Tightbeam.DeliverableContractTest do
              "lib/tightbeam/productions/catalog_rederive.ex"
            ]
 
-    assignments = Map.fetch!(fixed_base_sources, "lib/tightbeam/assignments.ex")
-    work_items = Map.fetch!(fixed_base_sources, "lib/tightbeam/work_items.ex")
-    supervision = Map.fetch!(fixed_base_sources, "lib/tightbeam/supervision.ex")
-    effort = Map.fetch!(fixed_base_sources, "lib/tightbeam/effort_checkin.ex")
-    schema = Map.fetch!(fixed_base_sources, "lib/tightbeam/schema.ex")
+    assignments = Map.fetch!(captured_sources, "lib/tightbeam/assignments.ex")
+    work_items = Map.fetch!(captured_sources, "lib/tightbeam/work_items.ex")
+    supervision = Map.fetch!(captured_sources, "lib/tightbeam/supervision.ex")
+    effort = Map.fetch!(captured_sources, "lib/tightbeam/effort_checkin.ex")
+    schema = Map.fetch!(captured_sources, "lib/tightbeam/schema.ex")
 
     contract =
       File.read!(Path.join([__DIR__, "..", "lib", "tightbeam", "deliverable_contract.ex"]))
@@ -214,9 +215,9 @@ defmodule Tightbeam.DeliverableContractTest do
   end
 
   test "boot refuses captured product-owner ancestry outside the frozen spawn chain", ctx do
-    main = Org.personal_session_key("flynn")
-    session(ctx.db, "ordinary-ancestor", "flynn", %{spawned_by: main})
-    session(ctx.db, "ordinary-child", "flynn", %{spawned_by: "ordinary-ancestor"})
+    main = Org.personal_session_key("operator")
+    session(ctx.db, "ordinary-ancestor", "operator", %{spawned_by: main})
+    session(ctx.db, "ordinary-child", "operator", %{spawned_by: "ordinary-ancestor"})
 
     card = create_card(ctx, "Ordinary ancestry must not confer authority")
     assignment = assign_to(ctx, card.id, "Subordinate result", false, "ordinary-child")
@@ -241,7 +242,7 @@ defmodule Tightbeam.DeliverableContractTest do
       WorkItems.__handle__(
         ctx.db,
         "work-item-update",
-        call("work-item-update", {:user, "flynn"}, nil, %{
+        call("work-item-update", {:user, "operator"}, nil, %{
           work_item_id: card.id,
           title: "Display title only"
         })
@@ -279,10 +280,10 @@ defmodule Tightbeam.DeliverableContractTest do
     assert completion.attest.deliverableClaim.name == "Write the specification only"
 
     assert %{code: "completion_deliverable_mismatch"} =
-             close(ctx, {:user, "flynn"}, card.id, completion.attest.id)
+             close(ctx, {:user, "operator"}, card.id, completion.attest.id)
 
     assert %{code: "owner_ruling_forbidden"} =
-             close(ctx, {:user, "flynn"}, card.id, completion.attest.id, "Accept spec only")
+             close(ctx, {:user, "operator"}, card.id, completion.attest.id, "Accept spec only")
 
     assert %{ok: true, workItem: closed} =
              close(
@@ -331,13 +332,13 @@ defmodule Tightbeam.DeliverableContractTest do
     assert completion.attest.deliverableClaim.id == assignment.deliverable.id
 
     assert %{code: "completion_deliverable_mismatch"} =
-             close(ctx, {:user, "flynn"}, card.id, completion.attest.id)
+             close(ctx, {:user, "operator"}, card.id, completion.attest.id)
 
     assert %{workItem: %{state: "open", closure: nil}} =
              WorkItems.__handle__(
                ctx.db,
                "work-item-get",
-               call("work-item-get", {:user, "flynn"}, nil, %{work_item_id: card.id})
+               call("work-item-get", {:user, "operator"}, nil, %{work_item_id: card.id})
              )
   end
 
@@ -490,7 +491,7 @@ defmodule Tightbeam.DeliverableContractTest do
       "testhost" => %{ssh: nil, base_dir: System.tmp_dir!(), cli_bin: nil}
     })
 
-    session(ctx.db, "retired-parent", "flynn", %{spawned_by: "product-owner"})
+    session(ctx.db, "retired-parent", "operator", %{spawned_by: "product-owner"})
     Org.set_operational_parent(ctx.db, "holder", "retired-parent")
 
     :ok =
@@ -591,12 +592,12 @@ defmodule Tightbeam.DeliverableContractTest do
     second_completion = complete(ctx, second.id, nil)
 
     assert %{code: "completion_claim_wrong_card"} =
-             close(ctx, {:user, "flynn"}, first_card.id, second_completion.attest.id)
+             close(ctx, {:user, "operator"}, first_card.id, second_completion.attest.id)
 
     short_id = String.slice(first_completion.attest.id, 0, 16)
 
     assert %{ok: true, workItem: %{state: "closed"}} =
-             close(ctx, {:user, "flynn"}, first_card.id, short_id)
+             close(ctx, {:user, "operator"}, first_card.id, short_id)
 
     subordinate_card = create_card(ctx, "Slate ordering")
     subordinate = assign(ctx, subordinate_card.id, "One partial result", false)
@@ -604,7 +605,7 @@ defmodule Tightbeam.DeliverableContractTest do
     _still_open = assign(ctx, subordinate_card.id, "Another open result", false)
 
     assert %{code: "assignments_open"} =
-             close(ctx, {:user, "flynn"}, subordinate_card.id, partial_completion.attest.id)
+             close(ctx, {:user, "operator"}, subordinate_card.id, partial_completion.attest.id)
 
     exact_reason_card = create_card(ctx, "Exact reason refusal")
     exact = assign(ctx, exact_reason_card.id, "Exact", true)
@@ -613,7 +614,7 @@ defmodule Tightbeam.DeliverableContractTest do
     assert %{code: "owner_ruling_not_applicable"} =
              close(
                ctx,
-               {:user, "flynn"},
+               {:user, "operator"},
                exact_reason_card.id,
                exact_completion.attest.id,
                "not applicable"
@@ -633,20 +634,20 @@ defmodule Tightbeam.DeliverableContractTest do
       )
 
     assert %{code: "ambiguous_id", candidates: ["att_collision_a", "att_collision_b"]} =
-             close(ctx, {:user, "flynn"}, card.id, "att_collision")
+             close(ctx, {:user, "operator"}, card.id, "att_collision")
 
     assert %{ok: true, workItem: %{state: "closed"}} =
-             close(ctx, {:user, "flynn"}, card.id, completion.attest.id)
+             close(ctx, {:user, "operator"}, card.id, completion.attest.id)
   end
 
   test "owner narrowing uses frozen nearest common lineage and fails closed", ctx do
-    session(ctx.db, "child-owner", "flynn", %{
+    session(ctx.db, "child-owner", "operator", %{
       archetype: "product-owner",
       spawned_by: "product-owner"
     })
 
-    session(ctx.db, "child-holder", "flynn", %{spawned_by: "child-owner"})
-    session(ctx.db, "sibling-holder", "flynn", %{spawned_by: "product-owner"})
+    session(ctx.db, "child-holder", "operator", %{spawned_by: "child-owner"})
+    session(ctx.db, "sibling-holder", "operator", %{spawned_by: "product-owner"})
 
     card = create_card(ctx, "Common owner card")
     child = assign_to(ctx, card.id, "Child partial", false, "child-holder")
@@ -689,7 +690,7 @@ defmodule Tightbeam.DeliverableContractTest do
     assert %{code: "product_owner_unavailable"} =
              close(
                ctx,
-               {:user, "flynn"},
+               {:user, "operator"},
                unavailable_card.id,
                partial_completion.attest.id,
                "cannot transfer authority"
@@ -705,7 +706,7 @@ defmodule Tightbeam.DeliverableContractTest do
       Assignments.__handle__(
         ctx.db,
         "reopen-assignment",
-        call("reopen-assignment", {:user, "flynn"}, nil, %{
+        call("reopen-assignment", {:user, "operator"}, nil, %{
           assignment_id: assignment.id,
           reason: "the first episode needs repair"
         })
@@ -715,13 +716,13 @@ defmodule Tightbeam.DeliverableContractTest do
     assert reopened.state == "open"
 
     assert %{code: "completion_claim_stale"} =
-             close(ctx, {:user, "flynn"}, card.id, first.attest.id)
+             close(ctx, {:user, "operator"}, card.id, first.attest.id)
 
     second = complete(ctx, assignment.id, "second")
     refute second.attest.id == first.attest.id
 
     assert %{ok: true, workItem: %{state: "closed"}} =
-             close(ctx, {:user, "flynn"}, card.id, second.attest.id)
+             close(ctx, {:user, "operator"}, card.id, second.attest.id)
 
     assert {:ok, [[2, 2]]} = completion_counts(ctx.db, assignment.id)
   end
@@ -779,7 +780,7 @@ defmodule Tightbeam.DeliverableContractTest do
       Assignments.__handle__(
         ctx.db,
         "reopen-assignment",
-        call("reopen-assignment", {:user, "flynn"}, nil, %{
+        call("reopen-assignment", {:user, "operator"}, nil, %{
           assignment_id: assignment.id,
           reason: reason
         })
@@ -838,13 +839,13 @@ defmodule Tightbeam.DeliverableContractTest do
     assignment = assign(ctx, card.id, "Whole card", true)
     completion = complete(ctx, assignment.id, nil)
 
-    first = close(ctx, {:user, "flynn"}, card.id, completion.attest.id, nil, "close-key")
-    replay = close(ctx, {:user, "flynn"}, card.id, completion.attest.id, nil, "other-key")
+    first = close(ctx, {:user, "operator"}, card.id, completion.attest.id, nil, "close-key")
+    replay = close(ctx, {:user, "operator"}, card.id, completion.attest.id, nil, "other-key")
 
     assert replay.workItem.closure == first.workItem.closure
 
     assert %{code: "work_item_closed"} =
-             close(ctx, {:user, "flynn"}, card.id, completion.attest.id, "changed")
+             close(ctx, {:user, "operator"}, card.id, completion.attest.id, "changed")
 
     assert {:ok, [[1, 1]]} =
              DB.query(
@@ -909,7 +910,7 @@ defmodule Tightbeam.DeliverableContractTest do
 
     racers = [
       Task.async(fn -> complete(ctx, terminal_assignment.id, "race completion") end),
-      Task.async(fn -> revoke(ctx, {:user, "flynn"}, terminal_assignment.id) end)
+      Task.async(fn -> revoke(ctx, {:user, "operator"}, terminal_assignment.id) end)
     ]
 
     terminal_results = Task.await_many(racers)
@@ -930,7 +931,7 @@ defmodule Tightbeam.DeliverableContractTest do
     close_results =
       [first_completion.attest.id, second_completion.attest.id]
       |> Enum.map(fn attest_id ->
-        Task.async(fn -> close(ctx, {:user, "flynn"}, close_card.id, attest_id) end)
+        Task.async(fn -> close(ctx, {:user, "operator"}, close_card.id, attest_id) end)
       end)
       |> Task.await_many()
 
@@ -994,13 +995,13 @@ defmodule Tightbeam.DeliverableContractTest do
     close_first_assignment = assign(ctx, close_first_card.id, "Whole close-first result", true)
 
     assert %{code: "completion_claim_not_found"} =
-             close(ctx, {:user, "flynn"}, close_first_card.id, "att_future_completion")
+             close(ctx, {:user, "operator"}, close_first_card.id, "att_future_completion")
 
     assert close_snapshot(ctx.db, close_first_card.id).closure == []
     close_first_completion = complete(ctx, close_first_assignment.id, nil)
 
     assert %{ok: true, workItem: %{state: "closed"}} =
-             close(ctx, {:user, "flynn"}, close_first_card.id, close_first_completion.attest.id)
+             close(ctx, {:user, "operator"}, close_first_card.id, close_first_completion.attest.id)
 
     completion_first_card = create_card(ctx, "Completion probe before close")
 
@@ -1010,7 +1011,7 @@ defmodule Tightbeam.DeliverableContractTest do
     completion_first = complete(ctx, completion_first_assignment.id, nil)
 
     assert %{ok: true, workItem: %{state: "closed"}} =
-             close(ctx, {:user, "flynn"}, completion_first_card.id, completion_first.attest.id)
+             close(ctx, {:user, "operator"}, completion_first_card.id, completion_first.attest.id)
 
     for card_id <- [close_first_card.id, completion_first_card.id] do
       assert {:ok, [[1, 1]]} =
@@ -1030,14 +1031,14 @@ defmodule Tightbeam.DeliverableContractTest do
              complete(ctx, completion_before_revoke.id, nil)
 
     assert %{code: "assignment_closed"} =
-             revoke(ctx, {:user, "flynn"}, completion_before_revoke.id)
+             revoke(ctx, {:user, "operator"}, completion_before_revoke.id)
 
     assert {:ok, [[1, 1]]} = completion_counts(ctx.db, completion_before_revoke.id)
 
     revoke_before_completion =
       assign(ctx, create_card(ctx, "Revoke before completion").id, "R then C", true)
 
-    assert %{outcome: "revoked"} = revoke(ctx, {:user, "flynn"}, revoke_before_completion.id)
+    assert %{outcome: "revoked"} = revoke(ctx, {:user, "operator"}, revoke_before_completion.id)
     assert %{code: "assignment_closed"} = complete(ctx, revoke_before_completion.id, nil)
     assert {:ok, [[0, 0]]} = completion_counts(ctx.db, revoke_before_completion.id)
   end
@@ -1046,8 +1047,8 @@ defmodule Tightbeam.DeliverableContractTest do
     identical_card = create_card(ctx, "Identical close requests")
     identical_assignment = assign(ctx, identical_card.id, "Identical whole result", true)
     identical_completion = complete(ctx, identical_assignment.id, nil)
-    first = close(ctx, {:user, "flynn"}, identical_card.id, identical_completion.attest.id)
-    replay = close(ctx, {:user, "flynn"}, identical_card.id, identical_completion.attest.id)
+    first = close(ctx, {:user, "operator"}, identical_card.id, identical_completion.attest.id)
+    replay = close(ctx, {:user, "operator"}, identical_card.id, identical_completion.attest.id)
     assert replay.workItem.closure == first.workItem.closure
 
     for first_kind <- [:exact, :narrow] do
@@ -1062,7 +1063,7 @@ defmodule Tightbeam.DeliverableContractTest do
         case first_kind do
           :exact ->
             {
-              close(ctx, {:user, "flynn"}, card.id, exact_completion.attest.id),
+              close(ctx, {:user, "operator"}, card.id, exact_completion.attest.id),
               close(
                 ctx,
                 {:session, "product-owner"},
@@ -1081,7 +1082,7 @@ defmodule Tightbeam.DeliverableContractTest do
                 partial_completion.attest.id,
                 reason
               ),
-              close(ctx, {:user, "flynn"}, card.id, exact_completion.attest.id)
+              close(ctx, {:user, "operator"}, card.id, exact_completion.attest.id)
             }
         end
 
@@ -1096,13 +1097,13 @@ defmodule Tightbeam.DeliverableContractTest do
   end
 
   test "a sibling-tree assignment changes narrowing authority only in the legal order", ctx do
-    session(ctx.db, "child-owner", "flynn", %{
+    session(ctx.db, "child-owner", "operator", %{
       archetype: "product-owner",
       spawned_by: "product-owner"
     })
 
-    session(ctx.db, "child-holder", "flynn", %{spawned_by: "child-owner"})
-    session(ctx.db, "sibling-holder", "flynn", %{spawned_by: "product-owner"})
+    session(ctx.db, "child-holder", "operator", %{spawned_by: "child-owner"})
+    session(ctx.db, "sibling-holder", "operator", %{spawned_by: "product-owner"})
 
     close_first_card = create_card(ctx, "Child closes before sibling assignment")
     child = assign_to(ctx, close_first_card.id, "Child result", false, "child-holder")
@@ -1158,20 +1159,20 @@ defmodule Tightbeam.DeliverableContractTest do
              )
   end
 
-  test "captured wi_113442f5 rows and real artifact cannot recur without explicit ruling", ctx do
-    captured = captured_wi_113442f5_fixture!()
-    captured_assignments = captured["assignments"]
-    captured_attests = captured["attests"]
+  test "an example record graph cannot recur without explicit ruling", ctx do
+    example = example_fixture!()
+    example_assignments = example["assignments"]
+    example_attests = example["attests"]
 
     spec_row =
-      Enum.find(captured_assignments, &(&1["id"] == "asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0"))
+      Enum.find(example_assignments, &(&1["id"] == "asg_00000000-0000-4000-8000-000000000002"))
 
     completion_row =
-      Enum.find(captured_attests, &(&1["id"] == "att_1ab4c74f-d4a3-4af2-8c61-c467062367e4"))
+      Enum.find(example_attests, &(&1["id"] == "att_00000000-0000-4000-8000-000000000004"))
 
     fixture = %{
-      work_item_id: captured["workItem"]["id"],
-      title: captured["workItem"]["title"],
+      work_item_id: example["workItem"]["id"],
+      title: example["workItem"]["title"],
       assignment_id: spec_row["id"],
       subject: spec_row["subject"],
       completion_attest_id: completion_row["id"],
@@ -1182,26 +1183,26 @@ defmodule Tightbeam.DeliverableContractTest do
       }
     }
 
-    assert fixture.work_item_id == "wi_113442f5-22ae-457b-a971-1b620069d490"
-    assert fixture.assignment_id == "asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0"
-    assert fixture.completion_attest_id == "att_1ab4c74f-d4a3-4af2-8c61-c467062367e4"
+    assert fixture.work_item_id == "wi_00000000-0000-4000-8000-000000000001"
+    assert fixture.assignment_id == "asg_00000000-0000-4000-8000-000000000002"
+    assert fixture.completion_attest_id == "att_00000000-0000-4000-8000-000000000004"
 
-    assert Enum.map(captured_assignments, & &1["effectKind"]) |> Enum.sort() ==
+    assert Enum.map(example_assignments, & &1["effectKind"]) |> Enum.sort() ==
              ~w(evidence policy review review)
 
-    refute Enum.any?(captured_assignments, &(&1["effectKind"] == "code"))
+    refute Enum.any?(example_assignments, &(&1["effectKind"] == "code"))
 
-    assert Enum.sort(Enum.map(captured["trace"]["assignments"], & &1["id"])) ==
-             Enum.sort(Enum.map(captured_assignments, & &1["id"]))
+    assert Enum.sort(Enum.map(example["trace"]["assignments"], & &1["id"])) ==
+             Enum.sort(Enum.map(example_assignments, & &1["id"]))
 
-    assert Enum.map(captured["trace"]["terminalTimeline"], & &1["verdict"])
+    assert Enum.map(example["trace"]["terminalTimeline"], & &1["verdict"])
            |> Enum.reject(&is_nil/1) ==
              ["spirit-approved", "changes-requested", "reviewed-clean"]
 
-    assert List.last(captured["trace"]["terminalTimeline"])["kind"] ==
+    assert List.last(example["trace"]["terminalTimeline"])["kind"] ==
              "disposition_transition"
 
-    repo = exact_wi_113442f5_commit_repo!()
+    repo = example_commit_repo!()
     fixture = put_in(fixture, [:commit_ref, :repo], "testhost:#{repo}")
 
     register_hosts(ctx.db, %{
@@ -1315,7 +1316,7 @@ defmodule Tightbeam.DeliverableContractTest do
       WorkItems.__handle__(
         ctx.db,
         "work-item-trace",
-        call("work-item-trace", {:user, "flynn"}, nil, %{work_item_id: card.id})
+        call("work-item-trace", {:user, "operator"}, nil, %{work_item_id: card.id})
       )
 
     assert Enum.sort(Enum.map(trace.assignments, & &1.id)) ==
@@ -1324,13 +1325,13 @@ defmodule Tightbeam.DeliverableContractTest do
     refute Enum.any?(trace.assignments, &String.starts_with?(&1.deliverable.name, "Implement "))
 
     assert %{code: "completion_deliverable_mismatch"} =
-             close(ctx, {:user, "flynn"}, card.id, completion.attest.id)
+             close(ctx, {:user, "operator"}, card.id, completion.attest.id)
 
     assert %{workItem: %{state: "open", closure: nil}} =
              WorkItems.__handle__(
                ctx.db,
                "work-item-get",
-               call("work-item-get", {:user, "flynn"}, nil, %{work_item_id: card.id})
+               call("work-item-get", {:user, "operator"}, nil, %{work_item_id: card.id})
              )
 
     implementation =
@@ -1339,7 +1340,7 @@ defmodule Tightbeam.DeliverableContractTest do
     implementation_completion = complete(ctx, implementation.id, "Implemented the whole card")
 
     assert %{ok: true, workItem: %{state: "closed", closure: %{basis: "exact"}}} =
-             close(ctx, {:user, "flynn"}, card.id, implementation_completion.attest.id)
+             close(ctx, {:user, "operator"}, card.id, implementation_completion.attest.id)
 
     narrowing_card = create_card(ctx, fixture.title)
     narrowing_assignment = assign(ctx, narrowing_card.id, fixture.subject, false)
@@ -1426,14 +1427,14 @@ defmodule Tightbeam.DeliverableContractTest do
              WorkItems.__handle__(
                db,
                "work-item-get",
-               call("work-item-get", {:user, "flynn"}, nil, %{work_item_id: "wi_v9_closed"})
+               call("work-item-get", {:user, "operator"}, nil, %{work_item_id: "wi_v9_closed"})
              )
 
     assert %{workItem: %{deliverableContract: "legacy", deliverable: nil, state: "failed"}} =
              WorkItems.__handle__(
                db,
                "work-item-get",
-               call("work-item-get", {:user, "flynn"}, nil, %{work_item_id: "wi_v9_failed"})
+               call("work-item-get", {:user, "operator"}, nil, %{work_item_id: "wi_v9_failed"})
              )
 
     assert %{
@@ -1445,7 +1446,7 @@ defmodule Tightbeam.DeliverableContractTest do
              WorkItems.__handle__(
                db,
                "work-item-get",
-               call("work-item-get", {:user, "flynn"}, nil, %{work_item_id: "wi_v9_active"})
+               call("work-item-get", {:user, "operator"}, nil, %{work_item_id: "wi_v9_active"})
              )
 
     for {assignment_id, attest_id} <- [
@@ -1470,7 +1471,7 @@ defmodule Tightbeam.DeliverableContractTest do
 
   test "keyed creation replay preserves original card and assignment bindings", ctx do
     first_card_call =
-      call("work-item-create", {:user, "flynn"}, nil, %{
+      call("work-item-create", {:user, "operator"}, nil, %{
         title: "Original card title",
         spec_ref_name: "original-spec.md",
         spec_ref_sha256: String.duplicate("a", 64),
@@ -1511,7 +1512,7 @@ defmodule Tightbeam.DeliverableContractTest do
     other_card = create_card(ctx, "Different card")
 
     first_assignment_call =
-      call("assign", {:user, "flynn"}, "holder", %{
+      call("assign", {:user, "operator"}, "holder", %{
         subject: "Original subordinate scope",
         work_item_id: first_card.id,
         idempotency_key: "assignment-create-key",
@@ -1568,7 +1569,7 @@ defmodule Tightbeam.DeliverableContractTest do
     seed_creation_replay_world!(first_db)
 
     durable_card_call =
-      call("work-item-create", {:user, "flynn"}, nil, %{
+      call("work-item-create", {:user, "operator"}, nil, %{
         title: "Durable original card",
         idempotency_key: "durable-card-create"
       })
@@ -1576,7 +1577,7 @@ defmodule Tightbeam.DeliverableContractTest do
     durable_card = WorkItems.__handle__(first_db, "work-item-create", durable_card_call)
 
     durable_assignment_call =
-      call("assign", {:user, "flynn"}, "holder", %{
+      call("assign", {:user, "operator"}, "holder", %{
         subject: "Durable original assignment",
         work_item_id: durable_card.id,
         idempotency_key: "durable-assignment-create",
@@ -1643,7 +1644,7 @@ defmodule Tightbeam.DeliverableContractTest do
       "testhost" => %{ssh: nil, base_dir: System.tmp_dir!(), cli_bin: nil}
     })
 
-    session(ctx.db, "alternate-holder", "flynn", %{spawned_by: "product-owner"})
+    session(ctx.db, "alternate-holder", "operator", %{spawned_by: "product-owner"})
 
     for {verb, first_binding} <- [
           {"assign", false},
@@ -1711,13 +1712,13 @@ defmodule Tightbeam.DeliverableContractTest do
 
       if first_binding do
         assert %{ok: true} =
-                 close(ctx, {:user, "flynn"}, original_card.id, completion.attest.id)
+                 close(ctx, {:user, "operator"}, original_card.id, completion.attest.id)
       else
         assert %{ok: true} =
                  WorkItems.__handle__(
                    ctx.db,
                    "work-item-fail",
-                   call("work-item-fail", {:user, "flynn"}, nil, %{
+                   call("work-item-fail", {:user, "operator"}, nil, %{
                      work_item_id: original_card.id,
                      reason: "terminal replay fixture"
                    })
@@ -1848,7 +1849,7 @@ defmodule Tightbeam.DeliverableContractTest do
     WorkItems.__handle__(
       ctx.db,
       "work-item-create",
-      call("work-item-create", {:user, "flynn"}, nil, %{title: title})
+      call("work-item-create", {:user, "operator"}, nil, %{title: title})
     )
   end
 
@@ -1867,7 +1868,7 @@ defmodule Tightbeam.DeliverableContractTest do
     Assignments.__handle__(
       ctx.db,
       "assign",
-      call("assign", {:user, "flynn"}, holder, params)
+      call("assign", {:user, "operator"}, holder, params)
       |> Map.merge(%{target_role: nil, role_fallback: false, supervision_interval_ms: 1_000})
     )
   end
@@ -1876,7 +1877,7 @@ defmodule Tightbeam.DeliverableContractTest do
     Assignments.__handle__(
       ctx.db,
       "dispatch",
-      call("dispatch", {:user, "flynn"}, holder, %{
+      call("dispatch", {:user, "operator"}, holder, %{
         subject: subject,
         brief: "Perform the exact dispatched obligation",
         work_item_id: work_item_id,
@@ -1900,7 +1901,7 @@ defmodule Tightbeam.DeliverableContractTest do
       idempotency_key: key
     }
 
-    call(verb, {:user, "flynn"}, holder, params)
+    call(verb, {:user, "operator"}, holder, params)
     |> Map.merge(%{target_role: nil, role_fallback: false, supervision_interval_ms: 1_000})
   end
 
@@ -2109,12 +2110,12 @@ defmodule Tightbeam.DeliverableContractTest do
     assert {:ok, _} =
              DB.query(
                db,
-               "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',0,'admin_add',1)"
+               "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',0,'admin_add',1)"
              )
 
-    ensure_main_session(db, "flynn")
-    session(db, "product-owner", "flynn", %{archetype: "product-owner"})
-    session(db, "holder", "flynn", %{spawned_by: "product-owner"})
+    ensure_main_session(db, "operator")
+    session(db, "product-owner", "operator", %{archetype: "product-owner"})
+    session(db, "holder", "operator", %{spawned_by: "product-owner"})
 
     register_hosts(db, %{
       "testhost" => %{ssh: nil, base_dir: System.tmp_dir!(), cli_bin: nil}
@@ -2149,7 +2150,7 @@ defmodule Tightbeam.DeliverableContractTest do
                INSERT INTO decision_requests
                  (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,lineageRung,
                   effortGeneration,deadlineWakeId,raisedAt,deadlineAt,question,options,context,status)
-               VALUES (?1,'effort','process:tightbeam','flynn',?2,?3,1,?4,?5,?6,?7,
+               VALUES (?1,'effort','process:tightbeam','operator',?2,?3,1,?4,?5,?6,?7,
                        'Continue or dismiss?','["continue","dismiss"]',
                        '{"actions":["continue","dismiss"]}','open')
                """,
@@ -2205,43 +2206,42 @@ defmodule Tightbeam.DeliverableContractTest do
     module
   end
 
-  defp captured_wi_113442f5_fixture! do
-    path = Path.expand("fixtures/deliverable_contract/wi_113442f5.json", __DIR__)
+  defp example_fixture! do
+    path = Path.expand("fixtures/deliverable_contract/example_work_item.json", __DIR__)
     bytes = File.read!(path)
 
     assert :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower) ==
-             "29d5caad12b7eb9f1d8f8046e8a7acbdd1b36f9c3c5c2e00cd41fb100323df39"
+             "6c0ecbcfc6d14aef3d07659ae64f9203bf71bf0a27ec0bb7fc1509368e6be622"
 
     JSON.decode!(bytes)
   end
 
-  defp exact_wi_113442f5_commit_repo! do
+  defp example_commit_repo! do
     repo =
       Path.join(
         System.tmp_dir!(),
-        "wi-113442f5-commit-#{System.unique_integer([:positive])}"
+        "example-commit-#{System.unique_integer([:positive])}"
       )
 
     git_dir = Path.join(repo, ".git")
-    object_dir = Path.join([git_dir, "objects", "85"])
+    object_dir = Path.join([git_dir, "objects", "fc"])
     File.mkdir_p!(object_dir)
     File.mkdir_p!(Path.join(git_dir, "refs"))
     File.write!(Path.join(git_dir, "HEAD"), "ref: refs/heads/main\n")
 
     body =
-      "tree 9d6c4696af016c2159465beeef5c95c6bd12a091\n" <>
-        "parent 64408a93190c31ca992af22c28a6726c8687c65f\n" <>
-        "author Mike Manzano <mike@clicketyclacks.co> 1787643229 +0000\n" <>
-        "committer Mike Manzano <mike@clicketyclacks.co> 1787643229 +0000\n\n" <>
-        "spec: address D3 review findings\n"
+      "tree 0000000000000000000000000000000000000000\n" <>
+        "author Example Author <author@example.invalid> 1 +0000\n" <>
+        "committer Example Author <author@example.invalid> 1 +0000\n\n" <>
+        "example: preserve a delivered commit reference\n"
 
     object = "commit #{byte_size(body)}\0" <> body
 
     assert :crypto.hash(:sha, object) |> Base.encode16(case: :lower) ==
-             "85ae5ecb126d54cf7759b4ce37d9459fd7bd0f0f"
+             "fc2d1e824ccf5e4e4761ba06928cb4a2d7a47602"
 
     File.write!(
-      Path.join(object_dir, "ae5ecb126d54cf7759b4ce37d9459fd7bd0f0f"),
+      Path.join(object_dir, "2d1e824ccf5e4e4761ba06928cb4a2d7a47602"),
       :zlib.compress(object)
     )
 
@@ -2300,7 +2300,7 @@ defmodule Tightbeam.DeliverableContractTest do
           archetype: "default",
           harness: "claude",
           provider: "anthropic",
-          model: Model.new("fable"),
+          model: Model.new("example-model"),
           host: "testhost"
         },
         overrides

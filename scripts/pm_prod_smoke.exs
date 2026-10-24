@@ -44,14 +44,14 @@ alias Tightbeam.{ConditionFacts, DB, Gateway, Model, Org}
 db = Tightbeam.DB
 IO.puts("42 boot: application started")
 
-{:ok, _} = DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
+{:ok, _} = DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('operator', 1, 1)")
 
 mk = fn key, spawned_by, built_in ->
   Org.create(db, %{
     session_key: key,
     display_name: key,
-    owner_user_id: "flynn",
-    origin: "user:flynn",
+    owner_user_id: "operator",
+    origin: "user:operator",
     archetype: "default",
     harness: "claude",
     provider: "anthropic",
@@ -62,7 +62,7 @@ mk = fn key, spawned_by, built_in ->
   })
 end
 
-main = mk.(Org.personal_session_key("flynn"), nil, true)
+main = mk.(Org.personal_session_key("operator"), nil, true)
 _holder = mk.("p42:holder", main.session_key, false)
 
 {:ok, _} =
@@ -70,13 +70,13 @@ _holder = mk.("p42:holder", main.session_key, false)
     db,
     """
     INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt, state)
-    VALUES ('asg_42', 'watch the prods', 'p42:holder', 'flynn', 1, 'open')
+    VALUES ('asg_42', 'watch the prods', 'p42:holder', 'operator', 1, 'open')
     """
   )
 
 # Seed the engine: one real turn that fails (no credential) is the first
 # terminal the sweep evaluates against the open obligation.
-:appended = Gateway.deliver_prompt("p42:holder", "user:flynn", "get to work", db: db)
+:appended = Gateway.deliver_prompt("p42:holder", "user:operator", "get to work", db: db)
 
 first =
   PmProd.await(
@@ -127,7 +127,7 @@ IO.puts("42c blocked: count frozen at #{at_block} across 8s of live ticks")
 
 # A new terminal re-enters the cycle (the block pre-filters the sweep, so
 # give the engine a fresh terminal the way real work would).
-:appended = Gateway.deliver_prompt("p42:holder", "user:flynn", "try again", db: db)
+:appended = Gateway.deliver_prompt("p42:holder", "user:operator", "try again", db: db)
 
 resumed =
   PmProd.await(

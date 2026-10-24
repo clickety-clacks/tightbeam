@@ -43,7 +43,7 @@ defmodule Tightbeam.JobTraceTest do
 
       INSERT INTO assignments
         (id, subject, holderKey, openedBySession, openedAt, state, reviewsAssignmentId)
-      VALUES ('asg_review', 'review', 'reviewer', 'reviewer', 4, 'open', 'asg_direct');
+      VALUES;
 
       INSERT INTO supervision_entitlements
         (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
@@ -62,7 +62,7 @@ defmodule Tightbeam.JobTraceTest do
          modelContext, harness, status, createdAt, endedAt)
       VALUES
         ('holder', 'm_direct', 'process:tightbeam', 'brief', 'asg_direct', 'wi_trace',
-         'gpt-5.6-sol', 'high', '1m', 'codex', 'delivered', 100, 100),
+         'gpt-5.6-example', 'high', '1m', 'codex', 'delivered', 100, 100),
         ('owner-session', 'm_nag', 'process:tightbeam', 'nag', NULL, 'wi_trace',
          NULL, NULL, NULL, NULL, 'queued', 100, NULL);
 
@@ -87,7 +87,7 @@ defmodule Tightbeam.JobTraceTest do
         (assignmentId, generation, state, baseHorizonMs, multiplier, armedAt,
          terminalSeqWatermark, holderKey, host, root, baseline, wakeId, evidence)
       VALUES
-        ('asg_direct', 1, 'probed', 10, 1, 100, 0, 'holder', 'eezo', '/tmp',
+        ('asg_direct', 1, 'probed', 10, 1, 100, 0, 'holder', 'test-host', '/tmp',
          '{"status":"available","observation":{"stamp":"/tmp/effort.stamp","prior":"observed","writes":0,"entries":1,"digest":"same"}}',
          'w_condition', '{"outcome":"zero_effect"}');
 
@@ -218,7 +218,7 @@ defmodule Tightbeam.JobTraceTest do
     # The stamp must arrive as FIELDS with their real values. Asserting only
     # that the keys exist stays green if a consumer hardcodes or drops them.
     stamped = Enum.find(trace.timeline, &(&1.type == "turn_start" and &1.id == 1))
-    assert {stamped.model, stamped.context, stamped.effort} == {"gpt-5.6-sol", "1m", "high"}
+    assert {stamped.model, stamped.context, stamped.effort} == {"gpt-5.6-example", "1m", "high"}
     assert stamped.harness == "codex"
 
     assert Enum.any?(trace.timeline, fn
@@ -423,8 +423,8 @@ defmodule Tightbeam.JobTraceTest do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("fable"),
-      host: "eezo"
+      model: Model.new("example-model"),
+      host: "test-host"
     })
   end
 

@@ -78,10 +78,10 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   }
 
   @filter_refs %{
-    "sessionKey" => "s_flynn",
+    "sessionKey" => "s_example",
     "workItemId" => "wi_firehose",
-    "origin" => "user:flynn",
-    "principal" => "user:flynn"
+    "origin" => "user:operator",
+    "principal" => "user:operator"
   }
 
   setup do
@@ -97,13 +97,13 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       DB.execute(
         db,
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES " <>
-          "('flynn', 0, 'admin_add', 1), ('kay', 0, 'admin_add', 1), " <>
+          "('operator', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1), " <>
           "('root', 1, 'admin_add', 1)"
       )
 
-    session!(db, "s_flynn", "flynn")
-    work_item!(db, "wi_firehose", "flynn")
-    assignment!(db, "asg_firehose", "s_flynn", "wi_firehose")
+    session!(db, "s_example", "operator")
+    work_item!(db, "wi_firehose", "operator")
+    assignment!(db, "asg_firehose", "s_example", "wi_firehose")
     %{db: db, hub: hub}
   end
 
@@ -262,7 +262,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       "subagent_marker.appended",
       %{
         "markerId" => Integer.to_string(marker_id),
-        "sessionKey" => "s_flynn",
+        "sessionKey" => "s_example",
         "assignmentId" => "asg_firehose",
         "workItemId" => "wi_firehose"
       },
@@ -282,7 +282,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       "subagent_marker.appended",
       %{
         "markerId" => Integer.to_string(unresolved_id),
-        "sessionKey" => "s_flynn"
+        "sessionKey" => "s_example"
       },
       unresolved_id,
       701
@@ -313,14 +313,14 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     assert_raise ArgumentError, ~r/refs do not match the registry/, fn ->
       Publisher.source_invalidation_notice("topline.created", 1, 2, %{
         "toplineId" => "tl_one",
-        "origin" => "user:flynn"
+        "origin" => "user:operator"
       })
     end
 
     assert_raise ArgumentError, ~r/refs do not match the registry/, fn ->
       Publisher.source_invalidation_notice("subagent_marker.appended", 1, 2, %{
         "markerId" => "1",
-        "sessionKey" => "s_flynn",
+        "sessionKey" => "s_example",
         "assignmentId" => "asg_firehose"
       })
     end
@@ -352,12 +352,12 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     %{valid: notices, unresolved_marker: unresolved_marker} = visibility_notices(ctx)
 
     Enum.each(notices, fn notice ->
-      assert StateVisibility.visible?(ctx.db, notice, "flynn", false)
-      refute StateVisibility.visible?(ctx.db, notice, "kay", false)
+      assert StateVisibility.visible?(ctx.db, notice, "operator", false)
+      refute StateVisibility.visible?(ctx.db, notice, "other", false)
       assert StateVisibility.visible?(ctx.db, notice, "root", true)
     end)
 
-    refute StateVisibility.visible?(ctx.db, unresolved_marker, "flynn", false)
+    refute StateVisibility.visible?(ctx.db, unresolved_marker, "operator", false)
     refute StateVisibility.visible?(ctx.db, unresolved_marker, "root", true)
 
     missing_topline =
@@ -382,7 +382,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
         Hub.register(ctx.hub, self(), %{
           mode: :filtered,
           db: ctx.db,
-          user_id: "kay",
+          user_id: "other",
           is_admin: false
         })
 
@@ -396,7 +396,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
         Hub.register(ctx.hub, self(), %{
           mode: :filtered,
           db: ctx.db,
-          user_id: "flynn",
+          user_id: "operator",
           is_admin: false
         })
 
@@ -597,7 +597,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
         800,
         %{
           "markerId" => Integer.to_string(resolved_marker_id),
-          "sessionKey" => "s_flynn",
+          "sessionKey" => "s_example",
           "assignmentId" => "asg_firehose",
           "workItemId" => "wi_firehose"
         }
@@ -611,7 +611,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
         801,
         %{
           "markerId" => Integer.to_string(unresolved_marker_id),
-          "sessionKey" => "s_flynn"
+          "sessionKey" => "s_example"
         }
       )
 
@@ -621,7 +621,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   defp topline_call(ctx, params) do
     %{
       verb: "test",
-      principal: {:user, "flynn"},
+      principal: {:user, "operator"},
       origin: "test",
       session_key: nil,
       params: params,
@@ -632,7 +632,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   defp marker_input(ctx, source_event_ref, assignment_id, at) do
     %{
       kind: "subagent_start",
-      principal: "s_flynn",
+      principal: "s_example",
       subagent_ref: "subagent:#{source_event_ref}",
       source_event_ref: source_event_ref,
       harness: :codex,
@@ -669,10 +669,10 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   defp ref_value("toplineId"), do: "tl_firehose"
   defp ref_value("membershipId"), do: "tlm_firehose"
   defp ref_value("assignmentId"), do: "asg_firehose"
-  defp ref_value("sessionKey"), do: "s_flynn"
+  defp ref_value("sessionKey"), do: "s_example"
   defp ref_value("workItemId"), do: "wi_firehose"
-  defp ref_value("origin"), do: "user:flynn"
-  defp ref_value("principal"), do: "user:flynn"
+  defp ref_value("origin"), do: "user:operator"
+  defp ref_value("principal"), do: "user:operator"
   defp ref_value(key), do: "#{key}-value"
 
   defp session!(db, key, owner) do
@@ -685,7 +685,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("claude-fable-5")
+      model: Model.new("claude-example-5")
     })
   end
 
@@ -709,7 +709,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
                """
                INSERT INTO assignments
                  (id, subject, holderKey, openedByUser, openedAt, workItemId)
-               VALUES (?1, 'Firehose proof', ?2, 'flynn', 1, ?3)
+               VALUES (?1, 'Firehose proof', ?2, 'operator', 1, ?3)
                """,
                [id, holder, work_item_id]
              )
