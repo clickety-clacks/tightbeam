@@ -2003,7 +2003,7 @@ mod tests {
     }
 
     #[test]
-    fn darwin_rows_distinguish_spooexample_marker_and_unmarked_adapter_evidence() {
+    fn darwin_rows_distinguish_spoofable_marker_and_unmarked_adapter_evidence() {
         let (rows, unparseable_rows) = parse_darwin_pass1(
             b"7 node TIGHTBEAM_LINEAGE=tb1-YUBi\n\
               8 codex-acp\n",
