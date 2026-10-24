@@ -1069,16 +1069,14 @@ defmodule Tightbeam.SupervisionTest do
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
   end
 
-  test "the August 31 Cards 1, 3, 4, and 5 durable filings rebase liveness", ctx do
+  test "durable filings rebase liveness", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq1 = terminal!(ctx.db, "holder")
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
     [wake] = Wakes.list_pending(ctx.db)
     cancel_wake!(ctx.db, wake)
 
-    # Exact wi_00000000-0000-4000-8000-000000000112 liveness specimens: Card 1's four filings; Card 3's
-    # dependency fallback; Card 4's durable progress; and Card 5's dependency
-    # fallback. att_00000000-0000-4000-8000-000000000113 remains the original valid dependency receipt.
+    # Deterministic examples cover progress, verdict, and dependency receipts.
     # This receipt-selection fixture deliberately does not model stale
     # post-closure state or unexpired-wake eligibility, which have separate
     # boundaries.
@@ -1154,8 +1152,6 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
-  # Immutable authority: art_00000000-0000-4000-8000-000000000125, SHA-256
-  # fe0945a8a210d50db4b8ae27f5c46dcb63f63d6dcef5884a41d3402a662c590a.
   # These cases drive explicit durable rows or synchronous process barriers. They
   # deliberately do not sleep, poll, widen a timeout, or infer a deadline from the
   # wall clock.
