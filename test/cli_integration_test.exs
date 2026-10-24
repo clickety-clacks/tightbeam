@@ -820,10 +820,7 @@ defmodule Tightbeam.CliIntegrationTest do
   # and the review link, because `--reviews` reached the handler under a name no
   # handler read until the router learned to alias it (#112).
   test "real CLI walks the verification papertrail end to end (A1/A2)", ctx do
-    # A real bundle import, not a fixture copy: under neutral-seed-v1 the org
-    # is born empty and the bundle arrives ONLY by an explicit learn — so this
-    # walk now exercises that real arrival path, and fails if learn stops
-    # delivering rules/.
+    # Importing the bundle explicitly verifies that learn delivers its rules.
     assert :initialized = Archetypes.init_identity!(ctx.base_dir)
 
     assert {:ok, _revision} =
@@ -864,13 +861,22 @@ defmodule Tightbeam.CliIntegrationTest do
       })
 
     reviewer =
-      Org.create
+      Org.create(ctx.db, %{
+        session_key: "cli-reviewer",
+        display_name: "CLI Reviewer",
+        owner_user_id: "operator",
+        origin: "user:operator",
+        archetype: "reviewer",
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("test")
       })
 
     Roles.create!(ctx.db, "cli-coder", "operator", coder.session_key)
-    Roles.create!
+    Roles.create!(ctx.db, "cli-reviewer", "operator", reviewer.session_key)
     coder_dir = session_workdir!(ctx, coder)
-    reviewer_dir = session_workdir!
+    reviewer_dir = session_workdir!(ctx, reviewer)
 
     {created, 0} =
       System.cmd(
@@ -985,7 +991,24 @@ defmodule Tightbeam.CliIntegrationTest do
     # The router aliases it to `:reviews_assignment_id` now, so the bypass that
     # stood in for it is gone.
     {reviewed, 0} =
-      System.cmd
+      System.cmd(
+        ctx.binary,
+        [
+          "assign",
+          "--subject",
+          "review of the feature",
+          "--session",
+          "cli-reviewer",
+          "--work-item",
+          item_id,
+          "--reviews",
+          work_id,
+          "--as-user",
+          "operator"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
 
     # The link is what the CLI is on trial for here: an assignment that came back
     # without it would still parse, and would still be a silently dropped edge.

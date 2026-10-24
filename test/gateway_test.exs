@@ -3114,7 +3114,14 @@ defmodule Tightbeam.GatewayTest do
     start_lane!(ctx.db, "stale-retune-host")
 
     result =
-      handlers["tune"]..
+      handlers["tune"].(%{
+        origin: "user:operator",
+        session_key: "stale-retune-host",
+        on_tune_elected: fn ->
+          # The retune's model was validated against TESTHOST's catalog, and
+          # its fork would be built with testhost placement. Moving the host
+          # under the election makes both stale; the harness alone matching
+          # must NOT be enough.
           {:ok, _} =
             DB.transaction(ctx.db, fn txn ->
               DB.Txn.q(txn, "UPDATE sessions SET host='otherhost' WHERE sessionKey=?1", [
