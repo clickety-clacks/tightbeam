@@ -656,13 +656,13 @@ fn api_key_needs_a_pipe() -> String {
 /// reaches a command line -- not even a `curl` invocation this process would
 /// spawn, which would put a billing credential in the process table.
 ///
-/// Recorded 2026-07-28 against both routes with deliberately invalid keys:
-/// anthropic answers `x-api-key` with 401 "API key is invalid.", and openai
+/// With deliberately invalid keys, anthropic answers `x-api-key` with 401
+/// "API key is invalid.", and openai
 /// answers a bearer key with 401 `invalid_api_key`. The openai result is the
 /// load-bearing one: a ChatGPT subscription token is refused from that same route
 /// with 403 naming the missing scope `api.model.read`, so the route does
-/// distinguish the two kinds. A VALID key has not been exercised against either
-/// route from this fleet -- see credential-kinds-v1.
+/// distinguish the two kinds. These examples do not establish that a valid key
+/// is accepted.
 fn validate_api_key(
     provider: &str,
     key: &str,

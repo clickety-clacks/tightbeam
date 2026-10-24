@@ -945,7 +945,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
      they both omit;
   2. every one of those replies reached the client;
   3. every reply frame carries the store seq of its own row — seq fidelity.
-     Arrival order is NOT asserted: delivery is a hint (ruled 2026-08-04),
+     Arrival order is NOT asserted: delivery is a hint,
      frames may legally arrive out of commit order, and the seq on each frame
      is what the client settles them with. A frame with a missing or wrong seq
      is unplaceable, and that is the defect. This replaced an arrival-order
@@ -1024,8 +1024,8 @@ defmodule Tightbeam.ClientE2E.Journeys do
         "the store committed replies the client never received: #{inspect(missing)}"
 
       true ->
-        # ARRIVAL order is deliberately not asserted. The wire contract (ruled
-        # 2026-08-04, "delivery is a hint, the store is truth") permits frames
+        # ARRIVAL order is deliberately not asserted. The wire contract
+        # permits frames
         # to arrive out of commit order; what it PROMISES is that every frame
         # carries the store seq that lets the client settle order. So the leg
         # asserts seq fidelity — frame seq present and equal to the store's —

@@ -150,7 +150,7 @@ defmodule Tightbeam.Placement do
   redefine. `base_dir` is still an argument because that own entry IS the
   gateway's base_dir; it no longer says where the registry lives.
 
-  There was a second source until 2026-07-28: a `TIGHTBEAM_HOSTS` env var merged
+  There was a second source: a `TIGHTBEAM_HOSTS` env var merged
   in ON TOP of the registry, so a stale env entry silently won over what
   assimilate had just written for the same name, and the gateway then dialled a
   different ssh destination than the one it had reported installing. Removed —

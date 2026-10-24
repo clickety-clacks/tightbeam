@@ -918,7 +918,7 @@ defmodule Tightbeam.Rules do
                   exit_class
                 )
 
-              # Everything else is a MALFUNCTION, not a verdict (§A3, user 2026-07-29,
+              # Everything else is a MALFUNCTION, not a verdict,
               # generalized under dark-factory doctrine): a clock, a crash, a containment
               # refusal, a token outside the declared set, or one of the four paths that
               # reached a deny with nothing observed at all. A clock or a crash decided,

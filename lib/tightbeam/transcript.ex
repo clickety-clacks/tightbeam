@@ -14,7 +14,7 @@ defmodule Tightbeam.Transcript do
   conversation fields, not either of those. "What did the agent DO" is
   `work-item-trace` plus forensics.
 
-  Two entry points, never one that guesses (user ruling): `session_key` is
+  Two entry points, never one that guesses: `session_key` is
   retrieval, `name` is LOOKUP that returns a candidate CHOICE and never content.
 
   Ordering is `messages.seq` — `INTEGER PRIMARY KEY AUTOINCREMENT` — everywhere.

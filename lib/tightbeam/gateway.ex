@@ -2618,8 +2618,8 @@ defmodule Tightbeam.Gateway do
     # source checkout builds it under cli/target. Knowing only the source path
     # meant every release install seeded a wrapper pointing at a directory that
     # does not exist there, telling a toolchain-free customer to run cargo:
-    # found by BOTH first-install agents, macOS and linux, within minutes of
-    # each other (2026-08-04). Not a fallback between implementations — both
+    # found by first-install agents on macOS and Linux. Not a fallback between
+    # implementations — both
     # candidates are the same binary, differing only in who compiled it.
     candidates =
       case System.get_env("RELEASE_ROOT") do
@@ -2751,8 +2751,7 @@ defmodule Tightbeam.Gateway do
           {:error, {failed_stage, reason}} ->
             # A FAILED TURN FAILS. It does not freeze the session behind a
             # ruling. Adjudication — episodes, holds, an escalation ladder, a
-            # `tightbeam adjudicate` verb — was deleted 2026-08-05 (user: "why
-            # is the substrate making a model selection?"), because model choice
+            # `tightbeam adjudicate` verb — was removed because model choice
             # is judgment and judgment belongs to inference, not to a substrate
             # mechanism. The pattern spec said exactly that in its first
             # paragraph and the implementation contradicted it anyway.
@@ -7280,7 +7279,7 @@ defmodule Tightbeam.Gateway do
   # function, so the r4.2 discipline lives in exactly one place: onboarding is named
   # ONLY for reasons onboarding can actually fix (missing/expired/revoked). A transient
   # server outage says retry (NOT onboard), an unsupported plan says onboarding won't help.
-  # This replaces the two divergent seams the incident exposed: the spawn seam OVER-named
+  # This replaces two divergent seams: the spawn seam OVER-named
   # (every reason -> "run onboard") and the turn seam UNDER-named (only `:missing`), so an
   # expired/transient turn got a raw error or a misdirect instead of an actionable remedy.
   #
@@ -8722,9 +8721,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # THE INDICATOR IS DERIVED, NEVER NARRATED (user's rule, 2026-08-04: "once a
-  # message of any type is delivered and there are no more pending messages, that
-  # typing indicator should be cleared"). One deterministic fact decides it — does
+  # THE INDICATOR IS DERIVED, NEVER NARRATED. One deterministic fact decides it — does
   # this session have a turn in 'queued' or 'running'? — read from the ledger, the
   # single-writer table every transition already funnels through. Every emission
   # recomputes from that truth; no site asserts its own opinion, so no site can

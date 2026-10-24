@@ -70,14 +70,9 @@ jobs:
           elixir --version
           rustc --version
 
-      # Gateway boot refuses unless at least one REGISTERED harness CLI probes on
-      # PATH. CI used to satisfy that by npm-installing pinned claude and codex,
-      # which is a network dependency, ~40s, and — measured — worth nothing: the
-      # suite's failure set is byte-identical with only the in-repo Fixture CLI on
-      # PATH (26 failures either way). CI holds no credentials,
-      # so it never drove a real harness turn to begin with; a pinned `--version`
-      # cannot catch a harness that changed under us. That is the LIVE
-      # feature_smoke matrix's job, and it stays its job.
+      # Gateway boot requires at least one registered harness CLI on PATH. The
+      # in-repo fixture CLI satisfies the suite prerequisite without credentials
+      # or a live harness turn.
       #
       # This is not a mock standing in for claude or codex. Fixture is a
       # registered harness in the test registry (config/test.exs) and this is its
@@ -85,20 +80,15 @@ jobs:
       - name: Put the in-repo harness CLI on PATH (suite prerequisite)
         run: echo "$GITHUB_WORKSPACE/priv/harness_cli" >> "$GITHUB_PATH"
 
-      # The undeclared dependency that lied loudest: the identity suite commits
-      # and MERGES in a real git repo, and git refuses to write a commit without a
-      # committer. `Identity.relearn!/1` runs its merge with no author env, so on
-      # a host with no git identity the merge fails for a reason that is not a
-      # conflict and relearn reports `{:conflict, []}` — a phantom conflict with
-      # nothing to resolve. Every developer mac has a global identity; Linux runners and the
-      # runners have none, which is the whole 2-failure IdentityTest delta.
+      # The identity suite creates commits in a temporary repository, so configure
+      # a committer explicitly for reliable results across environments.
       - name: Declare a git identity (suite prerequisite)
         run: |
           git config --global user.name "tightbeam ci"
           git config --global user.email "ci@tightbeam.invalid"
 
-      # Cache the dependency DOWNLOADS only — never cli/target. Two reasons, both
-      # learned the hard way (2026-07-27): (1) this step used to sit AFTER the cargo
+      # Cache the dependency DOWNLOADS only — never cli/target. Two reasons: (1) this step
+      # used to sit AFTER the cargo
       # build below, so its restore OVERWROTE the freshly built binary with a stale
       # cached one, and mix test then ran the stale binary while the diagnostic ran
       # the fresh one — the two disagreed and the failure was un-diagnosable. (2) Even

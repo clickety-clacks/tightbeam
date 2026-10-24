@@ -2462,13 +2462,9 @@ defmodule Tightbeam.Supervision do
         do: current.attemptCount,
         else: current.attemptCount + 1
 
-    # THE LADDER ADVANCES ON HEARD PRODS, NOT SENT ONES (user's design,
-    # 2026-08-15, after the correlated-outage postmortem). `current.prodCount`
-    # counts every prod CLAIMED — including prods whose wake-turn failed
-    # because the harness was down. During the 2026-08-10 outage that meant
-    # ladders exhausted into a dead tree: every rung's wake became a failed
-    # turn, the count climbed anyway, 127 strands stalled in one day, and
-    # nothing re-armed them when the harness recovered.
+    # THE LADDER ADVANCES ON HEARD PRODS, NOT SENT ONES. `current.prodCount`
+    # counts every prod claimed, including prods whose wake-turn failed because
+    # the harness was down.
     #
     # A failed prod turn is evidence about the TRANSPORT, not the holder. The
     # ladder measures unaccountability, so only prods that were actually

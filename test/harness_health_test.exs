@@ -4,7 +4,6 @@ defmodule Tightbeam.HarnessHealthTest do
   alias Tightbeam.{ConditionFacts, DB, EventLog, HarnessHealth, Ledger, Model, Org, Projection}
 
   # Captured, not invented: immutable process-failure provenance report
-  # process-failure-provenance-recon-frozen-214ac797f19e-2026-08-09.md,
   # specimens S1/lifecycle row 221422 and S9/lifecycle row 219529.
   @captured_codex_rate_limit %{
     "code" => -32_603,

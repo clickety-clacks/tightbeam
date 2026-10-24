@@ -4285,30 +4285,30 @@ defmodule Tightbeam.ConformanceTest do
     # loadset twin; producer-backed-gate was replaced 1:1 by
     # artifact-backed-gate. The ten exact-mechanism skips are untouched.
     #
-    # Deleting adjudication (2026-08-05) removed one more: C7's
+    # C7's
     # adjudication-hold-order, whose whole subject was a hold freezing the
     # turn-end shift. The shift itself is unchanged minus that first slot.
     #
-    # Fabric §13 Phase 0 (2026-08-13) adds one: C4's holder-verdict-wins, which
+    # The coordination contract adds C4's holder-verdict-wins, which
     # pins review-round selection against the wedge class. It is a
     # pending C4 dispatch-rule fixture with its own cases, so it lands in the
     # active and activated counts, not in the exact-mechanism skips.
     #
-    #  (2026-08-13) adds a second: C4's
+    # adds a second C4 case:
     # reopen-assignment-repair, which routes `reopen-assignment` itself
     # through the dispatch chokepoint (holder-verdict-wins only ever calls
     # `attest`) and exercises the defining displacement shape. It is also a
     # pending C4 fixture with its own named runner clause, not a catch-all.
     #
-    # Phase 1 of the coordination fabric (2026-08-13) adds the C8 class and two
+    # The coordination contract adds the C8 class and two
     # GREEN fixtures — class-delivery-policy and class-election-and-skew. Green
     # on both axes, so they raise the total and the active count and leave the
     # ACTIVATED counts alone: those measure fixtures still waiting on a
     # mechanism, and this mechanism ships on this branch.
-    # Second wave (2026-08-13) adds two more GREEN C8 fixtures —
+    # Two additional GREEN C8 fixtures cover
     # agent-question-carrier (seam ③) and read-cursors (seam ④) — on the same
     # both-axes rule as the first two.
-    # The live engine switch (2026-08-14) adds the C9 class and one GREEN
+    # The live engine switch adds the C9 class and one GREEN
     # fixture, live-engine-switch. Green on both axes, so it raises the total
     # and the active count and leaves the ACTIVATED counts alone. The class is
     # green too, so it adds no class registration either.

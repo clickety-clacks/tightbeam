@@ -1,6 +1,6 @@
 defmodule Tightbeam.RecordNoticeTest do
   @moduledoc """
-  Proofs for `EventLog.notice/5` (user rulings 2026-08-03).
+  Proofs for `EventLog.notice/5`.
 
   The bias being corrected: `[adapter recovered]` reached the chat while
   `adapter_down` reached a table no client reads. A notice is ONE call that
@@ -110,7 +110,7 @@ defmodule Tightbeam.RecordNoticeTest do
       )
 
     # Nobody was connected, so nothing was pushed. Replay is the other half of
-    # the ruling: the same rows a reconnecting socket drains (Wire.Socket reads
+    # the behavior: the same rows a reconnecting socket drains (Wire.Socket reads
     # list_after and frames each row with server_message/1).
     refute_received {:push_message, _, _, _}
 
@@ -121,7 +121,7 @@ defmodule Tightbeam.RecordNoticeTest do
     assert frame["attentionTier"] == 0
   end
 
-  ## user ruling 2: no session is a log line, never a mailbox
+  ## An audience without a session is logged, never delivered to a mailbox
 
   test "an audience with no session is logged and nothing is conjured for it", ctx do
     log =

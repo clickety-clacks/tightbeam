@@ -176,7 +176,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert {:ok, ^recovery_adapter, 6} = AdapterCoordinator.adapter_for(coordinator, key)
   end
 
-  # THE INCIDENT TEST (2026-08-14). A latched circuit vetoed the credential
+  # A latched circuit vetoed the credential
   # lifecycle's own start call, so an operator installing a WORKING credential
   # was refused by a verdict about the credential they were replacing -- and the
   # onboarding ceremony read that refusal as "this credential is bad". Recovery

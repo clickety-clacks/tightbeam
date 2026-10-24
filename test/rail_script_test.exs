@@ -714,7 +714,7 @@ defmodule Tightbeam.RailScriptTest do
     assert Enum.count(events, &(&1.kind == "decision_request_opened")) == 4
   end
 
-  # user's ruling (§A3, 2026-07-29): "no sensor malfunction silently decides against
+  # The contract requires that no sensor malfunction silently decide against
   # work." The two halves pull in opposite directions, so both are asserted: the denial
   # the caller receives is the one it received before the ruling, AND a decision request
   # now names the statute behind it.

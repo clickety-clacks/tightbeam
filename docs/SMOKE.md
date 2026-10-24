@@ -92,7 +92,7 @@ mid-run — never noise to shrug at.
 
 A fresh base_dir is NOT ready after copying files around; each item below is a
 seam with its own shape, and every one of these was rediscovered the hard way
-on 2026-07-25:
+in a captured run:
 
 - **Credentials are store rows, not loose files** — three parts per provider,
   and the metadata row's `kind` is what every credential seam dispatches on.

@@ -813,10 +813,7 @@ defmodule Tightbeam.SupervisionTest do
     end
   end
 
-  # THE OUTAGE REGRESSION (2026-08-15). During the 2026-08-10 claude outage,
-  # prods fired into a dead harness became failed turns, the stored counter
-  # climbed anyway, ladders exhausted into a dead tree (127 stalls in one day),
-  # and nothing re-armed them at recovery. The ladder measures the HOLDER's
+  # Prods fired into a dead harness become failed turns. The ladder measures the HOLDER's
   # unaccountability, so only prods that were DELIVERED — heard, then ignored —
   # may advance it. A failed prod turn is evidence about the transport.
   test "a prod whose wake-turn failed does not advance the ladder; a delivered one does",
@@ -2517,7 +2514,7 @@ defmodule Tightbeam.SupervisionTest do
            ] = rail_sweep_details(ctx.db, "holder")
   end
 
-  # The sweep is the second actor, so the ruling of 2026-07-29 (rails-mechanism §A3) has
+  # The sweep is the second actor, so the mechanism contract has
   # to reach it too: a rail-check timeout summons a mind here as well. What it must NOT do
   # is park the session — parking is the escalate EFFECT's consequence, and the ruling
   # changed what a timeout additionally does, not what it decides. So the sweep outcome

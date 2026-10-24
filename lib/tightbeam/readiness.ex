@@ -299,8 +299,8 @@ defmodule Tightbeam.Readiness do
       ["", "Diagnose further with: mix tightbeam.doctor (base_dir #{config.base_dir})"]
   end
 
-  # O7/I8 (PO ruling 2026-08-06): no credential kind carries a readable expiry, so
-  # there is NO pre-expiry wake — and this module is where that subtraction is made
+  # No credential kind carries a readable expiry, so there is NO pre-expiry wake —
+  # and this module is where that subtraction is made
   # HONEST rather than silent. For every credential that is present and working (a
   # live inventory), readiness states plainly that no pre-expiry warning is
   # available: the credential self-rotates or never expires, so an observed 401 in

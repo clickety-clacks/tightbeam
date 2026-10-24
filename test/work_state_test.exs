@@ -349,8 +349,7 @@ defmodule Tightbeam.WorkStateTest do
     dropped_assignment = handlers["assign"].(assign_call("holder", "dropped", dropped_item.id))
 
     # Exact shapes, not blind binds: a `_frame` match cannot fail for its
-    # stated reason — it would swallow any frame at all. (Salvaged from the
-    # observability worktree's uncommitted delta, 2026-08-04.)
+    # stated reason — it would swallow any frame at all.
     [
       %{"type" => "work_state_event", "from" => nil, "to" => "open"},
       %{"type" => "work_item_event", "kind" => "composition"}

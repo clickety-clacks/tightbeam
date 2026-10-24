@@ -164,7 +164,7 @@ defmodule Tightbeam.ApplicationRefusalTest do
     #    Asserted as "no dump APPEARED OR CHANGED", not "no dump exists": the VM writes
     #    erl_crash.dump into its working directory, which for `mix run` is the project
     #    root, and this repository already carries an unrelated one from a crash on
-    #    2026-07-28. A bare existence check therefore failed on a stale file and would
+    # A bare existence check therefore failed on a stale file and would
     #    equally have PASSED for the wrong reason on a machine where someone had just
     #    deleted one.
     assert dump_stamps(dirs_to_watch(parent)) == dump_before,

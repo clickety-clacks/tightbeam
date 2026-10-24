@@ -1235,7 +1235,7 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   # The adapter's own refusal of a model value — JSON-RPC -32602 Invalid params,
-  # recorded live 2026-07-28: the harness ACP adapter refused the platform id
+  # The harness ACP adapter refused the platform id
   # `gpt-5.1-codex` at `session/set_config_option {configId: "model"}` — is a
   # model decision, not an adapter fault, and it must say so in the house
   # vocabulary (`:model_unavailable`, the word `strict_apply/4` already uses)

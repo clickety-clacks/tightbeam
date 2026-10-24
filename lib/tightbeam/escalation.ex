@@ -733,7 +733,7 @@ defmodule Tightbeam.Escalation do
   #
   # THE MAXIM: an agent files a question, and keeps its obligation while it
   # waits — the row is data its asker chooses to honor, never a condition the
-  # substrate enforces (adjudication-deletion amendment, 2026-08-12).
+  # substrate enforces.
   #
   # WHAT THIS IS NOT, stated where the code is so a future reader trips over it:
   # nothing in the tree may READ an open `kind = 'agent'` row and act on its
@@ -1601,7 +1601,7 @@ defmodule Tightbeam.Escalation do
 
   THE MIRROR CASE IS RULED ACCEPTED — do not "fix" it. A summons evaluated before a
   healthy close but landing after it opens an episode for a sensor that has already
-  recovered. That is ACCEPTED BOUNDED STALENESS, not a defect (§A3/§B, ruled 2026-07-29):
+  recovered. That is ACCEPTED BOUNDED STALENESS, not a defect:
   the malfunction genuinely occurred and genuinely denied a call, so the summons is
   truthful, and the next healthy evaluation closes it.
   """

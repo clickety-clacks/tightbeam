@@ -1256,15 +1256,8 @@ defmodule Tightbeam.PlacementTest do
     assert Placement.hosts(base_dir, db)["work-1"].base_dir == "/z"
   end
 
-  # Fail-before evidence, measured 2026-07-28 against the hosts.json registry
-  # this table replaced (40 concurrent registrations of distinct hosts, 10
-  # trials, through the same public API): 371 of 400 calls returned {:ok, entry}
-  # to their caller and the host was then ABSENT from the registry — roughly 3
-  # of 40 survived a trial — and one reader crashed on a torn read
-  # (JSON.DecodeError at position 0; File.write! truncates before it writes).
-  # The DB owner serializes the row upserts, so the same shape must now leave
-  # every acknowledged host present, with a concurrent reader never observing a
-  # torn or partial registry (host-registry-v1 acceptance 1 and 2).
+  # Concurrent registrations must leave each acknowledged host present, and a
+  # concurrent reader must never observe a torn or partial registry.
   test "concurrent registrations all land and a concurrent reader never tears", %{
     base_dir: base_dir,
     db: db

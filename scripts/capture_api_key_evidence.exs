@@ -107,7 +107,7 @@ defmodule CaptureApiKeyEvidence do
 
   defp record!(provider, path, key, status, response_headers, body) do
     # The fixture records the RESPONSE. Vendor error bodies DO echo a masked key
-    # (`Incorrect API key provided: sk-proj-*ogus`, recorded 2026-07-28), so this
+    # (`Incorrect API key provided`), so this
     # is checked rather than assumed: nothing containing the key, a prefix of it,
     # or the string "sk-" is written to a file that goes into git.
     leaked =

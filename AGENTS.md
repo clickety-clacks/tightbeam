@@ -56,8 +56,8 @@ coordination fabric and product overview describe the supported behavior.
   Pin binaries explicitly (CODEX_PATH); re-probe behavior per version; never trust
   yesterday's diagnosis against today's binary.
 - **codex hooks run under `codex app-server` (the adapter path), TRUST-GATED** — not
-  inert (that earlier conclusion was a 0.144.x bundled-binary + untrusted-state
-  artifact, refuted 2026-07-23). A hook handler arms only if trusted or
+  inert (an earlier conclusion was based on a bundled binary and untrusted state).
+  A hook handler arms only if trusted or
   `bypass_hook_trust` is set; that key is a thread/start REQUEST override only (not
   config.toml, not a CLI flag). tightbeam delivers it via `CODEX_CONFIG={"bypass_hook_trust":true}`
   on the adapter spawn, which codex-acp spreads into every thread/start config map.
@@ -134,6 +134,6 @@ everyone downstream.
 Code that meets unexpected state — a database in an unknown shape, a missing table, a
 file an older version wrote — must REFUSE LOUDLY and name what it found, never guess
 and repair. Probing live state to deduce its shape (try-and-catch-duplicate ALTERs,
-sniffing stored DDL, existence guards) is the tell; ~2,000 lines of exactly that were
-deleted 2026-08-01. If a shape must be known, stamp it at write time; a missing or
+sniffing stored DDL, existence guards) is the tell; that approach was removed. If a
+shape must be known, stamp it at write time; a missing or
 unknown stamp is a refusal and a bug report, never an inference.

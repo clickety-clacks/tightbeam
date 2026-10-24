@@ -17,7 +17,7 @@ defmodule Tightbeam.GatewayTest do
   # message is sent and received, just later than 1s. A bare `node`
   # handshake 1s for the same reason; a full turn needs more.
   #
-  # RE-MEASURED 2026-07-29 under a 5-lane load (load average ~93 on 16 cores),
+  # Re-measured under a five-lane load,
   # which moved both the number and the explanation:
   #
   #   at 1_000:  4 of 4 runs failed here, and 5 of 5 at the mcp-servers wait
@@ -2189,7 +2189,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "children installs the CLI from the RELEASE layout when there is no source tree", ctx do
     # The release-install defect both first-install agents found within minutes
-    # of each other (macOS and linux, 2026-08-04): the seeding knew only
+    # of each other on macOS and Linux: the seeding knew only
     # cli/target/release, so every npm install got a bin/tightbeam telling a
     # toolchain-free customer to run cargo. In a release, the compiled CLI is
     # the npm package's own bin — a sibling of RELEASE_ROOT.
@@ -8833,7 +8833,7 @@ defmodule Tightbeam.GatewayTest do
            ]
 
     # EVERY failed turn speaks now. Adjudication used to route a failure into a
-    # brief instead of the marker, so deleting the brief (2026-08-05) would have
+    # brief instead of the marker, so deleting the brief would have
     # left this class of failure with no channel at all — the "agent progress
     # interrupted, no reason given" that occurs when a failed turn has no marker.
     frames = collect_pushes(9, [])
@@ -9622,8 +9622,8 @@ defmodule Tightbeam.GatewayTest do
     refute reason =~ "--as-user"
   end
 
-  # O6 reactive fix — THE INCIDENT PATH (G3 flatten). Guards A/B/C all force
-  # :checkout, but the incident 401s at :prompt: an expired/rejected credential 401s at
+  # O6 reactive path (G3 flatten). Guards A/B/C all force
+  # :checkout, but an expired/rejected credential returns 401 at :prompt:
   # API-call time, so checkout AND session SUCCEED (the harness holds a token) and catalog
   # health is still `:fresh` — a health lookup is blind to it. The common-path guarantee here: the operator reads the auth error as
   # human PROSE, never a raw inspected ACP map (G3 error_sentence flatten). RED-before-green:
@@ -9692,7 +9692,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:error, %{reason: reason, terminal_publish: publish, record_in_txn: record}} =
              runner.(Map.put(turn, :session_key, "k1"))
 
-    # It genuinely failed at :prompt — checkout + session succeeded (the incident path, not a
+    # It genuinely failed at :prompt — checkout and session succeeded (the path, not a
     # pre-engine refusal). The record keeps the stage.
     # reason is the raw ACP map here (health :fresh -> :not_applicable, no reclassify); the lane
     # stringifies it via error_text before the ledger, and the OPERATOR-facing marker flattens

@@ -119,7 +119,7 @@ defmodule Tightbeam.IdentityTest do
 
   # Work-custody pin: operating-model.md is composed into EVERY archetype, so
   # the custody rail reaches every session including learned-kungfu archetypes.
-  # The forensic reason it exists (2026-08-18): retirement deletes a workdir
+  # Retirement deletes a workdir
   # unless it holds registered in-workspace artifacts, so undeclared work is
   # destroyed silently and attests that cite raw workdir paths point at bytes
   # nobody owns — 7 of 10 paths cited over one day were already gone. Pin the

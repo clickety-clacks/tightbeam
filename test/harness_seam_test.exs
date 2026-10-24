@@ -182,7 +182,7 @@ defmodule Tightbeam.HarnessSeamTest do
     assert source =~ "Claude Code 2.1.257"
     assert source =~ "silent downgrade"
 
-    # The codex half is PROBED now, and kind-scoped: the 2026-07-28 api-key
+    # The codex half is probed now, and kind-scoped: the api-key
     # exercise (#99) recorded the codex adapter refusing a platform id at
     # set_config_option (-32602), so the note must carry that evidence — and it
     # must never grow back into a wholesale "cannot diverge" claim, which the

@@ -641,8 +641,8 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "REGRESSION: a lane whose reply commits LAST is not a delivery failure" do
-      # The field case (codex leg, 2026-08-04): B's trivial turn took 20.4s
-      # against Main's 12.6s, so B's reply committed 8.2s after Main's turn had
+      # One run had B's trivial turn take longer than Main's, so B's reply
+      # committed after Main's turn had
       # already ended — publish->arrival measured 0ms on all three frames. The
       # old rule asked only whether B's bubble preceded Main's and reported "a
       # delayed client frame", blaming the wire for which prompt the model
@@ -665,7 +665,7 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "out-of-order ARRIVAL with truthful seqs is not a defect" do
-      # The contract change (ruled 2026-08-04): delivery is a hint, the store is
+      # The contract is that delivery is a hint and the store is
       # truth, and ConnRegistry no longer filters — so frames may arrive in an
       # order the store never committed, carrying the seq that lets the client
       # settle them. Main's store committed done(1) -> slow(2); the frames

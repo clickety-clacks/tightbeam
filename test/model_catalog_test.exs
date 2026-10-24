@@ -805,7 +805,7 @@ defmodule Tightbeam.ModelCatalogTest do
     # not a slope: it waits out `GenServer.call`'s 5s and then comes back in the
     # shape the match above already refuses. So the number only has to separate
     # "served while the fetch hangs" from that floor. Three ordered quantities,
-    # measured on a 4-core linux box 2026-07-29: served costs 44-122us idle and
+    # measured on a four-core Linux box: served costs 44-122us idle and
     # 12ms (read) / 74ms (list) with the four cores 3x oversubscribed; the bound
     # below is 1s; the blocked floor is 5s. The old 100_000 sat inside the loaded
     # range, so a busy runner failed it with nothing wrong — and a wall-clock
@@ -1348,7 +1348,7 @@ defmodule Tightbeam.ModelCatalogTest do
       # The real one is the ONLY external process the catalog suite spawns, and a
       # spawn on a shared runner has an unbounded tail, so the test says when it
       # returned instead of guessing how long it takes. Three ordered quantities,
-      # measured 2026-07-29: the spawn itself is 24-38ms on the linux runner and
+      # measured in CI: the spawn itself is 24-38ms on Linux and
       # 128-168ms on the macOS one; the poll below then covers only the
       # Task -> GenServer hop that follows it (<1ms) inside its 100 x 5ms = 500ms
       # budget; the spawn gets the 10s bound of an external wait. Before this, the

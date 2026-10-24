@@ -11,10 +11,8 @@ defmodule Tightbeam.CredentialKindsTest do
   boundary: which route is called, which header is sent, which environment
   variable carries the credential, that no secret reaches a command line. That a
   VALID api key returns 200 from either vendor is not proven anywhere in the
-  suite, because no api key was reachable from this fleet on 2026-07-28 to record
-  one — see credential-kinds-v1 and the unproven row in docs/SMOKE.md. The
-  recorded fixtures used below are real 401s, captured live; nothing here is a
-  200 anyone invented.
+  suite. The recorded fixtures used below are vendor-shaped 401 responses; they
+  do not prove that a valid API key returns 200.
   """
 
   use Tightbeam.TestCase, async: false
@@ -330,11 +328,8 @@ defmodule Tightbeam.CredentialKindsTest do
       assert entry.provider == :openai
     end
 
-    # Recorded reality, the #89/#99 api-key exercise (2026-07-28): the platform
-    # route listed 125 bare ids; codex-acp REFUSED the platform id
-    # `gpt-5.1-codex` at session/set_config_option (-32602 Invalid params) and
-    # ACCEPTED `gpt-5.6-example`, which ran a real turn on the same adapter+auth.
-    # The fixture is that payload's shape trimmed to those two adjudicated ids.
+    # The fixture includes one platform model id accepted by the adapter and one
+    # rejected by it, so the catalog filter is exercised in both directions.
     test "an api-key codex catalog withholds platform ids the adapter refuses", ctx do
       stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"sk-proj-selectable"}))
       sh = fn _command -> {platform_fixture_body() <> "\n200", 0} end
@@ -644,7 +639,6 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "a rejected api key is dead, from the vendor's own recorded refusal" do
-      # RECORDED LIVE 2026-07-28 against api.anthropic.com with an invalid key.
       # The vendor's answer to `x-api-key` ("API key is invalid.") is a different
       # sentence from its answer to a bearer token ("Invalid bearer token"), which
       # is the evidence that the header is not interchangeable.

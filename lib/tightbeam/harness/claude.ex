@@ -355,9 +355,8 @@ defmodule Tightbeam.Harness.Claude do
       // leaves `code` UNDEFINED on the outer error and puts the real reason -- ENOTFOUND,
       // ECONNRESET, UND_ERR_CONNECT_TIMEOUT, a TLS failure -- in `error.cause`. So the
       // fallback always won, and a refusal that exists to report dirt named none of it.
-      // Measured 2026-08-04: a client-e2e leg blocked twice at two SHAs on
-      // `{:transport_exit, 70, "fetch failed"}` with a credential proven live by a 200
-      // from this same endpoint, and the message could not say which transport failed.
+      // A transport error must retain its underlying cause so a refusal names
+      // the actual network failure.
       const cause = error.cause;
       process.stderr.write(
         [cause && cause.code, cause && cause.message, error.code, error.message]
@@ -490,9 +489,8 @@ defmodule Tightbeam.Harness.Claude do
     end
   end
 
-  # Both kinds read the SAME route; only the header differs. Recorded live
-  # 2026-07-28 with deliberately invalid credentials, which is what pins the two
-  # names apart: `x-api-key` answers 401 "API key is invalid." while
+  # Both kinds read the SAME route; only the header differs: `x-api-key` answers
+  # 401 "API key is invalid." while
   # `Authorization: Bearer` answers 401 "Invalid bearer token" -- two distinct
   # code paths on one route, so the header is not interchangeable.
   #

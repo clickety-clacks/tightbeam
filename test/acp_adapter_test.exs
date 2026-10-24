@@ -250,7 +250,7 @@ defmodule Tightbeam.Acp.AdapterTest do
           return send({ id: m.id, error: { code: -32000, message: "Invalid value for config option model" } });
         }
         if (failMode === "model-invalid-params" && m.params.configId === "model") {
-          // Recorded live 2026-07-28: codex-acp's refusal of a model value the
+          // codex-acp refuses a model value the
           // catalog advertised (`gpt-5.1-codex`) — JSON-RPC -32602 Invalid params.
           return send({ id: m.id, error: { code: -32602, message: "Invalid params" } });
         }

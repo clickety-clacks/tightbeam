@@ -125,7 +125,7 @@ defmodule Tightbeam.ReadinessTest do
     # for GAPS holds: no adapter/credential/model/foreground line leaks here.
     assert first == "READY: #{names} can run turns."
 
-    # …but O7/I8 (PO ruling) require the pre-expiry-absence to be NAMED for every
+    # …but the readiness contract requires pre-expiry absence to be NAMED for every
     # onboarded credential, so a healthy install is no longer literally one line:
     # it carries exactly one advisory per live credential, and NOTHING else.
     advisory = Enum.reject(rest, &(&1 == ""))

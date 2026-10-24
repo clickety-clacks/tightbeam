@@ -15,10 +15,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     WorkItems
   }
 
-  # The adjudication postmortem's wiring fix (spec production-machine-v1 era,
-  # decisions ledger 2026-08-05): an 11-round spec pipeline ran
-  # spec->review->implementation with no product-owner edge to cross. This
-  # statute creates the edge; these tests prove it summons and releases, and
+  # This rule requires spec-backed work to receive product-owner review before
+  # implementation. These tests prove it summons and releases, and
   # that unspecced work never crosses it.
   setup do
     db = :"spirit_gate_db_#{System.unique_integer([:positive])}"

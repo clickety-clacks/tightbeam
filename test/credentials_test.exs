@@ -979,7 +979,7 @@ defmodule Tightbeam.CredentialsTest do
       refute_receive :forbidden_publish
     end
 
-    # THE INCIDENT TEST (2026-08-14). The prior contract restored the previous
+    # The prior contract restored the previous
     # credential when activation failed, which meant an operator who watched a
     # login fail — and may have chosen to stay logged out, "I was running out of
     # tokens anyway" — silently kept spending on the account they believed was

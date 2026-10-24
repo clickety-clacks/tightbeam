@@ -845,20 +845,16 @@ defmodule Tightbeam.Credentials do
     |> Enum.group_by(& &1.credential_provider(), &{&1.id(), "shared", machine})
   end
 
-  # A FAILED ONBOARDING LEAVES THE ORG FAILED — it never restores the previous
-  # credential. Ruled by user 2026-08-14 after the credential-swap incident:
-  # "we have no business adding security ON TOP of codex or claude logins."
+  # A FAILED ONBOARDING LEAVES THE ORGANIZATION FAILED — it never restores the
+  # previous credential. Restoring a prior credential after a failed login can
+  # resume real spend against an account the operator believes is disconnected.
   #
   # The substrate stores what the operator gave it and reports what the vendor
   # said when it was used. It holds no opinion about whether a vendor login is
   # valid — the vendor owns that, and the only honest test is a real turn.
   #
-  # The restore this replaced was worse than a wedge. An operator whose login
-  # fails believes the system is stopped, and may have CHOSEN that ("I was
-  # running out of tokens anyway, I'll leave it logged out"). Silently reviving
-  # the previous credential resumed real spend against an account they believed
-  # was disconnected — a state contradicting the operator's model, which the
-  # substrate must never construct. It also deadlocked recovery: activation
+  # Restoring a credential after a failed login could resume real spend while
+  # the system appears disconnected. It also deadlocked recovery: activation
   # fails while the adapter's circuit is latched open, so every attempt to
   # install a WORKING credential was reverted, and the latch is guaranteed
   # precisely when the old credential has stopped working — the only reason

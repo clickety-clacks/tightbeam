@@ -228,11 +228,8 @@ defmodule Tightbeam.Application do
     %{
       base_dir: Application.get_env(:tightbeam, :base_dir, default_base_dir()),
       cwd: Application.get_env(:tightbeam, :cwd, File.cwd!()),
-      # 11373: the Expanse's 1373 colonized worlds, plus one for Earth (user's
-      # port, agreed at project start). The code defaulted to 4321 long after the
-      # convention settled, so a bare `tightbeam-gateway` boot landed on a port no
-      # client dials — user's first clawline connect to a fresh production install
-      # failed exactly there (2026-08-04). The default IS the convention now.
+      # Keep the default port aligned with the client and packaged service
+      # configuration so a bare `tightbeam-gateway` boot accepts client connections.
       port: Application.get_env(:tightbeam, :port, 11_373),
       default_harness: Tightbeam.Harness.default().id(),
       default_model:
