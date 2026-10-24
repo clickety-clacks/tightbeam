@@ -11,10 +11,10 @@ defmodule Tightbeam.ToplinesTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1),('other', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 0, 'admin_add', 1),('other', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
       )
 
-    Enum.each(~w(operator other root), &ensure_main_session(db, &1))
+    Enum.each(~w(sample-user other root), &ensure_main_session(db, &1))
 
     :ok = Toplines.ensure_schema(db)
     %{db: db}
@@ -44,13 +44,13 @@ defmodule Tightbeam.ToplinesTest do
 
   test "create canonicalizes the title, attributes the actor, and reads by owner visibility",
        ctx do
-    session!(ctx.db, "s_example", "operator")
+    session!(ctx.db, "s_example", "sample-user")
 
     created =
       Toplines.create(
         ctx.db,
         call(
-          {:user, "operator"},
+          {:user, "sample-user"},
           %{title: "\u3000Cafe\u0301\u00A0", idempotency_key: "create-1"},
           10
         )
@@ -59,10 +59,10 @@ defmodule Tightbeam.ToplinesTest do
     assert %{
              topline: %{
                id: "tl_" <> _,
-               ownerUserId: "operator",
+               ownerUserId: "sample-user",
                title: "Café",
                state: "open",
-               createdActor: %{kind: "user", ref: "operator"},
+               createdActor: %{kind: "user", ref: "sample-user"},
                createdAt: created_at,
                updatedAt: created_at,
                closedAt: nil,
@@ -74,7 +74,7 @@ defmodule Tightbeam.ToplinesTest do
     assert is_integer(created_at)
 
     id = created.topline.id
-    assert %{toplines: [%{id: ^id}]} = Toplines.list(ctx.db, read_call({:user, "operator"}))
+    assert %{toplines: [%{id: ^id}]} = Toplines.list(ctx.db, read_call({:user, "sample-user"}))
     assert %{toplines: []} = Toplines.list(ctx.db, read_call({:user, "other"}))
     assert %{toplines: [%{id: ^id}]} = Toplines.list(ctx.db, read_call({:user, "root"}))
 
@@ -97,9 +97,9 @@ defmodule Tightbeam.ToplinesTest do
   end
 
   test "membership episodes retain reasons, attribution, history, and keyed replay", ctx do
-    work_item!(ctx.db, "wi_release", "operator")
+    work_item!(ctx.db, "wi_release", "sample-user")
 
-    create_call = call({:user, "operator"}, %{title: "Release", idempotency_key: "create"}, 100)
+    create_call = call({:user, "sample-user"}, %{title: "Release", idempotency_key: "create"}, 100)
     first_create = Toplines.create(ctx.db, create_call)
     assert first_create == Toplines.create(ctx.db, create_call)
     topline_id = first_create.topline.id
@@ -107,12 +107,12 @@ defmodule Tightbeam.ToplinesTest do
     assert %{code: "idempotency_conflict"} =
              Toplines.create(
                ctx.db,
-               call({:user, "operator"}, %{title: "Other", idempotency_key: "create"}, 101)
+               call({:user, "sample-user"}, %{title: "Other", idempotency_key: "create"}, 101)
              )
 
     link_call =
       call(
-        {:user, "operator"},
+        {:user, "sample-user"},
         %{
           topline_id: topline_id,
           work_item_id: "wi_release",
@@ -133,7 +133,7 @@ defmodule Tightbeam.ToplinesTest do
 
     assert linked.resolvedPlacementId == nil
     assert linked.membership.linkReason == "  groups the Cafe\u0301 release  "
-    assert linked.membership.linkedActor == %{kind: "user", ref: "operator"}
+    assert linked.membership.linkedActor == %{kind: "user", ref: "sample-user"}
     assert is_integer(linked.membership.linkedAt)
     membership_id = linked.membership.id
 
@@ -145,7 +145,7 @@ defmodule Tightbeam.ToplinesTest do
 
     unlink_call =
       call(
-        {:user, "operator"},
+        {:user, "sample-user"},
         %{membership_id: membership_id, reason: "work split", idempotency_key: "unlink"},
         120
       )
@@ -155,7 +155,7 @@ defmodule Tightbeam.ToplinesTest do
     assert ended.untaggedConcernIds == []
     assert ended.openedPlacement == nil
     assert ended.membership.unlinkReason == "work split"
-    assert ended.membership.unlinkedActor == %{kind: "user", ref: "operator"}
+    assert ended.membership.unlinkedActor == %{kind: "user", ref: "sample-user"}
     assert is_integer(ended.membership.unlinkedAt)
     assert ended.membership.unlinkedAt >= linked.membership.linkedAt
 
@@ -168,7 +168,7 @@ defmodule Tightbeam.ToplinesTest do
     assert %{topline: %{workMemberships: [], history: history, updatedAt: updated_at}} =
              Toplines.get(
                ctx.db,
-               read_call({:user, "operator"}, %{topline_id: topline_id, history: true})
+               read_call({:user, "sample-user"}, %{topline_id: topline_id, history: true})
              )
 
     assert updated_at == ended.membership.unlinkedAt
@@ -218,18 +218,18 @@ defmodule Tightbeam.ToplinesTest do
   end
 
   test "AC10 concurrent active-pair links commit once and append one event", ctx do
-    work_item!(ctx.db, "wi_race", "operator")
+    work_item!(ctx.db, "wi_race", "sample-user")
 
     topline =
       Toplines.create(
         ctx.db,
-        call({:user, "operator"}, %{title: "Race", idempotency_key: "race-create"}, 10)
+        call({:user, "sample-user"}, %{title: "Race", idempotency_key: "race-create"}, 10)
       ).topline
 
     calls =
       for key <- ["race-link-a", "race-link-b"] do
         call(
-          {:user, "operator"},
+          {:user, "sample-user"},
           %{
             topline_id: topline.id,
             work_item_id: "wi_race",
@@ -260,18 +260,18 @@ defmodule Tightbeam.ToplinesTest do
   end
 
   test "AC59 concurrent Concern tags commit once and append one event", ctx do
-    work_item!(ctx.db, "wi_reference_race", "operator")
+    work_item!(ctx.db, "wi_reference_race", "sample-user")
 
     topline =
       Toplines.create(
         ctx.db,
-        call({:user, "operator"}, %{title: "Reference race", idempotency_key: "race-create"}, 20)
+        call({:user, "sample-user"}, %{title: "Reference race", idempotency_key: "race-create"}, 20)
       ).topline
 
     Toplines.link_work(
       ctx.db,
       call(
-        {:user, "operator"},
+        {:user, "sample-user"},
         %{
           topline_id: topline.id,
           work_item_id: "wi_reference_race",
@@ -286,7 +286,7 @@ defmodule Tightbeam.ToplinesTest do
       Toplines.create_concern(
         ctx.db,
         call(
-          {:user, "operator"},
+          {:user, "sample-user"},
           %{topline_id: topline.id, title: "Risk", idempotency_key: "race-concern"},
           22
         )
@@ -295,7 +295,7 @@ defmodule Tightbeam.ToplinesTest do
     calls =
       for key <- ["race-reference-a", "race-reference-b"] do
         call(
-          {:user, "operator"},
+          {:user, "sample-user"},
           %{
             concern_id: concern.id,
             work_item_id: "wi_reference_race",
@@ -329,7 +329,7 @@ defmodule Tightbeam.ToplinesTest do
     created =
       Toplines.create(
         ctx.db,
-        call({:user, "operator"}, %{title: " Cafe\u0301 ", idempotency_key: "create"}, 10)
+        call({:user, "sample-user"}, %{title: " Cafe\u0301 ", idempotency_key: "create"}, 10)
       )
 
     id = created.topline.id
@@ -338,7 +338,7 @@ defmodule Tightbeam.ToplinesTest do
              Toplines.update(
                ctx.db,
                call(
-                 {:user, "operator"},
+                 {:user, "sample-user"},
                  %{
                    topline_id: id,
                    title: "\u00a0Café\u3000",
@@ -353,7 +353,7 @@ defmodule Tightbeam.ToplinesTest do
       Toplines.update(
         ctx.db,
         call(
-          {:user, "operator"},
+          {:user, "sample-user"},
           %{topline_id: id, title: "Ship", reason: "rename", idempotency_key: "rename"},
           12
         )
@@ -365,7 +365,7 @@ defmodule Tightbeam.ToplinesTest do
     closed =
       Toplines.close(
         ctx.db,
-        call({:user, "operator"}, %{topline_id: id, reason: "done", idempotency_key: "close"}, 13)
+        call({:user, "sample-user"}, %{topline_id: id, reason: "done", idempotency_key: "close"}, 13)
       )
 
     assert closed.topline.state == "closed"
@@ -375,7 +375,7 @@ defmodule Tightbeam.ToplinesTest do
              Toplines.update(
                ctx.db,
                call(
-                 {:user, "operator"},
+                 {:user, "sample-user"},
                  %{topline_id: id, title: "Ship", reason: "same", idempotency_key: "closed-same"},
                  14
                )
@@ -385,7 +385,7 @@ defmodule Tightbeam.ToplinesTest do
              Toplines.update(
                ctx.db,
                call(
-                 {:user, "operator"},
+                 {:user, "sample-user"},
                  %{
                    topline_id: id,
                    title: "Other",
@@ -400,7 +400,7 @@ defmodule Tightbeam.ToplinesTest do
       Toplines.reopen(
         ctx.db,
         call(
-          {:user, "operator"},
+          {:user, "sample-user"},
           %{topline_id: id, reason: "again", idempotency_key: "reopen"},
           16
         )
@@ -413,7 +413,7 @@ defmodule Tightbeam.ToplinesTest do
              Toplines.reopen(
                ctx.db,
                call(
-                 {:user, "operator"},
+                 {:user, "sample-user"},
                  %{topline_id: id, reason: "again", idempotency_key: "reopen-twice"},
                  17
                )
@@ -422,7 +422,7 @@ defmodule Tightbeam.ToplinesTest do
     assert %{topline: %{history: history}} =
              Toplines.get(
                ctx.db,
-               read_call({:user, "operator"}, %{topline_id: id, history: true})
+               read_call({:user, "sample-user"}, %{topline_id: id, history: true})
              )
 
     assert Enum.map(history, &{&1.seq, &1.kind}) == [
@@ -436,20 +436,20 @@ defmodule Tightbeam.ToplinesTest do
   end
 
   test "Concern definitions are immutable tags and membership unlink cleans current tags", ctx do
-    work_item!(ctx.db, "wi_concern", "operator")
-    session!(ctx.db, "s_example", "operator")
+    work_item!(ctx.db, "wi_concern", "sample-user")
+    session!(ctx.db, "s_example", "sample-user")
 
     topline =
       Toplines.create(
         ctx.db,
-        call({:user, "operator"}, %{title: "Intent", idempotency_key: "create"}, 20)
+        call({:user, "sample-user"}, %{title: "Intent", idempotency_key: "create"}, 20)
       ).topline
 
     membership =
       Toplines.link_work(
         ctx.db,
         call(
-          {:user, "operator"},
+          {:user, "sample-user"},
           %{
             topline_id: topline.id,
             work_item_id: "wi_concern",
@@ -475,7 +475,7 @@ defmodule Tightbeam.ToplinesTest do
     for {concern, key} <- Enum.zip(concerns, ["tag-risk", "tag-privacy"]) do
       request =
         call(
-          {:user, "operator"},
+          {:user, "sample-user"},
           %{
             concern_id: concern.id,
             work_item_id: "wi_concern",
@@ -493,7 +493,7 @@ defmodule Tightbeam.ToplinesTest do
     assert %{topline: %{concerns: projected, history: history}} =
              Toplines.get(
                ctx.db,
-               read_call({:user, "operator"}, %{topline_id: topline.id, history: true})
+               read_call({:user, "sample-user"}, %{topline_id: topline.id, history: true})
              )
 
     assert Map.new(projected, &{&1.title, &1.workItemIds}) == %{
@@ -504,13 +504,13 @@ defmodule Tightbeam.ToplinesTest do
     assert Enum.take(Enum.map(history, & &1.kind), -2) ==
              ["concern_work_tagged", "concern_work_tagged"]
 
-    work_item!(ctx.db, "wi_unlinked", "operator")
+    work_item!(ctx.db, "wi_unlinked", "sample-user")
 
     assert %{code: "topline_mismatch"} =
              Toplines.link_concern_work(
                ctx.db,
                call(
-                 {:user, "operator"},
+                 {:user, "sample-user"},
                  %{
                    concern_id: hd(concerns).id,
                    work_item_id: "wi_unlinked",
@@ -534,7 +534,7 @@ defmodule Tightbeam.ToplinesTest do
     Toplines.close(
       ctx.db,
       call(
-        {:user, "operator"},
+        {:user, "sample-user"},
         %{topline_id: topline.id, reason: "pause", idempotency_key: "close"},
         25
       )
@@ -542,7 +542,7 @@ defmodule Tightbeam.ToplinesTest do
 
     untag_request =
       call(
-        {:user, "operator"},
+        {:user, "sample-user"},
         %{
           concern_id: hd(concerns).id,
           work_item_id: "wi_concern",
@@ -564,7 +564,7 @@ defmodule Tightbeam.ToplinesTest do
              Toplines.link_concern_work(
                ctx.db,
                call(
-                 {:user, "operator"},
+                 {:user, "sample-user"},
                  %{
                    concern_id: hd(concerns).id,
                    work_item_id: "wi_concern",
@@ -579,7 +579,7 @@ defmodule Tightbeam.ToplinesTest do
       Toplines.unlink_work(
         ctx.db,
         call(
-          {:user, "operator"},
+          {:user, "sample-user"},
           %{membership_id: membership.id, reason: "split", idempotency_key: "unlink"},
           27
         )
@@ -591,7 +591,7 @@ defmodule Tightbeam.ToplinesTest do
     assert %{topline: %{concerns: cleaned, history: cleaned_history}} =
              Toplines.get(
                ctx.db,
-               read_call({:user, "operator"}, %{topline_id: topline.id, history: true})
+               read_call({:user, "sample-user"}, %{topline_id: topline.id, history: true})
              )
 
     assert Enum.all?(cleaned, &(&1.workItemIds == []))
@@ -602,19 +602,19 @@ defmodule Tightbeam.ToplinesTest do
     open =
       Toplines.create(
         ctx.db,
-        call({:user, "operator"}, %{title: "Open", idempotency_key: "open"}, 30)
+        call({:user, "sample-user"}, %{title: "Open", idempotency_key: "open"}, 30)
       ).topline
 
     closed =
       Toplines.create(
         ctx.db,
-        call({:user, "operator"}, %{title: "Closed", idempotency_key: "closed"}, 31)
+        call({:user, "sample-user"}, %{title: "Closed", idempotency_key: "closed"}, 31)
       ).topline
 
     Toplines.close(
       ctx.db,
       call(
-        {:user, "operator"},
+        {:user, "sample-user"},
         %{topline_id: closed.id, reason: "done", idempotency_key: "close"},
         32
       )
@@ -623,7 +623,7 @@ defmodule Tightbeam.ToplinesTest do
     assert [] = Toplines.query_public(ctx.db, %{principal: {:user, "other"}, state: nil})
 
     assert [%{topline: %{id: id}} = queried] =
-             Toplines.query_public(ctx.db, %{principal: {:user, "operator"}, state: ["open"]})
+             Toplines.query_public(ctx.db, %{principal: {:user, "sample-user"}, state: ["open"]})
 
     assert id == open.id
     item = Toplines.public_item(queried)
@@ -649,13 +649,13 @@ defmodule Tightbeam.ToplinesTest do
 
   test "public dependency digest uses the exact ordered integer Work Item rowVersion vector",
        ctx do
-    work_item!(ctx.db, "wi_dependency", "operator")
+    work_item!(ctx.db, "wi_dependency", "sample-user")
 
     topline =
       Toplines.create(
         ctx.db,
         call(
-          {:user, "operator"},
+          {:user, "sample-user"},
           %{title: "Dependency", idempotency_key: "dependency-create"},
           40
         )
@@ -665,7 +665,7 @@ defmodule Tightbeam.ToplinesTest do
       Toplines.link_work(
         ctx.db,
         call(
-          {:user, "operator"},
+          {:user, "sample-user"},
           %{
             topline_id: topline.id,
             work_item_id: "wi_dependency",
@@ -691,14 +691,14 @@ defmodule Tightbeam.ToplinesTest do
       |> Base.encode16(case: :lower)
 
     assert [%{topline: queried} = composed] =
-             Toplines.query_public(ctx.db, %{principal: {:user, "operator"}, state: ["open"]})
+             Toplines.query_public(ctx.db, %{principal: {:user, "sample-user"}, state: ["open"]})
 
     assert queried.id == topline.id
     assert Toplines.public_item(composed).dependencyVersion == expected_digest
   end
 
   test "Work Item mutation advances its rowVersion and the composed dependency digest", ctx do
-    work_item!(ctx.db, "wi_mutation", "operator")
+    work_item!(ctx.db, "wi_mutation", "sample-user")
 
     :ok =
       DB.execute(
@@ -709,13 +709,13 @@ defmodule Tightbeam.ToplinesTest do
     topline =
       Toplines.create(
         ctx.db,
-        call({:user, "operator"}, %{title: "Mutation", idempotency_key: "mutation-create"}, 42)
+        call({:user, "sample-user"}, %{title: "Mutation", idempotency_key: "mutation-create"}, 42)
       ).topline
 
     Toplines.link_work(
       ctx.db,
       call(
-        {:user, "operator"},
+        {:user, "sample-user"},
         %{
           topline_id: topline.id,
           work_item_id: "wi_mutation",
@@ -726,7 +726,7 @@ defmodule Tightbeam.ToplinesTest do
       )
     )
 
-    [before] = Toplines.query_public(ctx.db, %{principal: {:user, "operator"}, state: ["open"]})
+    [before] = Toplines.query_public(ctx.db, %{principal: {:user, "sample-user"}, state: ["open"]})
     before_item = Toplines.public_item(before)
     assert [%{workItemTitle: "Work wi_mutation"}] = before_item.workMemberships
 
@@ -734,13 +734,13 @@ defmodule Tightbeam.ToplinesTest do
       WorkItems.__handle__(
         ctx.db,
         "work-item-update",
-        call({:user, "operator"}, %{work_item_id: "wi_mutation", title: "After"}, 44)
+        call({:user, "sample-user"}, %{work_item_id: "wi_mutation", title: "After"}, 44)
       )
 
     assert updated.rowVersion == 9_000_000_000_000_001
 
     [after_update] =
-      Toplines.query_public(ctx.db, %{principal: {:user, "operator"}, state: ["open"]})
+      Toplines.query_public(ctx.db, %{principal: {:user, "sample-user"}, state: ["open"]})
 
     after_item = Toplines.public_item(after_update)
     assert [%{workItemTitle: "After"}] = after_item.workMemberships
@@ -750,20 +750,20 @@ defmodule Tightbeam.ToplinesTest do
       WorkItems.__handle__(
         ctx.db,
         "work-item-update",
-        call({:user, "operator"}, %{work_item_id: "wi_mutation", title: "After"}, 45)
+        call({:user, "sample-user"}, %{work_item_id: "wi_mutation", title: "After"}, 45)
       )
 
     assert unchanged.rowVersion == updated.rowVersion
 
     [after_noop] =
-      Toplines.query_public(ctx.db, %{principal: {:user, "operator"}, state: ["open"]})
+      Toplines.query_public(ctx.db, %{principal: {:user, "sample-user"}, state: ["open"]})
 
     assert Toplines.public_item(after_noop).dependencyVersion == after_item.dependencyVersion
   end
 
   test "the frozen in-transaction placement seam stores one pending episode and resolution",
        ctx do
-    work_item!(ctx.db, "wi_place", "operator")
+    work_item!(ctx.db, "wi_place", "sample-user")
 
     :ok =
       DB.execute(
@@ -771,7 +771,7 @@ defmodule Tightbeam.ToplinesTest do
         """
         INSERT INTO wakes
           (wakeId, sessionKey, origin, prompt, consumer, dueAt, state, createdAt)
-        VALUES ('w_place', 'agent:main:clawline:operator:main', 'process:tightbeam',
+        VALUES ('w_place', 'agent:main:clawline:sample-user:main', 'process:tightbeam',
                 'Choose placement', 'prompt', 40, 'pending', 40)
         """
       )
@@ -781,12 +781,12 @@ defmodule Tightbeam.ToplinesTest do
         Toplines.open_placement_in_txn(txn, %{
           id: "tlp_one",
           work_item_id: "wi_place",
-          owner_user_id: "operator",
+          owner_user_id: "sample-user",
           cause: "created",
           cause_ref: "wi_place",
           source_causal_event_seq: nil,
           actor_kind: "user",
-          actor_ref: "operator",
+          actor_ref: "sample-user",
           at: 40,
           prompt_wake_id: "w_place"
         })
@@ -797,9 +797,9 @@ defmodule Tightbeam.ToplinesTest do
              causeRef: "wi_place",
              dueAt: 40,
              id: "tlp_one",
-             openedActor: %{kind: "user", ref: "operator"},
+             openedActor: %{kind: "user", ref: "sample-user"},
              openedAt: 40,
-             ownerUserId: "operator",
+             ownerUserId: "sample-user",
              promptWake: %{id: "w_place", state: "pending"},
              resolutionActor: nil,
              resolutionReason: nil,
@@ -815,7 +815,7 @@ defmodule Tightbeam.ToplinesTest do
           work_item_id: "wi_place",
           state: "left_unlinked",
           actor_kind: "user",
-          actor_ref: "operator",
+          actor_ref: "sample-user",
           reason: "deliberate",
           at: 41,
           resolution_causal_event_seq: nil
@@ -823,7 +823,7 @@ defmodule Tightbeam.ToplinesTest do
       end)
 
     assert resolved.state == "left_unlinked"
-    assert resolved.resolutionActor == %{kind: "user", ref: "operator"}
+    assert resolved.resolutionActor == %{kind: "user", ref: "sample-user"}
     assert resolved.resolutionReason == "deliberate"
     assert resolved.resolvedAt == 41
 
@@ -833,7 +833,7 @@ defmodule Tightbeam.ToplinesTest do
                  work_item_id: "wi_place",
                  state: "left_unlinked",
                  actor_kind: "user",
-                 actor_ref: "operator",
+                 actor_ref: "sample-user",
                  reason: "again",
                  at: 42,
                  resolution_causal_event_seq: nil
@@ -843,7 +843,7 @@ defmodule Tightbeam.ToplinesTest do
 
   test "leave-unlinked resolves the caller's pending placement idempotently and lists resolved placements",
        ctx do
-    work_item!(ctx.db, "wi_leave", "operator")
+    work_item!(ctx.db, "wi_leave", "sample-user")
 
     :ok =
       DB.execute(
@@ -851,7 +851,7 @@ defmodule Tightbeam.ToplinesTest do
         """
         INSERT INTO wakes
           (wakeId, sessionKey, origin, prompt, consumer, dueAt, state, createdAt)
-        VALUES ('w_leave', 'agent:main:clawline:operator:main', 'process:tightbeam',
+        VALUES ('w_leave', 'agent:main:clawline:sample-user:main', 'process:tightbeam',
                 'Choose placement', 'prompt', 40, 'pending', 40)
         """
       )
@@ -861,12 +861,12 @@ defmodule Tightbeam.ToplinesTest do
         Toplines.open_placement_in_txn(txn, %{
           id: "tlp_leave",
           work_item_id: "wi_leave",
-          owner_user_id: "operator",
+          owner_user_id: "sample-user",
           cause: "created",
           cause_ref: "wi_leave",
           source_causal_event_seq: nil,
           actor_kind: "user",
-          actor_ref: "operator",
+          actor_ref: "sample-user",
           at: 40,
           prompt_wake_id: "w_leave"
         })
@@ -875,23 +875,23 @@ defmodule Tightbeam.ToplinesTest do
     request = %{work_item_id: "wi_leave", reason: "not now", idempotency_key: "leave-1"}
 
     assert %{placement: %{id: "tlp_leave", state: "left_unlinked", resolutionReason: "not now"}} =
-             Toplines.leave_unlinked(ctx.db, call({:user, "operator"}, request, 41))
+             Toplines.leave_unlinked(ctx.db, call({:user, "sample-user"}, request, 41))
 
     assert %{placement: %{id: "tlp_leave", state: "left_unlinked"}} =
-             Toplines.leave_unlinked(ctx.db, call({:user, "operator"}, request, 42))
+             Toplines.leave_unlinked(ctx.db, call({:user, "sample-user"}, request, 42))
 
     assert %{code: "placement_not_pending"} =
              Toplines.leave_unlinked(
                ctx.db,
-               call({:user, "operator"}, %{request | idempotency_key: "leave-2"}, 43)
+               call({:user, "sample-user"}, %{request | idempotency_key: "leave-2"}, 43)
              )
 
-    assert %{placements: []} = Toplines.list_placements(ctx.db, read_call({:user, "operator"}))
+    assert %{placements: []} = Toplines.list_placements(ctx.db, read_call({:user, "sample-user"}))
 
     assert %{placements: [%{id: "tlp_leave", state: "left_unlinked"}]} =
              Toplines.list_placements(
                ctx.db,
-               read_call({:user, "operator"}, %{state: "resolved"})
+               read_call({:user, "sample-user"}, %{state: "resolved"})
              )
 
     assert %{placements: []} =
@@ -906,19 +906,19 @@ defmodule Tightbeam.ToplinesTest do
 
   test "invalid, invisible, cross-owner, duplicate, and process operations refuse without writes",
        ctx do
-    work_item!(ctx.db, "wi_mine", "operator")
+    work_item!(ctx.db, "wi_mine", "sample-user")
     work_item!(ctx.db, "wi_theirs", "other")
 
     assert %{code: "invalid_message"} =
              Toplines.create(
                ctx.db,
-               call({:user, "operator"}, %{title: " ", idempotency_key: "k"})
+               call({:user, "sample-user"}, %{title: " ", idempotency_key: "k"})
              )
 
     assert %{code: "invalid_message"} =
              Toplines.create(
                ctx.db,
-               call({:user, "operator"}, %{title: "Valid", idempotency_key: " ", extra: true})
+               call({:user, "sample-user"}, %{title: "Valid", idempotency_key: " ", extra: true})
              )
 
     assert %{code: "process_denied"} =
@@ -933,7 +933,7 @@ defmodule Tightbeam.ToplinesTest do
     topline =
       Toplines.create(
         ctx.db,
-        call({:user, "operator"}, %{title: "Mine", idempotency_key: "mine"})
+        call({:user, "sample-user"}, %{title: "Mine", idempotency_key: "mine"})
       ).topline
 
     invisible = %{
@@ -944,7 +944,7 @@ defmodule Tightbeam.ToplinesTest do
     }
 
     assert %{code: "not_found"} =
-             Toplines.link_work(ctx.db, call({:user, "operator"}, invisible))
+             Toplines.link_work(ctx.db, call({:user, "sample-user"}, invisible))
 
     assert %{code: "owner_mismatch"} =
              Toplines.link_work(ctx.db, call({:user, "root"}, invisible))
@@ -952,7 +952,7 @@ defmodule Tightbeam.ToplinesTest do
     assert %{code: "invalid_message"} =
              Toplines.link_work(
                ctx.db,
-               call({:user, "operator"}, %{invisible | work_item_id: "wi_mine", reason: ""})
+               call({:user, "sample-user"}, %{invisible | work_item_id: "wi_mine", reason: ""})
              )
 
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM toplines")
@@ -977,7 +977,7 @@ defmodule Tightbeam.ToplinesTest do
     assert_raise DB.Error, fn ->
       Toplines.create(
         ctx.db,
-        call({:user, "operator"}, %{title: "Rolled back", idempotency_key: "rollback"}, 50)
+        call({:user, "sample-user"}, %{title: "Rolled back", idempotency_key: "rollback"}, 50)
       )
     end
 
@@ -987,10 +987,10 @@ defmodule Tightbeam.ToplinesTest do
   end
 
   test "compatibility delegates preserve Execution Map response bytes", ctx do
-    work_item!(ctx.db, "wi_map", "operator")
+    work_item!(ctx.db, "wi_map", "sample-user")
 
-    roster_call = read_call({:user, "operator"}) |> Map.put(:now, 9_000_000)
-    detail_call = read_call({:user, "operator"}, %{under: "wi_map"}) |> Map.put(:now, 9_000_000)
+    roster_call = read_call({:user, "sample-user"}) |> Map.put(:now, 9_000_000)
+    detail_call = read_call({:user, "sample-user"}, %{under: "wi_map"}) |> Map.put(:now, 9_000_000)
 
     assert JSON.encode!(Toplines.roster(ctx.db, roster_call)) ==
              JSON.encode!(ExecutionMap.roster(ctx.db, roster_call))
@@ -1064,7 +1064,7 @@ defmodule Tightbeam.ToplinesTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("claude-example-5")
+      model: Model.new("claude-fable-5")
     })
 
     key

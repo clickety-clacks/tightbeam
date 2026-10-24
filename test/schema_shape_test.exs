@@ -51,18 +51,18 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:paired, _device} =
              claim_org(db, %{
                device_id: "artifact-digest-migration",
-               claimed_name: "user",
+               claimed_name: "Sample User",
                platform: nil,
                model: nil
              })
 
-    _child = session(db, "child", "operator")
+    _child = session(db, "child", "sample-user")
 
     work_item =
       WorkItems.__handle__(db, "work-item-create", %{
         verb: "work-item-create",
-        origin: "user:operator",
-        principal: {:user, "operator"},
+        origin: "user:sample-user",
+        principal: {:user, "sample-user"},
         params: %{title: "Old artifact claim"}
       })
 
@@ -120,18 +120,18 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:paired, _device} =
              claim_org(db, %{
                device_id: "principal-duty-migration",
-               claimed_name: "user",
+               claimed_name: "Sample User",
                platform: nil,
                model: nil
              })
 
-    example_session = Org.personal_session_key("operator")
+    example_session = Org.personal_session_key("sample-user")
 
     direct =
       WorkItems.__handle__(db, "work-item-create", %{
         verb: "work-item-create",
-        origin: "user:operator",
-        principal: {:user, "operator"},
+        origin: "user:sample-user",
+        principal: {:user, "sample-user"},
         params: %{title: "legacy direct principal ask"}
       })
 
@@ -159,7 +159,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert_principal_duty_shape(db)
 
     assert {:ok,
-            [[direct_id, "operator", "direct", nil], [relayed_id, "operator", "relayed", source]]} =
+            [[direct_id, "sample-user", "direct", nil], [relayed_id, "sample-user", "relayed", source]]} =
              DB.query(
                db,
                "SELECT workItemId,sourceUserId,sourceKind,sourceSessionKey FROM work_item_sources ORDER BY sourceKind"
@@ -405,7 +405,7 @@ defmodule Tightbeam.SchemaShapeTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO decision_requests (id,kind,raiserId,ownerUserId,raisedAt,deadlineAt,statuteName,actionKey,question,context,status) VALUES ('dr_pre_terminal','statute','session:legacy','operator',1,2,'gate','legacy','legacy question','{}','open')"
+        "INSERT INTO decision_requests (id,kind,raiserId,ownerUserId,raisedAt,deadlineAt,statuteName,actionKey,question,context,status) VALUES ('dr_pre_terminal','statute','session:legacy','sample-user',1,2,'gate','legacy','legacy question','{}','open')"
       )
 
     :ok =
@@ -426,18 +426,18 @@ defmodule Tightbeam.SchemaShapeTest do
          actionKey,question,options,context,status,decision,ruledBy,ruledAt,
          rulingFactId,consumedAt)
       VALUES
-        ('dr_00000000-0000-4000-8000-000000000004','operator','agent:raiser','agent:raiser:legacy','operator',1,2,
+        ('dr_00000000-0000-4000-8000-000000000004','sample-user','agent:raiser','agent:raiser:legacy','sample-user',1,2,
          'legacy-complete','legacy complete','[{"label":"accept"}]','{}','ruled','accept',
-         'user:operator',11,11,NULL),
-        ('dr_00000000-0000-4000-8000-000000000002','operator','agent:raiser','agent:raiser:legacy','operator',1,2,
+         'user:sample-user',11,11,NULL),
+        ('dr_00000000-0000-4000-8000-000000000002','sample-user','agent:raiser','agent:raiser:legacy','sample-user',1,2,
          'legacy-missing-fact-id','legacy missing fact id','[{"label":"accept"}]','{}','ruled','accept',
-         'user:operator',12,NULL,NULL),
-        ('dr_00000000-0000-4000-8000-000000000003','operator','agent:raiser','agent:raiser:legacy','operator',1,2,
+         'user:sample-user',12,NULL,NULL),
+        ('dr_00000000-0000-4000-8000-000000000003','sample-user','agent:raiser','agent:raiser:legacy','sample-user',1,2,
          'legacy-missing-fact','legacy missing fact','[{"label":"accept"}]','{}','ruled','accept',
-         'user:operator',14,999,NULL),
-        ('dr_00000000-0000-4000-8000-000000000001','operator','agent:raiser','agent:raiser:legacy','operator',1,2,
+         'user:sample-user',14,999,NULL),
+        ('dr_00000000-0000-4000-8000-000000000001','sample-user','agent:raiser','agent:raiser:legacy','sample-user',1,2,
          'legacy-consumed','legacy consumed','[{"label":"accept"}]','{}','consumed','accept',
-         'user:operator',13,13,13);
+         'user:sample-user',13,13,13);
       DROP TABLE IF EXISTS decision_request_integrity_evidence;
       DROP TABLE IF EXISTS decision_request_terminal_epoch;
       UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v7', stampedAt=1;
@@ -1045,14 +1045,14 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:paired, _device} =
              claim_org(db, %{
                device_id: "legacy-device",
-               claimed_name: "user",
+               claimed_name: "Sample User",
                platform: nil,
                model: nil
              })
 
-    main = Org.get(db, Org.personal_session_key("operator"))
-    root = session(db, "root", "operator")
-    child = session(db, "child", "operator", spawned_by: root.session_key)
+    main = Org.get(db, Org.personal_session_key("sample-user"))
+    root = session(db, "root", "sample-user")
+    child = session(db, "child", "sample-user", spawned_by: root.session_key)
     main_key = main.session_key
     root_key = root.session_key
     child_key = child.session_key
@@ -1112,14 +1112,14 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:paired, _device} =
              claim_org(db, %{
                device_id: "legacy-device",
-               claimed_name: "user",
+               claimed_name: "Sample User",
                platform: nil,
                model: nil
              })
 
-    main = Org.get(db, Org.personal_session_key("operator"))
+    main = Org.get(db, Org.personal_session_key("sample-user"))
     main_key = main.session_key
-    _root = session(db, "root", "operator")
+    _root = session(db, "root", "sample-user")
     downgrade_to_previous_shape(db)
 
     error =
@@ -1146,14 +1146,14 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:paired, _device} =
              claim_org(db, %{
                device_id: "legacy-device",
-               claimed_name: "user",
+               claimed_name: "Sample User",
                platform: nil,
                model: nil
              })
 
-    main = Org.get(db, Org.personal_session_key("operator"))
-    root = session(db, "root", "operator")
-    child = session(db, "child", "operator", spawned_by: root.session_key)
+    main = Org.get(db, Org.personal_session_key("sample-user"))
+    root = session(db, "root", "sample-user")
+    child = session(db, "child", "sample-user", spawned_by: root.session_key)
 
     %{operational_parent: main_parent} =
       Org.set_operational_parent(db, root.session_key, main.session_key)
@@ -1182,7 +1182,7 @@ defmodule Tightbeam.SchemaShapeTest do
         """
         INSERT INTO assignments
           (id,subject,holderKey,openedByUser,openedAt)
-        VALUES ('asg_historical_root','historical controller','child','operator',1);
+        VALUES ('asg_historical_root','historical controller','child','sample-user',1);
         INSERT INTO wakes
           (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt,assignmentId)
         VALUES
@@ -1260,7 +1260,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:paired, _device} =
              claim_org(db, %{
                device_id: "legacy-device",
-               claimed_name: "user",
+               claimed_name: "Sample User",
                platform: nil,
                model: nil
              })
@@ -1306,7 +1306,7 @@ defmodule Tightbeam.SchemaShapeTest do
   # table that already exists in an older shape. It adds no column, so the
   # first query naming `modelContext` dies as an accidental `no such column` —
   # and a column added by hand would be worse, because `sessions.model` from
-  # before this change holds `claude-example-5[1m]`, which this build reads as a
+  # before this change holds `claude-fable-5[1m]`, which this build reads as a
   # family. A wrong answer from data that was right when it was written.
   test "a database predating the structured identity is refused by name", %{db: db} do
     :ok =
@@ -1317,17 +1317,17 @@ defmodule Tightbeam.SchemaShapeTest do
         harness    TEXT NOT NULL
       );
       INSERT INTO sessions (sessionKey, model, harness)
-      VALUES ('k1', 'claude-example-5[1m]', 'claude');
+      VALUES ('k1', 'claude-fable-5[1m]', 'claude');
       """)
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "predates the structured model identity"
-    assert error.message =~ "claude-example-5[1m]"
+    assert error.message =~ "claude-fable-5[1m]"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair, and it did not leave the row reinterpreted.
-    assert {:ok, [["claude-example-5[1m]"]]} =
+    assert {:ok, [["claude-fable-5[1m]"]]} =
              DB.query(db, "SELECT model FROM sessions WHERE sessionKey='k1'")
   end
 
@@ -1792,7 +1792,7 @@ defmodule Tightbeam.SchemaShapeTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("example-model")
+      model: Model.new("fable")
     })
   end
 
@@ -1881,12 +1881,12 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:paired, _device} =
              claim_org(db, %{
                device_id: "legacy-device",
-               claimed_name: "user",
+               claimed_name: "Sample User",
                platform: nil,
                model: nil
              })
 
-    holder = Org.get(db, Org.personal_session_key("operator")).session_key
+    holder = Org.get(db, Org.personal_session_key("sample-user")).session_key
     downgrade_to_v17(db)
 
     :ok =
@@ -1906,7 +1906,7 @@ defmodule Tightbeam.SchemaShapeTest do
       INSERT INTO decision_requests
         (id,kind,raiserId,ownerUserId,assignmentId,expecterUserId,lineageRung,effortGeneration,deadlineWakeId,raisedAt,deadlineAt,question,context,status)
       VALUES
-        ('dr_effort','effort','process:tightbeam','operator','asg_effort','operator',0,1,'w_deadline',1,2,'effort check','{}','open');
+        ('dr_effort','effort','process:tightbeam','sample-user','asg_effort','sample-user',0,1,'w_deadline',1,2,'effort check','{}','open');
       """)
 
     # Boot dispatch runs full-schema validation at the end, which requires every

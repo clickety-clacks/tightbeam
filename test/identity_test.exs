@@ -890,10 +890,10 @@ defmodule Tightbeam.IdentityTest do
     {_, 0} = System.cmd("git", ["-C", dir, "reset", "scratch.md"], stderr_to_stdout: true)
     File.rm!(Path.join(dir, "scratch.md"))
 
-    assert edit!(ctx.base, "coder", :guidance, "no-identity-edit", "user:operator")
+    assert edit!(ctx.base, "coder", :guidance, "no-identity-edit", "user:sample-user")
 
     assert git!(dir, ["log", "-1", "--format=%an <%ae>", "main"]) ==
-             "user:operator <user-operator@example.invalid>"
+             "user:sample-user <user-sample-user@example.invalid>"
 
     File.write!(Path.join(ctx.source, "guidance/new.md"), "new-source")
 

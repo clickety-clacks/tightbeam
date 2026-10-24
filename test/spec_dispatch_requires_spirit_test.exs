@@ -34,15 +34,15 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 1, 'admin_add', 1)"
       )
 
-    ensure_main_session(db, "operator")
+    ensure_main_session(db, "sample-user")
 
     holder = session(db, "impl-holder", "coder", "claude", "anthropic")
     owner = session(db, "po-holder", "product-owner", "codex", "openai")
     orchestrator = session(db, "slice-orchestrator", "orchestrator", "codex", "openai")
-    Roles.create!(db, "product-owner", "operator", owner.session_key)
+    Roles.create!(db, "product-owner", "sample-user", owner.session_key)
 
     start_supervised!(
       {Wakes,
@@ -53,7 +53,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
       Path.join(System.tmp_dir!(), "tightbeam-spirit-gate-#{System.unique_integer([:positive])}")
 
     assert :initialized = Archetypes.init_identity!(base_dir)
-    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "operator")
+    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "sample-user")
     _archetypes = Archetypes.load!(base_dir)
 
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
@@ -80,8 +80,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     Tightbeam.Org.create(db, %{
       session_key: key,
       display_name: key,
-      owner_user_id: "operator",
-      origin: "user:operator",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: archetype,
       harness: harness,
       provider: provider,
@@ -106,7 +106,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
 
     item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
-        principal: {:user, "operator"},
+        principal: {:user, "sample-user"},
         params: params
       })
 
@@ -122,8 +122,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     {:ok, slice} =
       Dispatch.dispatch(ctx.db, ctx.handlers, %{
         verb: "assign",
-        origin: "user:operator",
-        principal: {:user, "operator"},
+        origin: "user:sample-user",
+        principal: {:user, "sample-user"},
         session_key: ctx.orchestrator.session_key,
         target_role: nil,
         role_fallback: false,
@@ -143,8 +143,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
   defp dispatch_call(holder_key, item_id, subject) do
     %{
       verb: "dispatch",
-      origin: "user:operator",
-      principal: {:user, "operator"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
@@ -200,8 +200,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     {:ok, spirit} =
       Dispatch.dispatch(ctx.db, ctx.handlers, %{
         verb: "assign",
-        origin: "user:operator",
-        principal: {:user, "operator"},
+        origin: "user:sample-user",
+        principal: {:user, "sample-user"},
         session_key: ctx.owner.session_key,
         target_role: nil,
         role_fallback: false,
@@ -257,8 +257,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     review_call = fn n ->
       %{
         verb: "assign",
-        origin: "user:operator",
-        principal: {:user, "operator"},
+        origin: "user:sample-user",
+        principal: {:user, "sample-user"},
         session_key: ctx.owner.session_key,
         target_role: nil,
         role_fallback: false,
@@ -336,8 +336,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     review_call = fn n ->
       %{
         verb: "assign",
-        origin: "user:operator",
-        principal: {:user, "operator"},
+        origin: "user:sample-user",
+        principal: {:user, "sample-user"},
         session_key: ctx.owner.session_key,
         target_role: nil,
         role_fallback: false,
@@ -453,8 +453,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     review_call = fn n ->
       %{
         verb: "assign",
-        origin: "user:operator",
-        principal: {:user, "operator"},
+        origin: "user:sample-user",
+        principal: {:user, "sample-user"},
         session_key: ctx.owner.session_key,
         target_role: nil,
         role_fallback: false,

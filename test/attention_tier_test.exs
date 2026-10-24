@@ -66,7 +66,7 @@ defmodule Tightbeam.AttentionTierTest do
     def handle_call({:knows_session?, _sid}, _from, state), do: {:reply, true, state}
 
     def handle_call({:current_model, _sid}, _from, state),
-      do: {:reply, {:ok, "claude-example-5"}, state}
+      do: {:reply, {:ok, "claude-fable-5"}, state}
 
     def handle_call({:apply_model, _sid, _model}, _from, state), do: {:reply, :ok, state}
 
@@ -118,7 +118,7 @@ defmodule Tightbeam.AttentionTierTest do
     {:paired, _device} =
       claim_org(db, %{
         device_id: "attention-device",
-        claimed_name: "operator",
+        claimed_name: "sample-user",
         platform: nil,
         model: nil
       })
@@ -126,13 +126,13 @@ defmodule Tightbeam.AttentionTierTest do
     Org.create(db, %{
       session_key: "k1",
       display_name: "Main",
-      owner_user_id: "operator",
-      origin: "user:operator",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("claude-example-5")
+      model: Model.new("claude-fable-5")
     })
 
     base_dir = Path.join(System.tmp_dir!(), "attention_#{System.unique_integer([:positive])}")
@@ -159,7 +159,7 @@ defmodule Tightbeam.AttentionTierTest do
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,
-      default_model: Model.new("claude-example-5"),
+      default_model: Model.new("claude-fable-5"),
       max_live_sessions_per_user: 50,
       wake_tick_ms: 60_000,
       onboarding_lease_ms: 1_800_000,
@@ -207,13 +207,13 @@ defmodule Tightbeam.AttentionTierTest do
     Org.create(ctx.db, %{
       session_key: "k2",
       display_name: "Other",
-      owner_user_id: "operator",
-      origin: "user:operator",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("claude-example-5")
+      model: Model.new("claude-fable-5")
     })
 
     # k1's turn elects NOTHING, and while it is running — before its reply is
@@ -221,7 +221,7 @@ defmodule Tightbeam.AttentionTierTest do
     # newest turn" instead of THIS turn would stamp k1's reply from k2's election.
     interfere = fn ->
       assert :appended =
-               Gateway.deliver_prompt("k2", "user:operator", "other session work",
+               Gateway.deliver_prompt("k2", "user:sample-user", "other session work",
                  db: ctx.db,
                  client_message_id: "c_other_#{System.unique_integer([:positive])}"
                )
@@ -258,7 +258,7 @@ defmodule Tightbeam.AttentionTierTest do
     # `post` is the only client path that creates a message from client input, and
     # it forwards a fixed set of params; the tier is not among them.
     assert :appended =
-             Gateway.deliver_prompt("k1", "user:operator", "hello",
+             Gateway.deliver_prompt("k1", "user:sample-user", "hello",
                db: ctx.db,
                client_message_id: "c_forge",
                attention_tier: 1
@@ -288,7 +288,7 @@ defmodule Tightbeam.AttentionTierTest do
     assert %{code: "no_running_turn"} =
              handlers["attend"].(%{
                verb: "attend",
-               origin: "user:operator",
+               origin: "user:sample-user",
                principal: {:session, "k1"},
                session_key: nil,
                params: %{high: true}
@@ -297,7 +297,7 @@ defmodule Tightbeam.AttentionTierTest do
     # A QUEUED turn is not yet yours to elect on: the predicate is `running`, not
     # "any turn of mine".
     assert :appended =
-             Gateway.deliver_prompt("k1", "user:operator", "not started yet",
+             Gateway.deliver_prompt("k1", "user:sample-user", "not started yet",
                db: ctx.db,
                client_message_id: "c_queued"
              )
@@ -315,15 +315,15 @@ defmodule Tightbeam.AttentionTierTest do
     assert %{code: "invalid"} =
              handlers["attend"].(%{
                verb: "attend",
-               origin: "user:operator",
-               principal: {:user, "operator"},
+               origin: "user:sample-user",
+               principal: {:user, "sample-user"},
                session_key: nil,
                params: %{high: true}
              })
 
     # With a running turn, the election lands on THAT turn.
     assert :appended =
-             Gateway.deliver_prompt("k1", "user:operator", "queued work",
+             Gateway.deliver_prompt("k1", "user:sample-user", "queued work",
                db: ctx.db,
                client_message_id: "c_running"
              )
@@ -390,7 +390,7 @@ defmodule Tightbeam.AttentionTierTest do
     client_message_id = "c_#{System.unique_integer([:positive])}"
 
     assert :appended =
-             Gateway.deliver_prompt("k1", "user:operator", prompt,
+             Gateway.deliver_prompt("k1", "user:sample-user", prompt,
                db: ctx.db,
                client_message_id: client_message_id
              )

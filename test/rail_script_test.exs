@@ -43,7 +43,7 @@ defmodule Tightbeam.RailScriptTest do
     :ok = Wakes.ensure_schema(db)
     :ok = Placement.ensure_schema(db)
 
-    ensure_main_session(db, "operator")
+    ensure_main_session(db, "sample-user")
 
     {tmp, 0} = System.cmd("/bin/realpath", [System.tmp_dir!()])
 
@@ -71,13 +71,13 @@ defmodule Tightbeam.RailScriptTest do
       Org.create(db, %{
         session_key: "rail-holder",
         display_name: "Rail holder",
-        owner_user_id: "operator",
-        origin: "user:operator",
+        owner_user_id: "sample-user",
+        origin: "user:sample-user",
         archetype: "coder",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("example-model")
+        model: Model.new("fable")
       })
 
     on_exit(fn ->
@@ -160,7 +160,7 @@ defmodule Tightbeam.RailScriptTest do
       call()
       |> Map.put(
         :principal,
-        {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "operator"}}
+        {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "sample-user"}}
       )
 
     assert {:ok, "pass", "returned"} =
@@ -439,13 +439,13 @@ defmodule Tightbeam.RailScriptTest do
       Org.create(ctx.db, %{
         session_key: "remote-rail-holder",
         display_name: "Remote rail holder",
-        owner_user_id: "operator",
-        origin: "user:operator",
+        owner_user_id: "sample-user",
+        origin: "user:sample-user",
         archetype: "coder",
         host: "remote-testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("example-model")
+        model: Model.new("fable")
       })
 
     expected_workdir =
@@ -611,8 +611,8 @@ defmodule Tightbeam.RailScriptTest do
              Escalation.rule(
                ctx.db,
                %{
-                 origin: "user:operator",
-                 principal: {:user, "operator"},
+                 origin: "user:sample-user",
+                 principal: {:user, "sample-user"},
                  params: %{request_id: id, decision: "allow"}
                },
                authorized: true
@@ -676,8 +676,8 @@ defmodule Tightbeam.RailScriptTest do
     assert denial.reason == "rule_denied"
     assert denial.script_exit_class == "returned"
     assert denial.ref == "w1"
-    assert denial.origin == "user:operator"
-    assert denial.principal == "user:operator"
+    assert denial.origin == "user:sample-user"
+    assert denial.principal == "user:sample-user"
   end
 
   test "every non-pass exit class denies dispatch with the named legibility payload", ctx do
@@ -1176,8 +1176,8 @@ defmodule Tightbeam.RailScriptTest do
              Escalation.rule(
                ctx.db,
                %{
-                 origin: "user:operator",
-                 principal: {:user, "operator"},
+                 origin: "user:sample-user",
+                 principal: {:user, "sample-user"},
                  params: %{request_id: id, decision: "allow"}
                },
                authorized: true
@@ -1363,8 +1363,8 @@ defmodule Tightbeam.RailScriptTest do
              Escalation.rule(
                ctx.db,
                %{
-                 origin: "user:operator",
-                 principal: {:user, "operator"},
+                 origin: "user:sample-user",
+                 principal: {:user, "sample-user"},
                  params: %{request_id: id, decision: "allow"}
                },
                authorized: true
@@ -1444,8 +1444,8 @@ defmodule Tightbeam.RailScriptTest do
       Escalation.rule(
         ctx.db,
         %{
-          origin: "user:operator",
-          principal: {:user, "operator"},
+          origin: "user:sample-user",
+          principal: {:user, "sample-user"},
           params: %{request_id: id, decision: "allow"}
         },
         authorized: true
@@ -1560,8 +1560,8 @@ defmodule Tightbeam.RailScriptTest do
              Escalation.rule(
                ctx.db,
                %{
-                 origin: "user:operator",
-                 principal: {:user, "operator"},
+                 origin: "user:sample-user",
+                 principal: {:user, "sample-user"},
                  params: %{request_id: id, decision: "allow"}
                },
                authorized: true
@@ -1733,8 +1733,8 @@ defmodule Tightbeam.RailScriptTest do
   defp call(params \\ %{}) do
     %{
       verb: "post",
-      origin: "user:operator",
-      principal: {:user, "operator"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: nil,
       params: params
     }

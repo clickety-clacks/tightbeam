@@ -96,7 +96,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
     assert count(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE status='open'") == 1
 
-    owner_session = Org.personal_session_key("operator")
+    owner_session = Org.personal_session_key("sample-user")
 
     assert [
              %{
@@ -241,7 +241,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
              Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
 
     [wake] = notification_wakes(ctx.db)
-    owner_session = Org.personal_session_key("operator")
+    owner_session = Org.personal_session_key("sample-user")
 
     # FAIL-BEFORE: two failure modes, neither of which may consume the wake.
     for {tag, failure} <- [
@@ -276,7 +276,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
              Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
 
     assert [wake] = notification_wakes(ctx.db)
-    owner_session = Org.personal_session_key("operator")
+    owner_session = Org.personal_session_key("sample-user")
 
     drain!(ctx)
 
@@ -378,7 +378,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     # A retired ancestor remains in the graph but is skipped as a wake target.
     :ok = DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='top'")
     :ok = EffortCheckin.probe(ctx.db, ctx.config, bracket_wake(ctx.db, assignment.id))
-    personal = Org.personal_session_key("operator")
+    personal = Org.personal_session_key("sample-user")
     assert notified_rungs(ctx.db, assignment.id) == ["holder", "mid", personal]
 
     assert count(
@@ -651,7 +651,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     {:paired, _device} =
       claim_org(db, %{
         device_id: "delivery-device",
-        claimed_name: "operator",
+        claimed_name: "sample-user",
         platform: nil,
         model: nil
       })
@@ -665,20 +665,20 @@ defmodule Tightbeam.EscalationDeliveryTest do
   end
 
   defp create_session(db, key, host, spawned_by \\ nil) do
-    main? = key == Org.personal_session_key("operator")
+    main? = key == Org.personal_session_key("sample-user")
 
     Org.create(db, %{
       session_key: key,
       display_name: key,
       kind: if(main?, do: "main", else: "custom"),
       is_built_in: main?,
-      owner_user_id: "operator",
-      origin: "user:operator",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: "default",
       host: host,
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("claude-example-5"),
+      model: Model.new("claude-fable-5"),
       spawned_by: spawned_by,
       operational_parent: spawned_by
     })
@@ -690,7 +690,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
       cwd: base_dir,
       port: 0,
       default_harness: :claude,
-      default_model: Model.new("claude-example-5"),
+      default_model: Model.new("claude-fable-5"),
       max_live_sessions_per_user: 50,
       wake_tick_ms: 60_000,
       onboarding_lease_ms: 1_800_000,
@@ -724,8 +724,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
     item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
         verb: "work-item-create",
-        origin: "user:operator",
-        principal: {:user, "operator"},
+        origin: "user:sample-user",
+        principal: {:user, "sample-user"},
         session_key: nil,
         params: %{title: "Delivery trace"}
       })

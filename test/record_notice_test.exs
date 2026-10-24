@@ -27,26 +27,26 @@ defmodule Tightbeam.RecordNoticeTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 0, 'admin_add', 1)"
       )
 
-    create_session(db, Org.personal_session_key("operator"), "Main")
+    create_session(db, Org.personal_session_key("sample-user"), "Main")
     create_session(db, "work", "Work")
 
-    %{db: db, registry: registry, main: Org.personal_session_key("operator")}
+    %{db: db, registry: registry, main: Org.personal_session_key("sample-user")}
   end
 
   defp create_session(db, session_key, display_name) do
     Org.create(db, %{
       session_key: session_key,
       display_name: display_name,
-      owner_user_id: "operator",
-      origin: "user:operator",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("claude-example-5")
+      model: Model.new("claude-fable-5")
     })
   end
 
@@ -54,7 +54,7 @@ defmodule Tightbeam.RecordNoticeTest do
     {:ok, ref, _replaced} =
       ConnRegistry.register(registry, %{
         pid: self(),
-        user_id: "operator",
+        user_id: "sample-user",
         device_id: device_id,
         is_admin: false,
         subscriptions: MapSet.new(["chat"])
@@ -148,7 +148,7 @@ defmodule Tightbeam.RecordNoticeTest do
   end
 
   test "a retired session is not an audience", ctx do
-    Org.retire(ctx.db, "work", "user:operator", 1_000)
+    Org.retire(ctx.db, "work", "user:sample-user", 1_000)
 
     capture_log(fn ->
       :ok =
@@ -169,7 +169,7 @@ defmodule Tightbeam.RecordNoticeTest do
   test "an ambient audience lands in the named owner's main session", ctx do
     :ok =
       EventLog.notice(ctx.db, "endpoint_not_provisioned", "remote-host", "ssh refused",
-        audience: {:ambient, "operator"},
+        audience: {:ambient, "sample-user"},
         attention: :low,
         message: "[host unreachable]\n\ntest host did not answer.",
         conn_registry: ctx.registry

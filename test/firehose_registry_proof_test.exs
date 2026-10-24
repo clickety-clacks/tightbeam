@@ -80,8 +80,8 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   @filter_refs %{
     "sessionKey" => "s_example",
     "workItemId" => "wi_firehose",
-    "origin" => "user:operator",
-    "principal" => "user:operator"
+    "origin" => "user:sample-user",
+    "principal" => "user:sample-user"
   }
 
   setup do
@@ -97,12 +97,12 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       DB.execute(
         db,
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES " <>
-          "('operator', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1), " <>
+          "('sample-user', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1), " <>
           "('root', 1, 'admin_add', 1)"
       )
 
-    session!(db, "s_example", "operator")
-    work_item!(db, "wi_firehose", "operator")
+    session!(db, "s_example", "sample-user")
+    work_item!(db, "wi_firehose", "sample-user")
     assignment!(db, "asg_firehose", "s_example", "wi_firehose")
     %{db: db, hub: hub}
   end
@@ -313,7 +313,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     assert_raise ArgumentError, ~r/refs do not match the registry/, fn ->
       Publisher.source_invalidation_notice("topline.created", 1, 2, %{
         "toplineId" => "tl_one",
-        "origin" => "user:operator"
+        "origin" => "user:sample-user"
       })
     end
 
@@ -352,12 +352,12 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     %{valid: notices, unresolved_marker: unresolved_marker} = visibility_notices(ctx)
 
     Enum.each(notices, fn notice ->
-      assert StateVisibility.visible?(ctx.db, notice, "operator", false)
+      assert StateVisibility.visible?(ctx.db, notice, "sample-user", false)
       refute StateVisibility.visible?(ctx.db, notice, "other", false)
       assert StateVisibility.visible?(ctx.db, notice, "root", true)
     end)
 
-    refute StateVisibility.visible?(ctx.db, unresolved_marker, "operator", false)
+    refute StateVisibility.visible?(ctx.db, unresolved_marker, "sample-user", false)
     refute StateVisibility.visible?(ctx.db, unresolved_marker, "root", true)
 
     missing_topline =
@@ -396,7 +396,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
         Hub.register(ctx.hub, self(), %{
           mode: :filtered,
           db: ctx.db,
-          user_id: "operator",
+          user_id: "sample-user",
           is_admin: false
         })
 
@@ -621,7 +621,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   defp topline_call(ctx, params) do
     %{
       verb: "test",
-      principal: {:user, "operator"},
+      principal: {:user, "sample-user"},
       origin: "test",
       session_key: nil,
       params: params,
@@ -671,8 +671,8 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   defp ref_value("assignmentId"), do: "asg_firehose"
   defp ref_value("sessionKey"), do: "s_example"
   defp ref_value("workItemId"), do: "wi_firehose"
-  defp ref_value("origin"), do: "user:operator"
-  defp ref_value("principal"), do: "user:operator"
+  defp ref_value("origin"), do: "user:sample-user"
+  defp ref_value("principal"), do: "user:sample-user"
   defp ref_value(key), do: "#{key}-value"
 
   defp session!(db, key, owner) do
@@ -685,7 +685,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("claude-example-5")
+      model: Model.new("claude-fable-5")
     })
   end
 
@@ -709,7 +709,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
                """
                INSERT INTO assignments
                  (id, subject, holderKey, openedByUser, openedAt, workItemId)
-               VALUES (?1, 'Firehose proof', ?2, 'operator', 1, ?3)
+               VALUES (?1, 'Firehose proof', ?2, 'sample-user', 1, ?3)
                """,
                [id, holder, work_item_id]
              )

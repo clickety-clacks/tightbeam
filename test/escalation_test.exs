@@ -35,14 +35,14 @@ defmodule Tightbeam.EscalationTest do
 
     :ok = ensure_all_schemas(db)
 
-    ensure_main_session(db, "operator")
+    ensure_main_session(db, "sample-user")
 
-    raiser = session(db, "raiser", "operator")
+    raiser = session(db, "raiser", "sample-user")
 
     _admin_device =
       Devices.pair(db, %{
         device_id: "admin-device",
-        claimed_name: "operator",
+        claimed_name: "sample-user",
         platform: nil,
         model: nil
       })
@@ -126,7 +126,7 @@ defmodule Tightbeam.EscalationTest do
   test "owner delivery is one durable wake armed with the open transaction", ctx do
     parent = self()
     call = call(ctx.raiser, %{assignment_id: "a-delivery", kind: "completion"})
-    owner_session = Org.personal_session_key("operator")
+    owner_session = Org.personal_session_key("sample-user")
 
     {:decision_pending, id} = Escalation.escalate(ctx.db, call, statute(), escalation_ctx())
 
@@ -235,8 +235,8 @@ defmodule Tightbeam.EscalationTest do
 
     assert %{code: "invalid_decision"} =
              handlers["rule"].(%{
-               origin: "user:operator",
-               principal: {:user, "operator"},
+               origin: "user:sample-user",
+               principal: {:user, "sample-user"},
                params: %{request_id: id, decision: "later"}
              })
 
@@ -273,7 +273,7 @@ defmodule Tightbeam.EscalationTest do
     waiver =
       Escalation.waive(
         ctx.db,
-        %{origin: "user:operator", principal: {:user, "operator"}, params: %{request_id: first}},
+        %{origin: "user:sample-user", principal: {:user, "sample-user"}, params: %{request_id: first}},
         authorized: true,
         scheduler: ctx.scheduler
       )
@@ -295,8 +295,8 @@ defmodule Tightbeam.EscalationTest do
              Escalation.revoke_waiver(
                ctx.db,
                %{
-                 origin: "user:operator",
-                 principal: {:user, "operator"},
+                 origin: "user:sample-user",
+                 principal: {:user, "sample-user"},
                  params: %{waiver_id: waiver.id}
                },
                authorized: true
@@ -316,13 +316,13 @@ defmodule Tightbeam.EscalationTest do
 
     Escalation.waive(
       ctx.db,
-      %{origin: "user:operator", principal: {:user, "operator"}, params: %{request_id: id}},
+      %{origin: "user:sample-user", principal: {:user, "sample-user"}, params: %{request_id: id}},
       authorized: true
     )
 
     assert :allow = Escalation.resolve(ctx.db, call, statute())
 
-    Org.retire(ctx.db, ctx.raiser.session_key, "user:operator", 1_000)
+    Org.retire(ctx.db, ctx.raiser.session_key, "user:sample-user", 1_000)
 
     assert {:needs_request, nil} = Escalation.resolve(ctx.db, call, statute())
 
@@ -340,8 +340,8 @@ defmodule Tightbeam.EscalationTest do
 
     assert %{code: "not_raiser"} =
              Escalation.withdraw(ctx.db, %{
-               origin: "user:operator",
-               principal: {:user, "operator"},
+               origin: "user:sample-user",
+               principal: {:user, "sample-user"},
                params: %{request_id: id, reason: "no"}
              })
 
@@ -358,8 +358,8 @@ defmodule Tightbeam.EscalationTest do
       Escalation.waive(
         ctx.db,
         %{
-          origin: "user:operator",
-          principal: {:user, "operator"},
+          origin: "user:sample-user",
+          principal: {:user, "sample-user"},
           params: %{session_key: ctx.raiser.session_key, statute_name: "review"}
         },
         authorized: true
@@ -385,7 +385,7 @@ defmodule Tightbeam.EscalationTest do
     assert [%{id: ^id}] = Escalation.list(ctx.db, call, "open")
     assert %{id: ^id, context: %{"verb" => "attest"}} = Escalation.get(ctx.db, call, id)
 
-    Org.retire(ctx.db, ctx.raiser.session_key, "user:operator", 1_000)
+    Org.retire(ctx.db, ctx.raiser.session_key, "user:sample-user", 1_000)
     :ok = Escalation.recover_retired(ctx.db)
     assert request(ctx, id).status == "withdrawn"
   end
@@ -443,8 +443,8 @@ defmodule Tightbeam.EscalationTest do
   test "non-session raisers use the origin domain and option labels resolve to effects", ctx do
     call = %{
       verb: "attest",
-      origin: "user:operator",
-      principal: {:user, "operator"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: nil,
       params: %{assignment_id: "a-origin", kind: "completion"}
     }
@@ -455,7 +455,7 @@ defmodule Tightbeam.EscalationTest do
         options: [%{"label" => "ship", "effect" => "allow"}]
       })
 
-    assert %{raiser_id: "user:operator", raiser_session_key: nil} =
+    assert %{raiser_id: "user:sample-user", raiser_session_key: nil} =
              Escalation.get(ctx.db, call, id)
 
     assert %{decision: "allow"} =
@@ -483,8 +483,8 @@ defmodule Tightbeam.EscalationTest do
 
     assert %{status: "withdrawn"} =
              Escalation.withdraw(ctx.db, %{
-               origin: "user:operator",
-               principal: {:user, "operator"},
+               origin: "user:sample-user",
+               principal: {:user, "sample-user"},
                params: %{request_id: withdraw_id, reason: "changed course"}
              })
 
@@ -568,7 +568,7 @@ defmodule Tightbeam.EscalationTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("example-model")
+      model: Model.new("fable")
     })
   end
 
@@ -592,14 +592,14 @@ defmodule Tightbeam.EscalationTest do
 
   defp rule_call(id, decision) do
     %{
-      origin: "user:operator",
-      principal: {:user, "operator"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       params: %{request_id: id, decision: decision}
     }
   end
 
   defp request(ctx, id) do
-    Escalation.get(ctx.db, rule_call(id, "allow"), id, owner_user_id: "operator")
+    Escalation.get(ctx.db, rule_call(id, "allow"), id, owner_user_id: "sample-user")
   end
 
   # Decision notification wakes are the only ungated (targetGate = 0) wakes.

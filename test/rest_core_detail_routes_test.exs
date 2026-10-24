@@ -128,18 +128,18 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     {:paired, admin_device} =
       claim_org(db, %{
         device_id: "core-admin-device",
-        claimed_name: "user",
+        claimed_name: "Sample User",
         platform: nil,
         model: nil
       })
 
-    admin_session = ensure_main_session(db, "operator")
+    admin_session = ensure_main_session(db, "sample-user")
 
     work_item =
       WorkItems.__handle__(db, "work-item-create", %{
         verb: "work-item-create",
-        origin: "user:operator",
-        principal: {:user, "operator"},
+        origin: "user:sample-user",
+        principal: {:user, "sample-user"},
         session_key: nil,
         params: %{title: "Core detail fixture"}
       })
@@ -147,8 +147,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assignment =
       Assignments.__handle__(db, "assign", %{
         verb: "assign",
-        origin: "user:operator",
-        principal: {:user, "operator"},
+        origin: "user:sample-user",
+        principal: {:user, "sample-user"},
         session_key: admin_session.session_key,
         target_role: nil,
         role_fallback: false,
@@ -165,7 +165,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     wake =
       Wakes.schedule(db, %{
         session_key: admin_session.session_key,
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "Core detail wake",
         due_at: System.system_time(:millisecond) + 60_000,
         creator_session_key: admin_session.session_key,
@@ -177,7 +177,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       Ledger.enqueue(db, %{
         session_key: admin_session.session_key,
         message_id: "core-detail-message",
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "Core detail turn",
         assignment_id: assignment.id,
         job_ref: work_item.id
@@ -195,7 +195,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         INSERT INTO decision_requests
           (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName,
            actionKey, question, context, status)
-        VALUES (?1, 'statute', 'user:operator', 'operator', ?2, ?3, 'core-detail',
+        VALUES (?1, 'statute', 'user:sample-user', 'sample-user', ?2, ?3, 'core-detail',
                 'read', 'Allow the read?', '{}', 'open')
         """,
         [decision_request_id, now, now + 60_000]
@@ -209,7 +209,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
            lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
            question, context, status)
-        VALUES (?1, 'effort', 'process:tightbeam', 'operator', ?2, ?3,
+        VALUES (?1, 'effort', 'process:tightbeam', 'sample-user', ?2, ?3,
                 2, 1, ?4, ?5, ?6, 'Continue the effort?', '{}', 'open')
         """,
         [
@@ -230,7 +230,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           (id, kind, raiserId, raiserSessionKey, ownerUserId,
            expecterSessionKey, expecterUserId, raisedAt, question, context,
            status, askedOfRole)
-        VALUES (?1, 'agent', ?2, ?3, 'operator', ?3, 'operator', ?4,
+        VALUES (?1, 'agent', ?2, ?3, 'sample-user', ?3, 'sample-user', ?4,
                 'Answer the agent?', '{}', 'open', 'coder:core-detail')
         """,
         [
@@ -254,11 +254,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       })
 
     {:ok, true, %{marker: "cursor"}} =
-      ReadMarkers.set(db, "operator", "core-scope", "cursor")
+      ReadMarkers.set(db, "sample-user", "core-scope", "cursor")
 
     catalog = %{
       {"testhost", "claude"} => [
-        %{family: "example-model", context: nil, efforts: ["medium"], provider: :anthropic}
+        %{family: "fable", context: nil, efforts: ["medium"], provider: :anthropic}
       ]
     }
 
@@ -473,14 +473,14 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
          [:bearer_auth, :query_decode, :principal_resolution]},
         {path <> "?asUser=", "tbc_core_detail", 400, "invalid_message", nil,
          [:bearer_auth, :query_decode, :principal_resolution]},
-        {path <> "?asUser=operator&asUser=operator", "tbc_core_detail", 400, "invalid_as_user",
+        {path <> "?asUser=sample-user&asUser=sample-user", "tbc_core_detail", 400, "invalid_as_user",
          nil, [:bearer_auth, :query_decode, :principal_resolution]},
         {path <> "?asUser=mallory", ctx.admin_session.cli_token, 403, "identity_not_yours",
-         "this session belongs to operator",
+         "this session belongs to sample-user",
          [:bearer_auth, :query_decode, :principal_resolution]},
-        {path <> "?asUser=operator", nil, 400, "invalid_as_user", nil,
+        {path <> "?asUser=sample-user", nil, 400, "invalid_as_user", nil,
          [:bearer_auth, :query_decode, :principal_resolution]},
-        {path <> "?asUser=operator%zz", nil, 400, "malformed_query", nil,
+        {path <> "?asUser=sample-user%zz", nil, 400, "malformed_query", nil,
          [:bearer_auth, :query_decode]},
         {path <> "?unsupported=1", nil, 400, "invalid_filter", nil,
          [:bearer_auth, :query_decode, :principal_resolution, :request_validation]}
@@ -528,7 +528,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   test "AC7 covers every nine-resource AU4 grant and all decision-request kinds", ctx do
     admin = %{kind: "user", id: "admin", is_admin: true}
-    owner = %{kind: "user", id: "operator", is_admin: false}
+    owner = %{kind: "user", id: "sample-user", is_admin: false}
     session = %{kind: "session", id: ctx.admin_session.session_key, is_admin: false}
     denied_user = %{kind: "user", id: "outsider", is_admin: false}
     denied_session = %{kind: "session", id: "outsider-session", is_admin: false}
@@ -619,7 +619,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
              "rowVersion" => JSON.decode!(example_response.resp_body)["item"]["rowVersion"],
              "scopeKey" => "core-scope",
              "updatedAt" => JSON.decode!(example_response.resp_body)["item"]["updatedAt"],
-             "userId" => "operator"
+             "userId" => "sample-user"
            }
 
     assert JSON.decode!(alice_response.resp_body)["item"]["userId"] == "alice"
@@ -755,8 +755,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   defp core_detail_cases(ctx) do
     call = %{
-      principal: {:user, "operator"},
-      rest_principal: %{kind: "user", id: "operator", is_admin: true},
+      principal: {:user, "sample-user"},
+      rest_principal: %{kind: "user", id: "sample-user", is_admin: true},
       params: %{}
     }
 
@@ -829,8 +829,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         "read markers",
         "/api/read-markers/core-scope",
         "read_marker.updated",
-        %{"userId" => "operator", "scopeKey" => "core-scope"},
-        StateResources.query_read_marker(ctx.db, "operator", "core-scope"),
+        %{"userId" => "sample-user", "scopeKey" => "core-scope"},
+        StateResources.query_read_marker(ctx.db, "sample-user", "core-scope"),
         &StateResources.read_marker/1
       )
     ]
@@ -903,7 +903,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       """
       UPDATE turns
       SET wakeId = ?2, prompt = ?3, roleRef = 'coder:core-detail', roleFallback = 1,
-          model = 'example-model', thinkingLevel = 'medium', harness = 'claude',
+          model = 'fable', thinkingLevel = 'medium', harness = 'claude',
           replyAttention = 1, status = 'delivered', owner = 'owner-雪', adapterGen = 2,
           requestRef = 'request-ref', error = ?3, startedAt = ?4, endedAt = ?4,
           publishedAt = ?4
@@ -917,7 +917,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       """
       UPDATE decision_requests
       SET question = ?2, options = ?3, context = ?4, status = 'ruled',
-          decision = 'allow', rationale = ?2, ruledBy = 'user:operator', ruledAt = ?5
+          decision = 'allow', rationale = ?2, ruledBy = 'user:sample-user', ruledAt = ?5
       WHERE id = ?1
       """,
       [
@@ -969,7 +969,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     )
 
     assert {:ok, true, _marker} =
-             ReadMarkers.set(ctx.db, "operator", "core-scope", opaque)
+             ReadMarkers.set(ctx.db, "sample-user", "core-scope", opaque)
   end
 
   defp query!(db, sql, params) do
@@ -1065,7 +1065,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   defp assert_populated_contract("turns", item) do
     assert item["roleFallback"] == "owner"
     assert item["status"] == "delivered"
-    assert item["model"] == "example-model"
+    assert item["model"] == "fable"
     assert item["thinkingLevel"] == "medium"
     assert item["harness"] == "claude"
     assert is_nil(item["modelContext"])
@@ -1312,7 +1312,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   defp decision_kind_rows(ctx) do
     admin = %{kind: "user", id: "admin", is_admin: true}
-    owner = %{kind: "user", id: "operator", is_admin: false}
+    owner = %{kind: "user", id: "sample-user", is_admin: false}
     session = %{kind: "session", id: ctx.admin_session.session_key, is_admin: false}
     denied = %{kind: "user", id: "outsider", is_admin: false}
 
@@ -1411,7 +1411,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     wake =
       Wakes.schedule(ctx.db, %{
         session_key: ctx.admin_session.session_key,
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "Raw A6 wake",
         due_at: System.system_time(:millisecond) + 60_000,
         creator_session_key: ctx.admin_session.session_key,
@@ -1431,7 +1431,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       Ledger.enqueue(ctx.db, %{
         session_key: ctx.admin_session.session_key,
         message_id: "raw-a6-message",
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "Raw A6 turn",
         assignment_id: assignment.id,
         job_ref: work.id
@@ -1450,13 +1450,13 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     Org.create(ctx.db, %{
       session_key: "raw-a6-reader",
       display_name: "Raw A6 reader",
-      owner_user_id: "operator",
-      origin: "user:operator",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("example-model")
+      model: Model.new("fable")
     })
 
     decision_call =
@@ -1486,13 +1486,13 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       Org.create(ctx.db, %{
         session_key: "raw-a6-session",
         display_name: "Raw A6 session",
-        owner_user_id: "operator",
-        origin: "user:operator",
+        owner_user_id: "sample-user",
+        origin: "user:sample-user",
         archetype: "default",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("example-model")
+        model: Model.new("fable")
       })
 
     :ok = Publisher.accepted(ctx.db, firehose_call("spawn", session.session_key, %{}), session)
@@ -1512,7 +1512,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       })
 
     device_call = firehose_call("approve-device", nil, %{device_id: "raw-a6-device"})
-    device = Devices.approve_with_firehose(ctx.db, "raw-a6-device", "operator", device_call)
+    device = Devices.approve_with_firehose(ctx.db, "raw-a6-device", "sample-user", device_call)
     {device_raw, ws} = receive_raw_change(ws, "device.approved")
 
     device_frame =
@@ -1545,7 +1545,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     marker_call = firehose_call("read-marker-set", nil, %{scope_key: "raw-a6-scope"})
 
     assert {:ok, true, marker} =
-             ReadMarkers.set(ctx.db, "operator", "raw-a6-scope", "raw-a6-cursor",
+             ReadMarkers.set(ctx.db, "sample-user", "raw-a6-scope", "raw-a6-cursor",
                firehose_call: marker_call
              )
 
@@ -1579,8 +1579,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   defp firehose_call(verb, session_key, params) do
     %{
       verb: verb,
-      origin: "user:operator",
-      principal: {:user, "operator"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: session_key,
       params: params,
       firehose_in_txn: true,

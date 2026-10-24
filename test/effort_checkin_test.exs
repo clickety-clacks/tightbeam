@@ -74,7 +74,7 @@ defmodule Tightbeam.EffortCheckinTest do
       effort_checkin_horizon_ms: 10,
       cwd: base_dir,
       default_harness: :claude,
-      default_model: Model.new("claude-example-5"),
+      default_model: Model.new("claude-fable-5"),
       max_live_sessions_per_user: 50,
       wake_tick_ms: 60_000,
       onboarding_lease_ms: 1_800_000
@@ -3287,7 +3287,7 @@ defmodule Tightbeam.EffortCheckinTest do
           archetype: "default",
           harness: "claude",
           provider: "anthropic",
-          model: Model.new("example-model"),
+          model: Model.new("fable"),
           host: host
         },
         overrides

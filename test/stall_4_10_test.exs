@@ -15,22 +15,22 @@ defmodule Tightbeam.Stall410Test do
         "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('operator',0,'admin_add',1),('other',0,'admin_add',1)"
       )
 
-    example_session = session(db, Org.personal_session_key("operator"), "operator")
+    example_session = session(db, Org.personal_session_key("sample-user"), "sample-user")
     _other_session = session(db, Org.personal_session_key("other"), "other")
     %{db: db, example_session: example_session}
   end
 
   test "direct and relayed user provenance qualify; another user's item does not", ctx do
-    direct = create(ctx.db, {:user, "operator"}, "direct")
+    direct = create(ctx.db, {:user, "sample-user"}, "direct")
     relayed = create(ctx.db, {:session, ctx.example_session.session_key}, "relayed")
     other = create(ctx.db, {:user, "other"}, "other")
-    behind = create(ctx.db, {:user, "operator"}, "behind")
+    behind = create(ctx.db, {:user, "sample-user"}, "behind")
 
     assert %{mode: "notice"} =
-             deprioritize(ctx.db, {:user, "operator"}, direct.id, behind.id, "d1")
+             deprioritize(ctx.db, {:user, "sample-user"}, direct.id, behind.id, "d1")
 
     assert %{mode: "notice"} =
-             deprioritize(ctx.db, {:user, "operator"}, relayed.id, behind.id, "d2")
+             deprioritize(ctx.db, {:user, "sample-user"}, relayed.id, behind.id, "d2")
 
     assert %{code: "not_example_sourced"} =
              deprioritize(ctx.db, {:user, "other"}, other.id, other.id, "o1")
@@ -39,14 +39,14 @@ defmodule Tightbeam.Stall410Test do
   end
 
   test "notice is exactly once on keyed replay and wrong owner cannot file it", ctx do
-    item = create(ctx.db, {:user, "operator"}, "item")
-    behind = create(ctx.db, {:user, "operator"}, "behind")
+    item = create(ctx.db, {:user, "sample-user"}, "item")
+    behind = create(ctx.db, {:user, "sample-user"}, "behind")
 
-    first = deprioritize(ctx.db, {:user, "operator"}, item.id, behind.id, "same")
+    first = deprioritize(ctx.db, {:user, "sample-user"}, item.id, behind.id, "same")
     assert %{mode: "notice"} = first
 
     assert %{replayed: true, mode: "notice"} =
-             deprioritize(ctx.db, {:user, "operator"}, item.id, behind.id, "same")
+             deprioritize(ctx.db, {:user, "sample-user"}, item.id, behind.id, "same")
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -60,8 +60,8 @@ defmodule Tightbeam.Stall410Test do
   end
 
   test "owner session can ask which named priority wins", ctx do
-    item = create(ctx.db, {:user, "operator"}, "item")
-    behind = create(ctx.db, {:user, "operator"}, "behind")
+    item = create(ctx.db, {:user, "sample-user"}, "item")
+    behind = create(ctx.db, {:user, "sample-user"}, "behind")
 
     assert %{mode: "decision_request", decisionRequest: %{kind: "operator"} = request} =
              WorkItems.__handle__(
@@ -92,7 +92,7 @@ defmodule Tightbeam.Stall410Test do
   end
 
   test "moving a boundary rearms it and only the current generation escalates", ctx do
-    item = create(ctx.db, {:user, "operator"}, "goal")
+    item = create(ctx.db, {:user, "sample-user"}, "goal")
     first = boundary(ctx.db, item.id, "design ready", 1000, "b1")
     second = boundary(ctx.db, item.id, "implementation ready", 1000, "b2")
     assert second.generation == first.generation + 1
@@ -127,7 +127,7 @@ defmodule Tightbeam.Stall410Test do
           {"work-item-icebox", "iceboxed", %{}},
           {"work-item-fail", "failed", %{reason: "no longer viable"}}
         ] do
-      item = create(ctx.db, {:user, "operator"}, "#{target} goal")
+      item = create(ctx.db, {:user, "sample-user"}, "#{target} goal")
       horizon = boundary(ctx.db, item.id, "#{target} boundary", 1_000, "#{target}-horizon")
       params = maybe_add_completion_fixture(ctx.db, verb, item.id, params)
 
@@ -135,7 +135,7 @@ defmodule Tightbeam.Stall410Test do
                WorkItems.__handle__(
                  ctx.db,
                  verb,
-                 call({:user, "operator"}, Map.put(params, :work_item_id, item.id))
+                 call({:user, "sample-user"}, Map.put(params, :work_item_id, item.id))
                )
 
       assert {:ok, [["canceled", nil]]} =
@@ -176,7 +176,7 @@ defmodule Tightbeam.Stall410Test do
 
   test "terminal delivery race orders preserve true prior escalation and reject late replay",
        ctx do
-    delivered_first = create(ctx.db, {:user, "operator"}, "delivered first")
+    delivered_first = create(ctx.db, {:user, "sample-user"}, "delivered first")
     first_horizon = boundary(ctx.db, delivered_first.id, "first", 1_000, "race-first")
 
     {:ok, :ok} =
@@ -190,7 +190,7 @@ defmodule Tightbeam.Stall410Test do
              WorkItems.__handle__(
                ctx.db,
                "work-item-close",
-               call({:user, "operator"}, %{
+               call({:user, "sample-user"}, %{
                  work_item_id: delivered_first.id,
                  completion_attest_id: completion_fixture!(ctx.db, delivered_first.id)
                })
@@ -210,14 +210,14 @@ defmodule Tightbeam.Stall410Test do
                [delivered_first.id]
              )
 
-    terminal_first = create(ctx.db, {:user, "operator"}, "terminal first")
+    terminal_first = create(ctx.db, {:user, "sample-user"}, "terminal first")
     second_horizon = boundary(ctx.db, terminal_first.id, "second", 1_000, "race-second")
 
     assert %{ok: true} =
              WorkItems.__handle__(
                ctx.db,
                "work-item-close",
-               call({:user, "operator"}, %{
+               call({:user, "sample-user"}, %{
                  work_item_id: terminal_first.id,
                  completion_attest_id: completion_fixture!(ctx.db, terminal_first.id)
                })
@@ -269,7 +269,7 @@ defmodule Tightbeam.Stall410Test do
       WorkItems.__handle__(
         db,
         "work-item-boundary",
-        call({:user, "operator"}, %{
+        call({:user, "sample-user"}, %{
           work_item_id: item,
           boundary: boundary,
           horizon_ms: horizon,
@@ -288,7 +288,7 @@ defmodule Tightbeam.Stall410Test do
         suffix = Tightbeam.Id.uuid4()
         assignment_id = "asg_" <> suffix
         attest_id = "att_" <> suffix
-        holder = Org.personal_session_key("operator")
+        holder = Org.personal_session_key("sample-user")
         ts = System.system_time(:millisecond)
 
         Txn.q(
@@ -347,7 +347,7 @@ defmodule Tightbeam.Stall410Test do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("example-model"),
+      model: Model.new("fable"),
       host: "test-host"
     })
   end

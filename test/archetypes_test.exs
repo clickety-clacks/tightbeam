@@ -228,7 +228,7 @@ defmodule Tightbeam.ArchetypesTest do
     end
 
     Identity.init!(ctx.base_dir)
-    assert {:ok, _revision} = learn!(ctx.base_dir, "agentic-engineering", "user:operator")
+    assert {:ok, _revision} = learn!(ctx.base_dir, "agentic-engineering", "user:sample-user")
     revision = Identity.live_revision!(ctx.base_dir)
 
     for role <- ~w(product-owner orchestrator), harness <- [:codex, :claude] do
@@ -244,7 +244,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
+             learn!(ctx.base_dir, "agentic-engineering", "user:sample-user")
 
     loaded = Archetypes.load!(ctx.base_dir)
 
@@ -356,7 +356,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
+             learn!(ctx.base_dir, "agentic-engineering", "user:sample-user")
 
     revision = Identity.live_revision!(ctx.base_dir)
 
@@ -387,7 +387,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
+             learn!(ctx.base_dir, "agentic-engineering", "user:sample-user")
 
     revision = Identity.live_revision!(ctx.base_dir)
 
@@ -520,7 +520,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
+             learn!(ctx.base_dir, "agentic-engineering", "user:sample-user")
 
     revision = Identity.live_revision!(ctx.base_dir)
 
@@ -554,7 +554,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
+             learn!(ctx.base_dir, "agentic-engineering", "user:sample-user")
 
     loaded = Archetypes.load!(ctx.base_dir)
     revision = Identity.live_revision!(ctx.base_dir)
@@ -587,7 +587,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             learn!(ctx.base_dir, "agentic-engineering", "user:operator")
+             learn!(ctx.base_dir, "agentic-engineering", "user:sample-user")
 
     loaded = Archetypes.load!(ctx.base_dir)
     revision = Identity.live_revision!(ctx.base_dir)
@@ -650,7 +650,7 @@ defmodule Tightbeam.ArchetypesTest do
   test "kungfu scaffold rejects every invalid name class before identity mutation", ctx do
     for name <- ["", "-demo", "Demo", "demo_name", "demo--name", "demo-"] do
       assert_raise ArgumentError, ~r/invalid kungfu name/, fn ->
-        scaffold_kungfu!(ctx.base_dir, name, "A useful capability.", "user:operator")
+        scaffold_kungfu!(ctx.base_dir, name, "A useful capability.", "user:sample-user")
       end
 
       refute File.exists?(Path.join(ctx.base_dir, "identity/.git"))
@@ -660,7 +660,7 @@ defmodule Tightbeam.ArchetypesTest do
   test "kungfu scaffold requires purpose before identity mutation", ctx do
     for purpose <- [nil, "", "  "] do
       assert_raise ArgumentError, "kungfu purpose is required", fn ->
-        scaffold_kungfu!(ctx.base_dir, "demo", purpose, "user:operator")
+        scaffold_kungfu!(ctx.base_dir, "demo", purpose, "user:sample-user")
       end
 
       refute File.exists?(Path.join(ctx.base_dir, "identity/.git"))
@@ -687,7 +687,7 @@ defmodule Tightbeam.ArchetypesTest do
                        base_dir,
                        name,
                        "A useful capability.",
-                       "user:operator"
+                       "user:sample-user"
                      )
                    end
 
@@ -706,7 +706,7 @@ defmodule Tightbeam.ArchetypesTest do
         ctx.base_dir,
         "demo",
         ~s(Help teams turn "ideas" into shipped work.\nKeep it accountable.),
-        "user:operator"
+        "user:sample-user"
       )
 
     identity_dir = Path.join(ctx.base_dir, "identity")
@@ -717,7 +717,7 @@ defmodule Tightbeam.ArchetypesTest do
              git!(identity_dir, ["rev-parse", "tightbeam/live"])
 
     assert git!(identity_dir, ["log", "-1", "--format=%s|%an"]) ==
-             "kungfu-scaffold: demo|user:operator"
+             "kungfu-scaffold: demo|user:sample-user"
 
     assert Archetypes.load!(ctx.base_dir)["demo-role"].skills == []
   end

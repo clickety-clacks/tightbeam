@@ -34,10 +34,10 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 1, 'admin_add', 1)"
       )
 
-    ensure_main_session(db, "operator")
+    ensure_main_session(db, "sample-user")
 
     coder = session(db, "posture-coder", "coder", "codex", "openai")
     orchestrator = session(db, "posture-orchestrator", "orchestrator", "codex", "openai")
@@ -55,7 +55,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
       )
 
     assert :initialized = Archetypes.init_identity!(base_dir)
-    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "operator")
+    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "sample-user")
     _archetypes = Archetypes.load!(base_dir)
 
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
@@ -81,8 +81,8 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     Tightbeam.Org.create(db, %{
       session_key: key,
       display_name: key,
-      owner_user_id: "operator",
-      origin: "user:operator",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: archetype,
       harness: harness,
       provider: provider,
@@ -95,7 +95,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
 
   defp work_item(ctx) do
     WorkItems.__handle__(ctx.db, "work-item-create", %{
-      principal: {:user, "operator"},
+      principal: {:user, "sample-user"},
       params: %{title: "Posture subject #{System.unique_integer([:positive])}"}
     })
   end
@@ -103,8 +103,8 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
   defp assign_call(holder_key, item_id, subject) do
     %{
       verb: "assign",
-      origin: "user:operator",
-      principal: {:user, "operator"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
@@ -115,8 +115,8 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
   defp dispatch_call(holder_key, item_id, subject) do
     %{
       verb: "dispatch",
-      origin: "user:operator",
-      principal: {:user, "operator"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,

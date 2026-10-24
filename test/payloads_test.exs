@@ -5,11 +5,11 @@ defmodule Tightbeam.Wire.PayloadsTest do
   alias Tightbeam.Wire.Payloads
 
   test "pair, auth, ack, typing, activity, and sync frames use string camelCase keys" do
-    assert Payloads.pair_result({:ok, "token", "operator"}) == %{
+    assert Payloads.pair_result({:ok, "token", "sample-user"}) == %{
              "type" => "pair_result",
              "success" => true,
              "token" => "token",
-             "userId" => "operator"
+             "userId" => "sample-user"
            }
 
     assert Payloads.pair_result({:error, "pending"}) == %{
@@ -20,7 +20,7 @@ defmodule Tightbeam.Wire.PayloadsTest do
 
     auth =
       Payloads.auth_result_success(%{
-        user_id: "operator",
+        user_id: "sample-user",
         session_id: "connection-1",
         is_admin: true,
         replay_count: 2,
@@ -77,8 +77,8 @@ defmodule Tightbeam.Wire.PayloadsTest do
     refute Map.has_key?(user, "sender")
     refute Map.has_key?(user, "replyToMessageId")
 
-    attributed_user = Payloads.server_message(%{base | sender: "user:operator"})
-    assert attributed_user["sender"] == "user:operator"
+    attributed_user = Payloads.server_message(%{base | sender: "user:sample-user"})
+    assert attributed_user["sender"] == "user:sample-user"
 
     assistant =
       Payloads.server_message(%{
@@ -137,17 +137,17 @@ defmodule Tightbeam.Wire.PayloadsTest do
       order_index: 0,
       is_built_in: true,
       adopted: true,
-      owner_user_id: "operator",
-      origin: "user:operator",
-      spawned_by: "agent:main:clawline:operator:main",
-      operational_parent: "agent:main:clawline:operator:main",
-      effective_parent: "agent:main:clawline:operator:main",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
+      spawned_by: "agent:main:clawline:sample-user:main",
+      operational_parent: "agent:main:clawline:sample-user:main",
+      effective_parent: "agent:main:clawline:sample-user:main",
       effective_parent_source: :explicit,
       handle: nil,
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("example-model"),
+      model: Model.new("fable"),
       thinking_level: nil,
       state: "active",
       created_at: 1,
@@ -163,8 +163,8 @@ defmodule Tightbeam.Wire.PayloadsTest do
       "createdAt" => 1,
       "updatedAt" => 2,
       "adopted" => true,
-      "operationalParent" => "agent:main:clawline:operator:main",
-      "effectiveParent" => "agent:main:clawline:operator:main",
+      "operationalParent" => "agent:main:clawline:sample-user:main",
+      "effectiveParent" => "agent:main:clawline:sample-user:main",
       "effectiveParentSource" => "explicit",
       "startedBy" => "user"
     }
@@ -173,8 +173,8 @@ defmodule Tightbeam.Wire.PayloadsTest do
 
     assert stream ==
              Map.merge(existing_keys, %{
-               "origin" => "user:operator",
-               "spawnedBy" => "agent:main:clawline:operator:main"
+               "origin" => "user:sample-user",
+               "spawnedBy" => "agent:main:clawline:sample-user:main"
              })
 
     # `origin` and `spawnedBy` drop out when absent; `startedBy` never does —
@@ -191,7 +191,7 @@ defmodule Tightbeam.Wire.PayloadsTest do
 
     assert %{
              "operationalParent" => nil,
-             "effectiveParent" => "agent:main:clawline:operator:main",
+             "effectiveParent" => "agent:main:clawline:sample-user:main",
              "effectiveParentSource" => "owner_main"
            } =
              session

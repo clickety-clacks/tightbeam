@@ -35,14 +35,14 @@ defmodule Tightbeam.RetireOwnershipTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1),('other', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 0, 'admin_add', 1),('other', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
       )
 
-    Enum.each(~w(operator other root), &ensure_main_session(db, &1))
+    Enum.each(~w(sample-user other root), &ensure_main_session(db, &1))
 
-    # An ordinary spawned agent: a session holding a role, owned by operator.
-    session!(db, "agent:worker:app", "operator")
-    Roles.create!(db, "worker", "operator", "agent:worker:app")
+    # An ordinary spawned agent: a session holding a role, owned by sample-user.
+    session!(db, "agent:worker:app", "sample-user")
+    Roles.create!(db, "worker", "sample-user", "agent:worker:app")
 
     %{
       db: db,
@@ -51,7 +51,7 @@ defmodule Tightbeam.RetireOwnershipTest do
   end
 
   test "a role-origin agent retires a session its own owner owns", ctx do
-    session!(ctx.db, "target", "operator")
+    session!(ctx.db, "target", "sample-user")
 
     # THE BUG: this returned %{code: "not_found"} for every agent origin.
     assert %{deleted_session_key: "target", retired_session_keys: ["target"]} =
@@ -79,7 +79,7 @@ defmodule Tightbeam.RetireOwnershipTest do
   end
 
   test "a process origin still gets not_found", ctx do
-    session!(ctx.db, "process-target", "operator")
+    session!(ctx.db, "process-target", "sample-user")
 
     # `resolve_caller/2` gives a process a nil owner, and ownerUserId is NOT NULL,
     # so the fall-through to not_found is by construction rather than by guard.
@@ -88,14 +88,14 @@ defmodule Tightbeam.RetireOwnershipTest do
   end
 
   test "an unknown origin still gets not_found", ctx do
-    session!(ctx.db, "unknown-target", "operator")
+    session!(ctx.db, "unknown-target", "sample-user")
 
     assert %{code: "not_found"} = retire(ctx, "agent:no-such-role", nil, "unknown-target")
     assert Org.get(ctx.db, "unknown-target").state == "active"
   end
 
   test "the idempotency key is scoped to the resolved user, not the origin string", ctx do
-    session!(ctx.db, "idem-target", "operator")
+    session!(ctx.db, "idem-target", "sample-user")
 
     assert %{deleted_session_key: "idem-target"} =
              retire(ctx, "agent:worker", {:session, "agent:worker:app"}, "idem-target", "key-1")
@@ -105,17 +105,17 @@ defmodule Tightbeam.RetireOwnershipTest do
     {:ok, rows} =
       DB.query(ctx.db, "SELECT ownerUserId FROM wire_idempotency WHERE idempotencyKey = 'key-1'")
 
-    assert rows == [["operator"]]
+    assert rows == [["sample-user"]]
     refute rows == [["agent:worker"]]
 
     # And the replay returns the original answer rather than retiring again.
     assert %{deleted_session_key: "idem-target"} =
-             retire(ctx, "user:operator", {:user, "operator"}, "idem-target", "key-1")
+             retire(ctx, "user:sample-user", {:user, "sample-user"}, "idem-target", "key-1")
   end
 
   test "the effort menu offers retire exactly when the handler would authorize it", ctx do
-    # A holder owned by operator, dispatched by a SESSION rung also owned by operator.
-    session!(ctx.db, "holder", "operator", spawned_by: "agent:worker:app")
+    # A holder owned by sample-user, dispatched by a SESSION rung also owned by sample-user.
+    session!(ctx.db, "holder", "sample-user", spawned_by: "agent:worker:app")
 
     assignment =
       Assignments.__handle__(ctx.db, "dispatch", %{
@@ -135,8 +135,8 @@ defmodule Tightbeam.RetireOwnershipTest do
     session_rung = %{
       session_key: "agent:worker:app",
       user_id: nil,
-      owner_user_id: "operator",
-      principal_user_id: "operator",
+      owner_user_id: "sample-user",
+      principal_user_id: "sample-user",
       rung: 0
     }
 
@@ -160,7 +160,7 @@ defmodule Tightbeam.RetireOwnershipTest do
       session_key: "agent:worker:app",
       user_id: nil,
       owner_user_id: "other",
-      principal_user_id: "operator",
+      principal_user_id: "sample-user",
       rung: 0
     }
 
@@ -184,7 +184,7 @@ defmodule Tightbeam.RetireOwnershipTest do
     refute "retire" in foreign_menu
 
     assert %{code: "not_found"} =
-             retire(ctx, "user:operator", {:user, "operator"}, "other-holder")
+             retire(ctx, "user:sample-user", {:user, "sample-user"}, "other-holder")
   end
 
   ## Helpers
@@ -216,7 +216,7 @@ defmodule Tightbeam.RetireOwnershipTest do
           host: "testhost",
           harness: "claude",
           provider: "anthropic",
-          model: Model.new("example-model")
+          model: Model.new("fable")
         },
         Map.new(opts)
       )

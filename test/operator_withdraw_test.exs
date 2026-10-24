@@ -8,11 +8,11 @@ defmodule Tightbeam.OperatorWithdrawTest do
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = ensure_all_schemas(db)
 
-    owner_main = ensure_main_session(db, "operator")
-    raiser = session(db, "raiser", "operator")
-    opener = session(db, "opener", "operator")
-    holder = session(db, "holder", "operator")
-    outsider = session(db, "outsider", "operator")
+    owner_main = ensure_main_session(db, "sample-user")
+    raiser = session(db, "raiser", "sample-user")
+    opener = session(db, "opener", "sample-user")
+    holder = session(db, "holder", "sample-user")
+    outsider = session(db, "outsider", "sample-user")
 
     %{
       db: db,
@@ -71,7 +71,7 @@ defmodule Tightbeam.OperatorWithdrawTest do
   end
 
   test "the owner's personal session is the opener for a user-opened subject card", ctx do
-    assignment_id = assignment(ctx, "user-opener", opened_by_user: "operator")
+    assignment_id = assignment(ctx, "user-opener", opened_by_user: "sample-user")
     request = operator_request(ctx, assignment_id)
 
     assert %{status: "withdrawn", withdrawn_by: "agent:main"} =
@@ -125,7 +125,7 @@ defmodule Tightbeam.OperatorWithdrawTest do
 
   test "boot recovery withdraws an operator request from an already retired raiser once", ctx do
     request = operator_request(ctx, nil)
-    Org.retire(ctx.db, ctx.raiser.session_key, "user:operator", 60_000)
+    Org.retire(ctx.db, ctx.raiser.session_key, "user:sample-user", 60_000)
 
     assert :ok = Escalation.recover_retired(ctx.db)
 
@@ -152,7 +152,7 @@ defmodule Tightbeam.OperatorWithdrawTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("example-model")
+      model: Model.new("fable")
     })
   end
 

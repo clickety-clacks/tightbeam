@@ -19,13 +19,13 @@ defmodule Tightbeam.LedgerTest do
          archetype, identityName,
          harness, provider, model, thinkingLevel, modelContext, createdAt, updatedAt)
       VALUES
-        ('ledger-main', 'Ledger Main', 'main', 1, 'operator', 'user:operator',
+        ('ledger-main', 'Ledger Main', 'main', 1, 'sample-user', 'user:sample-user',
          'ledger-main', 'default', 'default',
          'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1),
-        ('k1', 'K1', 'custom', 0, 'operator', 'user:operator',
+        ('k1', 'K1', 'custom', 0, 'sample-user', 'user:sample-user',
          'ledger-main', 'default', 'default',
          'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1),
-        ('k2', 'K2', 'custom', 0, 'operator', 'user:operator',
+        ('k2', 'K2', 'custom', 0, 'sample-user', 'user:sample-user',
          'ledger-main', 'default', 'default',
          'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1);
       """)
@@ -253,7 +253,7 @@ defmodule Tightbeam.LedgerTest do
 
   # The stamp is the WHOLE identity, in fields. A context variant and a
   # reasoning level are different questions, and a turn's provenance has to be
-  # able to tell `gpt-5.6-example` at high from the same model at medium, and from
+  # able to tell `gpt-5.6-sol` at high from the same model at medium, and from
   # its 1M-context sibling. Reading back only model+harness would pass with the
   # effort and context columns never written at all.
   test "claim stamps every field of the session's selected mind after a tune",
@@ -267,19 +267,19 @@ defmodule Tightbeam.LedgerTest do
         db,
         """
         UPDATE sessions
-        SET model='gpt-5.6-example', thinkingLevel='high', modelContext='1m', harness='codex'
+        SET model='gpt-5.6-sol', thinkingLevel='high', modelContext='1m', harness='codex'
         WHERE sessionKey='k1'
         """
       )
 
     assert {:ok, %{seq: ^first, owner_lease: lease}} = Ledger.claim_next(db, "k1", "lane")
 
-    assert {:ok, [["running", "gpt-5.6-example", "high", "1m", "codex"]]} = mind(db, first)
+    assert {:ok, [["running", "gpt-5.6-sol", "high", "1m", "codex"]]} = mind(db, first)
 
     # The trace reads TERMINAL turns — the stamp must survive terminalization.
     :ok = Ledger.finish(db, first, "delivered", nil, owner_lease: lease)
 
-    assert {:ok, [["delivered", "gpt-5.6-example", "high", "1m", "codex"]]} = mind(db, first)
+    assert {:ok, [["delivered", "gpt-5.6-sol", "high", "1m", "codex"]]} = mind(db, first)
   end
 
   defp mind(db, seq) do
@@ -317,7 +317,7 @@ defmodule Tightbeam.LedgerTest do
   test "enqueue refuses a turn addressed to a session that has no row", %{db: db} do
     assert {:error, :no_session} =
              Ledger.enqueue(db, %{
-               session_key: "agent:main:clawline:operator:main",
+               session_key: "agent:main:clawline:sample-user:main",
                message_id: "m-phantom",
                origin: "process:tightbeam",
                prompt: "a prompt nobody can claim"
@@ -350,17 +350,17 @@ defmodule Tightbeam.LedgerTest do
   test "claim_next separates an empty queue from work nobody can claim", %{db: db} do
     assert :none = Ledger.claim_next(db, "k1", "lane")
 
-    insert_orphan_turn(db, "agent:main:clawline:operator:main")
+    insert_orphan_turn(db, "agent:main:clawline:sample-user:main")
 
     assert {:unclaimable, :no_session} =
-             Ledger.claim_next(db, "agent:main:clawline:operator:main", "lane")
+             Ledger.claim_next(db, "agent:main:clawline:sample-user:main", "lane")
   end
 
   test "unclaimable turns age into failed carrying the reason", %{db: db} do
-    seq = insert_orphan_turn(db, "agent:main:clawline:operator:main")
+    seq = insert_orphan_turn(db, "agent:main:clawline:sample-user:main")
 
     assert [^seq] =
-             Ledger.fail_unclaimable(db, "agent:main:clawline:operator:main", :no_session)
+             Ledger.fail_unclaimable(db, "agent:main:clawline:sample-user:main", :no_session)
 
     assert {:ok, [["failed", error]]} =
              DB.query(db, "SELECT status, error FROM turns WHERE seq = ?1", [seq])
@@ -369,7 +369,7 @@ defmodule Tightbeam.LedgerTest do
 
     # The named terminal rides the existing at-least-once publication feed.
     assert [%{seq: ^seq, status: "failed"}] = Ledger.unpublished_terminals(db)
-    assert Ledger.fail_unclaimable(db, "agent:main:clawline:operator:main", :no_session) == []
+    assert Ledger.fail_unclaimable(db, "agent:main:clawline:sample-user:main", :no_session) == []
   end
 
   # The diagnosis and the failure are separate transactions,
@@ -377,10 +377,10 @@ defmodule Tightbeam.LedgerTest do
   # in that window makes the turn claimable again, and aging it anyway destroys
   # live work on the strength of a reading that had already expired.
   test "a session appearing after the diagnosis spares its turn", %{db: db} do
-    seq = insert_orphan_turn(db, "agent:main:clawline:operator:main")
+    seq = insert_orphan_turn(db, "agent:main:clawline:sample-user:main")
 
     assert {:unclaimable, :no_session} =
-             Ledger.claim_next(db, "agent:main:clawline:operator:main", "lane")
+             Ledger.claim_next(db, "agent:main:clawline:sample-user:main", "lane")
 
     :ok =
       DB.execute(db, """
@@ -389,16 +389,16 @@ defmodule Tightbeam.LedgerTest do
          archetype, identityName,
          harness, provider, model, thinkingLevel, modelContext, createdAt, updatedAt)
       VALUES
-        ('agent:main:clawline:operator:main', 'user', 'main', 1, 'operator', 'user:operator',
-         'agent:main:clawline:operator:main', 'default',
+        ('agent:main:clawline:sample-user:main', 'user', 'main', 1, 'sample-user', 'user:sample-user',
+         'agent:main:clawline:sample-user:main', 'default',
          'default', 'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1);
       """)
 
-    assert Ledger.fail_unclaimable(db, "agent:main:clawline:operator:main", :no_session) == []
+    assert Ledger.fail_unclaimable(db, "agent:main:clawline:sample-user:main", :no_session) == []
     assert {:ok, [["queued"]]} = DB.query(db, "SELECT status FROM turns WHERE seq = ?1", [seq])
 
     assert {:ok, %{seq: ^seq}} =
-             Ledger.claim_next(db, "agent:main:clawline:operator:main", "lane")
+             Ledger.claim_next(db, "agent:main:clawline:sample-user:main", "lane")
   end
 
   # Identifying the aged rows by the error string this
@@ -406,15 +406,15 @@ defmodule Tightbeam.LedgerTest do
   # lane announces rows it did not touch. Only the statement that did the work
   # knows what it did.
   test "aging reports the rows it transitioned, never a previous batch", %{db: db} do
-    first = insert_orphan_turn(db, "agent:main:clawline:operator:main")
+    first = insert_orphan_turn(db, "agent:main:clawline:sample-user:main")
 
     assert [^first] =
-             Ledger.fail_unclaimable(db, "agent:main:clawline:operator:main", :no_session)
+             Ledger.fail_unclaimable(db, "agent:main:clawline:sample-user:main", :no_session)
 
-    second = insert_orphan_turn(db, "agent:main:clawline:operator:main")
+    second = insert_orphan_turn(db, "agent:main:clawline:sample-user:main")
 
     assert [^second] =
-             Ledger.fail_unclaimable(db, "agent:main:clawline:operator:main", :no_session)
+             Ledger.fail_unclaimable(db, "agent:main:clawline:sample-user:main", :no_session)
   end
 
   # A turn the ledger would refuse today, written the way the pre-guard gateway

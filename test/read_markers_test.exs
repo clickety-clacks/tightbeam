@@ -11,19 +11,19 @@ defmodule Tightbeam.ReadMarkersTest do
   end
 
   test "set, conditional write, and clear preserve a monotonic public row", %{db: db} do
-    assert {:ok, true, first} = ReadMarkers.set(db, "operator", "work:one", "s_1")
+    assert {:ok, true, first} = ReadMarkers.set(db, "sample-user", "work:one", "s_1")
     assert first.marker == "s_1"
 
-    assert {:ok, false, ^first} = ReadMarkers.set(db, "operator", "work:one", "s_1")
+    assert {:ok, false, ^first} = ReadMarkers.set(db, "sample-user", "work:one", "s_1")
 
     assert {:error, %{code: "read_marker_conflict"}} =
-             ReadMarkers.set(db, "operator", "work:one", "s_2",
+             ReadMarkers.set(db, "sample-user", "work:one", "s_2",
                expected?: true,
                expected: "stale"
              )
 
     assert {:ok, true, cleared} =
-             ReadMarkers.set(db, "operator", "work:one", nil,
+             ReadMarkers.set(db, "sample-user", "work:one", nil,
                expected?: true,
                expected: "s_1"
              )

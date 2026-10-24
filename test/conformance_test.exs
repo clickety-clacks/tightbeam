@@ -3571,7 +3571,7 @@ defmodule Tightbeam.ConformanceSupport do
         provider: session["provider"] || "anthropic",
         model:
           Model.from_params(session) ||
-            Model.new("example-model"),
+            Model.new("fable"),
         host: session["host"] || Placement.local_host_name()
       })
 

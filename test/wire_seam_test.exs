@@ -38,10 +38,10 @@ defmodule Tightbeam.Wire.SeamTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 0, 'admin_add', 1)"
       )
 
-    ensure_main_session(db, "operator")
+    ensure_main_session(db, "sample-user")
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-wire-seam-#{System.unique_integer([:positive])}")
@@ -75,13 +75,13 @@ defmodule Tightbeam.Wire.SeamTest do
   end
 
   test "assign --reviews lands the review link on the row", ctx do
-    producer = create_session(ctx.db, "producer", "operator")
-    reviewer = create_session(ctx.db, "reviewer", "operator")
+    producer = create_session(ctx.db, "producer", "sample-user")
+    reviewer = create_session(ctx.db, "reviewer", "sample-user")
 
     ok!(
       dispatch_cli(ctx, "tbc_wire_seam", %{
         verb: "assign",
-        asUser: "operator",
+        asUser: "sample-user",
         sessionKey: producer.session_key,
         params: %{subject: "fix the seam"}
       })
@@ -92,7 +92,7 @@ defmodule Tightbeam.Wire.SeamTest do
     ok!(
       dispatch_cli(ctx, "tbc_wire_seam", %{
         verb: "assign",
-        asUser: "operator",
+        asUser: "sample-user",
         sessionKey: reviewer.session_key,
         params: %{subject: "review the fix", reviews: produced}
       })
@@ -112,12 +112,12 @@ defmodule Tightbeam.Wire.SeamTest do
     # The handler's existing UnknownReviewTarget check is unreachable while the
     # param is dropped, so a typo'd id used to open an ordinary unlinked
     # assignment. Reaching the refusal is itself proof the id arrives.
-    reviewer = create_session(ctx.db, "reviewer", "operator")
+    reviewer = create_session(ctx.db, "reviewer", "sample-user")
 
     response =
       dispatch_cli(ctx, "tbc_wire_seam", %{
         verb: "assign",
-        asUser: "operator",
+        asUser: "sample-user",
         sessionKey: reviewer.session_key,
         params: %{subject: "review a ghost", reviews: "asg_never_existed"}
       })
@@ -149,7 +149,7 @@ defmodule Tightbeam.Wire.SeamTest do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("example-model"),
+      model: Model.new("fable"),
       host: "test-host"
     })
   end

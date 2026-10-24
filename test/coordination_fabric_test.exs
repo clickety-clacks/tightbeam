@@ -485,8 +485,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "O2: role-addressed classed wakes digest into a role-carrier that carries targetRole forward",
        %{db: db} do
-    seed_session(db, "s1", "operator")
-    Roles.create!(db, "role-x", "operator", "s1")
+    seed_session(db, "s1", "sample-user")
+    Roles.create!(db, "role-x", "sample-user", "s1")
 
     a =
       schedule_wake(db, %{
@@ -522,9 +522,9 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "O2: a role rebound inside the ceiling window reaches the new holder, not whoever held it when the members were filed",
        %{db: db} do
-    seed_session(db, "s1", "operator")
-    seed_session(db, "s2", "operator")
-    Roles.create!(db, "role-x", "operator", "s1")
+    seed_session(db, "s1", "sample-user")
+    seed_session(db, "s2", "sample-user")
+    Roles.create!(db, "role-x", "sample-user", "s1")
 
     test_pid = self()
     scheduler = :"coordination_fabric_role_scheduler_#{System.unique_integer([:positive])}"
@@ -594,8 +594,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "O2: mixed role- and session-addressed traffic for the same principal stays in separate groups",
        %{db: db} do
-    seed_session(db, "s1", "operator")
-    Roles.create!(db, "role-y", "operator", "s1")
+    seed_session(db, "s1", "sample-user")
+    Roles.create!(db, "role-y", "sample-user", "s1")
 
     role_member =
       schedule_wake(db, %{
@@ -1343,8 +1343,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   ## Seam ③ — the `input-needed` carrier (GitHub #11)
 
   test "an agent's question and the notification that carries it are one commit", %{db: db} do
-    seed_session(db, "agent:coder", "operator")
-    seed_session(db, "agent:po", "operator")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
 
     assert {:ok, %{decision_request: request}} =
              ask(db, "agent:coder", "agent:po", "ship behind a flag or block?")
@@ -1354,7 +1354,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert request.raiser_id == "session:agent:coder"
     assert request.raiser_session_key == "agent:coder"
     assert request.expecter_session_key == "agent:po"
-    assert request.expecter_user_id == "operator"
+    assert request.expecter_user_id == "sample-user"
     assert request.question == "ship behind a flag or block?"
     assert request.answer == nil
 
@@ -1394,8 +1394,8 @@ defmodule Tightbeam.CoordinationFabricTest do
     # HALF ONE, behavioural: an open question naming an assignment does not stop
     # its holder completing and closing that assignment. If it ever does,
     # adjudication has been rebuilt with a friendlier face.
-    seed_session(db, "agent:coder", "operator")
-    seed_session(db, "agent:po", "operator")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
     assignment = open_assignment(db, "agent:coder")
 
     assert {:ok, %{decision_request: request}} =
@@ -3168,8 +3168,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "the statute gate read cannot be reached by an agent row sharing its raiser",
        %{db: db} do
-    seed_session(db, "agent:coder", "operator")
-    seed_session(db, "agent:po", "operator")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
 
     # An open AGENT question from `agent:coder`, filed alongside an open
     # STATUTE escalation from the very same raiser — the closest two rows can
@@ -3200,8 +3200,8 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert Escalation.rule(
              db,
              %{
-               origin: "user:operator",
-               principal: {:user, "operator"},
+               origin: "user:sample-user",
+               principal: {:user, "sample-user"},
                params: %{
                  request_id: statute_id,
                  decision: "allow"
@@ -3245,8 +3245,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "--about refuses an assignment the asker cannot legitimately reference, identically to a fake id",
        %{db: db} do
-    seed_session(db, "agent:coder", "operator")
-    seed_session(db, "agent:po", "operator")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
     seed_session(db, "agent:outsider", "someone-else")
 
     # `agent:outsider` neither holds it, opened it, nor is the party a review
@@ -3279,8 +3279,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "--about stores a canonical prefix target and refusals emit no request, event, or wake",
        %{db: db} do
-    seed_session(db, "agent:coder", "operator")
-    seed_session(db, "agent:po", "operator")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
 
     {:ok, _} =
       DB.query(
@@ -3321,8 +3321,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "the expecter is preferred while an exact-id agent session may answer", %{db: db} do
-    seed_session(db, "agent:coder", "operator")
-    seed_session(db, "agent:po", "operator")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
     seed_session(db, "agent:stranger", "outsider")
 
     assert {:ok, %{decision_request: request}} = ask(db, "agent:coder", "agent:po", "which way?")
@@ -3380,8 +3380,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "answer hides fake and non-agent ids while an exact agent id grants session standing",
        %{db: db} do
-    seed_session(db, "agent:coder", "operator")
-    seed_session(db, "agent:po", "operator")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
     seed_session(db, "agent:outsider", "someone-else")
 
     assert {:ok, %{decision_request: agent_request}} =
@@ -3394,7 +3394,7 @@ defmodule Tightbeam.CoordinationFabricTest do
         db,
         "INSERT INTO decision_requests (id, kind, raiserId, raiserSessionKey, ownerUserId, " <>
           "raisedAt, deadlineAt, statuteName, actionKey, question, context, status) VALUES " <>
-          "(?1,'statute','session:agent:coder','agent:coder','operator',1,999999999999," <>
+          "(?1,'statute','session:agent:coder','agent:coder','sample-user',1,999999999999," <>
           "'deploy-gate','k1','q','{}','open')",
         [statute_id]
       )
@@ -3443,8 +3443,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "withdraw is the asker's own lawful exit, and nobody else's", %{db: db} do
-    seed_session(db, "agent:coder", "operator")
-    seed_session(db, "agent:po", "operator")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
 
     assert {:ok, %{decision_request: request}} = ask(db, "agent:coder", "agent:po", "which way?")
 
@@ -3465,8 +3465,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "the decision reader returns insufficient questions with an immutable audit trail",
        %{db: db} do
-    seed_session(db, "agent:coder", "operator")
-    seed_session(db, "agent:po", "operator")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
     seed_session(db, "agent:stranger", "outsider")
 
     assert {:ok, %{decision_request: request}} =
@@ -3547,8 +3547,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "answer, withdraw, and return race to one terminal winner", %{db: db} do
-    seed_session(db, "agent:coder", "operator")
-    seed_session(db, "agent:po", "operator")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
 
     assert {:ok, %{decision_request: request}} =
              ask(db, "agent:coder", "agent:po", "enough context?")
@@ -3592,8 +3592,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "concurrent exact answer retries converge on one terminal write", %{db: db} do
-    seed_session(db, "agent:coder", "operator")
-    seed_session(db, "agent:po", "operator")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
     seed_session(db, "agent:reviewer", "outsider")
 
     assert {:ok, %{decision_request: request}} =
@@ -3645,8 +3645,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "the schema refuses every shape the agent arm forbids", %{db: db} do
-    seed_session(db, "agent:coder", "operator")
-    seed_session(db, "agent:po", "operator")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
 
     # `deadlineAt` is left out of the column list entirely so every
     # row below is forbidden for exactly the one reason its comment names, not
@@ -3657,34 +3657,34 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     forbidden = [
       # Adjudication vocabulary, one column at a time.
-      {", statuteName) VALUES ('d1','agent','session:agent:coder','agent:coder','operator'," <>
-         "'agent:po','operator',1,'q','{}','open','deploy-gate')"},
-      {", decision) VALUES ('d2','agent','session:agent:coder','agent:coder','operator'," <>
-         "'agent:po','operator',1,'q','{}','open','allow')"},
-      {", parkWakeId) VALUES ('d3','agent','session:agent:coder','agent:coder','operator'," <>
-         "'agent:po','operator',1,'q','{}','open','w_1')"},
-      {", rulingFactId) VALUES ('d4','agent','session:agent:coder','agent:coder','operator'," <>
-         "'agent:po','operator',1,'q','{}','open',7)"},
+      {", statuteName) VALUES ('d1','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','open','deploy-gate')"},
+      {", decision) VALUES ('d2','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','open','allow')"},
+      {", parkWakeId) VALUES ('d3','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','open','w_1')"},
+      {", rulingFactId) VALUES ('d4','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','open',7)"},
       # `ruled` is not one of this arm's three words.
-      {") VALUES ('d5','agent','session:agent:coder','agent:coder','operator'," <>
-         "'agent:po','operator',1,'q','{}','ruled')"},
+      {") VALUES ('d5','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','ruled')"},
       # `answered` without an answer, and an answer without an author.
-      {") VALUES ('d6','agent','session:agent:coder','agent:coder','operator'," <>
-         "'agent:po','operator',1,'q','{}','answered')"},
-      {", answer) VALUES ('d7','agent','session:agent:coder','agent:coder','operator'," <>
-         "'agent:po','operator',1,'q','{}','answered','yes')"},
+      {") VALUES ('d6','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','answered')"},
+      {", answer) VALUES ('d7','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','answered','yes')"},
       # `returned` without all three audit fields, or audit fields on an open
       # row, can never be stored.
-      {") VALUES ('d11','agent','session:agent:coder','agent:coder','operator'," <>
-         "'agent:po','operator',1,'q','{}','returned')"},
-      {", returnReason) VALUES ('d12','agent','session:agent:coder','agent:coder','operator'," <>
-         "'agent:po','operator',1,'q','{}','open','unclear')"},
+      {") VALUES ('d11','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','returned')"},
+      {", returnReason) VALUES ('d12','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','open','unclear')"},
       {", returnedBy, returnReason, returnedAt) VALUES ('d13','agent'," <>
-         "'session:agent:coder','agent:coder','operator','agent:po','operator',1,'q','{}'," <>
+         "'session:agent:coder','agent:coder','sample-user','agent:po','sample-user',1,'q','{}'," <>
          "'returned','session:agent:po','   ',2)"},
       # `raiserId` must name the asking session, not some other principal.
-      {") VALUES ('d8','agent','user:operator','agent:coder','operator'," <>
-         "'agent:po','operator',1,'q','{}','open')"}
+      {") VALUES ('d8','agent','user:sample-user','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','open')"}
     ]
 
     for {tail} <- forbidden do
@@ -3701,7 +3701,7 @@ defmodule Tightbeam.CoordinationFabricTest do
                "INSERT INTO decision_requests (id, kind, raiserId, raiserSessionKey, " <>
                  "ownerUserId, expecterSessionKey, expecterUserId, raisedAt, deadlineAt, " <>
                  "question, context, status) VALUES ('d10','agent','session:agent:coder'," <>
-                 "'agent:coder','operator','agent:po','operator',1,999,'q','{}','open')"
+                 "'agent:coder','sample-user','agent:po','sample-user',1,999,'q','{}','open')"
              )
 
     assert deadlined =~ "CHECK constraint"
@@ -3713,7 +3713,7 @@ defmodule Tightbeam.CoordinationFabricTest do
                db,
                "INSERT INTO decision_requests (id, kind, raiserId, ownerUserId, raisedAt, " <>
                  "deadlineAt, statuteName, actionKey, question, context, status, answer, " <>
-                 "answeredBy, answeredAt) VALUES ('d9','statute','session:agent:coder','operator'," <>
+                 "answeredBy, answeredAt) VALUES ('d9','statute','session:agent:coder','sample-user'," <>
                  "1,2,'deploy-gate','k','q','{}','open','yes','session:agent:po',3)"
              )
 
@@ -3721,8 +3721,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "a question is visible to its asker, the principal asked, and nobody else", %{db: db} do
-    seed_session(db, "agent:coder", "operator")
-    seed_session(db, "agent:po", "operator")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
     seed_session(db, "agent:stranger", "outsider")
 
     assert {:ok, %{decision_request: request}} = ask(db, "agent:coder", "agent:po", "which way?")
@@ -3730,25 +3730,25 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert [%{id: id}] = list_requests(db, {:session, "agent:coder"})
     assert id == request.id
     assert [%{id: ^id}] = list_requests(db, {:session, "agent:po"})
-    assert [%{id: ^id}] = list_requests(db, {:user, "operator"})
+    assert [%{id: ^id}] = list_requests(db, {:user, "sample-user"})
     assert list_requests(db, {:session, "agent:stranger"}) == []
     assert list_requests(db, {:user, "outsider"}) == []
   end
 
   test "a sibling session sharing the asker's owner is not one of the three visible principals",
        %{db: db} do
-    seed_session(db, "agent:coder", "operator")
-    seed_session(db, "agent:po", "operator")
-    # Owned by operator too, same as coder — but neither asker, asked, nor the
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
+    # Owned by sample-user too, same as coder — but neither asker, asked, nor the
     # owner acting AS itself.
-    seed_session(db, "agent:reviewer", "operator")
+    seed_session(db, "agent:reviewer", "sample-user")
     seed_session(db, "agent:bob-app", "bob")
 
     assert {:ok, %{decision_request: request}} =
              ask(db, "agent:coder", "agent:bob-app", "which way?")
 
-    # `owner_user_id: "operator"` is exactly what the gateway resolves for ANY of
-    # operator's sessions (`decision-requests`'s `caller.owner_user_id`) — so this
+    # `owner_user_id: "sample-user"` is exactly what the gateway resolves for ANY of
+    # sample-user's sessions (`decision-requests`'s `caller.owner_user_id`) — so this
     # reproduces, at the call site `Escalation.list/get` actually see, what an
     # unrelated sibling session's call looks like. Before the fix, the
     # `ownerUserId` branch fired for this session
@@ -3759,8 +3759,8 @@ defmodule Tightbeam.CoordinationFabricTest do
       params: %{}
     }
 
-    assert Escalation.list(db, reviewer_call, "open", owner_user_id: "operator") == []
-    assert Escalation.get(db, reviewer_call, request.id, owner_user_id: "operator") == nil
+    assert Escalation.list(db, reviewer_call, "open", owner_user_id: "sample-user") == []
+    assert Escalation.get(db, reviewer_call, request.id, owner_user_id: "sample-user") == nil
 
     assert {:ok, %{decision_request: exact}} =
              verb(db, {:session, "agent:reviewer"}, "decision-request", %{request: request.id})
@@ -3781,7 +3781,7 @@ defmodule Tightbeam.CoordinationFabricTest do
              verb(db, {:process, "ci"}, "decision-request", %{request: request.id})
 
     assert {:error, %{code: "not_found"}} =
-             answer(db, {:user, "operator"}, request.id, "user boundaries stay narrow")
+             answer(db, {:user, "sample-user"}, request.id, "user boundaries stay narrow")
 
     assert {:error, %{code: "not_found"}} =
              answer(db, {:process, "ci"}, request.id, "processes gain no standing")
@@ -3825,21 +3825,21 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert effort.id == effort_id
     assert effort.kind == "effort"
     assert effort.options == ["continue", "dismiss"]
-    assert Escalation.list(db, reviewer_call, "open", owner_user_id: "operator") == []
+    assert Escalation.list(db, reviewer_call, "open", owner_user_id: "sample-user") == []
 
     # The owner acting AS itself — a user principal, not merely a session
     # resolving to the same owner — is the one the `ownerUserId` branch exists
     # for, and still sees it.
-    owner_call = %{origin: "user:operator", principal: {:user, "operator"}, params: %{}}
+    owner_call = %{origin: "user:sample-user", principal: {:user, "sample-user"}, params: %{}}
 
-    assert [%{id: id}] = Escalation.list(db, owner_call, "open", owner_user_id: "operator")
+    assert [%{id: id}] = Escalation.list(db, owner_call, "open", owner_user_id: "sample-user")
     assert id == request.id
   end
 
   ## Seam ④ — `--after` cursors (GitHub #13)
 
   test "the attests cursor is a (ts, id) keyset that survives a ts collision", %{db: db} do
-    seed_session(db, "agent:coder", "operator")
+    seed_session(db, "agent:coder", "sample-user")
     assignment = open_assignment(db, "agent:coder")
 
     # THREE attests sharing ONE millisecond. A `ts`-only cursor either repeats
@@ -3870,7 +3870,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "an unpaged attests read is byte-identical to what it always returned", %{db: db} do
-    seed_session(db, "agent:coder", "operator")
+    seed_session(db, "agent:coder", "sample-user")
     assignment = open_assignment(db, "agent:coder")
     for n <- 1..3, do: attest_row(db, assignment.id, "at_#{n}", 5_000 + n)
 
@@ -3889,7 +3889,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "an attests cursor from another assignment is not found, exactly like a fake one",
        %{db: db} do
-    seed_session(db, "agent:coder", "operator")
+    seed_session(db, "agent:coder", "sample-user")
     mine = open_assignment(db, "agent:coder")
     theirs = open_assignment(db, "agent:coder")
     attest_row(db, theirs.id, "at_elsewhere", 5_000)
@@ -3909,7 +3909,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "the execution-map cursor pages the flat roster on a stable order key", %{db: db} do
-    seed_session(db, "agent:coder", "operator")
+    seed_session(db, "agent:coder", "sample-user")
     ids = for n <- 1..4, do: work_item_row(db, "wi_#{n}", 1_000 + n)
 
     assert {:ok, all} = execution_map(db, %{})
@@ -3940,7 +3940,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "an exhausted execution-map page hands back a null cursor, never a boolean", %{db: db} do
-    seed_session(db, "agent:coder", "operator")
+    seed_session(db, "agent:coder", "sample-user")
     ids = for n <- 1..2, do: work_item_row(db, "wi_#{n}", 1_000 + n)
 
     # Paging exactly to the end: the last item is the cursor, and the next
@@ -3955,7 +3955,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "execution-map refuses a forest page and an unresolvable cursor by name", %{db: db} do
-    seed_session(db, "agent:coder", "operator")
+    seed_session(db, "agent:coder", "sample-user")
     work_item_row(db, "wi_1", 1_000)
 
     assert {:error, %{code: "invalid", message: forest}} =
@@ -4041,12 +4041,12 @@ defmodule Tightbeam.CoordinationFabricTest do
     do: verb(db, principal, "withdraw", %{request: request_id, reason: reason})
 
   defp attests(db, assignment_id, params),
-    do: verb(db, {:user, "operator"}, "attests", Map.put(params, :assignment_id, assignment_id))
+    do: verb(db, {:user, "sample-user"}, "attests", Map.put(params, :assignment_id, assignment_id))
 
-  defp execution_map(db, params), do: verb(db, {:user, "operator"}, "execution-map", params)
+  defp execution_map(db, params), do: verb(db, {:user, "sample-user"}, "execution-map", params)
 
   defp execution_map_select(db, params),
-    do: verb(db, {:user, "operator"}, "execution-map-select", params)
+    do: verb(db, {:user, "sample-user"}, "execution-map-select", params)
 
   defp list_requests(db, principal) do
     case verb(db, principal, "decision-requests", %{status: "open"}) do
@@ -4089,8 +4089,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   defp open_assignment(db, holder_key) do
     Tightbeam.Assignments.__handle__(db, "assign", %{
       verb: "assign",
-      origin: "user:operator",
-      principal: {:user, "operator"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
@@ -4117,7 +4117,7 @@ defmodule Tightbeam.CoordinationFabricTest do
         """
         INSERT INTO work_items (id, title, ownerUserId, state, createdByUser, createdAt,
                                 createdContextKnown)
-        VALUES (?1, ?1, 'operator', 'open', 'operator', ?2, 0)
+        VALUES (?1, ?1, 'sample-user', 'open', 'sample-user', ?2, 0)
         """,
         [id, created_at]
       )
@@ -4150,7 +4150,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       archetype: "coder",
       harness: "claude",
       provider: "anthropic",
-      model: Tightbeam.Model.new("example-model"),
+      model: Tightbeam.Model.new("fable"),
       host: Tightbeam.Placement.local_host_name()
     })
 

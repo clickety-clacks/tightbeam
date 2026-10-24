@@ -11,7 +11,7 @@ defmodule Tightbeam.OrgTest do
     start_supervised!({DB, path: ":memory:", name: name})
     :ok = Tightbeam.Schema.ensure_all(name)
 
-    main_key = Org.personal_session_key("operator")
+    main_key = Org.personal_session_key("sample-user")
 
     main =
       Org.create(
@@ -26,13 +26,13 @@ defmodule Tightbeam.OrgTest do
     Map.merge(
       %{
         display_name: "Main",
-        owner_user_id: "operator",
-        origin: "user:operator",
+        owner_user_id: "sample-user",
+        origin: "user:sample-user",
         archetype: "default",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
-        model: Model.new("example-model")
+        model: Model.new("fable")
       },
       overrides
     )
@@ -41,7 +41,7 @@ defmodule Tightbeam.OrgTest do
   test "create persists provenance, wire metadata, and boolean flags", %{db: db, main: session} do
     key = session.session_key
 
-    assert session.session_key == "agent:main:clawline:operator:main"
+    assert session.session_key == "agent:main:clawline:sample-user:main"
 
     assert %{
              archetype: "default",
@@ -136,12 +136,12 @@ defmodule Tightbeam.OrgTest do
             {%{
                session_key: main_key,
                source: :explicit,
-               owner_user_id: "operator"
+               owner_user_id: "sample-user"
              },
              %{
                session_key: main_key,
                source: :owner_main,
-               owner_user_id: "operator"
+               owner_user_id: "sample-user"
              }}} =
              DB.transaction(db, fn txn ->
                {
@@ -192,7 +192,7 @@ defmodule Tightbeam.OrgTest do
         db,
         base(%{session_key: "retired-id", identity_name: "default--fedcba9876543210"})
       )
-      |> then(&Org.retire(db, &1.session_key, "user:operator", 1_000))
+      |> then(&Org.retire(db, &1.session_key, "user:sample-user", 1_000))
 
     assert retired.state == "retired"
     assert Org.active_by_identity_name(db, retired.identity_name) == nil
@@ -201,7 +201,7 @@ defmodule Tightbeam.OrgTest do
 
   test "custom keys use the TypeScript s_ suffix format", %{db: db} do
     session = Org.create(db, base())
-    assert session.session_key =~ ~r/^agent:main:clawline:operator:main s_[0-9a-f]{8}$/
+    assert session.session_key =~ ~r/^agent:main:clawline:sample-user:main s_[0-9a-f]{8}$/
   end
 
   test "organization settings put and get through the KV seam", %{db: db} do
@@ -209,10 +209,10 @@ defmodule Tightbeam.OrgTest do
     assert :ok = Org.put_setting(db, "default-archetype", "coder")
     assert Org.get_setting(db, "default-archetype") == "coder"
 
-    assert :ok = Org.put_setting()
-    assert Org.get_setting(db, "default-archetype") == "reviewer"
+    assert :ok = Org.put_setting(db, "default-archetype", "sample-role")
+    assert Org.get_setting(db, "default-archetype") == "sample-role"
 
-    assert {:ok, [["default-archetype", "reviewer", updated_at]]} =
+    assert {:ok, [["default-archetype", "sample-role", updated_at]]} =
              DB.query(db, "SELECT key, value, updatedAt FROM org_settings")
 
     assert is_integer(updated_at)
@@ -228,7 +228,7 @@ defmodule Tightbeam.OrgTest do
     assert Org.by_cli_token(db, first.cli_token).session_key == first.session_key
     assert Org.by_cli_token(db, "tbs_unknown") == nil
 
-    Org.retire(db, first.session_key, "user:operator", 1_000)
+    Org.retire(db, first.session_key, "user:sample-user", 1_000)
     assert Org.by_cli_token(db, first.cli_token) == nil
 
     {:ok, [[index_sql]]} =
@@ -241,7 +241,7 @@ defmodule Tightbeam.OrgTest do
   end
 
   test "list scopes active sessions by owner unless admin and preserves ordering", %{db: db} do
-    main_key = Org.personal_session_key("operator")
+    main_key = Org.personal_session_key("sample-user")
     Org.create(db, base(%{session_key: "k2", order_index: 2}))
     Org.create(db, base(%{session_key: "k1", order_index: 1}))
     ensure_main_session(db, "sam")
@@ -255,18 +255,18 @@ defmodule Tightbeam.OrgTest do
       })
     )
 
-    assert Enum.map(Org.list_for_user(db, "operator", false), & &1.session_key) == [
+    assert Enum.map(Org.list_for_user(db, "sample-user", false), & &1.session_key) == [
              main_key,
              "k1",
              "k2"
            ]
 
-    assert length(Org.list_for_user(db, "operator", true)) == 5
+    assert length(Org.list_for_user(db, "sample-user", true)) == 5
 
-    retired = Org.retire(db, "k1", "user:operator", 1_000)
+    retired = Org.retire(db, "k1", "user:sample-user", 1_000)
     assert retired.state == "retired"
 
-    assert Enum.map(Org.list_for_user(db, "operator", false), & &1.session_key) == [
+    assert Enum.map(Org.list_for_user(db, "sample-user", false), & &1.session_key) == [
              main_key,
              "k2"
            ]
@@ -276,14 +276,14 @@ defmodule Tightbeam.OrgTest do
 
   test "retirement cancels gated direct and role targets, replaces the role, and preserves ungated delivery",
        %{db: db} do
-    main_key = Org.personal_session_key("operator")
+    main_key = Org.personal_session_key("sample-user")
     Org.create(db, base(%{session_key: "retiring"}))
-    Roles.create!(db, "reviewer", "operator", "retiring")
+    Roles.create!(db, "reviewer", "sample-user", "retiring")
 
     direct =
       Wakes.schedule(db, %{
         session_key: "retiring",
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "direct",
         due_at: 9_000
       })
@@ -292,7 +292,7 @@ defmodule Tightbeam.OrgTest do
       Wakes.schedule(db, %{
         session_key: "retiring",
         target_role: "reviewer",
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "role",
         due_at: 9_001
       })
@@ -300,13 +300,13 @@ defmodule Tightbeam.OrgTest do
     ungated =
       Wakes.schedule(db, %{
         session_key: "retiring",
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "ungated",
         due_at: 9_002,
         target_gate: 0
       })
 
-    assert %{state: "retired"} = Org.retire(db, "retiring", "user:operator", 1_000)
+    assert %{state: "retired"} = Org.retire(db, "retiring", "user:sample-user", 1_000)
     assert %{state: "canceled"} = Wakes.get(db, direct.wake_id)
 
     assert %{
@@ -343,7 +343,7 @@ defmodule Tightbeam.OrgTest do
     {:ok, [[wake_count]]} = DB.query(db, "SELECT count(*) FROM wakes")
     {:ok, [[cancellation_count]]} = DB.query(db, "SELECT count(*) FROM wake_cancellations")
 
-    assert %{state: "retired"} = Org.retire(db, "retiring", "user:operator", 1_000)
+    assert %{state: "retired"} = Org.retire(db, "retiring", "user:sample-user", 1_000)
     assert {:ok, [[^wake_count]]} = DB.query(db, "SELECT count(*) FROM wakes")
 
     assert {:ok, [[^cancellation_count]]} =
@@ -353,9 +353,9 @@ defmodule Tightbeam.OrgTest do
   test "retirement transaction preserves one selected V1 delivery path on the replacement", %{
     db: db
   } do
-    main_key = Org.personal_session_key("operator")
+    main_key = Org.personal_session_key("sample-user")
     Org.create(db, base(%{session_key: "retiring"}))
-    Roles.create!(db, "reviewer", "operator", "retiring")
+    Roles.create!(db, "reviewer", "sample-user", "retiring")
 
     lane = %{session_key: "retiring", target_role: "reviewer"}
 
@@ -388,7 +388,7 @@ defmodule Tightbeam.OrgTest do
     assert [%{member_state: "active", batch_id: batch_id}] =
              NoticeBatcher.source_refs(db, original.wake_id)
 
-    assert %{state: "retired"} = Org.retire(db, "retiring", "user:operator", 1_000)
+    assert %{state: "retired"} = Org.retire(db, "retiring", "user:sample-user", 1_000)
     assert %{replacement_wake_id: replacement_wake_id} = cancellation(db, original.wake_id)
 
     replacement = Wakes.get(db, replacement_wake_id)
@@ -449,7 +449,7 @@ defmodule Tightbeam.OrgTest do
     assert is_binary(sealed.envelope_sha256)
     assert sealed.delivery_wake_id == nil
 
-    assert %{state: "retired"} = Org.retire(db, "retiring", "user:operator", 1_000)
+    assert %{state: "retired"} = Org.retire(db, "retiring", "user:sample-user", 1_000)
     assert_immutable_retirement_chain(db, original, sealed)
   end
 
@@ -474,7 +474,7 @@ defmodule Tightbeam.OrgTest do
     assert sealed.release_cause == "overflow"
     assert sealed.delivery_wake_id == nil
 
-    assert %{state: "retired"} = Org.retire(db, "retiring", "user:operator", 1_000)
+    assert %{state: "retired"} = Org.retire(db, "retiring", "user:sample-user", 1_000)
     assert NoticeBatcher.batch(db, batch_id).state == "sealed"
     assert NoticeBatcher.batch(db, batch_id).delivery_wake_id == nil
     assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM wakes WHERE digest=1")
@@ -509,7 +509,7 @@ defmodule Tightbeam.OrgTest do
     assert armed.state == "delivery_pending"
     assert armed.delivery_wake_id == carrier_id
 
-    assert %{state: "retired"} = Org.retire(db, "retiring", "user:operator", 1_000)
+    assert %{state: "retired"} = Org.retire(db, "retiring", "user:sample-user", 1_000)
     assert_immutable_retirement_chain(db, original, armed)
   end
 
@@ -524,7 +524,7 @@ defmodule Tightbeam.OrgTest do
     assert terminal.state == "delivery_failed"
     assert Wakes.get(db, carrier_id).state == "fired"
 
-    assert %{state: "retired"} = Org.retire(db, "retiring", "user:operator", 1_000)
+    assert %{state: "retired"} = Org.retire(db, "retiring", "user:sample-user", 1_000)
     assert NoticeBatcher.batch(db, batch_id).state == "delivery_failed"
     assert Wakes.get(db, carrier_id).state == "fired"
     assert Enum.map(Wakes.digest_members(db, carrier_id), & &1.wake_id) == [original.wake_id]
@@ -545,7 +545,7 @@ defmodule Tightbeam.OrgTest do
     wake =
       Wakes.schedule(db, %{
         session_key: "retiring",
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "still pending",
         due_at: 9_000
       })
@@ -553,8 +553,8 @@ defmodule Tightbeam.OrgTest do
     for {principal, interval} <- [
           {"", 1_000},
           {nil, 1_000},
-          {"user:operator", 0},
-          {"user:operator", -1}
+          {"user:sample-user", 0},
+          {"user:sample-user", -1}
         ] do
       assert_raise ArgumentError, ~r/non-empty principal and positive supervision interval/, fn ->
         Org.retire(db, "retiring", principal, interval)
@@ -575,14 +575,14 @@ defmodule Tightbeam.OrgTest do
     wake =
       Wakes.schedule(db, %{
         session_key: "retiring",
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "cancel once",
         due_at: 9_000
       })
 
     results =
       for _ <- 1..2 do
-        Task.async(fn -> Org.retire(db, "retiring", "user:operator", 1_000) end)
+        Task.async(fn -> Org.retire(db, "retiring", "user:sample-user", 1_000) end)
       end
       |> Task.await_many()
 
@@ -606,20 +606,20 @@ defmodule Tightbeam.OrgTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO work_items (id,title,ownerUserId,state,createdByUser,createdContextKnown,createdAt) VALUES ('orphan','orphan','operator','open','operator',0,1)"
+        "INSERT INTO work_items (id,title,ownerUserId,state,createdByUser,createdContextKnown,createdAt) VALUES ('orphan','orphan','sample-user','open','sample-user',0,1)"
       )
 
     wake =
       Wakes.schedule(db, %{
         session_key: "retiring",
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "linked",
         due_at: 9_000,
         work_item_id: "orphan"
       })
 
     assert_raise RuntimeError, ~r/no liveness trigger/, fn ->
-      Org.retire(db, "retiring", "user:operator", 1_000)
+      Org.retire(db, "retiring", "user:sample-user", 1_000)
     end
 
     assert Org.get(db, "retiring").state == "active"
@@ -640,7 +640,7 @@ defmodule Tightbeam.OrgTest do
           archetype: "reviewer",
           harness: "codex",
           provider: "openai",
-          model: Model.new("gpt-5.6-example", effort: "high")
+          model: Model.new("gpt-5.6-sol", effort: "high")
         })
       )
 
@@ -651,7 +651,7 @@ defmodule Tightbeam.OrgTest do
   test "rename and set_model update the row", %{db: db} do
     original = Org.create(db, base(%{session_key: "k1"}))
     renamed = Org.rename(db, "k1", "Renamed")
-    selection = Model.new("claude-example-5", effort: "high", context: "1m")
+    selection = Model.new("claude-fable-5", effort: "high", context: "1m")
     updated = Org.set_model(db, "k1", selection, "anthropic")
 
     assert renamed.display_name == "Renamed"
@@ -668,7 +668,7 @@ defmodule Tightbeam.OrgTest do
       FROM sessions WHERE sessionKey = 'k1'
       """)
 
-    assert rows == [["Renamed", "claude-example-5", "high", "1m", "anthropic"]]
+    assert rows == [["Renamed", "claude-fable-5", "high", "1m", "anthropic"]]
   end
 
   test "pointer chain is append-only and current is latest", %{db: db} do
@@ -761,7 +761,7 @@ defmodule Tightbeam.OrgTest do
 
   defp selected_retirement_source(db, prompt) do
     Org.create(db, base(%{session_key: "retiring"}))
-    Roles.create!(db, "reviewer", "operator", "retiring")
+    Roles.create!(db, "reviewer", "sample-user", "retiring")
 
     {:ok, _policy} =
       DB.transaction(db, fn txn ->

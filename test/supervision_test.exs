@@ -114,12 +114,12 @@ defmodule Tightbeam.SupervisionTest do
     {:paired, _device} =
       claim_org(db, %{
         device_id: "supervision-device",
-        claimed_name: "operator",
+        claimed_name: "sample-user",
         platform: nil,
         model: nil
       })
 
-    main = Org.get(db, Org.personal_session_key("operator"))
+    main = Org.get(db, Org.personal_session_key("sample-user"))
     supervisor = session(db, "supervisor", main.session_key)
     holder = session(db, "holder", supervisor.session_key)
     assignment(db, "asg_1", holder.session_key, "ship it", 1)
@@ -191,7 +191,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "UPDATE assignments SET state='closed',outcome='completed',closedAt=5,closedByUser='operator',closingAttestId='att_closed' WHERE id='asg_closed'"
+        "UPDATE assignments SET state='closed',outcome='completed',closedAt=5,closedByUser='sample-user',closingAttestId='att_closed' WHERE id='asg_closed'"
       )
 
     {:ok, _} =
@@ -718,7 +718,7 @@ defmodule Tightbeam.SupervisionTest do
         """
         INSERT INTO work_items
           (id, title, ownerUserId, state, createdByUser, createdAt)
-        VALUES ('wi_bracket_first', 'Bracket first', 'operator', 'open', 'operator', 1);
+        VALUES ('wi_bracket_first', 'Bracket first', 'sample-user', 'open', 'sample-user', 1);
         UPDATE assignments SET workItemId='wi_bracket_first' WHERE id='asg_1';
         INSERT INTO supervision_entitlements
           (assignmentId, generation, dueAt, state, lastAttemptGeneration,
@@ -726,7 +726,7 @@ defmodule Tightbeam.SupervisionTest do
            supervisionIntervalMs)
         VALUES
           ('asg_1', 4, 5000, 'armed', NULL, NULL, 'assignment_open',
-           'asg_1', NULL, 'assignment_open', 'user:operator', 1000);
+           'asg_1', NULL, 'assignment_open', 'user:sample-user', 1000);
         """
       )
 
@@ -909,7 +909,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_epoch','asg_1','verdict','verified','operator',2)"
+        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_epoch','asg_1','verdict','verified','sample-user',2)"
       )
 
     seq2 = terminal!(ctx.db, "holder")
@@ -1038,7 +1038,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_legacy','asg_1','verdict','verified','operator',2)"
+        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_legacy','asg_1','verdict','verified','sample-user',2)"
       )
 
     seq2 = terminal!(ctx.db, "holder")
@@ -1103,10 +1103,10 @@ defmodule Tightbeam.SupervisionTest do
         """
         INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts)
         VALUES
-          ('att_00000000-0000-4000-8000-000000000121','asg_1','verdict','cannot-proceed-external-main-red','operator',10),
-          ('att_00000000-0000-4000-8000-000000000122','asg_1','verdict','liveness-crediting-false-stall','operator',11),
-          ('att_00000000-0000-4000-8000-000000000123','asg_1','verdict','liveness-crediting-false-stall','operator',12),
-          ('att_00000000-0000-4000-8000-000000000124','asg_1','verdict','liveness-crediting-false-stall','operator',13)
+          ('att_00000000-0000-4000-8000-000000000121','asg_1','verdict','cannot-proceed-external-main-red','sample-user',10),
+          ('att_00000000-0000-4000-8000-000000000122','asg_1','verdict','liveness-crediting-false-stall','sample-user',11),
+          ('att_00000000-0000-4000-8000-000000000123','asg_1','verdict','liveness-crediting-false-stall','sample-user',12),
+          ('att_00000000-0000-4000-8000-000000000124','asg_1','verdict','liveness-crediting-false-stall','sample-user',13)
         """
       )
 
@@ -1164,7 +1164,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_verdict','asg_1','verdict','verified','operator',2)"
+        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_verdict','asg_1','verdict','verified','sample-user',2)"
       )
 
     seq2 = terminal!(ctx.db, "holder")
@@ -1201,7 +1201,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_fact','asg_1','verdict','verified','operator',9000000000000)"
+        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_fact','asg_1','verdict','verified','sample-user',9000000000000)"
       )
 
     {:ok, _} =
@@ -1348,7 +1348,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_after_due','asg_1','verdict','verified','operator',9000000000000)"
+        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_after_due','asg_1','verdict','verified','sample-user',9000000000000)"
       )
 
     sweep_liveness!(name)
@@ -1395,7 +1395,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_restart','asg_1','verdict','verified','operator',9000000032000)"
+        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_restart','asg_1','verdict','verified','sample-user',9000000032000)"
       )
 
     sweep_liveness!(second)
@@ -1543,7 +1543,7 @@ defmodule Tightbeam.SupervisionTest do
         UPDATE supervision_entitlements
         SET generation=3, dueAt=9000000000000, state='armed',
             lastAttemptGeneration=NULL, claimClock=NULL, basisKind='assignment_open',
-            basisId='asg_1', cause='assignment_open', principal='user:operator',
+            basisId='asg_1', cause='assignment_open', principal='user:sample-user',
             supervisionIntervalMs=60000
         WHERE assignmentId='asg_1'
         """
@@ -1883,7 +1883,7 @@ defmodule Tightbeam.SupervisionTest do
         """
         INSERT INTO work_items
           (id, title, ownerUserId, state, createdByUser, createdAt)
-        VALUES ('wi_legacy_transfer', 'legacy transfer', 'operator', 'open', 'operator', 1)
+        VALUES ('wi_legacy_transfer', 'legacy transfer', 'sample-user', 'open', 'sample-user', 1)
         """
       )
 
@@ -2372,7 +2372,7 @@ defmodule Tightbeam.SupervisionTest do
       Wakes.schedule(ctx.db, %{
         session_key: "holder",
         target_role: nil,
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "self continuation",
         due_at: System.system_time(:millisecond) + 60_000,
         creator_session_key: "holder"
@@ -2392,7 +2392,7 @@ defmodule Tightbeam.SupervisionTest do
       Wakes.schedule(ctx.db, %{
         session_key: "holder",
         target_role: nil,
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "user reminder",
         due_at: System.system_time(:millisecond) + 60_000,
         creator_session_key: nil
@@ -3325,7 +3325,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_between','asg_1','verdict','verified','operator',2)"
+        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_between','asg_1','verdict','verified','sample-user',2)"
       )
 
     assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
@@ -3554,7 +3554,7 @@ defmodule Tightbeam.SupervisionTest do
       Wakes.schedule(ctx.db, %{
         session_key: "holder",
         target_role: nil,
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "later",
         due_at: System.system_time(:millisecond) + 60_000
       })
@@ -4201,7 +4201,7 @@ defmodule Tightbeam.SupervisionTest do
       Ledger.enqueue(db, %{
         session_key: session_key,
         message_id: message_id,
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "external",
         assignment_id: assignment_id
       })
@@ -4220,7 +4220,7 @@ defmodule Tightbeam.SupervisionTest do
              Ledger.enqueue(ctx.db, %{
                session_key: "holder",
                message_id: message_id,
-               origin: "user:operator",
+               origin: "user:sample-user",
                prompt: "checkpoint source turn",
                assignment_id: "asg_1",
                job_ref: "wi_checkpoint"
@@ -4231,7 +4231,7 @@ defmodule Tightbeam.SupervisionTest do
 
     assert %{wake_id: wake_id, state: "pending"} =
              ctx.handlers["wake"].(%{
-               origin: "user:operator",
+               origin: "user:sample-user",
                principal: {:session, "holder"},
                session_key: "holder",
                params: %{
@@ -4259,7 +4259,7 @@ defmodule Tightbeam.SupervisionTest do
   defp prepare_review_gate(ctx) do
     reviewer = session(ctx.db, "reviewer", ctx.main.session_key)
     {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET harness='codex' WHERE sessionKey='reviewer'")
-    Roles.create!(ctx.db, "reviewer", "operator", reviewer.session_key)
+    Roles.create!(ctx.db, "reviewer", "sample-user", reviewer.session_key)
 
     write_rules(
       ctx,
@@ -4449,7 +4449,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES (?1, ?2, ?3, 'operator', ?4)",
+        "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES (?1, ?2, ?3, 'sample-user', ?4)",
         [id, subject, holder, opened_at]
       )
 
@@ -4480,7 +4480,7 @@ defmodule Tightbeam.SupervisionTest do
         """
         INSERT INTO assignment_revocations
           (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
-        VALUES (?1, ?2, ?3, 'operator', NULL, 'supervision test revocation')
+        VALUES (?1, ?2, ?3, 'sample-user', NULL, 'supervision test revocation')
         """,
         [revocation_id, assignment_id, revoked_at]
       )
@@ -4499,7 +4499,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         db,
-        "UPDATE assignments SET state='closed', outcome='revoked', closedAt=?2, closedByUser='operator' WHERE id=?1",
+        "UPDATE assignments SET state='closed', outcome='revoked', closedAt=?2, closedByUser='sample-user' WHERE id=?1",
         [assignment_id, revoked_at]
       )
 
@@ -4525,7 +4525,7 @@ defmodule Tightbeam.SupervisionTest do
         """
         INSERT OR IGNORE INTO work_items
           (id,title,ownerUserId,state,createdByUser,createdAt)
-        VALUES (?1,?1,'operator','open','operator',1)
+        VALUES (?1,?1,'sample-user','open','sample-user',1)
         """,
         [work_item_id]
       )
@@ -4557,11 +4557,11 @@ defmodule Tightbeam.SupervisionTest do
         Assignments.interrupt_for_retire_in_txn(
           txn,
           session_key,
-          "operator",
-          "user:operator"
+          "sample-user",
+          "user:sample-user"
         )
 
-        Org.retire_in_txn(txn, session_key, "user:operator", 1_000)
+        Org.retire_in_txn(txn, session_key, "user:sample-user", 1_000)
       end)
 
     retired
@@ -4571,8 +4571,8 @@ defmodule Tightbeam.SupervisionTest do
     Org.create(db, %{
       session_key: key,
       display_name: key,
-      owner_user_id: "operator",
-      origin: "user:operator",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       spawned_by: spawned_by,
       operational_parent: spawned_by,
       kind: if(built_in, do: "main", else: "custom"),
@@ -4580,7 +4580,7 @@ defmodule Tightbeam.SupervisionTest do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("example-model"),
+      model: Model.new("fable"),
       host: "test-host"
     })
   end

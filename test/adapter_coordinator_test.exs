@@ -1059,21 +1059,21 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 0, 'admin_add', 1)"
       )
 
-    session_key = "agent:main:clawline:operator:main"
+    session_key = "agent:main:clawline:sample-user:main"
 
     Tightbeam.Org.create(db, %{
       session_key: session_key,
       display_name: "Main",
-      owner_user_id: "operator",
-      origin: "user:operator",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Tightbeam.Model.new("claude-example-5")
+      model: Tightbeam.Model.new("claude-fable-5")
     })
 
     session_key
@@ -1084,7 +1084,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       Tightbeam.Ledger.enqueue(db, %{
         session_key: session_key,
         message_id: "m_#{System.unique_integer([:positive])}",
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "do the thing"
       })
 

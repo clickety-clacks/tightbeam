@@ -33,7 +33,7 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
         Map.new(Harness.all(), fn harness ->
           entries =
             if harness.wire_name() == "claude" do
-              [%{family: "example-model", context: nil, efforts: [], provider: :anthropic}]
+              [%{family: "fable", context: nil, efforts: [], provider: :anthropic}]
             else
               []
             end
@@ -60,7 +60,7 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
       {:paired, device} =
         Tightbeam.TestCase.claim_org(db, %{
           device_id: "firehose-acceptance-#{id}",
-          claimed_name: "user",
+          claimed_name: "Sample User",
           platform: nil,
           model: nil
         })

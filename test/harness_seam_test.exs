@@ -149,7 +149,7 @@ defmodule Tightbeam.HarnessSeamTest do
   # The adapter accepts a
   # NARROWER model vocabulary than the derived catalog, and every substitution for a
   # refused model is a silent downgrade — `claude-opus-5` -> `opus` delivers Opus 4.8,
-  # and `claude-example-5` has no equivalent at all. This pins the recorded table AND the
+  # and `claude-fable-5` has no equivalent at all. This pins the recorded table AND the
   # rule that no substitution is smuggled in later: a request the adapter refuses must
   # fail, not quietly become a different model.
   test "the recorded claude model vocabulary never substitutes a refused model" do
@@ -158,9 +158,9 @@ defmodule Tightbeam.HarnessSeamTest do
     # The offered model set depends on the configured home; the catalog must
     # remain aligned with values the adapter can select.
     assert Enum.sort(selectable) ==
-             Enum.sort(~w(default sonnet opus haiku example-model claude-sonnet-5 claude-opus-4-8
-                          claude-haiku-4-5-20251001 claude-example-5 claude-opus-5
-                          claude-example-5-1 claude-example-5-1[1m]))
+             Enum.sort(~w(default sonnet opus haiku fable claude-sonnet-5 claude-opus-4-8
+                          claude-haiku-4-5-20251001 claude-fable-5 claude-opus-5
+                          claude-fable-5-1 claude-fable-5-1[1m]))
 
     # Values the adapter refuses must never appear here, or the gateway could
     # offer a model the adapter cannot select.
@@ -196,8 +196,8 @@ defmodule Tightbeam.HarnessSeamTest do
   test "claude 0.73.0 aliases select Example Model 5.1 at both context widths" do
     config = Tightbeam.Harness.Claude.session_config(%{}, "guidance")
 
-    assert config.model_option_aliases["example-model"] == "claude-example-5-1"
-    assert config.model_option_aliases["example-model[1m]"] == "claude-example-5-1[1m]"
+    assert config.model_option_aliases["fable"] == "claude-fable-5-1"
+    assert config.model_option_aliases["fable[1m]"] == "claude-fable-5-1[1m]"
     assert Tightbeam.Harness.Claude.adapter_version() == "0.73.0"
   end
 end

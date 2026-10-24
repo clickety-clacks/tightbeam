@@ -25,7 +25,7 @@ defmodule Tightbeam.Productions.BubbleTest do
   # delivery-driven, the terminal alert is tokenless and stands as a fact,
   # and retraction is observed. Lineage under test:
   #
-  #   main (operator's personal session, parentless)
+  #   main (sample-user's personal session, parentless)
   #     └─ supervisor
   #          └─ holder
   setup do
@@ -45,10 +45,10 @@ defmodule Tightbeam.Productions.BubbleTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 1, 'admin_add', 1)"
       )
 
-    main = session(db, Org.personal_session_key("operator"), nil, true)
+    main = session(db, Org.personal_session_key("sample-user"), nil, true)
     supervisor = session(db, "supervisor", main.session_key)
     holder = session(db, "holder", supervisor.session_key)
 
@@ -61,13 +61,13 @@ defmodule Tightbeam.Productions.BubbleTest do
         session_key: key,
         display_name: key,
         kind: if(built_in?, do: "main", else: "custom"),
-        owner_user_id: "operator",
-        origin: "user:operator",
+        owner_user_id: "sample-user",
+        origin: "user:sample-user",
         archetype: "default",
         harness: "claude",
         provider: "anthropic",
         host: "testhost",
-        model: Model.new("example-model"),
+        model: Model.new("fable"),
         spawned_by: spawned_by,
         operational_parent: spawned_by,
         is_built_in: built_in?
@@ -80,7 +80,7 @@ defmodule Tightbeam.Productions.BubbleTest do
   # queue through the one turn sink, claimed, and finished into `terminal`.
   defp fail_turn!(db, session_key, terminal \\ "failed", error \\ "quota exhausted") do
     :appended =
-      Tightbeam.Gateway.deliver_prompt(session_key, "user:operator", "do the thing",
+      Tightbeam.Gateway.deliver_prompt(session_key, "user:sample-user", "do the thing",
         db: db,
         device_id: "test",
         client_message_id: "cause-#{System.unique_integer([:positive])}"
@@ -107,7 +107,7 @@ defmodule Tightbeam.Productions.BubbleTest do
       Ledger.enqueue(db, %{
         session_key: session_key,
         message_id: "assigned-cause-#{System.unique_integer([:positive])}",
-        origin: "user:operator",
+        origin: "user:sample-user",
         prompt: "assigned work",
         assignment_id: assignment_id
       })
@@ -213,7 +213,7 @@ defmodule Tightbeam.Productions.BubbleTest do
         ctx.db,
         """
         INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt)
-        VALUES ('asg_exact_root','exact root','holder','operator',1)
+        VALUES ('asg_exact_root','exact root','holder','sample-user',1)
         """
       )
 
@@ -317,13 +317,13 @@ defmodule Tightbeam.Productions.BubbleTest do
       Org.create(ctx.db, %{
         session_key: "healthy-holder",
         display_name: "Healthy holder",
-        owner_user_id: "operator",
-        origin: "user:operator",
+        owner_user_id: "sample-user",
+        origin: "user:sample-user",
         archetype: "default",
         harness: "claude",
         provider: "anthropic",
         host: "healthy-host",
-        model: Model.new("example-model"),
+        model: Model.new("fable"),
         spawned_by: ctx.supervisor.session_key,
         operational_parent: ctx.supervisor.session_key
       })
@@ -338,7 +338,7 @@ defmodule Tightbeam.Productions.BubbleTest do
 
   test "a canceled cause turn never bubbles — cancellation is a decision", ctx do
     :appended =
-      Tightbeam.Gateway.deliver_prompt("holder", "user:operator", "doomed",
+      Tightbeam.Gateway.deliver_prompt("holder", "user:sample-user", "doomed",
         db: ctx.db,
         device_id: "test",
         client_message_id: "c-cancel"
@@ -388,7 +388,7 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     :ok = Bubble.recognize_terminal(ctx.db, top.seq)
 
-    assert ConditionFacts.standing?(ctx.db, "user-alerted", "operator")
+    assert ConditionFacts.standing?(ctx.db, "user-alerted", "sample-user")
 
     {:ok, [[alert_content, "substrate"]]} =
       DB.query(
@@ -434,7 +434,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     :ok = Bubble.recognize_terminal(ctx.db, seq)
 
     assert notice_turn(ctx.db, "supervisor") == []
-    assert ConditionFacts.standing?(ctx.db, "user-alerted", "operator")
+    assert ConditionFacts.standing?(ctx.db, "user-alerted", "sample-user")
   end
 
   test "the first delivered turn for an alerted owner clears the alert", ctx do
@@ -442,15 +442,15 @@ defmodule Tightbeam.Productions.BubbleTest do
       DB.transaction(ctx.db, fn txn ->
         ConditionFacts.file_in_txn(txn, %{
           kind: "user-alerted",
-          scope: "operator",
+          scope: "sample-user",
           origin: "process:tightbeam"
         })
       end)
 
-    assert ConditionFacts.standing?(ctx.db, "user-alerted", "operator")
+    assert ConditionFacts.standing?(ctx.db, "user-alerted", "sample-user")
 
     :appended =
-      Tightbeam.Gateway.deliver_prompt("holder", "user:operator", "the wall fell",
+      Tightbeam.Gateway.deliver_prompt("holder", "user:sample-user", "the wall fell",
         db: ctx.db,
         device_id: "test",
         client_message_id: "c-heal"
@@ -463,7 +463,7 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
 
-    refute ConditionFacts.standing?(ctx.db, "user-alerted", "operator")
+    refute ConditionFacts.standing?(ctx.db, "user-alerted", "sample-user")
 
     # And the next exhausted climb alerts AGAIN — the machine acts on current
     # state, and the current state says the user has not been told about the
@@ -481,7 +481,7 @@ defmodule Tightbeam.Productions.BubbleTest do
       :ok = Bubble.recognize_terminal(ctx.db, notice.seq)
     end
 
-    assert ConditionFacts.standing?(ctx.db, "user-alerted", "operator")
+    assert ConditionFacts.standing?(ctx.db, "user-alerted", "sample-user")
   end
 
   # Review B2: a cause turn whose lineage EXISTS but holds no active rung is
@@ -497,7 +497,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     seq = fail_turn!(ctx.db, "holder")
     :ok = Bubble.recognize_terminal(ctx.db, seq)
 
-    assert ConditionFacts.standing?(ctx.db, "user-alerted", "operator")
+    assert ConditionFacts.standing?(ctx.db, "user-alerted", "sample-user")
     assert notice_turn(ctx.db, "supervisor") == []
   end
 
@@ -538,7 +538,7 @@ defmodule Tightbeam.Productions.BubbleTest do
   test "the bubble LHS: terminal admission by notice-ness, suppression by owner", ctx do
     cause = %{
       notice?: false,
-      owner: "operator",
+      owner: "sample-user",
       session_key: "holder",
       cause_seq: 1,
       status: "failed"
@@ -555,7 +555,7 @@ defmodule Tightbeam.Productions.BubbleTest do
       DB.transaction(ctx.db, fn txn ->
         ConditionFacts.file_in_txn(txn, %{
           kind: "user-alerted",
-          scope: "operator",
+          scope: "sample-user",
           origin: "process:tightbeam"
         })
       end)
@@ -578,7 +578,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     seq = fail_turn!(ctx.db, "holder")
 
     :appended =
-      Tightbeam.Gateway.deliver_prompt("holder", "user:operator", "still queued",
+      Tightbeam.Gateway.deliver_prompt("holder", "user:sample-user", "still queued",
         db: ctx.db,
         device_id: "test",
         client_message_id: "c-pending"
@@ -611,7 +611,7 @@ defmodule Tightbeam.Productions.BubbleTest do
       DB.transaction(ctx.db, fn txn ->
         ConditionFacts.file_in_txn(txn, %{
           kind: "user-alerted",
-          scope: "operator",
+          scope: "sample-user",
           origin: "session:holder"
         })
       end)
@@ -649,7 +649,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     cause_seq = fail_assigned_turn!(ctx.db, ctx.main.session_key, assignment.id)
     assert :ok = Bubble.recognize_terminal(ctx.db, cause_seq)
 
-    assert {:ok, [["user:operator"]]} =
+    assert {:ok, [["user:sample-user"]]} =
              DB.query(
                ctx.db,
                "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1",
@@ -659,8 +659,8 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert %{outcome: "revoked"} =
              Assignments.__handle__(ctx.db, "revoke-assignment", %{
                verb: "revoke-assignment",
-               origin: "user:operator",
-               principal: {:user, "operator"},
+               origin: "user:sample-user",
+               principal: {:user, "sample-user"},
                session_key: nil,
                params: %{assignment_id: assignment.id, reason: "terminal disposition"}
              })

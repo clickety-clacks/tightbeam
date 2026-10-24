@@ -8,52 +8,52 @@ defmodule Tightbeam.RolesTest do
     db = :"roles_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    ensure_main_session(db, "operator")
+    ensure_main_session(db, "sample-user")
     %{db: db}
   end
 
   test "create validates names, uniqueness, and active bindings", %{db: db} do
-    active = session(db, "agent:active", "operator")
+    active = session(db, "agent:active", "sample-user")
 
     retired =
-      session(db, "agent:retired", "operator")
-      |> then(&Org.retire(db, &1.session_key, "user:operator", 1_000))
+      session(db, "agent:retired", "sample-user")
+      |> then(&Org.retire(db, &1.session_key, "user:sample-user", 1_000))
 
-    assert %{name: "builder", bound_session_key: nil, owner_user_id: "operator"} =
-             Roles.create!(db, "builder", "operator", nil)
+    assert %{name: "builder", bound_session_key: nil, owner_user_id: "sample-user"} =
+             Roles.create!(db, "builder", "sample-user", nil)
 
     assert %{name: "review:lead", bound_session_key: "agent:active"} =
-             Roles.create!(db, "review:lead", "operator", active.session_key)
+             Roles.create!(db, "review:lead", "sample-user", active.session_key)
 
-    assert {:error, %{code: "role_exists"}} = Roles.create!(db, "builder", "operator", nil)
-    assert {:error, %{code: "invalid_role_name"}} = Roles.create!(db, "Bad_Name", "operator", nil)
+    assert {:error, %{code: "role_exists"}} = Roles.create!(db, "builder", "sample-user", nil)
+    assert {:error, %{code: "invalid_role_name"}} = Roles.create!(db, "Bad_Name", "sample-user", nil)
 
     assert {:error, %{code: "invalid_role_name", message: agent_message}} =
-             Roles.create!(db, "agent:reserved", "operator", nil)
+             Roles.create!(db, "agent:reserved", "sample-user", nil)
 
     assert agent_message =~ "reserved agent:"
 
     assert {:error, %{code: "invalid_role_name", message: user_message}} =
-             Roles.create!(db, "user:reserved", "operator", nil)
+             Roles.create!(db, "user:reserved", "sample-user", nil)
 
     assert user_message =~ "reserved user:"
 
     assert {:error, %{code: "unknown_session"}} =
-             Roles.create!(db, "missing", "operator", "agent:missing")
+             Roles.create!(db, "missing", "sample-user", "agent:missing")
 
     assert {:error, %{code: "unknown_session"}} =
-             Roles.create!(db, "retired", "operator", retired.session_key)
+             Roles.create!(db, "retired", "sample-user", retired.session_key)
   end
 
   test "bind, remove, get, and sorted list return every documented branch", %{db: db} do
-    session(db, "agent:a", "operator")
+    session(db, "agent:a", "sample-user")
 
     retired =
-      session(db, "agent:r", "operator")
-      |> then(&Org.retire(db, &1.session_key, "user:operator", 1_000))
+      session(db, "agent:r", "sample-user")
+      |> then(&Org.retire(db, &1.session_key, "user:sample-user", 1_000))
 
-    Roles.create!(db, "zeta", "operator", nil)
-    Roles.create!(db, "alpha", "operator", nil)
+    Roles.create!(db, "zeta", "sample-user", nil)
+    Roles.create!(db, "alpha", "sample-user", nil)
 
     assert Roles.get(db, "missing") == nil
     assert Enum.map(Roles.list(db), & &1.name) == ["alpha", "zeta"]
@@ -70,18 +70,18 @@ defmodule Tightbeam.RolesTest do
   end
 
   test "resolution pins active bindings and falls back for every other incarnation", %{db: db} do
-    main = Org.personal_session_key("operator")
-    active = session(db, "agent:held", "operator")
-    stale = session(db, "agent:stale", "operator")
+    main = Org.personal_session_key("sample-user")
+    active = session(db, "agent:held", "sample-user")
+    stale = session(db, "agent:stale", "sample-user")
 
-    Roles.create!(db, "unbound", "operator", nil)
-    Roles.create!(db, "held", "operator", active.session_key)
-    Roles.create!(db, "stale", "operator", stale.session_key)
+    Roles.create!(db, "unbound", "sample-user", nil)
+    Roles.create!(db, "held", "sample-user", active.session_key)
+    Roles.create!(db, "stale", "sample-user", stale.session_key)
 
     assert {:ok, active.session_key, false} == Roles.resolve(db, "held")
     assert {:ok, main, true} == Roles.resolve(db, "unbound")
 
-    Org.retire(db, stale.session_key, "user:operator", 1_000)
+    Org.retire(db, stale.session_key, "user:sample-user", 1_000)
     assert {:ok, main, true} == Roles.resolve(db, "stale")
 
     {:ok, _} = DB.query(db, "DELETE FROM sessions WHERE sessionKey = ?1", [stale.session_key])
@@ -99,7 +99,7 @@ defmodule Tightbeam.RolesTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("example-model")
+      model: Model.new("fable")
     })
   end
 end

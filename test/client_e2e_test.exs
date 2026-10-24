@@ -1561,8 +1561,8 @@ defmodule Tightbeam.ClientE2ETest do
   describe "the client's session-status decode contract" do
     test "a full payload has no gaps" do
       assert Journeys.decode_contract_gaps(%{
-               "sessionKey" => "agent:main:user:operator",
-               "display" => %{"model" => "example-model"},
+               "sessionKey" => "agent:main:user:sample-user",
+               "display" => %{"model" => "fable"},
                "run" => %{"state" => "idle"},
                "capabilities" => %{}
              }) == []
@@ -1570,8 +1570,8 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "each field the Swift decoder requires is reported by name when missing" do
       full = %{
-        "sessionKey" => "agent:main:user:operator",
-        "display" => %{"model" => "example-model"},
+        "sessionKey" => "agent:main:user:sample-user",
+        "display" => %{"model" => "fable"},
         "run" => %{"state" => "idle"},
         "capabilities" => %{}
       }
@@ -1784,7 +1784,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "J0 passes: the wire pairs, authenticates, seeds Main and syncs", ctx do
       {:ok, %{token: token}} =
-        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "user")
+        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "Sample User")
 
       {:ok, client} = SimClient.connect("127.0.0.1", ctx.port, token, device_id: "sim-j0")
 
@@ -1804,7 +1804,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "posting with a malformed id is refused on the wire, not silently dropped", ctx do
       {:ok, %{token: token}} =
-        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-bad-id", claimed_name: "user")
+        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-bad-id", claimed_name: "Sample User")
 
       {:ok, client} = SimClient.connect("127.0.0.1", ctx.port, token, device_id: "sim-bad-id")
       watermark = SimClient.mark(client)
@@ -1837,7 +1837,7 @@ defmodule Tightbeam.ClientE2ETest do
       client: client,
       main_key: nil,
       gateway: nil,
-      leg: %{harness: "claude", host: "testhost", model: "example-model"},
+      leg: %{harness: "claude", host: "testhost", model: "fable"},
       turn_wait_ms: 10_000,
       settle_ms: 250
     }
@@ -1877,7 +1877,7 @@ defmodule Tightbeam.ClientE2ETest do
           host: "testhost",
           harness: :claude,
           provider: fn -> :anthropic end,
-          model: Model.new("example-model")
+          model: Model.new("fable")
         }
       )
 

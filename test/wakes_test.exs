@@ -187,28 +187,28 @@ defmodule Tightbeam.WakesTest do
       DB.execute(
         db,
         """
-        INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 1, 'admin_add', 1);
+        INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 1, 'admin_add', 1);
         INSERT INTO sessions
           (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
            operationalParent, archetype, harness,
            provider, model, host, state, createdAt, updatedAt)
         VALUES
-          ('agent:main:clawline:operator:main', 'Main', 'main', 1, 'operator', 'user:operator',
-           'agent:main:clawline:operator:main', 'default', 'claude',
-           'anthropic', 'example-model', 'sixth-host', 'active', 1, 1),
-          ('retiring', 'retiring', 'custom', 0, 'operator', 'user:operator',
-           'agent:main:clawline:operator:main', 'default', 'claude',
-           'anthropic', 'example-model', 'sixth-host', 'active', 1, 1),
-          ('replacement', 'replacement', 'custom', 0, 'operator', 'user:operator',
-           'agent:main:clawline:operator:main', 'default', 'claude', 'anthropic',
-           'example-model', 'sixth-host', 'active', 1, 1);
+          ('agent:main:clawline:sample-user:main', 'Main', 'main', 1, 'sample-user', 'user:sample-user',
+           'agent:main:clawline:sample-user:main', 'default', 'claude',
+           'anthropic', 'fable', 'sixth-host', 'active', 1, 1),
+          ('retiring', 'retiring', 'custom', 0, 'sample-user', 'user:sample-user',
+           'agent:main:clawline:sample-user:main', 'default', 'claude',
+           'anthropic', 'fable', 'sixth-host', 'active', 1, 1),
+          ('replacement', 'replacement', 'custom', 0, 'sample-user', 'user:sample-user',
+           'agent:main:clawline:sample-user:main', 'default', 'claude', 'anthropic',
+           'fable', 'sixth-host', 'active', 1, 1);
         INSERT INTO work_items
           (id, title, ownerUserId, state, createdByUser, createdAt)
-        VALUES ('wi_retarget', 'Retarget work', 'operator', 'open', 'operator', 1);
+        VALUES ('wi_retarget', 'Retarget work', 'sample-user', 'open', 'sample-user', 1);
         INSERT INTO assignments
           (id, subject, holderKey, openedByUser, openedAt, workItemId)
         VALUES
-          ('asg_retarget', 'retarget me', 'retiring', 'operator', 1,
+          ('asg_retarget', 'retarget me', 'retiring', 'sample-user', 1,
            'wi_retarget');
         INSERT INTO supervision_entitlements
           (assignmentId, generation, dueAt, state, lastAttemptGeneration,
@@ -257,7 +257,7 @@ defmodule Tightbeam.WakesTest do
         INSERT INTO turns
           (sessionKey,messageId,origin,prompt,assignmentId,status,createdAt,endedAt)
         VALUES
-          ('retiring','root-retarget','user:operator','root','asg_retarget','delivered',1,2)
+          ('retiring','root-retarget','user:sample-user','root','asg_retarget','delivered',1,2)
         """
       )
 
@@ -464,12 +464,12 @@ defmodule Tightbeam.WakesTest do
   end
 
   defp active_sessions!(db, keys) do
-    main = "agent:main:clawline:operator:main"
+    main = "agent:main:clawline:sample-user:main"
 
     values =
       keys
       |> Enum.map(fn key ->
-        "('#{key}', '#{key}', 'operator', 'user:operator', '#{main}', 'default', 'claude', 'anthropic', 'example-model', 'test-host', 'active', 1, 1)"
+        "('#{key}', '#{key}', 'sample-user', 'user:sample-user', '#{main}', 'default', 'claude', 'anthropic', 'fable', 'test-host', 'active', 1, 1)"
       end)
       |> Enum.join(",\n")
 
@@ -477,14 +477,14 @@ defmodule Tightbeam.WakesTest do
       DB.execute(
         db,
         """
-        INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 1, 'admin_add', 1);
+        INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 1, 'admin_add', 1);
         INSERT OR IGNORE INTO sessions
           (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
            operationalParent, archetype, harness, provider, model, host, state,
            createdAt, updatedAt)
         VALUES
-          ('#{main}', 'Main', 'main', 1, 'operator', 'user:operator', '#{main}',
-           'default', 'claude', 'anthropic', 'example-model', 'test-host', 'active', 1, 1);
+          ('#{main}', 'Main', 'main', 1, 'sample-user', 'user:sample-user', '#{main}',
+           'default', 'claude', 'anthropic', 'fable', 'test-host', 'active', 1, 1);
         INSERT INTO sessions
           (sessionKey, displayName, ownerUserId, origin, operationalParent,
            archetype, harness, provider, model, host, state, createdAt, updatedAt)

@@ -72,7 +72,7 @@ defmodule Tightbeam.Wire.SocketTest do
         host: "testhost",
         harness: :claude,
         provider: fn -> :anthropic end,
-        model: Model.new("example-model")
+        model: Model.new("fable")
       },
       ping_interval_ms: 60_000,
       pong_timeout_ms: 60_000
@@ -103,7 +103,7 @@ defmodule Tightbeam.Wire.SocketTest do
     {:paired, device} =
       claim_org(ctx.db, %{
         device_id: "chat-e2e",
-        claimed_name: "user",
+        claimed_name: "Sample User",
         platform: nil,
         model: nil
       })
@@ -221,7 +221,7 @@ defmodule Tightbeam.Wire.SocketTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("example-model")
+      model: Model.new("fable")
     })
 
     {:push, {:text, not_found}, _live} =
@@ -358,7 +358,7 @@ defmodule Tightbeam.Wire.SocketTest do
     {:paired, device} =
       claim_org(ctx.db, %{
         device_id: "reply-reference",
-        claimed_name: "user",
+        claimed_name: "Sample User",
         platform: nil,
         model: nil
       })
@@ -400,7 +400,7 @@ defmodule Tightbeam.Wire.SocketTest do
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("example-model")
+      model: Model.new("fable")
     })
 
     {:appended, _cross_session_target} =
@@ -557,7 +557,7 @@ defmodule Tightbeam.Wire.SocketTest do
     {:paired, device} =
       claim_org(ctx.db, %{
         device_id: "zero-reply-reference",
-        claimed_name: "user",
+        claimed_name: "Sample User",
         platform: nil,
         model: nil
       })
@@ -705,7 +705,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
   test "auth registers, replays at most 500, then sends sync_complete", ctx do
     {:paired, device} =
-      claim_org(ctx.db, %{device_id: "d1", claimed_name: "user", platform: nil, model: nil})
+      claim_org(ctx.db, %{device_id: "d1", claimed_name: "Sample User", platform: nil, model: nil})
 
     key = Org.personal_session_key(device.user_id)
 
@@ -734,7 +734,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
   test "concurrent first auths converge on one personal main stream", ctx do
     {:paired, device} =
-      claim_org(ctx.db, %{device_id: "race", claimed_name: "user", platform: nil, model: nil})
+      claim_org(ctx.db, %{device_id: "race", claimed_name: "Sample User", platform: nil, model: nil})
 
     proxy = :"main_seed_race_db_#{System.unique_integer([:positive])}"
     start_supervised!({MainSeedRaceDB, {proxy, ctx.db}})
@@ -769,7 +769,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
   test "drain filters a mid-replay push already covered by the replay window", ctx do
     {:paired, device} =
-      claim_org(ctx.db, %{device_id: "d1", claimed_name: "user", platform: nil, model: nil})
+      claim_org(ctx.db, %{device_id: "d1", claimed_name: "Sample User", platform: nil, model: nil})
 
     key = Org.personal_session_key(device.user_id)
 
@@ -808,7 +808,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
   test "drain never deletes a stalled frame the replay window excluded", ctx do
     {:paired, device} =
-      claim_org(ctx.db, %{device_id: "d1", claimed_name: "user", platform: nil, model: nil})
+      claim_org(ctx.db, %{device_id: "d1", claimed_name: "Sample User", platform: nil, model: nil})
 
     key = Org.personal_session_key(device.user_id)
 

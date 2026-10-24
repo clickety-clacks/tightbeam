@@ -336,7 +336,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
       host: @host,
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("example-model")
+      model: Model.new("fable")
     })
   end
 

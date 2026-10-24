@@ -108,20 +108,20 @@ defmodule Tightbeam.IdPrefixOperationsTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 0, 'admin_add', 1)"
       )
 
-    ensure_main_session(db, "operator")
+    ensure_main_session(db, "sample-user")
 
     Org.create(db, %{
       session_key: "holder",
       display_name: "holder",
-      owner_user_id: "operator",
-      origin: "user:operator",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("example-model"),
+      model: Model.new("fable"),
       host: "test-host"
     })
 
@@ -132,7 +132,7 @@ defmodule Tightbeam.IdPrefixOperationsTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO assignments (id, subject, holderKey, holderFallback, openedByUser, openedAt) VALUES ('asg_unique_alpha', 'work', 'holder', 0, 'operator', 1)"
+        "INSERT INTO assignments (id, subject, holderKey, holderFallback, openedByUser, openedAt) VALUES ('asg_unique_alpha', 'work', 'holder', 0, 'sample-user', 1)"
       )
 
     attests_call = %{
@@ -148,14 +148,14 @@ defmodule Tightbeam.IdPrefixOperationsTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_unique_alpha', 'work', 'operator', 'operator', 1)"
+        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_unique_alpha', 'work', 'sample-user', 'sample-user', 1)"
       )
 
     get_call = %{
       verb: "work-item-get",
-      origin: "user:operator",
+      origin: "user:sample-user",
       session_key: nil,
-      principal: {:user, "operator"},
+      principal: {:user, "sample-user"},
       params: %{work_item_id: "wi_unique"}
     }
 
@@ -172,16 +172,16 @@ defmodule Tightbeam.IdPrefixOperationsTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_race_alpha', 'alpha', 'operator', 'operator', 1)"
+        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_race_alpha', 'alpha', 'sample-user', 'sample-user', 1)"
       )
 
     completion_attest_id = completion_fixture!(ctx.db, "wi_race_alpha", "alpha")
 
     call = %{
       verb: "work-item-close",
-      origin: "user:operator",
+      origin: "user:sample-user",
       session_key: nil,
-      principal: {:user, "operator"},
+      principal: {:user, "sample-user"},
       params: %{
         work_item_id: "wi_race",
         completion_attest_id: completion_attest_id
@@ -189,7 +189,7 @@ defmodule Tightbeam.IdPrefixOperationsTest do
       on_id_resolved_in_txn: fn txn, :work_item, "wi_race_alpha" ->
         Txn.q(
           txn,
-          "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_race_beta', 'beta', 'operator', 'operator', 2)"
+          "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_race_beta', 'beta', 'sample-user', 'sample-user', 2)"
         )
       end
     }
@@ -209,7 +209,7 @@ defmodule Tightbeam.IdPrefixOperationsTest do
       {:ok, _} =
         DB.query(
           ctx.db,
-          "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES (?1, ?1, 'operator', 'operator', 1)",
+          "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES (?1, ?1, 'sample-user', 'sample-user', 1)",
           [id]
         )
     end
@@ -219,9 +219,9 @@ defmodule Tightbeam.IdPrefixOperationsTest do
     call = fn verb, prefix, params ->
       WorkItems.__handle__(ctx.db, verb, %{
         verb: verb,
-        origin: "user:operator",
+        origin: "user:sample-user",
         session_key: nil,
-        principal: {:user, "operator"},
+        principal: {:user, "sample-user"},
         params: Map.merge(%{work_item_id: prefix}, params)
       })
     end
@@ -246,7 +246,7 @@ defmodule Tightbeam.IdPrefixOperationsTest do
       {:ok, _} =
         DB.query(
           ctx.db,
-          "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES (?1, ?1, 'operator', 'operator', 1)",
+          "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES (?1, ?1, 'sample-user', 'sample-user', 1)",
           [id]
         )
     end
@@ -266,9 +266,9 @@ defmodule Tightbeam.IdPrefixOperationsTest do
     call = fn id ->
       WorkItems.__handle__(ctx.db, "work-item-close", %{
         verb: "work-item-close",
-        origin: "user:operator",
+        origin: "user:sample-user",
         session_key: nil,
-        principal: {:user, "operator"},
+        principal: {:user, "sample-user"},
         params: %{work_item_id: id},
         on_work_item_change: fn _, _ -> send(self(), :unexpected_callback) end
       })
@@ -294,7 +294,7 @@ defmodule Tightbeam.IdPrefixOperationsTest do
 
         Txn.q(
           txn,
-          "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES (?1,'close fixture','holder','operator',1,'open',?2)",
+          "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES (?1,'close fixture','holder','sample-user',1,'open',?2)",
           [assignment_id, work_item_id]
         )
 

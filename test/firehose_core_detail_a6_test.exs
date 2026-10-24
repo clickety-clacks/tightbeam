@@ -81,7 +81,7 @@ defmodule Tightbeam.Firehose.CoreDetailA6Test do
       Map.new(Tightbeam.Harness.all(), fn harness ->
         entries =
           if harness.wire_name() == "claude" do
-            [%{family: "example-model", context: nil, efforts: [], provider: :anthropic}]
+            [%{family: "fable", context: nil, efforts: [], provider: :anthropic}]
           else
             []
           end

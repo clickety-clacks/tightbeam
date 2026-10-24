@@ -62,7 +62,7 @@ defmodule Tightbeam.JobTraceTest do
          modelContext, harness, status, createdAt, endedAt)
       VALUES
         ('holder', 'm_direct', 'process:tightbeam', 'brief', 'asg_direct', 'wi_trace',
-         'gpt-5.6-example', 'high', '1m', 'codex', 'delivered', 100, 100),
+         'gpt-5.6-sol', 'high', '1m', 'codex', 'delivered', 100, 100),
         ('owner-session', 'm_nag', 'process:tightbeam', 'nag', NULL, 'wi_trace',
          NULL, NULL, NULL, NULL, 'queued', 100, NULL);
 
@@ -218,7 +218,7 @@ defmodule Tightbeam.JobTraceTest do
     # The stamp must arrive as FIELDS with their real values. Asserting only
     # that the keys exist stays green if a consumer hardcodes or drops them.
     stamped = Enum.find(trace.timeline, &(&1.type == "turn_start" and &1.id == 1))
-    assert {stamped.model, stamped.context, stamped.effort} == {"gpt-5.6-example", "1m", "high"}
+    assert {stamped.model, stamped.context, stamped.effort} == {"gpt-5.6-sol", "1m", "high"}
     assert stamped.harness == "codex"
 
     assert Enum.any?(trace.timeline, fn
@@ -423,7 +423,7 @@ defmodule Tightbeam.JobTraceTest do
       archetype: "default",
       harness: "claude",
       provider: "anthropic",
-      model: Model.new("example-model"),
+      model: Model.new("fable"),
       host: "test-host"
     })
   end

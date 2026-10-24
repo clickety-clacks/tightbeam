@@ -110,7 +110,7 @@ defmodule Tightbeam.TestCase do
       host: "testhost",
       harness: :claude,
       provider: fn -> :anthropic end,
-      model: Tightbeam.Model.new("example-model")
+      model: Tightbeam.Model.new("fable")
     })
   end
 
@@ -130,7 +130,7 @@ defmodule Tightbeam.TestCase do
           archetype: "default",
           harness: "claude",
           provider: "anthropic",
-          model: Tightbeam.Model.new("example-model"),
+          model: Tightbeam.Model.new("fable"),
           host: "testhost"
         })
 

@@ -135,7 +135,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     inputs =
       ctx.inputs
       |> put(:default_harness, :codex)
-      |> put(:default_model, Tightbeam.Model.new("gpt-5.6-example", effort: "medium"))
+      |> put(:default_model, Tightbeam.Model.new("gpt-5.6-sol", effort: "medium"))
 
     {0, report} = Doctor.evaluate(catalog, inputs)
     failed = find(report, "harness_auth:claude")

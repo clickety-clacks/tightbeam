@@ -30,7 +30,7 @@ defmodule Tightbeam.FirehoseSmokeTest do
   test "acceptance fixture catalog matches its claimed session and preserves overrides" do
     custom_catalog = %{
       {Placement.local_host_name(), "claude"} => [
-        %{family: "example-model", context: nil, efforts: [], provider: :anthropic},
+        %{family: "fable", context: nil, efforts: [], provider: :anthropic},
         %{family: "fixture-extra", context: nil, efforts: [], provider: :anthropic}
       ]
     }
@@ -58,7 +58,7 @@ defmodule Tightbeam.FirehoseSmokeTest do
       assert received["payload"]["host"] == Placement.local_host_name()
       assert received["payload"]["harness"] == "claude"
       assert received["payload"]["provider"] == "anthropic"
-      assert received["payload"]["model"] == "example-model"
+      assert received["payload"]["model"] == "fable"
       assert :ok = WS.close(ws)
     end
   end
@@ -868,8 +868,8 @@ defmodule Tightbeam.FirehoseSmokeTest do
   defp firehose_call(verb, params) do
     %{
       verb: verb,
-      origin: "user:operator",
-      principal: {:user, "operator"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: nil,
       params: params,
       firehose_in_txn: true
