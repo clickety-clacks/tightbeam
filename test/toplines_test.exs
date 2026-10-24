@@ -399,7 +399,11 @@ defmodule Tightbeam.ToplinesTest do
     reopened =
       Toplines.reopen(
         ctx.db,
-        call({:user, "operator"}, %{topline_id: id, reason: "again", idempotency_key: "reopen"}, 16)
+        call(
+          {:user, "operator"},
+          %{topline_id: id, reason: "again", idempotency_key: "reopen"},
+          16
+        )
       )
 
     assert reopened.topline.state == "open"
@@ -416,7 +420,10 @@ defmodule Tightbeam.ToplinesTest do
              )
 
     assert %{topline: %{history: history}} =
-             Toplines.get(ctx.db, read_call({:user, "operator"}, %{topline_id: id, history: true}))
+             Toplines.get(
+               ctx.db,
+               read_call({:user, "operator"}, %{topline_id: id, history: true})
+             )
 
     assert Enum.map(history, &{&1.seq, &1.kind}) == [
              {1, "topline_created"},
@@ -647,7 +654,11 @@ defmodule Tightbeam.ToplinesTest do
     topline =
       Toplines.create(
         ctx.db,
-        call({:user, "operator"}, %{title: "Dependency", idempotency_key: "dependency-create"}, 40)
+        call(
+          {:user, "operator"},
+          %{title: "Dependency", idempotency_key: "dependency-create"},
+          40
+        )
       ).topline
 
     membership =
@@ -899,7 +910,10 @@ defmodule Tightbeam.ToplinesTest do
     work_item!(ctx.db, "wi_theirs", "other")
 
     assert %{code: "invalid_message"} =
-             Toplines.create(ctx.db, call({:user, "operator"}, %{title: " ", idempotency_key: "k"}))
+             Toplines.create(
+               ctx.db,
+               call({:user, "operator"}, %{title: " ", idempotency_key: "k"})
+             )
 
     assert %{code: "invalid_message"} =
              Toplines.create(

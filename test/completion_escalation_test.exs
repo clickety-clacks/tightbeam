@@ -25,7 +25,8 @@ defmodule Tightbeam.CompletionEscalationTest do
     start_supervised!({DB, path: ":memory:", name: db})
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     :ok = Tightbeam.Schema.ensure_all(db)
-    assert {:ok, _} = Placement.register_host(db, "test-host", %{ssh: "test-host", base_dir: "/tmp"})
+    assert {:ok, _} =
+             Placement.register_host(db, "test-host", %{ssh: "test-host", base_dir: "/tmp"})
 
     {:ok, _} =
       DB.query(
@@ -763,7 +764,8 @@ defmodule Tightbeam.CompletionEscalationTest do
     db_child = %{id: db, start: {DB, :start_link, [[path: path, name: db]]}}
     start_supervised!(db_child)
     :ok = Tightbeam.Schema.ensure_all(db)
-    assert {:ok, _} = Placement.register_host(db, "test-host", %{ssh: "test-host", base_dir: "/tmp"})
+    assert {:ok, _} =
+             Placement.register_host(db, "test-host", %{ssh: "test-host", base_dir: "/tmp"})
 
     assert {:ok, _} =
              DB.query(

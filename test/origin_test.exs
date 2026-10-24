@@ -7,12 +7,13 @@ defmodule Tightbeam.OriginTest do
 
   test "parse and class read the closed class set structurally" do
     assert Origin.parse("user:operator") == {:user, "operator"}
-    assert Origin.parse == {:agent, "reviewer"}
+    assert Origin.parse() == {:agent, "reviewer"}
     assert Origin.parse("process:tightbeam") == {:process, "tightbeam"}
     assert Origin.parse("remedy:review-before-merge") == {:remedy, "review-before-merge"}
 
     # The identifier keeps its own colons — sessionKeys are colon-shaped.
-    assert Origin.parse("agent:main:clawline:operator:main") == {:agent, "main:clawline:operator:main"}
+    assert Origin.parse("agent:main:clawline:operator:main") ==
+             {:agent, "main:clawline:operator:main"}
 
     assert Origin.class("user:operator") == "user"
     assert Origin.class("remedy:r") == "remedy"
@@ -25,7 +26,7 @@ defmodule Tightbeam.OriginTest do
 
   test "started_by collapses every class onto the wire's three-way axis" do
     assert Origin.started_by("user:operator") == "user"
-    assert Origin.started_by == "agent"
+    assert Origin.started_by() == "agent"
 
     # Automation and rail remedies are both the substrate standing a session
     # up: nobody in the org asked for it, so the client hides it until adopted.

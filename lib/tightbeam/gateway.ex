@@ -7795,7 +7795,7 @@ defmodule Tightbeam.Gateway do
   # reached): the deny-on-nil case never precedes the admin check.
   #
   # `URI.decode_www_form/1` reverses `Wakes`'s `pinned_owner_field/1`
-  #: the raw text was LOSSY for a user id
+  # : the raw text was LOSSY for a user id
   # containing a space — "alice bob" pinned and captured back by `\S+` as
   # bare "alice" would transfer the OLD carrier's audit to a real user named
   # "alice." Decoding here is what makes the round trip exact regardless of

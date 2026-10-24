@@ -337,7 +337,8 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     assert get(ctx, "/api/host-env/alpha-host", ctx.admin_device.token).status == 404
 
     parity_cases = [
-      {"org known", "/api/hosts?asUser=operator", "tbc_rest_d1", %{"asUser" => "operator"}, 200, nil},
+      {"org known", "/api/hosts?asUser=operator", "tbc_rest_d1", %{"asUser" => "operator"}, 200,
+       nil},
       {"org unknown", "/api/hosts?asUser=unknown-user", "tbc_rest_d1",
        %{"asUser" => "unknown-user"}, 200, nil},
       {"org empty", "/api/hosts?asUser=", "tbc_rest_d1", %{"asUser" => ""}, 400,

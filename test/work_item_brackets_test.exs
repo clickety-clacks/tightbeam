@@ -605,7 +605,9 @@ defmodule Tightbeam.WorkItemBracketsTest do
     item = create(ctx, {:user, "operator"}, %{title: "Reasoned"})
 
     assert %{workItem: %{failReason: "cannot repro"}} =
-             dispose(ctx, "work-item-fail", {:user, "operator"}, item.id, %{reason: "cannot repro"})
+             dispose(ctx, "work-item-fail", {:user, "operator"}, item.id, %{
+               reason: "cannot repro"
+             })
 
     assert get(ctx, item.id).workItem.failReason == "cannot repro"
     assert Enum.find(list(ctx).workItems, &(&1.id == item.id)).failReason == "cannot repro"
@@ -875,7 +877,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
       )
 
   defp list(ctx),
-    do: ctx.handlers["work-item-list"].(work_item_call("work-item-list", {:user, "operator"}, %{}))
+    do:
+      ctx.handlers["work-item-list"].(work_item_call("work-item-list", {:user, "operator"}, %{}))
 
   defp update(ctx, id, patch),
     do:

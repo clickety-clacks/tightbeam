@@ -1264,7 +1264,14 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:error,
             {:model_apply_failed, %{"message" => "Invalid value for config option model"}}} =
-             Adapter.load_session(adapter, "sess-1", Model.new("example-model"), "/tmp", [], "guidance")
+             Adapter.load_session(
+               adapter,
+               "sess-1",
+               Model.new("example-model"),
+               "/tmp",
+               [],
+               "guidance"
+             )
 
     refute Adapter.knows_session?(adapter, "sess-1")
 

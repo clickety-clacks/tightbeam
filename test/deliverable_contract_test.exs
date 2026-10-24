@@ -1001,7 +1001,12 @@ defmodule Tightbeam.DeliverableContractTest do
     close_first_completion = complete(ctx, close_first_assignment.id, nil)
 
     assert %{ok: true, workItem: %{state: "closed"}} =
-             close(ctx, {:user, "operator"}, close_first_card.id, close_first_completion.attest.id)
+             close(
+               ctx,
+               {:user, "operator"},
+               close_first_card.id,
+               close_first_completion.attest.id
+             )
 
     completion_first_card = create_card(ctx, "Completion probe before close")
 

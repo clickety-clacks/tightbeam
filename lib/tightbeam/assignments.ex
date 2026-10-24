@@ -2328,7 +2328,7 @@ defmodule Tightbeam.Assignments do
     # built of multi-codepoint grapheme clusters (e.g. family-emoji ZWJ
     # sequences) could pass this guard while still tripping the table's CHECK,
     # turning a named `invalid_reason` refusal into a raw database error
-    #.
+    # .
     length_in_code_points = length(String.to_charlist(reason))
 
     if length_in_code_points in 1..2000 and String.trim(reason) != "",

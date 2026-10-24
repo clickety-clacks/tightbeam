@@ -1609,7 +1609,8 @@ defmodule Tightbeam.AdminProjectionTest do
     File.write!(Path.join(source, "intake.md"), "non-allowlisted\n")
 
     Application.put_env(:tightbeam, :identity_source_dir, source)
-    assert {:ok, _revision} = Identity.learn!(ctx.base_dir, "agentic-engineering", "user:operator")
+    assert {:ok, _revision} =
+             Identity.learn!(ctx.base_dir, "agentic-engineering", "user:operator")
 
     identity_dir = Path.join(ctx.base_dir, "identity")
 

@@ -12,7 +12,8 @@ defmodule Tightbeam.IdentityRendererTest do
     catalog = %{
       "specs-home.md" => specs,
       "development-environment.md" => dev,
-      "operating-model.md" => "model-before\n#include \"development-environment.md\"\nmodel-after",
+      "operating-model.md" =>
+        "model-before\n#include \"development-environment.md\"\nmodel-after",
       "operating-manual.md" => "manual-before\n#include \"specs-home.md\"\nmanual-after"
     }
 

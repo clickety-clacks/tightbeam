@@ -26,8 +26,10 @@ defmodule Tightbeam.Stall410Test do
     other = create(ctx.db, {:user, "other"}, "other")
     behind = create(ctx.db, {:user, "operator"}, "behind")
 
-    assert %{mode: "notice"} = deprioritize(ctx.db, {:user, "operator"}, direct.id, behind.id, "d1")
-    assert %{mode: "notice"} = deprioritize(ctx.db, {:user, "operator"}, relayed.id, behind.id, "d2")
+    assert %{mode: "notice"} =
+             deprioritize(ctx.db, {:user, "operator"}, direct.id, behind.id, "d1")
+    assert %{mode: "notice"} =
+             deprioritize(ctx.db, {:user, "operator"}, relayed.id, behind.id, "d2")
 
     assert %{code: "not_example_sourced"} =
              deprioritize(ctx.db, {:user, "other"}, other.id, other.id, "o1")

@@ -144,7 +144,8 @@ defmodule Tightbeam.AssignmentsTest do
   test "assign validates principals, input, liveness, opener typing, and idempotent races", ctx do
     assert %{code: "process_denied"} = handle(ctx, "assign", assign_call({:process, "cron"}))
     assert %{code: "principal_required"} = handle(ctx, "assign", assign_call(nil))
-    assert %{code: "invalid_subject"} = handle(ctx, "assign", assign_call({:user, "operator"}, " "))
+    assert %{code: "invalid_subject"} =
+             handle(ctx, "assign", assign_call({:user, "operator"}, " "))
 
     assert %{code: "invalid_subject"} =
              handle(ctx, "assign", assign_call({:user, "operator"}, String.duplicate("x", 2001)))
@@ -163,7 +164,11 @@ defmodule Tightbeam.AssignmentsTest do
 
     for interval <- [nil, 0, -1] do
       call =
-        Map.put(assign_call({:user, "operator"}, "no interval"), :supervision_interval_ms, interval)
+        Map.put(
+          assign_call({:user, "operator"}, "no interval"),
+          :supervision_interval_ms,
+          interval
+        )
 
       assert %{code: "invalid_supervision_interval"} =
                Assignments.__handle__(ctx.db, "assign", call)
@@ -213,7 +218,10 @@ defmodule Tightbeam.AssignmentsTest do
     Org.retire(ctx.db, "other-session", "user:other", 1_000)
 
     assert %{code: "session_retired"} =
-             handle(ctx, "assign", %{assign_call({:user, "operator"}) | session_key: "other-session"})
+             handle(ctx, "assign", %{
+               assign_call({:user, "operator"})
+               | session_key: "other-session"
+             })
 
     call = assign_call({:user, "operator"}, "once", "same-key")
     tasks = for _ <- 1..2, do: Task.async(fn -> handle(ctx, "assign", call) end)
@@ -612,7 +620,11 @@ defmodule Tightbeam.AssignmentsTest do
 
     for work_item_id <- [second.id, nil, "wi_missing"] do
       replay =
-        handle(ctx, "assign", assign_call({:user, "operator"}, "ignored", "work-key", work_item_id))
+        handle(
+          ctx,
+          "assign",
+          assign_call({:user, "operator"}, "ignored", "work-key", work_item_id)
+        )
 
       assert replay.id == linked.id
       assert replay.workItemId == first.id
@@ -1401,7 +1413,11 @@ defmodule Tightbeam.AssignmentsTest do
 
     # unknown_assignment has no row to snapshot, so it stays a plain assertion.
     assert %{code: "unknown_assignment"} =
-             handle(ctx, "reopen-assignment", reopen_call({:user, "operator"}, "asg_missing", "why"))
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "operator"}, "asg_missing", "why")
+             )
 
     assert_reopen_refused!(
       ctx,
@@ -2308,7 +2324,11 @@ defmodule Tightbeam.AssignmentsTest do
              )
 
     assert %{revocationReason: "second revocation"} =
-             handle(ctx, "assignment-get", assignment_get_call({:user, "operator"}, assignment.id))
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:user, "operator"}, assignment.id)
+             )
 
     assert {:ok, [[2, "second revocation", "test revocation"]]} =
              DB.query(
@@ -2418,7 +2438,11 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert %{revocationReason: "second reason"} =
              current =
-             handle(ctx, "assignment-get", assignment_get_call({:user, "operator"}, assignment.id))
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:user, "operator"}, assignment.id)
+             )
 
     assert %{assignment: %{revocationReason: "second reason"}} =
              WorkState.detail(ctx.db, assignment.id)
@@ -3039,7 +3063,11 @@ defmodule Tightbeam.AssignmentsTest do
     end
 
     assert %{state: "open", revocationReason: nil} =
-             handle(ctx, "assignment-get", assignment_get_call({:user, "operator"}, assignment.id))
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:user, "operator"}, assignment.id)
+             )
 
     assert {:ok, [[0]]} =
              DB.query(
@@ -3077,7 +3105,11 @@ defmodule Tightbeam.AssignmentsTest do
     assert revoked.closedByUser == "operator"
 
     assert %{revocationReason: "the work moved to its replacement"} =
-             handle(ctx, "assignment-get", assignment_get_call({:user, "operator"}, assignment.id))
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:user, "operator"}, assignment.id)
+             )
 
     assert %{
              "class" => "assignment.closed",
@@ -3211,7 +3243,11 @@ defmodule Tightbeam.AssignmentsTest do
              )
 
     assert %{revocationReason: "recorded reason"} =
-             handle(ctx, "assignment-get", assignment_get_call({:user, "operator"}, assignment.id))
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:user, "operator"}, assignment.id)
+             )
   end
 
   test "revocation replay emits no second state callback or accepted handoff", ctx do

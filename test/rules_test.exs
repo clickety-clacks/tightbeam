@@ -22,7 +22,12 @@ defmodule Tightbeam.RulesTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     {:paired, _device} =
-      claim_org(db, %{device_id: "rules-device", claimed_name: "operator", platform: nil, model: nil})
+      claim_org(db, %{
+        device_id: "rules-device",
+        claimed_name: "operator",
+        platform: nil,
+        model: nil
+      })
 
     Enum.each(~w(admin-user other reviewer), &ensure_main_session(db, &1))
 
@@ -340,7 +345,12 @@ defmodule Tightbeam.RulesTest do
   test "caller facts cover origin, admin, multi-role, unbound, retired, and malformed cases",
        ctx do
     {:pending, _} =
-      Devices.pair(ctx.db, %{device_id: "d2", claimed_name: "Test Device", platform: nil, model: nil})
+      Devices.pair(ctx.db, %{
+        device_id: "d2",
+        claimed_name: "Test Device",
+        platform: nil,
+        model: nil
+      })
 
     active = session(ctx.db, "active", "operator")
     retired = session(ctx.db, "retired", "admin-user")

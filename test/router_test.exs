@@ -1393,7 +1393,12 @@ defmodule Tightbeam.Wire.RouterTest do
     assert key == main.session_key
 
     for body <- [
-          %{verb: "assign", asUser: "operator", role: "missing-assignment", params: %{subject: "x"}},
+          %{
+            verb: "assign",
+            asUser: "operator",
+            role: "missing-assignment",
+            params: %{subject: "x"}
+          },
           %{verb: "assign", asUser: "operator", sessionKey: "missing", params: %{subject: "x"}}
         ] do
       response = dispatch_cli(ctx, "tbc_test", body)
@@ -1587,7 +1592,8 @@ defmodule Tightbeam.Wire.RouterTest do
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect"}).status == 200
     assert_receive {:call, %{origin: "agent:held", principal: {:session, "holder-token"}}}
 
-    assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "operator"}).status == 200
+    assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "operator"}).status ==
+             200
     assert_receive {:call, %{origin: "user:operator", principal: {:user, "operator"}}}
 
     # Registering a satellite also provisions its operator endpoint over ssh; this
@@ -1897,7 +1903,11 @@ defmodule Tightbeam.Wire.RouterTest do
         conn(
           :post,
           "/api/session-control",
-          JSON.encode!(%{"sessionKey" => key, "action" => "set_model", "model" => "example-model"})
+          JSON.encode!(%{
+            "sessionKey" => key,
+            "action" => "set_model",
+            "model" => "example-model"
+          })
         )
         |> put_req_header("authorization", "Bearer #{ctx.device.token}")
         |> Router.call(Router.init(opts))

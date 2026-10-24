@@ -133,7 +133,8 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "the run verdict is the worst leg verdict" do
-      good = Scorecard.add(%Leg{harness: "claude", host: "test-host"}, Scorecard.pass("3", "converse"))
+      good =
+        Scorecard.add(%Leg{harness: "claude", host: "test-host"}, Scorecard.pass("3", "converse"))
 
       bad =
         Scorecard.add(

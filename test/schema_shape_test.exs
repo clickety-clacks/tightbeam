@@ -158,7 +158,8 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     assert_principal_duty_shape(db)
 
-    assert {:ok, [[direct_id, "operator", "direct", nil], [relayed_id, "operator", "relayed", source]]} =
+    assert {:ok,
+            [[direct_id, "operator", "direct", nil], [relayed_id, "operator", "relayed", source]]} =
              DB.query(
                db,
                "SELECT workItemId,sourceUserId,sourceKind,sourceSessionKey FROM work_item_sources ORDER BY sourceKind"

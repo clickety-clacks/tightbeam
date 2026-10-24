@@ -2162,7 +2162,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   # `parts` is a dotted `__aliases__` path as the file's OWN source wrote it
   # (e.g. `[:Escalation]`, `[:TB, :Escalation]`, `[:Tightbeam, :Escalation]`)
   # — resolved by expanding only its FIRST segment through the alias map
-  #: a prior version handled a whole-module alias
+  # : a prior version handled a whole-module alias
   # (`alias Tightbeam.Escalation`, one segment) but not a PREFIX alias
   # (`alias Tightbeam, as: TB` then `TB.Escalation.consume(...)`, where the
   # alias covers only the leading segment and `:Escalation` rides along
@@ -2240,7 +2240,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   # `apply/3` naming a LITERAL Escalation module but a NON-literal function
-  #: `escalation_refs_called/2` above requires the
+  # : `escalation_refs_called/2` above requires the
   # function argument to be a literal atom to attribute the call to a `ref`,
   # and `has_dynamic_apply?/1` below only flags a non-literal MODULE — so a
   # literal-module, dynamic-function `apply/3` fell through both, invisible
@@ -2447,7 +2447,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   # occurrence in a `decision_requests` query is unreviewed disjunction, and
   # `kind = 'statute' OR 1 = 1` (or an exact IN-list with the same `OR 1 = 1`
   # tacked on) must not slip past an eq/IN check that never looked for it
-  #.
+  # .
   defp kind_predicate_shape(ref, text, declared_csv) do
     declared =
       declared_csv

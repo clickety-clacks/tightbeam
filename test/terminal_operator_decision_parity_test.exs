@@ -1273,7 +1273,8 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                  session: %{state: "none"}
                }
              }
-           } = Escalation.get(ctx.db, rule_call(known.id, %{}), known.id, owner_user_id: "operator")
+           } =
+             Escalation.get(ctx.db, rule_call(known.id, %{}), known.id, owner_user_id: "operator")
 
     assert %{
              ruling_attribution: %{
@@ -1283,7 +1284,9 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                }
              }
            } =
-             Escalation.get(ctx.db, rule_call(legacy.id, %{}), legacy.id, owner_user_id: "operator")
+             Escalation.get(ctx.db, rule_call(legacy.id, %{}), legacy.id,
+               owner_user_id: "operator"
+             )
 
     assert {:ok, [[1, ~s(["rulingLifecycleEvent"])]]} =
              DB.query(

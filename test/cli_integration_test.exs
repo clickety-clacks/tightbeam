@@ -1418,7 +1418,12 @@ defmodule Tightbeam.CliIntegrationTest do
                )
     end
 
-    common.("dr_00000000-0000-4000-8000-000000000001", "operator", ctx.session.session_key, "open")
+    common.(
+      "dr_00000000-0000-4000-8000-000000000001",
+      "operator",
+      ctx.session.session_key,
+      "open"
+    )
 
     common.(
       "dr_00000000-0000-4000-8000-000000000003",
@@ -1441,9 +1446,24 @@ defmodule Tightbeam.CliIntegrationTest do
                ["dr_00000000-0000-4000-8000-000000000003", now + 20]
              )
 
-    common.("dr_00000000-0000-4000-8000-000000000005", "operator", ctx.session.session_key, "open")
-    common.("dr_00000000-0000-4000-8000-000000000002", "operator", ctx.session.session_key, "open")
-    common.("dr_00000000-0000-4000-8000-000000000007", "operator", ctx.session.session_key, "open")
+    common.(
+      "dr_00000000-0000-4000-8000-000000000005",
+      "operator",
+      ctx.session.session_key,
+      "open"
+    )
+    common.(
+      "dr_00000000-0000-4000-8000-000000000002",
+      "operator",
+      ctx.session.session_key,
+      "open"
+    )
+    common.(
+      "dr_00000000-0000-4000-8000-000000000007",
+      "operator",
+      ctx.session.session_key,
+      "open"
+    )
 
     assert {:ok, _} =
              DB.query(

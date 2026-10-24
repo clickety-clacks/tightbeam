@@ -59,7 +59,8 @@ defmodule Tightbeam.EventLogTest do
 
     assert is_integer(event_id) and event_id > 0
 
-    assert {:ok, [[^event_id, 12_345, "verb", "wake", "user:operator", "user:operator", nil, payload]]} =
+    assert {:ok,
+            [[^event_id, 12_345, "verb", "wake", "user:operator", "user:operator", nil, payload]]} =
              DB.query(
                db,
                "SELECT id,ts,kind,verb,origin,principal,sessionKey,payload FROM events"

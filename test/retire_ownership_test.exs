@@ -182,7 +182,8 @@ defmodule Tightbeam.RetireOwnershipTest do
       end)
 
     refute "retire" in foreign_menu
-    assert %{code: "not_found"} = retire(ctx, "user:operator", {:user, "operator"}, "other-holder")
+    assert %{code: "not_found"} =
+             retire(ctx, "user:operator", {:user, "operator"}, "other-holder")
   end
 
   ## Helpers

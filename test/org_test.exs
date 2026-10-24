@@ -209,7 +209,7 @@ defmodule Tightbeam.OrgTest do
     assert :ok = Org.put_setting(db, "default-archetype", "coder")
     assert Org.get_setting(db, "default-archetype") == "coder"
 
-    assert :ok = Org.put_setting
+    assert :ok = Org.put_setting()
     assert Org.get_setting(db, "default-archetype") == "reviewer"
 
     assert {:ok, [["default-archetype", "reviewer", updated_at]]} =

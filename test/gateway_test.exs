@@ -3230,7 +3230,7 @@ defmodule Tightbeam.GatewayTest do
     # preflight read `claude`, so the outer same-harness check has already
     # passed. Only the in-transaction fresh read can refuse it now: this is
     # the interleaving the old racing-identical-swaps test could not build
-    #. The home pin moving BEHIND the commit
+    # . The home pin moving BEHIND the commit
     # (blocking 2) is what makes the loser's refusal side-effect-free.
     loser =
       Task.async(fn ->
@@ -4281,7 +4281,8 @@ defmodule Tightbeam.GatewayTest do
              spawn.(%{
                verb: "spawn",
                origin: "remedy:wrong-action",
-               principal: {:remedy, %{statute: "wrong-action", action: "wake", owner: "operator"}},
+               principal:
+                 {:remedy, %{statute: "wrong-action", action: "wake", owner: "operator"}},
                session_key: nil,
                params: %{
                  display_name: "Rejected",
@@ -4526,7 +4527,8 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "remote-host: cannot route gpt-5.6-example (effort medium) on remote-host"
     assert message =~ "upgrade codex on remote-host"
-    assert message =~ "remote-runner: cannot route gpt-5.6-example (effort medium) on remote-runner"
+    assert message =~
+             "remote-runner: cannot route gpt-5.6-example (effort medium) on remote-runner"
     assert message =~ "run tightbeam onboard openai on remote-runner"
   end
 
@@ -4709,7 +4711,10 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "no host in archetype default's where can run codex"
 
-    for {host, _base} <- [{"remote-host", "/srv/remote-host"}, {"remote-runner", "/srv/remote-runner"}] do
+    for {host, _base} <- [
+          {"remote-host", "/srv/remote-host"},
+          {"remote-runner", "/srv/remote-runner"}
+        ] do
       assert message =~ "Tightbeam has no credential for openai on #{host}"
       assert message =~ "Run on #{host}: tightbeam onboard openai --as-user <userId>"
     end
@@ -6725,7 +6730,8 @@ defmodule Tightbeam.GatewayTest do
     assert message =~ "high"
 
     # Nothing applied: the session is still on its prior model.
-    assert Org.get(ctx.db, "k-codex-fallback").model == Model.new("gpt-5.6-example", effort: "xhigh")
+    assert Org.get(ctx.db, "k-codex-fallback").model ==
+             Model.new("gpt-5.6-example", effort: "xhigh")
   end
 
   test "set_model with a bare model id and an explicit --effort still applies cleanly", ctx do
@@ -6758,7 +6764,8 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "gpt-5.6-example", effort: "medium"}
              })
 
-    assert Org.get(ctx.db, "k-codex-medium").model == Model.new("gpt-5.6-example", effort: "medium")
+    assert Org.get(ctx.db, "k-codex-medium").model ==
+             Model.new("gpt-5.6-example", effort: "medium")
   end
 
   test "set_model with a bare model id switching to an untiered model drops the effort qualifier",
@@ -6824,7 +6831,8 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "gpt-5.6-example", effort: "low"}
              })
 
-    assert Org.get(ctx.db, "k-codex-full-ref").model == Model.new("gpt-5.6-example", effort: "low")
+    assert Org.get(ctx.db, "k-codex-full-ref").model ==
+             Model.new("gpt-5.6-example", effort: "low")
   end
 
   test "set_reasoning composes the current model with the newly selected effort tier", ctx do
@@ -6855,7 +6863,8 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_reasoning", reasoningLevel: "xhigh"}
              })
 
-    assert Org.get(ctx.db, "k-codex-reasoning").model == Model.new("gpt-5.6-example", effort: "xhigh")
+    assert Org.get(ctx.db, "k-codex-reasoning").model ==
+             Model.new("gpt-5.6-example", effort: "xhigh")
   end
 
   test "set_reasoning rejects a level the current model does not offer", ctx do

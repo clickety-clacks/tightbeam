@@ -396,7 +396,8 @@ defmodule Tightbeam.LedgerTest do
 
     assert Ledger.fail_unclaimable(db, "agent:main:clawline:operator:main", :no_session) == []
     assert {:ok, [["queued"]]} = DB.query(db, "SELECT status FROM turns WHERE seq = ?1", [seq])
-    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, "agent:main:clawline:operator:main", "lane")
+    assert {:ok, %{seq: ^seq}} =
+             Ledger.claim_next(db, "agent:main:clawline:operator:main", "lane")
   end
 
   # Identifying the aged rows by the error string this
@@ -405,10 +406,12 @@ defmodule Tightbeam.LedgerTest do
   # knows what it did.
   test "aging reports the rows it transitioned, never a previous batch", %{db: db} do
     first = insert_orphan_turn(db, "agent:main:clawline:operator:main")
-    assert [^first] = Ledger.fail_unclaimable(db, "agent:main:clawline:operator:main", :no_session)
+    assert [^first] =
+             Ledger.fail_unclaimable(db, "agent:main:clawline:operator:main", :no_session)
 
     second = insert_orphan_turn(db, "agent:main:clawline:operator:main")
-    assert [^second] = Ledger.fail_unclaimable(db, "agent:main:clawline:operator:main", :no_session)
+    assert [^second] =
+             Ledger.fail_unclaimable(db, "agent:main:clawline:operator:main", :no_session)
   end
 
   # A turn the ledger would refuse today, written the way the pre-guard gateway
