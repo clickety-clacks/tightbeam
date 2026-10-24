@@ -260,7 +260,7 @@ defmodule Tightbeam.IdentityTest do
              "kungfu/agentic-engineering/preferred-models.md"
            ) == table
 
-    for name <- ~w do
+    for name <- ~w(coder orchestrator product-owner recon reviewer-code reviewer-spec spec-writer) do
       manifest_path = "archetypes/#{name}.toml"
       guidance = Identity.snapshot_at!(base, revision, name, :codex).guidance
 
@@ -332,7 +332,7 @@ defmodule Tightbeam.IdentityTest do
     base = Path.join(ctx.root, "model-selection-source")
     assert {:ok, revision} = learn!(base, "agentic-engineering", "operator")
 
-    for name <- ~w do
+    for name <- ~w(coder orchestrator product-owner recon reviewer-code reviewer-spec spec-writer) do
       guidance = Identity.snapshot_at!(base, revision, name, :codex).guidance
       assert occurrence_count(guidance, activity_table) == 1
       refute guidance =~ "# Model policy"
@@ -366,7 +366,7 @@ defmodule Tightbeam.IdentityTest do
 
     | Task class | Model (effort) |
     | --- | --- |
-    | Spec review | claude-example-5 |
+    | Spec review | claude-fable-5 |
     """)
 
     File.write!(Path.join(legacy, "guidance/preferred-models.md"), """
@@ -374,7 +374,7 @@ defmodule Tightbeam.IdentityTest do
 
     ## Working set (capsules)
 
-    - **claude-example-5** — legacy capsule
+    - **claude-fable-5** — legacy capsule
     """)
 
     for path <- Path.wildcard(Path.join(legacy, "archetypes/*.toml")) do
@@ -399,9 +399,9 @@ defmodule Tightbeam.IdentityTest do
 
     refute File.exists?(Path.join(identity_dir, "guidance/model-policy.md"))
     refute git_path_exists?(identity_dir, revision, "guidance/model-policy.md")
-    refute File.read!(Path.join(identity_dir, "guidance/preferred-models.md")) =~ "claude-example-5"
+    refute File.read!(Path.join(identity_dir, "guidance/preferred-models.md")) =~ "claude-fable-5"
 
-    for name <- ~w do
+    for name <- ~w(coder orchestrator product-owner recon reviewer-code reviewer-spec spec-writer) do
       guidance = Identity.snapshot_at!(base, revision, name, :codex).guidance
       refute guidance =~ "# Model policy"
       refute guidance =~ "| Task class |"
@@ -610,8 +610,8 @@ defmodule Tightbeam.IdentityTest do
     engineering_rule = File.read!(Path.join(base, "identity/rules/engineering.toml"))
     assert engineering_rule =~ ~s(name = "code-review-requires-passing-tests")
     assert engineering_rule =~ ~s(on_rule_denied = "surface")
-    assert engineering_rule =~ ~s
-    refute engineering_rule =~ ~s
+    assert engineering_rule =~ ~s(target_role = "reviewer-code")
+    refute engineering_rule =~ ~s(target_role = "reviewer")
 
     for {role, present_axis, absent_axis} <- [
           {"reviewer-code", "## Analysis axes: code", "## Analysis axes: spec"},
@@ -856,8 +856,9 @@ defmodule Tightbeam.IdentityTest do
     # `useConfigOnly` is what makes this a real bare host rather than a tidied one.
     # Emptying the config is not enough: git falls back to GUESSING an identity from
     # the passwd entry and the hostname, so a machine with no configured identity
-    # still commits by guessing an identity from the passwd entry and hostname.
-    # Disable that fallback so the test has no committer unless the code supplies one.
+    # still commits -- as "Test User <user@test-host.invalid>" here. That fallback is what
+    # made this environment untestable by simply clearing config, and it is off on
+    # a fresh satellite, where the commit genuinely has nowhere to get a committer.
     bare_config = Path.join(ctx.root, "bare-gitconfig")
     File.write!(bare_config, "[user]\n\tuseConfigOnly = true\n")
 
@@ -892,7 +893,7 @@ defmodule Tightbeam.IdentityTest do
     assert edit!(ctx.base, "coder", :guidance, "no-identity-edit", "user:operator")
 
     assert git!(dir, ["log", "-1", "--format=%an <%ae>", "main"]) ==
-             "user:operator <user-operator@tightbeam.local>"
+             "user:operator <user-operator@example.invalid>"
 
     File.write!(Path.join(ctx.source, "guidance/new.md"), "new-source")
 

@@ -3749,8 +3749,8 @@ defmodule Tightbeam.CoordinationFabricTest do
     # `owner_user_id: "operator"` is exactly what the gateway resolves for ANY of
     # operator's sessions (`decision-requests`'s `caller.owner_user_id`) — so this
     # reproduces, at the call site `Escalation.list/get` actually see, what an
-    # unrelated sibling session's call looks like (Sol xhigh review, finding
-    # 3). Before the fix, the `ownerUserId` branch fired for this session
+    # unrelated sibling session's call looks like. Before the fix, the
+    # `ownerUserId` branch fired for this session
     # exactly as it does for the owner acting as a user principal.
     reviewer_call = %{
       origin: "agent:reviewer",

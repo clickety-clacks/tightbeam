@@ -35,10 +35,10 @@ defmodule Tightbeam.RetireOwnershipTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1),('kay', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1),('other', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
       )
 
-    Enum.each(~w(operator kay root), &ensure_main_session(db, &1))
+    Enum.each(~w(operator other root), &ensure_main_session(db, &1))
 
     # An ordinary spawned agent: a session holding a role, owned by operator.
     session!(db, "agent:worker:app", "operator")
@@ -61,21 +61,21 @@ defmodule Tightbeam.RetireOwnershipTest do
   end
 
   test "a cross-owner retire still gets not_found", ctx do
-    session!(ctx.db, "kays-session", "kay")
+    session!(ctx.db, "other-session", "other")
 
     assert %{code: "not_found"} =
-             retire(ctx, "agent:worker", {:session, "agent:worker:app"}, "kays-session")
+             retire(ctx, "agent:worker", {:session, "agent:worker:app"}, "other-session")
 
-    assert Org.get(ctx.db, "kays-session").state == "active"
+    assert Org.get(ctx.db, "other-session").state == "active"
   end
 
   test "admin is NOT granted cross-owner retire", ctx do
-    session!(ctx.db, "kays-other", "kay")
+    session!(ctx.db, "other-other", "other")
 
     # user's ruling: admin approves devices; it is not a cross-owner mutation
     # grant. This asserts the authority was NOT widened while fixing the bug.
-    assert %{code: "not_found"} = retire(ctx, "user:root", {:user, "root"}, "kays-other")
-    assert Org.get(ctx.db, "kays-other").state == "active"
+    assert %{code: "not_found"} = retire(ctx, "user:root", {:user, "root"}, "other-other")
+    assert Org.get(ctx.db, "other-other").state == "active"
   end
 
   test "a process origin still gets not_found", ctx do
@@ -154,22 +154,22 @@ defmodule Tightbeam.RetireOwnershipTest do
 
     # A rung whose principal does NOT own the holder gets no retire item, and the
     # handler agrees.
-    session!(ctx.db, "kays-holder", "kay")
+    session!(ctx.db, "other-holder", "other")
 
     foreign_rung = %{
       session_key: "agent:worker:app",
       user_id: nil,
-      owner_user_id: "kay",
+      owner_user_id: "other",
       principal_user_id: "operator",
       rung: 0
     }
 
-    kays_assignment =
+    other_assignment =
       Assignments.__handle__(ctx.db, "assign", %{
         verb: "assign",
-        origin: "user:kay",
-        principal: {:user, "kay"},
-        session_key: "kays-holder",
+        origin: "user:other",
+        principal: {:user, "other"},
+        session_key: "other-holder",
         target_role: nil,
         role_fallback: false,
         supervision_interval_ms: 1_000,
@@ -178,11 +178,11 @@ defmodule Tightbeam.RetireOwnershipTest do
 
     {:ok, foreign_menu} =
       DB.transaction(ctx.db, fn txn ->
-        EffortCheckin.menu_in_txn(txn, assignment_row(txn, kays_assignment.id), foreign_rung)
+        EffortCheckin.menu_in_txn(txn, assignment_row(txn, other_assignment.id), foreign_rung)
       end)
 
     refute "retire" in foreign_menu
-    assert %{code: "not_found"} = retire(ctx, "user:operator", {:user, "operator"}, "kays-holder")
+    assert %{code: "not_found"} = retire(ctx, "user:operator", {:user, "operator"}, "other-holder")
   end
 
   ## Helpers

@@ -235,7 +235,7 @@ IO.puts("SMOKE 7 retraction: delivered turn cleared user-alerted")
 # 8. RETIRE: a queued notice canceled by a real retire still climbs — the
 #    fault remains untold, and cancellation of the MESSENGER is not a ruling
 #    on the fault. Second owner so operator's standing state can't interfere.
-{:ok, _} = DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('kay', 0, 1)")
+{:ok, _} = DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('other', 0, 1)")
 
 mk_owned = fn key, owner, spawned_by, built_in ->
   Org.create(db, %{
@@ -253,49 +253,49 @@ mk_owned = fn key, owner, spawned_by, built_in ->
   })
 end
 
-kay_main = mk_owned.(Org.personal_session_key("kay"), "kay", nil, true)
-_kay_sup = mk_owned.("kay:sup", "kay", kay_main.session_key, false)
-_kay_child = mk_owned.("kay:child", "kay", "kay:sup", false)
+other_main = mk_owned.(Org.personal_session_key("other"), "other", nil, true)
+_other_sup = mk_owned.("other:sup", "other", other_main.session_key, false)
+_other_child = mk_owned.("other:child", "other", "other:sup", false)
 
-:appended = Gateway.deliver_prompt("kay:child", "user:kay", "doomed work", db: db)
+:appended = Gateway.deliver_prompt("other:child", "user:other", "doomed work", db: db)
 
-kay_cause =
+other_cause =
   PmSmoke.await(
     fn ->
       case PmSmoke.q!(
              db,
-             "SELECT seq FROM turns WHERE sessionKey='kay:child' AND status IN ('failed','failed_unknown')"
+             "SELECT seq FROM turns WHERE sessionKey='other:child' AND status IN ('failed','failed_unknown')"
            ) do
         [[seq]] -> {:ok, seq}
         _ -> :retry
       end
     end,
-    "kay cause fails"
+    "other cause fails"
   )
 
-# The notice lands queued in kay:sup; retire kay:sup THROUGH THE REAL VERB
+# The notice lands queued in other:sup; retire other:sup THROUGH THE REAL VERB
 # before its lane can fail it, so the cancel path — not the failure path —
 # is what continues the climb. Race-tolerant: if the lane failed it first,
 # the climb continued anyway and the observation below still holds.
 PmSmoke.await(
   fn ->
-    case PmSmoke.q!(db, "SELECT seq FROM turns WHERE sessionKey='kay:sup' AND requestRef=?1", [
-           "bubble:#{kay_cause}"
+    case PmSmoke.q!(db, "SELECT seq FROM turns WHERE sessionKey='other:sup' AND requestRef=?1", [
+           "bubble:#{other_cause}"
          ]) do
       [[_]] -> {:ok, true}
       _ -> :retry
     end
   end,
-  "kay notice enqueued"
+  "other notice enqueued"
 )
 
 handlers = Gateway.handlers(%{db: db})
 
 retire_result =
   handlers["retire"].(%{
-    origin: "user:kay",
-    principal: {:user, "kay"},
-    session_key: "kay:sup",
+    origin: "user:other",
+    principal: {:user, "other"},
+    session_key: "other:sup",
     params: %{reason: "smoke retire"}
   })
 
@@ -303,12 +303,12 @@ IO.puts("SMOKE 8a retire verb: #{inspect(Map.take(retire_result, [:ok, :retired,
 
 PmSmoke.await(
   fn ->
-    if ConditionFacts.standing?(db, "user-alerted", "kay"), do: {:ok, true}, else: :retry
+    if ConditionFacts.standing?(db, "user-alerted", "other"), do: {:ok, true}, else: :retry
   end,
-  "kay climb survives retire and alerts"
+  "other climb survives retire and alerts"
 )
 
-IO.puts("SMOKE 8 canceled-messenger climb: kay alerted despite retired rung")
+IO.puts("SMOKE 8 canceled-messenger climb: other alerted despite retired rung")
 
 # 9. PROD SUPPRESSION, live: an open assignment prods on terminal; a standing
 #    work-blocked stops the production matching; retraction resumes it.

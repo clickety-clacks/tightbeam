@@ -11,10 +11,10 @@ defmodule Tightbeam.ToplinesTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1),('kay', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1),('other', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
       )
 
-    Enum.each(~w(operator kay root), &ensure_main_session(db, &1))
+    Enum.each(~w(operator other root), &ensure_main_session(db, &1))
 
     :ok = Toplines.ensure_schema(db)
     %{db: db}
@@ -75,14 +75,14 @@ defmodule Tightbeam.ToplinesTest do
 
     id = created.topline.id
     assert %{toplines: [%{id: ^id}]} = Toplines.list(ctx.db, read_call({:user, "operator"}))
-    assert %{toplines: []} = Toplines.list(ctx.db, read_call({:user, "kay"}))
+    assert %{toplines: []} = Toplines.list(ctx.db, read_call({:user, "other"}))
     assert %{toplines: [%{id: ^id}]} = Toplines.list(ctx.db, read_call({:user, "root"}))
 
     assert %{topline: %{id: ^id, workMemberships: [], concerns: []}} =
              Toplines.get(ctx.db, read_call({:session, "s_example"}, %{topline_id: id}))
 
-    assert Toplines.get(ctx.db, read_call({:user, "kay"}, %{topline_id: id})) ==
-             Toplines.get(ctx.db, read_call({:user, "kay"}, %{topline_id: "tl_missing"}))
+    assert Toplines.get(ctx.db, read_call({:user, "other"}, %{topline_id: id})) ==
+             Toplines.get(ctx.db, read_call({:user, "other"}, %{topline_id: "tl_missing"}))
 
     assert %{code: "process_denied"} =
              Toplines.list(ctx.db, read_call({:process, "tightbeam"}))
@@ -518,7 +518,7 @@ defmodule Tightbeam.ToplinesTest do
              Toplines.create_concern(
                ctx.db,
                call(
-                 {:user, "kay"},
+                 {:user, "other"},
                  %{topline_id: topline.id, title: "Invisible", idempotency_key: "foreign"},
                  24
                )
@@ -613,7 +613,7 @@ defmodule Tightbeam.ToplinesTest do
       )
     )
 
-    assert [] = Toplines.query_public(ctx.db, %{principal: {:user, "kay"}, state: nil})
+    assert [] = Toplines.query_public(ctx.db, %{principal: {:user, "other"}, state: nil})
 
     assert [%{topline: %{id: id}} = queried] =
              Toplines.query_public(ctx.db, %{principal: {:user, "operator"}, state: ["open"]})
@@ -884,7 +884,7 @@ defmodule Tightbeam.ToplinesTest do
              )
 
     assert %{placements: []} =
-             Toplines.list_placements(ctx.db, read_call({:user, "kay"}, %{state: "all"}))
+             Toplines.list_placements(ctx.db, read_call({:user, "other"}, %{state: "all"}))
 
     assert %{code: "process_denied"} =
              Toplines.leave_unlinked(
@@ -896,7 +896,7 @@ defmodule Tightbeam.ToplinesTest do
   test "invalid, invisible, cross-owner, duplicate, and process operations refuse without writes",
        ctx do
     work_item!(ctx.db, "wi_mine", "operator")
-    work_item!(ctx.db, "wi_theirs", "kay")
+    work_item!(ctx.db, "wi_theirs", "other")
 
     assert %{code: "invalid_message"} =
              Toplines.create(ctx.db, call({:user, "operator"}, %{title: " ", idempotency_key: "k"}))

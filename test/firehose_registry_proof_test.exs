@@ -97,7 +97,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       DB.execute(
         db,
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES " <>
-          "('operator', 0, 'admin_add', 1), ('kay', 0, 'admin_add', 1), " <>
+          "('operator', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1), " <>
           "('root', 1, 'admin_add', 1)"
       )
 
@@ -353,7 +353,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
     Enum.each(notices, fn notice ->
       assert StateVisibility.visible?(ctx.db, notice, "operator", false)
-      refute StateVisibility.visible?(ctx.db, notice, "kay", false)
+      refute StateVisibility.visible?(ctx.db, notice, "other", false)
       assert StateVisibility.visible?(ctx.db, notice, "root", true)
     end)
 
@@ -382,7 +382,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
         Hub.register(ctx.hub, self(), %{
           mode: :filtered,
           db: ctx.db,
-          user_id: "kay",
+          user_id: "other",
           is_admin: false
         })
 

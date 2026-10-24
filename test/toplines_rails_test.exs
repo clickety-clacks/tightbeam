@@ -9,9 +9,9 @@ defmodule Tightbeam.ToplinesRailsTest do
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
     insert_user!(db, "operator")
-    insert_user!(db, "kay")
+    insert_user!(db, "other")
     insert_work_item!(db, "wi_one", "operator")
-    insert_work_item!(db, "wi_two", "kay")
+    insert_work_item!(db, "wi_two", "other")
 
     :ok =
       DB.execute(
@@ -275,7 +275,7 @@ defmodule Tightbeam.ToplinesRailsTest do
   test "AC71 rejects both possible owner values for a cross-owner membership", %{db: db} do
     insert!(db, "toplines", topline_row("tl_one"))
 
-    for owner <- ["operator", "kay"] do
+    for owner <- ["operator", "other"] do
       assert_rejected(
         db,
         "topline_work_memberships",

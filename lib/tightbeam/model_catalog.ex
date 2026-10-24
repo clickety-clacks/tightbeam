@@ -536,7 +536,7 @@ defmodule Tightbeam.ModelCatalog do
   # genuinely revoked, or it can mean Claude Code rotated it inside the
   # harness home: the vendor's write-temp-then-rename severs the store's
   # symlink, the store copy freezes on the pre-rotation token, and the
-  # provider revokes the superseded one (issue #9). `Homes.sweep_auth/2`
+  # provider revokes the superseded one. `Homes.sweep_auth/2`
   # already knows how to harvest a severed home's regular file back into the
   # store and is a no-op when nothing is severed, so trying it here costs
   # nothing against a truly revoked credential and turns the staleness

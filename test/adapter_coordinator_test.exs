@@ -826,7 +826,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     Task.await(second)
   end
 
-  ## Task #14 — the guard covers the ACTION, not the RECORD
+  ## The guard covers the action, not the record
 
   test "a death absorbed by a replacement is recorded and told, but restarts nothing", ctx do
     key = {:claude, "shared", "testhost"}

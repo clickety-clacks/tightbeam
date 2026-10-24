@@ -2,9 +2,9 @@
 
 ## THE PHILOSOPHY GATE — run it before you design, again before you ship
 
-Tightbeam coordinates agents; the substrate records activity, delivers
-notifications, and applies configured rules without making judgments or taking
-control of user decisions.
+Tightbeam supports agent-run organizations; the substrate records activity,
+delivers notifications, and applies configured rules without making judgments
+or taking decisions away from users.
 Every spec and every change answers these ten. A "no" is a FINDING to report,
 not a style nit — the "hey, that's not what we're about" moment is this list
 doing its job. Layer vocabulary: PHYSICS = substrate mechanism (invariant,

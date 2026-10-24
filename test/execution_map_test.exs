@@ -74,10 +74,10 @@ defmodule Tightbeam.ExecutionMapTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1),('kay', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1),('other', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
       )
 
-    Enum.each(~w(operator kay root), &ensure_main_session(db, &1))
+    Enum.each(~w(operator other root), &ensure_main_session(db, &1))
 
     # The epoch is stamped once at table creation, so a test that needs a known
     # cutoff moves the single row rather than pretending to control the clock.
@@ -282,8 +282,8 @@ defmodule Tightbeam.ExecutionMapTest do
 
     # Unknown and invisible anchors are ONE answer, byte-identical.
     unknown = read(ctx, :topline, %{under: "wi_does_not_exist"})
-    item!(ctx.db, "wi_kay", owner: "kay")
-    invisible = read(ctx, :topline, %{under: "wi_kay"})
+    item!(ctx.db, "wi_other", owner: "other")
+    invisible = read(ctx, :topline, %{under: "wi_other"})
 
     assert unknown == %{code: "not_found", message: "work item not found"}
     assert JSON.encode!(unknown) == JSON.encode!(invisible)
@@ -764,9 +764,9 @@ defmodule Tightbeam.ExecutionMapTest do
 
   test "proof 12: with-item, NONE and unknown-versus-invisible ids in one proof", ctx do
     session!(ctx.db, "s_mine", "operator")
-    session!(ctx.db, "s_theirs", "kay")
+    session!(ctx.db, "s_theirs", "other")
     item!(ctx.db, "wi_selected")
-    item!(ctx.db, "wi_theirs", owner: "kay")
+    item!(ctx.db, "wi_theirs", owner: "other")
 
     assignment!(ctx.db, "asg_with_item", work_item_id: "wi_selected", holder: "s_mine")
     assignment!(ctx.db, "asg_none", work_item_id: nil, reviews: nil, holder: "s_mine")
@@ -817,9 +817,9 @@ defmodule Tightbeam.ExecutionMapTest do
 
   test "typed prefixes cover topline assignments, under anchors, and roster cursors", ctx do
     session!(ctx.db, "s_prefix_mine", "operator")
-    session!(ctx.db, "s_prefix_theirs", "kay")
+    session!(ctx.db, "s_prefix_theirs", "other")
     item!(ctx.db, "wi_prefix_alpha", created_at: at(1))
-    item!(ctx.db, "wi_prefix_hidden", owner: "kay", created_at: at(2))
+    item!(ctx.db, "wi_prefix_hidden", owner: "other", created_at: at(2))
     item!(ctx.db, "wi_prefix_zulu", created_at: at(3))
 
     assignment!(ctx.db, "asg_prefix_alpha",
@@ -1071,7 +1071,7 @@ defmodule Tightbeam.ExecutionMapTest do
   defp seed_twin_world(db, invisible: invisible?) do
     session!(db, "s_mine", "operator")
     session!(db, "s_lane", "operator")
-    if invisible?, do: session!(db, "s_theirs", "kay")
+    if invisible?, do: session!(db, "s_theirs", "other")
 
     item!(db, "wi_anchor", created_at: at(1))
     turn!(db, 200, "s_lane", job_ref: "wi_anchor")
@@ -1091,7 +1091,7 @@ defmodule Tightbeam.ExecutionMapTest do
     )
 
     if invisible? do
-      item!(db, "wi_theirs", owner: "kay", created_at: at(4))
+      item!(db, "wi_theirs", owner: "other", created_at: at(4))
       assignment!(db, "asg_theirs", work_item_id: "wi_theirs", holder: "s_theirs")
       attest!(db, "att_theirs", "asg_theirs", by_session: "s_theirs", ts: 3_500_000)
       wake!(db, "wk_theirs", "s_theirs", state: "pending", work_item_id: "wi_theirs")

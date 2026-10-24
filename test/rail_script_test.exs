@@ -294,7 +294,7 @@ defmodule Tightbeam.RailScriptTest do
   # backstop. The `+2_000` gap at rail_script.ex:166 is fixed in the CODE; the MEASUREMENT
   # is not, so the two windows overlap.
   #
-  # Task #43 recorded the fact that DOES separate them, so this test now carries both
+  # The observed distinction is recorded here, so this test carries both
   # halves: the duration still misleads, and the exit class still reads binary-enforced
   # under exactly that inflation. A discriminator that survives the condition which broke
   # the timing rule is the point — if someone rebuilds the layer claim on top of the

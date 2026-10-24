@@ -12,7 +12,7 @@ defmodule Tightbeam.TurnLifecycleTest do
     :ok =
       DB.execute(db, """
       INSERT INTO users (userId, isAdmin, creationKind, createdAt)
-      VALUES ('operator', 0, 'admin_add', 1), ('kay', 0, 'admin_add', 1), ('root', 1, 'admin_add', 1);
+      VALUES ('operator', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1), ('root', 1, 'admin_add', 1);
 
       INSERT INTO sessions
         (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin, operationalParent,
@@ -22,7 +22,7 @@ defmodule Tightbeam.TurnLifecycleTest do
         ('k1', 'user session', 'main', 1, 'operator', 'user:operator', 'k1',
          'default', 'default', 'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL,
          1, 1),
-        ('k2', 'Kay session', 'main', 1, 'kay', 'user:kay', 'k2',
+        ('k2', 'other session', 'main', 1, 'other', 'user:other', 'k2',
          'default', 'default', 'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL,
          1, 1);
       """)
@@ -250,7 +250,7 @@ defmodule Tightbeam.TurnLifecycleTest do
     assert %{turn: %{seq: ^seq}} = read(db, "k1", seq, {:user, "root"})
     assert %{turn: %{seq: ^seq}} = read(db, "k1", seq, {:session, "k1"})
 
-    hidden = read(db, "k1", seq, {:user, "kay"})
+    hidden = read(db, "k1", seq, {:user, "other"})
     foreign_role_token = read(db, "k1", seq, {:session, "k2"})
     mismatch = read(db, "k2", seq, {:user, "root"})
     unknown = read(db, "k1", seq + 100, {:user, "root"})

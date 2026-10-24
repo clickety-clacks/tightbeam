@@ -52,13 +52,13 @@ defmodule Tightbeam.TranscriptTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1),('kay', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('operator', 0, 'admin_add', 1),('other', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
       )
 
-    Enum.each(~w(operator kay root), &ensure_main_session(db, &1))
+    Enum.each(~w(operator other root), &ensure_main_session(db, &1))
 
     owned = session!(db, "owned", "operator", "Coder Session")
-    foreign = session!(db, "foreign", "kay", "Kay Session")
+    foreign = session!(db, "foreign", "other", "other Session")
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-transcript-#{System.unique_integer([:positive])}")
@@ -284,14 +284,14 @@ defmodule Tightbeam.TranscriptTest do
     assert length(read(ctx, %{session_key: "owned"}, {:session, "owned"}).messages) == 2
 
     # Non-owner and unknown key are byte-identical.
-    forbidden = read(ctx, %{session_key: "owned"}, {:user, "kay"})
-    unknown = read(ctx, %{session_key: "no-such-session"}, {:user, "kay"})
+    forbidden = read(ctx, %{session_key: "owned"}, {:user, "other"})
+    unknown = read(ctx, %{session_key: "no-such-session"}, {:user, "other"})
     assert forbidden == unknown
     assert forbidden.code == "not_found"
     assert read(ctx, %{session_key: "owned"}, {:session, "foreign"}) == forbidden
 
     # `--name` cannot enumerate what the caller may not read.
-    assert Enum.map(read(ctx, %{name: "Session"}, {:user, "kay"}).candidates, & &1.session_key) ==
+    assert Enum.map(read(ctx, %{name: "Session"}, {:user, "other"}).candidates, & &1.session_key) ==
              ["foreign"]
   end
 

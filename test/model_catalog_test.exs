@@ -561,7 +561,7 @@ defmodule Tightbeam.ModelCatalogTest do
     assert is_map(Gateway.org_options())
   end
 
-  # Issue #9: Claude Code rotates `.credentials.json` inside the harness home
+  # Credential rotation can replace `.credentials.json` inside the harness home
   # (write-temp-then-rename), which severs the symlink to the store copy. The
   # store copy freezes on the pre-rotation token and the provider revokes it,
   # so every refresh 401s "revoked" against a token that is fine everywhere
@@ -1503,7 +1503,7 @@ defmodule Tightbeam.ModelCatalogTest do
     end
   end
 
-  # Task #41. The catalog must not advertise a model the adapter will refuse, and no
+  # The catalog must not advertise a model the adapter will refuse, and no
   # substitution may be smuggled in at the only place a mapping could live.
   describe "claude selectable-model pin" do
     test "keeps Example Model 5.1 default and 1m vendor identities", ctx do

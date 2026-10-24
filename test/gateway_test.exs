@@ -1857,7 +1857,7 @@ defmodule Tightbeam.GatewayTest do
              ModelCatalog.route("testhost", "claude", Model.new("tiered-here"))
   end
 
-  # Task #41. A model the adapter cannot select must be refused by NAME and the
+  # A model the adapter cannot select must be refused by name and the
   # operator told what IS available — before, this died deep in the adapter as
   # "Invalid value for config option model", on every session/new and session/load.
   test "an unavailable model is refused by name and names what is offered", ctx do
@@ -5450,7 +5450,7 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:spinup_command, ["ssh" | _]}
   end
 
-  # Task #88 / per-host-catalogs-v1 acceptance 1. Both failure directions of one
+  # Both failure directions of one
   # defect: the catalog used to be the GATEWAY account's, applied to every host,
   # so a ref was validated against entitlements that had nothing to do with the
   # account the turn would run under. On the old tree this test is red twice —

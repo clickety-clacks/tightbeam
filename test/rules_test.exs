@@ -340,7 +340,7 @@ defmodule Tightbeam.RulesTest do
   test "caller facts cover origin, admin, multi-role, unbound, retired, and malformed cases",
        ctx do
     {:pending, _} =
-      Devices.pair(ctx.db, %{device_id: "d2", claimed_name: "Mike", platform: nil, model: nil})
+      Devices.pair(ctx.db, %{device_id: "d2", claimed_name: "Test Device", platform: nil, model: nil})
 
     active = session(ctx.db, "active", "operator")
     retired = session(ctx.db, "retired", "admin-user")

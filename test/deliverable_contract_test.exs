@@ -94,27 +94,28 @@ defmodule Tightbeam.DeliverableContractTest do
       |> File.read!()
 
     assert :sha256 |> :crypto.hash(archive) |> Base.encode16(case: :lower) ==
-             "282fa3bb92c0eb6795a26722c14092ba3b4a4edbbdca80d26d7a3fb9faaacc64"
+             "91b3afe3bb53cc25109be63a17d3a18b92675b30c4c100fbf20183afd34c18cf"
 
     assert {:ok, entries} = :erl_tar.extract({:binary, archive}, [:memory, :compressed])
 
-    fixed_base_sources =
+    captured_sources =
       Map.new(entries, fn {path, bytes} -> {List.to_string(path), bytes} end)
 
-    # This archive is produced from the complete lib/ tree at exact base
+    # This sanitized archive is based on the complete lib/ tree at exact base
     # 724e5c96f9513b37e937dc52eb014ba1ef2d1b5e (tree
-    # 41da8ae7ddee96e01c42ac482052862fba7041e9). Inspecting every production
-    # source file makes an empty optional-rail set an exact-source result, not
-    # an inference from a test that happened not to configure one.
-    exact_source =
-      fixed_base_sources
+    # 41da8ae7ddee96e01c42ac482052862fba7041e9). Local attribution has been
+    # removed from its comments. Inspecting every production source file makes
+    # an empty optional-rail set an exact-source result, not an inference from
+    # a test that happened not to configure one.
+    captured_source =
+      captured_sources
       |> Enum.sort()
       |> Enum.map_join("\n", fn {path, bytes} -> path <> "\n" <> bytes end)
 
-    refute exact_source =~ "CompletionEscalation"
-    refute exact_source =~ "completion_escalation"
+    refute captured_source =~ "CompletionEscalation"
+    refute captured_source =~ "completion_escalation"
 
-    assert fixed_base_sources
+    assert captured_sources
            |> Map.keys()
            |> Enum.filter(&String.starts_with?(&1, "lib/tightbeam/productions/"))
            |> Enum.sort() == [
@@ -123,11 +124,11 @@ defmodule Tightbeam.DeliverableContractTest do
              "lib/tightbeam/productions/catalog_rederive.ex"
            ]
 
-    assignments = Map.fetch!(fixed_base_sources, "lib/tightbeam/assignments.ex")
-    work_items = Map.fetch!(fixed_base_sources, "lib/tightbeam/work_items.ex")
-    supervision = Map.fetch!(fixed_base_sources, "lib/tightbeam/supervision.ex")
-    effort = Map.fetch!(fixed_base_sources, "lib/tightbeam/effort_checkin.ex")
-    schema = Map.fetch!(fixed_base_sources, "lib/tightbeam/schema.ex")
+    assignments = Map.fetch!(captured_sources, "lib/tightbeam/assignments.ex")
+    work_items = Map.fetch!(captured_sources, "lib/tightbeam/work_items.ex")
+    supervision = Map.fetch!(captured_sources, "lib/tightbeam/supervision.ex")
+    effort = Map.fetch!(captured_sources, "lib/tightbeam/effort_checkin.ex")
+    schema = Map.fetch!(captured_sources, "lib/tightbeam/schema.ex")
 
     contract =
       File.read!(Path.join([__DIR__, "..", "lib", "tightbeam", "deliverable_contract.ex"]))

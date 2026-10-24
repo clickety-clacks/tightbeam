@@ -249,7 +249,7 @@ defmodule Tightbeam.ArchetypesTest do
     loaded = Archetypes.load!(ctx.base_dir)
 
     assert Map.keys(loaded) |> Enum.sort() ==
-             ~w
+             ~w(avasarala coder default exec miller orchestrator product-owner recon reviewer-code reviewer-spec spec-writer)
 
     assert loaded["product-owner"].skills == [
              "worktree-session",
@@ -258,18 +258,22 @@ defmodule Tightbeam.ArchetypesTest do
              "human-communication"
            ]
 
-    for role <- ~w do
+    for role <- ~w(coder orchestrator product-owner recon reviewer-code reviewer-spec spec-writer) do
       assert "worktree-session" in loaded[role].skills
     end
 
-    refute Map.has_key?
+    refute Map.has_key?(loaded, "reviewer")
 
-    for role <- ~w do
+    for role <- ~w(reviewer-code reviewer-spec) do
       refute Enum.any?(loaded[role].skills, &String.starts_with?(&1, "review"))
       refute "spec-conformance" in loaded[role].skills
     end
 
-    refute File.exists?
+    refute File.exists?(
+             Application.app_dir(
+               :tightbeam,
+               "priv/kungfu/agentic-engineering/archetypes/reviewer.toml"
+             )
            )
 
     for skill <- ~w(reviewing-code reviewing-specs) do
@@ -387,7 +391,7 @@ defmodule Tightbeam.ArchetypesTest do
 
     revision = Identity.live_revision!(ctx.base_dir)
 
-    for role <- ~w do
+    for role <- ~w(coder orchestrator product-owner recon reviewer-code reviewer-spec spec-writer) do
       worktree_skill =
         Identity.snapshot_at!(ctx.base_dir, revision, role, :codex).skills["worktree-session"]
 
@@ -520,7 +524,7 @@ defmodule Tightbeam.ArchetypesTest do
 
     revision = Identity.live_revision!(ctx.base_dir)
 
-    for role <- ~w do
+    for role <- ~w(reviewer-code reviewer-spec) do
       guidance = Identity.snapshot_at!(ctx.base_dir, revision, role, :codex).guidance
 
       assert guidance =~ "The verdict note has a 2,000-character cap"
@@ -736,7 +740,7 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
-  # Stored selections hold FIELDS. A preference written as `"claude-example-5[1m]"`
+  # Stored selections hold FIELDS. A preference written as `"claude-fable-5[1m]"`
   # is refused by name rather than split here — splitting is the guess that read
   # a vendor context window as one of our reasoning levels and lost the model.
   test "archetype defaults and model preferences are fields, and packed strings are refused",
@@ -747,31 +751,31 @@ defmodule Tightbeam.ArchetypesTest do
     name = "prefs"
 
     [defaults]
-    model = "claude-example-5"
+    model = "claude-fable-5"
     effort = "high"
     context = "1m"
 
     [[model_preferences]]
-    model = "claude-example-5"
+    model = "claude-fable-5"
     effort = "high"
 
     [[model_preferences]]
-    model = "gpt-5.6-example"
+    model = "gpt-5.6-sol"
     """)
 
     archetype = Archetypes.load!(ctx.base_dir)["prefs"]
 
     assert archetype.defaults[:model] ==
-             Tightbeam.Model.new("claude-example-5", effort: "high", context: "1m")
+             Tightbeam.Model.new("claude-fable-5", effort: "high", context: "1m")
 
     assert archetype.model_preferences == [
-             Tightbeam.Model.new("claude-example-5", effort: "high"),
-             Tightbeam.Model.new("gpt-5.6-example")
+             Tightbeam.Model.new("claude-fable-5", effort: "high"),
+             Tightbeam.Model.new("gpt-5.6-sol")
            ]
 
     File.write!(path, """
     name = "prefs"
-    model_preferences = ["claude-example-5[1m]"]
+    model_preferences = ["claude-fable-5[1m]"]
     """)
 
     assert_raise ArgumentError, ~r/is a packed string; a preference is fields/, fn ->
