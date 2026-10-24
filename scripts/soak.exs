@@ -44,8 +44,7 @@ defmodule Tightbeam.Soak do
     # argv, and OptionParser treats it as the end-of-flags marker, demoting
     # every real flag to positional. Strip only that leading delimiter — a
     # later "--" is the CALLER'S end-of-options marker and must keep its
-    # meaning (codex review finding: rejecting all of them silently
-    # legalized flag-shaped positionals).
+    # meaning; rejecting all of them silently legalizes flag-shaped positionals.
     argv =
       case argv do
         ["--" | rest] -> rest

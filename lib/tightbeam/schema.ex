@@ -46,21 +46,12 @@ defmodule Tightbeam.Schema do
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
   #
-  # TWO LINES CARRIED THIS PHASE TO DIFFERENT NAMES, and this stamp is where
-  # they merge. Wave 1 (wakes classes/delivery, seams ①/②) stamped
-  # `coordination-fabric-classes-v1` then `-v2`. Wave 2 (the agent
-  # question arm, seams ③/④) stamped `coordination-fabric-v1-phase1` then
-  # `-v2`. Neither name ever
-  # described the OTHER line's DDL, so neither could serve the merged tree —
-  # this is a THIRD, brand-new name covering the union of both waves' schema
-  # (`wakes`'s class/delivery columns AND `decision_requests`'s agent arm),
-  # never having named any earlier vintage of either line (verified against
-  # both histories at merge time).
+  # This shape includes the wake delivery columns and the agent-request arm
+  # together. Earlier shape names describe only part of this schema, so this
+  # stamp identifies the complete set of tables written by this build.
   #
-  # `decision_requests.deadlineAt` went from `NOT NULL` to nullable at
-  # `coordination-fabric-v1-phase1-v2` — the agent arm's CHECK grew an explicit
-  # `deadlineAt IS NULL` requirement (finding 1 of round 1 on the same
-  # delta), and the stamp bumped for the same reason wave 1's did.
+  # `decision_requests.deadlineAt` is nullable for the agent arm, and its
+  # CHECK requires NULL for that arm. This shape records that table change.
   #
   # `CREATE TABLE IF NOT EXISTS` adds no column to a table that already
   # exists and does not widen an existing CHECK or relax an existing NOT

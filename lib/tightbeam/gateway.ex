@@ -6632,7 +6632,7 @@ defmodule Tightbeam.Gateway do
     # `tunable_session` returned before the lane was ever taken — is what
     # lets a second, concurrent, identical swap see the FIRST swap's result
     # and refuse `same_harness` instead of performing a same-harness no-op
-    # that still moves the barrier and appends a false tombstone (finding 5).
+    # that still moves the barrier and appends a false tombstone.
     #
     # History barrier (product ruling): a new engine gets a fresh visible
     # slate. Rows are RETAINED (never deleted) but replay stops at the
@@ -6756,7 +6756,7 @@ defmodule Tightbeam.Gateway do
         # pre-lane snapshot) sees that and refuses by the same name a
         # sequential same-harness request gets, rather than performing a
         # same-harness no-op that still moves the barrier and appends a
-        # false tombstone (finding 5).
+        # false tombstone.
         distinct_harness_error(harness)
 
       {:ok, {:refused, :not_found}} ->

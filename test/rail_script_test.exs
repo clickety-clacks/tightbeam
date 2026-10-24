@@ -974,7 +974,7 @@ defmodule Tightbeam.RailScriptTest do
     assert question =~ "script_exit_class unreported"
   end
 
-  # BLOCKING review finding. Recovery used to be ordered by the ACTOR's delayed mutation
+  # Recovery used to be ordered by the ACTOR's delayed mutation
   # instead of by what the evaluation observed: `decide` read "this statute has an open
   # episode", and the actor later withdrew EVERY open episode for that statute — including
   # ones opened in the interval between. A malfunction landing inside that window was

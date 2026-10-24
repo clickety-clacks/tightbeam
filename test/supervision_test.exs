@@ -2058,7 +2058,7 @@ defmodule Tightbeam.SupervisionTest do
     assert Supervision.ladder_target(ctx.db, "holder", 2) == nil
   end
 
-  # Review finding 2. The watermark row says "escalation"; retiring it as
+  # The watermark row says "escalation"; retiring it as
   # terminus must clear THAT row. Clearing against a rewritten branch loses the
   # CAS silently, and a watermark that never clears re-enters this path — and
   # re-logs it — on every one-second sweep, forever.
@@ -2118,7 +2118,7 @@ defmodule Tightbeam.SupervisionTest do
     assert Ledger.non_terminal_older_than(ctx.db, -1) == []
   end
 
-  # Review finding 4, on the GATE-LESS arm — the one path that reaches the echo,
+  # On the gate-less arm — the one path that reaches the echo,
   # because it accepts its session key without re-resolving anything. The echo
   # commits in the same transaction and cannot be taken back, so a refused
   # delivery must write NOTHING: a message with no turn is history nobody can

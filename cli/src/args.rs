@@ -576,8 +576,7 @@ pub enum Command {
 /// no filter surface at all. Making that a TYPE distinction rather than a runtime
 /// check is deliberate — re-attaching filters to assignment mode is a compile
 /// error, not a request that succeeds while quietly ignoring half of what was
-/// asked (found in code review of the first cut, which sent filters the reader
-/// then discarded).
+/// asked (otherwise the reader could receive filters it then discards).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToplineSelection {
     Under {
@@ -4272,8 +4271,8 @@ mod tests {
         ));
     }
 
-    // The blocking code-review finding on the first cut: the CLI attached roster
-    // filters to BOTH topline modes and sent them, while the reader selects solely
+    // The CLI must not attach roster filters to either topline mode: the reader
+    // selects solely
     // by assignment id — so `--assignments X --state closed` could return an OPEN
     // item after the CLI had promised the filter was applied.
     #[test]

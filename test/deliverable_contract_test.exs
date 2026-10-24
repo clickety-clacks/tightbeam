@@ -94,7 +94,7 @@ defmodule Tightbeam.DeliverableContractTest do
       |> File.read!()
 
     assert :sha256 |> :crypto.hash(archive) |> Base.encode16(case: :lower) ==
-             "91b3afe3bb53cc25109be63a17d3a18b92675b30c4c100fbf20183afd34c18cf"
+             "9b9bbf5269d3748c2598b249aeb9cfd48e0d3beebca362f05f779a23738ee019"
 
     assert {:ok, entries} = :erl_tar.extract({:binary, archive}, [:memory, :compressed])
 

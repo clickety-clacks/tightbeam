@@ -1984,7 +1984,7 @@ defmodule Tightbeam.Wakes do
   uses to select members, so a wake filed after another member's boundary or
   ceiling already passed waits for its own — never absorbed by somebody
   else's trigger. `due_reason` is computed exactly once, from that snapshot,
-  per member (finding 4): a member with no named reason is left pending, never
+  per member: a member with no named reason is left pending, never
   materialized under an empty `trigger=`.
 
   SOURCE ROWS ARE PRESERVED. A member is consumed
@@ -2138,7 +2138,7 @@ defmodule Tightbeam.Wakes do
       # Candidate group, but not ONE of its current members has reached its
       # own ceiling or seen a boundary since it was filed. Nothing is due —
       # refuse silently rather than materialize under a reason nobody can
-      # name (finding 4): every member simply waits for its own trigger.
+      # name: every member simply waits for its own trigger.
       [] ->
         nil
 
@@ -2194,7 +2194,7 @@ defmodule Tightbeam.Wakes do
   end
 
   # THE LATEST turn end for this session, or nil if none has ever ended. A
-  # turn boundary is the moment an in-flight turn ENDS (finding 3) — nothing
+  # turn boundary is the moment an in-flight turn ENDS — nothing
   # here judges whether the session is otherwise busy; queued or running work
   # behind the boundary is not a reason to hold what already crossed it.
   defp latest_turn_end(txn, session_key) do

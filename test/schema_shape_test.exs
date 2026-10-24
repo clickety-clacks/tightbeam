@@ -1383,17 +1383,10 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ @shape
   end
 
-  #  (wave 1): `classElection`'s CHECK
-  # constraint gained `'batcher'` (round-1 finding 7), but `CREATE TABLE IF
-  # NOT EXISTS` does not widen an existing table's CHECK any more than it
-  # adds a column. A `coordination-fabric-classes-v1` database's `wakes`
-  # table — reconstructed here byte-for-byte from cafe321's DDL — still
-  # enforces the OLD two-value CHECK. Without the shape bump, this database
-  # would boot silently (its stamp used to match `@shape`) and the first
-  # digest-carrier insert would die on a raw, unnamed `CHECK constraint
-  # failed` deep inside the batcher. This proves the boot gate now refuses it
-  # BY NAME first, before any DDL or insert ever reaches the stale
-  # constraint. Kept working across the wave-1/wave-2 merge: the oldest vintage on EITHER line must still refuse.
+  # An older database has a two-value `classElection` CHECK without
+  # `batcher`. `CREATE TABLE IF NOT EXISTS` does not widen an existing
+  # table's CHECK, so boot must refuse this shape by name before a digest
+  # insert reaches the stale constraint.
   test "a coordination-fabric-classes-v1 database is refused by name, never a raw CHECK violation",
        %{db: db} do
     :ok =
@@ -1455,22 +1448,10 @@ defmodule Tightbeam.SchemaShapeTest do
     refute ddl =~ "batcher"
   end
 
-  #  (wave 2): `decision_requests.deadlineAt`
-  # went from `NOT NULL` to nullable (round-1 finding 1's fix), and the
-  # per-kind CHECK arm grew explicit `deadlineAt IS NOT NULL`/`IS NULL`
-  # clauses — a real DDL change that landed in `2a3b24a` without bumping
-  # `@shape`, so `coordination-fabric-v1-phase1` named two different table
-  # shapes at once. `CREATE TABLE IF NOT EXISTS` does not relax an existing
-  # table's `NOT NULL` any more than it widens a `CHECK`: a
-  # `coordination-fabric-v1-phase1` database's `decision_requests` table —
-  # reconstructed here byte-exact from `git show
-  # f65c996:lib/tightbeam/escalation.ex` — still enforces `deadlineAt INTEGER
-  # NOT NULL`. Without the bump this database would boot silently (its stamp
-  # used to match `@shape`) and the first agent `ask` would die on a raw,
-  # unnamed `NOT NULL constraint failed` deep inside `file_agent_request/2`.
-  # This proves the boot gate now refuses it BY NAME first, before any DDL or
-  # insert ever reaches the stale constraint. Kept working across the
-  # wave-1/wave-2 merge.
+  # An older database requires `decision_requests.deadlineAt` to be NOT
+  # NULL. `CREATE TABLE IF NOT EXISTS` does not relax that constraint, so
+  # boot must refuse the old shape by name before an agent request reaches
+  # the stale constraint. The test preserves refusal coverage for that shape.
   test "a coordination-fabric-v1-phase1 database is refused by name, never a raw NOT NULL violation",
        %{db: db} do
     :ok =

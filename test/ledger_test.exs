@@ -372,7 +372,7 @@ defmodule Tightbeam.LedgerTest do
     assert Ledger.fail_unclaimable(db, "agent:main:clawline:operator:main", :no_session) == []
   end
 
-  # Review finding 3. The diagnosis and the failure are separate transactions,
+  # The diagnosis and the failure are separate transactions,
   # so the cause has to be re-asserted by the UPDATE itself. A session created
   # in that window makes the turn claimable again, and aging it anyway destroys
   # live work on the strength of a reading that had already expired.
@@ -399,7 +399,7 @@ defmodule Tightbeam.LedgerTest do
     assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, "agent:main:clawline:operator:main", "lane")
   end
 
-  # Re-review finding. Identifying the aged rows by the error string this
+  # Identifying the aged rows by the error string this
   # function itself wrote makes a second aging re-report the first batch, so the
   # lane announces rows it did not touch. Only the statement that did the work
   # knows what it did.

@@ -1248,7 +1248,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "O5 follow-up (round 2): a resolved role carrier reads through its pinned sessionKey, never a live role lookup",
        %{db: db} do
-    # REGRESSION PIN: before reviewer's round-2 finding, a role that RESOLVED at
+    # REGRESSION PIN: a role that RESOLVED at
     # materialization was readable through the carrier's own pinned
     # sessionKey (O2) — the fix for the orphaned case must not regress this,
     # provably: the role is removed entirely before the read, so only the
@@ -3125,7 +3125,7 @@ defmodule Tightbeam.CoordinationFabricTest do
              "a shadowing alias (that is the evasion being closed) but it caught it"
   end
 
-  test "TEETH (round 6, finding 3): an edited unscoped-literal function fails its pin's hash, " <>
+  test "an edited unscoped-literal function fails its pin's hash, " <>
          "rather than silently keeping a stale safety witness" do
     # `escalate/4`'s real pinned text, with one clause of whitespace changed
     # — a stand-in for ANY real edit. The hash is computed over the WHOLE

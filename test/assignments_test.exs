@@ -1469,7 +1469,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{attest: %{kind: "completion"}} =
              handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
 
-    # The marker carries actor + reason (finding 6), not just the id.
+    # The marker carries actor + reason, not just the id.
     assert marker_contents(ctx.db, "holder")
            |> Enum.any?(
              &(&1 ==
@@ -1579,6 +1579,7 @@ defmodule Tightbeam.AssignmentsTest do
           review.id,
           "the requested changes landed; this round owes a fresh verdict"
         )
+      )
 
     assert reopened.state == "open"
 
@@ -1650,8 +1651,8 @@ defmodule Tightbeam.AssignmentsTest do
            ]
   end
 
-  # : the reverse direction of finding 1, and on the
-  # SAME card rather than across two. Reopening lets one round carry more than
+  # This is the reverse case, on the SAME card rather than across two.
+  # Reopening lets one round carry more than
   # one verdict over its life, so "which round governs" and "which verdict on
   # that round governs" must come from the SAME row, not two independently
   # computed answers that happen to agree today. File reviewed-clean, close,
@@ -1781,7 +1782,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert reopen_mutation_snapshot(ctx.db, assignment.id) == before
   end
 
-  # : opener-or-admin left the holder — the mind
+  # Opening agent or admin changed the holder — the mind
   # that owes the replacement verdict — with no independent exit unless they
   # also happened to be the opener. `lead` opens the card; `reviewer` holds it.
   test "the holder has an independent reopen exit distinct from the opener",
@@ -3691,7 +3692,7 @@ defmodule Tightbeam.AssignmentsTest do
     count
   end
 
-  # : a refusal that returns the right code but still
+  # A refusal that returns the right code but still
   # mutated the row, the reopenings papertrail, or supervision would pass every
   # assertion that checked only the returned code. This snapshots all three
   # durable surfaces a reopen touches and pins them unchanged across a refusal.
