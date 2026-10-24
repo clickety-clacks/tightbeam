@@ -2555,15 +2555,21 @@ defmodule Tightbeam.GatewayTest do
 
     old = create_session(ctx.db, "agent:old", "operator")
     new = create_session(ctx.db, "agent:new", "operator")
-    Roles.create!
+    Roles.create!(ctx.db, "reviewer", "operator", old.session_key)
     wake_handler = Gateway.handlers(Map.put(config, :wake_scheduler, scheduler))["wake"]
     future = System.system_time(:millisecond) + 60_000
 
     scheduled =
-      wake_handler.
+      wake_handler.(%{
+        origin: "user:operator",
+        session_key: old.session_key,
+        target_role: "reviewer",
+        role_fallback: false,
+        params: %{prompt: "review this", at: future}
+      })
 
     assert Wakes.get(ctx.db, scheduled.wake_id).target_role == "reviewer"
-    assert :ok = Roles.bind
+    assert :ok = Roles.bind(ctx.db, "reviewer", new.session_key)
 
     {:ok, _} =
       DB.query(ctx.db, "UPDATE wakes SET dueAt = 0 WHERE wakeId = ?1", [scheduled.wake_id])
@@ -2578,9 +2584,15 @@ defmodule Tightbeam.GatewayTest do
              )
 
     deleted =
-      wake_handler.
+      wake_handler.(%{
+        origin: "user:operator",
+        session_key: new.session_key,
+        target_role: "reviewer",
+        role_fallback: false,
+        params: %{prompt: "will disappear", at: future}
+      })
 
-    assert :ok = Roles.rm
+    assert :ok = Roles.rm(ctx.db, "reviewer")
     {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt = 0 WHERE wakeId = ?1", [deleted.wake_id])
     assert :ok = Wakes.fire_due(scheduler)
     assert Wakes.get(ctx.db, deleted.wake_id).state == "fired"
@@ -3164,7 +3176,14 @@ defmodule Tightbeam.GatewayTest do
     start_lane!(ctx.db, "stale-effort")
 
     result =
-      handlers["tune"]..
+      handlers["tune"].(%{
+        origin: "user:operator",
+        session_key: "stale-effort",
+        on_tune_elected: fn ->
+          # set_reasoning DERIVED its target from the snapshot's model — a
+          # RELATIVE election. A concurrent model change makes that derivation
+          # stale: committing it would silently revert the model family the
+          # other request just elected (blocking).
           {:ok, _} =
             DB.transaction(ctx.db, fn txn ->
               DB.Txn.q(txn, "UPDATE sessions SET model='other-family' WHERE sessionKey=?1", [

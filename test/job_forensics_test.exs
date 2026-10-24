@@ -350,7 +350,14 @@ defmodule Tightbeam.JobForensicsTest do
     session(db, "requester-session")
 
     wake =
-      Wakes.schedule
+      Wakes.schedule(db, %{
+        session_key: "requester-session",
+        origin: "agent:reviewer",
+        creator_session_key: "requester-session",
+        prompt: "cancel me",
+        due_at: 1,
+        work_item_id: "wi_requester"
+      })
 
     assert %{canceled: false} =
              cancel_via_gateway(
@@ -363,11 +370,27 @@ defmodule Tightbeam.JobForensicsTest do
     refute Enum.any?(trace(db, "wi_requester").timeline, &(&1.type == "wake_canceled"))
 
     assert %{canceled: true} =
-             cancel_via_gateway
+             cancel_via_gateway(
+               db,
+               wake.wake_id,
+               "agent:reviewer",
+               {:session, "requester-session"}
+             )
 
     first = canceled_entry(db, "wi_requester", wake.wake_id)
 
-    assert_proven_cancellation
+    assert_proven_cancellation(first, %{
+      schedulingOrigin: "agent:reviewer",
+      requesterKind: "session",
+      requesterId: "requester-session",
+      reasonKind: "requester_withdrew",
+      causalSourceKind: "verb_call",
+      outcomeKind: "no_replacement",
+      primaryWorkKind: "work_item",
+      primaryWorkId: "wi_requester",
+      workImpactKind: "linked_work_not_open",
+      actionNeeded: false
+    })
 
     assert is_binary(first.causalSourceId) and first.causalSourceId != ""
 
@@ -399,7 +422,12 @@ defmodule Tightbeam.JobForensicsTest do
              )
 
     assert %{canceled: false} =
-             cancel_via_gateway
+             cancel_via_gateway(
+               db,
+               wake.wake_id,
+               "agent:reviewer",
+               {:session, "requester-session"}
+             )
 
     assert canceled_entry(db, "wi_requester", wake.wake_id) == first
   end

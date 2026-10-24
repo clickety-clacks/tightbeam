@@ -35,8 +35,8 @@ defmodule Tightbeam.RailRemedyTest do
     ensure_main_session(db, "operator")
 
     holder = session(db, "holder", "operator", "claude", "coder")
-    reviewer = session
-    Roles.create!
+    reviewer = session(db, "reviewer-session", "operator", "claude", "reviewer")
+    Roles.create!(db, "reviewer", "operator", reviewer.session_key)
 
     # Canonicalize the tmp base: Darwin's System.tmp_dir!/0 sits under the /var
     # symlink (/var -> /private/var), and Containment.rail_profile/1 (the rail scratch

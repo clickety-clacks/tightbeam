@@ -195,13 +195,13 @@ defmodule Tightbeam.WakesTest do
         VALUES
           ('agent:main:clawline:operator:main', 'Main', 'main', 1, 'operator', 'user:operator',
            'agent:main:clawline:operator:main', 'default', 'claude',
-           'anthropic', 'example-model', 'test-host', 'active', 1, 1),
+           'anthropic', 'example-model', 'sixth-host', 'active', 1, 1),
           ('retiring', 'retiring', 'custom', 0, 'operator', 'user:operator',
            'agent:main:clawline:operator:main', 'default', 'claude',
-           'anthropic', 'example-model', 'test-host', 'active', 1, 1),
+           'anthropic', 'example-model', 'sixth-host', 'active', 1, 1),
           ('replacement', 'replacement', 'custom', 0, 'operator', 'user:operator',
            'agent:main:clawline:operator:main', 'default', 'claude', 'anthropic',
-           'example-model', 'test-host', 'active', 1, 1);
+           'example-model', 'sixth-host', 'active', 1, 1);
         INSERT INTO work_items
           (id, title, ownerUserId, state, createdByUser, createdAt)
         VALUES ('wi_retarget', 'Retarget work', 'operator', 'open', 'operator', 1);
@@ -221,7 +221,24 @@ defmodule Tightbeam.WakesTest do
       )
 
     original =
-      Wakes.schedule
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        target_role: "reviewer",
+        origin: "process:tightbeam",
+        prompt: "continue",
+        consumer: "prompt",
+        due_at: 4_000,
+        condition_kind: "retirement",
+        condition_scope: "retiring",
+        creator_session_key: "retiring",
+        rumination: true,
+        work_item_id: "wi_retarget",
+        assignment_id: "asg_retarget",
+        target_gate: 0,
+        reresolve: "lineage",
+        reresolve_seed: "retiring",
+        reresolve_rung: 1
+      })
 
     {:ok, _} = DB.query(db, "UPDATE wakes SET createdAt=100 WHERE wakeId=?1", [original.wake_id])
     original = Wakes.get(db, original.wake_id)

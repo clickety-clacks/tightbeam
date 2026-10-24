@@ -762,7 +762,7 @@ defmodule Tightbeam.AdminProjectionTest do
        ctx do
     create_session!(ctx.db, "agent:identity-role-primary", "operator")
     create_session!(ctx.db, "agent:identity-role-rebound", "operator")
-    Roles.create!
+    Roles.create!(ctx.db, "identity-reviewer", "operator", "agent:identity-role-primary")
 
     call = firehose_call("identity-edit", %{})
     entries = AdminProjection.served_entries(ctx.db, ctx.base_dir)
@@ -781,7 +781,7 @@ defmodule Tightbeam.AdminProjectionTest do
              should_fire = Agent.get_and_update(hook_state, fn fired -> {not fired, true} end)
 
              if should_fire do
-               assert :ok = Roles.bind
+               assert :ok = Roles.bind(ctx.db, "identity-reviewer", "agent:identity-role-rebound")
                assert {:ok, [_item]} = AdminProjection.stamp_publication(ctx.db, call, [changed])
                send(parent, :role_retry_rebound)
              end
@@ -790,7 +790,11 @@ defmodule Tightbeam.AdminProjectionTest do
       )
 
     actual =
-      Gateway.handlers(%{db: proxy, base_dir: ctx.base_dir})["identity-status"].
+      Gateway.handlers(%{db: proxy, base_dir: ctx.base_dir})["identity-status"].(%{
+        origin: "agent:identity-reviewer",
+        principal: nil,
+        params: %{}
+      })
 
     assert_receive :role_retry_rebound
     assert actual.identity == StateResources.identity(hydrated_identity!(ctx.db, "served"))

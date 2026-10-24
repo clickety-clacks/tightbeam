@@ -278,7 +278,7 @@ defmodule Tightbeam.OrgTest do
        %{db: db} do
     main_key = Org.personal_session_key("operator")
     Org.create(db, base(%{session_key: "retiring"}))
-    Roles.create!
+    Roles.create!(db, "reviewer", "operator", "retiring")
 
     direct =
       Wakes.schedule(db, %{
@@ -289,7 +289,13 @@ defmodule Tightbeam.OrgTest do
       })
 
     role =
-      Wakes.schedule
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        target_role: "reviewer",
+        origin: "user:operator",
+        prompt: "role",
+        due_at: 9_001
+      })
 
     ungated =
       Wakes.schedule(db, %{
@@ -349,7 +355,7 @@ defmodule Tightbeam.OrgTest do
   } do
     main_key = Org.personal_session_key("operator")
     Org.create(db, base(%{session_key: "retiring"}))
-    Roles.create!
+    Roles.create!(db, "reviewer", "operator", "retiring")
 
     lane = %{session_key: "retiring", target_role: "reviewer"}
 
@@ -367,7 +373,15 @@ defmodule Tightbeam.OrgTest do
       end)
 
     original =
-      Wakes.schedule
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        target_role: "reviewer",
+        origin: "process:tightbeam",
+        creator_session_key: "agent:sender",
+        prompt: "selected source survives retirement",
+        due_at: 0,
+        class: "fyi"
+      })
 
     assert original.delivery_rule == NoticeBatcher.rule()
 
@@ -444,7 +458,15 @@ defmodule Tightbeam.OrgTest do
       selected_retirement_source(db, "overflow retirement 1")
 
     for n <- 2..51 do
-      Wakes.schedule
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        target_role: "reviewer",
+        origin: "process:tightbeam",
+        creator_session_key: "agent:sender",
+        prompt: "overflow retirement #{n}",
+        due_at: 0,
+        class: "fyi"
+      })
     end
 
     sealed = NoticeBatcher.batch(db, batch_id)
@@ -609,7 +631,16 @@ defmodule Tightbeam.OrgTest do
     Org.create(db, base(%{session_key: "root", handle: "orchestrator:news"}))
 
     child =
-      Org.create
+      Org.create(
+        db,
+        base(%{
+          session_key: "child",
+          origin: "agent:orchestrator:news",
+          spawned_by: "root",
+          archetype: "reviewer",
+          harness: "codex",
+          provider: "openai",
+          model: Model.new("gpt-5.6-example", effort: "high")
         })
       )
 
@@ -730,14 +761,31 @@ defmodule Tightbeam.OrgTest do
 
   defp selected_retirement_source(db, prompt) do
     Org.create(db, base(%{session_key: "retiring"}))
-    Roles.create!
+    Roles.create!(db, "reviewer", "operator", "retiring")
 
     {:ok, _policy} =
-      DB.transaction
+      DB.transaction(db, fn txn ->
+        Org.apply_notice_batching_lane_policy_in_txn(
+          txn,
+          %{session_key: "retiring", target_role: "reviewer"},
+          true,
+          "notice-batching-org-immutable-retirement-test:#{prompt}",
+          "agent:test-policy",
+          "retirement-immutable-fixture",
+          1_000
+        )
       end)
 
     original =
-      Wakes.schedule
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        target_role: "reviewer",
+        origin: "process:tightbeam",
+        creator_session_key: "agent:sender",
+        prompt: prompt,
+        due_at: 0,
+        class: "fyi"
+      })
 
     assert [%{member_state: "active", batch_id: batch_id}] =
              NoticeBatcher.source_refs(db, original.wake_id)

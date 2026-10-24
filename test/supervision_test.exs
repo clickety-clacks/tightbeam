@@ -4261,11 +4261,32 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   defp prepare_review_gate(ctx) do
-    reviewer = session
-    {:ok, _} = DB.query
-    Roles.create!
+    reviewer = session(ctx.db, "reviewer", ctx.main.session_key)
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET harness='codex' WHERE sessionKey='reviewer'")
+    Roles.create!(ctx.db, "reviewer", "operator", reviewer.session_key)
 
-    write_rules
+    write_rules(
+      ctx,
+      """
+      [[rule]]
+      name = "completion-needs-review"
+      verb = "attest"
+      text = "completion requires review"
+      edges = ["verb", "turn-end"]
+      effect = "remedy"
+      deny_when = [
+        { fact = "attest.kind", op = "eq", value = "completion" },
+        { fact = "assignment.verdicts", op = "not_in", value = ["reviewed-clean"] }
+      ]
+      [rule.remedy]
+      action = "assign"
+      produces = "reviewed-clean"
+      target_role = "reviewer"
+      [rule.remedy.params]
+      subject = "review of assignment {assignment_id}"
+      reviews = "{assignment_id}"
+      """
+    )
   end
 
   defp load_turn_end_deny(ctx) do
