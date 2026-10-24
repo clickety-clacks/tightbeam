@@ -65,7 +65,7 @@ coordination fabric and product overview describe the supported behavior.
   full command text) and deny actually blocks. Two prerequisites: CODEX_PATH must pin
   the binary (codex-acp otherwise runs a stale bundled 0.144.5), and the boot
   wiring-check prompt must ask the probe model to echo the refusal verbatim (codex
-  surfaces a block as a tool result, not agent text). See specs permission-seam-spike.md.
+  surfaces a block as a tool result, not agent text).
 
 ## Change only what the task requires
 

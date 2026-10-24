@@ -30,23 +30,14 @@
 # `check_carrier_on_real_turn/1` proves the CARRIER: a real CLI artifact-record
 # inside a real harness turn, bound to that turn and reading tool-call-observed.
 #
-# "A REAL AGENT WALKS THE GATES" was proven in the field, not dropped. Both legs
-# did the whole lifecycle autonomously and honestly on 2026-07-30 — claude
-# 11:19:56 open → 11:20:48 verified → 11:21:02 recorded → 11:21:07 closed, codex
-# the same shape at 12:09–12:12, landing art_00000000-0000-4000-8000-000000000100 tool-call-observed with a
-# non-null edge. Driving that chain through a scripted holder is what the split
-# gives up, because a capable holder finishes it before any scripted denial can
-# fire; the second group keeps the substrate half under assertion every run and
-# accepts the holder completing its own assignment rather than calling it a race.
+# Integrated harness turns exercise holder verification and artifact recording.
+# The scripted cases keep the substrate assertions deterministic while allowing
+# a capable holder to complete its own assignment.
 #
-# Both groups additionally need the org's identity/rules to carry the shipped
-# verification statutes (completion-requires-verification,
-# completion-requires-results-artifact) AND a `coder` archetype that admits this
-# host. Rules load once at gateway BOOT, so an org whose law changed under a
-# running gateway must be rebooted before the run. On linux-runner that means the
-# eb0ea2b org-law workaround must be REVERTED first: with it installed the
-# artifact statute never denies and the gate-chain group fails at its third
-# denial, which is exactly what keeps that leg falsifiable.
+# Both groups require the configured product rules and a `coder` archetype that
+# admits the test environment. Rules load at gateway boot, so restart the gateway
+# after changing them. A rule set that skips the artifact denial invalidates the
+# expected denial sequence, which this check verifies explicitly.
 
 defmodule FeatureSmoke do
   defmodule Failure do
@@ -595,27 +586,12 @@ defmodule FeatureSmoke do
   # inside the window this group occupies, and the group proves that rather than trusting
   # it.
   #
-  # The earlier shape drove this chain through a real holder, and both field runs proved
-  # it unassertable that way. Handed grounded work and the statute's own remedy prompt, a
-  # competent holder verified, recorded its report and completed before the scripted
-  # denials could fire — claude 11:19:56 open → 11:20:48 verified → 11:21:02 recorded →
-  # 11:21:07 closed, and codex the same shape at 12:09–12:12. The scripted denial then hit
-  # `assignment_closed`. The agents were right and the journey was wrong: it had been
-  # asserting that a capable holder would fail to do its job.
+  # A live holder may act on a remedy wake before the next scripted denial. This
+  # test checks denial behavior through direct calls, while a separate integrated
+  # harness turn exercises the real CLI and adapter path.
   #
-  # WHERE THE REAL-AGENT PROOF LIVES NOW, so no one reads this split as a proof dropped
-  # rather than relocated. Those two field runs ARE the "a real agent walks the gates"
-  # evidence, and they are stronger than the scripted version was: both holders verified
-  # with grounded notes of their own, recorded over the real CLI — codex landed
-  # art_00000000-0000-4000-8000-000000000100 `tool-call-observed` with a non-null edge, which is the R7 datum itself —
-  # and completed, autonomously and honestly, on both harnesses. What remains under
-  # assertion every run is the substrate half, in `check_carrier_on_real_turn/1` below,
-  # which accepts the holder completing its own assignment as the legitimate outcome it is
-  # rather than as a race to be suppressed.
-  #
-  # What this half proves is the LAW: each statute denies while its fact is unsatisfied,
-  # in order, and the artifact releases the last one. An org carrying the eb0ea2b
-  # workaround still fails at the third denial, so falsifiability is untouched.
+  # This half proves that each statute denies while its fact is unsatisfied, in
+  # order, and that the artifact releases the last one.
   #
   # WHY THE HOLDER CANNOT QUIETLY LEAK INTO THIS, stated so it can be attacked rather than
   # trusted. The verification and artifact statutes both remedy by WAKING the holder, so a
@@ -815,12 +791,9 @@ defmodule FeatureSmoke do
       # holding a prompt nothing has read. An earlier version of this assertion demanded
       # zero rows and could never have passed.
       #
-      # `startedAt` IS NOT THE LINE EITHER, and the field disproved it before it ever ran.
-      # The operator's row above came back `session-concurrent`, and that class is returned
-      # only when `Ledger.running_turn_message_id/2` finds a turn at `status = 'running'` —
-      # the same UPDATE that writes `startedAt`. So on the run that produced art_00000000-0000-4000-8000-000000000101 a
-      # turn was ALREADY running, and an assertion on `startedAt` would have failed a group
-      # that was otherwise behaving exactly as designed.
+      # `startedAt` is not sufficient evidence by itself. The `session-concurrent`
+      # result is returned only when `Ledger.running_turn_message_id/2` finds a turn
+      # at `status = 'running'`, the same UPDATE that writes `startedAt`.
       #
       # THE LESSON, which is worth more here than any assertion: TURN STATE TRACKS THE
       # LANE, NOT THE AGENT. `running` means the lane claimed the turn and is handing it to
@@ -909,16 +882,15 @@ defmodule FeatureSmoke do
   #
   # WHICH HALF OF CODEX THIS PROVES. Codex as a verdict FILER is proven on this gateway —
   # the live walks filed reviewed-clean over codex cleanly. What rests on the trust-gated
-  # `CODEX_CONFIG` hook seam is codex as the artifact RECORDER, and until the field runs it
-  # had only the 0.145.0 spike behind it (§5.2). The holder is therefore always the leg's
+  # `CODEX_CONFIG` hook seam is codex as the artifact RECORDER. The holder is
+  # therefore always the leg's
   # own harness and the class is asserted PER LEG, which is what makes a filtered
   # single-leg run a complete answer to that one question.
   #
   # NO GATES ARE DRIVEN HERE, so no remedy wakes fire and there is nothing to serialize
   # against beyond this group's own wake. The holder completing its assignment afterwards
   # is ACCEPTED AND NOT REQUIRED: that is what a capable holder does with grounded work,
-  # it is what both field runs did, and a journey that treated it as a failure would be
-  # asserting that good agents behave badly.
+  # this is the expected outcome for a holder with grounded work.
   defp check_carrier_on_real_turn(state) do
     u = unique()
     marker = "results-#{u}.md"
@@ -1215,7 +1187,7 @@ defmodule FeatureSmoke do
   # `"#{rule.name}: #{rule.text}"` — matching a statute name as a SUBSTRING of that is not
   # statute identity, because any statute whose text quoted the expected name would
   # satisfy it. A false green on the third denial is the one this group cannot afford: it
-  # is what makes an org still carrying the eb0ea2b workaround look like a pass.
+  # is what makes a ruleset that skips a required denial look like a pass.
   #
   # The durable row is exact. Every statute denial goes through
   # `Dispatch.best_effort_denial/6`, which JSON-encodes the whole error before the call

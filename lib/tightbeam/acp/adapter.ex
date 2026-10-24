@@ -293,7 +293,7 @@ defmodule Tightbeam.Acp.Adapter do
   @spec knows_session?(adapter(), String.t()) ::
           boolean() | {:error, {:adapter_unavailable, term()}}
   def knows_session?(adapter, session_id) do
-    # The BOOT-BOUNDARY budget (task #20): a residency call legally queues
+    # The BOOT-BOUNDARY budget: a residency call legally queues
     # behind a slow codex boot, and the old 5s caller budget undercut that queue.
     # A DEAD adapter still fails promptly via :noproc — only a BOOTING one waits.
     GenServer.call(adapter, {:knows_session?, session_id}, @boot_boundary_timeout)

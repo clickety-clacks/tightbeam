@@ -124,7 +124,7 @@ defmodule Tightbeam.HarnessProcessTest do
         AdapterCoordinator,
         # Wait bound, not the subject: 50ms was enough for the fake adapter to
         # exit gracefully on quiet hosts and NOT on a loaded CI runner, where
-        # the park killed it and the row read "killed" (run 30941227365). The
+        # the park killed it and the row read "killed". The
         # graceful path exits promptly; this only bounds a genuinely-slow one.
         adapter_sup: ctx.sup,
         adapter_context: fn _ -> [] end,

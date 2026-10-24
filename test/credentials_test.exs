@@ -886,7 +886,7 @@ defmodule Tightbeam.CredentialsTest do
 
       # The operator's credential stays where they put it: the substrate holds no
       # opinion about a vendor login, and reverting one silently resumes spend on
-      # an account the operator believes is disconnected (user, 2026-08-14).
+      # an account the operator believes is disconnected.
       assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
                ~S({"token":"candidate"})
 

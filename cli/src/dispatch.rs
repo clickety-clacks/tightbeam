@@ -517,7 +517,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 } => {
                     params.push(string_field("setting", "set_harness"));
                     params.push(string_field("harness", harness));
-                    // `model` is REQUIRED on this variant (v0.2 program §4):
+                    // `model` is REQUIRED on this variant:
                     // parsing cannot build a `TuneControl::Harness` without
                     // one, so it always crosses as a named, non-empty value.
                     model_fields.push(("model", Some(Some(model.clone()))));
@@ -1469,7 +1469,7 @@ pub fn build_onboard_phase_request(
 
 /// Build a `wake --user <owner>` request carrying the onboarding sign-in prompt, so the
 /// operator who cannot see the ceremony's terminal still receives the URL+code. The wake
-/// row IS the durable record of the delivery (wi_00000000-0000-4000-8000-000000000106) -- it persists in the substrate
+/// row IS the durable record of the delivery -- it persists in the substrate
 /// with the code text, the target, and timestamps.
 ///
 /// `userId` is a target field and `prompt` a param, exactly as `Command::Wake` builds them.
@@ -2642,7 +2642,7 @@ mod tests {
             r#"{"asUser":"operator","verb":"tune","sessionKey":"agent:coder:x s_1","params":{"setting":"set_harness","harness":"codex","model":"gpt-5.6-example","effort":"high"}}"#
         );
 
-        // No model named: REFUSED at parse time (v0.2 program §4 — the
+        // No model named: REFUSED at parse time (the
         // substrate never elects a destination model). This body can no
         // longer be built at all, so there is nothing byte-exact to assert
         // here; `args::tune_refuses_a_packed_model_an_invented_harness_and_a_partial_naming`
@@ -4065,12 +4065,8 @@ mod tests {
             })
         );
 
-        // The linux-runner failure, as a test: with TIGHTBEAM_BASE_DIR naming the org --
-        // the variable the README documents and both service units set -- discovery
-        // must read THAT gateway.json. It read ~/.tightbeam's instead, so `tightbeam
-        // onboard` dialled a pre-existing org's port while its own gateway served
-        // elsewhere. Both variables set, disagreeing, is the case that matters:
-        // BASE_DIR wins, exactly as Tightbeam.BaseDir resolves it.
+        // With both variables set to different directories, discovery must read the
+        // `gateway.json` selected by TIGHTBEAM_BASE_DIR, matching Tightbeam.BaseDir.
         let env = HashMap::from([
             (
                 "TIGHTBEAM_BASE_DIR".to_owned(),
@@ -4150,9 +4146,8 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    // RECORDED REALITY, not a chosen fixture: `Placement.provision_endpoint` writes
-    // TIGHTBEAM_ADVERTISED_URL verbatim, and that value is the WEBSOCKET url -- in
-    // production, `ws://linux-runner:11373`. This base is the root of an HTTP path
+    // `Placement.provision_endpoint` writes TIGHTBEAM_ADVERTISED_URL verbatim, and
+    // that value may be a websocket URL such as `ws://example.invalid:11373`. This base is the root of an HTTP path
     // (`/agent/dispatch`), and the http client rejects the scheme outright with
     // "Unknown Scheme: unknown scheme 'ws'", so every satellite ceremony died on the
     // one url a real gateway ever writes. The sibling fixtures above hardcode

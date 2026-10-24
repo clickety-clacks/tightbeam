@@ -850,17 +850,14 @@ defmodule Tightbeam.IdentityTest do
   # merge commit for want of a committer and the empty conflict list was read as one.
   # Nothing proved that fix, so CI could not have caught it coming back.
   #
-  # Both write paths are covered, because both supply their own committer and both
-  # are reachable on such a host: `edit!` was observed on linux-runner committing cleanly
-  # as `user:operator <user-operator@tightbeam.local>` with no host identity present, and
-  # that observation was the only evidence it worked.
+  # Both write paths are covered because each supplies its own committer and can
+  # operate when no host identity is configured.
   test "relearn and edit both commit on a host with no git identity at all", ctx do
     # `useConfigOnly` is what makes this a real bare host rather than a tidied one.
     # Emptying the config is not enough: git falls back to GUESSING an identity from
     # the passwd entry and the hostname, so a machine with no configured identity
-    # still commits -- as "user Manzano <operator@test-host…>" here. That fallback is what
-    # made this environment untestable by simply clearing config, and it is off on
-    # a fresh satellite, where the commit genuinely has nowhere to get a committer.
+    # still commits by guessing an identity from the passwd entry and hostname.
+    # Disable that fallback so the test has no committer unless the code supplies one.
     bare_config = Path.join(ctx.root, "bare-gitconfig")
     File.write!(bare_config, "[user]\n\tuseConfigOnly = true\n")
 

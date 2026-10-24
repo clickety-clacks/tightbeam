@@ -115,8 +115,8 @@ missing =
     # ClientE2E.Substrate.query/2 reads the gateway's state.db by EXEC'ing
     # sqlite3(1) — it does not go through exqlite. Without it J0 reports
     # "driver error: Erlang error: :enoent", which names neither sqlite3 nor
-    # PATH. The GitHub runner images happen to ship it and every dev mac has it;
-    # linux-runner does not, which is one of the 44 first-linux-run failures.
+    # PATH. Some development environments do not include sqlite3, so report the
+    # missing prerequisite explicitly instead of failing with an opaque error.
     if System.find_executable("sqlite3") do
       acc
     else

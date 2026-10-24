@@ -9,14 +9,10 @@ defmodule Tightbeam.BaseDir do
     * `mix tightbeam.catalog_diff` read both, in the right order
     * `Tightbeam.Application` read neither, defaulting bare
 
-  So install-time and runtime resolved `base_dir` DIFFERENTLY FROM THE SAME
-  ENVIRONMENT. With `TIGHTBEAM_BASE_DIR` set, `mix tightbeam.init` wrote the
-  identity repo into `~/.tightbeam` and reported success, while the service
-  booted against the requested directory with no identity repo in it — and if
-  `~/.tightbeam` already held an unrelated org, init no-op'd against it and
-  printed "already initialized", which reads as confirmation that the new
-  install is ready when nothing was done. Found on linux-runner, 2026-07-27, by the
-  production-install smoke, where it silently targeted a live unrelated org.
+  So install-time and runtime resolved `base_dir` differently from the same
+  environment. With `TIGHTBEAM_BASE_DIR` set, initialization and the running
+  service could select different directories, making a successful initialization
+  message misleading or causing later commands to contact the wrong gateway.
 
   Precedence, matching what the README documents and what `catalog_diff`
   already did:

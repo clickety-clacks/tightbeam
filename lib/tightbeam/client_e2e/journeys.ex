@@ -82,7 +82,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       label: "converse",
       action: ~s(post "hello, who are you?" in Main),
       client:
-        "echo message frame carrying our clientMessageId; typing active=true; assistant message replying to that clientMessageId; typing active=false and no further typing=true through the settle window. The indicator is the INVARIANT; its LABEL is not asserted here — the substrate relays only labels the harness reports and a plain turn legitimately has none (SMOKE step 3, measured 0e40b93). Step 4 asserts the label where an event backs it.",
+        "echo message frame carrying our clientMessageId; typing active=true; assistant message replying to that clientMessageId; typing active=false and no further typing=true through the settle window. The indicator is the INVARIANT; its LABEL is not asserted here — the substrate relays only labels the harness reports and a plain turn legitimately has none (SMOKE step 3, as observed in a client-e2e run). Step 4 asserts the label where an event backs it.",
       substrate: "turn row for that clientMessageId reaches `delivered`"
     },
     %{
@@ -1785,8 +1785,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
   WHAT IS NOT HERE: the reply's CONTENT. Whether the agent obeyed the prompt's
   instruction is agent EFFECTIVENESS, which evals own; e2e tests substrate
-  FUNCTIONALITY (user, 2026-07-26, after run a888f9b row 16 failed the claude
-  leg on reply text while every substrate oracle held). A competent agent that
+  FUNCTIONALITY. A competent agent that
   answers the wake differently must still pass every leg above.
 
   `observed` keys: `:wake_id` (as dispatched), `:turn`, `:message_id`,
@@ -2219,7 +2218,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
   WHAT IS NOT HERE: the indicator's LABEL. ON and OFF are invariants and fail
   hard; the label is harness-reported and the substrate fabricates none, so a
   plain conversational turn legitimately runs unlabeled (SMOKE step 3 as
-  amended, measured in run 0e40b93). Step 4 asserts the label where a
+  amended, as observed in a client-e2e run). Step 4 asserts the label where a
   `tool_call*` event backs it.
 
   `observed` keys: `:frames` (ordered, from the post watermark through the

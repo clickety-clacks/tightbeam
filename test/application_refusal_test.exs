@@ -1,9 +1,8 @@
 defmodule Tightbeam.ApplicationRefusalTest do
   # AN EXPECTED REFUSAL MUST EXIT WITH ITS SENTENCE; A DEFECT MUST STILL CRASH.
   #
-  # Measured on linux-runner from the npm tarball, before the fix: the no-harness-CLI refusal
-  # printed the right words and then produced "Kernel pid terminated
-  # (application_controller)" plus an erl_crash.dump — a release runs the app as
+  # A no-harness-CLI refusal must not produce "Kernel pid terminated
+  # (application_controller)" or an erl_crash.dump — a release runs the app as
   # permanent, so `{:error, _}` from start/2 escalates into a kernel panic.
   #
   # This boots the application IN A SUBPROCESS rather than asserting against a seam.

@@ -1,4 +1,4 @@
-//! Machine-readable emission of onboarding sign-in deliverables (wi_00000000-0000-4000-8000-000000000106).
+//! Machine-readable emission of onboarding sign-in deliverables.
 //!
 //! Interactive onboarding is INCOMPLETE until the operator holds the sign-in URL and, for
 //! the device-code providers, the one-time code (ceremony-lifecycle-v1.md, "The definition
@@ -48,7 +48,7 @@ impl Deliverable {
 /// unmistakable amid the vendor's human passthrough text.
 ///
 /// `wake_id` is the operator-wake identity -- the wake row IS the durable record of this
-/// delivery (wi_00000000-0000-4000-8000-000000000106). `delivery_file` is the path to the local 0600 copy. Both are
+/// delivery. `delivery_file` is the path to the local 0600 copy. Both are
 /// threaded through so the machine-readable line points a relay at where the delivery landed.
 pub(crate) fn structured_line(
     provider: &str,
@@ -340,7 +340,7 @@ mod tests {
         };
         let line = structured_line(
             "openai",
-            "linux-runner",
+            "test-host",
             &deliverable,
             Some("w_1"),
             Some("/w/onboard-delivery-openai-1.json"),
@@ -349,7 +349,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid json");
         let d = &parsed["onboardingDelivery"];
         assert_eq!(d["provider"], "openai");
-        assert_eq!(d["machine"], "linux-runner");
+        assert_eq!(d["machine"], "test-host");
         assert_eq!(d["kind"], "device_code");
         assert_eq!(d["url"], "https://auth.openai.com/codex/device");
         assert_eq!(d["code"], "VG6S-L35ON");
@@ -362,7 +362,7 @@ mod tests {
         let deliverable = Deliverable::SignInUrl {
             url: "https://claude.ai/oauth/authorize?x=1".to_owned(),
         };
-        let line = structured_line("anthropic", "linux-runner", &deliverable, None, None);
+        let line = structured_line("anthropic", "test-host", &deliverable, None, None);
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid json");
         let d = &parsed["onboardingDelivery"];
         assert_eq!(d["kind"], "paste_back");
@@ -382,7 +382,7 @@ mod tests {
         };
         let file = delivery_file_json(
             "openai",
-            "linux-runner",
+            "test-host",
             &deliverable,
             1000,
             Some(901_000),
@@ -406,7 +406,7 @@ mod tests {
         let notified = Notified::NotNotified {
             reason: "gateway did not supply ownerUserId".to_owned(),
         };
-        let file = delivery_file_json("anthropic", "linux-runner", &deliverable, 5, None, &notified);
+        let file = delivery_file_json("anthropic", "test-host", &deliverable, 5, None, &notified);
         let parsed: serde_json::Value = serde_json::from_str(&file).expect("valid json");
         let n = &parsed["onboardingDelivery"]["notification"];
         assert_eq!(n["notified"], false);

@@ -13,7 +13,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     WorkItems
   }
 
-  # The posture gate (user, 2026-08-31): implementation runs under a posture the
+  # The posture gate ensures implementation runs under a posture the
   # orchestrator rules on receiving the slice, heavy or light, filed as a verdict on
   # a card on the work item. These tests prove the two rails refuse to open a coder
   # card without that verdict, on assign and on dispatch alike, that the verdict

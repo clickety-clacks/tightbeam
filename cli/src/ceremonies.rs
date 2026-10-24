@@ -62,7 +62,7 @@ fn lease_deadline(ready: &serde_json::Value, now: Instant) -> Instant {
     now + lease_timeout(ready)
 }
 
-/// The owner user id the gateway names on the `begin` reply (wi_00000000-0000-4000-8000-000000000106), so the CLI can
+/// The owner user id the gateway names on the `begin` reply, so the CLI can
 /// wake THAT user with the sign-in URL+code. Absent on a gateway too old to send it or a
 /// caller with no owner (a process principal) -- the emission then degrades loudly rather
 /// than waking no one. Pure so the wire shape can be pinned by a test.
@@ -86,7 +86,7 @@ struct Ceremony<'a> {
     endpoint: &'a Endpoint,
     deadline: Instant,
     load_harnesses: &'a HarnessLoader<'a>,
-    // Emission context (wi_00000000-0000-4000-8000-000000000106): who to attribute the wake to, how to send it, which
+    // Emission context: who to attribute the wake to, how to send it, which
     // provider/machine the delivery names, and the owner user to wake (absent on an older
     // gateway or a non-owned caller -> the CLI degrades loudly).
     identity: &'a Identity,
@@ -901,7 +901,7 @@ fn wake_id_of(reply: &serde_json::Value) -> Option<String> {
 }
 
 /// Surface a sign-in deliverable the operator cannot see on the ceremony's terminal, through
-/// the three channels of user's triad (wi_00000000-0000-4000-8000-000000000106): the operator WAKE (the durable substrate
+/// the three delivery channels: the operator wake (the durable substrate
 /// row AND the notification, in one), a 0600 local delivery FILE, and a machine-readable
 /// STRUCTURED line on stdout. Every channel is best-effort and LOUD on failure -- a delivery
 /// that cannot be waked or filed says so rather than vanishing.
@@ -2207,7 +2207,7 @@ mod tests {
             401,
             "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\
              \"message\":\"Invalid bearer token\"}}",
-            "linux-runner",
+            "test-host",
         );
 
         assert!(message.contains("Invalid bearer token"), "{message}");
@@ -2216,7 +2216,7 @@ mod tests {
         // Must not read as a subscription problem: `onboard` classifies the cancel
         // phase off that exact phrase, and a rejected paste is not that.
         assert!(!message.contains("no subscription"), "{message}");
-        assert!(message.contains("linux-runner"), "{message}");
+        assert!(message.contains("test-host"), "{message}");
         assert!(
             message.contains("Nothing was banked"),
             "the api-key path's promise, verbatim: {message}"
@@ -2236,7 +2236,7 @@ mod tests {
     /// authorization re-authorizing something that was never broken.
     #[test]
     fn an_unreachable_provider_is_not_a_verdict_on_the_token() {
-        let message = unvalidated_setup_token("dns error: failed to lookup address", "linux-runner");
+        let message = unvalidated_setup_token("dns error: failed to lookup address", "test-host");
 
         assert!(message.contains("could not reach anthropic"), "{message}");
         assert!(message.contains("NOT validated"), "{message}");
@@ -2250,7 +2250,7 @@ mod tests {
 
     #[test]
     fn an_api_key_network_timeout_is_not_reported_as_lease_expiry_or_rejection() {
-        let message = unvalidated_api_key("openai", "network operation timed out", "linux-runner");
+        let message = unvalidated_api_key("openai", "network operation timed out", "test-host");
 
         assert!(message.contains("could not reach openai"), "{message}");
         assert!(message.contains("timed out"), "{message}");
@@ -2748,7 +2748,7 @@ mod tests {
             identity: &Identity::User("operator".to_owned()),
             send: &send,
             provider: "openai",
-            machine: Some("linux-runner"),
+            machine: Some("test-host"),
             owner_user_id: Some("operator".to_owned()),
         };
 
@@ -2858,7 +2858,7 @@ mod tests {
             identity: &Identity::User("operator".to_owned()),
             send: &send,
             provider: "openai",
-            machine: Some("linux-runner"),
+            machine: Some("test-host"),
             owner_user_id: Some("operator".to_owned()),
         };
 
@@ -2944,7 +2944,7 @@ mod tests {
             identity: &Identity::User("operator".to_owned()),
             send: &|_, _, _| panic!("a ceremony that emitted nothing must send no wake"),
             provider: "openai",
-            machine: Some("linux-runner"),
+            machine: Some("test-host"),
             owner_user_id: Some("operator".to_owned()),
         };
 
@@ -3062,7 +3062,7 @@ mod tests {
             identity: &Identity::User("operator".to_owned()),
             send: &send,
             provider: "openai",
-            machine: Some("linux-runner"),
+            machine: Some("test-host"),
             owner_user_id: Some("operator".to_owned()),
         };
         let deliverable = Deliverable::DeviceCode {
@@ -3070,7 +3070,7 @@ mod tests {
             code: "VG6S-L35ON".to_owned(),
         };
 
-        let notified = notify_operator(&ceremony, &deliverable, "linux-runner");
+        let notified = notify_operator(&ceremony, &deliverable, "test-host");
 
         assert_eq!(
             notified,
@@ -3106,14 +3106,14 @@ mod tests {
             identity: &Identity::Session,
             send: &send,
             provider: "openai",
-            machine: Some("linux-runner"),
+            machine: Some("test-host"),
             owner_user_id: None,
         };
         let deliverable = Deliverable::SignInUrl {
             url: "https://claude.ai/oauth/authorize".to_owned(),
         };
 
-        let notified = notify_operator(&ceremony, &deliverable, "linux-runner");
+        let notified = notify_operator(&ceremony, &deliverable, "test-host");
 
         match notified {
             Notified::NotNotified { reason } => assert!(reason.contains("ownerUserId"), "{reason}"),
@@ -4048,8 +4048,8 @@ mod tests {
 
     #[test]
     fn staging_path_reads_the_wire_shape_the_gateway_actually_sends() {
-        // Verbatim from a live gateway on linux-runner (2026-07-27), captured off the wire
-        // during the production-install smoke. Every response key is lower-camelCase
+        // This response shape comes from the gateway wire format. Every response key is
+        // lower-camelCase
         // because router.ex camelizes atom keys on the way out.
         let ready: serde_json::Value = serde_json::from_str(
             r#"{"provider":"anthropic","stagingPath":"/tmp/tightbeam-anthropic-onboard-7","leaseId":"lease-7","status":"ready"}"#,

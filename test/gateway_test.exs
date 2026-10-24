@@ -14,8 +14,8 @@ defmodule Tightbeam.GatewayTest do
   #
   # MEASURED: at 1s this failed 2 of 5 samples on loaded macOS CI while the SAME
   # runner Task went on to complete (the Task.await below it passes), so the
-  # message is sent and received, just later than 1s. #56 gave a bare `node`
-  # handshake 1s for the same reason (fdb2a21); a full turn needs more.
+  # message is sent and received, just later than 1s. A bare `node`
+  # handshake 1s for the same reason; a full turn needs more.
   #
   # RE-MEASURED 2026-07-29 under a 5-lane load (load average ~93 on 16 cores),
   # which moved both the number and the explanation:
@@ -3353,7 +3353,7 @@ defmodule Tightbeam.GatewayTest do
     assert total == 3, "the two earlier rows must still exist beneath the barrier"
   end
 
-  # THE ADJUDICATION BOUNDARY (v0.2 program §4), proved at the seam: a live
+  # THE ADJUDICATION BOUNDARY, proved at the seam: a live
   # switch happens because a CALLER named one, and every way it can fail is a
   # NAMED refusal that leaves the session exactly as it was. Nothing here
   # initiates a switch, holds one pending, or picks an engine on the caller's
@@ -7542,7 +7542,7 @@ defmodule Tightbeam.GatewayTest do
   # and `modelCatalog.models` advertise one row per model with a base ref, deliberately
   # — the effort tier belongs to the reasoning picker — while the catalog only holds an
   # effort-bearing model as `id[effort]`. `set_model` composes the two and has since
-  # cbc8d2e; `set_harness` did not, so the same bare id round-tripped through one verb
+  # `set_harness` did not, so the same bare id round-tripped through one verb
   # and was refused by the other as "not offered by codex on testhost" (#69).
   test "set_harness accepts the bare model id the picker advertises", ctx do
     base_dir = role_test_base("harness-bare-model")
@@ -8390,12 +8390,12 @@ defmodule Tightbeam.GatewayTest do
     publish.("delivered")
   end
 
-  # wi_00000000-0000-4000-8000-000000000102 — the PROVISIONING SEAM, not just deliver_home: a real turn that
+  # The PROVISIONING SEAM, not just deliver_home: a real turn that
   # provisions a fresh harness session must pin the shared home to the SESSION'S
   # selected model (not the org default), so the adapter offers+accepts it at
   # session/new. Deleting the harness_session pin calls leaves settings.json
   # unwritten on the turn path and fails this — the coverage the deliver_home
-  # unit tests alone do not give (asg_00000000-0000-4000-8000-000000000105 finding #2).
+  # unit tests alone do not give.
   @tag timeout: 180_000
   test "provisioning a turn pins the shared home to the session's selected model", ctx do
     exact_registry =
@@ -9328,7 +9328,7 @@ defmodule Tightbeam.GatewayTest do
     assert Projection.list_after(ctx.db, owner_session, nil, 100) == []
   end
 
-  # AC6 (spec 1ae8fa52 §O6/I7+I9). O6 RATIFIES the existing turn-path refuse-by-name
+  # AC6. O6 RATIFIES the existing turn-path refuse-by-name
   # (`unonboarded_refusal`): a turn onto a {host, harness} whose catalog health is
   # `unavailable({:needs_onboarding, :missing})` is refused with the EXACT
   # `tightbeam onboard <provider> --as-user <userId>` remedy — the same sentence boot
@@ -9466,7 +9466,7 @@ defmodule Tightbeam.GatewayTest do
     refute_received {:prompt_started, _}
   end
 
-  # AC6 (spec 1ae8fa52 §O6), the present-but-unverified clause: a host whose credential
+  # AC6, the present-but-unverified clause: a host whose credential
   # is present-and-live but whose harness cannot execute surfaces as catalog `fresh` +
   # broken executability (spec O1/AC1), which is NOT `needs_onboarding`. Such a turn MUST
   # NOT be refused with the onboarding remedy — "run onboard" would be false, the
@@ -9540,7 +9540,7 @@ defmodule Tightbeam.GatewayTest do
     refute reason =~ "--as-user"
   end
 
-  # AC6 / I7 (spec 1ae8fa52 §O6), the r4.2 narrowing guard: I7 refuses ONLY on `:missing`
+  # AC6 / I7, the r4.2 narrowing guard: I7 refuses ONLY on `:missing`
   # (the credential store AFFIRMATIVELY answering "absent"), NEVER on the wildcard
   # `{:needs_onboarding, _}`. The `:credential_server_unavailable` transient means "could
   # not ASK" — the Credentials server was momentarily unreachable — and MUST NOT be
@@ -9622,7 +9622,7 @@ defmodule Tightbeam.GatewayTest do
     refute reason =~ "--as-user"
   end
 
-  # O6 reactive fix (spec 1ae8fa52) — THE INCIDENT PATH (G3 flatten). Guards A/B/C all force
+  # O6 reactive fix — THE INCIDENT PATH (G3 flatten). Guards A/B/C all force
   # :checkout, but the incident 401s at :prompt: an expired/rejected credential 401s at
   # API-call time, so checkout AND session SUCCEED (the harness holds a token) and catalog
   # health is still `:fresh` — a health lookup is blind to it. The common-path guarantee here: the operator reads the auth error as

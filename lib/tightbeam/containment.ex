@@ -4,16 +4,12 @@ defmodule Tightbeam.Containment do
 
   ## What containment is for
 
-  Containment keeps agents ON THE RAILS. It is not a defence against a malicious
-  agent, and it is not a security boundary. A circumvention that requires an agent
-  to be deliberately hostile is explicitly OUT OF SCOPE: we do not design for it,
-  and a finding premised on it is not work.
+  Containment keeps ordinary execution within configured write roots. It is not a
+  defence against deliberately hostile code and is not a security boundary.
 
-  This is a standing product ruling, not a default to be re-litigated per change.
-  Weigh a proposed hardening by whether it keeps honest work inside its lines —
-  parity, correctness, legibility — and decline it when the only story that
-  reaches it is malice. Reviewers do not hold this frame and will raise
-  security-shaped findings by default; that alone does not make them work.
+  Containment changes should keep ordinary execution within its limits and preserve
+  correctness and legibility. Deliberately hostile code remains outside this
+  feature's protection scope.
 
   The neutral truth is the SET OF WRITE ROOTS. Seatbelt SBPL is macOS's encoding
   of that set, not the set itself, so only the encoding is per-OS: this module
@@ -46,7 +42,7 @@ defmodule Tightbeam.Containment do
   # silently widened rail profiles by
   # `/private/tmp`; on linux it granted `/dev`, and `/dev/shm` is world-writable tmpfs —
   # a DURABLE write channel outside the scratch root, surviving the scratch rm_rf. Proven
-  # on linux-runner: a rail script under a real rail profile wrote /dev/shm and returned PASS.
+  # A rail script under a real rail profile can write to /dev/shm and return PASS.
   #
   # `/dev/null` is granted deliberately and is the only fixed grant: `>/dev/null` is in
   # shipped conformance rail scripts (c5_script_guards), so the need is measured rather

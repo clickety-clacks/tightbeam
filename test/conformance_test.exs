@@ -68,7 +68,7 @@ defmodule Tightbeam.ConformanceSupport do
     # applies, or it says no by name. There is no third word — no "queued", no
     # "applied at the next boundary", no "switched to the nearest available" —
     # because each of those would be the substrate deciding something on the
-    # caller's behalf (v0.2 program §4). Enumerated so adding one would have to
+    # caller's behalf. Enumerated so adding one would have to
     # be written down here first.
     "live-switch" => ~w(refuse pass)
   }
@@ -819,7 +819,7 @@ defmodule Tightbeam.ConformanceSupport do
   # The rule NAME cannot tell a genuine denial from a load-induced one: a rail script that
   # blows its budget denies under the SAME rule with reason `script_timeout`, so a case
   # asserting only the name went green while proving nothing about the mechanism it names
-  # (task #38's residual class). The `script_return` a fixture already declares determines
+  # (the residual class). The `script_return` a fixture already declares determines
   # the reason its mechanism must produce, so both are pinned and a timeout reads RED.
   defp expected_denial(kase), do: {kase["reason"], deny_reason(kase["script_return"])}
 
@@ -4290,7 +4290,7 @@ defmodule Tightbeam.ConformanceTest do
     # turn-end shift. The shift itself is unchanged minus that first slot.
     #
     # Fabric §13 Phase 0 (2026-08-13) adds one: C4's holder-verdict-wins, which
-    # pins review-round selection against the wi_00000000-0000-4000-8000-000000000109 wedge class. It is a
+    # pins review-round selection against the wedge class. It is a
     # pending C4 dispatch-rule fixture with its own cases, so it lands in the
     # active and activated counts, not in the exact-mechanism skips.
     #

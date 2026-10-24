@@ -1,6 +1,6 @@
 defmodule Tightbeam.RetireOwnershipTest do
   @moduledoc """
-  Proofs for task #34: `retire` derived the caller's owner by string-stripping
+  Regression coverage: `retire` derives the caller's owner from its identity, rather than string-stripping
   `call.origin`, so an agent whose origin is `agent:<role>` — the normal spawned
   agent — resolved to a non-username, matched no row, and got `not_found`. No
   agent could retire anything, including sessions its own owner controls, while

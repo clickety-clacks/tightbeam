@@ -188,7 +188,7 @@ on 2026-07-25:
    title) and fabricates none, so a plain conversational turn can legitimately
    run with an unlabeled indicator. A label is REQUIRED only where an event
    backs it — step 4, which is also the proof CAP-012 cites. Measured on the
-   claude leg at `claude-sonnet-5[medium]` (client-e2e run 0e40b93): a plain
+   claude leg at `claude-sonnet-5[medium]` in an observed client-e2e run: a plain
    turn and an explicitly reasoning-provoking turn each produced the full
    frame sequence with ZERO `agent_progress` frames, claude-agent-acp having
    sent no thought chunk. The user-visible consequence — an unlabeled

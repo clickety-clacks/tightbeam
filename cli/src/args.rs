@@ -133,7 +133,7 @@ pub enum ActivationCommand {
 pub enum TuneControl {
     /// A different HARNESS. The engine changes, so the engine's conversation
     /// cannot come with it — Tightbeam's session, role, work, and graph
-    /// position do. `model` is REQUIRED (v0.2 program §4: the substrate
+    /// position do. `model` is REQUIRED (the substrate
     /// never elects) — the SOURCE model and its effort tier are never
     /// inherited across the boundary either, because a tier is vocabulary
     /// the destination may not have, so an omitted `--effort` on a model
@@ -2136,7 +2136,7 @@ fn parse_with_optional_catalog(
                 }
             }
 
-            // THE SUBSTRATE NEVER ELECTS (v0.2 program §4). A harness swap
+            // THE SUBSTRATE NEVER ELECTS. A harness swap
             // re-engines the mind answering a session; the CLI does not let
             // that request leave with no model named and trust the far side
             // to pick one, the same way it does not let `--context` (a
@@ -3763,7 +3763,7 @@ mod tests {
             })
         );
 
-        // A harness switch with NO model is REFUSED (v0.2 program §4): the
+        // A harness switch with NO model is REFUSED: the
         // substrate does not compose the destination's own default, and the
         // CLI does not invent one either — it does not know what the
         // destination host offers, and inventing one is the whole failure
@@ -5224,10 +5224,15 @@ mod tests {
         fs::write(&skill_path, "skill body").unwrap();
         let skill_path = skill_path.display().to_string();
 
-        let commands = vec![,
+        let commands = vec![
+            (
+                strings(&[
+                    "wake", "--role", "reviewer", "--prompt", "go", "--after", "30s", "--at",
+                    "123", "--as", "coder",
+                ]),
                 Command::Wake {
                     identity: Identity::Role("coder".to_owned()),
-                    target: Target::Role),
+                    target: Target::Role("reviewer".to_owned()),
                     prompt: "go".to_owned(),
                     after_ms: Some("30000".to_owned()),
                     at: Some("123".to_owned()),
@@ -5255,7 +5260,31 @@ mod tests {
                     scope: Some("app".to_owned()),
                     idempotency_key: Some("fact-1".to_owned()),
                 },
-            ),,
+            ),
+            (
+                strings(&[
+                    "spawn",
+                    "--display",
+                    "Worker",
+                    "--key",
+                    "k",
+                    "--archetype",
+                    "worker",
+                    "--harness",
+                    "codex",
+                    "--model",
+                    "gpt",
+                    "--effort",
+                    "high",
+                    "--context",
+                    "1m",
+                    "--name",
+                    "reviewer",
+                    "--host",
+                    "test-host",
+                    "--as-user",
+                    "operator",
+                ]),
                 Command::Spawn {
                     identity: Identity::User("operator".to_owned()),
                     display_name: "Worker".to_owned(),
@@ -5265,7 +5294,7 @@ mod tests {
                     model: Some(Some("gpt".to_owned())),
                     effort: Some(Some("high".to_owned())),
                     context: Some(Some("1m".to_owned())),
-                    handle: Some),
+                    handle: Some("reviewer".to_owned()),
                     host: Some("test-host".to_owned()),
                 },
             ),

@@ -398,7 +398,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
     # and does not die with a TERM to the parent. Capture the tree BEFORE
     # signalling (children reparent once the parent is gone) and reap it too,
     # or the port keeps answering and a restart looks like :port_still_answering
-    # (found by the codex J7 leg re-run after task #20).
+    # (observed in an integrated client-e2e run).
     descendants = if ours?(gateway), do: capture_tree(gateway.os_pid), else: []
 
     if ours?(gateway) do

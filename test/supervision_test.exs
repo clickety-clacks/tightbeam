@@ -3855,7 +3855,7 @@ defmodule Tightbeam.SupervisionTest do
 
     # The rung is REFUNDED: schedule claimed prodCount 1, the suppressed fire
     # voided it. Without this, suppressed prods consume the ladder and a
-    # blocked holder gets escalated over — the SMOKE 42 linux-runner finding.
+    # blocked holder gets escalated over.
     assert %{prodCount: 0} = Supervision.prod_state(ctx.db, "asg_1")
 
     # An agent's own wake to the SAME blocked session still delivers — the

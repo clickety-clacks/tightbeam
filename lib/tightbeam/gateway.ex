@@ -347,10 +347,8 @@ defmodule Tightbeam.Gateway do
   @doc """
   Check harness and identity readiness before the production store is created.
 
-  Returns WHICH harnesses are installed, not merely that one is: the defaults a
-  fresh org runs on are derived from what the box actually has, and throwing
-  that away is why a codex-only machine defaulted to claude and claude-sonnet-5
-  (user, 2026-08-04).
+  Returns which harnesses are installed: defaults for a fresh organization are
+  derived from the available providers.
   """
   @spec preflight(config()) :: {:ok, [atom()]} | {:error, {:no_harness_cli, String.t()}}
   def preflight(config) do
@@ -3428,11 +3426,11 @@ defmodule Tightbeam.Gateway do
           with_home_pin_lock(harness, session.host, fn ->
             # Pin the shared home to THIS session's model, then session/new,
             # ATOMICALLY per adapter. The harness re-reads its projected home at
-            # every session/new (proven live, wi_00000000-0000-4000-8000-000000000102), so pinning the
+            # every session/new, so pinning the
             # selected model here is what makes the adapter offer and accept it —
             # acceptance tracks selection, killing accepted-then-dead for spawn.
             # The lock keeps a concurrent session's pin from clobbering ours in
-            # the window before the adapter reads the file (asg_00000000-0000-4000-8000-000000000105).
+            # the window before the adapter reads the file.
             pin_home_to_session_model(config, session, harness)
 
             with {:ok, sid} <-
@@ -3471,7 +3469,7 @@ defmodule Tightbeam.Gateway do
                 # session's model is offered and accepted rather than dying on an
                 # org-default pin. Held across the load (and its new-session
                 # fallback) so no concurrent session re-pins the shared home mid
-                # provision (asg_00000000-0000-4000-8000-000000000105).
+                # provision.
                 pin_home_to_session_model(config, session, harness)
 
                 AdapterCoordinator.with_load_slot(
@@ -3554,7 +3552,7 @@ defmodule Tightbeam.Gateway do
 
   # Re-pin the shared {harness, host} home to the session's resolved model so the
   # harness adapter offers and accepts it at the next session/new or session/load
-  # (both re-read the projected home — proven live, wi_00000000-0000-4000-8000-000000000102). Called only on
+  # (both re-read the projected home). Called only on
   # the two branches that push a fresh model to the adapter (create,
   # resume-after-adapter-loss), never the resident-turn common path, so most
   # turns pay nothing. Idempotent when the model is unchanged: the home reconcile
@@ -4578,7 +4576,7 @@ defmodule Tightbeam.Gateway do
   defp onboarding_caller(db, call), do: resolve_caller(db, call.origin)
 
   # The begin reply carries the OWNER user id so the CLI can wake THAT user with the
-  # sign-in URL+code the ceremony is about to surface (wi_00000000-0000-4000-8000-000000000106). An onboarding run
+  # sign-in URL+code the ceremony is about to surface. An onboarding run
   # in a session no operator watches must deliver its URL+code out of band, and the
   # gateway is the only party that knows whose org this is. Added ONLY to the begin
   # "ready" reply; finish/cancel and every error map pass through untouched. An origin
@@ -6166,7 +6164,7 @@ defmodule Tightbeam.Gateway do
 
   # THE LIVE ENGINE SWITCH.
   #
-  # ADJUDICATION BOUNDARY (v0.2 program §4): this runs because a CALLER named a
+  # ADJUDICATION BOUNDARY: this runs because a CALLER named a
   # harness on this request, and for no other reason. The substrate never
   # initiates a switch, never walks a preference list looking for a better
   # engine, and never holds a session pending someone's model decision. A
@@ -6593,7 +6591,7 @@ defmodule Tightbeam.Gateway do
   # shared home at session/new|load, and the pin is now session-varying, so
   # without this lock two sessions with different models provisioning on one host
   # clobber each other's pin before the adapter reads it — reintroducing
-  # accepted-then-dead as a race (asg_00000000-0000-4000-8000-000000000105). Session mutation locks are keyed
+  # accepted-then-dead as a race. Session mutation locks are keyed
   # by session_key and lanes are one-per-session, so they do NOT cover this
   # cross-session shared resource. Only the create/resume-after-loss branches
   # take this lock; the resident-turn common path holds no pin and never blocks.
@@ -6771,7 +6769,7 @@ defmodule Tightbeam.Gateway do
       {:ok, :swapped} ->
         # Pin the shared home to the model this session now runs on the new
         # harness, not the org default, so the next turn's session/new offers
-        # and accepts it (wi_00000000-0000-4000-8000-000000000102). AFTER the commit, deliberately: the pin used to run ahead of the transaction
+        # and accepts it. AFTER the commit, deliberately: the pin used to run ahead of the transaction
         # on the theory that a refused swap made it "wasted work, never a
         # wrong result" — false for two RACING swaps electing DIFFERENT
         # models. The loser re-pinned the shared home to its model and was

@@ -1307,7 +1307,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
   end
 
-  # The wi_00000000-0000-4000-8000-000000000109 wedge CLASS (fabric §13 Phase 0). A review round that carries
+  # The wedge class (fabric §13 Phase 0). A review round that carries
   # no holder-filed verdict carries no judgment, so it may not displace one — and
   # a card CLOSED without a verdict never can carry one, which is what left the
   # producer with no lawful exit.
@@ -1543,7 +1543,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   # Fabric §13 Phase 0 exit: the wedge CLASS is exercisable by an AGENT — no
   # admin, no database console. Every principal below is a session.
-  test "an agent walks the wi_00000000-0000-4000-8000-000000000109 wedge class out through reopen-assignment", ctx do
+  test "an agent walks the wedge class out through reopen-assignment", ctx do
     producer = handle(ctx, "assign", assign_call({:session, "holder"}, "wedged producer"))
 
     review =

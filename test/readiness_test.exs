@@ -247,7 +247,7 @@ defmodule Tightbeam.ReadinessTest do
     assert line =~ "TIGHTBEAM_DEFAULT_MODEL"
   end
 
-  # THE WRONG CAUSE (task #12). A tiered model named with no effort IS in the
+  # THE WRONG CAUSE. A tiered model named with no effort IS in the
   # live catalog; what is missing is the tier. Blaming the catalog sends the
   # operator to `catalog.diff` to hunt for a model that is already there — the
   # same defect class adjudication was fixed for, surviving in a second copy

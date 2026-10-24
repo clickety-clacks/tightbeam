@@ -1987,7 +1987,7 @@ defmodule Tightbeam.Wakes do
   per member (finding 4): a member with no named reason is left pending, never
   materialized under an empty `trigger=`.
 
-  SOURCE ROWS ARE PRESERVED (Law 2, wi_00000000-0000-4000-8000-000000000107's title). A member is consumed
+  SOURCE ROWS ARE PRESERVED. A member is consumed
   through the typed cancellation seam as `superseded` with the digest named as
   its REPLACEMENT — the same shape re-resolution already uses. Its prompt, its
   sender, its class and its election all stay on the row; the digest-member

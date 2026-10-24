@@ -373,7 +373,7 @@ defmodule Tightbeam.Homes do
   # started against a hollow credential dies with `authentication_failed` an hour later and
   # points at nothing, while this refuses at the door and says which home. But it is manual
   # to clear, not transient. A health surface that can be QUERIED for it belongs to the
-  # doctor check (wi_00000000-0000-4000-8000-000000000103), not here.
+  # doctor check, not here.
   defp harvest_one(base_dir, module, home, bytes) do
     Tightbeam.Credentials.store_harvested(
       base_dir,

@@ -1,6 +1,6 @@
 defmodule Tightbeam.AttentionTierTest do
   @moduledoc """
-  Proofs for the assistant attention tier (user, 2026-07-26).
+  Proofs for the assistant attention tier.
 
   TWO tiers, agent-elected: normal (0, what electing nothing gives) and high (1).
   The substrate derives nothing and decides no presentation — it stamps the

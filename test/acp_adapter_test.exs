@@ -105,7 +105,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         end
       end)
 
-    # The boot-boundary proof (task #20): a residency call legally queues behind a
+    # The boot-boundary proof: a residency call legally queues behind a
     # slow codex boot, and the 5s DEFAULT GenServer.call budget it replaced would
     # have given up. There is no way to observe "did not give up at 5s" in under
     # 5s, so the wait below is the price of the assertion, not slack.

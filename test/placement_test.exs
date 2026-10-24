@@ -1158,7 +1158,7 @@ defmodule Tightbeam.PlacementTest do
            }
   end
 
-  # wi_00000000-0000-4000-8000-000000000102 — accepted-then-dead: the claude adapter's offered/accepted model
+  # accepted-then-dead: the claude adapter's offered/accepted model
   # set follows the projected home's settings.json "model" pin (proven live —
   # scripts/probe-opus5.mjs + scripts/probe-reread.mjs: a session/new re-reads the
   # pin, so a home pinned to model X offers+accepts X and refuses everything

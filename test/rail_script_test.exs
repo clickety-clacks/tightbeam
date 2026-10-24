@@ -177,7 +177,7 @@ defmodule Tightbeam.RailScriptTest do
   # when it genuinely times out — which is what locked the two origins together in the
   # record. Same subject, and now the proof they are distinguishable: the reason is
   # identical because both really are timeouts, and the class differs because only one of
-  # them was reported by the wrapper (task #43).
+  # them was reported by the wrapper.
   test "BEAM backstop closes a wrapper that outlives its timeout", ctx do
     wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
     File.write!(wrapper, "#!/bin/sh\nexec /bin/sleep 30\n")
@@ -209,7 +209,7 @@ defmodule Tightbeam.RailScriptTest do
   # to apply. Each of the paths below reaches a deny WITHOUT the observation, and each
   # used to record the value the observation would have carried — so a fabricated
   # `error:1` was byte-identical to a script that really did exit 1, and the invariant
-  # "every failure names itself" could not be checked by anything (task #43).
+  # "every failure names itself" could not be checked by anything.
   #
   # The `reason` column is deliberately unchanged from what each path recorded before.
   test "a deny reached without an observation is classed unreported, not fabricated", ctx do
@@ -267,7 +267,7 @@ defmodule Tightbeam.RailScriptTest do
   # Reached in production when the DB process is down: `invocation_context` calls
   # `Org.get`, which exits `:noproc`. Nothing was spawned and nothing was observed, and
   # the row that would have recorded it cannot be written either — so the returned class
-  # is the only place this can be said (task #43).
+  # is the only place this can be said.
   test "a substrate exit is classed unreported, like a substrate raise", ctx do
     stop_supervised!(Tightbeam.DB)
 
@@ -282,7 +282,7 @@ defmodule Tightbeam.RailScriptTest do
   end
 
   # The recorded duration cannot locate a `script_timeout` in either timeout window, so
-  # no timing rule can name the layer (task #38).
+  # no timing rule can name the layer.
   #
   # `RailScript.run/5` measures with `System.monotonic_time` in the CALLING BEAM process
   # (rail_script.ex:13 and :27), while the wrapper is an OS process that keeps running on
@@ -461,7 +461,7 @@ defmodule Tightbeam.RailScriptTest do
     refute File.exists?(expected_workdir)
 
     # The class used to be `error:1` — a child exit for a child that was never spawned,
-    # and the same string a script that really exits 1 produces (task #43).
+    # and the same string a script that really exits 1 produces.
     assert {:error, "script_error", "unreported"} =
              RailScript.run(
                ctx.db,
@@ -933,7 +933,7 @@ defmodule Tightbeam.RailScriptTest do
   # The malfunction that never reached the engine: the invocation context could not be
   # resolved, so NO script was spawned — the third `unreported` row of §A3's table. It
   # recorded `error:1`, a child exit asserted for a child that never existed and
-  # byte-identical to a script that really did exit 1. That is task #43's fabrication,
+  # byte-identical to a script that really did exit 1. That is a fabricated result,
   # surviving here because it sits a level above `rail_script.ex` where the rest of it
   # was cleaned out.
   test "an unresolvable invocation context records unreported, never a fabricated exit", ctx do
@@ -1641,8 +1641,8 @@ defmodule Tightbeam.RailScriptTest do
       # proves — and then self-exits after 5s. A test that returns while its
       # fixture is still alive hands those seconds to whoever runs next: with
       # random test order on a slow runner, that was the suite-end census,
-      # which correctly refused to call the run green (CI macOS, run
-      # 30944574943). The fixture is this test's; waiting for it is too.
+      # which correctly refused to call the run green. The fixture is this
+      # test's; waiting for it is too.
       deadline = System.monotonic_time(:millisecond) + 8_000
 
       wait_for_exit = fn wait ->
@@ -1670,7 +1670,7 @@ defmodule Tightbeam.RailScriptTest do
     # parses `tightbeam rail-exec child exit: <N>` off wrapper stderr and has no way to
     # disagree with it, so a made-up line there was undetectable by construction. The
     # `cli` suite asserts the binary's bytes; this asserts what the substrate ends up
-    # recording, with the real binary in the path (task #43).
+    # recording, with the real binary in the path.
     test "a check whose input never arrived records unreported, not a child exit", ctx do
       wrapper = Path.join([ctx.base_dir, "bin", "tightbeam"])
       File.cp!(@release_binary, wrapper)

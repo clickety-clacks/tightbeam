@@ -14,7 +14,7 @@ to do. It holds your identity, mailbox, and history across restarts and machine 
 tightbeam refuses a command, it names the rule that refused it. Read the reason.
 
 ## See what is around you
-Run `tightbeam list`. It returns the sessions you can address, the archetypes in this org,
+Run `tightbeam list`. It returns the sessions you can address, the archetypes in the organization,
 the hosts (machines agents run on), and the model catalog (the model names you may use). Use
 a model name from that catalog exactly. Each session row names the host it runs on — yours
 included. Run `tightbeam identity current` to print your own session key. Never open
@@ -76,7 +76,7 @@ escalating the silence. The substrate routes lifecycle exceptions through the re
 graph. Main is for root-terminal cases, not a routine fallback.
 
 ## Say how urgent a wake is: --class
-Attention is the scarcest thing this org has. Tell tightbeam how urgent a message is and it
+Attention is the scarcest thing the organization has. Tell tightbeam how urgent a message is and it
 shapes WHEN the receiver spends a turn on it — never whether it is recorded:
 
     tightbeam wake --role owner --prompt "the requested report is ready" --class fyi
@@ -178,8 +178,8 @@ owner assignment for the same work item, one of two ways and never neither.
 
 Carry it: open an integration assignment against a staffed role and name the line in its
 subject. No row holds a release line and no verb binds one; the assignment you open, with the
-line named in its subject, is the whole record. The default is both active lines, `0.1.9` and
-`main` (the 0.2.0 line) — open one integration assignment per line unless the card says otherwise.
+line named in its subject, is the whole record. The default is each currently supported
+integration line — open one integration assignment per line unless the card says otherwise.
 
 Or record why you cannot: file a `progress` attest that states the exact reason the work is not
 carried now and names the principal who must clear it. A card that pins a single line or

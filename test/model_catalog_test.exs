@@ -1353,7 +1353,7 @@ defmodule Tightbeam.ModelCatalogTest do
       # Task -> GenServer hop that follows it (<1ms) inside its 100 x 5ms = 500ms
       # budget; the spawn gets the 10s bound of an external wait. Before this, the
       # 500ms poll covered the spawn as well — 13x the linux cost but only 3x the
-      # macOS one — and one linux excursion past 500ms (run 30430140506) reported
+      # macOS one — and one Linux excursion past 500ms reported
       # it as "condition did not become true", the shape of a broken verdict
       # rather than of a slow runner.
       parent = self()
@@ -1782,8 +1782,8 @@ defmodule Tightbeam.ModelCatalogTest do
       assert_receive {:fetch_started, 2}, 2_000
     end
 
-    # The test-host production repro (orchestrator, 2026-08-06): a CLEAN one-shot
-    # ceremony, yet placement refused with `:in_progress` MINUTES after `status`
+    # A completed one-shot ceremony must not leave placement refused with
+    # `:in_progress` after `status`
     # read onboarded. `credential_status/2` returns `:in_progress` only while the
     # onboarding lease stands (credentials.ex), and `finish_onboard` clears the
     # lease on completion — so the refusal minutes later is the CATALOG holding

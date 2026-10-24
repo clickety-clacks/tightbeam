@@ -1593,7 +1593,7 @@ defmodule Tightbeam.Placement do
         # The pinned model tracks the SESSION'S resolved selection when the caller
         # supplies one (`:model`), falling back to the org default only when there
         # is no session context (adapter cold-boot). The claude adapter's offered
-        # /accepted model set follows this home pin (wi_00000000-0000-4000-8000-000000000102), so pinning the
+        # /accepted model set follows this home pin, so pinning the
         # selected model is what makes the adapter accept it at session/new — the
         # cure for the accepted-then-dead class.
         default_model: Keyword.get(opts, :model) || Map.get(config, :default_model),
