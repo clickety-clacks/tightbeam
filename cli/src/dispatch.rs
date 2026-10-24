@@ -2857,14 +2857,23 @@ mod tests {
             ]),
             r#"{"as":"coder","verb":"wake","sessionKey":"agent:r","params":{"prompt":"go","afterMs":30000}}"#
         );
-        assert_eq!,
+        assert_eq!(
+            body(&[
+                "wake",
+                "--role",
+                "reviewer",
+                "--prompt",
+                "go",
+                "--as-user",
+                "operator"
+            ]),
             r#"{"asUser":"operator","verb":"wake","role":"reviewer","params":{"prompt":"go"}}"#
         );
         assert_eq!(
             body(&[
                 "wake",
                 "--user",
-                "operator",
+                "user-a",
                 "--prompt",
                 "go",
                 "--at",
@@ -2872,13 +2881,13 @@ mod tests {
                 "--as-process",
                 "cron"
             ]),
-            r#"{"asProcess":"cron","verb":"wake","userId":"operator","params":{"prompt":"go","at":123}}"#
+            r#"{"asProcess":"cron","verb":"wake","userId":"user-a","params":{"prompt":"go","at":123}}"#
         );
         assert_eq!(
             body(&[
                 "wake",
                 "--user",
-                "operator",
+                "user-a",
                 "--prompt",
                 "go",
                 "--at",
@@ -2886,13 +2895,13 @@ mod tests {
                 "--as-user",
                 "operator"
             ]),
-            r#"{"asUser":"operator","verb":"wake","userId":"operator","params":{"prompt":"go","at":1}}"#
+            r#"{"asUser":"operator","verb":"wake","userId":"user-a","params":{"prompt":"go","at":1}}"#
         );
         assert_eq!(
             body(&[
                 "wake",
                 "--user",
-                "operator",
+                "user-a",
                 "--prompt",
                 "go",
                 "--at",
@@ -2900,7 +2909,7 @@ mod tests {
                 "--as-user",
                 "operator"
             ]),
-            r#"{"asUser":"operator","verb":"wake","userId":"operator","params":{"prompt":"go","at":16}}"#
+            r#"{"asUser":"operator","verb":"wake","userId":"user-a","params":{"prompt":"go","at":16}}"#
         );
     }
 
@@ -3186,14 +3195,38 @@ mod tests {
             ]),
             r#"{"asProcess":"ci","verb":"condition","params":{"kind":"build-finished","scope":"app","idempotencyKey":"fact-1"}}"#
         );
-        assert_eq!,
+        assert_eq!(
+            body(&["condition", "--kind", "review-landed", "--as", "reviewer",]),
             r#"{"as":"reviewer","verb":"condition","params":{"kind":"review-landed"}}"#
         );
     }
 
     #[test]
     fn builds_byte_exact_spawn_and_identity_edit_bodies() {
-        assert_eq!,
+        assert_eq!(
+            body(&[
+                "spawn",
+                "--display",
+                "Reviewer",
+                "--name",
+                "reviewer",
+                "--archetype",
+                "worker",
+                "--harness",
+                "codex",
+                "--model",
+                "gpt",
+                "--effort",
+                "high",
+                "--context",
+                "1m",
+                "--host",
+                "test-host",
+                "--key",
+                "k1",
+                "--as-user",
+                "operator"
+            ]),
             r#"{"asUser":"operator","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","effort":"high","context":"1m","handle":"reviewer","host":"test-host"}}"#
         );
 
@@ -3202,13 +3235,45 @@ mod tests {
         // vanish. Dropped here, the gateway reads silence and inherits the
         // default's context over the operator's explicit choice. The empty
         // flag is present-with-value; `nonempty` threw exactly those away.
-        assert_eq!,
+        assert_eq!(
+            body(&[
+                "spawn",
+                "--display",
+                "Reviewer",
+                "--archetype",
+                "worker",
+                "--harness",
+                "codex",
+                "--model",
+                "gpt",
+                "--context",
+                "",
+                "--key",
+                "k1",
+                "--as-user",
+                "operator"
+            ]),
             r#"{"asUser":"operator","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","context":null}}"#
         );
 
         // …and an OMITTED flag still omits the key, or inheritance downstream
         // can never fire. The pair is what gives either one meaning.
-        assert_eq!,
+        assert_eq!(
+            body(&[
+                "spawn",
+                "--display",
+                "Reviewer",
+                "--archetype",
+                "worker",
+                "--harness",
+                "codex",
+                "--model",
+                "gpt",
+                "--key",
+                "k1",
+                "--as-user",
+                "operator"
+            ]),
             r#"{"asUser":"operator","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt"}}"#
         );
         let command = Command::IdentityEdit {
@@ -3448,7 +3513,8 @@ mod tests {
             ]),
             r#"{"asUser":"operator","verb":"attest","params":{"assignmentId":"asg_1","kind":"verdict","verdictKind":"verified"}}"#
         );
-        assert_eq!,
+        assert_eq!(
+            body(&["attests", "asg_1", "--as", "reviewer"]),
             r#"{"as":"reviewer","verb":"attests","params":{"assignmentId":"asg_1"}}"#
         );
         assert_eq!(
