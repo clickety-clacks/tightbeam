@@ -3968,9 +3968,17 @@ mod tests {
             Err(TUNE_USAGE.to_owned())
         );
 
-        // A live switch names ONE session. Re-engining "whoever holds
-        // reviewer" is a different act and is not spelled here.
-        assert_eq!,
+        // This command does not support role-targeted model changes.
+        assert_eq!(
+            tune(&[
+                "tune",
+                "--role",
+                "reviewer",
+                "--model",
+                "m",
+                "--as-user",
+                "operator"
+            ]),
             Err(TUNE_USAGE.to_owned())
         );
 
@@ -4254,7 +4262,7 @@ mod tests {
         assert!(matches!(
             parse_with_catalog(strings(&[
                 "assimilate",
-                "operator@host",
+                "flynn@host",
                 "--as-user",
                 "operator",
             ]), &catalog),
@@ -4849,8 +4857,16 @@ mod tests {
     fn decision_request_requires_one_exact_request_flag_and_closed_identity_flags() {
         let request_id = "dr_12345678-1234-4234-9234-123456789abc";
 
-        assert_eq!),
-            Ok),
+        assert_eq!(
+            parse(strings(&[
+                "decision-request",
+                "--request",
+                request_id,
+                "--as",
+                "reviewer",
+            ])),
+            Ok(Command::DecisionRequest {
+                identity: Identity::Role("reviewer".to_owned()),
                 request_id: request_id.to_owned(),
             })
         );
