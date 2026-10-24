@@ -76,7 +76,7 @@ defmodule Tightbeam.Wire.SeamTest do
 
   test "assign --reviews lands the review link on the row", ctx do
     producer = create_session(ctx.db, "producer", "operator")
-    reviewer = create_session
+    reviewer = create_session(ctx.db, "reviewer", "operator")
 
     ok!(
       dispatch_cli(ctx, "tbc_wire_seam", %{
@@ -89,7 +89,13 @@ defmodule Tightbeam.Wire.SeamTest do
 
     produced = assignment_id(ctx.db, "fix the seam")
 
-    ok!
+    ok!(
+      dispatch_cli(ctx, "tbc_wire_seam", %{
+        verb: "assign",
+        asUser: "operator",
+        sessionKey: reviewer.session_key,
+        params: %{subject: "review the fix", reviews: produced}
+      })
     )
 
     {:ok, [[link]]} =
@@ -106,10 +112,15 @@ defmodule Tightbeam.Wire.SeamTest do
     # The handler's existing UnknownReviewTarget check is unreachable while the
     # param is dropped, so a typo'd id used to open an ordinary unlinked
     # assignment. Reaching the refusal is itself proof the id arrives.
-    reviewer = create_session
+    reviewer = create_session(ctx.db, "reviewer", "operator")
 
     response =
-      dispatch_cli
+      dispatch_cli(ctx, "tbc_wire_seam", %{
+        verb: "assign",
+        asUser: "operator",
+        sessionKey: reviewer.session_key,
+        params: %{subject: "review a ghost", reviews: "asg_never_existed"}
+      })
 
     assert JSON.decode!(response.resp_body)["error"]["code"] == "unknown_review_target"
     assert assignment_id(ctx.db, "review a ghost") == nil
