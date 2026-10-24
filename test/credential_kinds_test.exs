@@ -556,7 +556,7 @@ defmodule Tightbeam.CredentialKindsTest do
         if String.contains?(script, "api.openai.com") do
           {~s({"data":[{"id":"gpt-5.6-example","object":"model"}]}) <> "\n200", 0}
         else
-          {~s <>
+          {~s({"models":[{"slug":"gpt-5.6-example","display_name":"Example Model","supported_reasoning_levels":[{"effort":"medium"}]}]}) <>
              "\n200 0.145.0", 0}
         end
       end
