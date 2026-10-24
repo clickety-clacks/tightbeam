@@ -28,6 +28,7 @@ defmodule Tightbeam.Stall410Test do
 
     assert %{mode: "notice"} =
              deprioritize(ctx.db, {:user, "operator"}, direct.id, behind.id, "d1")
+
     assert %{mode: "notice"} =
              deprioritize(ctx.db, {:user, "operator"}, relayed.id, behind.id, "d2")
 

@@ -4527,8 +4527,10 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "remote-host: cannot route gpt-5.6-example (effort medium) on remote-host"
     assert message =~ "upgrade codex on remote-host"
+
     assert message =~
              "remote-runner: cannot route gpt-5.6-example (effort medium) on remote-runner"
+
     assert message =~ "run tightbeam onboard openai on remote-runner"
   end
 

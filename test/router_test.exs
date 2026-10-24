@@ -1594,6 +1594,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "operator"}).status ==
              200
+
     assert_receive {:call, %{origin: "user:operator", principal: {:user, "operator"}}}
 
     # Registering a satellite also provisions its operator endpoint over ssh; this

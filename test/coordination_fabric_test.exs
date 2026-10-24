@@ -1856,6 +1856,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     source = File.read!("lib/tightbeam/escalation.ex")
     source =~ ~r/^  def #{Regex.escape(Atom.to_string(ref))}[\(,]/m
   end
+
   #
   # Everything below reads Elixir's own parse tree instead of `Macro.to_string`
   # text, closing three evasions a text/substring scan cannot see by
