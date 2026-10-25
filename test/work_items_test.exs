@@ -261,6 +261,63 @@ defmodule Tightbeam.WorkItemsTest do
     end)
   end
 
+  test "process principals can perform every work-item disposition with actor attribution", ctx do
+    process = {:process, "scheduler"}
+    item = create(ctx, {:user, "other"}, %{title: "Process disposition"})
+
+    assert {:ok, %{ok: true, workItem: %{state: "iceboxed"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               call("work-item-icebox", process, %{work_item_id: item.id})
+             )
+
+    assert {:ok, %{ok: true, workItem: %{state: "open"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               call("work-item-reopen", process, %{work_item_id: item.id})
+             )
+
+    assert {:ok, %{ok: true, workItem: %{state: "closed"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               call("work-item-close", process, %{work_item_id: item.id})
+             )
+
+    failed = create(ctx, {:user, "other"}, %{title: "Process failure"})
+
+    assert {:ok, %{ok: true, workItem: %{state: "failed", failReason: "not needed"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               call("work-item-fail", process, %{
+                 work_item_id: failed.id,
+                 reason: "not needed"
+               })
+             )
+
+    assert {:ok, [["process:scheduler"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT principal FROM events WHERE verb = 'work-item-close' ORDER BY id DESC LIMIT 1"
+             )
+  end
+
+  test "process principals can read work-item traces", ctx do
+    item = create(ctx, {:user, "other"}, %{title: "Process trace"})
+
+    assert %{workItem: %{id: item_id, ownerUserId: "other"}} =
+             WorkItems.__handle__(
+               ctx.db,
+               "work-item-trace",
+               call("work-item-trace", {:process, "reporter"}, %{work_item_id: item.id})
+             )
+
+    assert item_id == item.id
+  end
+
   test "Firehose Gateway routing creation publishes committed wake once", ctx do
     alias Tightbeam.Firehose.Hub
     hub = start_supervised!({Hub, name: Hub})

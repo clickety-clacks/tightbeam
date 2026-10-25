@@ -884,7 +884,7 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
-  ## Terminal dispositions (owner-or-admin) — icebox/reopen/close/fail
+  ## Work-item dispositions — icebox/reopen/close/fail
 
   defp dispose_result(db, call, verb) do
     with :ok <- ensure_body_schema_for_use(db),
@@ -1050,6 +1050,8 @@ defmodule Tightbeam.WorkItems do
       _ -> false
     end
   end
+
+  defp disposition_allowed?(_txn, {:process, _process}, _item), do: true
 
   defp disposition_allowed?(_txn, _principal, _item), do: false
 
@@ -1385,6 +1387,8 @@ defmodule Tightbeam.WorkItems do
       _ -> false
     end
   end
+
+  defp trace_allowed?(_db, {:process, _process}, _item), do: true
 
   defp trace_allowed?(_db, _principal, _item), do: false
   defp trace_not_found, do: error("not_found", "work item not found")
