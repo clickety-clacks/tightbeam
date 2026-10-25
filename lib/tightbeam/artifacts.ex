@@ -290,6 +290,7 @@ defmodule Tightbeam.Artifacts do
       )
       when is_map(filters) and is_map(principal) and is_integer(limit) and limit > 0 do
     {visibility_sql, visibility_params} = StateVisibility.artifact_collection_scope(principal)
+
     {filter_clauses, filter_params} =
       artifact_filter_clauses(filters, length(visibility_params))
     where = Enum.join([visibility_sql | filter_clauses], " AND ")

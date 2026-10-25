@@ -207,8 +207,7 @@ defmodule Tightbeam.StateVisibility do
 
   def attest_collection_scope(%{kind: "session", id: session_key})
       when is_binary(session_key) do
-    {"(assignment.holderKey = ?1 OR assignment.openedBySession = ?2)",
-     [session_key, session_key]}
+    {"(assignment.holderKey = ?1 OR assignment.openedBySession = ?2)", [session_key, session_key]}
   end
 
   def attest_collection_scope(%{kind: "user", id: user_id}) when is_binary(user_id) do
