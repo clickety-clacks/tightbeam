@@ -499,6 +499,31 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert live_message["clientMessageId"] == "direct-human-post"
     assert live_message["turnIncludesHuman"]
     direct_id = live_message["id"]
+    :ok = Hub.delivered(Hub, self())
+
+    assert {:ok, {:appended, empty_sender_message}} =
+             DB.transaction(ctx.db, fn txn ->
+               {:appended, message} =
+                 Projection.append_in_txn(txn, %{
+                   session_key: session.session_key,
+                   role: "user",
+                   content: "historical human message with an empty stored sender",
+                   sender: ""
+                 })
+
+               Tightbeam.Firehose.Publisher.message_in_txn(txn, session.session_key, message)
+               {:appended, message}
+             end)
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "message.created", "payload" => empty_sender_notice}}
+
+    assert empty_sender_notice["id"] == empty_sender_message.id
+    assert empty_sender_notice["sender"] == "user:outsider"
+    :ok = Hub.delivered(Hub, self())
+
+    assert {:ok, [[""]]} =
+             DB.query(ctx.db, "SELECT sender FROM messages WHERE id=?1", [empty_sender_message.id])
 
     assert {:ok, [[nil]]} =
              DB.query(ctx.db, "SELECT sender FROM messages WHERE id=?1", [direct_id])
@@ -512,10 +537,12 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       |> then(&JSON.decode!(&1.resp_body))
 
     historical_item = Enum.find(history["items"], &(&1["id"] == historical.id))
+    empty_sender_item = Enum.find(history["items"], &(&1["id"] == empty_sender_message.id))
     direct_item = Enum.find(history["items"], &(&1["id"] == direct_id))
 
     assert historical_item["role"] == "user"
     assert historical_item["sender"] == "user:outsider"
+    assert empty_sender_item["sender"] == "user:outsider"
     assert direct_item["sender"] == "user:outsider"
     assert direct_item["turnIncludesHuman"]
 
@@ -700,7 +727,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert first_history_item["llmVisibleMessageId"] ==
              first_history_message.llm_visible_message_id
 
-    assert first_history_item["rowVersion"] == first_history_message.seq
+    assert first_history_item["rowVersion"] ==
+             max(first_history_message.seq, first_history_message.timestamp)
 
     direct_tail =
       StateResources.query_messages_for_session_page(ctx.db, session.session_key, :latest, 4)

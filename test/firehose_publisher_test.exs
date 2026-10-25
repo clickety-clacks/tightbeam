@@ -912,6 +912,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
                role: "user",
                content: "hello",
                timestamp: 9,
+               sender: "user:flynn",
                attachments: []
              })
 
@@ -1013,7 +1014,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
         assert_received {:firehose_notice, frame}
         equality.(frame)
         assert frame["payload"]["id"] == message.id
-        assert frame["payload"]["rowVersion"] == message.seq
+
+        assert frame["payload"]["rowVersion"] ==
+                 max(message.seq, message.timestamp) +
+                   if(is_integer(frame["payload"]["turnSeq"]),
+                     do: frame["payload"]["turnSeq"],
+                     else: 0
+                   )
+
         Hub.delivered(Hub, self())
       else
         refute_received {:firehose_notice, _frame}
@@ -1606,7 +1614,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
       message_type: nil,
       content: content,
       timestamp: seq,
-      sender: nil,
+      sender: "user:fixture",
       device_id: nil,
       client_message_id: nil,
       reply_to_message_id: nil,

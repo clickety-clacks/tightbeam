@@ -952,11 +952,11 @@ defmodule Tightbeam.TerminalCredentialFailure do
         end
 
       [["delivered", message_id]] ->
-        Txn.q(txn, "UPDATE messages SET content=?2,timestamp=?3 WHERE id=?1 AND content<>?2", [
-          message_id,
-          content,
-          now
-        ])
+        Txn.q(
+          txn,
+          "UPDATE messages SET content=?2,timestamp=MAX(?3,timestamp+1,seq+1) WHERE id=?1 AND content<>?2",
+          [message_id, content, now]
+        )
 
         if Txn.changes(txn) == 1 do
           [message] = message_by_id(txn, message_id)

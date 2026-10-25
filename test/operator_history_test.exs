@@ -168,7 +168,7 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
     assert hd(all["items"])["clientMessageId"] == "c_original"
     assert hd(all["items"])["deviceId"] == "owner-device"
     assert hd(all["items"])["seq"] == first.seq
-    assert hd(all["items"])["rowVersion"] == first.seq
+    assert hd(all["items"])["rowVersion"] == max(first.seq, first.timestamp)
     assert hd(all["items"])["sessionKey"] == ctx.selected.session_key
 
     assert Enum.at(all["items"], 1)["marker"] == %{

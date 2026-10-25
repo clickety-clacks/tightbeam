@@ -536,10 +536,9 @@ defmodule Tightbeam.Projection do
   defp marker_content("harness-switch", from, to) do
     "[engine swap]\n\n" <>
       "This session's engine changed from #{marker_endpoint(from)} to #{marker_endpoint(to)}.\n\n" <>
-      "Earlier messages are RETAINED and are not deleted, but they are no longer " <>
-      "shown here: a new engine cannot load the previous engine's session, so the " <>
-      "visible transcript starts fresh from this point. This is expected after a " <>
-      "harness swap, not a fault."
+      "Earlier messages are retained and remain visible in this transcript. A new " <>
+      "engine cannot load the previous engine's session, so the agent starts with a " <>
+      "fresh working context. This is expected after a harness swap, not a fault."
   end
 
   defp marker_content("model-retune", from, to) do

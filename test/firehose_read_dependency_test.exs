@@ -300,7 +300,10 @@ defmodule Tightbeam.FirehoseReadDependencyTest do
       item = StateResources.message(row)
       assert item["at"] == message.timestamp
       assert item["turnSeq"] == turn
-      assert item["rowVersion"] == message.seq
+
+      assert item["rowVersion"] ==
+               max(message.seq, message.timestamp) + if(is_integer(turn), do: turn, else: 0)
+
       assert item["content"] == message.content
       assert JSON.decode!(StateResources.encode_item("transcript messages", item, %{})) == item
     end
