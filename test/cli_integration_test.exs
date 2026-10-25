@@ -1754,23 +1754,6 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert retried =~ "session:cli-holder"
 
-    assert {:ok, effort_rule_result} =
-             Tightbeam.Dispatch.dispatch(
-               ctx.db,
-               Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000}),
-               %{
-                 verb: "effort-rule",
-                 origin: "agent:cli-holder",
-                 principal: {:session, "cli-holder"},
-                 session_key: nil,
-                 params: %{request: continue_request, action: "continue"}
-               }
-             )
-
-    assert effort_rule_result.id == continue_request
-    assert effort_rule_result.status == "ruled"
-    refute Map.has_key?(effort_rule_result, :row_version)
-
     {:ok, [[^generations_after]]} =
       DB.query(
         ctx.db,
@@ -1807,6 +1790,69 @@ defmodule Tightbeam.CliIntegrationTest do
                       principal: {:session, "cli-holder"},
                       params: %{request: ^dismiss_request, action: "dismiss"}
                     }}
+  end
+
+  test "legacy decision verb JSON omits the stored rowVersion on each result path", ctx do
+    agent_id = open_agent_request(ctx)
+
+    assert {200, %{"result" => %{"id" => ^agent_id, "status" => "withdrawn"} = withdrawn}} =
+             raw_agent_dispatch(ctx, ctx.session.cli_token, %{
+               "verb" => "withdraw",
+               "params" => %{"request" => agent_id, "reason" => "no longer needed"}
+             })
+
+    refute Map.has_key?(withdrawn, "rowVersion")
+
+    statute_withdraw_id = open_statute_request(ctx, "flynn")
+
+    assert {200,
+            %{"result" => %{"id" => ^statute_withdraw_id, "status" => "withdrawn"} =
+                 withdrawn_statute}} =
+             raw_agent_dispatch(ctx, ctx.session.cli_token, %{
+               "verb" => "withdraw",
+               "params" => %{"request" => statute_withdraw_id, "reason" => "statute ended"}
+             })
+
+    refute Map.has_key?(withdrawn_statute, "rowVersion")
+
+    statute_rule_id = open_statute_request(ctx, "other")
+    rule_call = %{
+      "asUser" => "flynn",
+      "verb" => "rule",
+      "params" => %{"request" => statute_rule_id, "decision" => "allow"}
+    }
+
+    assert {200,
+            %{"result" => %{"id" => ^statute_rule_id, "status" => "ruled"} = ruled_statute}} =
+             raw_agent_dispatch(ctx, ctx.session.cli_token, rule_call)
+
+    refute Map.has_key?(ruled_statute, "rowVersion")
+
+    assert {200,
+            %{"result" => %{"id" => ^statute_rule_id, "status" => "ruled"} =
+                 replayed_statute}} =
+             raw_agent_dispatch(ctx, ctx.session.cli_token, rule_call)
+
+    refute Map.has_key?(replayed_statute, "rowVersion")
+
+    effort_id = open_effort_request(ctx, "wire-row-version")
+    effort_params = %{"request" => effort_id, "action" => "continue"}
+
+    assert {200, %{"result" => %{"id" => ^effort_id, "status" => "ruled"} = effort_ruled}} =
+             raw_agent_dispatch(ctx, ctx.session.cli_token, %{
+               "verb" => "effort-rule",
+               "params" => effort_params
+             })
+
+    refute Map.has_key?(effort_ruled, "rowVersion")
+
+    assert {200, %{"result" => %{"id" => ^effort_id, "status" => "ruled"} = effort_replay}} =
+             raw_agent_dispatch(ctx, ctx.session.cli_token, %{
+               "verb" => "effort-rule",
+               "params" => effort_params
+             })
+
+    refute Map.has_key?(effort_replay, "rowVersion")
   end
 
   test "real CLI rejects duplicate exact-request flags before dispatch", ctx do
