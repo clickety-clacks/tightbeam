@@ -2541,18 +2541,13 @@ defmodule Tightbeam.Rules do
       assignment, cache ->
         kinds =
           if assignment.effect_kind == "code" and get_in(call, [:params, :kind]) == "completion" do
-            producer_commit_refs =
-              Assignments.qualifying_verification_commit_refs(
-                db,
-                assignment.id,
-                assignment.holder_key
-              )
-
+            # Let the transaction report uncovered producer commits by hash;
+            # this rule only distinguishes a clean independent review from no
+            # such review or a blocking review verdict.
             Assignments.qualifying_review_verdict_kinds(
               db,
               assignment.id,
-              assignment.holder_key,
-              producer_commit_refs
+              assignment.holder_key
             )
           else
             Assignments.qualifying_review_verdict_kinds(

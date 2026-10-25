@@ -9,7 +9,7 @@
 [[rule]]
 name = "completion-requires-review"
 verb = "attest"
-text = "code, policy, release, and live-mutation completion needs the most recent holder-filed review-conclusion verdict (reviewed-clean or changes-requested), pooled across all --reviews-linked cards, to be reviewed-clean on a card held by a different session; verdicts of other kinds are ignored; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide review-session selection only"
+text = "code, policy, release, and live-mutation completion needs the most recent holder-filed review-conclusion verdict (reviewed-clean or changes-requested), pooled across all --reviews-linked cards, to be reviewed-clean on a card held by a different session; code completion also requires that review to cover every commit in the holder's latest verified result, and a missing-coverage refusal names the uncovered commits; verdicts of other kinds are ignored; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide review-session selection only"
 external_producer = true
 edges = ["verb"]
 effect = "remedy"

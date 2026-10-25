@@ -1179,9 +1179,10 @@ defmodule Tightbeam.Escalation do
   nothing, and fires no condition fact. It writes the text, names who wrote it,
   and wakes the asker — which is the whole of what the substrate owes here.
 
-  Any authenticated agent session may answer when it holds the request's exact
-  id. The asked session remains the preferred responder, not an authorization
-  gate. A user principal keeps the existing asked-owner boundary.
+  Any authenticated agent session may answer an ordinary request when it holds
+  the request's exact id. A cannot-proceed request is narrower: only its asked
+  session, or the asked owner user, may answer because that answer settles the
+  standing condition. A user principal keeps the existing asked-owner boundary.
 
   Kind and principal standing are checked before a non-agent row is revealed.
   A nonexistent id, a non-agent id, and an agent question outside a user's
@@ -1195,7 +1196,7 @@ defmodule Tightbeam.Escalation do
 
     case get_raw(db, request_id) do
       %{kind: "agent"} = request ->
-        if decision_reader?(call, request) do
+        if answer_reader?(call, request) do
           cond do
             not (is_binary(text) and String.trim(text) != "") ->
               error("invalid", "an answer requires text")
@@ -1663,6 +1664,11 @@ defmodule Tightbeam.Escalation do
   end
 
   defp decision_reader?(%{principal: {:session, _key}}, _request), do: true
+
+  defp answer_reader?(%{principal: {:session, key}}, request),
+    do: not cannot_proceed_request?(request) or key == request.expecter_session_key
+
+  defp answer_reader?(call, request), do: decision_reader?(call, request)
 
   defp decision_reader?(%{principal: {:user, user_id}}, request),
     do: user_id == request.expecter_user_id

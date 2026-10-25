@@ -4481,30 +4481,44 @@ defmodule Tightbeam.Assignments do
         verification
       )
 
-    review_qualifies? =
-      if Map.get(call, :review_pending, false) do
-        true
-      else
-        independent_clean_review? =
-          match?(
-            %{kind: "reviewed-clean", holder: holder} when holder != assignment.holderKey,
-            review
-          )
+    review_pending? = Map.get(call, :review_pending, false)
 
-        independent_clean_review? and
-          review_covers_commit_refs?(
+    independent_clean_review? =
+      review_pending? or
+        match?(
+          %{kind: "reviewed-clean", holder: holder} when holder != assignment.holderKey,
+          review
+        )
+
+    review_covers_producer_commits? =
+      review_pending? or
+        review_covers_commit_refs?(
+          review && review.commit_refs,
+          verification && verification.commit_refs
+        )
+
+    cond do
+      verification_qualifies? and independent_clean_review? and
+          not review_covers_producer_commits? ->
+        uncovered_commits =
+          uncovered_producer_commits(
             review && review.commit_refs,
             verification && verification.commit_refs
           )
-      end
 
-    if verification_qualifies? and review_qualifies? do
-      :ok
-    else
-      error(
-        "inapplicable_code_evidence",
-        "code completion requires a holder verification and the latest independent clean review covering the verified producer commit refs, unless review is pending"
-      )
+        error(
+          "inapplicable_code_evidence",
+          "latest independent clean review is missing verified producer commits: #{Enum.join(uncovered_commits, ", ")}"
+        )
+
+      verification_qualifies? and independent_clean_review? ->
+        :ok
+
+      true ->
+        error(
+          "inapplicable_code_evidence",
+          "code completion requires a holder verification and the latest independent clean review, unless review is pending"
+        )
     end
   end
 
@@ -4561,6 +4575,32 @@ defmodule Tightbeam.Assignments do
   end
 
   defp review_covers_commit_refs?(_review_refs, _producer_refs), do: false
+
+  defp uncovered_producer_commits(review_refs, producer_refs) when is_list(producer_refs) do
+    review_refs = if is_list(review_refs), do: review_refs, else: []
+
+    reviewed_commits =
+      review_refs
+      |> Enum.flat_map(fn
+        %{"commit" => commit} when is_binary(commit) -> [String.downcase(commit)]
+        _ -> []
+      end)
+      |> MapSet.new()
+
+    producer_refs
+    |> Enum.flat_map(fn
+      %{"commit" => commit} when is_binary(commit) ->
+        commit = String.downcase(commit)
+        if MapSet.member?(reviewed_commits, commit), do: [], else: [commit]
+
+      _ ->
+        []
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp uncovered_producer_commits(_review_refs, _producer_refs), do: []
 
   defp latest_verification_conclusion_in_txn(txn, assignment_id, holder) do
     case Txn.q(
