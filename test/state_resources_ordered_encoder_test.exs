@@ -182,13 +182,13 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     non_agent_bytes = StateResources.encode_item("decision-requests", non_agent, @catalog)
 
     assert StateResources.item_shape_complete?("decision-requests", non_agent)
-    assert StateResources.item_shape_superset?("decision-requests", non_agent)
+    refute StateResources.item_shape_superset?("decision-requests", non_agent)
     assert non_agent_bytes == expected_bytes("decision requests", non_agent_fields, non_agent)
     refute Enum.any?(return_fields, &String.contains?(non_agent_bytes, &1))
 
     with_return_fields = Map.merge(non_agent, Map.take(agent, return_fields))
     refute StateResources.item_shape_complete?("decision-requests", with_return_fields)
-    refute StateResources.item_shape_superset?("decision-requests", with_return_fields)
+    assert StateResources.item_shape_superset?("decision-requests", with_return_fields)
 
     assert_raise ArgumentError, ~r/extra or missing field/, fn ->
       StateResources.encode_item("decision-requests", with_return_fields, @catalog)

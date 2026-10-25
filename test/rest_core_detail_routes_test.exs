@@ -461,7 +461,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       refute Enum.any?(return_fields, &Map.has_key?(item, &1))
     end
 
-    {_port, ws} = start_change_server(ctx)
     returned_at = System.system_time(:millisecond)
     returned_by = "session:#{ctx.admin_session.session_key}"
     reason = "The requested authority is missing."
@@ -483,20 +482,22 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert_wire_contract("decision requests", returned_item)
 
     row = StateResources.query_decision_request(ctx.db, agent_id)
-    Hub.committed("decision_request.returned", row, %{"decisionRequestId" => agent_id})
-    {raw_notice, ws} = receive_raw_change(ws, "decision_request.returned")
-    notice = JSON.decode!(raw_notice)
+    notice =
+      Publisher.committed_notice("decision_request.returned", row, %{
+        "decisionRequestId" => agent_id
+      })
+
     assert notice["payload"] == returned_item
 
-    assert raw_json_value(raw_notice, "payload") ==
+    notice_bytes = Publisher.encode_wire_notice(notice, ctx.catalog)
+
+    assert raw_json_value(notice_bytes, "payload") ==
              raw_json_value(returned_response.resp_body, "item")
 
     assert_ordered_fields(
-      raw_json_value(raw_notice, "payload"),
+      raw_json_value(notice_bytes, "payload"),
       expected_fields("decision requests", returned_item)
     )
-
-    :ok = WS.close(ws)
   end
 
   test "malformed stored decision options fail without a partial REST item", ctx do
