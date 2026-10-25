@@ -224,6 +224,7 @@ defmodule Tightbeam.SessionLane do
       lane_owner: "lane:#{inspect(self())}:#{System.unique_integer([:positive])}"
     }
 
+    Tightbeam.HarklightWakes.origin_ready(state.session_key)
     report_state(state, nil)
     token = Keyword.get(opts, :settlement_reservation)
     if is_nil(token), do: send(self(), :nudge)

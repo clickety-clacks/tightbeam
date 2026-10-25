@@ -66,6 +66,7 @@ impl CommandContext {
                 ("cli.harness_health_evidence_other", DispatchPath)
             }
             ArtifactRecord { .. } => ("cli.artifact_record", DispatchPath),
+            HarklightSend { .. } => ("cli.harklight_send", DispatchPath),
             ArtifactContentFetch { .. } => ("cli.artifact_content_fetch", DispatchPath),
             Artifacts { .. } => ("cli.artifacts", DispatchPath),
             ToolCallObserved => ("cli.tool_call_observed", Requests::ToolCallObserved),
@@ -415,6 +416,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         },
 
         ArtifactRecord { .. }
+        | HarklightSend { .. }
         | ToolCallObserved
         | Tune { .. }
         | EffortRule { .. }

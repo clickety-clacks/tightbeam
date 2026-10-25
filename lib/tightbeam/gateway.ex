@@ -78,6 +78,7 @@ defmodule Tightbeam.Gateway do
     Harness,
     HarnessHealth,
     HarnessProcess,
+    HarklightSend,
     Identity,
     Idempotency,
     LaneManager,
@@ -339,6 +340,7 @@ defmodule Tightbeam.Gateway do
           },
           tick_ms: config.wake_tick_ms,
           name: Tightbeam.WakeScheduler},
+         {Tightbeam.HarklightWakes, db: db, send_runner: Map.get(config, :harklight_send_runner)},
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
          {Tightbeam.AdapterCoordinator,
@@ -880,6 +882,9 @@ defmodule Tightbeam.Gateway do
       end,
       {"artifact-get", []} => fn call ->
         Artifacts.get(db, call.params[:artifact_id]) || %{code: "not_found"}
+      end,
+      {"harklight-send", []} => fn call ->
+        HarklightSend.send_request(db, call, runner: Map.get(config, :harklight_send_runner))
       end,
       {"artifacts", []} => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
       {"rule", ["decision_request.ruled"]} => fn call ->
