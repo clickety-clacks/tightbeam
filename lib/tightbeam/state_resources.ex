@@ -1700,6 +1700,7 @@ defmodule Tightbeam.StateResources do
       |> public()
       |> Map.update!("options", fn _filtered_options -> decision_options!(stored_options) end)
 
+    validate_decision_return_triplet!(row)
     validate_decision_deadline!(row)
 
     row =
@@ -1741,6 +1742,22 @@ defmodule Tightbeam.StateResources do
     do: raise(ArgumentError, "decision request deadlineAt is projection_invalid")
 
   defp validate_decision_deadline!(_row), do: :ok
+
+  defp validate_decision_return_triplet!(%{"kind" => "agent"} = row) do
+    return_fields = ~w(returnedBy returnReason returnedAt)
+    all_nil? = Enum.all?(return_fields, &(Map.fetch!(row, &1) == nil))
+    all_present? = Enum.all?(return_fields, &(not is_nil(Map.fetch!(row, &1))))
+
+    valid? =
+      (row["status"] == "returned" and all_present?) or
+        (row["status"] != "returned" and all_nil?)
+
+    unless valid? do
+      raise ArgumentError, "decision request return fields are projection_invalid"
+    end
+  end
+
+  defp validate_decision_return_triplet!(_row), do: :ok
 
   defp decision_options!(nil), do: []
 
@@ -2153,6 +2170,9 @@ defmodule Tightbeam.StateResources do
        )
        when kind != "agent",
        do: raise(ArgumentError, "non-agent decision requests cannot be returned")
+
+  defp validate_item_invariants!("decision requests", %{"kind" => "agent"} = item),
+    do: validate_decision_return_triplet!(item)
 
   defp validate_item_invariants!(
          "attests",

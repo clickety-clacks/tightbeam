@@ -202,6 +202,16 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
       )
     end
 
+    populated_before_return =
+      agent
+      |> Map.put("returnedBy", "session:fixture")
+      |> Map.put("returnReason", "Missing authority")
+      |> Map.put("returnedAt", 1)
+
+    assert_raise ArgumentError, ~r/return fields are projection_invalid/, fn ->
+      StateResources.encode_item("decision-requests", populated_before_return, @catalog)
+    end
+
     returned =
       agent
       |> Map.put("status", "returned")
@@ -211,6 +221,14 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
 
     assert StateResources.encode_item("decision-requests", returned, @catalog) ==
              expected_bytes("decision requests", fields, returned)
+
+    assert_raise ArgumentError, ~r/return fields are projection_invalid/, fn ->
+      StateResources.encode_item(
+        "decision-requests",
+        Map.put(returned, "returnReason", nil),
+        @catalog
+      )
+    end
 
     assert_raise ArgumentError, fn ->
       StateResources.encode_item(

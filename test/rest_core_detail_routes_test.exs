@@ -452,6 +452,17 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       expected_fields("decision requests", before_item)
     )
 
+    query!(ctx.db, "UPDATE decision_requests SET returnedBy=?2 WHERE id=?1", [
+      agent_id,
+      "session:fixture"
+    ])
+
+    invalid_before_return = get(ctx, "/api/decision-requests/#{agent_id}")
+    assert invalid_before_return.status == 500
+    assert_error(invalid_before_return, 500, "decision requests", "projection_invalid")
+
+    query!(ctx.db, "UPDATE decision_requests SET returnedBy=NULL WHERE id=?1", [agent_id])
+
     for kind <- [:statute, :effort] do
       id = Map.fetch!(ctx.decision_request_ids, kind)
       response = get(ctx, "/api/decision-requests/#{id}")
@@ -470,6 +481,17 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       "UPDATE decision_requests SET status='returned', returnedBy=?2, returnReason=?3, returnedAt=?4 WHERE id=?1",
       [agent_id, returned_by, reason, returned_at]
     )
+
+    query!(ctx.db, "UPDATE decision_requests SET returnReason=NULL WHERE id=?1", [agent_id])
+
+    invalid_returned = get(ctx, "/api/decision-requests/#{agent_id}")
+    assert invalid_returned.status == 500
+    assert_error(invalid_returned, 500, "decision requests", "projection_invalid")
+
+    query!(ctx.db, "UPDATE decision_requests SET returnReason=?2 WHERE id=?1", [
+      agent_id,
+      reason
+    ])
 
     returned_response = get(ctx, "/api/decision-requests/#{agent_id}")
     assert returned_response.status == 200, returned_response.resp_body
