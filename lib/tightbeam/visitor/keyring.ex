@@ -13,7 +13,7 @@ defmodule Tightbeam.Visitor.Keyring do
 
   @schema "visitor-keyring-v1"
   @visitor_schema "visitor-principal-v3-v1"
-  @current_previsitor_schema "coordination-fabric-v1-phase1-v21"
+  @current_previsitor_schema "coordination-fabric-v1-phase1-v22"
   @artifact_digest_previous_schema "coordination-fabric-v1-phase1-v20"
   @migratable_previsitor_schema "coordination-fabric-v1-phase1-v19"
   @filename "visitor-keyring-v1.json"

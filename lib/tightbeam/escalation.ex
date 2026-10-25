@@ -276,7 +276,7 @@ defmodule Tightbeam.Escalation do
            ON escalation_waivers (raiserId, statuteName, revokedAt);
          """
 
-  @request_columns """
+  @pre_version_request_columns """
   id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
   expecterSessionKey, expecterUserId, lineageRung, effortGeneration, deadlineWakeId,
   raisedAt, deadlineAt,
@@ -286,6 +286,143 @@ defmodule Tightbeam.Escalation do
   withdrawnReason, withdrawnAt, askedOfRole, answer, answeredBy, answeredAt,
   returnedBy, returnReason, returnedAt
   """
+
+  @request_columns """
+  id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
+  expecterSessionKey, expecterUserId, lineageRung, effortGeneration, deadlineWakeId,
+  raisedAt, deadlineAt,
+  statuteName, actionKey, question, options, context, status, decision, rationale,
+  ruledBy, ruledViaSessionKey, ruledViaPrincipal, ruledViaSessionState,
+  ruledAt, rulingFactId, consumedAt, parkWakeId, withdrawnBy,
+  withdrawnReason, withdrawnAt, askedOfRole, answer, answeredBy, answeredAt,
+  returnedBy, returnReason, returnedAt, rowVersion
+  """
+
+  @versioned_decision_request_ddl String.replace(
+                                    @decision_request_ddl,
+                                    "  returnedAt        INTEGER,\n",
+                                    "  returnedAt        INTEGER,\n  rowVersion         INTEGER NOT NULL DEFAULT 1,\n",
+                                    global: false
+                                  )
+
+  @versioned_terminal_insert_trigger """
+  CREATE TRIGGER decision_request_operator_terminal_insert
+  BEFORE INSERT ON decision_requests
+  WHEN typeof(NEW.rowVersion) <> 'integer' OR NEW.rowVersion < 1 OR
+       (NEW.kind = 'operator' AND NEW.status = 'ruled' AND
+         (NEW.ruledViaPrincipal IS NULL OR
+          NEW.ruledViaSessionState IS NULL OR
+          NEW.ruledViaSessionState NOT IN ('known','none') OR
+          (NEW.ruledViaSessionState = 'known' AND NEW.ruledViaSessionKey IS NULL) OR
+          (NEW.ruledViaSessionState = 'none' AND NEW.ruledViaSessionKey IS NOT NULL)))
+  BEGIN
+    SELECT RAISE(ABORT, 'decision_request_integrity_invalid');
+  END;
+  """
+
+  @versioned_terminal_update_trigger """
+  CREATE TRIGGER decision_request_operator_terminal_update
+  BEFORE UPDATE ON decision_requests
+  WHEN typeof(NEW.rowVersion) <> 'integer' OR NEW.rowVersion < 1 OR
+       (NEW.kind = 'operator' AND NEW.status = 'ruled' AND OLD.status <> 'ruled' AND
+         (NEW.ruledViaPrincipal IS NULL OR
+          NEW.ruledViaSessionState IS NULL OR
+          NEW.ruledViaSessionState NOT IN ('known','none') OR
+          (NEW.ruledViaSessionState = 'known' AND NEW.ruledViaSessionKey IS NULL) OR
+          (NEW.ruledViaSessionState = 'none' AND NEW.ruledViaSessionKey IS NOT NULL)))
+  BEGIN
+    SELECT RAISE(ABORT, 'decision_request_integrity_invalid');
+  END;
+  """
+
+  @decision_row_version_trigger """
+  CREATE TRIGGER decision_requests_row_version
+  AFTER UPDATE OF
+    id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
+    expecterSessionKey, expecterUserId, lineageRung, effortGeneration,
+    deadlineWakeId, raisedAt, deadlineAt, statuteName, question, options,
+    context, status, decision, rationale, ruledBy, ruledAt, consumedAt,
+    withdrawnBy, withdrawnReason, withdrawnAt, askedOfRole, answer,
+    answeredBy, answeredAt, returnedBy, returnReason, returnedAt
+  ON decision_requests
+  WHEN NEW.id IS NOT OLD.id
+    OR NEW.kind IS NOT OLD.kind
+    OR NEW.raiserId IS NOT OLD.raiserId
+    OR NEW.raiserSessionKey IS NOT OLD.raiserSessionKey
+    OR NEW.ownerUserId IS NOT OLD.ownerUserId
+    OR NEW.assignmentId IS NOT OLD.assignmentId
+    OR NEW.expecterSessionKey IS NOT OLD.expecterSessionKey
+    OR NEW.expecterUserId IS NOT OLD.expecterUserId
+    OR NEW.lineageRung IS NOT OLD.lineageRung
+    OR NEW.effortGeneration IS NOT OLD.effortGeneration
+    OR NEW.deadlineWakeId IS NOT OLD.deadlineWakeId
+    OR NEW.raisedAt IS NOT OLD.raisedAt
+    OR NEW.deadlineAt IS NOT OLD.deadlineAt
+    OR NEW.statuteName IS NOT OLD.statuteName
+    OR NEW.question IS NOT OLD.question
+    OR NEW.options IS NOT OLD.options
+    OR NEW.context IS NOT OLD.context
+    OR NEW.status IS NOT OLD.status
+    OR NEW.decision IS NOT OLD.decision
+    OR NEW.rationale IS NOT OLD.rationale
+    OR NEW.ruledBy IS NOT OLD.ruledBy
+    OR NEW.ruledAt IS NOT OLD.ruledAt
+    OR NEW.consumedAt IS NOT OLD.consumedAt
+    OR NEW.withdrawnBy IS NOT OLD.withdrawnBy
+    OR NEW.withdrawnReason IS NOT OLD.withdrawnReason
+    OR NEW.withdrawnAt IS NOT OLD.withdrawnAt
+    OR NEW.askedOfRole IS NOT OLD.askedOfRole
+    OR NEW.answer IS NOT OLD.answer
+    OR NEW.answeredBy IS NOT OLD.answeredBy
+    OR NEW.answeredAt IS NOT OLD.answeredAt
+    OR NEW.returnedBy IS NOT OLD.returnedBy
+    OR NEW.returnReason IS NOT OLD.returnReason
+    OR NEW.returnedAt IS NOT OLD.returnedAt
+  BEGIN
+    UPDATE decision_requests
+       SET rowVersion = OLD.rowVersion + 1
+     WHERE id = NEW.id;
+  END;
+  """
+
+  @current_versioned_terminal_insert_trigger String.replace(
+                                               @versioned_terminal_insert_trigger,
+                                               "CREATE TRIGGER ",
+                                               "CREATE TRIGGER IF NOT EXISTS ",
+                                               global: false
+                                             )
+  @current_versioned_terminal_update_trigger String.replace(
+                                               @versioned_terminal_update_trigger,
+                                               "CREATE TRIGGER ",
+                                               "CREATE TRIGGER IF NOT EXISTS ",
+                                               global: false
+                                             )
+  @current_decision_row_version_trigger String.replace(
+                                          @decision_row_version_trigger,
+                                          "CREATE TRIGGER ",
+                                          "CREATE TRIGGER IF NOT EXISTS ",
+                                          global: false
+                                        )
+
+  @current_ddl String.replace(
+                 @ddl,
+                 @decision_request_ddl,
+                 @versioned_decision_request_ddl,
+                 global: false
+               )
+  @current_ddl Regex.replace(
+                 ~r/CREATE TRIGGER IF NOT EXISTS decision_request_operator_terminal_insert.*?END;/s,
+                 @current_ddl,
+                 @current_versioned_terminal_insert_trigger,
+                 global: false
+               )
+  @current_ddl Regex.replace(
+                 ~r/CREATE TRIGGER IF NOT EXISTS decision_request_operator_terminal_update.*?END;/s,
+                 @current_ddl,
+                 @current_versioned_terminal_update_trigger,
+                 global: false
+               )
+  @current_ddl @current_ddl <> "\n" <> @current_decision_row_version_trigger
 
   @legacy_request_columns """
   id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
@@ -334,7 +471,24 @@ defmodule Tightbeam.Escalation do
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB), do: DB.execute(db, @current_ddl)
+
+  @doc false
+  @spec migrate_decision_row_version_v1_in_txn(Txn.t()) :: :ok
+  def migrate_decision_row_version_v1_in_txn(txn) do
+    :ok =
+      Txn.exec(
+        txn,
+        "ALTER TABLE decision_requests ADD COLUMN rowVersion INTEGER NOT NULL DEFAULT 1"
+      )
+
+    :ok = Txn.exec(txn, "DROP TRIGGER decision_request_operator_terminal_insert")
+    :ok = Txn.exec(txn, "DROP TRIGGER decision_request_operator_terminal_update")
+    :ok = Txn.exec(txn, @versioned_terminal_insert_trigger)
+    :ok = Txn.exec(txn, @versioned_terminal_update_trigger)
+    :ok = Txn.exec(txn, @decision_row_version_trigger)
+    :ok
+  end
 
   @doc false
   @spec ensure_terminal_epoch(DB.server()) :: :ok
@@ -381,8 +535,8 @@ defmodule Tightbeam.Escalation do
     Txn.q(
       txn,
       """
-      INSERT INTO decision_requests_ruled_integrity_v1 (#{@request_columns})
-      SELECT #{@request_columns} FROM decision_requests
+      INSERT INTO decision_requests_ruled_integrity_v1 (#{@pre_version_request_columns})
+      SELECT #{@pre_version_request_columns} FROM decision_requests
       """
     )
 
@@ -443,7 +597,9 @@ defmodule Tightbeam.Escalation do
 
   defp preflight_ruled_decision_integrity_in_txn(txn) do
     txn
-    |> Txn.q("SELECT #{@request_columns} FROM decision_requests WHERE status = 'ruled'")
+    |> Txn.q(
+      "SELECT #{@pre_version_request_columns} FROM decision_requests WHERE status = 'ruled'"
+    )
     |> Enum.each(fn row ->
       request = request_from_row(row)
 
@@ -658,7 +814,7 @@ defmodule Tightbeam.Escalation do
           if fact_id, do: nudge(opts, [fact_id])
 
           case result do
-            %{kind: "operator", status: "ruled"} -> terminal_operator_projection(result)
+            %{kind: "operator", status: "ruled"} -> terminal_operator_legacy_projection(result)
             other -> other
           end
 
@@ -1752,7 +1908,7 @@ defmodule Tightbeam.Escalation do
           cond do
             request.kind == "operator" and request.status in ["ruled", "consumed"] ->
               case validate_operator_terminal_in_txn(txn, request, "detail", observer) do
-                :ok -> terminal_operator_projection(request)
+                :ok -> terminal_operator_legacy_projection(request)
                 {:error, refusal} -> refusal
               end
 
@@ -1760,7 +1916,7 @@ defmodule Tightbeam.Escalation do
               integrity_error(request.id)
 
             true ->
-              request
+              Map.delete(request, :row_version)
           end
 
         [] ->
@@ -1881,6 +2037,7 @@ defmodule Tightbeam.Escalation do
     request_in_txn_optional: "any",
     migrate_terminal_operator_decision_v1_in_txn: "any",
     migrate_ruled_decision_integrity_v1_in_txn: "any",
+    migrate_decision_row_version_v1_in_txn: "any",
     preflight_ruled_decision_integrity_in_txn: "any",
     # DELEGATE: no SQL literal of its own — reaches one of the entries above
     # by a local call. `answer/2`/`return_request/2`/`ask/2`/`rule/3`/`waive/3`/`withdraw/2`/
@@ -3217,6 +3374,19 @@ defmodule Tightbeam.Escalation do
   @doc false
   @spec terminal_operator_projection(map()) :: map()
   def terminal_operator_projection(request) do
+    row_version = Map.get(request, :row_version)
+
+    unless is_integer(row_version) and row_version > 0 do
+      raise ArgumentError, "decision request rowVersion is projection_invalid"
+    end
+
+    Map.put(terminal_operator_projection_fields(request), :row_version, row_version)
+  end
+
+  defp terminal_operator_legacy_projection(request),
+    do: terminal_operator_projection_fields(request)
+
+  defp terminal_operator_projection_fields(request) do
     %{
       id: request.id,
       kind: request.kind,
@@ -3376,6 +3546,11 @@ defmodule Tightbeam.Escalation do
     request_from_row(through_ruled_by ++ [nil, nil, nil] ++ from_ruled_at)
   end
 
+  defp request_from_row(row) when is_list(row) and length(row) == 40 do
+    {columns, [row_version]} = Enum.split(row, -1)
+    columns |> request_from_row() |> Map.put(:row_version, row_version)
+  end
+
   defp request_from_row([
          id,
          kind,
@@ -3461,7 +3636,7 @@ defmodule Tightbeam.Escalation do
   end
 
   defp list_projection(%{kind: "operator", status: "ruled"} = request),
-    do: terminal_operator_projection(request)
+    do: terminal_operator_legacy_projection(request)
 
   defp list_projection(%{kind: "operator"} = request),
     do:
@@ -3488,7 +3663,8 @@ defmodule Tightbeam.Escalation do
         :ruling_fact_id,
         :consumed_at,
         :park_wake_id,
-        :withdrawn_by
+        :withdrawn_by,
+        :row_version
       ])
 
   defp waiver_in_txn(txn, id) do

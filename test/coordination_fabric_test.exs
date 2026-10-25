@@ -1513,6 +1513,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       raw_by_id: "any",
       raw_by_id_in_txn: "any",
       raw_by_id_in_txn!: "any",
+      migrate_decision_row_version_v1_in_txn: "any",
       resolve: "statute",
       rule: "any",
       rule_statute: "any",
@@ -1583,6 +1584,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       raw_by_id: 2,
       raw_by_id_in_txn: 2,
       raw_by_id_in_txn!: 2,
+      migrate_decision_row_version_v1_in_txn: 1,
       resolve: 3,
       rule: 3,
       rule_statute: 4,
@@ -1707,6 +1709,9 @@ defmodule Tightbeam.CoordinationFabricTest do
       ],
       migrate_ruled_decision_integrity_v1_in_txn: [
         {"lib/tightbeam/schema.ex", "upgrade_ruled_decision_integrity_v1/1"}
+      ],
+      migrate_decision_row_version_v1_in_txn: [
+        {"lib/tightbeam/schema.ex", "upgrade_decision_row_version_v1/1"}
       ]
     }
 
@@ -3400,6 +3405,11 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "answer hides fake and non-agent ids while an exact agent id grants session standing",
        %{db: db} do
+    start_supervised!(
+      {Wakes,
+       db: db, deliver: fn _wake -> true end, tick_ms: 60_000, name: Tightbeam.WakeScheduler}
+    )
+
     seed_session(db, "agent:coder", "flynn")
     seed_session(db, "agent:po", "flynn")
     seed_session(db, "agent:outsider", "someone-else")
@@ -3460,6 +3470,17 @@ defmodule Tightbeam.CoordinationFabricTest do
              admin_call(db, "rule", %{request: agent_request.id, decision: "allow"})
 
     assert authorized_agent =~ "answered, not ruled"
+
+    assert {:ok, ruled_statute} =
+             admin_call(db, "rule", %{request: statute_id, decision: "allow"})
+
+    assert ruled_statute.kind == "statute"
+    assert ruled_statute.status == "ruled"
+    assert ruled_statute.decision == "allow"
+    refute Map.has_key?(ruled_statute, :row_version)
+
+    assert {:ok, ^ruled_statute} =
+             admin_call(db, "rule", %{request: statute_id, decision: "allow"})
   end
 
   test "withdraw is the asker's own lawful exit, and nobody else's", %{db: db} do
@@ -3477,6 +3498,26 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     assert withdrawn.status == "withdrawn"
     assert withdrawn.withdrawn_reason == "worked it out myself"
+    refute Map.has_key?(withdrawn, :row_version)
+
+    statute_id = "dr_withdraw_statute"
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO decision_requests (id, kind, raiserId, raiserSessionKey, ownerUserId, " <>
+          "raisedAt, deadlineAt, statuteName, actionKey, question, context, status) VALUES " <>
+          "(?1,'statute','session:agent:coder','agent:coder','flynn',1,999999999999," <>
+          "'withdraw-gate','withdraw-k1','q','{}','open')",
+        [statute_id]
+      )
+
+    assert {:ok, withdrawn_statute} =
+             withdraw(db, {:session, "agent:coder"}, statute_id, "statute no longer applies")
+
+    assert withdrawn_statute.kind == "statute"
+    assert withdrawn_statute.status == "withdrawn"
+    refute Map.has_key?(withdrawn_statute, :row_version)
 
     # A withdrawn question can no longer be answered: the exit is real.
     assert {:error, %{code: "not_open"}} =
@@ -3491,6 +3532,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     assert {:ok, %{decision_request: request}} =
              ask(db, "agent:coder", "agent:po", "ship which migration?")
+
+    refute Map.has_key?(request, :row_version)
 
     assert {:error, %{code: "invalid"}} =
              return_request(db, {:session, "agent:po"}, request.id, "  ")
@@ -3508,6 +3551,7 @@ defmodule Tightbeam.CoordinationFabricTest do
                "  name the migration and rollback boundary  "
              )
 
+    refute Map.has_key?(returned, :row_version)
     assert returned.status == "returned"
     assert returned.question == request.question
     assert returned.context == request.context
@@ -3528,6 +3572,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert id == request.id
     assert listed.return_reason == returned.return_reason
     assert listed.returned_by == returned.returned_by
+    refute Map.has_key?(listed, :row_version)
 
     assert [notice] = wakes_for(db, "agent:coder")
     assert notice.prompt =~ request.question
@@ -3790,6 +3835,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert exact.id == request.id
     assert exact.question == request.question
     assert exact.context == request.context
+    refute Map.has_key?(exact, :row_version)
 
     assert {:error, %{code: "not_found"}} =
              verb(db, {:session, "agent:reviewer"}, "decision-request", %{
