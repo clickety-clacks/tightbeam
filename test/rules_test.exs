@@ -1216,6 +1216,65 @@ defmodule Tightbeam.RulesTest do
              )
   end
 
+  test "uncovered producer commits reach the detailed completion refusal", ctx do
+    :ok =
+      DB.execute(ctx.db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1),('other',1)")
+
+    stub_commit_ref_validation()
+    holder = session(ctx.db, "coverage-producer", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "coverage-reviewer", "other", archetype: "reviewer")
+
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "code")
+
+    review =
+      assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
+
+    producer_refs = fixture_commit_refs()
+    missing_commit = hd(producer_refs)["commit"]
+
+    review_refs = [
+      %{
+        "repo" => hd(producer_refs)["repo"],
+        "commit" => String.duplicate("b", 40)
+      }
+    ]
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             commit_ref_verdict(
+               ctx,
+               reviewer.session_key,
+               review.id,
+               "reviewed-clean",
+               review_refs
+             )
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", producer_refs)
+
+    put_raw(
+      ctx,
+      File.read!(
+        Path.expand("../priv/kungfu/agentic-engineering/rules/engineering.toml", __DIR__)
+      )
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    completion =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: producer.id,
+        kind: "completion"
+      })
+
+    assert :ok = Rules.evaluate(ctx.db, completion)
+
+    assert {:error, %{code: "inapplicable_code_evidence", message: message}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert message =~ "latest independent clean review is missing verified producer commits"
+    assert message =~ missing_commit
+  end
+
   test "artifact kinds fact resolves holder-recorded kinds only (A6)", ctx do
     holder = session(ctx.db, "artifact-holder", "flynn", archetype: "coder")
     other = session(ctx.db, "artifact-other", "other")
