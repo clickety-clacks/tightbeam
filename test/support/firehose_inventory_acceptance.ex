@@ -265,11 +265,12 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
                 sender: "process:tightbeam"
               })
 
-            Tightbeam.Firehose.Publisher.committed_in_txn(txn, "message.created", message, %{
-              "messageId" => message.id,
-              "sessionKey" => main.session_key,
-              "ownerUserId" => fixture.user_id
-            })
+            Tightbeam.Firehose.Publisher.message_in_txn(
+              txn,
+              main.session_key,
+              message,
+              fixture.user_id
+            )
           end)
       end)
 

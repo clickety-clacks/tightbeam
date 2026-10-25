@@ -5176,6 +5176,10 @@ defmodule Tightbeam.Schema do
   defp bootstrap_module(db, Tightbeam.Wakes, _current?),
     do: Tightbeam.Wakes.ensure_historical_schema(db)
 
+  # Harklight storage is additive and has no historical predecessor. A refused
+  # migration must leave the predecessor schema untouched.
+  defp bootstrap_module(_db, Tightbeam.HarklightWakes, _current?), do: :ok
+
   defp bootstrap_module(_db, Tightbeam.NoticeBatcher, _current?), do: :ok
 
   defp bootstrap_module(db, Tightbeam.Toplines, _current?),

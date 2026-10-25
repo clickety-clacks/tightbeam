@@ -72,7 +72,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert state.subscriptions == %{}
 
     {:push, {:text, ready}, state} =
-      inbound(
+      subscribe(
         %{
           "type" => "subscribe",
           "subscriptionId" => "wide",
@@ -102,7 +102,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     :ok = Hub.delivered(ctx.hub, self())
 
     {:push, {:text, ready}, state} =
-      inbound(
+      subscribe(
         %{
           "type" => "subscribe",
           "protocolVersion" => 2,
@@ -158,7 +158,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert state.selected_session_key == nil
 
     {:push, {:text, all_ready}, state} =
-      inbound(
+      subscribe(
         %{
           "type" => "subscribe",
           "protocolVersion" => 2,
@@ -174,7 +174,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
            }
 
     {:push, {:text, session_ready}, state} =
-      inbound(
+      subscribe(
         %{
           "type" => "subscribe",
           "protocolVersion" => 2,
@@ -202,7 +202,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
              JSON.decode!(auth_bytes)
 
     {:push, {:text, _ready}, state} =
-      inbound(
+      subscribe(
         %{
           "type" => "subscribe",
           "subscriptionId" => "work",
@@ -212,7 +212,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       )
 
     {:push, {:text, _ready}, state} =
-      inbound(
+      subscribe(
         %{
           "type" => "subscribe",
           "subscriptionId" => "all-work",
@@ -246,7 +246,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     state =
       Enum.reduce(1..100, state, fn index, state ->
         {:push, {:text, _ready}, state} =
-          inbound(
+          subscribe(
             %{
               "type" => "subscribe",
               "subscriptionId" => "s#{index}"
@@ -274,7 +274,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
 
     {:push, {:text, _ready}, state} =
-      inbound(
+      subscribe(
         %{"type" => "subscribe", "subscriptionId" => "all"},
         state
       )
@@ -294,7 +294,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
 
     {:push, {:text, _ready}, state} =
-      inbound(
+      subscribe(
         %{
           "type" => "subscribe",
           "subscriptionId" => "work",
@@ -584,6 +584,14 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
   defp inbound(payload, state),
     do: ChangeSocket.handle_in({JSON.encode!(payload), opcode: :text}, state)
+
+  defp subscribe(payload, state) do
+    assert {:ok, subscribed} = inbound(payload, state)
+    assert_receive {:firehose_control, ready}
+    result = ChangeSocket.handle_info({:firehose_control, ready}, subscribed)
+    :ok = Hub.delivered(subscribed.deps.firehose_hub, self())
+    result
+  end
 
   defp assert_registry_match!(handler_effects, rows) do
     # Archive/release are lifecycle entry points, not executable Gateway verbs.

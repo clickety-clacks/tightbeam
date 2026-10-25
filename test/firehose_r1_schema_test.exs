@@ -259,7 +259,13 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
             recordedMessageId,recordedTurnEvidence,state,home,createdAt,updatedAt
      FROM artifacts ORDER BY artifactId
      """), rows(db, "SELECT * FROM decision_request_terminal_epoch"),
-     rows(db, "SELECT * FROM turns ORDER BY seq")}
+     rows(db, """
+     SELECT seq,sessionKey,messageId,wakeId,origin,prompt,roleRef,roleFallback,
+            assignmentId,jobRef,model,thinkingLevel,modelContext,harness,
+            replyAttention,status,owner,adapterGen,requestRef,error,
+            createdAt,startedAt,endedAt,publishedAt
+     FROM turns ORDER BY seq
+     """)}
   end
 
   defp objects(db),

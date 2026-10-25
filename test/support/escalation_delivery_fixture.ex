@@ -703,11 +703,10 @@ defmodule Tightbeam.EscalationDeliveryFixture do
               "deliver_wait_in_txn/3"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5", "deliver_prompt/4"} =>
                1,
-             # `deliver_prompt_in_txn/5` declines undeliverable addresses BEFORE
-             # appending the echo, and hands the append+enqueue pair to this one
-             # private. Still exactly one turn sink; it simply has a name now.
-             {"lib/tightbeam/gateway.ex", "Ledger.enqueue_in_txn/2",
-              "append_and_enqueue_in_txn/7"} => 1,
+             # `deliver_prompt_in_txn/5` declines undeliverable addresses before
+             # appending the echo. Message enqueue then reaches this one turn sink.
+             {"lib/tightbeam/gateway.ex", "Ledger.enqueue_in_txn/2", "enqueue_message_in_txn/9"} =>
+               1,
              {"lib/tightbeam/harness_health.ex", "Gateway.deliver_prompt_in_txn/5",
               "incident_notice_in_txn/4"} => 1,
              # One concrete-session snapshot admits its carrier and actual turn
