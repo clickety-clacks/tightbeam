@@ -123,7 +123,7 @@ defmodule Tightbeam.StateVisibility do
     work_item_id = value(row, :work_item_id)
     work_item = work_item_visible?(db, work_item_id, principal)
 
-    session_principal?(principal, creator) or work_item
+    principal.is_admin or session_principal?(principal, creator) or work_item
   end
 
   defp do_core_detail_visible?(_db, _resource, _row, _principal), do: false
@@ -133,67 +133,37 @@ defmodule Tightbeam.StateVisibility do
   def artifact_visible?(db, row, principal),
     do: core_detail_visible?(db, "artifacts", row, principal)
 
-  @doc "Check whether a principal may read an assignment, by id or its canonical row."
-  @spec assignment_visible?(DB.server(), String.t() | map(), map()) :: boolean()
-  def assignment_visible?(db, assignment_id, principal) when is_binary(assignment_id) do
-    case query_rows(
-           db,
-           """
-           SELECT a.holderKey, a.openedByUser, a.openedBySession, wi.ownerUserId
-           FROM assignments AS a
-           LEFT JOIN work_items AS wi ON wi.id = a.workItemId
-           WHERE a.id = ?1
-           """,
-           [assignment_id]
-         ) do
-      [[holder_key, opened_by_user, opened_by_session, owner_user_id]] ->
-        assignment_row_visible?(
-          principal,
-          holder_key,
-          opened_by_user,
-          opened_by_session,
-          owner_user_id
-        )
-
-      [] ->
-        false
-    end
-  end
-
-  def assignment_visible?(db, row, principal) when is_map(row) do
-    if principal.is_admin do
-      true
-    else
-      case value(row, :holder_key) do
-        holder_key when is_binary(holder_key) ->
-          assignment_row_visible?(
-            principal,
-            holder_key,
-            value(row, :opened_by_user),
-            value(row, :opened_by_session),
-            value(row, :owner_user_id)
-          )
-
-        _ ->
-          case value(row, :id) do
-            id when is_binary(id) -> assignment_visible?(db, id, principal)
-            _ -> false
-          end
-      end
-    end
-  end
-
-  @doc "An attest is visible only when its parent assignment is visible."
+  @doc "Apply the AU4 parent-assignment grant to an attest or nested attest collection."
   @spec attest_visible?(DB.server(), map(), map()) :: boolean()
   def attest_visible?(db, row, principal) when is_map(row) do
     case value(row, :assignment) do
       assignment when is_map(assignment) ->
-        assignment_visible?(db, assignment, principal)
+        attest_parent_visible?(principal, assignment)
 
       _ ->
         case value(row, :assignment_id) do
           assignment_id when is_binary(assignment_id) ->
-            assignment_visible?(db, assignment_id, principal)
+            case query_rows(
+                   db,
+                   """
+                   SELECT a.holderKey, a.openedByUser, a.openedBySession, wi.ownerUserId
+                   FROM assignments AS a
+                   LEFT JOIN work_items AS wi ON wi.id = a.workItemId
+                   WHERE a.id = ?1
+                   """,
+                   [assignment_id]
+                 ) do
+              [[holder_key, opened_by_user, opened_by_session, owner_user_id]] ->
+                attest_parent_visible?(principal, %{
+                  holder_key: holder_key,
+                  opened_by_user: opened_by_user,
+                  opened_by_session: opened_by_session,
+                  owner_user_id: owner_user_id
+                })
+
+              [] ->
+                false
+            end
 
           _ ->
             false
@@ -201,31 +171,17 @@ defmodule Tightbeam.StateVisibility do
     end
   end
 
-  defp assignment_row_visible?(%{is_admin: true}, _holder, _opened_user, _opened_session, _owner),
-    do: true
+  defp attest_parent_visible?(%{is_admin: true}, _assignment), do: true
 
-  defp assignment_row_visible?(
-         %{kind: "session", id: principal_id},
-         holder_key,
-         _opened_user,
-         opened_by_session,
-         _owner_user_id
-       ) do
-    principal_id == holder_key or principal_id == opened_by_session
+  defp attest_parent_visible?(%{kind: "session", id: id}, assignment) do
+    id == value(assignment, :holder_key) or id == value(assignment, :opened_by_session)
   end
 
-  defp assignment_row_visible?(
-         %{kind: "user", id: principal_id},
-         _holder_key,
-         opened_by_user,
-         _opened_by_session,
-         owner_user_id
-       ) do
-    principal_id == opened_by_user or principal_id == owner_user_id
+  defp attest_parent_visible?(%{kind: "user", id: id}, assignment) do
+    id == value(assignment, :opened_by_user) or id == value(assignment, :owner_user_id)
   end
 
-  defp assignment_row_visible?(_principal, _holder, _opened_user, _opened_session, _owner),
-    do: false
+  defp attest_parent_visible?(_principal, _assignment), do: false
 
   defp trace_core_detail(%{core_detail_trace: nil}, _event), do: :ok
 

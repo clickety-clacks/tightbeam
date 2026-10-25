@@ -51,8 +51,6 @@ defmodule Tightbeam.Wire.Router do
 
   alias Tightbeam.{
     Assets,
-    Artifacts,
-    Assignments,
     CliCompatibility,
     ColdStart,
     Devices,
@@ -81,11 +79,6 @@ defmodule Tightbeam.Wire.Router do
     artifacts: %{
       route: "artifacts.collection",
       resource: "artifacts",
-      query_owner: Artifacts,
-      query: :query_artifact,
-      serializer_owner: StateResources,
-      serializer: :artifact,
-      visibility: :artifact_visible?,
       filters: %{
         "workItemId" => :string,
         "createdBySession" => :string,
@@ -97,11 +90,6 @@ defmodule Tightbeam.Wire.Router do
     attests: %{
       route: "attests.collection",
       resource: "attests",
-      query_owner: Assignments,
-      query: :query_attests,
-      serializer_owner: StateResources,
-      serializer: :attest,
-      visibility: :attest_visible?,
       filters: %{
         "assignmentId" => :string,
         "workItemId" => :string,
@@ -196,13 +184,7 @@ defmodule Tightbeam.Wire.Router do
     },
     sessions: %{resource: "sessions", query: :query_session, serializer: :session},
     devices: %{resource: "devices", query: :query_device, serializer: :device},
-    artifacts: %{
-      resource: "artifacts",
-      query_owner: Artifacts,
-      query: :query_artifact,
-      serializer: :artifact,
-      visibility: :artifact_visible?
-    },
+    artifacts: %{resource: "artifacts", query: :query_artifact, serializer: :artifact},
     read_markers: %{resource: "read markers", query: :query_read_marker, serializer: :read_marker}
   }
   @multipart_opts Plug.Parsers.init(
@@ -385,17 +367,17 @@ defmodule Tightbeam.Wire.Router do
   end
 
   get "/api/artifacts" do
-    state_collection(conn, Map.fetch!(@state_read_specs, :artifacts))
+    d2a_collection(conn, Map.fetch!(@state_read_specs, :artifacts))
   end
 
   get "/api/attests" do
-    state_collection(conn, Map.fetch!(@state_read_specs, :attests))
+    d2a_collection(conn, Map.fetch!(@state_read_specs, :attests))
   end
 
   get "/api/assignments/:assignment_id/attests" do
     spec = Map.fetch!(@state_read_specs, :attests)
 
-    state_collection(
+    d2a_collection(
       conn,
       Map.merge(spec, %{
         route: "assignments.attests.collection",
@@ -629,11 +611,13 @@ defmodule Tightbeam.Wire.Router do
          {:ok, query} <- decode_state_query(conn),
          {:ok, principal} <- state_principal(auth, query, conn),
          {:ok, request} <- state_collection_request(query, spec),
-         request <- state_collection_parent_scope(request, spec),
          {:ok, boundary} <- state_cursor_boundary(request, principal, spec),
-         :ok <- state_collection_parent_visible(conn, spec, principal),
          seam <- state_seam!(spec),
-         visible <- state_collection_visibility(spec, seam, principal),
+         visible <-
+           if(spec.resource == "work items",
+             do: principal,
+             else: apply(StateVisibility, seam.visibility, [principal.is_admin])
+           ),
          rows <- state_collection_rows(conn, spec, seam, request.filters, visible),
          {page_rows, page} <- state_page(rows, boundary, request, principal, spec),
          items <- state_serialize_rows(page_rows, spec) do
@@ -649,6 +633,88 @@ defmodule Tightbeam.Wire.Router do
     _error in [ArgumentError, KeyError, MatchError] ->
       state_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
+
+  defp d2a_collection(conn, spec) do
+    started_at = System.monotonic_time(:microsecond)
+
+    with {:ok, auth} <- state_bearer_auth(conn),
+         {:ok, query} <- decode_state_query(conn),
+         {:ok, principal} <- state_principal(auth, query, conn),
+         {:ok, request} <- state_collection_request(query, spec),
+         request <- d2a_collection_parent_scope(request, spec),
+         {:ok, boundary} <- state_cursor_boundary(request, principal, spec),
+         :ok <- d2a_collection_parent_visible(conn, spec, principal),
+         rows <- d2a_collection_rows(conn, spec, request.filters, principal),
+         {page_rows, page} <- state_page(rows, boundary, request, principal, spec),
+         items <- d2a_serialize_rows(page_rows, spec) do
+      state_send(conn, 200, state_collection_envelope(conn, spec.resource, items, page))
+    else
+      {:error, 404, "not_found", _message} ->
+        state_not_found(conn, spec.resource, started_at)
+
+      {:error, status, code, message} ->
+        state_error(conn, spec.resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp d2a_collection_parent_scope(request, %{parent_assignment_id: assignment_id}) do
+    filters =
+      Map.update(request.filters, "assignmentId", [assignment_id], fn values ->
+        Enum.filter(values, &(&1 == assignment_id))
+      end)
+
+    %{request | filters: filters, filter_fingerprint: state_filter_fingerprint(filters)}
+  end
+
+  defp d2a_collection_parent_scope(request, _spec), do: request
+
+  defp d2a_collection_parent_visible(conn, %{parent_assignment_id: assignment_id}, principal) do
+    if StateVisibility.attest_visible?(db(conn), %{assignment_id: assignment_id}, principal),
+      do: :ok,
+      else: {:error, 404, "not_found", nil}
+  end
+
+  defp d2a_collection_parent_visible(_conn, _spec, _principal), do: :ok
+
+  defp d2a_collection_rows(conn, %{resource: "artifacts"} = spec, filters, principal) do
+    rows = StateResources.query_artifact(db(conn), %{filters: filters, principal: principal})
+    d2a_sort_rows!(rows, spec.order)
+  end
+
+  defp d2a_collection_rows(conn, %{resource: "attests"} = spec, filters, principal) do
+    rows = StateResources.query_attest(db(conn), %{filters: filters, principal: principal})
+    d2a_sort_rows!(rows, spec.order)
+  end
+
+  defp d2a_serialize_rows(rows, %{resource: "artifacts"}),
+    do: Enum.map(rows, &StateResources.artifact/1)
+
+  defp d2a_serialize_rows(rows, %{resource: "attests"}),
+    do: Enum.map(rows, &StateResources.attest/1)
+
+  defp d2a_sort_rows!(rows, order) when is_list(rows) do
+    Enum.each(rows, fn row ->
+      tuple = state_row_tuple(row, order)
+
+      unless Enum.zip(tuple, order)
+             |> Enum.all?(fn
+               {value, {_field, :string}} -> is_binary(value) and value != ""
+               {value, {_field, :integer}} -> is_integer(value)
+             end) do
+        raise ArgumentError, "D2 resource row has an invalid order tuple"
+      end
+    end)
+
+    rows
+    |> Enum.uniq_by(&state_row_tuple(&1, order))
+    |> Enum.sort_by(&state_row_tuple(&1, order))
+  end
+
+  defp d2a_sort_rows!(_rows, _order),
+    do: raise(ArgumentError, "D2 resource query did not return a list")
 
   defp state_detail(conn, %{resource: "identity"} = spec, id) do
     started_at = System.monotonic_time(:microsecond)
@@ -743,7 +809,6 @@ defmodule Tightbeam.Wire.Router do
                core_detail_row(conn, spec, key, core_detail_trace_principal(conn, principal))
              end
            ),
-         :ok <- core_detail_visibility(conn, spec, row, principal),
          true <- not is_nil(row),
          :ok <- core_detail_probe(conn, spec.resource, :schema),
          :ok <- core_detail_probe(conn, spec.resource, :serializer),
@@ -767,19 +832,6 @@ defmodule Tightbeam.Wire.Router do
     _error in [ArgumentError, KeyError, MatchError] ->
       state_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
-
-  defp core_detail_visibility(conn, %{visibility: visibility}, row, principal) do
-    allowed =
-      apply(StateVisibility, visibility, [
-        db(conn),
-        row,
-        core_detail_trace_principal(conn, principal)
-      ])
-
-    if allowed, do: :ok, else: {:error, :not_found}
-  end
-
-  defp core_detail_visibility(_conn, _spec, _row, _principal), do: :ok
 
   defp core_detail_serialize(conn, spec, row) do
     core_detail_trace(conn, {:serializer, spec.resource, spec.serializer})
@@ -835,16 +887,6 @@ defmodule Tightbeam.Wire.Router do
   defp core_detail_row(conn, %{query: query, resource: "read markers"}, scope_key, principal) do
     core_detail_trace(conn, {:shared_lookup, "read markers", query})
     apply(StateResources, query, [db(conn), %{key: scope_key, principal: principal}, %{}])
-  end
-
-  defp core_detail_row(
-         conn,
-         %{query_owner: owner, query: query, resource: resource},
-         key,
-         principal
-       ) do
-    core_detail_trace(conn, {:shared_lookup, resource, query})
-    apply(owner, query, [db(conn), %{key: key, principal: principal}])
   end
 
   defp core_detail_row(conn, %{query: query, resource: resource}, key, principal) do
@@ -1098,33 +1140,6 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
-  defp state_collection_parent_scope(request, %{parent_assignment_id: assignment_id}) do
-    filters =
-      Map.update(request.filters, "assignmentId", [assignment_id], fn values ->
-        Enum.filter(values, &(&1 == assignment_id))
-      end)
-
-    %{request | filters: filters, filter_fingerprint: state_filter_fingerprint(filters)}
-  end
-
-  defp state_collection_parent_scope(request, _spec), do: request
-
-  defp state_collection_parent_visible(conn, %{parent_assignment_id: assignment_id}, principal) do
-    if StateVisibility.assignment_visible?(db(conn), assignment_id, principal),
-      do: :ok,
-      else: {:error, 404, "not_found", nil}
-  end
-
-  defp state_collection_parent_visible(_conn, _spec, _principal), do: :ok
-
-  defp state_collection_visibility(%{resource: "work items"}, _seam, principal),
-    do: principal
-
-  defp state_collection_visibility(%{query_owner: _owner}, _seam, principal), do: principal
-
-  defp state_collection_visibility(_spec, seam, principal),
-    do: apply(StateVisibility, seam.visibility, [principal.is_admin])
-
   defp state_single_value(query, key) do
     case Map.get(query, key, []) do
       [] -> {:ok, nil}
@@ -1225,26 +1240,6 @@ defmodule Tightbeam.Wire.Router do
 
   defp state_cursor_tuple_valid?(_tuple, _order), do: false
 
-  defp state_collection_rows(
-         conn,
-         %{query_owner: owner} = spec,
-         seam,
-         filters,
-         principal
-       )
-       when is_map(principal) do
-    filters
-    |> state_filter_combinations()
-    |> Enum.flat_map(fn combination ->
-      case apply(owner, seam.query, [db(conn), %{filters: combination, principal: principal}]) do
-        rows when is_list(rows) -> rows
-        _ -> raise ArgumentError, "#{spec.resource} collection query did not return a list"
-      end
-    end)
-    |> Enum.uniq_by(&state_row_tuple(&1, spec.order))
-    |> Enum.sort_by(&state_row_tuple(&1, spec.order))
-  end
-
   defp state_collection_rows(_conn, _spec, _seam, _filters, false), do: []
 
   defp state_collection_rows(conn, %{resource: "work items"} = spec, _seam, filters, principal) do
@@ -1289,22 +1284,6 @@ defmodule Tightbeam.Wire.Router do
 
   defp state_seam!(%{resource: "work items"}),
     do: %{query: :query_work_item, serializer: :work_item}
-
-  defp state_seam!(%{
-         query_owner: query_owner,
-         query: query,
-         serializer_owner: serializer_owner,
-         serializer: serializer,
-         visibility: visibility
-       }) do
-    %{
-      query_owner: query_owner,
-      query: query,
-      serializer_owner: serializer_owner,
-      serializer: serializer,
-      visibility: visibility
-    }
-  end
 
   defp state_seam!(spec) do
     row = Registry.rows() |> Map.fetch!(spec.class)
@@ -1426,10 +1405,6 @@ defmodule Tightbeam.Wire.Router do
       Map.has_key?(row, camel) -> Map.fetch!(row, camel)
       true -> raise KeyError, key: field, term: row
     end
-  end
-
-  defp state_serialize_rows(rows, %{serializer_owner: owner, serializer: serializer}) do
-    Enum.map(rows, &apply(owner, serializer, [&1]))
   end
 
   defp state_serialize_rows(rows, spec) do

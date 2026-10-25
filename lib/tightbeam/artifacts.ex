@@ -283,11 +283,7 @@ defmodule Tightbeam.Artifacts do
   end
 
   @doc false
-  @spec query_artifact(DB.server(), map()) :: map() | [map()] | nil
-  def query_artifact(db, %{key: artifact_id, principal: _principal})
-      when is_binary(artifact_id),
-      do: get(db, artifact_id)
-
+  @spec query_artifact(DB.server(), map()) :: [map()]
   def query_artifact(db, %{filters: filters, principal: principal})
       when is_map(filters) and is_map(principal) do
     db
@@ -334,8 +330,7 @@ defmodule Tightbeam.Artifacts do
       [
         {"workItemId", filters[:work_item_id]},
         {"createdBySession", filters[:session_key]},
-        {"kind", filters[:kind]},
-        {"state", filters[:state]}
+        {"kind", filters[:kind]}
       ]
       |> Enum.reject(fn {_column, value} -> is_nil(value) end)
       |> Enum.with_index(1)

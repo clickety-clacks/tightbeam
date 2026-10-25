@@ -1149,9 +1149,9 @@ defmodule Tightbeam.Assignments do
     Enum.map(rows, &hd/1)
   end
 
-  @doc false
-  @spec query_attests(DB.server(), map()) :: [map()]
-  def query_attests(db, %{filters: filters, principal: principal})
+  @doc "List every attest filed against an assignment in deterministic order."
+  @spec list_attests(DB.server(), String.t() | map()) :: [map()]
+  def list_attests(db, %{filters: filters, principal: principal})
       when is_map(filters) and is_map(principal) do
     {:ok, rows} =
       DB.query(
@@ -1184,6 +1184,8 @@ defmodule Tightbeam.Assignments do
       end
     end)
   end
+
+  def list_attests(db, assignment_id), do: list_attests(db, assignment_id, nil, nil)
 
   defp attest_query_rows([
          id,
@@ -1247,10 +1249,6 @@ defmodule Tightbeam.Assignments do
 
   defp filter_match?(actual, expected) when is_list(expected), do: actual in expected
   defp filter_match?(actual, expected), do: actual == expected
-
-  @doc "List every attest filed against an assignment in deterministic order."
-  @spec list_attests(DB.server(), String.t()) :: [map()]
-  def list_attests(db, assignment_id), do: list_attests(db, assignment_id, nil, nil)
 
   @doc """
   The same list, paged by a `(ts, id)` KEYSET (fabric §13 Phase 1 seam ④,

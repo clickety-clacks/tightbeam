@@ -259,6 +259,20 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
     assert hidden_detail.status == 404
     assert hidden_detail.resp_body == unknown_detail.resp_body
 
+    principal_mismatch =
+      get(
+        ctx,
+        "/api/artifacts?workItemId=#{ctx.alice_item.id}&createdBySession=#{ctx.creator_session.session_key}&limit=1&before=#{body["page"]["oldestCursor"]}",
+        ctx.bob.device.token
+      )
+
+    assert principal_mismatch.status == 404
+    assert principal_mismatch.resp_body == unknown_detail.resp_body
+
+    admin_collection = get(ctx, "/api/artifacts", ctx.admin_device.token)
+    assert admin_collection.status == 200, admin_collection.resp_body
+    assert length(JSON.decode!(admin_collection.resp_body)["items"]) == 3
+
     owner_session_collection =
       get(
         ctx,
@@ -409,6 +423,20 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
 
     assert outsider_nested.status == 404
     assert outsider_nested.resp_body == unknown_parent.resp_body
+
+    principal_mismatch =
+      get(
+        ctx,
+        "/api/assignments/#{ctx.owner_assignment_id}/attests?limit=1&before=#{owner_body["page"]["oldestCursor"]}",
+        ctx.bob.device.token
+      )
+
+    assert principal_mismatch.status == 404
+    assert principal_mismatch.resp_body == unknown_parent.resp_body
+
+    admin_collection = get(ctx, "/api/attests", ctx.admin_device.token)
+    assert admin_collection.status == 200, admin_collection.resp_body
+    assert length(JSON.decode!(admin_collection.resp_body)["items"]) == 5
   end
 
   defp create_user(db, user_id) do
