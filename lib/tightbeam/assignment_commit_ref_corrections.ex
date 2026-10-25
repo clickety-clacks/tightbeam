@@ -82,7 +82,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
           end)
 
         unless actual == expected,
-               do: raise(ArgumentError, "unexpected commit-ref correction schema objects")
+          do: raise(ArgumentError, "unexpected commit-ref correction schema objects")
 
         previous_fk_violations =
           Tightbeam.Schema.migration_foreign_keys_in_txn(
