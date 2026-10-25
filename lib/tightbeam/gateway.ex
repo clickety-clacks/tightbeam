@@ -2271,7 +2271,8 @@ defmodule Tightbeam.Gateway do
       Keyword.get(opts, :attachments, []) || []
     )
 
-    if is_binary(device_id) and device_id != "" and is_binary(client_message_id) and
+    if is_binary(origin) and String.starts_with?(origin, "user:") and is_binary(device_id) and
+         device_id != "" and is_binary(client_message_id) and
          client_message_id != "" and is_binary(payload_sha256) do
       identity = %{
         "targetSessionKey" => target,
@@ -2283,6 +2284,26 @@ defmodule Tightbeam.Gateway do
       }
 
       NoticeBatcher.persist_source_client_in_txn(txn, wake.wake_id, identity)
+
+      case Projection.append_in_txn(txn, %{
+             session_key: target,
+             role: "user",
+             content: prompt,
+             timestamp: wake.created_at,
+             sender: origin,
+             device_id: device_id,
+             client_message_id: client_message_id,
+             attachments: Keyword.get(opts, :attachments, []) || []
+           }) do
+        {:appended, message} ->
+          Tightbeam.Firehose.Publisher.message_in_txn(txn, target, message)
+
+        {:duplicate, _message} ->
+          :ok
+
+        {:conflict, _message} ->
+          raise DB.Error, message: "queued human post conflicts with an existing message"
+      end
     end
 
     Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
@@ -2306,6 +2327,41 @@ defmodule Tightbeam.Gateway do
   defp staged_prompt_target_gate(_target_gate), do: 1
 
   defp append_and_enqueue_in_txn(txn, target, role_ref, role_fallback, origin, stamped, opts) do
+    queued_human_post_delivery? = opts[:queued_human_post_delivery] == true
+
+    human_source_messages =
+      opts[:wake_id]
+      |> case do
+        wake_id when is_binary(wake_id) ->
+          NoticeBatcher.carrier_human_posts_in_txn(txn, wake_id)
+
+        _ ->
+          []
+      end
+      |> Enum.map(fn source ->
+        input = %{
+          session_key: target,
+          role: "user",
+          content: source.content,
+          timestamp: source.timestamp,
+          device_id: source.device_id,
+          client_message_id: source.client_message_id,
+          attachments: source.attachments
+        }
+
+        case Projection.append_in_txn(txn, input) do
+          {:appended, message} ->
+            message
+
+          {:duplicate, message} ->
+            message
+
+          {:conflict, message} ->
+            raise DB.Error,
+              message: "batched human post conflicts with existing message #{message.id}"
+        end
+      end)
+
     input = %{
       session_key: target,
       role: "user",
@@ -2318,50 +2374,117 @@ defmodule Tightbeam.Gateway do
 
     case Projection.append_in_txn(txn, input) do
       {:appended, message} ->
-        {assignment_id, job_ref} = turn_attribution(txn, opts)
+        enqueue_message_in_txn(
+          txn,
+          target,
+          role_ref,
+          role_fallback,
+          origin,
+          stamped,
+          opts,
+          message,
+          human_source_messages
+        )
 
-        enqueued =
-          Ledger.enqueue_in_txn(txn, %{
-            session_key: target,
-            message_id: message.id,
-            wake_id: opts[:wake_id],
-            origin: origin,
-            prompt: stamped,
-            role_ref: role_ref || opts[:role_ref],
-            role_fallback: role_fallback || opts[:role_fallback] || false,
-            assignment_id: assignment_id,
-            job_ref: job_ref,
-            request_ref: opts[:request_ref]
-          })
-
-        case enqueued do
-          {:ok, seq} ->
-            if is_binary(opts[:wake_id]) do
-              source_ids = NoticeBatcher.carrier_source_ids_in_txn(txn, opts[:wake_id])
-              source_ids = if source_ids == [], do: [opts[:wake_id]], else: source_ids
-
-              Enum.each(source_ids, fn source_id ->
-                DB.Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [
-                  source_id,
-                  seq
-                ])
-              end)
-            end
-
-            fire_wake_in_txn(txn, opts)
-            Tightbeam.Firehose.Publisher.message_in_txn(txn, target, message)
-
-            {:appended, target, message, opts}
-
-          # The ledger is the single writer and refuses on its own authority, so
-          # this stays reachable for any future caller even though the check
-          # above already declined this one in the same transaction.
-          {:error, :no_session} ->
-            refuse_undeliverable_turn(txn, target, origin, opts)
-        end
+      {:duplicate, message} when queued_human_post_delivery? ->
+        enqueue_message_in_txn(
+          txn,
+          target,
+          role_ref,
+          role_fallback,
+          origin,
+          stamped,
+          opts,
+          message,
+          human_source_messages
+        )
 
       other ->
         other
+    end
+  end
+
+  defp enqueue_message_in_txn(
+         txn,
+         target,
+         role_ref,
+         role_fallback,
+         origin,
+         stamped,
+         opts,
+         message,
+         human_source_messages
+       ) do
+    {assignment_id, job_ref} = turn_attribution(txn, opts)
+
+    turn_attrs = %{
+      session_key: target,
+      message_id: message.id,
+      wake_id: opts[:wake_id],
+      origin: origin,
+      prompt: stamped,
+      role_ref: role_ref || opts[:role_ref],
+      role_fallback: role_fallback || opts[:role_fallback] || false,
+      assignment_id: assignment_id,
+      job_ref: job_ref,
+      request_ref: opts[:request_ref]
+    }
+
+    turn_attrs =
+      if is_binary(opts[:wake_id]) do
+        case NoticeBatcher.carrier_turn_metadata_in_txn(txn, opts[:wake_id]) do
+          %{
+            chat_message_format: chat_message_format,
+            member_count: count,
+            human_member_count: human_count
+          } ->
+            turn_attrs
+            |> Map.put(:trigger_source, "batch")
+            |> Map.put(:batch_member_count, count)
+            |> Map.put(
+              :is_batch_carrier,
+              chat_message_format == "member-rows-v1" and
+                human_count == length(human_source_messages)
+            )
+
+          nil ->
+            turn_attrs
+        end
+      else
+        turn_attrs
+      end
+
+    enqueued = Ledger.enqueue_in_txn(txn, turn_attrs)
+
+    case enqueued do
+      {:ok, seq} ->
+        if is_binary(opts[:wake_id]) do
+          source_ids = NoticeBatcher.carrier_source_ids_in_txn(txn, opts[:wake_id])
+          source_ids = if source_ids == [], do: [opts[:wake_id]], else: source_ids
+
+          Enum.each(source_ids, fn source_id ->
+            DB.Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [
+              source_id,
+              seq
+            ])
+          end)
+        end
+
+        fire_wake_in_txn(txn, opts)
+
+        Enum.each(human_source_messages, fn source_message ->
+          Tightbeam.Firehose.Publisher.message_in_txn(txn, target, source_message)
+        end)
+
+        Tightbeam.Firehose.Publisher.message_in_txn(txn, target, message)
+
+        {:appended, target, message, opts}
+
+      # The ledger is the single writer and refuses on its own authority, so
+      # this stays reachable for any future caller even though the check
+      # above already declined this one in the same transaction.
+      {:error, :no_session} ->
+        refuse_undeliverable_turn(txn, target, origin, opts)
     end
   end
 

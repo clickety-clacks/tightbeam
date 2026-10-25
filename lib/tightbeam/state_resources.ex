@@ -32,7 +32,20 @@ defmodule Tightbeam.StateResources do
          t.roleRef, t.roleFallback, t.assignmentId, t.jobRef, t.model, t.thinkingLevel,
          t.modelContext, t.harness, t.replyAttention, t.status, t.owner,
          t.adapterGen, t.requestRef, t.error, t.createdAt, t.startedAt,
-         t.endedAt, t.publishedAt
+         t.endedAt, t.publishedAt, t.rowVersion,
+         CASE
+           WHEN t.triggerSource IS NOT NULL THEN t.triggerSource
+           WHEN EXISTS (
+             SELECT 1 FROM wakes AS carrier
+             WHERE carrier.wakeId=t.wakeId AND carrier.digest=1
+           ) THEN NULL
+           WHEN t.origin LIKE 'user:%' THEN 'mike'
+           WHEN t.origin LIKE 'agent:%' THEN 'agent'
+           WHEN t.origin LIKE 'process:%' THEN 'process'
+           WHEN t.origin IS NULL THEN NULL
+           ELSE 'other'
+         END,
+         t.batchMemberCount
   FROM turns AS t
   """
 
@@ -85,17 +98,91 @@ defmodule Tightbeam.StateResources do
   @message_select """
   SELECT m.seq, m.id, m.sessionKey, m.role, m.messageType, m.content,
          m.markerKind, m.markerFrom, m.markerTo,
-         m.timestamp, m.sender, m.deviceId, m.clientMessageId,
+         m.timestamp,
+         CASE WHEN m.sender IS NULL AND m.role='user' THEN COALESCE(
+           CASE WHEN t.messageId=m.id THEN t.origin END,
+           (
+             SELECT source.origin
+             FROM wakes AS source INDEXED BY notice_source_client_identity
+             WHERE m.deviceId IS NOT NULL AND m.clientMessageId IS NOT NULL
+               AND source.sourceClientIdentity IS NOT NULL
+               AND json_extract(source.sourceClientIdentity,'$.targetSessionKey')=+m.sessionKey
+               AND json_extract(source.sourceClientIdentity,'$.deviceId')=+m.deviceId
+               AND json_extract(source.sourceClientIdentity,'$.clientMessageId')=+m.clientMessageId
+           ),
+           'user:' || session_owner.ownerUserId
+         ) ELSE m.sender END,
+         m.deviceId, m.clientMessageId,
          m.replyToMessageId, m.replyToClientMessageId, m.llmVisibleMessageId,
          m.attachments, m.attentionTier,
          t.seq, t.assignmentId, t.jobRef, t.harness, t.model,
-         t.thinkingLevel, t.modelContext
+         t.thinkingLevel, t.modelContext,
+         CASE WHEN m.id=t.messageId AND t.isBatchCarrier=1 THEN 1 ELSE 0 END,
+         CASE
+           WHEN t.seq IS NULL THEN NULL
+           WHEN EXISTS (
+             SELECT 1 FROM messages AS human
+             WHERE human.id=t.messageId AND human.sessionKey=t.sessionKey
+               AND human.role='user'
+               AND COALESCE(human.sender, t.origin)='user:' || session_owner.ownerUserId
+           ) OR EXISTS (
+             SELECT 1
+             FROM wakes AS batch_source INDEXED BY wakes_delivered_turn
+             JOIN messages AS human INDEXED BY messages_client_dedupe
+               ON human.sessionKey=json_extract(batch_source.sourceClientIdentity,'$.targetSessionKey')
+              AND human.deviceId=json_extract(batch_source.sourceClientIdentity,'$.deviceId')
+              AND human.clientMessageId=json_extract(batch_source.sourceClientIdentity,'$.clientMessageId')
+             WHERE batch_source.deliveredTurnSeq=t.seq
+               AND batch_source.sourceClientIdentity IS NOT NULL
+               AND human.sessionKey=t.sessionKey
+               AND human.deviceId IS NOT NULL
+               AND human.clientMessageId IS NOT NULL
+               AND human.role='user'
+               AND COALESCE(human.sender, batch_source.origin)='user:' || session_owner.ownerUserId
+           ) THEN 1
+           WHEN t.triggerSource='batch' AND t.batchMemberCount = (
+             SELECT COUNT(*) FROM wakes AS batch_source INDEXED BY wakes_delivered_turn
+             WHERE batch_source.deliveredTurnSeq=t.seq AND batch_source.wakeId IS NOT t.wakeId
+           ) AND NOT EXISTS (
+             SELECT 1 FROM wakes AS batch_source INDEXED BY wakes_delivered_turn
+             WHERE batch_source.deliveredTurnSeq=t.seq
+               AND batch_source.wakeId IS NOT t.wakeId
+               AND batch_source.origin='user:' || session_owner.ownerUserId
+           ) THEN 0
+           WHEN t.triggerSource='batch' THEN NULL
+           WHEN EXISTS (
+             SELECT 1 FROM messages AS trigger_message
+             WHERE trigger_message.id=t.messageId AND trigger_message.sessionKey=t.sessionKey
+               AND trigger_message.role='user'
+               AND COALESCE(trigger_message.sender, t.origin) LIKE 'user:%'
+           ) THEN 0
+           WHEN EXISTS (
+             SELECT 1 FROM wakes AS carrier
+             WHERE carrier.wakeId=t.wakeId AND carrier.digest=1
+           ) THEN NULL
+           WHEN t.origin LIKE 'agent:%' OR t.origin LIKE 'process:%' THEN 0
+           ELSE NULL
+         END
   FROM messages AS m
   LEFT JOIN turns AS t
-    ON t.messageId = CASE m.role WHEN 'user' THEN m.id ELSE m.replyToMessageId END
+    ON t.seq IN (
+      SELECT direct.seq
+      FROM turns AS direct
+      WHERE direct.messageId = CASE m.role WHEN 'user' THEN m.id ELSE m.replyToMessageId END
+      UNION
+      SELECT source.deliveredTurnSeq
+      FROM wakes AS source INDEXED BY notice_source_client_identity
+      WHERE m.role='user' AND m.deviceId IS NOT NULL AND m.clientMessageId IS NOT NULL
+        AND source.sourceClientIdentity IS NOT NULL
+        AND json_extract(source.sourceClientIdentity,'$.targetSessionKey')=+m.sessionKey
+        AND json_extract(source.sourceClientIdentity,'$.deviceId')=+m.deviceId
+        AND json_extract(source.sourceClientIdentity,'$.clientMessageId')=+m.clientMessageId
+        AND source.deliveredTurnSeq IS NOT NULL
+    )
    AND NOT EXISTS (
      SELECT 1 FROM turn_repair_attempts AS r WHERE r.attemptSeq = t.seq
    )
+  LEFT JOIN sessions AS session_owner ON session_owner.sessionKey=m.sessionKey
   """
 
   alias Tightbeam.{
@@ -136,7 +223,7 @@ defmodule Tightbeam.StateResources do
     "wakes" =>
       ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon deliveryStatus rowVersion),
     "turns" =>
-      ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt rowVersion),
+      ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt triggerSource batchMemberCount rowVersion),
     "decision requests" =>
       ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
     "sessions" =>
@@ -149,7 +236,7 @@ defmodule Tightbeam.StateResources do
       ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
     "read markers" => ~w(userId scopeKey marker updatedAt rowVersion),
     "transcript messages" =>
-      ~w(id seq sessionKey role messageType marker content at sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier turnSeq assignmentId jobRef harness provider model effort context rowVersion),
+      ~w(id seq sessionKey role messageType marker content at sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier turnSeq turnIncludesHuman isBatchCarrier assignmentId jobRef harness provider model effort context rowVersion),
     "condition facts" => ~w(id ts kind scope origin rowVersion),
     "critical state" =>
       ~w(sessionKey reason startedAt expiresAt hardDeadline updatedAt rowVersion),
@@ -208,12 +295,12 @@ defmodule Tightbeam.StateResources do
     },
     "turns" => %{
       strings:
-        ~w(sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness status owner requestRef error),
+        ~w(sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness status owner requestRef error triggerSource),
       integers:
-        ~w(seq replyAttention adapterGen createdAt startedAt endedAt publishedAt rowVersion),
+        ~w(seq replyAttention adapterGen createdAt startedAt endedAt publishedAt batchMemberCount rowVersion),
       booleans: [],
       nullable:
-        ~w(messageId wakeId roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness owner adapterGen requestRef error startedAt endedAt publishedAt)
+        ~w(messageId wakeId roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness owner adapterGen requestRef error startedAt endedAt publishedAt triggerSource batchMemberCount)
     },
     "decision requests" => %{
       strings:
@@ -273,7 +360,7 @@ defmodule Tightbeam.StateResources do
       strings:
         ~w(id sessionKey role messageType content sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId assignmentId jobRef harness provider model effort),
       integers: ~w(seq at attentionTier turnSeq rowVersion),
-      booleans: [],
+      booleans: ~w(turnIncludesHuman isBatchCarrier),
       nullable:
         ~w(sender deviceId clientMessageId replyToMessageId replyToClientMessageId assignmentId jobRef harness provider model effort turnSeq context)
     },
@@ -739,6 +826,17 @@ defmodule Tightbeam.StateResources do
     |> Enum.map(&turn_row/1)
   end
 
+  @doc "Return the queued and running turns for one session."
+  def query_active_turns_for_session(source, session_key) do
+    source
+    |> query(
+      @turn_select <>
+        " WHERE t.sessionKey = ?1 AND t.status IN ('queued','running') ORDER BY t.seq ASC",
+      [session_key]
+    )
+    |> Enum.map(&turn_row/1)
+  end
+
   @doc "Return one bounded page of a session's turn history."
   def query_turns_for_session_page(source, session_key, boundary, limit) do
     with_read_transaction(source, fn txn ->
@@ -1082,6 +1180,11 @@ defmodule Tightbeam.StateResources do
       [] -> nil
       _rows -> raise ArgumentError, "transcript message resolves to more than one turn"
     end
+  end
+
+  @doc false
+  def message_query_plan(source, id) do
+    query(source, "EXPLAIN QUERY PLAN " <> @message_select <> " WHERE m.id = ?1", [id])
   end
 
   def query_device(db, %{key: id, principal: principal}) do
@@ -1841,6 +1944,17 @@ defmodule Tightbeam.StateResources do
       end
 
     item = if is_nil(message_type), do: Map.delete(item, "messageType"), else: item
+
+    item =
+      if value(row, :is_batch_carrier) == true,
+        do: Map.put(item, "isBatchCarrier", true),
+        else: item
+
+    item =
+      if is_nil(value(row, :turn_includes_human)),
+        do: item,
+        else: Map.put(item, "turnIncludesHuman", required_boolean!(row, :turn_includes_human))
+
     exact!("transcript messages", item)
   end
 
@@ -2095,7 +2209,28 @@ defmodule Tightbeam.StateResources do
     )
   end
 
+  defp conditional_fields!("turns", fields, item) do
+    fields =
+      if Map.has_key?(item, "triggerSource"),
+        do: fields,
+        else: List.delete(fields, "triggerSource")
+
+    if Map.has_key?(item, "batchMemberCount"),
+      do: fields,
+      else: List.delete(fields, "batchMemberCount")
+  end
+
   defp conditional_fields!("transcript messages", fields, item) do
+    fields =
+      if Map.has_key?(item, "turnIncludesHuman"),
+        do: fields,
+        else: List.delete(fields, "turnIncludesHuman")
+
+    fields =
+      if Map.has_key?(item, "isBatchCarrier"),
+        do: fields,
+        else: List.delete(fields, "isBatchCarrier")
+
     fields = if Map.has_key?(item, "marker"), do: fields, else: List.delete(fields, "marker")
 
     case Map.fetch(item, "messageType") do
@@ -2549,7 +2684,10 @@ defmodule Tightbeam.StateResources do
          created_at,
          started_at,
          ended_at,
-         published_at
+         published_at,
+         row_version,
+         trigger_source,
+         batch_member_count
        ]) do
     %{
       seq: seq,
@@ -2575,7 +2713,10 @@ defmodule Tightbeam.StateResources do
       created_at: created_at,
       started_at: started_at,
       ended_at: ended_at,
-      published_at: published_at
+      published_at: published_at,
+      trigger_source: trigger_source,
+      batch_member_count: batch_member_count,
+      row_version: row_version
     }
   end
 
@@ -2604,7 +2745,9 @@ defmodule Tightbeam.StateResources do
          harness,
          model,
          effort,
-         context
+         context,
+         is_batch_carrier,
+         turn_includes_human
        ]) do
     {harness, model, effort, context} =
       if role == "assistant",
@@ -2631,6 +2774,13 @@ defmodule Tightbeam.StateResources do
       attachments: JSON.decode!(attachments),
       attention_tier: attention_tier,
       turn_seq: turn_seq,
+      is_batch_carrier: is_batch_carrier == 1,
+      turn_includes_human:
+        case turn_includes_human do
+          1 -> true
+          0 -> false
+          nil -> nil
+        end,
       assignment_id: assignment_id,
       job_ref: job_ref,
       harness: harness,

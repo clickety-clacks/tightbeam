@@ -65,7 +65,14 @@ defmodule Tightbeam.Ledger do
     createdAt  INTEGER NOT NULL,
     startedAt  INTEGER,
     endedAt    INTEGER,
-    publishedAt INTEGER
+    publishedAt INTEGER,
+    triggerSource TEXT CHECK (
+      triggerSource IS NULL OR triggerSource IN ('batch','mike','agent','process','other')
+    ),
+    batchMemberCount INTEGER CHECK (
+      batchMemberCount IS NULL OR batchMemberCount >= 0
+    ),
+    isBatchCarrier INTEGER CHECK (isBatchCarrier IS NULL OR isBatchCarrier=1)
   );
   CREATE INDEX IF NOT EXISTS turns_pending
     ON turns (status, sessionKey, seq)
@@ -163,6 +170,15 @@ defmodule Tightbeam.Ledger do
     now = System.system_time(:millisecond)
     session_key = Map.fetch!(attrs, :session_key)
 
+    trigger_source =
+      case Map.fetch(attrs, :trigger_source) do
+        {:ok, trigger_source} -> trigger_source
+        :error -> inferred_trigger_source(txn, attrs)
+      end
+
+    batch_member_count = Map.get(attrs, :batch_member_count)
+    is_batch_carrier = if Map.get(attrs, :is_batch_carrier, false), do: 1, else: nil
+
     eligibility = enqueue_eligibility_in_txn(txn, session_key)
 
     if eligibility == :ok do
@@ -171,8 +187,9 @@ defmodule Tightbeam.Ledger do
         """
           INSERT INTO turns
             (sessionKey, messageId, wakeId, origin, prompt, roleRef, roleFallback,
-             assignmentId, jobRef, requestRef, createdAt)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             assignmentId, jobRef, requestRef, createdAt, triggerSource, batchMemberCount,
+             isBatchCarrier)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         """,
         [
           session_key,
@@ -185,7 +202,10 @@ defmodule Tightbeam.Ledger do
           Map.get(attrs, :assignment_id),
           Map.get(attrs, :job_ref),
           Map.get(attrs, :request_ref),
-          now
+          now,
+          trigger_source,
+          batch_member_count,
+          is_batch_carrier
         ]
       )
 
@@ -219,6 +239,26 @@ defmodule Tightbeam.Ledger do
       {:error, eligibility}
     end
   end
+
+  defp inferred_trigger_source(txn, attrs) do
+    origin = Map.fetch!(attrs, :origin)
+
+    if digest_wake?(txn, Map.get(attrs, :wake_id)) do
+      nil
+    else
+      cond do
+        String.starts_with?(origin, "user:") -> "mike"
+        String.starts_with?(origin, "agent:") -> "agent"
+        String.starts_with?(origin, "process:") -> "process"
+        true -> "other"
+      end
+    end
+  end
+
+  defp digest_wake?(_txn, wake_id) when not is_binary(wake_id), do: false
+
+  defp digest_wake?(txn, wake_id),
+    do: Txn.q(txn, "SELECT digest FROM wakes WHERE wakeId=?1", [wake_id]) == [[1]]
 
   @doc """
   Would `enqueue_in_txn/2` accept a turn for this key? The SAME question the

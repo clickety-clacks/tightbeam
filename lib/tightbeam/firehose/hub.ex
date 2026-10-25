@@ -16,6 +16,8 @@ defmodule Tightbeam.Firehose.Hub do
               principal_id: nil,
               is_admin: false,
               subscriptions: %{},
+              pending_subscriptions: %{},
+              pending_notices: :queue.new(),
               seq: 0,
               queue: :queue.new(),
               queued: 0,
@@ -75,6 +77,12 @@ defmodule Tightbeam.Firehose.Hub do
 
   def subscribe(server, pid, id, filters),
     do: GenServer.call(server, {:subscribe, pid, id, filters})
+
+  def begin_subscribe(server, pid, id, filters),
+    do: GenServer.call(server, {:begin_subscribe, pid, id, filters})
+
+  def finish_subscribe(server, pid, id, notices),
+    do: GenServer.call(server, {:finish_subscribe, pid, id, notices})
 
   def unsubscribe(server, pid, id), do: GenServer.call(server, {:unsubscribe, pid, id})
   def sequence(server, pid), do: GenServer.call(server, {:sequence, pid})
@@ -166,6 +174,58 @@ defmodule Tightbeam.Firehose.Hub do
   def handle_call({:subscribe, pid, id, filters}, _, state),
     do: {:reply, :ok, update(state, pid, &put_in(&1.subscriptions[id], filters))}
 
+  def handle_call({:begin_subscribe, pid, id, filters}, _, state),
+    do: {:reply, :ok, update(state, pid, &put_in(&1.pending_subscriptions[id], filters))}
+
+  def handle_call({:finish_subscribe, pid, id, notices}, _, state) do
+    case state.sockets[pid] do
+      nil ->
+        {:reply, :ok, state}
+
+      socket ->
+        case socket.pending_subscriptions[id] do
+          nil ->
+            {:reply, :ok, state}
+
+          filters ->
+            {pending_notices, remaining_notices} =
+              socket.pending_notices
+              |> :queue.to_list()
+              |> Enum.split_with(fn {subscription_id, _notice} -> subscription_id == id end)
+
+            {snapshot_frames, seq} = matching_notice_frames(notices, id, filters, socket.seq)
+
+            {pending_frames, seq} =
+              matching_notice_frames(
+                Enum.map(pending_notices, fn {_subscription_id, notice} -> notice end),
+                id,
+                filters,
+                seq
+              )
+
+            ready = %{"type" => "subscription_ready", "subscriptionId" => id}
+
+            socket = %{
+              socket
+              | subscriptions: Map.put(socket.subscriptions, id, filters),
+                pending_subscriptions: Map.delete(socket.pending_subscriptions, id),
+                pending_notices: :queue.from_list(remaining_notices),
+                seq: seq
+            }
+
+            socket =
+              enqueue(
+                socket,
+                pid,
+                [ready | snapshot_frames ++ pending_frames],
+                state.queue_limit
+              )
+
+            {:reply, :ok, put_in(state.sockets[pid], socket)}
+        end
+    end
+  end
+
   def handle_call({:unsubscribe, pid, id}, _, state),
     do:
       {:reply, :ok, update(state, pid, &%{&1 | subscriptions: Map.delete(&1.subscriptions, id)})}
@@ -214,7 +274,15 @@ defmodule Tightbeam.Firehose.Hub do
     sockets =
       Map.new(state.sockets, fn {pid, socket} ->
         if not socket.overflowed, do: send(pid, :firehose_overflow)
-        {pid, %{socket | queue: :queue.new(), queued: 0, overflowed: true}}
+
+        {pid,
+         %{
+           socket
+           | queue: :queue.new(),
+             queued: 0,
+             pending_notices: :queue.new(),
+             overflowed: true
+         }}
       end)
 
     {:noreply, %{state | sockets: sockets}}
@@ -311,31 +379,79 @@ defmodule Tightbeam.Firehose.Hub do
   defp interested?(%{mode: :all}, _notice), do: true
 
   defp interested?(socket, notice),
-    do: Enum.any?(socket.subscriptions, fn {_id, filters} -> matches?(notice, filters) end)
+    do:
+      Enum.any?(Map.merge(socket.subscriptions, socket.pending_subscriptions), fn {_id, filters} ->
+        matches?(notice, filters)
+      end)
 
   defp deliver_visible_notice(socket, pid, notice, limit, authorized? \\ false) do
+    pending_subscriptions =
+      socket.pending_subscriptions
+      |> Enum.filter(fn {_id, filters} -> matches?(notice, filters) end)
+
     frames =
       if socket.mode == :all,
         do: [notice],
         else: matching_frames(notice, socket.subscriptions, socket.seq)
 
-    if frames != [] and not secret_payload?(notice["payload"]) and
+    if (frames != [] or pending_subscriptions != []) and not secret_payload?(notice["payload"]) and
          (authorized? or visible?(socket, notice)) do
-      seq = if socket.mode == :all, do: socket.seq, else: List.last(frames)["seq"]
-      enqueue(%{socket | seq: seq}, pid, Enum.map(frames, &Publisher.wire_notice/1), limit)
+      seq =
+        if frames == [] or socket.mode == :all,
+          do: socket.seq,
+          else: List.last(frames)["seq"]
+
+      socket =
+        Enum.reduce(pending_subscriptions, socket, fn {id, _filters}, socket ->
+          enqueue_pending_notice(socket, pid, {id, notice}, limit)
+        end)
+
+      if frames == [] or socket.overflowed,
+        do: socket,
+        else: enqueue(%{socket | seq: seq}, pid, frames, limit)
     else
       socket
     end
   end
 
+  defp enqueue_pending_notice(socket, _, _, _) when socket.overflowed, do: socket
+
+  defp enqueue_pending_notice(socket, pid, notice, limit) do
+    occupied =
+      socket.queued + if(socket.in_flight, do: 1, else: 0) + :queue.len(socket.pending_notices)
+
+    if occupied + 1 > limit do
+      send(pid, :firehose_overflow)
+
+      %{
+        socket
+        | queue: :queue.new(),
+          queued: 0,
+          pending_notices: :queue.new(),
+          overflowed: true
+      }
+    else
+      %{socket | pending_notices: :queue.in(notice, socket.pending_notices)}
+    end
+  end
+
   defp enqueue(socket, _, [], _), do: socket
+  defp enqueue(%{overflowed: true} = socket, _, _, _), do: socket
 
   defp enqueue(socket, pid, frames, limit) do
-    occupied = socket.queued + if(socket.in_flight, do: 1, else: 0)
+    occupied =
+      socket.queued + if(socket.in_flight, do: 1, else: 0) + :queue.len(socket.pending_notices)
 
     if occupied + length(frames) > limit do
       send(pid, :firehose_overflow)
-      %{socket | queue: :queue.new(), queued: 0, overflowed: true}
+
+      %{
+        socket
+        | queue: :queue.new(),
+          queued: 0,
+          pending_notices: :queue.new(),
+          overflowed: true
+      }
     else
       queue = Enum.reduce(frames, socket.queue, &:queue.in(&1, &2))
       dispatch_next(%{socket | queue: queue, queued: socket.queued + length(frames)}, pid)
@@ -350,12 +466,33 @@ defmodule Tightbeam.Firehose.Hub do
       {{:value, frame}, queue} ->
         socket = %{socket | queue: queue, queued: socket.queued - 1}
 
-        send(pid, {:firehose_notice, frame})
+        send_frame(pid, frame)
         %{socket | in_flight: true}
 
       {:empty, _} ->
         socket
     end
+  end
+
+  defp send_frame(pid, %{"type" => "subscription_ready"} = frame),
+    do: send(pid, {:firehose_control, frame})
+
+  defp send_frame(pid, frame),
+    do: send(pid, {:firehose_notice, Publisher.wire_notice(frame)})
+
+  defp matching_notice_frames(notices, id, filters, seq) do
+    {frames, seq} =
+      Enum.reduce(notices, {[], seq}, fn notice, {frames, seq} ->
+        case matching_frames(notice, %{id => filters}, seq) do
+          [] ->
+            {frames, seq}
+
+          [frame] ->
+            {[frame | frames], frame["seq"]}
+        end
+      end)
+
+    {Enum.reverse(frames), seq}
   end
 
   defp matching_frames(notice, subscriptions, seq) do
@@ -441,7 +578,17 @@ defmodule Tightbeam.Firehose.Hub do
       |> :queue.to_list()
       |> Enum.filter(&(socket.mode != :pending and visible?(socket, &1)))
 
-    %{socket | queue: :queue.from_list(frames), queued: length(frames)}
+    pending_notices =
+      socket.pending_notices
+      |> :queue.to_list()
+      |> Enum.filter(fn {_id, notice} -> socket.mode != :pending and visible?(socket, notice) end)
+
+    %{
+      socket
+      | queue: :queue.from_list(frames),
+        queued: length(frames),
+        pending_notices: :queue.from_list(pending_notices)
+    }
   end
 
   defp update(state, pid, fun) do

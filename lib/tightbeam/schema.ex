@@ -307,6 +307,65 @@ defmodule Tightbeam.Schema do
   @o2_shape "row-driven-o2-v1-019"
   @o2_pre_liveness_shape "row-driven-o2-pre-liveness-v1-019"
   @shape "row-driven-admission-v1-019"
+
+  @assignment_row_version_insert_trigger """
+  CREATE TRIGGER IF NOT EXISTS assignments_row_version_initial
+  AFTER INSERT ON assignments
+  BEGIN
+    UPDATE assignments SET rowVersion=MAX(1, NEW.openedAt) WHERE id=NEW.id;
+  END;
+  """
+
+  @assignment_row_version_update_trigger """
+  CREATE TRIGGER IF NOT EXISTS assignments_row_version_projected_update
+  AFTER UPDATE OF subject, holderKey, holderRole, holderFallback, openedByUser, openedBySession,
+    openedAt, state, outcome, closedAt, closedByUser, closedBySession, closedByProcess,
+    closingAttestId, workItemId, reviewsAssignmentId, holderHarness, holderProvider
+  ON assignments
+  WHEN NEW.subject IS NOT OLD.subject OR NEW.holderKey IS NOT OLD.holderKey OR
+    NEW.holderRole IS NOT OLD.holderRole OR NEW.holderFallback IS NOT OLD.holderFallback OR
+    NEW.openedByUser IS NOT OLD.openedByUser OR NEW.openedBySession IS NOT OLD.openedBySession OR
+    NEW.openedAt IS NOT OLD.openedAt OR NEW.state IS NOT OLD.state OR
+    NEW.outcome IS NOT OLD.outcome OR NEW.closedAt IS NOT OLD.closedAt OR
+    NEW.closedByUser IS NOT OLD.closedByUser OR NEW.closedBySession IS NOT OLD.closedBySession OR
+    NEW.closedByProcess IS NOT OLD.closedByProcess OR
+    NEW.closingAttestId IS NOT OLD.closingAttestId OR NEW.workItemId IS NOT OLD.workItemId OR
+    NEW.reviewsAssignmentId IS NOT OLD.reviewsAssignmentId OR
+    NEW.holderHarness IS NOT OLD.holderHarness OR NEW.holderProvider IS NOT OLD.holderProvider
+  BEGIN
+    UPDATE assignments SET rowVersion=OLD.rowVersion+1 WHERE id=NEW.id;
+  END;
+  """
+
+  @turn_row_version_insert_trigger """
+  CREATE TRIGGER IF NOT EXISTS turns_row_version_initial
+  AFTER INSERT ON turns
+  BEGIN
+    UPDATE turns SET rowVersion=MAX(1, NEW.createdAt, NEW.seq) WHERE seq=NEW.seq;
+  END;
+  """
+
+  @turn_row_version_update_trigger """
+  CREATE TRIGGER IF NOT EXISTS turns_row_version_projected_update
+  AFTER UPDATE OF sessionKey, messageId, wakeId, origin, prompt, roleRef, roleFallback,
+    assignmentId, jobRef, model, thinkingLevel, modelContext, harness, replyAttention,
+    status, owner, adapterGen, requestRef, error, createdAt, startedAt, endedAt, publishedAt
+  ON turns
+  WHEN NEW.sessionKey IS NOT OLD.sessionKey OR NEW.messageId IS NOT OLD.messageId OR
+    NEW.wakeId IS NOT OLD.wakeId OR NEW.origin IS NOT OLD.origin OR NEW.prompt IS NOT OLD.prompt OR
+    NEW.roleRef IS NOT OLD.roleRef OR NEW.roleFallback IS NOT OLD.roleFallback OR
+    NEW.assignmentId IS NOT OLD.assignmentId OR NEW.jobRef IS NOT OLD.jobRef OR
+    NEW.model IS NOT OLD.model OR NEW.thinkingLevel IS NOT OLD.thinkingLevel OR
+    NEW.modelContext IS NOT OLD.modelContext OR NEW.harness IS NOT OLD.harness OR
+    NEW.replyAttention IS NOT OLD.replyAttention OR NEW.status IS NOT OLD.status OR
+    NEW.owner IS NOT OLD.owner OR NEW.adapterGen IS NOT OLD.adapterGen OR
+    NEW.requestRef IS NOT OLD.requestRef OR NEW.error IS NOT OLD.error OR
+    NEW.createdAt IS NOT OLD.createdAt OR NEW.startedAt IS NOT OLD.startedAt OR
+    NEW.endedAt IS NOT OLD.endedAt OR NEW.publishedAt IS NOT OLD.publishedAt
+  BEGIN
+    UPDATE turns SET rowVersion=OLD.rowVersion+1 WHERE seq=NEW.seq;
+  END;
+  """
   @supervision_batch_delivery_previous_trigger """
   CREATE TRIGGER IF NOT EXISTS supervision_lineage_fire_requires_sidecar
   BEFORE UPDATE OF state ON wakes
@@ -1921,8 +1980,11 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_work_item_delivery_owner_link(db)
     :ok = upgrade_supervision_receipt_cancellation_v1(db)
     :ok = upgrade_assignment_source_replacement_v1(db)
+    :ok = ensure_direct_apply_row_versions(db)
+    :ok = ensure_turn_chat_provenance(db)
     :ok = Tightbeam.QueuedMessageSuppression.ensure_schema(db)
     :ok = Tightbeam.NoticeBatcher.ensure_schema(db)
+    :ok = ensure_notice_batch_chat_message_format(db)
 
     # Preserve exact historical Toplines DDL and its stamp if a preceding
     # migration refuses. Bootstrap already qualified it; now activate V6.
@@ -1981,6 +2043,216 @@ defmodule Tightbeam.Schema do
          end) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
+    end
+  end
+
+  @doc false
+  def ensure_direct_apply_row_versions(db) do
+    case DB.migration_transaction(db, :direct_apply_row_versions, [], [], fn txn ->
+           assignment_columns =
+             Txn.q(txn, "PRAGMA table_info(assignments)")
+             |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+           turn_columns =
+             Txn.q(txn, "PRAGMA table_info(turns)")
+             |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+           required_assignment_columns =
+             ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId workItemId reviewsAssignmentId holderHarness holderProvider)
+
+           required_turn_columns =
+             ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt)
+
+           unless Enum.all?(required_assignment_columns, &(&1 in assignment_columns)) do
+             raise ShapeError, message: "direct_apply_assignment_row_version_incompatible_shape"
+           end
+
+           unless Enum.all?(required_turn_columns, &(&1 in turn_columns)) do
+             raise ShapeError, message: "direct_apply_turn_row_version_incompatible_shape"
+           end
+
+           assignment_row_version_added? = "rowVersion" not in assignment_columns
+           turn_row_version_added? = "rowVersion" not in turn_columns
+
+           if assignment_row_version_added? do
+             :ok =
+               Txn.exec(
+                 txn,
+                 "ALTER TABLE assignments ADD COLUMN rowVersion INTEGER NOT NULL DEFAULT 1 CHECK(rowVersion > 0)"
+               )
+           end
+
+           if turn_row_version_added? do
+             :ok =
+               Txn.exec(
+                 txn,
+                 "ALTER TABLE turns ADD COLUMN rowVersion INTEGER NOT NULL DEFAULT 1 CHECK(rowVersion > 0)"
+               )
+           end
+
+           assignment_version_column =
+             Txn.q(txn, "PRAGMA table_info(assignments)")
+             |> Enum.find(fn [_cid, name | _rest] -> name == "rowVersion" end)
+
+           turn_version_column =
+             Txn.q(txn, "PRAGMA table_info(turns)")
+             |> Enum.find(fn [_cid, name | _rest] -> name == "rowVersion" end)
+
+           unless match?([_, "rowVersion", "INTEGER", 1, "1", 0], assignment_version_column) do
+             raise ShapeError, message: "direct_apply_assignment_row_version_incompatible_column"
+           end
+
+           unless match?([_, "rowVersion", "INTEGER", 1, "1", 0], turn_version_column) do
+             raise ShapeError, message: "direct_apply_turn_row_version_incompatible_column"
+           end
+
+           if assignment_row_version_added? do
+             Txn.q(txn, """
+             UPDATE assignments
+             SET rowVersion=MAX(
+               rowVersion,
+               1 + MAX(
+                 1, openedAt, COALESCE(closedAt,0),
+                 COALESCE((SELECT MAX(ts) FROM assignment_reopenings r
+                           WHERE r.assignmentId=assignments.id),0),
+                 COALESCE((SELECT MAX(ts) FROM attests a
+                           WHERE a.assignmentId=assignments.id),0),
+                 COALESCE((SELECT MAX(createdAt) FROM assignment_commit_ref_corrections c
+                           WHERE c.assignmentId=assignments.id),0)
+               )
+             )
+             """)
+           end
+
+           if turn_row_version_added? do
+             Txn.q(txn, """
+             UPDATE turns
+             SET rowVersion=MAX(
+               rowVersion,
+               1 + MAX(
+                 1, seq, createdAt, COALESCE(startedAt,0), COALESCE(endedAt,0),
+                 COALESCE(publishedAt,0)
+               )
+             )
+             """)
+           end
+
+           :ok = Txn.exec(txn, @assignment_row_version_insert_trigger)
+           :ok = Txn.exec(txn, @assignment_row_version_update_trigger)
+           :ok = Txn.exec(txn, @turn_row_version_insert_trigger)
+           :ok = Txn.exec(txn, @turn_row_version_update_trigger)
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "direct_apply_row_version_migration_failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  def ensure_turn_chat_provenance(db) do
+    case DB.migration_transaction(db, :turn_chat_provenance, [], [], fn txn ->
+           turn_columns =
+             Txn.q(txn, "PRAGMA table_info(turns)")
+             |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+           required_turn_columns =
+             ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt rowVersion)
+
+           unless Enum.all?(required_turn_columns, &(&1 in turn_columns)) do
+             raise ShapeError, message: "turn_chat_provenance_incompatible_shape"
+           end
+
+           if "triggerSource" not in turn_columns do
+             :ok = Txn.exec(txn, "ALTER TABLE turns ADD COLUMN triggerSource TEXT")
+           end
+
+           if "batchMemberCount" not in turn_columns do
+             :ok = Txn.exec(txn, "ALTER TABLE turns ADD COLUMN batchMemberCount INTEGER")
+           end
+
+           if "isBatchCarrier" not in turn_columns do
+             :ok = Txn.exec(txn, "ALTER TABLE turns ADD COLUMN isBatchCarrier INTEGER")
+           end
+
+           turn_columns = Txn.q(txn, "PRAGMA table_info(turns)")
+
+           trigger_source_column =
+             Enum.find(turn_columns, fn [_cid, name | _rest] -> name == "triggerSource" end)
+
+           batch_member_count_column =
+             Enum.find(turn_columns, fn [_cid, name | _rest] -> name == "batchMemberCount" end)
+
+           is_batch_carrier_column =
+             Enum.find(turn_columns, fn [_cid, name | _rest] -> name == "isBatchCarrier" end)
+
+           unless match?([_, "triggerSource", "TEXT", 0, nil, 0], trigger_source_column) do
+             raise ShapeError, message: "turn_chat_provenance_trigger_source_incompatible_column"
+           end
+
+           unless match?([_, "batchMemberCount", "INTEGER", 0, nil, 0], batch_member_count_column) do
+             raise ShapeError, message: "turn_chat_provenance_member_count_incompatible_column"
+           end
+
+           unless match?([_, "isBatchCarrier", "INTEGER", 0, nil, 0], is_batch_carrier_column) do
+             raise ShapeError, message: "turn_chat_provenance_carrier_incompatible_column"
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "turn_chat_provenance_migration_failed: #{Exception.message(error)}"
+    end
+  end
+
+  defp ensure_notice_batch_chat_message_format(db) do
+    case DB.migration_transaction(db, :notice_batch_chat_message_format, [], [], fn txn ->
+           batch_columns =
+             Txn.q(txn, "PRAGMA table_info(notice_batches)")
+             |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+           unless "chatMessageFormat" in batch_columns do
+             :ok =
+               Txn.exec(
+                 txn,
+                 "ALTER TABLE notice_batches ADD COLUMN chatMessageFormat TEXT " <>
+                   "CHECK(chatMessageFormat IS NULL OR chatMessageFormat='member-rows-v1')"
+               )
+           end
+
+           batch_columns = Txn.q(txn, "PRAGMA table_info(notice_batches)")
+
+           format_column =
+             Enum.find(batch_columns, fn [_cid, name | _rest] -> name == "chatMessageFormat" end)
+
+           unless match?([_, "chatMessageFormat", "TEXT", 0, nil, 0], format_column) do
+             raise ShapeError, message: "notice_batch_chat_message_format_incompatible_column"
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "notice_batch_chat_message_format_migration_failed: #{Exception.message(error)}"
     end
   end
 
