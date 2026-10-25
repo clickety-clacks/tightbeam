@@ -37,7 +37,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "turns" =>
       ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt rowVersion),
     "decision requests" =>
-      ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
+      ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt returnedBy returnReason returnedAt rowVersion),
     "sessions" =>
       ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
@@ -56,7 +56,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "turns" =>
       ~w(messageId wakeId roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness owner adapterGen requestRef error startedAt endedAt publishedAt),
     "decision requests" =>
-      ~w(raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId deadlineAt statuteName decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt context),
+      ~w(raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId deadlineAt statuteName decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt returnedBy returnReason returnedAt context),
     "sessions" =>
       ~w(ownerUserId spawnedBy handle identityName identityRevision provider model thinkingLevel modelContext host clearedThroughSeq overrides),
     "devices" => ~w(claimedName platform model),
@@ -72,7 +72,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "turns" =>
       ~w(seq replyAttention adapterGen createdAt startedAt endedAt publishedAt rowVersion),
     "decision requests" =>
-      ~w(lineageRung effortGeneration raisedAt deadlineAt ruledAt consumedAt withdrawnAt answeredAt rowVersion),
+      ~w(lineageRung effortGeneration raisedAt deadlineAt ruledAt consumedAt withdrawnAt answeredAt returnedAt rowVersion),
     "sessions" => ~w(orderIndex clearedThroughSeq createdAt updatedAt rowVersion),
     "devices" => ~w(createdAt rowVersion),
     "artifacts" => ~w(createdAt updatedAt rowVersion),
@@ -101,7 +101,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     {"wakes", "classElection"} => ~w(sender classifier batcher),
     {"turns", "status"} => ~w(queued running delivered canceled failed failed_unknown),
     {"decision requests", "kind"} => ~w(statute effort agent),
-    {"decision requests", "status"} => ~w(open ruled consumed withdrawn superseded answered),
+    {"decision requests", "status"} =>
+      ~w(open ruled consumed withdrawn superseded answered returned),
     {"sessions", "kind"} => ~w(main dm custom),
     {"sessions", "state"} => ~w(active retired),
     {"sessions", "mechanicalStatus"} => ~w(idle running),
@@ -436,6 +437,86 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     :ok = WS.close(ws)
   end
 
+  test "agent return triplet is shared in REST and Firehose while other kinds omit it", ctx do
+    agent_id = ctx.decision_request_ids.agent
+    return_fields = ~w(returnedBy returnReason returnedAt)
+
+    before_response = get(ctx, "/api/decision-requests/#{agent_id}")
+    assert before_response.status == 200, before_response.resp_body
+    before_item = JSON.decode!(before_response.resp_body)["item"]
+    assert before_item["kind"] == "agent"
+    assert Enum.all?(return_fields, &(Map.fetch!(before_item, &1) == nil))
+
+    assert_ordered_fields(
+      raw_json_value(before_response.resp_body, "item"),
+      expected_fields("decision requests", before_item)
+    )
+
+    before_row = StateResources.query_decision_request(ctx.db, agent_id)
+
+    assert_raise ArgumentError, ~r/return fields are projection_invalid/, fn ->
+      before_row
+      |> Map.put(:returned_by, "session:fixture")
+      |> StateResources.decision_request()
+    end
+
+    for kind <- [:statute, :effort] do
+      id = Map.fetch!(ctx.decision_request_ids, kind)
+      response = get(ctx, "/api/decision-requests/#{id}")
+      assert response.status == 200, response.resp_body
+      item = JSON.decode!(response.resp_body)["item"]
+      assert item["kind"] == Atom.to_string(kind)
+      refute Enum.any?(return_fields, &Map.has_key?(item, &1))
+    end
+
+    returned_at = System.system_time(:millisecond)
+    returned_by = "session:#{ctx.admin_session.session_key}"
+    reason = "The requested authority is missing."
+
+    query!(
+      ctx.db,
+      "UPDATE decision_requests SET status='returned', returnedBy=?2, returnReason=?3, returnedAt=?4 WHERE id=?1",
+      [agent_id, returned_by, reason, returned_at]
+    )
+
+    returned_row = StateResources.query_decision_request(ctx.db, agent_id)
+
+    assert_raise ArgumentError, ~r/return fields are projection_invalid/, fn ->
+      returned_row
+      |> Map.put(:return_reason, nil)
+      |> StateResources.decision_request()
+    end
+
+    returned_response = get(ctx, "/api/decision-requests/#{agent_id}")
+    assert returned_response.status == 200, returned_response.resp_body
+    returned_item = JSON.decode!(returned_response.resp_body)["item"]
+    assert returned_item["status"] == "returned"
+    assert returned_item["returnedBy"] == returned_by
+    assert returned_item["returnReason"] == reason
+    assert returned_item["returnedAt"] == returned_at
+    assert returned_item["returnedAt"] > 0
+    assert_wire_contract("decision requests", returned_item)
+
+    row = StateResources.query_decision_request(ctx.db, agent_id)
+
+    notice =
+      Publisher.committed_notice("decision_request.returned", row, %{
+        "decisionRequestId" => agent_id
+      })
+
+    assert notice["payload"] == returned_item
+
+    notice_bytes = Publisher.encode_wire_notice(notice, ctx.catalog)
+
+    assert raw_json_value(notice_bytes, "payload") ==
+             raw_json_value(returned_response.resp_body, "item")
+
+    assert_ordered_fields(
+      raw_json_value(notice_bytes, "payload"),
+      expected_fields("decision requests", returned_item)
+    )
+  end
+
   test "malformed stored decision options fail without a partial REST item", ctx do
     id = ctx.decision_request_id
 
@@ -756,14 +837,15 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           serializer: serializer
         } <-
           core_detail_cases(ctx) do
-      expected_keys = Map.fetch!(@r7_fields, resource) |> MapSet.new()
+      fields = expected_fields(resource, item)
+      expected_keys = MapSet.new(fields)
       assert MapSet.new(Map.keys(item)) == expected_keys
       refute StateResources.item_has_secret_fields?(item)
       assert_wire_contract(resource, item)
       assert_populated_contract(resource, item)
 
       expected = StateResources.encode_item(resource, item, ctx.catalog)
-      assert_ordered_fields(expected, Map.fetch!(@r7_fields, resource))
+      assert_ordered_fields(expected, fields)
       response = get(ctx, path)
       assert response.status == 200
       assert_application_headers(response)
@@ -1058,7 +1140,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   end
 
   defp assert_wire_contract(resource, item) do
-    for field <- Map.fetch!(@r7_fields, resource) do
+    for field <- expected_fields(resource, item) do
       value = Map.fetch!(item, field)
 
       cond do
@@ -1100,6 +1182,13 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       end
     end
   end
+
+  defp expected_fields("decision requests", %{"kind" => kind}) when kind != "agent" do
+    fields = Map.fetch!(@r7_fields, "decision requests")
+    Enum.reject(fields, &(&1 in ~w(returnedBy returnReason returnedAt)))
+  end
+
+  defp expected_fields(resource, _item), do: Map.fetch!(@r7_fields, resource)
 
   defp assert_json_value(value) when is_binary(value) or is_number(value) or is_boolean(value),
     do: :ok
