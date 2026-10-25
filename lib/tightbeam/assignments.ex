@@ -3120,7 +3120,7 @@ defmodule Tightbeam.Assignments do
       nil ->
         error("unknown_assignment", "unknown assignment: #{assignment_id}")
 
-      assignment ->
+      %{holderKey: holder} = assignment ->
         cond do
           assignment.state != "open" and call.params[:kind] == "cannot-proceed" ->
             cannot_proceed_closed(assignment.outcome)
