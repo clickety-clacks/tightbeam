@@ -117,7 +117,7 @@ defmodule Tightbeam.ToplinesSchemaTest do
       ToplinesSchema.manifest()
       |> Enum.filter(&(&1.type in ["index", "trigger"]))
       |> Enum.map(fn object ->
-        [_, table] = Regex.run(~r/ON\s+([A-Za-z0-9_]+)/i, object.sql)
+        [_, table] = Regex.run(~r/\bON\s+([A-Za-z0-9_]+)/i, object.sql)
         [object.type, object.name, table]
       end)
       |> Enum.filter(fn [_, _, table] ->

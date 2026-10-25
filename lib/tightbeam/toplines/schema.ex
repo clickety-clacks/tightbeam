@@ -726,11 +726,11 @@ defmodule Tightbeam.Toplines.Schema do
       |> Enum.map(fn object ->
         table =
           if object.type == "trigger" do
-            case Regex.run(~r/ON\s+([A-Za-z0-9_]+)/i, object.sql) do
+            case Regex.run(~r/\bON\s+([A-Za-z0-9_]+)/i, object.sql) do
               [_, name] -> name
             end
           else
-            case Regex.run(~r/ON\s+([A-Za-z0-9_]+)/i, object.sql) do
+            case Regex.run(~r/\bON\s+([A-Za-z0-9_]+)/i, object.sql) do
               [_, name] -> name
             end
           end
@@ -752,7 +752,7 @@ defmodule Tightbeam.Toplines.Schema do
   end
 
   defp attached_to_actor_table?(sql) do
-    case Regex.run(~r/ON\s+([A-Za-z0-9_]+)/i, sql) do
+    case Regex.run(~r/\bON\s+([A-Za-z0-9_]+)/i, sql) do
       [_, table] -> table in @actor_tables
       _ -> false
     end
