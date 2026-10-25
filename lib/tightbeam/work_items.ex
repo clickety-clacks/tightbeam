@@ -61,10 +61,9 @@ defmodule Tightbeam.WorkItems do
   )
   """
 
-  @actor_work_item_columns
-  "id,title,specRefName,specRefSha256,isBug,ownerUserId,deliveryOwnerSessionKey,state," <>
-    "failReason,routingWakeId,slateWakeId,createdByUser,createdBySession,createdByProcess," <>
-    "createdByViaSessionKey,createdInTurnSeq,createdContextKnown,createdAt"
+  @actor_work_item_columns "id,title,specRefName,specRefSha256,isBug,ownerUserId,deliveryOwnerSessionKey,state," <>
+                             "failReason,routingWakeId,slateWakeId,createdByUser,createdBySession,createdByProcess," <>
+                             "createdByViaSessionKey,createdInTurnSeq,createdContextKnown,createdAt"
 
   defmodule CancellationRefused do
     @moduledoc false
