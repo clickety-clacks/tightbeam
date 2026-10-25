@@ -6703,6 +6703,7 @@ defmodule Tightbeam.Wakes do
           ", (SELECT routingWakeId FROM work_items WHERE id=wakes.work_item_id), (SELECT slateWakeId FROM work_items WHERE id=wakes.work_item_id)"
         ) <>
           " INDEXED BY wakes_due WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL AND waitMode IS NULL AND consumer<>'cron'" <>
+          " AND NOT EXISTS (SELECT 1 FROM harklight_wake_entries e JOIN harklight_wake_handles h ON h.handle=e.handle JOIN sessions s ON s.sessionKey=h.sessionKey WHERE e.wakeId=wakes.wakeId AND (s.state<>'active' OR s.host<>h.host))" <>
           " AND NOT (consumer='prompt' AND digest=0 AND COALESCE(deliveryRule,'')<>'turn-boundary-digest r1')" <>
           " ORDER BY dueAt ASC",
         [now()]

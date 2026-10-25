@@ -339,6 +339,48 @@ defmodule Tightbeam.Wire.SeamTest do
            }) == %{subject: "review the fix", reviews_assignment_id: "asg_reviewed"}
   end
 
+  test "a session token supplies transport provenance independently of the asserted actor", ctx do
+    session = create_session(ctx.db, "transport-provenance", "flynn")
+
+    opts =
+      Keyword.update!(ctx.opts, :handlers, fn handlers ->
+        Map.put(handlers, "facts-read", fn call ->
+          %{transport_session_key: call.transport_session_key, principal: inspect(call.principal)}
+        end)
+      end)
+
+    session_result =
+      ok!(dispatch_cli(%{ctx | opts: opts}, session.cli_token, %{verb: "facts-read"}))
+
+    assert session_result["transportSessionKey"] == session.session_key
+    assert session_result["principal"] == inspect({:session, session.session_key})
+
+    org_result =
+      ok!(
+        dispatch_cli(%{ctx | opts: opts}, "tbc_wire_seam", %{
+          verb: "facts-read",
+          asUser: "flynn"
+        })
+      )
+
+    assert org_result["transportSessionKey"] == nil
+  end
+
+  test "the sender operation requires the session transport before any external call", ctx do
+    body = %{
+      verb: "harklight-send",
+      params: %{harklightSession: "new", senderId: "sender", title: "Question"}
+    }
+
+    org = dispatch_cli(ctx, "tbc_wire_seam", Map.put(body, :asUser, "flynn"))
+    assert JSON.decode!(org.resp_body)["error"]["code"] == "harklight_origin_unavailable"
+
+    session = create_session(ctx.db, "send-origin", "flynn")
+    Org.set_host(ctx.db, session.session_key, Tightbeam.Placement.local_host_name())
+    local = dispatch_cli(ctx, session.cli_token, %{body | params: %{}})
+    assert JSON.decode!(local.resp_body)["error"]["code"] == "invalid_harklight_send"
+  end
+
   test "assignment-stop-turn crosses dispatch and refuses a non-opener", ctx do
     holder = create_session(ctx.db, "stop-holder", "flynn")
 

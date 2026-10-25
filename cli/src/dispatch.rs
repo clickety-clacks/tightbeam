@@ -459,6 +459,37 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "artifacts", vec![], params))
         }
+        Command::HarklightSend {
+            identity,
+            session,
+            sender_id,
+            title,
+            body,
+            choices,
+            files,
+            vendor_session_id,
+        } => {
+            let mut params = vec![
+                string_field("harklightSession", session),
+                string_field("senderId", sender_id),
+                string_field("title", title),
+                format!(
+                    "\"choices\":{}",
+                    serde_json::to_string(choices).expect("choices are JSON serializable")
+                ),
+                format!(
+                    "\"files\":{}",
+                    serde_json::to_string(files).expect("files are JSON serializable")
+                ),
+            ];
+            if let Some(value) = body {
+                params.push(string_field("body", value));
+            }
+            if let Some(value) = vendor_session_id {
+                params.push(string_field("vendorSessionId", value));
+            }
+            Ok(request(identity, "harklight-send", vec![], params))
+        }
         // Not a verb and not on /agent/dispatch: it changes no domain state, it
         // tells the gateway to look at this session's running turn NOW, while the
         // command it observed has not run yet.
@@ -3604,6 +3635,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::ArtifactRecord { identity, .. }
         | Command::ArtifactContentFetch { identity, .. }
         | Command::Artifacts { identity, .. }
+        | Command::HarklightSend { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::Retire { identity, .. }
@@ -3877,6 +3909,28 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    #[test]
+    fn send_command_builds_one_request_without_caller_origin() {
+        let request: Value = serde_json::from_str(&body(&[
+            "harklight-send",
+            "--session",
+            "new",
+            "--sender-id",
+            "sender",
+            "--title",
+            "Question",
+            "--choices-json",
+            r#"["Yes"]"#,
+        ]))
+        .unwrap();
+        assert_eq!(request["verb"], "harklight-send");
+        assert_eq!(request["params"]["harklightSession"], "new");
+        assert_eq!(request["params"]["senderId"], "sender");
+        assert_eq!(request["params"]["choices"], serde_json::json!(["Yes"]));
+        assert!(request.get("sessionKey").is_none());
+        assert!(request["params"].get("sessionKey").is_none());
     }
 
     #[test]
