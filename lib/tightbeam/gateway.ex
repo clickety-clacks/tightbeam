@@ -873,7 +873,7 @@ defmodule Tightbeam.Gateway do
         case request do
           nil -> %{code: "not_found", message: "decision request not found"}
           %{code: _} = err -> err
-          request -> %{decision_request: request}
+          request -> decision_request_result(request)
         end
       end,
       {"approve-device", ["device.approved"]} =>
@@ -7709,7 +7709,9 @@ defmodule Tightbeam.Gateway do
   # A refusal travels BARE so Dispatch turns it into a denial; a row travels
   # wrapped, in the same envelope `decision-request` already uses.
   defp decision_request_result(%{code: _} = error), do: error
-  defp decision_request_result(request), do: %{decision_request: request}
+
+  defp decision_request_result(request),
+    do: %{decision_request: Map.delete(request, :row_version)}
 
   defp coordination_share_readable?(_db, %{principal: {:session, key}}, %{session_key: key}),
     do: true

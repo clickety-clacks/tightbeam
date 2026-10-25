@@ -814,7 +814,7 @@ defmodule Tightbeam.Escalation do
           if fact_id, do: nudge(opts, [fact_id])
 
           case result do
-            %{kind: "operator", status: "ruled"} -> terminal_operator_projection(result)
+            %{kind: "operator", status: "ruled"} -> terminal_operator_legacy_projection(result)
             other -> other
           end
 
@@ -1908,7 +1908,7 @@ defmodule Tightbeam.Escalation do
           cond do
             request.kind == "operator" and request.status in ["ruled", "consumed"] ->
               case validate_operator_terminal_in_txn(txn, request, "detail", observer) do
-                :ok -> terminal_operator_projection(request)
+                :ok -> terminal_operator_legacy_projection(request)
                 {:error, refusal} -> refusal
               end
 
@@ -1916,7 +1916,7 @@ defmodule Tightbeam.Escalation do
               integrity_error(request.id)
 
             true ->
-              request
+              Map.delete(request, :row_version)
           end
 
         [] ->
@@ -3380,6 +3380,13 @@ defmodule Tightbeam.Escalation do
       raise ArgumentError, "decision request rowVersion is projection_invalid"
     end
 
+    Map.put(terminal_operator_projection_fields(request), :row_version, row_version)
+  end
+
+  defp terminal_operator_legacy_projection(request),
+    do: terminal_operator_projection_fields(request)
+
+  defp terminal_operator_projection_fields(request) do
     %{
       id: request.id,
       kind: request.kind,
@@ -3630,7 +3637,7 @@ defmodule Tightbeam.Escalation do
   end
 
   defp list_projection(%{kind: "operator", status: "ruled"} = request),
-    do: terminal_operator_projection(request)
+    do: terminal_operator_legacy_projection(request)
 
   defp list_projection(%{kind: "operator"} = request),
     do:
@@ -3657,7 +3664,8 @@ defmodule Tightbeam.Escalation do
         :ruling_fact_id,
         :consumed_at,
         :park_wake_id,
-        :withdrawn_by
+        :withdrawn_by,
+        :row_version
       ])
 
   defp waiver_in_txn(txn, id) do

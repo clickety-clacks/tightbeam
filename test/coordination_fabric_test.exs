@@ -3497,6 +3497,8 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert {:ok, %{decision_request: request}} =
              ask(db, "agent:coder", "agent:po", "ship which migration?")
 
+    refute Map.has_key?(request, :row_version)
+
     assert {:error, %{code: "invalid"}} =
              return_request(db, {:session, "agent:po"}, request.id, "  ")
 
@@ -3513,6 +3515,7 @@ defmodule Tightbeam.CoordinationFabricTest do
                "  name the migration and rollback boundary  "
              )
 
+    refute Map.has_key?(returned, :row_version)
     assert returned.status == "returned"
     assert returned.question == request.question
     assert returned.context == request.context
@@ -3533,6 +3536,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert id == request.id
     assert listed.return_reason == returned.return_reason
     assert listed.returned_by == returned.returned_by
+    refute Map.has_key?(listed, :row_version)
 
     assert [notice] = wakes_for(db, "agent:coder")
     assert notice.prompt =~ request.question
@@ -3795,6 +3799,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert exact.id == request.id
     assert exact.question == request.question
     assert exact.context == request.context
+    refute Map.has_key?(exact, :row_version)
 
     assert {:error, %{code: "not_found"}} =
              verb(db, {:session, "agent:reviewer"}, "decision-request", %{
