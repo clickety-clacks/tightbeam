@@ -3405,6 +3405,14 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "answer hides fake and non-agent ids while an exact agent id grants session standing",
        %{db: db} do
+    start_supervised!(
+      {Wakes,
+       db: db,
+       deliver: fn _wake -> true end,
+       tick_ms: 60_000,
+       name: Tightbeam.WakeScheduler}
+    )
+
     seed_session(db, "agent:coder", "flynn")
     seed_session(db, "agent:po", "flynn")
     seed_session(db, "agent:outsider", "someone-else")
