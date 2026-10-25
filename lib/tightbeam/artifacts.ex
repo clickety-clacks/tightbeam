@@ -401,8 +401,8 @@ defmodule Tightbeam.Artifacts do
 
     {
       " AND (artifact.createdAt #{comparison} ?#{first} OR " <>
-        "(artifact.createdAt = ?#{first + 1} AND artifact.artifactId #{id_comparison} ?#{first + 2}))",
-      [ts, ts, id]
+        "(artifact.createdAt = ?#{first} AND artifact.artifactId #{id_comparison} ?#{first + 1}))",
+      [ts, id]
     }
   end
 

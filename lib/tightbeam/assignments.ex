@@ -1274,8 +1274,8 @@ defmodule Tightbeam.Assignments do
 
     {
       " AND (a.ts #{comparison} ?#{first} OR " <>
-        "(a.ts = ?#{first + 1} AND a.id #{id_comparison} ?#{first + 2}))",
-      [ts, ts, id]
+        "(a.ts = ?#{first} AND a.id #{id_comparison} ?#{first + 1}))",
+      [ts, id]
     }
   end
 

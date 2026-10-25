@@ -174,38 +174,30 @@ defmodule Tightbeam.StateVisibility do
   @doc "Apply the AU4 parent-assignment grant to an attest or nested attest collection."
   @spec attest_visible?(DB.server(), map(), map()) :: boolean()
   def attest_visible?(db, row, principal) when is_map(row) do
-    case value(row, :assignment) do
-      assignment when is_map(assignment) ->
-        attest_parent_visible?(principal, assignment)
+    assignment_id =
+      case value(row, :assignment) do
+        assignment when is_map(assignment) -> value(assignment, :id)
+        _ -> value(row, :assignment_id)
+      end
+
+    case assignment_id do
+      assignment_id when is_binary(assignment_id) ->
+        {scope_sql, scope_params} = attest_collection_scope(principal)
+        assignment_index = length(scope_params) + 1
+
+        query_rows(
+          db,
+          """
+          SELECT 1
+          FROM assignments AS assignment
+          LEFT JOIN work_items AS wi ON wi.id = assignment.workItemId
+          WHERE #{scope_sql} AND assignment.id = ?#{assignment_index}
+          """,
+          scope_params ++ [assignment_id]
+        ) != []
 
       _ ->
-        case value(row, :assignment_id) do
-          assignment_id when is_binary(assignment_id) ->
-            case query_rows(
-                   db,
-                   """
-                   SELECT a.holderKey, a.openedByUser, a.openedBySession, wi.ownerUserId
-                   FROM assignments AS a
-                   LEFT JOIN work_items AS wi ON wi.id = a.workItemId
-                   WHERE a.id = ?1
-                   """,
-                   [assignment_id]
-                 ) do
-              [[holder_key, opened_by_user, opened_by_session, owner_user_id]] ->
-                attest_parent_visible?(principal, %{
-                  holder_key: holder_key,
-                  opened_by_user: opened_by_user,
-                  opened_by_session: opened_by_session,
-                  owner_user_id: owner_user_id
-                })
-
-              [] ->
-                false
-            end
-
-          _ ->
-            false
-        end
+        false
     end
   end
 
@@ -224,18 +216,6 @@ defmodule Tightbeam.StateVisibility do
   end
 
   def attest_collection_scope(_principal), do: {"0=1", []}
-
-  defp attest_parent_visible?(%{is_admin: true}, _assignment), do: true
-
-  defp attest_parent_visible?(%{kind: "session", id: id}, assignment) do
-    id == value(assignment, :holder_key) or id == value(assignment, :opened_by_session)
-  end
-
-  defp attest_parent_visible?(%{kind: "user", id: id}, assignment) do
-    id == value(assignment, :opened_by_user) or id == value(assignment, :owner_user_id)
-  end
-
-  defp attest_parent_visible?(_principal, _assignment), do: false
 
   defp trace_core_detail(%{core_detail_trace: nil}, _event), do: :ok
 
