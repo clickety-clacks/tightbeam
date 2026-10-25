@@ -64,6 +64,7 @@ defmodule Tightbeam.MixProject do
       {:websock_adapter, "~> 0.5"},
       # Archetype manifests are TOML (spec §Agent identity; rails will share the format).
       {:toml, "~> 0.7"},
+      {:tz, "~> 0.28.4"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end

@@ -78,6 +78,7 @@ defmodule Tightbeam.Gateway do
     Harness,
     HarnessHealth,
     HarnessProcess,
+    HarklightSend,
     Identity,
     Idempotency,
     LaneManager,
@@ -332,6 +333,7 @@ defmodule Tightbeam.Gateway do
           deliver: deliver,
           delivery_opts: delivery_config,
           internal_consumers: %{
+            "rate_limit_reset" => &Tightbeam.RateLimitReset.release(db, &1),
             "effort_probe" => &EffortCheckin.probe(db, config, &1),
             "effort_deadline" => &EffortCheckin.deadline(db, config, &1),
             "assignment_inactivity_deadline" => &Supervision.deadline(db, &1),
@@ -339,6 +341,7 @@ defmodule Tightbeam.Gateway do
           },
           tick_ms: config.wake_tick_ms,
           name: Tightbeam.WakeScheduler},
+         {Tightbeam.HarklightWakes, db: db, send_runner: Map.get(config, :harklight_send_runner)},
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
          {Tightbeam.AdapterCoordinator,
@@ -881,6 +884,9 @@ defmodule Tightbeam.Gateway do
       {"artifact-get", []} => fn call ->
         Artifacts.get(db, call.params[:artifact_id]) || %{code: "not_found"}
       end,
+      {"harklight-send", []} => fn call ->
+        HarklightSend.send_request(db, call, runner: Map.get(config, :harklight_send_runner))
+      end,
       {"artifacts", []} => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
       {"rule", ["decision_request.ruled"]} => fn call ->
         Escalation.rule(db, call,
@@ -1224,6 +1230,15 @@ defmodule Tightbeam.Gateway do
       end,
       {"read-marker-clear", ["read_marker.updated"]} => fn call ->
         read_marker_result(db, call, :clear)
+      end,
+      {"subtree-guidance-set", []} => fn call ->
+        subtree_guidance_result(db, call, :set)
+      end,
+      {"subtree-guidance-withdraw", []} => fn call ->
+        subtree_guidance_result(db, call, :withdraw)
+      end,
+      {"subtree-guidance-show", []} => fn call ->
+        subtree_guidance_result(db, call, :show)
       end,
       {"config", ["config.updated"]} =>
         admin_call_handler(db, fn call -> config_result(db, call) end),
@@ -4486,6 +4501,12 @@ defmodule Tightbeam.Gateway do
     guidance = append_transcript_self_inspection(snapshot.guidance, session.session_key)
 
     guidance =
+      case Tightbeam.SubtreeGuidance.section(config.db, session.session_key) do
+        nil -> guidance
+        section -> guidance <> "\n\n" <> section
+      end
+
+    guidance =
       if session[:ephemeral] do
         guidance <>
           "\n\nYou are an ephemeral inspection helper. Read and inspect only. " <>
@@ -6031,6 +6052,56 @@ defmodule Tightbeam.Gateway do
         %{code: "unknown_caller"}
     end
   end
+
+  defp subtree_guidance_result(db, call, operation) do
+    caller_key =
+      case resolve_caller(db, call.origin) do
+        %{caller_session: %{session_key: key}} -> key
+        _ -> nil
+      end
+
+    subject = if operation == :show, do: call.params[:session_key] || caller_key, else: caller_key
+
+    case {operation, subject} do
+      {:show, nil} ->
+        %{
+          code: "no_caller_session",
+          message:
+            "no_caller_session rule: subtree guidance belongs to a session; " <>
+              "name one with --session or call as an agent session"
+        }
+
+      {_write, nil} ->
+        %{
+          code: "no_caller_session",
+          message:
+            "no_caller_session rule: subtree guidance is written by the session " <>
+              "it belongs to; call as an agent session"
+        }
+
+      {:set, writer} ->
+        unwrap_subtree_guidance(
+          Tightbeam.SubtreeGuidance.set(
+            db,
+            writer,
+            call.params[:name],
+            call.params[:archetypes],
+            call.params[:text]
+          )
+        )
+
+      {:withdraw, writer} ->
+        unwrap_subtree_guidance(
+          Tightbeam.SubtreeGuidance.withdraw(db, writer, call.params[:name])
+        )
+
+      {:show, session_key} ->
+        unwrap_subtree_guidance(Tightbeam.SubtreeGuidance.show(db, session_key))
+    end
+  end
+
+  defp unwrap_subtree_guidance({:ok, result}), do: result
+  defp unwrap_subtree_guidance({:error, error}), do: error
 
   defp valid_read_marker?(marker) when is_integer(marker), do: marker >= 0
   defp valid_read_marker?(marker) when is_binary(marker), do: marker != ""

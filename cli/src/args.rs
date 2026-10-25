@@ -164,6 +164,16 @@ pub enum Command {
         work_item_id: Option<String>,
         session_key: Option<String>,
     },
+    HarklightSend {
+        identity: Identity,
+        session: String,
+        sender_id: String,
+        title: String,
+        body: Option<String>,
+        choices: Vec<String>,
+        files: Vec<String>,
+        vendor_session_id: Option<String>,
+    },
     /// Substrate-reserved: the PreToolUse hook reporting that this session is
     /// about to run `artifact-record`. Carries no identity flag because the
     /// observation is the session's by definition — the gateway resolves the
@@ -473,6 +483,20 @@ pub enum Command {
         remove: bool,
         content: Option<String>,
     },
+    SubtreeGuidanceSet {
+        identity: Identity,
+        name: String,
+        archetypes: Option<Vec<String>>,
+        text: String,
+    },
+    SubtreeGuidanceWithdraw {
+        identity: Identity,
+        name: String,
+    },
+    SubtreeGuidanceShow {
+        identity: Identity,
+        session_key: Option<String>,
+    },
     IdentityStatus {
         identity: Identity,
         archetype: Option<String>,
@@ -751,6 +775,10 @@ COMMANDS:
       Record a deliberate artifact pointer for the calling session.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
+  harklight-send --session new|<handle> --sender-id <id> --title <text>
+      [--body <text>] [--choices-json <array>] [--files-json <array>]
+      [--vendor-session-id <id>]
+      Send from the authenticated local session and register its reply wake.
   artifact-content-fetch <artifactId>
       Fetch captured bytes as contentBase64 with contentSha256 and contentSize.
       Reads stored custody only, never the origin path; uncaptured content is reported unavailable.
@@ -976,6 +1004,22 @@ COMMANDS:
 
   identity current
       Print this session's key without printing its bearer credential.
+
+  subtree-guidance set <name> [--archetype <a,b>] [--file <path>]
+      Write a guidance entry, as the calling session, for the sessions below it
+      in the org. Without --file the Markdown text is read from stdin. Without
+      --archetype the entry applies to every descendant; with a comma-separated
+      archetype list it applies only to descendants of exactly those
+      archetypes. Reusing a name replaces that entry. The entry joins each
+      affected descendant's served guidance immediately and changed sessions
+      that are started receive the update as a prompt.
+  subtree-guidance withdraw <name>
+      Remove the calling session's entry of that name. Affected descendants'
+      guidance updates immediately and changed started sessions are told.
+  subtree-guidance show [--session <key>]
+      Print the subtree guidance entries a session wrote and the section that
+      currently applies to it, exactly as served. Defaults to the calling
+      session.
 
   ADMIN (require --as-user of an admin, or an admin-owned agent handle):
   identity edit <archetype> [--manifest | --skill <name> [--rm]] [--key <idempotencyKey>]
@@ -2287,6 +2331,48 @@ fn parse_with_optional_catalog(
                 session_key: nonempty(flags, "session"),
             })
         }
+        "harklight-send" => {
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| {
+                    !matches!(
+                        flag.as_str(),
+                        "as" | "session"
+                            | "sender-id"
+                            | "title"
+                            | "body"
+                            | "choices-json"
+                            | "files-json"
+                            | "vendor-session-id"
+                    )
+                })
+            {
+                return Err("usage: tightbeam harklight-send --session new|<handle> --sender-id <id> --title <text> [--body <text>] [--choices-json <array>] [--files-json <array>] [--vendor-session-id <id>]".to_owned());
+            }
+            let list = |name: &str| -> Result<Vec<String>, String> {
+                match flags.get(name) {
+                    None => Ok(Vec::new()),
+                    Some(value) => serde_json::from_str::<Vec<String>>(value)
+                        .map_err(|_| format!("--{name} must be a JSON array of strings")),
+                }
+            };
+            let sender_identity = identity(flags)?;
+            if !matches!(sender_identity, Identity::Session | Identity::Role(_)) {
+                return Err(
+                    "harklight-send requires the authenticated session or one of its roles"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::HarklightSend {
+                identity: sender_identity,
+                session: nonempty(flags, "session").ok_or("--session is required")?,
+                sender_id: nonempty(flags, "sender-id").ok_or("--sender-id is required")?,
+                title: nonempty(flags, "title").ok_or("--title is required")?,
+                body: flags.get("body").cloned(),
+                choices: list("choices-json")?,
+                files: list("files-json")?,
+                vendor_session_id: nonempty(flags, "vendor-session-id"),
+            })
+        }
         "spawn" => {
             let display_name =
                 nonempty(flags, "display").ok_or_else(|| "--display is required".to_owned())?;
@@ -3296,6 +3382,7 @@ fn parse_with_optional_catalog(
             })
         }
         "identity" => parse_identity_command(&parsed, flags),
+        "subtree-guidance" => parse_subtree_guidance_command(&parsed, flags),
         "kungfu" => match parsed.positional.as_slice() {
             [_, list] if list == "list" => Ok(Command::KungfuList {
                 identity: identity(flags)?,
@@ -3396,7 +3483,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -3791,6 +3878,58 @@ fn parse_identity_command(
     }
 }
 
+fn parse_subtree_guidance_command(
+    parsed: &Flags,
+    flags: &HashMap<String, String>,
+) -> Result<Command, String> {
+    match parsed.positional.get(1).map(String::as_str) {
+        Some("set") if parsed.positional.len() == 3 => {
+            let name = parsed.positional[2].clone();
+            let archetypes = nonempty(flags, "archetype").map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            });
+            let text = match nonempty(flags, "file") {
+                Some(path) => fs::read(path)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .map_err(|error| error.to_string())?,
+                None => {
+                    use std::io::Read;
+                    let mut text = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut text)
+                        .map_err(|error| error.to_string())?;
+                    text
+                }
+            };
+            Ok(Command::SubtreeGuidanceSet {
+                identity: identity(flags)?,
+                name,
+                archetypes,
+                text,
+            })
+        }
+        Some("withdraw") if parsed.positional.len() == 3 => Ok(Command::SubtreeGuidanceWithdraw {
+            identity: identity(flags)?,
+            name: parsed.positional[2].clone(),
+        }),
+        Some("show") if parsed.positional.len() == 2 => Ok(Command::SubtreeGuidanceShow {
+            identity: identity(flags)?,
+            session_key: nonempty(flags, "session"),
+        }),
+        _ => Err(
+            "usage: tightbeam subtree-guidance set <name> [--archetype <a,b>] [--file <path>] | \
+             tightbeam subtree-guidance withdraw <name> | \
+             tightbeam subtree-guidance show [--session <key>]"
+                .to_owned(),
+        ),
+    }
+}
+
 fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
     if parsed.positional.len() != 2 {
         return Err(
@@ -4035,6 +4174,64 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn send_command_uses_session_identity_and_closed_inputs() {
+        assert_eq!(
+            parse(strings(&[
+                "harklight-send",
+                "--session",
+                "new",
+                "--sender-id",
+                "sender",
+                "--title",
+                "Question",
+                "--choices-json",
+                r#"["Yes","No"]"#,
+                "--files-json",
+                r#"["/tmp/request.txt"]"#,
+            ])),
+            Ok(Command::HarklightSend {
+                identity: Identity::Session,
+                session: "new".to_owned(),
+                sender_id: "sender".to_owned(),
+                title: "Question".to_owned(),
+                body: None,
+                choices: vec!["Yes".to_owned(), "No".to_owned()],
+                files: vec!["/tmp/request.txt".to_owned()],
+                vendor_session_id: None,
+            })
+        );
+
+        assert!(
+            parse(strings(&[
+                "harklight-send",
+                "--session",
+                "new",
+                "--sender-id",
+                "sender",
+                "--title",
+                "Question",
+                "--as-user",
+                "owner",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(strings(&[
+                "harklight-send",
+                "--session",
+                "new",
+                "--sender-id",
+                "sender",
+                "--title",
+                "Question",
+                "--session-key",
+                "someone-else",
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -5278,6 +5475,7 @@ mod tests {
                 "session-diagnose",
                 "effort-rule",
                 "harness-process",
+                "harklight-send",
                 "harness-health-observe-other",
                 "harness-health-resolve-other",
                 "harness-health-review-other",
@@ -5308,6 +5506,7 @@ mod tests {
                 "revoke-assignment",
                 "reopen-assignment",
                 "spawn",
+                "subtree-guidance",
                 "wake",
                 "work-item-close",
                 "work-item-create",
@@ -6249,7 +6448,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
@@ -6969,6 +7168,37 @@ mod tests {
                     identity: Identity::User("flynn".to_owned()),
                     session_key: None,
                     all: true,
+                },
+            ),
+            (
+                vec![
+                    "subtree-guidance".to_owned(),
+                    "set".to_owned(),
+                    "style".to_owned(),
+                    "--archetype".to_owned(),
+                    "coder, reviewer".to_owned(),
+                    "--file".to_owned(),
+                    skill_path.clone(),
+                ],
+                Command::SubtreeGuidanceSet {
+                    identity: Identity::Session,
+                    name: "style".to_owned(),
+                    archetypes: Some(vec!["coder".to_owned(), "reviewer".to_owned()]),
+                    text: "skill body".to_owned(),
+                },
+            ),
+            (
+                strings(&["subtree-guidance", "withdraw", "style"]),
+                Command::SubtreeGuidanceWithdraw {
+                    identity: Identity::Session,
+                    name: "style".to_owned(),
+                },
+            ),
+            (
+                strings(&["subtree-guidance", "show", "--session", "agent:x"]),
+                Command::SubtreeGuidanceShow {
+                    identity: Identity::Session,
+                    session_key: Some("agent:x".to_owned()),
                 },
             ),
             (

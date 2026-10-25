@@ -988,6 +988,8 @@ defmodule Tightbeam.Org do
 
     if Txn.changes(txn) != 1, do: raise("retirement state changed before commit")
 
+    Txn.handoff(txn, Tightbeam.HarklightWakes, {:origin_changed, session_key})
+
     readdress_retirement_notices_in_txn!(txn, session_key)
 
     session = stamp_session_change_in_txn(txn, session_key, retirement_epoch)
@@ -1010,6 +1012,9 @@ defmodule Tightbeam.Org do
       WHERE w.state='pending' AND (w.consumer='prompt' OR w.targetGate=1)
         AND w.consumer NOT IN ('assignment_inactivity_deadline','assignment_inactivity_climb')
         AND ((w.targetRole IS NULL AND w.sessionKey=?1) OR r.boundSessionKey=?1)
+        AND NOT EXISTS (
+          SELECT 1 FROM harklight_wake_entries e WHERE e.wakeId=w.wakeId
+        )
       ORDER BY w.createdAt,w.wakeId
       """,
       [session_key]
@@ -1505,6 +1510,8 @@ defmodule Tightbeam.Org do
       ]
     )
 
+    Txn.handoff(txn, Tightbeam.HarklightWakes, {:pointer_changed, session_key})
+
     %{
       session_key: session_key,
       harness_session_id: harness_session_id,
@@ -1657,6 +1664,10 @@ defmodule Tightbeam.Org do
         end
 
       publish_session_in_txn(txn, class, session)
+
+      if before.host != session.host or before.state != session.state,
+        do: Txn.handoff(txn, Tightbeam.HarklightWakes, {:origin_changed, session_key})
+
       {:changed, session, result}
     end
   end
