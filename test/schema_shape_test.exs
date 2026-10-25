@@ -936,7 +936,7 @@ defmodule Tightbeam.SchemaShapeTest do
        %{db: db} do
     holder = setup_v17_effort_db(db)
 
-    # A pending process:tightbeam prompt on the SAME assignment that carries
+    # A pending reserved-principal prompt on the SAME assignment that carries
     # effort history, with no generation or deadline referencing it. The
     # substrate cannot prove it is not an effort wake, so it must refuse by name.
     :ok =

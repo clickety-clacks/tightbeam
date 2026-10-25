@@ -2091,7 +2091,8 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   # The reproduction, end to end: this is the exact shape of the six orphans —
-  # `process:tightbeam` re-resolving a lineage whose owner has no main session.
+  # The reserved process principal re-resolving a lineage whose owner has no
+  # main session.
   test "a lineage notice for an owner with no main session enqueues nothing and is named", ctx do
     retire!(ctx.db, "supervisor")
     retire!(ctx.db, ctx.main.session_key)
@@ -4341,8 +4342,9 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   # Agent origin on purpose: work-blocked is an agent-only kind, and
-  # ConditionFacts refuses it from process:tightbeam — the substrate never
-  # decides a session is blocked (spec production-machine-v1 §Standing facts).
+  # ConditionFacts refuses it from the reserved process principal — the
+  # substrate never decides a session is blocked (spec production-machine-v1
+  # §Standing facts).
   defp file_fact(db, kind, scope) do
     {:ok, %{fact_id: _}} =
       DB.transaction(

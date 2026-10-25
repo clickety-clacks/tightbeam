@@ -474,7 +474,8 @@ and raises on any miss.
 
 34. [auto: PM1-2] A spawned session's turn fails (no credential) →
     `[turn failed]` in its own stream, and a notice turn in its parent's
-    queue: `requestRef = bubble:<cause_seq>`, origin `process:tightbeam`.
+    queue: `requestRef = bubble:<cause_seq>`, origin the reserved process
+    principal.
     PASS: both rows, exact marker.
 35. [auto: PM3-4] Every rung's notice fails (same wall) → the SAME cause
     climbs to the owner's main; its failure posts `[no agent can act]` into
@@ -482,7 +483,8 @@ and raises on any miss.
     `user-alerted` stands for the OWNER user id.
 36. [auto: PM5] A fresh failure under the alerted owner does not re-climb:
     still exactly one notice per rung. PASS: notice count unchanged.
-37. [auto: PM6] Seams: `process:tightbeam` filing `work-blocked` is refused
+37. [auto: PM6] Seams: the reserved process principal filing `work-blocked`
+    is refused
     (`agent_only_kind`, at ConditionFacts); a session self-asserting is
     refused (`not_authorized`, at the verb); the lineage parent's assertion
     is accepted.

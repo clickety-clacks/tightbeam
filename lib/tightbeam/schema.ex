@@ -1930,7 +1930,8 @@ defmodule Tightbeam.Schema do
 
            # EGR-9 preflight. Before the new stamp commits, refuse if any
            # ambiguous legacy prompt wake exists: a pending prompt wake from
-           # process:tightbeam attributed to an assignment that has effort
+           # the reserved process principal attributed to an assignment that
+           # has effort
            # history but carries no ownership row. The substrate cannot prove
            # such a wake is not an effort wake, so it names the ids and rolls
            # back — it does not inspect prompts, classify, cancel, or advance the

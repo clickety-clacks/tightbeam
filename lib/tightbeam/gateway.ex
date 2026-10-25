@@ -8664,7 +8664,7 @@ defmodule Tightbeam.Gateway do
   # STORED NOTICES: ordinary appended messages so structural boundaries and
   # failure notices ride replay and live push with no new frame type. The
   # stored discriminator keeps those two meanings distinct. sender
-  # "process:tightbeam" is the anti-forgery — real model output always commits
+  # "reserved principal" is the anti-forgery — real model output always commits
   # with sender "tightbeam", so no session can emit either by typing one.
   defp append_stored_notice(db, session_key, content, message_type)
        when message_type in ["marker", "substrate"] do

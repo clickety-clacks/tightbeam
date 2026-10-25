@@ -49,8 +49,8 @@ If no reporting exception applies, record the one valid bounded checkpoint
 when available or schedule a concrete continuation wake. Never manufacture
 a generic progress attest. Completion remains the holder's truthful terminal
 receipt. A qualifying progress row resets the prod countdown; scheduled
-wakes pause it; words do neither. If you stall, prods arrive from
-process:tightbeam and escalate up your spawner chain after N misses.
+wakes pause it; words do neither. If you stall, prods arrive from the reserved
+process principal and escalate up your spawner chain after N misses.
 
 Retiring: your hires are yours to clean up. When a hire's last open
 assignment closes and you have no further work planned for it, retire

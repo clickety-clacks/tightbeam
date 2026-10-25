@@ -2739,8 +2739,9 @@ defmodule Tightbeam.Wakes do
   # pending branch, drain SCHEDULES a wake, and this sweep FIRES it — so a
   # work-blocked fact asserted after the drain's recheck but before the fire
   # still has one effectful edge left to recognize at. Only supervision's own
-  # wakes are eligible: origin `process:tightbeam` AND an assignmentId AND the
-  # prompt consumer AND NOT a digest carrier — today that combination is
+  # wakes are eligible: reserved process principal origin AND an assignmentId
+  # AND the prompt consumer AND NOT a digest carrier — today that combination
+  # is
   # scheduled nowhere else (the escalation decision notices carry no
   # assignmentId), and it must stay that way or this discriminator learns to
   # suppress someone else's mail. The `not wake.digest` guard is load-bearing
