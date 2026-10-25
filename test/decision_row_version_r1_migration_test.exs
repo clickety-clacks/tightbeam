@@ -228,6 +228,7 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
   } do
     assert :ok = Schema.upgrade_firehose_r1(db)
     assert :ok = Schema.ensure_all(db)
+    assert :done = Schema.backfill_wake_delivery(db)
     :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn',0,1)")
     ensure_main_session(db, "flynn")
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
