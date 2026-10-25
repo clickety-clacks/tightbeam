@@ -101,12 +101,11 @@ defmodule Tightbeam.DeliverableContractTest do
     captured_sources =
       Map.new(entries, fn {path, bytes} -> {List.to_string(path), bytes} end)
 
-    # This sanitized archive is based on the complete lib/ tree at exact base
-    # 724e5c96f9513b37e937dc52eb014ba1ef2d1b5e (tree
-    # 41da8ae7ddee96e01c42ac482052862fba7041e9). Local attribution has been
-    # removed from its comments. Inspecting every production source file makes
-    # an empty optional-rail set an exact-source result, not an inference from
-    # a test that happened not to configure one.
+    # This sanitized archive contains the complete lib/ source tree used for
+    # the contract checks. Local attribution has been removed from its comments.
+    # Inspecting every production source file makes an empty optional-rail set
+    # an exact-source result, not an inference from a test that happened not to
+    # configure one.
     captured_source =
       captured_sources
       |> Enum.sort()

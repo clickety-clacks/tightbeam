@@ -1,11 +1,10 @@
 # Harness adapter seam coverage
 
-Source of truth: `harness-adapter-seam-v1.md`, READY r10. Baseline:
-`5ae730c8a32ca423b6107525a25fc438c605aa5d`.
+Source of truth: `harness-adapter-seam-v1.md`.
 
-This is the implementation checklist re-derived from this worktree before any
-production edit. Line numbers describe the baseline and intentionally drift as
-the sites move. A grouped row covers every named line in that group.
+This is the implementation checklist re-derived from its source snapshot. Line
+numbers refer to that snapshot and intentionally drift as the sites move. A
+grouped row covers every named line in that group.
 
 ## Scan
 

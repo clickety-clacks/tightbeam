@@ -1,5 +1,5 @@
 -- Captured predecessor-domain fixture.
--- Source build: Tightbeam 724e5c96f9513b37e937dc52eb014ba1ef2d1b5e
+-- Source build: captured predecessor release.
 -- Source shape: coordination-fabric-v1-phase1-v9
 -- Capture method: exact base Schema.ensure_all/1 followed by a SQLite dump of
 -- closed, failed, completed, surrendered, revoked, and completed-then-reopened rows.
