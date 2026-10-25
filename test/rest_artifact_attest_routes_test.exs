@@ -470,7 +470,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
       ])
   end
 
-  defp get(ctx, path, bearer \ nil) do
+  defp get(ctx, path, bearer \\ nil) do
     conn(:get, path)
     |> put_req_header("authorization", "Bearer #{bearer || ctx.admin_device.token}")
     |> Router.call(Router.init(ctx.opts))
