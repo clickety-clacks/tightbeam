@@ -482,6 +482,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert_wire_contract("decision requests", returned_item)
 
     row = StateResources.query_decision_request(ctx.db, agent_id)
+
     notice =
       Publisher.committed_notice("decision_request.returned", row, %{
         "decisionRequestId" => agent_id
