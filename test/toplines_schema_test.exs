@@ -99,10 +99,12 @@ defmodule Tightbeam.ToplinesSchemaTest do
       """)
 
     assert :ok = ToplinesSchema.activate(db, 124, defer_v6_migration: true)
+
     assert {:ok, [["standalone-toplines-v6"]]} =
              DB.query(db, "SELECT shape FROM topline_schema_stamp")
 
     assert :ok = ToplinesSchema.activate(db, 125)
+
     assert {:ok, [["standalone-toplines-v7"]]} =
              DB.query(db, "SELECT shape FROM topline_schema_stamp")
 

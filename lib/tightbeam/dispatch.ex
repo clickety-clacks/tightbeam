@@ -156,7 +156,16 @@ defmodule Tightbeam.Dispatch do
       {:refuse, error} ->
         # Terminal guard fires BEFORE Rules.decide: no statute or remedy episode
         # touches a non-open item (work-item-brackets §Mechanism, Proof 12).
-        best_effort_denial(db, verb, origin, principal, session_key, call[:transport_session_key], error)
+        best_effort_denial(
+          db,
+          verb,
+          origin,
+          principal,
+          session_key,
+          call[:transport_session_key],
+          error
+        )
+
         {:error, error}
     end
   end
@@ -201,7 +210,16 @@ defmodule Tightbeam.Dispatch do
 
     case decision do
       {:deny, error} ->
-        best_effort_denial(db, verb, origin, principal, session_key, call[:transport_session_key], error)
+        best_effort_denial(
+          db,
+          verb,
+          origin,
+          principal,
+          session_key,
+          call[:transport_session_key],
+          error
+        )
+
         {:error, error}
 
       {:remedy, statute, ref, error} ->
@@ -223,7 +241,17 @@ defmodule Tightbeam.Dispatch do
           )
         else
           error = remedy_error(error, outcome)
-          best_effort_denial(db, verb, origin, principal, session_key, call[:transport_session_key], error)
+
+          best_effort_denial(
+            db,
+            verb,
+            origin,
+            principal,
+            session_key,
+            call[:transport_session_key],
+            error
+          )
+
           {:error, error}
         end
 
@@ -234,7 +262,16 @@ defmodule Tightbeam.Dispatch do
             id -> {:decision_pending, id}
           end
 
-        best_effort_denial(db, verb, origin, principal, session_key, call[:transport_session_key], ctx.error)
+        best_effort_denial(
+          db,
+          verb,
+          origin,
+          principal,
+          session_key,
+          call[:transport_session_key],
+          ctx.error
+        )
+
         outcome
 
       # A sensor malfunction denies AND summons (§A3). The caller gets the denial it
@@ -245,7 +282,16 @@ defmodule Tightbeam.Dispatch do
       # cannot raise: the summons is subordinate to the deny (§B3), so an unreachable
       # mind is a recorded gap and never a crashed call.
       {:deny_escalate, statute, ctx} ->
-        best_effort_denial(db, verb, origin, principal, session_key, call[:transport_session_key], ctx.error)
+        best_effort_denial(
+          db,
+          verb,
+          origin,
+          principal,
+          session_key,
+          call[:transport_session_key],
+          ctx.error
+        )
+
         :ok = RailEpisodes.summon(db, call, statute, Map.put(ctx, :dr_id, nil))
         {:error, ctx.error}
 
@@ -269,7 +315,16 @@ defmodule Tightbeam.Dispatch do
               message: "ruling authorization was no longer available"
             }
 
-            best_effort_denial(db, verb, origin, principal, session_key, call[:transport_session_key], error)
+            best_effort_denial(
+              db,
+              verb,
+              origin,
+              principal,
+              session_key,
+              call[:transport_session_key],
+              error
+            )
+
             {:error, error}
         end
     end
@@ -357,7 +412,7 @@ defmodule Tightbeam.Dispatch do
                 session_key,
                 payload,
                 principal,
-            call[:transport_session_key],
+                call[:transport_session_key],
                 &Publisher.denied_in_txn(&1, publisher_call, recorded)
               )
 
@@ -376,6 +431,7 @@ defmodule Tightbeam.Dispatch do
 
           {:returned, {:firehose_effect, result, changed?}} when is_boolean(changed?) ->
             payload = audit_payload(verb, call, {:returned, result})
+
             :ok =
               append_event(
                 db,
@@ -484,19 +540,28 @@ defmodule Tightbeam.Dispatch do
     end
   end
 
-  defp append_event(db, kind, verb, origin, session_key, payload, principal, transport_session_key),
-    do:
-      append_event_with_handoff(
-        db,
-        kind,
-        verb,
-        origin,
-        session_key,
-        payload,
-        principal,
-        transport_session_key,
-        nil
-      )
+  defp append_event(
+         db,
+         kind,
+         verb,
+         origin,
+         session_key,
+         payload,
+         principal,
+         transport_session_key
+       ),
+       do:
+         append_event_with_handoff(
+           db,
+           kind,
+           verb,
+           origin,
+           session_key,
+           payload,
+           principal,
+           transport_session_key,
+           nil
+         )
 
   # A handler that wrote already has its audit row, written in its own
   # transaction (`DBObservation.audit_in_txn/2`); the outcome completes that

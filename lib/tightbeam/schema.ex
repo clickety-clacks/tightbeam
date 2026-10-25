@@ -2016,7 +2016,12 @@ defmodule Tightbeam.Schema do
                    [[@launch_preparation_boot_shape]] ->
                      :ok = Tightbeam.Assignments.migrate_actor_attribution_in_txn(txn)
                      :ok = Tightbeam.WorkItems.migrate_actor_attribution_in_txn(txn)
-                     :ok = Tightbeam.AssignmentCommitRefCorrections.migrate_actor_attribution_in_txn(txn)
+
+                     :ok =
+                       Tightbeam.AssignmentCommitRefCorrections.migrate_actor_attribution_in_txn(
+                         txn
+                       )
+
                      :ok = Tightbeam.Roles.migrate_actor_attribution_in_txn(txn)
                      :ok = migrate_work_item_body_actor_attribution_in_txn(txn)
                      :ok = Tightbeam.EventLog.migrate_transport_session_attribution_in_txn(txn)
@@ -2024,7 +2029,12 @@ defmodule Tightbeam.Schema do
                      :ok = Txn.exec(txn, "ALTER TABLE sessions ADD COLUMN createdBySession TEXT")
                      :ok = Txn.exec(txn, "ALTER TABLE sessions ADD COLUMN createdByProcess TEXT")
                      :ok = Txn.exec(txn, "ALTER TABLE sessions ADD COLUMN createdViaSession TEXT")
-                     :ok = Txn.exec(txn, "ALTER TABLE decision_requests ADD COLUMN ruledByActorSessionKey TEXT")
+
+                     :ok =
+                       Txn.exec(
+                         txn,
+                         "ALTER TABLE decision_requests ADD COLUMN ruledByActorSessionKey TEXT"
+                       )
 
                      Txn.q(
                        txn,
@@ -3235,8 +3245,11 @@ defmodule Tightbeam.Schema do
             do: [expected, @actor_work_item_body_table_ddl],
             else: [expected]
 
-        unless Enum.any?(expected_shapes, &(normalize_schema_sql(actual) == normalize_schema_sql(&1))),
-          do: incompatible_work_item_body!("malformed object #{name}")
+        unless Enum.any?(
+                 expected_shapes,
+                 &(normalize_schema_sql(actual) == normalize_schema_sql(&1))
+               ),
+               do: incompatible_work_item_body!("malformed object #{name}")
 
       [] ->
         incompatible_work_item_body!("missing object #{name}")
@@ -3255,11 +3268,15 @@ defmodule Tightbeam.Schema do
              Txn.q(txn, "PRAGMA legacy_alter_table") == [[1]],
            do:
              raise(ArgumentError,
-               message: "work-item body actor migration requires foreign_keys OFF and legacy_alter_table ON"
+               message:
+                 "work-item body actor migration requires foreign_keys OFF and legacy_alter_table ON"
              )
 
     old_ddl = Enum.find(@work_item_body_objects, &(&1.name == "work_item_bodies")).sql
-    [[actual_ddl]] = Txn.q(txn, "SELECT sql FROM sqlite_schema WHERE type='table' AND name='work_item_bodies'")
+
+    [[actual_ddl]] =
+      Txn.q(txn, "SELECT sql FROM sqlite_schema WHERE type='table' AND name='work_item_bodies'")
+
     normalized = normalize_schema_sql(actual_ddl)
 
     cond do
@@ -3267,7 +3284,9 @@ defmodule Tightbeam.Schema do
         :ok
 
       normalized != normalize_schema_sql(old_ddl) ->
-        raise ShapeError, message: "incompatible_work_item_body_v1: actor migration found an unknown body-table shape"
+        raise ShapeError,
+          message:
+            "incompatible_work_item_body_v1: actor migration found an unknown body-table shape"
 
       true ->
         [[before_count]] = Txn.q(txn, "SELECT COUNT(*) FROM work_item_bodies")
@@ -3285,7 +3304,12 @@ defmodule Tightbeam.Schema do
           :ok = Txn.exec(txn, "DROP #{String.upcase(type)} #{quoted}")
         end)
 
-        :ok = Txn.exec(txn, "ALTER TABLE work_item_bodies RENAME TO work_item_bodies_before_actor_attribution")
+        :ok =
+          Txn.exec(
+            txn,
+            "ALTER TABLE work_item_bodies RENAME TO work_item_bodies_before_actor_attribution"
+          )
+
         :ok = Txn.exec(txn, @actor_work_item_body_table_ddl)
 
         :ok =
@@ -3302,7 +3326,10 @@ defmodule Tightbeam.Schema do
         Enum.each(objects, fn [_type, _name, sql] -> :ok = Txn.exec(txn, sql) end)
 
         unless Txn.q(txn, "PRAGMA foreign_key_check(work_item_bodies)") == previous_fk_violations,
-          do: raise(ShapeError, message: "work-item body actor migration changed foreign-key results")
+          do:
+            raise(ShapeError,
+              message: "work-item body actor migration changed foreign-key results"
+            )
 
         :ok
     end

@@ -2311,6 +2311,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, nil, "missing_reason")
     assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "   ", "invalid_reason")
+
     process_reopen =
       reopen_call({:process, "cron"}, assignment.id, "process repair")
       |> Map.put(:transport_session_key, "holder")

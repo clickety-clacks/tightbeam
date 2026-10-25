@@ -101,7 +101,9 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
       params: %{work_item_id: "wi_a1", delivery_owner_session_key: "pdo-a"}
     }
 
-    assert %{deliveryOwnerSessionKey: "pdo-a"} = WorkItems.__handle__(db, "work-item-update", call)
+    assert %{deliveryOwnerSessionKey: "pdo-a"} =
+             WorkItems.__handle__(db, "work-item-update", call)
+
     assert %{"accountableSessionKey" => "pdo-a", "deliveryState" => "current"} =
              DeliveryResponsibilities.current_owner(db, "wi_a1")
   end

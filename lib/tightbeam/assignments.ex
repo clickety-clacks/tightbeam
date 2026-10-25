@@ -850,7 +850,9 @@ defmodule Tightbeam.Assignments do
       txn,
       "SELECT #{predecessor_columns |> String.split(",") |> Enum.map_join(",", &String.trim/1)} FROM #{table} LIMIT 0"
     )
+
     [[before_count]] = Txn.q(txn, "SELECT COUNT(*) FROM #{table}")
+
     previous_sequence =
       case Txn.q(txn, "SELECT 1 FROM sqlite_schema WHERE name='sqlite_sequence'") do
         [[1]] ->
@@ -864,11 +866,15 @@ defmodule Tightbeam.Assignments do
       end
 
     objects =
-      Txn.q(txn, """
-      SELECT type,name,sql FROM sqlite_schema
-      WHERE tbl_name=?1 AND type IN ('index','trigger') AND sql IS NOT NULL
-      ORDER BY type,name
-      """, [table])
+      Txn.q(
+        txn,
+        """
+        SELECT type,name,sql FROM sqlite_schema
+        WHERE tbl_name=?1 AND type IN ('index','trigger') AND sql IS NOT NULL
+        ORDER BY type,name
+        """,
+        [table]
+      )
 
     Enum.each(objects, fn [type, name, _sql] ->
       quoted_name = "\"" <> String.replace(name, "\"", "\"\"") <> "\""
@@ -877,7 +883,13 @@ defmodule Tightbeam.Assignments do
 
     :ok = Txn.exec(txn, "ALTER TABLE #{table} RENAME TO #{renamed_table}")
     :ok = Txn.exec(txn, create_ddl)
-    :ok = Txn.exec(txn, "INSERT INTO #{table} (#{columns}) SELECT #{select_columns} FROM #{renamed_table}")
+
+    :ok =
+      Txn.exec(
+        txn,
+        "INSERT INTO #{table} (#{columns}) SELECT #{select_columns} FROM #{renamed_table}"
+      )
+
     [[^before_count]] = Txn.q(txn, "SELECT COUNT(*) FROM #{table}")
     :ok = Txn.exec(txn, "DROP TABLE #{renamed_table}")
     Enum.each(objects, fn [_type, _name, sql] -> :ok = Txn.exec(txn, sql) end)
@@ -4092,7 +4104,9 @@ defmodule Tightbeam.Assignments do
   defp apply_reopen(txn, call, assignment) do
     assignment_id = assignment.id
     reopened_at = now()
-    {reopened_user, reopened_session, reopened_process, reopened_via_session} = assignment_actor(call)
+
+    {reopened_user, reopened_session, reopened_process, reopened_via_session} =
+      assignment_actor(call)
 
     Txn.q(
       txn,
@@ -4348,8 +4362,12 @@ defmodule Tightbeam.Assignments do
   defp same_attest_principal_as_opener?(_assignment, _attest), do: false
 
   defp attest_notice_origin(%{byUser: user}) when is_binary(user), do: "user:" <> user
-  defp attest_notice_origin(%{byProcess: process}) when is_binary(process), do: "process:" <> process
-  defp attest_notice_origin(%{bySession: session}) when is_binary(session), do: "agent:" <> session
+
+  defp attest_notice_origin(%{byProcess: process}) when is_binary(process),
+    do: "process:" <> process
+
+  defp attest_notice_origin(%{bySession: session}) when is_binary(session),
+    do: "agent:" <> session
 
   defp append_assignment_marker(txn, assignment, :opened) do
     append_substrate(txn, assignment.holderKey, "[assignment opened: #{assignment.id}]")
@@ -4387,6 +4405,7 @@ defmodule Tightbeam.Assignments do
 
   defp insert_attest(txn, call, assignment_id, allow_closed \\ false) do
     {by_user, by_session, by_process, by_actor_session} = attest_actor(call)
+
     {by_harness, by_provider} =
       verdict_author_family(txn, call.params.kind, by_session || by_actor_session)
 
@@ -4452,7 +4471,9 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
 
-    activity_sessions = [attrs.by_session, attrs.by_actor_session] |> Enum.filter(&is_binary/1) |> Enum.uniq()
+    activity_sessions =
+      [attrs.by_session, attrs.by_actor_session] |> Enum.filter(&is_binary/1) |> Enum.uniq()
+
     Enum.each(activity_sessions, &Supervision.activity_in_txn(txn, attrs.assignment_id, &1, ts))
 
     attest([

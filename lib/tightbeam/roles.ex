@@ -97,7 +97,9 @@ defmodule Tightbeam.Roles do
   @doc false
   def create_in_txn!(%Txn{} = txn, name, owner_user_id, bound_session_key, call) do
     case create!(txn, name, owner_user_id, bound_session_key) do
-      {:error, error} -> raise TransactionError, error: error
+      {:error, error} ->
+        raise TransactionError, error: error
+
       role ->
         record_creator_in_txn(txn, name, call)
         role
@@ -115,8 +117,17 @@ defmodule Tightbeam.Roles do
         :ok = Txn.exec(txn, "ALTER TABLE roles ADD COLUMN createdByProcess TEXT")
         :ok = Txn.exec(txn, "ALTER TABLE roles ADD COLUMN createdViaSession TEXT")
 
-      ["name", "boundSessionKey", "ownerUserId", "createdAt", "updatedAt", "createdByUser",
-       "createdBySession", "createdByProcess", "createdViaSession"] ->
+      [
+        "name",
+        "boundSessionKey",
+        "ownerUserId",
+        "createdAt",
+        "updatedAt",
+        "createdByUser",
+        "createdBySession",
+        "createdByProcess",
+        "createdViaSession"
+      ] ->
         :ok
 
       other ->
@@ -309,9 +320,15 @@ defmodule Tightbeam.Roles do
   defp record_creator_in_txn(txn, name, call) do
     {user, session, process} =
       case call[:principal] do
-        {:user, actor} -> {actor, nil, nil}
-        {:session, actor} -> {nil, actor, nil}
-        {:process, actor} -> {nil, nil, actor}
+        {:user, actor} ->
+          {actor, nil, nil}
+
+        {:session, actor} ->
+          {nil, actor, nil}
+
+        {:process, actor} ->
+          {nil, nil, actor}
+
         {:remedy, _} ->
           case call[:origin] do
             "process:" <> actor -> {nil, nil, actor}
@@ -320,7 +337,8 @@ defmodule Tightbeam.Roles do
             _ -> {nil, nil, nil}
           end
 
-        _ -> {nil, nil, nil}
+        _ ->
+          {nil, nil, nil}
       end
 
     actor_session =

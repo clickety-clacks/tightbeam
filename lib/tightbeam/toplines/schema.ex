@@ -373,20 +373,20 @@ defmodule Tightbeam.Toplines.Schema do
   @title_tables ["toplines", "topline_concerns"]
   @title_indexes ["toplines_id_owner", "topline_concerns_id_topline"]
   @v6_objects Enum.map(@v5_objects, fn object ->
-             if object.name in @title_tables do
-               # Unicode normalization and scalar limits are enforced by the
-               # product API. Persisted DDL must also work in bare SQLite.
-               sql =
-                 object.sql
-                 |> String.split("\n")
-                 |> Enum.reject(&String.contains?(&1, "tightbeam_"))
-                 |> Enum.join("\n")
+                if object.name in @title_tables do
+                  # Unicode normalization and scalar limits are enforced by the
+                  # product API. Persisted DDL must also work in bare SQLite.
+                  sql =
+                    object.sql
+                    |> String.split("\n")
+                    |> Enum.reject(&String.contains?(&1, "tightbeam_"))
+                    |> Enum.join("\n")
 
-               %{object | sql: sql}
-             else
-               object
-             end
-           end)
+                  %{object | sql: sql}
+                else
+                  object
+                end
+              end)
 
   @objects Enum.map(@v6_objects, fn object ->
              sql =
@@ -771,7 +771,9 @@ defmodule Tightbeam.Toplines.Schema do
 
     Enum.each(@actor_tables, fn name ->
       copy = "toplines_v7_#{name}_copy"
-      :ok = Txn.exec(txn, "CREATE TEMP TABLE #{copy} AS SELECT rowid AS __rowid__, * FROM #{name}")
+
+      :ok =
+        Txn.exec(txn, "CREATE TEMP TABLE #{copy} AS SELECT rowid AS __rowid__, * FROM #{name}")
     end)
 
     :ok = Txn.exec(txn, "PRAGMA defer_foreign_keys=ON")
@@ -824,7 +826,10 @@ defmodule Tightbeam.Toplines.Schema do
       end
 
       [[count]] = Txn.q(txn, "SELECT COUNT(*) FROM #{name}")
-      unless count == counts[name], do: raise("Toplines actor migration changed #{name} row count")
+
+      unless count == counts[name],
+        do: raise("Toplines actor migration changed #{name} row count")
+
       :ok = Txn.exec(txn, "DROP TABLE #{copy}")
     end)
 
@@ -844,10 +849,12 @@ defmodule Tightbeam.Toplines.Schema do
     end
 
     verify_manifest!(txn)
+
     Txn.q(txn, "UPDATE topline_schema_stamp SET shape=?1, stampedAt=?2 WHERE singleton=1", [
       @shape,
       stamped_at
     ])
+
     maybe_interrupt!(opts, :after_actor_stamp)
     :ok
   end

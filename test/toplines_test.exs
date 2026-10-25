@@ -959,6 +959,7 @@ defmodule Tightbeam.ToplinesTest do
       |> then(&Toplines.leave_unlinked(ctx.db, &1))
 
     assert process_leave.placement.state == "left_unlinked"
+
     assert process_leave.placement.resolutionActor == %{
              kind: "process",
              ref: "cron",
@@ -1083,6 +1084,7 @@ defmodule Tightbeam.ToplinesTest do
       |> then(&Toplines.create(ctx.db, &1))
 
     assert created.topline.ownerUserId == "kay"
+
     assert created.topline.createdActor == %{
              kind: "process",
              ref: "scheduler",
@@ -1102,6 +1104,7 @@ defmodule Tightbeam.ToplinesTest do
     user_result = Toplines.create(ctx.db, call({:user, "flynn"}, params, 23))
 
     assert user_result == session_result
+
     assert {:ok, [["session", "topline-caller", "topline-caller", "user", "flynn"]]} =
              DB.query(
                ctx.db,

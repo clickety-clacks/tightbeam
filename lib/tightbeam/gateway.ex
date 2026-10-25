@@ -4555,13 +4555,18 @@ defmodule Tightbeam.Gateway do
   end
 
   defp explicit_owner_user(_db, owner) when not is_binary(owner) or owner == "" do
-    {:error, %{code: "missing_owner_user", message: "ownerUserId is required for process-created records"}}
+    {:error,
+     %{code: "missing_owner_user", message: "ownerUserId is required for process-created records"}}
   end
 
   defp explicit_owner_user(db, owner) do
     case DB.query(db, "SELECT 1 FROM users WHERE userId = ?1", [owner]) do
-      {:ok, [[1]]} -> {:ok, owner}
-      _ -> {:error, %{code: "unknown_owner_user", message: "ownerUserId does not name an existing user"}}
+      {:ok, [[1]]} ->
+        {:ok, owner}
+
+      _ ->
+        {:error,
+         %{code: "unknown_owner_user", message: "ownerUserId does not name an existing user"}}
     end
   end
 
@@ -7155,9 +7160,15 @@ defmodule Tightbeam.Gateway do
   defp spawn_actor_fields(call) do
     actor =
       case call[:principal] do
-        {:user, user} -> %{created_by_user: user}
-        {:session, session} -> %{created_by_session: session}
-        {:process, process} -> %{created_by_process: process}
+        {:user, user} ->
+          %{created_by_user: user}
+
+        {:session, session} ->
+          %{created_by_session: session}
+
+        {:process, process} ->
+          %{created_by_process: process}
+
         {:remedy, _} ->
           case call.origin do
             "process:" <> process -> %{created_by_process: process}
@@ -7166,7 +7177,8 @@ defmodule Tightbeam.Gateway do
             _ -> %{}
           end
 
-        _ -> %{}
+        _ ->
+          %{}
       end
 
     actor_session =
@@ -7545,24 +7557,25 @@ defmodule Tightbeam.Gateway do
     # Placement resolved the host FIRST, so the ref is judged against the account
     # that will actually run the turn (#88) — not the gateway's.
     with {:ok, {model, routed}} <- prepared do
-      input = %{
-        display_name: p.display_name,
-        kind: "custom",
-        owner_user_id: caller.owner_user_id,
-        origin: call.origin,
-        spawned_by: caller.caller_session && caller.caller_session.session_key,
-        created_via_session_key: call[:transport_session_key],
-        handle: p[:handle],
-        order_index: length(sessions),
-        archetype: archetype.name,
-        overrides: overrides,
-        identity_name: identity_name,
-        host: host,
-        harness: harness_string,
-        provider: routed.provider,
-        model: model
-      }
-      |> Map.merge(spawn_actor_fields(call))
+      input =
+        %{
+          display_name: p.display_name,
+          kind: "custom",
+          owner_user_id: caller.owner_user_id,
+          origin: call.origin,
+          spawned_by: caller.caller_session && caller.caller_session.session_key,
+          created_via_session_key: call[:transport_session_key],
+          handle: p[:handle],
+          order_index: length(sessions),
+          archetype: archetype.name,
+          overrides: overrides,
+          identity_name: identity_name,
+          host: host,
+          harness: harness_string,
+          provider: routed.provider,
+          model: model
+        }
+        |> Map.merge(spawn_actor_fields(call))
 
       session_result =
         DB.transaction(db, fn txn ->

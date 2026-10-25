@@ -40,14 +40,19 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
 
   @doc false
   def migrate_actor_attribution_in_txn(%Txn{} = txn) do
-    old_columns = ~w(id assignmentId commitRefs reason evidenceArtifactId actorKind actorRef cause idempotencyKey requestFingerprint verifiedAt createdAt)
+    old_columns =
+      ~w(id assignmentId commitRefs reason evidenceArtifactId actorKind actorRef cause idempotencyKey requestFingerprint verifiedAt createdAt)
+
     new_columns =
       List.insert_at(
         old_columns,
         Enum.find_index(old_columns, &(&1 == "actorRef")) + 1,
         "actorSessionKey"
       )
-    columns = Txn.q(txn, "PRAGMA table_info(assignment_commit_ref_corrections)") |> Enum.map(&Enum.at(&1, 1))
+
+    columns =
+      Txn.q(txn, "PRAGMA table_info(assignment_commit_ref_corrections)")
+      |> Enum.map(&Enum.at(&1, 1))
 
     case columns do
       ^new_columns ->
@@ -63,8 +68,10 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
         expected_index =
           "CREATE INDEX assignment_commit_ref_corrections_assignment ON assignment_commit_ref_corrections (assignmentId, createdAt, id)"
 
-        unless attached == [["index", "assignment_commit_ref_corrections_assignment", expected_index]],
-          do: raise(ArgumentError, "unexpected commit-ref correction schema objects")
+        unless attached == [
+                 ["index", "assignment_commit_ref_corrections_assignment", expected_index]
+               ],
+               do: raise(ArgumentError, "unexpected commit-ref correction schema objects")
 
         previous_fk_violations =
           Tightbeam.Schema.migration_foreign_keys_in_txn(
@@ -73,9 +80,21 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
           )
 
         [[count]] = Txn.q(txn, "SELECT COUNT(*) FROM assignment_commit_ref_corrections")
-        :ok = Txn.exec(txn, "CREATE TEMP TABLE assignment_commit_ref_corrections_actor_copy AS SELECT rowid AS __rowid__, * FROM assignment_commit_ref_corrections")
+
+        :ok =
+          Txn.exec(
+            txn,
+            "CREATE TEMP TABLE assignment_commit_ref_corrections_actor_copy AS SELECT rowid AS __rowid__, * FROM assignment_commit_ref_corrections"
+          )
+
         :ok = Txn.exec(txn, "DROP INDEX assignment_commit_ref_corrections_assignment")
-        :ok = Txn.exec(txn, "ALTER TABLE assignment_commit_ref_corrections RENAME TO assignment_commit_ref_corrections_before_actor")
+
+        :ok =
+          Txn.exec(
+            txn,
+            "ALTER TABLE assignment_commit_ref_corrections RENAME TO assignment_commit_ref_corrections_before_actor"
+          )
+
         :ok = Txn.exec(txn, @ddl)
 
         :ok =
@@ -92,7 +111,11 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
                  txn,
                  ["assignment_commit_ref_corrections"]
                ) -- previous_fk_violations == [],
-               do: raise(ArgumentError, "commit-ref correction actor migration left invalid foreign keys")
+               do:
+                 raise(
+                   ArgumentError,
+                   "commit-ref correction actor migration left invalid foreign keys"
+                 )
 
         :ok
 

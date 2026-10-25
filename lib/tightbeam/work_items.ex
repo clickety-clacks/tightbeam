@@ -62,9 +62,9 @@ defmodule Tightbeam.WorkItems do
   """
 
   @actor_work_item_columns
-    "id,title,specRefName,specRefSha256,isBug,ownerUserId,deliveryOwnerSessionKey,state," <>
-      "failReason,routingWakeId,slateWakeId,createdByUser,createdBySession,createdByProcess," <>
-      "createdByViaSessionKey,createdInTurnSeq,createdContextKnown,createdAt"
+  "id,title,specRefName,specRefSha256,isBug,ownerUserId,deliveryOwnerSessionKey,state," <>
+    "failReason,routingWakeId,slateWakeId,createdByUser,createdBySession,createdByProcess," <>
+    "createdByViaSessionKey,createdInTurnSeq,createdContextKnown,createdAt"
 
   defmodule CancellationRefused do
     @moduledoc false
@@ -125,7 +125,11 @@ defmodule Tightbeam.WorkItems do
   def migrate_actor_attribution_in_txn(%Txn{} = txn) do
     unless Txn.q(txn, "PRAGMA foreign_keys") == [[0]] and
              Txn.q(txn, "PRAGMA legacy_alter_table") == [[1]],
-           do: raise(ArgumentError, "work-item actor migration requires foreign_keys OFF and legacy_alter_table ON")
+           do:
+             raise(
+               ArgumentError,
+               "work-item actor migration requires foreign_keys OFF and legacy_alter_table ON"
+             )
 
     columns = String.split(@actor_work_item_columns, ",")
     stored_columns = Txn.q(txn, "PRAGMA table_info(work_items)") |> Enum.map(&Enum.at(&1, 1))
@@ -137,17 +141,21 @@ defmodule Tightbeam.WorkItems do
         Enum.reject(columns, &(&1 in ["createdByProcess", "createdByViaSessionKey"]))
 
       unless stored_columns == predecessor_columns,
-        do: raise(ArgumentError, "unknown work-item actor-attribution columns: #{inspect(stored_columns)}")
+        do:
+          raise(
+            ArgumentError,
+            "unknown work-item actor-attribution columns: #{inspect(stored_columns)}"
+          )
 
       Txn.q(txn, "SELECT #{Enum.join(predecessor_columns, ",")} FROM work_items LIMIT 0")
       [[before_count]] = Txn.q(txn, "SELECT COUNT(*) FROM work_items")
 
       objects =
         Txn.q(txn, """
-      SELECT type,name,sql FROM sqlite_schema
-      WHERE tbl_name='work_items' AND type IN ('index','trigger') AND sql IS NOT NULL
-      ORDER BY type,name
-      """)
+        SELECT type,name,sql FROM sqlite_schema
+        WHERE tbl_name='work_items' AND type IN ('index','trigger') AND sql IS NOT NULL
+        ORDER BY type,name
+        """)
 
       Enum.each(objects, fn [type, name, _sql] ->
         quoted = "\"" <> String.replace(name, "\"", "\"\"") <> "\""
@@ -211,7 +219,10 @@ defmodule Tightbeam.WorkItems do
           case key && idempotency_item(txn, owner, key) do
             nil ->
               id = "wi_" <> Tightbeam.Id.uuid4()
-              created_in_turn_seq = running_turn_seq(txn, created_by_session || created_via_session)
+
+              created_in_turn_seq =
+                running_turn_seq(txn, created_by_session || created_via_session)
+
               priority = call.params[:priority] || default_priority_in_txn(txn)
               created_at = now()
 
@@ -692,6 +703,7 @@ defmodule Tightbeam.WorkItems do
         else
           {updated_by_user, updated_by_session, updated_by_process, updated_via_session} =
             body_attribution(params)
+
           updated_at = now()
 
           Txn.q(

@@ -243,7 +243,10 @@ defmodule Tightbeam.Toplines do
     params = Map.get(call, :params, %{})
 
     with {:ok, caller} <- caller(db, call),
-         :ok <- valid_shape(params, [:idempotency_key, :title, :owner_user_id], optional: [:owner_user_id]),
+         :ok <-
+           valid_shape(params, [:idempotency_key, :title, :owner_user_id],
+             optional: [:owner_user_id]
+           ),
          {:ok, title} <- canonical_title(param(params, :title)),
          :ok <- valid_key(param(params, :idempotency_key)),
          {:ok, owner_user_id} <- create_owner(db, caller, param(params, :owner_user_id)) do
@@ -1948,6 +1951,7 @@ defmodule Tightbeam.Toplines do
   defp actor(kind, ref), do: %{kind: kind, ref: ref}
   defp actor(nil, nil, nil), do: nil
   defp actor(kind, ref, nil), do: actor(kind, ref)
+
   defp actor(kind, ref, session_key),
     do: %{kind: kind, ref: ref, actingSessionKey: session_key}
 

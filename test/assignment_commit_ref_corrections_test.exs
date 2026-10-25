@@ -264,7 +264,8 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     )
   end
 
-  test "process corrections retain actor and acting session; malformed requests are refused", ctx do
+  test "process corrections retain actor and acting session; malformed requests are refused",
+       ctx do
     process_call = %{
       principal: {:process, "scheduler"},
       transport_session_key: "po-owner",

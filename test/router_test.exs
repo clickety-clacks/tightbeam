@@ -436,13 +436,21 @@ defmodule Tightbeam.Wire.RouterTest do
     handlers =
       ctx.opts[:handlers]
       |> Map.put("work-item-get", fn call ->
-        send(parent, {:body_auth_handler, call.verb, call.origin, call.principal,
-              call[:transport_session_key]})
+        send(
+          parent,
+          {:body_auth_handler, call.verb, call.origin, call.principal,
+           call[:transport_session_key]}
+        )
+
         real_handlers["work-item-get"].(call)
       end)
       |> Map.put("work-item-update", fn call ->
-        send(parent, {:body_auth_handler, call.verb, call.origin, call.principal,
-              call[:transport_session_key]})
+        send(
+          parent,
+          {:body_auth_handler, call.verb, call.origin, call.principal,
+           call[:transport_session_key]}
+        )
+
         real_handlers["work-item-update"].(call)
       end)
 
@@ -451,8 +459,7 @@ defmodule Tightbeam.Wire.RouterTest do
     _final_body =
       Enum.reduce(
         [
-          {"tbc_test", %{asUser: "flynn"}, "user:flynn", {:user, "flynn"}, nil,
-           "org-user-body"},
+          {"tbc_test", %{asUser: "flynn"}, "user:flynn", {:user, "flynn"}, nil, "org-user-body"},
           {session.cli_token, %{asUser: "flynn"}, "user:flynn", {:user, "flynn"},
            session.session_key, "session-user-body"},
           {session.cli_token, %{as: "body-auth-role"}, "agent:body-auth-role",
@@ -473,6 +480,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
           assert get.status == 200, get.resp_body
           assert JSON.decode!(get.resp_body)["result"]["workItem"]["body"] == previous_body
+
           assert_receive {:body_auth_handler, "work-item-get", ^origin, ^principal,
                           ^acting_session}
 
@@ -491,8 +499,10 @@ defmodule Tightbeam.Wire.RouterTest do
           update_result = JSON.decode!(update.resp_body)["result"]
           refute Map.has_key?(update_result["workItem"], "body")
           assert update_result["bodyUpdate"]["state"] == "present"
+
           assert_receive {:body_auth_handler, "work-item-update", ^origin, ^principal,
                           ^acting_session}
+
           body
         end
       )
@@ -519,6 +529,7 @@ defmodule Tightbeam.Wire.RouterTest do
         dispatch_cli(ctx, session.cli_token, %{verb: verb, asProcess: "cron", params: params})
 
       assert response.status == 200, response.resp_body
+
       assert_receive {:body_auth_handler, ^verb, "process:cron", {:process, "cron"},
                       "body-auth-session"}
     end
@@ -3537,6 +3548,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     wrong_user = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "mike"})
     assert wrong_user.status == 200, wrong_user.resp_body
+
     assert_receive {:call,
                     %{
                       origin: "user:mike",
@@ -3546,6 +3558,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     process = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asProcess: "cron"})
     assert process.status == 200, process.resp_body
+
     assert_receive {:call,
                     %{
                       origin: "process:cron",
