@@ -1754,6 +1754,23 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert retried =~ "session:cli-holder"
 
+    assert {:ok, effort_rule_result} =
+             Tightbeam.Dispatch.dispatch(
+               ctx.db,
+               Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000}),
+               %{
+                 verb: "effort-rule",
+                 origin: "agent:cli-holder",
+                 principal: {:session, "cli-holder"},
+                 session_key: nil,
+                 params: %{request: continue_request, action: "continue"}
+               }
+             )
+
+    assert effort_rule_result.id == continue_request
+    assert effort_rule_result.status == "ruled"
+    refute Map.has_key?(effort_rule_result, :row_version)
+
     {:ok, [[^generations_after]]} =
       DB.query(
         ctx.db,

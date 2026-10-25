@@ -783,13 +783,15 @@ defmodule Tightbeam.Gateway do
       {"activation-status", []} => fn call -> Activations.handle(db, call.verb, call) end,
       {"activations", []} => fn call -> Activations.handle(db, call.verb, call) end,
       {"rule", ["decision_request.ruled"]} => fn call ->
-        Escalation.rule(db, call,
-          authorized: admin_origin?(db, call.origin),
-          scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
+        agent_decision_result(
+          Escalation.rule(db, call,
+            authorized: admin_origin?(db, call.origin),
+            scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
+          )
         )
       end,
       {"effort-rule", ["decision_request.ruled"]} => fn call ->
-        EffortCheckin.rule(db, config, call)
+        agent_decision_result(EffortCheckin.rule(db, config, call))
       end,
       {"waive", []} => fn call ->
         Escalation.waive(db, call,
@@ -800,7 +802,9 @@ defmodule Tightbeam.Gateway do
       {"revoke-waiver", []} => fn call ->
         Escalation.revoke_waiver(db, call, authorized: admin_origin?(db, call.origin))
       end,
-      {"withdraw", ["decision_request.withdrawn"]} => fn call -> Escalation.withdraw(db, call) end,
+      {"withdraw", ["decision_request.withdrawn"]} => fn call ->
+        agent_decision_result(Escalation.withdraw(db, call))
+      end,
       # The `input-needed` carrier (fabric §7, GitHub #11). Both verbs are
       # ordinary routed verbs and nothing more: `Rules.decide` sees them at the
       # Dispatch chokepoint like every other, the target is resolved by the same
@@ -7712,6 +7716,13 @@ defmodule Tightbeam.Gateway do
 
   defp decision_request_result(request),
     do: %{decision_request: Map.delete(request, :row_version)}
+
+  # Decision verbs keep their historical bare response maps. The stored
+  # version is exposed by the REST projection only, so remove it without
+  # changing these legacy envelopes or their refusal results.
+  defp agent_decision_result(%{code: _} = error), do: error
+  defp agent_decision_result(result) when is_map(result), do: Map.delete(result, :row_version)
+  defp agent_decision_result(result), do: result
 
   defp coordination_share_readable?(_db, %{principal: {:session, key}}, %{session_key: key}),
     do: true

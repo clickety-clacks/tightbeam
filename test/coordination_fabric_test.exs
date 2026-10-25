@@ -3465,6 +3465,17 @@ defmodule Tightbeam.CoordinationFabricTest do
              admin_call(db, "rule", %{request: agent_request.id, decision: "allow"})
 
     assert authorized_agent =~ "answered, not ruled"
+
+    assert {:ok, ruled_statute} =
+             admin_call(db, "rule", %{request: statute_id, decision: "allow"})
+
+    assert ruled_statute.kind == "statute"
+    assert ruled_statute.status == "ruled"
+    assert ruled_statute.decision == "allow"
+    refute Map.has_key?(ruled_statute, :row_version)
+
+    assert {:ok, ^ruled_statute} =
+             admin_call(db, "rule", %{request: statute_id, decision: "allow"})
   end
 
   test "withdraw is the asker's own lawful exit, and nobody else's", %{db: db} do
@@ -3482,6 +3493,26 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     assert withdrawn.status == "withdrawn"
     assert withdrawn.withdrawn_reason == "worked it out myself"
+    refute Map.has_key?(withdrawn, :row_version)
+
+    statute_id = "dr_withdraw_statute"
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO decision_requests (id, kind, raiserId, raiserSessionKey, ownerUserId, " <>
+          "raisedAt, deadlineAt, statuteName, actionKey, question, context, status) VALUES " <>
+          "(?1,'statute','session:agent:coder','agent:coder','flynn',1,999999999999," <>
+          "'withdraw-gate','withdraw-k1','q','{}','open')",
+        [statute_id]
+      )
+
+    assert {:ok, withdrawn_statute} =
+             withdraw(db, {:session, "agent:coder"}, statute_id, "statute no longer applies")
+
+    assert withdrawn_statute.kind == "statute"
+    assert withdrawn_statute.status == "withdrawn"
+    refute Map.has_key?(withdrawn_statute, :row_version)
 
     # A withdrawn question can no longer be answered: the exit is real.
     assert {:error, %{code: "not_open"}} =
