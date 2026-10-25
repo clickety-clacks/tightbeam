@@ -293,6 +293,7 @@ defmodule Tightbeam.Artifacts do
 
     {filter_clauses, filter_params} =
       artifact_filter_clauses(filters, length(visibility_params))
+
     where = Enum.join([visibility_sql | filter_clauses], " AND ")
     base_params = visibility_params ++ filter_params
 

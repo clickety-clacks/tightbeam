@@ -644,8 +644,8 @@ defmodule Tightbeam.Wire.Router do
          request <- d2a_collection_parent_scope(request, spec),
          {:ok, boundary} <- state_cursor_boundary(request, principal, spec),
          :ok <- d2a_collection_parent_visible(conn, spec, principal),
-        rows <-
-          d2a_collection_rows(conn, spec, request.filters, principal, boundary, request.limit),
+         rows <-
+           d2a_collection_rows(conn, spec, request.filters, principal, boundary, request.limit),
          {page_rows, page} <- state_page(rows, boundary, request, principal, spec),
          items <- d2a_serialize_rows(page_rows, spec) do
       state_send(conn, 200, state_collection_envelope(conn, spec.resource, items, page))
