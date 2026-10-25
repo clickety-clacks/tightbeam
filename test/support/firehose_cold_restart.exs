@@ -95,7 +95,10 @@ Application.put_env(:tightbeam, :port, port)
 Application.put_env(:tightbeam, :default_harness, :fixture)
 Application.put_env(:tightbeam, :default_model, Model.new("fixture-model"))
 Application.put_env(:tightbeam, :autostart, true)
-Application.put_env(:tightbeam, :drain_timeout_ms, 1_000)
+# Reopening can start a holder turn. Give its bounded drain 500 ms while
+# preserving the five seconds reserved for Firehose close acknowledgements.
+drain_budget = if System.get_env("FIREHOSE_REOPEN_PROOF") == "1", do: 5_500, else: 1_000
+Application.put_env(:tightbeam, :drain_timeout_ms, drain_budget)
 
 if missing_executable do
   empty_bin = Path.join(base, "empty-executable-path")
