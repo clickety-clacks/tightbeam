@@ -499,6 +499,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert live_message["clientMessageId"] == "direct-human-post"
     assert live_message["turnIncludesHuman"]
     direct_id = live_message["id"]
+    :ok = Hub.delivered(Hub, self())
 
     assert {:ok, {:appended, empty_sender_message}} =
              DB.transaction(ctx.db, fn txn ->
@@ -519,6 +520,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     assert empty_sender_notice["id"] == empty_sender_message.id
     assert empty_sender_notice["sender"] == "user:outsider"
+    :ok = Hub.delivered(Hub, self())
 
     assert {:ok, [[""]]} =
              DB.query(ctx.db, "SELECT sender FROM messages WHERE id=?1", [empty_sender_message.id])
