@@ -1231,6 +1231,7 @@ defmodule Tightbeam.RulesTest do
 
     producer_refs = fixture_commit_refs()
     missing_commit = hd(producer_refs)["commit"]
+
     review_refs = [
       %{
         "repo" => hd(producer_refs)["repo"],
@@ -1239,15 +1240,24 @@ defmodule Tightbeam.RulesTest do
     ]
 
     assert %{attest: %{verdictKind: "reviewed-clean"}} =
-             commit_ref_verdict(ctx, reviewer.session_key, review.id, "reviewed-clean", review_refs)
+             commit_ref_verdict(
+               ctx,
+               reviewer.session_key,
+               review.id,
+               "reviewed-clean",
+               review_refs
+             )
 
     assert %{attest: %{verdictKind: "verified"}} =
              commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", producer_refs)
 
     put_raw(
       ctx,
-      File.read!(Path.expand("../priv/kungfu/agentic-engineering/rules/engineering.toml", __DIR__))
+      File.read!(
+        Path.expand("../priv/kungfu/agentic-engineering/rules/engineering.toml", __DIR__)
+      )
     )
+
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     completion =
