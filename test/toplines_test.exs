@@ -160,7 +160,11 @@ defmodule Tightbeam.ToplinesTest do
         call({:session, "s_flynn"}, %{title: "Session intent", idempotency_key: "create-2"}, 11)
       )
 
-    assert session_created.topline.createdActor == %{kind: "session", ref: "s_flynn"}
+    assert session_created.topline.createdActor == %{
+             kind: "session",
+             ref: "s_flynn",
+             actingSessionKey: "s_flynn"
+           }
   end
 
   test "membership episodes retain reasons, attribution, history, and keyed replay", ctx do
@@ -954,7 +958,15 @@ defmodule Tightbeam.ToplinesTest do
              Toplines.list_placements(ctx.db, read_call({:user, "kay"}, %{state: "all"}))
 
     process_leave =
-      call({:process, "cron"}, %{work_item_id: "wi_leave"}, 44)
+      call(
+        {:process, "cron"},
+        %{
+          work_item_id: "wi_leave",
+          reason: "automation left unlinked",
+          idempotency_key: "process-leave"
+        },
+        44
+      )
       |> Map.put(:transport_session_key, "s_flynn")
       |> then(&Toplines.leave_unlinked(ctx.db, &1))
 
@@ -1034,11 +1046,13 @@ defmodule Tightbeam.ToplinesTest do
                call({:user, "flynn"}, %{title: "Valid", idempotency_key: " ", extra: true})
              )
 
-    assert %{code: "missing_owner_user"} =
+    assert %{code: "invalid_message", message: message} =
              Toplines.create(
                ctx.db,
                call({:process, "cron"}, %{title: "Valid", idempotency_key: "k"})
              )
+
+    assert message =~ "ownerUserId"
 
     assert %{code: "invalid_message"} =
              Toplines.create(ctx.db, call({:process, "cron"}, %{unexpected: true}))

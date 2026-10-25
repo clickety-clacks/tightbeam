@@ -351,7 +351,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     acting_for_flynn =
       conn(:get, "/api/sessions?asUser=#{ctx.device.user_id}")
-      |> put_req_header("authorization", "Bearer " <> reader.cli_token)
+      |> put_req_header("authorization", "Bearer " <> reader.token)
       |> Router.call(Router.init(ctx.opts ++ [model_catalog: %{}]))
 
     assert acting_for_flynn.status == 200, acting_for_flynn.resp_body

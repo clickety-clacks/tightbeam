@@ -5,6 +5,9 @@ defmodule PortableToplinesFixture do
   @tables ~w(toplines topline_work_memberships topline_concerns topline_concern_refs
     topline_events topline_idempotency topline_placement_obligations topline_schema_stamp)
 
+  @actor_tables ~w(toplines topline_work_memberships topline_concerns topline_concern_refs
+    topline_events topline_idempotency topline_placement_obligations)
+
   def snapshot(db) do
     {:ok, schema} = DB.query(db, "SELECT type,name,sql FROM sqlite_schema ORDER BY name")
 
@@ -15,6 +18,37 @@ defmodule PortableToplinesFixture do
       end
 
     {schema, rows}
+  end
+
+  def actor_tables, do: @actor_tables
+
+  def legacy_rows(db) do
+    for table <- @actor_tables, into: %{} do
+      {:ok, info} = DB.query(db, "PRAGMA table_info(#{table})")
+      columns = Enum.map(info, &Enum.at(&1, 1))
+
+      query =
+        if table == "topline_idempotency" and "callerUserId" in columns do
+          """
+          SELECT rowid, 'user', callerUserId, NULL, 'user', callerUserId,
+                 operation, idempotencyKey, requestFingerprint, canonicalResponse
+          FROM topline_idempotency ORDER BY rowid
+          """
+        else
+          columns =
+            if table == "topline_idempotency" do
+              ~w(callerActorKind callerActorRef callerSessionKey callerIdempotencyKind
+                callerIdempotencyRef operation idempotencyKey requestFingerprint canonicalResponse)
+            else
+              Enum.reject(columns, &String.ends_with?(&1, "ActorSessionKey"))
+            end
+
+          "SELECT rowid, #{Enum.join(columns, ", ")} FROM #{table} ORDER BY rowid"
+        end
+
+      {:ok, rows} = DB.query(db, query)
+      {table, rows}
+    end
   end
 
   def call(params, now \\ 10),
@@ -215,7 +249,7 @@ try do
   :ok = Schema.ensure_all(db)
   :ok = DB.assert_base_admitted!(db, base)
   marker = File.read!(Path.join(base, "build-owner.json"))
-  # Fresh V6 is externally readable as well as the populated upgraded case.
+  # Fresh V7 is externally readable as well as the populated upgraded case.
   stop.()
   F.assert_portable!(sqlite, path, Path.join(base, "fresh-vacuum.db"))
   start.()
@@ -232,6 +266,7 @@ try do
 
   {topline, concern} = F.populate!(db)
   before = F.snapshot(db)
+  legacy_rows = F.legacy_rows(db)
   stop.()
 
   {failure, code} =
@@ -279,14 +314,13 @@ try do
   {old_schema, old_rows} = before
   {new_schema, new_rows} = F.snapshot(db)
 
-  assert Map.delete(new_rows, "topline_schema_stamp") ==
-           Map.delete(old_rows, "topline_schema_stamp")
+  assert F.legacy_rows(db) == legacy_rows
 
-  assert [[1, 1, "standalone-toplines-v6", activated_at]] = new_rows["topline_schema_stamp"]
+  assert [[1, 1, "standalone-toplines-v7", activated_at]] = new_rows["topline_schema_stamp"]
   assert is_integer(activated_at) and activated_at > 123
 
   unaffected = fn rows ->
-    Enum.reject(rows, fn [_, name, _] -> name in ["toplines", "topline_concerns"] end)
+    Enum.reject(rows, fn [_, name, _] -> name in F.actor_tables() end)
   end
 
   assert unaffected.(old_schema) == unaffected.(new_schema)
@@ -353,7 +387,7 @@ try do
   assert F.sqlite!(sqlite, restored, "PRAGMA quick_check; PRAGMA foreign_key_check;") == "ok\n"
   assert F.portable_rows!(sqlite, path) == F.portable_rows!(sqlite, vacuum)
   assert F.portable_rows!(sqlite, path) == F.portable_rows!(sqlite, restored)
-  IO.puts("V6 populated VACUUM and dump/restore: rows, integrity, foreign keys preserved")
+  IO.puts("V7 populated VACUUM and dump/restore: rows, integrity, foreign keys preserved")
 after
   if pid = Process.whereis(db), do: GenServer.stop(pid)
 end

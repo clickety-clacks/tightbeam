@@ -3719,12 +3719,12 @@ defmodule Tightbeam.GatewayTest do
         params: %{
           display_name: "Automation Builder",
           handle: "automation-builder",
-          owner_user_id: "other",
+          owner_user_id: ctx.device.user_id,
           idempotency_key: "spawn-automation-builder"
         }
       })
 
-    assert %{name: "automation-builder", owner_user_id: "other"} =
+    assert %{name: "automation-builder", owner_user_id: ctx.device.user_id} =
              Roles.get(ctx.db, "automation-builder")
 
     assert %{
@@ -3732,7 +3732,7 @@ defmodule Tightbeam.GatewayTest do
              created_by_session: nil,
              created_by_process: "cron",
              created_via_session_key: "k1",
-             owner_user_id: "other"
+             owner_user_id: ctx.device.user_id
            } = Org.get(ctx.db, process_created.session_key)
 
     Roles.create!(ctx.db, "taken", "flynn", nil)

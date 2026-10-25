@@ -1297,8 +1297,14 @@ defmodule Tightbeam.WorkItemsTest do
     first = create(ctx, {:user, "flynn"}, %{title: "First"})
     assert %{workItem: detail, assignments: []} = get(ctx, {:session, "holder"}, first.id)
 
-    assert Map.drop(detail, [:body, :bodyUpdatedByUser, :bodyUpdatedBySession, :bodyUpdatedAt]) ==
-             first
+    assert Map.drop(detail, [
+             :body,
+             :bodyUpdatedByUser,
+             :bodyUpdatedBySession,
+             :bodyUpdatedByProcess,
+             :bodyUpdatedViaSessionKey,
+             :bodyUpdatedAt
+           ]) == first
 
     assert detail.body == nil
     second = create(ctx, {:user, "flynn"}, %{title: "Second"})

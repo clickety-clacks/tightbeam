@@ -68,9 +68,20 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
         expected_index =
           "CREATE INDEX assignment_commit_ref_corrections_assignment ON assignment_commit_ref_corrections (assignmentId, createdAt, id)"
 
-        unless attached == [
-                 ["index", "assignment_commit_ref_corrections_assignment", expected_index]
-               ],
+        expected = [
+          [
+            "index",
+            "assignment_commit_ref_corrections_assignment",
+            normalize_schema_sql(expected_index)
+          ]
+        ]
+
+        actual =
+          Enum.map(attached, fn [type, name, sql] ->
+            [type, name, normalize_schema_sql(sql)]
+          end)
+
+        unless actual == expected,
                do: raise(ArgumentError, "unexpected commit-ref correction schema objects")
 
         previous_fk_violations =
@@ -705,4 +716,6 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
   end
 
   defp error(code, message), do: %{code: code, message: message}
+
+  defp normalize_schema_sql(sql), do: sql |> String.replace(~r/\s+/, " ") |> String.trim()
 end

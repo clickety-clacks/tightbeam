@@ -2951,6 +2951,10 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  defp agent_identity(%{"asProcess" => "tightbeam"}, {:session, _session}, _conn) do
+    {:error, 403, "reserved_origin", "process:tightbeam is reserved to the substrate"}
+  end
+
   defp agent_identity(body, {:session, session}, conn) do
     roles = Roles.for_session(db(conn), session.session_key)
     session_principal = {:session, session.session_key}

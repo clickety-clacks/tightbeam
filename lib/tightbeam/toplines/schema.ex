@@ -546,7 +546,9 @@ defmodule Tightbeam.Toplines.Schema do
             if exact_manifest?(stored), do: :ok, else: refusal("schema_shape_mismatch")
 
           @v6_shape ->
-            if exact_manifest?(stored, @v6_objects) and portable_actor_rebuild_allowed?(txn) do
+            v6_stored = stored_objects(txn, @v6_objects)
+
+            if exact_manifest?(v6_stored, @v6_objects) and portable_actor_rebuild_allowed?(txn) do
               if Keyword.get(opts, :defer_v6_migration, false),
                 do: :ok,
                 else: migrate_v6!(txn, activated_at, opts)
@@ -709,7 +711,7 @@ defmodule Tightbeam.Toplines.Schema do
   defp portable_actor_rebuild_allowed?(txn) do
     attached =
       Txn.q(txn, """
-      SELECT type, name, tbl_name, sql FROM sqlite_schema
+      SELECT type, name, tbl_name FROM sqlite_schema
       WHERE tbl_name IN (#{Enum.map_join(@actor_tables, ",", &("'" <> &1 <> "'"))})
         AND sql IS NOT NULL
       ORDER BY type, name
@@ -733,7 +735,7 @@ defmodule Tightbeam.Toplines.Schema do
             end
           end
 
-        [object.type, object.name, table, object.sql]
+        [object.type, object.name, table]
       end)
       |> Enum.sort()
 

@@ -41,8 +41,7 @@ defmodule Tightbeam.CheckTierTest do
       ["bad1", assignment.id, "verdict", nil, nil, "reviewer", nil, 1],
       ["bad2", assignment.id, "verdict", "tests-passed", nil, nil, nil, 1],
       ["bad3", assignment.id, "verdict", "tests-passed", nil, "reviewer", "other", 1],
-      ["bad4", assignment.id, "progress", "tests-passed", nil, "holder", nil, 1],
-      ["bad5", assignment.id, "progress", nil, nil, nil, "flynn", 1]
+      ["bad4", assignment.id, "progress", "tests-passed", nil, "holder", nil, 1]
     ]
 
     Enum.each(invalid, fn params ->
@@ -55,6 +54,20 @@ defmodule Tightbeam.CheckTierTest do
 
       assert message =~ "CHECK constraint"
     end)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO attests
+                 (id, assignmentId, kind, verdictKind, note, bySession, byUser, ts)
+               VALUES ('user-progress', ?1, 'progress', NULL, NULL, NULL, 'flynn', 1)
+               """,
+               [assignment.id]
+             )
+
+    assert {:ok, [["flynn"]]} =
+             DB.query(ctx.db, "SELECT byUser FROM attests WHERE id='user-progress'")
 
     progress = attest(ctx, {:session, "holder"}, assignment.id, "progress")
     assert progress.attest.verdictKind == nil
