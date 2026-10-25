@@ -3407,10 +3407,7 @@ defmodule Tightbeam.CoordinationFabricTest do
        %{db: db} do
     start_supervised!(
       {Wakes,
-       db: db,
-       deliver: fn _wake -> true end,
-       tick_ms: 60_000,
-       name: Tightbeam.WakeScheduler}
+       db: db, deliver: fn _wake -> true end, tick_ms: 60_000, name: Tightbeam.WakeScheduler}
     )
 
     seed_session(db, "agent:coder", "flynn")

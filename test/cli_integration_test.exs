@@ -1795,10 +1795,7 @@ defmodule Tightbeam.CliIntegrationTest do
   test "legacy decision verb JSON omits the stored rowVersion on each result path", ctx do
     start_supervised!(
       {Wakes,
-       db: ctx.db,
-       deliver: fn _wake -> true end,
-       tick_ms: 60_000,
-       name: Tightbeam.WakeScheduler}
+       db: ctx.db, deliver: fn _wake -> true end, tick_ms: 60_000, name: Tightbeam.WakeScheduler}
     )
 
     agent_id = open_agent_request(ctx)
