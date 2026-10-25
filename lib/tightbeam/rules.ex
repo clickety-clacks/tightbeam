@@ -2541,11 +2541,18 @@ defmodule Tightbeam.Rules do
       assignment, cache ->
         kinds =
           if assignment.effect_kind == "code" and get_in(call, [:params, :kind]) == "completion" do
+            producer_commit_refs =
+              Assignments.qualifying_verification_commit_refs(
+                db,
+                assignment.id,
+                assignment.holder_key
+              )
+
             Assignments.qualifying_review_verdict_kinds(
               db,
               assignment.id,
               assignment.holder_key,
-              get_in(call, [:params, :commit_refs])
+              producer_commit_refs
             )
           else
             Assignments.qualifying_review_verdict_kinds(

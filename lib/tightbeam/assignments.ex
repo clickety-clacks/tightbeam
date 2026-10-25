@@ -1146,8 +1146,9 @@ defmodule Tightbeam.Assignments do
   @doc """
   Return the current independent clean review for a submitted result.
 
-  When the producer submits commit refs, the winning clean review must include
-  every submitted commit. Additional reviewed commits do not disqualify it.
+  When the producer's latest verification includes commit refs, the winning
+  clean review must include every verified producer commit. Additional reviewed
+  commits do not disqualify it.
   """
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
           [String.t()]
@@ -1208,6 +1209,29 @@ defmodule Tightbeam.Assignments do
          ) do
       {:ok, [["verified"]]} -> ["verified"]
       _ -> []
+    end
+  end
+
+  @doc false
+  @spec qualifying_verification_commit_refs(DB.server(), String.t(), String.t()) :: list() | nil
+  def qualifying_verification_commit_refs(db, assignment_id, holder_key) do
+    case DB.query(
+           db,
+           """
+           SELECT verdictKind,commitRefs
+           FROM attests
+           WHERE assignmentId=?1 AND kind='verdict' AND bySession=?2
+             AND verdictKind IN ('verified','verification-failed')
+           ORDER BY ts DESC,rowid DESC
+           LIMIT 1
+           """,
+           [assignment_id, holder_key]
+         ) do
+      {:ok, [["verified", encoded_refs]]} when is_binary(encoded_refs) ->
+        JSON.decode!(encoded_refs)
+
+      _ ->
+        nil
     end
   end
 
@@ -4468,7 +4492,10 @@ defmodule Tightbeam.Assignments do
           )
 
         independent_clean_review? and
-          review_covers_commit_refs?(review && review.commit_refs, call.params[:commit_refs])
+          review_covers_commit_refs?(
+            review && review.commit_refs,
+            verification && verification.commit_refs
+          )
       end
 
     if verification_qualifies? and review_qualifies? do
@@ -4476,7 +4503,7 @@ defmodule Tightbeam.Assignments do
     else
       error(
         "inapplicable_code_evidence",
-        "code completion requires a holder verification and the latest independent clean review covering the submitted producer commit refs, unless review is pending"
+        "code completion requires a holder verification and the latest independent clean review covering the verified producer commit refs, unless review is pending"
       )
     end
   end
@@ -4539,7 +4566,7 @@ defmodule Tightbeam.Assignments do
     case Txn.q(
            txn,
            """
-           SELECT verdictKind,bySession
+           SELECT verdictKind,bySession,commitRefs
            FROM attests
            WHERE assignmentId=?1
              AND kind='verdict'
@@ -4550,8 +4577,12 @@ defmodule Tightbeam.Assignments do
            """,
            [assignment_id, holder]
          ) do
-      [[kind, author]] ->
-        %{kind: kind, holder: author}
+      [[kind, author, encoded_refs]] ->
+        %{
+          kind: kind,
+          holder: author,
+          commit_refs: if(is_binary(encoded_refs), do: JSON.decode!(encoded_refs), else: nil)
+        }
 
       [] ->
         nil

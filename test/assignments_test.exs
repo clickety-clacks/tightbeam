@@ -6051,7 +6051,7 @@ defmodule Tightbeam.AssignmentsTest do
     ]
 
     review_refs = [
-      %{"repo" => "testhost:/tmp/reviewer-checkout", "commit" => String.duplicate("B", 40)},
+      %{"repo" => "testhost:/tmp/reviewer-checkout", "commit" => String.duplicate("A", 40)},
       %{
         "repo" => "testhost:/tmp/second-reviewer-checkout",
         "commit" => String.duplicate("c", 40)
@@ -6085,12 +6085,23 @@ defmodule Tightbeam.AssignmentsTest do
              |> put_in([:params, :commit_refs], producer_refs)
              |> then(&handle(ctx, "attest", &1))
 
+    assert Assignments.qualifying_verification_commit_refs(ctx.db, producer.id, "holder") ==
+             producer_refs
+
     Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
       send(parent, :completion_commit_ref_lookup)
       {"", 0}
     end)
 
     assert ["reviewed-clean"] ==
+             Assignments.qualifying_review_verdict_kinds(
+               ctx.db,
+               producer.id,
+               "holder",
+               producer_refs
+             )
+
+    assert [] ==
              Assignments.qualifying_review_verdict_kinds(
                ctx.db,
                producer.id,
