@@ -783,12 +783,14 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
              )
   end
 
-  test "only the exact internal spawn remedy admits itemless spawn and still checks item refs", %{
+  test "process staffing requires a work item while exact spawn remedy checks item refs", %{
     db: db
   } do
     set_owner(db, {:user, "owner"}, "wi_a1", "pdo-a")
 
-    assert {:ok, {:ok, :ok, mismatch, itemless_ref, spoofed}} =
+    assert {:ok,
+            {:ok, :ok, mismatch, itemless_ref, spoofed, process_spawn, process_assign,
+             process_dispatch}} =
              DB.transaction(db, fn txn ->
                remedy = %{
                  verb: "spawn",
@@ -819,6 +821,15 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                    principal: {:session, "peer"}
                }
 
+               process_spawn = %{
+                 remedy
+                 | origin: "process:scheduler",
+                   principal: {:process, "scheduler"}
+               }
+
+               process_assign = %{process_spawn | verb: "assign"}
+               process_dispatch = %{process_spawn | verb: "dispatch"}
+
                {
                  DeliveryResponsibilities.check_staffing_owner_in_txn(
                    txn,
@@ -844,6 +855,21 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                    txn,
                    public_origin_only,
                    owner_user_id: "owner"
+                 ),
+                 DeliveryResponsibilities.check_staffing_owner_in_txn(
+                   txn,
+                   process_spawn,
+                   owner_user_id: "owner"
+                 ),
+                 DeliveryResponsibilities.check_staffing_owner_in_txn(
+                   txn,
+                   process_assign,
+                   owner_user_id: "owner"
+                 ),
+                 DeliveryResponsibilities.check_staffing_owner_in_txn(
+                   txn,
+                   process_dispatch,
+                   owner_user_id: "owner"
                  )
                }
              end)
@@ -851,6 +877,9 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert %{code: "delivery_owner_mismatch"} = mismatch
     assert %{code: "delivery_owner_reference_requires_work_item"} = itemless_ref
     assert %{code: "work_item_required"} = spoofed
+    assert %{code: "work_item_required"} = process_spawn
+    assert %{code: "work_item_required"} = process_assign
+    assert %{code: "work_item_required"} = process_dispatch
   end
 
   test "unlinked stores have no recipient or second delivery ledger", %{db: db} do

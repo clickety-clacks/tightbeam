@@ -415,9 +415,9 @@ defmodule Tightbeam.DeliveryResponsibilities do
     end
   end
 
-  # Itemless assignment, dispatch, and spawn controls stay on their established
-  # paths. Process spawn validates its explicit owner in the gateway, and the
-  # typed internal spawn remedy is handled first above.
+  # Itemless assignment and dispatch controls remain limited to user/session
+  # principals; public itemless spawn remains limited to user/agent origins.
+  # The typed internal spawn remedy is handled first above.
   defp itemless_non_owner_link_control?(call) do
     itemless_human_assignment_control?(call) or
       itemless_public_dispatch_control?(call) or itemless_public_spawn_control?(call)
@@ -447,8 +447,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
        when is_binary(origin) and is_map(params),
        do:
          is_nil(Map.get(params, :work_item_id)) and
-           (String.starts_with?(origin, "user:") or String.starts_with?(origin, "agent:") or
-              String.starts_with?(origin, "process:"))
+           (String.starts_with?(origin, "user:") or String.starts_with?(origin, "agent:"))
 
   defp itemless_public_spawn_control?(_call), do: false
 
