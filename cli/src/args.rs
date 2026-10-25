@@ -473,6 +473,20 @@ pub enum Command {
         remove: bool,
         content: Option<String>,
     },
+    SubtreeGuidanceSet {
+        identity: Identity,
+        name: String,
+        archetypes: Option<Vec<String>>,
+        text: String,
+    },
+    SubtreeGuidanceWithdraw {
+        identity: Identity,
+        name: String,
+    },
+    SubtreeGuidanceShow {
+        identity: Identity,
+        session_key: Option<String>,
+    },
     IdentityStatus {
         identity: Identity,
         archetype: Option<String>,
@@ -976,6 +990,22 @@ COMMANDS:
 
   identity current
       Print this session's key without printing its bearer credential.
+
+  subtree-guidance set <name> [--archetype <a,b>] [--file <path>]
+      Write a guidance entry, as the calling session, for the sessions below it
+      in the org. Without --file the Markdown text is read from stdin. Without
+      --archetype the entry applies to every descendant; with a comma-separated
+      archetype list it applies only to descendants of exactly those
+      archetypes. Reusing a name replaces that entry. The entry joins each
+      affected descendant's served guidance immediately and changed sessions
+      that are started receive the update as a prompt.
+  subtree-guidance withdraw <name>
+      Remove the calling session's entry of that name. Affected descendants'
+      guidance updates immediately and changed started sessions are told.
+  subtree-guidance show [--session <key>]
+      Print the subtree guidance entries a session wrote and the section that
+      currently applies to it, exactly as served. Defaults to the calling
+      session.
 
   ADMIN (require --as-user of an admin, or an admin-owned agent handle):
   identity edit <archetype> [--manifest | --skill <name> [--rm]] [--key <idempotencyKey>]
@@ -3296,6 +3326,7 @@ fn parse_with_optional_catalog(
             })
         }
         "identity" => parse_identity_command(&parsed, flags),
+        "subtree-guidance" => parse_subtree_guidance_command(&parsed, flags),
         "kungfu" => match parsed.positional.as_slice() {
             [_, list] if list == "list" => Ok(Command::KungfuList {
                 identity: identity(flags)?,
@@ -3787,6 +3818,58 @@ fn parse_identity_command(
         }
         _ => Err(
             "usage: tightbeam identity current|edit|status|relearn|repoint|apply ...".to_owned(),
+        ),
+    }
+}
+
+fn parse_subtree_guidance_command(
+    parsed: &Flags,
+    flags: &HashMap<String, String>,
+) -> Result<Command, String> {
+    match parsed.positional.get(1).map(String::as_str) {
+        Some("set") if parsed.positional.len() == 3 => {
+            let name = parsed.positional[2].clone();
+            let archetypes = nonempty(flags, "archetype").map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            });
+            let text = match nonempty(flags, "file") {
+                Some(path) => fs::read(path)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .map_err(|error| error.to_string())?,
+                None => {
+                    use std::io::Read;
+                    let mut text = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut text)
+                        .map_err(|error| error.to_string())?;
+                    text
+                }
+            };
+            Ok(Command::SubtreeGuidanceSet {
+                identity: identity(flags)?,
+                name,
+                archetypes,
+                text,
+            })
+        }
+        Some("withdraw") if parsed.positional.len() == 3 => Ok(Command::SubtreeGuidanceWithdraw {
+            identity: identity(flags)?,
+            name: parsed.positional[2].clone(),
+        }),
+        Some("show") if parsed.positional.len() == 2 => Ok(Command::SubtreeGuidanceShow {
+            identity: identity(flags)?,
+            session_key: nonempty(flags, "session"),
+        }),
+        _ => Err(
+            "usage: tightbeam subtree-guidance set <name> [--archetype <a,b>] [--file <path>] | \
+             tightbeam subtree-guidance withdraw <name> | \
+             tightbeam subtree-guidance show [--session <key>]"
+                .to_owned(),
         ),
     }
 }
@@ -5308,6 +5391,7 @@ mod tests {
                 "revoke-assignment",
                 "reopen-assignment",
                 "spawn",
+                "subtree-guidance",
                 "wake",
                 "work-item-close",
                 "work-item-create",
@@ -6969,6 +7053,37 @@ mod tests {
                     identity: Identity::User("flynn".to_owned()),
                     session_key: None,
                     all: true,
+                },
+            ),
+            (
+                vec![
+                    "subtree-guidance".to_owned(),
+                    "set".to_owned(),
+                    "style".to_owned(),
+                    "--archetype".to_owned(),
+                    "coder, reviewer".to_owned(),
+                    "--file".to_owned(),
+                    skill_path.clone(),
+                ],
+                Command::SubtreeGuidanceSet {
+                    identity: Identity::Session,
+                    name: "style".to_owned(),
+                    archetypes: Some(vec!["coder".to_owned(), "reviewer".to_owned()]),
+                    text: "skill body".to_owned(),
+                },
+            ),
+            (
+                strings(&["subtree-guidance", "withdraw", "style"]),
+                Command::SubtreeGuidanceWithdraw {
+                    identity: Identity::Session,
+                    name: "style".to_owned(),
+                },
+            ),
+            (
+                strings(&["subtree-guidance", "show", "--session", "agent:x"]),
+                Command::SubtreeGuidanceShow {
+                    identity: Identity::Session,
+                    session_key: Some("agent:x".to_owned()),
                 },
             ),
             (

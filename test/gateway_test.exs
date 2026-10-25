@@ -24,6 +24,10 @@ defmodule Tightbeam.GatewayTest do
 
     expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle)
     expected = expected ++ ~w(kungfu-setup sentinel-enable sentinel-disable sentinel-list)
+
+    expected =
+      expected ++ ~w(subtree-guidance-set subtree-guidance-withdraw subtree-guidance-show)
+
     assert Enum.sort(Map.keys(handlers)) == Enum.sort(expected)
     assert Enum.sort(Map.keys(effects)) == Enum.sort(expected)
     assert Enum.all?(Map.values(handlers), &is_function(&1, 1))
