@@ -1875,10 +1875,41 @@ defmodule Tightbeam.GatewayTest do
 
     assert snapshot_seq == base_socket_seq + 1
 
+    :ok = Tightbeam.Firehose.Hub.unsubscribe(Tightbeam.Firehose.Hub, self(), "caption")
+
+    buffered_subscription_id = "caption-buffered"
+    subscription_filters = %{"classes" => ["turn."], "sessionKey" => session}
+
+    :ok =
+      Tightbeam.Firehose.Hub.begin_subscribe(
+        Tightbeam.Firehose.Hub,
+        self(),
+        buffered_subscription_id,
+        subscription_filters
+      )
+
     assert :ok =
              Ledger.finish(ctx.db, turn_seq, "delivered", nil,
                owner_lease: batch_turn.owner_lease
              )
+
+    :ok =
+      Tightbeam.Firehose.Hub.finish_subscribe(
+        Tightbeam.Firehose.Hub,
+        self(),
+        buffered_subscription_id,
+        []
+      )
+
+    assert_receive {:firehose_control, buffered_ready}, 1_000
+
+    assert {:push, {:text, buffered_ready_frame}, socket_state} =
+             ChangeSocket.handle_info({:firehose_control, buffered_ready}, socket_state)
+
+    assert JSON.decode!(buffered_ready_frame) == %{
+             "type" => "subscription_ready",
+             "subscriptionId" => buffered_subscription_id
+           }
 
     assert_receive {:firehose_notice, ended_notice}, 1_000
 
@@ -1888,7 +1919,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{
              "type" => "change",
              "schemaVersion" => 2,
-             "subscriptionId" => "caption",
+             "subscriptionId" => "caption-buffered",
              "seq" => ended_seq,
              "class" => "turn.ended",
              "resource" => "turns",

@@ -32,7 +32,7 @@ defmodule Tightbeam.StateResources do
          t.roleRef, t.roleFallback, t.assignmentId, t.jobRef, t.model, t.thinkingLevel,
          t.modelContext, t.harness, t.replyAttention, t.status, t.owner,
          t.adapterGen, t.requestRef, t.error, t.createdAt, t.startedAt,
-         t.endedAt, t.publishedAt, t.rowVersion,
+         t.endedAt, t.publishedAt,
          CASE
            WHEN t.triggerSource IS NOT NULL THEN t.triggerSource
            WHEN EXISTS (
@@ -2685,7 +2685,6 @@ defmodule Tightbeam.StateResources do
          started_at,
          ended_at,
          published_at,
-         row_version,
          trigger_source,
          batch_member_count
        ]) do
@@ -2715,8 +2714,7 @@ defmodule Tightbeam.StateResources do
       ended_at: ended_at,
       published_at: published_at,
       trigger_source: trigger_source,
-      batch_member_count: batch_member_count,
-      row_version: row_version
+      batch_member_count: batch_member_count
     }
   end
 
