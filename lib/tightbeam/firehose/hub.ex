@@ -330,8 +330,16 @@ defmodule Tightbeam.Firehose.Hub do
 
   defp visible?(notice, socket) do
     payload = notice["payload"] || %{}
+    resource = notice["resource"]
 
-    not secret_payload?(payload) and
+    has_secret_fields? =
+      if resource in ["decision requests", "decision-requests"] do
+        Tightbeam.StateResources.item_has_secret_fields?(resource, payload)
+      else
+        secret_payload?(payload)
+      end
+
+    not has_secret_fields? and
       StateVisibility.visible?(socket.db, notice, socket.user_id, socket.is_admin)
   end
 

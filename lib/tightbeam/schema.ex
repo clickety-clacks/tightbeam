@@ -111,10 +111,12 @@ defmodule Tightbeam.Schema do
   # is the current one-step boot arm; the migration creates those additive
   # objects, backfills existing work-item provenance, and stamps v20 in the same
   # transaction.
-  # Artifact digest evidence adds one bit in v21. Historical migration seams
-  # keep their fixed destinations; boot composes v19 through v20 to v21.
-  @shape "coordination-fabric-v1-phase1-v21"
+  # Artifact digest evidence remains the fixed v20-to-v21 destination. Stored
+  # decision versions add the current v21-to-v22 rung.
+  @shape "coordination-fabric-v1-phase1-v22"
+  @artifact_digest_next_shape "coordination-fabric-v1-phase1-v21"
   @artifact_digest_previous_shape "coordination-fabric-v1-phase1-v20"
+  @decision_row_version_previous_shape "coordination-fabric-v1-phase1-v21"
   @principal_duty_previous_shape "coordination-fabric-v1-phase1-v19"
   @completion_escalation_previous_shape "coordination-fabric-v1-phase1-v18"
   @completion_escalation_label "incompatible_completion_escalation_v1"
@@ -2131,7 +2133,11 @@ defmodule Tightbeam.Schema do
            Txn.q(
              txn,
              "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
-             [@artifact_digest_previous_shape, @shape, System.system_time(:millisecond)]
+             [
+               @artifact_digest_previous_shape,
+               @artifact_digest_next_shape,
+               System.system_time(:millisecond)
+             ]
            )
 
            if Txn.changes(txn) != 1 do
@@ -2150,6 +2156,51 @@ defmodule Tightbeam.Schema do
         raise ShapeError,
           message:
             "incompatible_artifact_digest_integrity_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_decision_row_version_v1(DB.server()) :: :ok
+  def upgrade_decision_row_version_v1(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@decision_row_version_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_decision_row_version_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Tightbeam.Escalation.migrate_decision_row_version_v1_in_txn(txn)
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
+             [
+               @decision_row_version_previous_shape,
+               @shape,
+               System.system_time(:millisecond)
+             ]
+           )
+
+           if Txn.changes(txn) != 1 do
+             raise ShapeError, message: "incompatible_decision_row_version_v1: stamp race"
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_decision_row_version_v1: upgrade failed: #{Exception.message(error)}"
     end
   end
 
@@ -2399,12 +2450,17 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@decision_row_version_previous_shape]]} ->
+        upgrade_decision_row_version_v1(db)
+
       {:ok, [[@principal_duty_previous_shape]]} ->
         :ok = upgrade_principal_duty_v1(db)
-        upgrade_artifact_digest_integrity_v1(db)
+        :ok = upgrade_artifact_digest_integrity_v1(db)
+        upgrade_decision_row_version_v1(db)
 
       {:ok, [[@artifact_digest_previous_shape]]} ->
-        upgrade_artifact_digest_integrity_v1(db)
+        :ok = upgrade_artifact_digest_integrity_v1(db)
+        upgrade_decision_row_version_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -2421,7 +2477,8 @@ defmodule Tightbeam.Schema do
           this build: #{@shape}
 
         There is no migration from #{found}. The supported upgrade sources are
-        #{@principal_duty_previous_shape} and #{@artifact_digest_previous_shape}.
+        #{@principal_duty_previous_shape}, #{@artifact_digest_previous_shape}, and
+        #{@decision_row_version_previous_shape}.
         Move this database aside and let it be recreated.
         """
 

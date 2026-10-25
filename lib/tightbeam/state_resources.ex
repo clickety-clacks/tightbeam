@@ -3,7 +3,8 @@ defmodule Tightbeam.StateResources do
   Canonical public item serializers shared by state reads and the firehose.
 
   Every resource enters the public wire through one named function here.
-  Storage-secret field names are impossible to emit from this seam.
+  Storage-secret field names are excluded, except inside stored decision-request
+  options, whose public contract preserves every option field unchanged.
   """
 
   require Logger
@@ -593,19 +594,6 @@ defmodule Tightbeam.StateResources do
       :return_reason,
       :returned_at
     ])
-    |> Map.put(:row_version, decision_request_version(row))
-  end
-
-  defp decision_request_version(row) do
-    [
-      row.answered_at,
-      row.withdrawn_at,
-      row.consumed_at,
-      row.ruled_at,
-      row.raised_at
-    ]
-    |> Enum.filter(&is_integer/1)
-    |> Enum.max()
   end
 
   defp detail_principal(%{rest_principal: %{kind: kind, id: id, is_admin: is_admin}}),
@@ -1615,6 +1603,12 @@ defmodule Tightbeam.StateResources do
 
   def item_has_secret_fields?(_value), do: false
 
+  def item_has_secret_fields?(resource, item) when is_binary(resource) and is_map(item) do
+    resource = Map.get(@item_resource_aliases, resource, resource)
+    item = if resource == "decision requests", do: Map.delete(item, "options"), else: item
+    item_has_secret_fields?(item)
+  end
+
   @doc false
   def item_wire_schema do
     Map.new(@item_field_order, fn {resource, fields} ->
@@ -1692,7 +1686,8 @@ defmodule Tightbeam.StateResources do
   end
 
   defp decision_request_projection(row) do
-    row_version = value(row, :row_version) || decision_request_version(row)
+    row_version = value(row, :row_version)
+    stored_options = value(row, :options)
 
     unless is_integer(row_version) and row_version > 0 do
       raise ArgumentError, "decision request rowVersion is projection_invalid"
@@ -1702,7 +1697,7 @@ defmodule Tightbeam.StateResources do
       row
       |> Map.put(:row_version, row_version)
       |> public()
-      |> Map.update!("options", &decision_options!/1)
+      |> Map.update!("options", fn _filtered_options -> decision_options!(stored_options) end)
 
     validate_decision_deadline!(row)
 
@@ -1753,7 +1748,7 @@ defmodule Tightbeam.StateResources do
       label when is_binary(label) ->
         %{"label" => label}
 
-      %{"label" => label} = option when map_size(option) == 1 and is_binary(label) ->
+      %{"label" => label} = option when is_binary(label) ->
         option
 
       _invalid ->
@@ -2039,7 +2034,13 @@ defmodule Tightbeam.StateResources do
   end
 
   defp validate_wire_value!(value, :decision_option, label) do
-    validate_closed_wire_object!(value, %{"label" => :string}, label)
+    case value do
+      %{"label" => option_label} when is_binary(option_label) ->
+        validate_json_value!(value, label)
+
+      _invalid ->
+        raise ArgumentError, "#{label} must contain a string label"
+    end
   end
 
   defp validate_wire_value!(value, :document, label) do
@@ -2244,7 +2245,7 @@ defmodule Tightbeam.StateResources do
   end
 
   defp encode_item_field("decision requests", "options", value) do
-    encode_closed_list!(value, ~w(label), "decision requests.options")
+    encode_j!(value)
   end
 
   defp encode_item_field("decision requests", "context", value), do: encode_j!(value)

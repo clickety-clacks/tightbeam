@@ -260,8 +260,12 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
 
     request_id = request.id
 
-    assert %{id: ^request_id, status: "ruled", raised_at: raised_at} =
-             Escalation.get(ctx.db, owner_operator_rule(request_id, %{}), request_id)
+    assert {:ok, [[^request_id, "ruled", raised_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id, status, raisedAt FROM decision_requests WHERE id=?1",
+               [request_id]
+             )
 
     assert raised_at == request.raised_at
   end

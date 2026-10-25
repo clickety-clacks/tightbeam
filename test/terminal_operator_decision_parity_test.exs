@@ -61,14 +61,28 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
              ruled =
              Escalation.operator_rule(ctx.db, rule, scheduler: ctx.scheduler)
 
+    refute Map.has_key?(ruled, :row_version)
     refute Map.has_key?(ruled, :ruled_via_principal)
     refute Map.has_key?(ruled, :ruled_via_session_state)
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        wake_tick_ms: 1_000,
+        wake_scheduler: ctx.scheduler
+      })
+
+    gateway_result = Dispatch.dispatch(ctx.db, handlers, rule)
+
+    assert {:ok, %{decision_request: public_ruled}} = gateway_result
+    refute Map.has_key?(public_ruled, :row_version)
 
     firehose_item =
       ctx.db
       |> Escalation.raw_by_id(request.id)
       |> StateResources.decision_request()
 
+    assert is_integer(firehose_item["rowVersion"])
     assert firehose_item["rulingAttribution"]["performer"]["principal"]["state"] == "known"
     refute Map.has_key?(firehose_item, "ruledViaPrincipal")
     refute Map.has_key?(firehose_item, "ruledViaSessionState")
@@ -77,6 +91,8 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
     detailed = Escalation.get(ctx.db, rule, request.id, owner_user_id: "sample-user")
 
     assert listed == detailed
+    refute Map.has_key?(listed, :row_version)
+    refute Map.has_key?(detailed, :row_version)
 
     assert %{
              id: id,

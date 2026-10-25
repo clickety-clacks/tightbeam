@@ -378,6 +378,88 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     end
   end
 
+  test "stored decision options preserve fields and author order in REST and Firehose", ctx do
+    id = ctx.decision_request_id
+
+    query!(ctx.db, "UPDATE decision_requests SET options = NULL WHERE id = ?1", [id])
+    null_response = get(ctx, "/api/decision-requests/#{id}")
+    assert null_response.status == 200
+    assert JSON.decode!(null_response.resp_body)["item"]["options"] == []
+
+    string_options = ["Proceed", "Stop"]
+
+    query!(ctx.db, "UPDATE decision_requests SET options = ?2 WHERE id = ?1", [
+      id,
+      JSON.encode!(string_options)
+    ])
+
+    string_response = get(ctx, "/api/decision-requests/#{id}")
+
+    assert JSON.decode!(string_response.resp_body)["item"]["options"] == [
+             %{"label" => "Proceed"},
+             %{"label" => "Stop"}
+           ]
+
+    options = [
+      %{"label" => "Proceed", "effect" => "allow", "group" => 1},
+      %{
+        "label" => "Stop",
+        "effect" => "future-value",
+        "metadata" => %{"modes" => ["fast", nil, true]},
+        "token" => "stored-option-value"
+      }
+    ]
+
+    stored_options = JSON.encode!(options)
+
+    query!(ctx.db, "UPDATE decision_requests SET options = ?2 WHERE id = ?1", [
+      id,
+      stored_options
+    ])
+
+    response = get(ctx, "/api/decision-requests/#{id}")
+    assert response.status == 200, response.resp_body
+    item = JSON.decode!(response.resp_body)["item"]
+    assert item["options"] == options
+
+    assert {:ok, [[^stored_options]]} =
+             DB.query(ctx.db, "SELECT options FROM decision_requests WHERE id = ?1", [id])
+
+    {_port, ws} = start_change_server(ctx)
+    row = StateResources.query_decision_request(ctx.db, id)
+    Hub.committed("decision_request.opened", row, %{"decisionRequestId" => id})
+    {raw_notice, ws} = receive_raw_change(ws, "decision_request.opened")
+    notice = JSON.decode!(raw_notice)
+
+    assert notice["payload"]["options"] == options
+    assert raw_json_value(raw_notice, "payload") == raw_json_value(response.resp_body, "item")
+    :ok = WS.close(ws)
+  end
+
+  test "malformed stored decision options fail without a partial REST item", ctx do
+    id = ctx.decision_request_id
+
+    invalid_options = [
+      {"invalid JSON", "{"},
+      {"non-array", ~s({"label":"Proceed"})},
+      {"null element", JSON.encode!([%{"label" => "Proceed"}, nil])},
+      {"missing label", JSON.encode!([%{"label" => "Proceed"}, %{"effect" => "allow"}])},
+      {"non-string label", JSON.encode!([%{"label" => "Proceed"}, %{"label" => 1}])}
+    ]
+
+    for {example, stored_options} <- invalid_options do
+      query!(ctx.db, "UPDATE decision_requests SET options = ?2 WHERE id = ?1", [
+        id,
+        stored_options
+      ])
+
+      response = get(ctx, "/api/decision-requests/#{id}")
+      assert response.status == 500, "#{example}: #{response.resp_body}"
+      assert_error(response, 500, "decision requests", "projection_invalid")
+      assert_application_headers(response)
+    end
+  end
+
   test "AC11 captures real committed raw frames and compares payload bytes to HTTP item bytes",
        ctx do
     {:ok, queued_turn} =

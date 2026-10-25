@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision, WorkItems}
 
-  @shape "coordination-fabric-v1-phase1-v21"
+  @shape "coordination-fabric-v1-phase1-v22"
   @principal_duty_previous_shape "coordination-fabric-v1-phase1-v19"
   @completion_escalation_previous_shape "coordination-fabric-v1-phase1-v18"
   @effort_generator_retirement_previous_shape "coordination-fabric-v1-phase1-v17"
@@ -95,14 +95,14 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v21"]]} =
-             DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert Tightbeam.Artifacts.get(db, "art_old_claim").content_sha256_status ==
              "attested-not-verified"
   end
 
   defp downgrade_to_v20(db) do
+    downgrade_decision_row_version(db)
     :ok = DB.execute(db, "ALTER TABLE artifacts DROP COLUMN contentSha256Verified")
 
     {:ok, _} =
@@ -110,6 +110,42 @@ defmodule Tightbeam.SchemaShapeTest do
         db,
         "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v20', stampedAt=1"
       )
+
+    :ok
+  end
+
+  defp downgrade_decision_row_version(db) do
+    :ok = DB.execute(db, "DROP TRIGGER decision_requests_row_version")
+    :ok = DB.execute(db, "DROP TRIGGER decision_request_operator_terminal_insert")
+    :ok = DB.execute(db, "DROP TRIGGER decision_request_operator_terminal_update")
+    :ok = DB.execute(db, "ALTER TABLE decision_requests DROP COLUMN rowVersion")
+
+    :ok =
+      DB.execute(db, """
+      CREATE TRIGGER decision_request_operator_terminal_insert
+      BEFORE INSERT ON decision_requests
+      WHEN NEW.kind = 'operator' AND NEW.status = 'ruled' AND
+           (NEW.ruledViaPrincipal IS NULL OR
+            NEW.ruledViaSessionState IS NULL OR
+            NEW.ruledViaSessionState NOT IN ('known','none') OR
+            (NEW.ruledViaSessionState = 'known' AND NEW.ruledViaSessionKey IS NULL) OR
+            (NEW.ruledViaSessionState = 'none' AND NEW.ruledViaSessionKey IS NOT NULL))
+      BEGIN
+        SELECT RAISE(ABORT, 'decision_request_integrity_invalid');
+      END;
+
+      CREATE TRIGGER decision_request_operator_terminal_update
+      BEFORE UPDATE OF status ON decision_requests
+      WHEN NEW.kind = 'operator' AND NEW.status = 'ruled' AND OLD.status <> 'ruled' AND
+           (NEW.ruledViaPrincipal IS NULL OR
+            NEW.ruledViaSessionState IS NULL OR
+            NEW.ruledViaSessionState NOT IN ('known','none') OR
+            (NEW.ruledViaSessionState = 'known' AND NEW.ruledViaSessionKey IS NULL) OR
+            (NEW.ruledViaSessionState = 'none' AND NEW.ruledViaSessionKey IS NOT NULL))
+      BEGIN
+        SELECT RAISE(ABORT, 'decision_request_integrity_invalid');
+      END;
+      """)
 
     :ok
   end
@@ -145,6 +181,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     drop_principal_duty(db)
     :ok = DB.execute(db, "ALTER TABLE artifacts DROP COLUMN contentSha256Verified")
+    downgrade_decision_row_version(db)
     :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v19'")
 
     refute table?(db, "work_item_sources")
