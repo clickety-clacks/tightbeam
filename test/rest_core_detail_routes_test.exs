@@ -495,6 +495,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       raw_json_value(raw_notice, "payload"),
       expected_fields("decision requests", returned_item)
     )
+
     :ok = WS.close(ws)
   end
 
