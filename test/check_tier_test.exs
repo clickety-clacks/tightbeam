@@ -174,6 +174,9 @@ defmodule Tightbeam.CheckTierTest do
     assert Enum.all?(rows, &Map.has_key?(&1, :verdictKind))
     assert %{attests: [_ | _]} = query_attests(ctx, {:user, "flynn"}, assignment.id)
     process_result = verdict(ctx, {:process, "cron"}, assignment.id, "reviewed")
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE attests SET ts = 7 WHERE id = ?1", [process_result.attest.id])
+
     assert %{attests: rows} = query_attests(ctx, {:process, "cron"}, assignment.id)
     assert Enum.map(rows, & &1.id) == Enum.sort(expected ++ [process_result.attest.id])
     assert %{code: "principal_required"} = query_attests(ctx, nil, assignment.id)

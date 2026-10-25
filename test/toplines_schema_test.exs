@@ -103,7 +103,43 @@ defmodule Tightbeam.ToplinesSchemaTest do
     assert {:ok, [["standalone-toplines-v6"]]} =
              DB.query(db, "SELECT shape FROM topline_schema_stamp")
 
-    assert :ok = ToplinesSchema.activate(db, 125)
+    {:ok, actual_attached} =
+      DB.query(db, """
+      SELECT type,name,tbl_name FROM sqlite_schema
+      WHERE tbl_name IN ('toplines','topline_work_memberships','topline_concerns',
+        'topline_concern_refs','topline_events','topline_idempotency',
+        'topline_placement_obligations')
+        AND type IN ('index','trigger') AND sql IS NOT NULL
+      ORDER BY type,name
+      """)
+
+    expected_attached =
+      ToplinesSchema.manifest()
+      |> Enum.filter(&(&1.type in ["index", "trigger"]))
+      |> Enum.map(fn object ->
+        [_, table] = Regex.run(~r/ON\s+([A-Za-z0-9_]+)/i, object.sql)
+        [object.type, object.name, table]
+      end)
+      |> Enum.filter(fn [_, _, table] ->
+        table in ~w(toplines topline_work_memberships topline_concerns topline_concern_refs
+          topline_events topline_idempotency topline_placement_obligations)
+      end)
+      |> Enum.sort()
+
+    {:ok, tables} = DB.query(db, "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+
+    foreign_key_targets =
+      tables
+      |> Enum.map(fn [name] ->
+        {:ok, refs} =
+          DB.query(db, "PRAGMA foreign_key_list(\"#{String.replace(name, "\"", "\"\"")}\")")
+
+        {name, Enum.map(refs, &Enum.at(&1, 2))}
+      end)
+
+    assert :ok = ToplinesSchema.activate(db, 125),
+           inspect(%{actual_attached: actual_attached, expected_attached: expected_attached,
+             foreign_key_targets: foreign_key_targets}, limit: :infinity)
 
     assert {:ok, [["standalone-toplines-v7"]]} =
              DB.query(db, "SELECT shape FROM topline_schema_stamp")

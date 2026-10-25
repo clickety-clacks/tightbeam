@@ -40,7 +40,7 @@ defmodule PortableToplinesFixture do
               ~w(callerActorKind callerActorRef callerSessionKey callerIdempotencyKind
                 callerIdempotencyRef operation idempotencyKey requestFingerprint canonicalResponse)
             else
-              Enum.reject(columns, &String.ends_with?(&1, "ActorSessionKey"))
+              Enum.reject(columns, &String.ends_with?(String.downcase(&1), "actorsessionkey"))
             end
 
           "SELECT rowid, #{Enum.join(columns, ", ")} FROM #{table} ORDER BY rowid"

@@ -499,6 +499,19 @@ defmodule Tightbeam.DeliveryResponsibilities do
 
         active_assignment_holder?(txn, session_key, work_item_id)
 
+      {:process, _process} ->
+        case Map.get(call, :transport_session_key) do
+          ^owner ->
+            true
+
+          session_key when is_binary(session_key) ->
+            txn = Keyword.fetch!(opts, :txn)
+            active_assignment_holder?(txn, session_key, work_item_id)
+
+          _ ->
+            false
+        end
+
       _ ->
         false
     end
