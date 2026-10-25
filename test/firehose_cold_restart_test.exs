@@ -287,6 +287,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
 
           assert assignment_detail!(new["port"], device.token, id) == snapshot
           resumed = subscribe!(new["port"], device.token, ["assignment."])
+
           holder_turns =
             subscribe!(new["port"], device.token, ["turn."], %{"sessionKey" => fixture["holder"]})
 
