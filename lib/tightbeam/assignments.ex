@@ -18,6 +18,7 @@ defmodule Tightbeam.Assignments do
     Projection,
     Productions.CompletionEscalation,
     Supervision,
+    StateVisibility,
     Wakes
   }
 
@@ -1147,6 +1148,105 @@ defmodule Tightbeam.Assignments do
     {:ok, rows} = DB.query(db, sql, params)
     Enum.map(rows, &hd/1)
   end
+
+  @doc false
+  @spec query_attests(DB.server(), map()) :: [map()]
+  def query_attests(db, %{filters: filters, principal: principal})
+      when is_map(filters) and is_map(principal) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT a.id, a.assignmentId, a.kind, a.verdictKind, a.note, a.bySession, a.byUser,
+               a.producer, a.producerCommand, a.byHarness, a.byProvider, a.commitRefs, a.ts,
+               assignment.id, assignment.holderKey, assignment.openedByUser,
+               assignment.openedBySession, assignment.workItemId, wi.ownerUserId
+        FROM attests AS a
+        JOIN assignments AS assignment ON assignment.id = a.assignmentId
+        LEFT JOIN work_items AS wi ON wi.id = assignment.workItemId
+        ORDER BY a.ts DESC, a.id DESC
+        """,
+        []
+      )
+
+    rows
+    |> Enum.flat_map(fn row ->
+      {attest_values, assignment_row, work_item_id} = attest_query_rows(row)
+
+      if StateVisibility.attest_visible?(db, %{assignment: assignment_row}, principal) do
+        attest_row = attest(attest_values)
+
+        if attest_matches_filters?(attest_row, work_item_id, filters),
+          do: [attest_row],
+          else: []
+      else
+        []
+      end
+    end)
+  end
+
+  defp attest_query_rows([
+         id,
+         assignment_id,
+         kind,
+         verdict_kind,
+         note,
+         by_session,
+         by_user,
+         producer,
+         producer_command,
+         by_harness,
+         by_provider,
+         commit_refs,
+         ts,
+         parent_assignment_id,
+         holder_key,
+         opened_by_user,
+         opened_by_session,
+         work_item_id,
+         owner_user_id
+       ]) do
+    attest_values = [
+        id,
+        assignment_id,
+        kind,
+        verdict_kind,
+        note,
+        by_session,
+        by_user,
+        producer,
+        producer_command,
+        by_harness,
+        by_provider,
+        commit_refs,
+        ts
+      ]
+
+    assignment_row = %{
+      id: parent_assignment_id,
+      holder_key: holder_key,
+      opened_by_user: opened_by_user,
+      opened_by_session: opened_by_session,
+      owner_user_id: owner_user_id
+    }
+
+    {attest_values, assignment_row, work_item_id}
+  end
+
+  defp attest_matches_filters?(attest_row, work_item_id, filters) do
+    Enum.all?(filters, fn
+      {"assignmentId", expected} -> filter_match?(attest_row.assignmentId, expected)
+      {"workItemId", expected} -> filter_match?(work_item_id, expected)
+      {"kind", expected} -> filter_match?(attest_row.kind, expected)
+      {"verdictKind", expected} -> filter_match?(attest_row.verdictKind, expected)
+      {"bySession", expected} -> filter_match?(attest_row.bySession, expected)
+      {"byUser", expected} -> filter_match?(attest_row.byUser, expected)
+      _ -> false
+    end)
+  end
+
+  defp filter_match?(actual, expected) when is_list(expected), do: actual in expected
+  defp filter_match?(actual, expected), do: actual == expected
 
   @doc "List every attest filed against an assignment in deterministic order."
   @spec list_attests(DB.server(), String.t()) :: [map()]

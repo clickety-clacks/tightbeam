@@ -24,7 +24,7 @@ defmodule Tightbeam.Artifacts do
   through `recorded_kinds/3`, which reads neither column.
   """
 
-  alias Tightbeam.{DB, IdPrefix, Org, Placement, TurnObservations}
+  alias Tightbeam.{DB, IdPrefix, Org, Placement, StateVisibility, TurnObservations}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -282,6 +282,33 @@ defmodule Tightbeam.Artifacts do
     end
   end
 
+  @doc false
+  @spec query_artifact(DB.server(), map()) :: map() | [map()] | nil
+  def query_artifact(db, %{key: artifact_id, principal: _principal})
+      when is_binary(artifact_id),
+      do: get(db, artifact_id)
+
+  def query_artifact(db, %{filters: filters, principal: principal})
+      when is_map(filters) and is_map(principal) do
+    db
+    |> list(%{})
+    |> Enum.filter(&StateVisibility.artifact_visible?(db, &1, principal))
+    |> Enum.filter(&artifact_matches_filters?(&1, filters))
+  end
+
+  defp artifact_matches_filters?(artifact, filters) do
+    Enum.all?(filters, fn
+      {"workItemId", expected} -> filter_match?(artifact.work_item_id, expected)
+      {"createdBySession", expected} -> filter_match?(artifact.created_by_session, expected)
+      {"kind", expected} -> filter_match?(artifact.kind, expected)
+      {"state", expected} -> filter_match?(artifact.state, expected)
+      _ -> false
+    end)
+  end
+
+  defp filter_match?(actual, expected) when is_list(expected), do: actual in expected
+  defp filter_match?(actual, expected), do: actual == expected
+
   @doc """
   Distinct artifact kinds a session recorded on a work item.
 
@@ -307,7 +334,8 @@ defmodule Tightbeam.Artifacts do
       [
         {"workItemId", filters[:work_item_id]},
         {"createdBySession", filters[:session_key]},
-        {"kind", filters[:kind]}
+        {"kind", filters[:kind]},
+        {"state", filters[:state]}
       ]
       |> Enum.reject(fn {_column, value} -> is_nil(value) end)
       |> Enum.with_index(1)
