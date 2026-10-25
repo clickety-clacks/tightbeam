@@ -6052,7 +6052,10 @@ defmodule Tightbeam.AssignmentsTest do
 
     review_refs = [
       %{"repo" => "testhost:/tmp/reviewer-checkout", "commit" => String.duplicate("B", 40)},
-      %{"repo" => "testhost:/tmp/second-reviewer-checkout", "commit" => String.duplicate("c", 40)},
+      %{
+        "repo" => "testhost:/tmp/second-reviewer-checkout",
+        "commit" => String.duplicate("c", 40)
+      },
       %{"repo" => "testhost:/tmp/third-reviewer-checkout", "commit" => String.duplicate("d", 40)}
     ]
 
