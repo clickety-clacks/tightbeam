@@ -240,8 +240,16 @@ defmodule Tightbeam.GatewayTest do
       trace_dispatch(opts)
 
       {:reply,
-       {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}},
-       parent}
+       {:error,
+        %{
+          "code" => -32603,
+          "message" => "Internal error",
+          "data" => %{
+            "details" => "auth expired token=provider-secret",
+            "statusCode" => 500,
+            "requestId" => "req_gateway_failure_1"
+          }
+        }}, parent}
     end
 
     def handle_call({:prompt, _sid, "fail before dispatch", _opts}, _from, parent) do
@@ -8932,6 +8940,27 @@ defmodule Tightbeam.GatewayTest do
              "terminal:committed"
            ]
 
+    assert trace.failure_evidence.correlation == %{
+             turn_seq: turn.seq,
+             acp_request_id: 73,
+             launch_id: nil,
+             launch_sequence: nil
+           }
+
+    assert trace.failure_evidence.upstream == %{
+             http_status: 500,
+             error_class: "http:500",
+             request_id: "req_gateway_failure_1"
+           }
+
+    assert trace.failure_evidence.loaded_build == %{
+             captured_at: nil,
+             provenance: nil,
+             identity: nil
+           }
+
+    refute JSON.encode!(trace.failure_evidence) =~ "provider-secret"
+
     # EVERY failed turn speaks now. Adjudication used to route a failure into a
     # brief instead of the marker, so deleting the brief (2026-08-05) would have
     # left this class of failure with no channel at all — the "agent progress
@@ -8998,6 +9027,11 @@ defmodule Tightbeam.GatewayTest do
              "prompt:failed",
              "terminal:committed"
            ]
+
+    assert pre_dispatch_trace.failure_evidence.correlation.acp_request_id == nil
+    assert pre_dispatch_trace.failure_evidence.upstream.http_status == nil
+    assert pre_dispatch_trace.failure_evidence.upstream.request_id == nil
+    assert pre_dispatch_trace.failure_evidence.loaded_build.identity == nil
   end
 
   test "known process causes persist safely on the assignment and route to its owner", ctx do

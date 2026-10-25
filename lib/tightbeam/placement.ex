@@ -1343,6 +1343,7 @@ defmodule Tightbeam.Placement do
       process_ssh: host_config.ssh,
       process_identity_dir: host_config.base_dir,
       process_helper: Path.join(host_config[:cli_bin] || config.cli_bin, "tightbeam"),
+      launch_build_identity: launch_build_identity(adapter_provenance),
       on_auth_event: auth_event_handler(config, host, module, adapter_provenance),
       on_subagent_event: subagent_event_handler(config, host, module),
       env: []
@@ -1538,6 +1539,29 @@ defmodule Tightbeam.Placement do
       source_sha256: "unavailable",
       tightbeam_build: Tightbeam.BuildStamp.build(),
       tightbeam_sha: Tightbeam.BuildStamp.sha()
+    }
+  end
+
+  defp launch_build_identity(provenance) do
+    adapter = %{
+      package: Map.get(provenance, :package),
+      version: Map.get(provenance, :version),
+      source_sha256: Map.get(provenance, :source_sha256)
+    }
+
+    %{
+      provenance: "launch-plan-filesystem",
+      adapter: adapter,
+      sdk: Map.get(provenance, :sdk),
+      executable: %{
+        kind: "adapter-bundle",
+        version: Map.get(provenance, :version),
+        sha256: Map.get(provenance, :source_sha256)
+      },
+      tightbeam: %{
+        build: Map.get(provenance, :tightbeam_build),
+        sha: Map.get(provenance, :tightbeam_sha)
+      }
     }
   end
 

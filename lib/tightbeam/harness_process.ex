@@ -44,6 +44,22 @@ defmodule Tightbeam.HarnessProcess do
 
   @ddl """
   #{@process_ddl}
+  CREATE TABLE IF NOT EXISTS harness_process_builds (
+    launchId        TEXT PRIMARY KEY REFERENCES harness_processes(launchId),
+    capturedAt      INTEGER NOT NULL CHECK(capturedAt >= 0),
+    provenance      TEXT NOT NULL CHECK(provenance = 'launch-plan-filesystem'),
+    buildJson       TEXT NOT NULL CHECK(length(buildJson) BETWEEN 2 AND 4096)
+  );
+  CREATE TRIGGER IF NOT EXISTS harness_process_build_immutable_update
+  BEFORE UPDATE ON harness_process_builds
+  BEGIN
+    SELECT RAISE(ABORT, 'harness process build identity is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS harness_process_build_immutable_delete
+  BEFORE DELETE ON harness_process_builds
+  BEGIN
+    SELECT RAISE(ABORT, 'harness process build identity is immutable');
+  END;
   CREATE TABLE IF NOT EXISTS harness_park_fences (
     adapterKey       TEXT PRIMARY KEY,
     requestedAt      INTEGER NOT NULL
@@ -111,6 +127,7 @@ defmodule Tightbeam.HarnessProcess do
         Path.dirname(stderr_path)
 
     identity_path = Path.join([root, "harness-processes", launch_id <> ".identity"])
+    build_identity = normalize_build_identity(Keyword.get(opts, :launch_build_identity))
     if is_nil(ssh), do: File.mkdir_p!(Path.dirname(identity_path))
 
     case DB.transaction(db, fn txn ->
@@ -156,6 +173,18 @@ defmodule Tightbeam.HarnessProcess do
                  ]
                )
 
+               if build_identity do
+                 DB.Txn.q(
+                   txn,
+                   """
+                   INSERT INTO harness_process_builds
+                     (launchId,capturedAt,provenance,buildJson)
+                   VALUES (?1,?2,'launch-plan-filesystem',?3)
+                   """,
+                   [launch_id, now(), JSON.encode!(build_identity)]
+                 )
+               end
+
                :ok
 
              [[1]] ->
@@ -172,6 +201,35 @@ defmodule Tightbeam.HarnessProcess do
       wrap_command(Keyword.fetch!(opts, :cmd), ssh, helper_path, identity_path, launch_id)
     )
     |> Keyword.put(:harness_process_launch_id, launch_id)
+  end
+
+  @doc "Read the unresolved launch and its immutable build snapshot in a caller transaction."
+  @spec failure_launch_in_txn(DB.Txn.t(), String.t(), String.t()) :: map() | nil
+  def failure_launch_in_txn(%DB.Txn{} = txn, harness, host) do
+    case DB.Txn.q(
+           txn,
+           """
+           SELECT p.launchId,p.launchSequence,b.capturedAt,b.provenance,b.buildJson
+           FROM harness_processes p
+           LEFT JOIN harness_process_builds b ON b.launchId=p.launchId
+           WHERE p.harness=?1 AND p.host=?2 AND p.resolvedAt IS NULL
+             AND p.state IN ('launching','running','park_requested','kill_failed')
+           ORDER BY p.launchSequence DESC LIMIT 1
+           """,
+           [harness, host]
+         ) do
+      [[launch_id, launch_sequence, captured_at, provenance, build_json]] ->
+        %{
+          launch_id: launch_id,
+          launch_sequence: launch_sequence,
+          build_captured_at: captured_at,
+          build_provenance: provenance,
+          build: decode_build(build_json)
+        }
+
+      [] ->
+        nil
+    end
   end
 
   @doc "Read and persist the identity written by the launched process itself."
@@ -1151,6 +1209,71 @@ defmodule Tightbeam.HarnessProcess do
       resolved_at: resolved_at,
       last_error: last_error
     }
+  end
+
+  defp normalize_build_identity(%{} = identity) do
+    %{
+      "provenance" => "launch-plan-filesystem",
+      "adapter" => normalize_component(Map.get(identity, :adapter)),
+      "sdk" => normalize_component(Map.get(identity, :sdk)),
+      "executable" => normalize_executable(Map.get(identity, :executable)),
+      "tightbeam" => normalize_tightbeam(Map.get(identity, :tightbeam))
+    }
+  end
+
+  defp normalize_build_identity(_identity), do: nil
+
+  defp normalize_component(%{} = component) do
+    %{
+      "package" => bounded_string(Map.get(component, :package), 128),
+      "version" => bounded_string(Map.get(component, :version), 64),
+      "sourceSha256" => digest(Map.get(component, :source_sha256))
+    }
+  end
+
+  defp normalize_component(_component), do: nil
+
+  defp normalize_executable(%{} = executable) do
+    %{
+      "kind" => bounded_string(Map.get(executable, :kind), 32),
+      "version" => bounded_string(Map.get(executable, :version), 64),
+      "sha256" => digest(Map.get(executable, :sha256))
+    }
+  end
+
+  defp normalize_executable(_executable), do: nil
+
+  defp normalize_tightbeam(%{} = tightbeam) do
+    %{
+      "build" => non_negative_integer(Map.get(tightbeam, :build)),
+      "sha" => digest(Map.get(tightbeam, :sha))
+    }
+  end
+
+  defp normalize_tightbeam(_tightbeam), do: nil
+
+  defp bounded_string(value, max) when is_binary(value) do
+    value = String.trim(value)
+    if value != "" and byte_size(value) <= max, do: value, else: nil
+  end
+
+  defp bounded_string(_value, _max), do: nil
+
+  defp digest(value) when is_binary(value) do
+    if Regex.match?(~r/\A[0-9a-f]{40}([0-9a-f]{24})?\z/, value), do: value, else: nil
+  end
+
+  defp digest(_value), do: nil
+  defp non_negative_integer(value) when is_integer(value) and value >= 0, do: value
+  defp non_negative_integer(_value), do: nil
+
+  defp decode_build(nil), do: nil
+
+  defp decode_build(build_json) do
+    case JSON.decode(build_json) do
+      {:ok, build} when is_map(build) -> build
+      _ -> nil
+    end
   end
 
   defp key_name({harness, preset, host}), do: "#{harness}:#{preset}@#{host}"

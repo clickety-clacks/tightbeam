@@ -88,6 +88,7 @@ defmodule Tightbeam.Gateway do
     NoticeBatcher,
     Org,
     Projection,
+    ProviderTurnFailure,
     Rails,
     Rules,
     Roles,
@@ -2781,6 +2782,9 @@ defmodule Tightbeam.Gateway do
             raw_reason = reason
             safe_failure = safe_process_failure(failed_stage, raw_reason)
 
+            failure_snapshot =
+              ProviderTurnFailure.capture(session, failed_stage, raw_reason)
+
             {reason, credential_refused?} =
               case turn_credential_refusal(session) do
                 {:refused, message} -> {message, true}
@@ -2857,6 +2861,7 @@ defmodule Tightbeam.Gateway do
                 end
 
               EventLog.lifecycle_in_txn(txn, "harness_turn_error", turn.session_key, detail)
+              :ok = ProviderTurnFailure.record_in_txn(txn, turn.seq, failure_snapshot)
 
               notice =
                 assignment_process_failure_notice_in_txn(

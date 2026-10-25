@@ -142,6 +142,10 @@ defmodule Tightbeam.Harness.Claude do
     package_dir = Path.join([node_modules, "@agentclientprotocol", @adapter_package])
     package_path = Path.join(package_dir, "package.json")
     bundle_path = Path.join([package_dir, "dist", @adapter_bundle])
+    sdk_package = "@anthropic-ai/claude-agent-sdk"
+
+    sdk_package_path =
+      Path.join([node_modules, "@anthropic-ai", "claude-agent-sdk", "package.json"])
 
     if Support.local?(target) do
       with {:ok, package_bytes} <- File.read(package_path),
@@ -150,7 +154,8 @@ defmodule Tightbeam.Harness.Claude do
         %{
           package: install_package(),
           version: version,
-          source_sha256: sha256(source)
+          source_sha256: sha256(source),
+          sdk: package_identity_from_file(sdk_package, sdk_package_path)
         }
       else
         _ -> unavailable_adapter_provenance()
@@ -160,7 +165,8 @@ defmodule Tightbeam.Harness.Claude do
         "const fs=require('fs'),c=require('crypto');" <>
           "const p=JSON.parse(fs.readFileSync(#{JSON.encode!(package_path)},'utf8'));" <>
           "const s=fs.readFileSync(#{JSON.encode!(bundle_path)});" <>
-          "process.stdout.write(JSON.stringify({version:p.version,sourceSha256:c.createHash('sha256').update(s).digest('hex')}));"
+          "let sdk=null;try{sdk=JSON.parse(fs.readFileSync(#{JSON.encode!(sdk_package_path)},'utf8')).version}catch(_){};" <>
+          "process.stdout.write(JSON.stringify({version:p.version,sourceSha256:c.createHash('sha256').update(s).digest('hex'),sdkVersion:sdk}));"
 
       command =
         ["ssh" | Support.ssh_opts()] ++
@@ -169,8 +175,13 @@ defmodule Tightbeam.Harness.Claude do
       case target.sh.(command) do
         {output, 0} ->
           case JSON.decode(String.trim(output)) do
-            {:ok, %{"version" => version, "sourceSha256" => digest}} ->
-              %{package: install_package(), version: version, source_sha256: digest}
+            {:ok, %{"version" => version, "sourceSha256" => digest} = observed} ->
+              %{
+                package: install_package(),
+                version: version,
+                source_sha256: digest,
+                sdk: package_identity_from_version(sdk_package, observed["sdkVersion"])
+              }
 
             _ ->
               unavailable_adapter_provenance()
@@ -1135,8 +1146,28 @@ defmodule Tightbeam.Harness.Claude do
   end
 
   defp unavailable_adapter_provenance do
-    %{package: install_package(), version: @adapter_version, source_sha256: "unavailable"}
+    %{
+      package: install_package(),
+      version: @adapter_version,
+      source_sha256: "unavailable",
+      sdk: nil
+    }
   end
+
+  defp package_identity_from_file(package, path) do
+    with {:ok, bytes} <- File.read(path),
+         {:ok, %{"version" => version}} when is_binary(version) <- JSON.decode(bytes) do
+      %{package: package, version: version}
+    else
+      _ -> nil
+    end
+  end
+
+  defp package_identity_from_version(package, version)
+       when is_binary(version) and version != "",
+       do: %{package: package, version: version}
+
+  defp package_identity_from_version(_package, _version), do: nil
 
   defp sha256(bytes),
     do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)

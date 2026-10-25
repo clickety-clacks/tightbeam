@@ -36,6 +36,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.WorkState,
     Tightbeam.Productions.BubbleSweeper,
     Tightbeam.HarnessProcess,
+    Tightbeam.ProviderTurnFailure,
     Tightbeam.AdminProjection,
     Tightbeam.HarnessHealth,
     Tightbeam.Toplines,
