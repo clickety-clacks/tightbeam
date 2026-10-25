@@ -101,7 +101,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     {"wakes", "classElection"} => ~w(sender classifier batcher),
     {"turns", "status"} => ~w(queued running delivered canceled failed failed_unknown),
     {"decision requests", "kind"} => ~w(statute effort agent),
-    {"decision requests", "status"} => ~w(open ruled consumed withdrawn superseded answered returned),
+    {"decision requests", "status"} =>
+      ~w(open ruled consumed withdrawn superseded answered returned),
     {"sessions", "kind"} => ~w(main dm custom),
     {"sessions", "state"} => ~w(active retired),
     {"sessions", "mechanicalStatus"} => ~w(idle running),
@@ -445,6 +446,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     before_item = JSON.decode!(before_response.resp_body)["item"]
     assert before_item["kind"] == "agent"
     assert Enum.all?(return_fields, &(Map.fetch!(before_item, &1) == nil))
+
     assert_ordered_fields(
       raw_json_value(before_response.resp_body, "item"),
       expected_fields("decision requests", before_item)
@@ -485,8 +487,10 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     {raw_notice, ws} = receive_raw_change(ws, "decision_request.returned")
     notice = JSON.decode!(raw_notice)
     assert notice["payload"] == returned_item
+
     assert raw_json_value(raw_notice, "payload") ==
              raw_json_value(returned_response.resp_body, "item")
+
     assert_ordered_fields(
       raw_json_value(raw_notice, "payload"),
       expected_fields("decision requests", returned_item)

@@ -337,7 +337,8 @@ defmodule Tightbeam.StateResources do
     {"wakes", "classElection"} => ~w(sender classifier batcher),
     {"turns", "status"} => ~w(queued running delivered canceled failed failed_unknown),
     {"decision requests", "kind"} => ~w(statute effort agent),
-    {"decision requests", "status"} => ~w(open ruled consumed withdrawn superseded answered returned),
+    {"decision requests", "status"} =>
+      ~w(open ruled consumed withdrawn superseded answered returned),
     {"sessions", "kind"} => ~w(main dm custom),
     {"sessions", "state"} => ~w(active retired),
     {"sessions", "mechanicalStatus"} => ~w(idle running),

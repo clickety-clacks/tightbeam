@@ -184,7 +184,7 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     assert StateResources.item_shape_complete?("decision-requests", non_agent)
     assert StateResources.item_shape_superset?("decision-requests", non_agent)
     assert non_agent_bytes == expected_bytes("decision requests", non_agent_fields, non_agent)
-    refute Enum.any?(return_fields, &(String.contains?(non_agent_bytes, &1)))
+    refute Enum.any?(return_fields, &String.contains?(non_agent_bytes, &1))
 
     with_return_fields = Map.merge(non_agent, Map.take(agent, return_fields))
     refute StateResources.item_shape_complete?("decision-requests", with_return_fields)
@@ -213,7 +213,11 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
              expected_bytes("decision requests", fields, returned)
 
     assert_raise ArgumentError, fn ->
-      StateResources.encode_item("decision-requests", Map.put(returned, "returnedAt", 0), @catalog)
+      StateResources.encode_item(
+        "decision-requests",
+        Map.put(returned, "returnedAt", 0),
+        @catalog
+      )
     end
   end
 
