@@ -1806,8 +1806,11 @@ defmodule Tightbeam.CliIntegrationTest do
     statute_withdraw_id = open_statute_request(ctx, "flynn")
 
     assert {200,
-            %{"result" => %{"id" => ^statute_withdraw_id, "status" => "withdrawn"} =
-                 withdrawn_statute}} =
+            %{
+              "result" =>
+                %{"id" => ^statute_withdraw_id, "status" => "withdrawn"} =
+                  withdrawn_statute
+            }} =
              raw_agent_dispatch(ctx, ctx.session.cli_token, %{
                "verb" => "withdraw",
                "params" => %{"request" => statute_withdraw_id, "reason" => "statute ended"}
@@ -1816,21 +1819,24 @@ defmodule Tightbeam.CliIntegrationTest do
     refute Map.has_key?(withdrawn_statute, "rowVersion")
 
     statute_rule_id = open_statute_request(ctx, "other")
+
     rule_call = %{
       "asUser" => "flynn",
       "verb" => "rule",
       "params" => %{"request" => statute_rule_id, "decision" => "allow"}
     }
 
-    assert {200,
-            %{"result" => %{"id" => ^statute_rule_id, "status" => "ruled"} = ruled_statute}} =
+    assert {200, %{"result" => %{"id" => ^statute_rule_id, "status" => "ruled"} = ruled_statute}} =
              raw_agent_dispatch(ctx, ctx.session.cli_token, rule_call)
 
     refute Map.has_key?(ruled_statute, "rowVersion")
 
     assert {200,
-            %{"result" => %{"id" => ^statute_rule_id, "status" => "ruled"} =
-                 replayed_statute}} =
+            %{
+              "result" =>
+                %{"id" => ^statute_rule_id, "status" => "ruled"} =
+                  replayed_statute
+            }} =
              raw_agent_dispatch(ctx, ctx.session.cli_token, rule_call)
 
     refute Map.has_key?(replayed_statute, "rowVersion")
