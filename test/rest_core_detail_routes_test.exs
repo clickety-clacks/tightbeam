@@ -452,6 +452,82 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert Enum.any?(admin_items, &(&1["sessionKey"] == outsider_session.session_key))
   end
 
+  test "REST and Firehose fill sender for direct and historical human messages", ctx do
+    device = outsider_device(ctx)
+    session = ensure_main_session(ctx.db, "outsider")
+
+    {:appended, historical} =
+      Projection.append(ctx.db, %{
+        session_key: session.session_key,
+        role: "user",
+        content: "historical human message without a stored sender"
+      })
+
+    :ok =
+      Hub.register(Hub, self(), %{
+        mode: :subscribed,
+        db: ctx.db,
+        user_id: "outsider",
+        is_admin: false
+      })
+
+    :ok =
+      Hub.subscribe(Hub, self(), "human-sender-projection", %{
+        "classes" => ["message.created"],
+        "sessionKey" => session.session_key
+      })
+
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+
+    post = Gateway.handlers(%{db: ctx.db})["post"]
+
+    assert %{ack: "direct-human-post"} =
+             post.(%{
+               session_key: session.session_key,
+               origin: "user:outsider",
+               params: %{
+                 content: "direct human post without sender metadata",
+                 device_id: device.device_id,
+                 client_message_id: "direct-human-post"
+               }
+             })
+
+    assert_receive {:firehose_notice, %{"class" => "message.created", "payload" => live_message}}
+
+    assert live_message["role"] == "user"
+    assert live_message["sender"] == "user:outsider"
+    assert live_message["clientMessageId"] == "direct-human-post"
+    assert live_message["turnIncludesHuman"]
+    direct_id = live_message["id"]
+
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT sender FROM messages WHERE id=?1", [direct_id])
+
+    history =
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/messages?limit=20&tail=true",
+        device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    historical_item = Enum.find(history["items"], &(&1["id"] == historical.id))
+    direct_item = Enum.find(history["items"], &(&1["id"] == direct_id))
+
+    assert historical_item["role"] == "user"
+    assert historical_item["sender"] == "user:outsider"
+    assert direct_item["sender"] == "user:outsider"
+    assert direct_item["turnIncludesHuman"]
+
+    detail =
+      get(ctx, "/api/sessions/#{session.session_key}/messages/#{direct_id}", device.token)
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert detail["item"]["sender"] == "user:outsider"
+    assert detail["item"]["turnIncludesHuman"]
+    assert live_message["sender"] == detail["item"]["sender"]
+  end
+
   test "session and retained transcript collections use bounded exclusive keysets", ctx do
     outsider_device = outsider_device(ctx)
     owner = "outsider"

@@ -84,6 +84,9 @@ defmodule Tightbeam.NoticeBatcher do
     retryCount INTEGER NOT NULL DEFAULT 0 CHECK (retryCount >= 0),
     overflowCount INTEGER NOT NULL DEFAULT 0 CHECK (overflowCount >= 0),
     memberCount INTEGER NOT NULL DEFAULT 0 CHECK (memberCount >= 0),
+    chatMessageFormat TEXT CHECK (
+      chatMessageFormat IS NULL OR chatMessageFormat = 'member-rows-v1'
+    ),
     renderedBytes INTEGER NOT NULL DEFAULT 0 CHECK (renderedBytes >= 0),
     lastAttemptAt INTEGER,
     lastFailure TEXT,
@@ -1119,8 +1122,10 @@ defmodule Tightbeam.NoticeBatcher do
       """
       INSERT INTO notice_batches(batchId,recipientAddress,sessionKey,targetRole,
         visibilityScope,policyRevision,state,dueAt,openedAt,sealedAt,releaseCause,
-        deliveryToken,envelope,envelopeSha256,deliveryWakeId,memberCount,renderedBytes)
-      VALUES(?1,?2,?3,NULL,?4,?5,'delivery_pending',?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+        deliveryToken,envelope,envelopeSha256,deliveryWakeId,memberCount,
+        chatMessageFormat,renderedBytes)
+      VALUES(?1,?2,?3,NULL,?4,?5,'delivery_pending',?6,?7,?8,?9,?10,?11,?12,?13,?14,
+        'member-rows-v1',?15)
       """,
       [
         batch_id,
@@ -1526,6 +1531,78 @@ defmodule Tightbeam.NoticeBatcher do
       [delivery_wake_id]
     )
     |> Enum.map(&hd/1)
+  end
+
+  @doc false
+  @spec carrier_turn_metadata_in_txn(Txn.t(), String.t()) ::
+          %{
+            chat_message_format: String.t() | nil,
+            member_count: non_neg_integer(),
+            human_member_count: non_neg_integer()
+          }
+          | nil
+  def carrier_turn_metadata_in_txn(%Txn{} = txn, delivery_wake_id)
+      when is_binary(delivery_wake_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT batch.chatMessageFormat,batch.memberCount,
+                  SUM(CASE WHEN source.origin LIKE 'user:%' THEN 1 ELSE 0 END)
+           FROM notice_batches AS batch
+           LEFT JOIN notice_batch_members AS member
+             ON member.batchId=batch.batchId AND member.state='included'
+           LEFT JOIN wakes AS source ON source.wakeId=member.sourceWakeId
+           WHERE batch.deliveryWakeId=?1
+           GROUP BY batch.batchId
+           """,
+           [delivery_wake_id]
+         ) do
+      [[chat_message_format, member_count, human_member_count]] ->
+        %{
+          chat_message_format: chat_message_format,
+          member_count: member_count,
+          human_member_count: human_member_count
+        }
+
+      [] ->
+        nil
+    end
+  end
+
+  @doc false
+  def carrier_human_posts_in_txn(%Txn{} = txn, delivery_wake_id)
+      when is_binary(delivery_wake_id) do
+    txn
+    |> carrier_source_ids_in_txn(delivery_wake_id)
+    |> Enum.flat_map(fn source_wake_id ->
+      case Txn.q(
+             txn,
+             "SELECT origin,prompt,createdAt FROM wakes WHERE wakeId=?1 AND sourceClientIdentity IS NOT NULL",
+             [source_wake_id]
+           ) do
+        [[origin, prompt, created_at]] when is_binary(origin) ->
+          if String.starts_with?(origin, "user:") do
+            identity = source_client_identity_in_txn(txn, source_wake_id)
+
+            [
+              %{
+                source_wake_id: source_wake_id,
+                origin: origin,
+                content: prompt,
+                timestamp: created_at,
+                device_id: Map.fetch!(identity, "deviceId"),
+                client_message_id: Map.fetch!(identity, "clientMessageId"),
+                attachments: delivery_attachments_in_txn(txn, source_wake_id)
+              }
+            ]
+          else
+            []
+          end
+
+        _ ->
+          []
+      end
+    end)
   end
 
   @doc false

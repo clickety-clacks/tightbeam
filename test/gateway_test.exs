@@ -2,6 +2,7 @@ defmodule Tightbeam.GatewayTest do
   alias Tightbeam.GatewayTurnFixture.{AdapterStub, CoordinatorStub}
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
+  alias Tightbeam.Wire.ChangeSocket
 
   # The committed packaging shim, for the writer→consumer seam test below.
   @shim Path.expand("../packaging/tightbeam-gateway", __DIR__)
@@ -1244,12 +1245,57 @@ defmodule Tightbeam.GatewayTest do
       }
     }
 
+    human_origin = call.origin
+
     assert %{ack: "post-queued-1"} = post.(call)
 
-    assert {:ok, [[source_wake_id, "pending", "queued human message", "fyi"]]} =
+    assert_receive {:firehose_notice,
+                    %{"class" => "message.created", "payload" => accepted_message}}
+
+    assert accepted_message["role"] == "user"
+    assert accepted_message["sender"] == human_origin
+    assert accepted_message["deviceId"] == "post-device"
+    assert accepted_message["clientMessageId"] == "post-queued-1"
+    assert accepted_message["attachments"] == [attachment]
+    assert is_nil(accepted_message["turnSeq"])
+    refute Map.has_key?(accepted_message, "turnIncludesHuman")
+    refute accepted_message["isBatchCarrier"]
+    accepted_message_id = accepted_message["id"]
+    :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
+
+    assert {:ok, [[^accepted_message_id, "user", ^human_origin, "post-device", "post-queued-1"]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId,state,prompt,class FROM wakes WHERE prompt='queued human message'"
+               """
+               SELECT id, role, sender, deviceId, clientMessageId
+               FROM messages
+               WHERE clientMessageId = ?1
+               """,
+               ["post-queued-1"]
+             )
+
+    assert {:ok, [[source_wake_id, "pending", "queued human message", "fyi", ^human_origin]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT wakeId, state, prompt, class, origin
+               FROM wakes
+               WHERE prompt = 'queued human message'
+               """
+             )
+
+    assert {:ok, [["k1", "post-device", "post-queued-1", source_wake_id]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT json_extract(sourceClientIdentity, '$.targetSessionKey'),
+                      json_extract(sourceClientIdentity, '$.deviceId'),
+                      json_extract(sourceClientIdentity, '$.clientMessageId'),
+                      json_extract(sourceClientIdentity, '$.sourceWakeId')
+               FROM wakes
+               WHERE wakeId = ?1
+               """,
+               [source_wake_id]
              )
 
     assert {:ok, [[encoded_attachments]]} =
@@ -1260,6 +1306,16 @@ defmodule Tightbeam.GatewayTest do
              )
 
     assert JSON.decode!(encoded_attachments) == [attachment]
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE messages SET sender=NULL WHERE id=?1",
+               [accepted_message_id]
+             )
+
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT sender FROM messages WHERE id=?1", [accepted_message_id])
 
     notice_sources =
       for content <- ["first ready notice", "second ready notice"] do
@@ -1280,7 +1336,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert NoticeBatcher.recover(ctx.db) == []
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM messages WHERE clientMessageId='post-queued-1'"
@@ -1321,7 +1377,7 @@ defmodule Tightbeam.GatewayTest do
                 human_message_id,
                 "user",
                 "queued human message",
-                "user:flynn",
+                nil,
                 "post-device",
                 "post-queued-1",
                 encoded_attachments
@@ -1332,6 +1388,8 @@ defmodule Tightbeam.GatewayTest do
                "SELECT id,role,content,sender,deviceId,clientMessageId,attachments FROM messages WHERE clientMessageId=?1",
                ["post-queued-1"]
              )
+
+    assert human_message_id == accepted_message_id
 
     assert JSON.decode!(encoded_attachments) == [attachment]
 
@@ -1346,6 +1404,13 @@ defmodule Tightbeam.GatewayTest do
              DB.query(
                ctx.db,
                "SELECT state,memberCount FROM notice_batches WHERE deliveryWakeId=?1",
+               [carrier_id]
+             )
+
+    assert {:ok, [["member-rows-v1"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT chatMessageFormat FROM notice_batches WHERE deliveryWakeId=?1",
                [carrier_id]
              )
 
@@ -1365,7 +1430,14 @@ defmodule Tightbeam.GatewayTest do
 
     assert human_turn_seq < carrier_turn_seq
 
-    assert_receive {:firehose_notice, %{"class" => "message.created"} = human_notice}
+    assert_receive {:firehose_notice,
+                    %{"class" => "message.created", "payload" => human_payload} = human_notice}
+
+    assert human_payload["id"] == accepted_message_id
+    assert human_payload["role"] == "user"
+    assert human_payload["sender"] == human_origin
+    assert human_payload["turnSeq"] == human_turn_seq
+    assert human_payload["turnIncludesHuman"]
     assert human_notice["refs"]["messageId"] == human_message_id
     assert human_notice["payload"]["deviceId"] == "post-device"
     assert human_notice["payload"]["clientMessageId"] == "post-queued-1"
@@ -1374,6 +1446,10 @@ defmodule Tightbeam.GatewayTest do
 
     assert_receive {:firehose_notice, %{"class" => "message.created"} = carrier_notice}
     assert carrier_notice["refs"]["messageId"] == carrier_message_id
+    assert carrier_notice["payload"]["isBatchCarrier"]
+    assert String.starts_with?(carrier_notice["payload"]["sender"], "process:")
+    assert is_nil(carrier_notice["payload"]["deviceId"])
+    assert is_nil(carrier_notice["payload"]["clientMessageId"])
     assert_message_notice_matches_rest!(ctx.db, carrier_notice)
     :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
     :sys.get_state(Tightbeam.Firehose.Hub)
@@ -1410,6 +1486,682 @@ defmodule Tightbeam.GatewayTest do
                ctx.db,
                "SELECT COUNT(*) FROM messages WHERE clientMessageId='post-queued-1'"
              )
+  end
+
+  @tag recipient_readiness: true
+  test "untyped carriers remain visible beside separate human batch rows", ctx do
+    owner = "test-owner"
+    session = "test-session"
+    now = System.system_time(:millisecond)
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES(?1,0,?2)", [
+               owner,
+               now
+             ])
+
+    Org.create(ctx.db, %{
+      session_key: session,
+      display_name: "Chat test session",
+      owner_user_id: owner,
+      origin: "user:" <> owner,
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    human_content = "human message in the batch"
+    second_human_content = "second human message in the batch"
+    agent_content = "agent notice in the batch"
+    human_sender = "user:" <> owner
+
+    human_source =
+      Wakes.schedule(ctx.db, %{
+        session_key: session,
+        origin: "user:" <> owner,
+        prompt: human_content,
+        due_at: now,
+        class: "fyi"
+      })
+
+    second_human_source =
+      Wakes.schedule(ctx.db, %{
+        session_key: session,
+        origin: "user:" <> owner,
+        prompt: second_human_content,
+        due_at: now,
+        class: "fyi"
+      })
+
+    agent_source =
+      Wakes.schedule(ctx.db, %{
+        session_key: session,
+        origin: "agent:another-session",
+        prompt: agent_content,
+        due_at: now,
+        class: "fyi"
+      })
+
+    attachment = %{
+      "assetId" => "test-asset",
+      "mimeType" => "image/png",
+      "filename" => "diagram.png",
+      "size" => 123
+    }
+
+    identity = %{
+      "targetSessionKey" => session,
+      "deviceId" => "chat-device",
+      "clientMessageId" => "human-batch-message",
+      "sourceWakeId" => human_source.wake_id,
+      "payloadSha256" => Base.encode16(:crypto.hash(:sha256, human_content), case: :lower),
+      "createdAt" => human_source.created_at
+    }
+
+    second_identity = %{
+      "targetSessionKey" => session,
+      "deviceId" => "chat-device",
+      "clientMessageId" => "second-human-batch-message",
+      "sourceWakeId" => second_human_source.wake_id,
+      "payloadSha256" => Base.encode16(:crypto.hash(:sha256, second_human_content), case: :lower),
+      "createdAt" => second_human_source.created_at
+    }
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               :ok =
+                 NoticeBatcher.persist_source_client_in_txn(txn, human_source.wake_id, identity)
+
+               :ok =
+                 NoticeBatcher.persist_source_client_in_txn(
+                   txn,
+                   second_human_source.wake_id,
+                   second_identity
+                 )
+
+               NoticeBatcher.persist_source_attachments_in_txn(
+                 txn,
+                 human_source.wake_id,
+                 [attachment]
+               )
+             end)
+
+    {:appended, accepted_human} =
+      Projection.append(ctx.db, %{
+        session_key: session,
+        role: "user",
+        content: human_content,
+        timestamp: human_source.created_at,
+        sender: human_sender,
+        device_id: "chat-device",
+        client_message_id: "human-batch-message",
+        attachments: [attachment]
+      })
+
+    {:appended, accepted_second_human} =
+      Projection.append(ctx.db, %{
+        session_key: session,
+        role: "user",
+        content: second_human_content,
+        timestamp: second_human_source.created_at,
+        sender: human_sender,
+        device_id: "chat-device",
+        client_message_id: "second-human-batch-message"
+      })
+
+    start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
+
+    :ok =
+      Tightbeam.Firehose.Hub.register(Tightbeam.Firehose.Hub, self(), %{
+        mode: :subscribed,
+        db: ctx.db,
+        user_id: owner,
+        is_admin: false
+      })
+
+    :ok =
+      Tightbeam.Firehose.Hub.subscribe(Tightbeam.Firehose.Hub, self(), "chat-session", %{
+        "classes" => ["message.created", "turn.queued", "turn.started", "wake.scheduled"],
+        "sessionKey" => session
+      })
+
+    carrier_id = "test-batch-carrier"
+    envelope = Enum.join([human_content, second_human_content, agent_content], "\n")
+
+    _carrier =
+      Wakes.schedule(ctx.db, %{
+        wake_id: carrier_id,
+        session_key: session,
+        origin: "process:tightbeam",
+        prompt: envelope,
+        due_at: now,
+        class: "fyi",
+        digest: true
+      })
+
+    assert {:ok, [[recipient_address, visibility_scope]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceAddress,sourceVisibilityScope FROM wakes WHERE wakeId=?1",
+               [human_source.wake_id]
+             )
+
+    batch_id = "test-batch"
+    delivery_token = "test-delivery-token"
+    policy_revision = NoticeBatcher.policy_revision()
+    envelope_hash = Base.encode16(:crypto.hash(:sha256, envelope), case: :lower)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO notice_batches(batchId,recipientAddress,sessionKey,targetRole,
+                 visibilityScope,policyRevision,state,dueAt,openedAt,sealedAt,releaseCause,
+                 deliveryToken,envelope,envelopeSha256,deliveryWakeId,memberCount,renderedBytes)
+               VALUES(?1,?2,?3,NULL,?4,?5,'delivery_pending',?6,?7,?7,'idle',?8,?9,?10,?11,3,?12)
+               """,
+               [
+                 batch_id,
+                 recipient_address,
+                 session,
+                 visibility_scope,
+                 policy_revision,
+                 now,
+                 human_source.created_at,
+                 delivery_token,
+                 envelope,
+                 envelope_hash,
+                 carrier_id,
+                 byte_size(envelope)
+               ]
+             )
+
+    for {source, publication_seq} <-
+          Enum.with_index([human_source, second_human_source, agent_source], 1) do
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 """
+                 INSERT INTO notice_batch_members(memberId,batchId,sourceWakeId,policyRef,
+                   recipientAddress,visibilityScope,publicationSeq,policyRevision,senderPrincipal,
+                   cause,class,payload,renderedBytes,state,addedAt)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'wake','fyi',?10,?11,'included',?12)
+                 """,
+                 [
+                   "test-batch-member-#{publication_seq}",
+                   batch_id,
+                   source.wake_id,
+                   NoticeBatcher.policy_ref(source.wake_id),
+                   recipient_address,
+                   visibility_scope,
+                   publication_seq,
+                   policy_revision,
+                   source.origin,
+                   source.prompt,
+                   byte_size(source.prompt),
+                   source.created_at
+                 ]
+               )
+    end
+
+    assert :appended =
+             Gateway.deliver_prompt(session, "process:tightbeam", envelope,
+               db: ctx.db,
+               wake_id: carrier_id,
+               sender: "process:tightbeam",
+               fire_wake_in_txn: true,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
+
+    assert {:ok, [[turn_seq, "queued", "process:tightbeam", queued_prompt, "batch", 3]]} =
+             DB.query(
+               ctx.db,
+               "SELECT seq,status,origin,prompt,triggerSource,batchMemberCount " <>
+                 "FROM turns WHERE wakeId=?1",
+               [carrier_id]
+             )
+
+    assert queued_prompt =~ human_content
+    assert queued_prompt =~ second_human_content
+    assert queued_prompt =~ agent_content
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
+
+    first_human_notice =
+      receive_firehose_notice_matching!(Tightbeam.Firehose.Hub, fn notice ->
+        payload = notice["payload"] || %{}
+
+        notice["class"] == "message.created" and
+          payload["clientMessageId"] == "human-batch-message"
+      end)
+
+    assert %{
+             "payload" => %{
+               "role" => "user",
+               "sender" => ^human_sender,
+               "deviceId" => "chat-device",
+               "clientMessageId" => "human-batch-message",
+               "attachments" => [^attachment],
+               "turnSeq" => ^turn_seq,
+               "turnIncludesHuman" => true
+             }
+           } = first_human_notice
+
+    refute first_human_notice["payload"]["isBatchCarrier"]
+
+    human_message_id = first_human_notice["payload"]["id"]
+    assert human_message_id == accepted_human.id
+    :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
+
+    second_human_notice =
+      receive_firehose_notice_matching!(Tightbeam.Firehose.Hub, fn notice ->
+        payload = notice["payload"] || %{}
+
+        notice["class"] == "message.created" and
+          payload["clientMessageId"] == "second-human-batch-message"
+      end)
+
+    assert %{
+             "payload" => %{
+               "role" => "user",
+               "sender" => ^human_sender,
+               "deviceId" => "chat-device",
+               "clientMessageId" => "second-human-batch-message",
+               "turnSeq" => ^turn_seq,
+               "turnIncludesHuman" => true
+             }
+           } = second_human_notice
+
+    second_human_message_id = second_human_notice["payload"]["id"]
+    assert second_human_message_id == accepted_second_human.id
+    :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
+
+    carrier_notice =
+      receive_firehose_notice_matching!(Tightbeam.Firehose.Hub, fn notice ->
+        payload = notice["payload"] || %{}
+
+        notice["class"] == "message.created" and payload["sender"] == "process:tightbeam"
+      end)
+
+    assert carrier_notice["payload"]["turnIncludesHuman"]
+    refute carrier_notice["payload"]["isBatchCarrier"]
+
+    carrier_message_id = carrier_notice["payload"]["id"]
+    :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
+
+    assert {:ok, %{seq: ^turn_seq} = batch_turn} =
+             Ledger.claim_next(ctx.db, session, "batch-turn")
+
+    assert %{
+             "class" => "turn.started",
+             "payload" => %{
+               "status" => "running",
+               "origin" => "process:tightbeam",
+               "sessionKey" => ^session,
+               "seq" => ^turn_seq,
+               "triggerSource" => "batch",
+               "batchMemberCount" => 3
+             }
+           } =
+             receive_firehose_notice_matching!(Tightbeam.Firehose.Hub, fn notice ->
+               notice["class"] == "turn.started" and
+                 get_in(notice, ["payload", "seq"]) == turn_seq
+             end)
+
+    :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
+    :ok = Tightbeam.Firehose.Hub.unsubscribe(Tightbeam.Firehose.Hub, self(), "chat-session")
+    base_socket_seq = Tightbeam.Firehose.Hub.sequence(Tightbeam.Firehose.Hub, self())
+    token = "caption-test-token"
+
+    socket_state = %ChangeSocket{
+      phase: :live,
+      user_id: owner,
+      principal_kind: :user,
+      principal_id: owner,
+      credential_digest: :crypto.hash(:sha256, token),
+      deps: %{
+        db: ctx.db,
+        firehose_hub: Tightbeam.Firehose.Hub,
+        model_catalog: %{},
+        cli_token: token
+      }
+    }
+
+    assert {:ok, socket_state} =
+             ChangeSocket.handle_in(
+               {JSON.encode!(%{
+                  "type" => "subscribe",
+                  "subscriptionId" => "caption",
+                  "filters" => %{"classes" => ["turn."], "sessionKey" => session}
+                }), opcode: :text},
+               socket_state
+             )
+
+    assert_receive {:firehose_control, ready}, 1_000
+
+    assert {:push, {:text, ready_frame}, socket_state} =
+             ChangeSocket.handle_info({:firehose_control, ready}, socket_state)
+
+    assert JSON.decode!(ready_frame) == %{
+             "type" => "subscription_ready",
+             "subscriptionId" => "caption"
+           }
+
+    assert_receive {:firehose_notice, snapshot_notice}, 1_000
+
+    assert {:push, {:text, snapshot_frame}, socket_state} =
+             ChangeSocket.handle_info({:firehose_notice, snapshot_notice}, socket_state)
+
+    assert %{
+             "type" => "change",
+             "schemaVersion" => 2,
+             "subscriptionId" => "caption",
+             "seq" => snapshot_seq,
+             "class" => "turn.started",
+             "resource" => "turns",
+             "op" => "upsert",
+             "refs" => %{"turnSeq" => ^turn_seq, "sessionKey" => ^session},
+             "payload" => %{
+               "seq" => ^turn_seq,
+               "status" => "running",
+               "triggerSource" => "batch",
+               "batchMemberCount" => 3
+             }
+           } = JSON.decode!(snapshot_frame)
+
+    assert snapshot_seq == base_socket_seq + 1
+
+    :ok = Tightbeam.Firehose.Hub.unsubscribe(Tightbeam.Firehose.Hub, self(), "caption")
+
+    buffered_subscription_id = "caption-buffered"
+    subscription_filters = %{"classes" => ["turn."], "sessionKey" => session}
+
+    :ok =
+      Tightbeam.Firehose.Hub.begin_subscribe(
+        Tightbeam.Firehose.Hub,
+        self(),
+        buffered_subscription_id,
+        subscription_filters
+      )
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn_seq, "delivered", nil,
+               owner_lease: batch_turn.owner_lease
+             )
+
+    :ok =
+      Tightbeam.Firehose.Hub.finish_subscribe(
+        Tightbeam.Firehose.Hub,
+        self(),
+        buffered_subscription_id,
+        []
+      )
+
+    assert_receive {:firehose_control, buffered_ready}, 1_000
+
+    assert {:push, {:text, buffered_ready_frame}, socket_state} =
+             ChangeSocket.handle_info({:firehose_control, buffered_ready}, socket_state)
+
+    assert JSON.decode!(buffered_ready_frame) == %{
+             "type" => "subscription_ready",
+             "subscriptionId" => buffered_subscription_id
+           }
+
+    assert_receive {:firehose_notice, ended_notice}, 1_000
+
+    assert {:push, {:text, ended_frame}, socket_state} =
+             ChangeSocket.handle_info({:firehose_notice, ended_notice}, socket_state)
+
+    assert %{
+             "type" => "change",
+             "schemaVersion" => 2,
+             "subscriptionId" => "caption-buffered",
+             "seq" => ended_seq,
+             "class" => "turn.ended",
+             "resource" => "turns",
+             "op" => "upsert",
+             "refs" => %{"turnSeq" => ^turn_seq, "sessionKey" => ^session},
+             "payload" => %{"seq" => ^turn_seq, "status" => "delivered"}
+           } = JSON.decode!(ended_frame)
+
+    assert ended_seq == base_socket_seq + 2
+
+    assert {:push, {:text, heartbeat_frame}, heartbeat_state} =
+             ChangeSocket.handle_info(:firehose_heartbeat, socket_state)
+
+    assert JSON.decode!(heartbeat_frame) == %{"type" => "heartbeat", "seq" => base_socket_seq + 2}
+
+    Process.cancel_timer(heartbeat_state.heartbeat_timer)
+
+    human_row = StateResources.query_message(ctx.db, human_message_id)
+    assert human_row.role == "user"
+    assert human_row.at == human_source.created_at
+    assert human_row.device_id == "chat-device"
+    assert human_row.client_message_id == "human-batch-message"
+    assert human_row.turn_seq == turn_seq
+    assert human_row.turn_includes_human
+    assert StateResources.message(human_row)["turnIncludesHuman"]
+    refute StateResources.message(human_row)["isBatchCarrier"]
+
+    carrier_row = StateResources.query_message(ctx.db, carrier_message_id)
+    refute StateResources.message(carrier_row)["isBatchCarrier"]
+
+    second_human_row = StateResources.query_message(ctx.db, second_human_message_id)
+    assert second_human_row.role == "user"
+    assert second_human_row.at == second_human_source.created_at
+    assert second_human_row.device_id == "chat-device"
+    assert second_human_row.client_message_id == "second-human-batch-message"
+    assert second_human_row.turn_seq == turn_seq
+    assert second_human_row.turn_includes_human
+
+    {:appended, human_reply} =
+      Projection.append(ctx.db, %{
+        session_key: session,
+        role: "assistant",
+        content: "reply to the batch",
+        sender: "tightbeam",
+        reply_to_message_id: carrier_message_id
+      })
+
+    human_reply_row = StateResources.query_message(ctx.db, human_reply.id)
+    assert human_reply_row.turn_seq == turn_seq
+    assert human_reply_row.turn_includes_human
+
+    {:appended, agent_message} =
+      Projection.append(ctx.db, %{
+        session_key: session,
+        role: "user",
+        content: "agent only prompt",
+        sender: "agent:another-session"
+      })
+
+    {:ok, agent_turn_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: session,
+        message_id: agent_message.id,
+        origin: "agent:another-session",
+        prompt: "agent only prompt"
+      })
+
+    {:appended, agent_reply} =
+      Projection.append(ctx.db, %{
+        session_key: session,
+        role: "assistant",
+        content: "reply to the agent",
+        sender: "tightbeam",
+        reply_to_message_id: agent_message.id
+      })
+
+    agent_reply_row = StateResources.query_message(ctx.db, agent_reply.id)
+    assert agent_reply_row.turn_seq == agent_turn_seq
+    refute agent_reply_row.turn_includes_human
+    refute StateResources.message(agent_reply_row)["turnIncludesHuman"]
+
+    agent_turn = StateResources.query_turn_by_seq(ctx.db, agent_turn_seq)
+    assert StateResources.turn(agent_turn)["triggerSource"] == "agent"
+    assert is_nil(StateResources.turn(agent_turn)["batchMemberCount"])
+
+    {:appended, other_user_message} =
+      Projection.append(ctx.db, %{
+        session_key: session,
+        role: "user",
+        content: "message from a different user",
+        sender: "user:other-owner"
+      })
+
+    {:ok, other_user_turn_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: session,
+        message_id: other_user_message.id,
+        origin: "user:other-owner",
+        prompt: "message from a different user"
+      })
+
+    other_user_row = StateResources.query_message(ctx.db, other_user_message.id)
+    assert other_user_row.turn_seq == other_user_turn_seq
+    refute other_user_row.turn_includes_human
+    assert StateResources.message(other_user_row)["turnIncludesHuman"] == false
+
+    plan = StateResources.message_query_plan(ctx.db, human_message_id)
+
+    assert Enum.any?(plan, fn [_id, _parent, _not_used, detail] ->
+             String.contains?(detail, "SEARCH source USING INDEX notice_source_client_identity") and
+               length(Regex.scan(~r/=\?/, detail)) == 3
+           end),
+           inspect(plan)
+
+    assert Enum.any?(plan, fn [_id, _parent, _not_used, detail] ->
+             String.contains?(detail, "SEARCH human USING INDEX messages_client_dedupe")
+           end),
+           inspect(plan)
+
+    refute Enum.any?(plan, fn [_id, _parent, _not_used, detail] ->
+             String.contains?(detail, "SCAN turns") or String.contains?(detail, "SCAN t ")
+           end)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE turns SET triggerSource=NULL,batchMemberCount=NULL,isBatchCarrier=NULL WHERE seq=?1",
+               [turn_seq]
+             )
+
+    refute StateResources.message(StateResources.query_message(ctx.db, carrier_message_id))[
+             "isBatchCarrier"
+           ]
+  end
+
+  @tag recipient_readiness: true
+  test "a proven member-row carrier is typed when a batch has no human members", ctx do
+    session = "k1"
+    now = System.system_time(:millisecond)
+
+    source =
+      Tightbeam.Wakes.schedule(ctx.db, %{
+        session_key: session,
+        origin: "agent:another-session",
+        prompt: "agent-only batch member",
+        due_at: now,
+        class: "fyi"
+      })
+
+    carrier_id = "member-row-format-empty-human-carrier"
+    envelope = "agent-only carrier envelope"
+
+    Tightbeam.Wakes.schedule(ctx.db, %{
+      wake_id: carrier_id,
+      session_key: session,
+      origin: "process:tightbeam",
+      prompt: envelope,
+      due_at: now,
+      class: "fyi",
+      digest: true
+    })
+
+    assert {:ok, [[recipient_address, visibility_scope]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceAddress,sourceVisibilityScope FROM wakes WHERE wakeId=?1",
+               [source.wake_id]
+             )
+
+    batch_id = "member-row-format-empty-human-batch"
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO notice_batches(batchId,recipientAddress,sessionKey,targetRole,
+                 visibilityScope,policyRevision,state,dueAt,openedAt,sealedAt,releaseCause,
+                 deliveryToken,envelope,envelopeSha256,deliveryWakeId,memberCount,
+                 chatMessageFormat,renderedBytes)
+               VALUES(?1,?2,?3,NULL,?4,?5,'delivery_pending',?6,?7,?7,'idle',?8,?9,?10,?11,1,
+                 'member-rows-v1',?12)
+               """,
+               [
+                 batch_id,
+                 recipient_address,
+                 session,
+                 visibility_scope,
+                 NoticeBatcher.policy_revision(),
+                 now,
+                 source.created_at,
+                 "member-row-format-token",
+                 envelope,
+                 Base.encode16(:crypto.hash(:sha256, envelope), case: :lower),
+                 carrier_id,
+                 byte_size(envelope)
+               ]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO notice_batch_members(memberId,batchId,sourceWakeId,policyRef,
+                 recipientAddress,visibilityScope,publicationSeq,policyRevision,senderPrincipal,
+                 cause,class,payload,renderedBytes,state,addedAt)
+               VALUES(?1,?2,?3,?4,?5,?6,1,?7,?8,'wake','fyi',?9,?10,'included',?11)
+               """,
+               [
+                 "member-row-format-agent-member",
+                 batch_id,
+                 source.wake_id,
+                 NoticeBatcher.policy_ref(source.wake_id),
+                 recipient_address,
+                 visibility_scope,
+                 NoticeBatcher.policy_revision(),
+                 source.origin,
+                 source.prompt,
+                 byte_size(source.prompt),
+                 source.created_at
+               ]
+             )
+
+    assert :appended =
+             Gateway.deliver_prompt(session, "process:tightbeam", envelope,
+               db: ctx.db,
+               wake_id: carrier_id,
+               sender: "process:tightbeam",
+               fire_wake_in_txn: true,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
+
+    assert {:ok, [[turn_seq, message_id]]} =
+             DB.query(ctx.db, "SELECT seq,messageId FROM turns WHERE wakeId=?1", [carrier_id])
+
+    message = StateResources.query_message(ctx.db, message_id) |> StateResources.message()
+    assert message["isBatchCarrier"]
+    assert message["turnIncludesHuman"] == false
+
+    turn = StateResources.query_turn_by_seq(ctx.db, turn_seq) |> StateResources.turn()
+    assert turn["triggerSource"] == "batch"
+    assert turn["batchMemberCount"] == 1
   end
 
   @tag recipient_readiness: true
@@ -12065,6 +12817,17 @@ defmodule Tightbeam.GatewayTest do
     item_bytes = StateResources.encode_item("transcript messages", item)
     wire_notice = Tightbeam.Firehose.Publisher.encode_wire_notice(notice)
     assert String.contains?(wire_notice, "\"payload\":" <> item_bytes)
+  end
+
+  defp receive_firehose_notice_matching!(hub, predicate) do
+    assert_receive {:firehose_notice, notice}, 1_000
+
+    if predicate.(notice) do
+      notice
+    else
+      :ok = Tightbeam.Firehose.Hub.delivered(hub, self())
+      receive_firehose_notice_matching!(hub, predicate)
+    end
   end
 
   defp put_skill!(base_dir, name, body) do

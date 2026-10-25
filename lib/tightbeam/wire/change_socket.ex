@@ -2,11 +2,12 @@ defmodule Tightbeam.Wire.ChangeSocket do
   @moduledoc "State-change authentication and delivery; router activation is composed separately."
   @behaviour WebSock
   alias Tightbeam.Firehose.{Hub, Publisher}
-  alias Tightbeam.StateVisibility
+  alias Tightbeam.{StateResources, StateVisibility}
   alias Tightbeam.Devices
   alias Tightbeam.Org
   alias Tightbeam.Wire.OperatorSession
   @max_subscriptions 100
+  @turn_classes ~w(turn.queued turn.started turn.ended)
   @filter_keys ~w(classes sessionKey workItemId origin principal)
   defstruct phase: :unauthed,
             user_id: nil,
@@ -61,6 +62,13 @@ defmodule Tightbeam.Wire.ChangeSocket do
   end
 
   def handle_info({:firehose_notice, _}, state), do: {:ok, state}
+
+  def handle_info({:firehose_control, frame}, %{phase: :live} = state) do
+    Hub.delivered(hub(state), self())
+    push(frame, state)
+  end
+
+  def handle_info({:firehose_control, _}, state), do: {:ok, state}
 
   def handle_info(:firehose_heartbeat, %{phase: :live} = state) do
     if credential_current?(state) do
@@ -273,9 +281,18 @@ defmodule Tightbeam.Wire.ChangeSocket do
           {:ok, filters} ->
             case authorized_filters(state, filters) do
               :ok ->
-                :ok = Hub.subscribe(hub(state), self(), id, filters)
+                :ok = Hub.begin_subscribe(hub(state), self(), id, filters)
                 state = %{state | subscriptions: Map.put(state.subscriptions, id, filters)}
-                push(%{"type" => "subscription_ready", "subscriptionId" => id}, state)
+
+                :ok =
+                  Hub.finish_subscribe(
+                    hub(state),
+                    self(),
+                    id,
+                    active_turn_notices(state, filters)
+                  )
+
+                {:ok, state}
 
               {:error, message} ->
                 invalid(message, state)
@@ -332,6 +349,29 @@ defmodule Tightbeam.Wire.ChangeSocket do
     timer = Process.send_after(self(), :firehose_heartbeat, heartbeat_ms(state))
     %{state | heartbeat_timer: timer}
   end
+
+  defp active_turn_notices(state, filters) do
+    session_key = filters["sessionKey"]
+
+    if is_binary(session_key) do
+      StateResources.query_active_turns_for_session(db(state), session_key)
+      |> Enum.map(fn turn ->
+        class = if turn.status == "queued", do: "turn.queued", else: "turn.started"
+        Publisher.committed_notice(class, turn, %{"sessionKey" => session_key})
+      end)
+      |> Enum.filter(fn notice ->
+        class_filter_matches?(filters["classes"], notice["class"]) and
+          StateVisibility.visible?(db(state), notice, visibility_principal(state))
+      end)
+    else
+      []
+    end
+  end
+
+  defp class_filter_matches?(nil, class), do: class in @turn_classes
+
+  defp class_filter_matches?(classes, class) when is_list(classes),
+    do: Enum.any?(classes, &String.starts_with?(class, &1))
 
   defp invalid(message, state), do: push(error(message), state)
 

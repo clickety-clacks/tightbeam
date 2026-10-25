@@ -307,6 +307,7 @@ defmodule Tightbeam.Schema do
   @o2_shape "row-driven-o2-v1-019"
   @o2_pre_liveness_shape "row-driven-o2-pre-liveness-v1-019"
   @shape "row-driven-admission-v1-019"
+
   @supervision_batch_delivery_previous_trigger """
   CREATE TRIGGER IF NOT EXISTS supervision_lineage_fire_requires_sidecar
   BEFORE UPDATE OF state ON wakes
@@ -1921,8 +1922,10 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_work_item_delivery_owner_link(db)
     :ok = upgrade_supervision_receipt_cancellation_v1(db)
     :ok = upgrade_assignment_source_replacement_v1(db)
+    :ok = ensure_turn_chat_provenance(db)
     :ok = Tightbeam.QueuedMessageSuppression.ensure_schema(db)
     :ok = Tightbeam.NoticeBatcher.ensure_schema(db)
+    :ok = ensure_notice_batch_chat_message_format(db)
 
     # Preserve exact historical Toplines DDL and its stamp if a preceding
     # migration refuses. Bootstrap already qualified it; now activate V6.
@@ -1981,6 +1984,108 @@ defmodule Tightbeam.Schema do
          end) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
+    end
+  end
+
+  @doc false
+  def ensure_turn_chat_provenance(db) do
+    case DB.migration_transaction(db, :turn_chat_provenance, [], [], fn txn ->
+           turn_columns =
+             Txn.q(txn, "PRAGMA table_info(turns)")
+             |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+           required_turn_columns =
+             ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt)
+
+           unless Enum.all?(required_turn_columns, &(&1 in turn_columns)) do
+             raise ShapeError, message: "turn_chat_provenance_incompatible_shape"
+           end
+
+           if "triggerSource" not in turn_columns do
+             :ok = Txn.exec(txn, "ALTER TABLE turns ADD COLUMN triggerSource TEXT")
+           end
+
+           if "batchMemberCount" not in turn_columns do
+             :ok = Txn.exec(txn, "ALTER TABLE turns ADD COLUMN batchMemberCount INTEGER")
+           end
+
+           if "isBatchCarrier" not in turn_columns do
+             :ok = Txn.exec(txn, "ALTER TABLE turns ADD COLUMN isBatchCarrier INTEGER")
+           end
+
+           turn_columns = Txn.q(txn, "PRAGMA table_info(turns)")
+
+           trigger_source_column =
+             Enum.find(turn_columns, fn [_cid, name | _rest] -> name == "triggerSource" end)
+
+           batch_member_count_column =
+             Enum.find(turn_columns, fn [_cid, name | _rest] -> name == "batchMemberCount" end)
+
+           is_batch_carrier_column =
+             Enum.find(turn_columns, fn [_cid, name | _rest] -> name == "isBatchCarrier" end)
+
+           unless match?([_, "triggerSource", "TEXT", 0, nil, 0], trigger_source_column) do
+             raise ShapeError, message: "turn_chat_provenance_trigger_source_incompatible_column"
+           end
+
+           unless match?([_, "batchMemberCount", "INTEGER", 0, nil, 0], batch_member_count_column) do
+             raise ShapeError, message: "turn_chat_provenance_member_count_incompatible_column"
+           end
+
+           unless match?([_, "isBatchCarrier", "INTEGER", 0, nil, 0], is_batch_carrier_column) do
+             raise ShapeError, message: "turn_chat_provenance_carrier_incompatible_column"
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "turn_chat_provenance_migration_failed: #{Exception.message(error)}"
+    end
+  end
+
+  defp ensure_notice_batch_chat_message_format(db) do
+    case DB.migration_transaction(db, :notice_batch_chat_message_format, [], [], fn txn ->
+           batch_columns =
+             Txn.q(txn, "PRAGMA table_info(notice_batches)")
+             |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+           unless "chatMessageFormat" in batch_columns do
+             :ok =
+               Txn.exec(
+                 txn,
+                 "ALTER TABLE notice_batches ADD COLUMN chatMessageFormat TEXT " <>
+                   "CHECK(chatMessageFormat IS NULL OR chatMessageFormat='member-rows-v1')"
+               )
+           end
+
+           batch_columns = Txn.q(txn, "PRAGMA table_info(notice_batches)")
+
+           format_column =
+             Enum.find(batch_columns, fn [_cid, name | _rest] -> name == "chatMessageFormat" end)
+
+           unless match?([_, "chatMessageFormat", "TEXT", 0, nil, 0], format_column) do
+             raise ShapeError, message: "notice_batch_chat_message_format_incompatible_column"
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "notice_batch_chat_message_format_migration_failed: #{Exception.message(error)}"
     end
   end
 
