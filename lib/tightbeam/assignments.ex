@@ -121,6 +121,105 @@ defmodule Tightbeam.Assignments do
   )
   """
 
+  @actor_assignment_columns "id,subject,holderKey,holderRole,holderFallback,openedByUser,openedBySession," <>
+                              "openedByProcess,openedByViaSession,openedAt,state,outcome,closedAt,closedByUser," <>
+                              "closedBySession,closedByProcess,closedByViaSession,closingAttestId,workItemId," <>
+                              "reviewsAssignmentId,holderHarness,holderProvider,reminderState"
+  @actor_assignments_ddl """
+  CREATE TABLE assignments (
+    id TEXT PRIMARY KEY,
+    subject TEXT NOT NULL CHECK(length(subject) BETWEEN 1 AND 2000 AND length(trim(subject)) >= 1),
+    holderKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+    holderRole TEXT NULL,
+    holderFallback INTEGER NOT NULL DEFAULT 0 CHECK(holderFallback IN (0, 1)),
+    openedByUser TEXT NULL,
+    openedBySession TEXT NULL,
+    openedByProcess TEXT NULL,
+    openedByViaSession TEXT NULL,
+    openedAt INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open', 'closed')),
+    outcome TEXT NULL CHECK(outcome IN ('completed', 'surrendered', 'revoked')),
+    closedAt INTEGER NULL,
+    closedByUser TEXT NULL,
+    closedBySession TEXT NULL,
+    closedByProcess TEXT NULL,
+    closedByViaSession TEXT NULL,
+    closingAttestId TEXT NULL REFERENCES attests(id),
+    workItemId TEXT NULL REFERENCES work_items(id),
+    reviewsAssignmentId TEXT NULL REFERENCES assignments(id),
+    holderHarness TEXT NULL,
+    holderProvider TEXT NULL,
+    reminderState TEXT NULL,
+    CHECK(holderRole IS NOT NULL OR holderFallback = 0),
+    CHECK(
+      ((openedByUser IS NOT NULL) + (openedBySession IS NOT NULL) +
+       (openedByProcess IS NOT NULL)) = 1
+    ),
+    CHECK(
+      (state = 'open' AND outcome IS NULL AND closedAt IS NULL AND
+       closedByUser IS NULL AND closedBySession IS NULL AND closedByProcess IS NULL AND
+       closedByViaSession IS NULL AND closingAttestId IS NULL)
+      OR
+      (state = 'closed' AND outcome IS NOT NULL AND closedAt IS NOT NULL AND
+       ((closedByUser IS NOT NULL) + (closedBySession IS NOT NULL) +
+        (closedByProcess IS NOT NULL)) = 1)
+    ),
+    CHECK(outcome NOT IN ('completed', 'surrendered') OR closingAttestId IS NOT NULL),
+    CHECK(outcome != 'revoked' OR closingAttestId IS NULL)
+  )
+  """
+
+  @actor_reopenings_ddl """
+  CREATE TABLE assignment_reopenings (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    assignmentId         TEXT    NOT NULL REFERENCES assignments(id),
+    ts                   INTEGER NOT NULL,
+    reopenedByUser       TEXT    NULL REFERENCES users(userId),
+    reopenedBySession    TEXT    NULL REFERENCES sessions(sessionKey),
+    reopenedByProcess    TEXT    NULL,
+    reopenedByViaSession TEXT    NULL,
+    reason               TEXT    NOT NULL CHECK(length(trim(reason)) BETWEEN 1 AND 2000),
+    priorOutcome         TEXT    NOT NULL CHECK(priorOutcome IN ('completed', 'surrendered', 'revoked')),
+    priorClosedAt        INTEGER NOT NULL,
+    priorClosedByUser    TEXT    NULL,
+    priorClosedBySession TEXT    NULL,
+    priorClosedByProcess TEXT    NULL,
+    priorClosedByViaSession TEXT NULL,
+    priorClosingAttestId TEXT    NULL REFERENCES attests(id),
+    CHECK(
+      ((reopenedByUser IS NOT NULL) + (reopenedBySession IS NOT NULL) +
+       (reopenedByProcess IS NOT NULL)) = 1
+    )
+  )
+  """
+
+  @actor_revocations_table_ddl """
+  CREATE TABLE assignment_revocations (
+    id TEXT PRIMARY KEY,
+    assignmentId TEXT NOT NULL REFERENCES assignments(id),
+    revokedAt INTEGER NOT NULL,
+    revokedByUser TEXT NULL REFERENCES users(userId),
+    revokedBySession TEXT NULL REFERENCES sessions(sessionKey),
+    revokedByProcess TEXT NULL,
+    revokedByViaSession TEXT NULL,
+    reason TEXT NOT NULL CHECK(
+      length(reason) BETWEEN 1 AND 2000
+      AND length(trim(reason,
+        char(9) || char(10) || char(11) || char(12) || char(13) || ' ' ||
+        char(133) || char(160) || char(5760) ||
+        char(8192) || char(8193) || char(8194) || char(8195) || char(8196) ||
+        char(8197) || char(8198) || char(8199) || char(8200) || char(8201) ||
+        char(8202) || char(8232) || char(8233) || char(8239) || char(8287) ||
+        char(12288)
+      )) >= 1
+    ),
+    CHECK(
+      ((revokedByUser IS NOT NULL) + (revokedBySession IS NOT NULL) +
+       (revokedByProcess IS NOT NULL)) = 1
+    )
+  )
+  """
+
   @doc false
   def rebuild_r1_process_close_in_txn(%Txn{} = txn) do
     previous_fk_violations =
@@ -371,7 +470,7 @@ defmodule Tightbeam.Assignments do
     :ok = Txn.exec(txn, @revocation_trigger_ddl)
   end
 
-  @attests_ddl """
+  @legacy_attests_ddl """
   CREATE TABLE IF NOT EXISTS attests (
     id TEXT PRIMARY KEY,
     assignmentId TEXT NOT NULL REFERENCES assignments(id),
@@ -405,7 +504,44 @@ defmodule Tightbeam.Assignments do
   )
   """
 
-  @pre_cannot_proceed_attests_ddl @attests_ddl
+  @attests_ddl """
+  CREATE TABLE IF NOT EXISTS attests (
+    id TEXT PRIMARY KEY,
+    assignmentId TEXT NOT NULL REFERENCES assignments(id),
+    kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender', 'cannot-proceed', 'verdict')),
+    verdictKind TEXT NULL,
+    note TEXT NULL CHECK(note IS NULL OR length(trim(note)) BETWEEN 1 AND 2000),
+    bySession TEXT NULL REFERENCES sessions(sessionKey),
+    byUser TEXT NULL REFERENCES users(userId),
+    byProcess TEXT NULL,
+    byActorSession TEXT NULL,
+    producer TEXT NULL,
+    producerCommand TEXT NULL,
+    byHarness TEXT NULL,
+    byProvider TEXT NULL,
+    commitRefs TEXT NULL,
+    artifactId TEXT NULL REFERENCES artifacts(artifactId),
+    contentSha256 TEXT NULL,
+    waitId TEXT NULL REFERENCES wakes(wakeId),
+    ts INTEGER NOT NULL,
+    CHECK(
+      (kind IN ('progress', 'completion', 'surrender', 'cannot-proceed') AND
+       ((bySession IS NOT NULL) + (byUser IS NOT NULL) + (byProcess IS NOT NULL)) = 1 AND
+       verdictKind IS NULL)
+      OR
+      (kind = 'verdict' AND verdictKind IS NOT NULL AND
+       ((bySession IS NOT NULL) + (byUser IS NOT NULL) + (byProcess IS NOT NULL)) = 1)
+    ),
+    CHECK(producer IS NULL OR kind = 'verdict'),
+    CHECK(producerCommand IS NULL OR producer IS NOT NULL),
+    CHECK(byHarness IS NULL OR kind = 'verdict'),
+    CHECK(byProvider IS NULL OR kind = 'verdict'),
+    CHECK((artifactId IS NULL) = (contentSha256 IS NULL)),
+    CHECK(artifactId IS NULL OR kind = 'verdict')
+  )
+  """
+
+  @pre_cannot_proceed_attests_ddl @legacy_attests_ddl
                                   |> String.replace(
                                     "kind IN ('progress', 'completion', 'surrender', 'cannot-proceed', 'verdict')",
                                     "kind IN ('progress', 'completion', 'surrender', 'verdict')",
@@ -505,6 +641,18 @@ defmodule Tightbeam.Assignments do
   end
 
   @doc false
+  def ensure_pre_actor_schema(db) do
+    :ok = DB.execute(db, @assignments_ddl)
+    :ok = DB.execute(db, @legacy_attests_ddl)
+    :ok = DB.execute(db, @cannot_proceed_ddl)
+    :ok = DB.execute(db, @assignment_files_ddl)
+    :ok = DB.execute(db, @assignment_effects_ddl)
+    :ok = DB.execute(db, @assignment_priorities_ddl)
+    :ok = DB.execute(db, @interruptions_ddl)
+    Tightbeam.EffortCheckin.ensure_schema(db)
+  end
+
+  @doc false
   def ensure_pre_cannot_proceed_schema(db) do
     :ok = DB.execute(db, @assignments_ddl)
     :ok = DB.execute(db, @pre_cannot_proceed_attests_ddl)
@@ -527,7 +675,7 @@ defmodule Tightbeam.Assignments do
 
     migrated_attests_ddl =
       String.replace(
-        @attests_ddl,
+        @legacy_attests_ddl,
         "CREATE TABLE IF NOT EXISTS attests",
         "CREATE TABLE attests_cannot_proceed_v1",
         global: false
@@ -550,6 +698,205 @@ defmodule Tightbeam.Assignments do
     :ok = Txn.exec(txn, "DROP TABLE attests")
     :ok = Txn.exec(txn, "ALTER TABLE attests_cannot_proceed_v1 RENAME TO attests")
     :ok = Txn.exec(txn, @cannot_proceed_ddl)
+    :ok
+  end
+
+  @doc false
+  def migrate_attest_actor_attribution_in_txn(%Txn{} = txn) do
+    unless Txn.q(txn, "PRAGMA foreign_keys") == [[0]] and
+             Txn.q(txn, "PRAGMA legacy_alter_table") == [[1]],
+           do:
+             raise(
+               ArgumentError,
+               "attest actor migration requires foreign_keys OFF and legacy_alter_table ON"
+             )
+
+    # The owning schema migration is keyed by the exact predecessor stamp. These
+    # column reads also make an incomplete or hand-edited predecessor fail before
+    # the first write.
+    Txn.q(
+      txn,
+      "SELECT id,assignmentId,kind,verdictKind,note,bySession,byUser,producer," <>
+        "producerCommand,byHarness,byProvider,commitRefs,artifactId,contentSha256,waitId,ts " <>
+        "FROM attests LIMIT 0"
+    )
+
+    previous_fk_violations = Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(attests))
+    [[before_count]] = Txn.q(txn, "SELECT COUNT(*) FROM attests")
+
+    objects =
+      Txn.q(txn, """
+      SELECT sql FROM sqlite_schema
+      WHERE tbl_name='attests' AND type IN ('index','trigger') AND sql IS NOT NULL
+      ORDER BY type,name
+      """)
+
+    :ok = Txn.exec(txn, "ALTER TABLE attests RENAME TO attests_before_actor_attribution")
+
+    migrated_ddl =
+      String.replace(
+        @attests_ddl,
+        "CREATE TABLE IF NOT EXISTS attests",
+        "CREATE TABLE attests_actor_attribution",
+        global: false
+      )
+
+    :ok = Txn.exec(txn, migrated_ddl)
+
+    columns =
+      "id,assignmentId,kind,verdictKind,note,bySession,byUser,byProcess,byActorSession,producer," <>
+        "producerCommand,byHarness,byProvider,commitRefs,artifactId,contentSha256,waitId,ts"
+
+    :ok =
+      Txn.exec(
+        txn,
+        "INSERT INTO attests_actor_attribution (#{columns}) " <>
+          "SELECT id,assignmentId,kind,verdictKind,note,bySession,byUser,NULL,NULL,producer," <>
+          "producerCommand,byHarness,byProvider,commitRefs,artifactId,contentSha256,waitId,ts " <>
+          "FROM attests_before_actor_attribution"
+      )
+
+    [[^before_count]] = Txn.q(txn, "SELECT COUNT(*) FROM attests_actor_attribution")
+    :ok = Txn.exec(txn, "DROP TABLE attests_before_actor_attribution")
+    :ok = Txn.exec(txn, "ALTER TABLE attests_actor_attribution RENAME TO attests")
+    Enum.each(objects, fn [sql] -> :ok = Txn.exec(txn, sql) end)
+
+    unless Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(attests)) --
+             previous_fk_violations == [],
+           do: raise(ArgumentError, "attest actor migration left invalid foreign keys")
+
+    :ok
+  end
+
+  @doc false
+  def migrate_actor_attribution_in_txn(%Txn{} = txn) do
+    unless Txn.q(txn, "PRAGMA foreign_keys") == [[0]] and
+             Txn.q(txn, "PRAGMA legacy_alter_table") == [[1]],
+           do:
+             raise(
+               ArgumentError,
+               "assignment actor migration requires foreign_keys OFF and legacy_alter_table ON"
+             )
+
+    previous_fk_violations =
+      Tightbeam.Schema.migration_foreign_keys_in_txn(
+        txn,
+        ~w(assignments attests assignment_reopenings assignment_revocations)
+      )
+
+    :ok = migrate_attest_actor_attribution_in_txn(txn)
+
+    rebuild_actor_table_in_txn(
+      txn,
+      "assignments",
+      "assignments_actor_attribution",
+      @actor_assignments_ddl,
+      @actor_assignment_columns,
+      "id,subject,holderKey,holderRole,holderFallback,openedByUser,openedBySession," <>
+        "openedAt,state,outcome,closedAt,closedByUser,closedBySession,closedByProcess," <>
+        "closingAttestId,workItemId,reviewsAssignmentId,holderHarness,holderProvider,reminderState",
+      "id,subject,holderKey,holderRole,holderFallback,openedByUser,openedBySession,NULL,NULL," <>
+        "openedAt,state,outcome,closedAt,closedByUser,closedBySession,closedByProcess,NULL," <>
+        "closingAttestId,workItemId,reviewsAssignmentId,holderHarness,holderProvider,reminderState"
+    )
+
+    rebuild_actor_table_in_txn(
+      txn,
+      "assignment_reopenings",
+      "assignment_reopenings_actor_attribution",
+      @actor_reopenings_ddl,
+      "id,assignmentId,ts,reopenedByUser,reopenedBySession,reopenedByProcess,reopenedByViaSession,reason," <>
+        "priorOutcome,priorClosedAt,priorClosedByUser,priorClosedBySession," <>
+        "priorClosedByProcess,priorClosedByViaSession,priorClosingAttestId",
+      "id,assignmentId,ts,reopenedByUser,reopenedBySession,NULL,NULL,reason,priorOutcome," <>
+        "priorClosedAt,priorClosedByUser,priorClosedBySession,priorClosedByProcess,NULL," <>
+        "priorClosingAttestId",
+      "id,assignmentId,ts,reopenedByUser,reopenedBySession,NULL,NULL,reason,priorOutcome," <>
+        "priorClosedAt,priorClosedByUser,priorClosedBySession,priorClosedByProcess,NULL," <>
+        "priorClosingAttestId"
+    )
+
+    rebuild_actor_table_in_txn(
+      txn,
+      "assignment_revocations",
+      "assignment_revocations_actor_attribution",
+      @actor_revocations_table_ddl,
+      "id,assignmentId,revokedAt,revokedByUser,revokedBySession,revokedByProcess,revokedByViaSession,reason",
+      "id,assignmentId,revokedAt,revokedByUser,revokedBySession,revokedByProcess,reason",
+      "id,assignmentId,revokedAt,revokedByUser,revokedBySession,revokedByProcess,NULL,reason"
+    )
+
+    unless Tightbeam.Schema.migration_foreign_keys_in_txn(
+             txn,
+             ~w(assignments attests assignment_reopenings assignment_revocations)
+           ) -- previous_fk_violations == [],
+           do: raise(ArgumentError, "assignment actor migration left invalid foreign keys")
+
+    :ok
+  end
+
+  defp rebuild_actor_table_in_txn(
+         txn,
+         table,
+         renamed_table,
+         create_ddl,
+         columns,
+         predecessor_columns,
+         select_columns
+       ) do
+    # Resolve the complete predecessor before mutating it, and retain explicit
+    # indexes/triggers so the table swap changes only the actor representation.
+    Txn.q(
+      txn,
+      "SELECT #{predecessor_columns |> String.split(",") |> Enum.map_join(",", &String.trim/1)} FROM #{table} LIMIT 0"
+    )
+    [[before_count]] = Txn.q(txn, "SELECT COUNT(*) FROM #{table}")
+    previous_sequence =
+      case Txn.q(txn, "SELECT 1 FROM sqlite_schema WHERE name='sqlite_sequence'") do
+        [[1]] ->
+          case Txn.q(txn, "SELECT seq FROM sqlite_sequence WHERE name=?1", [table]) do
+            [[sequence]] -> sequence
+            [] -> nil
+          end
+
+        [] ->
+          nil
+      end
+
+    objects =
+      Txn.q(txn, """
+      SELECT type,name,sql FROM sqlite_schema
+      WHERE tbl_name=?1 AND type IN ('index','trigger') AND sql IS NOT NULL
+      ORDER BY type,name
+      """, [table])
+
+    Enum.each(objects, fn [type, name, _sql] ->
+      quoted_name = "\"" <> String.replace(name, "\"", "\"\"") <> "\""
+      :ok = Txn.exec(txn, "DROP #{String.upcase(type)} #{quoted_name}")
+    end)
+
+    :ok = Txn.exec(txn, "ALTER TABLE #{table} RENAME TO #{renamed_table}")
+    :ok = Txn.exec(txn, create_ddl)
+    :ok = Txn.exec(txn, "INSERT INTO #{table} (#{columns}) SELECT #{select_columns} FROM #{renamed_table}")
+    [[^before_count]] = Txn.q(txn, "SELECT COUNT(*) FROM #{table}")
+    :ok = Txn.exec(txn, "DROP TABLE #{renamed_table}")
+    Enum.each(objects, fn [_type, _name, sql] -> :ok = Txn.exec(txn, sql) end)
+
+    if is_integer(previous_sequence) do
+      Txn.q(
+        txn,
+        "UPDATE sqlite_sequence SET seq=MAX(seq,?2) WHERE name=?1",
+        [table, previous_sequence]
+      )
+
+      if Txn.changes(txn) == 0,
+        do:
+          Txn.q(txn, "INSERT INTO sqlite_sequence(name,seq) VALUES (?1,?2)", [
+            table,
+            previous_sequence
+          ])
+    end
+
     :ok
   end
 
@@ -1237,7 +1584,7 @@ defmodule Tightbeam.Assignments do
 
     select_from = """
     SELECT att.id, att.assignmentId, att.kind, att.verdictKind, att.note,
-           att.bySession, att.byUser, att.producer, att.producerCommand,
+           att.bySession, att.byUser, att.byProcess, att.byActorSession, att.producer, att.producerCommand,
            att.byHarness, att.byProvider, att.commitRefs, att.ts
     FROM attests AS att
     JOIN assignments AS parent ON parent.id = att.assignmentId
@@ -1261,7 +1608,7 @@ defmodule Tightbeam.Assignments do
       ["att.ts", "att.id"],
       boundary,
       limit,
-      fn row -> [Enum.at(row, 12), hd(row)] end
+      fn row -> [Enum.at(row, 14), hd(row)] end
     )
     |> then(fn page -> %{page | rows: Enum.map(page.rows, &attest_collection_row/1)} end)
   end
@@ -1278,7 +1625,7 @@ defmodule Tightbeam.Assignments do
 
     select_from = """
     SELECT att.id, att.assignmentId, att.kind, att.verdictKind, att.note,
-           att.bySession, att.byUser, att.producer, att.producerCommand,
+           att.bySession, att.byUser, att.byProcess, att.byActorSession, att.producer, att.producerCommand,
            att.byHarness, att.byProvider, att.commitRefs, att.ts
     FROM attests AS att
     JOIN assignments AS parent ON parent.id = att.assignmentId
@@ -1302,7 +1649,7 @@ defmodule Tightbeam.Assignments do
       ["att.ts", "att.id"],
       boundary,
       limit,
-      fn row -> [Enum.at(row, 12), hd(row)] end
+      fn row -> [Enum.at(row, 14), hd(row)] end
     )
     |> then(fn page -> %{page | rows: Enum.map(page.rows, &attest_collection_row/1)} end)
   end
@@ -1311,7 +1658,7 @@ defmodule Tightbeam.Assignments do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, artifactId, contentSha256, waitId, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
+        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, byProcess, byActorSession, producer, producerCommand, byHarness, byProvider, commitRefs, artifactId, contentSha256, waitId, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
         [assignment_id]
       )
 
@@ -1333,6 +1680,7 @@ defmodule Tightbeam.Assignments do
           "verdictKind" -> "att.verdictKind"
           "bySession" -> "att.bySession"
           "byUser" -> "att.byUser"
+          "byProcess" -> "att.byProcess"
           _ -> raise ArgumentError, "unsupported attest collection filter"
         end
 
@@ -1349,6 +1697,8 @@ defmodule Tightbeam.Assignments do
          note,
          by_session,
          by_user,
+         by_process,
+         by_actor_session,
          producer,
          producer_command,
          by_harness,
@@ -1364,6 +1714,8 @@ defmodule Tightbeam.Assignments do
       note: note,
       by_session: by_session,
       by_user: by_user,
+      by_process: by_process,
+      by_actor_session: by_actor_session,
       producer: producer,
       producer_command: producer_command,
       by_harness: by_harness,
@@ -1379,9 +1731,10 @@ defmodule Tightbeam.Assignments do
       DB.query(
         db,
         """
-        SELECT id, assignmentId, ts, reopenedByUser, reopenedBySession, reason,
+        SELECT id, assignmentId, ts, reopenedByUser, reopenedBySession, reopenedByProcess,
+          reopenedByViaSession, reason,
           priorOutcome, priorClosedAt, priorClosedByUser, priorClosedBySession, priorClosedByProcess,
-          priorClosingAttestId
+          priorClosedByViaSession, priorClosingAttestId
         FROM assignment_reopenings
         WHERE assignmentId = ?1
         ORDER BY ts ASC, id ASC
@@ -2365,16 +2718,16 @@ defmodule Tightbeam.Assignments do
 
         id = id("asg_")
         now = now()
-        {opened_user, opened_session} = opener(call.principal)
+        {opened_user, opened_session, opened_process, opened_via_session} = assignment_actor(call)
 
         Txn.q(
           txn,
           """
           INSERT INTO assignments
             (id, subject, holderKey, holderRole, holderFallback, openedByUser,
-             openedBySession, openedAt, workItemId, reviewsAssignmentId,
+             openedBySession, openedByProcess, openedByViaSession, openedAt, workItemId, reviewsAssignmentId,
              holderHarness, holderProvider)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
           """,
           [
             id,
@@ -2384,6 +2737,8 @@ defmodule Tightbeam.Assignments do
             if(call.role_fallback, do: 1, else: 0),
             opened_user,
             opened_session,
+            opened_process,
+            opened_via_session,
             now,
             work_item_id,
             reviews_assignment_id,
@@ -2753,11 +3108,8 @@ defmodule Tightbeam.Assignments do
       nil ->
         error("unknown_assignment", "unknown assignment: #{assignment_id}")
 
-      %{holderKey: holder} = assignment ->
+      assignment ->
         cond do
-          not match?({:session, _}, call.principal) ->
-            error("not_holder", "assignment is held by session #{holder}")
-
           assignment.state != "open" and call.params[:kind] == "cannot-proceed" ->
             cannot_proceed_closed(assignment.outcome)
 
@@ -2866,10 +3218,19 @@ defmodule Tightbeam.Assignments do
       txn,
       """
       UPDATE assignments SET state = 'closed', outcome = 'completed', closedAt = ?2,
-        closedBySession = ?3, closingAttestId = ?4
+        closedByUser = ?3, closedBySession = ?4, closedByProcess = ?5,
+        closedByViaSession = ?6, closingAttestId = ?7
       WHERE id = ?1 AND state = 'open'
       """,
-      [assignment.id, attest.ts, attest.bySession, attest.id]
+      [
+        assignment.id,
+        attest.ts,
+        attest.byUser,
+        attest.bySession,
+        attest.byProcess,
+        attest.byActorSession,
+        attest.id
+      ]
     )
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
@@ -2881,7 +3242,7 @@ defmodule Tightbeam.Assignments do
         # The typed terminal notice already reports this attest when it reaches
         # the card opener. Preserve the separate source only when the canonical
         # terminal route selects another currently accountable recipient.
-        if wake.session_key != assignment_opener_session(assignment) do
+        if wake.session_key != assignment_opener_session(txn, assignment) do
           notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
         end
 
@@ -2925,7 +3286,7 @@ defmodule Tightbeam.Assignments do
       nil ->
         condition_id = id("cp_")
         opener_ref = assignment_opener_ref(assignment)
-        target = assignment_opener_session(assignment)
+        target = assignment_opener_session(txn, assignment)
 
         [[asker_owner]] =
           Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [
@@ -3105,15 +3466,41 @@ defmodule Tightbeam.Assignments do
     }
   end
 
-  defp assignment_opener_ref(%{openedBySession: session}) when is_binary(session),
-    do: "session:" <> session
+  defp assignment_opener_ref(%{openedByProcess: process}) when is_binary(process),
+    do: "process:" <> process
 
   defp assignment_opener_ref(%{openedByUser: user}) when is_binary(user), do: "user:" <> user
 
-  defp assignment_opener_session(%{openedBySession: session}) when is_binary(session), do: session
+  defp assignment_opener_ref(%{openedBySession: session}) when is_binary(session),
+    do: "session:" <> session
 
-  defp assignment_opener_session(%{openedByUser: user}) when is_binary(user),
+  defp assignment_opener_session(_txn, %{openedBySession: session}) when is_binary(session),
+    do: session
+
+  defp assignment_opener_session(_txn, %{openedByUser: user}) when is_binary(user),
     do: Org.personal_session_key(user)
+
+  defp assignment_opener_session(txn, %{openedByProcess: process} = assignment)
+       when is_binary(process) do
+    owner =
+      case assignment.workItemId do
+        work_item_id when is_binary(work_item_id) ->
+          case Txn.q(txn, "SELECT ownerUserId FROM work_items WHERE id=?1", [work_item_id]) do
+            [[user]] -> user
+            [] -> nil
+          end
+
+        _ ->
+          case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [
+                 assignment.holderKey
+               ]) do
+            [[user]] -> user
+            [] -> nil
+          end
+      end
+
+    if is_binary(owner), do: Org.personal_session_key(owner), else: nil
+  end
 
   defp verdict_in_txn(txn, call) do
     assignment_id = call.params[:assignment_id]
@@ -3139,7 +3526,7 @@ defmodule Tightbeam.Assignments do
               true ->
                 with :ok <- valid_verdict_kind(call.params[:verdict_kind]),
                      :ok <- valid_note(call.params[:note]),
-                     {by_user, by_session} = opener(call.principal),
+                     {by_user, by_session, _by_process, _by_actor_session} = attest_actor(call),
                      :ok <-
                        Wakes.validate_verification_verdict_in_txn(txn, %{
                          assignment_id: assignment_id,
@@ -3287,7 +3674,7 @@ defmodule Tightbeam.Assignments do
     case Txn.q(
            txn,
            """
-           SELECT id,assignmentId,kind,verdictKind,note,bySession,byUser,producer,
+           SELECT id,assignmentId,kind,verdictKind,note,bySession,byUser,byProcess,byActorSession,producer,
              producerCommand,byHarness,byProvider,commitRefs,artifactId,contentSha256,
              waitId,ts
            FROM attests
@@ -3484,7 +3871,7 @@ defmodule Tightbeam.Assignments do
     txn
     |> Txn.q(
       """
-      SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer,
+      SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, byProcess, byActorSession, producer,
              producerCommand, byHarness, byProvider, commitRefs,
              artifactId, contentSha256, waitId, ts
       FROM attests
@@ -3528,7 +3915,7 @@ defmodule Tightbeam.Assignments do
   end
 
   defp revoke_open_assignment_in_txn(txn, call, assignment_id) do
-    {closed_user, closed_session} = opener(call.principal)
+    {closed_user, closed_session, closed_process, closed_via_session} = assignment_actor(call)
     closed_at = now()
     revocation_id = id("rev_")
     reopening_id = current_reopening_id(txn, assignment_id)
@@ -3537,8 +3924,9 @@ defmodule Tightbeam.Assignments do
       txn,
       """
       INSERT INTO assignment_revocations
-        (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        (id, assignmentId, revokedAt, revokedByUser, revokedBySession, revokedByProcess,
+         revokedByViaSession, reason)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
       """,
       [
         revocation_id,
@@ -3546,6 +3934,8 @@ defmodule Tightbeam.Assignments do
         closed_at,
         closed_user,
         closed_session,
+        closed_process,
+        closed_via_session,
         call.params[:reason]
       ]
     )
@@ -3564,10 +3954,11 @@ defmodule Tightbeam.Assignments do
       txn,
       """
       UPDATE assignments SET state = 'closed', outcome = 'revoked', closedAt = ?2,
-        closedByUser = ?3, closedBySession = ?4
+        closedByUser = ?3, closedBySession = ?4, closedByProcess = ?5,
+        closedByViaSession = ?6
       WHERE id = ?1 AND state = 'open'
       """,
-      [assignment_id, closed_at, closed_user, closed_session]
+      [assignment_id, closed_at, closed_user, closed_session, closed_process, closed_via_session]
     )
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
@@ -3701,27 +4092,32 @@ defmodule Tightbeam.Assignments do
   defp apply_reopen(txn, call, assignment) do
     assignment_id = assignment.id
     reopened_at = now()
-    {reopened_user, reopened_session} = opener(call.principal)
+    {reopened_user, reopened_session, reopened_process, reopened_via_session} = assignment_actor(call)
 
     Txn.q(
       txn,
       """
       INSERT INTO assignment_reopenings
-        (assignmentId, ts, reopenedByUser, reopenedBySession, reason, priorOutcome,
-         priorClosedAt, priorClosedByUser, priorClosedBySession, priorClosedByProcess, priorClosingAttestId)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        (assignmentId, ts, reopenedByUser, reopenedBySession, reopenedByProcess,
+         reopenedByViaSession, reason, priorOutcome, priorClosedAt,
+         priorClosedByUser, priorClosedBySession, priorClosedByProcess,
+         priorClosedByViaSession, priorClosingAttestId)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
       """,
       [
         assignment_id,
         reopened_at,
         reopened_user,
         reopened_session,
+        reopened_process,
+        reopened_via_session,
         call.params[:reason],
         assignment.outcome,
         assignment.closedAt,
         assignment.closedByUser,
         assignment.closedBySession,
         assignment.closedByProcess,
+        assignment.closedByViaSession,
         assignment.closingAttestId
       ]
     )
@@ -3730,7 +4126,8 @@ defmodule Tightbeam.Assignments do
       txn,
       """
       UPDATE assignments SET state = 'open', outcome = NULL, closedAt = NULL,
-        closedByUser = NULL, closedBySession = NULL, closedByProcess = NULL, closingAttestId = NULL
+        closedByUser = NULL, closedBySession = NULL, closedByProcess = NULL,
+        closedByViaSession = NULL, closingAttestId = NULL
       WHERE id = ?1 AND state = 'closed'
       """,
       [assignment_id]
@@ -3906,7 +4303,7 @@ defmodule Tightbeam.Assignments do
   defp append_attest_marker_summary(text, _note), do: text
 
   defp notify_assignment_opener_of_attest_in_txn(txn, assignment, attest) do
-    recipient = assignment_opener_session(assignment)
+    recipient = assignment_opener_session(txn, assignment)
 
     recipient_exists? =
       case assignment do
@@ -3936,26 +4333,23 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  defp same_attest_principal_as_opener?(
-         %{openedByUser: opener, openedBySession: nil},
-         %{byUser: opener, bySession: nil}
-       )
+  defp same_attest_principal_as_opener?(%{openedByUser: opener}, %{byUser: opener})
        when is_binary(opener),
        do: true
 
-  defp same_attest_principal_as_opener?(
-         %{openedByUser: nil, openedBySession: opener},
-         %{byUser: nil, bySession: opener}
-       )
+  defp same_attest_principal_as_opener?(%{openedBySession: opener}, %{bySession: opener})
+       when is_binary(opener),
+       do: true
+
+  defp same_attest_principal_as_opener?(%{openedByProcess: opener}, %{byProcess: opener})
        when is_binary(opener),
        do: true
 
   defp same_attest_principal_as_opener?(_assignment, _attest), do: false
 
-  defp attest_notice_origin(%{bySession: session}) when is_binary(session),
-    do: "agent:" <> session
-
   defp attest_notice_origin(%{byUser: user}) when is_binary(user), do: "user:" <> user
+  defp attest_notice_origin(%{byProcess: process}) when is_binary(process), do: "process:" <> process
+  defp attest_notice_origin(%{bySession: session}) when is_binary(session), do: "agent:" <> session
 
   defp append_assignment_marker(txn, assignment, :opened) do
     append_substrate(txn, assignment.holderKey, "[assignment opened: #{assignment.id}]")
@@ -3992,8 +4386,9 @@ defmodule Tightbeam.Assignments do
   end
 
   defp insert_attest(txn, call, assignment_id, allow_closed \\ false) do
-    {by_user, by_session} = opener(call.principal)
-    {by_harness, by_provider} = verdict_author_family(txn, call.params.kind, by_session)
+    {by_user, by_session, by_process, by_actor_session} = attest_actor(call)
+    {by_harness, by_provider} =
+      verdict_author_family(txn, call.params.kind, by_session || by_actor_session)
 
     insert_attest_row(txn, %{
       assignment_id: assignment_id,
@@ -4002,6 +4397,8 @@ defmodule Tightbeam.Assignments do
       note: call.params[:note],
       by_session: by_session,
       by_user: by_user,
+      by_process: by_process,
+      by_actor_session: by_actor_session,
       producer: nil,
       producer_command: nil,
       by_harness: by_harness,
@@ -4022,12 +4419,12 @@ defmodule Tightbeam.Assignments do
       txn,
       """
       INSERT INTO attests
-        (id, assignmentId, kind, verdictKind, note, bySession, byUser, producer,
+        (id, assignmentId, kind, verdictKind, note, bySession, byUser, byProcess, byActorSession, producer,
          producerCommand, byHarness, byProvider, commitRefs, artifactId, contentSha256, waitId, ts)
-      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
       WHERE EXISTS (
         SELECT 1 FROM assignments
-        WHERE id = ?2 AND (state = 'open' OR ?17 = 1)
+        WHERE id = ?2 AND (state = 'open' OR ?19 = 1)
       )
       """,
       [
@@ -4038,6 +4435,8 @@ defmodule Tightbeam.Assignments do
         attrs.note,
         attrs.by_session,
         attrs.by_user,
+        attrs.by_process,
+        attrs.by_actor_session,
         attrs.producer,
         attrs.producer_command,
         attrs.by_harness,
@@ -4053,9 +4452,8 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
 
-    if is_binary(attrs.by_session) do
-      Supervision.activity_in_txn(txn, attrs.assignment_id, attrs.by_session, ts)
-    end
+    activity_sessions = [attrs.by_session, attrs.by_actor_session] |> Enum.filter(&is_binary/1) |> Enum.uniq()
+    Enum.each(activity_sessions, &Supervision.activity_in_txn(txn, attrs.assignment_id, &1, ts))
 
     attest([
       id,
@@ -4065,6 +4463,8 @@ defmodule Tightbeam.Assignments do
       attrs.note,
       attrs.by_session,
       attrs.by_user,
+      attrs.by_process,
+      attrs.by_actor_session,
       attrs.producer,
       attrs.producer_command,
       attrs.by_harness,
@@ -4128,9 +4528,6 @@ defmodule Tightbeam.Assignments do
 
   defp fetch_assignment!(txn, id), do: fetch_assignment(txn, id) || raise("missing assignment")
 
-  defp principal_allowed({:process, _}, _verb),
-    do: error("process_denied", "process principals cannot use assignment verbs")
-
   defp principal_allowed({:remedy, %{action: "assign"}}, "assign"), do: :ok
 
   defp principal_allowed({:remedy, _}, verb),
@@ -4140,10 +4537,10 @@ defmodule Tightbeam.Assignments do
     do:
       error(
         "principal_required",
-        "assignment verbs require a user credential or a session token"
+        "assignment verbs require a user credential, a session token, or a process identity"
       )
 
-  defp principal_allowed({kind, _}, _verb) when kind in [:session, :user], do: :ok
+  defp principal_allowed({kind, _}, _verb) when kind in [:session, :user, :process], do: :ok
 
   defp valid_subject(subject) when is_binary(subject) do
     if String.length(subject) in 1..2000 and String.trim(subject) != "",
@@ -4308,11 +4705,8 @@ defmodule Tightbeam.Assignments do
       {:ok, []} ->
         error("unknown_assignment", "unknown assignment: #{assignment_id}")
 
-      {:ok, [[holder, state, reviews_assignment_id]]} when kind == "completion" ->
+      {:ok, [[_holder, state, reviews_assignment_id]]} when kind == "completion" ->
         cond do
-          not match?({:session, _}, call.principal) ->
-            error("not_holder", "assignment is held by session #{holder}")
-
           state != "open" ->
             assignment_closed()
 
@@ -4326,11 +4720,8 @@ defmodule Tightbeam.Assignments do
             :ok
         end
 
-      {:ok, [[holder, state, nil]]} when kind == "verdict" ->
+      {:ok, [[_holder, state, nil]]} when kind == "verdict" ->
         cond do
-          not match?({:session, _}, call.principal) ->
-            error("not_holder", "assignment is held by session #{holder}")
-
           call.params[:verdict_kind] not in ["verified", "verification-failed"] ->
             error(
               "invalid_commit_refs",
@@ -4664,6 +5055,7 @@ defmodule Tightbeam.Assignments do
 
   defp principal_id({:user, user}), do: "user:" <> user
   defp principal_id({:session, session}), do: "session:" <> session
+  defp principal_id({:process, process}), do: "process:" <> process
   defp principal_id({:remedy, %{owner: owner}}), do: "user:" <> owner
 
   defp row_commit_principal_id({:remedy, %{statute: statute}}), do: "remedy:" <> statute
@@ -4707,9 +5099,22 @@ defmodule Tightbeam.Assignments do
     }
   end
 
-  defp opener({:user, user}), do: {user, nil}
-  defp opener({:session, session}), do: {nil, session}
-  defp opener({:remedy, %{owner: owner}}), do: {owner, nil}
+  defp assignment_actor(call), do: attest_actor(call)
+
+  defp attest_actor(%{principal: {:user, user}} = call),
+    do: {user, nil, nil, transport_session(call)}
+
+  defp attest_actor(%{principal: {:session, session}} = call),
+    do: {nil, session, nil, transport_session(call) || session}
+
+  defp attest_actor(%{principal: {:process, process}} = call),
+    do: {nil, nil, process, transport_session(call)}
+
+  defp attest_actor(%{principal: {:remedy, %{owner: owner}}} = call),
+    do: {owner, nil, nil, transport_session(call)}
+
+  defp transport_session(call),
+    do: if(is_binary(call[:transport_session_key]), do: call.transport_session_key, else: nil)
 
   defp assignment_closed, do: error("assignment_closed", "assignment is already closed")
 
@@ -4930,10 +5335,11 @@ defmodule Tightbeam.Assignments do
 
   defp revoked_by?(assignment, {:user, user}), do: assignment.closedByUser == user
   defp revoked_by?(assignment, {:session, session}), do: assignment.closedBySession == session
+  defp revoked_by?(assignment, {:process, process}), do: assignment.closedByProcess == process
 
   defp columns do
-    "id, subject, holderKey, holderRole, holderFallback, openedByUser, openedBySession, " <>
-      "openedAt, state, outcome, closedAt, closedByUser, closedBySession, closedByProcess, closingAttestId, " <>
+    "id, subject, holderKey, holderRole, holderFallback, openedByUser, openedBySession, openedByProcess, openedByViaSession, " <>
+      "openedAt, state, outcome, closedAt, closedByUser, closedBySession, closedByProcess, closedByViaSession, closingAttestId, " <>
       "(SELECT r.reason FROM assignment_revocation_generations g " <>
       "JOIN assignment_revocations r ON r.id = g.revocationId " <>
       "WHERE g.assignmentId = assignments.id AND g.reopeningId IS " <>
@@ -4955,6 +5361,8 @@ defmodule Tightbeam.Assignments do
          holder_fallback,
          opened_by_user,
          opened_by_session,
+         opened_by_process,
+         opened_by_via_session,
          opened_at,
          state,
          outcome,
@@ -4962,6 +5370,7 @@ defmodule Tightbeam.Assignments do
          closed_by_user,
          closed_by_session,
          closed_by_process,
+         closed_by_via_session,
          closing_attest_id,
          revocation_reason,
          work_item_id,
@@ -4979,6 +5388,8 @@ defmodule Tightbeam.Assignments do
       holderFallback: holder_fallback == 1,
       openedByUser: opened_by_user,
       openedBySession: opened_by_session,
+      openedByProcess: opened_by_process,
+      openedByViaSession: opened_by_via_session,
       openedAt: opened_at,
       state: state,
       outcome: outcome,
@@ -4986,6 +5397,7 @@ defmodule Tightbeam.Assignments do
       closedByUser: closed_by_user,
       closedBySession: closed_by_session,
       closedByProcess: closed_by_process,
+      closedByViaSession: closed_by_via_session,
       closingAttestId: closing_attest_id,
       revocationReason: revocation_reason,
       workItemId: work_item_id,
@@ -5020,6 +5432,8 @@ defmodule Tightbeam.Assignments do
          note,
          by_session,
          by_user,
+         by_process,
+         by_actor_session,
          producer,
          producer_command,
          by_harness,
@@ -5038,6 +5452,8 @@ defmodule Tightbeam.Assignments do
       note: note,
       bySession: by_session,
       byUser: by_user,
+      byProcess: by_process,
+      byActorSession: by_actor_session,
       producer: producer,
       producerCommand: producer_command,
       byHarness: by_harness,
@@ -5056,12 +5472,15 @@ defmodule Tightbeam.Assignments do
          ts,
          reopened_by_user,
          reopened_by_session,
+         reopened_by_process,
+         reopened_by_via_session,
          reason,
          prior_outcome,
          prior_closed_at,
          prior_closed_by_user,
          prior_closed_by_session,
          prior_closed_by_process,
+         prior_closed_by_via_session,
          prior_closing_attest_id
        ]) do
     %{
@@ -5070,12 +5489,15 @@ defmodule Tightbeam.Assignments do
       ts: ts,
       reopenedByUser: reopened_by_user,
       reopenedBySession: reopened_by_session,
+      reopenedByProcess: reopened_by_process,
+      reopenedByViaSession: reopened_by_via_session,
       reason: reason,
       priorOutcome: prior_outcome,
       priorClosedAt: prior_closed_at,
       priorClosedByUser: prior_closed_by_user,
       priorClosedBySession: prior_closed_by_session,
       priorClosedByProcess: prior_closed_by_process,
+      priorClosedByViaSession: prior_closed_by_via_session,
       priorClosingAttestId: prior_closing_attest_id
     }
   end

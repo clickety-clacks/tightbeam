@@ -84,7 +84,11 @@ defmodule Tightbeam.CheckTierTest do
 
     assert length(Assignments.list_attests(ctx.db, assignment.id)) == 3
     assert Assignments.verdict_kinds(ctx.db, assignment.id) == ["tests-passed"]
-    assert %{code: "process_denied"} = verdict(ctx, {:process, "cron"}, assignment.id, "reviewed")
+
+    process_result = verdict(ctx, {:process, "cron"}, assignment.id, "reviewed")
+    assert process_result.attest.byProcess == "cron"
+    assert process_result.attest.byActorSession == nil
+    assert length(Assignments.list_attests(ctx.db, assignment.id)) == 4
     assert %{code: "principal_required"} = verdict(ctx, nil, assignment.id, "reviewed")
 
     assert %{code: "unknown_assignment"} =
@@ -156,7 +160,9 @@ defmodule Tightbeam.CheckTierTest do
     assert Enum.map(rows, & &1.id) == expected
     assert Enum.all?(rows, &Map.has_key?(&1, :verdictKind))
     assert %{attests: [_ | _]} = query_attests(ctx, {:user, "flynn"}, assignment.id)
-    assert %{code: "process_denied"} = query_attests(ctx, {:process, "cron"}, assignment.id)
+    process_result = verdict(ctx, {:process, "cron"}, assignment.id, "reviewed")
+    assert %{attests: rows} = query_attests(ctx, {:process, "cron"}, assignment.id)
+    assert Enum.map(rows, & &1.id) == Enum.sort(expected ++ [process_result.attest.id])
     assert %{code: "principal_required"} = query_attests(ctx, nil, assignment.id)
     assert %{code: "unknown_assignment"} = query_attests(ctx, {:user, "flynn"}, "missing")
   end

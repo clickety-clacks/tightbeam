@@ -131,6 +131,7 @@ defmodule Tightbeam.Dispatch do
             session_key,
             assignment,
             principal,
+            call[:transport_session_key],
             &Publisher.observed_accepted_in_txn(&1, call)
           )
 
@@ -146,6 +147,7 @@ defmodule Tightbeam.Dispatch do
             session_key,
             result,
             principal,
+            call[:transport_session_key],
             &Publisher.observed_accepted_in_txn(&1, call)
           )
 
@@ -154,7 +156,7 @@ defmodule Tightbeam.Dispatch do
       {:refuse, error} ->
         # Terminal guard fires BEFORE Rules.decide: no statute or remedy episode
         # touches a non-open item (work-item-brackets §Mechanism, Proof 12).
-        best_effort_denial(db, verb, origin, principal, session_key, error)
+        best_effort_denial(db, verb, origin, principal, session_key, call[:transport_session_key], error)
         {:error, error}
     end
   end
@@ -199,7 +201,7 @@ defmodule Tightbeam.Dispatch do
 
     case decision do
       {:deny, error} ->
-        best_effort_denial(db, verb, origin, principal, session_key, error)
+        best_effort_denial(db, verb, origin, principal, session_key, call[:transport_session_key], error)
         {:error, error}
 
       {:remedy, statute, ref, error} ->
@@ -221,7 +223,7 @@ defmodule Tightbeam.Dispatch do
           )
         else
           error = remedy_error(error, outcome)
-          best_effort_denial(db, verb, origin, principal, session_key, error)
+          best_effort_denial(db, verb, origin, principal, session_key, call[:transport_session_key], error)
           {:error, error}
         end
 
@@ -232,7 +234,7 @@ defmodule Tightbeam.Dispatch do
             id -> {:decision_pending, id}
           end
 
-        best_effort_denial(db, verb, origin, principal, session_key, ctx.error)
+        best_effort_denial(db, verb, origin, principal, session_key, call[:transport_session_key], ctx.error)
         outcome
 
       # A sensor malfunction denies AND summons (§A3). The caller gets the denial it
@@ -243,7 +245,7 @@ defmodule Tightbeam.Dispatch do
       # cannot raise: the summons is subordinate to the deny (§B3), so an unreachable
       # mind is a recorded gap and never a crashed call.
       {:deny_escalate, statute, ctx} ->
-        best_effort_denial(db, verb, origin, principal, session_key, ctx.error)
+        best_effort_denial(db, verb, origin, principal, session_key, call[:transport_session_key], ctx.error)
         :ok = RailEpisodes.summon(db, call, statute, Map.put(ctx, :dr_id, nil))
         {:error, ctx.error}
 
@@ -267,7 +269,7 @@ defmodule Tightbeam.Dispatch do
               message: "ruling authorization was no longer available"
             }
 
-            best_effort_denial(db, verb, origin, principal, session_key, error)
+            best_effort_denial(db, verb, origin, principal, session_key, call[:transport_session_key], error)
             {:error, error}
         end
     end
@@ -311,6 +313,7 @@ defmodule Tightbeam.Dispatch do
             session_key,
             error,
             principal,
+            call[:transport_session_key],
             &Publisher.denied_in_txn(&1, publisher_call, error)
           )
 
@@ -354,6 +357,7 @@ defmodule Tightbeam.Dispatch do
                 session_key,
                 payload,
                 principal,
+            call[:transport_session_key],
                 &Publisher.denied_in_txn(&1, publisher_call, recorded)
               )
 
@@ -372,7 +376,17 @@ defmodule Tightbeam.Dispatch do
 
           {:returned, {:firehose_effect, result, changed?}} when is_boolean(changed?) ->
             payload = audit_payload(verb, call, {:returned, result})
-            :ok = append_event(db, "verb", verb, origin, session_key, payload, principal)
+            :ok =
+              append_event(
+                db,
+                "verb",
+                verb,
+                origin,
+                session_key,
+                payload,
+                principal,
+                call[:transport_session_key]
+              )
 
             :ok =
               Publisher.accepted_after_handler(
@@ -395,7 +409,8 @@ defmodule Tightbeam.Dispatch do
                   origin,
                   session_key,
                   payload,
-                  principal
+                  principal,
+                  call[:transport_session_key]
                 )
             else
               :ok =
@@ -407,6 +422,7 @@ defmodule Tightbeam.Dispatch do
                   session_key,
                   payload,
                   principal,
+                  call[:transport_session_key],
                   &Publisher.accepted_in_txn(&1, publisher_call, caller_only_stripped(result)),
                   verb in @read_verbs
                 )
@@ -428,6 +444,7 @@ defmodule Tightbeam.Dispatch do
                 session_key,
                 payload,
                 principal,
+                call[:transport_session_key],
                 &Publisher.denied_in_txn(&1, publisher_call, denial_error)
               )
 
@@ -453,7 +470,7 @@ defmodule Tightbeam.Dispatch do
     previous =
       Process.put(
         :tightbeam_dispatch_audit,
-        Map.take(call, [:verb, :origin, :session_key, :principal])
+        Map.take(call, [:verb, :origin, :session_key, :principal, :transport_session_key])
       )
 
     Process.delete(:tightbeam_dispatch_audited)
@@ -467,8 +484,19 @@ defmodule Tightbeam.Dispatch do
     end
   end
 
-  defp append_event(db, kind, verb, origin, session_key, payload, principal),
-    do: append_event_with_handoff(db, kind, verb, origin, session_key, payload, principal, nil)
+  defp append_event(db, kind, verb, origin, session_key, payload, principal, transport_session_key),
+    do:
+      append_event_with_handoff(
+        db,
+        kind,
+        verb,
+        origin,
+        session_key,
+        payload,
+        principal,
+        transport_session_key,
+        nil
+      )
 
   # A handler that wrote already has its audit row, written in its own
   # transaction (`DBObservation.audit_in_txn/2`); the outcome completes that
@@ -484,6 +512,7 @@ defmodule Tightbeam.Dispatch do
          session_key,
          payload,
          principal,
+         transport_session_key,
          handoff,
          async \\ false
        ) do
@@ -509,7 +538,8 @@ defmodule Tightbeam.Dispatch do
             session_key,
             payload,
             principal,
-            System.system_time(:millisecond)
+            System.system_time(:millisecond),
+            transport_session_key
           )
         end
       rescue
@@ -726,7 +756,15 @@ defmodule Tightbeam.Dispatch do
 
   defp sha256(body), do: Base.encode16(:crypto.hash(:sha256, body), case: :lower)
 
-  defp best_effort_denial(db, verb, origin, principal, session_key, error) do
+  defp best_effort_denial(
+         db,
+         verb,
+         origin,
+         principal,
+         session_key,
+         transport_session_key,
+         error
+       ) do
     try do
       :ok =
         append_event_with_handoff(
@@ -737,6 +775,7 @@ defmodule Tightbeam.Dispatch do
           session_key,
           JSON.encode!(error),
           principal,
+          transport_session_key,
           fn txn ->
             Publisher.denied_in_txn(
               txn,
@@ -745,6 +784,7 @@ defmodule Tightbeam.Dispatch do
                 origin: origin,
                 principal: principal,
                 session_key: session_key,
+                transport_session_key: transport_session_key,
                 params: %{}
               },
               error

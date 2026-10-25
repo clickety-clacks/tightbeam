@@ -255,7 +255,8 @@ defmodule Tightbeam.DBObservation do
           audit.session_key,
           nil,
           Map.get(audit, :principal),
-          System.system_time(:millisecond)
+          System.system_time(:millisecond),
+          Map.get(audit, :transport_session_key)
         )
 
       _ ->

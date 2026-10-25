@@ -2311,7 +2311,21 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, nil, "missing_reason")
     assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "   ", "invalid_reason")
-    assert_reopen_refused!(ctx, {:process, "cron"}, assignment.id, "why", "process_denied")
+    process_reopen =
+      reopen_call({:process, "cron"}, assignment.id, "process repair")
+      |> Map.put(:transport_session_key, "holder")
+      |> then(&handle(ctx, "reopen-assignment", &1))
+
+    assert process_reopen.state == "open"
+
+    assert {:ok, [["cron", "holder"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reopenedByProcess,reopenedByViaSession FROM assignment_reopenings WHERE assignmentId=?1 ORDER BY id DESC LIMIT 1",
+               [assignment.id]
+             )
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
 
     assert %{state: "open"} =
              handle(
@@ -3667,20 +3681,24 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   @tag assignment_delta: true
-  test "public revoke cannot claim the internal recovery process", ctx do
+  test "process principals revoke assignments with attribution", ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "process spoof"))
 
-    assert %{code: "process_denied"} =
-             handle(ctx, "revoke-assignment", revoke_call({:process, "tightbeam"}, assignment.id))
+    revoked =
+      revoke_call({:process, "cron"}, assignment.id)
+      |> Map.put(:transport_session_key, "holder")
+      |> then(&handle(ctx, "revoke-assignment", &1))
 
-    assert {:ok, [["open", nil, nil, nil]]} =
+    assert revoked.outcome == "revoked"
+
+    assert {:ok, [["closed", nil, nil, "cron", "holder"]]} =
              DB.query(
                ctx.db,
-               "SELECT state,closedByUser,closedBySession,closedByProcess FROM assignments WHERE id=?1",
+               "SELECT state,closedByUser,closedBySession,closedByProcess,closedByViaSession FROM assignments WHERE id=?1",
                [assignment.id]
              )
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM assignment_revocations WHERE assignmentId=?1",
@@ -4095,7 +4113,14 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "assign validates principals, input, liveness, opener typing, and idempotent races", ctx do
-    assert %{code: "process_denied"} = handle(ctx, "assign", assign_call({:process, "cron"}))
+    process_assignment =
+      assign_call({:process, "cron"})
+      |> Map.put(:transport_session_key, "holder")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert process_assignment.openedByProcess == "cron"
+    assert process_assignment.openedByViaSession == "holder"
+
     assert %{code: "principal_required"} = handle(ctx, "assign", assign_call(nil))
     assert %{code: "invalid_subject"} = handle(ctx, "assign", assign_call({:user, "flynn"}, " "))
 
@@ -5399,7 +5424,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert %{code: "not_holder"} =
              attest_call({:session, "holder"}, review.id, "verdict")
-             |> put_in([:params, :verdict_kind], "third-party")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
              |> then(&handle(ctx, "attest", &1))
 
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
@@ -5638,14 +5663,24 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
-    assert %{code: "process_denied"} =
-             handle(ctx, "attest", attest_call({:process, "cron"}, assignment.id, "progress"))
+    process_progress =
+      attest_call({:process, "cron"}, assignment.id, "progress")
+      |> Map.put(:transport_session_key, "holder")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert process_progress.attest.byProcess == "cron"
+    assert process_progress.attest.byActorSession == "holder"
 
     assert %{code: "principal_required"} =
              handle(ctx, "attest", attest_call(nil, assignment.id, "progress"))
 
-    assert %{code: "not_holder"} =
-             handle(ctx, "attest", attest_call({:user, "flynn"}, assignment.id, "progress"))
+    user_progress =
+      attest_call({:user, "flynn"}, assignment.id, "progress")
+      |> Map.put(:transport_session_key, "holder")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert user_progress.attest.byUser == "flynn"
+    assert user_progress.attest.byActorSession == "holder"
 
     third_party_progress =
       handle(
@@ -5823,7 +5858,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.attest_count(ctx.db, assignment.id) == 1
   end
 
-  test "revoke permits typed principals, denies process and missing principals, and creates no attest",
+  test "revoke permits typed principals and creates no attest",
        ctx do
     for {principal, opener} <- [
           {{:user, "admin"}, {:user, "flynn"}},
@@ -5839,8 +5874,11 @@ defmodule Tightbeam.AssignmentsTest do
 
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "deny"))
 
-    assert %{code: "process_denied"} =
-             handle(ctx, "revoke-assignment", revoke_call({:process, "x"}, assignment.id))
+    process_revoked =
+      handle(ctx, "revoke-assignment", revoke_call({:process, "x"}, assignment.id))
+
+    assert process_revoked.outcome == "revoked"
+    assert process_revoked.closedByProcess == "x"
 
     assert %{code: "principal_required"} =
              handle(ctx, "revoke-assignment", revoke_call(nil, assignment.id))
@@ -5872,7 +5910,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{code: "invalid_state_filter"} =
              handle(ctx, "assignments", query_call({:user, "flynn"}, "bad", nil))
 
-    assert %{code: "process_denied"} =
+    assert %{code: "invalid_state_filter"} =
              handle(ctx, "assignments", query_call({:process, "x"}, "bad", nil))
 
     assert %{code: "principal_required"} =
@@ -6028,14 +6066,16 @@ defmodule Tightbeam.AssignmentsTest do
       attest_call({:user, "flynn"}, assignment.id, "completion")
       |> put_in([:params, :commit_refs], refs)
 
-    assert %{code: "not_holder"} = handle(ctx, "attest", completion)
+    assert %{attest: %{byUser: "flynn", byActorSession: nil}} =
+             handle(ctx, "attest", completion)
 
     verification =
       attest_call({:user, "flynn"}, assignment.id, "verdict")
       |> put_in([:params, :verdict_kind], "verified")
       |> put_in([:params, :commit_refs], refs)
 
-    assert %{code: "not_holder"} = handle(ctx, "attest", verification)
+    assert %{attest: %{byUser: "flynn", byActorSession: nil}} =
+             handle(ctx, "attest", verification)
   end
 
   test "a review retraction committed before code completion defeats code completion", ctx do
@@ -6450,13 +6490,15 @@ defmodule Tightbeam.AssignmentsTest do
                assignment_get_call({:session, "holder"}, "unknown-assignment")
              )
 
-    assert %{code: "process_denied"} =
-             handle(
-               ctx,
-               "assignment-get",
-               assignment_get_call({:process, "worker"}, assignment.id)
-               |> put_in([:params, :fact_id], matching_before_request.fact_id)
-             )
+    process_read =
+      handle(
+        ctx,
+        "assignment-get",
+        assignment_get_call({:process, "worker"}, assignment.id)
+        |> put_in([:params, :fact_id], matching_before_request.fact_id)
+      )
+
+    assert process_read.id == assignment.id
 
     assert snapshot.() == before_reads
 

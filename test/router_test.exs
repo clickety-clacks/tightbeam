@@ -348,6 +348,16 @@ defmodule Tightbeam.Wire.RouterTest do
     assert body["resource"] == "sessions"
     assert Enum.map(body["items"], & &1["sessionKey"]) == [visible.session_key]
     assert body["items"] == [Tightbeam.StateResources.session(visible)]
+
+    acting_for_flynn =
+      conn(:get, "/api/sessions?asUser=#{ctx.device.user_id}")
+      |> put_req_header("authorization", "Bearer " <> reader.cli_token)
+      |> Router.call(Router.init(ctx.opts ++ [model_catalog: %{}]))
+
+    assert acting_for_flynn.status == 200, acting_for_flynn.resp_body
+    flynn_sessions = JSON.decode!(acting_for_flynn.resp_body)["items"]
+    assert Enum.all?(flynn_sessions, &(&1["ownerUserId"] == ctx.device.user_id))
+    assert Enum.any?(flynn_sessions, &(&1["sessionKey"] == "collection-hidden"))
   end
 
   test "core device detail preserves authorization order and canonical envelope", ctx do
@@ -396,7 +406,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(response.resp_body)["error"]["code"] == "invalid_message"
   end
 
-  test "work-item body verbs preserve credential-specific identity authorization", ctx do
+  test "work-item body verbs preserve acting-session attribution across identities", ctx do
     session = create_session(ctx.db, "body-auth-session", ctx.device.user_id)
     Roles.create!(ctx.db, "body-auth-role", ctx.device.user_id, session.session_key)
 
@@ -426,11 +436,13 @@ defmodule Tightbeam.Wire.RouterTest do
     handlers =
       ctx.opts[:handlers]
       |> Map.put("work-item-get", fn call ->
-        send(parent, {:body_auth_handler, call.verb, call.origin, call.principal})
+        send(parent, {:body_auth_handler, call.verb, call.origin, call.principal,
+              call[:transport_session_key]})
         real_handlers["work-item-get"].(call)
       end)
       |> Map.put("work-item-update", fn call ->
-        send(parent, {:body_auth_handler, call.verb, call.origin, call.principal})
+        send(parent, {:body_auth_handler, call.verb, call.origin, call.principal,
+              call[:transport_session_key]})
         real_handlers["work-item-update"].(call)
       end)
 
@@ -439,14 +451,15 @@ defmodule Tightbeam.Wire.RouterTest do
     _final_body =
       Enum.reduce(
         [
-          {"tbc_test", %{asUser: "flynn"}, "user:flynn", {:user, "flynn"}, "org-user-body"},
+          {"tbc_test", %{asUser: "flynn"}, "user:flynn", {:user, "flynn"}, nil,
+           "org-user-body"},
           {session.cli_token, %{asUser: "flynn"}, "user:flynn", {:user, "flynn"},
-           "session-user-body"},
+           session.session_key, "session-user-body"},
           {session.cli_token, %{as: "body-auth-role"}, "agent:body-auth-role",
-           {:session, session.session_key}, "session-role-body"}
+           {:session, session.session_key}, session.session_key, "session-role-body"}
         ],
         "initial-body",
-        fn {bearer, selector, origin, principal, body}, previous_body ->
+        fn {bearer, selector, origin, principal, acting_session, body}, previous_body ->
           get =
             dispatch_cli(
               ctx,
@@ -460,7 +473,8 @@ defmodule Tightbeam.Wire.RouterTest do
 
           assert get.status == 200, get.resp_body
           assert JSON.decode!(get.resp_body)["result"]["workItem"]["body"] == previous_body
-          assert_receive {:body_auth_handler, "work-item-get", ^origin, ^principal}
+          assert_receive {:body_auth_handler, "work-item-get", ^origin, ^principal,
+                          ^acting_session}
 
           update =
             dispatch_cli(
@@ -477,34 +491,36 @@ defmodule Tightbeam.Wire.RouterTest do
           update_result = JSON.decode!(update.resp_body)["result"]
           refute Map.has_key?(update_result["workItem"], "body")
           assert update_result["bodyUpdate"]["state"] == "present"
-          assert_receive {:body_auth_handler, "work-item-update", ^origin, ^principal}
+          assert_receive {:body_auth_handler, "work-item-update", ^origin, ^principal,
+                          ^acting_session}
           body
         end
       )
 
-    stored_body = "session-role-body"
+    stored_body = "session-process-body"
 
     for {bearer, selector, verb, body} <- [
           {"tbc_test", %{asProcess: "cron"}, "work-item-get", nil},
-          {"tbc_test", %{asProcess: "cron"}, "work-item-update", "denied-org-process"}
+          {"tbc_test", %{asProcess: "cron"}, "work-item-update", "org-process-body"}
         ] do
       params = if body, do: %{workItemId: id, body: body}, else: %{workItemId: id}
       response = dispatch_cli(ctx, bearer, Map.merge(%{verb: verb, params: params}, selector))
-      assert response.status == 403
-      assert JSON.decode!(response.resp_body)["error"]["code"] == "process_denied"
-      assert_receive {:body_auth_handler, ^verb, "process:cron", {:process, "cron"}}
+      assert response.status == 200, response.resp_body
+      assert_receive {:body_auth_handler, ^verb, "process:cron", {:process, "cron"}, nil}
     end
 
-    for verb <- ["work-item-get", "work-item-update"] do
-      body = if verb == "work-item-update", do: "denied-session-process", else: nil
+    for {verb, body} <- [
+          {"work-item-get", nil},
+          {"work-item-update", "session-process-body"}
+        ] do
       params = if body, do: %{workItemId: id, body: body}, else: %{workItemId: id}
 
       response =
         dispatch_cli(ctx, session.cli_token, %{verb: verb, asProcess: "cron", params: params})
 
-      assert response.status == 403
-      assert JSON.decode!(response.resp_body)["error"]["code"] == "identity_not_yours"
-      refute_receive {:body_auth_handler, _, _, _}
+      assert response.status == 200, response.resp_body
+      assert_receive {:body_auth_handler, ^verb, "process:cron", {:process, "cron"},
+                      "body-auth-session"}
     end
 
     for {verb, body} <- [{"work-item-get", nil}, {"work-item-update", "denied-held-role"}] do
@@ -515,7 +531,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
       assert response.status == 403
       assert JSON.decode!(response.resp_body)["error"]["code"] == "principal_required"
-      assert_receive {:body_auth_handler, ^verb, "agent:body-auth-role", nil}
+      assert_receive {:body_auth_handler, ^verb, "agent:body-auth-role", nil, nil}
     end
 
     for verb <- ["work-item-get", "work-item-update"] do
@@ -527,7 +543,7 @@ defmodule Tightbeam.Wire.RouterTest do
       response = dispatch_cli(ctx, "tbc_test", %{verb: verb, params: params})
       assert response.status == 400
       assert JSON.decode!(response.resp_body)["error"]["code"] == "invalid_message"
-      refute_receive {:body_auth_handler, _, _, _}
+      refute_receive {:body_auth_handler, _, _, _, _}
     end
 
     assert WorkItems.__handle__(ctx.db, "work-item-get", %{
@@ -3351,7 +3367,9 @@ defmodule Tightbeam.Wire.RouterTest do
              400
 
     assert dispatch_cli(ctx, "invalid-bearer", body).status == 401
-    assert dispatch_cli(ctx, "tbc_test", Map.put(body, :asProcess, "fixture")).status == 403
+    process_fetch = dispatch_cli(ctx, "tbc_test", Map.put(body, :asProcess, "fixture"))
+    assert process_fetch.status == 200, process_fetch.resp_body
+    assert JSON.decode!(process_fetch.resp_body) == %{"result" => expected}
     assert dispatch_cli(ctx, writer.cli_token, Map.put(body, :sessionKey, nil)).status == 400
 
     assert dispatch_cli(ctx, writer.cli_token, put_in(body, [:params, :originPath], "/not/read")).status ==
@@ -3401,13 +3419,8 @@ defmodule Tightbeam.Wire.RouterTest do
                     }}
 
     empty_user = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: ""})
-
-    assert empty_user.status == 403
-
-    assert JSON.decode!(empty_user.resp_body)["error"] == %{
-             "code" => "identity_not_yours",
-             "message" => "this session belongs to flynn"
-           }
+    assert empty_user.status == 400
+    assert JSON.decode!(empty_user.resp_body)["error"]["code"] == "invalid_message"
 
     # Registering a satellite also provisions its operator endpoint over ssh; this
     # test is about the identity ladder, so the reach is stubbed and the gateway
@@ -3523,24 +3536,29 @@ defmodule Tightbeam.Wire.RouterTest do
     end
 
     wrong_user = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "mike"})
-
-    assert wrong_user.status == 403
-
-    assert JSON.decode!(wrong_user.resp_body)["error"] == %{
-             "code" => "identity_not_yours",
-             "message" => "this session belongs to flynn"
-           }
+    assert wrong_user.status == 200, wrong_user.resp_body
+    assert_receive {:call,
+                    %{
+                      origin: "user:mike",
+                      principal: {:user, "mike"},
+                      transport_session_key: "holder-token"
+                    }}
 
     process = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asProcess: "cron"})
-    assert process.status == 403
-    assert JSON.decode!(process.resp_body)["error"]["code"] == "identity_not_yours"
+    assert process.status == 200, process.resp_body
+    assert_receive {:call,
+                    %{
+                      origin: "process:cron",
+                      principal: {:process, "cron"},
+                      transport_session_key: "holder-token"
+                    }}
 
     reserved = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asProcess: "tightbeam"})
     assert reserved.status == 403
 
     assert JSON.decode!(reserved.resp_body)["error"] == %{
-             "code" => "identity_not_yours",
-             "message" => "a session token cannot act as a process"
+             "code" => "reserved_origin",
+             "message" => "process:tightbeam is reserved to the substrate"
            }
 
     roleless_key = roleless.session_key

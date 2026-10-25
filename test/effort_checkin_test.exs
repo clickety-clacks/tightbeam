@@ -1451,7 +1451,7 @@ defmodule Tightbeam.EffortCheckinTest do
              )
   end
 
-  test "sessions and users may rule an open effort check-in but processes cannot", ctx do
+  test "processes may rule an open effort check-in and retain the acting session", ctx do
     item = dispatch(ctx, {:user, "h1"}, "holder", "open ruling")
     request = escalate(ctx, item.id)
     assert request.expecter_user_id == "h1"
@@ -1460,16 +1460,27 @@ defmodule Tightbeam.EffortCheckinTest do
       verb: "effort-rule",
       origin: "process:test-process",
       principal: {:process, "test-process"},
-      params: %{request_id: request.id, action: "continue"}
+      params: %{request_id: request.id, action: "continue"},
+      transport_session_key: "parent"
     }
 
-    assert %{code: "not_authorized"} = EffortCheckin.rule(ctx.db, ctx.config, process_call)
+    assert %{status: "ruled", decision: "continue", ruled_by: "process:test-process"} =
+             EffortCheckin.rule(ctx.db, ctx.config, process_call)
+
+    assert rows(
+             ctx.db,
+             "SELECT ruledByActorSessionKey FROM decision_requests WHERE id=?1",
+             [request.id]
+           ) == [["parent"]]
+
+    second_item = dispatch(ctx, {:user, "h1"}, "holder", "user ruling")
+    second_request = escalate(ctx, second_item.id)
 
     assert %{status: "ruled", decision: "continue", ruled_by: "user:h2"} =
              EffortCheckin.rule(
                ctx.db,
                ctx.config,
-               effort_call(request.id, "continue", {:user, "h2"})
+               effort_call(second_request.id, "continue", {:user, "h2"})
              )
   end
 

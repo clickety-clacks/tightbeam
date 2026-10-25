@@ -57,7 +57,11 @@ defmodule Tightbeam.Toplines do
 
   @doc false
   def ensure_historical_schema(db),
-    do: ToplinesSchema.activate(db, System.system_time(:millisecond), defer_v5_migration: true)
+    do:
+      ToplinesSchema.activate(db, System.system_time(:millisecond),
+        defer_v5_migration: true,
+        defer_v6_migration: true
+      )
 
   @doc false
   def __handle__(db, "topline-create", call), do: create(db, call)
@@ -157,9 +161,9 @@ defmodule Tightbeam.Toplines do
       """
       INSERT INTO topline_placement_obligations
         (id, workItemId, ownerUserId, cause, causeRef, sourceCausalEventSeq,
-         historyCausalSeq, openedActorKind, openedActorRef, state,
+         historyCausalSeq, openedActorKind, openedActorRef, openedActorSessionKey, state,
          openedAt, dueAt, promptWakeId)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10, ?10, ?11)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?11, ?12)
       """,
       [
         Map.fetch!(attrs, :id),
@@ -171,6 +175,7 @@ defmodule Tightbeam.Toplines do
         history_seq,
         Map.fetch!(attrs, :actor_kind),
         Map.fetch!(attrs, :actor_ref),
+        Map.get(attrs, :actor_session_key),
         Map.fetch!(attrs, :at),
         Map.fetch!(attrs, :prompt_wake_id)
       ]
@@ -185,7 +190,8 @@ defmodule Tightbeam.Toplines do
     work_item_id = Map.fetch!(attrs, :work_item_id)
     resolution_seq = Map.get(attrs, :resolution_causal_event_seq)
 
-    if Map.fetch!(attrs, :actor_kind) == "process" do
+    if Map.fetch!(attrs, :actor_kind) == "process" and
+         Map.fetch!(attrs, :actor_ref) == "tightbeam" do
       require_terminal_source!(txn, resolution_seq, work_item_id, Map.fetch!(attrs, :reason))
     end
 
@@ -205,8 +211,8 @@ defmodule Tightbeam.Toplines do
           """
           UPDATE topline_placement_obligations
           SET state = ?2, resolutionActorKind = ?3, resolutionActorRef = ?4,
-              resolutionReason = ?5, resolvedAt = ?6,
-              resolutionCausalEventSeq = ?7, historyCausalSeq = ?8
+              resolutionActorSessionKey = ?5, resolutionReason = ?6, resolvedAt = ?7,
+              resolutionCausalEventSeq = ?8, historyCausalSeq = ?9
           WHERE id = ?1 AND state = 'pending'
           """,
           [
@@ -214,6 +220,7 @@ defmodule Tightbeam.Toplines do
             Map.fetch!(attrs, :state),
             Map.fetch!(attrs, :actor_kind),
             Map.fetch!(attrs, :actor_ref),
+            Map.get(attrs, :actor_session_key),
             Map.fetch!(attrs, :reason),
             Map.fetch!(attrs, :at),
             resolution_seq,
@@ -235,17 +242,18 @@ defmodule Tightbeam.Toplines do
   def create(db, call) do
     params = Map.get(call, :params, %{})
 
-    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
-         :ok <- valid_shape(params, [:idempotency_key, :title]),
+    with {:ok, caller} <- caller(db, call),
+         :ok <- valid_shape(params, [:idempotency_key, :title, :owner_user_id], optional: [:owner_user_id]),
          {:ok, title} <- canonical_title(param(params, :title)),
-         :ok <- valid_key(param(params, :idempotency_key)) do
+         :ok <- valid_key(param(params, :idempotency_key)),
+         {:ok, owner_user_id} <- create_owner(db, caller, param(params, :owner_user_id)) do
       operation = "topline-create"
       key = param(params, :idempotency_key)
-      fingerprint = fingerprint(operation, %{title: title})
+      fingerprint = fingerprint(operation, %{ownerUserId: owner_user_id, title: title})
 
       transaction!(db, fn txn ->
         with {:ok, caller} <- reauthorize(txn, caller) do
-          case replay(txn, caller.user, operation, key, fingerprint) do
+          case replay(txn, caller, operation, key, fingerprint) do
             {:ok, response} ->
               response
 
@@ -261,10 +269,18 @@ defmodule Tightbeam.Toplines do
                 """
                 INSERT INTO toplines
                   (id, ownerUserId, title, state, createdActorKind, createdActorRef,
-                   createdAt, updatedAt, closedAt)
-                VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?6, NULL)
+                   createdActorSessionKey, createdAt, updatedAt, closedAt)
+                VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7, ?7, NULL)
                 """,
-                [topline_id, caller.user, title, caller.actor_kind, caller.actor_ref, now]
+                [
+                  topline_id,
+                  owner_user_id,
+                  title,
+                  caller.actor_kind,
+                  caller.actor_ref,
+                  caller.actor_session_key,
+                  now
+                ]
               )
 
               append_event(
@@ -282,7 +298,7 @@ defmodule Tightbeam.Toplines do
               )
 
               response = %{topline: summary_in_txn(txn, topline_id)}
-              remember(txn, caller.user, operation, key, fingerprint, response)
+              remember(txn, caller, operation, key, fingerprint, response)
               response
           end
         end
@@ -294,7 +310,7 @@ defmodule Tightbeam.Toplines do
   def update(db, call) do
     params = Map.get(call, :params, %{})
 
-    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+    with {:ok, caller} <- caller(db, call),
          :ok <- valid_shape(params, [:idempotency_key, :reason, :title, :topline_id]),
          :ok <- valid_id(param(params, :topline_id), "tl_"),
          {:ok, title} <- canonical_title(param(params, :title)),
@@ -310,7 +326,7 @@ defmodule Tightbeam.Toplines do
       transaction!(db, fn txn ->
         with {:ok, caller} <- reauthorize(txn, caller),
              {:ok, topline} <- visible_topline(txn, topline_id, caller) do
-          case replay(txn, caller.user, "topline-update", key, fingerprint) do
+          case replay(txn, caller, "topline-update", key, fingerprint) do
             {:ok, response} ->
               response
 
@@ -349,7 +365,7 @@ defmodule Tightbeam.Toplines do
               )
 
               response = %{topline: summary_in_txn(txn, topline_id)}
-              remember(txn, caller.user, "topline-update", key, fingerprint, response)
+              remember(txn, caller, "topline-update", key, fingerprint, response)
               response
           end
         end
@@ -366,7 +382,7 @@ defmodule Tightbeam.Toplines do
   defp change_state(db, call, operation, from_state, to_state) do
     params = Map.get(call, :params, %{})
 
-    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+    with {:ok, caller} <- caller(db, call),
          :ok <- valid_shape(params, [:idempotency_key, :reason, :topline_id]),
          :ok <- valid_id(param(params, :topline_id), "tl_"),
          :ok <- valid_reason(param(params, :reason)),
@@ -379,7 +395,7 @@ defmodule Tightbeam.Toplines do
       transaction!(db, fn txn ->
         with {:ok, caller} <- reauthorize(txn, caller),
              {:ok, topline} <- visible_topline(txn, topline_id, caller) do
-          case replay(txn, caller.user, operation, key, fingerprint) do
+          case replay(txn, caller, operation, key, fingerprint) do
             {:ok, response} ->
               response
 
@@ -407,7 +423,7 @@ defmodule Tightbeam.Toplines do
               })
 
               response = %{topline: summary_in_txn(txn, topline_id)}
-              remember(txn, caller.user, operation, key, fingerprint, response)
+              remember(txn, caller, operation, key, fingerprint, response)
               response
           end
         end
@@ -419,7 +435,7 @@ defmodule Tightbeam.Toplines do
   def link_work(db, call) do
     params = Map.get(call, :params, %{})
 
-    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+    with {:ok, caller} <- caller(db, call),
          :ok <- valid_shape(params, [:idempotency_key, :reason, :topline_id, :work_item_id]),
          :ok <- valid_id(param(params, :topline_id), "tl_"),
          :ok <- valid_id(param(params, :work_item_id), "wi_"),
@@ -442,7 +458,7 @@ defmodule Tightbeam.Toplines do
         with {:ok, caller} <- reauthorize(txn, caller),
              {:ok, topline} <- visible_topline(txn, topline_id, caller),
              {:ok, _work_item} <- visible_work_item(txn, work_item_id, caller) do
-          case replay(txn, caller.user, operation, key, fingerprint) do
+          case replay(txn, caller, operation, key, fingerprint) do
             {:ok, response} ->
               response
 
@@ -466,8 +482,8 @@ defmodule Tightbeam.Toplines do
                     """
                     INSERT INTO topline_work_memberships
                       (id, toplineId, workItemId, ownerUserId, linkReason,
-                       linkedActorKind, linkedActorRef, linkedAt)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                       linkedActorKind, linkedActorRef, linkedActorSessionKey, linkedAt)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                     """,
                     [
                       membership_id,
@@ -477,6 +493,7 @@ defmodule Tightbeam.Toplines do
                       reason,
                       caller.actor_kind,
                       caller.actor_ref,
+                      caller.actor_session_key,
                       now
                     ]
                   )
@@ -502,7 +519,7 @@ defmodule Tightbeam.Toplines do
                     resolvedPlacementId: nil
                   }
 
-                  remember(txn, caller.user, operation, key, fingerprint, response)
+                  remember(txn, caller, operation, key, fingerprint, response)
                   response
               end
           end
@@ -515,7 +532,7 @@ defmodule Tightbeam.Toplines do
   def unlink_work(db, call) do
     params = Map.get(call, :params, %{})
 
-    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+    with {:ok, caller} <- caller(db, call),
          :ok <- valid_shape(params, [:idempotency_key, :membership_id, :reason]),
          :ok <- valid_id(param(params, :membership_id), "tlm_"),
          :ok <- valid_reason(param(params, :reason)),
@@ -529,7 +546,7 @@ defmodule Tightbeam.Toplines do
       transaction!(db, fn txn ->
         with {:ok, caller} <- reauthorize(txn, caller),
              {:ok, membership} <- visible_membership(txn, membership_id, caller) do
-          case replay(txn, caller.user, operation, key, fingerprint) do
+          case replay(txn, caller, operation, key, fingerprint) do
             {:ok, response} ->
               response
 
@@ -550,10 +567,18 @@ defmodule Tightbeam.Toplines do
                   """
                   UPDATE topline_work_memberships
                   SET unlinkReason = ?2, unlinkedActorKind = ?3,
-                      unlinkedActorRef = ?4, unlinkedAt = ?5
+                      unlinkedActorRef = ?4, unlinkedActorSessionKey = ?5,
+                      unlinkedAt = ?6
                   WHERE id = ?1 AND unlinkedAt IS NULL
                   """,
-                  [membership_id, reason, caller.actor_kind, caller.actor_ref, now]
+                  [
+                    membership_id,
+                    reason,
+                    caller.actor_kind,
+                    caller.actor_ref,
+                    caller.actor_session_key,
+                    now
+                  ]
                 )
 
                 touch_topline(txn, membership.topline_id, now)
@@ -584,7 +609,7 @@ defmodule Tightbeam.Toplines do
                   untaggedConcernIds: concern_ids
                 }
 
-                remember(txn, caller.user, operation, key, fingerprint, response)
+                remember(txn, caller, operation, key, fingerprint, response)
                 response
               end
           end
@@ -597,7 +622,7 @@ defmodule Tightbeam.Toplines do
   def create_concern(db, call) do
     params = Map.get(call, :params, %{})
 
-    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+    with {:ok, caller} <- caller(db, call),
          :ok <- valid_shape(params, [:idempotency_key, :title, :topline_id]),
          :ok <- valid_id(param(params, :topline_id), "tl_"),
          {:ok, title} <- canonical_title(param(params, :title)),
@@ -610,7 +635,7 @@ defmodule Tightbeam.Toplines do
       transaction!(db, fn txn ->
         with {:ok, caller} <- reauthorize(txn, caller),
              {:ok, topline} <- visible_topline(txn, topline_id, caller) do
-          case replay(txn, caller.user, operation, key, fingerprint) do
+          case replay(txn, caller, operation, key, fingerprint) do
             {:ok, response} ->
               response
 
@@ -628,10 +653,19 @@ defmodule Tightbeam.Toplines do
                 txn,
                 """
                 INSERT INTO topline_concerns
-                  (id, toplineId, title, createdActorKind, createdActorRef, createdAt)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                  (id, toplineId, title, createdActorKind, createdActorRef,
+                   createdActorSessionKey, createdAt)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 """,
-                [concern_id, topline_id, title, caller.actor_kind, caller.actor_ref, now]
+                [
+                  concern_id,
+                  topline_id,
+                  title,
+                  caller.actor_kind,
+                  caller.actor_ref,
+                  caller.actor_session_key,
+                  now
+                ]
               )
 
               touch_topline(txn, topline_id, now)
@@ -650,7 +684,7 @@ defmodule Tightbeam.Toplines do
               )
 
               response = %{concern: concern_in_txn(txn, concern_id)}
-              remember(txn, caller.user, operation, key, fingerprint, response)
+              remember(txn, caller, operation, key, fingerprint, response)
               response
           end
         end
@@ -662,7 +696,7 @@ defmodule Tightbeam.Toplines do
   def link_concern_work(db, call) do
     params = Map.get(call, :params, %{})
 
-    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+    with {:ok, caller} <- caller(db, call),
          :ok <- valid_shape(params, [:concern_id, :idempotency_key, :reason, :work_item_id]),
          :ok <- valid_id(param(params, :concern_id), "tlc_"),
          :ok <- valid_id(param(params, :work_item_id), "wi_"),
@@ -682,7 +716,7 @@ defmodule Tightbeam.Toplines do
              {:ok, concern} <- visible_concern(txn, concern_id, caller),
              {:ok, work_item} <- visible_work_item(txn, work_item_id, caller),
              :ok <- concern_contains_work(txn, concern, work_item) do
-          case replay(txn, caller.user, operation, key, fingerprint) do
+          case replay(txn, caller, operation, key, fingerprint) do
             {:ok, response} ->
               response
 
@@ -703,8 +737,8 @@ defmodule Tightbeam.Toplines do
                   """
                   INSERT INTO topline_concern_refs
                     (toplineId, concernId, workItemId, tagReason,
-                     taggedActorKind, taggedActorRef, taggedAt)
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     taggedActorKind, taggedActorRef, taggedActorSessionKey, taggedAt)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                   """,
                   [
                     concern.topline_id,
@@ -713,6 +747,7 @@ defmodule Tightbeam.Toplines do
                     reason,
                     caller.actor_kind,
                     caller.actor_ref,
+                    caller.actor_session_key,
                     now
                   ]
                 )
@@ -733,7 +768,7 @@ defmodule Tightbeam.Toplines do
                 )
 
                 response = %{concernTag: concern_tag_in_txn(txn, concern_id, work_item_id)}
-                remember(txn, caller.user, operation, key, fingerprint, response)
+                remember(txn, caller, operation, key, fingerprint, response)
                 response
               end
           end
@@ -746,7 +781,7 @@ defmodule Tightbeam.Toplines do
   def unlink_concern_work(db, call) do
     params = Map.get(call, :params, %{})
 
-    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+    with {:ok, caller} <- caller(db, call),
          :ok <- valid_shape(params, [:concern_id, :idempotency_key, :reason, :work_item_id]),
          :ok <- valid_id(param(params, :concern_id), "tlc_"),
          :ok <- valid_id(param(params, :work_item_id), "wi_"),
@@ -765,7 +800,7 @@ defmodule Tightbeam.Toplines do
         with {:ok, caller} <- reauthorize(txn, caller),
              {:ok, concern} <- visible_concern(txn, concern_id, caller),
              {:ok, _work_item} <- visible_work_item(txn, work_item_id, caller) do
-          case replay(txn, caller.user, operation, key, fingerprint) do
+          case replay(txn, caller, operation, key, fingerprint) do
             {:ok, response} ->
               response
 
@@ -798,7 +833,7 @@ defmodule Tightbeam.Toplines do
                 )
 
                 response = %{concernId: concern_id, workItemId: work_item_id}
-                remember(txn, caller.user, operation, key, fingerprint, response)
+                remember(txn, caller, operation, key, fingerprint, response)
                 response
               else
                 error("concern_tag_absent", "concern tag is not applied to work item")
@@ -813,7 +848,7 @@ defmodule Tightbeam.Toplines do
   def list(db, call) do
     params = Map.get(call, :params, %{})
 
-    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+    with {:ok, caller} <- caller(db, call),
          :ok <- valid_shape(params, [:state], optional: [:state]),
          {:ok, state} <- list_state(param(params, :state)) do
       {owner_sql, owner_params} = owner_filter(caller, "t")
@@ -834,7 +869,7 @@ defmodule Tightbeam.Toplines do
   def get(db, call) do
     params = Map.get(call, :params, %{})
 
-    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+    with {:ok, caller} <- caller(db, call),
          :ok <- valid_shape(params, [:history, :topline_id], optional: [:history]),
          :ok <- valid_id(param(params, :topline_id), "tl_"),
          :ok <- valid_history(param(params, :history)) do
@@ -872,7 +907,7 @@ defmodule Tightbeam.Toplines do
   def leave_unlinked(db, call) do
     params = Map.get(call, :params, %{})
 
-    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+    with {:ok, caller} <- caller(db, call),
          :ok <- valid_shape(params, [:idempotency_key, :reason, :work_item_id]),
          :ok <- valid_id(param(params, :work_item_id), "wi_"),
          :ok <- valid_reason(param(params, :reason)),
@@ -886,7 +921,7 @@ defmodule Tightbeam.Toplines do
       transaction!(db, fn txn ->
         with {:ok, caller} <- reauthorize(txn, caller),
              {:ok, _work_item} <- visible_work_item(txn, work_item_id, caller) do
-          case replay(txn, caller.user, operation, key, fingerprint) do
+          case replay(txn, caller, operation, key, fingerprint) do
             {:ok, response} ->
               response
 
@@ -899,6 +934,7 @@ defmodule Tightbeam.Toplines do
                      state: "left_unlinked",
                      actor_kind: caller.actor_kind,
                      actor_ref: caller.actor_ref,
+                     actor_session_key: caller.actor_session_key,
                      reason: reason,
                      at: mutation_time(call)
                    }) do
@@ -907,7 +943,7 @@ defmodule Tightbeam.Toplines do
 
                 placement ->
                   response = %{placement: placement}
-                  remember(txn, caller.user, operation, key, fingerprint, response)
+                  remember(txn, caller, operation, key, fingerprint, response)
                   response
               end
           end
@@ -919,7 +955,7 @@ defmodule Tightbeam.Toplines do
   def list_placements(db, call) do
     params = Map.get(call, :params, %{})
 
-    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+    with {:ok, caller} <- caller(db, call),
          :ok <- valid_shape(params, [:state], optional: [:state]),
          {:ok, state} <- placement_state(param(params, :state)) do
       transaction!(db, fn txn ->
@@ -954,7 +990,7 @@ defmodule Tightbeam.Toplines do
   defp summary_sql(where) do
     """
     SELECT t.id, t.ownerUserId, t.title, t.state, t.createdActorKind,
-           t.createdActorRef, t.createdAt, t.updatedAt, t.closedAt,
+           t.createdActorRef, t.createdActorSessionKey, t.createdAt, t.updatedAt, t.closedAt,
            (SELECT COUNT(*) FROM topline_work_memberships m
             WHERE m.toplineId = t.id AND m.unlinkedAt IS NULL),
           (SELECT COUNT(*) FROM topline_concerns c
@@ -1019,6 +1055,7 @@ defmodule Tightbeam.Toplines do
          state,
          actor_kind,
          actor_ref,
+         actor_session_key,
          created,
          updated,
          closed,
@@ -1030,7 +1067,7 @@ defmodule Tightbeam.Toplines do
       ownerUserId: owner,
       title: title,
       state: state,
-      createdActor: actor(actor_kind, actor_ref),
+      createdActor: actor(actor_kind, actor_ref, actor_session_key),
       createdAt: created,
       updatedAt: updated,
       closedAt: closed,
@@ -1060,8 +1097,8 @@ defmodule Tightbeam.Toplines do
   defp membership_sql(where) do
     """
     SELECT m.id, m.toplineId, m.workItemId, m.ownerUserId, m.linkReason,
-           m.linkedActorKind, m.linkedActorRef, m.linkedAt, m.unlinkReason,
-           m.unlinkedActorKind, m.unlinkedActorRef, m.unlinkedAt,
+           m.linkedActorKind, m.linkedActorRef, m.linkedActorSessionKey, m.linkedAt, m.unlinkReason,
+           m.unlinkedActorKind, m.unlinkedActorRef, m.unlinkedActorSessionKey, m.unlinkedAt,
            wi.title, wi.state
     FROM topline_work_memberships m
     JOIN work_items wi ON wi.id = m.workItemId
@@ -1077,10 +1114,12 @@ defmodule Tightbeam.Toplines do
          link_reason,
          linked_kind,
          linked_ref,
+         linked_session,
          linked_at,
          unlink_reason,
          unlinked_kind,
          unlinked_ref,
+         unlinked_session,
          unlinked_at,
          work_title,
          work_state
@@ -1091,10 +1130,10 @@ defmodule Tightbeam.Toplines do
       workItemId: work_item_id,
       ownerUserId: owner,
       linkReason: link_reason,
-      linkedActor: actor(linked_kind, linked_ref),
+      linkedActor: actor(linked_kind, linked_ref, linked_session),
       linkedAt: linked_at,
       unlinkReason: unlink_reason,
-      unlinkedActor: actor(unlinked_kind, unlinked_ref),
+      unlinkedActor: actor(unlinked_kind, unlinked_ref, unlinked_session),
       unlinkedAt: unlinked_at,
       workItemTitle: work_title,
       workItemState: work_state
@@ -1119,7 +1158,8 @@ defmodule Tightbeam.Toplines do
 
   defp concern_sql(where) do
     """
-    SELECT c.id, c.toplineId, c.title, c.createdActorKind, c.createdActorRef, c.createdAt,
+    SELECT c.id, c.toplineId, c.title, c.createdActorKind, c.createdActorRef,
+           c.createdActorSessionKey, c.createdAt,
            COALESCE((SELECT json_group_array(workItemId) FROM (
              SELECT r.workItemId FROM topline_concern_refs r
              WHERE r.concernId = c.id ORDER BY r.workItemId ASC
@@ -1129,9 +1169,18 @@ defmodule Tightbeam.Toplines do
     """
   end
 
-  defp concern([id, topline_id, title, created_kind, created_ref, created_at, work_item_ids]) do
+  defp concern([
+         id,
+         topline_id,
+         title,
+         created_kind,
+         created_ref,
+         created_session,
+         created_at,
+         work_item_ids
+       ]) do
     %{
-      createdActor: actor(created_kind, created_ref),
+      createdActor: actor(created_kind, created_ref, created_session),
       createdAt: created_at,
       id: id,
       title: title,
@@ -1141,12 +1190,12 @@ defmodule Tightbeam.Toplines do
   end
 
   defp concern_tag_in_txn(txn, concern_id, work_item_id) do
-    [[topline_id, ^concern_id, ^work_item_id, reason, kind, ref, tagged_at]] =
+    [[topline_id, ^concern_id, ^work_item_id, reason, kind, ref, session_key, tagged_at]] =
       Txn.q(
         txn,
         """
         SELECT toplineId, concernId, workItemId, tagReason,
-               taggedActorKind, taggedActorRef, taggedAt
+               taggedActorKind, taggedActorRef, taggedActorSessionKey, taggedAt
         FROM topline_concern_refs
         WHERE concernId = ?1 AND workItemId = ?2
         """,
@@ -1156,7 +1205,7 @@ defmodule Tightbeam.Toplines do
     %{
       concernId: concern_id,
       tagReason: reason,
-      taggedActor: actor(kind, ref),
+      taggedActor: actor(kind, ref, session_key),
       taggedAt: tagged_at,
       toplineId: topline_id,
       workItemId: work_item_id
@@ -1168,8 +1217,10 @@ defmodule Tightbeam.Toplines do
            txn,
            """
            SELECT p.cause, p.causeRef, p.dueAt, p.id, p.openedActorKind,
-                  p.openedActorRef, p.openedAt, p.ownerUserId, p.promptWakeId,
-                  w.state, p.resolutionActorKind, p.resolutionActorRef,
+                  p.openedActorRef, p.openedActorSessionKey, p.openedAt,
+                  p.ownerUserId, p.promptWakeId, w.state,
+                  p.resolutionActorKind, p.resolutionActorRef,
+                  p.resolutionActorSessionKey,
                   p.resolutionReason, p.resolvedAt, p.state, p.workItemId, wi.title
            FROM topline_placement_obligations p
            JOIN wakes w ON w.wakeId = p.promptWakeId
@@ -1186,12 +1237,14 @@ defmodule Tightbeam.Toplines do
           placement_id,
           opened_kind,
           opened_ref,
+          opened_session,
           opened_at,
           owner,
           wake_id,
           wake_state,
           resolution_kind,
           resolution_ref,
+          resolution_session,
           resolution_reason,
           resolved_at,
           state,
@@ -1204,11 +1257,11 @@ defmodule Tightbeam.Toplines do
           causeRef: cause_ref,
           dueAt: due_at,
           id: placement_id,
-          openedActor: actor(opened_kind, opened_ref),
+          openedActor: actor(opened_kind, opened_ref, opened_session),
           openedAt: opened_at,
           ownerUserId: owner,
           promptWake: %{id: wake_id, state: wake_state},
-          resolutionActor: actor(resolution_kind, resolution_ref),
+          resolutionActor: actor(resolution_kind, resolution_ref, resolution_session),
           resolutionReason: resolution_reason,
           resolvedAt: resolved_at,
           state: state,
@@ -1268,7 +1321,7 @@ defmodule Tightbeam.Toplines do
         db,
         """
         SELECT toplineId, seq, kind, membershipId, concernId,
-               actorKind, actorRef, reason, eventAt, detail
+               actorKind, actorRef, actorSessionKey, reason, eventAt, detail
         FROM topline_events
         WHERE toplineId = ?1
         ORDER BY seq ASC
@@ -1287,12 +1340,13 @@ defmodule Tightbeam.Toplines do
          concern_id,
          actor_kind,
          actor_ref,
+         actor_session_key,
          reason,
          at,
          detail
        ]) do
     %{
-      actor: actor(actor_kind, actor_ref),
+      actor: actor(actor_kind, actor_ref, actor_session_key),
       at: at,
       concernId: concern_id,
       detail: atomize_keys(JSON.decode!(detail)),
@@ -1327,8 +1381,8 @@ defmodule Tightbeam.Toplines do
       """
       INSERT INTO topline_events
         (toplineId, seq, kind, membershipId, concernId,
-         actorKind, actorRef, reason, eventAt, detail)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         actorKind, actorRef, actorSessionKey, reason, eventAt, detail)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
       """,
       [
         topline_id,
@@ -1338,6 +1392,7 @@ defmodule Tightbeam.Toplines do
         concern_id,
         caller.actor_kind,
         caller.actor_ref,
+        caller.actor_session_key,
         reason,
         at,
         canonical_json(detail)
@@ -1497,15 +1552,18 @@ defmodule Tightbeam.Toplines do
     :ok
   end
 
-  defp replay(txn, user, operation, key, fingerprint) do
+  defp replay(txn, caller, operation, key, fingerprint) do
+    {idempotency_kind, idempotency_ref} = idempotency_identity(caller)
+
     case Txn.q(
            txn,
            """
            SELECT requestFingerprint, canonicalResponse
            FROM topline_idempotency
-           WHERE callerUserId = ?1 AND operation = ?2 AND idempotencyKey = ?3
+           WHERE callerIdempotencyKind = ?1 AND callerIdempotencyRef = ?2
+             AND operation = ?3 AND idempotencyKey = ?4
            """,
-           [user, operation, key]
+           [idempotency_kind, idempotency_ref, operation, key]
          ) do
       [] -> :new
       [[^fingerprint, response]] -> {:ok, response |> JSON.decode!() |> atomize_keys()}
@@ -1513,19 +1571,42 @@ defmodule Tightbeam.Toplines do
     end
   end
 
-  defp remember(txn, user, operation, key, fingerprint, response) do
+  defp remember(txn, caller, operation, key, fingerprint, response) do
+    {idempotency_kind, idempotency_ref} = idempotency_identity(caller)
+
     Txn.q(
       txn,
       """
       INSERT INTO topline_idempotency
-        (callerUserId, operation, idempotencyKey, requestFingerprint, canonicalResponse)
-      VALUES (?1, ?2, ?3, ?4, ?5)
+        (callerActorKind, callerActorRef, callerSessionKey,
+         callerIdempotencyKind, callerIdempotencyRef, operation,
+         idempotencyKey, requestFingerprint, canonicalResponse)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
       """,
-      [user, operation, key, fingerprint, canonical_json(response)]
+      [
+        caller.actor_kind,
+        caller.actor_ref,
+        caller.actor_session_key,
+        idempotency_kind,
+        idempotency_ref,
+        operation,
+        key,
+        fingerprint,
+        canonical_json(response)
+      ]
     )
 
     :ok
   end
+
+  # V6 scoped idempotency to the owning user for both user and session calls.
+  # Preserve that replay scope while the adjacent actor columns retain who
+  # actually submitted each new request.
+  defp idempotency_identity(%{actor_kind: "session", user: user})
+       when is_binary(user) and user != "",
+       do: {"user", user}
+
+  defp idempotency_identity(%{actor_kind: kind, actor_ref: ref}), do: {kind, ref}
 
   defp fingerprint(operation, parameters) do
     bytes = fingerprint_json(%{operation: operation, parameters: parameters})
@@ -1595,13 +1676,30 @@ defmodule Tightbeam.Toplines do
     ArgumentError -> key
   end
 
-  defp caller(_db, {:process, _}),
-    do: error("process_denied", "process principals cannot access Toplines")
+  defp caller(db, %{principal: principal} = call) do
+    with {:ok, caller} <- caller(db, principal) do
+      actor_session_key =
+        Map.get(call, :transport_session_key) ||
+          case principal do
+            {:session, session_key} -> session_key
+            _ -> nil
+          end
+
+      {:ok, Map.put(caller, :actor_session_key, actor_session_key)}
+    end
+  end
 
   defp caller(db, {:user, user}) when is_binary(user) do
     case DB.query(db, "SELECT isAdmin FROM users WHERE userId = ?1", [user]) do
       {:ok, [[admin]]} ->
-        {:ok, %{user: user, admin: admin == 1, actor_kind: "user", actor_ref: user}}
+        {:ok,
+         %{
+           user: user,
+           admin: admin == 1,
+           actor_kind: "user",
+           actor_ref: user,
+           actor_session_key: nil
+         }}
 
       _ ->
         error("not_found", "record not found")
@@ -1620,26 +1718,44 @@ defmodule Tightbeam.Toplines do
            [session]
          ) do
       {:ok, [[user, admin]]} ->
-        {:ok, %{user: user, admin: admin == 1, actor_kind: "session", actor_ref: session}}
+        {:ok,
+         %{
+           user: user,
+           admin: admin == 1,
+           actor_kind: "session",
+           actor_ref: session,
+           actor_session_key: nil
+         }}
 
       _ ->
         error("not_found", "record not found")
     end
   end
 
+  defp caller(_db, {:process, process}) when is_binary(process) and process != "" do
+    {:ok,
+     %{
+       user: nil,
+       admin: false,
+       actor_kind: "process",
+       actor_ref: process,
+       actor_session_key: nil
+     }}
+  end
+
   defp caller(_db, _principal), do: error("invalid_message", "invalid message")
 
-  defp reauthorize(txn, %{actor_kind: "user", actor_ref: user}) do
+  defp reauthorize(txn, %{actor_kind: "user", actor_ref: user} = caller) do
     case Txn.q(txn, "SELECT isAdmin FROM users WHERE userId = ?1", [user]) do
       [[admin]] ->
-        {:ok, %{user: user, admin: admin == 1, actor_kind: "user", actor_ref: user}}
+        {:ok, Map.merge(caller, %{user: user, admin: admin == 1})}
 
       [] ->
         error("not_found", "record not found")
     end
   end
 
-  defp reauthorize(txn, %{actor_kind: "session", actor_ref: session}) do
+  defp reauthorize(txn, %{actor_kind: "session", actor_ref: session} = caller) do
     case Txn.q(
            txn,
            """
@@ -1651,13 +1767,34 @@ defmodule Tightbeam.Toplines do
            [session]
          ) do
       [[user, admin]] ->
-        {:ok, %{user: user, admin: admin == 1, actor_kind: "session", actor_ref: session}}
+        {:ok, Map.merge(caller, %{user: user, admin: admin == 1})}
 
       [] ->
         error("not_found", "record not found")
     end
   end
 
+  defp reauthorize(_txn, %{actor_kind: "process"} = caller), do: {:ok, caller}
+
+  defp create_owner(_db, %{actor_kind: kind, user: user}, _requested)
+       when kind in ["user", "session"],
+       do: {:ok, user}
+
+  defp create_owner(db, %{actor_kind: "process"}, owner_user_id)
+       when is_binary(owner_user_id) and owner_user_id != "" do
+    case DB.query(db, "SELECT 1 FROM users WHERE userId = ?1", [owner_user_id]) do
+      {:ok, [[1]]} ->
+        {:ok, owner_user_id}
+
+      _ ->
+        error("not_found", "ownerUserId does not name an existing user")
+    end
+  end
+
+  defp create_owner(_db, %{actor_kind: "process"}, _owner_user_id),
+    do: error("invalid_message", "ownerUserId is required for process-created Toplines")
+
+  defp owner_filter(%{actor_kind: "process"}, _alias), do: {"", []}
   defp owner_filter(%{admin: true}, _alias), do: {"", []}
 
   defp owner_filter(caller, alias_name) do
@@ -1733,6 +1870,7 @@ defmodule Tightbeam.Toplines do
   defp param_key("membershipId"), do: :membership_id
   defp param_key("toplineId"), do: :topline_id
   defp param_key("workItemId"), do: :work_item_id
+  defp param_key("ownerUserId"), do: :owner_user_id
   defp param_key("history"), do: :history
   defp param_key("reason"), do: :reason
   defp param_key("state"), do: :state
@@ -1748,6 +1886,7 @@ defmodule Tightbeam.Toplines do
   defp camel_key(:membership_id), do: "membershipId"
   defp camel_key(:topline_id), do: "toplineId"
   defp camel_key(:work_item_id), do: "workItemId"
+  defp camel_key(:owner_user_id), do: "ownerUserId"
   defp camel_key(key), do: Atom.to_string(key)
 
   defp canonical_title(value) when is_binary(value) do
@@ -1807,6 +1946,10 @@ defmodule Tightbeam.Toplines do
 
   defp actor(nil, nil), do: nil
   defp actor(kind, ref), do: %{kind: kind, ref: ref}
+  defp actor(nil, nil, nil), do: nil
+  defp actor(kind, ref, nil), do: actor(kind, ref)
+  defp actor(kind, ref, session_key),
+    do: %{kind: kind, ref: ref, actingSessionKey: session_key}
 
   defp mutation_time(call) do
     case Map.get(call, :now) do

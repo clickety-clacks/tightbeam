@@ -35,7 +35,8 @@ defmodule Tightbeam.EventLog do
           verb: String.t(),
           origin: String.t(),
           principal: String.t() | nil,
-          session_key: String.t() | nil
+          session_key: String.t() | nil,
+          transport_session_key: String.t() | nil
         }
 
   @typedoc "A lifecycle event row (crashes, takeovers, dirty exits …)."
@@ -190,21 +191,62 @@ defmodule Tightbeam.EventLog do
         payload,
         principal,
         ts
+      ),
+      do:
+        append_event_in_txn(
+          txn,
+          kind,
+          verb,
+          origin,
+          session_key,
+          payload,
+          principal,
+          ts,
+          nil
+        )
+
+  @doc false
+  def append_event_in_txn(
+        %Txn{} = txn,
+        kind,
+        verb,
+        origin,
+        session_key,
+        payload,
+        principal,
+        ts,
+        transport_session_key
       )
       when kind in ~w(verb denied) and is_integer(ts) and ts >= 0 do
     [[event_id]] =
       Txn.q(
         txn,
         """
-        INSERT INTO events (ts, kind, verb, origin, principal, sessionKey, payload)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        INSERT INTO events
+          (ts, kind, verb, origin, principal, sessionKey, payload, transportSessionKey)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         RETURNING id
         """,
-        [ts, kind, verb, origin, serialize_principal(principal), session_key, encode(payload)]
+        [
+          ts,
+          kind,
+          verb,
+          origin,
+          serialize_principal(principal),
+          session_key,
+          encode(payload),
+          transport_session_key
+        ]
       )
 
     Tightbeam.DBObservation.audit_recorded(verb, event_id)
     event_id
+  end
+
+  @doc false
+  def migrate_transport_session_attribution_in_txn(%Txn{} = txn) do
+    Txn.q(txn, "ALTER TABLE events ADD COLUMN transportSessionKey TEXT")
+    :ok
   end
 
   @doc "Complete an audit row written in the handler's transaction with the known outcome."
@@ -226,14 +268,14 @@ defmodule Tightbeam.EventLog do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT id, ts, kind, verb, origin, principal, sessionKey FROM events WHERE id > ?1 ORDER BY id LIMIT ?2",
+        "SELECT id, ts, kind, verb, origin, principal, sessionKey, transportSessionKey FROM events WHERE id > ?1 ORDER BY id LIMIT ?2",
         [
           after_id,
           limit
         ]
       )
 
-    Enum.map(rows, fn [id, ts, kind, verb, origin, principal, sk] ->
+    Enum.map(rows, fn [id, ts, kind, verb, origin, principal, sk, transport_session_key] ->
       %{
         id: id,
         ts: ts,
@@ -241,7 +283,8 @@ defmodule Tightbeam.EventLog do
         verb: verb,
         origin: origin,
         principal: principal,
-        session_key: sk
+        session_key: sk,
+        transport_session_key: transport_session_key
       }
     end)
   end

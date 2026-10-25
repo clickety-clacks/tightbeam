@@ -463,6 +463,14 @@ defmodule Tightbeam.WorkItemsTest do
 
     assert null_message =~ "NOT NULL constraint failed: work_items.ownerUserId"
 
+    assert {:error, %DB.Error{message: creator_message}} =
+             DB.query(
+               db,
+               "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdByProcess, createdAt) VALUES ('wi_two_creators','x','flynn','flynn','cron',1)"
+             )
+
+    assert creator_message =~ "CHECK constraint"
+
     assert {:ok, columns} = DB.query(db, "PRAGMA table_info(work_items)")
 
     assert Enum.map(columns, fn [_cid, name | _] -> name end) == [
@@ -478,6 +486,8 @@ defmodule Tightbeam.WorkItemsTest do
              "slateWakeId",
              "createdByUser",
              "createdBySession",
+             "createdByProcess",
+             "createdByViaSessionKey",
              "createdInTurnSeq",
              "createdContextKnown",
              "createdAt",
@@ -516,8 +526,16 @@ defmodule Tightbeam.WorkItemsTest do
            ]
   end
 
-  test "create validates every field and records session or user creator", ctx do
-    assert %{code: "process_denied"} = create(ctx, {:process, "cron"}, %{title: "x"})
+  test "create validates every field and records user, session, and process creators", ctx do
+    assert %{code: "missing_owner_user", message: missing_owner_error} =
+             create(ctx, {:process, "cron"}, %{title: "x"})
+
+    assert missing_owner_error =~ "ownerUserId"
+
+    assert %{code: "unknown_owner_user", message: unknown_owner_error} =
+             create(ctx, {:process, "cron"}, %{title: "x", owner_user_id: "missing"})
+
+    assert unknown_owner_error =~ "ownerUserId"
     assert %{code: "principal_required"} = create(ctx, nil, %{title: "x"})
 
     for title <- [nil, " ", String.duplicate("x", 2001)] do
@@ -540,6 +558,7 @@ defmodule Tightbeam.WorkItemsTest do
     assert String.starts_with?(user.id, "wi_")
     assert user.createdByUser == "flynn"
     assert user.createdBySession == nil
+    assert user.createdByProcess == nil
     assert user.specRefName == nil
     assert user.specRefSha256 == nil
     refute user.isBug
@@ -557,9 +576,21 @@ defmodule Tightbeam.WorkItemsTest do
 
     assert session.createdBySession == "holder"
     assert session.createdByUser == nil
+    assert session.createdByProcess == nil
     assert session.specRefName == "spec.md"
     assert session.specRefSha256 == @sha
     assert session.isBug
+
+    process =
+      create_call({:process, "cron"}, %{title: "Process item", owner_user_id: "other"})
+      |> Map.put(:transport_session_key, "holder")
+      |> then(&WorkItems.__handle__(ctx.db, "work-item-create", &1))
+
+    assert process.ownerUserId == "other"
+    assert process.createdByProcess == "cron"
+    assert process.createdByUser == nil
+    assert process.createdBySession == nil
+    assert process.createdByViaSessionKey == "holder"
 
     assert user.priority == 4
 
@@ -701,14 +732,32 @@ defmodule Tightbeam.WorkItemsTest do
         brief: "A complete brief."
       })
 
-    assert %{code: "process_denied", message: authority_error} =
+    assert %{code: "missing_owner_user", message: authority_error} =
              WorkItems.__handle__(ctx.db, "work-item-handoff", process_call)
 
-    assert authority_error =~ "automated callers cannot hand off work items"
-    assert authority_error =~ "user credential or session token"
-    refute authority_error =~ "--work-item"
+    assert authority_error =~ "ownerUserId"
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM work_items")
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+  end
+
+  test "process handoff accepts an explicit owner and retains actor and session", ctx do
+    call =
+      handoff_call({:process, "scheduler"}, %{
+        title: "Scheduled handoff",
+        owner_user_id: "other",
+        delivery_owner_session_key: ctx.other.session_key,
+        brief: "Take ownership of this scheduled item."
+      })
+      |> Map.put(:transport_session_key, ctx.holder.session_key)
+
+    assert %{created: true, wakeScheduled: true, workItem: item} =
+             WorkItems.__handle__(ctx.db, "work-item-handoff", call)
+
+    assert item.ownerUserId == "other"
+    assert item.createdByProcess == "scheduler"
+    assert item.createdByViaSessionKey == ctx.holder.session_key
+    assert item.createdByUser == nil
+    assert item.createdBySession == nil
   end
 
   test "handoff wake failure rolls back both new and existing item state", ctx do
@@ -815,7 +864,7 @@ defmodule Tightbeam.WorkItemsTest do
   end
 
   test "update implements the complete PATCH matrix", ctx do
-    assert %{code: "process_denied"} = update(ctx, {:process, "cron"}, "missing", %{})
+    assert %{code: "unknown_work_item"} = update(ctx, {:process, "cron"}, "missing", %{})
     assert %{code: "principal_required"} = update(ctx, nil, "missing", %{})
     assert %{code: "unknown_work_item"} = update(ctx, {:user, "flynn"}, "missing", %{})
 

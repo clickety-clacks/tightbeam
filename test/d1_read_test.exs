@@ -560,24 +560,17 @@ defmodule Tightbeam.D1ReadRouteTest do
            ]
   end
 
-  test "session asUser distinguishes absent, empty, matching, and unauthorized identities", ctx do
+  test "session asUser selects another user while rejecting an empty identity", ctx do
     assert get(ctx.opts, "/api/hosts", ctx.session.cli_token).status == 200
     assert get(ctx.opts, "/api/hosts?asUser=admin", ctx.session.cli_token).status == 200
 
-    for query <- ["?asUser=", "?asUser=operator"] do
-      response = get(ctx.opts, "/api/hosts" <> query, ctx.session.cli_token)
+    empty = get(ctx.opts, "/api/hosts?asUser=", ctx.session.cli_token)
+    assert empty.status == 400
+    assert JSON.decode!(empty.resp_body)["error"]["code"] == "invalid_message"
 
-      assert response.status == 403
-
-      assert JSON.decode!(response.resp_body) == %{
-               "schemaVersion" => 1,
-               "resource" => "hosts",
-               "error" => %{
-                 "code" => "identity_not_yours",
-                 "message" => "this session belongs to admin"
-               }
-             }
-    end
+    operator = get(ctx.opts, "/api/hosts?asUser=operator", ctx.session.cli_token)
+    assert operator.status == 200, operator.resp_body
+    assert is_list(JSON.decode!(operator.resp_body)["items"])
   end
 
   test "missing REST details honor the 3ms not-found floor without a scheduler overshoot", ctx do
@@ -637,7 +630,7 @@ defmodule Tightbeam.D1ReadRouteTest do
     invalid = get(ctx.opts, "/api/kungfu?unknown=value", ctx.admin.token)
     assert invalid.status == 400
     assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_filter"
-    assert get(ctx.opts, "/api/kungfu?asUser=other", ctx.session.cli_token).status == 403
+    assert get(ctx.opts, "/api/kungfu?asUser=operator", ctx.session.cli_token).status == 200
     hidden = get(ctx.opts, "/api/kungfu/no-such-bundle", ctx.operator.token)
     assert hidden.status == 404
     collection = get(ctx.opts, "/api/kungfu", ctx.operator.token)
