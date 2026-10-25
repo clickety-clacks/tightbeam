@@ -357,7 +357,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
       StateResources.query_active_turns_for_session(db(state), session_key)
       |> Enum.map(fn turn ->
         class = if turn.status == "queued", do: "turn.queued", else: "turn.started"
-        Publisher.committed_notice(class, turn, %{})
+        Publisher.committed_notice(class, turn, %{"sessionKey" => session_key})
       end)
       |> Enum.filter(fn notice ->
         class_filter_matches?(filters["classes"], notice["class"]) and
