@@ -327,8 +327,10 @@ defmodule Tightbeam.Wire.RouterTest do
       })
 
     reader = Devices.approve(ctx.db, "collection-reader-device", "collection-reader")
+    _actor = Devices.add_user(ctx.db, "collection-actor", false)
     visible = create_session(ctx.db, "collection-visible", "collection-reader")
-    _hidden = create_session(ctx.db, "collection-hidden", ctx.device.user_id)
+    hidden = create_session(ctx.db, "collection-hidden", "collection-actor")
+    _other_owner = create_session(ctx.db, "collection-other-owner", ctx.device.user_id)
 
     catalog = %{
       {"testhost", "claude"} => [
@@ -349,15 +351,15 @@ defmodule Tightbeam.Wire.RouterTest do
     assert Enum.map(body["items"], & &1["sessionKey"]) == [visible.session_key]
     assert body["items"] == [Tightbeam.StateResources.session(visible)]
 
-    acting_for_flynn =
-      conn(:get, "/api/sessions?asUser=#{ctx.device.user_id}")
+    acting_for_collection_actor =
+      conn(:get, "/api/sessions?asUser=collection-actor")
       |> put_req_header("authorization", "Bearer " <> visible.cli_token)
       |> Router.call(Router.init(ctx.opts ++ [model_catalog: %{}]))
 
-    assert acting_for_flynn.status == 200, acting_for_flynn.resp_body
-    flynn_sessions = JSON.decode!(acting_for_flynn.resp_body)["items"]
-    assert Enum.all?(flynn_sessions, &(&1["ownerUserId"] == ctx.device.user_id))
-    assert Enum.any?(flynn_sessions, &(&1["sessionKey"] == "collection-hidden"))
+    assert acting_for_collection_actor.status == 200, acting_for_collection_actor.resp_body
+    actor_sessions = JSON.decode!(acting_for_collection_actor.resp_body)["items"]
+    assert Enum.map(actor_sessions, & &1["sessionKey"]) == [hidden.session_key]
+    assert actor_sessions == [Tightbeam.StateResources.session(hidden)]
   end
 
   test "core device detail preserves authorization order and canonical envelope", ctx do

@@ -138,9 +138,12 @@ defmodule Tightbeam.ToplinesSchemaTest do
         {name, Enum.map(refs, &Enum.at(&1, 2))}
       end)
 
-    assert :ok = ToplinesSchema.activate(db, 125),
+    migration_result = ToplinesSchema.activate(db, 125)
+
+    assert migration_result == :ok,
            inspect(
              %{
+               result: migration_result,
                actual_attached: actual_attached,
                expected_attached: expected_attached,
                foreign_key_targets: foreign_key_targets
