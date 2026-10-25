@@ -86,7 +86,7 @@ defmodule Tightbeam.StateResources do
     "turns" =>
       ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt rowVersion),
     "decision requests" =>
-      ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
+      ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt returnedBy returnReason returnedAt rowVersion),
     "sessions" =>
       ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion),
     "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
@@ -164,12 +164,12 @@ defmodule Tightbeam.StateResources do
     },
     "decision requests" => %{
       strings:
-        ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId statuteName question status decision rationale ruledBy withdrawnBy withdrawnReason askedOfRole answer answeredBy),
+        ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId statuteName question status decision rationale ruledBy withdrawnBy withdrawnReason askedOfRole answer answeredBy returnedBy returnReason),
       integers:
-        ~w(lineageRung effortGeneration raisedAt deadlineAt ruledAt consumedAt withdrawnAt answeredAt rowVersion),
+        ~w(lineageRung effortGeneration raisedAt deadlineAt ruledAt consumedAt withdrawnAt answeredAt returnedAt rowVersion),
       booleans: [],
       nullable:
-        ~w(raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId deadlineAt statuteName decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt context)
+        ~w(raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId deadlineAt statuteName decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt returnedBy returnReason returnedAt context)
     },
     "sessions" => %{
       strings:
@@ -337,7 +337,7 @@ defmodule Tightbeam.StateResources do
     {"wakes", "classElection"} => ~w(sender classifier batcher),
     {"turns", "status"} => ~w(queued running delivered canceled failed failed_unknown),
     {"decision requests", "kind"} => ~w(statute effort agent),
-    {"decision requests", "status"} => ~w(open ruled consumed withdrawn superseded answered),
+    {"decision requests", "status"} => ~w(open ruled consumed withdrawn superseded answered returned),
     {"sessions", "kind"} => ~w(main dm custom),
     {"sessions", "state"} => ~w(active retired),
     {"sessions", "mechanicalStatus"} => ~w(idle running),
@@ -582,18 +582,21 @@ defmodule Tightbeam.StateResources do
   defp decision_request_query_row(nil), do: nil
 
   defp decision_request_query_row(row) do
-    row
-    |> Map.drop([
-      :action_key,
-      :ruled_via_session_key,
-      :ruled_via_principal,
-      :ruled_via_session_state,
-      :ruling_fact_id,
-      :park_wake_id,
-      :returned_by,
-      :return_reason,
-      :returned_at
-    ])
+    row =
+      Map.drop(row, [
+        :action_key,
+        :ruled_via_session_key,
+        :ruled_via_principal,
+        :ruled_via_session_state,
+        :ruling_fact_id,
+        :park_wake_id
+      ])
+
+    if Map.get(row, :kind) == "agent" do
+      row
+    else
+      Map.drop(row, [:returned_by, :return_reason, :returned_at])
+    end
   end
 
   defp detail_principal(%{rest_principal: %{kind: kind, id: id, is_admin: is_admin}}),
@@ -1565,12 +1568,7 @@ defmodule Tightbeam.StateResources do
 
     case Map.fetch(@item_field_order, resource) do
       {:ok, fields} ->
-        fields =
-          if resource == "transcript messages" and not Map.has_key?(item, "messageType") do
-            List.delete(fields, "messageType")
-          else
-            fields
-          end
+        fields = item_shape_fields(resource, fields, item)
 
         Enum.sort(Map.keys(item)) == Enum.sort(fields)
 
@@ -1582,7 +1580,7 @@ defmodule Tightbeam.StateResources do
   @doc false
   def item_shape_superset?(resource, item) when is_binary(resource) and is_map(item) do
     resource = Map.get(@item_resource_aliases, resource, resource)
-    fields = Map.fetch!(@item_field_order, resource)
+    fields = item_shape_fields(resource, Map.fetch!(@item_field_order, resource), item)
 
     required =
       if resource == "transcript messages", do: List.delete(fields, "messageType"), else: fields
@@ -1681,7 +1679,9 @@ defmodule Tightbeam.StateResources do
   end
 
   defp closed_projection(row, resource) do
-    fields = Map.fetch!(@item_field_order, resource)
+    fields =
+      conditional_projection_fields!(resource, Map.fetch!(@item_field_order, resource), row)
+
     row |> Map.take(fields) |> then(&exact!(resource, &1))
   end
 
@@ -1760,7 +1760,8 @@ defmodule Tightbeam.StateResources do
     do: raise(ArgumentError, "decision request options are projection_invalid")
 
   defp exact!(resource, item) do
-    expected = Map.fetch!(@item_field_order, resource)
+    expected =
+      conditional_projection_fields!(resource, Map.fetch!(@item_field_order, resource), item)
 
     if Enum.sort(Map.keys(item)) == Enum.sort(expected) do
       item
@@ -1925,7 +1926,30 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  defp conditional_fields!("decision requests", fields, item),
+    do: decision_request_fields(fields, item)
+
   defp conditional_fields!(_resource, fields, _item), do: fields
+
+  defp item_shape_fields("transcript messages", fields, item) do
+    if Map.has_key?(item, "messageType"), do: fields, else: List.delete(fields, "messageType")
+  end
+
+  defp item_shape_fields("decision requests", fields, item) do
+    decision_request_fields(fields, item)
+  end
+
+  defp item_shape_fields(_resource, fields, _item), do: fields
+
+  defp conditional_projection_fields!("decision requests", fields, item),
+    do: decision_request_fields(fields, item)
+
+  defp conditional_projection_fields!(_resource, fields, _item), do: fields
+
+  defp decision_request_fields(fields, %{"kind" => "agent"}), do: fields
+
+  defp decision_request_fields(fields, _item),
+    do: Enum.reject(fields, &(&1 in ~w(returnedBy returnReason returnedAt)))
 
   defp exact_item_keys!(resource, item, fields) do
     unless Enum.sort(Map.keys(item)) == Enum.sort(fields) do
@@ -1951,6 +1975,9 @@ defmodule Tightbeam.StateResources do
     type =
       cond do
         field == "rowVersion" ->
+          :positive_integer
+
+        resource == "decision requests" and field == "returnedAt" ->
           :positive_integer
 
         resource == "condition facts" and field == "id" ->
@@ -2118,6 +2145,13 @@ defmodule Tightbeam.StateResources do
       raise ArgumentError, "condition facts id must equal rowVersion"
     end
   end
+
+  defp validate_item_invariants!(
+         "decision requests",
+         %{"kind" => kind, "status" => "returned"}
+       )
+       when kind != "agent",
+       do: raise(ArgumentError, "non-agent decision requests cannot be returned")
 
   defp validate_item_invariants!(
          "attests",
