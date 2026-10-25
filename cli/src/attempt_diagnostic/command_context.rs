@@ -116,6 +116,8 @@ impl CommandContext {
             WorkItemClose { .. } => ("cli.work_item_close", DispatchPath),
             WorkItemFail { .. } => ("cli.work_item_fail", DispatchPath),
             Attest { .. } => ("cli.attest", DispatchPath),
+            MementoSet { .. } => ("cli.memento_set", DispatchPath),
+            Mementos { .. } => ("cli.mementos", DispatchPath),
             Attests { .. } => ("cli.attests", DispatchPath),
             AssignmentGet { .. } => ("cli.assignment_get", DispatchPath),
             Assignments { .. } => ("cli.assignments", DispatchPath),
@@ -317,6 +319,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | Topline { .. }
         | DurableToplines { .. }
         | DurableTopline { .. }
+        | Mementos { .. }
         | Attests { .. }
         | AssignmentGet { .. }
         | Assignments { .. }
@@ -441,6 +444,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | WorkItemClose { .. }
         | WorkItemFail { .. }
         | Attest { .. }
+        | MementoSet { .. }
         | CancelWake { .. }
         | IdentityRepoint { .. }
         | IdentityApply { .. }

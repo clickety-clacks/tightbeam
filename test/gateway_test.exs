@@ -25,6 +25,7 @@ defmodule Tightbeam.GatewayTest do
 
     expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle)
     expected = expected ++ ~w(kungfu-setup sentinel-enable sentinel-disable sentinel-list)
+    expected = expected ++ ~w(harklight-send memento-set mementos)
 
     expected =
       expected ++ ~w(subtree-guidance-set subtree-guidance-withdraw subtree-guidance-show)

@@ -7,14 +7,18 @@ defmodule Tightbeam.Assignments do
   alias Tightbeam.DB.Txn
 
   alias Tightbeam.{
+    AttestEvidence,
     ConditionFacts,
+    Dispatch,
     EffortCheckin,
     Escalation,
     EventLog,
+    Mementos,
     Org,
     Placement,
     Projection,
     RailRemedy,
+    Rules,
     Supervision,
     Wakes
   }
@@ -704,7 +708,7 @@ defmodule Tightbeam.Assignments do
       )
 
     case rows do
-      [row] -> assignment(row)
+      [row] -> assignment(row) |> then(&Mementos.attach(db, "assignment", &1))
       [] -> nil
     end
   end
@@ -1045,6 +1049,7 @@ defmodule Tightbeam.Assignments do
       assignment
       |> Map.put(:files, Map.get(files, assignment.id, []))
       |> Map.put(:commitRefCorrections, Map.get(corrections, assignment.id, []))
+      |> then(&Mementos.attach(db, "assignment", &1))
     end)
   end
 
@@ -1349,7 +1354,7 @@ defmodule Tightbeam.Assignments do
         [assignment_id]
       )
 
-    Enum.map(rows, &attest/1)
+    Enum.map(rows, fn row -> attest(row) |> then(&Mementos.attach(db, "attest", &1)) end)
   end
 
   defp attest_collection_where(assignment_id, filters) do
@@ -1435,7 +1440,7 @@ defmodule Tightbeam.Assignments do
         [work_item_id]
       )
 
-    Enum.map(rows, &assignment/1)
+    Enum.map(rows, fn row -> assignment(row) |> then(&Mementos.attach(db, "assignment", &1)) end)
   end
 
   @doc "Resolve an assignment's story membership without changing direct ownership readers."
@@ -1770,46 +1775,56 @@ defmodule Tightbeam.Assignments do
          :ok <- extra_validation.() do
       owner = principal_id(call.principal)
       key = call.params[:idempotency_key]
+      snapshot = Rules.effective_snapshot()
 
       result =
         transaction_with_row_commits(
           db,
           fn txn ->
-            result =
-              case open_assignment_in_txn(txn, call, owner, key, files, verb) do
-                {:created, assignment} ->
-                  created = after_create.(txn, assignment)
-                  accept_assignment_in_txn(created, txn, call)
+            Rules.with_snapshot(snapshot, fn ->
+              result =
+                case open_assignment_in_txn(txn, call, owner, key, files, verb) do
+                  {:created, assignment, effects} ->
+                    {:created, created_assignment, delivery} = after_create.(txn, assignment)
 
-                other ->
-                  other
+                    accept_assignment_in_txn(
+                      {:created, created_assignment, delivery, effects},
+                      txn,
+                      call
+                    )
+
+                  other ->
+                    other
+                end
+
+              case result do
+                {:accepted_in_txn, _event_id, {:created, assignment, _delivery, _effects}} ->
+                  Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, assignment)
+
+                {:created, assignment, _delivery, _effects} ->
+                  Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, assignment)
+
+                {:replayed, _assignment} ->
+                  Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+                _ ->
+                  :ok
               end
 
-            case result do
-              {:accepted_in_txn, _event_id, {:created, assignment, _delivery}} ->
-                Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, assignment)
-
-              {:created, assignment, _delivery} ->
-                Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, assignment)
-
-              {:replayed, _assignment} ->
-                Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
-
-              _ ->
-                :ok
-            end
-
-            result
+              result
+            end)
           end,
           &opened_assignment_commits(&1, &2, call, verb)
         )
 
       case result do
-        {:accepted_in_txn, event_id, {:created, assignment, delivery}} ->
+        {:accepted_in_txn, event_id, {:created, assignment, delivery, effects}} ->
+          close_memento_effects(db, call, effects)
           assignment = finalize_created_assignment(call, assignment, delivery)
           {:accepted_in_txn, event_id, %{assignment: assignment}}
 
-        {:created, assignment, delivery} ->
+        {:created, assignment, delivery, effects} ->
+          close_memento_effects(db, call, effects)
           finalize_created_assignment(call, assignment, delivery)
 
         {:replayed, assignment} ->
@@ -1821,6 +1836,7 @@ defmodule Tightbeam.Assignments do
     end
   rescue
     error in UnknownReviewTarget -> error("unknown_review_target", Exception.message(error))
+    error in Mementos.Refusal -> memento_refusal(error)
   end
 
   defp finalize_created_assignment(call, assignment, delivery) do
@@ -1839,7 +1855,7 @@ defmodule Tightbeam.Assignments do
       else: assignment
   end
 
-  defp accept_assignment_in_txn({:created, assignment, _delivery} = result, txn, call) do
+  defp accept_assignment_in_txn({:created, assignment, _delivery, _effects} = result, txn, call) do
     if call[:accepted_event_in_txn] do
       event_id =
         EventLog.append_event_in_txn(
@@ -1863,8 +1879,18 @@ defmodule Tightbeam.Assignments do
     case key && idempotency_assignment(txn, owner, key) do
       nil ->
         case create_assignment(txn, call, owner, key, files, verb) do
-          %{code: _} = error -> error
-          assignment -> {:created, assignment}
+          %{code: _} = error ->
+            error
+
+          assignment ->
+            admitted =
+              Mementos.admit_in_txn!(
+                txn,
+                call |> Map.put_new(:verb, verb) |> Map.put_new(:rules_prechecked, true)
+              )
+
+            Mementos.append_inline!(txn, "assignment", assignment.id, admitted)
+            {:created, assignment, admitted.memento_close_effects}
         end
 
       id ->
@@ -1886,28 +1912,35 @@ defmodule Tightbeam.Assignments do
       # transaction is deliberate — a registry this cannot read is reported as
       # such, and a failed CHECK never rejects the claim (§Design 5).
       artifact_cursor = artifact_cursor(db)
+      snapshot = Rules.effective_snapshot()
 
       result =
         transaction_with_row_commits(
           db,
           fn txn ->
-            result = attest_in_txn(txn, call)
+            Rules.with_snapshot(snapshot, fn ->
+              result = attest_in_txn(txn, call)
+              public_result = Map.delete(result, :memento_close_effects)
 
-            cond do
-              Map.get(result, :replayed, false) ->
-                Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+              cond do
+                Map.get(result, :replayed, false) ->
+                  Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
 
-              not Map.has_key?(result, :code) ->
-                Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, result)
+                not Map.has_key?(result, :code) ->
+                  Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, public_result)
 
-              true ->
-                :ok
-            end
+                true ->
+                  :ok
+              end
 
-            result
+              result
+            end)
           end,
           &attest_commits(&1, &2, call)
         )
+
+      close_memento_effects(db, call, Map.get(result, :memento_close_effects, []))
+      result = Map.delete(result, :memento_close_effects)
 
       result =
         complete_attest_condition_fact_deliveries(
@@ -1939,7 +1972,23 @@ defmodule Tightbeam.Assignments do
 
     TransitionRace ->
       assignment_closed()
+
+    error in Mementos.Refusal ->
+      memento_refusal(error)
   end
+
+  defp close_memento_effects(_db, _call, []), do: :ok
+
+  defp close_memento_effects(db, call, effects) do
+    Dispatch.close_rule_effects(
+      db,
+      call[:rule_effect_handlers] || Tightbeam.Gateway.handlers(%{db: db}),
+      effects
+    )
+  end
+
+  defp memento_refusal(error),
+    do: error.admission || error.details || %{code: error.code, message: error.message}
 
   # Per effort-checkin-v2 §Design 5 and the provenance it cites verbatim —
   # "Artifacts are the referents" — an attest's referents are the artifacts the
@@ -2211,6 +2260,7 @@ defmodule Tightbeam.Assignments do
 
           result =
             assignment(row)
+            |> then(&Mementos.attach(db, "assignment", &1))
             |> Map.put(:reopenings, list_reopenings(db, assignment_id))
             |> Map.put(
               :commitRefCorrections,
@@ -2722,10 +2772,12 @@ defmodule Tightbeam.Assignments do
   end
 
   defp attest_in_txn(txn, call) do
-    with :ok <- validate_revision_binding_in_txn(txn, call) do
-      if call.params[:kind] == "verdict",
-        do: verdict_in_txn(txn, call),
-        else: lifecycle_attest_in_txn(txn, call)
+    prepared = AttestEvidence.prepare_in_txn!(txn, Map.put_new(call, :verb, "attest"))
+
+    with :ok <- validate_revision_binding_in_txn(txn, prepared) do
+      if prepared.params[:kind] == "verdict",
+        do: verdict_in_txn(txn, prepared),
+        else: lifecycle_attest_in_txn(txn, prepared)
     end
   end
 
@@ -2748,6 +2800,9 @@ defmodule Tightbeam.Assignments do
 
       not (is_binary(artifact_id) and artifact_id != "" and is_binary(hash) and hash != "") ->
         error("invalid_revision_binding", "artifact and sha256 must be nonblank text")
+
+      call[:validated_operational_evidence] != nil ->
+        :ok
 
       true ->
         case Txn.q(
@@ -2849,11 +2904,21 @@ defmodule Tightbeam.Assignments do
   end
 
   defp insert_and_apply_lifecycle_attest(txn, call, assignment, holder) do
-    attest = insert_attest(txn, call, assignment.id)
+    admitted =
+      call
+      |> Map.put_new(:verb, "attest")
+      |> Map.put_new(:rules_prechecked, true)
+      |> then(&Mementos.admit_in_txn!(txn, &1))
+
+    attest = insert_attest(txn, admitted, assignment.id)
+    Mementos.append_inline!(txn, "attest", attest.id, admitted)
     EffortCheckin.holder_activity_in_txn(txn, assignment.id, holder, attest)
     Wakes.record_terminal_handoff_action_in_txn(txn, holder, attest)
-    result = apply_lifecycle_attest(txn, call, assignment, attest)
-    file_attest_condition_fact(txn, assignment, attest, result)
+    result = apply_lifecycle_attest(txn, admitted, assignment, attest)
+
+    txn
+    |> file_attest_condition_fact(assignment, attest, result)
+    |> Map.put(:memento_close_effects, admitted.memento_close_effects)
   end
 
   defp apply_lifecycle_attest(txn, %{params: %{kind: "progress"}}, assignment, attest) do
@@ -3195,7 +3260,14 @@ defmodule Tightbeam.Assignments do
                      ]) != [[1]],
                      do: raise(TransitionRace)
 
-                  attest = insert_attest(txn, call, assignment_id)
+                  admitted =
+                    call
+                    |> Map.put_new(:verb, "attest")
+                    |> Map.put_new(:rules_prechecked, true)
+                    |> then(&Mementos.admit_in_txn!(txn, &1))
+
+                  attest = insert_attest(txn, admitted, assignment_id)
+                  Mementos.append_inline!(txn, "attest", attest.id, admitted)
                   notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
 
                   :ok =
@@ -3211,7 +3283,13 @@ defmodule Tightbeam.Assignments do
                   :ok = settle_reviewed_assignment_in_txn(txn, call, assignment, attest)
 
                   append_attest_marker(txn, attest)
-                  result = %{assignment: assignment, attest: attest}
+
+                  result = %{
+                    assignment: assignment,
+                    attest: attest,
+                    memento_close_effects: admitted.memento_close_effects
+                  }
+
                   file_attest_condition_fact(txn, assignment, attest, result)
                 else
                   {:error, error} -> error
@@ -4204,14 +4282,14 @@ defmodule Tightbeam.Assignments do
       )
 
     case rows do
-      [row] -> assignment(row)
+      [row] -> assignment(row) |> then(&Mementos.attach(db, "assignment", &1))
       [] -> nil
     end
   end
 
   defp fetch_assignment(txn, id) do
     case Txn.q(txn, "SELECT #{columns()} FROM assignments WHERE id = ?1", [id]) do
-      [row] -> assignment(row)
+      [row] -> assignment(row) |> then(&Mementos.attach(txn, "assignment", &1))
       [] -> nil
     end
   end
@@ -4353,10 +4431,12 @@ defmodule Tightbeam.Assignments do
       {"verdict", nil, "verified"} ->
         case DB.query(
                db,
-               "SELECT holderKey,reviewsAssignmentId FROM assignments WHERE id=?1",
+               "SELECT a.holderKey,a.reviewsAssignmentId,COALESCE(e.effectKind,'code') " <>
+                 "FROM assignments a LEFT JOIN assignment_effects e ON e.assignmentId=a.id " <>
+                 "WHERE a.id=?1",
                [call.params[:assignment_id]]
              ) do
-          {:ok, [[holder, nil]]} when call.principal == {:session, holder} ->
+          {:ok, [[holder, nil, "code"]]} when call.principal == {:session, holder} ->
             error("invalid_commit_refs", "producer verification requires immutable commitRefs")
 
           _ ->
@@ -4384,13 +4464,15 @@ defmodule Tightbeam.Assignments do
 
     case DB.query(
            db,
-           "SELECT holderKey, state, reviewsAssignmentId FROM assignments WHERE id = ?1",
+           "SELECT a.holderKey,a.state,a.reviewsAssignmentId,COALESCE(e.effectKind,'code') " <>
+             "FROM assignments a LEFT JOIN assignment_effects e ON e.assignmentId=a.id " <>
+             "WHERE a.id = ?1",
            [assignment_id]
          ) do
       {:ok, []} ->
         error("unknown_assignment", "unknown assignment: #{assignment_id}")
 
-      {:ok, [[holder, state, reviews_assignment_id]]} when kind == "completion" ->
+      {:ok, [[holder, state, reviews_assignment_id, _effect_kind]]} when kind == "completion" ->
         cond do
           not match?({:session, _}, call.principal) ->
             error("not_holder", "assignment is held by session #{holder}")
@@ -4408,7 +4490,7 @@ defmodule Tightbeam.Assignments do
             :ok
         end
 
-      {:ok, [[holder, state, nil]]} when kind == "verdict" ->
+      {:ok, [[holder, state, nil, effect_kind]]} when kind == "verdict" ->
         cond do
           not match?({:session, _}, call.principal) ->
             error("not_holder", "assignment is held by session #{holder}")
@@ -4422,14 +4504,15 @@ defmodule Tightbeam.Assignments do
           state != "open" ->
             assignment_closed()
 
-          call.params[:verdict_kind] == "verified" and call.params[:commit_refs] == [] ->
+          effect_kind == "code" and call.params[:verdict_kind] == "verified" and
+              call.params[:commit_refs] == [] ->
             error("invalid_commit_refs", "producer verification requires immutable commitRefs")
 
           true ->
             :ok
         end
 
-      {:ok, [[_holder, _state, _reviews_assignment_id]]} ->
+      {:ok, [[_holder, _state, _reviews_assignment_id, _effect_kind]]} ->
         :ok
     end
   end
@@ -4851,8 +4934,8 @@ defmodule Tightbeam.Assignments do
   defp opened_assignment_commits(txn, result, call, verb) do
     assignment =
       case result do
-        {:created, assignment, _delivery} -> assignment
-        {:accepted_in_txn, _event_id, {:created, assignment, _delivery}} -> assignment
+        {:created, assignment, _delivery, _effects} -> assignment
+        {:accepted_in_txn, _event_id, {:created, assignment, _delivery, _effects}} -> assignment
         _ -> nil
       end
 
