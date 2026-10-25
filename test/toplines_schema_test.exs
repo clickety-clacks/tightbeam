@@ -126,7 +126,8 @@ defmodule Tightbeam.ToplinesSchemaTest do
       end)
       |> Enum.sort()
 
-    {:ok, tables} = DB.query(db, "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+    {:ok, tables} =
+      DB.query(db, "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
 
     foreign_key_targets =
       tables
@@ -138,8 +139,14 @@ defmodule Tightbeam.ToplinesSchemaTest do
       end)
 
     assert :ok = ToplinesSchema.activate(db, 125),
-           inspect(%{actual_attached: actual_attached, expected_attached: expected_attached,
-             foreign_key_targets: foreign_key_targets}, limit: :infinity)
+           inspect(
+             %{
+               actual_attached: actual_attached,
+               expected_attached: expected_attached,
+               foreign_key_targets: foreign_key_targets
+             },
+             limit: :infinity
+           )
 
     assert {:ok, [["standalone-toplines-v7"]]} =
              DB.query(db, "SELECT shape FROM topline_schema_stamp")
