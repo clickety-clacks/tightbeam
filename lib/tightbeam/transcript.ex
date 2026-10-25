@@ -1,7 +1,7 @@
 defmodule Tightbeam.Transcript do
   @moduledoc """
   Read the client-visible conversation out of the substrate's OWN rows —
-  `messages` joined to `turns`, filtered by `sessions.clearedThroughSeq`. A pure
+  `messages` joined to `turns`, independent of `sessions.clearedThroughSeq`. A pure
   read: no table, no column, no emission of its own (spec transcript-verb-v1).
 
   Not the harness transcript file. The conversation is already substrate truth
@@ -116,8 +116,8 @@ defmodule Tightbeam.Transcript do
         error
 
       {:ok, bound} ->
-        entries = select(db, session.session_key, session.cleared_through_seq, bound, limit)
-        flags = flags(db, session, bound, entries)
+        entries = select(db, session.session_key, bound, limit)
+        flags = flags(db, session.session_key, bound, entries)
 
         %{
           session_key: session.session_key,
@@ -131,10 +131,8 @@ defmodule Tightbeam.Transcript do
     end
   end
 
-  # EXISTENCE-based, not visibility-based: the retained row resolves even at or
-  # below the barrier, and only the returned RANGE is floored. That is what lets
-  # a caller whose history was cleared between pages catch up from the id it
-  # already holds instead of being stranded.
+  # The boundary marks an agent-context restart, not a transcript range. Any
+  # retained row in this session can anchor a page before or after it.
   defp resolve_cursor(_db, _session_key, :tail), do: {:ok, :tail}
 
   defp resolve_cursor(db, session_key, {direction, id}) do
@@ -154,31 +152,22 @@ defmodule Tightbeam.Transcript do
     end
   end
 
-  ## Range selection — every mode selects only from V (seq > barrier)
+  ## Range selection — every mode selects from the full session history
 
-  defp select(db, session_key, barrier, :tail, limit) do
+  defp select(db, session_key, :tail, limit) do
     db
-    |> rows("AND m.seq > ?2 ORDER BY m.seq DESC LIMIT ?3", [session_key, barrier, limit])
+    |> rows("ORDER BY m.seq DESC LIMIT ?2", [session_key, limit])
     |> Enum.reverse()
   end
 
-  defp select(db, session_key, barrier, {:before, cursor_seq}, limit) do
+  defp select(db, session_key, {:before, cursor_seq}, limit) do
     db
-    |> rows("AND m.seq > ?2 AND m.seq < ?3 ORDER BY m.seq DESC LIMIT ?4", [
-      session_key,
-      barrier,
-      cursor_seq,
-      limit
-    ])
+    |> rows("AND m.seq < ?2 ORDER BY m.seq DESC LIMIT ?3", [session_key, cursor_seq, limit])
     |> Enum.reverse()
   end
 
-  defp select(db, session_key, barrier, {:after, cursor_seq}, limit) do
-    rows(db, "AND m.seq > ?2 ORDER BY m.seq ASC LIMIT ?3", [
-      session_key,
-      max(barrier, cursor_seq),
-      limit
-    ])
+  defp select(db, session_key, {:after, cursor_seq}, limit) do
+    rows(db, "AND m.seq > ?2 ORDER BY m.seq ASC LIMIT ?3", [session_key, cursor_seq, limit])
   end
 
   # The pinned turn join: a `user` entry joins on `turns.messageId = entry.id`, an
@@ -240,12 +229,12 @@ defmodule Tightbeam.Transcript do
     }
   end
 
-  ## Page flags — barrier-relative: cleared rows never make either flag true
+  ## Page flags — computed over the full session history
 
-  defp flags(db, session, bound, []) do
+  defp flags(db, session_key, bound, []) do
     # An empty page reports the direction it could still travel, so a caller is
     # never told history exists that it can never page to.
-    visible? = visible_any?(db, session)
+    visible? = visible_any?(db, session_key)
 
     case bound do
       :tail -> %{before: false, after: false}
@@ -254,38 +243,38 @@ defmodule Tightbeam.Transcript do
     end
   end
 
-  defp flags(db, session, _bound, entries) do
+  defp flags(db, session_key, _bound, entries) do
     oldest = List.first(entries).id
     newest = List.last(entries).id
 
     %{
-      before: neighbor?(db, session, "<", oldest),
-      after: neighbor?(db, session, ">", newest)
+      before: neighbor?(db, session_key, "<", oldest),
+      after: neighbor?(db, session_key, ">", newest)
     }
   end
 
-  defp visible_any?(db, session) do
+  defp visible_any?(db, session_key) do
     {:ok, [[count]]} =
       DB.query(
         db,
-        "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1 AND seq > ?2 LIMIT 1",
-        [session.session_key, session.cleared_through_seq]
+        "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1 LIMIT 1",
+        [session_key]
       )
 
     count > 0
   end
 
-  defp neighbor?(db, session, comparison, id) do
+  defp neighbor?(db, session_key, comparison, id) do
     {:ok, [[count]]} =
       DB.query(
         db,
         """
         SELECT COUNT(*) FROM messages
-        WHERE sessionKey = ?1 AND seq > ?2
-          AND seq #{comparison} (SELECT seq FROM messages WHERE id = ?3)
+        WHERE sessionKey = ?1
+          AND seq #{comparison} (SELECT seq FROM messages WHERE id = ?2)
         LIMIT 1
         """,
-        [session.session_key, session.cleared_through_seq, id]
+        [session_key, id]
       )
 
     count > 0
@@ -307,8 +296,8 @@ defmodule Tightbeam.Transcript do
     %{candidates: candidates}
   end
 
-  # `lastActivityAt` is the timestamp of the session's highest VISIBLE message
-  # seq, or the session's own createdAt when it has none. Ordering by it is
+  # `lastActivityAt` is the timestamp of the session's highest message seq, or
+  # the session's own createdAt when it has none. Ordering by it is
   # BEST-EFFORT DISPLAY DATA — a stored timestamp can tie or regress — which is
   # why the seq-only discipline governs entries and not this ranking.
   defp candidate_rows(db, name) do
@@ -319,7 +308,7 @@ defmodule Tightbeam.Transcript do
         SELECT s.sessionKey, s.displayName, s.state, s.ownerUserId,
                COALESCE(
                  (SELECT m.timestamp FROM messages AS m
-                  WHERE m.sessionKey = s.sessionKey AND m.seq > s.clearedThroughSeq
+                  WHERE m.sessionKey = s.sessionKey
                   ORDER BY m.seq DESC LIMIT 1),
                  s.createdAt
                ) AS lastActivityAt

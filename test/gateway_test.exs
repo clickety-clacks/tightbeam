@@ -1438,6 +1438,7 @@ defmodule Tightbeam.GatewayTest do
     assert human_payload["sender"] == human_origin
     assert human_payload["turnSeq"] == human_turn_seq
     assert human_payload["turnIncludesHuman"]
+    assert human_payload["rowVersion"] > accepted_message["rowVersion"]
     assert human_notice["refs"]["messageId"] == human_message_id
     assert human_notice["payload"]["deviceId"] == "post-device"
     assert human_notice["payload"]["clientMessageId"] == "post-queued-1"
@@ -4903,12 +4904,14 @@ defmodule Tightbeam.GatewayTest do
              to: "codex (gpt-5.6-sol (effort medium))"
            }
 
-    # It names the change, both ends of it, and that nothing was deleted.
+    # It names the change, both ends of it, and explains the context restart
+    # without claiming that earlier transcript rows are hidden.
     assert tombstone.content =~ "[engine swap]"
     assert tombstone.content =~ "claude (before-model)"
     assert tombstone.content =~ "codex (gpt-5.6-sol (effort medium))"
-    assert tombstone.content =~ "RETAINED"
-    assert tombstone.content =~ "not deleted"
+    assert tombstone.content =~ "remain visible in this transcript"
+    assert tombstone.content =~ "fresh working context"
+    refute tombstone.content =~ "no longer shown"
     assert tombstone.content =~ "expected"
 
     # And the buried rows really are retained, not deleted — the marker's claim

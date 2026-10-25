@@ -99,9 +99,9 @@ defmodule Tightbeam.StateResources do
   SELECT m.seq, m.id, m.sessionKey, m.role, m.messageType, m.content,
          m.markerKind, m.markerFrom, m.markerTo,
          m.timestamp,
-         CASE WHEN m.sender IS NULL AND m.role='user' THEN COALESCE(
-           CASE WHEN t.messageId=m.id THEN t.origin END,
-           (
+         CASE WHEN NULLIF(m.sender, '') IS NULL AND m.role='user' THEN COALESCE(
+           NULLIF(CASE WHEN t.messageId=m.id THEN t.origin END, ''),
+           NULLIF((
              SELECT source.origin
              FROM wakes AS source INDEXED BY notice_source_client_identity
              WHERE m.deviceId IS NOT NULL AND m.clientMessageId IS NOT NULL
@@ -109,7 +109,7 @@ defmodule Tightbeam.StateResources do
                AND json_extract(source.sourceClientIdentity,'$.targetSessionKey')=+m.sessionKey
                AND json_extract(source.sourceClientIdentity,'$.deviceId')=+m.deviceId
                AND json_extract(source.sourceClientIdentity,'$.clientMessageId')=+m.clientMessageId
-           ),
+           ), ''),
            'user:' || session_owner.ownerUserId
          ) ELSE m.sender END,
          m.deviceId, m.clientMessageId,
@@ -124,7 +124,7 @@ defmodule Tightbeam.StateResources do
              SELECT 1 FROM messages AS human
              WHERE human.id=t.messageId AND human.sessionKey=t.sessionKey
                AND human.role='user'
-               AND COALESCE(human.sender, t.origin)='user:' || session_owner.ownerUserId
+               AND COALESCE(NULLIF(human.sender, ''), NULLIF(t.origin, ''))='user:' || session_owner.ownerUserId
            ) OR EXISTS (
              SELECT 1
              FROM wakes AS batch_source INDEXED BY wakes_delivered_turn
@@ -138,7 +138,7 @@ defmodule Tightbeam.StateResources do
                AND human.deviceId IS NOT NULL
                AND human.clientMessageId IS NOT NULL
                AND human.role='user'
-               AND COALESCE(human.sender, batch_source.origin)='user:' || session_owner.ownerUserId
+               AND COALESCE(NULLIF(human.sender, ''), NULLIF(batch_source.origin, ''))='user:' || session_owner.ownerUserId
            ) THEN 1
            WHEN t.triggerSource='batch' AND t.batchMemberCount = (
              SELECT COUNT(*) FROM wakes AS batch_source INDEXED BY wakes_delivered_turn
@@ -154,7 +154,7 @@ defmodule Tightbeam.StateResources do
              SELECT 1 FROM messages AS trigger_message
              WHERE trigger_message.id=t.messageId AND trigger_message.sessionKey=t.sessionKey
                AND trigger_message.role='user'
-               AND COALESCE(trigger_message.sender, t.origin) LIKE 'user:%'
+               AND COALESCE(NULLIF(trigger_message.sender, ''), NULLIF(t.origin, '')) LIKE 'user:%'
            ) THEN 0
            WHEN EXISTS (
              SELECT 1 FROM wakes AS carrier
@@ -1916,7 +1916,7 @@ defmodule Tightbeam.StateResources do
       "messageType" => message_type,
       "content" => required_wire_string!(value(row, :content), "content"),
       "at" => message_at!(row),
-      "sender" => nullable_string!(value(row, :sender), "sender"),
+      "sender" => message_sender!(row, stored_type),
       "deviceId" => nullable_string!(value(row, :device_id), "deviceId"),
       "clientMessageId" => nullable_string!(value(row, :client_message_id), "clientMessageId"),
       "replyToMessageId" =>
@@ -2785,8 +2785,22 @@ defmodule Tightbeam.StateResources do
       model: model,
       effort: effort,
       context: context,
-      row_version: seq
+      # A staged human row gains its turn association when it is delivered.
+      # Include that sequence so publishing the updated projection advances
+      # rowVersion even when the message timestamp is unchanged.
+      row_version: max(seq, at) + if(is_integer(turn_seq), do: turn_seq, else: 0)
     }
+  end
+
+  defp message_sender!(row, message_type) do
+    sender = nullable_string!(value(row, :sender), "sender")
+
+    if value(row, :role) == "user" and is_nil(message_type) and
+         (not is_binary(sender) or sender == "") do
+      raise ArgumentError, "human message sender is projection_invalid"
+    end
+
+    sender
   end
 
   defp message_marker(row) do

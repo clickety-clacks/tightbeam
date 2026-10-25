@@ -162,9 +162,9 @@ defmodule Tightbeam.TranscriptTest do
              read(ctx, %{session_key: "owned", after: "s_does_not_exist"})
   end
 
-  ## Proof 5 — the history barrier
+  ## Proof 5 — the context boundary does not filter history
 
-  test "proof 5: cleared rows are never served and never set a flag", ctx do
+  test "proof 5: clearedThroughSeq leaves full history and paging flags visible", ctx do
     ids = seed(ctx.db, "owned", 4)
     page = read(ctx, %{session_key: "owned", limit: 2})
     held_oldest = page.oldest_id
@@ -174,16 +174,16 @@ defmodule Tightbeam.TranscriptTest do
     clear_through!(ctx.db, "owned", held_newest)
     fresh = seed(ctx.db, "owned", 2)
 
-    # Nothing at or below the barrier is served, in any mode.
+    # The boundary remains a session value, but does not remove earlier rows.
     tail = read(ctx, %{session_key: "owned", limit: 50})
-    assert Enum.map(tail.messages, & &1.id) == fresh
+    assert Enum.map(tail.messages, & &1.id) == ids ++ fresh
     refute tail.has_more_before
 
-    # An at-or-below cursor still RESOLVES (existence-based) and floors the range.
+    # A cursor before the boundary still pages through the earlier history.
     before_page = read(ctx, %{session_key: "owned", before: held_oldest})
-    assert before_page.messages == []
-    assert before_page.oldest_id == nil
-    assert before_page.newest_id == nil
+    assert Enum.map(before_page.messages, & &1.id) == Enum.take(ids, 2)
+    assert before_page.oldest_id == hd(ids)
+    assert before_page.newest_id == List.last(Enum.take(ids, 2))
     refute before_page.has_more_before
     assert before_page.has_more_after
 
@@ -196,11 +196,10 @@ defmodule Tightbeam.TranscriptTest do
     assert Enum.map(narrow.messages, & &1.id) == [hd(fresh)]
     assert narrow.has_more_after
 
-    # A row committed above the barrier is served; the cleared ones are gone.
+    # The rows held before the boundary remain in the visible set.
     assert length(ids) == 4
-    refute Enum.any?(tail.messages, &(&1.id in Enum.take(ids, 2)))
 
-    # `--name` lastActivityAt reflects visible rows only.
+    # `--name` lastActivityAt reflects the latest message in full history.
     [candidate] = read(ctx, %{name: "Coder Session"}).candidates
 
     {:ok, [[visible_at]]} =

@@ -13,6 +13,7 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
     HarnessHealth,
     Model,
     Org,
+    StateResources,
     TerminalCredentialFailure
   }
 
@@ -92,6 +93,8 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
     assert {:ok, [[^expected]]} =
              DB.query(db, "SELECT content FROM messages WHERE id=?1", [message_id])
 
+    initial_message = db |> StateResources.query_message(message_id) |> StateResources.message()
+
     assert {:ok, :recorded} =
              DB.transaction(db, fn txn ->
                TerminalCredentialFailure.record_redirect_in_txn(
@@ -107,6 +110,9 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
     assert {:ok, [[^updated]]} =
              DB.query(db, "SELECT content FROM messages WHERE id=?1", [message_id])
 
+    updated_message = db |> StateResources.query_message(message_id) |> StateResources.message()
+    assert updated_message["rowVersion"] > initial_message["rowVersion"]
+
     assert {:ok, :duplicate} =
              DB.transaction(db, fn txn ->
                TerminalCredentialFailure.record_redirect_in_txn(
@@ -116,6 +122,9 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
                  "alternate"
                )
              end)
+
+    unchanged_message = db |> StateResources.query_message(message_id) |> StateResources.message()
+    assert unchanged_message["rowVersion"] == updated_message["rowVersion"]
 
     assert {:ok, [[1]]} =
              DB.query(db, "SELECT COUNT(*) FROM messages WHERE clientMessageId=?1", [
