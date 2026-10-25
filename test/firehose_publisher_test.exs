@@ -1614,7 +1614,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
       message_type: nil,
       content: content,
       timestamp: seq,
-      sender: nil,
+      sender: "user:fixture",
       device_id: nil,
       client_message_id: nil,
       reply_to_message_id: nil,
