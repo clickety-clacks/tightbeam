@@ -141,15 +141,14 @@ defmodule Tightbeam.StateVisibility do
       when is_binary(session_key) do
     {
       """
-      (artifact.createdBySession = ?1 OR EXISTS (
-        SELECT 1 FROM work_items AS artifact_work_item
-        WHERE artifact_work_item.id = artifact.workItemId AND (
-          artifact_work_item.createdBySession = ?2 OR EXISTS (
-            SELECT 1 FROM assignments AS artifact_assignment
-            WHERE artifact_assignment.workItemId = artifact_work_item.id
-              AND artifact_assignment.holderKey = ?3
-          )
-        )
+      (artifact.createdBySession = ?1 OR artifact.workItemId IN (
+        SELECT artifact_work_item.id
+        FROM work_items AS artifact_work_item
+        WHERE artifact_work_item.createdBySession = ?2
+        UNION
+        SELECT artifact_assignment.workItemId
+        FROM assignments AS artifact_assignment
+        WHERE artifact_assignment.holderKey = ?3
       ))
       """,
       [session_key, session_key, session_key]

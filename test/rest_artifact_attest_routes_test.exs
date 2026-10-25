@@ -309,6 +309,20 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
     assert owner_session_collection.status == 200
     assert JSON.decode!(owner_session_collection.resp_body)["items"] == []
 
+    held_session_collection =
+      get(
+        ctx,
+        "/api/artifacts?workItemId=#{ctx.alice_item.id}",
+        ctx.bob.session.cli_token
+      )
+
+    assert held_session_collection.status == 200, held_session_collection.resp_body
+
+    assert JSON.decode!(held_session_collection.resp_body)["items"] == [
+             StateResources.artifact(Artifacts.get(ctx.db, ctx.owner_artifact.artifact_id)),
+             StateResources.artifact(Artifacts.get(ctx.db, ctx.second_owner_artifact.artifact_id))
+           ]
+
     creator_session_collection =
       get(
         ctx,
