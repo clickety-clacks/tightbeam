@@ -552,6 +552,7 @@ mod tests {
             title: None,
             delivery_owner: "PRIVATE_OWNER".into(),
             brief: "PRIVATE_BRIEF".into(),
+            owner_user_id: None,
         };
         let context = CommandContext::for_command(&command).unwrap();
         assert_eq!(
