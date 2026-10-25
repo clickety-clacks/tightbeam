@@ -1793,7 +1793,8 @@ defmodule Tightbeam.GatewayTest do
     carrier_message_id = carrier_notice["payload"]["id"]
     :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
 
-    assert {:ok, %{seq: ^turn_seq}} = Ledger.claim_next(ctx.db, session, "batch-turn")
+    assert {:ok, %{seq: ^turn_seq} = batch_turn} =
+             Ledger.claim_next(ctx.db, session, "batch-turn")
 
     assert %{
              "class" => "turn.started",
@@ -1874,7 +1875,10 @@ defmodule Tightbeam.GatewayTest do
 
     assert snapshot_seq == base_socket_seq + 1
 
-    assert :ok = Ledger.finish(ctx.db, turn_seq, "delivered", nil)
+    assert :ok =
+             Ledger.finish(ctx.db, turn_seq, "delivered", nil,
+               owner_lease: batch_turn.owner_lease
+             )
 
     assert_receive {:firehose_notice, ended_notice}, 1_000
 
