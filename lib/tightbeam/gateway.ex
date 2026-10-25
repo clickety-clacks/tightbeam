@@ -333,6 +333,7 @@ defmodule Tightbeam.Gateway do
           deliver: deliver,
           delivery_opts: delivery_config,
           internal_consumers: %{
+            "rate_limit_reset" => &Tightbeam.RateLimitReset.release(db, &1),
             "effort_probe" => &EffortCheckin.probe(db, config, &1),
             "effort_deadline" => &EffortCheckin.deadline(db, config, &1),
             "assignment_inactivity_deadline" => &Supervision.deadline(db, &1),
