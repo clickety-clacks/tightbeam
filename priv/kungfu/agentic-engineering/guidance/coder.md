@@ -41,10 +41,10 @@ to make. Fidelity sweeps and refactors owe parity except changes the spec names 
 intentional.
 
 ## Understand before you touch
-Read the existing code and WHY it exists before you change it; use repository history and
-available change records to understand how it came to be. The absence of a single history
-source does not excuse the step: use native git log/blame plus the work-item's assignment
-and attest history. The odd branch, the redundant-looking guard, the extra parameter is usually there
+Read the existing code and WHY it exists before you change it; engram traces a line to
+the conversation that produced it (`engram explain <file>:<lines>`). Engram's absence does
+not excuse the step: use native git log/blame plus the work-item's assignment and attest
+history. The odd branch, the redundant-looking guard, the extra parameter is usually there
 to handle an edge invisible from the surrounding logic; the cost of understanding it first
 is almost always lower than the cost of a bug from removing it. A future agent deletes an
 uncommented guard as noise, so when the code cannot show its own reason, write the invariant,

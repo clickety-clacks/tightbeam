@@ -4263,7 +4263,7 @@ defmodule Tightbeam.GatewayTest do
       spawn.(%{
         verb: "spawn",
         origin: "remedy:hire-reviewer",
-        principal: {:remedy, %{statute: "hire-reviewer", action: "spawn", owner: "flynn"}},
+        principal: {:remedy, %{statute: "hire-reviewer", action: "spawn", owner: "sample-user"}},
         session_key: nil,
         params: %{
           display_name: "Remedy Reviewer",
@@ -4273,13 +4273,13 @@ defmodule Tightbeam.GatewayTest do
       })
 
     assert is_binary(created.session_key)
-    assert Org.get(ctx.db, created.session_key).owner_user_id == "flynn"
+    assert Org.get(ctx.db, created.session_key).owner_user_id == "sample-user"
 
     assert %{code: "unknown_caller"} =
              spawn.(%{
                verb: "spawn",
                origin: "remedy:wrong-action",
-               principal: {:remedy, %{statute: "wrong-action", action: "wake", owner: "flynn"}},
+               principal: {:remedy, %{statute: "wrong-action", action: "wake", owner: "sample-user"}},
                session_key: nil,
                params: %{
                  display_name: "Rejected",
