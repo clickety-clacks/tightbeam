@@ -84,7 +84,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
   def handle_info(:firehose_revoked, state), do: {:stop, :normal, 1008, state}
 
   def handle_info(:firehose_shutdown, state) do
-    Hub.shutdown_delivered(hub(state), self())
     {:stop, :normal, 1012, state}
   end
 

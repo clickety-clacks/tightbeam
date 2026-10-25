@@ -255,6 +255,12 @@ defmodule Tightbeam.Firehose.Hub do
   def handle_call({:shutdown_delivered, pid}, _, state), do: {:reply, :ok, drop(state, pid)}
 
   @impl true
+  # WebSock invokes terminate before Bandit writes the close frame. During
+  # shutdown, keep the monitored socket until it exits so the application
+  # cannot stop Bandit before the 1012 frame is sent.
+  def handle_cast({:unregister, _pid}, %{shutting_down: true} = state),
+    do: {:noreply, state}
+
   def handle_cast({:unregister, pid}, state), do: {:noreply, drop(state, pid)}
 
   def handle_cast({:delivered, pid}, state),
