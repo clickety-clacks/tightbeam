@@ -168,7 +168,12 @@ defmodule Tightbeam.WorkItems do
       insert_columns = "rowid," <> Enum.join(columns, ",")
 
       select_columns =
-        ["rowid" | Enum.map(columns, fn column -> if column in actor_columns, do: "NULL", else: column end)]
+        [
+          "rowid"
+          | Enum.map(columns, fn column ->
+              if column in actor_columns, do: "NULL", else: column
+            end)
+        ]
         |> Enum.join(",")
 
       :ok =
