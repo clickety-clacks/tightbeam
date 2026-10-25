@@ -1827,7 +1827,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     refute Map.has_key?(withdrawn, "rowVersion")
 
-    statute_withdraw_id = open_statute_request(ctx, "flynn")
+    statute_withdraw_id = open_statute_request(ctx, "sample-user")
 
     assert {200,
             %{
@@ -1845,7 +1845,7 @@ defmodule Tightbeam.CliIntegrationTest do
     statute_rule_id = open_statute_request(ctx, "other")
 
     rule_call = %{
-      "asUser" => "flynn",
+      "asUser" => "sample-user",
       "verb" => "rule",
       "params" => %{"request" => statute_rule_id, "decision" => "allow"}
     }
