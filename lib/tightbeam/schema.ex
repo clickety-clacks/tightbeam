@@ -2252,7 +2252,8 @@ defmodule Tightbeam.Schema do
 
       {:error, error} ->
         raise ShapeError,
-          message: "notice_batch_chat_message_format_migration_failed: #{Exception.message(error)}"
+          message:
+            "notice_batch_chat_message_format_migration_failed: #{Exception.message(error)}"
     end
   end
 
