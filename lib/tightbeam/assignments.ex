@@ -2892,6 +2892,14 @@ defmodule Tightbeam.Assignments do
 
     liveness_trigger = disposition_liveness_trigger!(txn, closed_assignment.workItemId)
 
+    settle_cannot_proceed_by_disposition_in_txn(
+      txn,
+      assignment.id,
+      principal_id(call.principal),
+      attest.ts,
+      liveness_trigger
+    )
+
     disposition =
       assignment_disposition_command(
         assignment.id,
@@ -3933,6 +3941,54 @@ defmodule Tightbeam.Assignments do
     else
       :ok
     end
+  end
+
+  @doc false
+  def settle_cannot_proceed_by_answer_in_txn(
+        %Txn{} = txn,
+        request_id,
+        principal,
+        settled_at
+      )
+      when is_binary(request_id) and is_binary(principal) and is_integer(settled_at) do
+    case Txn.q(
+           txn,
+           """
+           SELECT cp.id, cp.assignmentId
+           FROM assignment_cannot_proceed cp
+           JOIN decision_requests dr ON dr.id=cp.decisionRequestId
+           WHERE cp.decisionRequestId=?1 AND cp.state='standing' AND dr.status='answered'
+           """,
+           [request_id]
+         ) do
+      [[condition_id, assignment_id]] ->
+        Txn.q(
+          txn,
+          """
+          UPDATE assignment_cannot_proceed
+          SET state='settled', settledAt=?2, settlementKind='disposed', settledBy=?3
+          WHERE id=?1 AND state='standing'
+          """,
+          [condition_id, settled_at, principal]
+        )
+
+        if Txn.changes(txn) != 1, do: raise(TransitionRace)
+
+        :ok = EffortCheckin.reconcile_wait_relief_in_txn(txn, assignment_id, settled_at)
+
+        case fetch_assignment(txn, assignment_id) do
+          %{holderKey: holder} ->
+            append_substrate(txn, holder, "[cannot-proceed settled by opener answer]")
+
+          nil ->
+            :ok
+        end
+
+      [] ->
+        :ok
+    end
+
+    :ok
   end
 
   defp same_attest_principal_as_opener?(

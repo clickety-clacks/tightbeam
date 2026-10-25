@@ -2793,7 +2793,7 @@ defmodule Tightbeam.AssignmentsTest do
     end
   end
 
-  test "cannot-proceed is session-filed, idempotent, pauses one card, and releases on its exact fact",
+  test "cannot-proceed is session-filed, idempotent, pauses one card, and releases on its exact custom fact",
        ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
 
@@ -2846,14 +2846,14 @@ defmodule Tightbeam.AssignmentsTest do
     partial_release =
       attest_call({:session, "holder"}, first.id, "cannot-proceed")
       |> put_in([:params, :note], "partial release tuple")
-      |> put_in([:params, :release_fact_kind], "dependency-ready")
+      |> put_in([:params, :release_fact_kind], "decision_request_transition")
 
     assert %{code: "invalid_release_tuple"} = handle(ctx, "attest", partial_release)
 
     filing =
       attest_call({:session, "holder"}, first.id, "cannot-proceed")
       |> put_in([:params, :note], "waiting for the exact release fact")
-      |> put_in([:params, :release_fact_kind], "dependency-ready")
+      |> put_in([:params, :release_fact_kind], "decision_request_transition")
       |> put_in([:params, :release_fact_scope], first.id)
       |> put_in([:params, :release_fact_principal_ref], "agent:holder")
 
@@ -2886,7 +2886,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, _wrong_fact} =
              DB.transaction(ctx.db, fn txn ->
                ConditionFacts.file_in_txn(txn, %{
-                 kind: "dependency-ready",
+                 kind: "decision_request_transition",
                  scope: first.id,
                  origin: "agent:other-session"
                })
@@ -2930,15 +2930,6 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{code: "cannot_proceed_conflict"} = handle(ctx, "attest", conflicting)
 
     assert %{code: "cannot_proceed_standing"} =
-             Tightbeam.Escalation.answer(
-               ctx.db,
-               call("answer", {:session, "other-session"}, nil, %{
-                 request: filed.decisionRequest.id,
-                 answer: "try again"
-               })
-             )
-
-    assert %{code: "cannot_proceed_standing"} =
              Tightbeam.Escalation.return_request(
                ctx.db,
                call("return", {:session, "other-session"}, nil, %{
@@ -2975,7 +2966,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, fact} =
              DB.transaction(ctx.db, fn txn ->
                ConditionFacts.file_in_txn(txn, %{
-                 kind: "dependency-ready",
+                 kind: "decision_request_transition",
                  scope: first.id,
                  origin: "agent:holder"
                })
@@ -3352,6 +3343,101 @@ defmodule Tightbeam.AssignmentsTest do
                FROM assignments WHERE id=?1
                """,
                [assignment.id]
+             )
+  end
+
+  test "an accepted opener answer settles a standing cannot-proceed", ctx do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    assignment =
+      assign_call({:user, "flynn"}, "opener answer")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "opener answer resolves the block")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert %{status: "answered", answer: "Resume the work"} =
+             Tightbeam.Escalation.answer(
+               ctx.db,
+               call("answer", {:user, "flynn"}, nil, %{
+                 request: blocked.decisionRequest.id,
+                 answer: "Resume the work"
+               })
+             )
+
+    assert Wakes.get(ctx.db, blocked.decisionWake.wake_id).state == "canceled"
+
+    assert {:ok, [["settled", "disposed", nil, "user:flynn", "answered"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT cp.state,cp.settlementKind,cp.settlementFactId,cp.settledBy,dr.status
+               FROM assignment_cannot_proceed cp
+               JOIN decision_requests dr ON dr.id=cp.decisionRequestId
+               WHERE cp.id=?1
+               """,
+               [blocked.cannotProceed.id]
+             )
+
+    assert %{assignment: %{state: "closed", outcome: "completed"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "holder"}, assignment.id, "completion")
+             )
+  end
+
+  test "a clean review settles cannot-proceed after review-pending completion", ctx do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    assignment =
+      assign_call({:user, "flynn"}, "review-pending completion")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    review =
+      assign_call({:user, "flynn"}, "completion review")
+      |> put_in([:params, :reviews_assignment_id], assignment.id)
+      |> Map.put(:session_key, "other-session")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{assignment: %{state: "open"}} =
+             attest_call({:session, "holder"}, assignment.id, "completion")
+             |> Map.put(:review_pending, true)
+             |> then(&handle(ctx, "attest", &1))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "clean review closes this completion")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> then(&handle(ctx, "attest", &1))
+
+    assert {:ok, [["closed", "completed"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,outcome FROM assignments WHERE id=?1",
+               [assignment.id]
+             )
+
+    assert Wakes.get(ctx.db, blocked.decisionWake.wake_id).state == "canceled"
+
+    assert {:ok, [["settled", "disposed", nil, "session:other-session", "withdrawn"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT cp.state,cp.settlementKind,cp.settlementFactId,cp.settledBy,dr.status
+               FROM assignment_cannot_proceed cp
+               JOIN decision_requests dr ON dr.id=cp.decisionRequestId
+               WHERE cp.id=?1
+               """,
+               [blocked.cannotProceed.id]
              )
   end
 

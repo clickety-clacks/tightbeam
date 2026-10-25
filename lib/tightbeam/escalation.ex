@@ -1197,9 +1197,6 @@ defmodule Tightbeam.Escalation do
       %{kind: "agent"} = request ->
         if decision_reader?(call, request) do
           cond do
-            cannot_proceed_request?(request) ->
-              cannot_proceed_decision_error()
-
             not (is_binary(text) and String.trim(text) != "") ->
               error("invalid", "an answer requires text")
 
@@ -1455,6 +1452,18 @@ defmodule Tightbeam.Escalation do
         )
 
         if Txn.changes(txn) == 1 do
+          if cannot_proceed_request?(before) do
+            Wakes.clear_decision_request_notice_in_txn(txn, request.id)
+
+            :ok =
+              Tightbeam.Assignments.settle_cannot_proceed_by_answer_in_txn(
+                txn,
+                request.id,
+                answered_by,
+                answered_at
+              )
+          end
+
           EventLog.lifecycle_in_txn(
             txn,
             "decision_request_answered",
@@ -1883,7 +1892,7 @@ defmodule Tightbeam.Escalation do
   defp cannot_proceed_decision_error do
     error(
       "cannot_proceed_standing",
-      "cannot-proceed decisions settle only through exact assignment disposition or release fact"
+      "cannot-proceed requests cannot be returned or withdrawn; settle them with an authorized answer, exact release fact, or assignment disposition"
     )
   end
 
