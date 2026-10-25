@@ -77,7 +77,10 @@ defmodule Tightbeam.Wire.Router do
                    "harness-health-resolve-other",
                    "harness-health-close-promotion",
                    "harness-health-review-other",
-                   "harness-health-evidence-other"
+                   "harness-health-evidence-other",
+                   "subtree-guidance-set",
+                   "subtree-guidance-withdraw",
+                   "subtree-guidance-show"
                  ]
   @max_upload_bytes 32 * 1024 * 1024
   @state_not_found_floor_us 3_000
@@ -3694,6 +3697,9 @@ defmodule Tightbeam.Wire.Router do
     "settle-turn" => ~w(idempotency_key outcome reason session_key turn_seq)a,
     "spawn" =>
       ~w(archetype context display_name effort handle harness host idempotency_key model overrides work_item_id)a,
+    "subtree-guidance-set" => ~w(name archetypes text)a,
+    "subtree-guidance-show" => ~w(session_key)a,
+    "subtree-guidance-withdraw" => ~w(name)a,
     "topline" => ~w(history origin owner quiet_over session spec spec_sha state topline_id)a,
     "toplines" => ~w(origin owner quiet_over session spec spec_sha state)a,
     "transcript" => ~w(after before limit name session_key)a,
