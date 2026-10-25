@@ -249,7 +249,12 @@ defmodule Tightbeam.FirehoseColdRestartTest do
 
       ws = subscribe!(old["port"], device.token, ["assignment."])
 
+      holder_turns =
+        subscribe!(old["port"], device.token, ["turn."], %{"sessionKey" => fixture["holder"]})
+
       try do
+        previous_turn = latest_turn_seq!(old["port"], device.token, fixture["holder"])
+
         %{"result" => %{"state" => "open"}} =
           dispatch!(plan, old["port"], device, "reopen-assignment", %{
             "assignmentId" => id,
@@ -269,6 +274,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
         assert %{"result" => %{"reopenings" => [%{"reason" => "First restart"}]}} = before
         generations = generations!(plan, "first", id)
         assert [[1, "canceled", _], [2, "armed", _]] = generations
+        assert_holder_turn_ended!(holder_turns, id, previous_turn)
         File.write!(Path.join(plan.base, "first-stop"), "stop\n")
         assert {:ok, {:closed, 1012}, _} = WS.recv_event(ws, 5_000)
         assert exit!(first, plan, "first") == 0
@@ -288,6 +294,9 @@ defmodule Tightbeam.FirehoseColdRestartTest do
           assert assignment_detail!(new["port"], device.token, id) == snapshot
           resumed = subscribe!(new["port"], device.token, ["assignment."])
 
+          holder_turns =
+            subscribe!(new["port"], device.token, ["turn."], %{"sessionKey" => fixture["holder"]})
+
           try do
             %{"result" => %{"state" => "closed"}} =
               dispatch!(plan, new["port"], device, "revoke-assignment", %{
@@ -303,6 +312,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
                    } = JSON.decode!(raw)
 
             assert assignment_detail!(new["port"], device.token, id) == closed
+            previous_turn = latest_turn_seq!(new["port"], device.token, fixture["holder"])
 
             %{"result" => %{"state" => "open"}} =
               dispatch!(plan, new["port"], device, "reopen-assignment", %{
@@ -318,6 +328,9 @@ defmodule Tightbeam.FirehoseColdRestartTest do
               dispatch!(plan, new["port"], device, "assignment-get", %{"assignmentId" => id})
 
             assert Enum.map(history, & &1["reason"]) == ["First restart", "After restart"]
+            # The reopened assignment's ordinary holder wake may be running when
+            # shutdown begins. Let that turn settle before checking the socket close.
+            assert_holder_turn_ended!(holder_turns, id, previous_turn)
             File.write!(Path.join(plan.base, "second-stop"), "stop\n")
             assert {:ok, {:closed, 1012}, _} = WS.recv_event(resumed, 5_000)
             assert exit!(second, plan, "second") == 0
@@ -332,12 +345,14 @@ defmodule Tightbeam.FirehoseColdRestartTest do
               })
             )
           after
+            WS.close(holder_turns)
             WS.close(resumed)
           end
         after
           cleanup!(second, plan, "second")
         end
       after
+        WS.close(holder_turns)
         WS.close(ws)
       end
     after
@@ -366,6 +381,47 @@ defmodule Tightbeam.FirehoseColdRestartTest do
     end
 
     wait.(wait)
+  end
+
+  defp latest_turn_seq!(port, token, holder) do
+    {:ok, {{_, 200, _}, _, raw}} =
+      :httpc.request(
+        :get,
+        {~c"http://127.0.0.1:#{port}/api/sessions/#{holder}/turns?limit=1&tail=true",
+         [{~c"authorization", String.to_charlist("Bearer " <> token)}]},
+        [timeout: 2_000],
+        body_format: :binary
+      )
+
+    case JSON.decode!(raw)["items"] do
+      [] -> 0
+      [%{"seq" => seq}] -> seq
+    end
+  end
+
+  defp assert_holder_turn_ended!(ws, assignment_id, after_seq) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+
+    await = fn recur ->
+      remaining = deadline - System.monotonic_time(:millisecond)
+      assert remaining > 0, "holder turn settlement deadline"
+      {:ok, {:text, raw}, _} = WS.recv(ws, remaining)
+
+      case JSON.decode!(raw) do
+        %{
+          "class" => "turn.ended",
+          "refs" => %{"assignmentId" => ^assignment_id, "turnSeq" => seq},
+          "payload" => %{"status" => status}
+        }
+        when seq > after_seq and status in ~w(delivered canceled failed failed_unknown) ->
+          :ok
+
+        _ ->
+          recur.(recur)
+      end
+    end
+
+    await.(await)
   end
 
   defp dispatch!(plan, port, device, verb, params, extra \\ %{}) do
@@ -685,7 +741,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
     end
   end
 
-  defp subscribe!(port, token, classes \\ ["work_item.created"]) do
+  defp subscribe!(port, token, classes \\ ["work_item.created"], filters \\ %{}) do
     {:ok, ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
     :ok = WS.send_text(ws, JSON.encode!(%{"type" => "auth", "token" => token}))
     {:ok, {:text, raw}, ws} = WS.recv(ws, 2_000)
@@ -698,7 +754,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
           "type" => "subscribe",
           "protocolVersion" => 2,
           "subscriptionId" => "restart",
-          "filters" => %{"classes" => classes}
+          "filters" => Map.put(filters, "classes", classes)
         })
       )
 
