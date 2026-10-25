@@ -43,7 +43,6 @@ defmodule Tightbeam.WorkItems do
     specRefSha256 TEXT NULL CHECK(specRefSha256 IS NULL OR (length(specRefSha256) = 64 AND specRefSha256 NOT GLOB '*[^0-9a-f]*')),
     isBug INTEGER NOT NULL DEFAULT 0 CHECK(isBug IN (0, 1)),
     ownerUserId TEXT NOT NULL,
-    deliveryOwnerSessionKey TEXT NULL REFERENCES sessions(sessionKey),
     state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open','iceboxed','closed','failed')),
     failReason TEXT NULL,
     routingWakeId TEXT NULL,
@@ -55,15 +54,17 @@ defmodule Tightbeam.WorkItems do
     createdInTurnSeq INTEGER NULL,
     createdContextKnown INTEGER NOT NULL DEFAULT 0,
     createdAt INTEGER NOT NULL,
+    deliveryOwnerSessionKey TEXT NULL REFERENCES sessions(sessionKey),
     CHECK((specRefName IS NULL) = (specRefSha256 IS NULL)),
     CHECK((createdByUser IS NOT NULL) + (createdBySession IS NOT NULL) +
           (createdByProcess IS NOT NULL) = 1)
   )
   """
 
-  @actor_work_item_columns "id,title,specRefName,specRefSha256,isBug,ownerUserId,deliveryOwnerSessionKey,state," <>
+  @actor_work_item_columns "id,title,specRefName,specRefSha256,isBug,ownerUserId,state," <>
                              "failReason,routingWakeId,slateWakeId,createdByUser,createdBySession,createdByProcess," <>
-                             "createdByViaSessionKey,createdInTurnSeq,createdContextKnown,createdAt"
+                             "createdByViaSessionKey,createdInTurnSeq,createdContextKnown,createdAt," <>
+                             "deliveryOwnerSessionKey"
 
   defmodule CancellationRefused do
     @moduledoc false
@@ -136,8 +137,8 @@ defmodule Tightbeam.WorkItems do
     if stored_columns == columns do
       :ok
     else
-      predecessor_columns =
-        Enum.reject(columns, &(&1 in ["createdByProcess", "createdByViaSessionKey"]))
+      actor_columns = ["createdByProcess", "createdByViaSessionKey"]
+      predecessor_columns = Enum.reject(columns, &(&1 in actor_columns))
 
       unless stored_columns == predecessor_columns,
         do:
@@ -164,8 +165,11 @@ defmodule Tightbeam.WorkItems do
       :ok = Txn.exec(txn, "ALTER TABLE work_items RENAME TO work_items_before_actor_attribution")
       :ok = Txn.exec(txn, @actor_work_items_ddl)
 
-      insert_columns = "rowid," <> @actor_work_item_columns
-      select_columns = "rowid," <> Enum.join(predecessor_columns, ",") <> ",NULL,NULL"
+      insert_columns = "rowid," <> Enum.join(columns, ",")
+
+      select_columns =
+        ["rowid" | Enum.map(columns, fn column -> if column in actor_columns, do: "NULL", else: column end)]
+        |> Enum.join(",")
 
       :ok =
         Txn.exec(
