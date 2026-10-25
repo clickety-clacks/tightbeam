@@ -747,9 +747,18 @@ defmodule Tightbeam.StateResources do
     end
   end
 
-  def query_artifact(db, %{filters: filters, principal: principal})
-      when is_map(filters) and is_map(principal),
-      do: Artifacts.query_artifact(db, %{filters: filters, principal: principal})
+  def query_artifact(
+        db,
+        %{filters: filters, principal: principal, boundary: boundary, limit: limit}
+      )
+      when is_map(filters) and is_map(principal) and is_integer(limit) and limit > 0,
+      do:
+        Artifacts.query_artifact(db, %{
+          filters: filters,
+          principal: principal,
+          boundary: boundary,
+          limit: limit
+        })
 
   def query_artifact(db, %{key: id, principal: principal}) do
     detail_selection(db, "artifacts", principal, &Artifacts.get_in_txn(&1, id))
@@ -757,9 +766,18 @@ defmodule Tightbeam.StateResources do
 
   def query_artifact(db, id), do: Artifacts.get(db, id)
 
-  def query_attest(db, %{filters: filters, principal: principal})
-      when is_map(filters) and is_map(principal),
-      do: Assignments.list_attests(db, %{filters: filters, principal: principal})
+  def query_attest(
+        db,
+        %{filters: filters, principal: principal, boundary: boundary, limit: limit}
+      )
+      when is_map(filters) and is_map(principal) and is_integer(limit) and limit > 0,
+      do:
+        Assignments.list_attests(db, %{
+          filters: filters,
+          principal: principal,
+          boundary: boundary,
+          limit: limit
+        })
 
   def query_attest(db, id) do
     {:ok, rows} =

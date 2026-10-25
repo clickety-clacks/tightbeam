@@ -166,6 +166,19 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
 
   test "artifact collection and detail share the canonical projection, filters, and tuple cursor",
        ctx do
+    bounded_rows =
+      StateResources.query_artifact(ctx.db, %{
+        filters: %{
+          "workItemId" => [ctx.alice_item.id],
+          "createdBySession" => [ctx.creator_session.session_key]
+        },
+        principal: %{kind: "user", id: "alice", is_admin: false},
+        boundary: :latest,
+        limit: 1
+      })
+
+    assert length(bounded_rows) == 2
+
     collection =
       get(
         ctx,
@@ -195,6 +208,19 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
 
     assert JSON.decode!(older_page.resp_body)["items"] == [
              StateResources.artifact(Artifacts.get(ctx.db, ctx.owner_artifact.artifact_id))
+           ]
+
+    newer_page =
+      get(
+        ctx,
+        "/api/artifacts?workItemId=#{ctx.alice_item.id}&createdBySession=#{ctx.creator_session.session_key}&limit=1&after=#{JSON.decode!(older_page.resp_body)["page"]["newestCursor"]}",
+        ctx.alice.device.token
+      )
+
+    assert newer_page.status == 200, newer_page.resp_body
+
+    assert JSON.decode!(newer_page.resp_body)["items"] == [
+             StateResources.artifact(Artifacts.get(ctx.db, ctx.second_owner_artifact.artifact_id))
            ]
 
     filtered =
@@ -298,6 +324,16 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
   end
 
   test "attest collection and nested reads authorize parents before filtering and paging", ctx do
+    bounded_rows =
+      StateResources.query_attest(ctx.db, %{
+        filters: %{"workItemId" => [ctx.alice_item.id], "kind" => ["progress"]},
+        principal: %{kind: "user", id: "alice", is_admin: false},
+        boundary: :latest,
+        limit: 1
+      })
+
+    assert length(bounded_rows) == 2
+
     global =
       get(
         ctx,
@@ -356,6 +392,19 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
 
     assert JSON.decode!(prior_owner_page.resp_body)["items"] == [
              attest_wire_item(List.first(ctx.owner_attests))
+           ]
+
+    newer_owner_page =
+      get(
+        ctx,
+        "/api/assignments/#{ctx.owner_assignment_id}/attests?limit=1&after=#{JSON.decode!(prior_owner_page.resp_body)["page"]["newestCursor"]}",
+        ctx.alice.device.token
+      )
+
+    assert newer_owner_page.status == 200, newer_owner_page.resp_body
+
+    assert JSON.decode!(newer_owner_page.resp_body)["items"] == [
+             attest_wire_item(List.last(ctx.owner_attests))
            ]
 
     holder_nested =

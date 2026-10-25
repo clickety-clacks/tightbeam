@@ -133,6 +133,44 @@ defmodule Tightbeam.StateVisibility do
   def artifact_visible?(db, row, principal),
     do: core_detail_visible?(db, "artifacts", row, principal)
 
+  @doc false
+  @spec artifact_collection_scope(map()) :: {String.t(), [term()]}
+  def artifact_collection_scope(%{is_admin: true}), do: {"1=1", []}
+
+  def artifact_collection_scope(%{kind: "session", id: session_key})
+      when is_binary(session_key) do
+    {
+      """
+      (artifact.createdBySession = ?1 OR EXISTS (
+        SELECT 1 FROM work_items AS artifact_work_item
+        WHERE artifact_work_item.id = artifact.workItemId AND (
+          artifact_work_item.createdBySession = ?2 OR EXISTS (
+            SELECT 1 FROM assignments AS artifact_assignment
+            WHERE artifact_assignment.workItemId = artifact_work_item.id
+              AND artifact_assignment.holderKey = ?3
+          )
+        )
+      ))
+      """,
+      [session_key, session_key, session_key]
+    }
+  end
+
+  def artifact_collection_scope(%{kind: "user", id: user_id}) when is_binary(user_id) do
+    {
+      """
+      EXISTS (
+        SELECT 1 FROM work_items AS artifact_work_item
+        WHERE artifact_work_item.id = artifact.workItemId
+          AND artifact_work_item.ownerUserId = ?1
+      )
+      """,
+      [user_id]
+    }
+  end
+
+  def artifact_collection_scope(_principal), do: {"0=1", []}
+
   @doc "Apply the AU4 parent-assignment grant to an attest or nested attest collection."
   @spec attest_visible?(DB.server(), map(), map()) :: boolean()
   def attest_visible?(db, row, principal) when is_map(row) do
@@ -170,6 +208,22 @@ defmodule Tightbeam.StateVisibility do
         end
     end
   end
+
+  @doc false
+  @spec attest_collection_scope(map()) :: {String.t(), [term()]}
+  def attest_collection_scope(%{is_admin: true}), do: {"1=1", []}
+
+  def attest_collection_scope(%{kind: "session", id: session_key})
+      when is_binary(session_key) do
+    {"(assignment.holderKey = ?1 OR assignment.openedBySession = ?2)",
+     [session_key, session_key]}
+  end
+
+  def attest_collection_scope(%{kind: "user", id: user_id}) when is_binary(user_id) do
+    {"(assignment.openedByUser = ?1 OR wi.ownerUserId = ?2)", [user_id, user_id]}
+  end
+
+  def attest_collection_scope(_principal), do: {"0=1", []}
 
   defp attest_parent_visible?(%{is_admin: true}, _assignment), do: true
 
