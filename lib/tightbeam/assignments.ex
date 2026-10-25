@@ -1207,20 +1207,20 @@ defmodule Tightbeam.Assignments do
          owner_user_id
        ]) do
     attest_values = [
-        id,
-        assignment_id,
-        kind,
-        verdict_kind,
-        note,
-        by_session,
-        by_user,
-        producer,
-        producer_command,
-        by_harness,
-        by_provider,
-        commit_refs,
-        ts
-      ]
+      id,
+      assignment_id,
+      kind,
+      verdict_kind,
+      note,
+      by_session,
+      by_user,
+      producer,
+      producer_command,
+      by_harness,
+      by_provider,
+      commit_refs,
+      ts
+    ]
 
     assignment_row = %{
       id: parent_assignment_id,

@@ -21,7 +21,10 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
 
   setup do
     base_dir =
-      Path.join(System.tmp_dir!(), "tightbeam-artifact-attest-#{System.unique_integer([:positive])}")
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-artifact-attest-#{System.unique_integer([:positive])}"
+      )
 
     File.mkdir_p!(base_dir)
     :initialized = Identity.init!(base_dir)
@@ -55,6 +58,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
 
     insert_assignment(db, owner_assignment_id, bob.session.session_key, "bob", alice_item.id)
     insert_assignment(db, opener_assignment_id, bob.session.session_key, "alice", bob_item.id)
+
     insert_session_opened_assignment(
       db,
       session_opener_assignment_id,
@@ -66,12 +70,30 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
     insert_assignment(db, hidden_assignment_id, bob.session.session_key, "bob", bob_item.id)
 
     owner_attests = [
-      insert_attest(db, "fixture-attest-owner-1", owner_assignment_id, bob.session.session_key, 100),
-      insert_attest(db, "fixture-attest-owner-2", owner_assignment_id, bob.session.session_key, 200)
+      insert_attest(
+        db,
+        "fixture-attest-owner-1",
+        owner_assignment_id,
+        bob.session.session_key,
+        100
+      ),
+      insert_attest(
+        db,
+        "fixture-attest-owner-2",
+        owner_assignment_id,
+        bob.session.session_key,
+        200
+      )
     ]
 
     opener_attest =
-      insert_attest(db, "fixture-attest-opener-1", opener_assignment_id, bob.session.session_key, 300)
+      insert_attest(
+        db,
+        "fixture-attest-opener-1",
+        opener_assignment_id,
+        bob.session.session_key,
+        300
+      )
 
     _session_opener_attest =
       insert_attest(
@@ -83,13 +105,25 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
       )
 
     _hidden_attest =
-      insert_attest(db, "fixture-attest-hidden-1", hidden_assignment_id, bob.session.session_key, 400)
+      insert_attest(
+        db,
+        "fixture-attest-hidden-1",
+        hidden_assignment_id,
+        bob.session.session_key,
+        400
+      )
 
     owner_artifact =
       record_artifact(db, creator_session.session_key, alice_item.id, "report", "Owner artifact")
 
     second_owner_artifact =
-      record_artifact(db, creator_session.session_key, alice_item.id, "doc", "Second owner artifact")
+      record_artifact(
+        db,
+        creator_session.session_key,
+        alice_item.id,
+        "doc",
+        "Second owner artifact"
+      )
 
     hidden_artifact =
       record_artifact(db, creator_session.session_key, bob_item.id, "report", "Hidden artifact")
@@ -130,7 +164,8 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
     }
   end
 
-  test "artifact collection and detail share the canonical projection, filters, and tuple cursor", ctx do
+  test "artifact collection and detail share the canonical projection, filters, and tuple cursor",
+       ctx do
     collection =
       get(
         ctx,
@@ -142,7 +177,11 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
     body = JSON.decode!(collection.resp_body)
     assert body["resource"] == "artifacts"
     assert length(body["items"]) == 1
-    assert body["items"] == [StateResources.artifact(Artifacts.get(ctx.db, ctx.second_owner_artifact.artifact_id))]
+
+    assert body["items"] == [
+             StateResources.artifact(Artifacts.get(ctx.db, ctx.second_owner_artifact.artifact_id))
+           ]
+
     assert body["page"]["hasMoreBefore"]
 
     older_page =
@@ -153,6 +192,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
       )
 
     assert older_page.status == 200, older_page.resp_body
+
     assert JSON.decode!(older_page.resp_body)["items"] == [
              StateResources.artifact(Artifacts.get(ctx.db, ctx.owner_artifact.artifact_id))
            ]
@@ -165,6 +205,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
       )
 
     assert filtered.status == 200, filtered.resp_body
+
     assert JSON.decode!(filtered.resp_body)["items"] == [
              StateResources.artifact(Artifacts.get(ctx.db, ctx.owner_artifact.artifact_id))
            ]
@@ -187,6 +228,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
       )
 
     assert released.status == 200
+
     assert JSON.decode!(released.resp_body)["items"] == [
              StateResources.artifact(Artifacts.get(ctx.db, ctx.second_owner_artifact.artifact_id))
            ]
@@ -200,10 +242,13 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
       get(ctx, "/api/artifacts/#{ctx.owner_artifact.artifact_id}", ctx.alice.device.token)
 
     assert detail.status == 200, detail.resp_body
+
     assert JSON.decode!(detail.resp_body)["item"] ==
              StateResources.artifact(Artifacts.get(ctx.db, ctx.owner_artifact.artifact_id))
 
-    hidden_collection = get(ctx, "/api/artifacts?workItemId=#{ctx.bob_item.id}", ctx.alice.device.token)
+    hidden_collection =
+      get(ctx, "/api/artifacts?workItemId=#{ctx.bob_item.id}", ctx.alice.device.token)
+
     assert hidden_collection.status == 200
     assert JSON.decode!(hidden_collection.resp_body)["items"] == []
 
@@ -232,6 +277,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
       )
 
     assert creator_session_collection.status == 200
+
     assert JSON.decode!(creator_session_collection.resp_body)["items"] == [
              StateResources.artifact(Artifacts.get(ctx.db, ctx.hidden_artifact.artifact_id))
            ]
@@ -268,6 +314,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
       )
 
     assert opener_nested.status == 200, opener_nested.resp_body
+
     assert JSON.decode!(opener_nested.resp_body)["items"] == [
              StateResources.attest(ctx.opener_attest)
            ]
@@ -292,6 +339,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
       )
 
     assert prior_owner_page.status == 200, prior_owner_page.resp_body
+
     assert JSON.decode!(prior_owner_page.resp_body)["items"] == [
              StateResources.attest(List.first(ctx.owner_attests))
            ]
@@ -304,6 +352,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
       )
 
     assert holder_nested.status == 200, holder_nested.resp_body
+
     assert JSON.decode!(holder_nested.resp_body)["items"] == [
              StateResources.attest(ctx.opener_attest)
            ]
@@ -337,6 +386,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
 
     unknown_parent =
       get(ctx, "/api/assignments/unknown-assignment/attests", ctx.alice.device.token)
+
     assert forbidden_parent.status == 404
     assert forbidden_parent.resp_body == unknown_parent.resp_body
 
@@ -396,7 +446,13 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
           (id, subject, holderKey, holderFallback, openedByUser, openedAt, state, workItemId)
         VALUES (?1, 'REST read fixture', ?2, 0, ?3, ?4, 'open', ?5)
         """,
-        [assignment_id, holder_session, opened_by_user, System.system_time(:millisecond), work_item_id]
+        [
+          assignment_id,
+          holder_session,
+          opened_by_user,
+          System.system_time(:millisecond),
+          work_item_id
+        ]
       )
 
     assignment_id
@@ -417,7 +473,13 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
           (id, subject, holderKey, holderFallback, openedBySession, openedAt, state, workItemId)
         VALUES (?1, 'REST read fixture', ?2, 0, ?3, ?4, 'open', ?5)
         """,
-        [assignment_id, holder_session, opened_by_session, System.system_time(:millisecond), work_item_id]
+        [
+          assignment_id,
+          holder_session,
+          opened_by_session,
+          System.system_time(:millisecond),
+          work_item_id
+        ]
       )
 
     assignment_id

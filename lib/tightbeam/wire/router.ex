@@ -837,7 +837,12 @@ defmodule Tightbeam.Wire.Router do
     apply(StateResources, query, [db(conn), %{key: scope_key, principal: principal}, %{}])
   end
 
-  defp core_detail_row(conn, %{query_owner: owner, query: query, resource: resource}, key, principal) do
+  defp core_detail_row(
+         conn,
+         %{query_owner: owner, query: query, resource: resource},
+         key,
+         principal
+       ) do
     core_detail_trace(conn, {:shared_lookup, resource, query})
     apply(owner, query, [db(conn), %{key: key, principal: principal}])
   end
