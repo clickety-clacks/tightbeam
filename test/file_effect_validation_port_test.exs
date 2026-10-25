@@ -486,6 +486,69 @@ defmodule Tightbeam.FileEffectValidationPortTest do
     assert Mementos.current(ctx.db, "attest", attest_id, "example/progress") == ["observed"]
   end
 
+  test "verified without commit refs still refuses outside selected operational evidence", ctx do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO assignment_effects(assignmentId,effectKind) VALUES(?1,'policy')",
+        [
+          ctx.assignment_id
+        ]
+      )
+
+    policy = %{
+      name: "operation-evidence",
+      purpose: "attest-operational-evidence",
+      source: "test-policy",
+      conditions: [
+        %{fact: "assignment.effect_kind", op: "eq", value: "live_mutation"},
+        %{fact: "assignment.declared_files_present", op: "eq", value: false}
+      ]
+    }
+
+    snapshot = Rules.effective_snapshot() |> Map.put(:policies, [policy])
+
+    call = %{
+      verb: "attest",
+      principal: {:session, ctx.holder},
+      session_key: ctx.holder,
+      origin: ctx.holder,
+      params: %{
+        assignment_id: ctx.assignment_id,
+        kind: "verdict",
+        verdict_kind: "verified"
+      }
+    }
+
+    file = fn candidate ->
+      Rules.with_snapshot(snapshot, fn -> ctx.handlers["attest"].(candidate) end)
+    end
+
+    assert %{code: "invalid_commit_refs"} = file.(call)
+    assert %{code: "invalid_commit_refs"} = file.(put_in(call, [:params, :commit_refs], []))
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE assignment_effects SET effectKind='live_mutation' WHERE assignmentId=?1",
+        [
+          ctx.assignment_id
+        ]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO assignment_files(assignmentId,path) VALUES(?1,'notes/result.md')",
+        [
+          ctx.assignment_id
+        ]
+      )
+
+    assert %{code: "invalid_commit_refs"} = file.(call)
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM attests")
+  end
+
   test "verified filing binds captured evidence and inline metadata in one transaction", ctx do
     {:ok, _} =
       DB.query(
@@ -539,6 +602,8 @@ defmodule Tightbeam.FileEffectValidationPortTest do
       }
     }
 
+    assert is_nil(call.params[:commit_refs])
+
     file = fn candidate ->
       Rules.with_snapshot(snapshot, fn -> ctx.handlers["attest"].(candidate) end)
     end
@@ -551,6 +616,7 @@ defmodule Tightbeam.FileEffectValidationPortTest do
     assert %{attest: filed} = file.(call)
     assert filed.artifactId == captured.id
     assert filed.contentSha256 == captured.hash
+    assert filed.commitRefs == nil
 
     assert {:ok, [[artifact_id, digest]]} =
              DB.query(ctx.db, "SELECT artifactId, contentSha256 FROM attests WHERE id=?1", [

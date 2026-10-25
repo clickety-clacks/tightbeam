@@ -2774,10 +2774,31 @@ defmodule Tightbeam.Assignments do
   defp attest_in_txn(txn, call) do
     prepared = AttestEvidence.prepare_in_txn!(txn, Map.put_new(call, :verb, "attest"))
 
-    with :ok <- validate_revision_binding_in_txn(txn, prepared) do
+    with :ok <- require_producer_commit_refs_after_evidence(txn, prepared),
+         :ok <- validate_revision_binding_in_txn(txn, prepared) do
       if prepared.params[:kind] == "verdict",
         do: verdict_in_txn(txn, prepared),
         else: lifecycle_attest_in_txn(txn, prepared)
+    end
+  end
+
+  # Producer verification requires commit refs unless the selected operational
+  # evidence route has validated the evidence for this call.
+  defp require_producer_commit_refs_after_evidence(txn, call) do
+    if call.params[:kind] == "verdict" and call.params[:verdict_kind] == "verified" and
+         call.params[:commit_refs] in [nil, []] and
+         is_nil(call[:validated_operational_evidence]) do
+      case Txn.q(txn, "SELECT holderKey,reviewsAssignmentId FROM assignments WHERE id=?1", [
+             call.params[:assignment_id]
+           ]) do
+        [[holder, nil]] when call.principal == {:session, holder} ->
+          error("invalid_commit_refs", "producer verification requires immutable commitRefs")
+
+        _ ->
+          :ok
+      end
+    else
+      :ok
     end
   end
 
