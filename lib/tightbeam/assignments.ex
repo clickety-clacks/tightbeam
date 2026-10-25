@@ -1140,6 +1140,18 @@ defmodule Tightbeam.Assignments do
   """
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t()) :: [String.t()]
   def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key) do
+    qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, nil)
+  end
+
+  @doc """
+  Return the current independent clean review for a submitted result.
+
+  When the producer submits commit refs, the winning clean review must include
+  every submitted commit. Additional reviewed commits do not disqualify it.
+  """
+  @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
+          [String.t()]
+  def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, commit_refs) do
     {:ok, rows} =
       DB.query(
         db,
@@ -1147,7 +1159,8 @@ defmodule Tightbeam.Assignments do
         WITH winning_verdict AS (
           SELECT
             r.holderKey AS reviewHolderKey,
-            v.verdictKind AS verdictKind
+            v.verdictKind AS verdictKind,
+            v.commitRefs AS commitRefs
           FROM attests AS v
           JOIN assignments AS r
             ON r.id = v.assignmentId
@@ -1158,7 +1171,7 @@ defmodule Tightbeam.Assignments do
           ORDER BY v.ts DESC, v.rowid DESC
           LIMIT 1
         )
-        SELECT verdictKind
+        SELECT reviewHolderKey, verdictKind, commitRefs
         FROM winning_verdict
         WHERE reviewHolderKey != ?2
           AND verdictKind = 'reviewed-clean'
@@ -1167,16 +1180,14 @@ defmodule Tightbeam.Assignments do
       )
 
     case rows do
-      [[verdict_kind]] when is_binary(verdict_kind) -> [verdict_kind]
-      _ -> []
-    end
-  end
+      [[_review_holder, "reviewed-clean", encoded_refs]] ->
+        review_refs = if is_binary(encoded_refs), do: JSON.decode!(encoded_refs), else: nil
 
-  @doc "Return the current independent clean review for a submitted result."
-  @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
-          [String.t()]
-  def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, _commit_refs) do
-    qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key)
+        if review_covers_commit_refs?(review_refs, commit_refs), do: ["reviewed-clean"], else: []
+
+      _ ->
+        []
+    end
   end
 
   @doc "Return the current producer verification for a submitted result."
@@ -4447,18 +4458,25 @@ defmodule Tightbeam.Assignments do
       )
 
     review_qualifies? =
-      Map.get(call, :review_pending, false) or
-        match?(
-          %{kind: "reviewed-clean", holder: holder} when holder != assignment.holderKey,
-          review
-        )
+      if Map.get(call, :review_pending, false) do
+        true
+      else
+        independent_clean_review? =
+          match?(
+            %{kind: "reviewed-clean", holder: holder} when holder != assignment.holderKey,
+            review
+          )
+
+        independent_clean_review? and
+          review_covers_commit_refs?(review && review.commit_refs, call.params[:commit_refs])
+      end
 
     if verification_qualifies? and review_qualifies? do
       :ok
     else
       error(
         "inapplicable_code_evidence",
-        "code completion requires a holder verification and the latest independent clean review, unless review is pending"
+        "code completion requires a holder verification and the latest independent clean review covering the submitted producer commit refs, unless review is pending"
       )
     end
   end
@@ -4469,7 +4487,7 @@ defmodule Tightbeam.Assignments do
     case Txn.q(
            txn,
            """
-           SELECT v.verdictKind,r.holderKey
+           SELECT v.verdictKind,r.holderKey,v.commitRefs
            FROM attests v
            JOIN assignments r ON r.id=v.assignmentId
            WHERE r.reviewsAssignmentId=?1
@@ -4481,13 +4499,41 @@ defmodule Tightbeam.Assignments do
            """,
            [assignment_id]
          ) do
-      [[kind, holder]] ->
-        %{kind: kind, holder: holder}
+      [[kind, holder, encoded_refs]] ->
+        %{
+          kind: kind,
+          holder: holder,
+          commit_refs: if(is_binary(encoded_refs), do: JSON.decode!(encoded_refs), else: nil)
+        }
 
       [] ->
         nil
     end
   end
+
+  defp review_covers_commit_refs?(_review_refs, nil), do: true
+  defp review_covers_commit_refs?(_review_refs, []), do: true
+
+  defp review_covers_commit_refs?(review_refs, producer_refs)
+       when is_list(review_refs) and is_list(producer_refs) do
+    review_commits =
+      review_refs
+      |> Enum.flat_map(fn
+        %{"commit" => commit} when is_binary(commit) -> [String.downcase(commit)]
+        _ -> []
+      end)
+      |> MapSet.new()
+
+    Enum.all?(producer_refs, fn
+      %{"commit" => commit} when is_binary(commit) ->
+        MapSet.member?(review_commits, String.downcase(commit))
+
+      _ ->
+        false
+    end)
+  end
+
+  defp review_covers_commit_refs?(_review_refs, _producer_refs), do: false
 
   defp latest_verification_conclusion_in_txn(txn, assignment_id, holder) do
     case Txn.q(

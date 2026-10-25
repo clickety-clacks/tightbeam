@@ -6024,7 +6024,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert after_verdict == before_verdict + 1
   end
 
-  test "code completion keeps verification and review requirements without ref matching", ctx do
+  test "code completion requires review coverage and allows additional reviewed refs", ctx do
     parent = self()
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
@@ -6050,6 +6050,12 @@ defmodule Tightbeam.AssignmentsTest do
       %{"repo" => "testhost:/tmp/completion-checkout", "commit" => String.duplicate("b", 40)}
     ]
 
+    review_refs = [
+      %{"repo" => "testhost:/tmp/reviewer-checkout", "commit" => String.duplicate("B", 40)},
+      %{"repo" => "testhost:/tmp/second-reviewer-checkout", "commit" => String.duplicate("c", 40)},
+      %{"repo" => "testhost:/tmp/third-reviewer-checkout", "commit" => String.duplicate("d", 40)}
+    ]
+
     producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "evidence producer"))
 
     review =
@@ -6061,6 +6067,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{attest: %{verdictKind: "reviewed-clean"}} =
              attest_call({:session, "other-session"}, review.id, "verdict")
              |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], review_refs)
              |> then(&handle(ctx, "attest", &1))
 
     completion =
@@ -6080,11 +6087,19 @@ defmodule Tightbeam.AssignmentsTest do
       {"", 0}
     end)
 
-    assert %{
-             attest: %{kind: "completion", commitRefs: ^canonical_completion_refs},
-             assignment: %{outcome: "completed"}
-           } =
-             handle(ctx, "attest", completion)
+    assert ["reviewed-clean"] ==
+             Assignments.qualifying_review_verdict_kinds(
+               ctx.db,
+               producer.id,
+               "holder",
+               canonical_completion_refs
+             )
+
+    assert {:ok,
+            %{
+              attest: %{kind: "completion", commitRefs: ^canonical_completion_refs},
+              assignment: %{outcome: "completed"}
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
     refute_received :completion_commit_ref_lookup
 
@@ -6133,6 +6148,10 @@ defmodule Tightbeam.AssignmentsTest do
       %{"repo" => "testhost:/tmp/completion-result", "commit" => String.duplicate("b", 40)}
     ]
 
+    review_refs = [
+      %{"repo" => "testhost:/tmp/reviewer-result", "commit" => String.duplicate("b", 40)}
+    ]
+
     producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "retraction producer"))
 
     review =
@@ -6144,6 +6163,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{attest: %{verdictKind: "reviewed-clean"}} =
              attest_call({:session, "other-session"}, review.id, "verdict")
              |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], review_refs)
              |> then(&handle(ctx, "attest", &1))
 
     assert %{attest: %{verdictKind: "verified"}} =
@@ -6155,6 +6175,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{attest: %{verdictKind: "changes-requested"}} =
              attest_call({:session, "other-session"}, review.id, "verdict")
              |> put_in([:params, :verdict_kind], "changes-requested")
+             |> put_in([:params, :commit_refs], review_refs)
              |> then(&handle(ctx, "attest", &1))
 
     completion =
@@ -6223,7 +6244,7 @@ defmodule Tightbeam.AssignmentsTest do
              handle(ctx, "attest", completion)
   end
 
-  test "code completion accepts a linked clean review without commitRefs", ctx do
+  test "code completion refuses a clean review without the producer commit ref", ctx do
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
     on_exit(fn ->
@@ -6266,11 +6287,25 @@ defmodule Tightbeam.AssignmentsTest do
       attest_call({:session, "holder"}, producer.id, "completion")
       |> put_in([:params, :commit_refs], candidate_refs)
 
-    assert %{attest: %{kind: "completion"}, assignment: %{outcome: "completed"}} =
-             handle(ctx, "attest", completion)
+    assert [] ==
+             Assignments.qualifying_review_verdict_kinds(
+               ctx.db,
+               producer.id,
+               "holder",
+               candidate_refs
+             )
+
+    assert %{code: "inapplicable_code_evidence"} = handle(ctx, "attest", completion)
+
+    assert %{state: "open", closingAttestId: nil} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:session, "holder"}, producer.id)
+             )
   end
 
-  test "code completion accepts a linked clean review recorded for a different commit", ctx do
+  test "code completion refuses a linked clean review recorded for a different commit", ctx do
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
     on_exit(fn ->
@@ -6313,8 +6348,22 @@ defmodule Tightbeam.AssignmentsTest do
       attest_call({:session, "holder"}, producer.id, "completion")
       |> put_in([:params, :commit_refs], producer_refs)
 
-    assert %{attest: %{kind: "completion"}, assignment: %{outcome: "completed"}} =
-             handle(ctx, "attest", completion)
+    assert [] ==
+             Assignments.qualifying_review_verdict_kinds(
+               ctx.db,
+               producer.id,
+               "holder",
+               producer_refs
+             )
+
+    assert %{code: "inapplicable_code_evidence"} = handle(ctx, "attest", completion)
+
+    assert %{state: "open", closingAttestId: nil} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:session, "holder"}, producer.id)
+             )
   end
 
   test "attests returns every kind in timestamp and id order", ctx do
