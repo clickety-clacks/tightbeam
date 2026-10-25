@@ -434,7 +434,7 @@ defmodule Tightbeam.Org do
           identityRevision, cliToken,
           harness, provider, model, thinkingLevel, modelContext, host, state, createdAt, updatedAt)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-          ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 'active', ?25, ?25)
+          ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, 'active', ?26, ?26)
       """,
       [
         session_key,
