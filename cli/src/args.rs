@@ -3472,7 +3472,12 @@ mod tests {
     #[test]
     fn harness_process_operator_command_lists_launches() {
         assert_eq!(
-            parse(strings(&["harness-process", "list", "--as-user", "operator"])),
+            parse(strings(&[
+                "harness-process",
+                "list",
+                "--as-user",
+                "operator"
+            ])),
             Ok(Command::HarnessProcesses {
                 identity: Identity::User("operator".to_owned()),
             })
@@ -3963,7 +3968,13 @@ mod tests {
 
         // No session named.
         assert_eq!(
-            tune(&["tune", "--model", "claude-example-5", "--as-user", "operator"]),
+            tune(&[
+                "tune",
+                "--model",
+                "claude-example-5",
+                "--as-user",
+                "operator"
+            ]),
             Err(TUNE_USAGE.to_owned())
         );
 
@@ -4726,7 +4737,13 @@ mod tests {
     fn reopen_assignment_requires_an_id_and_a_reason() {
         for args in [
             strings(&["reopen-assignment", "--as-user", "operator"]),
-            strings(&["reopen-assignment", "asg_1", "asg_2", "--as-user", "operator"]),
+            strings(&[
+                "reopen-assignment",
+                "asg_1",
+                "asg_2",
+                "--as-user",
+                "operator",
+            ]),
             strings(&["reopen-assignment", "asg_1", "--as-user", "operator"]),
         ] {
             assert_eq!(
@@ -5499,7 +5516,12 @@ mod tests {
                 "--as-user",
                 "operator",
             ]),
-            strings(&["topline-placement-list", "--history", "--as-user", "operator"]),
+            strings(&[
+                "topline-placement-list",
+                "--history",
+                "--as-user",
+                "operator",
+            ]),
         ] {
             assert!(parse(args).unwrap_err().contains("does not accept"));
         }

@@ -3873,7 +3873,13 @@ mod tests {
     #[test]
     fn builds_byte_exact_config_bodies() {
         assert_eq!(
-            body(&["config", "get", "default-archetype", "--as-user", "operator"]),
+            body(&[
+                "config",
+                "get",
+                "default-archetype",
+                "--as-user",
+                "operator"
+            ]),
             r#"{"asUser":"operator","verb":"config","params":{"action":"get","setting":"default-archetype"}}"#
         );
         assert_eq!(
@@ -4013,7 +4019,13 @@ mod tests {
                 r#"{"asUser":"operator","verb":"identity-status","params":{}}"#,
             ),
             (
-                &["identity", "apply", "agent:coder:app", "--as-user", "operator"][..],
+                &[
+                    "identity",
+                    "apply",
+                    "agent:coder:app",
+                    "--as-user",
+                    "operator",
+                ][..],
                 r#"{"asUser":"operator","verb":"identity-apply","params":{"all":false,"sessionKey":"agent:coder:app"}}"#,
             ),
             (
@@ -4425,7 +4437,11 @@ mod tests {
             ("wss", "wss://test-host:11373", "https://test-host:11373"),
             // http and https are already the dispatch scheme and pass through whole.
             ("http", "http://test-host:11373", "http://test-host:11373"),
-            ("https", "https://test-host:11373", "https://test-host:11373"),
+            (
+                "https",
+                "https://test-host:11373",
+                "https://test-host:11373",
+            ),
         ];
         for (name, written, expected) in cases {
             let dir = root.join(name);
