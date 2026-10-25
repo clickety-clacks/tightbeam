@@ -1014,12 +1014,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
         assert_received {:firehose_notice, frame}
         equality.(frame)
         assert frame["payload"]["id"] == message.id
+
         assert frame["payload"]["rowVersion"] ==
                  max(message.seq, message.timestamp) +
                    if(is_integer(frame["payload"]["turnSeq"]),
                      do: frame["payload"]["turnSeq"],
                      else: 0
                    )
+
         Hub.delivered(Hub, self())
       else
         refute_received {:firehose_notice, _frame}
