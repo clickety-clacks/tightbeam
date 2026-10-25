@@ -567,6 +567,8 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
   end
 
   defp attest_wire_item(row) do
+    row = Map.delete(row, :deliverableClaim)
+
     "attests"
     |> StateResources.encode_item(StateResources.attest(row))
     |> JSON.decode!()
