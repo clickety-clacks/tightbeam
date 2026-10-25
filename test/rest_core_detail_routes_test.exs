@@ -37,7 +37,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "wakes" =>
       ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon deliveryStatus rowVersion),
     "turns" =>
-      ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt rowVersion),
+      ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt triggerSource batchMemberCount rowVersion),
     "decision requests" =>
       ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
     "sessions" =>
@@ -57,7 +57,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "wakes" =>
       ~w(targetRole prompt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey workItemId assignmentId canceledAt class classElection deliveryRule deliveryStatus),
     "turns" =>
-      ~w(messageId wakeId roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness owner adapterGen requestRef error startedAt endedAt publishedAt),
+      ~w(messageId wakeId roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness owner adapterGen requestRef error startedAt endedAt publishedAt triggerSource batchMemberCount),
     "decision requests" =>
       ~w(raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId deadlineAt statuteName decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt context),
     "sessions" =>
@@ -73,7 +73,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "wakes" =>
       ~w(dueAt createdAt firedAt reresolveRung conditionAfterId canceledAt targetGate rowVersion),
     "turns" =>
-      ~w(seq replyAttention adapterGen createdAt startedAt endedAt publishedAt rowVersion),
+      ~w(seq replyAttention adapterGen createdAt startedAt endedAt publishedAt batchMemberCount rowVersion),
     "decision requests" =>
       ~w(lineageRung effortGeneration raisedAt deadlineAt ruledAt consumedAt withdrawnAt answeredAt rowVersion),
     "sessions" => ~w(orderIndex clearedThroughSeq createdAt updatedAt rowVersion),

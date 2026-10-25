@@ -3,11 +3,12 @@ defmodule Tightbeam.RateLimitReset do
 
   alias Tightbeam.{DB, EventLog, Harness, HarnessProcess, Wakes}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Harness.Claude
 
   @consumer "rate_limit_reset"
 
   def schedule_in_txn(%Txn{} = txn, session, result, reason, observed_at) do
-    with "claude" <- to_string(session.harness),
+    with true <- to_string(session.harness) == Claude.wire_name(),
          reset_at when is_integer(reset_at) <- from_error(reason, observed_at),
          {_, %{observationId: observation_id}} <- result do
       wake_id = "rate-limit-reset:" <> observation_id
@@ -25,7 +26,7 @@ defmodule Tightbeam.RateLimitReset do
         # A retry can encounter another limit before a normal success has
         # resolved the incident. Reinstate admission's hold for that reset.
         if open_incident(txn, observation_id) != [] do
-          HarnessProcess.begin_park_in_txn(txn, adapter_key("claude", session.host))
+          HarnessProcess.begin_park_in_txn(txn, adapter_key(Claude.wire_name(), session.host))
         end
       end
     end

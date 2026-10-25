@@ -527,7 +527,13 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
       "filters" => %{"classes" => ["kungfu."]}
     }
 
-    assert {:push, {:text, ready}, subscribed} = send_frame.(live, request)
+    assert {:ok, subscribed} = send_frame.(live, request)
+    assert_receive {:firehose_control, ready_frame}
+
+    assert {:push, {:text, ready}, ^subscribed} =
+             ChangeSocket.handle_info({:firehose_control, ready_frame}, subscribed)
+
+    :ok = Hub.delivered(hub, self())
     assert JSON.decode!(ready)["type"] == "subscription_ready"
     assert subscribed.subscriptions == %{"one" => %{"classes" => ["kungfu."]}}
 
