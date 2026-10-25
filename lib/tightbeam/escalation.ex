@@ -3406,7 +3406,6 @@ defmodule Tightbeam.Escalation do
       ruled_at: request.ruled_at,
       ruling_fact_id: request.ruling_fact_id,
       consumed_at: request.consumed_at,
-      row_version: row_version,
       ruling_attribution: operator_ruling_attribution(request)
     }
   end
