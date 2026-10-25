@@ -713,7 +713,7 @@ defmodule Tightbeam.Toplines.Schema do
       Txn.q(txn, """
       SELECT type, name, tbl_name FROM sqlite_schema
       WHERE tbl_name IN (#{Enum.map_join(@actor_tables, ",", &("'" <> &1 <> "'"))})
-        AND sql IS NOT NULL
+        AND type IN ('index', 'trigger') AND sql IS NOT NULL
       ORDER BY type, name
       """)
 

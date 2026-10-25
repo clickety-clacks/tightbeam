@@ -61,7 +61,7 @@ defmodule PortableToplinesFixture do
       session_key: nil
     }
 
-  def populate!(db) do
+  def populate_legacy_v5!(db) do
     :ok =
       DB.execute(db, """
       INSERT INTO users (userId,isAdmin,createdAt) VALUES ('synthetic',1,1);
@@ -71,83 +71,54 @@ defmodule PortableToplinesFixture do
       INSERT INTO wakes (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt)
         VALUES ('w_fixture','agent:main:clawline:synthetic:main','process:tightbeam',
                 'Choose placement','prompt',1,'pending',1);
+      INSERT INTO toplines
+        (rowid,id,ownerUserId,title,state,createdActorKind,createdActorRef,createdAt,updatedAt,closedAt)
+        VALUES (1,'tl_fixture','synthetic','Café','open','user','synthetic',10,10,NULL);
+      INSERT INTO toplines
+        (rowid,id,ownerUserId,title,state,createdActorKind,createdActorRef,createdAt,updatedAt,closedAt)
+        VALUES (99,'tl_closed_fixture','synthetic','Closed','closed','user','synthetic',14,14,14);
+      INSERT INTO topline_work_memberships
+        (id,toplineId,workItemId,ownerUserId,linkReason,linkedActorKind,linkedActorRef,linkedAt,
+         unlinkReason,unlinkedActorKind,unlinkedActorRef,unlinkedAt)
+        VALUES ('tlm_fixture','tl_fixture','wi_fixture','synthetic','group','user','synthetic',11,
+                NULL,NULL,NULL,NULL);
+      INSERT INTO topline_concerns
+        (id,toplineId,title,createdActorKind,createdActorRef,createdAt)
+        VALUES ('tlc_fixture','tl_fixture','Résumé💩','user','synthetic',12);
+      INSERT INTO topline_concern_refs
+        (toplineId,concernId,workItemId,tagReason,taggedActorKind,taggedActorRef,taggedAt)
+        VALUES ('tl_fixture','tlc_fixture','wi_fixture','tag','user','synthetic',13);
+      INSERT INTO topline_events
+        (toplineId,seq,kind,membershipId,concernId,actorKind,actorRef,reason,eventAt,detail)
+        VALUES
+          ('tl_fixture',1,'topline_created',NULL,NULL,'user','synthetic',NULL,10,'{"title":"Café"}'),
+          ('tl_fixture',2,'work_linked','tlm_fixture',NULL,'user','synthetic','group',11,
+           '{"workItemId":"wi_fixture","linkReason":"group"}'),
+          ('tl_fixture',3,'concern_created',NULL,'tlc_fixture','user','synthetic',NULL,12,
+           '{"title":"Résumé💩"}'),
+          ('tl_fixture',4,'concern_work_tagged',NULL,'tlc_fixture','user','synthetic','tag',13,
+           '{"workItemId":"wi_fixture","tagReason":"tag"}'),
+          ('tl_closed_fixture',1,'topline_created',NULL,NULL,'user','synthetic',NULL,14,
+           '{"title":"Closed"}'),
+          ('tl_closed_fixture',2,'topline_closed',NULL,NULL,'user','synthetic','done',14,
+           '{"fromState":"open","toState":"closed"}');
+      INSERT INTO topline_idempotency
+        (callerUserId,operation,idempotencyKey,requestFingerprint,canonicalResponse)
+        VALUES ('synthetic','topline-create','legacy-key',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                '{"legacy":true}'),
+               ('synthetic','topline-close','close',
+                'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                '{"topline":{"id":"tl_closed_fixture","state":"closed"}}');
+      INSERT INTO topline_placement_obligations
+        (id,workItemId,ownerUserId,cause,causeRef,sourceCausalEventSeq,resolutionCausalEventSeq,
+         historyCausalSeq,openedActorKind,openedActorRef,state,openedAt,dueAt,promptWakeId,
+         resolutionActorKind,resolutionActorRef,resolutionReason,resolvedAt)
+        VALUES ('tlp_fixture','wi_fixture','synthetic','created','wi_fixture',NULL,NULL,0,
+                'user','synthetic','pending',1,1,'w_fixture',NULL,NULL,NULL,NULL);
       """)
 
-    %{topline: topline} =
-      Toplines.create(db, call(%{title: "\u3000Cafe\u0301\u00a0", idempotency_key: "create"}))
-
-    assert topline.title == "Café"
-
-    %{membership: _} =
-      Toplines.link_work(
-        db,
-        call(
-          %{
-            topline_id: topline.id,
-            work_item_id: "wi_fixture",
-            reason: "group",
-            idempotency_key: "link"
-          },
-          11
-        )
-      )
-
-    %{concern: concern} =
-      Toplines.create_concern(
-        db,
-        call(
-          %{
-            topline_id: topline.id,
-            title: "\u00a0Re\u0301sume\u0301💩\u3000",
-            idempotency_key: "concern"
-          },
-          12
-        )
-      )
-
-    assert concern.title == "Résumé💩"
-
-    refute Map.has_key?(
-             Toplines.link_concern_work(
-               db,
-               call(
-                 %{
-                   concern_id: concern.id,
-                   work_item_id: "wi_fixture",
-                   reason: "tag",
-                   idempotency_key: "tag"
-                 },
-                 13
-               )
-             ),
-             :code
-           )
-
-    %{topline: closed} = Toplines.create(db, call(%{title: "Closed", idempotency_key: "closed"}))
-
-    assert Toplines.close(
-             db,
-             call(%{topline_id: closed.id, reason: "done", idempotency_key: "close"}, 14)
-           ).topline.state == "closed"
-
-    {:ok, _} =
-      DB.transaction(db, fn txn ->
-        Toplines.open_placement_in_txn(txn, %{
-          id: "tlp_fixture",
-          work_item_id: "wi_fixture",
-          owner_user_id: "synthetic",
-          cause: "created",
-          cause_ref: "wi_fixture",
-          actor_kind: "user",
-          actor_ref: "synthetic",
-          at: 1,
-          prompt_wake_id: "w_fixture"
-        })
-      end)
-
-    # Non-dense rowids must survive the rebuild, along with stable product IDs.
-    {:ok, _} = DB.query(db, "UPDATE toplines SET rowid=99 WHERE id=?1", [closed.id])
-    {topline, concern}
+    {%{id: "tl_fixture"}, %{id: "tlc_fixture"}}
   end
 
   def sqlite!(sqlite, path, command) do
@@ -264,7 +235,7 @@ try do
       :ok = DB.Txn.exec(txn, File.read!("test/fixtures/toplines_v5.sql"))
     end)
 
-  {topline, concern} = F.populate!(db)
+  {topline, concern} = F.populate_legacy_v5!(db)
   before = F.snapshot(db)
   legacy_rows = F.legacy_rows(db)
   stop.()
@@ -311,7 +282,7 @@ try do
 
   # Exercise the production boot ordering, not only the standalone activator.
   assert :ok = Schema.ensure_all(db)
-  {old_schema, old_rows} = before
+  {old_schema, _old_rows} = before
   {new_schema, new_rows} = F.snapshot(db)
 
   assert F.legacy_rows(db) == legacy_rows
@@ -330,8 +301,13 @@ try do
   assert {:ok, [[0]]} = DB.query(db, "PRAGMA defer_foreign_keys")
 
   # Validation is still owned by the actual product API on the migrated base.
-  assert Toplines.create(db, F.call(%{title: " Café ", idempotency_key: "create"})).topline ==
-           topline
+  assert %{topline: %{title: "Café"}} =
+           Toplines.create(
+             db,
+             F.call(%{title: " Café ", idempotency_key: "post-migration-create"})
+           )
+
+  post_create = F.snapshot(db)
 
   for invalid <- [1, "", "\u00a0\u3000", <<255>>, String.duplicate("💩", 2001)] do
     params = %{title: invalid, idempotency_key: "invalid"}
@@ -347,7 +323,7 @@ try do
              Toplines.create_concern(db, F.call(Map.put(params, :topline_id, topline.id)))
   end
 
-  assert F.snapshot(db) == {new_schema, new_rows}
+  assert F.snapshot(db) == post_create
 
   updated =
     Toplines.update(

@@ -904,6 +904,7 @@ defmodule Tightbeam.ToplinesTest do
   test "leave-unlinked resolves the caller's pending placement idempotently and lists resolved placements",
        ctx do
     work_item!(ctx.db, "wi_leave", "flynn")
+    session!(ctx.db, "s_flynn", "flynn")
 
     :ok =
       DB.execute(
@@ -956,6 +957,33 @@ defmodule Tightbeam.ToplinesTest do
 
     assert %{placements: []} =
              Toplines.list_placements(ctx.db, read_call({:user, "kay"}, %{state: "all"}))
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        INSERT INTO wakes
+          (wakeId, sessionKey, origin, prompt, consumer, dueAt, state, createdAt)
+        VALUES ('w_process_leave', 'agent:main:clawline:flynn:main', 'process:tightbeam',
+                'Choose placement', 'prompt', 44, 'pending', 44)
+        """
+      )
+
+    {:ok, _} =
+      DB.transaction(ctx.db, fn txn ->
+        Toplines.open_placement_in_txn(txn, %{
+          id: "tlp_process_leave",
+          work_item_id: "wi_leave",
+          owner_user_id: "flynn",
+          cause: "created",
+          cause_ref: "wi_leave",
+          source_causal_event_seq: nil,
+          actor_kind: "user",
+          actor_ref: "flynn",
+          at: 44,
+          prompt_wake_id: "w_process_leave"
+        })
+      end)
 
     process_leave =
       call(

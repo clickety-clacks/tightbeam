@@ -4115,6 +4115,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "assign validates principals, input, liveness, opener typing, and idempotent races", ctx do
     work_item = create_work_item(ctx, "Process assignment")
+    set_delivery_owner(ctx, work_item.id, "holder")
 
     process_assignment =
       assign_call({:process, "cron"}, "Process assignment", nil, work_item.id)
@@ -6056,6 +6057,18 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "non-session commit-ref attestations retain actor attribution", ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
     assignment =
       assign_call({:user, "flynn"}, "non-session evidence")
       |> put_in([:params, :effect_kind], "code")
