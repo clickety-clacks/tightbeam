@@ -307,7 +307,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
 
     assert global.status == 200, global.resp_body
     global_body = JSON.decode!(global.resp_body)
-    assert global_body["items"] == [StateResources.attest(ctx.opener_attest)]
+    assert global_body["items"] == [attest_wire_item(ctx.opener_attest)]
     assert global_body["page"]["hasMoreBefore"] == false
 
     repeated_assignment_filter =
@@ -330,7 +330,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
     assert opener_nested.status == 200, opener_nested.resp_body
 
     assert JSON.decode!(opener_nested.resp_body)["items"] == [
-             StateResources.attest(ctx.opener_attest)
+             attest_wire_item(ctx.opener_attest)
            ]
 
     owner_nested =
@@ -342,7 +342,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
 
     assert owner_nested.status == 200, owner_nested.resp_body
     owner_body = JSON.decode!(owner_nested.resp_body)
-    assert owner_body["items"] == [StateResources.attest(List.last(ctx.owner_attests))]
+    assert owner_body["items"] == [attest_wire_item(List.last(ctx.owner_attests))]
     assert owner_body["page"]["hasMoreBefore"]
 
     prior_owner_page =
@@ -355,7 +355,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
     assert prior_owner_page.status == 200, prior_owner_page.resp_body
 
     assert JSON.decode!(prior_owner_page.resp_body)["items"] == [
-             StateResources.attest(List.first(ctx.owner_attests))
+             attest_wire_item(List.first(ctx.owner_attests))
            ]
 
     holder_nested =
@@ -368,7 +368,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
     assert holder_nested.status == 200, holder_nested.resp_body
 
     assert JSON.decode!(holder_nested.resp_body)["items"] == [
-             StateResources.attest(ctx.opener_attest)
+             attest_wire_item(ctx.opener_attest)
            ]
 
     session_collection =
@@ -552,7 +552,7 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
         )
     end)
 
-    released = Enum.at(artifacts, 2)
+    released = Enum.at(artifacts, 1)
 
     {:ok, _rows} =
       DB.query(db, "UPDATE artifacts SET state = 'released' WHERE artifactId = ?1", [
@@ -564,5 +564,11 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
     conn(:get, path)
     |> put_req_header("authorization", "Bearer #{bearer || ctx.admin_device.token}")
     |> Router.call(Router.init(ctx.opts))
+  end
+
+  defp attest_wire_item(row) do
+    "attests"
+    |> StateResources.encode_item(StateResources.attest(row))
+    |> JSON.decode!()
   end
 end
