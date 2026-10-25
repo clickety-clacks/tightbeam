@@ -664,6 +664,207 @@ defmodule Tightbeam.CliIntegrationTest do
     assert version == CliCompatibility.required_version()
   end
 
+  test "real CLI captures and fetches assignment-produced bytes", ctx do
+    item =
+      ctx.handlers["work-item-create"].(%{
+        verb: "work-item-create",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        params: %{title: "Captured result"}
+      })
+
+    assignment =
+      ctx.handlers["assign"].(%{
+        verb: "assign",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: ctx.session.session_key,
+        target_role: nil,
+        role_fallback: false,
+        params: %{subject: "Record observed result", work_item_id: item.id}
+      })
+
+    bytes = <<0, 1, 255>>
+    digest = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+
+    {recorded, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Observed result",
+          "--path",
+          "missing-result.bin",
+          "--work-item",
+          item.id,
+          "--produced-by-assignment",
+          assignment.id,
+          "--content-base64",
+          Base.encode64(bytes)
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    recorded = JSON.decode!(recorded)
+    assert recorded["contentSha256"] == digest
+    assert recorded["producedByAssignmentId"] == assignment.id
+
+    {fetched, 0} =
+      System.cmd(ctx.binary, ["artifact-content-fetch", recorded["artifactId"]],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(fetched) == %{
+             "artifactId" => recorded["artifactId"],
+             "contentSha256" => digest,
+             "contentSize" => byte_size(bytes),
+             "contentBase64" => Base.encode64(bytes)
+           }
+
+    assert {:ok, [[payload]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload FROM events WHERE verb='artifact-content-fetch' ORDER BY id DESC LIMIT 1"
+             )
+
+    assert JSON.decode!(payload) == nil
+    refute payload =~ Base.encode64(bytes)
+  end
+
+  test "real CLI writes and reads declared record metadata", ctx do
+    manifest = Path.join([ctx.base_dir, "identity", "kungfu", "example", "manifest.toml"])
+    File.mkdir_p!(Path.dirname(manifest))
+
+    File.write!(
+      manifest,
+      "[[mementos]]\nname = \"receipt\"\nrecords = [\"work_item\"]\nmany = false\n"
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "test-identity-revision")
+
+    item =
+      ctx.handlers["work-item-create"].(%{
+        verb: "work-item-create",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        params: %{title: "Recorded metadata"}
+      })
+
+    record = "work_item:#{item.id}"
+
+    {written, 0} =
+      System.cmd(
+        ctx.binary,
+        ["memento-set", "--record", record, "--name", "example/receipt", "--value", "observed"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(written) == %{
+             "record" => record,
+             "mementos" => %{"example/receipt" => ["observed"]}
+           }
+
+    {read, 0} =
+      System.cmd(ctx.binary, ["mementos", "--record", record],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(read) == JSON.decode!(written)
+  end
+
+  test "real CLI carries repeated inline metadata through lifecycle writes", ctx do
+    manifest = Path.join([ctx.base_dir, "identity", "kungfu", "example", "manifest.toml"])
+    File.mkdir_p!(Path.dirname(manifest))
+
+    File.write!(
+      manifest,
+      "[[mementos]]\nname = \"receipt\"\nrecords = [\"work_item\", \"assignment\", \"attest\"]\nmany = true\n"
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "test-identity-revision")
+    run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+
+    assert {created, 0} =
+             run.([
+               "work-item-create",
+               "--title",
+               "Inline metadata",
+               "--as-user",
+               "flynn",
+               "--memento",
+               "example/receipt=first",
+               "--memento",
+               "example/receipt=second"
+             ])
+
+    item_id = JSON.decode!(created)["id"]
+
+    assert Tightbeam.Mementos.current(ctx.db, "work_item", item_id, "example/receipt") ==
+             ["first", "second"]
+
+    assert {assigned, 0} =
+             run.([
+               "assign",
+               "--subject",
+               "Inline assignment",
+               "--session",
+               ctx.session.session_key,
+               "--work-item",
+               item_id,
+               "--as-user",
+               "flynn",
+               "--memento",
+               "example/receipt=assigned"
+             ])
+
+    assignment_id = JSON.decode!(assigned)["id"]
+
+    assert Tightbeam.Mementos.current(ctx.db, "assignment", assignment_id, "example/receipt") ==
+             ["assigned"]
+
+    assert {dispatched, 0} =
+             run.([
+               "dispatch",
+               "--holder",
+               ctx.worker.session_key,
+               "--subject",
+               "Inline dispatch",
+               "--brief",
+               "Record the synthetic result.",
+               "--memento",
+               "example/receipt=dispatched"
+             ])
+
+    dispatched_id = JSON.decode!(dispatched)["id"]
+
+    assert Tightbeam.Mementos.current(ctx.db, "assignment", dispatched_id, "example/receipt") ==
+             ["dispatched"]
+
+    assert {filed, 0} =
+             run.([
+               "attest",
+               assignment_id,
+               "--kind",
+               "progress",
+               "--note",
+               "Observed progress",
+               "--memento",
+               "example/receipt=filed"
+             ])
+
+    attest_id = JSON.decode!(filed)["attest"]["id"]
+
+    assert Tightbeam.Mementos.current(ctx.db, "attest", attest_id, "example/receipt") ==
+             ["filed"]
+  end
+
   test "cancel-turn cancels an owned unattributed turn and refuses another user's session", ctx do
     :ok = DB.execute(ctx.db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('owner',0,1)")
     :ok = DB.execute(ctx.db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('other',0,1)")

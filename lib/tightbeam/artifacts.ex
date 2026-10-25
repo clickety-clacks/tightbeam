@@ -278,6 +278,13 @@ defmodule Tightbeam.Artifacts do
   """
   @spec record(DB.server(), map()) :: map()
   def record(db \\ Tightbeam.DB, call) do
+    case captured_input(call.params) do
+      {:ok, digest, bytes} -> record_with_content(db, call, digest, bytes)
+      error -> error
+    end
+  end
+
+  defp record_with_content(db, call, digest, captured_bytes) do
     case {call[:principal], call[:session_key], call[:params][:work_item_id]} do
       {{:session, session_key}, session_key, work_item_id}
       when is_binary(session_key) and is_binary(work_item_id) ->
@@ -319,7 +326,7 @@ defmodule Tightbeam.Artifacts do
                        producer_id,
                        parent_session,
                        call.params.origin_path,
-                       call.params[:content_sha256],
+                       digest,
                        recorded_message_id,
                        evidence,
                        now,
@@ -327,6 +334,16 @@ defmodule Tightbeam.Artifacts do
                        origin_workspace
                      ]
                    )
+
+                   if captured_bytes != nil do
+                     ArtifactContent.store_in_txn(
+                       txn,
+                       artifact_id,
+                       digest,
+                       captured_bytes,
+                       now
+                     )
+                   end
 
                    if is_binary(producer_id) do
                      Tightbeam.Supervision.activity_in_txn(
@@ -395,6 +412,40 @@ defmodule Tightbeam.Artifacts do
         %{code: "invalid", message: "artifact-record requires a session caller"}
     end
   end
+
+  defp captured_input(params) do
+    if Map.has_key?(params, :content_base64) do
+      case params[:content_base64] do
+        encoded when is_binary(encoded) ->
+          with {:ok, bytes} <- Base.decode64(encoded),
+               true <- Base.encode64(bytes) == encoded do
+            digest = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+
+            if is_nil(params[:content_sha256]) or params[:content_sha256] == digest do
+              {:ok, digest, bytes}
+            else
+              %{
+                code: "content_sha256_mismatch",
+                message: "contentSha256 must match captured bytes"
+              }
+            end
+          else
+            _ -> invalid_content_base64()
+          end
+
+        _ ->
+          invalid_content_base64()
+      end
+    else
+      {:ok, params[:content_sha256], nil}
+    end
+  end
+
+  defp invalid_content_base64,
+    do: %{
+      code: "invalid_artifact_content_base64",
+      message: "contentBase64 must be strict standard Base64"
+    }
 
   defp validate_session_active_in_txn(txn, session_key) do
     case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [session_key]) do

@@ -153,6 +153,7 @@ pub enum Command {
         description: Option<String>,
         work_item_id: Option<String>,
         content_sha256: Option<String>,
+        content_base64: Option<String>,
         produced_by_assignment_id: Option<String>,
     },
     ArtifactContentFetch {
@@ -233,6 +234,7 @@ pub enum Command {
     },
     Assign {
         identity: Identity,
+        mementos: Vec<(String, String)>,
         subject: String,
         target: Target,
         idempotency_key: Option<String>,
@@ -244,6 +246,7 @@ pub enum Command {
     },
     Dispatch {
         identity: Identity,
+        mementos: Vec<(String, String)>,
         subject: String,
         holder: String,
         work_item_id: Option<String>,
@@ -343,6 +346,7 @@ pub enum Command {
     },
     WorkItemCreate {
         identity: Identity,
+        mementos: Vec<(String, String)>,
         title: String,
         spec_ref_name: Option<String>,
         spec_ref_sha256: Option<String>,
@@ -436,6 +440,7 @@ pub enum Command {
     },
     Attest {
         identity: Identity,
+        mementos: Vec<(String, String)>,
         assignment_id: String,
         kind: String,
         verdict: Option<String>,
@@ -447,6 +452,21 @@ pub enum Command {
         release_fact_kind: Option<String>,
         release_fact_scope: Option<String>,
         release_fact_principal_ref: Option<String>,
+    },
+    MementoSet {
+        identity: Identity,
+        record: String,
+        name: String,
+        values: Vec<String>,
+        clear: bool,
+    },
+    Mementos {
+        identity: Identity,
+        record: String,
+        history: bool,
+        name: Option<String>,
+        limit: Option<u32>,
+        cursor: Option<String>,
     },
     Attests {
         identity: Identity,
@@ -771,7 +791,7 @@ COMMANDS:
 
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
-                  [--produced-by-assignment <assignmentId>]
+                  [--produced-by-assignment <assignmentId>] [--content-base64 <bytes>]
       Record a deliberate artifact pointer for the calling session.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
@@ -782,6 +802,11 @@ COMMANDS:
   artifact-content-fetch <artifactId>
       Fetch captured bytes as contentBase64 with contentSha256 and contentSize.
       Reads stored custody only, never the origin path; uncaptured content is reported unavailable.
+  memento-set --record <kind>:<id> --name <name> (--value <value>... | --clear)
+      Set a declared record value and retain its history.
+  mementos --record <kind>:<id> [--history] [--name <name>]
+      [--limit <count>] [--cursor <cursor>]
+      Read current declared values or their ordered history.
 
   spawn --display "<name>" [--name <role>] [--archetype <a>]
         [--harness {{HARNESSES_PIPE}}] [--model <model>] [--effort <level>]
@@ -1204,6 +1229,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "api-key",
     "clear-spec-ref",
     "clear-delivery-owner",
+    "clear",
     "daemon-credential",
     "dry-run",
     "help",
@@ -1221,6 +1247,7 @@ struct Flags {
     positional: Vec<String>,
     flags: HashMap<String, String>,
     duplicates: HashSet<String>,
+    repeated: HashMap<String, Vec<String>>,
     missing_values: HashSet<String>,
     body_operations: Vec<BodyUpdateOperation>,
 }
@@ -1240,6 +1267,7 @@ fn split_args(args: Vec<String>) -> Flags {
     let mut positional = Vec::new();
     let mut flags = HashMap::new();
     let mut duplicates = HashSet::new();
+    let mut repeated: HashMap<String, Vec<String>> = HashMap::new();
     let mut missing_values = HashSet::new();
     let mut index = 0;
     while index < args.len() {
@@ -1256,6 +1284,12 @@ fn split_args(args: Vec<String>) -> Flags {
                     missing_values.insert(name.to_owned());
                 }
                 let value = next.cloned().unwrap_or_default();
+                if name == "memento" || name == "value" {
+                    repeated
+                        .entry(name.to_owned())
+                        .or_default()
+                        .push(value.clone());
+                }
                 if flags.insert(name.to_owned(), value).is_some() {
                     duplicates.insert(name.to_owned());
                 }
@@ -1272,6 +1306,7 @@ fn split_args(args: Vec<String>) -> Flags {
         positional,
         flags,
         duplicates,
+        repeated,
         missing_values,
         body_operations: Vec::new(),
     }
@@ -1370,9 +1405,28 @@ fn split_work_item_update_args(args: Vec<String>) -> Flags {
         positional,
         flags,
         duplicates,
+        repeated: HashMap::new(),
         missing_values,
         body_operations,
     }
+}
+
+fn inline_mementos(parsed: &Flags) -> Result<Vec<(String, String)>, String> {
+    parsed
+        .repeated
+        .get("memento")
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            let (name, value) = entry
+                .split_once('=')
+                .ok_or("--memento requires <name>=<value>")?;
+            if name.is_empty() || value.is_empty() {
+                return Err("--memento requires non-empty name and value".to_owned());
+            }
+            Ok((name.to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
@@ -2285,7 +2339,7 @@ fn parse_with_optional_catalog(
         }
         "artifact-record" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>] [--produced-by-assignment <assignmentId>]".to_owned());
+                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>] [--content-base64 <bytes>] [--produced-by-assignment <assignmentId>]".to_owned());
             }
             Ok(Command::ArtifactRecord {
                 identity: identity(flags)?,
@@ -2296,6 +2350,7 @@ fn parse_with_optional_catalog(
                 description: nonempty(flags, "description"),
                 work_item_id: nonempty(flags, "work-item"),
                 content_sha256: nonempty(flags, "sha256"),
+                content_base64: nonempty(flags, "content-base64"),
                 produced_by_assignment_id: nonempty(flags, "produced-by-assignment"),
             })
         }
@@ -2481,6 +2536,7 @@ fn parse_with_optional_catalog(
                     "reviews",
                     "effect-kind",
                     "files",
+                    "memento",
                     "succeeds",
                 ],
             )?;
@@ -2505,6 +2561,7 @@ fn parse_with_optional_catalog(
                 .transpose()?;
             Ok(Command::Assign {
                 identity: identity(flags)?,
+                mementos: inline_mementos(&parsed)?,
                 subject,
                 target: targets.into_iter().next().expect("exactly one target"),
                 idempotency_key: nonempty(flags, "key"),
@@ -2527,6 +2584,7 @@ fn parse_with_optional_catalog(
                     "work-item",
                     "effect-kind",
                     "workdir-root",
+                    "memento",
                     "key",
                     "succeeds",
                 ],
@@ -2543,6 +2601,7 @@ fn parse_with_optional_catalog(
             let brief = nonempty(flags, "brief").ok_or_else(|| "--brief is required".to_owned())?;
             Ok(Command::Dispatch {
                 identity: identity(flags)?,
+                mementos: inline_mementos(&parsed)?,
                 subject,
                 holder: holders.into_iter().next().expect("exactly one holder"),
                 work_item_id: nonempty(flags, "work-item"),
@@ -2826,6 +2885,7 @@ fn parse_with_optional_catalog(
             }
             Ok(Command::WorkItemCreate {
                 identity: identity(flags)?,
+                mementos: inline_mementos(&parsed)?,
                 title: nonempty(flags, "title").ok_or_else(|| "--title is required".to_owned())?,
                 spec_ref_name,
                 spec_ref_sha256,
@@ -3240,6 +3300,16 @@ fn parse_with_optional_catalog(
                         .map_err(|error| format!("--commit-refs must be a JSON array: {error}"))
                 })
                 .transpose()?;
+            let artifact_id = nonempty(flags, "artifact");
+            let content_sha256 = nonempty(flags, "sha256");
+            if artifact_id.is_some() != content_sha256.is_some() {
+                return Err("--artifact and --sha256 must be supplied together".to_owned());
+            }
+            if kind != "verdict" && artifact_id.is_some() {
+                return Err(
+                    "--artifact and --sha256 are only valid when --kind is verdict".to_owned(),
+                );
+            }
             let release_fact_kind = nonempty(flags, "release-fact-kind");
             let release_fact_scope = nonempty(flags, "release-fact-scope");
             let release_fact_principal_ref = nonempty(flags, "release-fact-principal-ref");
@@ -3279,6 +3349,7 @@ fn parse_with_optional_catalog(
             }
             Ok(Command::Attest {
                 identity: identity(flags)?,
+                mementos: inline_mementos(&parsed)?,
                 assignment_id,
                 kind,
                 verdict,
@@ -3290,6 +3361,61 @@ fn parse_with_optional_catalog(
                 release_fact_kind,
                 release_fact_scope,
                 release_fact_principal_ref,
+            })
+        }
+        "memento-set" => {
+            closed_command_flags("memento-set", flags, &["record", "name", "value", "clear"])?;
+            let values = parsed.repeated.get("value").cloned().unwrap_or_default();
+            let clear = flags.contains_key("clear");
+            if parsed.positional.len() != 1
+                || clear == !values.is_empty()
+                || parsed.duplicates.iter().any(|flag| flag != "value")
+                || values.iter().any(String::is_empty)
+            {
+                return Err("usage: tightbeam memento-set --record <kind>:<id> --name <name> (--value <value>... | --clear)".to_owned());
+            }
+            Ok(Command::MementoSet {
+                identity: identity(flags)?,
+                record: nonempty(flags, "record").ok_or("--record is required")?,
+                name: nonempty(flags, "name").ok_or("--name is required")?,
+                values,
+                clear,
+            })
+        }
+        "mementos" => {
+            closed_command_flags(
+                "mementos",
+                flags,
+                &["record", "history", "name", "limit", "cursor"],
+            )?;
+            let history = flags.contains_key("history");
+            if parsed.positional.len() != 1
+                || !parsed.duplicates.is_empty()
+                || (!history
+                    && ["name", "limit", "cursor"]
+                        .iter()
+                        .any(|flag| flags.contains_key(*flag)))
+            {
+                return Err("history options require mementos --history".to_owned());
+            }
+            let limit = flags
+                .get("limit")
+                .map(|value| {
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| "--limit requires a positive integer".to_owned())
+                })
+                .transpose()?;
+            if limit == Some(0) {
+                return Err("--limit requires a positive integer".to_owned());
+            }
+            Ok(Command::Mementos {
+                identity: identity(flags)?,
+                record: nonempty(flags, "record").ok_or("--record is required")?,
+                history,
+                name: nonempty(flags, "name"),
+                limit,
+                cursor: nonempty(flags, "cursor"),
             })
         }
         "attests" => {
@@ -3483,7 +3609,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -5489,6 +5615,8 @@ mod tests {
                 "kungfu",
                 "learn",
                 "list",
+                "memento-set",
+                "mementos",
                 "onboard",
                 "operator-ask",
                 "operator-rule",
@@ -6448,7 +6576,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
@@ -6998,6 +7126,49 @@ mod tests {
             ]))
             .unwrap_err()
             .contains("only valid when --kind is cannot-proceed")
+        );
+    }
+
+    #[test]
+    fn attest_evidence_requires_paired_revision_and_valid_memento_input() {
+        assert_eq!(
+            parse(strings(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "verdict",
+                "--verdict",
+                "verified",
+                "--artifact",
+                "art_1",
+            ])),
+            Err("--artifact and --sha256 must be supplied together".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "progress",
+                "--artifact",
+                "art_1",
+                "--sha256",
+                "abc123",
+            ])),
+            Err("--artifact and --sha256 are only valid when --kind is verdict".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "verdict",
+                "--verdict",
+                "verified",
+                "--memento",
+                "missing-equals",
+            ])),
+            Err("--memento requires <name>=<value>".to_owned())
         );
     }
 

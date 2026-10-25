@@ -94,6 +94,19 @@ fn string_field(name: &str, value: &str) -> String {
     format!("\"{name}\":{}", quoted(value))
 }
 
+fn append_mementos(fields: &mut Vec<String>, entries: &[(String, String)]) {
+    if !entries.is_empty() {
+        let values: Vec<_> = entries
+            .iter()
+            .map(|(name, value)| serde_json::json!({"name": name, "value": value}))
+            .collect();
+        fields.push(format!(
+            "\"mementos\":{}",
+            serde_json::to_string(&values).expect("mementos are JSON serializable")
+        ));
+    }
+}
+
 /// Roster filters, shared verbatim by `toplines` and `topline --under` — the
 /// spec says "the same roster filters", so there is one builder, not two lists.
 fn filter_params(filters: &crate::args::ToplineFilters) -> Vec<String> {
@@ -427,6 +440,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             description,
             work_item_id,
             content_sha256,
+            content_base64,
             produced_by_assignment_id,
         } => {
             let mut params = vec![
@@ -438,6 +452,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 ("description", description),
                 ("workItemId", work_item_id),
                 ("contentSha256", content_sha256),
+                ("contentBase64", content_base64),
                 ("producedByAssignmentId", produced_by_assignment_id),
             ] {
                 if let Some(value) = value {
@@ -446,6 +461,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "artifact-record", vec![], params))
         }
+        Command::ArtifactContentFetch {
+            identity,
+            artifact_id,
+        } => Ok(request(
+            identity,
+            "artifact-content-fetch",
+            vec![],
+            vec![string_field("artifactId", artifact_id)],
+        )),
         Command::Artifacts {
             identity,
             work_item_id,
@@ -648,6 +672,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         }
         Command::Assign {
             identity,
+            mementos,
             subject,
             target,
             idempotency_key,
@@ -684,10 +709,12 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = succeeds {
                 params.push(string_field("succeedsAssignmentId", value));
             }
+            append_mementos(&mut params, mementos);
             Ok(request(identity, "assign", vec![target], params))
         }
         Command::Dispatch {
             identity,
+            mementos,
             subject,
             holder,
             work_item_id,
@@ -716,6 +743,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = succeeds {
                 params.push(string_field("succeedsAssignmentId", value));
             }
+            append_mementos(&mut params, mementos);
             Ok(request(
                 identity,
                 "dispatch",
@@ -964,6 +992,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         )),
         Command::WorkItemCreate {
             identity,
+            mementos,
             title,
             spec_ref_name,
             spec_ref_sha256,
@@ -983,6 +1012,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
             }
+            append_mementos(&mut params, mementos);
             Ok(request(identity, "work-item-create", vec![], params))
         }
         Command::WorkItemHandoff {
@@ -1238,6 +1268,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         }
         Command::Attest {
             identity,
+            mementos,
             assignment_id,
             kind,
             verdict,
@@ -1272,6 +1303,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = content_sha256 {
                 params.push(string_field("contentSha256", value));
             }
+            append_mementos(&mut params, mementos);
             if let Some(value) = wait_id {
                 params.push(string_field("waitId", value));
             }
@@ -1285,6 +1317,47 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 params.push(string_field("releaseFactPrincipalRef", value));
             }
             Ok(request(identity, "attest", vec![], params))
+        }
+        Command::MementoSet {
+            identity,
+            record,
+            name,
+            values,
+            clear,
+        } => {
+            let mut params = vec![string_field("record", record), string_field("name", name)];
+            if *clear {
+                params.push("\"clear\":true".to_owned());
+            } else {
+                params.push(format!(
+                    "\"values\":{}",
+                    serde_json::to_string(values).expect("strings are JSON serializable")
+                ));
+            }
+            Ok(request(identity, "memento-set", vec![], params))
+        }
+        Command::Mementos {
+            identity,
+            record,
+            history,
+            name,
+            limit,
+            cursor,
+        } => {
+            let mut params = vec![string_field("record", record)];
+            if *history {
+                params.push("\"history\":true".to_owned());
+            }
+            if let Some(value) = name {
+                params.push(string_field("name", value));
+            }
+            if let Some(value) = limit {
+                params.push(format!("\"limit\":{value}"));
+            }
+            if let Some(value) = cursor {
+                params.push(string_field("cursor", value));
+            }
+            Ok(request(identity, "mementos", vec![], params))
         }
         Command::Attests {
             identity,
@@ -3678,6 +3751,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemClose { identity, .. }
         | Command::WorkItemFail { identity, .. }
         | Command::Attest { identity, .. }
+        | Command::MementoSet { identity, .. }
+        | Command::Mementos { identity, .. }
         | Command::Attests { identity, .. }
         | Command::AssignmentGet { identity, .. }
         | Command::Assignments { identity, .. }
