@@ -178,13 +178,8 @@ defmodule Tightbeam.ClientE2E.WS do
     end
   end
 
-  defp dispatch_frame(ws, _fin, 0x8, payload, _deadline) do
-    code = close_code(payload)
-    # Complete the peer's close handshake before reporting its code. This
-    # lets a guarded shutdown wait for the connection process to exit.
-    close(ws)
-    {:ok, {:closed, code}, ws}
-  end
+  defp dispatch_frame(ws, _fin, 0x8, payload, _deadline),
+    do: {:ok, {:closed, close_code(payload)}, ws}
 
   defp dispatch_frame(ws, _fin, 0x9, payload, deadline) do
     case :gen_tcp.send(ws.socket, encode(0xA, payload)) do

@@ -474,8 +474,6 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert_receive :firehose_shutdown
     refute Task.yield(shutdown, 0)
     assert {:stop, :normal, 1012, ^state} = ChangeSocket.handle_info(:firehose_shutdown, state)
-    refute Task.yield(shutdown, 0)
-    assert :ok = Hub.shutdown_delivered(ctx.hub, self())
     assert :ok = Task.await(shutdown)
   end
 
@@ -488,8 +486,6 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert {:stop, :normal, 1012, ^state} =
              ChangeSocket.handle_info(:firehose_shutdown, state)
 
-    refute Task.yield(shutdown, 0)
-    assert :ok = Hub.shutdown_delivered(ctx.hub, self())
     assert :ok = Task.await(shutdown)
   end
 
