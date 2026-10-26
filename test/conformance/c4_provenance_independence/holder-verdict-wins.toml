@@ -4,7 +4,7 @@ name = "holder-verdict-wins"
 phase = "pending"
 blocking_phase = "P3"
 kind = "dispatch-rule"
-source = "coordination-fabric-v1 §13 Phase 0; wi_1b0237fe wedge class"
+source = "coordination-fabric-v1 §13 Phase 0; wi_00000000 wedge class"
 legibility = "event:denied(rule=coder-completion-needs-independent-review)"
 
 # Review judgments come from holder-filed verdict rows, never from bare card

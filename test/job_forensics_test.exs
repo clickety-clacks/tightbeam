@@ -957,8 +957,8 @@ defmodule Tightbeam.JobForensicsTest do
           (wakeId, sessionKey, origin, prompt, consumer, dueAt, state, createdAt,
            canceledAt, work_item_id, targetGate)
         VALUES
-          ('w_eca7e8a2-646b-4ada-8760-685db9df622c', 'legacy-target',
-           'process:legacy', 'preserved production specimen', 'prompt',
+          ('w_00000000-0000-4000-8000-000000000002', 'legacy-target',
+           'process:legacy', 'synthetic legacy specimen', 'prompt',
            1786352503252, 'canceled', 1786266103252, 1786266112203,
            'wi_legacy_cancel', 1)
         """
@@ -995,7 +995,7 @@ defmodule Tightbeam.JobForensicsTest do
     assert {:ok, [[0]]} =
              DB.query(
                legacy_db,
-               "SELECT count(*) FROM wake_cancellations WHERE wakeId='w_eca7e8a2-646b-4ada-8760-685db9df622c'"
+               "SELECT count(*) FROM wake_cancellations WHERE wakeId='w_00000000-0000-4000-8000-000000000002'"
              )
 
     assert {:ok, [[activated_at]]} =
@@ -1010,7 +1010,7 @@ defmodule Tightbeam.JobForensicsTest do
       canceled_entry(
         legacy_db,
         "wi_legacy_cancel",
-        "w_eca7e8a2-646b-4ada-8760-685db9df622c"
+        "w_00000000-0000-4000-8000-000000000002"
       ),
       scheduling_origin: "process:legacy"
     )

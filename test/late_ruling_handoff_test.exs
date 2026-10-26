@@ -83,7 +83,7 @@ defmodule Tightbeam.LateRulingHandoffTest do
     WorkItems
   }
 
-  @incident_request_id "dr_07bdef13-45ae-435f-bc79-b2dc6b0a5ebf"
+  @incident_request_id "dr_00000000-0000-4000-8000-000000000001"
 
   defmodule LaneDoorbell do
     use GenServer
