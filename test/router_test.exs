@@ -634,6 +634,26 @@ defmodule Tightbeam.Wire.RouterTest do
     assert get_device(ctx, other, "/api/work-items/#{item.id}").status == 404
   end
 
+  test "D2-D resource paths dispatch to their canonical not-found envelopes", ctx do
+    cases = [
+      {"/api/sessions/agent:absent:main/coordination-share?from=1&to=2", "coordination share"},
+      {"/api/wakes/w_missing/digest-members", "digest members"}
+    ]
+
+    for {path, resource} <- cases do
+      response = get_device(ctx, ctx.device, path)
+
+      assert response.status == 404
+      assert get_resp_header(response, "cache-control") == ["no-store"]
+
+      assert JSON.decode!(response.resp_body) == %{
+               "schemaVersion" => 1,
+               "resource" => resource,
+               "error" => %{"code" => "not_found"}
+             }
+    end
+  end
+
   test "all work-item verbs route, preserve generic target behavior, and map unknown ids", ctx do
     target = create_session(ctx.db, "work-item-target", "flynn")
 

@@ -40,7 +40,7 @@ defmodule Tightbeam.ExecutionMap do
      through any item-attributed carrier.
   """
 
-  alias Tightbeam.{CausalEvents, DB, Escalation, IdPrefix}
+  alias Tightbeam.{CausalEvents, DB, Escalation, IdPrefix, StateResources, StateVisibility, Wakes}
 
   @edge_basis "concurrent_turn"
   @coverage_basis "conservative_shared"
@@ -143,6 +143,103 @@ defmodule Tightbeam.ExecutionMap do
       true ->
         invalid("topline requires --under <workItemId> or --assignments <id,...>")
     end
+  end
+
+  @doc "Read one visible session's coordination share and its closed R9 dependency version."
+  @spec query_coordination_share(DB.server(), map()) :: map() | nil
+  def query_coordination_share(
+        db,
+        %{key: session_key, from: from, to: to, principal: principal}
+      )
+      when is_binary(session_key) and is_integer(from) and is_integer(to) and from < to and
+             is_map(principal) do
+    case StateResources.query_session(db, %{key: session_key, principal: principal}) do
+      nil ->
+        nil
+
+      session ->
+        if StateVisibility.coordination_share_visible?(db, session, principal) do
+          share = Wakes.coordination_share(db, session_key, from, to)
+          dependency_version = coordination_share_dependency_version(db, session_key, from, to)
+          Map.put(share, :dependency_version, dependency_version)
+        else
+          nil
+        end
+    end
+  end
+
+  defp coordination_share_dependency_version(db, session_key, from, to) do
+    {:ok, turn_rows} =
+      DB.query(
+        db,
+        """
+        SELECT seq, wakeId, createdAt, startedAt, endedAt
+        FROM turns
+        WHERE sessionKey = ?1 AND createdAt >= ?2 AND createdAt < ?3
+        ORDER BY seq
+        """,
+        [session_key, from, to]
+      )
+
+    turn_entries =
+      Enum.map(turn_rows, fn [seq, _wake_id, created_at, started_at, ended_at] ->
+        {"turns", seq, dependency_natural_version([seq, created_at, started_at, ended_at])}
+      end)
+
+    wake_ids = turn_rows |> Enum.map(&Enum.at(&1, 1)) |> Enum.reject(&is_nil/1) |> Enum.uniq()
+    wake_entries = coordination_wake_dependency_entries(db, wake_ids)
+
+    {:ok, prod_rows} =
+      DB.query(
+        db,
+        """
+        SELECT seq
+        FROM causal_events
+        WHERE sessionKey = ?1 AND kind = 'prod_fired' AND at >= ?2 AND at < ?3
+        ORDER BY seq
+        """,
+        [session_key, from, to]
+      )
+
+    prod_entries = Enum.map(prod_rows, fn [seq] -> {"causal events", seq, seq} end)
+
+    dependency_digest(turn_entries ++ wake_entries ++ prod_entries)
+  end
+
+  defp coordination_wake_dependency_entries(_db, []), do: []
+
+  defp coordination_wake_dependency_entries(db, wake_ids) do
+    placeholders = Enum.map_join(1..length(wake_ids), ",", &"?#{&1}")
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT wakeId, createdAt, firedAt, canceledAt
+        FROM wakes
+        WHERE wakeId IN (#{placeholders})
+        """,
+        wake_ids
+      )
+
+    Enum.map(rows, fn [wake_id, created_at, fired_at, canceled_at] ->
+      {"wakes", wake_id, dependency_natural_version([created_at, fired_at, canceled_at])}
+    end)
+  end
+
+  defp dependency_natural_version(values) do
+    values
+    |> Enum.filter(&is_integer/1)
+    |> Enum.max(fn -> raise ArgumentError, "dependency row has no natural version" end)
+  end
+
+  defp dependency_digest(entries) do
+    vector =
+      entries
+      |> Enum.map(fn {resource, key, version} -> [resource, key, version] end)
+      |> Enum.sort_by(fn [resource, key, _version] -> {resource, JSON.encode!(key)} end)
+
+    :crypto.hash(:sha256, JSON.encode!(vector)) |> Base.encode16(case: :lower)
   end
 
   ## --under — the anchor plus its transitive visible linked descendants
