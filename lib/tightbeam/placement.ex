@@ -11,7 +11,7 @@ defmodule Tightbeam.Placement do
   before any DB exists. The gateway's own machine is under its
   REAL hostname (`local_host_name/0`; ssh: nil) — never under an indexical
   like "local", because the org's vocabulary must match the operator's
-  ("spawn on eezo" has to resolve on eezo, including on eezo itself). Which
+  ("spawn on host-a" has to resolve on host-a, including on host-a itself). Which
   machine is local is carried by `ssh: nil`, not by a special name. Host
   names are what archetype `where` lists and session rows refer to; the ssh
   destination is how to reach one. WHY a host set contains what it does is
@@ -1593,7 +1593,7 @@ defmodule Tightbeam.Placement do
         # The pinned model tracks the SESSION'S resolved selection when the caller
         # supplies one (`:model`), falling back to the org default only when there
         # is no session context (adapter cold-boot). The claude adapter's offered
-        # /accepted model set follows this home pin (wi_263814d3), so pinning the
+        # /accepted model set follows this home pin, so pinning the
         # selected model is what makes the adapter accept it at session/new — the
         # cure for the accepted-then-dead class.
         default_model: Keyword.get(opts, :model) || Map.get(config, :default_model),

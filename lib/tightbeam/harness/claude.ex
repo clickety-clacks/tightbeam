@@ -84,7 +84,7 @@ defmodule Tightbeam.Harness.Claude do
   # set_config_option (-32602 for `gpt-5.1-codex`) while accepting codex-native
   # slugs (`gpt-5.6-sol` ran a real turn). Codex's api-key catalog now carries
   # its own `@adapter_selectable_models` guard on this precedent.
-  # RE-MEASURED 2026-08-05 on gibson (claude CLI 2.1.221, the production grant):
+  # RE-MEASURED 2026-08-05 on a production host (claude CLI 2.1.221, the production grant):
   # `claude -p --model claude-fable-5` answered a real prompt — the 2026-07-26
   # REJECTED row for fable was one environment's snapshot, not a property of the
   # account or the CLI (Flynn was literally talking to Fable while this table
@@ -92,7 +92,7 @@ defmodule Tightbeam.Harness.Claude do
   # (JOURNAL.md:804); the projected-home model pin (ops-hardening-v1 §3) is what
   # makes it deterministic. Keep re-probing per the note above before trusting
   # any row here, in either direction.
-  # RE-MEASURED 2026-08-06 on gibson (adapter 0.59.0, the production grant):
+  # RE-MEASURED 2026-08-06 on a production host (adapter 0.59.0, the production grant):
   # a pin-probe home (settings.json model=claude-opus-5) OFFERED and ACCEPTED
   # claude-opus-5, and a live prompt through the production adapter+credential
   # answered as Opus 5 — the 2026-07-26 REJECTED row for opus-5 was, like
@@ -100,7 +100,7 @@ defmodule Tightbeam.Harness.Claude do
   # default-pin vocabulary, not the grant; the operator's own picker offered
   # Opus 5 all along). Same lesson, second occurrence: re-probe from a second
   # vantage before trusting any row here, in either direction.
-  # UPGRADED 2026-09-01 on gibson to claude-agent-acp 0.73.0 / SDK 0.3.257 /
+  # UPGRADED 2026-09-01 on a production host to claude-agent-acp 0.73.0 / SDK 0.3.257 /
   # bundled Claude Code 2.1.257. This version offers and accepts claude-fable-5-1
   # plus its 1M-context variant.
   # Its public picker still exposes aliases, but their meaning changed: opus[1m]

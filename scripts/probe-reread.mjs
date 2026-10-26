@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Re-read probe — establishes the mechanism the home-pin durable fix relies on
-// (wi_263814d3): a LIVE, long-lived claude-agent-acp adapter RE-READS its home's
+// a LIVE, long-lived claude-agent-acp adapter RE-READS its home's
 // model pin at every session/new, so re-pinning the shared home to a session's
 // resolved model BEFORE that session's session/new (or session/load) makes the
 // adapter offer and accept it — without an adapter restart. This is WHY
