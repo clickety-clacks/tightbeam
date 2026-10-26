@@ -38,7 +38,7 @@ of:
    writes into a base dir and installs npm packages; it touches nothing else, but
    "touches nothing else" is a claim you should be able to make about the host.
 
-Actual host assignments belong in `docs/TEST-HOSTS.md`, not here.
+Choose an authorized host from the deployment environment; this runbook does not assign hosts.
 
 ## Prerequisites, checked first
 
@@ -208,9 +208,9 @@ diagnostic that sends the operator to the wrong machine is a FINDING.
 
 ## 7. End of run — retain or return, deliberately
 
-**Default: retain.** Per `docs/TEST-HOSTS.md` §5 an installation stays so later
+**Default: retain.** An installation stays so later
 runbooks have something to run against, and this satellite is the prerequisite for
-`INTER-NODE-COMMS.md`. Clean only temporary artifacts: scratch clones, `/tmp`
+cross-host journeys. Clean only temporary artifacts: scratch clones, `/tmp`
 staging, probe output outside the base dir.
 
 **Returning a host to unassimilated is a separately authorized action**, not a

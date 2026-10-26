@@ -411,7 +411,7 @@ the tool call, with the statute text delivered only as the denial reason.
     the satellite's projected home, `settings.json`/`hooks.json` in the shared
     home with elected archetype skills materialized separately at the exact
     remote session cwd, and no credential bytes in any captured ssh/rsync
-    command. Agent-to-agent delivery across hosts is `docs/INTER-NODE-COMMS.md`.
+    command.
     Score this step from that run: PASS / BLOCKED(no assimilated satellite).
 
 ## 10. Roles (offices: typed targets, binding, fallback, late binding)
