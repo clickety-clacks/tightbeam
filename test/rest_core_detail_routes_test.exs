@@ -2079,6 +2079,12 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert Enum.map(selected_admin_items, & &1["userId"]) == ["flynn", "flynn"]
     assert Enum.map(selected_admin_items, & &1["scopeKey"]) == ["chat:admin", "core-scope"]
 
+    selected_admin_org =
+      get(ctx, "/api/read-markers?asUser=flynn", ctx.opts[:cli_token])
+
+    assert selected_admin_org.status == 200
+    assert selected_admin_org.resp_body == selected_admin_markers.resp_body
+
     assert get_without_authorization(ctx, "/api/read-markers?asUser=").resp_body ==
              all_markers.resp_body
 
