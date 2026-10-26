@@ -9,7 +9,13 @@ defmodule Tightbeam.Wire.RequestObservation do
 
   def call(conn, next) do
     {request_id, valid?} = request_id(conn)
-    context = %{request_id: request_id, principal_kind: "unknown", principal_ref: nil}
+
+    context = %{
+      request_id: request_id,
+      listener_generation: conn.private[:tightbeam_listener_generation],
+      principal_kind: "unknown",
+      principal_ref: nil
+    }
 
     RequestContext.bind(context, fn ->
       previous = Process.get(@key)

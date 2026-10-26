@@ -258,6 +258,13 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:new_candidate_session, model, cwd, mcp, guidance}, from, state),
       do: handle_call({:new_session, model, cwd, mcp, guidance}, from, state)
 
+    def handle_call(
+          {:new_candidate_session, model, cwd, mcp, guidance, _correlation},
+          from,
+          state
+        ),
+        do: handle_call({:new_session, model, cwd, mcp, guidance}, from, state)
+
     def handle_call({:current_model, sid}, _from, {_parent, models} = state),
       do: {:reply, Map.fetch(models, sid), state}
 
@@ -291,6 +298,13 @@ defmodule Tightbeam.GatewayTest do
         60_000 -> raise "timed out waiting for queued harness switch candidate"
       end
     end
+
+    def handle_call(
+          {:new_candidate_session, model, cwd, mcp, guidance, _correlation},
+          from,
+          parent
+        ),
+        do: handle_call({:new_candidate_session, model, cwd, mcp, guidance}, from, parent)
   end
 
   defmodule FailingCandidateAdapterStub do
@@ -303,6 +317,13 @@ defmodule Tightbeam.GatewayTest do
       send(parent, :candidate_prepare_attempted)
       {:reply, {:error, :deliberate_candidate_failure}, parent}
     end
+
+    def handle_call(
+          {:new_candidate_session, model, cwd, mcp, guidance, _correlation},
+          from,
+          parent
+        ),
+        do: handle_call({:new_candidate_session, model, cwd, mcp, guidance}, from, parent)
   end
 
   defmodule MismatchedCandidateAdapterStub do
@@ -318,6 +339,15 @@ defmodule Tightbeam.GatewayTest do
        {:error,
         {:session_prepare_failed, {:runtime_config_mismatch, actual}, "candidate-mismatch",
          %{status: "verified", reason: nil}}}, parent}
+    end
+
+    def handle_call(
+          {:new_candidate_session, model, cwd, mcp, guidance, correlation},
+          from,
+          parent
+        ) do
+      send(parent, {:candidate_correlation, correlation})
+      handle_call({:new_candidate_session, model, cwd, mcp, guidance}, from, parent)
     end
   end
 
@@ -6186,24 +6216,37 @@ defmodule Tightbeam.GatewayTest do
     start_supervised!({CoordinatorStub, candidate})
     start_lane!(ctx.db, "k1")
 
+    correlation = %{
+      request_id: "req_initial_mismatch",
+      listener_generation: "lgen_initial_mismatch",
+      principal_kind: "user",
+      principal_ref: "user:flynn"
+    }
+
+    result =
+      Tightbeam.RequestContext.bind(correlation, fn ->
+        Gateway.handlers(config)["tune"].(%{
+          origin: "user:flynn",
+          session_key: "k1",
+          params: %{setting: "set_model", model: "claude-opus-5-5"}
+        })
+      end)
+
     assert %{
              ok: false,
              code: "runtime_config_mismatch",
              model: "claude-sonnet-4-6",
              projection_committed: false,
              message: message
-           } =
-             Gateway.handlers(config)["tune"].(%{
-               origin: "user:flynn",
-               session_key: "k1",
-               params: %{setting: "set_model", model: "claude-opus-5-5"}
-             })
+           } = result
 
     assert message =~ "different model"
     assert message =~ "not committed"
 
     assert_receive {:mismatched_candidate_closed, "candidate-mismatch",
                     %Model{family: "claude-opus-5-5"}, %Model{family: "claude-sonnet-4-6"}}
+
+    assert_receive {:candidate_correlation, ^correlation}
 
     assert Org.get(ctx.db, "k1").model == before
     assert Org.current_pointer(ctx.db, "k1") == nil

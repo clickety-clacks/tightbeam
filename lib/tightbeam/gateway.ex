@@ -7935,6 +7935,8 @@ defmodule Tightbeam.Gateway do
                          session.host,
                          spinup_opts(config, db, harness, session.host, model)
                        ) do
+                  correlation = Tightbeam.RequestContext.capture()
+
                   case at_tune_boundary(
                          config,
                          db,
@@ -7949,7 +7951,8 @@ defmodule Tightbeam.Gateway do
                                harness,
                                harness_atom,
                                model,
-                               routed.provider
+                               routed.provider,
+                               correlation
                              )
                            end)
                          end,
@@ -8399,7 +8402,8 @@ defmodule Tightbeam.Gateway do
          harness,
          harness_atom,
          model,
-         provider
+         provider,
+         correlation
        ) do
     handoff = durable_session_handoff(db, session.session_key)
     deliver_opts = if config[:sh], do: [sh: config.sh], else: []
@@ -8423,7 +8427,8 @@ defmodule Tightbeam.Gateway do
                  model,
                  cwd,
                  mcp_servers_for_archetype(session.archetype),
-                 guidance
+                 guidance,
+                 correlation: correlation
                ) do
             {:ok, sid} ->
               {:ok, adapter, sid, handoff.through_seq}
@@ -8802,6 +8807,7 @@ defmodule Tightbeam.Gateway do
   defp apply_model_change(config, db, call, session, new_ref) do
     with {:ok, routed} <- validate_catalog_model(session.host, session.harness, new_ref, false) do
       allow_queued = repair_tune_authorized?(db, call, session)
+      correlation = Tightbeam.RequestContext.capture()
 
       boundary =
         at_tune_boundary(
@@ -8816,7 +8822,8 @@ defmodule Tightbeam.Gateway do
                 session,
                 new_ref,
                 routed.provider,
-                call[:principal] || call.origin
+                call[:principal] || call.origin,
+                correlation
               )
             end)
           end,
@@ -8949,10 +8956,18 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp apply_tuned_model(config, db, session, new_ref, provider, principal) do
+  defp apply_tuned_model(config, db, session, new_ref, provider, principal, correlation) do
     case Org.current_pointer(db, session.session_key) do
       nil ->
-        prepare_initial_tuned_model(config, db, session, new_ref, provider, principal)
+        prepare_initial_tuned_model(
+          config,
+          db,
+          session,
+          new_ref,
+          provider,
+          principal,
+          correlation
+        )
 
       pointer ->
         coordinator = Process.whereis(Tightbeam.AdapterCoordinator)
@@ -9062,7 +9077,15 @@ defmodule Tightbeam.Gateway do
   # A session with no harness pointer has no live runtime whose acceptance can
   # be inferred from the stored projection. Prepare and verify the first
   # runtime before committing the model and pointer together.
-  defp prepare_initial_tuned_model(config, db, session, new_ref, provider, principal) do
+  defp prepare_initial_tuned_model(
+         config,
+         db,
+         session,
+         new_ref,
+         provider,
+         principal,
+         correlation
+       ) do
     harness = Harness.parse!(session.harness).id()
     destination = %{session | model: new_ref, provider: provider}
 
@@ -9079,7 +9102,8 @@ defmodule Tightbeam.Gateway do
                  new_ref,
                  cwd,
                  mcp_servers_for_archetype(session.archetype),
-                 snapshot.guidance
+                 snapshot.guidance,
+                 correlation: correlation
                ) do
             {:ok, sid} ->
               {:ok, adapter, sid}

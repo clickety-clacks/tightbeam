@@ -657,6 +657,9 @@ defmodule Tightbeam.Acp.AdapterTest do
         cmd: [System.find_executable("node"), path, capture_path, fail_mode, gate_mode],
         home: "/tmp",
         cwd: "/tmp",
+        identity_evidence_path: Path.join(run_dir, "identity.jsonl"),
+        connection_generation: 7,
+        loaded_identity: Keyword.get(opts, :loaded_identity),
         name: :"adapter_#{System.unique_integer([:positive])}"
       ]
       |> then(fn adapter_opts ->
@@ -2833,7 +2836,8 @@ defmodule Tightbeam.Acp.AdapterTest do
                Model.new("claude-opus-5-5", effort: "high"),
                "/tmp",
                [],
-               "guidance"
+               "guidance",
+               correlation: %{request_id: "req_exact", listener_generation: "lgen_exact"}
              )
 
     assert {:ok, ^expected} = Adapter.current_model(adapter, "sess-1")
@@ -2847,6 +2851,49 @@ defmodule Tightbeam.Acp.AdapterTest do
     refute Enum.any?(captured_requests(capture_path), fn request ->
              request["method"] == "session/close" and request["sessionId"] == "sess-1"
            end)
+
+    evidence =
+      capture_path
+      |> Path.dirname()
+      |> Path.join("identity.jsonl")
+      |> File.read!()
+      |> String.trim()
+      |> JSON.decode!()
+
+    assert evidence["outcome"] == "verified"
+    assert evidence["correlation"]["requestId"] == "req_exact"
+    assert evidence["correlation"]["listenerGeneration"] == "lgen_exact"
+    assert evidence["correlation"]["sessionId"] == "sess-1"
+    assert evidence["correlation"]["adapterConnectionGeneration"] == 7
+    assert evidence["correlation"]["harnessLaunchId"] == nil
+    assert length(evidence["correlation"]["acpRequestIds"]) == 3
+
+    assert evidence["requested"] == %{
+             "family" => "claude-opus-5-5",
+             "context" => nil,
+             "effort" => "high"
+           }
+
+    assert evidence["joinedRequested"]["context"] == "1m"
+    assert evidence["acceptedReadback"]["model"] == evidence["joinedRequested"]
+
+    assert evidence["writes"] == [
+             %{
+               "requestId" => 3,
+               "configId" => "model",
+               "value" => "claude-opus-5-5[1m]"
+             },
+             %{"requestId" => 4, "configId" => "effort", "value" => "high"}
+           ]
+
+    assert evidence["acceptedReadback"]["modelCurrentValue"] == "opus[1m]"
+    assert evidence["acceptedReadback"]["effortCurrentValue"] == "high"
+    assert evidence["resident"]["modelInfos"] == nil
+    assert evidence["resident"]["modelInfosReason"] == "not_exposed_by_acp_public_response"
+    assert evidence["loadedIdentity"]["acp"]["sha256"] == nil
+
+    assert evidence["loadedIdentity"]["acp"]["reason"] ==
+             "process_loader_attestation_unavailable"
   end
 
   for {name, fail_mode} <- [
@@ -2875,6 +2922,23 @@ defmodule Tightbeam.Acp.AdapterTest do
              end)
 
       refute Adapter.knows_session?(adapter, "sess-1")
+
+      evidence =
+        capture_path
+        |> Path.dirname()
+        |> Path.join("identity.jsonl")
+        |> File.read!()
+        |> String.trim()
+        |> JSON.decode!()
+
+      assert evidence["outcome"] == "mismatch"
+      assert evidence["cleanup"]["status"] == "verified"
+
+      assert evidence["acceptedReadback"]["model"] == %{
+               "family" => "opus",
+               "context" => "1m",
+               "effort" => "high"
+             }
     end
   end
 

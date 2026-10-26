@@ -1564,6 +1564,8 @@ defmodule Tightbeam.Placement do
       home: home,
       cwd: config.cwd,
       stderr_path: stderr_path,
+      identity_evidence_path:
+        Path.join([config.base_dir, "diagnostics", "acp-model-identity-v1.log"]),
       process_ssh: host_config.ssh,
       process_identity_dir: process_identity_dir,
       process_helper: Path.join(host_config[:cli_bin] || config.cli_bin, "tightbeam"),
