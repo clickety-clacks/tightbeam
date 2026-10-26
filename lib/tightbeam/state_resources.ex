@@ -103,6 +103,7 @@ defmodule Tightbeam.StateResources do
       ~w(sessionKey reason startedAt expiresAt hardDeadline updatedAt rowVersion),
     "config" => ~w(key value updatedAt rowVersion),
     "host environment" => ~w(host harness name value valuePresent updatedAt rowVersion),
+    "harness processes" => ~w(id host harness pid state createdAt resolvedAt),
     "hosts" => ~w(host rowVersion),
     "identity" => ~w(name liveRevision state sessionRevisions staleness conflicts rowVersion),
     "kungfu" =>
@@ -243,6 +244,12 @@ defmodule Tightbeam.StateResources do
       booleans: ~w(valuePresent),
       nullable: ~w(value)
     },
+    "harness processes" => %{
+      strings: ~w(id host harness state),
+      integers: ~w(pid createdAt resolvedAt),
+      booleans: [],
+      nullable: ~w(pid resolvedAt)
+    },
     "hosts" => %{
       strings: ~w(host),
       integers: ~w(rowVersion),
@@ -348,6 +355,8 @@ defmodule Tightbeam.StateResources do
     {"artifacts", "contentSha256Status"} => ~w(none verified attested-not-verified),
     {"artifacts", "recordedTurnEvidence"} => ~w(tool-call-observed session-concurrent none),
     {"artifacts", "state"} => ~w(in-workspace archived released),
+    {"harness processes", "state"} =>
+      ~w(launching running park_requested closed_gracefully killed kill_failed exited),
     {"transcript messages", "role"} => ~w(user assistant),
     {"transcript messages", "attentionTier"} => [-1, 0, 1],
     {"identity", "state"} => ~w(ready relearn_conflicted),
@@ -1472,6 +1481,29 @@ defmodule Tightbeam.StateResources do
     )
   end
 
+  @doc "Closed HarnessProcesses item serializer."
+  def harness_process(row) do
+    reject_public_shape_drift!(row, "harness processes")
+    state = required_string!(row, :state)
+
+    unless state in ~w(launching running park_requested closed_gracefully killed kill_failed exited) do
+      raise ArgumentError, "harness process state is outside its normative enum domain"
+    end
+
+    exact!(
+      "harness processes",
+      %{
+        "id" => required_string!(row, :launch_id),
+        "host" => required_string!(row, :host),
+        "harness" => required_string!(row, :harness),
+        "pid" => nullable_integer!(value(row, :os_pid), "pid"),
+        "state" => state,
+        "createdAt" => required_integer!(row, :created_at),
+        "resolvedAt" => nullable_integer!(value(row, :resolved_at), "resolvedAt")
+      }
+    )
+  end
+
   @doc "Closed user serializer shared by user.added and user.promoted."
   def user(row) do
     reject_public_shape_drift!(row, "users")
@@ -1923,6 +1955,12 @@ defmodule Tightbeam.StateResources do
       _ -> raise ArgumentError, "#{field} must be an integer"
     end
   end
+
+  defp nullable_integer!(nil, _field), do: nil
+  defp nullable_integer!(value, _field) when is_integer(value), do: value
+
+  defp nullable_integer!(_value, field),
+    do: raise(ArgumentError, "#{field} must be an integer or null")
 
   defp required_version!(row) do
     case value(row, :row_version) do
