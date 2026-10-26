@@ -2209,6 +2209,7 @@ defmodule Tightbeam.DeliverableContractTest do
   defp synthetic_reviewed_spec_fixture! do
     path =
       Path.expand("fixtures/deliverable_contract/synthetic_reviewed_spec_history.json", __DIR__)
+
     bytes = File.read!(path)
 
     assert :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower) ==
