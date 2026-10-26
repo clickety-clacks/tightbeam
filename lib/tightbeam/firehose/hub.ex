@@ -708,18 +708,39 @@ defmodule Tightbeam.Firehose.Hub do
     }
   end
 
-  defp overflow_matches?(_notices, :pending, _subscriptions, _user_id, _principal_kind, _principal_id),
-    do: false
+  defp overflow_matches?(
+         _notices,
+         :pending,
+         _subscriptions,
+         _user_id,
+         _principal_kind,
+         _principal_id
+       ),
+       do: false
 
-  defp overflow_matches?(_notices, :all, _subscriptions, _user_id, _principal_kind, _principal_id),
-    do: true
+  defp overflow_matches?(
+         _notices,
+         :all,
+         _subscriptions,
+         _user_id,
+         _principal_kind,
+         _principal_id
+       ),
+       do: true
 
-  defp overflow_matches?(:unknown, _mode, _subscriptions, _user_id, _principal_kind, _principal_id),
-    do: true
+  defp overflow_matches?(
+         :unknown,
+         _mode,
+         _subscriptions,
+         _user_id,
+         _principal_kind,
+         _principal_id
+       ),
+       do: true
 
   defp overflow_matches?(_notices, _mode, subscriptions, _user_id, _principal_kind, _principal_id)
        when map_size(subscriptions) == 0,
-    do: true
+       do: true
 
   defp overflow_matches?(notices, _mode, subscriptions, user_id, principal_kind, principal_id)
        when is_list(notices) do
@@ -733,8 +754,15 @@ defmodule Tightbeam.Firehose.Hub do
     end)
   end
 
-  defp overflow_matches?(_notices, _mode, _subscriptions, _user_id, _principal_kind, _principal_id),
-    do: false
+  defp overflow_matches?(
+         _notices,
+         _mode,
+         _subscriptions,
+         _user_id,
+         _principal_kind,
+         _principal_id
+       ),
+       do: false
 
   defp matches_subscription?(notice, subscriptions),
     do: Enum.any?(subscriptions, fn {_id, filters} -> matches?(notice, filters) end)
@@ -756,12 +784,14 @@ defmodule Tightbeam.Firehose.Hub do
 
   defp sync_socket_filters(state, pid) do
     case state.sockets[pid] do
-      nil -> :ets.delete(state.ingress, {:socket, pid})
+      nil ->
+        :ets.delete(state.ingress, {:socket, pid})
+
       socket ->
         :ets.insert(
           state.ingress,
-          {{:socket, pid}, socket.mode, socket_filters(socket), socket.user_id, socket.principal_kind,
-           socket.principal_id}
+          {{:socket, pid}, socket.mode, socket_filters(socket), socket.user_id,
+           socket.principal_kind, socket.principal_id}
         )
     end
   end
