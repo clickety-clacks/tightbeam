@@ -460,7 +460,9 @@ defmodule Tightbeam.ToolCallsTest do
       attentionTier messageType markerKind markerFrom markerTo
     )
 
-    message_rows_sql = "SELECT " <> Enum.join(message_columns, ", ") <> " FROM messages ORDER BY seq"
+    message_rows_sql =
+      "SELECT " <> Enum.join(message_columns, ", ") <> " FROM messages ORDER BY seq"
+
     {:ok, message_rows_before} = DB.query(ctx.db, message_rows_sql, [])
 
     {:ok, [[root_shape_before]]} = DB.query(ctx.db, "SELECT shape FROM schema_stamp", [])
@@ -497,7 +499,10 @@ defmodule Tightbeam.ToolCallsTest do
     assert index_names == [["messages_client_dedupe"], ["messages_session"]]
 
     {:ok, session_index_columns} = DB.query(ctx.db, "PRAGMA index_info(messages_session)", [])
-    assert Enum.map(session_index_columns, fn [_seq, _cid, name] -> name end) == ["sessionKey", "seq"]
+    assert Enum.map(session_index_columns, fn [_seq, _cid, name] -> name end) == [
+             "sessionKey",
+             "seq"
+           ]
 
     {:ok, dedupe_index_columns} =
       DB.query(ctx.db, "PRAGMA index_info(messages_client_dedupe)", [])
@@ -509,7 +514,7 @@ defmodule Tightbeam.ToolCallsTest do
     assert root_shape_after == root_shape_before
 
     {:ok, [[0, "tool-call-transition-v1-011"]]} =
-             DB.query(ctx.db, "SELECT id, shape FROM tool_call_transition_migration", [])
+      DB.query(ctx.db, "SELECT id, shape FROM tool_call_transition_migration", [])
 
     {:ok, [[message_sql]]} =
       DB.query(
