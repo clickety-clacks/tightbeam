@@ -1690,6 +1690,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     )
 
     anonymous_sessions = get_without_authorization(ctx, "/api/sessions?limit=1")
+    anonymous_all_sessions = get_without_authorization(ctx, "/api/sessions")
     org_sessions = get(ctx, "/api/sessions?limit=1", ctx.opts[:cli_token])
 
     assert anonymous_sessions.status == 200
@@ -1888,7 +1889,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       assert session_response.status == 200
 
       assert JSON.decode!(session_response.resp_body)["items"] ==
-               JSON.decode!(anonymous_sessions.resp_body)["items"]
+               JSON.decode!(anonymous_all_sessions.resp_body)["items"]
 
       assert message_response.status == 200
 
@@ -1908,7 +1909,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         get_without_authorization(ctx, message_path <> "?asUser=flynn", headers)
 
       assert selected_session_fallback.status == 200
-      assert selected_session_fallback.resp_body == anonymous_sessions.resp_body
+      assert selected_session_fallback.resp_body == anonymous_all_sessions.resp_body
       assert selected_message_fallback.status == 200
 
       assert JSON.decode!(selected_message_fallback.resp_body)["items"] ==
@@ -3846,7 +3847,14 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       assert raw_json_value(as_user.resp_body, "item") == item_bytes
 
       unauthenticated = get(ctx, path, "")
-      assert_error(unauthenticated, 401, resource, "auth_failed")
+
+      if resource == "transcript messages" do
+        assert unauthenticated.status == 200
+        assert unauthenticated.resp_body == get_without_authorization(ctx, path).resp_body
+      else
+        assert_error(unauthenticated, 401, resource, "auth_failed")
+      end
+
       assert_application_headers(unauthenticated)
 
       unsupported_filter = get(ctx, path <> "?unsupported=value", List.first(bearers))
