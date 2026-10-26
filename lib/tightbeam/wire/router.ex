@@ -982,7 +982,9 @@ defmodule Tightbeam.Wire.Router do
         core_detail_item(conn, spec, key, principal)
       end
     else
-      {:error, :not_found} -> state_not_found(conn, spec.resource)
+      {:error, :not_found} ->
+        state_not_found(conn, spec.resource)
+
       {:error, status, code, message} ->
         state_error(conn, spec.resource, status, code, message)
     end
@@ -1165,7 +1167,9 @@ defmodule Tightbeam.Wire.Router do
 
       user_id ->
         case resolve_cli_as_user(auth, user_id) do
-          {:ok, principal} -> {:ok, state_principal_view(principal, conn)}
+          {:ok, principal} ->
+            {:ok, state_principal_view(principal, conn)}
+
           {:error, _status, _code, _message} ->
             state_principal(auth, Map.delete(query, "asUser"), conn)
         end
