@@ -8,7 +8,7 @@ Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 Application.put_env(:tightbeam, :fixture_harness, true)
 Application.put_env(:tightbeam, :local_host_name, "testhost")
-alias Tightbeam.{Boot, DB, Harness, Model}
+alias Tightbeam.{Boot, DB, Harness, Model, Org, ReadMarkers}
 
 {:ok, db} =
   DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [])
@@ -88,6 +88,68 @@ try do
   {:ok, device} =
     SimClient.pair("127.0.0.1", port, device_id: "cold-firehose", claimed_name: "Synthetic")
 
+  session =
+    Org.create(DB, %{
+      session_key: "agent:observer-worker",
+      display_name: "Observer fixture",
+      owner_user_id: device.user_id,
+      origin: "user:#{device.user_id}",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+  user_message_id = "observer-question"
+  reply_message_id = "observer-answer"
+
+  {:ok, _} =
+    DB.query(
+      DB,
+      """
+      INSERT INTO messages
+        (id, sessionKey, role, content, timestamp, sender, llmVisibleMessageId, attachments)
+      VALUES (?1, ?2, 'user', 'observer question', 1, ?3, ?1, '[]')
+      """,
+      [user_message_id, session.session_key, "user:#{device.user_id}"]
+    )
+
+  {:ok, _} =
+    DB.query(
+      DB,
+      """
+      INSERT INTO messages
+        (id, sessionKey, role, content, timestamp, sender, replyToMessageId,
+         llmVisibleMessageId, attachments)
+      VALUES (?1, ?2, 'assistant', 'observer answer', 2, 'agent:observer-worker', ?3, ?1, '[]')
+      """,
+      [reply_message_id, session.session_key, user_message_id]
+    )
+
+  {:ok, true, _marker} =
+    ReadMarkers.set(DB, device.user_id, "chat:observer", "observer-answer")
+
+  %{"cliToken" => cli_token} = base |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
+
+  {:ok, observer_ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
+
+  try do
+    :ok =
+      WS.send_text(
+        observer_ws,
+        JSON.encode!(%{
+          "type" => "subscribe",
+          "protocolVersion" => 2,
+          "subscriptionId" => "credentialless",
+          "filters" => %{"classes" => ["work_item.created"]}
+        })
+      )
+
+    {:ok, {:text, observer_ready}, observer_ws} = WS.recv(observer_ws, 2_000)
+    assert %{"type" => "subscription_ready", "subscriptionId" => "credentialless"} =
+             JSON.decode!(observer_ready)
+
   {:ok, ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
 
   try do
@@ -108,10 +170,8 @@ try do
 
     {:ok, {:text, ready}, ws} = WS.recv(ws, 2_000)
     assert %{"type" => "subscription_ready"} = JSON.decode!(ready)
-    %{"cliToken" => token} = base |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
-
     headers = [
-      {~c"authorization", String.to_charlist("Bearer " <> token)},
+      {~c"authorization", String.to_charlist("Bearer " <> cli_token)},
       {~c"x-tightbeam-cli-version",
        String.to_charlist(Tightbeam.CliCompatibility.required_version())}
     ]
@@ -141,6 +201,15 @@ try do
              "payload" => item
            } = JSON.decode!(raw)
 
+    {:ok, {:text, observer_raw}, observer_ws} = WS.recv(observer_ws, 2_000)
+
+    assert %{
+             "type" => "change",
+             "class" => "work_item.created",
+             "refs" => %{"workItemId" => ^id},
+             "payload" => ^item
+           } = JSON.decode!(observer_raw)
+
     {:ok, {{_, 200, _}, _, detail}} =
       :httpc.request(
         :get,
@@ -151,12 +220,61 @@ try do
       )
 
     assert JSON.decode!(detail)["item"] == item
+
+    get_json = fn path, auth_headers ->
+      {:ok, {{_, 200, _}, _, response}} =
+        :httpc.request(
+          :get,
+          {String.to_charlist("http://127.0.0.1:#{port}" <> path), auth_headers},
+          [timeout: 2_000],
+          body_format: :binary
+        )
+
+      JSON.decode!(response)
+    end
+
+    authenticated_headers = [
+      {~c"authorization", String.to_charlist("Bearer " <> cli_token)}
+    ]
+
+    anonymous_sessions = get_json.("/api/sessions", [])
+    authenticated_sessions = get_json.("/api/sessions", authenticated_headers)
+    assert anonymous_sessions["items"] == authenticated_sessions["items"]
+    assert Enum.any?(anonymous_sessions["items"], &(&1["sessionKey"] == session.session_key))
+
+    encoded_session_key = URI.encode_www_form(session.session_key)
+    session_path = "/api/sessions/#{encoded_session_key}"
+    assert get_json.(session_path, []) == get_json.(session_path, authenticated_headers)
+
+    messages_path = session_path <> "/messages"
+    anonymous_messages = get_json.(messages_path, [])
+    authenticated_messages = get_json.(messages_path, authenticated_headers)
+    assert anonymous_messages["items"] == authenticated_messages["items"]
+    assert Enum.map(anonymous_messages["items"], & &1["id"]) == [user_message_id, reply_message_id]
+
+    message_path = messages_path <> "/#{reply_message_id}"
+
+    assert get_json.(message_path, []) == get_json.(message_path, authenticated_headers)
+
+    as_user = URI.encode_www_form(device.user_id)
+    marker_collection = "/api/read-markers?asUser=#{as_user}"
+    anonymous_markers = get_json.(marker_collection, [])
+    authenticated_markers = get_json.(marker_collection, authenticated_headers)
+    assert anonymous_markers["items"] == authenticated_markers["items"]
+    assert Enum.any?(anonymous_markers["items"], &(&1["scopeKey"] == "chat:observer"))
+
+    encoded_scope = URI.encode_www_form("chat:observer")
+    marker_detail = "/api/read-markers/#{encoded_scope}?asUser=#{as_user}"
+    assert get_json.(marker_detail, []) == get_json.(marker_detail, authenticated_headers)
+
     assert File.regular?(Path.join(base, "state.db"))
     assert File.read!(Path.join(base, "build-owner.json")) == marker
     refute File.exists?(tripwire)
-    :ok = WS.close(ws)
   after
     WS.close(ws)
+  end
+  after
+    WS.close(observer_ws)
   end
 after
   :ok = Application.stop(:tightbeam)
