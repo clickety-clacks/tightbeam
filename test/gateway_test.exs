@@ -3712,6 +3712,7 @@ defmodule Tightbeam.GatewayTest do
              })
 
     owner_user_id = ctx.device.user_id
+    process_work_item = create_work_item(ctx.db, "Process role creation")
 
     process_created =
       spawn.(%{
@@ -3722,6 +3723,7 @@ defmodule Tightbeam.GatewayTest do
           display_name: "Automation Builder",
           handle: "automation-builder",
           owner_user_id: owner_user_id,
+          work_item_id: process_work_item.id,
           idempotency_key: "spawn-automation-builder"
         }
       })

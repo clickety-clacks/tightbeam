@@ -244,17 +244,22 @@ defmodule Tightbeam.RailsTest do
   end
 
   defp assert_unavailable(expected \\ nil, load) do
-    log =
+    raw_log =
       ExUnit.CaptureLog.capture_log(fn ->
         result = load.()
         assert is_list(result)
         assert Enum.all?(result, &(&1.pattern == ".*" and &1.action == nil))
       end)
+
+    log =
+      raw_log
+      |> String.replace_prefix("\e[33m\n", "\n")
+      |> String.replace_suffix("\e[0m", "")
       |> String.trim()
 
     assert log =~ "unavailable"
     if is_struct(expected, Regex), do: assert(log =~ expected)
     if is_binary(expected), do: assert(log =~ expected)
-    %{message: log}
+    %{message: raw_log}
   end
 end

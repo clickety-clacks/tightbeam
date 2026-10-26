@@ -62,7 +62,7 @@ defmodule Tightbeam.EventLog do
           principal: String.t() | nil
         }
 
-  @ddl """
+  @legacy_events_ddl """
   CREATE TABLE IF NOT EXISTS events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     ts         INTEGER NOT NULL,
@@ -73,6 +73,23 @@ defmodule Tightbeam.EventLog do
     sessionKey TEXT,
     payload    TEXT    NOT NULL DEFAULT 'null'
   );
+  """
+
+  @events_ddl """
+  CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         INTEGER NOT NULL,
+    kind       TEXT    NOT NULL CHECK (kind IN ('verb','denied')),
+    verb       TEXT    NOT NULL,
+    origin     TEXT    NOT NULL,
+    principal  TEXT,
+    sessionKey TEXT,
+    payload    TEXT    NOT NULL DEFAULT 'null',
+    transportSessionKey TEXT
+  );
+  """
+
+  @shared_ddl """
   CREATE INDEX IF NOT EXISTS events_session ON events (sessionKey, id);
 
   CREATE TABLE IF NOT EXISTS lifecycle_events (
@@ -91,7 +108,10 @@ defmodule Tightbeam.EventLog do
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @events_ddl <> @shared_ddl)
+
+  @doc false
+  def ensure_pre_actor_schema(db), do: DB.execute(db, @legacy_events_ddl <> @shared_ddl)
 
   ## Verb events (dispatch appends these)
 
@@ -245,8 +265,14 @@ defmodule Tightbeam.EventLog do
 
   @doc false
   def migrate_transport_session_attribution_in_txn(%Txn{} = txn) do
-    Txn.q(txn, "ALTER TABLE events ADD COLUMN transportSessionKey TEXT")
-    :ok
+    if Enum.any?(Txn.q(txn, "PRAGMA table_info(events)"), fn [_cid, name | _] ->
+         name == "transportSessionKey"
+       end) do
+      :ok
+    else
+      Txn.q(txn, "ALTER TABLE events ADD COLUMN transportSessionKey TEXT")
+      :ok
+    end
   end
 
   @doc "Complete an audit row written in the handler's transaction with the known outcome."

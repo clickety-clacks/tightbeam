@@ -1906,6 +1906,7 @@ defmodule Tightbeam.Schema do
 
     Enum.each(@schema_modules, fn
       Tightbeam.Ledger -> :ok
+      Tightbeam.EventLog -> :ok = Tightbeam.EventLog.ensure_pre_actor_schema(db)
       Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
       Tightbeam.NoticeBatcher -> :ok
       Tightbeam.HarnessProcess -> :ok = Tightbeam.HarnessProcess.ensure_historical_schema(db)
@@ -1918,6 +1919,7 @@ defmodule Tightbeam.Schema do
 
     Enum.each(@schema_modules, fn
       Tightbeam.Ledger -> :ok
+      Tightbeam.EventLog -> :ok = Tightbeam.EventLog.ensure_pre_actor_schema(db)
       Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
       Tightbeam.NoticeBatcher -> :ok
       Tightbeam.HarnessProcess -> :ok
@@ -2009,6 +2011,7 @@ defmodule Tightbeam.Schema do
            ["PRAGMA legacy_alter_table=OFF", "PRAGMA foreign_keys=ON"],
            fn txn ->
              :ok = Txn.exec(txn, marker_ddl)
+             :ok = Tightbeam.EventLog.migrate_transport_session_attribution_in_txn(txn)
 
              case Txn.q(txn, "SELECT singleton,shape FROM actor_attribution_schema_stamp") do
                [] ->
@@ -2024,7 +2027,6 @@ defmodule Tightbeam.Schema do
 
                      :ok = Tightbeam.Roles.migrate_actor_attribution_in_txn(txn)
                      :ok = migrate_work_item_body_actor_attribution_in_txn(txn)
-                     :ok = Tightbeam.EventLog.migrate_transport_session_attribution_in_txn(txn)
                      :ok = Txn.exec(txn, "ALTER TABLE sessions ADD COLUMN createdByUser TEXT")
                      :ok = Txn.exec(txn, "ALTER TABLE sessions ADD COLUMN createdBySession TEXT")
                      :ok = Txn.exec(txn, "ALTER TABLE sessions ADD COLUMN createdByProcess TEXT")
@@ -5243,6 +5245,9 @@ defmodule Tightbeam.Schema do
   # the final schema pass installs the clear-attempt table after migrations.
   defp bootstrap_module(db, Tightbeam.Ledger, _current?),
     do: Tightbeam.Ledger.ensure_historical_schema(db)
+
+  defp bootstrap_module(db, Tightbeam.EventLog, _current?),
+    do: Tightbeam.EventLog.ensure_pre_actor_schema(db)
 
   # Health redelivery is installed only after all exact predecessor migrations
   # succeed. Existing wake storage still bootstraps before those migrations.

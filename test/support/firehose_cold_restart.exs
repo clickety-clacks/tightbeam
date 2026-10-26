@@ -100,7 +100,13 @@ Application.put_env(:tightbeam, :drain_timeout_ms, 1_000)
 if missing_executable do
   empty_bin = Path.join(base, "empty-executable-path")
   File.mkdir_p!(empty_bin)
+  # Readiness vectors need a local SSH path to construct their inert command.
+  # Keep only this non-networking placeholder alongside the absent harness CLIs.
+  ssh_path = Path.join(empty_bin, "ssh")
+  File.write!(ssh_path, "#!/bin/sh\nexit 64\n")
+  File.chmod!(ssh_path, 0o755)
   System.put_env("PATH", empty_bin)
+  ^ssh_path = System.find_executable("ssh")
 
   for module <- Harness.all() do
     nil = System.find_executable(module.cli_binary())

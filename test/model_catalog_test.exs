@@ -309,9 +309,12 @@ defmodule Tightbeam.ModelCatalogTest do
         send(pid, {:stray, :message})
         assert :sys.get_state(pid) == before
       end)
+      |> String.replace_prefix("\e[33m\n", "\n")
+      |> String.replace_suffix("\e[0m", "")
+      |> String.trim()
 
     assert log =~ "model catalog ignored unexpected message: {:stray, :message}"
-    assert length(String.split(String.trim(log), "\n")) == 1
+    assert length(String.split(log, "\n")) == 1
   end
 
   defp drain_host_reads do
