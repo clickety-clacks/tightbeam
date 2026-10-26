@@ -2873,7 +2873,7 @@ mod tests {
             body(&[
                 "wake",
                 "--user",
-                "mike",
+                "sampleuser",
                 "--prompt",
                 "go",
                 "--at",
@@ -2881,13 +2881,13 @@ mod tests {
                 "--as-process",
                 "cron"
             ]),
-            r#"{"asProcess":"cron","verb":"wake","userId":"mike","params":{"prompt":"go","at":123}}"#
+            r#"{"asProcess":"cron","verb":"wake","userId":"sampleuser","params":{"prompt":"go","at":123}}"#
         );
         assert_eq!(
             body(&[
                 "wake",
                 "--user",
-                "mike",
+                "sampleuser",
                 "--prompt",
                 "go",
                 "--at",
@@ -2895,13 +2895,13 @@ mod tests {
                 "--as-user",
                 "flynn"
             ]),
-            r#"{"asUser":"flynn","verb":"wake","userId":"mike","params":{"prompt":"go","at":1}}"#
+            r#"{"asUser":"flynn","verb":"wake","userId":"sampleuser","params":{"prompt":"go","at":1}}"#
         );
         assert_eq!(
             body(&[
                 "wake",
                 "--user",
-                "mike",
+                "sampleuser",
                 "--prompt",
                 "go",
                 "--at",
@@ -2909,7 +2909,7 @@ mod tests {
                 "--as-user",
                 "flynn"
             ]),
-            r#"{"asUser":"flynn","verb":"wake","userId":"mike","params":{"prompt":"go","at":16}}"#
+            r#"{"asUser":"flynn","verb":"wake","userId":"sampleuser","params":{"prompt":"go","at":16}}"#
         );
     }
 

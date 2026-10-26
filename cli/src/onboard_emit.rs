@@ -377,7 +377,7 @@ mod tests {
             code: "VG6S-L35ON".to_owned(),
         };
         let notified = Notified::Waked {
-            user_id: "mike".to_owned(),
+            user_id: "sampleuser".to_owned(),
             wake_id: Some("w_1".to_owned()),
         };
         let file = delivery_file_json(
@@ -394,7 +394,7 @@ mod tests {
         assert_eq!(d["mintedAtMs"], 1000);
         assert_eq!(d["expiresAtMs"], 901_000);
         assert_eq!(d["notification"]["notified"], true);
-        assert_eq!(d["notification"]["userId"], "mike");
+        assert_eq!(d["notification"]["userId"], "sampleuser");
         assert_eq!(d["notification"]["wakeId"], "w_1");
     }
 

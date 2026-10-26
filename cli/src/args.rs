@@ -622,7 +622,7 @@ IDENTITY (optional inside a session workdir; otherwise required):
   --as <role>          act as a role you currently hold. Use this when YOU (an
                        agent) run the command. The role must be bound to your
                        active session.
-                       To reply to [from user:mike], use wake --user mike; to
+                       To reply to [from user:sampleuser], use wake --user sampleuser; to
                        reply to [from agent:notetaker], use wake --role
                        notetaker. [from process:x] cannot be woken.
   --as-user <userId>   act as a human user (e.g. "flynn"). Use this for
@@ -4822,10 +4822,10 @@ mod tests {
                 "--rationale",
                 "dependency first",
                 "--as-user",
-                "mike",
+                "sampleuser",
             ])),
             Ok(Command::OperatorRule {
-                identity: Identity::User("mike".to_owned()),
+                identity: Identity::User("sampleuser".to_owned()),
                 request_id: "dr_1".to_owned(),
                 decision: None,
                 response: Some("ship after 013".to_owned()),
