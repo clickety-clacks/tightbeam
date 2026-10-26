@@ -830,7 +830,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
   end
 
-  test "a committed session-restart marker publishes one canonical message.created" do
+  test "a committed session-restart marker publishes one canonical transition.recorded" do
     db = :firehose_session_restart_marker_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
@@ -857,7 +857,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     :ok =
       Hub.subscribe(Hub, self(), "session-restart-markers", %{
-        "classes" => ["message.created"],
+        "classes" => ["transition.recorded", "message.created"],
         "sessionKey" => session_key
       })
 
@@ -870,12 +870,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
                           to: "new-session"
                         })
 
-               refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
+               refute_receive {:firehose_notice, %{"class" => "transition.recorded"}}, 0
                {:appended, marker}
              end)
 
     notice = receive_notice()
-    assert notice["class"] == "message.created"
+    assert notice["class"] == "transition.recorded"
     assert notice["refs"]["messageId"] == marker.id
     assert notice["refs"]["sessionKey"] == session_key
     assert notice["refs"]["ownerUserId"] == "flynn"
@@ -896,6 +896,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     item_bytes = StateResources.encode_item("transcript messages", canonical)
     assert String.contains?(Publisher.encode_wire_notice(notice), "\"payload\":" <> item_bytes)
 
+    refute_receive {:firehose_notice, %{"class" => "transition.recorded"}}, 0
     refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
   end
 
@@ -968,7 +969,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
       |> Tightbeam.StateResources.query_message(marker.id)
       |> Tightbeam.StateResources.message()
 
-    assert marker_notice["class"] == "message.created"
+    assert marker_notice["class"] == "transition.recorded"
     assert marker_notice["payload"] == marker_canonical
 
     assert marker_notice["payload"]["marker"] == %{

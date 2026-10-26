@@ -59,6 +59,9 @@ defmodule Tightbeam.Firehose.Registry do
     {"artifact.released", "artifacts", "upsert", "artifactId"},
     {"read_marker.updated", "read-markers", "upsert", "scopeKey"},
     {"message.created", "messages", "upsert", "messageId"},
+    {"transition.recorded", "messages", "upsert", "messageId"},
+    {"tool_call.started", "tool calls", "upsert", "toolCallId"},
+    {"tool_call.ended", "tool calls", "upsert", "toolCallId"},
     {"condition_fact.filed", "condition-facts", "upsert", "factId"},
     {"critical_lease.updated", "critical-state", "upsert", "sessionKey"}
   ]
@@ -199,6 +202,7 @@ defmodule Tightbeam.Firehose.Registry do
     "artifacts" => :artifact,
     "read-markers" => :read_marker,
     "messages" => :message,
+    "tool calls" => :tool_call,
     "condition-facts" => :condition_fact,
     "critical-state" => :critical_state,
     "config" => :config,
@@ -253,6 +257,30 @@ defmodule Tightbeam.Firehose.Registry do
             version_source: "append_only"
           })
           |> Map.put(:primary_refs, ["messageId", "sessionKey"])
+        end)
+        |> Map.update!("transition.recorded", fn row ->
+          row
+          |> Map.merge(%{
+            query: :query_message,
+            visibility: :visible?,
+            rebuild: true,
+            version_source: "append_only"
+          })
+          |> Map.put(:primary_refs, ["messageId", "sessionKey"])
+        end)
+        |> then(fn rows ->
+          Enum.reduce(~w(tool_call.started tool_call.ended), rows, fn class, rows ->
+            Map.update!(rows, class, fn row ->
+              row
+              |> Map.merge(%{
+                query: :query_tool_call,
+                visibility: :visible?,
+                rebuild: true,
+                version_source: "tool_calls.rowVersion"
+              })
+              |> Map.put(:primary_refs, ["toolCallId", "sessionKey"])
+            end)
+          end)
         end)
         |> Map.update!("session.updated", fn row ->
           Map.merge(row, %{
