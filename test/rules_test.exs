@@ -1081,8 +1081,12 @@ defmodule Tightbeam.RulesTest do
     assert malformed_trace.resolver_arity == 4
     assert malformed_trace.normalized_submitted_refs == %{status: "invalid"}
 
-    assert malformed_trace.effective_refs ==
-             Enum.map(native_refs, &Map.put(&1, "verifiedRefCommit", &1["commit"]))
+    assert [effective_ref] = malformed_trace.effective_refs
+    assert effective_ref["repo"] == "sirius:/srv/tightbeam"
+    assert effective_ref["repoOriginalBytes"] == 21
+    assert effective_ref["repoTruncated"] == false
+    assert effective_ref["repoSha256"] == sha256("sirius:/srv/tightbeam")
+    assert effective_ref["verifiedRefCommit"] == String.duplicate("a", 40)
 
     assert malformed_trace.selected_review_assignment_id == revoked_review.id
     assert malformed_trace.selected_review_state == "closed"
@@ -1121,16 +1125,33 @@ defmodule Tightbeam.RulesTest do
     seed_commit_ref_correction!(ctx, producer, native_refs)
     review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
     insert_bound_review_verdict!(ctx, review, "reviewed-clean", native_refs)
+    completion_attest_id = "att_#{Tightbeam.Id.uuid4()}"
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests (id,assignmentId,kind,bySession,ts) VALUES (?1,?2,'completion',?3,1)",
+               [completion_attest_id, review.id, review.holderKey]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET state='closed',outcome='completed',closedAt=1,closedBySession=?1,closingAttestId=?2 WHERE id=?3",
+               [review.holderKey, completion_attest_id, review.id]
+             )
 
     put_raw(ctx, review_gate_rule())
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    long_repo = "sirius:/srv/" <> String.duplicate("private-segment-", 40)
 
     mismatch =
       p3_call("attest", {:session, holder.session_key}, %{
         assignment_id: producer.id,
         kind: "completion",
         commit_refs: [
-          %{repo: "sirius:/srv/tightbeam", commit: String.duplicate("b", 40)}
+          %{repo: long_repo, commit: String.duplicate("b", 40)}
         ]
       })
       |> Map.put(:request_id, "req_trace_1")
@@ -1140,6 +1161,15 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, ctx.handlers, mismatch)
 
     assert mismatch_trace.qualification_stage.status == "passed"
+    assert mismatch_trace.selected_review_state == "closed"
+    assert mismatch_trace.selected_review_outcome == "completed"
+
+    assert [submitted_ref] = mismatch_trace.normalized_submitted_refs
+    assert byte_size(submitted_ref["repo"]) <= 256
+    assert submitted_ref["repoOriginalBytes"] == byte_size(long_repo)
+    assert submitted_ref["repoTruncated"] == true
+    assert submitted_ref["repoSha256"] == sha256(long_repo)
+    refute submitted_ref["repo"] == long_repo
 
     assert mismatch_trace.preflight_stage == %{
              status: "failed",
@@ -1150,6 +1180,10 @@ defmodule Tightbeam.RulesTest do
     assert mismatch_trace.request_id == "req_trace_1"
     assert mismatch_trace.listener_generation == 7
     assert Assignments.attest_count(ctx.db, producer.id) == 0
+
+    assert [%{rule_trace: persisted}] = EventLog.rail_denials(ctx.db, 0, 10)
+    assert get_in(persisted, ["normalized_submitted_refs", Access.at(0), "repoTruncated"])
+    refute JSON.encode!(persisted) =~ long_repo
 
     assert {:ok, [["open"]]} =
              DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [producer.id])
@@ -1792,6 +1826,9 @@ defmodule Tightbeam.RulesTest do
 
     work_item_id
   end
+
+  defp sha256(value),
+    do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
 
   defp insert_bound_review_verdict!(ctx, review, verdict_kind, native_refs) do
     attest_id = "att_#{Tightbeam.Id.uuid4()}"

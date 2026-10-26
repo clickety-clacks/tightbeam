@@ -1155,7 +1155,7 @@ defmodule Tightbeam.Assignments do
   @doc "Return bounded resolver inputs and stage outcomes without changing review selection."
   @spec qualifying_review_trace(DB.server(), String.t(), String.t(), term()) :: map()
   def qualifying_review_trace(db, assignment_id, assignment_holder_key, commit_refs) do
-    submitted = trace_submitted_commit_refs(commit_refs)
+    submitted = canonical_trace_input(commit_refs)
 
     {:ok, rows} =
       DB.query(
@@ -1175,7 +1175,7 @@ defmodule Tightbeam.Assignments do
         [assignment_id]
       )
 
-    corrected_refs = effective_subject_trace_refs(db, assignment_id)
+    corrected_refs = effective_subject_refs(db, assignment_id)
     effective_refs = corrected_refs || submitted
 
     case rows do
@@ -1183,7 +1183,11 @@ defmodule Tightbeam.Assignments do
         stored_refs = canonical_stored_commit_refs(encoded_refs)
         independent? = holder != assignment_holder_key
         clean? = verdict == "reviewed-clean"
-        active? = state == "open" and is_nil(outcome)
+
+        valid_lifecycle? =
+          (state == "open" and is_nil(outcome)) or
+            (state == "closed" and outcome == "completed")
+
         decoded_revision = decode_trace_revision(reviewed_revision)
 
         subject_bound? =
@@ -1195,7 +1199,7 @@ defmodule Tightbeam.Assignments do
               true
           end
 
-        qualification_passed? = independent? and clean? and active? and subject_bound?
+        qualification_passed? = independent? and clean? and valid_lifecycle? and subject_bound?
 
         expected_compatibility_refs =
           case effective_refs do
@@ -1213,20 +1217,20 @@ defmodule Tightbeam.Assignments do
 
         %{
           resolver_arity: 4,
-          normalized_submitted_refs: submitted,
-          effective_refs: effective_refs,
+          normalized_submitted_refs: trace_commit_refs(submitted),
+          effective_refs: trace_commit_refs(effective_refs),
           selected_review_assignment_id: review_id,
           selected_review_attest_id: attest_id,
           selected_review_holder_key: holder,
           selected_review_state: state,
           selected_review_outcome: outcome,
           selected_verdict_kind: verdict,
-          reviewed_revision: decoded_revision,
+          reviewed_revision: trace_commit_refs(decoded_revision),
           qualification_stage: %{
             status: if(qualification_passed?, do: "passed", else: "failed"),
             reason:
               cond do
-                not active? -> "review_assignment_not_open"
+                not valid_lifecycle? -> "review_assignment_invalid_lifecycle"
                 not independent? -> "holder_not_independent"
                 not clean? -> "verdict_not_reviewed_clean"
                 not subject_bound? -> "reviewed_subject_mismatch"
@@ -1245,8 +1249,8 @@ defmodule Tightbeam.Assignments do
       [] ->
         %{
           resolver_arity: 4,
-          normalized_submitted_refs: submitted,
-          effective_refs: effective_refs,
+          normalized_submitted_refs: trace_commit_refs(submitted),
+          effective_refs: trace_commit_refs(effective_refs),
           selected_review_assignment_id: nil,
           selected_review_attest_id: nil,
           selected_review_holder_key: nil,
@@ -4437,14 +4441,14 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  defp trace_submitted_commit_refs(refs) do
+  defp canonical_trace_input(refs) do
     case canonical_commit_refs(refs) do
       {:ok, value} -> value
       :error -> %{status: "invalid"}
     end
   end
 
-  defp effective_subject_trace_refs(db, assignment_id) do
+  defp effective_subject_refs(db, assignment_id) do
     case DB.query(
            db,
            "SELECT commitRefs FROM assignment_commit_ref_corrections WHERE assignmentId=?1",
@@ -4489,6 +4493,39 @@ defmodule Tightbeam.Assignments do
       _ -> %{status: "invalid"}
     end
   end
+
+  @trace_repo_bytes 256
+
+  defp trace_commit_refs(refs) when is_list(refs), do: Enum.map(refs, &trace_commit_ref/1)
+  defp trace_commit_refs(value), do: value
+
+  defp trace_commit_ref(%{"repo" => repo} = ref) when is_binary(repo) do
+    original_bytes = byte_size(repo)
+
+    ref
+    |> Map.put("repo", utf8_prefix(repo, @trace_repo_bytes))
+    |> Map.put("repoOriginalBytes", original_bytes)
+    |> Map.put("repoTruncated", original_bytes > @trace_repo_bytes)
+    |> Map.put("repoSha256", sha256(repo))
+  end
+
+  defp trace_commit_ref(ref), do: ref
+
+  defp utf8_prefix(value, max_bytes) when byte_size(value) <= max_bytes, do: value
+
+  defp utf8_prefix(value, max_bytes) do
+    prefix = binary_part(value, 0, max_bytes)
+    valid_utf8_prefix(prefix)
+  end
+
+  defp valid_utf8_prefix(value) do
+    if String.valid?(value),
+      do: value,
+      else: value |> binary_part(0, byte_size(value) - 1) |> valid_utf8_prefix()
+  end
+
+  defp sha256(value),
+    do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
 
   defp canonical_native_commit_refs(refs) when is_list(refs) and refs != [] do
     refs
