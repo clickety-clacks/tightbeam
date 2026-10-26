@@ -1423,7 +1423,12 @@ defmodule Tightbeam.StateResources do
         %{
           rows:
             Enum.map(page.rows, fn [row_user_id, scope_key, marker, updated_at] ->
-              %{user_id: row_user_id, scope_key: scope_key, marker: marker, updated_at: updated_at}
+              %{
+                user_id: row_user_id,
+                scope_key: scope_key,
+                marker: marker,
+                updated_at: updated_at
+              }
             end),
           flags: page
         }

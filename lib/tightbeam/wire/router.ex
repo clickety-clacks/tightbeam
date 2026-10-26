@@ -1335,8 +1335,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, 400, "invalid_cursor", nil} = error ->
         if Map.get(principal, :kind) != "observer" and
              observer_page_cursor?(query, route, resource, filters, tuple_valid?),
-          do: {:error, 404, "not_found", nil},
-          else: error
+           do: {:error, 404, "not_found", nil},
+           else: error
 
       other ->
         other

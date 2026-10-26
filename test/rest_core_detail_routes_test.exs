@@ -1693,6 +1693,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     assert anonymous_sessions.status == 200
     assert_application_headers(anonymous_sessions)
+
     assert JSON.decode!(anonymous_sessions.resp_body)["items"] ==
              JSON.decode!(org_sessions.resp_body)["items"]
 
@@ -1717,6 +1718,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     anonymous_session = get_without_authorization(ctx, "/api/sessions/#{session_key}")
     org_session = get(ctx, "/api/sessions/#{session_key}", ctx.opts[:cli_token])
     assert anonymous_session.status == 200
+
     assert JSON.decode!(anonymous_session.resp_body)["item"] ==
              JSON.decode!(org_session.resp_body)["item"]
 
@@ -1726,6 +1728,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     assert anonymous_messages.status == 200
     assert_application_headers(anonymous_messages)
+
     assert JSON.decode!(anonymous_messages.resp_body)["items"] ==
              JSON.decode!(org_messages.resp_body)["items"]
 
@@ -1742,6 +1745,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       org_message = get(ctx, path, ctx.opts[:cli_token])
 
       assert anonymous_message.status == 200
+
       assert JSON.decode!(anonymous_message.resp_body)["item"] ==
                JSON.decode!(org_message.resp_body)["item"]
     end
@@ -1760,7 +1764,12 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       "invalid_as_user"
     )
 
-    assert_error(get_without_authorization(ctx, "/api/work-items"), 401, "work items", "auth_failed")
+    assert_error(
+      get_without_authorization(ctx, "/api/work-items"),
+      401,
+      "work items",
+      "auth_failed"
+    )
 
     assert_error(
       get_without_authorization(ctx, "/api/sessions", [{"authorization", ""}]),
@@ -1775,7 +1784,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     Devices.add_user(ctx.db, "bob", false)
 
     for scope_key <- ["chat:one", "chat:two", "chat:three"] do
-      assert {:ok, true, _marker} = ReadMarkers.set(ctx.db, "alice", scope_key, "cursor-#{scope_key}")
+      assert {:ok, true, _marker} =
+               ReadMarkers.set(ctx.db, "alice", scope_key, "cursor-#{scope_key}")
     end
 
     assert {:ok, true, _marker} = ReadMarkers.set(ctx.db, "bob", "chat:other", "bob-cursor")
@@ -1803,7 +1813,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     all_alice_markers = get_without_authorization(ctx, "/api/read-markers?asUser=alice")
     assert all_alice_markers.status == 200
-    assert Enum.all?(JSON.decode!(all_alice_markers.resp_body)["items"], &(&1["userId"] == "alice"))
+
+    assert Enum.all?(
+             JSON.decode!(all_alice_markers.resp_body)["items"],
+             &(&1["userId"] == "alice")
+           )
 
     unknown_user_markers = get_without_authorization(ctx, "/api/read-markers?asUser=unregistered")
     assert unknown_user_markers.status == 200
