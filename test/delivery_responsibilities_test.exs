@@ -486,6 +486,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
        %{db: db} do
     tmp =
       Path.join(System.tmp_dir!(), "office-target-rules-#{System.unique_integer([:positive])}")
+
     on_exit(fn -> File.rm_rf!(tmp) end)
     load_delivery_rules!(tmp)
     handlers = assignment_handlers(db)
