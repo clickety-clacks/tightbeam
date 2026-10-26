@@ -58,6 +58,17 @@ deny_when = [
 ]
 
 [[rule]]
+name = "engineering-assign-production-office-target-refused"
+verb = "assign"
+text = "Production work, including review, cannot be assigned to a product-owner, PDO, or orchestrator session. Assign a qualified non-office worker or use a genuine coordination handoff."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.effect_kind", op = "ne", value = "coordination" },
+  { fact = "target.archetype", op = "in", value = ["product-owner", "pdo", "orchestrator"] },
+]
+
+[[rule]]
 name = "engineering-assign-production-needs-topology"
 verb = "assign"
 text = "Production staffing requires returned attributable topology for this work item. Current delivery owner: {delivery_owner_ref}. Record topology-decided on the item, then have that owner or an active exact-item assignment holder retry."
@@ -119,6 +130,17 @@ deny_when = [
   { fact = "assign.effect_kind", op = "ne", value = "coordination" },
   { fact = "work_item.reference_state", op = "eq", value = "known" },
   { fact = "work_item.has_delivery_owner", op = "ne", value = true },
+]
+
+[[rule]]
+name = "engineering-dispatch-production-office-target-refused"
+verb = "dispatch"
+text = "Production work, including review, cannot be dispatched to a product-owner, PDO, or orchestrator session. Use work-item-handoff with either --work-item <workItemId> or --title \"<title>\", plus --delivery-owner <sessionKey> and --brief \"<brief>\", to hand coordination to the office in one call; staff production separately."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.effect_kind", op = "ne", value = "coordination" },
+  { fact = "target.archetype", op = "in", value = ["product-owner", "pdo", "orchestrator"] },
 ]
 
 [[rule]]
