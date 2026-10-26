@@ -78,6 +78,12 @@ defmodule Tightbeam.Firehose.Rebuild do
   defp query(db, "message.created", refs, _user_id),
     do: StateResources.query_message(db, fetch!(refs, "messageId"))
 
+  defp query(db, "transition.recorded", refs, _user_id),
+    do: StateResources.query_message(db, fetch!(refs, "messageId"))
+
+  defp query(db, class, refs, _user_id) when class in ~w(tool_call.started tool_call.ended),
+    do: StateResources.query_tool_call_for_rebuild(db, fetch!(refs, "toolCallId"))
+
   defp query(db, class, refs, _user_id) when class in ~w(session.updated session.harness_changed),
     do: StateResources.query_session(db, fetch!(refs, "sessionKey"))
 

@@ -37,7 +37,13 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.all?(Map.values(handlers), &is_function(&1, 1))
     assert effects["reopen-assignment"] == ["assignment.reopened"]
     assert effects["artifact-content-fetch"] == []
-    assert effects["tune"] == ["message.created", "session.updated", "session.harness_changed"]
+
+    assert effects["tune"] == [
+             "transition.recorded",
+             "session.updated",
+             "session.harness_changed"
+           ]
+
     assert effects["repair-assignment"] == ["message.created", "session.updated"]
     assert effects["session-po-set"] == ["wake.scheduled"]
 
@@ -3794,7 +3800,7 @@ defmodule Tightbeam.GatewayTest do
 
     :ok =
       Tightbeam.Firehose.Hub.subscribe(Tightbeam.Firehose.Hub, self(), "initial-model-retune", %{
-        "classes" => ["message.created"],
+        "classes" => ["transition.recorded", "message.created"],
         "sessionKey" => "k1"
       })
 
@@ -3810,11 +3816,12 @@ defmodule Tightbeam.GatewayTest do
 
     assert Org.get(ctx.db, "k1").model == Model.new("claude-opus-5-5")
 
-    assert_receive {:firehose_notice, %{"class" => "message.created"} = message_notice}
+    assert_receive {:firehose_notice, %{"class" => "transition.recorded"} = message_notice}
     assert_message_notice_matches_rest!(ctx.db, message_notice)
     assert message_notice["payload"]["marker"]["kind"] == "model-retune"
     :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
     :sys.get_state(Tightbeam.Firehose.Hub)
+    refute_receive {:firehose_notice, %{"class" => "transition.recorded"}}, 0
     refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
   end
 
@@ -4823,7 +4830,7 @@ defmodule Tightbeam.GatewayTest do
 
     :ok =
       Tightbeam.Firehose.Hub.subscribe(Tightbeam.Firehose.Hub, self(), "swapme", %{
-        "classes" => ["session.", "message.created"],
+        "classes" => ["session.", "transition.recorded", "message.created"],
         "sessionKey" => "swapme"
       })
 
@@ -4842,7 +4849,7 @@ defmodule Tightbeam.GatewayTest do
 
     :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
 
-    assert_receive {:firehose_notice, %{"class" => "message.created"} = message_notice}
+    assert_receive {:firehose_notice, %{"class" => "transition.recorded"} = message_notice}
     assert_message_notice_matches_rest!(ctx.db, message_notice)
     assert message_notice["payload"]["marker"]["kind"] == "harness-switch"
 
@@ -4852,6 +4859,7 @@ defmodule Tightbeam.GatewayTest do
     :sys.get_state(Tightbeam.Firehose.Hub)
     refute_receive {:firehose_notice, %{"class" => "session.harness_changed"}}, 0
     refute_receive {:firehose_notice, %{"class" => "session.updated"}}, 0
+    refute_receive {:firehose_notice, %{"class" => "transition.recorded"}}, 0
     refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
 
     rest_opts =
@@ -6902,7 +6910,7 @@ defmodule Tightbeam.GatewayTest do
 
     :ok =
       Tightbeam.Firehose.Hub.subscribe(Tightbeam.Firehose.Hub, self(), "model-retune", %{
-        "classes" => ["message.created"],
+        "classes" => ["transition.recorded", "message.created"],
         "sessionKey" => "k1"
       })
 
@@ -6939,11 +6947,12 @@ defmodule Tightbeam.GatewayTest do
     assert marker_facts.from == "fable"
     assert marker_facts.to == "claude-sonnet-4-6"
 
-    assert_receive {:firehose_notice, %{"class" => "message.created"} = message_notice}
+    assert_receive {:firehose_notice, %{"class" => "transition.recorded"} = message_notice}
     assert_message_notice_matches_rest!(ctx.db, message_notice)
     assert message_notice["payload"]["marker"]["kind"] == "model-retune"
     :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
     :sys.get_state(Tightbeam.Firehose.Hub)
+    refute_receive {:firehose_notice, %{"class" => "transition.recorded"}}, 0
     refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
   end
 
