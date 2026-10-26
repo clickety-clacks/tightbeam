@@ -35,6 +35,7 @@ defmodule Tightbeam.FirehoseIngressOverflowTest do
       end)
 
     assert_receive {:subscriber_ready, ^affected_subscriber}, 5_000
+
     on_exit(fn ->
       if Process.alive?(affected_subscriber), do: send(affected_subscriber, :stop)
     end)
