@@ -417,7 +417,7 @@ defmodule Tightbeam.HarnessProcess do
                  values,
                  &(&1 in ~w(launching running park_requested closed_gracefully killed kill_failed exited))
                ),
-          do: raise(ArgumentError, "invalid harness process collection filter")
+               do: raise(ArgumentError, "invalid harness process collection filter")
 
       _invalid ->
         raise ArgumentError, "invalid harness process collection filter"

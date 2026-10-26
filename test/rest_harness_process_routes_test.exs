@@ -136,6 +136,7 @@ defmodule Tightbeam.RestHarnessProcessRoutesTest do
       )
 
     assert later.status == 200, later.resp_body
+
     assert Enum.map(JSON.decode!(later.resp_body)["items"], & &1["id"]) == [
              "launch-b",
              "launch-c"
