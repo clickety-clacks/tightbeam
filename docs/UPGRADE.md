@@ -187,7 +187,7 @@ feature checks. The aggregate order and feature-area runbooks are in
 permission to point a command at a live base.
 
 For source-lineage context, canonical tag `v0.1.8+1343` (build 1343,
-`b2add64414b41606a713ed284abf01a0b4d125e6`, the release Gibson runs) writes
+`b2add64414b41606a713ed284abf01a0b4d125e6`, the reference production release) writes
 `operator-decision-requests-v1`, which current 0.1.9 names as a predecessor.
 This is a verified reference lineage, not presumed provenance for a later real
 0.1.8 database. The actual snapshot's manifest must establish its source tag,
@@ -622,7 +622,7 @@ isolated test gateway.
    `PRAGMA quick_check = ok`; no foreign key failures; all new columns and
    indexes; and no migration temporary table.
 
-Do not run the TARS or Shrdlu cold-install custody matrix again. This is the
+Do not repeat the earlier cold-install custody matrix. This is the
 upgrade-preservation check that matrix did not cover.
 
 ## Release upgrade sequence

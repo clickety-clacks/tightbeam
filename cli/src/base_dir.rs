@@ -17,7 +17,7 @@
 //! So with `TIGHTBEAM_BASE_DIR` set — which is what the README documents, and
 //! what the systemd unit and LaunchDaemon in it both set — the CLI read
 //! `~/.tightbeam/gateway.json`: not its own gateway, but whatever unrelated org
-//! happened to live at the default path. Found on shrdlu, 2026-07-27, by the
+//! happened to live at the default path. Found on a test host, 2026-07-27, by the
 //! production-install smoke: `tightbeam onboard anthropic` dialled port 4321 from
 //! a pre-existing org while its own gateway was serving on 11373. Nothing was
 //! listening there, so it failed loudly by luck; had that org been up, onboarding

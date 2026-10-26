@@ -23,7 +23,7 @@
 # shared stage uses one selected fixture leg; it does not prove parity for the
 # other selected or filtered legs. Per-harness local deployment and carrier checks
 # preflight and exercise every selected leg. A filtered run reports
-# INCOMPLETE(parity) by design; the gibson gate still wants both legs green
+# INCOMPLETE(parity) by design; the production acceptance gate still wants both legs green
 # (artifact-carrier-proposal-v1 §7.3).
 #
 # The artifact area retains two different checks: `check_gate_chain_enforced/1`
@@ -34,7 +34,7 @@
 # "A REAL AGENT WALKS THE GATES" was proven in the field, not dropped. Both legs
 # did the whole lifecycle autonomously and honestly on 2026-07-30 — claude
 # 11:19:56 open → 11:20:48 verified → 11:21:02 recorded → 11:21:07 closed, codex
-# the same shape at 12:09–12:12, landing art_0f26ec21 tool-call-observed with a
+# the same shape at 12:09–12:12, recording a tool-call-observed artifact with a
 # non-null edge. Driving that chain through a scripted holder is what the split
 # gives up, because a capable holder finishes it before any scripted denial can
 # fire; the shared gate-chain check retains the substrate half once per invocation,
@@ -44,7 +44,7 @@
 # verification statutes (completion-requires-verification,
 # completion-requires-results-artifact) AND a `coder` archetype that admits this
 # host. Rules load once at gateway BOOT, so an org whose law changed under a
-# running gateway must be rebooted before the run. On shrdlu that means the
+# running gateway must be rebooted before the run. On the test host that means the
 # eb0ea2b org-law workaround must be REVERTED first: with it installed the
 # artifact statute never denies and the gate-chain group fails at its third
 # denial, which is exactly what keeps that leg falsifiable.
@@ -531,7 +531,7 @@ defmodule FeatureSmoke do
   # rather than relocated. Those two field runs ARE the "a real agent walks the gates"
   # evidence, and they are stronger than the scripted version was: both holders verified
   # with grounded notes of their own, recorded over the real CLI — codex landed
-  # art_0f26ec21 `tool-call-observed` with a non-null edge, which is the R7 datum itself —
+  # a `tool-call-observed` artifact with a non-null edge, which is the R7 datum itself —
   # and completed, autonomously and honestly, on both harnesses. What remains under
   # assertion every run is the substrate half, in `check_carrier_on_real_turn/1` below,
   # which accepts the holder completing its own assignment as the legitimate outcome it is
@@ -888,7 +888,7 @@ defmodule FeatureSmoke do
       # `startedAt` IS NOT THE LINE EITHER, and the field disproved it before it ever ran.
       # The operator's row above came back `session-concurrent`, and that class is returned
       # only when `Ledger.running_turn_message_id/2` finds a turn at `status = 'running'` —
-      # the same UPDATE that writes `startedAt`. So on the run that produced art_d968e72a a
+      # the same UPDATE that writes `startedAt`. So in the observed run a
       # turn was ALREADY running, and an assertion on `startedAt` would have failed a group
       # that was otherwise behaving exactly as designed.
       #
@@ -1160,7 +1160,7 @@ defmodule FeatureSmoke do
   #
   # THE HOST IS PINNED, and the seed depends on it. `Placement.resolve/3` reads a nil host
   # as "first of archetype.where" unless the archetype grants `["*"]`, and the shipped coder
-  # archetype is `where = ["eezo", "racter"]` — so an unpinned spawn on any other gateway
+  # archetype is a restricted `where` list — so an unpinned spawn on any other gateway
   # places the holder on a DIFFERENT machine while the seed is written locally. Where an
   # org's coder archetype does not admit this host the spawn is refused `host_not_allowed`
   # by name, which is the right failure: about the org's law, not about a file that

@@ -1783,7 +1783,7 @@ pub fn build_onboard_phase_request(
 
 /// Build a `wake --user <owner>` request carrying the onboarding sign-in prompt, so the
 /// operator who cannot see the ceremony's terminal still receives the URL+code. The wake
-/// row IS the durable record of the delivery (wi_0535922b) -- it persists in the substrate
+/// row IS the durable record of the delivery -- it persists in the substrate
 /// with the code text, the target, and timestamps.
 ///
 /// `userId` is a target field and `prompt` a param, exactly as `Command::Wake` builds them.
@@ -5853,7 +5853,7 @@ mod tests {
             })
         );
 
-        // The shrdlu failure, as a test: with TIGHTBEAM_BASE_DIR naming the org --
+        // The production failure, as a test: with TIGHTBEAM_BASE_DIR naming the org --
         // the variable the README documents and both service units set -- discovery
         // must read THAT gateway.json. It read ~/.tightbeam's instead, so `tightbeam
         // onboard` dialled a pre-existing org's port while its own gateway served
@@ -5940,7 +5940,7 @@ mod tests {
 
     // RECORDED REALITY, not a chosen fixture: `Placement.provision_endpoint` writes
     // TIGHTBEAM_ADVERTISED_URL verbatim, and that value is the WEBSOCKET url -- in
-    // production, `ws://shrdlu:11373`. This base is the root of an HTTP path
+    // production, `ws://gateway.example:11373`. This base is the root of an HTTP path
     // (`/agent/dispatch`), and the http client rejects the scheme outright with
     // "Unknown Scheme: unknown scheme 'ws'", so every satellite ceremony died on the
     // one url a real gateway ever writes. The sibling fixtures above hardcode

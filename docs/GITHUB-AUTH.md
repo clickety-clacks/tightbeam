@@ -210,11 +210,11 @@ When creating or opening a project whose remote URL is on a GitHub hostname:
 Example refusal:
 
 ```text
-Tightbeam cannot use GitHub from host eezo for github.com: gh is not
+Tightbeam cannot use GitHub from host example-macos-host for github.com: gh is not
 authenticated in the non-interactive project environment. Run:
   tightbeam onboard github --hostname github.com
   tightbeam onboard github --hostname github.com --remote <remote-url>
-on eezo, then retry. Do not paste a PAT into an agent.
+on that host, then retry. Do not paste a PAT into an agent.
 ```
 
 Projects without a GitHub remote do not fail this gate unless their requested
@@ -369,11 +369,11 @@ Session/project status should expose only non-secret fields. Suggested display:
 ```json
 {
   "github": {
-    "host": "eezo",
+    "host": "example-macos-host",
     "hostname": "github.com",
     "gh_path": "/opt/homebrew/bin/gh",
     "state": "live",
-    "account": "gdiab",
+    "account": "example-user",
     "git_protocol": "https",
     "storage": "file",
     "repair": null

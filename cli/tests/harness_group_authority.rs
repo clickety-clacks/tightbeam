@@ -1,6 +1,6 @@
 //! Regression coverage for harness-group instance authority and errno classification.
 //!
-//! Named classes from att_981d3490: same-group pre-stop, signal-time revalidation failure,
+//! Named process-group scenarios: same-group pre-stop, signal-time revalidation failure,
 //! and (in unit tests) PID/PGID reuse plus macOS individual-PID EPERM handling.
 
 use std::fs;
