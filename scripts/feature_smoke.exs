@@ -18,7 +18,7 @@
 #
 # A narrowed run needs a model only for the legs it selected, which is what makes
 # one leg affordable rather than merely shorter. It also reports INCOMPLETE(parity)
-# by design and proves nothing about the leg it skipped, so the gibson gate still
+# by design and proves nothing about the leg it skipped, so the production acceptance gate still
 # wants both legs green (artifact-carrier-proposal-v1 §7.3); the filter is for
 # answering one leg's question quickly, not for satisfying the gate.
 #
