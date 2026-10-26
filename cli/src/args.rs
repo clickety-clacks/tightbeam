@@ -3486,7 +3486,7 @@ mod tests {
             parse(strings(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "node-a",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR=value=with=equals",
@@ -3495,7 +3495,7 @@ mod tests {
             ])),
             Ok(Command::HostEnvSet {
                 identity: Identity::Role("operator".to_owned()),
-                host: "gibson".to_owned(),
+                host: "node-a".to_owned(),
                 harness: "claude".to_owned(),
                 name: "EXAMPLE_OVERLAY_VAR".to_owned(),
                 value: "value=with=equals".to_owned(),
@@ -3506,7 +3506,7 @@ mod tests {
             parse(strings(&[
                 "host-env-list",
                 "--host",
-                "gibson",
+                "node-a",
                 "--harness",
                 "claude",
                 "--as-user",
@@ -3514,7 +3514,7 @@ mod tests {
             ])),
             Ok(Command::HostEnvList {
                 identity: Identity::User("flynn".to_owned()),
-                host: Some("gibson".to_owned()),
+                host: Some("node-a".to_owned()),
                 harness: Some("claude".to_owned()),
             })
         );
@@ -3523,7 +3523,7 @@ mod tests {
             parse(strings(&[
                 "host-env-unset",
                 "--host",
-                "gibson",
+                "node-a",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR",
@@ -3532,7 +3532,7 @@ mod tests {
             ])),
             Ok(Command::HostEnvUnset {
                 identity: Identity::User("flynn".to_owned()),
-                host: "gibson".to_owned(),
+                host: "node-a".to_owned(),
                 harness: "claude".to_owned(),
                 name: "EXAMPLE_OVERLAY_VAR".to_owned(),
             })
@@ -3546,13 +3546,13 @@ mod tests {
             strings(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "node-a",
                 "EXAMPLE_OVERLAY_VAR=value",
             ]),
             strings(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "node-a",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR",
@@ -5282,7 +5282,7 @@ mod tests {
                     "--name",
                     "reviewer",
                     "--host",
-                    "eezo",
+                    "lab1",
                     "--as-user",
                     "flynn",
                 ]),
@@ -5296,7 +5296,7 @@ mod tests {
                     effort: Some(Some("high".to_owned())),
                     context: Some(Some("1m".to_owned())),
                     handle: Some("reviewer".to_owned()),
-                    host: Some("eezo".to_owned()),
+                    host: Some("lab1".to_owned()),
                 },
             ),
             (
