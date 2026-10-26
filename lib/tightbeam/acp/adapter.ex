@@ -1062,6 +1062,7 @@ defmodule Tightbeam.Acp.Adapter do
         # option list, so the session/new options must be remembered first.
         state = %{state | context_usage: Map.delete(state.context_usage, sid)}
         state = remember_config_options(state, sid, result)
+        model = join_catalog_model_to_public_option(state.preset, model, result)
 
         with :ok <- project_guidance(state, sid, guidance),
              {:ok, applied_model} <-
@@ -2453,6 +2454,40 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp model_option_values(_result), do: []
+
+  # A contextless catalog row may join one context-qualified Claude option only
+  # through that option's versioned public label. Wire aliases and token counts
+  # do not establish model identity, and multiple matches leave the row unchanged
+  # so the existing exact readback check rejects any unproved selection.
+  defp join_catalog_model_to_public_option(
+         preset,
+         %Model{family: "claude-opus-5-5", context: nil} = catalog_model,
+         result
+       ) do
+    if "claude-" in preset.canonical_model_prefixes do
+      matches =
+        result
+        |> model_option_entries()
+        |> Enum.map(&public_model_from_label(preset, &1))
+        |> Enum.filter(fn
+          %Model{family: family, context: context} ->
+            family == catalog_model.family and not is_nil(context)
+
+          _ ->
+            false
+        end)
+        |> Enum.uniq()
+
+      case matches do
+        [%Model{} = public_model] -> %{catalog_model | context: public_model.context}
+        _ -> catalog_model
+      end
+    else
+      catalog_model
+    end
+  end
+
+  defp join_catalog_model_to_public_option(_preset, model, _result), do: model
 
   defp readback_confirms_model?(result, preset, %Model{} = model) do
     match?(%Model{}, confirmed_public_model(result, preset, model))
