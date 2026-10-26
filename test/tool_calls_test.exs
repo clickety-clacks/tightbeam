@@ -489,12 +489,14 @@ defmodule Tightbeam.ToolCallsTest do
 
     {:ok, root_stamp_before} =
       DB.query(ctx.db, "SELECT shape,stampedAt FROM schema_stamp", [])
+
     assert [
              ["launch-preparation-evidence-v1-0112", _root_stamped_at_before]
            ] = root_stamp_before
 
     {:ok, memento_stamp_before} =
       DB.query(ctx.db, "SELECT version FROM memento_judgment_index_version", [])
+
     assert memento_stamp_before == [[1]]
 
     {:ok, [[message_high_water]]} =
