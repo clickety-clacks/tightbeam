@@ -2,6 +2,14 @@
 # Resolve a defective rule with its responsible owner; preserve the governing
 # restriction and continue separable authorized work while it is corrected.
 
+[[policy]]
+name = "operational-evidence-for-unfiled-live-effects"
+purpose = "attest-operational-evidence"
+when = [
+  { fact = "assignment.effect_kind", op = "eq", value = "live_mutation" },
+  { fact = "assignment.declared_files_present", op = "eq", value = false },
+]
+
 # Qualifying completion requires an applicable independent reviewed-clean conclusion.
 # When review is needed, O2 sends an accountable notification; the owner directs staffing.
 # The notification does not force a reviewer-code assignment or satisfy completion checks.

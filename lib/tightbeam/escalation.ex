@@ -1748,6 +1748,17 @@ defmodule Tightbeam.Escalation do
     consumed?
   end
 
+  @doc false
+  def consume_in_txn(%Txn{} = txn, ruling_id, _verb, _origin) do
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET status='consumed', consumedAt=?2 WHERE id=?1 AND kind='statute' AND status='ruled'",
+      [ruling_id, now()]
+    )
+
+    Txn.changes(txn) == 1
+  end
+
   @doc "Rule one open request. `:authorized` is supplied by Gateway's admin axis."
   @spec rule(DB.server(), map(), keyword()) :: map()
   def rule(db, call, opts \\ []) do
