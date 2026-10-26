@@ -2187,7 +2187,7 @@ defmodule Tightbeam.GatewayTest do
 
     call = %{
       session_key: "k1",
-      origin: "session:k1",
+      origin: "user:flynn",
       params: %{
         content: "first immediate human message",
         device_id: "direct-post-device",
@@ -2207,6 +2207,21 @@ defmodule Tightbeam.GatewayTest do
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM messages WHERE clientMessageId='direct-post-1'"
+             )
+
+    assert {:ok, [["user:flynn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sender FROM messages WHERE clientMessageId='direct-post-1'"
+             )
+
+    assert {:ok, [["user:flynn"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT t.origin FROM turns t JOIN messages m ON m.id=t.messageId
+               WHERE m.clientMessageId='direct-post-1'
+               """
              )
 
     assert {:ok, [[seq, "running"]]} =
