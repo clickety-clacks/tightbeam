@@ -3714,7 +3714,7 @@ defmodule Tightbeam.GatewayTest do
     owner_user_id = ctx.device.user_id
     process_work_item = create_work_item(ctx.db, "Process role creation")
 
-    assert %{deliveryOwnerSessionKey: "k1"} =
+    assert %{ownerUserId: ^owner_user_id, deliveryOwnerSessionKey: "k1"} =
              WorkItems.__handle__(ctx.db, "work-item-update", %{
                verb: "work-item-update",
                origin: "user:flynn",
