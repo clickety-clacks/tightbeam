@@ -113,6 +113,7 @@ defmodule Tightbeam.MessageSenderRepairTest do
       })
 
     {:ok, root_before} = DB.query(name, "SELECT shape,stampedAt FROM schema_stamp")
+
     {:ok, effort_before} =
       DB.query(name, "SELECT * FROM effort_holder_activity_cancellation_epoch")
 
