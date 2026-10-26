@@ -1393,22 +1393,11 @@ defmodule Tightbeam.StateResources do
     end)
   end
 
-  @doc "Return one bounded page of read markers for the selected user or all markers for an observer/admin."
+  @doc "Return one bounded page of read markers for the selected user or all markers for an observer."
   def query_read_markers_page(db, principal, boundary, limit),
     do: query_read_markers_page(db, principal, nil, boundary, limit)
 
   def query_read_markers_page(db, %{kind: "observer"} = principal, scope_key, boundary, limit) do
-    {where, params} = marker_scope_filter(scope_key)
-    query_read_markers_page(db, principal, where, params, boundary, limit)
-  end
-
-  def query_read_markers_page(
-        db,
-        %{kind: "user", is_admin: true} = principal,
-        scope_key,
-        boundary,
-        limit
-      ) do
     {where, params} = marker_scope_filter(scope_key)
     query_read_markers_page(db, principal, where, params, boundary, limit)
   end
