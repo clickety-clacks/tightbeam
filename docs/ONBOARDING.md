@@ -307,7 +307,7 @@ green scorecard imply more than it proved:
 | openai `/v1/models` response SHAPE | same capture — it drives `derive_platform_entries/1` in `harness/codex.ex` |
 | OpenCode Go `gpt-5.6-luna` Pi-shaped request | recorded live — HTTP 200 and Pi `stop_reason=stop` |
 | codex-acp / claude-agent-acp run a turn on api-key auth | **NOT VERIFIED, not budgeted.** Expected, not observed. |
-| pi-acp runs a turn through Tightbeam with OpenCode Go | recorded live — isolated spawn, Luna response, and pre-exec Bash denial; see `docs/smoke-runs/2026-08-23-pi-core-product.md` |
+| pi-acp runs a turn through Tightbeam with OpenCode Go | recorded live — isolated spawn, Luna response, and pre-exec Bash denial |
 
 The last row is the one to say out loud. Everything above it is about reaching
 the vendor; that row is about the harness actually working.
