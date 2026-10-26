@@ -220,6 +220,14 @@ await.(
   "escape descendant did not exec sleep"
 )
 
+# The descendant may exec before adapter boot persists its launch identity.
+await.(
+  await,
+  fn -> match?([%{state: "running"}], HarnessProcess.list(DB)) end,
+  1_500,
+  "adapter launch did not reach running"
+)
+
 [row] = HarnessProcess.list(DB)
 true = row.state == "running"
 true = row.process_group_id != escape_pgid
