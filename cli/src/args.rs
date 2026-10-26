@@ -1868,9 +1868,20 @@ fn parse_with_optional_catalog(
                         .to_owned(),
                 );
             }
-            if !wait && assignment_id.is_some() && !replace_queued && after_ms.is_none() {
+            if !wait && assignment_id.is_some() && condition_kind.is_some() {
                 return Err(
-                    "--assignment requires --predicate, --after-turn, or --after".to_owned(),
+                    "--assignment cannot be combined with --when-fact; use a dependency predicate for an assignment-scoped fact wait"
+                        .to_owned(),
+                );
+            }
+            if !wait
+                && assignment_id.is_some()
+                && !replace_queued
+                && after_ms.is_none()
+                && at.is_none()
+            {
+                return Err(
+                    "--assignment requires --predicate, --after-turn, --after, or --at".to_owned(),
                 );
             }
             if predicate.is_some() && fallback_after_ms.is_none() && at.is_none() {
@@ -5243,7 +5254,43 @@ mod tests {
                 "--prompt",
                 "no trigger",
             ])),
-            Err("--assignment requires --predicate, --after-turn, or --after".to_owned())
+            Err("--assignment requires --predicate, --after-turn, --after, or --at".to_owned())
+        );
+
+        assert!(matches!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder:app",
+                "--assignment",
+                "asg_123",
+                "--at",
+                "1900000000000",
+                "--prompt",
+                "recheck the card",
+            ])),
+            Ok(Command::Wake {
+                assignment_id: Some(ref assignment_id),
+                at: Some(ref at),
+                ..
+            }) if assignment_id == "asg_123" && at == "1900000000000"
+        ));
+
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder:app",
+                "--assignment",
+                "asg_123",
+                "--when-fact",
+                "build-finished",
+                "--fallback-after",
+                "2h",
+                "--prompt",
+                "recheck the card",
+            ])),
+            Err("--assignment cannot be combined with --when-fact; use a dependency predicate for an assignment-scoped fact wait".to_owned())
         );
     }
 

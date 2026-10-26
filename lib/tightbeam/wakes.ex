@@ -2012,6 +2012,62 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  @doc "Register one assignment-scoped timed liveness checkpoint atomically."
+  @spec register_checkpoint_in_txn(Txn.t(), map()) :: wake() | {:error, map()}
+  def register_checkpoint_in_txn(%Txn{} = txn, input) do
+    with :ok <- validate_checkpoint_input(input),
+         {:ok, obligation} <- wait_obligation_in_txn(txn, input),
+         :ok <- wait_target_allowed(input, obligation),
+         :ok <- recheck_wait_admission_in_txn(txn, input),
+         turn_seq when is_integer(turn_seq) <-
+           running_assignment_turn_seq_in_txn(
+             txn,
+             input.registrant_session_key,
+             obligation.id
+           ) do
+      schedule_in_txn(txn, %{
+        session_key: input.session_key,
+        target_role: input[:target_role],
+        origin: input.origin,
+        prompt: input.prompt,
+        due_at: input.due_at,
+        creator_session_key: input.registrant_session_key,
+        assignment_id: obligation.id,
+        owner_user_id: obligation.owner_user_id,
+        obligation_ref: obligation.id,
+        originating_turn_seq: turn_seq,
+        class: input[:class],
+        sender_scheduled: true
+      })
+    else
+      nil ->
+        wait_error(
+          "no_running_turn",
+          "an assignment checkpoint requires the holder's running turn for that assignment"
+        )
+
+      error ->
+        error
+    end
+  end
+
+  defp validate_checkpoint_input(input) do
+    valid =
+      is_binary(input[:session_key]) and input.session_key != "" and
+        is_binary(input[:origin]) and input.origin != "" and
+        is_binary(input[:prompt]) and input.prompt != "" and
+        is_binary(input[:assignment_id]) and input.assignment_id != "" and
+        is_binary(input[:registrant_session_key]) and input.registrant_session_key != "" and
+        is_binary(input[:owner_user_id]) and input.owner_user_id != "" and
+        is_integer(input[:due_at]) and input.due_at > now() and
+        (is_nil(input[:target_role]) or
+           (is_binary(input.target_role) and input.target_role != ""))
+
+    if valid,
+      do: :ok,
+      else: wait_error("invalid_checkpoint", "invalid assignment checkpoint registration")
+  end
+
   defp recheck_wait_admission_in_txn(txn, input) do
     call = %{
       verb: "wake",
@@ -2647,6 +2703,20 @@ defmodule Tightbeam.Wakes do
            "SELECT seq FROM turns WHERE sessionKey=?1 AND status='running' " <>
              "AND status IN ('queued','running') LIMIT 1",
            [session_key]
+         ) do
+      [[seq]] -> seq
+      [] -> nil
+    end
+  end
+
+  defp running_assignment_turn_seq_in_txn(_txn, nil, _assignment_id), do: nil
+
+  defp running_assignment_turn_seq_in_txn(txn, session_key, assignment_id) do
+    case Txn.q(
+           txn,
+           "SELECT seq FROM turns WHERE sessionKey=?1 AND assignmentId=?2 " <>
+             "AND status='running' LIMIT 1",
+           [session_key, assignment_id]
          ) do
       [[seq]] -> seq
       [] -> nil
@@ -7838,7 +7908,9 @@ defmodule Tightbeam.Wakes do
   end
 
   defp select_wake_sql(extra_columns \\ "") do
-    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon, ownerUserId, obligationRef, waitMode, predicate, resolverKind, resolverId, resolverHolder, resolverAddressee, necessity, verificationAssignmentId, verificationHolderKey, selectedPolicyName, verificationState, verificationAttestId, verificationNoticeWakeId, originatingTurnSeq, recognitionAt, recognitionPath, recognitionReason, recognitionEvidence, recognitionDisposition, recognitionTransition#{extra_columns} FROM wakes"
+    # Checkpoints remain ordinary timed wakes in storage so delivery keeps the
+    # established timed path. Their atomic binding is the durable type marker.
+    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon, ownerUserId, obligationRef, COALESCE(waitMode, CASE WHEN assignmentId IS NOT NULL AND obligationRef=assignmentId AND EXISTS (SELECT 1 FROM supervision_liveness_checkpoint_bindings checkpoint WHERE checkpoint.wakeId=wakes.wakeId AND checkpoint.assignmentId=wakes.assignmentId) THEN 'checkpoint' END), predicate, resolverKind, resolverId, resolverHolder, resolverAddressee, necessity, verificationAssignmentId, verificationHolderKey, selectedPolicyName, verificationState, verificationAttestId, verificationNoticeWakeId, originatingTurnSeq, recognitionAt, recognitionPath, recognitionReason, recognitionEvidence, recognitionDisposition, recognitionTransition#{extra_columns} FROM wakes"
   end
 
   defp to_wake([

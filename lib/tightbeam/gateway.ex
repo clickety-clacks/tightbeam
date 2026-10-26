@@ -6827,6 +6827,9 @@ defmodule Tightbeam.Gateway do
           owner_user_id: wait_owner_user_id_in_txn(txn, call[:principal])
         })
 
+      match?({:session, _}, call[:principal]) and is_binary(p[:assignment_id]) ->
+        register_assignment_checkpoint_in_txn(txn, call, session_key, due_at)
+
       p[:condition_kind] == "subagent_stop" ->
         caller_session = creator_session_key(call[:principal])
 
@@ -6866,6 +6869,31 @@ defmodule Tightbeam.Gateway do
           p[:condition_scope],
           replacement_assignment_id
         )
+    end
+  end
+
+  defp register_assignment_checkpoint_in_txn(txn, call, session_key, due_at) do
+    p = call.params
+
+    case Wakes.register_checkpoint_in_txn(txn, %{
+           session_key: session_key,
+           target_role: Map.get(call, :target_role),
+           origin: call.origin,
+           prompt: p.prompt,
+           due_at: due_at,
+           assignment_id: p.assignment_id,
+           registrant_session_key: creator_session_key(call[:principal]),
+           owner_user_id: wait_owner_user_id_in_txn(txn, call[:principal]),
+           class: p[:class]
+         }) do
+      %{wake_id: _} = wake ->
+        case bind_liveness_checkpoint_in_txn(txn, call, wake) do
+          :armed -> %{wake | wait_mode: "checkpoint"}
+          other -> raise "assignment checkpoint binding failed: #{inspect(other)}"
+        end
+
+      error ->
+        error
     end
   end
 
@@ -7256,6 +7284,9 @@ defmodule Tightbeam.Gateway do
       wake_id: wake.wake_id,
       due_at: wake.due_at,
       state: wake.state,
+      assignment_id: wake.assignment_id,
+      obligation_ref: wake.obligation_ref,
+      wait_mode: mode,
       recognition_path: wake.recognition_path,
       eligible: wait_response_eligible?(wake)
     }

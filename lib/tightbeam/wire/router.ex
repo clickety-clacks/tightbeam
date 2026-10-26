@@ -2800,9 +2800,10 @@ defmodule Tightbeam.Wire.Router do
   end
 
   # SUBSTRATE-INTERNAL params, PER VERB: fields a client may not set on that verb
-  # because the substrate is their only legitimate author. Ordinary notifications
-  # cannot supply wake attribution. Typed obligation waits name an assignment for
-  # the existing atomic admission checks; that reference is not authority.
+  # because the substrate is their only legitimate author. Immediate notifications
+  # cannot supply wake attribution. Typed obligation waits and timed checkpoints
+  # name an assignment for the existing atomic admission checks; that reference is
+  # not authority.
   #
   # An operator ruling's transport provenance follows the same rule: the router
   # derives it from bearer authentication above, so `ruledViaSessionKey` cannot
@@ -3009,6 +3010,10 @@ defmodule Tightbeam.Wire.Router do
         params
         |> Map.put(:replacement_assignment_id, params.assignment_id)
         |> Map.delete(:assignment_id)
+
+      (is_number(params[:after_ms]) or is_number(params[:at])) and
+          is_nil(params[:condition_kind]) ->
+        params
 
       true ->
         Map.delete(params, :assignment_id)
