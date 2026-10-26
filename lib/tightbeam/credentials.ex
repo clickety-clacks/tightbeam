@@ -416,25 +416,36 @@ defmodule Tightbeam.Credentials do
 
   def handle_call({:begin_onboard, provider}, _from, state) do
     state = expire_lease(state, provider)
-    {previous, pending} = Map.pop(state.pending, provider)
-    state = %{state | pending: pending}
 
-    if previous, do: cleanup_staging!(state, previous.path)
+    case Map.fetch(state.pending, provider) do
+      {:ok, _active_lease} ->
+        # A lease is owned by this machine's one credential lifecycle process and
+        # by its unguessable id at finish/cancel. Do not expose that id or its
+        # staging path as conflict provenance: both are ceremony capabilities.
+        state.log_event.(
+          "credential_onboarding_conflict",
+          "#{provider}@#{state.machine}",
+          nil
+        )
 
-    with :ok <- state.gate.(provider) do
-      path = onboarding_staging_path(state, provider)
-      lease_id = Tightbeam.Id.uuid4()
-      :ok = prepare_staging!(state, path)
+        {:reply, {:error, :onboarding_already_in_progress}, state}
 
-      lease = %{
-        id: lease_id,
-        path: path,
-        expires_at: state.now.() + div(state.onboarding_lease_ms, 1000)
-      }
+      :error ->
+        with :ok <- state.gate.(provider) do
+          path = onboarding_staging_path(state, provider)
+          lease_id = Tightbeam.Id.uuid4()
+          :ok = prepare_staging!(state, path)
 
-      {:reply, {:ok, path, lease_id}, put_in(state.pending[provider], lease)}
-    else
-      {:error, _reason} = error -> {:reply, error, state}
+          lease = %{
+            id: lease_id,
+            path: path,
+            expires_at: state.now.() + div(state.onboarding_lease_ms, 1000)
+          }
+
+          {:reply, {:ok, path, lease_id}, put_in(state.pending[provider], lease)}
+        else
+          {:error, _reason} = error -> {:reply, error, state}
+        end
     end
   end
 
