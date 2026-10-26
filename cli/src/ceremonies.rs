@@ -4048,7 +4048,7 @@ mod tests {
 
     #[test]
     fn staging_path_reads_the_wire_shape_the_gateway_actually_sends() {
-        // Verbatim from a live gateway on shrdlu (2026-07-27), captured off the wire
+        // Verbatim from a live gateway (2026-07-27), captured off the wire
         // during the production-install smoke. Every response key is lower-camelCase
         // because router.ex camelizes atom keys on the way out.
         let ready: serde_json::Value = serde_json::from_str(
