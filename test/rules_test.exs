@@ -1012,6 +1012,270 @@ defmodule Tightbeam.RulesTest do
              )
   end
 
+  test "four-argument refusal trace is reconstructable, redacted, and stage truthful", ctx do
+    holder = session(ctx.db, "trace-producer", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "trace-reviewer", "other", archetype: "reviewer")
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "code")
+
+    native_refs = [
+      %{
+        "repo" => "sirius:/srv/tightbeam",
+        "remote" => "https://example.invalid/tightbeam.git",
+        "ref" => "refs/heads/main",
+        "commit" => String.duplicate("a", 40)
+      }
+    ]
+
+    seed_commit_ref_correction!(ctx, producer, native_refs)
+
+    revoked_review =
+      assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
+
+    revocation_id = "rev_#{Tightbeam.Id.uuid4()}"
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO assignment_revocations (id,assignmentId,revokedAt,revokedByUser,reason) VALUES (?1,?2,?3,'flynn','review withdrawn')",
+               [revocation_id, revoked_review.id, now]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO assignment_revocation_generations (revocationId,assignmentId,reopeningId) VALUES (?1,?2,NULL)",
+               [revocation_id, revoked_review.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET state='closed',outcome='revoked',closedAt=?1,closedByUser='flynn' WHERE id=?2",
+               [now, revoked_review.id]
+             )
+
+    insert_bound_review_verdict!(ctx, revoked_review, "reviewed-clean", native_refs)
+
+    put_raw(ctx, review_gate_rule())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    injected = "credential-do-not-retain"
+
+    malformed_completion =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: producer.id,
+        kind: "completion",
+        commit_refs: [
+          %{
+            repo: "sirius:/srv/tightbeam",
+            commit: String.duplicate("a", 40),
+            token: injected
+          }
+        ]
+      })
+
+    assert {:error, %{rule_trace: malformed_trace} = refusal} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, malformed_completion)
+
+    assert malformed_trace.resolver_arity == 4
+    assert malformed_trace.normalized_submitted_refs == %{status: "invalid"}
+
+    assert malformed_trace.effective_refs ==
+             Enum.map(native_refs, &Map.put(&1, "verifiedRefCommit", &1["commit"]))
+
+    assert malformed_trace.selected_review_assignment_id == revoked_review.id
+    assert malformed_trace.selected_review_state == "closed"
+    assert malformed_trace.selected_review_outcome == "revoked"
+    assert malformed_trace.qualification_stage.status == "failed"
+    assert malformed_trace.preflight_stage.status == "failed"
+    assert malformed_trace.transition_stage.status == "not_attempted"
+    assert malformed_trace.request_id == nil
+    assert malformed_trace.listener_generation == nil
+    refute inspect(refusal) =~ injected
+
+    assert [%{rule_trace: persisted}] = EventLog.rail_denials(ctx.db, 0, 10)
+    assert persisted["normalized_submitted_refs"] == %{"status" => "invalid"}
+    refute JSON.encode!(persisted) =~ injected
+    assert Assignments.attest_count(ctx.db, producer.id) == 0
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [producer.id])
+  end
+
+  test "canonical preflight mismatch cannot complete and matching corrected refs still succeed",
+       ctx do
+    holder = session(ctx.db, "preflight-producer", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "preflight-reviewer", "other", archetype: "reviewer")
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "code")
+
+    native_refs = [
+      %{
+        "repo" => "sirius:/srv/tightbeam",
+        "remote" => "https://example.invalid/tightbeam.git",
+        "ref" => "refs/heads/main",
+        "commit" => String.duplicate("a", 40)
+      }
+    ]
+
+    seed_commit_ref_correction!(ctx, producer, native_refs)
+    review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
+    insert_bound_review_verdict!(ctx, review, "reviewed-clean", native_refs)
+
+    put_raw(ctx, review_gate_rule())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    mismatch =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: producer.id,
+        kind: "completion",
+        commit_refs: [
+          %{repo: "sirius:/srv/tightbeam", commit: String.duplicate("b", 40)}
+        ]
+      })
+      |> Map.put(:request_id, "req_trace_1")
+      |> Map.put(:listener_generation, 7)
+
+    assert {:error, %{rule_trace: mismatch_trace}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, mismatch)
+
+    assert mismatch_trace.qualification_stage.status == "passed"
+
+    assert mismatch_trace.preflight_stage == %{
+             status: "failed",
+             reason: "canonical_ref_mismatch"
+           }
+
+    assert mismatch_trace.transition_stage.status == "not_attempted"
+    assert mismatch_trace.request_id == "req_trace_1"
+    assert mismatch_trace.listener_generation == 7
+    assert Assignments.attest_count(ctx.db, producer.id) == 0
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [producer.id])
+
+    register_hosts(ctx.db, %{
+      "sirius" => %{
+        ssh: nil,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        cli_bin: nil
+      }
+    })
+
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+    Application.put_env(:tightbeam, :commit_ref_command, fn _, _, _ -> {"", 0} end)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    matching =
+      put_in(mismatch, [:params, :commit_refs], [
+        %{repo: "sirius:/srv/tightbeam", commit: String.duplicate("a", 40)}
+      ])
+
+    assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, matching)
+
+    assert Assignments.attest_count(ctx.db, producer.id) == 1
+  end
+
+  test "supported correction handler appends verified metadata without rewriting lifecycle rows",
+       ctx do
+    holder = session(ctx.db, "correction-producer", "flynn", archetype: "coder")
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "code")
+    work_item_id = "wi_correction_#{System.unique_integer([:positive])}"
+    attach_work_item(ctx, producer.id, work_item_id)
+
+    assert %{assignment: %{state: "closed", outcome: "completed"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, holder.session_key}, %{
+                 assignment_id: producer.id,
+                 kind: "completion"
+               })
+             )
+
+    artifact_id = "art_#{Tightbeam.Id.uuid4()}"
+    message_id = "msg_#{Tightbeam.Id.uuid4()}"
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO messages (id,sessionKey,role,content,timestamp,llmVisibleMessageId) VALUES (?1,?2,'assistant','evidence',1,?1)",
+               [message_id, holder.session_key]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO artifacts
+                 (artifactId,kind,title,createdBySession,workItemId,originPath,contentSha256,
+                  recordedMessageId,state,createdAt,updatedAt)
+               VALUES (?1,'report','correction evidence',?2,?3,'report.md',?4,?5,
+                       'in-workspace',1,1)
+               """,
+               [
+                 artifact_id,
+                 holder.session_key,
+                 work_item_id,
+                 String.duplicate("c", 64),
+                 message_id
+               ]
+             )
+
+    register_hosts(ctx.db, %{
+      "sirius" => %{
+        ssh: nil,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        cli_bin: nil
+      }
+    })
+
+    commit = String.duplicate("a", 40)
+    remote = "https://example.invalid/tightbeam.git"
+    ref_name = "refs/heads/main"
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _command, args, _opts ->
+      cond do
+        Enum.take(args, -3) == ["remote", "get-url", "origin"] -> {remote <> "\n", 0}
+        "ls-remote" in args -> {"#{commit}\t#{ref_name}\n", 0}
+        "merge-base" in args -> {"", 0}
+        true -> {commit <> "\n", 0}
+      end
+    end)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    call =
+      p3_call("assignment-commitref-correct", {:user, "flynn"}, %{
+        assignment_id: producer.id,
+        commit_refs: [
+          %{repo: "sirius:/srv/tightbeam", remote: remote, ref: ref_name, commit: commit}
+        ],
+        evidence_artifact_id: artifact_id,
+        reason: "original completion omitted its canonical ref",
+        idempotency_key: "correction-1"
+      })
+
+    assert %{correction: %{commitRefs: [%{"verifiedRefCommit" => ^commit}]}} =
+             ctx.handlers["assignment-commitref-correct"].(call)
+
+    assert Assignments.attest_count(ctx.db, producer.id) == 1
+
+    assert {:ok, [["closed", "completed"]]} =
+             DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id=?1", [producer.id])
+  end
+
   test "artifact kinds fact resolves holder-recorded kinds only (A6)", ctx do
     holder = session(ctx.db, "artifact-holder", "flynn", archetype: "coder")
     other = session(ctx.db, "artifact-other", "other")
@@ -1468,6 +1732,101 @@ defmodule Tightbeam.RulesTest do
           home
         ]
       )
+  end
+
+  defp seed_commit_ref_correction!(ctx, producer, native_refs) do
+    work_item_id = "wi_trace_#{System.unique_integer([:positive])}"
+    attach_work_item(ctx, producer.id, work_item_id)
+    artifact_id = "art_#{Tightbeam.Id.uuid4()}"
+    message_id = "msg_#{Tightbeam.Id.uuid4()}"
+    hash = String.duplicate("c", 64)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO messages (id,sessionKey,role,content,timestamp,llmVisibleMessageId) VALUES (?1,?2,'assistant','recorded',1,?1)",
+        [message_id, producer.holderKey]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO artifacts
+          (artifactId,kind,title,createdBySession,workItemId,originPath,recordedMessageId,
+           state,createdAt,updatedAt,contentSha256)
+        VALUES (?1,'report','correction evidence',?2,?3,'/tmp/correction.txt',?4,
+                'in-workspace',1,1,?5)
+        """,
+        [artifact_id, producer.holderKey, work_item_id, message_id, hash]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO artifact_assignment_producers (artifactId,assignmentId) VALUES (?1,?2)",
+        [artifact_id, producer.id]
+      )
+
+    verified_refs =
+      Enum.map(native_refs, &Map.put(&1, "verifiedRefCommit", &1["commit"]))
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO assignment_commit_ref_corrections
+          (id,assignmentId,commitRefs,reason,evidenceArtifactId,actorKind,actorRef,cause,
+           idempotencyKey,requestFingerprint,verifiedAt,createdAt)
+        VALUES (?1,?2,?3,'correct original null refs',?4,'user','flynn',
+                'historical_canonical_commitref_correction',?1,?5,1,1)
+        """,
+        [
+          "crc_#{Tightbeam.Id.uuid4()}",
+          producer.id,
+          JSON.encode!(verified_refs),
+          artifact_id,
+          String.duplicate("d", 64)
+        ]
+      )
+
+    work_item_id
+  end
+
+  defp insert_bound_review_verdict!(ctx, review, verdict_kind, native_refs) do
+    attest_id = "att_#{Tightbeam.Id.uuid4()}"
+    compatibility_refs = Enum.map(native_refs, &Map.take(&1, ["repo", "commit"]))
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO attests
+          (id,assignmentId,kind,verdictKind,bySession,commitRefs,ts)
+        VALUES (?1,?2,'verdict',?3,?4,?5,?6)
+        """,
+        [
+          attest_id,
+          review.id,
+          verdict_kind,
+          review.holderKey,
+          JSON.encode!(compatibility_refs),
+          System.system_time(:millisecond)
+        ]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO assignment_reviewed_revisions
+          (attestId,producerAssignmentId,subjectRevision,createdAt)
+        VALUES (?1,?2,?3,1)
+        """,
+        [attest_id, review.reviewsAssignmentId, JSON.encode!(native_refs)]
+      )
+
+    attest_id
   end
 
   defp review_gate_rule do

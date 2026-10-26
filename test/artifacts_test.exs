@@ -2,7 +2,16 @@ defmodule Tightbeam.ArtifactsTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
-  alias Tightbeam.{Artifacts, DB, Gateway, Ledger, Org, Placement, Projection, WorkItems}
+  alias Tightbeam.{
+    Artifacts,
+    DB,
+    Gateway,
+    Ledger,
+    Org,
+    Placement,
+    Projection,
+    WorkItems
+  }
 
   setup do
     db = :"artifacts_db_#{System.unique_integer([:positive])}"
@@ -94,6 +103,60 @@ defmodule Tightbeam.ArtifactsTest do
              }),
              & &1.artifact_id
            ) == [first.artifact_id]
+  end
+
+  test "records a bounded producer assignment binding only for its holder and work item", ctx do
+    assignment_id = "asg_artifact_producer"
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        CREATE TABLE assignments (
+          id TEXT PRIMARY KEY,
+          subject TEXT NOT NULL,
+          holderKey TEXT NOT NULL,
+          openedByUser TEXT,
+          openedAt INTEGER NOT NULL,
+          workItemId TEXT,
+          state TEXT NOT NULL DEFAULT 'open'
+        );
+        CREATE TABLE artifact_assignment_producers (
+          artifactId TEXT PRIMARY KEY REFERENCES artifacts(artifactId),
+          assignmentId TEXT NOT NULL REFERENCES assignments(id)
+        );
+        """
+      )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,workItemId) VALUES (?1,'review report',?2,'flynn',1,'wi_banana')",
+               [assignment_id, ctx.child.session_key]
+             )
+
+    artifact =
+      record(ctx.db, ctx.child.session_key, %{
+        kind: "report",
+        title: "Bound review report",
+        origin_path: "reports/review.md",
+        produced_by_assignment_id: assignment_id
+      })
+
+    assert {:ok, [[^assignment_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId FROM artifact_assignment_producers WHERE artifactId=?1",
+               [artifact.artifact_id]
+             )
+
+    assert %{code: "invalid_producer"} =
+             record(ctx.db, ctx.parent.session_key, %{
+               kind: "report",
+               title: "Wrong holder",
+               origin_path: "reports/wrong.md",
+               produced_by_assignment_id: assignment_id
+             })
   end
 
   test "readable local bytes are hashed and a supplied mismatch records nothing", ctx do

@@ -103,46 +103,68 @@ defmodule Tightbeam.Artifacts do
             case DB.transaction(db, fn txn ->
                    case IdPrefix.resolve_in_txn(txn, :work_item, work_item_id) do
                      {:ok, canonical_id} ->
-                       parent_session =
-                         Org.effective_parent_in_txn(txn, session_key).session_key
+                       producer_id = call.params[:produced_by_assignment_id]
 
-                       Txn.q(
-                         txn,
-                         """
-                         INSERT INTO artifacts
-                           (artifactId, kind, title, description, createdBySession, workItemId,
-                            parentSession, originPath, contentSha256, contentSha256Verified,
-                            recordedMessageId, recordedTurnEvidence, state, home, createdAt, updatedAt)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                                 'in-workspace', NULL, ?13, ?13)
-                         """,
-                         [
-                           artifact_id,
-                           call.params.kind,
-                           call.params.title,
-                           call.params[:description],
-                           session_key,
-                           canonical_id,
-                           parent_session,
-                           call.params.origin_path,
-                           content_sha256,
-                           verified,
-                           recorded_message_id,
-                           evidence,
-                           now
-                         ]
-                       )
-
-                       [row] =
-                         Txn.q(
+                       producer_check =
+                         validate_producer_assignment(
                            txn,
-                           "SELECT #{columns()} FROM artifacts WHERE artifactId = ?1",
-                           [artifact_id]
+                           producer_id,
+                           session_key,
+                           canonical_id
                          )
 
-                       artifact = artifact(row)
-                       Publisher.maybe_accepted_in_txn(txn, call, artifact)
-                       artifact
+                       if producer_check != :ok do
+                         producer_check
+                       else
+                         parent_session =
+                           Org.effective_parent_in_txn(txn, session_key).session_key
+
+                         Txn.q(
+                           txn,
+                           """
+                           INSERT INTO artifacts
+                             (artifactId, kind, title, description, createdBySession, workItemId,
+                              parentSession, originPath, contentSha256, contentSha256Verified,
+                              recordedMessageId, recordedTurnEvidence, state, home, createdAt, updatedAt)
+                           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                                   'in-workspace', NULL, ?13, ?13)
+                           """,
+                           [
+                             artifact_id,
+                             call.params.kind,
+                             call.params.title,
+                             call.params[:description],
+                             session_key,
+                             canonical_id,
+                             parent_session,
+                             call.params.origin_path,
+                             content_sha256,
+                             verified,
+                             recorded_message_id,
+                             evidence,
+                             now
+                           ]
+                         )
+
+                         if is_binary(producer_id) do
+                           Txn.q(
+                             txn,
+                             "INSERT INTO artifact_assignment_producers (artifactId,assignmentId) VALUES (?1,?2)",
+                             [artifact_id, producer_id]
+                           )
+                         end
+
+                         [row] =
+                           Txn.q(
+                             txn,
+                             "SELECT #{columns()} FROM artifacts WHERE artifactId = ?1",
+                             [artifact_id]
+                           )
+
+                         artifact = artifact(row)
+                         Publisher.maybe_accepted_in_txn(txn, call, artifact)
+                         artifact
+                       end
 
                      :unknown ->
                        %{code: "unknown_work_item", message: "unknown work item: #{work_item_id}"}
@@ -170,6 +192,33 @@ defmodule Tightbeam.Artifacts do
         %{code: "invalid", message: "artifact-record requires a session caller"}
     end
   end
+
+  defp validate_producer_assignment(_txn, nil, _session_key, _work_item_id), do: :ok
+
+  defp validate_producer_assignment(txn, assignment_id, session_key, work_item_id)
+       when is_binary(assignment_id) and assignment_id != "" do
+    case Txn.q(
+           txn,
+           "SELECT holderKey,workItemId FROM assignments WHERE id=?1 AND state='open'",
+           [assignment_id]
+         ) do
+      [[^session_key, ^work_item_id]] ->
+        :ok
+
+      _ ->
+        %{
+          code: "invalid_producer",
+          message:
+            "artifact producer must be an open assignment held by the caller on this work item"
+        }
+    end
+  end
+
+  defp validate_producer_assignment(_txn, _assignment_id, _session_key, _work_item_id),
+    do: %{
+      code: "invalid_producer",
+      message: "producedByAssignmentId must be nonblank text"
+    }
 
   # The best edge the substrate OBSERVED, with the observation method named.
   #
