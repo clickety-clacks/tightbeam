@@ -49,11 +49,11 @@ defmodule Tightbeam.MessageSenderRepairTest do
     ambiguous_message = human_message!(db, "no-session", nil, nil)
 
     assert {:ok, []} =
-      DB.query(db, "INSERT INTO turns(sessionKey,messageId,origin) VALUES(?1,?2,?3)", [
-        "turn-session",
-        turn_message.id,
-        "user:turn"
-      ])
+             DB.query(db, "INSERT INTO turns(sessionKey,messageId,origin) VALUES(?1,?2,?3)", [
+               "turn-session",
+               turn_message.id,
+               "user:turn"
+             ])
 
     for origin <- ["user:first", "user:second"] do
       assert {:ok, []} =
@@ -113,7 +113,8 @@ defmodule Tightbeam.MessageSenderRepairTest do
       })
 
     {:ok, root_before} = DB.query(name, "SELECT shape,stampedAt FROM schema_stamp")
-    {:ok, effort_before} = DB.query(name, "SELECT * FROM effort_holder_activity_cancellation_epoch")
+    {:ok, effort_before} =
+      DB.query(name, "SELECT * FROM effort_holder_activity_cancellation_epoch")
 
     :ok = ensure_all_schemas(name)
 
@@ -154,11 +155,15 @@ defmodule Tightbeam.MessageSenderRepairTest do
       })
 
     assert {:ok, []} =
-      DB.query(db, "INSERT INTO wakes(wakeId,origin,sourceClientIdentity) VALUES(?1,?2,?3)", [
-        wake_id,
-        origin,
-        identity
-      ])
+             DB.query(
+               db,
+               "INSERT INTO wakes(wakeId,origin,sourceClientIdentity) VALUES(?1,?2,?3)",
+               [
+                 wake_id,
+                 origin,
+                 identity
+               ]
+             )
   end
 
   defp maybe_put(map, _key, nil), do: map
