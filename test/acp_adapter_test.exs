@@ -249,6 +249,15 @@ defmodule Tightbeam.Acp.AdapterTest do
         if (failMode === "canonical-opus55-alias") {
           return { value, name: "Opus (1M context)", description: "Opus 5.5 with 1M context" };
         }
+        if (failMode === "canonical-opus55-family-only") {
+          return { value, name: "Opus (1M context)", description: "Opus with 1M context" };
+        }
+        if (failMode === "canonical-opus55-token-only") {
+          return { value, name: "Opus", description: "1M context" };
+        }
+        if (failMode === "canonical-opus55-context-mismatch") {
+          return { value, name: "Opus (1M context)", description: "Opus 5.5 with 200K context" };
+        }
         if (failMode === "canonical-opus55-drift") {
           return { value, name: "Opus (1M context)", description: "Opus 5" };
         }
@@ -434,7 +443,7 @@ defmodule Tightbeam.Acp.AdapterTest do
           models[m.params.sessionId] = "opus[1m]";
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
-        if ((failMode === "canonical-opus55-alias" || failMode === "canonical-opus55-drift") &&
+        if (["canonical-opus55-alias", "canonical-opus55-drift", "canonical-opus55-family-only", "canonical-opus55-token-only", "canonical-opus55-context-mismatch"].includes(failMode) &&
             m.params.configId === "model" &&
             ["claude-opus-5-5", "claude-opus-5-5[1m]"].includes(m.params.value)) {
           models[m.params.sessionId] = "opus[1m]";
@@ -648,6 +657,9 @@ defmodule Tightbeam.Acp.AdapterTest do
         cmd: [System.find_executable("node"), path, capture_path, fail_mode, gate_mode],
         home: "/tmp",
         cwd: "/tmp",
+        identity_evidence_path: Path.join(run_dir, "identity.jsonl"),
+        connection_generation: 7,
+        loaded_identity: Keyword.get(opts, :loaded_identity),
         name: :"adapter_#{System.unique_integer([:positive])}"
       ]
       |> then(fn adapter_opts ->
@@ -2812,25 +2824,122 @@ defmodule Tightbeam.Acp.AdapterTest do
            end)
   end
 
-  test "an opaque Claude alias refuses a variant when default context was requested" do
+  test "a contextless catalog model joins an exact Claude public option identity" do
     {adapter, capture_path} =
       start_adapter(harness: :claude, fail_mode: "canonical-opus55-alias")
 
-    assert {:error,
-            {:session_prepare_failed,
-             {:runtime_config_mismatch, %Model{family: "opus", context: "1m"}}, "sess-1",
-             %{status: "verified"}}} =
+    expected = Model.new("claude-opus-5-5", context: "1m", effort: "high")
+
+    assert {:ok, "sess-1"} =
              Adapter.new_candidate_session(
                adapter,
-               Model.new("claude-opus-5-5"),
+               Model.new("claude-opus-5-5", effort: "high"),
                "/tmp",
                [],
-               "guidance"
+               "guidance",
+               correlation: %{request_id: "req_exact", listener_generation: "lgen_exact"}
              )
 
+    assert {:ok, ^expected} = Adapter.current_model(adapter, "sess-1")
+
     assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and
+               request["configId"] == "model" and
+               request["value"] == "claude-opus-5-5[1m]"
+           end)
+
+    refute Enum.any?(captured_requests(capture_path), fn request ->
              request["method"] == "session/close" and request["sessionId"] == "sess-1"
            end)
+
+    evidence =
+      capture_path
+      |> Path.dirname()
+      |> Path.join("identity.jsonl")
+      |> File.read!()
+      |> String.trim()
+      |> JSON.decode!()
+
+    assert evidence["outcome"] == "verified"
+    assert evidence["correlation"]["requestId"] == "req_exact"
+    assert evidence["correlation"]["listenerGeneration"] == "lgen_exact"
+    assert evidence["correlation"]["sessionId"] == "sess-1"
+    assert evidence["correlation"]["adapterConnectionGeneration"] == 7
+    assert evidence["correlation"]["harnessLaunchId"] == nil
+    assert length(evidence["correlation"]["acpRequestIds"]) == 3
+
+    assert evidence["requested"] == %{
+             "family" => "claude-opus-5-5",
+             "context" => nil,
+             "effort" => "high"
+           }
+
+    assert evidence["joinedRequested"]["context"] == "1m"
+    assert evidence["acceptedReadback"]["model"] == evidence["joinedRequested"]
+
+    assert evidence["writes"] == [
+             %{
+               "requestId" => 3,
+               "configId" => "model",
+               "value" => "claude-opus-5-5[1m]"
+             },
+             %{"requestId" => 4, "configId" => "effort", "value" => "high"}
+           ]
+
+    assert evidence["acceptedReadback"]["modelCurrentValue"] == "opus[1m]"
+    assert evidence["acceptedReadback"]["effortCurrentValue"] == "high"
+    assert evidence["resident"]["modelInfos"] == nil
+    assert evidence["resident"]["modelInfosReason"] == "not_exposed_by_acp_public_response"
+    assert evidence["loadedIdentity"]["acp"]["sha256"] == nil
+
+    assert evidence["loadedIdentity"]["acp"]["reason"] ==
+             "process_loader_attestation_unavailable"
+  end
+
+  for {name, fail_mode} <- [
+        {"family-only label", "canonical-opus55-family-only"},
+        {"token-count-only label", "canonical-opus55-token-only"},
+        {"contradictory context label", "canonical-opus55-context-mismatch"}
+      ] do
+    test "a contextless catalog model rejects #{name} as identity proof" do
+      {adapter, capture_path} =
+        start_adapter(harness: :claude, fail_mode: unquote(fail_mode))
+
+      assert {:error,
+              {:session_prepare_failed,
+               {:runtime_config_mismatch, %Model{family: "opus", context: "1m"}}, "sess-1",
+               %{status: "verified"}}} =
+               Adapter.new_candidate_session(
+                 adapter,
+                 Model.new("claude-opus-5-5", effort: "high"),
+                 "/tmp",
+                 [],
+                 "guidance"
+               )
+
+      assert Enum.any?(captured_requests(capture_path), fn request ->
+               request["method"] == "session/close" and request["sessionId"] == "sess-1"
+             end)
+
+      refute Adapter.knows_session?(adapter, "sess-1")
+
+      evidence =
+        capture_path
+        |> Path.dirname()
+        |> Path.join("identity.jsonl")
+        |> File.read!()
+        |> String.trim()
+        |> JSON.decode!()
+
+      assert evidence["outcome"] == "mismatch"
+      assert evidence["cleanup"]["status"] == "verified"
+
+      assert evidence["acceptedReadback"]["model"] == %{
+               "family" => "opus",
+               "context" => "1m",
+               "effort" => "high"
+             }
+    end
   end
 
   test "an unseen offered Claude model verifies across harnesses and after a same-harness fork" do

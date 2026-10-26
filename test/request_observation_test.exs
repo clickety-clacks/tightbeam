@@ -3,13 +3,27 @@ defmodule Tightbeam.RequestObservationTest do
   import Plug.Conn
   import Plug.Test
   alias Tightbeam.{DB, Diagnostics, Org, RequestContext, Schema}
-  alias Tightbeam.Wire.Router
+  alias Tightbeam.Wire.{RequestObservation, Router}
 
   setup do
     start_supervised!({Diagnostics, notify: self()})
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = Schema.ensure_all(db)
     %{db: db, opts: Router.init(db: db, cli_token: "private_org_token", handlers: %{})}
+  end
+
+  test "listener generation stays in request correlation" do
+    conn =
+      conn(:get, "/version")
+      |> put_private(:tightbeam_listener_generation, "lgen_fixture")
+
+    response =
+      RequestObservation.call(conn, fn observed ->
+        assert RequestContext.capture().listener_generation == "lgen_fixture"
+        send_resp(observed, 200, "ok")
+      end)
+
+    assert response.status == 200
   end
 
   test "malformed and repeated IDs refuse before authentication and restore prior context", %{

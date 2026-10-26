@@ -94,6 +94,13 @@ defmodule Tightbeam.GatewayTurnFixture do
       do: handle_call({:new_session, model, cwd, mcp_servers, guidance}, from, parent)
 
     def handle_call(
+          {:new_candidate_session, model, cwd, mcp_servers, guidance, _correlation},
+          from,
+          parent
+        ),
+        do: handle_call({:new_session, model, cwd, mcp_servers, guidance}, from, parent)
+
+    def handle_call(
           {:new_session, model, cwd, mcp_servers, guidance, _request_timeout},
           from,
           parent

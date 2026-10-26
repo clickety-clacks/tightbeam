@@ -22,7 +22,7 @@ defmodule Tightbeam.Acp.Adapter do
   use GenServer
   require Logger
   alias Tightbeam.{ErrorDiagnostic, Harness, Model}
-  alias Tightbeam.Acp.{Conn, ContextUsage}
+  alias Tightbeam.Acp.{Conn, ContextUsage, IdentityEvidence}
 
   # Boot may spend 60s initializing ACP before the separate 120s gate
   # deadline starts. Residency calls queue behind handle_continue, so their
@@ -62,6 +62,10 @@ defmodule Tightbeam.Acp.Adapter do
     :on_guidance,
     :on_guidance_verified,
     :on_subagent_event,
+    :identity_evidence_path,
+    :harness_process_launch_id,
+    :connection_generation,
+    :loaded_identity,
     stderr_offset: 0,
     chunks: %{},
     progress: %{},
@@ -122,8 +126,22 @@ defmodule Tightbeam.Acp.Adapter do
              {:session_prepare_failed, term(), String.t(),
               %{status: String.t(), reason: term() | nil}}}
           | {:error, term()}
-  def new_candidate_session(adapter, model, cwd, mcp_servers, guidance),
-    do: call(adapter, {:new_candidate_session, model, cwd, mcp_servers, guidance}, 30_000)
+  def new_candidate_session(adapter, model, cwd, mcp_servers, guidance, opts \\ []),
+    do: new_candidate_call(adapter, model, cwd, mcp_servers, guidance, opts)
+
+  defp new_candidate_call(adapter, model, cwd, mcp_servers, guidance, opts) do
+    case Keyword.get(opts, :correlation, %{}) do
+      correlation when map_size(correlation) == 0 ->
+        call(adapter, {:new_candidate_session, model, cwd, mcp_servers, guidance}, 30_000)
+
+      correlation ->
+        call(
+          adapter,
+          {:new_candidate_session, model, cwd, mcp_servers, guidance, correlation},
+          30_000
+        )
+    end
+  end
 
   # The turn path keeps each failure's diagnostic carrier. The gateway renders
   # `ErrorDiagnostic.classified/1` of it as the text the health and supervision
@@ -486,7 +504,11 @@ defmodule Tightbeam.Acp.Adapter do
       on_auth_event: Keyword.get(opts, :on_auth_event),
       on_guidance: Keyword.get(opts, :on_guidance),
       on_guidance_verified: Keyword.get(opts, :on_guidance_verified),
-      on_subagent_event: Keyword.get(opts, :on_subagent_event)
+      on_subagent_event: Keyword.get(opts, :on_subagent_event),
+      identity_evidence_path: Keyword.get(opts, :identity_evidence_path),
+      harness_process_launch_id: Keyword.get(opts, :harness_process_launch_id),
+      connection_generation: Keyword.get(opts, :connection_generation),
+      loaded_identity: Keyword.get(opts, :loaded_identity)
     }
 
     # A binary that cannot execute still opens the port (the spawn is `sh -c`),
@@ -740,11 +762,19 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp session_call({:new_session, model, cwd, mcp_servers, guidance}, _from, state) do
-    new_session_reply(state, model, cwd, mcp_servers, guidance, 60_000, false)
+    new_session_reply(state, model, cwd, mcp_servers, guidance, 60_000, false, %{})
   end
 
   defp session_call({:new_candidate_session, model, cwd, mcp_servers, guidance}, _from, state) do
-    new_session_reply(state, model, cwd, mcp_servers, guidance, 60_000, true)
+    new_session_reply(state, model, cwd, mcp_servers, guidance, 60_000, true, %{})
+  end
+
+  defp session_call(
+         {:new_candidate_session, model, cwd, mcp_servers, guidance, correlation},
+         _from,
+         state
+       ) do
+    new_session_reply(state, model, cwd, mcp_servers, guidance, 60_000, true, correlation)
   end
 
   defp session_call(
@@ -752,7 +782,7 @@ defmodule Tightbeam.Acp.Adapter do
          _from,
          state
        ) do
-    new_session_reply(state, model, cwd, mcp_servers, guidance, request_timeout, false)
+    new_session_reply(state, model, cwd, mcp_servers, guidance, request_timeout, false, %{})
   end
 
   defp session_call({:load_session, sid, model, cwd, mcp_servers, guidance}, _from, state) do
@@ -1044,24 +1074,32 @@ defmodule Tightbeam.Acp.Adapter do
          mcp_servers,
          guidance,
          request_timeout,
-         report_cleanup?
+         report_cleanup?,
+         correlation
        ) do
-    case Conn.request(
-           state.conn,
+    capture? =
+      report_cleanup? and match?(%Model{family: "claude-opus-5-5"}, model) and
+        is_binary(state.identity_evidence_path)
+
+    if capture?, do: Process.put({__MODULE__, :identity_observations}, [])
+
+    case identity_request(
+           state,
            "session/new",
            %{
              cwd: cwd,
              mcpServers: mcp_servers,
              _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
            },
-           timeout: request_timeout,
-           diagnostic: true
+           request_timeout
          ) do
       {:ok, %{"sessionId" => sid} = result} when is_binary(sid) ->
         # The apply below resolves wire-by-name candidates from the cached
         # option list, so the session/new options must be remembered first.
         state = %{state | context_usage: Map.delete(state.context_usage, sid)}
         state = remember_config_options(state, sid, result)
+        catalog_model = model
+        model = join_catalog_model_to_public_option(state.preset, model, result)
 
         with :ok <- project_guidance(state, sid, guidance),
              {:ok, applied_model} <-
@@ -1076,6 +1114,18 @@ defmodule Tightbeam.Acp.Adapter do
             |> remember_config_options(sid, result)
             |> put_in([Access.key(:unprompted)], MapSet.put(state.unprompted, sid))
 
+          record_identity_evidence(
+            state,
+            correlation,
+            catalog_model,
+            model,
+            sid,
+            applied_model,
+            result,
+            :verified,
+            nil
+          )
+
           {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
         else
           {:error, error} ->
@@ -1085,6 +1135,19 @@ defmodule Tightbeam.Acp.Adapter do
 
             if report_cleanup? do
               cleanup = close_failed_new_session(state, sid)
+
+              record_identity_evidence(
+                state,
+                correlation,
+                catalog_model,
+                model,
+                sid,
+                mismatch_model(error),
+                result,
+                if(mismatch_model(error), do: :mismatch, else: :refused),
+                cleanup
+              )
+
               {:reply, {:error, {:session_prepare_failed, error, sid, cleanup}}, state}
             else
               {:reply, {:error, error}, state}
@@ -1092,19 +1155,156 @@ defmodule Tightbeam.Acp.Adapter do
         end
 
       {:ok, result} ->
+        record_identity_evidence(
+          state,
+          correlation,
+          model,
+          model,
+          nil,
+          nil,
+          result,
+          :unknown,
+          nil
+        )
+
         {:reply, {:error, {:invalid_new_session_response, result}}, state}
 
       {:error, error} ->
+        record_identity_evidence(
+          state,
+          correlation,
+          model,
+          model,
+          nil,
+          nil,
+          %{},
+          :refused,
+          nil
+        )
+
         {:reply, {:error, request_failure(error, "session/new")}, state}
     end
   end
 
   defp close_failed_new_session(state, sid) do
-    case Conn.request(state.conn, "session/close", %{sessionId: sid}, diagnostic: true) do
+    case identity_request(state, "session/close", %{sessionId: sid}, 60_000) do
       {:ok, _result} -> %{status: "verified", reason: nil}
       {:error, reason} -> %{status: "unverified", reason: reason}
     end
   end
+
+  defp identity_request(state, method, params, timeout) do
+    case Process.get({__MODULE__, :identity_observations}) do
+      observations when is_list(observations) ->
+        ref = make_ref()
+
+        result =
+          Conn.request(state.conn, method, params,
+            timeout: timeout,
+            diagnostic: true,
+            notify_dispatched: {self(), ref}
+          )
+
+        request_id =
+          receive do
+            {:acp_request_dispatched, ^ref, id} -> id
+            {:acp_request_not_dispatched, ^ref, _reason} -> nil
+          after
+            0 -> nil
+          end
+
+        config_options =
+          case result do
+            {:ok, %{"configOptions" => options}} when is_list(options) -> options
+            _ -> nil
+          end
+
+        observation = %{
+          request_id: request_id,
+          method: method,
+          config_id: params[:configId] || params["configId"],
+          value: params[:value] || params["value"],
+          config_options: config_options
+        }
+
+        Process.put({__MODULE__, :identity_observations}, [observation | observations])
+        result
+
+      _ ->
+        Conn.request(state.conn, method, params, timeout: timeout, diagnostic: true)
+    end
+  end
+
+  defp record_identity_evidence(
+         state,
+         correlation,
+         requested,
+         joined_requested,
+         sid,
+         accepted,
+         initial_result,
+         outcome,
+         cleanup
+       ) do
+    observations = Process.delete({__MODULE__, :identity_observations}) || []
+
+    if is_binary(state.identity_evidence_path) and
+         match?(%Model{family: "claude-opus-5-5"}, requested) do
+      accepted_options =
+        Enum.find_value(observations, fn
+          %{config_options: options} when is_list(options) -> options
+          _ -> nil
+        end) || evidence_config_options(initial_result)
+
+      request_ids =
+        observations
+        |> Enum.reverse()
+        |> Enum.map(& &1.request_id)
+        |> Enum.reject(&is_nil/1)
+
+      correlation = %{
+        request_id: correlation[:request_id] || correlation["requestId"],
+        listener_generation:
+          correlation[:listener_generation] || correlation["listenerGeneration"],
+        session_id: sid,
+        acp_request_ids: request_ids,
+        adapter_connection_generation: state.connection_generation,
+        harness_launch_id: state.harness_process_launch_id
+      }
+
+      IdentityEvidence.record(state.identity_evidence_path, %{
+        correlation: correlation,
+        requested: requested,
+        joined_requested: joined_requested,
+        writes: Enum.reverse(observations),
+        resident: %{
+          config_options: evidence_config_options(initial_result),
+          effort_config: state.preset.effort_config,
+          model_infos_reason: "not_exposed_by_acp_public_response"
+        },
+        accepted: %{
+          model: accepted,
+          config_options: accepted_options,
+          effort_config: state.preset.effort_config
+        },
+        loaded_identity: state.loaded_identity,
+        outcome: outcome,
+        cleanup: cleanup
+      })
+    end
+
+    :ok
+  end
+
+  defp mismatch_model(reason) do
+    case ErrorDiagnostic.classified(reason) do
+      {:runtime_config_mismatch, %Model{} = model} -> model
+      _ -> nil
+    end
+  end
+
+  defp evidence_config_options(%{"configOptions" => options}) when is_list(options), do: options
+  defp evidence_config_options(_), do: []
 
   defp verify_candidate_model(true, %Model{} = requested, %Model{} = actual)
        when requested.family != actual.family or
@@ -1999,7 +2199,7 @@ defmodule Tightbeam.Acp.Adapter do
   defp apply_model_to_session(state, sid, model_ref, request_timeout)
        when is_integer(request_timeout) or request_timeout == :infinity do
     apply_model_to_session(state, sid, model_ref, fn method, params ->
-      Conn.request(state.conn, method, params, timeout: request_timeout, diagnostic: true)
+      identity_request(state, method, params, request_timeout)
     end)
   end
 
@@ -2453,6 +2653,40 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp model_option_values(_result), do: []
+
+  # A contextless catalog row may join one context-qualified Claude option only
+  # through that option's versioned public label. Wire aliases and token counts
+  # do not establish model identity, and multiple matches leave the row unchanged
+  # so the existing exact readback check rejects any unproved selection.
+  defp join_catalog_model_to_public_option(
+         preset,
+         %Model{family: "claude-opus-5-5", context: nil} = catalog_model,
+         result
+       ) do
+    if "claude-" in preset.canonical_model_prefixes do
+      matches =
+        result
+        |> model_option_entries()
+        |> Enum.map(&public_model_from_label(preset, &1))
+        |> Enum.filter(fn
+          %Model{family: family, context: context} ->
+            family == catalog_model.family and not is_nil(context)
+
+          _ ->
+            false
+        end)
+        |> Enum.uniq()
+
+      case matches do
+        [%Model{} = public_model] -> %{catalog_model | context: public_model.context}
+        _ -> catalog_model
+      end
+    else
+      catalog_model
+    end
+  end
+
+  defp join_catalog_model_to_public_option(_preset, model, _result), do: model
 
   defp readback_confirms_model?(result, preset, %Model{} = model) do
     match?(%Model{}, confirmed_public_model(result, preset, model))
