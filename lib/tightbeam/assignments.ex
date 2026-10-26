@@ -417,6 +417,18 @@ defmodule Tightbeam.Assignments do
                                     global: false
                                   )
 
+  @reviewed_revisions_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_reviewed_revisions (
+    attestId             TEXT PRIMARY KEY,
+    producerAssignmentId TEXT NOT NULL,
+    subjectRevision      TEXT NOT NULL
+      CHECK(json_valid(subjectRevision) AND json_type(subjectRevision) = 'array'),
+    createdAt            INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS assignment_reviewed_revisions_producer
+    ON assignment_reviewed_revisions (producerAssignmentId, createdAt, attestId);
+  """
+
   @cannot_proceed_ddl """
   CREATE TABLE IF NOT EXISTS assignment_cannot_proceed (
     id TEXT PRIMARY KEY,
@@ -496,6 +508,7 @@ defmodule Tightbeam.Assignments do
     # SQLite permits the referenced table to arrive in the following DDL.
     :ok = DB.execute(db, @assignments_ddl)
     :ok = DB.execute(db, @attests_ddl)
+    :ok = DB.execute(db, @reviewed_revisions_ddl)
     :ok = DB.execute(db, @cannot_proceed_ddl)
     :ok = DB.execute(db, @assignment_files_ddl)
     :ok = DB.execute(db, @assignment_effects_ddl)
@@ -1262,7 +1275,14 @@ defmodule Tightbeam.Assignments do
         [assignment_id]
       )
 
-    Enum.map(rows, &attest/1)
+    Enum.map(rows, fn row ->
+      filed = attest(row)
+
+      case reviewed_revision(db, filed.id) do
+        nil -> filed
+        revision -> Map.put(filed, :reviewedRevision, revision)
+      end
+    end)
   end
 
   @spec list_reopenings(DB.server(), String.t()) :: [map()]
@@ -2554,10 +2574,14 @@ defmodule Tightbeam.Assignments do
   end
 
   defp attest_in_txn(txn, call) do
-    with :ok <- validate_revision_binding_in_txn(txn, call) do
-      if call.params[:kind] == "verdict",
-        do: verdict_in_txn(txn, call),
-        else: lifecycle_attest_in_txn(txn, call)
+    if review_subject_revision_claim?(call) do
+      verdict_in_txn(txn, call)
+    else
+      with :ok <- validate_revision_binding_in_txn(txn, call) do
+        if call.params[:kind] == "verdict",
+          do: verdict_in_txn(txn, call),
+          else: lifecycle_attest_in_txn(txn, call)
+      end
     end
   end
 
@@ -2582,33 +2606,158 @@ defmodule Tightbeam.Assignments do
         error("invalid_revision_binding", "artifact and sha256 must be nonblank text")
 
       true ->
-        case Txn.q(
-               txn,
-               """
-               SELECT 1
-               FROM assignments review
-               JOIN artifacts art ON art.artifactId=?2
-               JOIN assignments producer ON producer.id=art.producedByAssignmentId
-               JOIN work_items wi ON wi.id=art.workItemId
-               JOIN sessions rs ON rs.sessionKey=review.holderKey
-               JOIN sessions ps ON ps.sessionKey=producer.holderKey
-               WHERE review.id=?1
-                 AND review.reviewsAssignmentId=art.producedByAssignmentId
-                 AND art.contentSha256=?3
-                 AND rs.ownerUserId=wi.ownerUserId
-                 AND ps.ownerUserId=wi.ownerUserId
-               """,
-               [call.params[:assignment_id], artifact_id, hash]
-             ) do
-          [[1]] ->
-            :ok
+        validate_legacy_revision_binding_in_txn(txn, call, artifact_id, hash)
+    end
+  end
 
-          [] ->
+  defp validate_legacy_revision_binding_in_txn(txn, call, artifact_id, hash) do
+    case Txn.q(
+           txn,
+           """
+           SELECT 1
+           FROM assignments review
+           JOIN artifacts art ON art.artifactId=?2
+           JOIN assignments producer ON producer.id=art.producedByAssignmentId
+           JOIN work_items wi ON wi.id=art.workItemId
+           JOIN sessions rs ON rs.sessionKey=review.holderKey
+           JOIN sessions ps ON ps.sessionKey=producer.holderKey
+           WHERE review.id=?1
+             AND review.reviewsAssignmentId=art.producedByAssignmentId
+             AND art.contentSha256=?3
+             AND rs.ownerUserId=wi.ownerUserId
+             AND ps.ownerUserId=wi.ownerUserId
+           """,
+           [call.params[:assignment_id], artifact_id, hash]
+         ) do
+      [[1]] ->
+        :ok
+
+      [] ->
+        error(
+          "invalid_revision_binding",
+          "artifact revision must match the assignment reviewed by this review card"
+        )
+    end
+  end
+
+  defp validate_review_revision_binding_in_txn(txn, call, assignment) do
+    artifact_id = call.params[:artifact_id]
+    hash = call.params[:content_sha256]
+    submitted_refs = call.params[:commit_refs]
+
+    cond do
+      not (is_binary(artifact_id) and String.trim(artifact_id) != "" and is_binary(hash) and
+               String.trim(hash) != "") ->
+        error(
+          "invalid_revision_binding",
+          "review verdict requires a nonblank report artifactId and contentSha256"
+        )
+
+      true ->
+        with {:ok, [_ | _] = canonical_submitted} <-
+               canonical_native_commit_refs(submitted_refs),
+             :ok <- validate_review_report_in_txn(txn, assignment, artifact_id, hash),
+             {:ok, authoritative_refs} <-
+               authoritative_subject_revision_in_txn(txn, assignment.reviewsAssignmentId),
+             true <- canonical_submitted == authoritative_refs do
+          :ok
+        else
+          :error ->
             error(
               "invalid_revision_binding",
-              "artifact revision must match the assignment reviewed by this review card"
+              "review verdict requires a producer-bound native commitRef subject revision"
+            )
+
+          {:error, :report_binding} ->
+            error(
+              "invalid_revision_binding",
+              "review report must be SHA-bound, produced by this review assignment, and share its work item"
+            )
+
+          {:error, :owner_binding} ->
+            error(
+              "invalid_revision_binding",
+              "review and producer holders must own their shared work item"
+            )
+
+          {:error, :missing_subject_revision} ->
+            error(
+              "invalid_revision_binding",
+              "producer assignment has no authoritative native commitRef"
+            )
+
+          false ->
+            error(
+              "invalid_revision_binding",
+              "submitted subject revision does not match the producer's authoritative native commitRef"
             )
         end
+    end
+  end
+
+  defp validate_review_report_in_txn(txn, assignment, artifact_id, hash) do
+    case Txn.q(
+           txn,
+           """
+           SELECT art.producedByAssignmentId, art.workItemId, art.contentSha256,
+                  review.workItemId, producer.workItemId,
+                  rs.ownerUserId, ps.ownerUserId, wi.ownerUserId
+           FROM assignments review
+           JOIN assignments producer ON producer.id=review.reviewsAssignmentId
+           JOIN sessions rs ON rs.sessionKey=review.holderKey
+           JOIN sessions ps ON ps.sessionKey=producer.holderKey
+           LEFT JOIN work_items wi ON wi.id=review.workItemId
+           JOIN artifacts art ON art.artifactId=?2
+           WHERE review.id=?1
+           """,
+           [assignment.id, artifact_id]
+         ) do
+      [
+        [
+          produced_by,
+          artifact_work_item,
+          stored_hash,
+          review_work_item,
+          producer_work_item,
+          review_owner,
+          producer_owner,
+          work_item_owner
+        ]
+      ] ->
+        cond do
+          produced_by != assignment.id or stored_hash != hash or
+            artifact_work_item != review_work_item or producer_work_item != review_work_item or
+              is_nil(review_work_item) ->
+            {:error, :report_binding}
+
+          review_owner != work_item_owner or producer_owner != work_item_owner ->
+            {:error, :owner_binding}
+
+          true ->
+            :ok
+        end
+
+      [] ->
+        {:error, :report_binding}
+    end
+  end
+
+  defp authoritative_subject_revision_in_txn(txn, producer_id) do
+    case Txn.q(
+           txn,
+           "SELECT commitRefs FROM assignment_commit_ref_corrections WHERE assignmentId=?1",
+           [producer_id]
+         ) do
+      [[encoded]] ->
+        with {:ok, decoded} <- JSON.decode(encoded),
+             {:ok, [_ | _] = canonical} <- canonical_authoritative_commit_refs(decoded) do
+          {:ok, canonical}
+        else
+          _ -> {:error, :missing_subject_revision}
+        end
+
+      [] ->
+        {:error, :missing_subject_revision}
     end
   end
 
@@ -3017,6 +3166,8 @@ defmodule Tightbeam.Assignments do
               true ->
                 with :ok <- valid_verdict_kind(call.params[:verdict_kind]),
                      :ok <- valid_note(call.params[:note]),
+                     :ok <-
+                       validate_verdict_revision_binding_in_txn(txn, call, assignment),
                      {by_user, by_session} = opener(call.principal),
                      :ok <-
                        Wakes.validate_verification_verdict_in_txn(txn, %{
@@ -3031,7 +3182,17 @@ defmodule Tightbeam.Assignments do
                      ]) != [[1]],
                      do: raise(TransitionRace)
 
-                  attest = insert_attest(txn, call, assignment_id)
+                  {insert_call, reviewed_revision} = review_verdict_storage(call, assignment)
+                  attest = insert_attest(txn, insert_call, assignment_id)
+
+                  :ok =
+                    persist_reviewed_revision_in_txn(txn, attest, assignment, reviewed_revision)
+
+                  attest =
+                    if reviewed_revision,
+                      do: Map.put(attest, :reviewedRevision, reviewed_revision),
+                      else: attest
+
                   notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
 
                   :ok =
@@ -3055,6 +3216,58 @@ defmodule Tightbeam.Assignments do
                 end
             end
         end
+    end
+  end
+
+  defp review_verdict_storage(call, assignment) do
+    if is_binary(assignment.reviewsAssignmentId) and
+         call.params[:verdict_kind] in ["reviewed-clean", "changes-requested"] do
+      {:ok, canonical} = canonical_native_commit_refs(call.params[:commit_refs])
+
+      compatibility_refs =
+        Enum.map(canonical, fn ref ->
+          %{"repo" => ref["repo"], "commit" => ref["commit"]}
+        end)
+
+      {put_in(call, [:params, :commit_refs], compatibility_refs), canonical}
+    else
+      {call, nil}
+    end
+  end
+
+  defp persist_reviewed_revision_in_txn(_txn, _attest, _assignment, nil), do: :ok
+
+  defp persist_reviewed_revision_in_txn(txn, attest, assignment, revision) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO assignment_reviewed_revisions
+        (attestId, producerAssignmentId, subjectRevision, createdAt)
+      VALUES (?1, ?2, ?3, ?4)
+      """,
+      [attest.id, assignment.reviewsAssignmentId, JSON.encode!(revision), attest.ts]
+    )
+
+    if Txn.changes(txn) == 1, do: :ok, else: raise(TransitionRace)
+  end
+
+  defp reviewed_revision(db, attest_id) do
+    case DB.query(
+           db,
+           "SELECT subjectRevision FROM assignment_reviewed_revisions WHERE attestId=?1",
+           [attest_id]
+         ) do
+      {:ok, [[encoded]]} -> JSON.decode!(encoded)
+      {:ok, []} -> nil
+    end
+  end
+
+  defp validate_verdict_revision_binding_in_txn(txn, call, assignment) do
+    if is_binary(assignment.reviewsAssignmentId) and
+         call.params[:verdict_kind] in ["reviewed-clean", "changes-requested"] do
+      validate_review_revision_binding_in_txn(txn, call, assignment)
+    else
+      :ok
     end
   end
 
@@ -4176,6 +4389,23 @@ defmodule Tightbeam.Assignments do
   defp prepare_attest_commit_refs(db, call) do
     refs = call.params[:commit_refs]
 
+    if review_subject_revision_claim?(call) do
+      case canonical_native_commit_refs(refs) do
+        {:ok, canonical} ->
+          {:ok, put_in(call, [:params, :commit_refs], canonical)}
+
+        :error ->
+          # The admission transaction reports the missing or malformed subject
+          # binding as one revision-binding refusal, alongside the report
+          # binding checks. The submitted value carries no authority here.
+          {:ok, call}
+      end
+    else
+      prepare_regular_attest_commit_refs(db, call, refs)
+    end
+  end
+
+  defp prepare_regular_attest_commit_refs(db, call, refs) do
     case valid_commit_refs(db, call.params[:kind], refs) do
       %{code: "unverifiable_commit_ref"} = error ->
         if late_ruling_receipt?(call.params),
@@ -4194,6 +4424,11 @@ defmodule Tightbeam.Assignments do
       error ->
         error
     end
+  end
+
+  defp review_subject_revision_claim?(call) do
+    call.params[:kind] == "verdict" and
+      call.params[:verdict_kind] in ["reviewed-clean", "changes-requested"]
   end
 
   defp commit_ref_filing_allowed(db, call) do
@@ -4338,6 +4573,96 @@ defmodule Tightbeam.Assignments do
   end
 
   defp canonical_commit_refs(_), do: :error
+
+  defp canonical_native_commit_refs(refs) when is_list(refs) and refs != [] do
+    refs
+    |> Enum.reduce_while({:ok, []}, fn
+      ref, {:ok, acc} when is_map(ref) ->
+        normalized = normalize_commit_ref(ref)
+
+        case normalized do
+          %{
+            "repo" => repo,
+            "remote" => remote,
+            "ref" => ref_name,
+            "commit" => commit
+          }
+          when map_size(normalized) == 4 and is_binary(repo) and repo != "" and
+                 is_binary(remote) and remote != "" and is_binary(ref_name) and
+                 is_binary(commit) and byte_size(commit) in [40, 64] ->
+            if Regex.match?(~r/\Arefs\/(?:heads|tags)\/[A-Za-z0-9._\/-]+\z/u, ref_name) and
+                 Regex.match?(~r/\A[0-9a-fA-F]+\z/u, commit) do
+              canonical = %{
+                "repo" => repo,
+                "remote" => remote,
+                "ref" => ref_name,
+                "commit" => String.downcase(commit)
+              }
+
+              {:cont, {:ok, [canonical | acc]}}
+            else
+              {:halt, :error}
+            end
+
+          _ ->
+            {:halt, :error}
+        end
+
+      _, _ ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, canonical} ->
+        canonical =
+          Enum.sort_by(canonical, &{&1["repo"], &1["remote"], &1["ref"], &1["commit"]})
+
+        if length(canonical) == length(Enum.uniq(canonical)),
+          do: {:ok, canonical},
+          else: :error
+
+      :error ->
+        :error
+    end
+  end
+
+  defp canonical_native_commit_refs(_), do: :error
+
+  # The correction control records its successful ref-tip proof alongside the
+  # four fields that identify the producer subject. Keep that proof metadata
+  # admissible on the authoritative row, but never make it part of the subject
+  # compared with a reviewer's exact native commitRef claim.
+  defp canonical_authoritative_commit_refs(refs) when is_list(refs) and refs != [] do
+    refs
+    |> Enum.reduce_while({:ok, []}, fn
+      ref, {:ok, acc} when is_map(ref) ->
+        normalized = normalize_commit_ref(ref)
+        keys = Map.keys(normalized) |> Enum.sort()
+
+        if keys in [
+             ["commit", "ref", "remote", "repo"],
+             ["commit", "ref", "remote", "repo", "verifiedRefCommit"]
+           ] and valid_verified_ref_commit?(normalized) do
+          {:cont, {:ok, [Map.drop(normalized, ["verifiedRefCommit"]) | acc]}}
+        else
+          {:halt, :error}
+        end
+
+      _, _ ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, projected} -> canonical_native_commit_refs(Enum.reverse(projected))
+      :error -> :error
+    end
+  end
+
+  defp canonical_authoritative_commit_refs(_), do: :error
+
+  defp valid_verified_ref_commit?(%{"verifiedRefCommit" => commit})
+       when is_binary(commit) and byte_size(commit) in [40, 64],
+       do: Regex.match?(~r/\A[0-9a-fA-F]+\z/u, commit)
+
+  defp valid_verified_ref_commit?(ref), do: not Map.has_key?(ref, "verifiedRefCommit")
 
   defp applicable_code_completion_in_txn(_txn, _assignment, %{params: %{kind: kind}})
        when kind != "completion",

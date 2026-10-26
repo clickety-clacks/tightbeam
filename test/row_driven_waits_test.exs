@@ -422,7 +422,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert turn_count(ctx.db, success.wake_id) == 1
   end
 
-  test "artifact and exact-revision review waits preserve producer and revision identity", ctx do
+  test "artifact waits preserve producer identity and do not infer a reviewed revision", ctx do
     work_item(ctx.db, "wi-output")
     assignment(ctx.db, "P", "resolver", "wi-output")
     assignment(ctx.db, "Q", "resolver", "wi-output")
@@ -440,13 +440,12 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     existing =
       register_wait(ctx.db, due_after(), artifact_predicate("P", h1, true))
 
-    assert existing.recognition_path == "success"
-    assert existing.recognition_transition.label == "registration-snapshot"
+    assert existing.recognition_path == nil
     assert turn_count(ctx.db, existing.wake_id) == 0
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert :ok = Wakes.fire_due(ctx.scheduler)
-    assert turn_count(ctx.db, existing.wake_id) == 1
+    assert turn_count(ctx.db, existing.wake_id) == 0
 
     assignment(ctx.db, "P2", "resolver", "wi-output")
 
@@ -472,22 +471,15 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     candidate = record_artifact(ctx.db, "P3", h1)
     assert Wakes.get(ctx.db, unknown_revision.wake_id).recognition_path == nil
 
-    assert %{attest: %{artifactId: nil, contentSha256: nil}} =
+    assert %{code: "invalid_revision_binding"} =
              attest(ctx.db, "P3-review", "verifier", "verdict", "reviewed-clean")
 
     assert Wakes.get(ctx.db, unknown_revision.wake_id).recognition_path == nil
 
     bound_clean = review_verdict(ctx.db, "P3-review", candidate, "reviewed-clean")
     no_hash = Wakes.get(ctx.db, unknown_revision.wake_id)
-    assert no_hash.recognition_path == "success"
-    assert no_hash.recognition_transition["domain"] == "attest"
-    assert no_hash.recognition_transition["row_id"] == bound_clean.attest.id
-
-    assert no_hash.recognition_evidence["artifact_revision"] == %{
-             "hash" => h1,
-             "id" => candidate.artifact_id,
-             "producer" => "P3"
-           }
+    assert bound_clean.attest.verdictKind == "reviewed-clean"
+    assert no_hash.recognition_path == nil
 
     assignment(ctx.db, "P4", "resolver", "wi-output")
     assignment(ctx.db, "P4-review", "verifier", "wi-output", "P4")
@@ -2588,7 +2580,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
   end
 
   defp review_verdict(db, review_id, artifact, verdict_kind) do
-    Assignments.__handle__(db, "attest", %{
+    call = %{
       principal: {:session, "verifier"},
       origin: "session:verifier",
       params: %{
@@ -2599,7 +2591,9 @@ defmodule Tightbeam.RowDrivenWaitsTest do
         content_sha256: artifact.content_sha256,
         note: "revision verdict"
       }
-    })
+    }
+
+    Assignments.__handle__(db, "attest", stage_review_verdict(db, call))
   end
 
   defp revoke(db, assignment_id) do

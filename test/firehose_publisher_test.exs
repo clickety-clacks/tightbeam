@@ -562,6 +562,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
         }
     }
 
+    clean = stage_review_verdict(db, clean)
+
     assert {:ok, %{attest: %{verdictKind: "reviewed-clean"}}} =
              Dispatch.dispatch(db, handlers, clean)
 

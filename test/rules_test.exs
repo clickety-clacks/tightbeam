@@ -741,14 +741,19 @@ defmodule Tightbeam.RulesTest do
       DB.execute(ctx.db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1),('reviewer',1)")
 
     holder = session(ctx.db, "null-ref-review-author", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "null-ref-review-judge", "reviewer", archetype: "reviewer-code")
+    reviewer = session(ctx.db, "null-ref-review-judge", "flynn", archetype: "reviewer-code")
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
 
     review =
-      assignment(ctx, reviewer.session_key, {:user, "reviewer"}, reviews: producer.id)
+      assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
 
-    assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: nil}} =
-             verdict(ctx, reviewer.session_key, review.id, "reviewed-clean")
+    assert %{verdictKind: "reviewed-clean", commitRefs: nil} =
+             insert_legacy_review_verdict!(
+               ctx,
+               reviewer.session_key,
+               review.id,
+               "reviewed-clean"
+             )
 
     assert %{assignment: %{state: "closed"}} =
              Assignments.__handle__(
@@ -1194,7 +1199,7 @@ defmodule Tightbeam.RulesTest do
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
 
     holder = session(ctx.db, "producer", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "reviewer", "other", harness: "claude", provider: "anthropic")
+    reviewer = session(ctx.db, "reviewer", "flynn", harness: "claude", provider: "anthropic")
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
     review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
 
@@ -1225,8 +1230,8 @@ defmodule Tightbeam.RulesTest do
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
 
     holder = session(ctx.db, "producer", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "reviewer", "other", harness: "claude", provider: "anthropic")
-    third = session(ctx.db, "third", "other", harness: "codex", provider: "openai")
+    reviewer = session(ctx.db, "reviewer", "flynn", harness: "claude", provider: "anthropic")
+    third = session(ctx.db, "third", "flynn", harness: "codex", provider: "openai")
     producer = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "policy")
 
     verdict(ctx, reviewer.session_key, producer.id, "direct")
@@ -1329,7 +1334,7 @@ defmodule Tightbeam.RulesTest do
       DB.execute(ctx.db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1),('other',1)")
 
     holder = session(ctx.db, "gate-holder", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "gate-reviewer", "other", archetype: "reviewer")
+    reviewer = session(ctx.db, "gate-reviewer", "flynn", archetype: "reviewer")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "policy")
     parent = self()
     actual_attest = ctx.handlers["attest"]
@@ -1644,7 +1649,7 @@ defmodule Tightbeam.RulesTest do
 
   test "changes-requested wakes and reopens the author card, then clean review closes it", ctx do
     holder = session(ctx.db, "review-change-author", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "review-change-judge", "reviewer", archetype: "reviewer-code")
+    reviewer = session(ctx.db, "review-change-judge", "flynn", archetype: "reviewer-code")
 
     _owner =
       session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
@@ -1676,7 +1681,7 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, ctx.handlers, completion_call)
 
     first_review =
-      assignment(ctx, reviewer.session_key, {:user, "reviewer"}, reviews: producer.id)
+      assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
 
     assert %{attest: %{verdictKind: "changes-requested"}} =
              commit_ref_verdict(
@@ -1724,7 +1729,7 @@ defmodule Tightbeam.RulesTest do
              )
 
     second_review =
-      assignment(ctx, reviewer.session_key, {:user, "reviewer"}, reviews: producer.id)
+      assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
 
     assert %{attest: %{verdictKind: "changes-requested"}} =
              commit_ref_verdict(
@@ -1777,7 +1782,7 @@ defmodule Tightbeam.RulesTest do
     holder = session(ctx.db, "integrated-subject-author", "flynn", archetype: "coder")
 
     reviewer =
-      session(ctx.db, "integrated-subject-reviewer", "reviewer", archetype: "reviewer-code")
+      session(ctx.db, "integrated-subject-reviewer", "flynn", archetype: "reviewer-code")
 
     {:ok, _} =
       DB.query(
@@ -1786,7 +1791,7 @@ defmodule Tightbeam.RulesTest do
       )
 
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
-    review = assignment(ctx, reviewer.session_key, {:user, "reviewer"}, reviews: producer.id)
+    review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     stub_commit_ref_validation()
@@ -1833,7 +1838,7 @@ defmodule Tightbeam.RulesTest do
     holder = session(ctx.db, "unreferenced-review-author", "flynn", archetype: "coder")
 
     reviewer =
-      session(ctx.db, "unreferenced-review-judge", "reviewer", archetype: "reviewer-code")
+      session(ctx.db, "unreferenced-review-judge", "flynn", archetype: "reviewer-code")
 
     owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
 
@@ -1857,7 +1862,7 @@ defmodule Tightbeam.RulesTest do
 
       if older_exact_review? do
         older_review =
-          assignment(ctx, reviewer.session_key, {:user, "reviewer"},
+          assignment(ctx, reviewer.session_key, {:user, "flynn"},
             reviews: producer.id,
             subject: "#{label} earlier exact review"
           )
@@ -1883,13 +1888,18 @@ defmodule Tightbeam.RulesTest do
       end
 
       latest_review =
-        assignment(ctx, reviewer.session_key, {:user, "reviewer"},
+        assignment(ctx, reviewer.session_key, {:user, "flynn"},
           reviews: producer.id,
           subject: "#{label} latest review"
         )
 
-      assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: nil}} =
-               verdict(ctx, reviewer.session_key, latest_review.id, "reviewed-clean")
+      assert %{verdictKind: "reviewed-clean", commitRefs: nil} =
+               insert_legacy_review_verdict!(
+                 ctx,
+                 reviewer.session_key,
+                 latest_review.id,
+                 "reviewed-clean"
+               )
 
       assert %{assignment: %{state: "closed"}} =
                Assignments.__handle__(
@@ -4118,35 +4128,24 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
-  test "artifact revisions bind their producer, review verdict, and predicate candidate", ctx do
+  test "review verdict binds a review-produced report to the producer's native revision", ctx do
     producer_holder = session(ctx.db, "revision-producer", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "revision-reviewer", "flynn", archetype: "reviewer")
-    foreign_holder = session(ctx.db, "revision-foreign", "kay", archetype: "coder")
     producer = assignment(ctx, producer_holder.session_key, {:user, "flynn"})
     attach_work_item(ctx, producer.id, "wi_revision_binding")
 
     review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
 
-    foreign = assignment(ctx, foreign_holder.session_key, {:user, "kay"})
-
     {:ok, _} =
-      DB.query(ctx.db, "UPDATE assignments SET workItemId=?2 WHERE id=?1", [
-        foreign.id,
-        "wi_revision_binding"
+      DB.query(ctx.db, "UPDATE assignments SET workItemId=?1 WHERE id=?2", [
+        "wi_revision_binding",
+        review.id
       ])
 
     hash = String.duplicate("a", 64)
+    refs = native_commit_refs(fixture_commit_refs())
 
-    assert %{code: "invalid_producer"} =
-             record_revision_artifact(
-               ctx,
-               foreign_holder.session_key,
-               foreign.id,
-               "wi_revision_binding",
-               hash
-             )
-
-    artifact =
+    producer_artifact =
       record_revision_artifact(
         ctx,
         producer_holder.session_key,
@@ -4155,65 +4154,132 @@ defmodule Tightbeam.RulesTest do
         hash
       )
 
-    assert artifact.produced_by_assignment_id == producer.id
-    assert artifact.content_sha256 == hash
-
-    legacy = verdict(ctx, reviewer.session_key, review.id, "reviewed-clean")
-    assert legacy.attest.artifactId == nil
-    assert legacy.attest.contentSha256 == nil
-
-    predicate = %{
-      owner_user_id: "flynn",
-      conditions: [
-        %{fact: "artifact.present", op: "eq", value: true},
-        %{fact: "artifact.content_sha256", op: "eq", value: hash},
-        %{
-          fact: "review.qualifying_verdict_kinds",
-          op: "in",
-          value: ["reviewed-clean"]
-        }
-      ],
-      bindings: %{artifact: %{artifact_id: artifact.artifact_id, content_sha256: hash}}
-    }
-
-    assert {:ok, %{matched: false}} = Rules.evaluate_predicate(ctx.db, predicate)
-
     assert %{code: "invalid_revision_binding"} =
-             revision_verdict(ctx, reviewer.session_key, review.id, artifact.artifact_id, nil)
+             revision_verdict(
+               ctx,
+               reviewer.session_key,
+               review.id,
+               producer_artifact.artifact_id,
+               hash,
+               refs
+             )
+
+    report =
+      record_revision_artifact(
+        ctx,
+        reviewer.session_key,
+        review.id,
+        "wi_revision_binding",
+        hash
+      )
+
+    # No producer-carried authoritative revision exists yet; the filer's claim
+    # and the truthful report cannot manufacture one.
+    assert %{code: "invalid_revision_binding", message: missing_message} =
+             revision_verdict(
+               ctx,
+               reviewer.session_key,
+               review.id,
+               report.artifact_id,
+               hash,
+               refs
+             )
+
+    assert missing_message =~ "no authoritative native commitRef"
+    insert_commit_ref_correction!(ctx, producer.id, report.artifact_id, refs)
+
+    for {artifact_id, submitted_hash, submitted_refs} <- [
+          {nil, nil, refs},
+          {report.artifact_id, nil, refs},
+          {report.artifact_id, String.duplicate("b", 64), refs},
+          {producer_artifact.artifact_id, hash, refs},
+          {report.artifact_id, hash,
+           put_in(refs, [Access.at(0), "commit"], String.duplicate("b", 40))}
+        ] do
+      assert %{code: "invalid_revision_binding"} =
+               revision_verdict(
+                 ctx,
+                 reviewer.session_key,
+                 review.id,
+                 artifact_id,
+                 submitted_hash,
+                 submitted_refs
+               )
+    end
+
+    # A null provenance edge remains invalid; restoring it does not rewrite any
+    # prior row and allows the positive case to exercise the same immutable bytes.
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE artifacts SET producedByAssignmentId=NULL WHERE artifactId=?1", [
+        report.artifact_id
+      ])
 
     assert %{code: "invalid_revision_binding"} =
              revision_verdict(
                ctx,
                reviewer.session_key,
                review.id,
-               artifact.artifact_id,
-               String.duplicate("b", 64)
+               report.artifact_id,
+               hash,
+               refs
              )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE artifacts SET producedByAssignmentId=?1 WHERE artifactId=?2",
+        [review.id, report.artifact_id]
+      )
 
     valid =
       revision_verdict(
         ctx,
         reviewer.session_key,
         review.id,
-        artifact.artifact_id,
+        report.artifact_id,
         hash,
+        refs,
         "reviewed-clean"
       )
 
-    assert valid.attest.artifactId == artifact.artifact_id
+    assert valid.attest.artifactId == report.artifact_id
     assert valid.attest.contentSha256 == hash
-    assert {:ok, %{matched: true}} = Rules.evaluate_predicate(ctx.db, predicate)
+    assert valid.attest.commitRefs == fixture_commit_refs()
+    assert valid.attest.reviewedRevision == refs
 
-    revision_verdict(
-      ctx,
-      reviewer.session_key,
-      review.id,
-      artifact.artifact_id,
-      hash,
-      "changes-requested"
-    )
+    assert [stored] = Assignments.list_attests(ctx.db, review.id)
+    assert stored.reviewedRevision == refs
 
-    assert {:ok, %{matched: false}} = Rules.evaluate_predicate(ctx.db, predicate)
+    # Closing the review remains the earlier lifecycle refusal and does not
+    # reopen or mutate the card, even with otherwise valid bindings.
+    closed_review =
+      assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
+
+    closing_attest_id = "att_#{Tightbeam.Id.uuid4()}"
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests(id,assignmentId,kind,bySession,ts) VALUES (?1,?2,'completion',?3,2)",
+        [closing_attest_id, closed_review.id, reviewer.session_key]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE assignments SET state='closed',outcome='completed',closedAt=2,closedBySession=?1,closingAttestId=?2 WHERE id=?3",
+        [reviewer.session_key, closing_attest_id, closed_review.id]
+      )
+
+    assert %{code: "assignment_closed"} =
+             revision_verdict(
+               ctx,
+               reviewer.session_key,
+               closed_review.id,
+               report.artifact_id,
+               hash,
+               refs
+             )
   end
 
   test "artifact presence is one boolean for a fixed producer and hash selector", ctx do
@@ -4310,30 +4376,34 @@ defmodule Tightbeam.RulesTest do
   end
 
   defp verdict(ctx, session_key, assignment_id, verdict_kind, note \\ nil) do
-    Assignments.__handle__(
-      ctx.db,
-      "attest",
-      p3_call("attest", {:session, session_key}, %{
-        assignment_id: assignment_id,
-        kind: "verdict",
-        verdict_kind: verdict_kind,
-        note: note
-      })
-    )
+    params = %{
+      assignment_id: assignment_id,
+      kind: "verdict",
+      verdict_kind: verdict_kind,
+      note: note
+    }
+
+    call =
+      p3_call("attest", {:session, session_key}, params)
+      |> then(&stage_review_verdict(ctx.db, &1, commit_refs: fixture_commit_refs()))
+
+    Assignments.__handle__(ctx.db, "attest", call)
   end
 
   defp commit_ref_verdict(ctx, session_key, assignment_id, verdict_kind, refs, note \\ nil) do
-    Assignments.__handle__(
-      ctx.db,
-      "attest",
-      p3_call("attest", {:session, session_key}, %{
-        assignment_id: assignment_id,
-        kind: "verdict",
-        verdict_kind: verdict_kind,
-        note: note,
-        commit_refs: refs
-      })
-    )
+    params = %{
+      assignment_id: assignment_id,
+      kind: "verdict",
+      verdict_kind: verdict_kind,
+      note: note,
+      commit_refs: refs
+    }
+
+    call =
+      p3_call("attest", {:session, session_key}, params)
+      |> then(&stage_review_verdict(ctx.db, &1, commit_refs: refs))
+
+    Assignments.__handle__(ctx.db, "attest", call)
   end
 
   defp stub_commit_ref_validation do
@@ -4404,6 +4474,7 @@ defmodule Tightbeam.RulesTest do
          assignment_id,
          artifact_id,
          hash,
+         refs,
          verdict_kind \\ "reviewed-clean"
        ) do
     Assignments.__handle__(
@@ -4414,9 +4485,64 @@ defmodule Tightbeam.RulesTest do
         kind: "verdict",
         verdict_kind: verdict_kind,
         artifact_id: artifact_id,
-        content_sha256: hash
+        content_sha256: hash,
+        commit_refs: refs
       })
     )
+  end
+
+  defp native_commit_refs(refs) do
+    Enum.map(refs, fn ref ->
+      ref = Map.new(ref, fn {key, value} -> {to_string(key), value} end)
+
+      ref
+      |> Map.put("remote", "test://#{ref["repo"]}")
+      |> Map.put("ref", "refs/heads/main")
+    end)
+  end
+
+  defp insert_commit_ref_correction!(ctx, producer_id, evidence_artifact_id, refs) do
+    # Match AssignmentCommitRefCorrections.verify_ref/2: the durable control
+    # retains the verified ref-tip commit in addition to the native subject.
+    verified_refs =
+      Enum.map(refs, fn ref -> Map.put(ref, "verifiedRefCommit", ref["commit"]) end)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO assignment_commit_ref_corrections
+          (id,assignmentId,commitRefs,reason,evidenceArtifactId,actorKind,actorRef,cause,
+           idempotencyKey,requestFingerprint,verifiedAt,createdAt)
+        VALUES (?1,?2,?3,'review binding test',?4,'user','flynn',
+                'historical_canonical_commitref_correction',?1,?5,1,1)
+        """,
+        [
+          "crc_#{Tightbeam.Id.uuid4()}",
+          producer_id,
+          JSON.encode!(verified_refs),
+          evidence_artifact_id,
+          String.duplicate("a", 64)
+        ]
+      )
+  end
+
+  defp insert_legacy_review_verdict!(ctx, session_key, assignment_id, kind) do
+    id = "att_#{Tightbeam.Id.uuid4()}"
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO attests
+          (id,assignmentId,kind,verdictKind,bySession,byHarness,byProvider,ts)
+        VALUES (?1,?2,'verdict',?3,?4,'claude','anthropic',?5)
+        """,
+        [id, assignment_id, kind, session_key, System.system_time(:millisecond)]
+      )
+
+    Assignments.list_attests(ctx.db, assignment_id)
+    |> Enum.find(&(&1.id == id))
   end
 
   defp record_revision_artifact(ctx, session_key, producer_id, work_item_id, hash) do
@@ -4529,22 +4655,26 @@ defmodule Tightbeam.RulesTest do
 
     review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
 
-    for {session_key, assignment_id, kind} <- [
-          {holder.session_key, producer.id, "verified"},
-          {reviewer.session_key, review.id, "reviewed-clean"}
-        ] do
-      assert %{attest: %{verdictKind: ^kind}} =
-               Assignments.__handle__(
-                 ctx.db,
-                 "attest",
-                 p3_call("attest", {:session, session_key}, %{
-                   assignment_id: assignment_id,
-                   kind: "verdict",
-                   verdict_kind: kind,
-                   commit_refs: refs
-                 })
-               )
-    end
+    assert %{attest: %{verdictKind: "verified"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, holder.session_key}, %{
+                 assignment_id: producer.id,
+                 kind: "verdict",
+                 verdict_kind: "verified",
+                 commit_refs: refs
+               })
+             )
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             commit_ref_verdict(
+               ctx,
+               reviewer.session_key,
+               review.id,
+               "reviewed-clean",
+               refs
+             )
 
     refs
   end
