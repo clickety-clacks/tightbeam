@@ -857,7 +857,7 @@ defmodule Tightbeam.PlacementTest do
   test "an overlay is isolated by both host and harness", %{base_dir: base_dir, db: db} do
     Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
 
-    for host <- ["gibson", "other-host"] do
+    for host <- ["host-a", "other-host"] do
       assert {:ok, _} =
                Placement.register_host(db, host, %{
                  ssh: host,
@@ -869,7 +869,7 @@ defmodule Tightbeam.PlacementTest do
     assert {:ok, _row} =
              Placement.set_env_overlay(
                db,
-               "gibson",
+               "host-a",
                "claude",
                "EXAMPLE_OVERLAY_VAR",
                "isolated",
@@ -892,8 +892,8 @@ defmodule Tightbeam.PlacementTest do
       sh: sh
     }
 
-    gibson_claude = Placement.adapter_opts(config, {:claude, "default", "gibson"})[:cmd]
-    gibson_codex = Placement.adapter_opts(config, {:codex, "default", "gibson"})[:cmd]
+    gibson_claude = Placement.adapter_opts(config, {:claude, "default", "host-a"})[:cmd]
+    gibson_codex = Placement.adapter_opts(config, {:codex, "default", "host-a"})[:cmd]
     other_claude = Placement.adapter_opts(config, {:claude, "default", "other-host"})[:cmd]
 
     assert "EXAMPLE_OVERLAY_VAR='isolated'" in gibson_claude

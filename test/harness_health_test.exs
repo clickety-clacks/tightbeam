@@ -35,7 +35,7 @@ defmodule Tightbeam.HarnessHealthTest do
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: "default",
-      host: "gibson",
+      host: "host-a",
       harness: "codex",
       provider: "openai",
       model: Model.new("gpt-5")
@@ -51,7 +51,7 @@ defmodule Tightbeam.HarnessHealthTest do
           owner_user_id: "flynn",
           origin: "user:flynn",
           archetype: "coder",
-          host: "gibson",
+          host: "host-a",
           harness: "claude",
           provider: "anthropic",
           model: Model.new("claude-fable-5"),
@@ -82,7 +82,7 @@ defmodule Tightbeam.HarnessHealthTest do
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: "coder",
-      host: "eezo",
+      host: "host-b",
       harness: "claude",
       provider: "anthropic",
       model: Model.new("claude-fable-5"),
@@ -113,7 +113,7 @@ defmodule Tightbeam.HarnessHealthTest do
              HarnessHealth.observe(ctx.db, failure(first, "auth-dead", 1_000, "failure-1"))
 
     assert HarnessHealth.active(ctx.db) == []
-    refute ConditionFacts.harness_unavailable?(ctx.db, "claude", "gibson")
+    refute ConditionFacts.harness_unavailable?(ctx.db, "claude", "host-a")
 
     assert {:pending, %{distinctSessions: 1}} =
              HarnessHealth.observe(
@@ -138,7 +138,7 @@ defmodule Tightbeam.HarnessHealthTest do
              )
 
     assert opened.failureClass == "auth-dead"
-    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "auth-dead")
+    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "host-a", "auth-dead")
 
     incident = HarnessHealth.get(ctx.db, opened.id)
     assert incident.affectedSessions == Enum.sort(Enum.map(ctx.sessions, & &1.session))
@@ -168,12 +168,12 @@ defmodule Tightbeam.HarnessHealthTest do
     assert Enum.map(HarnessHealth.active(ctx.db), & &1.failureClass) ==
              ["auth-dead", "rate-limit-dead"]
 
-    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "auth-dead")
+    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "host-a", "auth-dead")
 
     assert ConditionFacts.harness_failure_standing?(
              ctx.db,
              "claude",
-             "gibson",
+             "host-a",
              "rate-limit-dead"
            )
   end
@@ -240,7 +240,7 @@ defmodule Tightbeam.HarnessHealthTest do
       owner_user_id: "zoe",
       origin: "user:zoe",
       archetype: "default",
-      host: "gibson",
+      host: "host-a",
       harness: "codex",
       provider: "openai",
       model: Model.new("gpt-5")
@@ -252,7 +252,7 @@ defmodule Tightbeam.HarnessHealthTest do
       owner_user_id: "zoe",
       origin: "user:zoe",
       archetype: "coder",
-      host: "gibson",
+      host: "host-a",
       harness: "claude",
       provider: "anthropic",
       model: Model.new("claude-fable-5"),
@@ -274,7 +274,7 @@ defmodule Tightbeam.HarnessHealthTest do
              HarnessHealth.observe_provider_invalidation(
                ctx.db,
                "claude",
-               "gibson",
+               "host-a",
                %{"authMode" => nil, "planType" => nil},
                conn_registry: :missing_harness_health_registry
              )
@@ -283,7 +283,7 @@ defmodule Tightbeam.HarnessHealthTest do
              HarnessHealth.observe_provider_invalidation(
                ctx.db,
                "claude",
-               "gibson",
+               "host-a",
                %{"authMode" => nil, "planType" => nil},
                conn_registry: :missing_harness_health_registry
              )
@@ -386,7 +386,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
     assert HarnessHealth.active(ctx.db) == []
     assert HarnessHealth.get(ctx.db, incident.id).state == "resolved"
-    refute HarnessHealth.unavailable?(ctx.db, "claude", "gibson")
+    refute HarnessHealth.unavailable?(ctx.db, "claude", "host-a")
   end
 
   test "one open incident absorbs later evidence and preserves its first evidence", ctx do
@@ -419,7 +419,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
     resolution = %{
       harness: "claude",
-      host: "gibson",
+      host: "host-a",
       failure_class: "auth-dead",
       session_key: first.session,
       assignment_id: first.assignment,
@@ -432,7 +432,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:resolved, resolved} = HarnessHealth.resolve(ctx.db, resolution)
     assert resolved.id == opened.id
     assert resolved.state == "resolved"
-    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "auth-dead")
+    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "host-a", "auth-dead")
 
     assert {:duplicate, duplicate} = HarnessHealth.resolve(ctx.db, resolution)
     assert duplicate.id == opened.id
@@ -481,7 +481,7 @@ defmodule Tightbeam.HarnessHealthTest do
   test "evidence cannot claim a different shared harness membership", ctx do
     input = %{
       harness: "claude",
-      host: "gibson",
+      host: "host-a",
       failure_class: "auth-dead",
       evidence_kind: "terminal-failure",
       session_key: ctx.outside_session,
@@ -514,7 +514,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM harness_health_observations")
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM harness_health_incidents")
 
-    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "auth-dead")
+    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "host-a", "auth-dead")
 
     refute Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
              event.kind == "harness_health_incident_opened"
@@ -548,7 +548,7 @@ defmodule Tightbeam.HarnessHealthTest do
   defp failure(ref, failure_class, observed_at, correlation_id) do
     %{
       harness: "claude",
-      host: "gibson",
+      host: "host-a",
       failure_class: failure_class,
       evidence_kind: "terminal-failure",
       session_key: ref.session,

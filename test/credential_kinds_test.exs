@@ -53,7 +53,7 @@ defmodule Tightbeam.CredentialKindsTest do
 
   describe "the credential store records the kind" do
     test "an API key banks with the kind recorded and no expiry", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(staging, ".credentials.json"), "sk-ant-api03-staged")
@@ -79,7 +79,7 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "a subscription banks with its kind and keeps its expiry", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
 
@@ -103,7 +103,7 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "no credential is its own state, not a kind", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
       assert Credentials.kind(:anthropic, server) == :none
       assert Credentials.kind(:openai, server) == :none
@@ -111,7 +111,7 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "both providers on one host can hold different kinds", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
       {:ok, claude_staging, claude_lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(claude_staging, ".credentials.json"), "sk-ant-api03-staged")
