@@ -1013,7 +1013,7 @@ defmodule Tightbeam.WakesTest do
     sender_session_key = "wake-sender"
     active_sessions!(db, [sender_session_key])
 
-    hub = start_supervised!({Hub, name: nil})
+    hub = start_supervised!({Hub, name: Hub})
 
     :ok =
       Hub.register(hub, self(), %{
@@ -1086,7 +1086,7 @@ defmodule Tightbeam.WakesTest do
   test "an existing undeliverable sender row is not republished to Firehose", %{db: db} do
     sender_session_key = "wake-sender-duplicate"
     active_sessions!(db, [sender_session_key])
-    hub = start_supervised!({Hub, name: nil})
+    hub = start_supervised!({Hub, name: Hub})
 
     :ok =
       Hub.register(hub, self(), %{
@@ -1148,7 +1148,7 @@ defmodule Tightbeam.WakesTest do
   test "a rolled-back undeliverable cancellation publishes no sender message", %{db: db} do
     sender_session_key = "wake-sender-rollback"
     active_sessions!(db, [sender_session_key])
-    hub = start_supervised!({Hub, name: nil})
+    hub = start_supervised!({Hub, name: Hub})
 
     :ok =
       Hub.register(hub, self(), %{
