@@ -1838,7 +1838,7 @@ defmodule Tightbeam.EffortCheckinTest do
     # Nothing is ever written in this workdir: the work is on another machine and
     # every horizon's worth of it is DECLARED, which is all the substrate needs.
     for horizon <- 1..3 do
-      artifact!(ctx.db, "holder", item.id, "shrdlu:/etc/nginx/sites-enabled/app.#{horizon}")
+      artifact!(ctx.db, "holder", item.id, "node-c:/etc/nginx/sites-enabled/app.#{horizon}")
       assert nil == fire_probe(ctx, remote.id)
       assert silent_rearm(ctx.db, remote.id, horizon + 1)
     end

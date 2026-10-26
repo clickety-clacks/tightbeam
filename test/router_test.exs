@@ -2989,7 +2989,7 @@ defmodule Tightbeam.Wire.RouterTest do
                     }}
 
     # Previously 200 on the owner's personal session with role_fallback: true —
-    # the phantom binding of wi_756153b7. The seam refuses it now.
+    # the phantom role binding. The seam refuses it now.
     unbound =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "assign",
@@ -3023,11 +3023,11 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(response.resp_body)["error"]["code"] == "session_retired"
   end
 
-  # wi_756153b7. Assigning to a role with no live holder used to bind the owner's
+  # Assigning to a role with no live holder used to bind the owner's
   # personal session with holderFallback=1: an obligation on a session that is not
   # the role's holder and commonly not even the requested provider, while the
-  # requester believed it dispatched. Specimens asg_6f380b79 (unbound role) and
-  # asg_388a5a54 (role whose bound session had been retired) — both shapes below.
+  # requester believed it dispatched. Both unbound and retired-holder shapes
+  # are exercised below.
   #
   # Run against the REAL assign/dispatch handlers over a session-authenticated
   # request, because the claim is "no row", and a mocked handler writes none either

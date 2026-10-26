@@ -67,8 +67,8 @@ defmodule Tightbeam.CredentialKindsTest do
   end
 
   defp stock_codex_models_body do
-    # Trimmed from Racter's unauthenticated stock Codex 0.154.0 model/list
-    # capture, evidence/pr103-stock-model-list.json SHA-256 28fecba310f7a634.
+    # Trimmed from an unauthenticated stock Codex 0.154.0 model/list
+    # response; only the response shape needed by this test is retained.
     Path.join([__DIR__, "fixtures", "model_catalog", "codex_0_154_0_stock_models.json"])
     |> File.read!()
   end
@@ -117,7 +117,7 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "an OpenCode Go API key banks in Pi's native auth.json", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "lab1")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:opencode_go, server)
 
@@ -128,10 +128,10 @@ defmodule Tightbeam.CredentialKindsTest do
 
       assert :ok = Credentials.finish_onboard(:opencode_go, :api_key, lease_id, server)
 
-      store = Credentials.credential_path(ctx.base, "eezo", :opencode_go)
+      store = Credentials.credential_path(ctx.base, "lab1", :opencode_go)
 
       metadata_path =
-        Path.join([ctx.base, "homes", "eezo", "pi", ".tightbeam", "credential.json"])
+        Path.join([ctx.base, "homes", "lab1", "pi", ".tightbeam", "credential.json"])
 
       assert JSON.decode!(File.read!(store)) == %{
                "opencode-go" => %{"type" => "api_key", "key" => "fixture-go-key"}
@@ -145,19 +145,19 @@ defmodule Tightbeam.CredentialKindsTest do
       assert metadata["kind"] == "api_key"
       assert metadata["onboarded"] == true
       assert metadata["expires_at"] == nil
-      assert Credentials.kind_at(ctx.base, "eezo", :opencode_go) == :api_key
+      assert Credentials.kind_at(ctx.base, "lab1", :opencode_go) == :api_key
     end
 
     test "Pi runtime credential replacement survives restart without a legacy bank", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "lab1")
       {:ok, staging, lease_id} = Credentials.begin_onboard(:opencode_go, server)
       initial = ~s({"opencode-go":{"type":"api_key","key":"fixture-original"}})
       rotated = ~s({"opencode-go":{"type":"api_key","key":"fixture-runtime-replacement"}})
       File.write!(Path.join(staging, "auth.json"), initial)
       assert :ok = Credentials.finish_onboard(:opencode_go, :api_key, lease_id, server)
 
-      home = Tightbeam.Homes.home_path(ctx.base, "eezo", :pi)
-      credential = Credentials.credential_path(ctx.base, "eezo", :opencode_go)
+      home = Tightbeam.Homes.home_path(ctx.base, "lab1", :pi)
+      credential = Credentials.credential_path(ctx.base, "lab1", :opencode_go)
       assert credential == Path.join(home, "auth.json")
       refute "auth.json" in Tightbeam.Harness.Pi.owned_home_entries()
       legacy = Path.join([ctx.base, "auth", "pi", "auth.json"])
@@ -169,16 +169,16 @@ defmodule Tightbeam.CredentialKindsTest do
       File.mkdir_p!(Path.dirname(legacy))
       File.write!(legacy, initial)
       GenServer.stop(server)
-      {:ok, restarted} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, restarted} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "lab1")
       assert Credentials.status(:opencode_go, restarted) == :onboarded
       assert File.read!(credential) == rotated
       assert File.read!(legacy) == initial
-      assert Credentials.kind_at(ctx.base, "eezo", :opencode_go) == :api_key
+      assert Credentials.kind_at(ctx.base, "lab1", :opencode_go) == :api_key
       GenServer.stop(restarted)
     end
 
     test "a malformed Pi auth.json is refused before it reaches the store", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "lab1")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:opencode_go, server)
       File.write!(Path.join(staging, "auth.json"), ~s({"opencode-go":{"type":"api_key"}}))
@@ -188,11 +188,11 @@ defmodule Tightbeam.CredentialKindsTest do
 
       assert found =~ "opencode-go.key is missing"
       assert sentence =~ "tightbeam onboard opencode-go"
-      refute File.exists?(Credentials.credential_path(ctx.base, "eezo", :opencode_go))
+      refute File.exists?(Credentials.credential_path(ctx.base, "lab1", :opencode_go))
     end
 
     test "a Pi auth.json that is not JSON is refused with its offset, not its bytes", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "lab1")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:opencode_go, server)
       sentinel = "sk-fixture-SENTINEL-0123456789abcdef"
@@ -203,7 +203,7 @@ defmodule Tightbeam.CredentialKindsTest do
 
       assert found =~ "the Pi auth.json is not valid JSON: invalid byte at offset 15"
       refute found =~ sentinel
-      refute File.exists?(Credentials.credential_path(ctx.base, "eezo", :opencode_go))
+      refute File.exists?(Credentials.credential_path(ctx.base, "lab1", :opencode_go))
     end
 
     test "a subscription banks with its kind without inferring expiry", ctx do
@@ -1062,7 +1062,7 @@ defmodule Tightbeam.CredentialKindsTest do
       refute JSON.encode!(reply) =~ "SENTINEL"
     end
 
-    # wi_0535922b: the begin reply names the OWNER user so the CLI can wake that
+    # The begin reply names the owner user so the CLI can wake that
     # user with the sign-in URL+code a session-run ceremony would otherwise trap
     # on a pty nobody watches. Only the begin "ready" reply carries it; a caller
     # with an owner (a user or agent origin) resolves, a process origin does not.

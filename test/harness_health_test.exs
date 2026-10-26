@@ -106,7 +106,7 @@ defmodule Tightbeam.HarnessHealthTest do
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: "coder",
-      host: "eezo",
+      host: "lab1",
       harness: "claude",
       provider: "anthropic",
       model: Model.new("claude-fable-5")
@@ -1331,8 +1331,8 @@ defmodule Tightbeam.HarnessHealthTest do
                  review_id,
                  ctx.outside_session,
                  JSON.encode!([
-                   %{"repo" => "racter", "commit" => candidate_commit},
-                   %{"repo" => "racter", "commit" => second_candidate_commit}
+                   %{"repo" => "node-b", "commit" => candidate_commit},
+                   %{"repo" => "node-b", "commit" => second_candidate_commit}
                  ]),
                  report_id,
                  report_sha,

@@ -30,7 +30,7 @@ defmodule Tightbeam.ArtifactsTest do
       record(ctx.db, ctx.child.session_key, %{
         kind: "report",
         title: "Private",
-        origin_path: "eezo:/tmp/private"
+        origin_path: "lab1:/tmp/private"
       })
 
     owner = %{kind: "user", id: "flynn", is_admin: false}
@@ -89,7 +89,7 @@ defmodule Tightbeam.ArtifactsTest do
       record(ctx.db, ctx.child.session_key, %{
         kind: "report",
         title: "Filtered",
-        origin_path: "eezo:/tmp/filtered"
+        origin_path: "lab1:/tmp/filtered"
       })
 
     refute_receive {:firehose_notice, _}
@@ -233,7 +233,7 @@ defmodule Tightbeam.ArtifactsTest do
       record(ctx.db, ctx.child.session_key, %{
         kind: "report",
         title: "Floor",
-        origin_path: "eezo:/tmp/external-artifact"
+        origin_path: "lab1:/tmp/external-artifact"
       })
 
     assert_receive {:firehose_notice, %{"class" => "artifact.recorded", "payload" => creation}}
@@ -281,7 +281,7 @@ defmodule Tightbeam.ArtifactsTest do
       record(ctx.db, ctx.child.session_key, %{
         kind: "report",
         title: "Legacy",
-        origin_path: "eezo:/tmp/legacy"
+        origin_path: "lab1:/tmp/legacy"
       })
 
     {:ok, _} =
@@ -918,12 +918,12 @@ defmodule Tightbeam.ArtifactsTest do
     on_exit(fn -> File.rm_rf(workspace) end)
 
     # The exact form the operating manual teaches for remote work. Resolving it
-    # against the workspace would make "shrdlu:" a missing directory and raise.
+    # against the workspace would treat the remote-host prefix as a missing directory.
     row =
       record(ctx.db, ctx.child.session_key, %{
         kind: "report",
         title: "Remote vhost",
-        origin_path: "shrdlu:/etc/nginx/sites-enabled/app"
+        origin_path: "node-c:/etc/nginx/sites-enabled/app"
       })
 
     assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
