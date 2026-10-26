@@ -60,9 +60,7 @@ defmodule Tightbeam.Firehose.Hub do
           GenServer.cast(pid, {:ingress, bytes, message})
         else
           :ets.update_counter(table, :ingress, [{2, -1}, {3, -bytes}])
-
-          if :ets.insert_new(table, {:overflow, true}),
-            do: GenServer.cast(pid, :ingress_overflow)
+          mark_ingress_overflow(table, pid, message)
         end
     end
 
@@ -167,15 +165,24 @@ defmodule Tightbeam.Firehose.Hub do
           do: requeue_visible(socket),
           else: socket
 
-      {:reply, :ok, put_in(state.sockets[pid], socket)}
+      state = put_in(state.sockets[pid], socket)
+      sync_socket_filters(state, pid)
+
+      {:reply, :ok, state}
     end
   end
 
-  def handle_call({:subscribe, pid, id, filters}, _, state),
-    do: {:reply, :ok, update(state, pid, &put_in(&1.subscriptions[id], filters))}
+  def handle_call({:subscribe, pid, id, filters}, _, state) do
+    state = update(state, pid, &put_in(&1.subscriptions[id], filters))
+    sync_socket_filters(state, pid)
+    {:reply, :ok, state}
+  end
 
-  def handle_call({:begin_subscribe, pid, id, filters}, _, state),
-    do: {:reply, :ok, update(state, pid, &put_in(&1.pending_subscriptions[id], filters))}
+  def handle_call({:begin_subscribe, pid, id, filters}, _, state) do
+    state = update(state, pid, &put_in(&1.pending_subscriptions[id], filters))
+    sync_socket_filters(state, pid)
+    {:reply, :ok, state}
+  end
 
   def handle_call({:finish_subscribe, pid, id, notices}, _, state) do
     case state.sockets[pid] do
@@ -221,14 +228,18 @@ defmodule Tightbeam.Firehose.Hub do
                 state.queue_limit
               )
 
-            {:reply, :ok, put_in(state.sockets[pid], socket)}
+            state = put_in(state.sockets[pid], socket)
+            sync_socket_filters(state, pid)
+            {:reply, :ok, state}
         end
     end
   end
 
-  def handle_call({:unsubscribe, pid, id}, _, state),
-    do:
-      {:reply, :ok, update(state, pid, &%{&1 | subscriptions: Map.delete(&1.subscriptions, id)})}
+  def handle_call({:unsubscribe, pid, id}, _, state) do
+    state = update(state, pid, &%{&1 | subscriptions: Map.delete(&1.subscriptions, id)})
+    sync_socket_filters(state, pid)
+    {:reply, :ok, state}
+  end
 
   def handle_call({:sequence, pid}, _, state),
     do: {:reply, (state.sockets[pid] && state.sockets[pid].seq) || 0, state}
@@ -269,20 +280,32 @@ defmodule Tightbeam.Firehose.Hub do
   end
 
   def handle_cast(:ingress_overflow, state) do
+    # Clear the coalescing marker before taking targets. A concurrent dropped
+    # publication can then create the next marker, so its target cannot be lost
+    # between the target scan and this handler returning.
     :ets.delete(state.ingress, :overflow)
 
     sockets =
-      Map.new(state.sockets, fn {pid, socket} ->
-        if not socket.overflowed, do: send(pid, :firehose_overflow)
+      state.ingress
+      |> :ets.match_object({{:overflow_target, :_}, :_})
+      |> Enum.reduce(state.sockets, fn {{:overflow_target, pid}, _}, sockets ->
+        :ets.delete(state.ingress, {:overflow_target, pid})
 
-        {pid,
-         %{
-           socket
-           | queue: :queue.new(),
-             queued: 0,
-             pending_notices: :queue.new(),
-             overflowed: true
-         }}
+        case sockets[pid] do
+          nil ->
+            sockets
+
+          socket ->
+            if not socket.overflowed, do: send(pid, :firehose_overflow)
+
+            Map.put(sockets, pid, %{
+              socket
+              | queue: :queue.new(),
+                queued: 0,
+                pending_notices: :queue.new(),
+                overflowed: true
+            })
+        end
       end)
 
     {:noreply, %{state | sockets: sockets}}
@@ -606,6 +629,8 @@ defmodule Tightbeam.Firehose.Hub do
   defp drop(state, pid) do
     {socket, sockets} = Map.pop(state.sockets, pid)
     if socket, do: Process.demonitor(socket.monitor, [:flush])
+    :ets.delete(state.ingress, {:socket, pid})
+    :ets.delete(state.ingress, {:overflow_target, pid})
     state = %{state | sockets: sockets}
 
     if state.shutdown_waiter && map_size(sockets) == 0 do
@@ -613,6 +638,198 @@ defmodule Tightbeam.Firehose.Hub do
       %{state | shutdown_waiter: nil}
     else
       state
+    end
+  end
+
+  defp mark_ingress_overflow(table, server, message) do
+    table
+    |> overflow_targets(message)
+    |> Enum.each(&:ets.insert_new(table, {{:overflow_target, &1}, true}))
+
+    if :ets.insert_new(table, {:overflow, true}),
+      do: GenServer.cast(server, :ingress_overflow)
+  end
+
+  defp overflow_targets(table, message) do
+    notices = ingress_notices(message)
+
+    table
+    |> :ets.match_object({{:socket, :_}, :_, :_, :_, :_, :_, :_})
+    |> Enum.flat_map(fn
+      {{:socket, pid}, mode, subscriptions, user_id, device_id, principal_kind, principal_id} ->
+        if overflow_matches?(
+             notices,
+             mode,
+             subscriptions,
+             user_id,
+             device_id,
+             principal_kind,
+             principal_id
+           ),
+           do: [pid],
+           else: []
+    end)
+  end
+
+  defp ingress_notices({:publish, %{"class" => class} = notice}) when is_binary(class),
+    do: [overflow_notice(notice)]
+
+  defp ingress_notices({:committed, class, payload, refs})
+       when class in ~w(session.spawned session.updated session.harness_changed session.retired) and
+              is_map(payload) and is_map(refs) do
+    [overflow_notice(session_probe(class, payload, refs))]
+  end
+
+  defp ingress_notices({:committed, class, payload, refs})
+       when is_binary(class) and is_map(payload) and is_map(refs) do
+    [Publisher.committed_notice(class, payload, refs)]
+  rescue
+    _ -> :unknown
+  end
+
+  defp ingress_notices({:accepted, db, call, result}) do
+    db
+    |> Publisher.accepted_notices(call, result)
+    |> Enum.map(&overflow_notice/1)
+  rescue
+    _ -> :unknown
+  end
+
+  defp ingress_notices({:denied, call, error}) do
+    call
+    |> Publisher.denied_notices(error)
+    |> Enum.map(&overflow_notice/1)
+  rescue
+    _ -> :unknown
+  end
+
+  defp ingress_notices(_message), do: :unknown
+
+  defp overflow_notice(%{"class" => "session.retired"} = notice),
+    do: {:session_retired, notice}
+
+  defp overflow_notice(notice), do: notice
+
+  defp session_probe(class, payload, refs) do
+    session_key = refs["sessionKey"] || payload[:session_key] || payload["sessionKey"]
+    owner = refs["ownerUserId"] || payload[:owner_user_id] || payload["ownerUserId"]
+
+    %{
+      "class" => class,
+      "refs" => Map.merge(refs, %{"sessionKey" => session_key, "ownerUserId" => owner}),
+      "payload" => %{"sessionKey" => session_key, "ownerUserId" => owner}
+    }
+  end
+
+  defp overflow_matches?(
+         _notices,
+         :pending,
+         _subscriptions,
+         _user_id,
+         _device_id,
+         _principal_kind,
+         _principal_id
+       ),
+       do: false
+
+  defp overflow_matches?(
+         _notices,
+         :all,
+         _subscriptions,
+         _user_id,
+         _device_id,
+         _principal_kind,
+         _principal_id
+       ),
+       do: true
+
+  defp overflow_matches?(
+         :unknown,
+         _mode,
+         _subscriptions,
+         _user_id,
+         _device_id,
+         _principal_kind,
+         _principal_id
+       ),
+       do: true
+
+  defp overflow_matches?(
+         _notices,
+         _mode,
+         subscriptions,
+         _user_id,
+         _device_id,
+         _principal_kind,
+         _principal_id
+       )
+       when map_size(subscriptions) == 0,
+       do: true
+
+  defp overflow_matches?(
+         notices,
+         _mode,
+         subscriptions,
+         user_id,
+         device_id,
+         principal_kind,
+         principal_id
+       )
+       when is_list(notices) do
+    Enum.any?(notices, fn
+      {:session_retired, notice} ->
+        session_retired_for?(notice, user_id, principal_kind, principal_id) or
+          matches_subscription?(notice, subscriptions)
+
+      notice ->
+        device_revoked_for?(notice, device_id, principal_kind) or
+          matches_subscription?(notice, subscriptions)
+    end)
+  end
+
+  defp overflow_matches?(
+         _notices,
+         _mode,
+         _subscriptions,
+         _user_id,
+         _device_id,
+         _principal_kind,
+         _principal_id
+       ),
+       do: false
+
+  defp device_revoked_for?(notice, device_id, principal_kind),
+    do: revoked?(notice, %Socket{device_id: device_id, principal_kind: principal_kind})
+
+  defp matches_subscription?(notice, subscriptions),
+    do: Enum.any?(subscriptions, fn {_id, filters} -> matches?(notice, filters) end)
+
+  defp session_retired_for?(notice, _user_id, :session, principal_id) do
+    payload = notice["payload"] || %{}
+    refs = notice["refs"] || %{}
+    refs["sessionKey"] == principal_id or payload["sessionKey"] == principal_id
+  end
+
+  defp session_retired_for?(notice, user_id, _principal_kind, _principal_id) do
+    payload = notice["payload"] || %{}
+    refs = notice["refs"] || %{}
+    payload["ownerUserId"] == user_id or refs["ownerUserId"] == user_id
+  end
+
+  defp socket_filters(socket),
+    do: Map.merge(socket.subscriptions, socket.pending_subscriptions)
+
+  defp sync_socket_filters(state, pid) do
+    case state.sockets[pid] do
+      nil ->
+        :ets.delete(state.ingress, {:socket, pid})
+
+      socket ->
+        :ets.insert(
+          state.ingress,
+          {{:socket, pid}, socket.mode, socket_filters(socket), socket.user_id, socket.device_id,
+           socket.principal_kind, socket.principal_id}
+        )
     end
   end
 

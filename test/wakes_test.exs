@@ -4,6 +4,7 @@ defmodule Tightbeam.WakesTest do
   import ExUnit.CaptureLog
 
   alias Tightbeam.{DB, EventLog, NoticeBatcher, Wakes}
+  alias Tightbeam.Firehose.Hub
   alias Tightbeam.DB.Txn
 
   describe "terminal notification identity and payload (no admission)" do
@@ -1012,6 +1013,22 @@ defmodule Tightbeam.WakesTest do
     sender_session_key = "wake-sender"
     active_sessions!(db, [sender_session_key])
 
+    hub = start_supervised!({Hub, name: Hub})
+
+    :ok =
+      Hub.register(hub, self(), %{
+        mode: :subscribed,
+        db: db,
+        user_id: "flynn",
+        is_admin: false
+      })
+
+    :ok =
+      Hub.subscribe(hub, self(), "undeliverable-sender", %{
+        "classes" => ["message.created"],
+        "sessionKey" => sender_session_key
+      })
+
     wake =
       Wakes.schedule(db, %{
         session_key: "missing-recipient",
@@ -1044,6 +1061,144 @@ defmodule Tightbeam.WakesTest do
     assert wake_id == wake.wake_id
     assert elem(sender_notice, 0) == wake.wake_id
     assert Wakes.get(db, wake.wake_id).state == "canceled"
+
+    _barrier = Hub.sequence(hub, self())
+
+    assert_received {:firehose_notice, notice}
+    assert notice["class"] == "message.created"
+    assert notice["refs"]["sessionKey"] == sender_session_key
+
+    assert notice["payload"]["content"] ==
+             "Wake #{wake.wake_id} could not be delivered and was canceled."
+
+    assert notice["payload"]["messageType"] == "substrate"
+    assert notice["refs"]["messageId"] == notice["payload"]["id"]
+    assert notice["refs"]["ownerUserId"] == "flynn"
+
+    assert notice["payload"] ==
+             db
+             |> Tightbeam.StateResources.query_message(notice["payload"]["id"])
+             |> Tightbeam.StateResources.message()
+
+    refute_received {:firehose_notice, %{"class" => "message.created"}}
+  end
+
+  test "an existing undeliverable sender row is not republished to Firehose", %{db: db} do
+    sender_session_key = "wake-sender-duplicate"
+    active_sessions!(db, [sender_session_key])
+    hub = start_supervised!({Hub, name: Hub})
+
+    :ok =
+      Hub.register(hub, self(), %{
+        mode: :subscribed,
+        db: db,
+        user_id: "flynn",
+        is_admin: false
+      })
+
+    :ok =
+      Hub.subscribe(hub, self(), "undeliverable-sender-duplicate", %{
+        "classes" => ["message.created"],
+        "sessionKey" => sender_session_key
+      })
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "missing-recipient",
+        origin: "session:#{sender_session_key}",
+        creator_session_key: sender_session_key,
+        consumer: "missing_consumer",
+        due_at: 0
+      })
+
+    client_message_id = "wake-undeliverable:#{wake.wake_id}"
+
+    assert {:ok, {:appended, _message}} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.Projection.append_in_txn(txn, %{
+                 session_key: sender_session_key,
+                 role: "assistant",
+                 content: "Wake #{wake.wake_id} could not be delivered and was canceled.",
+                 sender: "process:tightbeam",
+                 message_type: "substrate",
+                 attention_tier: Tightbeam.Projection.attention_tier(:high),
+                 device_id: "process:tightbeam",
+                 client_message_id: client_message_id
+               })
+             end)
+
+    assert {:ok, {:canceled, {wake_id, sender_notice}}} =
+             DB.transaction(db, fn txn ->
+               Wakes.undeliverable_delivery_in_txn(
+                 txn,
+                 wake.wake_id,
+                 "unknown internal consumer",
+                 System.system_time(:millisecond),
+                 "consumer_unavailable"
+               )
+             end)
+
+    assert wake_id == wake.wake_id
+    assert elem(sender_notice, 0) == wake.wake_id
+
+    _barrier = Hub.sequence(hub, self())
+    refute_received {:firehose_notice, %{"class" => "message.created"}}
+  end
+
+  test "a rolled-back undeliverable cancellation publishes no sender message", %{db: db} do
+    sender_session_key = "wake-sender-rollback"
+    active_sessions!(db, [sender_session_key])
+    hub = start_supervised!({Hub, name: Hub})
+
+    :ok =
+      Hub.register(hub, self(), %{
+        mode: :subscribed,
+        db: db,
+        user_id: "flynn",
+        is_admin: false
+      })
+
+    :ok =
+      Hub.subscribe(hub, self(), "undeliverable-sender-rollback", %{
+        "classes" => ["message.created"],
+        "sessionKey" => sender_session_key
+      })
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "missing-recipient",
+        origin: "session:#{sender_session_key}",
+        creator_session_key: sender_session_key,
+        consumer: "missing_consumer",
+        due_at: 0
+      })
+
+    wake_id = wake.wake_id
+
+    assert {:error, %RuntimeError{message: "forced rollback"}} =
+             DB.transaction(db, fn txn ->
+               assert {:canceled, {^wake_id, _sender_notice}} =
+                        Wakes.undeliverable_delivery_in_txn(
+                          txn,
+                          wake.wake_id,
+                          "unknown internal consumer",
+                          System.system_time(:millisecond),
+                          "consumer_unavailable"
+                        )
+
+               raise "forced rollback"
+             end)
+
+    _barrier = Hub.sequence(hub, self())
+    refute_received {:firehose_notice, %{"class" => "message.created"}}
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM messages WHERE sessionKey=?1 AND clientMessageId=?2",
+               [sender_session_key, "wake-undeliverable:#{wake.wake_id}"]
+             )
   end
 
   test "exiting internal consumer leaves its wake pending and does not crash the scheduler", %{
