@@ -1975,6 +1975,17 @@ defmodule Tightbeam.Schema do
     :ok = ensure_notice_delivery_runtime_indexes(db)
     :ok = upgrade_effort_holder_activity_cancellation_v1(db)
     :ok = upgrade_evidence_release(db)
+
+    sender_repair_counts = Tightbeam.Projection.repair_missing_human_senders(db)
+
+    if Enum.any?(Map.values(sender_repair_counts), &(&1 > 0)) do
+      Logger.info(
+        "stored human message sender repair turn=#{sender_repair_counts.turn} " <>
+          "wake=#{sender_repair_counts.wake} owner=#{sender_repair_counts.owner} " <>
+          "left_null=#{sender_repair_counts.left_null}"
+      )
+    end
+
     :ok = Tightbeam.ToolCalls.ensure_schema(db)
 
     case DB.finish_schema(db) do
