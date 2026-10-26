@@ -3,6 +3,65 @@ defmodule Tightbeam.FirehoseIngressOverflowTest do
 
   alias Tightbeam.{DB, Firehose.Hub}
 
+  test "credentialless observers receive subscribed revocation notices without revoking" do
+    db = :"firehose_observer_revocation_db_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    hub = start_supervised!({Hub, name: nil})
+
+    :ok =
+      Hub.register(hub, self(), %{
+        mode: :filtered,
+        db: db,
+        user_id: nil,
+        device_id: nil,
+        principal_kind: :observer,
+        principal_id: nil,
+        is_admin: false
+      })
+
+    :ok =
+      Hub.subscribe(hub, self(), "revocations", %{
+        "classes" => ["device.revoked", "session.retired"]
+      })
+
+    Hub.publish(hub, %{"class" => "device.revoked", "refs" => %{}, "payload" => %{}})
+
+    Hub.publish(hub, %{
+      "class" => "session.retired",
+      "refs" => %{},
+      "payload" => %{}
+    })
+
+    _barrier = Hub.sequence(hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "device.revoked",
+                      "seq" => 1,
+                      "subscriptionId" => "revocations"
+                    }}
+
+    :ok = Hub.delivered(hub, self())
+    _barrier = Hub.sequence(hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "session.retired",
+                      "seq" => 2,
+                      "subscriptionId" => "revocations"
+                    }}
+
+    :ok = Hub.delivered(hub, self())
+    _barrier = Hub.sequence(hub, self())
+
+    refute_received :firehose_revoked
+
+    assert %{overflowed: false, queued: 0, seq: 2, in_flight: false} =
+             Hub.connection_stats(hub, self())
+  end
+
   test "shared ingress overflow closes only subscribers that could miss a matching notice" do
     db = :"firehose_ingress_overflow_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
@@ -113,6 +172,91 @@ defmodule Tightbeam.FirehoseIngressOverflowTest do
     _barrier = Hub.sequence(hub, self())
     assert_receive {:firehose_notice, %{"class" => "message.created", "seq" => 1}}, 5_000
     refute_received :firehose_overflow
+  end
+
+  test "a dropped device revocation overflows its device socket" do
+    db = :"firehose_device_revocation_overflow_db_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
+
+    hub = start_supervised!({Hub, name: nil})
+    parent = self()
+
+    device_subscriber =
+      spawn(fn ->
+        :ok =
+          Hub.register(hub, self(), %{
+            mode: :filtered,
+            db: db,
+            user_id: "flynn",
+            device_id: "own-device",
+            principal_kind: :user,
+            principal_id: "flynn",
+            is_admin: true
+          })
+
+        :ok =
+          Hub.subscribe(hub, self(), "device-messages", %{
+            "classes" => ["message.created"],
+            "sessionKey" => "device-session"
+          })
+
+        send(parent, {:device_subscriber_ready, self()})
+
+        receive do
+          :firehose_overflow ->
+            send(parent, {:device_subscriber_overflowed, self()})
+
+            receive do
+              :stop -> :ok
+            end
+
+          :stop ->
+            :ok
+        end
+      end)
+
+    assert_receive {:device_subscriber_ready, ^device_subscriber}, 5_000
+
+    on_exit(fn ->
+      if Process.alive?(device_subscriber), do: send(device_subscriber, :stop)
+    end)
+
+    :ok = :sys.suspend(hub)
+
+    try do
+      Enum.each(1..1_000, fn index ->
+        Hub.publish(hub, %{
+          "class" => "message.created",
+          "refs" => %{
+            "messageId" => "unrelated-#{index}",
+            "sessionKey" => "unrelated-session",
+            "ownerUserId" => "flynn"
+          },
+          "payload" => %{
+            "id" => "unrelated-#{index}",
+            "sessionKey" => "unrelated-session",
+            "ownerUserId" => "flynn"
+          }
+        })
+      end)
+
+      Hub.publish(hub, %{
+        "class" => "device.revoked",
+        "refs" => %{"deviceId" => "own-device"},
+        "payload" => %{"deviceId" => "own-device"}
+      })
+    after
+      :ok = :sys.resume(hub)
+    end
+
+    _barrier = Hub.sequence(hub, self())
+
+    assert_receive {:device_subscriber_overflowed, ^device_subscriber}, 5_000
+    assert %{overflowed: true, queued: 0, seq: 0} = Hub.connection_stats(hub, device_subscriber)
   end
 
   defp register_subscriber!(hub, db, pid, session_key, id) do

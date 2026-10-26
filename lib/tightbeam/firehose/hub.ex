@@ -555,6 +555,8 @@ defmodule Tightbeam.Firehose.Hub do
       )
   end
 
+  defp revoked?(_notice, %{principal_kind: :observer}), do: false
+
   defp revoked?(%{"class" => "device.revoked", "refs" => refs}, socket),
     do: refs["deviceId"] == socket.device_id
 
@@ -573,6 +575,9 @@ defmodule Tightbeam.Firehose.Hub do
 
   defp visible?(%{principal_kind: :session, principal_id: session_key, db: db}, notice),
     do: StateVisibility.visible?(db, notice, %{kind: "session", id: session_key})
+
+  defp visible?(%{principal_kind: :observer, db: db}, notice),
+    do: StateVisibility.visible?(db, notice, %{kind: "observer"})
 
   defp visible?(
          %{principal_kind: :user, principal_id: user_id, db: db, is_admin: is_admin},
@@ -649,10 +654,18 @@ defmodule Tightbeam.Firehose.Hub do
     notices = ingress_notices(message)
 
     table
-    |> :ets.match_object({{:socket, :_}, :_, :_, :_, :_, :_})
+    |> :ets.match_object({{:socket, :_}, :_, :_, :_, :_, :_, :_})
     |> Enum.flat_map(fn
-      {{:socket, pid}, mode, subscriptions, user_id, principal_kind, principal_id} ->
-        if overflow_matches?(notices, mode, subscriptions, user_id, principal_kind, principal_id),
+      {{:socket, pid}, mode, subscriptions, user_id, device_id, principal_kind, principal_id} ->
+        if overflow_matches?(
+             notices,
+             mode,
+             subscriptions,
+             user_id,
+             device_id,
+             principal_kind,
+             principal_id
+           ),
           do: [pid],
           else: []
     end)
@@ -713,6 +726,7 @@ defmodule Tightbeam.Firehose.Hub do
          :pending,
          _subscriptions,
          _user_id,
+         _device_id,
          _principal_kind,
          _principal_id
        ),
@@ -723,6 +737,7 @@ defmodule Tightbeam.Firehose.Hub do
          :all,
          _subscriptions,
          _user_id,
+         _device_id,
          _principal_kind,
          _principal_id
        ),
@@ -733,16 +748,33 @@ defmodule Tightbeam.Firehose.Hub do
          _mode,
          _subscriptions,
          _user_id,
+         _device_id,
          _principal_kind,
          _principal_id
        ),
        do: true
 
-  defp overflow_matches?(_notices, _mode, subscriptions, _user_id, _principal_kind, _principal_id)
+  defp overflow_matches?(
+         _notices,
+         _mode,
+         subscriptions,
+         _user_id,
+         _device_id,
+         _principal_kind,
+         _principal_id
+       )
        when map_size(subscriptions) == 0,
        do: true
 
-  defp overflow_matches?(notices, _mode, subscriptions, user_id, principal_kind, principal_id)
+  defp overflow_matches?(
+         notices,
+         _mode,
+         subscriptions,
+         user_id,
+         device_id,
+         principal_kind,
+         principal_id
+       )
        when is_list(notices) do
     Enum.any?(notices, fn
       {:session_retired, notice} ->
@@ -750,7 +782,8 @@ defmodule Tightbeam.Firehose.Hub do
           matches_subscription?(notice, subscriptions)
 
       notice ->
-        matches_subscription?(notice, subscriptions)
+        device_revoked_for?(notice, device_id, principal_kind) or
+          matches_subscription?(notice, subscriptions)
     end)
   end
 
@@ -759,10 +792,14 @@ defmodule Tightbeam.Firehose.Hub do
          _mode,
          _subscriptions,
          _user_id,
+         _device_id,
          _principal_kind,
          _principal_id
        ),
        do: false
+
+  defp device_revoked_for?(notice, device_id, principal_kind),
+    do: revoked?(notice, %Socket{device_id: device_id, principal_kind: principal_kind})
 
   defp matches_subscription?(notice, subscriptions),
     do: Enum.any?(subscriptions, fn {_id, filters} -> matches?(notice, filters) end)
@@ -791,7 +828,7 @@ defmodule Tightbeam.Firehose.Hub do
         :ets.insert(
           state.ingress,
           {{:socket, pid}, socket.mode, socket_filters(socket), socket.user_id,
-           socket.principal_kind, socket.principal_id}
+           socket.device_id, socket.principal_kind, socket.principal_id}
         )
     end
   end
