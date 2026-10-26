@@ -194,6 +194,41 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     ChangeSocket.terminate(:normal, state)
   end
 
+  test "a first subscribe starts a credentialless observer for the connection lifetime", ctx do
+    {:push, {:text, ready}, observer_state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "protocolVersion" => 2,
+          "subscriptionId" => "observer",
+          "filters" => %{"classes" => ["work_item."]}
+        },
+        ctx.state
+      )
+
+    assert JSON.decode!(ready) == %{
+             "type" => "subscription_ready",
+             "subscriptionId" => "observer"
+           }
+
+    assert observer_state.phase == :live
+    assert observer_state.principal_kind == :observer
+    assert observer_state.principal_id == "observer"
+    assert is_nil(observer_state.credential_digest)
+    assert observer_state.subscriptions == %{"observer" => %{"classes" => ["work_item."]}}
+
+    assert {:ok, ^observer_state} =
+             inbound(%{"type" => "auth", "token" => "ignored-after-observer"}, observer_state)
+
+    assert {:push, {:text, heartbeat}, heartbeat_state} =
+             ChangeSocket.handle_info(:firehose_heartbeat, observer_state)
+
+    assert JSON.decode!(heartbeat)["type"] == "heartbeat"
+    assert heartbeat_state.principal_kind == :observer
+    assert heartbeat_state.subscriptions == observer_state.subscriptions
+    ChangeSocket.terminate(:normal, heartbeat_state)
+  end
+
   test "auth is in-band and subscriptions are multiplexed with conjunctive filters", ctx do
     {:push, {:text, auth_bytes}, state} =
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
