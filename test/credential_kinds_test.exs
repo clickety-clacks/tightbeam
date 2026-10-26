@@ -1066,7 +1066,7 @@ defmodule Tightbeam.CredentialKindsTest do
     # user with the sign-in URL+code a session-run ceremony would otherwise trap
     # on a pty nobody watches. Only the begin "ready" reply carries it; a caller
     # with an owner (a user or agent origin) resolves, a process origin does not.
-    test "the begin reply carries ownerUserId for the operator wake (wi_0535922b)", ctx do
+    test "the begin reply carries ownerUserId for the operator wake", ctx do
       :ok = Tightbeam.Devices.ensure_schema(ctx.db)
 
       {:ok, _rows} =
