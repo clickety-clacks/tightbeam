@@ -94,10 +94,11 @@ defmodule Tightbeam.MessageSenderRepairTest do
     name = :"sender_repair_schema_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name}, id: name)
     :ok = ensure_all_schemas(name)
+    session = ensure_main_session(name, "recorded-turn")
 
     {:appended, message} =
       Projection.append(name, %{
-        session_key: "historical-session",
+        session_key: session.session_key,
         role: "user",
         content: "historical human post",
         device_id: "historical-device",
@@ -106,7 +107,7 @@ defmodule Tightbeam.MessageSenderRepairTest do
 
     {:ok, _turn_seq} =
       Tightbeam.Ledger.enqueue(name, %{
-        session_key: "historical-session",
+        session_key: session.session_key,
         message_id: message.id,
         origin: "user:recorded-turn",
         prompt: "historical human post"
