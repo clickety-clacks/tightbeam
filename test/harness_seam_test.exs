@@ -156,7 +156,7 @@ defmodule Tightbeam.HarnessSeamTest do
     selectable = Tightbeam.Harness.Claude.adapter_selectable_models()
 
     # Recorded live 2026-07-26 (claude CLI 2.1.220 / claude-agent-acp 0.59.0);
-    # fable added 2026-08-05 after a live re-measurement on gibson (CLI 2.1.221,
+    # fable added 2026-08-05 after a live re-measurement on host-a (CLI 2.1.221,
     # the production grant) answered a real prompt on claude-fable-5 — the July
     # REJECTED row was one environment's snapshot, not an account property.
     assert Enum.sort(selectable) ==
@@ -166,10 +166,10 @@ defmodule Tightbeam.HarnessSeamTest do
 
     # Values the adapter REFUSES must never appear here — listing one would make the
     # gateway offer a model the adapter cannot select. Fable left this list
-    # 2026-08-05: measured answering a real prompt on gibson with the production
+    # 2026-08-05: measured answering a real prompt on host-a with the production
     # grant, so the July refusal was environmental, not categorical. Opus 5 left
     # 2026-08-06 the same way: pin-probed offered+accepted and answered a live
-    # prompt on gibson with the production grant.
+    # prompt on host-a with the production grant.
     for refused <- ~w(claude-opus-4-7 claude-sonnet-4-6
                       claude-opus-4-6 claude-opus-4-5-20251101 claude-sonnet-4-5-20250929
                       claude-opus-4-1-20250805) do

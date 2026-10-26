@@ -906,7 +906,7 @@ defmodule Tightbeam.HarnessProcessTest do
   # The exemplar is an identity we cannot READ — a file whose contents name no
   # process. It used to be a launch that never wrote one at all, which is the
   # opposite fact (see the unlaunched tests below) and made this test a receipt
-  # for the defect that fenced claude:shared@eezo forever after a mid-launch
+  # for the defect that fenced claude:shared@host-b forever after a mid-launch
   # crash.
   test "a kill_failed durable park fences checkout after coordinator recreation", ctx do
     key = {:claude, "shared", "testhost"}
@@ -952,7 +952,7 @@ defmodule Tightbeam.HarnessProcessTest do
   # SMOKE §11 step 43: the gateway was SIGKILLed between `prepare_launch`'s
   # INSERT and the spawn, so the row claimed a process the launcher had never
   # started. Reconciliation read the absent identity file as "cannot identify
-  # this process" and recorded kill_failed, which fenced claude:shared@eezo
+  # this process" and recorded kill_failed, which fenced claude:shared@host-b
   # permanently — every session on the host failed forever, on a reboot whose
   # only job was recovery.
   test "a launch that never minted a process is resolved by reconciliation, not fenced", ctx do
@@ -987,7 +987,7 @@ defmodule Tightbeam.HarnessProcessTest do
            )
   end
 
-  # The reboot-orphan sibling (gibson, 2026-08-05, second occurrence of the
+  # The reboot-orphan sibling (host-a, 2026-08-05, second occurrence of the
   # class): a row whose identity file names a pid from a PREVIOUS OS BOOT.
   # The signal helper rightly refuses to signal it (the pid may be reused),
   # but a boot-identity mismatch is PROOF the process died with the machine —

@@ -116,7 +116,7 @@ missing =
     # sqlite3(1) — it does not go through exqlite. Without it J0 reports
     # "driver error: Erlang error: :enoent", which names neither sqlite3 nor
     # PATH. The GitHub runner images happen to ship it and every dev mac has it;
-    # shrdlu does not, which is one of the 44 first-linux-run failures.
+    # host-d does not, which is one of the 44 first-linux-run failures.
     if System.find_executable("sqlite3") do
       acc
     else
