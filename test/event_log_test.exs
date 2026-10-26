@@ -201,7 +201,10 @@ defmodule Tightbeam.EventLogTest do
                [event_id]
              )
 
-    assert Map.new(Enum.zip(@legacy_event_columns, event)) == %{
+    event_fields = Map.new(Enum.zip(@legacy_event_columns, event))
+    payload = event_fields["payload"]
+
+    assert event_fields == %{
              "id" => event_id,
              "ts" => 12_345,
              "kind" => "verb",
