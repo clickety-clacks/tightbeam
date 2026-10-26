@@ -929,7 +929,7 @@ defmodule Tightbeam.Wire.Router do
            end),
          {:ok, query} <-
            core_detail_operation(conn, spec.resource, :query_decode, fn ->
-             decode_state_query(conn)
+             observer_read_query(conn, spec.resource)
            end),
          {:ok, principal} <-
            core_detail_operation(
@@ -951,8 +951,27 @@ defmodule Tightbeam.Wire.Router do
              spec.resource,
              :key_decode,
              fn -> core_detail_key(spec.resource, raw_key) end
-           ),
-         :ok <- core_detail_probe(conn, spec.resource, :lookup),
+           ) do
+      if observer_marker_scope_detail?(spec, principal, query) do
+        read_marker_index_page(conn, query, principal,
+          scope_key: key,
+          not_found_when_empty?: true
+        )
+      else
+        core_detail_item(conn, spec, key, principal)
+      end
+    else
+      {:error, :not_found} -> state_not_found(conn, spec.resource)
+      {:error, status, code, message} ->
+        state_error(conn, spec.resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp core_detail_item(conn, spec, key, principal) do
+    with :ok <- core_detail_probe(conn, spec.resource, :lookup),
          row <-
            core_detail_operation(
              conn,
@@ -972,19 +991,16 @@ defmodule Tightbeam.Wire.Router do
       core_detail_trace(conn, {:envelope, spec.resource})
       state_send(conn, 200, state_detail_envelope(spec.resource, item_bytes))
     else
-      false ->
-        state_not_found(conn, spec.resource)
-
-      {:error, :not_found} ->
-        state_not_found(conn, spec.resource)
-
-      {:error, status, code, message} ->
-        state_error(conn, spec.resource, status, code, message)
+      false -> state_not_found(conn, spec.resource)
+      {:error, :not_found} -> state_not_found(conn, spec.resource)
+      {:error, status, code, message} -> state_error(conn, spec.resource, status, code, message)
     end
-  rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
-      state_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
+
+  defp observer_marker_scope_detail?(%{resource: "read markers"}, %{kind: "observer"}, query),
+    do: is_nil(observer_as_user(query))
+
+  defp observer_marker_scope_detail?(_spec, _principal, _query), do: false
 
   defp read_marker_index(conn) do
     with {:ok, auth} <-
@@ -993,22 +1009,40 @@ defmodule Tightbeam.Wire.Router do
            end),
          {:ok, query} <-
            core_detail_operation(conn, "read markers", :query_decode, fn ->
-             decode_state_query(conn)
+             observer_read_query(conn, "read markers")
            end),
          {:ok, principal} <-
            core_detail_operation(conn, "read markers", :principal_resolution, fn ->
              read_marker_collection_principal(auth, query, conn)
-           end),
-         :ok <-
+           end) do
+      read_marker_index_page(conn, query, principal)
+    else
+      {:error, status, code, message} -> state_error(conn, "read markers", status, code, message)
+    end
+  end
+
+  defp read_marker_index_page(conn, query, principal, opts \\ []) do
+    query =
+      case Keyword.fetch(opts, :scope_key) do
+        {:ok, scope_key} -> Map.put(query, "scopeKey", [scope_key])
+        :error -> query
+      end
+
+    not_found_when_empty? = Keyword.get(opts, :not_found_when_empty?, false)
+
+    with :ok <-
            core_detail_operation(conn, "read markers", :request_validation, fn ->
              read_marker_collection_request(query)
            end),
+         {:ok, scope_key} <- one_query_value(query, "scopeKey"),
+         true <- is_nil(scope_key) or scope_key != "",
+         filters <- if(scope_key, do: %{"scopeKey" => [scope_key]}, else: %{}),
          {:ok, limit, boundary} <-
            state_page_request(
              query,
              "read_markers.collection",
              "read markers",
-             %{},
+             filters,
              principal,
              &read_marker_tuple?/1,
              @state_default_limit,
@@ -1022,10 +1056,12 @@ defmodule Tightbeam.Wire.Router do
              StateResources.query_read_markers_page(
                db(conn),
                core_detail_trace_principal(conn, principal),
+               scope_key,
                boundary,
                limit
              )
            end),
+         false <- not_found_when_empty? and page_result.rows == [],
          page <-
            state_page_metadata(
              page_result.rows,
@@ -1033,7 +1069,7 @@ defmodule Tightbeam.Wire.Router do
              &read_marker_tuple/1,
              "read_markers.collection",
              "read markers",
-             %{},
+             filters,
              principal,
              :asc
            ),
@@ -1050,6 +1086,8 @@ defmodule Tightbeam.Wire.Router do
 
       state_send(conn, 200, body)
     else
+      true -> state_not_found(conn, "read markers")
+      false -> state_error(conn, "read markers", 400, "invalid_filter", nil)
       {:error, status, code, message} -> state_error(conn, "read markers", status, code, message)
     end
   rescue
@@ -1071,9 +1109,12 @@ defmodule Tightbeam.Wire.Router do
   defp read_marker_tuple?(_tuple), do: false
 
   defp read_marker_collection_request(query) do
-    if Enum.all?(Map.keys(query), &(&1 in ["asUser", "limit", "before", "after", "tail"])),
-      do: :ok,
-      else: {:error, 400, "invalid_filter", nil}
+    if Enum.all?(
+         Map.keys(query),
+         &(&1 in ["asUser", "scopeKey", "limit", "before", "after", "tail"])
+       ),
+       do: :ok,
+       else: {:error, 400, "invalid_filter", nil}
   end
 
   defp core_detail_auth(conn, resource)
@@ -1083,28 +1124,38 @@ defmodule Tightbeam.Wire.Router do
 
   defp core_detail_auth(conn, _resource), do: state_bearer_auth(conn)
 
-  defp core_detail_route_principal(:observer, query, conn, "read markers"),
-    do: observer_marker_principal(query, conn)
-
-  defp core_detail_route_principal(:observer, query, conn, _resource),
-    do: observer_principal_for_query(query, conn)
+  defp core_detail_route_principal(auth, query, conn, resource)
+       when resource in ["sessions", "transcript messages", "read markers"],
+       do: observer_read_route_principal(auth, query, conn)
 
   defp core_detail_route_principal(auth, query, conn, _resource),
     do: state_principal(auth, query, conn)
 
-  defp observer_marker_principal(query, conn) do
-    observer_principal_for_query(query, conn)
-  end
+  defp read_marker_collection_principal(auth, query, conn),
+    do: observer_read_route_principal(auth, query, conn)
 
-  defp read_marker_collection_principal(:observer, query, conn) do
+  defp observer_read_route_principal(:observer, query, conn),
+    do: observer_principal_for_query(query, conn)
+
+  defp observer_read_route_principal({:session, session} = auth, query, conn) do
     case observer_as_user(query) do
-      nil -> {:ok, observer_principal()}
-      user_id -> observer_user_principal(user_id, conn)
+      nil ->
+        state_principal(auth, Map.delete(query, "asUser"), conn)
+
+      user_id ->
+        case resolve_cli_as_user(auth, user_id) do
+          {:ok, principal} -> {:ok, state_principal_view(principal, conn)}
+          {:error, _status, _code, _message} ->
+            state_principal(auth, Map.delete(query, "asUser"), conn)
+        end
     end
   end
 
-  defp read_marker_collection_principal(auth, query, conn),
-    do: core_detail_route_principal(auth, query, conn, "read markers")
+  defp observer_read_route_principal({:device, _device} = auth, query, conn),
+    do: state_principal(auth, Map.delete(query, "asUser"), conn)
+
+  defp observer_read_route_principal(auth, query, conn),
+    do: state_principal(auth, query, conn)
 
   defp observer_principal_for_query(query, conn) do
     case observer_as_user(query) do
@@ -1113,8 +1164,7 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
-  # Query values are accumulated in reverse order by decode_state_query/1, so
-  # the first value is the last asUser value supplied by the caller.
+  # Observer reads normalize repeated asUser values to the caller's last value.
   defp observer_as_user(query) do
     case Map.get(query, "asUser", []) do
       [user_id | _earlier] when is_binary(user_id) and user_id != "" -> user_id
@@ -1144,7 +1194,7 @@ defmodule Tightbeam.Wire.Router do
            end),
          {:ok, query} <-
            core_detail_operation(conn, "sessions", :query_decode, fn ->
-             decode_state_query(conn)
+             observer_read_query(conn, "sessions")
            end),
          {:ok, principal} <-
            core_detail_operation(conn, "sessions", :principal_resolution, fn ->
@@ -1451,8 +1501,13 @@ defmodule Tightbeam.Wire.Router do
   defp work_tuple?(_tuple), do: false
 
   defp session_collection(conn, session_key, resource, query_fun, serializer) do
-    with {:ok, auth} <- selected_session_auth(conn),
-         {:ok, request} <- decode_state_query(conn),
+    auth_result =
+      if resource == "transcript messages",
+        do: session_message_auth(conn),
+        else: selected_session_auth(conn)
+
+    with {:ok, auth} <- auth_result,
+         {:ok, request} <- observer_read_query(conn, resource),
          {:ok, principal, request} <-
            session_collection_principal(auth, request, conn, session_key, resource),
          :ok <- session_collection_request(request, session_key),
@@ -1508,7 +1563,10 @@ defmodule Tightbeam.Wire.Router do
     do: StateResources.query_session(db, %{key: session_key, principal: principal})
 
   defp session_message_auth(conn) do
-    observer_read_auth(conn)
+    case selected_session_auth(conn) do
+      {:error, 401, "auth_failed", _message} -> {:ok, :observer}
+      result -> result
+    end
   end
 
   # Organization credentials can select a user for this session's collection.
@@ -1550,6 +1608,51 @@ defmodule Tightbeam.Wire.Router do
           "transcript messages"
         )
     end
+  end
+
+  defp session_collection_principal(
+         {:session, bearer_session_key} = auth,
+         query,
+         conn,
+         _session_key,
+         "transcript messages"
+       ) do
+    request = Map.delete(query, "asUser")
+
+    case Map.get(query, "asUser", []) do
+      [user_id] ->
+        case Org.get(db(conn), bearer_session_key) do
+          %{owner_user_id: _owner} = bearer_session ->
+            case resolve_cli_as_user({:session, bearer_session}, user_id) do
+              {:ok, principal} ->
+                {:ok, state_principal_view(principal, conn), request}
+
+              {:error, _status, _code, _message} ->
+                with {:ok, principal} <- selected_session_principal(auth, request, conn),
+                     do: {:ok, principal, request}
+            end
+
+          nil ->
+            {:error, 404, "not_found", nil}
+        end
+
+      [] ->
+        with {:ok, principal} <- selected_session_principal(auth, request, conn),
+             do: {:ok, principal, request}
+    end
+  end
+
+  defp session_collection_principal(
+         {:device, _user_id, _is_admin} = auth,
+         query,
+         conn,
+         _session_key,
+         "transcript messages"
+       ) do
+    request = Map.delete(query, "asUser")
+
+    with {:ok, principal} <- selected_session_principal(auth, request, conn),
+         do: {:ok, principal, request}
   end
 
   defp session_collection_principal(auth, query, conn, _session_key, _resource) do
@@ -1841,6 +1944,12 @@ defmodule Tightbeam.Wire.Router do
 
   defp decode_state_query(conn), do: decode_state_query_string(conn.query_string)
 
+  defp observer_read_query(conn, resource)
+       when resource in ["sessions", "transcript messages", "read markers"],
+       do: decode_observer_state_query_string(conn.query_string)
+
+  defp observer_read_query(conn, _resource), do: decode_state_query(conn)
+
   defp decode_state_query_string(""), do: {:ok, %{}}
 
   defp decode_state_query_string(query_string) do
@@ -1857,6 +1966,42 @@ defmodule Tightbeam.Wire.Router do
         {:cont, {:ok, Map.update(query, key, [value], &[value | &1])}}
       else
         :error -> {:halt, {:error, 400, "malformed_query", nil}}
+      end
+    end)
+  end
+
+  defp decode_observer_state_query_string(""), do: {:ok, %{}}
+
+  defp decode_observer_state_query_string(query_string) do
+    Enum.reduce_while(String.split(query_string, "&", trim: false), {:ok, %{}}, fn encoded,
+                                                                                   {:ok, query} ->
+      {raw_key, raw_value} =
+        case String.split(encoded, "=", parts: 2) do
+          [key, value] -> {key, value}
+          [key] -> {key, ""}
+        end
+
+      case decode_state_query_part(raw_key) do
+        {:ok, "asUser"} ->
+          case decode_state_query_part(raw_value) do
+            {:ok, value} when value != "" ->
+              {:cont, {:ok, Map.put(query, "asUser", [value])}}
+
+            _unusable_selector ->
+              {:cont, {:ok, Map.delete(query, "asUser")}}
+          end
+
+        {:ok, key} ->
+          case decode_state_query_part(raw_value) do
+            {:ok, value} ->
+              {:cont, {:ok, Map.update(query, key, [value], &[value | &1])}}
+
+            :error ->
+              {:halt, {:error, 400, "malformed_query", nil}}
+          end
+
+        :error ->
+          {:halt, {:error, 400, "malformed_query", nil}}
       end
     end)
   end
