@@ -1757,7 +1757,10 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert selected_sessions.resp_body == selected_sessions_org.resp_body
 
     selected_session = get_without_authorization(ctx, "/api/sessions/#{session_key}?asUser=flynn")
-    selected_session_org = get(ctx, "/api/sessions/#{session_key}?asUser=flynn", ctx.opts[:cli_token])
+
+    selected_session_org =
+      get(ctx, "/api/sessions/#{session_key}?asUser=flynn", ctx.opts[:cli_token])
+
     assert selected_session.status == 200
     assert selected_session.resp_body == selected_session_org.resp_body
 
@@ -1825,6 +1828,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     Devices.add_user(ctx.db, "alice", false)
     ensure_main_session(ctx.db, "alice")
+
     repeated_last =
       get_without_authorization(ctx, "/api/sessions?asUser=flynn&asUser=alice")
 
@@ -1882,9 +1886,12 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       session_response = get_without_authorization(ctx, "/api/sessions", headers)
       message_response = get_without_authorization(ctx, message_path, headers)
       assert session_response.status == 200
+
       assert JSON.decode!(session_response.resp_body)["items"] ==
                JSON.decode!(anonymous_sessions.resp_body)["items"]
+
       assert message_response.status == 200
+
       assert JSON.decode!(message_response.resp_body)["items"] ==
                JSON.decode!(anonymous_messages.resp_body)["items"]
 
@@ -1903,8 +1910,10 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       assert selected_session_fallback.status == 200
       assert selected_session_fallback.resp_body == anonymous_sessions.resp_body
       assert selected_message_fallback.status == 200
+
       assert JSON.decode!(selected_message_fallback.resp_body)["items"] ==
                JSON.decode!(anonymous_messages.resp_body)["items"]
+
       assert selected_session_with_bad_bearer.status == 200
       assert selected_session_with_bad_bearer.resp_body == selected_sessions_org.resp_body
       assert selected_message_with_bad_bearer.status == 200
@@ -1931,7 +1940,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       "work items",
       "auth_failed"
     )
-
   end
 
   test "credentialless marker reads apply AU2 selection and all-user collection", ctx do
@@ -1949,8 +1957,10 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     all_markers = get_without_authorization(ctx, "/api/read-markers")
     admin_markers = get(ctx, "/api/read-markers", ctx.opts[:cli_token])
     assert all_markers.status == 200
+
     assert JSON.decode!(all_markers.resp_body)["items"] ==
              JSON.decode!(admin_markers.resp_body)["items"]
+
     all_marker_users = JSON.decode!(all_markers.resp_body)["items"] |> Enum.map(& &1["userId"])
     assert "alice" in all_marker_users
     assert "bob" in all_marker_users
