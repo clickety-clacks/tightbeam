@@ -1481,6 +1481,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       rule_operator_request_in_txn: "operator",
       operator_withdraw_in_txn: "operator",
       open_counts_by_assignment: "statute,effort",
+      open_statute_effort_ids_for_assignments_in_txn: "statute,effort",
       consume: "any",
       withdraw_for_retired: "any",
       withdraw_episodes: "any",
@@ -1552,6 +1553,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       rule_operator_request_in_txn: 6,
       operator_withdraw_in_txn: 4,
       open_counts_by_assignment: 1,
+      open_statute_effort_ids_for_assignments_in_txn: 2,
       consume: 2,
       withdraw_for_retired: 2,
       withdraw_episodes: 3,
@@ -1659,7 +1661,13 @@ defmodule Tightbeam.CoordinationFabricTest do
     # (visibility-filter and IN-list placeholder text, never a table name);
     # any function joining this set is new dynamic SQL that has not been
     # reviewed and fails closed, by name, until it is.
-    pinned_dynamic_queries = MapSet.new([{:list, 4}, {:get, 4}, {:decision_trace_rows, 2}])
+    pinned_dynamic_queries =
+      MapSet.new([
+        {:list, 4},
+        {:get, 4},
+        {:decision_trace_rows, 2},
+        {:open_statute_effort_ids_for_assignments_in_txn, 2}
+      ])
 
     found_dynamic_queries = dynamic_query_refs("lib/tightbeam/escalation.ex")
 
@@ -1701,6 +1709,7 @@ defmodule Tightbeam.CoordinationFabricTest do
         {"lib/tightbeam/state_resources.ex", "query_decision_request/2"}
       ],
       raw_by_id_in_txn: [
+        {"lib/tightbeam/execution_map.ex", "rest_allowed_open_requests/3"},
         {"lib/tightbeam/state_resources.ex", "query_decision_request/2"}
       ],
       raw_by_id_in_txn!: [{"lib/tightbeam/effort_checkin.ex", "request_for_id/2"}],

@@ -1218,17 +1218,7 @@ defmodule Tightbeam.ExecutionMap do
       assignment_ids
       |> Enum.sort()
       |> Enum.chunk_every(@rest_assignment_batch_size)
-      |> Enum.flat_map(fn batch ->
-        marks = Enum.map_join(batch, ",", fn _ -> "?" end)
-
-        Txn.q(
-          txn,
-          "SELECT id FROM decision_requests WHERE status = 'open' AND kind IN ('statute','effort') AND assignmentId IN (" <>
-            marks <> ") ORDER BY id",
-          batch
-        )
-        |> Enum.map(&hd/1)
-      end)
+      |> Enum.flat_map(&Escalation.open_statute_effort_ids_for_assignments_in_txn(txn, &1))
       |> Enum.map(&Escalation.raw_by_id_in_txn(txn, &1))
       |> Enum.reject(&is_nil/1)
       |> Enum.filter(fn row ->
