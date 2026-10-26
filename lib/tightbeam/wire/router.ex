@@ -77,7 +77,22 @@ defmodule Tightbeam.Wire.Router do
   @state_max_limit 500
   @state_not_found_floor_us 3_000
   @state_malformed_percent_escape ~r/%(?![0-9A-Fa-f]{2})/
+  @execution_map_filter_order ~w(origin ownerUserId state quietOverMs specRefName specRefSha256 sessionKey)
   @state_read_specs %{
+    execution_map: %{
+      route: "execution_map.collection",
+      resource: "execution map",
+      filters: %{
+        "origin" => {:enum, ~w(user session all)},
+        "ownerUserId" => :string,
+        "state" => {:enum, ~w(open iceboxed closed failed)},
+        "quietOverMs" => :integer,
+        "specRefName" => :string,
+        "specRefSha256" => :sha256,
+        "sessionKey" => :string
+      },
+      order: [{:created_at, :integer}, {:id, :string}]
+    },
     artifacts: %{
       route: "artifacts.collection",
       resource: "artifacts",
@@ -555,6 +570,22 @@ defmodule Tightbeam.Wire.Router do
     state_collection(conn, Map.fetch!(@state_read_specs, :work_items))
   end
 
+  get "/api/execution-map" do
+    execution_map_read(conn, :flat, nil)
+  end
+
+  get "/api/execution-map/tree" do
+    execution_map_read(conn, :tree, nil)
+  end
+
+  get "/api/execution-map/subtrees/:work_item_id" do
+    execution_map_read(conn, :subtree, work_item_id)
+  end
+
+  get "/api/execution-map/assignments" do
+    execution_map_read(conn, :assignments, nil)
+  end
+
   get "/api/work-items/:work_item_id" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :work_items), work_item_id)
   end
@@ -754,6 +785,247 @@ defmodule Tightbeam.Wire.Router do
 
   defp d2a_sort_rows!(_rows, _order),
     do: raise(ArgumentError, "D2 resource query did not return a list")
+
+  defp execution_map_read(conn, mode, parent_id) do
+    spec = Map.fetch!(@state_read_specs, :execution_map)
+    started_at = System.monotonic_time(:microsecond)
+
+    with {:ok, auth} <- state_bearer_auth(conn),
+         {:ok, query} <- decode_state_query(conn),
+         {:ok, principal} <- state_principal(auth, query, conn),
+         {:ok, request} <- execution_map_request(mode, query),
+         {:ok, boundary} <- execution_map_boundary(mode, request, principal, spec) do
+      principal = core_detail_trace_principal(conn, principal)
+      core_detail_trace(conn, {:shared_lookup, spec.resource, :query_execution_map})
+      core_detail_trace(conn, {:operation, spec.resource, mode})
+
+      call = %{
+        filters: request.filters,
+        principal: principal,
+        boundary: boundary,
+        limit: request.limit,
+        work_item_id: parent_id,
+        assignment_ids: request.assignment_ids
+      }
+
+      result =
+        case mode do
+          :flat -> Tightbeam.ExecutionMap.list_execution_map(db(conn), call)
+          :tree -> Tightbeam.ExecutionMap.query_execution_map_tree(db(conn), call)
+          :subtree -> Tightbeam.ExecutionMap.query_execution_map_subtree(db(conn), call)
+          :assignments -> Tightbeam.ExecutionMap.query_execution_map_assignments(db(conn), call)
+        end
+
+      case result do
+        {:error, 404, "not_found", _message} ->
+          state_not_found(conn, spec.resource, started_at)
+
+        {:error, 400, "ambiguous_id", candidate_ids} ->
+          execution_map_ambiguous(conn, candidate_ids)
+
+        {:error, status, code, message} ->
+          state_error(conn, spec.resource, status, code, message)
+
+        result when mode == :flat ->
+          page = execution_map_page(result, request, principal, spec)
+          state_send(conn, 200, execution_map_envelope(:flat, result, page))
+
+        result ->
+          state_send(conn, 200, execution_map_envelope(mode, result, nil))
+      end
+    else
+      {:error, 404, "not_found", _message} ->
+        state_not_found(conn, spec.resource, started_at)
+
+      {:error, status, code, message} ->
+        state_error(conn, spec.resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, "execution map", 500, "projection_invalid", nil)
+  end
+
+  defp execution_map_request(mode, query) when mode in [:flat, :tree, :subtree] do
+    paging = if mode == :flat, do: ~w(before after limit), else: []
+    allowed = @execution_map_filter_order ++ paging ++ ["asUser"]
+
+    with true <- Enum.all?(Map.keys(query), &(&1 in allowed)),
+         true <- Enum.all?(@execution_map_filter_order, &(length(Map.get(query, &1, [])) <= 1)),
+         {:ok, before_cursor} <- state_single_value(query, "before"),
+         {:ok, after_cursor} <- state_single_value(query, "after"),
+         true <- is_nil(before_cursor) or is_nil(after_cursor),
+         {:ok, limit_value} <- state_single_value(query, "limit"),
+         {:ok, limit} <- state_limit(limit_value),
+         {:ok, filters} <- execution_map_filters(query) do
+      {:ok,
+       %{
+         before: before_cursor,
+         after: after_cursor,
+         limit: limit,
+         filters: filters,
+         filter_fingerprint: execution_map_filter_fingerprint(filters),
+         assignment_ids: []
+       }}
+    else
+      _ -> {:error, 400, "invalid_filter", nil}
+    end
+  end
+
+  defp execution_map_request(:assignments, query) do
+    with true <- Enum.all?(Map.keys(query), &(&1 in ["assignmentId", "asUser"])),
+         [_ | _] = ids <- Map.get(query, "assignmentId", []),
+         true <- Enum.all?(ids, &(&1 != "")) do
+      {:ok,
+       %{
+         before: nil,
+         after: nil,
+         limit: @state_default_limit,
+         filters: %{},
+         filter_fingerprint: nil,
+         assignment_ids: Enum.reverse(ids)
+       }}
+    else
+      _ -> {:error, 400, "invalid_filter", nil}
+    end
+  end
+
+  defp execution_map_filters(query) do
+    with {:ok, origin} <- state_single_value(query, "origin"),
+         true <- is_nil(origin) or origin in ~w(user session all),
+         {:ok, owner_user_id} <- state_single_value(query, "ownerUserId"),
+         true <- is_nil(owner_user_id) or owner_user_id != "",
+         {:ok, state} <- state_single_value(query, "state"),
+         true <- is_nil(state) or state in ~w(open iceboxed closed failed),
+         {:ok, quiet_value} <- state_single_value(query, "quietOverMs"),
+         {:ok, quiet_over_ms} <- execution_map_nonnegative_integer(quiet_value),
+         {:ok, spec_ref_name} <- state_single_value(query, "specRefName"),
+         true <- is_nil(spec_ref_name) or spec_ref_name != "",
+         {:ok, spec_ref_sha256} <- state_single_value(query, "specRefSha256"),
+         true <- is_nil(spec_ref_sha256) or is_binary(spec_ref_name),
+         true <- is_nil(spec_ref_sha256) or Regex.match?(~r/^[0-9a-f]{64}$/, spec_ref_sha256),
+         {:ok, session_key} <- state_single_value(query, "sessionKey"),
+         true <- is_nil(session_key) or session_key != "" do
+      fields = [
+        {"origin", origin},
+        {"ownerUserId", owner_user_id},
+        {"state", state},
+        {"quietOverMs", quiet_over_ms},
+        {"specRefName", spec_ref_name},
+        {"specRefSha256", spec_ref_sha256},
+        {"sessionKey", session_key}
+      ]
+
+      {:ok, Map.new(Enum.reject(fields, fn {_key, value} -> is_nil(value) end))}
+    else
+      _ -> {:error, 400, "invalid_filter", nil}
+    end
+  end
+
+  defp execution_map_nonnegative_integer(nil), do: {:ok, nil}
+
+  defp execution_map_nonnegative_integer(value) when is_binary(value) do
+    if Regex.match?(~r/^(0|[1-9][0-9]*)$/, value),
+      do: {:ok, String.to_integer(value)},
+      else: :error
+  end
+
+  defp execution_map_nonnegative_integer(_value), do: :error
+
+  defp execution_map_filter_fingerprint(filters) do
+    @execution_map_filter_order
+    |> Enum.map(&Map.get(filters, &1))
+    |> JSON.encode!()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp execution_map_boundary(:flat, request, principal, spec),
+    do: state_cursor_boundary(request, principal, spec)
+
+  defp execution_map_boundary(_mode, _request, _principal, _spec), do: {:ok, :latest}
+
+  defp execution_map_page(result, request, principal, spec) do
+    case result.items do
+      [] ->
+        %{
+          oldest_cursor: nil,
+          newest_cursor: nil,
+          has_more_before: result.flags.has_more_before,
+          has_more_after: result.flags.has_more_after
+        }
+
+      items ->
+        oldest = hd(items)
+        newest = List.last(items)
+
+        %{
+          oldest_cursor:
+            encode_state_cursor(
+              [oldest.created_at, oldest.id],
+              "before",
+              request.filter_fingerprint,
+              principal,
+              spec
+            ),
+          newest_cursor:
+            encode_state_cursor(
+              [newest.created_at, newest.id],
+              "after",
+              request.filter_fingerprint,
+              principal,
+              spec
+            ),
+          has_more_before: result.flags.has_more_before,
+          has_more_after: result.flags.has_more_after
+        }
+    end
+  end
+
+  defp execution_map_ambiguous(conn, candidate_ids) do
+    body =
+      ~s({"schemaVersion":1,"resource":"execution map","error":{"code":"ambiguous_id","candidateIds":) <>
+        JSON.encode!(candidate_ids) <> "}}"
+
+    state_send(conn, 400, body)
+  end
+
+  defp execution_map_envelope(mode, result, page) do
+    prefix =
+      ~s({"schemaVersion":1,"resource":"execution map","edgeBasis":"concurrent_turn","coverage":{"attributionCutoff":) <>
+        JSON.encode!(result.attribution_cutoff) <>
+        ~s(,"basis":"conservative_shared"},"dependencyVersion":) <>
+        JSON.encode!(result.dependency_version)
+
+    case mode do
+      :flat ->
+        prefix <>
+          ~s(,"items":[) <>
+          Enum.map_join(result.items, ",", &Tightbeam.ExecutionMap.execution_map_node/1) <>
+          ~s(],"page":{"oldestCursor":) <>
+          JSON.encode!(page.oldest_cursor) <>
+          ~s(,"newestCursor":) <>
+          JSON.encode!(page.newest_cursor) <>
+          ~s(,"hasMoreBefore":) <>
+          JSON.encode!(page.has_more_before) <>
+          ~s(,"hasMoreAfter":) <> JSON.encode!(page.has_more_after) <> "}}"
+
+      :tree ->
+        prefix <>
+          ~s(,"roots":[) <>
+          Enum.map_join(result.roots, ",", &Tightbeam.ExecutionMap.execution_map_node/1) <> "]}"
+
+      :subtree ->
+        prefix <>
+          ~s(,"roots":[) <>
+          Enum.map_join(result.roots, ",", &Tightbeam.ExecutionMap.execution_map_node/1) <> "]}"
+
+      :assignments ->
+        prefix <>
+          ~s(,"items":[) <>
+          Enum.map_join(result.items, ",", &Tightbeam.ExecutionMap.execution_map_node/1) <>
+          ~s(],"noItem":) <> JSON.encode!(result.no_item) <> "}"
+    end
+  end
 
   defp state_detail(conn, %{resource: "identity"} = spec, id) do
     started_at = System.monotonic_time(:microsecond)

@@ -2016,6 +2016,7 @@ defmodule Tightbeam.Escalation do
     rule_operator_request_in_txn: "operator",
     operator_withdraw_in_txn: "operator",
     open_counts_by_assignment: "statute,effort",
+    open_statute_effort_ids_for_assignments_in_txn: "statute,effort",
     # DIRECT: own SQL literal, unscoped by kind (id-scoped internal plumbing,
     # a genuinely cross-kind read, or a documented kind-agnostic exit).
     consume: "any",
@@ -2095,6 +2096,22 @@ defmodule Tightbeam.Escalation do
       [row] -> request_from_row(row)
       [] -> nil
     end
+  end
+
+  @doc "Open statute and effort request ids for one nonempty batch of assignment ids."
+  @spec open_statute_effort_ids_for_assignments_in_txn(Txn.t(), [String.t()]) :: [String.t()]
+  def open_statute_effort_ids_for_assignments_in_txn(_txn, []), do: []
+
+  def open_statute_effort_ids_for_assignments_in_txn(txn, assignment_ids) do
+    marks = Enum.map_join(assignment_ids, ",", fn _ -> "?" end)
+
+    Txn.q(
+      txn,
+      "SELECT id FROM decision_requests WHERE status = 'open' AND kind IN ('statute','effort') AND assignmentId IN (" <>
+        marks <> ") ORDER BY id",
+      assignment_ids
+    )
+    |> Enum.map(&hd/1)
   end
 
   @doc "EFFORT ONLY: the open effort request currently carrying this deadline wake."
