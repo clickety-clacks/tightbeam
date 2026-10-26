@@ -217,14 +217,8 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert is_nil(observer_state.credential_digest)
     assert observer_state.subscriptions == %{"observer" => %{"classes" => ["work_item."]}}
 
-    assert {:push, {:text, error}, ^observer_state} =
+    assert {:ok, ^observer_state} =
              inbound(%{"type" => "auth", "token" => "ignored-after-observer"}, observer_state)
-
-    assert JSON.decode!(error) == %{
-             "type" => "error",
-             "code" => "invalid_request",
-             "message" => "unsupported request"
-           }
 
     assert {:push, {:text, heartbeat}, heartbeat_state} =
              ChangeSocket.handle_info(:firehose_heartbeat, observer_state)
@@ -233,6 +227,41 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert heartbeat_state.principal_kind == :observer
     assert heartbeat_state.subscriptions == observer_state.subscriptions
     ChangeSocket.terminate(:normal, heartbeat_state)
+  end
+
+  test "an unusable first auth frame continues as an observer", ctx do
+    for auth_frame <- [
+          %{"type" => "auth"},
+          %{"type" => "auth", "token" => ""},
+          %{"type" => "auth", "token" => "unverifiable-token"}
+        ] do
+      assert {:ok, observer_state} = inbound(auth_frame, ctx.state)
+      assert observer_state.phase == :live
+      assert observer_state.principal_kind == :observer
+      assert observer_state.principal_id == "observer"
+      assert is_nil(observer_state.credential_digest)
+      assert observer_state.subscriptions == %{}
+
+      {:push, {:text, ready}, subscribed_state} =
+        subscribe(
+          %{
+            "type" => "subscribe",
+            "protocolVersion" => 2,
+            "subscriptionId" => "observer",
+            "filters" => %{}
+          },
+          observer_state
+        )
+
+      assert JSON.decode!(ready) == %{
+               "type" => "subscription_ready",
+               "subscriptionId" => "observer"
+             }
+
+      assert subscribed_state.principal_kind == :observer
+      assert subscribed_state.subscriptions == %{"observer" => %{}}
+      ChangeSocket.terminate(:normal, subscribed_state)
+    end
   end
 
   test "auth is in-band and subscriptions are multiplexed with conjunctive filters", ctx do
