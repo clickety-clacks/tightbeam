@@ -61,6 +61,23 @@ defmodule PortableToplinesFixture do
       session_key: nil
     }
 
+  def legacy_create_response do
+    %{
+      topline: %{
+        id: "tl_fixture",
+        ownerUserId: "synthetic",
+        title: "Café",
+        state: "open",
+        createdActor: %{kind: "user", ref: "synthetic"},
+        createdAt: 10,
+        updatedAt: 10,
+        closedAt: nil,
+        activeWorkCount: 0,
+        openConcernCount: 0
+      }
+    }
+  end
+
   def populate_legacy_v5!(db) do
     :ok =
       DB.execute(db, """
@@ -117,6 +134,41 @@ defmodule PortableToplinesFixture do
         VALUES ('tlp_fixture','wi_fixture','synthetic','created','wi_fixture',NULL,NULL,0,
                 'user','synthetic','pending',1,1,'w_fixture',NULL,NULL,NULL,NULL);
       """)
+
+    legacy_create_fingerprint =
+      :crypto.hash(
+        :sha256,
+        ~s({"operation":"topline-create","parameters":{"title":"Café"}})
+      )
+      |> Base.encode16(case: :lower)
+
+    # V5 records the create response from the title-only request fingerprint.
+    legacy_create_response =
+      JSON.encode!(%{
+        "topline" => %{
+          "id" => "tl_fixture",
+          "ownerUserId" => "synthetic",
+          "title" => "Café",
+          "state" => "open",
+          "createdActor" => %{"kind" => "user", "ref" => "synthetic"},
+          "createdAt" => 10,
+          "updatedAt" => 10,
+          "closedAt" => nil,
+          "activeWorkCount" => 0,
+          "openConcernCount" => 0
+        }
+      })
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO topline_idempotency
+          (callerUserId,operation,idempotencyKey,requestFingerprint,canonicalResponse)
+        VALUES (?1, 'topline-create', 'create', ?2, ?3)
+        """,
+        ["synthetic", legacy_create_fingerprint, legacy_create_response]
+      )
 
     {%{id: "tl_fixture"}, %{id: "tlc_fixture"}}
   end
@@ -300,7 +352,11 @@ try do
   assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
   assert {:ok, [[0]]} = DB.query(db, "PRAGMA defer_foreign_keys")
 
-  # Validation is still owned by the actual product API on the migrated base.
+  # The legacy create key still replays its pre-migration stored response.
+  assert Toplines.create(db, F.call(%{title: " Café ", idempotency_key: "create"})) ==
+           F.legacy_create_response()
+
+  # Validation of a new create is still owned by the actual product API.
   assert %{topline: %{title: "Café"}} =
            Toplines.create(
              db,

@@ -1132,6 +1132,19 @@ defmodule Tightbeam.ToplinesTest do
              ref: "scheduler",
              actingSessionKey: "acting-session"
            }
+
+    assert %{code: "idempotency_conflict"} =
+             call(
+               {:process, "scheduler"},
+               %{
+                 title: "Scheduled topline",
+                 idempotency_key: "scheduled",
+                 owner_user_id: "flynn"
+               },
+               22
+             )
+             |> Map.put(:transport_session_key, "acting-session")
+             |> then(&Toplines.create(ctx.db, &1))
   end
 
   test "Topline idempotency keeps user scope while recording the submitting session", ctx do

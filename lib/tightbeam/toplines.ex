@@ -252,7 +252,14 @@ defmodule Tightbeam.Toplines do
          {:ok, owner_user_id} <- create_owner(db, caller, param(params, :owner_user_id)) do
       operation = "topline-create"
       key = param(params, :idempotency_key)
-      fingerprint = fingerprint(operation, %{ownerUserId: owner_user_id, title: title})
+
+      fingerprint_parameters =
+        case caller.actor_kind do
+          "process" -> %{ownerUserId: owner_user_id, title: title}
+          _ -> %{title: title}
+        end
+
+      fingerprint = fingerprint(operation, fingerprint_parameters)
 
       transaction!(db, fn txn ->
         with {:ok, caller} <- reauthorize(txn, caller) do
