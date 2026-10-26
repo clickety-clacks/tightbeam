@@ -665,9 +665,9 @@ defmodule Tightbeam.Firehose.Hub do
              device_id,
              principal_kind,
              principal_id
-           ),
-          do: [pid],
-          else: []
+          ),
+           do: [pid],
+           else: []
     end)
   end
 
@@ -827,8 +827,8 @@ defmodule Tightbeam.Firehose.Hub do
       socket ->
         :ets.insert(
           state.ingress,
-          {{:socket, pid}, socket.mode, socket_filters(socket), socket.user_id,
-           socket.device_id, socket.principal_kind, socket.principal_id}
+          {{:socket, pid}, socket.mode, socket_filters(socket), socket.user_id, socket.device_id,
+           socket.principal_kind, socket.principal_id}
         )
     end
   end
