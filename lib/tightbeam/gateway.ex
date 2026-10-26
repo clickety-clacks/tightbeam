@@ -65,6 +65,7 @@ defmodule Tightbeam.Gateway do
     AdminProjection,
     Archetypes,
     Artifacts,
+    ArtifactContent,
     Assignments,
     ConditionFacts,
     CriticalLeases,
@@ -875,6 +876,8 @@ defmodule Tightbeam.Gateway do
           end
         end,
       {"facts-read", []} => fn call -> facts_read_result(db, call) end,
+      {"memento-set", []} => fn call -> Tightbeam.Mementos.__handle__(db, "memento-set", call) end,
+      {"mementos", []} => fn call -> Tightbeam.Mementos.__handle__(db, "mementos", call) end,
       {"artifact-record", ["artifact.recorded"]} => fn call ->
         Artifacts.record(db, Map.put(call, :artifact_base_dir, config[:base_dir]))
       end,

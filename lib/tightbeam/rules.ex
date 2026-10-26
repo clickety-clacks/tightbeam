@@ -67,6 +67,8 @@ defmodule Tightbeam.Rules do
 
   @persist_key __MODULE__
   @policy_key {__MODULE__, :policies}
+  @snapshot_key {__MODULE__, :effective_snapshot}
+  @call_snapshot_key {__MODULE__, :call_snapshot}
   @rule_keys MapSet.new([
                "name",
                "verb",
@@ -82,9 +84,9 @@ defmodule Tightbeam.Rules do
                "recurrence_suppression"
              ])
   @condition_keys MapSet.new(["fact", "op", "value"])
-  @policy_keys MapSet.new(["name", "purpose", "when", "verification"])
+  @policy_keys MapSet.new(["name", "purpose", "when", "verification", "evidence_memento"])
   @verification_keys MapSet.new(["trigger", "terminal", "fallback"])
-  @policy_purposes ~w(wait-effort-relief wait-verification-admission)
+  @policy_purposes ~w(wait-effort-relief wait-verification-admission attest-file-effect-evidence attest-operational-evidence)
   @recurrence_keys MapSet.new([
                      "scope",
                      "fingerprint",
@@ -159,9 +161,11 @@ defmodule Tightbeam.Rules do
     "org.live_sessions_owned_by_caller" => :int,
     "caller.verb_count_24h" => :int,
     "attest.kind" => :string,
+    "call.file_effect_manifest.valid" => :bool,
     "assignment.verdicts" => {:list, :string},
     "assignment.is_producing_card" => :bool,
     "assignment.effect_kind" => :string,
+    "assignment.declared_files_present" => :bool,
     "assignment.state" => :string,
     "assignment.outcome" => :string,
     "assignment.holder_noted_verdict_kinds" => {:list, :string},
@@ -342,6 +346,7 @@ defmodule Tightbeam.Rules do
     law_base = Keyword.get(opts, :law_base, base_dir)
     revision = Keyword.get(opts, :revision)
     identity_manifest_sha = revision || identity_manifest_sha(base_dir)
+    declarations = Tightbeam.Mementos.read_declarations!(law_base, identity_manifest_sha)
 
     :persistent_term.put({__MODULE__, :unavailable_verbs}, %{})
 
@@ -352,7 +357,9 @@ defmodule Tightbeam.Rules do
       |> Enum.sort()
       |> Enum.flat_map(fn path ->
         try do
-          load_file!(path, verbs, law_base, identity_manifest_sha)
+          Tightbeam.Mementos.with_declarations(declarations, fn ->
+            load_file!(path, verbs, law_base, identity_manifest_sha)
+          end)
         rescue
           error ->
             require Logger
@@ -493,6 +500,14 @@ defmodule Tightbeam.Rules do
     :persistent_term.put(@persist_key, rules)
     :persistent_term.put(@policy_key, policies)
 
+    :persistent_term.put(@snapshot_key, %{
+      rules: rules,
+      policies: policies,
+      declarations: declarations,
+      revision: identity_manifest_sha,
+      active_admission_contract: %{"attest" => "legacy"}
+    })
+
     RuleRuntime.install_admission(&evaluate/2)
 
     RuleRuntime.install(%{
@@ -505,11 +520,91 @@ defmodule Tightbeam.Rules do
     rules
   end
 
+  @doc false
+  def effective_snapshot do
+    Process.get(@call_snapshot_key) ||
+      :persistent_term.get(@snapshot_key, %{
+        rules: [],
+        policies: [],
+        declarations: %{revision: nil, names: %{}},
+        revision: nil,
+        active_admission_contract: %{"attest" => "legacy"}
+      })
+  end
+
+  @doc false
+  def with_snapshot(fun) when is_function(fun, 0) do
+    case Process.get(@call_snapshot_key) do
+      nil ->
+        Process.put(@call_snapshot_key, effective_snapshot())
+
+        try do
+          fun.()
+        after
+          Process.delete(@call_snapshot_key)
+        end
+
+      _snapshot ->
+        fun.()
+    end
+  end
+
+  @doc false
+  def with_snapshot(snapshot, fun) when is_map(snapshot) and is_function(fun, 0) do
+    previous = Process.get(@call_snapshot_key, :absent)
+    Process.put(@call_snapshot_key, snapshot)
+
+    try do
+      fun.()
+    after
+      if previous == :absent,
+        do: Process.delete(@call_snapshot_key),
+        else: Process.put(@call_snapshot_key, previous)
+    end
+  end
+
+  @doc false
+  def active_admission_contract(verb),
+    do: Map.get(effective_snapshot().active_admission_contract, verb, "legacy")
+
+  @doc false
+  def assert_session_contract_in_txn!(_txn, %{verb: verb}) do
+    case active_admission_contract(verb) do
+      "legacy" ->
+        :ok
+
+      _ ->
+        raise Tightbeam.Mementos.Refusal,
+          code: "policy_revision_unavailable",
+          message: "replacement session contract has not been activated"
+    end
+  end
+
+  @doc "Select a declared evidence policy in the call's pinned snapshot."
+  def select_policy(db, purpose, call) do
+    with_snapshot(fn ->
+      effective_snapshot().policies
+      |> Enum.filter(&(&1.purpose == purpose))
+      |> Enum.sort_by(& &1.name)
+      |> Enum.find_value(:none, fn policy ->
+        case evaluate_conditions(policy.conditions, policy, db, call, %{}) do
+          {:match, _cache} ->
+            {:ok, policy}
+
+          {:no_match, _cache} ->
+            false
+
+          {:error, fact} ->
+            raise ArgumentError, "#{policy.source}: policy #{policy.name}: failed to read #{fact}"
+        end
+      end)
+    end)
+  end
+
   @doc "Select the bytewise-smallest matching predicate-only policy for one snapshot."
   @spec select_policy_in_txn(DB.Txn.t(), String.t(), map()) :: {:ok, map()} | :none
   def select_policy_in_txn(%DB.Txn{} = txn, purpose, context) do
-    @policy_key
-    |> :persistent_term.get([])
+    effective_snapshot().policies
     |> Enum.filter(&(&1.purpose == purpose))
     |> Enum.sort_by(& &1.name)
     |> Enum.find_value(:none, fn policy ->
@@ -543,7 +638,7 @@ defmodule Tightbeam.Rules do
   @doc "Return the dry statute decision and the actor-owned close/consume work."
   @spec decide(GenServer.server(), map()) :: {term(), [term()], [String.t()]}
   def decide(db, call) do
-    rules = :persistent_term.get(@persist_key, [])
+    rules = effective_snapshot().rules
     verb = Map.fetch!(call, :verb)
     edge = edge(call)
 
@@ -565,9 +660,7 @@ defmodule Tightbeam.Rules do
   @doc false
   @spec active_identity_manifest_sha() :: String.t() | nil
   def active_identity_manifest_sha do
-    @persist_key
-    |> :persistent_term.get([])
-    |> Enum.find_value(& &1.identity_manifest_sha)
+    effective_snapshot().revision
   end
 
   @doc "Validate and evaluate an ad hoc predicate against one transaction snapshot."
@@ -1334,12 +1427,38 @@ defmodule Tightbeam.Rules do
 
     conditions = validate_policy_conditions!(Map.get(policy, "when"), fail)
     verification = validate_policy_verification!(purpose, Map.get(policy, "verification"), fail)
+    evidence_memento = Map.get(policy, "evidence_memento")
+
+    if purpose in ~w(attest-file-effect-evidence attest-operational-evidence) do
+      Enum.each(conditions, fn %{fact: fact} ->
+        unless fact in ~w(assignment.effect_kind assignment.declared_files_present) or
+                 String.starts_with?(fact, "assignment.memento."),
+               do: fail.("when uses a fact unavailable to attest evidence selection: #{fact}")
+      end)
+    end
+
+    case purpose do
+      "attest-file-effect-evidence" ->
+        case Tightbeam.Mementos.declarations().names[evidence_memento] do
+          %{many: true, records: records} ->
+            unless "attest" in records,
+              do: fail.("evidence_memento must name a declared many attest memento")
+
+          _ ->
+            fail.("evidence_memento must name a declared many attest memento")
+        end
+
+      _ ->
+        unless is_nil(evidence_memento),
+          do: fail.("evidence_memento is valid only for attest-file-effect-evidence")
+    end
 
     %{
       name: raw_name,
       purpose: purpose,
       conditions: conditions,
       verification: verification,
+      evidence_memento: evidence_memento,
       source: path,
       identity_manifest_sha: identity_manifest_sha
     }
@@ -1886,7 +2005,7 @@ defmodule Tightbeam.Rules do
       end
     end
 
-    type = Map.get(@facts, fact)
+    type = Map.get(@facts, fact) || Tightbeam.MementoFacts.type(fact)
 
     if is_nil(type), do: fail.("condition ##{index} has unknown fact: #{inspect(fact)}")
     unless op in @operators, do: fail.("condition ##{index} has unknown op: #{inspect(op)}")
@@ -2486,6 +2605,26 @@ defmodule Tightbeam.Rules do
       assignment, cache -> {assignment.effect_kind, cache}
     end)
   end
+
+  defp compute_fact("assignment.declared_files_present", db, %{verb: "attest"} = call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        {:ok, [[present]]} =
+          query(
+            db,
+            "SELECT EXISTS(SELECT 1 FROM assignment_files WHERE assignmentId = ?1)",
+            [assignment.id]
+          )
+
+        {present == 1, cache}
+    end)
+  end
+
+  defp compute_fact("assignment.declared_files_present", _db, _call, cache),
+    do: {nil, cache}
 
   defp compute_fact("assignment.state", db, call, cache) do
     with_dependency("$assignment", db, call, cache, fn
@@ -3542,6 +3681,96 @@ defmodule Tightbeam.Rules do
     end)
   end
 
+  defp compute_fact("call.comparison_value", _db, call, cache),
+    do: {Tightbeam.MementoFacts.comparison_value(call), cache}
+
+  defp compute_fact("call.file_effect_manifest.valid", _db, call, cache),
+    do: {get_in(call, [:file_effect_manifest, :valid]) == true, cache}
+
+  defp compute_fact("call.has_comparison_value", _db, call, cache),
+    do: {Tightbeam.MementoFacts.has_comparison_value?(call), cache}
+
+  defp compute_fact("call." <> _ = fact, _db, call, cache),
+    do: {Tightbeam.MementoFacts.call_value(fact, Map.get(call, :memento_writes, [])), cache}
+
+  defp compute_fact(fact, db, call, cache) do
+    case String.split(fact, ".", parts: 3) do
+      ["assignment", selector, property]
+      when selector in ~w(latest_linked_review latest_holder_verdict) ->
+        with_dependency("$assignment", db, call, cache, fn
+          nil, cache ->
+            {nil, cache}
+
+          assignment, cache ->
+            key = {:memento_judgment, selector}
+
+            selected =
+              case Map.fetch(cache, key) do
+                {:ok, row} -> row
+                :error -> Tightbeam.MementoFacts.select(db, assignment.id, selector)
+              end
+
+            cache = Map.put(cache, key, selected)
+
+            case String.split(property, ".", parts: 2) do
+              [operator, name] ->
+                cached_memento_value(
+                  db,
+                  "attest",
+                  selected && selected.id,
+                  operator,
+                  name,
+                  call,
+                  cache
+                )
+
+              [_] ->
+                {Tightbeam.MementoFacts.judgment_value(db, selected, property, []), cache}
+            end
+        end)
+
+      ["assignment", operator, name] ->
+        with_dependency("$assignment", db, call, cache, fn
+          nil, cache ->
+            {nil, cache}
+
+          assignment, cache ->
+            cached_memento_value(db, "assignment", assignment.id, operator, name, call, cache)
+        end)
+
+      ["work_item", operator, name] ->
+        with_dependency("$work_item_id", db, call, cache, fn
+          nil, cache -> {nil, cache}
+          id, cache -> cached_memento_value(db, "work_item", id, operator, name, call, cache)
+        end)
+    end
+  end
+
+  defp cached_memento_value(db, kind, id, operator, name, call, cache) do
+    key = {:memento_value, kind, id, name}
+
+    values =
+      case Map.fetch(cache, key) do
+        {:ok, values} -> values
+        :error -> if id, do: Tightbeam.Mementos.current(db, kind, id, name), else: []
+      end
+
+    value =
+      case operator do
+        "memento_matches_call" ->
+          proposed = call |> Map.get(:memento_writes, []) |> Map.new() |> Map.get(name, [])
+          Tightbeam.MementoFacts.matches?(values, proposed)
+
+        "memento_contains_comparison_value" ->
+          Tightbeam.MementoFacts.contains_comparison?(values, call)
+
+        _ ->
+          Tightbeam.MementoFacts.value(operator, values)
+      end
+
+    {value, Map.put(cache, key, values)}
+  end
+
   defp resolve_dispatch_assignment(db, call) do
     case {call.verb, Map.get(call.params, :work_item_id)} do
       {"dispatch", work_item_id} when is_binary(work_item_id) ->
@@ -3605,7 +3834,7 @@ defmodule Tightbeam.Rules do
   end
 
   defp assignment_context(db, where, params) do
-    case DB.query(
+    case query(
            db,
            """
            SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.holderKey, a.holderRole,
@@ -3730,6 +3959,9 @@ defmodule Tightbeam.Rules do
 
   defp compare(left, "in", right), do: left in right
   defp compare(left, "not_in", right), do: left not in right
+
+  defp query(%DB.Txn{} = txn, sql, params), do: {:ok, DB.Txn.q(txn, sql, params)}
+  defp query(db, sql, params), do: DB.query(db, sql, params)
 
   defp identity_manifest_sha(base_dir) do
     identity_dir = Path.join(base_dir, "identity")

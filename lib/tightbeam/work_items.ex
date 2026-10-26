@@ -19,9 +19,12 @@ defmodule Tightbeam.WorkItems do
   alias Tightbeam.{
     CausalEvents,
     DB,
+    Dispatch,
     EffortCheckin,
     ExecutionMap,
+    Mementos,
     Org,
+    Rules,
     StateResources,
     StateVisibility,
     Wakes
@@ -114,76 +117,99 @@ defmodule Tightbeam.WorkItems do
          :ok <- valid_idempotency_key(key),
          {:ok, owner} <- resolve_owner(db, call.principal) do
       {created_by_user, created_by_session} = creator(call.principal)
+      snapshot = Rules.effective_snapshot()
 
       result =
         transaction(db, fn txn ->
-          case key && idempotency_item(txn, owner, key) do
-            nil ->
-              id = "wi_" <> Tightbeam.Id.uuid4()
-              created_in_turn_seq = running_turn_seq(txn, created_by_session)
-              priority = call.params[:priority] || default_priority_in_txn(txn)
-              created_at = now()
+          Rules.with_snapshot(snapshot, fn ->
+            case key && idempotency_item(txn, owner, key) do
+              nil ->
+                admitted =
+                  Mementos.admit_in_txn!(
+                    txn,
+                    call
+                    |> Map.put_new(:verb, "work-item-create")
+                    |> Map.put_new(:rules_prechecked, true)
+                  )
 
-              Txn.q(
-                txn,
-                """
-                INSERT INTO work_items
-                  (id, title, specRefName, specRefSha256, isBug, ownerUserId,
-                   state, createdByUser, createdBySession, createdInTurnSeq,
-                   createdContextKnown, createdAt)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, 1, ?10)
-                """,
-                [
-                  id,
-                  call.params.title,
-                  call.params[:spec_ref_name],
-                  call.params[:spec_ref_sha256],
-                  bool_to_int(is_bug),
-                  owner,
-                  created_by_user,
-                  created_by_session,
-                  created_in_turn_seq,
-                  created_at
-                ]
-              )
+                id = "wi_" <> Tightbeam.Id.uuid4()
+                created_in_turn_seq = running_turn_seq(txn, created_by_session)
+                priority = call.params[:priority] || default_priority_in_txn(txn)
+                created_at = now()
 
-              put_priority_in_txn(txn, id, priority)
-              stamp_version_in_txn(txn, id, created_at)
-              routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
-
-              if key do
                 Txn.q(
                   txn,
-                  "INSERT INTO wire_idempotency (ownerUserId, operation, idempotencyKey, sessionKey) VALUES (?1, 'work-item-create', ?2, ?3)",
-                  [owner, key, id]
+                  """
+                  INSERT INTO work_items
+                    (id, title, specRefName, specRefSha256, isBug, ownerUserId,
+                     state, createdByUser, createdBySession, createdInTurnSeq,
+                     createdContextKnown, createdAt)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, 1, ?10)
+                  """,
+                  [
+                    id,
+                    call.params.title,
+                    call.params[:spec_ref_name],
+                    call.params[:spec_ref_sha256],
+                    bool_to_int(is_bug),
+                    owner,
+                    created_by_user,
+                    created_by_session,
+                    created_in_turn_seq,
+                    created_at
+                  ]
                 )
-              end
 
-              item = fetch_in_txn(txn, id)
-              on_routing_wake_scheduled_in_txn(call).(txn, routing_wake)
-              Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
-              {:created, item, routing_wake}
+                put_priority_in_txn(txn, id, priority)
+                stamp_version_in_txn(txn, id, created_at)
+                routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
 
-            item_id ->
-              item = fetch_in_txn(txn, item_id)
-              Publisher.maybe_observed_accepted_in_txn(txn, call)
-              {:replayed, item}
-          end
+                if key do
+                  Txn.q(
+                    txn,
+                    "INSERT INTO wire_idempotency (ownerUserId, operation, idempotencyKey, sessionKey) VALUES (?1, 'work-item-create', ?2, ?3)",
+                    [owner, key, id]
+                  )
+                end
+
+                item = fetch_in_txn(txn, id)
+                Mementos.append_inline!(txn, "work_item", id, admitted)
+                on_routing_wake_scheduled_in_txn(call).(txn, routing_wake)
+                Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
+                {:created, item, routing_wake, admitted.memento_close_effects}
+
+              item_id ->
+                item = fetch_in_txn(txn, item_id)
+                Publisher.maybe_observed_accepted_in_txn(txn, call)
+                {:replayed, item}
+            end
+          end)
         end)
 
       case result do
         # An actual create makes an owner-visible item — one owner-routed
         # metadata doorbell (constitution §2: the owner is nagged about their
         # unassigned item). A keyed replay created nothing, so it stays silent.
-        {:created, item, routing_wake} ->
+        {:created, item, routing_wake, effects} ->
+          if effects != [],
+            do:
+              Dispatch.close_rule_effects(
+                db,
+                call[:rule_effect_handlers] || Tightbeam.Gateway.handlers(%{db: db}),
+                effects
+              )
+
           best_effort(fn -> on_change(call).(item.id, "metadata") end)
           best_effort(fn -> on_routing_wake_scheduled(call).(routing_wake) end)
-          public_work_item(item)
+          public_work_item(item) |> then(&Mementos.attach(db, "work_item", &1))
 
         {:replayed, item} ->
-          public_work_item(item)
+          public_work_item(item) |> then(&Mementos.attach(db, "work_item", &1))
       end
     end
+  rescue
+    error in Mementos.Refusal ->
+      error.admission || error.details || %{code: error.code, message: error.message}
   end
 
   defp idempotency_item(txn, owner, key) do
@@ -241,7 +267,7 @@ defmodule Tightbeam.WorkItems do
         {:updated, item, changed?} ->
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
 
-          result = public_work_item(item)
+          result = public_work_item(item) |> then(&Mementos.attach(db, "work_item", &1))
 
           if Map.has_key?(call.params, :body) or Map.get(call.params, :clear_body, false),
             do: %{workItem: result, bodyUpdate: body_update_descriptor(item, changed?)},
@@ -313,7 +339,7 @@ defmodule Tightbeam.WorkItems do
           end
 
           %{
-            workItem: public_work_item(item),
+            workItem: Mementos.attach(db, "work_item", public_work_item(item)),
             created: created?,
             wakeScheduled: true
           }
@@ -784,7 +810,7 @@ defmodule Tightbeam.WorkItems do
       case result do
         {:disposed, item, changed?, _old_state} ->
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
-          %{ok: true, workItem: public_work_item(item)}
+          %{ok: true, workItem: Mementos.attach(db, "work_item", public_work_item(item))}
 
         error ->
           error
@@ -1194,7 +1220,7 @@ defmodule Tightbeam.WorkItems do
 
         item ->
           %{
-            workItem: public_detail_work_item(item),
+            workItem: Mementos.attach(db, "work_item", public_detail_work_item(item)),
             assignments: Tightbeam.Assignments.__for_work_item__(db, item.id)
           }
       end
@@ -1533,7 +1559,15 @@ defmodule Tightbeam.WorkItems do
       {:ok, rows} =
         DB.query(db, "SELECT #{columns()} FROM work_items ORDER BY createdAt DESC, id DESC")
 
-      %{workItems: Enum.map(rows, &(work_item(&1) |> public_work_item() |> public_summary()))}
+      %{
+        workItems:
+          Enum.map(rows, fn row ->
+            row
+            |> work_item()
+            |> public_work_item()
+            |> then(&Mementos.attach(db, "work_item", &1))
+          end)
+      }
     end
   end
 
