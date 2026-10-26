@@ -665,7 +665,7 @@ defmodule Tightbeam.Firehose.Hub do
              device_id,
              principal_kind,
              principal_id
-          ),
+           ),
            do: [pid],
            else: []
     end)
