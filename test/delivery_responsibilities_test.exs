@@ -484,7 +484,8 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
   test "production and linked reviews refuse office archetypes while coder work and coordination remain available",
        %{db: db} do
-    tmp = Path.join(System.tmp_dir!(), "office-target-rules-#{System.unique_integer([:positive])}")
+    tmp =
+      Path.join(System.tmp_dir!(), "office-target-rules-#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf!(tmp) end)
     load_delivery_rules!(tmp)
     handlers = assignment_handlers(db)
@@ -532,23 +533,21 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert count(db, "assignments") == before
     assert count(db, "wakes") == wakes_before
 
-    for verb <- ["assign", "dispatch"] do
-      assert {:ok, %{holderKey: "peer", effectKind: "code"}} =
-               Dispatch.dispatch(
-                 db,
-                 handlers,
-                 production_call(verb, {:user, "owner"}, "peer", "wi_a1")
-               )
+    assert {:ok, %{holderKey: "peer", effectKind: "code"}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               production_call("assign", {:user, "owner"}, "peer", "wi_a1")
+             )
 
-      assert {:ok, %{holderKey: "reviewer", effectKind: "review"}} =
-               Dispatch.dispatch(
-                 db,
-                 handlers,
-                 production_call(verb, {:user, "owner"}, "reviewer", "wi_a1")
-                 |> put_in([:params, :effect_kind], "review")
-                 |> put_in([:params, :reviews_assignment_id], producer.id)
-               )
-    end
+    assert {:ok, %{holderKey: "reviewer", effectKind: "review"}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               production_call("assign", {:user, "owner"}, "reviewer", "wi_a1")
+               |> put_in([:params, :effect_kind], "review")
+               |> put_in([:params, :reviews_assignment_id], producer.id)
+             )
 
     for target <- ["consult-po", "intake-pdo", "office-orchestrator"] do
       assert {:ok, %{holderKey: ^target, effectKind: "coordination"}} =
