@@ -147,132 +147,138 @@ try do
       )
 
     {:ok, {:text, observer_ready}, observer_ws} = WS.recv(observer_ws, 2_000)
+
     assert %{"type" => "subscription_ready", "subscriptionId" => "credentialless"} =
              JSON.decode!(observer_ready)
 
-  {:ok, ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
+    {:ok, ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
 
-  try do
-    :ok = WS.send_text(ws, JSON.encode!(%{"type" => "auth", "token" => device.token}))
-    {:ok, {:text, auth}, ws} = WS.recv(ws, 2_000)
-    assert %{"type" => "auth_result", "success" => true} = JSON.decode!(auth)
+    try do
+      :ok = WS.send_text(ws, JSON.encode!(%{"type" => "auth", "token" => device.token}))
+      {:ok, {:text, auth}, ws} = WS.recv(ws, 2_000)
+      assert %{"type" => "auth_result", "success" => true} = JSON.decode!(auth)
 
-    :ok =
-      WS.send_text(
-        ws,
+      :ok =
+        WS.send_text(
+          ws,
+          JSON.encode!(%{
+            "type" => "subscribe",
+            "protocolVersion" => 2,
+            "subscriptionId" => "cold",
+            "filters" => %{"classes" => ["work_item.created"]}
+          })
+        )
+
+      {:ok, {:text, ready}, ws} = WS.recv(ws, 2_000)
+      assert %{"type" => "subscription_ready"} = JSON.decode!(ready)
+
+      headers = [
+        {~c"authorization", String.to_charlist("Bearer " <> cli_token)},
+        {~c"x-tightbeam-cli-version",
+         String.to_charlist(Tightbeam.CliCompatibility.required_version())}
+      ]
+
+      body =
         JSON.encode!(%{
-          "type" => "subscribe",
-          "protocolVersion" => 2,
-          "subscriptionId" => "cold",
-          "filters" => %{"classes" => ["work_item.created"]}
+          "verb" => "work-item-create",
+          "asUser" => device.user_id,
+          "params" => %{"title" => "Cold persistent delivery"}
         })
-      )
 
-    {:ok, {:text, ready}, ws} = WS.recv(ws, 2_000)
-    assert %{"type" => "subscription_ready"} = JSON.decode!(ready)
-    headers = [
-      {~c"authorization", String.to_charlist("Bearer " <> cli_token)},
-      {~c"x-tightbeam-cli-version",
-       String.to_charlist(Tightbeam.CliCompatibility.required_version())}
-    ]
-
-    body =
-      JSON.encode!(%{
-        "verb" => "work-item-create",
-        "asUser" => device.user_id,
-        "params" => %{"title" => "Cold persistent delivery"}
-      })
-
-    {:ok, {{_, 200, _}, _, response}} =
-      :httpc.request(
-        :post,
-        {~c"http://127.0.0.1:#{port}/agent/dispatch", headers, ~c"application/json", body},
-        [timeout: 2_000],
-        body_format: :binary
-      )
-
-    assert %{"result" => %{"id" => id}} = JSON.decode!(response)
-    {:ok, {:text, raw}, ws} = WS.recv(ws, 2_000)
-
-    assert %{
-             "type" => "change",
-             "class" => "work_item.created",
-             "refs" => %{"workItemId" => ^id},
-             "payload" => item
-           } = JSON.decode!(raw)
-
-    {:ok, {:text, observer_raw}, observer_ws} = WS.recv(observer_ws, 2_000)
-
-    assert %{
-             "type" => "change",
-             "class" => "work_item.created",
-             "refs" => %{"workItemId" => ^id},
-             "payload" => ^item
-           } = JSON.decode!(observer_raw)
-
-    {:ok, {{_, 200, _}, _, detail}} =
-      :httpc.request(
-        :get,
-        {String.to_charlist("http://127.0.0.1:#{port}/api/work-items/#{id}"),
-         [{~c"authorization", String.to_charlist("Bearer " <> device.token)}]},
-        [timeout: 2_000],
-        body_format: :binary
-      )
-
-    assert JSON.decode!(detail)["item"] == item
-
-    get_json = fn path, auth_headers ->
       {:ok, {{_, 200, _}, _, response}} =
         :httpc.request(
-          :get,
-          {String.to_charlist("http://127.0.0.1:#{port}" <> path), auth_headers},
+          :post,
+          {~c"http://127.0.0.1:#{port}/agent/dispatch", headers, ~c"application/json", body},
           [timeout: 2_000],
           body_format: :binary
         )
 
-      JSON.decode!(response)
+      assert %{"result" => %{"id" => id}} = JSON.decode!(response)
+      {:ok, {:text, raw}, ws} = WS.recv(ws, 2_000)
+
+      assert %{
+               "type" => "change",
+               "class" => "work_item.created",
+               "refs" => %{"workItemId" => ^id},
+               "payload" => item
+             } = JSON.decode!(raw)
+
+      {:ok, {:text, observer_raw}, observer_ws} = WS.recv(observer_ws, 2_000)
+
+      assert %{
+               "type" => "change",
+               "class" => "work_item.created",
+               "refs" => %{"workItemId" => ^id},
+               "payload" => ^item
+             } = JSON.decode!(observer_raw)
+
+      {:ok, {{_, 200, _}, _, detail}} =
+        :httpc.request(
+          :get,
+          {String.to_charlist("http://127.0.0.1:#{port}/api/work-items/#{id}"),
+           [{~c"authorization", String.to_charlist("Bearer " <> device.token)}]},
+          [timeout: 2_000],
+          body_format: :binary
+        )
+
+      assert JSON.decode!(detail)["item"] == item
+
+      get_json = fn path, auth_headers ->
+        {:ok, {{_, 200, _}, _, response}} =
+          :httpc.request(
+            :get,
+            {String.to_charlist("http://127.0.0.1:#{port}" <> path), auth_headers},
+            [timeout: 2_000],
+            body_format: :binary
+          )
+
+        JSON.decode!(response)
+      end
+
+      authenticated_headers = [
+        {~c"authorization", String.to_charlist("Bearer " <> cli_token)}
+      ]
+
+      anonymous_sessions = get_json.("/api/sessions", [])
+      authenticated_sessions = get_json.("/api/sessions", authenticated_headers)
+      assert anonymous_sessions["items"] == authenticated_sessions["items"]
+      assert Enum.any?(anonymous_sessions["items"], &(&1["sessionKey"] == session.session_key))
+
+      encoded_session_key = URI.encode_www_form(session.session_key)
+      session_path = "/api/sessions/#{encoded_session_key}"
+      assert get_json.(session_path, []) == get_json.(session_path, authenticated_headers)
+
+      messages_path = session_path <> "/messages"
+      anonymous_messages = get_json.(messages_path, [])
+      authenticated_messages = get_json.(messages_path, authenticated_headers)
+      assert anonymous_messages["items"] == authenticated_messages["items"]
+
+      assert Enum.map(anonymous_messages["items"], & &1["id"]) == [
+               user_message_id,
+               reply_message_id
+             ]
+
+      message_path = messages_path <> "/#{reply_message_id}"
+
+      assert get_json.(message_path, []) == get_json.(message_path, authenticated_headers)
+
+      as_user = URI.encode_www_form(device.user_id)
+      marker_collection = "/api/read-markers?asUser=#{as_user}"
+      anonymous_markers = get_json.(marker_collection, [])
+      authenticated_markers = get_json.(marker_collection, authenticated_headers)
+      assert anonymous_markers["items"] == authenticated_markers["items"]
+      assert Enum.any?(anonymous_markers["items"], &(&1["scopeKey"] == "chat:observer"))
+
+      encoded_scope = URI.encode_www_form("chat:observer")
+      marker_detail = "/api/read-markers/#{encoded_scope}?asUser=#{as_user}"
+      assert get_json.(marker_detail, []) == get_json.(marker_detail, authenticated_headers)
+
+      assert File.regular?(Path.join(base, "state.db"))
+      assert File.read!(Path.join(base, "build-owner.json")) == marker
+      refute File.exists?(tripwire)
+    after
+      WS.close(ws)
     end
-
-    authenticated_headers = [
-      {~c"authorization", String.to_charlist("Bearer " <> cli_token)}
-    ]
-
-    anonymous_sessions = get_json.("/api/sessions", [])
-    authenticated_sessions = get_json.("/api/sessions", authenticated_headers)
-    assert anonymous_sessions["items"] == authenticated_sessions["items"]
-    assert Enum.any?(anonymous_sessions["items"], &(&1["sessionKey"] == session.session_key))
-
-    encoded_session_key = URI.encode_www_form(session.session_key)
-    session_path = "/api/sessions/#{encoded_session_key}"
-    assert get_json.(session_path, []) == get_json.(session_path, authenticated_headers)
-
-    messages_path = session_path <> "/messages"
-    anonymous_messages = get_json.(messages_path, [])
-    authenticated_messages = get_json.(messages_path, authenticated_headers)
-    assert anonymous_messages["items"] == authenticated_messages["items"]
-    assert Enum.map(anonymous_messages["items"], & &1["id"]) == [user_message_id, reply_message_id]
-
-    message_path = messages_path <> "/#{reply_message_id}"
-
-    assert get_json.(message_path, []) == get_json.(message_path, authenticated_headers)
-
-    as_user = URI.encode_www_form(device.user_id)
-    marker_collection = "/api/read-markers?asUser=#{as_user}"
-    anonymous_markers = get_json.(marker_collection, [])
-    authenticated_markers = get_json.(marker_collection, authenticated_headers)
-    assert anonymous_markers["items"] == authenticated_markers["items"]
-    assert Enum.any?(anonymous_markers["items"], &(&1["scopeKey"] == "chat:observer"))
-
-    encoded_scope = URI.encode_www_form("chat:observer")
-    marker_detail = "/api/read-markers/#{encoded_scope}?asUser=#{as_user}"
-    assert get_json.(marker_detail, []) == get_json.(marker_detail, authenticated_headers)
-
-    assert File.regular?(Path.join(base, "state.db"))
-    assert File.read!(Path.join(base, "build-owner.json")) == marker
-    refute File.exists?(tripwire)
-  after
-    WS.close(ws)
-  end
   after
     WS.close(observer_ws)
   end
