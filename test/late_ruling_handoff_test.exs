@@ -149,7 +149,7 @@ defmodule Tightbeam.LateRulingHandoffTest do
     }
   end
 
-  test "dr_07bdef13_survives_revocation_late_ruling_successor_and_consumption", ctx do
+  test "late ruling survives revocation, successor handoff, and consumption", ctx do
     source_item = work_item(ctx.db, ctx.opener.session_key, "source item")
 
     source =
