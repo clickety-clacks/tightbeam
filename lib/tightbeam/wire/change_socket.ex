@@ -191,16 +191,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
         )
 
       true ->
-        known = Devices.by_id(db(state), string(message["deviceId"]))
-
-        reason =
-          case known do
-            %{status: "pending"} -> "device_not_approved"
-            %{status: "allowlisted"} -> "token_revoked"
-            _ -> "auth_failed"
-          end
-
-        stop_with(auth_failure(reason), 1008, state)
+        {:ok, observer_connection(state)}
     end
   end
 

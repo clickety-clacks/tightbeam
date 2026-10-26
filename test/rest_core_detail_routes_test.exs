@@ -627,8 +627,12 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         ctx.admin_device.token
       )
 
-    assert wrong_principal.status == 400
-    assert JSON.decode!(wrong_principal.resp_body)["error"]["code"] == "invalid_cursor"
+    admin_first_page =
+      get(ctx, "/api/sessions?limit=2", ctx.admin_device.token)
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert wrong_principal.status == 200
+    assert JSON.decode!(wrong_principal.resp_body)["items"] == admin_first_page["items"]
 
     append_history = fn index, extra ->
       {:appended, row} =
@@ -1706,16 +1710,30 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
              "/api/sessions?limit=1&after=#{URI.encode_www_form(session_cursor)}"
            ).status == 200
 
-    assert_error(
+    admin_with_observer_cursor =
       get(
         ctx,
         "/api/sessions?limit=1&after=#{URI.encode_www_form(session_cursor)}",
         ctx.opts[:cli_token]
-      ),
-      404,
-      "sessions",
-      "not_found"
-    )
+      )
+
+    assert admin_with_observer_cursor.status == 200
+
+    assert JSON.decode!(admin_with_observer_cursor.resp_body)["items"] ==
+             JSON.decode!(org_sessions.resp_body)["items"]
+
+    org_session_cursor = JSON.decode!(org_sessions.resp_body)["page"]["newestCursor"]
+
+    observer_with_admin_cursor =
+      get_without_authorization(
+        ctx,
+        "/api/sessions?limit=1&after=#{URI.encode_www_form(org_session_cursor)}"
+      )
+
+    assert observer_with_admin_cursor.status == 200
+
+    assert JSON.decode!(observer_with_admin_cursor.resp_body)["items"] ==
+             JSON.decode!(anonymous_sessions.resp_body)["items"]
 
     anonymous_session = get_without_authorization(ctx, "/api/sessions/#{session_key}")
     org_session = get(ctx, "/api/sessions/#{session_key}", ctx.opts[:cli_token])
@@ -1733,6 +1751,36 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     assert JSON.decode!(anonymous_messages.resp_body)["items"] ==
              JSON.decode!(org_messages.resp_body)["items"]
+
+    anonymous_message_page = get_without_authorization(ctx, message_path <> "?limit=1")
+    org_message_page = get(ctx, message_path <> "?limit=1", ctx.opts[:cli_token])
+
+    anonymous_message_cursor =
+      JSON.decode!(anonymous_message_page.resp_body)["page"]["newestCursor"]
+
+    org_message_cursor = JSON.decode!(org_message_page.resp_body)["page"]["newestCursor"]
+
+    observer_with_org_message_cursor =
+      get_without_authorization(
+        ctx,
+        message_path <> "?limit=1&after=#{URI.encode_www_form(org_message_cursor)}"
+      )
+
+    org_with_observer_message_cursor =
+      get(
+        ctx,
+        message_path <> "?limit=1&after=#{URI.encode_www_form(anonymous_message_cursor)}",
+        ctx.opts[:cli_token]
+      )
+
+    assert observer_with_org_message_cursor.status == 200
+    assert org_with_observer_message_cursor.status == 200
+
+    assert JSON.decode!(observer_with_org_message_cursor.resp_body)["items"] ==
+             JSON.decode!(anonymous_message_page.resp_body)["items"]
+
+    assert JSON.decode!(org_with_observer_message_cursor.resp_body)["items"] ==
+             JSON.decode!(org_message_page.resp_body)["items"]
 
     message_cursor = JSON.decode!(anonymous_messages.resp_body)["page"]["newestCursor"]
 
@@ -1830,6 +1878,33 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     Devices.add_user(ctx.db, "alice", false)
     ensure_main_session(ctx.db, "alice")
 
+    flynn_session_page =
+      get_without_authorization(ctx, "/api/sessions?asUser=flynn&limit=1")
+
+    alice_session_page =
+      get_without_authorization(ctx, "/api/sessions?asUser=alice&limit=1")
+
+    flynn_with_alice_session_cursor =
+      get_without_authorization(
+        ctx,
+        "/api/sessions?asUser=flynn&limit=1&after=#{URI.encode_www_form(JSON.decode!(alice_session_page.resp_body)["page"]["newestCursor"])}"
+      )
+
+    alice_with_flynn_session_cursor =
+      get_without_authorization(
+        ctx,
+        "/api/sessions?asUser=alice&limit=1&after=#{URI.encode_www_form(JSON.decode!(flynn_session_page.resp_body)["page"]["newestCursor"])}"
+      )
+
+    assert flynn_with_alice_session_cursor.status == 200
+    assert alice_with_flynn_session_cursor.status == 200
+
+    assert JSON.decode!(flynn_with_alice_session_cursor.resp_body)["items"] ==
+             JSON.decode!(flynn_session_page.resp_body)["items"]
+
+    assert JSON.decode!(alice_with_flynn_session_cursor.resp_body)["items"] ==
+             JSON.decode!(alice_session_page.resp_body)["items"]
+
     repeated_last =
       get_without_authorization(ctx, "/api/sessions?asUser=flynn&asUser=alice")
 
@@ -1882,14 +1957,21 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       assert response.resp_body == expected.resp_body
     end
 
+    current_selected_sessions_org =
+      get(ctx, "/api/sessions?asUser=flynn", ctx.opts[:cli_token])
+
     for authorization <- ["", "Bearer ", "Basic malformed", "Bearer invalid-token"] do
       headers = [{"authorization", authorization}]
       session_response = get_without_authorization(ctx, "/api/sessions", headers)
       message_response = get_without_authorization(ctx, message_path, headers)
+      current_observer_sessions = get_without_authorization(ctx, "/api/sessions")
       assert session_response.status == 200
 
-      assert JSON.decode!(session_response.resp_body)["items"] ==
-               JSON.decode!(anonymous_all_sessions.resp_body)["items"]
+      assert Enum.map(JSON.decode!(session_response.resp_body)["items"], & &1["sessionKey"]) ==
+               Enum.map(
+                 JSON.decode!(current_observer_sessions.resp_body)["items"],
+                 & &1["sessionKey"]
+               )
 
       assert message_response.status == 200
 
@@ -1909,14 +1991,29 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         get_without_authorization(ctx, message_path <> "?asUser=flynn", headers)
 
       assert selected_session_fallback.status == 200
-      assert selected_session_fallback.resp_body == anonymous_all_sessions.resp_body
+
+      current_observer_session_keys =
+        get_without_authorization(ctx, "/api/sessions")
+        |> then(&JSON.decode!(&1.resp_body))
+        |> Map.fetch!("items")
+        |> Enum.map(& &1["sessionKey"])
+
+      assert Enum.map(
+               JSON.decode!(selected_session_fallback.resp_body)["items"],
+               & &1["sessionKey"]
+             ) ==
+               current_observer_session_keys
+
       assert selected_message_fallback.status == 200
 
       assert JSON.decode!(selected_message_fallback.resp_body)["items"] ==
                JSON.decode!(anonymous_messages.resp_body)["items"]
 
       assert selected_session_with_bad_bearer.status == 200
-      assert selected_session_with_bad_bearer.resp_body == selected_sessions_org.resp_body
+
+      assert JSON.decode!(selected_session_with_bad_bearer.resp_body)["items"] ==
+               JSON.decode!(current_selected_sessions_org.resp_body)["items"]
+
       assert selected_message_with_bad_bearer.status == 200
       assert selected_message_with_bad_bearer.resp_body == selected_messages_org.resp_body
 
@@ -1996,6 +2093,30 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     first_body = JSON.decode!(first.resp_body)
     assert [%{"userId" => "alice"} = first_item] = first_body["items"]
     assert is_binary(first_body["page"]["newestCursor"])
+
+    bob_first = get_without_authorization(ctx, "/api/read-markers?asUser=bob&limit=1")
+    bob_first_body = JSON.decode!(bob_first.resp_body)
+    assert [%{"userId" => "bob"}] = bob_first_body["items"]
+
+    bob_with_alice_cursor =
+      get_without_authorization(
+        ctx,
+        "/api/read-markers?asUser=bob&limit=1&after=#{URI.encode_www_form(first_body["page"]["newestCursor"])}"
+      )
+
+    alice_with_bob_cursor =
+      get_without_authorization(
+        ctx,
+        "/api/read-markers?asUser=alice&limit=1&after=#{URI.encode_www_form(bob_first_body["page"]["newestCursor"])}"
+      )
+
+    assert bob_with_alice_cursor.status == 200
+    assert alice_with_bob_cursor.status == 200
+
+    assert JSON.decode!(bob_with_alice_cursor.resp_body)["items"] ==
+             bob_first_body["items"]
+
+    assert JSON.decode!(alice_with_bob_cursor.resp_body)["items"] == first_body["items"]
 
     second =
       get_without_authorization(
@@ -2093,8 +2214,14 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           {"authorization", authorization}
         ])
 
+      missing_detail_response =
+        get_without_authorization(ctx, "/api/read-markers/chat%3Amissing", [
+          {"authorization", authorization}
+        ])
+
       assert detail_response.status == 200
       assert detail_response.resp_body == scoped_detail.resp_body
+      assert_error(missing_detail_response, 404, "read markers", "not_found")
 
       unusable_selector_detail =
         get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=alice%zz", [

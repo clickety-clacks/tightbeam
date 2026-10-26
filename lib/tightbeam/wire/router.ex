@@ -1040,7 +1040,7 @@ defmodule Tightbeam.Wire.Router do
          true <- is_nil(scope_key) or scope_key != "",
          filters <- if(scope_key, do: %{"scopeKey" => [scope_key]}, else: %{}),
          {:ok, limit, boundary} <-
-           state_page_request(
+           observer_aware_state_page_request(
              query,
              "read_markers.collection",
              "read markers",
@@ -1369,6 +1369,81 @@ defmodule Tightbeam.Wire.Router do
       {:error, _status, _code, _message} = error -> error
       _ -> {:error, 400, "invalid_cursor", nil}
     end
+  end
+
+  defp observer_aware_state_page_request(
+         query,
+         route,
+         resource,
+         filters,
+         principal,
+         tuple_valid?,
+         default_limit,
+         default,
+         head_boundary,
+         tail_boundary
+       ) do
+    result =
+      state_page_request(
+        query,
+        route,
+        resource,
+        filters,
+        principal,
+        tuple_valid?,
+        default_limit,
+        default,
+        head_boundary,
+        tail_boundary
+      )
+
+    case result do
+      {:error, 400, "invalid_cursor", nil} = error ->
+        if page_cursor_for_other_principal?(
+             query,
+             route,
+             resource,
+             filters,
+             principal,
+             tuple_valid?
+           ) do
+          with {:ok, limit} <- state_page_limit(Map.get(query, "limit", []), default_limit),
+               do: {:ok, limit, default}
+        else
+          error
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp page_cursor_for_other_principal?(query, route, resource, filters, principal, tuple_valid?) do
+    Enum.any?(["before", "after"], fn direction ->
+      other_direction = if direction == "before", do: "after", else: "before"
+
+      with {:ok, cursor} when is_binary(cursor) <- state_page_cursor_value(query, direction),
+           {:ok, nil} <- state_page_cursor_value(query, other_direction),
+           {:ok, nil} <- state_page_tail(Map.get(query, "tail", [])),
+           true <- cursor != "",
+           {:ok, bytes} <- Base.url_decode64(cursor, padding: false),
+           {:ok, payload} when is_map(payload) <- JSON.decode(bytes),
+           true <- Enum.sort(Map.keys(payload)) == d1_cursor_keys(),
+           true <- payload["version"] == @d1_cursor_version,
+           true <- payload["route"] == route and payload["resource"] == resource,
+           true <- payload["direction"] == direction,
+           true <- payload["filters"] == d1_filter_fingerprint(filters),
+           true <-
+             payload["principalKind"] != state_cursor_principal_kind(principal) or
+               payload["principalId"] != Map.get(principal, :id),
+           true <- tuple_valid?.(payload["tuple"]) do
+        true
+      else
+        _ -> false
+      end
+    end)
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] -> false
   end
 
   defp state_page_limit([], default), do: {:ok, default}
