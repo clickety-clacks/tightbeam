@@ -2344,6 +2344,7 @@ defmodule Tightbeam.Gateway do
           role: "user",
           content: source.content,
           timestamp: source.timestamp,
+          sender: source.origin,
           device_id: source.device_id,
           client_message_id: source.client_message_id,
           attachments: source.attachments
@@ -2369,7 +2370,7 @@ defmodule Tightbeam.Gateway do
       device_id: opts[:device_id],
       client_message_id: opts[:client_message_id],
       attachments: opts[:attachments] || [],
-      sender: opts[:sender]
+      sender: opts[:sender] || origin
     }
 
     case Projection.append_in_txn(txn, input) do

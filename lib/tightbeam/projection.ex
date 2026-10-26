@@ -168,6 +168,82 @@ defmodule Tightbeam.Projection do
   end
 
   @doc false
+  @spec repair_missing_human_senders(db()) :: %{
+          turn: non_neg_integer(),
+          wake: non_neg_integer(),
+          owner: non_neg_integer(),
+          left_null: non_neg_integer()
+        }
+  def repair_missing_human_senders(db \\ Tightbeam.DB) do
+    transaction!(db, &repair_missing_human_senders_in_txn/1)
+  end
+
+  @doc false
+  def repair_missing_human_senders_in_txn(%Txn{} = txn) do
+    # Use only recorded row links. If a link yields conflicting principals,
+    # leave it unresolved rather than selecting one by row order.
+    candidates =
+      Txn.q(
+        txn,
+        """
+        SELECT m.id,
+          (SELECT CASE WHEN COUNT(DISTINCT t.origin)=1 THEN MIN(t.origin) END
+           FROM turns AS t
+           WHERE t.messageId=m.id AND t.sessionKey=m.sessionKey
+             AND length(trim(t.origin))>0),
+          (SELECT CASE WHEN COUNT(DISTINCT source.origin)=1 THEN MIN(source.origin) END
+           FROM wakes AS source INDEXED BY notice_source_client_identity
+           WHERE m.deviceId IS NOT NULL AND m.clientMessageId IS NOT NULL
+             AND source.sourceClientIdentity IS NOT NULL
+             AND json_extract(source.sourceClientIdentity,'$.targetSessionKey')=+m.sessionKey
+             AND json_extract(source.sourceClientIdentity,'$.deviceId')=+m.deviceId
+             AND json_extract(source.sourceClientIdentity,'$.clientMessageId')=+m.clientMessageId
+             AND length(trim(source.origin))>0),
+          (SELECT ownerUserId FROM sessions AS session WHERE session.sessionKey=m.sessionKey)
+        FROM messages AS m
+        WHERE m.role='user' AND m.messageType IS NULL AND m.sender IS NULL
+        ORDER BY m.seq
+        """,
+        []
+      )
+
+    Enum.reduce(candidates, %{turn: 0, wake: 0, owner: 0, left_null: 0}, fn
+      [id, turn_origin, wake_origin, owner_user_id], counts ->
+        case stored_human_sender(turn_origin, wake_origin, owner_user_id) do
+          {source, sender} ->
+            Txn.q(
+              txn,
+              "UPDATE messages SET sender=?2 WHERE id=?1 AND sender IS NULL",
+              [id, sender]
+            )
+
+            if Txn.changes(txn) == 1 do
+              Map.update!(counts, source, &(&1 + 1))
+            else
+              counts
+            end
+
+          nil ->
+            Map.update!(counts, :left_null, &(&1 + 1))
+        end
+    end)
+  end
+
+  defp stored_human_sender(turn_origin, _wake_origin, _owner_user_id)
+       when is_binary(turn_origin) and turn_origin != "",
+       do: {:turn, turn_origin}
+
+  defp stored_human_sender(_turn_origin, wake_origin, _owner_user_id)
+       when is_binary(wake_origin) and wake_origin != "",
+       do: {:wake, wake_origin}
+
+  defp stored_human_sender(_turn_origin, _wake_origin, owner_user_id)
+       when is_binary(owner_user_id) and owner_user_id != "",
+       do: {:owner, "user:" <> owner_user_id}
+
+  defp stored_human_sender(_turn_origin, _wake_origin, _owner_user_id), do: nil
+
+  @doc false
   @spec client_message_result_in_txn(Txn.t(), map()) ::
           :new | {:duplicate, message()} | {:conflict, message()}
   def client_message_result_in_txn(%Txn{} = txn, input) do
