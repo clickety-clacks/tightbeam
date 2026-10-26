@@ -106,7 +106,7 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
     assert process_command(pid) != "", "the recycled pid's process must survive"
   end
 
-  # ── F1 (review att_d3e5cff7) — the case pid+command equality CANNOT see ─────
+  # A case that pid+command equality cannot detect:
   #
   # The reviewer's probe: a STALE descriptor whose recorded process is gone and
   # whose pid is now held by a LATER process running the SAME command line (a

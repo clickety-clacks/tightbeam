@@ -34,7 +34,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "eezo" => %{
+      "lab1" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -1026,7 +1026,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "eezo"
+      host: "lab1"
     })
   end
 end

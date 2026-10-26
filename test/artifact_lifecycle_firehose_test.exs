@@ -101,7 +101,7 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
           Process.put(key, time)
 
           try do
-            row = record(ctx.db, "eezo:/tmp/clock-#{time}")
+            row = record(ctx.db, "lab1:/tmp/clock-#{time}")
             assert row.created_at == time
             row
           after
@@ -117,7 +117,7 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
 
     assert Process.get(key) == nil
     before = System.system_time(:millisecond)
-    row = record(ctx.db, "eezo:/tmp/default-clock")
+    row = record(ctx.db, "lab1:/tmp/default-clock")
     assert row.created_at >= before
     assert row.created_at <= System.system_time(:millisecond)
     assert {:ok, nil} = DB.transaction(ctx.db, fn _ -> Process.get(key) end)
@@ -125,7 +125,7 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
 
   test "AL10 final batch failure rolls back prior row and floor writes and all handoffs", ctx do
     File.write!(Path.join(ctx.work, "result.md"), "retained filesystem effect")
-    rows = [record(ctx.db, "result.md"), record(ctx.db, "eezo:/tmp/external")]
+    rows = [record(ctx.db, "result.md"), record(ctx.db, "lab1:/tmp/external")]
 
     for _ <- rows do
       assert_receive {:firehose_notice, %{"class" => "artifact.recorded"}}
@@ -195,7 +195,7 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
     :erlang.trace(hub, true, [:call, {:tracer, self()}])
 
     try do
-      record(ctx.db, "eezo:/tmp/hidden")
+      record(ctx.db, "lab1:/tmp/hidden")
       assert Hub.sequence(Hub, self()) == 0
       assert_receive {:trace, ^hub, :call, {Hub, :matches?, _}}
       refute_receive {:firehose_notice, _}

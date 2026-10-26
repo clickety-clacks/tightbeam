@@ -24,7 +24,7 @@ try do
     owner_user_id: "mike",
     origin: "user:mike",
     archetype: "default",
-    host: "racter",
+    host: "node-b",
     harness: "codex",
     provider: "openai",
     model: Model.new("gpt-fixture")
@@ -32,7 +32,7 @@ try do
 
   assert {:opened, incident} =
            TerminalCredentialFailure.open(db, %{
-             host: "racter",
+             host: "node-b",
              harness: "codex",
              provider: "openai",
              correlation_id: "admin-lifecycle",

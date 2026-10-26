@@ -2792,7 +2792,7 @@ defmodule Tightbeam.ModelCatalogTest do
       assert_receive {:fetch_started, 2}, 60_000
     end
 
-    # The eezo production repro (orchestrator, 2026-08-06): a CLEAN one-shot
+    # A production reproduction showed a clean one-shot
     # ceremony, yet placement refused with `:in_progress` MINUTES after `status`
     # read onboarded. `credential_status/2` returns `:in_progress` only while the
     # onboarding lease stands (credentials.ex), and `finish_onboard` clears the

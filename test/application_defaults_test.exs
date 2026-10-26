@@ -1,7 +1,7 @@
 defmodule Tightbeam.ApplicationDefaultsTest do
   # apply_installed_defaults/2 must derive the no-preference boot default from
   # what the box can ACTUALLY RUN (installed AND onboarded), not merely what is
-  # on PATH. The tester-blocking bug (mike repro 2026-08-06, wi_24028d10): BOTH
+  # on PATH. A reproduced failure had BOTH
   # CLIs installed, ONLY codex onboarded -> registry-order claude + claude-sonnet-5,
   # a dead default whose first turn cannot run.
   use Tightbeam.TestCase, async: false

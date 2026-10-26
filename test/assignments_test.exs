@@ -29,7 +29,7 @@ defmodule Tightbeam.AssignmentsTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "eezo" => %{
+      "lab1" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -6915,7 +6915,7 @@ defmodule Tightbeam.AssignmentsTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "eezo"
+      host: "lab1"
     }
 
     Org.create(db, Map.merge(input, overrides))

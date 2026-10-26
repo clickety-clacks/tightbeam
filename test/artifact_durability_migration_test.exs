@@ -191,8 +191,7 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
     seed_artifact(db, "art_external_1", "in-workspace")
     seed_artifact(db, "art_unread_1", "in-workspace")
 
-    # Two shapes of uncaptured row. Retirement must be able to release both
-    # (att_7669b55f §6, B1 and B3).
+    # Two shapes of uncaptured row. Retirement must be able to release both.
     #
     # The external shape: `Artifacts.archive_session/4` releases an artifact whose
     # bytes lie outside the workspace straight from `in-workspace`, home NULL,

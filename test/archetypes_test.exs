@@ -826,7 +826,7 @@ defmodule Tightbeam.ArchetypesTest do
   test "where wildcard must stand alone and where must be non-empty", ctx do
     path = Path.join(manifests_dir!(ctx.base_dir), "bad.toml")
 
-    File.write!(path, "name = \"bad\"\nwhere = [\"*\", \"eezo\"]\n")
+    File.write!(path, "name = \"bad\"\nwhere = [\"*\", \"lab1\"]\n")
 
     assert_unavailable(~r/must be the only element/, fn -> Archetypes.load!(ctx.base_dir) end)
 

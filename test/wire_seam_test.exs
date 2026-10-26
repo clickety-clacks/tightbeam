@@ -485,7 +485,7 @@ defmodule Tightbeam.Wire.SeamTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "eezo"
+      host: "lab1"
     })
   end
 
