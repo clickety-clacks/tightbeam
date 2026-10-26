@@ -2,6 +2,12 @@ defmodule Tightbeam.AssignmentProcessCloseR1MigrationTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.{Assignments, DB, Schema}
 
+  @r1_predecessor_columns ~w(
+    id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state
+    outcome closedAt closedByUser closedBySession closingAttestId workItemId reviewsAssignmentId
+    holderHarness holderProvider reminderState
+  )
+
   setup do
     db = start_supervised!({DB, name: :process_close_r1_db, path: ":memory:"})
     :ok = Schema.ensure_all(db)
@@ -11,8 +17,11 @@ defmodule Tightbeam.AssignmentProcessCloseR1MigrationTest do
   test "upgrade preserves raw reminder bytes, references and attached objects", %{db: db} do
     seed(db)
     before = snapshot(db)
+    before_r1_assignments =
+      Enum.map(elem(before, 0), &Map.take(&1, @r1_predecessor_columns))
+
     assert {:ok, :ok} = rebuild(db)
-    assert retained(db) == elem(before, 0)
+    assert Enum.map(retained(db), &Map.take(&1, @r1_predecessor_columns)) == before_r1_assignments
     assert objects(db) == elem(before, 2)
 
     assert rows(db, "SELECT closedByProcess FROM assignments ORDER BY id") == [

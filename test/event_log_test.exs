@@ -99,7 +99,11 @@ defmodule Tightbeam.EventLogTest do
 
   test "schema upgrade adds transport attribution without changing legacy event values" do
     name = :"event_log_upgrade_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: ":memory:", name: name})
+
+    start_supervised!(
+      Supervisor.child_spec({DB, path: ":memory:", name: name}, id: name)
+    )
+
     :ok = EventLog.ensure_pre_actor_schema(name)
 
     :ok =
@@ -153,7 +157,11 @@ defmodule Tightbeam.EventLogTest do
 
   test "schema bootstrap runs event attribution migration before current appends" do
     name = :"event_log_schema_bootstrap_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: ":memory:", name: name})
+
+    start_supervised!(
+      Supervisor.child_spec({DB, path: ":memory:", name: name}, id: name)
+    )
+
     :ok = Schema.ensure_all(name)
 
     {:ok, event_id} =
