@@ -1158,16 +1158,16 @@ defmodule Tightbeam.DeliverableContractTest do
              )
   end
 
-  test "captured wi_113442f5 rows and real artifact cannot recur without explicit ruling", ctx do
-    captured = captured_wi_113442f5_fixture!()
+  test "reviewed specification alone cannot complete implementation without explicit ruling", ctx do
+    captured = synthetic_reviewed_spec_fixture!()
     captured_assignments = captured["assignments"]
     captured_attests = captured["attests"]
 
     spec_row =
-      Enum.find(captured_assignments, &(&1["id"] == "asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0"))
+      Enum.find(captured_assignments, &(&1["id"] == "asg_295031f3-f187-5675-99c3-f6f01f676a45"))
 
     completion_row =
-      Enum.find(captured_attests, &(&1["id"] == "att_1ab4c74f-d4a3-4af2-8c61-c467062367e4"))
+      Enum.find(captured_attests, &(&1["id"] == "att_3bdeaa72-7555-530d-867c-062c0ab56bf4"))
 
     fixture = %{
       work_item_id: captured["workItem"]["id"],
@@ -1182,9 +1182,9 @@ defmodule Tightbeam.DeliverableContractTest do
       }
     }
 
-    assert fixture.work_item_id == "wi_113442f5-22ae-457b-a971-1b620069d490"
-    assert fixture.assignment_id == "asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0"
-    assert fixture.completion_attest_id == "att_1ab4c74f-d4a3-4af2-8c61-c467062367e4"
+    assert fixture.work_item_id == "wi_166776b5-681a-5a8a-b9f6-99e0beee2805"
+    assert fixture.assignment_id == "asg_295031f3-f187-5675-99c3-f6f01f676a45"
+    assert fixture.completion_attest_id == "att_3bdeaa72-7555-530d-867c-062c0ab56bf4"
 
     assert Enum.map(captured_assignments, & &1["effectKind"]) |> Enum.sort() ==
              ~w(evidence policy review review)
@@ -1201,7 +1201,7 @@ defmodule Tightbeam.DeliverableContractTest do
     assert List.last(captured["trace"]["terminalTimeline"])["kind"] ==
              "disposition_transition"
 
-    repo = exact_wi_113442f5_commit_repo!()
+    repo = synthetic_reviewed_spec_commit_repo!()
     fixture = put_in(fixture, [:commit_ref, :repo], "testhost:#{repo}")
 
     register_hosts(ctx.db, %{
@@ -2205,43 +2205,43 @@ defmodule Tightbeam.DeliverableContractTest do
     module
   end
 
-  defp captured_wi_113442f5_fixture! do
-    path = Path.expand("fixtures/deliverable_contract/wi_113442f5.json", __DIR__)
+  defp synthetic_reviewed_spec_fixture! do
+    path = Path.expand("fixtures/deliverable_contract/synthetic_reviewed_spec_history.json", __DIR__)
     bytes = File.read!(path)
 
     assert :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower) ==
-             "29d5caad12b7eb9f1d8f8046e8a7acbdd1b36f9c3c5c2e00cd41fb100323df39"
+             "7a9dc3a05a21f5c9cf1ecfe3c20e4ff49057501b5e27c817718fe61b2faf06b9"
 
     JSON.decode!(bytes)
   end
 
-  defp exact_wi_113442f5_commit_repo! do
+  defp synthetic_reviewed_spec_commit_repo! do
     repo =
       Path.join(
         System.tmp_dir!(),
-        "wi-113442f5-commit-#{System.unique_integer([:positive])}"
+        "synthetic-reviewed-spec-commit-#{System.unique_integer([:positive])}"
       )
 
     git_dir = Path.join(repo, ".git")
-    object_dir = Path.join([git_dir, "objects", "85"])
+    object_dir = Path.join([git_dir, "objects", "9b"])
     File.mkdir_p!(object_dir)
     File.mkdir_p!(Path.join(git_dir, "refs"))
     File.write!(Path.join(git_dir, "HEAD"), "ref: refs/heads/main\n")
 
     body =
-      "tree 9d6c4696af016c2159465beeef5c95c6bd12a091\n" <>
-        "parent 64408a93190c31ca992af22c28a6726c8687c65f\n" <>
-        "author Mike Manzano <mike@clicketyclacks.co> 1787643229 +0000\n" <>
-        "committer Mike Manzano <mike@clicketyclacks.co> 1787643229 +0000\n\n" <>
-        "spec: address D3 review findings\n"
+      "tree 1111111111111111111111111111111111111111\n" <>
+        "parent 2222222222222222222222222222222222222222\n" <>
+        "author Test Fixture <fixture@example.invalid> 1700000000 +0000\n" <>
+        "committer Test Fixture <fixture@example.invalid> 1700000000 +0000\n\n" <>
+        "spec: reviewed example revision\n"
 
     object = "commit #{byte_size(body)}\0" <> body
 
     assert :crypto.hash(:sha, object) |> Base.encode16(case: :lower) ==
-             "85ae5ecb126d54cf7759b4ce37d9459fd7bd0f0f"
+             "9b09091e08371122dfa5992558f020e6fa168b7d"
 
     File.write!(
-      Path.join(object_dir, "ae5ecb126d54cf7759b4ce37d9459fd7bd0f0f"),
+      Path.join(object_dir, "09091e08371122dfa5992558f020e6fa168b7d"),
       :zlib.compress(object)
     )
 
