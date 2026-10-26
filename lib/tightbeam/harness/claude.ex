@@ -166,7 +166,7 @@ defmodule Tightbeam.Harness.Claude do
   def reconcile_home(target, home, desired) do
     # THE FABLE FIX (ops-hardening-v1 §3): claude's offered-model list is
     # environment-dependent — the same home and auth offers fable at a cwd whose
-    # settings file pins it and not at a bare one (JOURNAL.md:804) — so every
+    # settings file pins it and not at a bare one — so every
     # projected home pins the org's default model, making the offered list
     # deterministic. Harness-owned, because WHICH config key means "model" and
     # how a model is spelled there is this harness's business and nobody

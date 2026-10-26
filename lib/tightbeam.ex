@@ -6,7 +6,6 @@ defmodule Tightbeam do
   Tenets). This app is the Elixir port of the reference gateway; start here:
 
     * `docs/ARCHITECTURE.md` — module map + supervision tree + the turn pipeline
-    * `docs/HANDOFF.md` — how to contribute
     * `Tightbeam.Ledger` — the exemplar module (style, @spec, invariants-in-SQL)
 
   The one flow to understand is the turn pipeline: a post or wake commits a
