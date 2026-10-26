@@ -123,10 +123,97 @@ defmodule Tightbeam.StateVisibility do
     work_item_id = value(row, :work_item_id)
     work_item = work_item_visible?(db, work_item_id, principal)
 
-    session_principal?(principal, creator) or work_item
+    principal.is_admin or session_principal?(principal, creator) or work_item
   end
 
   defp do_core_detail_visible?(_db, _resource, _row, _principal), do: false
+
+  @doc "Apply the existing AU4 creator-session, linked-work-item, or admin grant to an artifact."
+  @spec artifact_visible?(DB.server(), map(), map()) :: boolean()
+  def artifact_visible?(db, row, principal),
+    do: core_detail_visible?(db, "artifacts", row, principal)
+
+  @doc false
+  @spec artifact_collection_scope(map()) :: {String.t(), [term()]}
+  def artifact_collection_scope(%{is_admin: true}), do: {"1=1", []}
+
+  def artifact_collection_scope(%{kind: "session", id: session_key})
+      when is_binary(session_key) do
+    {
+      """
+      (artifact.createdBySession = ?1 OR artifact.workItemId IN (
+        SELECT artifact_work_item.id
+        FROM work_items AS artifact_work_item
+        WHERE artifact_work_item.createdBySession = ?2
+        UNION
+        SELECT artifact_assignment.workItemId
+        FROM assignments AS artifact_assignment
+        WHERE artifact_assignment.holderKey = ?3
+      ))
+      """,
+      [session_key, session_key, session_key]
+    }
+  end
+
+  def artifact_collection_scope(%{kind: "user", id: user_id}) when is_binary(user_id) do
+    {
+      """
+      EXISTS (
+        SELECT 1 FROM work_items AS artifact_work_item
+        WHERE artifact_work_item.id = artifact.workItemId
+          AND artifact_work_item.ownerUserId = ?1
+      )
+      """,
+      [user_id]
+    }
+  end
+
+  def artifact_collection_scope(_principal), do: {"0=1", []}
+
+  @doc "Apply the AU4 parent-assignment grant to an attest or nested attest collection."
+  @spec attest_visible?(DB.server(), map(), map()) :: boolean()
+  def attest_visible?(db, row, principal) when is_map(row) do
+    assignment_id =
+      case value(row, :assignment) do
+        assignment when is_map(assignment) -> value(assignment, :id)
+        _ -> value(row, :assignment_id)
+      end
+
+    case assignment_id do
+      assignment_id when is_binary(assignment_id) ->
+        {scope_sql, scope_params} = attest_collection_scope(principal)
+        assignment_index = length(scope_params) + 1
+
+        query_rows(
+          db,
+          """
+          SELECT 1
+          FROM assignments AS assignment
+          LEFT JOIN work_items AS wi ON wi.id = assignment.workItemId
+          WHERE #{scope_sql} AND assignment.id = ?#{assignment_index}
+          """,
+          scope_params ++ [assignment_id]
+        ) != []
+
+      _ ->
+        false
+    end
+  end
+
+  @doc false
+  @spec attest_collection_scope(map()) :: {String.t(), [term()]}
+  def attest_collection_scope(%{is_admin: true}), do: {"1=1", []}
+
+  def attest_collection_scope(%{kind: "session", id: session_key})
+      when is_binary(session_key) do
+    {"(assignment.holderKey = ?1 OR assignment.openedBySession = ?2)", [session_key, session_key]}
+  end
+
+  def attest_collection_scope(%{kind: "user", id: user_id}) when is_binary(user_id) do
+    {"(assignment.openedByUser = ?1 OR wi.ownerUserId = ?2)", [user_id, user_id]}
+  end
+
+  def attest_collection_scope(_principal), do: {"0=1", []}
 
   defp trace_core_detail(%{core_detail_trace: nil}, _event), do: :ok
 

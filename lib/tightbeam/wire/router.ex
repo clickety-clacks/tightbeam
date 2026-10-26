@@ -76,6 +76,30 @@ defmodule Tightbeam.Wire.Router do
   @state_not_found_floor_us 3_000
   @state_malformed_percent_escape ~r/%(?![0-9A-Fa-f]{2})/
   @state_read_specs %{
+    artifacts: %{
+      route: "artifacts.collection",
+      resource: "artifacts",
+      filters: %{
+        "workItemId" => :string,
+        "createdBySession" => :string,
+        "kind" => :string,
+        "state" => {:enum, ~w(in-workspace archived released)}
+      },
+      order: [{:created_at, :integer}, {:artifact_id, :string}]
+    },
+    attests: %{
+      route: "attests.collection",
+      resource: "attests",
+      filters: %{
+        "assignmentId" => :string,
+        "workItemId" => :string,
+        "kind" => :string,
+        "verdictKind" => :string,
+        "bySession" => :string,
+        "byUser" => :string
+      },
+      order: [{:ts, :integer}, {:id, :string}]
+    },
     work_items: %{
       route: "work_items.collection",
       resource: "work items",
@@ -342,6 +366,26 @@ defmodule Tightbeam.Wire.Router do
     state_detail(conn, Map.fetch!(@state_read_specs, :kungfu), name)
   end
 
+  get "/api/artifacts" do
+    d2a_collection(conn, Map.fetch!(@state_read_specs, :artifacts))
+  end
+
+  get "/api/attests" do
+    d2a_collection(conn, Map.fetch!(@state_read_specs, :attests))
+  end
+
+  get "/api/assignments/:assignment_id/attests" do
+    spec = Map.fetch!(@state_read_specs, :attests)
+
+    d2a_collection(
+      conn,
+      Map.merge(spec, %{
+        route: "assignments.attests.collection",
+        parent_assignment_id: assignment_id
+      })
+    )
+  end
+
   get "/api/assignments/:assignment_id" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :assignments), assignment_id)
   end
@@ -589,6 +633,117 @@ defmodule Tightbeam.Wire.Router do
     _error in [ArgumentError, KeyError, MatchError] ->
       state_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
+
+  defp d2a_collection(conn, spec) do
+    started_at = System.monotonic_time(:microsecond)
+
+    with {:ok, auth} <- state_bearer_auth(conn),
+         {:ok, query} <- decode_state_query(conn),
+         {:ok, principal} <- state_principal(auth, query, conn),
+         {:ok, request} <- state_collection_request(query, spec),
+         request <- d2a_collection_parent_scope(request, spec),
+         {:ok, boundary} <- state_cursor_boundary(request, principal, spec),
+         :ok <- d2a_collection_parent_visible(conn, spec, principal),
+         rows <-
+           d2a_collection_rows(conn, spec, request.filters, principal, boundary, request.limit),
+         {page_rows, page} <- state_page(rows, boundary, request, principal, spec),
+         items <- d2a_serialize_rows(page_rows, spec) do
+      state_send(conn, 200, state_collection_envelope(conn, spec.resource, items, page))
+    else
+      {:error, 404, "not_found", _message} ->
+        state_not_found(conn, spec.resource, started_at)
+
+      {:error, status, code, message} ->
+        state_error(conn, spec.resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp d2a_collection_parent_scope(request, %{parent_assignment_id: assignment_id}) do
+    filters =
+      Map.update(request.filters, "assignmentId", [assignment_id], fn values ->
+        Enum.filter(values, &(&1 == assignment_id))
+      end)
+
+    %{request | filters: filters, filter_fingerprint: state_filter_fingerprint(filters)}
+  end
+
+  defp d2a_collection_parent_scope(request, _spec), do: request
+
+  defp d2a_collection_parent_visible(conn, %{parent_assignment_id: assignment_id}, principal) do
+    if StateVisibility.attest_visible?(db(conn), %{assignment_id: assignment_id}, principal),
+      do: :ok,
+      else: {:error, 404, "not_found", nil}
+  end
+
+  defp d2a_collection_parent_visible(_conn, _spec, _principal), do: :ok
+
+  defp d2a_collection_rows(
+         conn,
+         %{resource: "artifacts"} = spec,
+         filters,
+         principal,
+         boundary,
+         limit
+       ) do
+    rows =
+      StateResources.query_artifact(db(conn), %{
+        filters: filters,
+        principal: principal,
+        boundary: boundary,
+        limit: limit
+      })
+
+    d2a_sort_rows!(rows, spec.order)
+  end
+
+  defp d2a_collection_rows(
+         conn,
+         %{resource: "attests"} = spec,
+         filters,
+         principal,
+         boundary,
+         limit
+       ) do
+    rows =
+      StateResources.query_attest(db(conn), %{
+        filters: filters,
+        principal: principal,
+        boundary: boundary,
+        limit: limit
+      })
+
+    d2a_sort_rows!(rows, spec.order)
+  end
+
+  defp d2a_serialize_rows(rows, %{resource: "artifacts"}),
+    do: Enum.map(rows, &StateResources.artifact/1)
+
+  defp d2a_serialize_rows(rows, %{resource: "attests"}),
+    do: Enum.map(rows, &StateResources.attest/1)
+
+  defp d2a_sort_rows!(rows, order) when is_list(rows) do
+    Enum.each(rows, fn row ->
+      tuple = state_row_tuple(row, order)
+
+      unless Enum.zip(tuple, order)
+             |> Enum.all?(fn
+               {value, {_field, :string}} -> is_binary(value) and value != ""
+               {value, {_field, :integer}} -> is_integer(value)
+             end) do
+        raise ArgumentError, "D2 resource row has an invalid order tuple"
+      end
+    end)
+
+    rows
+    |> Enum.uniq_by(&state_row_tuple(&1, order))
+    |> Enum.sort_by(&state_row_tuple(&1, order))
+  end
+
+  defp d2a_sort_rows!(_rows, _order),
+    do: raise(ArgumentError, "D2 resource query did not return a list")
 
   defp state_detail(conn, %{resource: "identity"} = spec, id) do
     started_at = System.monotonic_time(:microsecond)
