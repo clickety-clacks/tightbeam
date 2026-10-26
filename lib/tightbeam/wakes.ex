@@ -25,7 +25,17 @@ defmodule Tightbeam.Wakes do
   use GenServer
   require Logger
 
-  alias Tightbeam.{ConditionFacts, DB, Escalation, EventLog, Gateway, NoticeBatcher}
+  alias Tightbeam.{
+    ConditionFacts,
+    DB,
+    Escalation,
+    EventLog,
+    Gateway,
+    NoticeBatcher,
+    StateResources,
+    StateVisibility
+  }
+
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -2433,6 +2443,61 @@ defmodule Tightbeam.Wakes do
         }
       end)
     end
+  end
+
+  @doc "Read a visible digest carrier's members with their shared R9 dependency version."
+  @spec query_digest_members(db(), map()) :: [map()] | nil
+  def query_digest_members(db, %{key: digest_wake_id, principal: principal})
+      when is_binary(digest_wake_id) and is_map(principal) do
+    carrier =
+      StateResources.query_wake(db, %{key: digest_wake_id, principal: principal})
+
+    if not is_nil(carrier) and StateVisibility.digest_member_visible?(db, carrier, principal) do
+      members =
+        db
+        |> digest_members(digest_wake_id)
+        |> Enum.sort_by(&{Map.fetch!(&1, :created_at), Map.fetch!(&1, :wake_id)})
+
+      dependency_version = digest_members_dependency_version(db, digest_wake_id, members)
+
+      Enum.map(members, &Map.put(&1, :dependency_version, dependency_version))
+    else
+      nil
+    end
+  end
+
+  defp digest_members_dependency_version(db, digest_wake_id, members) do
+    wake_ids =
+      [digest_wake_id | Enum.map(members, &Map.fetch!(&1, :wake_id))]
+      |> Enum.uniq()
+
+    placeholders = Enum.map_join(1..length(wake_ids), ",", &"?#{&1}")
+
+    {:ok, wake_rows} =
+      DB.query(
+        db,
+        """
+        SELECT wakeId, createdAt, firedAt, canceledAt
+        FROM wakes
+        WHERE wakeId IN (#{placeholders})
+        """,
+        wake_ids
+      )
+
+    entries =
+      Enum.map(wake_rows, fn [wake_id, created_at, fired_at, canceled_at] ->
+        {"wakes", wake_id,
+         [created_at, fired_at, canceled_at]
+         |> Enum.filter(&is_integer/1)
+         |> Enum.max(fn -> raise ArgumentError, "wake dependency has no natural version" end)}
+      end)
+
+    vector =
+      entries
+      |> Enum.map(fn {resource, key, version} -> [resource, key, version] end)
+      |> Enum.sort_by(fn [resource, key, _version] -> {resource, JSON.encode!(key)} end)
+
+    :crypto.hash(:sha256, JSON.encode!(vector)) |> Base.encode16(case: :lower)
   end
 
   ## The classed-row read (fabric §12 Q5; §11 acceptance 1)

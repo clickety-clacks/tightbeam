@@ -26,6 +26,9 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
       ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon rowVersion),
     "turns" =>
       ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt rowVersion),
+    "coordination share" =>
+      ~w(sessionKey from to turns wakeTurns classedTurns coordinationTurns summons algedonic byClass share dependencyVersion),
+    "digest members" => ~w(wakeId prompt class classElection createdAt dependencyVersion),
     "decision requests" =>
       ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt returnedBy returnReason returnedAt rowVersion),
     "sessions" =>
@@ -49,6 +52,11 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
       ~w(name purpose phrases rootArchetype installedRevision status documents rowVersion)
   }
 
+  # These REST list resources use the shared item encoder but do not emit
+  # rebuildable Firehose rows.
+  @rest_read_resources ["coordination share", "digest members"]
+  @firehose_field_order Map.drop(@field_order, @rest_read_resources)
+
   @resource_aliases %{
     "work-items" => "work items",
     "decision-requests" => "decision requests",
@@ -67,9 +75,9 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
       |> Enum.map(&Map.get(@resource_aliases, &1, &1))
       |> MapSet.new()
 
-    assert registry_resources == MapSet.new(Map.keys(@field_order))
+    assert registry_resources == MapSet.new(Map.keys(@firehose_field_order))
 
-    for {resource, fields} <- @field_order do
+    for {resource, fields} <- @firehose_field_order do
       item = item(resource, fields)
 
       assert StateResources.encode_item(resource, item, @catalog) ==
@@ -650,6 +658,8 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
   defp valid_value({:nullable, _type}, _field), do: nil
   defp valid_value(:string, field), do: field
   defp valid_value(:integer, _field), do: 1
+  defp valid_value(:integer_map, _field), do: %{"fyi" => 1}
+  defp valid_value(:number, _field), do: 0.5
   defp valid_value(:positive_integer, _field), do: 1
   defp valid_value(:boolean, _field), do: false
   defp valid_value({:enum, values}, _field), do: hd(values)
@@ -705,6 +715,8 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
   defp invalid_value({:enum, [value | _values]}) when is_integer(value), do: 99
   defp invalid_value({:enum, _values}), do: "outside-enum"
   defp invalid_value({:array, _type, _order}), do: %{}
+  defp invalid_value(:integer_map), do: []
+  defp invalid_value(:number), do: "not-a-number"
   defp invalid_value(:session_overrides), do: %{}
   defp invalid_value(:string_map), do: []
   defp invalid_value(:json), do: :not_json

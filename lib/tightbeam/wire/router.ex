@@ -55,11 +55,13 @@ defmodule Tightbeam.Wire.Router do
     ColdStart,
     Devices,
     Dispatch,
+    ExecutionMap,
     ModelCatalog,
     Org,
     Roles,
     StateResources,
     StateVisibility,
+    Wakes,
     WorkState
   }
 
@@ -409,6 +411,10 @@ defmodule Tightbeam.Wire.Router do
     core_detail(conn, Map.fetch!(@core_detail_specs, :wakes), wake_id)
   end
 
+  get "/api/wakes/:wake_id/digest-members" do
+    d2d_digest_members(conn, wake_id)
+  end
+
   get "/api/turns/:turn_seq" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :turns), turn_seq)
   end
@@ -423,6 +429,10 @@ defmodule Tightbeam.Wire.Router do
 
   get "/api/sessions/:session_key" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :sessions), session_key)
+  end
+
+  get "/api/sessions/:session_key/coordination-share" do
+    d2d_coordination_share(conn, session_key)
   end
 
   get "/api/devices/:device_id" do
@@ -1134,6 +1144,93 @@ defmodule Tightbeam.Wire.Router do
       state_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
 
+  defp d2d_coordination_share(conn, raw_session_key) do
+    resource = "coordination share"
+    started_at = System.monotonic_time(:microsecond)
+
+    with {:ok, auth} <- state_bearer_auth(conn),
+         {:ok, query} <- decode_state_query(conn),
+         {:ok, principal} <- state_principal(auth, query, conn),
+         {:ok, {from, to}} <- d2d_coordination_window(query),
+         share when is_map(share) <-
+           ExecutionMap.query_coordination_share(db(conn), %{
+             key: raw_session_key,
+             from: from,
+             to: to,
+             principal: principal
+           }),
+         item <- StateResources.coordination_share(share),
+         item_bytes <- StateResources.encode_item(resource, item, state_catalog(conn)) do
+      state_send(conn, 200, state_detail_envelope(resource, item_bytes))
+    else
+      nil ->
+        state_not_found(conn, resource, started_at)
+
+      {:error, 404, "not_found", _message} ->
+        state_not_found(conn, resource, started_at)
+
+      {:error, status, code, message} ->
+        state_error(conn, resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, "coordination share", 500, "projection_invalid", nil)
+  end
+
+  defp d2d_digest_members(conn, raw_wake_id) do
+    resource = "digest members"
+    started_at = System.monotonic_time(:microsecond)
+
+    with {:ok, auth} <- state_bearer_auth(conn),
+         {:ok, query} <- decode_state_query(conn),
+         {:ok, principal} <- state_principal(auth, query, conn),
+         :ok <- state_detail_request(query),
+         members when is_list(members) <-
+           Wakes.query_digest_members(db(conn), %{key: raw_wake_id, principal: principal}),
+         items <- Enum.map(members, &StateResources.digest_member/1) do
+      state_send(conn, 200, state_collection_envelope(conn, resource, items, nil))
+    else
+      nil ->
+        state_not_found(conn, resource, started_at)
+
+      {:error, 404, "not_found", _message} ->
+        state_not_found(conn, resource, started_at)
+
+      {:error, status, code, message} ->
+        state_error(conn, resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, "digest members", 500, "projection_invalid", nil)
+  end
+
+  defp d2d_coordination_window(query) do
+    with true <- Enum.all?(Map.keys(query), &(&1 in ~w(asUser from to))),
+         {:ok, from_text} <- state_single_value(query, "from"),
+         {:ok, to_text} <- state_single_value(query, "to"),
+         {:ok, from} <- d2d_epoch_milliseconds(from_text),
+         {:ok, to} <- d2d_epoch_milliseconds(to_text),
+         true <- from < to do
+      {:ok, {from, to}}
+    else
+      _ -> {:error, 400, "invalid_filter", nil}
+    end
+  end
+
+  defp d2d_epoch_milliseconds(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {milliseconds, ""}
+      when milliseconds >= -9_223_372_036_854_775_808 and
+             milliseconds <= 9_223_372_036_854_775_807 ->
+        {:ok, milliseconds}
+
+      _ ->
+        {:error, :invalid}
+    end
+  end
+
+  defp d2d_epoch_milliseconds(_value), do: {:error, :invalid}
+
   defp core_detail_serialize(conn, spec, row) do
     core_detail_trace(conn, {:serializer, spec.resource, spec.serializer})
     apply(StateResources, spec.serializer, [row])
@@ -1717,12 +1814,17 @@ defmodule Tightbeam.Wire.Router do
     catalog = state_catalog(conn)
     item_bytes = Enum.map_join(items, ",", &StateResources.encode_item(resource, &1, catalog))
 
-    "{" <>
-      ~s("schemaVersion":1,"resource":#{JSON.encode!(resource)},"items":[#{item_bytes}],) <>
-      ~s("page":{"oldestCursor":#{JSON.encode!(page.oldest_cursor)},) <>
-      ~s("newestCursor":#{JSON.encode!(page.newest_cursor)},) <>
-      ~s("hasMoreBefore":#{JSON.encode!(page.has_more_before)},) <>
-      ~s("hasMoreAfter":#{JSON.encode!(page.has_more_after)}}})
+    if is_nil(page) do
+      "{" <>
+        ~s("schemaVersion":1,"resource":#{JSON.encode!(resource)},"items":[#{item_bytes}]})
+    else
+      "{" <>
+        ~s("schemaVersion":1,"resource":#{JSON.encode!(resource)},"items":[#{item_bytes}],) <>
+        ~s("page":{"oldestCursor":#{JSON.encode!(page.oldest_cursor)},) <>
+        ~s("newestCursor":#{JSON.encode!(page.newest_cursor)},) <>
+        ~s("hasMoreBefore":#{JSON.encode!(page.has_more_before)},) <>
+        ~s("hasMoreAfter":#{JSON.encode!(page.has_more_after)}}})
+    end
   end
 
   defp state_detail_envelope(resource, item_bytes) do

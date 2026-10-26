@@ -59,6 +59,22 @@ defmodule Tightbeam.StateVisibility do
     do_core_detail_visible?(db, resource, row, principal)
   end
 
+  @doc "Apply the existing target-session, owner, or admin grant to coordination share."
+  @spec coordination_share_visible?(DB.server(), map(), map()) :: boolean()
+  def coordination_share_visible?(db, row, principal) when is_map(row) and is_map(principal),
+    do: core_detail_visible?(db, "sessions", row, principal)
+
+  def coordination_share_visible?(_db, _row, _principal), do: false
+
+  @doc "Apply the parent digest-carrier wake grant before selecting digest members."
+  @spec digest_member_visible?(DB.server(), map(), map()) :: boolean()
+  def digest_member_visible?(db, row, principal) when is_map(row) and is_map(principal) do
+    (value(row, :digest) == true or value(row, :digest) == 1) and
+      core_detail_visible?(db, "wakes", row, principal)
+  end
+
+  def digest_member_visible?(_db, _row, _principal), do: false
+
   defp do_core_detail_visible?(_db, resource, _row, _principal)
        when resource in ["work items", "assignments"],
        do: true
