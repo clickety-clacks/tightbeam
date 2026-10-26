@@ -25,12 +25,12 @@ defmodule Tightbeam.ToolCallsTest do
     {:paired, device} =
       Devices.pair(db, %{
         device_id: "tool-calls-device",
-        claimed_name: "Flynn",
+        claimed_name: "Test Device",
         platform: nil,
         model: nil
       })
 
-    session = ensure_main_session(db, "flynn")
+    session = ensure_main_session(db, "tool-call-owner")
 
     {:appended, prompt_message} =
       Projection.append(db, %{
@@ -43,7 +43,7 @@ defmodule Tightbeam.ToolCallsTest do
       Ledger.enqueue(db, %{
         session_key: session.session_key,
         message_id: prompt_message.id,
-        origin: "user:flynn",
+        origin: "user:tool-call-owner",
         prompt: prompt_message.content
       })
 
@@ -58,7 +58,12 @@ defmodule Tightbeam.ToolCallsTest do
     ]
 
     :ok =
-      Hub.register(Hub, self(), %{mode: :subscribed, db: db, user_id: "flynn", is_admin: false})
+      Hub.register(Hub, self(), %{
+        mode: :subscribed,
+        db: db,
+        user_id: "tool-call-owner",
+        is_admin: false
+      })
 
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
@@ -435,7 +440,7 @@ defmodule Tightbeam.ToolCallsTest do
           txn,
           """
           UPDATE messages
-          SET sender='user:flynn', deviceId='migration-device', clientMessageId='migration-client',
+          SET sender='user:tool-call-owner', deviceId='migration-device', clientMessageId='migration-client',
               replyToMessageId='reply-message', replyToClientMessageId='reply-client',
               llmVisibleMessageId='visible-migration-message',
               attachments='[{\"name\":\"preserved.txt\"}]', attentionTier=1
@@ -499,6 +504,7 @@ defmodule Tightbeam.ToolCallsTest do
     assert index_names == [["messages_client_dedupe"], ["messages_session"]]
 
     {:ok, session_index_columns} = DB.query(ctx.db, "PRAGMA index_info(messages_session)", [])
+
     assert Enum.map(session_index_columns, fn [_seq, _cid, name] -> name end) == [
              "sessionKey",
              "seq"
