@@ -39,8 +39,7 @@ CULTURE = kungfu (domain). See shared specs coordination-fabric-v1.md.
 3. **What's the exit?** No state whose exit condition is someone else's
    decision — every wait ends on time, a turn boundary, or the waiter's own
    choice. And every state has a lawful AGENT-reachable repair verb: if repair
-   requires an admin at a database console, the design is incomplete
-   (completion-selection wedge, wi_1b0237fe, 2026-08-12).
+   requires an admin at a database console, the design is incomplete.
 4. **Does failure correlate?** A wrong deterministic rule wrongs every case
    identically and silently — correlated failure is what brittleness IS. Keep
    rules small and boring, and put a mind above them.
@@ -61,9 +60,8 @@ CULTURE = kungfu (domain). See shared specs coordination-fabric-v1.md.
 
 ## WHERE THE SPECS LIVE (read before designing anything)
 
-The spec commons is its own repo: github.com/clickety-clacks/tightbeam-specs
-(gibson clone ~/src/tightbeam-specs; canonical checkout on the NFS at
-eezo:~/shared-workspace/shared/specs/tightbeam). For 0.2 work start with:
+The spec commons is its own repo: github.com/clickety-clacks/tightbeam-specs.
+For 0.2 work start with:
 - `v0.2-program-2026-08-12.md` — the program: rulings, staffing, phases,
   election ledgers, org-pause state. The record of every decision.
 - `coordination-fabric-v1.md` — the design authority for the fabric.
@@ -73,9 +71,6 @@ eezo:~/shared-workspace/shared/specs/tightbeam). For 0.2 work start with:
   map and working norms. Read it before doing ANY 0.2 program work.
 - `tightbeam.md` — the spec hub for the wider corpus; `tightbeam-decisions.md`
   — the decisions ledger.
-The 0.2 orchestrator runs in tmux session `tb02` on gibson
-(`tmux attach -t tb02`) — coordinate 0.2 work through it, don't duplicate it.
-
 ## ACP / harness facts (for anyone touching the adapter layer)
 
 - **Zed is the ACP reference implementation.** For ANY protocol capability/semantics
@@ -120,9 +115,8 @@ intentional.
 - The canonical gate handles environment hygiene. For ad-hoc Mix runs outside the
   script, such as `mix test path/to/file.exs`, use `env -u NAME` to remove every
   inherited `TIGHTBEAM_*` and `RELEASE_*` variable.
-  After `wi_8f90c5b3` merges, the suite is immune to the
-  known `TIGHTBEAM_*` config leaks. Keep stripping both prefixes: that proof covers
-  only config, while `RELEASE_ROOT` is read directly from the environment in `lib/`.
+  Keep stripping both prefixes even if the suite's `TIGHTBEAM_*` config isolation
+  is present: `RELEASE_ROOT` is read directly from the environment in `lib/`.
 - Make the requested change first. Then run the focused tests that exercise it, followed
   by only the broader verification that its risk warrants. Do not run a full-suite
   baseline before writing code; an untouched-tree replay delays the change without

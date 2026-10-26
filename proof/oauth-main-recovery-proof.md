@@ -1,11 +1,10 @@
-# OAuth Main recovery wake — redacted proof
+# Subscription OAuth recovery proof
 
 ## Verdict
 
-PASS against binding specification `art_e675c607`, SHA-256
-`032ffdfd25ef3dfb6d850e429edb7c352ae058098f4f8a3c0784f7531527a6ce`.
+PASS against the accepted binding specification.
 
-The implementation schedules one immediate native-Main wake only after a
+The implementation schedules one immediate native Main wake only after a
 successful OpenAI or Anthropic subscription OAuth finish. API-key completion
 does not schedule the recovery wake.
 
@@ -25,62 +24,39 @@ does not schedule the recovery wake.
 
 ## Stored wake proof
 
-The accepted disposable organization was created once at
-`/tmp/oauth-main-proof-54626d3c-root5.8HlKSH`. Credentials remained
-file-backed with mode 0600 and were never printed or copied into this report.
+The accepted disposable organization was created once in an isolated temporary
+base. Credentials remained file-backed with mode 0600 and were never printed
+or copied into this report.
 
-The isolated source-mode gateway projected Tightbeam CLI 0.2.0 with SHA-256
-`fce48625145081c98fd0d976e939c8fa357814d4fd8ae34f337c7ced704ef4fd`.
-Its catalog contained the shipped engineering bundle and the two exact proof
-bundles:
+The isolated source-mode gateway projected the 0.2.0 CLI and catalog with
+the shipped engineering bundle and two proof bundles: one rooted at
+`product-owner` and one at `coder`. Both bundles were learned through the real
+admin gateway path, and both installation receipts existed. The identity
+revision was clean, equal at source and installation, and carried by Main and
+both proof sessions. An unrelated reviewer received no OAuth recovery
+notification.
 
-- `oauth-proof-product`: root archetype `product-owner`, manifest SHA-256
-  `bf1af7666a56b3c7e336aafecb991cbd93fac1ce5316e49efd909490b36c1005`
-- `oauth-proof-coder`: root archetype `coder`, manifest SHA-256
-  `8952d596b64b7d2945eabdb8482681cab626b4e5bdbb06a7b1ccecac8b6f9b6f`
+One authenticated OpenAI subscription finish produced exactly one immediate
+recovery wake for the native Main session. Its origin was `process:tightbeam`,
+its consumer was `prompt`, its state was `fired`, and `targetGate=1`. It had no
+role target, condition, or re-resolution. One Codex turn was delivered with
+`gpt-5.6-sol` at `medium` effort.
 
-Both bundles were learned through the real admin gateway path. Both
-`installed.toml` receipts existed. Identity revision
-`9c0fd30163c33e86b0d96ca44e42961b8d974feb` was clean, was equal at `main`
-and `tightbeam/live`, and was carried by Main, product-owner, and coder. The
-unrelated reviewer remained at seed revision
-`14d9d10d` and received zero OAuth recovery notifications.
-
-One authenticated OpenAI subscription finish produced exactly one recovery
-wake, `w_3161047e-f57f-4027-a985-157b1bb2720c`, with:
-
-- native Main session `agent:main:clawline:oauth-proof:main`
-- origin `process:tightbeam`
-- consumer `prompt`
-- state `fired`
-- `targetGate=1`
-- no role target, condition, or re-resolution
-- one delivered Codex turn using `gpt-5.6-sol`, effort `medium`
-
-The stored and delivered prompt was unchanged:
-
-> The OAuth token for openai on gibson was refreshed. Read the manifests for every installed or learned Kung Fu. Read each manifest's declared main archetype. Find live agents with those archetypes. Notify each that the OAuth token was refreshed, and require each to inspect and resume any stalled agent graph.
+The stored and delivered prompt matched exactly. It instructed Main to read
+the installed bundle manifests, find live sessions with the declared main
+archetypes, notify them of the OAuth refresh, and require each to inspect and
+resume stalled work.
 
 ## Real Main-turn proof
 
 Main read the installed manifests, reduced their declarations to the two
 distinct roots `product-owner` and `coder`, and resolved the live session
 roster. It delivered one immediate recovery instruction to each matching
-session:
-
-- `agent:oauth-proof-product`, wake
-  `w_055de387-c681-4998-8156-25371c04c5fa`
-- `agent:oauth-proof-coder`, wake
-  `w_392e02aa-900e-4338-a7e9-552a01262e02`
-
-Each instruction stated that the OpenAI OAuth token was refreshed and required
-the agent to inspect its full graph and resume stalled work. Both turns reached
-`delivered` with no error. The unrelated live reviewer
-`agent:oauth-proof-unrelated` received zero Main recovery notifications.
+session. Both turns reached `delivered` with no error. The unrelated live
+reviewer received no Main recovery notification.
 
 ## Excluded incident evidence
 
-Roots one through four and all pre-stop/raced attempts remain preserved only as
-substrate incident evidence. They are not used as proof. The accepted verdict
-depends solely on the fresh root-five run and the fresh repository gates listed
-above.
+Earlier disposable roots and pre-stop or raced attempts remain incident
+evidence. They are not used as proof. The accepted verdict depends solely on
+the fresh isolated run and the repository gates listed above.
