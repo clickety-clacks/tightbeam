@@ -173,21 +173,46 @@ defmodule Tightbeam.ExecutionMap do
       DB.query(
         db,
         """
-        SELECT seq, wakeId, createdAt, startedAt, endedAt
-        FROM turns
-        WHERE sessionKey = ?1 AND createdAt >= ?2 AND createdAt < ?3
-        ORDER BY seq
+        SELECT t.seq, t.createdAt, t.startedAt, t.endedAt,
+               w.wakeId, w.createdAt, w.firedAt, w.canceledAt
+        FROM turns AS t
+        LEFT JOIN wakes AS w ON w.wakeId = t.wakeId
+        WHERE t.sessionKey = ?1 AND t.createdAt >= ?2 AND t.createdAt < ?3
+        ORDER BY t.seq
         """,
         [session_key, from, to]
       )
 
     turn_entries =
-      Enum.map(turn_rows, fn [seq, _wake_id, created_at, started_at, ended_at] ->
+      Enum.map(turn_rows, fn [
+                               seq,
+                               created_at,
+                               started_at,
+                               ended_at,
+                               _wake_id,
+                               _wake_created_at,
+                               _wake_fired_at,
+                               _wake_canceled_at
+                             ] ->
         {"turns", seq, dependency_natural_version([seq, created_at, started_at, ended_at])}
       end)
 
-    wake_ids = turn_rows |> Enum.map(&Enum.at(&1, 1)) |> Enum.reject(&is_nil/1) |> Enum.uniq()
-    wake_entries = coordination_wake_dependency_entries(db, wake_ids)
+    {_seen_wake_ids, wake_entries} =
+      Enum.reduce(turn_rows, {MapSet.new(), []}, fn
+        [_, _, _, _, wake_id, created_at, fired_at, canceled_at], {seen, entries}
+        when is_binary(wake_id) ->
+          if MapSet.member?(seen, wake_id) do
+            {seen, entries}
+          else
+            entry =
+              {"wakes", wake_id, dependency_natural_version([created_at, fired_at, canceled_at])}
+
+            {MapSet.put(seen, wake_id), [entry | entries]}
+          end
+
+        _, acc ->
+          acc
+      end)
 
     {:ok, prod_rows} =
       DB.query(
@@ -204,27 +229,6 @@ defmodule Tightbeam.ExecutionMap do
     prod_entries = Enum.map(prod_rows, fn [seq] -> {"causal events", seq, seq} end)
 
     dependency_digest(turn_entries ++ wake_entries ++ prod_entries)
-  end
-
-  defp coordination_wake_dependency_entries(_db, []), do: []
-
-  defp coordination_wake_dependency_entries(db, wake_ids) do
-    placeholders = Enum.map_join(1..length(wake_ids), ",", &"?#{&1}")
-
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT wakeId, createdAt, firedAt, canceledAt
-        FROM wakes
-        WHERE wakeId IN (#{placeholders})
-        """,
-        wake_ids
-      )
-
-    Enum.map(rows, fn [wake_id, created_at, fired_at, canceled_at] ->
-      {"wakes", wake_id, dependency_natural_version([created_at, fired_at, canceled_at])}
-    end)
   end
 
   defp dependency_natural_version(values) do

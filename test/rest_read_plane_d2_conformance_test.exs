@@ -186,6 +186,62 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     assert forbidden.resp_body == unknown.resp_body
   end
 
+  test "coordination share dependency query supports more wakes than SQLite bind parameters",
+       ctx do
+    wake_count = 32_767
+    session_key = ctx.admin_session.session_key
+    from = 1_000
+    to = 1_100
+    created_at = from + 50
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        WITH RECURSIVE n(value) AS (
+          SELECT 1
+          UNION ALL
+          SELECT value + 1 FROM n WHERE value < ?3
+        )
+        INSERT INTO wakes (wakeId, sessionKey, origin, prompt, dueAt, createdAt)
+        SELECT 'w_d2d_large_' || value, ?1, 'user:fixture', 'large window', ?2, ?2
+        FROM n
+        """,
+        [session_key, created_at, wake_count]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        WITH RECURSIVE n(value) AS (
+          SELECT 1
+          UNION ALL
+          SELECT value + 1 FROM n WHERE value < ?3
+        )
+        INSERT INTO turns (sessionKey, messageId, wakeId, origin, prompt, status, createdAt)
+        SELECT ?1, 'm_d2d_large_' || value, 'w_d2d_large_' || value,
+               'user:fixture', 'large window', 'delivered', ?2
+        FROM n
+        """,
+        [session_key, created_at, wake_count]
+      )
+
+    response =
+      get(
+        ctx,
+        "/api/sessions/#{session_key}/coordination-share?from=#{from}&to=#{to}",
+        ctx.admin_device.token
+      )
+
+    assert response.status == 200, response.resp_body
+
+    item = JSON.decode!(response.resp_body)["item"]
+    assert item["turns"] == wake_count
+    assert item["wakeTurns"] == wake_count
+    assert item["dependencyVersion"] =~ ~r/\A[0-9a-f]{64}\z/
+  end
+
   test "digest members retain carrier membership, canonical order, closed fields, and parent visibility",
        ctx do
     session_key = ctx.admin_session.session_key
