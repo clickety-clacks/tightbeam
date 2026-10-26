@@ -70,8 +70,8 @@ defmodule Tightbeam.Harness.Claude do
   # together.
   #
   # ALSO GRANT- AND HOME-DEPENDENT, not only version-dependent. A smoke run recorded
-  # opus-5 and fable-5 "refused on this grant", and JOURNAL.md:804 records the offered
-  # list changing with the home's `settings.json` and the session cwd. So this table
+  # opus-5 and fable-5 "refused on this grant", and the offered
+  # list changes with the home's `settings.json` and the session cwd. So this table
   # pins THREE things at once, and a different account may legitimately accept more.
   # That is why the set is injectable (`claude_selectable_models` in the catalog's
   # options, `:all` to disable) rather than only editable here.
@@ -89,7 +89,7 @@ defmodule Tightbeam.Harness.Claude do
   # REJECTED row for fable was one environment's snapshot, not a property of the
   # account or the CLI (Flynn was literally talking to Fable while this table
   # said his account could not). The offered list is environment-dependent
-  # (JOURNAL.md:804); the projected-home model pin (ops-hardening-v1 §3) is what
+  # across homes; the projected-home model pin is what
   # makes it deterministic. Keep re-probing per the note above before trusting
   # any row here, in either direction.
   # RE-MEASURED 2026-08-06 on a production host (adapter 0.59.0, the production grant):
@@ -291,7 +291,7 @@ defmodule Tightbeam.Harness.Claude do
   def reconcile_home(target, home, desired) do
     # THE FABLE FIX (ops-hardening-v1 §3): claude's offered-model list is
     # environment-dependent — the same home and auth offers fable at a cwd whose
-    # settings file pins it and not at a bare one (JOURNAL.md:804) — so every
+    # settings file pins it and not at a bare one — so every
     # projected home pins the org's default model, making the offered list
     # deterministic. Harness-owned, because WHICH config key means "model" and
     # how a model is spelled there is this harness's business and nobody
