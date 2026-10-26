@@ -15,7 +15,7 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
   alias Tightbeam.Wire.Router
 
   @provider_name "spark"
-  @spark_endpoint "https://model.example/v1"
+  @spark_endpoint "https://spark.tailf064dc.ts.net/v1"
   @release_binary Path.expand("../cli/target/release/tightbeam", __DIR__)
   @cli_token "tbc_local_openai_live"
 
