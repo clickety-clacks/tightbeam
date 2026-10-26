@@ -453,8 +453,9 @@ defmodule Tightbeam.HarklightWakes do
         if origin_eligible?(acc.db, session_key, host) do
           if handle_state == "complete", do: acc, else: start_worker(acc, handle)
         else
-          acc = stop_worker(acc, handle)
+          # Persist invalidation before the worker's DOWN can reach observers.
           mark_finished(acc.db, handle, "origin_unavailable")
+          acc = stop_worker(acc, handle)
           notify_pending_origin_unavailable(acc.db, handle)
           acc
         end
