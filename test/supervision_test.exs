@@ -1079,9 +1079,8 @@ defmodule Tightbeam.SupervisionTest do
     [wake] = Wakes.list_pending(ctx.db)
     cancel_wake!(ctx.db, wake)
 
-    # Exact wi_4ee303fa liveness specimens: Card 1's four filings; Card 3's
-    # dependency fallback; Card 4's durable progress; and Card 5's dependency
-    # fallback. att_99c4c115 remains the original valid dependency receipt.
+    # These cases distinguish repeated filings, dependency fallback, and
+    # durable progress. The earlier dependency receipt remains valid.
     # This receipt-selection fixture deliberately does not model stale
     # post-closure state or unexpired-wake eligibility, which have separate
     # boundaries.
@@ -1157,8 +1156,6 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
-  # Immutable authority: art_201ab36d, SHA-256
-  # fe0945a8a210d50db4b8ae27f5c46dcb63f63d6dcef5884a41d3402a662c590a.
   # These cases drive explicit durable rows or synchronous process barriers. They
   # deliberately do not sleep, poll, widen a timeout, or infer a deadline from the
   # wall clock.

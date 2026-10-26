@@ -4297,7 +4297,7 @@ defmodule Tightbeam.ConformanceTest do
     # turn-end shift. The shift itself is unchanged minus that first slot.
     #
     # Fabric §13 Phase 0 (2026-08-13) adds one: C4's holder-verdict-wins, which
-    # pins review-round selection against the wi_1b0237fe wedge class. It is a
+    # pins review-round selection against a verdictless later round. It is a
     # pending C4 dispatch-rule fixture with its own cases, so it lands in the
     # active and activated counts, not in the exact-mechanism skips.
     #

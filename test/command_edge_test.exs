@@ -520,7 +520,7 @@ defmodule Tightbeam.CommandEdgeTest do
     assert CommandEdge.validate_command!(command) == command
 
     assert_raise ArgumentError, ~r/invalid CredentialPark/, fn ->
-      CommandEdge.validate_command!(%{command | adapter_keys: [{:codex, "shared", "tars"}]})
+      CommandEdge.validate_command!(%{command | adapter_keys: [{:codex, "shared", "lab2"}]})
     end
   end
 

@@ -3221,13 +3221,13 @@ mod tests {
                 "--context",
                 "1m",
                 "--host",
-                "eezo",
+                "lab1",
                 "--key",
                 "k1",
                 "--as-user",
                 "flynn"
             ]),
-            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","effort":"high","context":"1m","handle":"reviewer","host":"eezo"}}"#
+            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","effort":"high","context":"1m","handle":"reviewer","host":"lab1"}}"#
         );
 
         // A flag NAMED but left empty is a real selection — "the vendor's
@@ -3524,11 +3524,11 @@ mod tests {
                 "--kind",
                 "completion",
                 "--commit-refs",
-                r#"[{"repo":"eezo:/src/repo","commit":"abc123"}]"#,
+                r#"[{"repo":"lab1:/src/repo","commit":"abc123"}]"#,
                 "--as",
                 "builder",
             ]),
-            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","commitRefs":[{"commit":"abc123","repo":"eezo:/src/repo"}]}}"#
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","commitRefs":[{"commit":"abc123","repo":"lab1:/src/repo"}]}}"#
         );
     }
 
@@ -3910,39 +3910,39 @@ mod tests {
             body(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "node-a",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR=example",
                 "--as",
                 "operator",
             ]),
-            r#"{"as":"operator","verb":"host-env-set","params":{"host":"gibson","harness":"claude","name":"EXAMPLE_OVERLAY_VAR","value":"example"}}"#
+            r#"{"as":"operator","verb":"host-env-set","params":{"host":"node-a","harness":"claude","name":"EXAMPLE_OVERLAY_VAR","value":"example"}}"#
         );
         assert_eq!(
             body(&[
                 "host-env-list",
                 "--host",
-                "gibson",
+                "node-a",
                 "--harness",
                 "claude",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"host-env-list","params":{"host":"gibson","harness":"claude"}}"#
+            r#"{"asUser":"flynn","verb":"host-env-list","params":{"host":"node-a","harness":"claude"}}"#
         );
         assert_eq!(
             body(&[
                 "host-env-unset",
                 "--host",
-                "gibson",
+                "node-a",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"host-env-unset","params":{"host":"gibson","harness":"claude","name":"EXAMPLE_OVERLAY_VAR"}}"#
+            r#"{"asUser":"flynn","verb":"host-env-unset","params":{"host":"node-a","harness":"claude","name":"EXAMPLE_OVERLAY_VAR"}}"#
         );
     }
 
@@ -4426,11 +4426,11 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("tightbeam_cli_session_ws_{unique}"));
         let cases = [
-            ("ws", "ws://gibson:11373", "http://gibson:11373"),
-            ("wss", "wss://gibson:11373", "https://gibson:11373"),
+            ("ws", "ws://node-a:11373", "http://node-a:11373"),
+            ("wss", "wss://node-a:11373", "https://node-a:11373"),
             // http and https are already the dispatch scheme and pass through whole.
-            ("http", "http://gibson:11373", "http://gibson:11373"),
-            ("https", "https://gibson:11373", "https://gibson:11373"),
+            ("http", "http://node-a:11373", "http://node-a:11373"),
+            ("https", "https://node-a:11373", "https://node-a:11373"),
         ];
         for (name, written, expected) in cases {
             let dir = root.join(name);

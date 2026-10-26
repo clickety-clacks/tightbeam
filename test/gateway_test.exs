@@ -8426,12 +8426,12 @@ defmodule Tightbeam.GatewayTest do
     publish.("delivered")
   end
 
-  # wi_263814d3 — the PROVISIONING SEAM, not just deliver_home: a real turn that
+  # The provisioning seam, beyond deliver_home: a real turn that
   # provisions a fresh harness session must pin the shared home to the SESSION'S
   # selected model (not the org default), so the adapter offers+accepts it at
   # session/new. Deleting the harness_session pin calls leaves settings.json
   # unwritten on the turn path and fails this — the coverage the deliver_home
-  # unit tests alone do not give (asg_6508eff5 finding #2).
+  # unit tests alone do not give.
   @tag timeout: 180_000
   test "provisioning a turn pins the shared home to the session's selected model", ctx do
     exact_registry =

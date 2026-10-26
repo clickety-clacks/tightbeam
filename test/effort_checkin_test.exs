@@ -1691,9 +1691,8 @@ defmodule Tightbeam.EffortCheckinTest do
   # renamed the public surrender transition to cannot-proceed AND made it
   # NON-terminal (it re-arms and files a decision request), so `surrendered` is
   # unreachable as a terminal close on main; holder-retire is the third distinct
-  # terminal transition (outcome=revoked, durable principal). dr_15c79322 (repo
-  # migration authority) and the c321d74a rename are settled adjudications; this
-  # suite implements them, it does not re-file them.
+  # terminal transition (outcome=revoked, durable principal). This suite checks
+  # the settled behavior; it does not initiate a decision.
   # ==================================================================
 
   # The retirement SET (EGR-3) = {max unretired generation} UNION {source
@@ -2342,7 +2341,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert wake_cancellations(ctx.db, b_hc.wake_id) == []
 
     # EGR-8 forbids retirement from rewriting the fired wake or its turn. The
-    # sibling queued-turn amendment wi_154bf46b — which would dispose the queued
+    # separate queued-turn change — which would dispose the queued
     # turn at close — is ABSENT from this checkout and owns a separate acceptance
     # lane per the spec's Architecture section ("runs beside, not inside ... Neither
     # owns the other's tables or acceptance lane"), so A3 asserts only that MY

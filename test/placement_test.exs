@@ -119,9 +119,9 @@ defmodule Tightbeam.PlacementTest do
     assert Placement.resolve(archetype, "work-1", hosts) == {:ok, "work-1"}
 
     assert {:error, %{code: "host_not_allowed", message: message}} =
-             Placement.resolve(archetype, "tars", hosts)
+             Placement.resolve(archetype, "lab2", hosts)
 
-    assert message =~ "tars"
+    assert message =~ "lab2"
     assert message =~ "work-1, work-2"
 
     assert {:error, %{code: "unknown_host", message: unknown}} =
