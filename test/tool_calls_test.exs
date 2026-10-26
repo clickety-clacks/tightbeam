@@ -459,6 +459,21 @@ defmodule Tightbeam.ToolCallsTest do
         to: "claude-opus-5-5"
       })
 
+    {:appended, repair_message} =
+      Projection.append(ctx.db, %{
+        session_key: ctx.session_key,
+        role: "user",
+        content: "Repair this recorded human sender before the message rebuild."
+      })
+
+    {:ok, _repair_turn_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: ctx.session_key,
+        message_id: repair_message.id,
+        origin: "user:recorded-before-rebuild",
+        prompt: "Repair this recorded human sender before the message rebuild."
+      })
+
     message_columns = ~w(
       seq id sessionKey role content timestamp sender deviceId clientMessageId
       replyToMessageId replyToClientMessageId llmVisibleMessageId attachments
@@ -470,7 +485,19 @@ defmodule Tightbeam.ToolCallsTest do
 
     {:ok, message_rows_before} = DB.query(ctx.db, message_rows_sql, [])
 
-    {:ok, [[root_shape_before]]} = DB.query(ctx.db, "SELECT shape FROM schema_stamp", [])
+    sender_index = Enum.find_index(message_columns, &(&1 == "sender"))
+
+    {:ok, root_stamp_before} =
+      DB.query(ctx.db, "SELECT shape,stampedAt FROM schema_stamp", [])
+
+    assert [
+             ["launch-preparation-evidence-v1-0112", _root_stamped_at_before]
+           ] = root_stamp_before
+
+    {:ok, memento_stamp_before} =
+      DB.query(ctx.db, "SELECT version FROM memento_judgment_index_version", [])
+
+    assert memento_stamp_before == [[1]]
 
     {:ok, [[message_high_water]]} =
       DB.query(ctx.db, "SELECT seq FROM sqlite_sequence WHERE name = 'messages'", [])
@@ -485,11 +512,29 @@ defmodule Tightbeam.ToolCallsTest do
 
     rewind_messages_to_predecessor(ctx.db)
 
-    assert :ok = ToolCalls.ensure_schema(ctx.db)
+    :ok = Tightbeam.Schema.ensure_all(ctx.db)
     assert :ok = ToolCalls.ensure_schema(ctx.db)
 
+    {:ok, [[message_high_water_after]]} =
+      DB.query(ctx.db, "SELECT seq FROM sqlite_sequence WHERE name = 'messages'", [])
+
+    assert message_high_water_after == preserved_high_water
+
     {:ok, message_rows_after} = DB.query(ctx.db, message_rows_sql, [])
-    assert message_rows_after == message_rows_before
+
+    expected_message_rows =
+      Enum.map(message_rows_before, fn row ->
+        if Enum.at(row, 1) == repair_message.id do
+          List.replace_at(row, sender_index, "user:recorded-before-rebuild")
+        else
+          row
+        end
+      end)
+
+    assert message_rows_after == expected_message_rows
+
+    assert {:ok, [["user:recorded-before-rebuild"]]} =
+             DB.query(ctx.db, "SELECT sender FROM messages WHERE id=?1", [repair_message.id])
 
     {:ok, columns_after} = DB.query(ctx.db, "PRAGMA table_info(messages)", [])
     assert Enum.map(columns_after, fn [_cid, name | _rest] -> name end) == message_columns
@@ -516,8 +561,11 @@ defmodule Tightbeam.ToolCallsTest do
     assert Enum.map(dedupe_index_columns, fn [_seq, _cid, name] -> name end) ==
              ["sessionKey", "deviceId", "clientMessageId"]
 
-    {:ok, [[root_shape_after]]} = DB.query(ctx.db, "SELECT shape FROM schema_stamp", [])
-    assert root_shape_after == root_shape_before
+    assert {:ok, ^root_stamp_before} =
+             DB.query(ctx.db, "SELECT shape,stampedAt FROM schema_stamp", [])
+
+    assert {:ok, ^memento_stamp_before} =
+             DB.query(ctx.db, "SELECT version FROM memento_judgment_index_version", [])
 
     {:ok, [[0, "tool-call-transition-v1-011"]]} =
       DB.query(ctx.db, "SELECT id, shape FROM tool_call_transition_migration", [])
