@@ -1067,6 +1067,7 @@ defmodule Tightbeam.WakesTest do
     assert_received {:firehose_notice, notice}
     assert notice["class"] == "message.created"
     assert notice["refs"]["sessionKey"] == sender_session_key
+
     assert notice["payload"]["content"] ==
              "Wake #{wake.wake_id} could not be delivered and was canceled."
 
