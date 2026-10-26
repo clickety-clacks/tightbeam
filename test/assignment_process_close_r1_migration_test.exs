@@ -17,6 +17,7 @@ defmodule Tightbeam.AssignmentProcessCloseR1MigrationTest do
   test "upgrade preserves raw reminder bytes, references and attached objects", %{db: db} do
     seed(db)
     before = snapshot(db)
+
     before_r1_assignments =
       Enum.map(elem(before, 0), &Map.take(&1, @r1_predecessor_columns))
 

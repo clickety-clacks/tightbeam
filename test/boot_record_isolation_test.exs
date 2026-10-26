@@ -406,6 +406,7 @@ defmodule Tightbeam.BootRecordIsolationTest do
     File.mkdir_p!(Path.join(dir, "kungfu/broken"))
     File.write!(Path.join(dir, "kungfu/broken/manifest.toml"), "root_archetype='broken'")
     {_, 0} = System.cmd("git", ["add", "."], cd: dir)
+
     {_, 0} =
       System.cmd(
         "git",
@@ -420,6 +421,7 @@ defmodule Tightbeam.BootRecordIsolationTest do
         ],
         cd: dir
       )
+
     {_, 0} = System.cmd("git", ["branch", "-f", "tightbeam/live", "HEAD"], cd: dir)
 
     assert capture_log(fn -> assert :ok = AdminProjection.bootstrap_served(db, base) end) =~
