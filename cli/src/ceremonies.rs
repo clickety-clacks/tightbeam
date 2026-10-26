@@ -62,7 +62,7 @@ fn lease_deadline(ready: &serde_json::Value, now: Instant) -> Instant {
     now + lease_timeout(ready)
 }
 
-/// The owner user id the gateway names on the `begin` reply (wi_0535922b), so the CLI can
+/// The owner user id the gateway names on the `begin` reply, so the CLI can
 /// wake THAT user with the sign-in URL+code. Absent on a gateway too old to send it or a
 /// caller with no owner (a process principal) -- the emission then degrades loudly rather
 /// than waking no one. Pure so the wire shape can be pinned by a test.
@@ -86,7 +86,7 @@ struct Ceremony<'a> {
     endpoint: &'a Endpoint,
     deadline: Instant,
     load_harnesses: &'a HarnessLoader<'a>,
-    // Emission context (wi_0535922b): who to attribute the wake to, how to send it, which
+    // Emission context: who to attribute the wake to, how to send it, which
     // provider/machine the delivery names, and the owner user to wake (absent on an older
     // gateway or a non-owned caller -> the CLI degrades loudly).
     identity: &'a Identity,
@@ -901,7 +901,7 @@ fn wake_id_of(reply: &serde_json::Value) -> Option<String> {
 }
 
 /// Surface a sign-in deliverable the operator cannot see on the ceremony's terminal, through
-/// the three channels of Mike's triad (wi_0535922b): the operator WAKE (the durable substrate
+/// three delivery channels: the operator WAKE (the durable substrate
 /// row AND the notification, in one), a 0600 local delivery FILE, and a machine-readable
 /// STRUCTURED line on stdout. Every channel is best-effort and LOUD on failure -- a delivery
 /// that cannot be waked or filed says so rather than vanishing.

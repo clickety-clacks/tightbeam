@@ -1,4 +1,4 @@
-//! Machine-readable emission of onboarding sign-in deliverables (wi_0535922b).
+//! Machine-readable emission of onboarding sign-in deliverables.
 //!
 //! Interactive onboarding is INCOMPLETE until the operator holds the sign-in URL and, for
 //! the device-code providers, the one-time code (ceremony-lifecycle-v1.md, "The definition
@@ -48,7 +48,7 @@ impl Deliverable {
 /// unmistakable amid the vendor's human passthrough text.
 ///
 /// `wake_id` is the operator-wake identity -- the wake row IS the durable record of this
-/// delivery (wi_0535922b). `delivery_file` is the path to the local 0600 copy. Both are
+/// delivery. `delivery_file` is the path to the local 0600 copy. Both are
 /// threaded through so the machine-readable line points a relay at where the delivery landed.
 pub(crate) fn structured_line(
     provider: &str,

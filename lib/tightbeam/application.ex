@@ -190,7 +190,7 @@ defmodule Tightbeam.Application do
   # only user"). The first repair special-cased exactly one INSTALLED binary,
   # but a tester with BOTH CLIs on PATH and ONLY codex onboarded still fell to
   # registry-order claude + claude-sonnet-5 — a dead default whose first turn
-  # cannot run (mike repro 2026-08-06, wi_24028d10). Installed is not runnable;
+  # cannot run (observed in production). Installed is not runnable;
   # installed-AND-onboarded is. Onboarded-ness is read synchronously from disk
   # here (Credentials.kind_at), before the async catalog exists.
   #
