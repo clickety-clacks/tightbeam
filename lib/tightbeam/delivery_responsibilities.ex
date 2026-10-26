@@ -415,9 +415,9 @@ defmodule Tightbeam.DeliveryResponsibilities do
     end
   end
 
-  # Existing itemless human assignment, dispatch, and spawn coordination stay
-  # on their established paths. The typed internal spawn remedy is handled first
-  # above and still validates its owner references.
+  # Itemless assignment and dispatch controls remain limited to user/session
+  # principals; public itemless spawn remains limited to user/agent origins.
+  # The typed internal spawn remedy is handled first above.
   defp itemless_non_owner_link_control?(call) do
     itemless_human_assignment_control?(call) or
       itemless_public_dispatch_control?(call) or itemless_public_spawn_control?(call)
@@ -497,6 +497,19 @@ defmodule Tightbeam.DeliveryResponsibilities do
         txn = Keyword.fetch!(opts, :txn)
 
         active_assignment_holder?(txn, session_key, work_item_id)
+
+      {:process, _process} ->
+        case Map.get(call, :transport_session_key) do
+          ^owner ->
+            true
+
+          session_key when is_binary(session_key) ->
+            txn = Keyword.fetch!(opts, :txn)
+            active_assignment_holder?(txn, session_key, work_item_id)
+
+          _ ->
+            false
+        end
 
       _ ->
         false

@@ -741,7 +741,7 @@ defmodule Tightbeam.RulesTest do
 
     Rules.load!(ctx.base_dir, ["spawn"])
 
-    assert {:error, %{code: "forbidden"}} =
+    assert {:error, %{code: "unknown_caller"}} =
              Dispatch.dispatch(ctx.db, %{"spawn" => handler}, process_call)
 
     put_rule(ctx, rule("statute", "spawn", "caller.origin_class", "eq", "process"))

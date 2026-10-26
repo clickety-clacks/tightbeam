@@ -35,6 +35,21 @@ defmodule Tightbeam.Schema do
     }
   ]
 
+  @actor_work_item_body_table_ddl """
+  CREATE TABLE work_item_bodies (
+    workItemId TEXT PRIMARY KEY REFERENCES work_items(id),
+    body TEXT,
+    updatedByUser TEXT REFERENCES users(userId),
+    updatedBySession TEXT REFERENCES sessions(sessionKey),
+    updatedByProcess TEXT,
+    updatedViaSessionKey TEXT,
+    updatedAt INTEGER NOT NULL CHECK(updatedAt >= 0),
+    CHECK(body IS NULL OR (typeof(body) = 'text' AND length(CAST(body AS BLOB)) <= 65536)),
+    CHECK((updatedByUser IS NOT NULL) + (updatedBySession IS NOT NULL) +
+          (updatedByProcess IS NOT NULL) = 1)
+  )
+  """
+
   @schema_modules [
     Tightbeam.Ledger,
     Tightbeam.EventLog,
@@ -405,6 +420,7 @@ defmodule Tightbeam.Schema do
   @decision_request_row_schema_shape "decision-request-row-schema-v2-019"
   @launch_preparation_boot_shape "launch-preparation-boot-v1-0110"
   @evidence_release_shape "launch-preparation-evidence-v1-0112"
+  @actor_attribution_shape "actor-attribution-v1-012"
   @identity_publication_denial_diagnostic_previous_shape @artifact_origin_shape
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
   @supervision_receipt_cancellation_shape "supervision-receipt-cancellation-v1-019"
@@ -1895,6 +1911,7 @@ defmodule Tightbeam.Schema do
 
     Enum.each(@schema_modules, fn
       Tightbeam.Ledger -> :ok
+      Tightbeam.EventLog -> :ok = Tightbeam.EventLog.ensure_pre_actor_schema(db)
       Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
       Tightbeam.NoticeBatcher -> :ok
       Tightbeam.HarnessProcess -> :ok = Tightbeam.HarnessProcess.ensure_historical_schema(db)
@@ -1907,9 +1924,11 @@ defmodule Tightbeam.Schema do
 
     Enum.each(@schema_modules, fn
       Tightbeam.Ledger -> :ok
+      Tightbeam.EventLog -> :ok = Tightbeam.EventLog.ensure_pre_actor_schema(db)
       Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
       Tightbeam.NoticeBatcher -> :ok
       Tightbeam.HarnessProcess -> :ok
+      Tightbeam.Assignments -> :ok = Tightbeam.Assignments.ensure_pre_actor_schema(db)
       module -> :ok = module.ensure_schema(db)
     end)
 
@@ -1931,7 +1950,7 @@ defmodule Tightbeam.Schema do
     :ok = ensure_notice_batch_chat_message_format(db)
 
     # Preserve exact historical Toplines DDL and its stamp if a preceding
-    # migration refuses. Bootstrap already qualified it; now activate V6.
+    # migration refuses. Bootstrap already qualified it; now activate V7.
     :ok = Tightbeam.Toplines.ensure_schema(db)
 
     # Refused predecessors must retain their exact schema, including indexes.
@@ -1957,6 +1976,9 @@ defmodule Tightbeam.Schema do
     :ok = ensure_hot_query_indexes(db)
     :ok = migrate_retired_workspace_cleanup(db)
     :ok = Tightbeam.Ephemeral.migrate(db)
+
+    :ok = upgrade_actor_attribution(db)
+    :ok = Tightbeam.Assignments.ensure_schema(db)
 
     case Tightbeam.CronWake.ensure_schema(db) do
       :ok ->
@@ -1991,6 +2013,89 @@ defmodule Tightbeam.Schema do
     case DB.finish_schema(db) do
       :ok -> Tightbeam.Recognition.activate(db)
       {:error, error} -> raise error
+    end
+  end
+
+  defp upgrade_actor_attribution(db) do
+    marker_ddl = """
+    CREATE TABLE IF NOT EXISTS actor_attribution_schema_stamp (
+      singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+      shape TEXT NOT NULL CHECK(shape = '#{@actor_attribution_shape}'),
+      stampedAt INTEGER NOT NULL CHECK(typeof(stampedAt) = 'integer' AND stampedAt >= 0)
+    )
+    """
+
+    case DB.migration_transaction(
+           db,
+           :actor_attribution,
+           ["PRAGMA foreign_keys=OFF", "PRAGMA legacy_alter_table=ON"],
+           ["PRAGMA legacy_alter_table=OFF", "PRAGMA foreign_keys=ON"],
+           fn txn ->
+             :ok = Txn.exec(txn, marker_ddl)
+             :ok = Tightbeam.EventLog.migrate_transport_session_attribution_in_txn(txn)
+
+             case Txn.q(txn, "SELECT singleton,shape FROM actor_attribution_schema_stamp") do
+               [] ->
+                 case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+                   [[predecessor_shape]]
+                   when predecessor_shape in [
+                          @launch_preparation_boot_shape,
+                          @evidence_release_shape
+                        ] ->
+                     :ok = Tightbeam.Assignments.migrate_actor_attribution_in_txn(txn)
+                     :ok = Tightbeam.WorkItems.migrate_actor_attribution_in_txn(txn)
+
+                     :ok =
+                       Tightbeam.AssignmentCommitRefCorrections.migrate_actor_attribution_in_txn(
+                         txn
+                       )
+
+                     :ok = Tightbeam.Roles.migrate_actor_attribution_in_txn(txn)
+                     :ok = migrate_work_item_body_actor_attribution_in_txn(txn)
+                     :ok = Txn.exec(txn, "ALTER TABLE sessions ADD COLUMN createdByUser TEXT")
+                     :ok = Txn.exec(txn, "ALTER TABLE sessions ADD COLUMN createdBySession TEXT")
+                     :ok = Txn.exec(txn, "ALTER TABLE sessions ADD COLUMN createdByProcess TEXT")
+                     :ok = Txn.exec(txn, "ALTER TABLE sessions ADD COLUMN createdViaSession TEXT")
+
+                     :ok =
+                       Txn.exec(
+                         txn,
+                         "ALTER TABLE decision_requests ADD COLUMN ruledByActorSessionKey TEXT"
+                       )
+
+                     Txn.q(
+                       txn,
+                       "INSERT INTO actor_attribution_schema_stamp (singleton,shape,stampedAt) VALUES (1,?1,?2)",
+                       [@actor_attribution_shape, System.system_time(:millisecond)]
+                     )
+
+                     :ok
+
+                   rows ->
+                     raise ShapeError,
+                       message:
+                         "incompatible actor-attribution predecessor schema stamp: #{inspect(rows)}"
+                 end
+
+               [[1, @actor_attribution_shape]] ->
+                 :ok
+
+               rows ->
+                 raise ShapeError,
+                   message: "incompatible actor-attribution schema stamp: #{inspect(rows)}"
+             end
+           end
+         ) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "actor-attribution schema migration failed and was rolled back: #{Exception.message(error)}"
     end
   end
 
@@ -3268,8 +3373,16 @@ defmodule Tightbeam.Schema do
   defp validate_work_item_body_object!(txn, %{type: type, name: name, sql: expected}) do
     case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2", [type, name]) do
       [[actual]] when is_binary(actual) ->
-        if normalize_schema_sql(actual) != normalize_schema_sql(expected),
-          do: incompatible_work_item_body!("malformed object #{name}")
+        expected_shapes =
+          if name == "work_item_bodies",
+            do: [expected, @actor_work_item_body_table_ddl],
+            else: [expected]
+
+        unless Enum.any?(
+                 expected_shapes,
+                 &(normalize_schema_sql(actual) == normalize_schema_sql(&1))
+               ),
+               do: incompatible_work_item_body!("malformed object #{name}")
 
       [] ->
         incompatible_work_item_body!("missing object #{name}")
@@ -3281,6 +3394,79 @@ defmodule Tightbeam.Schema do
 
   defp incompatible_work_item_body!(detail),
     do: raise(ShapeError, message: "incompatible_work_item_body_v1: #{detail}")
+
+  @doc false
+  def migrate_work_item_body_actor_attribution_in_txn(%Txn{} = txn) do
+    unless Txn.q(txn, "PRAGMA foreign_keys") == [[0]] and
+             Txn.q(txn, "PRAGMA legacy_alter_table") == [[1]],
+           do:
+             raise(ArgumentError,
+               message:
+                 "work-item body actor migration requires foreign_keys OFF and legacy_alter_table ON"
+             )
+
+    old_ddl = Enum.find(@work_item_body_objects, &(&1.name == "work_item_bodies")).sql
+
+    [[actual_ddl]] =
+      Txn.q(txn, "SELECT sql FROM sqlite_schema WHERE type='table' AND name='work_item_bodies'")
+
+    normalized = normalize_schema_sql(actual_ddl)
+
+    cond do
+      normalized == normalize_schema_sql(@actor_work_item_body_table_ddl) ->
+        :ok
+
+      normalized != normalize_schema_sql(old_ddl) ->
+        raise ShapeError,
+          message:
+            "incompatible_work_item_body_v1: actor migration found an unknown body-table shape"
+
+      true ->
+        [[before_count]] = Txn.q(txn, "SELECT COUNT(*) FROM work_item_bodies")
+        previous_fk_violations = Txn.q(txn, "PRAGMA foreign_key_check(work_item_bodies)")
+
+        objects =
+          Txn.q(txn, """
+          SELECT type,name,sql FROM sqlite_schema
+          WHERE tbl_name='work_item_bodies' AND type IN ('index','trigger') AND sql IS NOT NULL
+          ORDER BY type,name
+          """)
+
+        Enum.each(objects, fn [type, name, _sql] ->
+          quoted = "\"" <> String.replace(name, "\"", "\"\"") <> "\""
+          :ok = Txn.exec(txn, "DROP #{String.upcase(type)} #{quoted}")
+        end)
+
+        :ok =
+          Txn.exec(
+            txn,
+            "ALTER TABLE work_item_bodies RENAME TO work_item_bodies_before_actor_attribution"
+          )
+
+        :ok = Txn.exec(txn, @actor_work_item_body_table_ddl)
+
+        :ok =
+          Txn.exec(txn, """
+          INSERT INTO work_item_bodies
+            (rowid,workItemId,body,updatedByUser,updatedBySession,updatedByProcess,
+             updatedViaSessionKey,updatedAt)
+          SELECT rowid,workItemId,body,updatedByUser,updatedBySession,NULL,NULL,updatedAt
+          FROM work_item_bodies_before_actor_attribution
+          """)
+
+        [[^before_count]] = Txn.q(txn, "SELECT COUNT(*) FROM work_item_bodies")
+        :ok = Txn.exec(txn, "DROP TABLE work_item_bodies_before_actor_attribution")
+        Enum.each(objects, fn [_type, _name, sql] -> :ok = Txn.exec(txn, sql) end)
+
+        unless Txn.q(txn, "PRAGMA foreign_key_check(work_item_bodies)") == previous_fk_violations,
+          do:
+            raise(ShapeError,
+              message: "work-item body actor migration changed foreign-key results"
+            )
+
+        :ok
+    end
+  end
 
   @doc false
   @spec ensure_supervision_liveness_v1_in_txn(Txn.t()) :: :ok
@@ -5250,6 +5436,9 @@ defmodule Tightbeam.Schema do
   defp bootstrap_module(db, Tightbeam.Ledger, _current?),
     do: Tightbeam.Ledger.ensure_historical_schema(db)
 
+  defp bootstrap_module(db, Tightbeam.EventLog, _current?),
+    do: Tightbeam.EventLog.ensure_pre_actor_schema(db)
+
   # Health redelivery is installed only after all exact predecessor migrations
   # succeed. Existing wake storage still bootstraps before those migrations.
   defp bootstrap_module(db, Tightbeam.Wakes, _current?),
@@ -5293,7 +5482,7 @@ defmodule Tightbeam.Schema do
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
-        Tightbeam.Assignments.ensure_schema(db)
+        Tightbeam.Assignments.ensure_pre_actor_schema(db)
 
       {:ok, [[_predecessor]]} ->
         Tightbeam.Assignments.ensure_pre_cannot_proceed_schema(db)

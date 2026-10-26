@@ -551,6 +551,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             handle,
             host,
             work_item_id,
+            owner_user_id,
         } => {
             let mut params = vec![
                 string_field("displayName", display_name),
@@ -569,6 +570,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 ("handle", handle.clone().map(Some)),
                 ("host", host.clone().map(Some)),
                 ("workItemId", work_item_id.clone().map(Some)),
+                ("ownerUserId", owner_user_id.clone().map(Some)),
             ] {
                 match value {
                     Some(Some(value)) => params.push(string_field(name, &value)),
@@ -994,12 +996,16 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             identity,
             mementos,
             title,
+            owner_user_id,
             spec_ref_name,
             spec_ref_sha256,
             priority,
             idempotency_key,
         } => {
             let mut params = vec![string_field("title", title)];
+            if let Some(value) = owner_user_id {
+                params.push(string_field("ownerUserId", value));
+            }
             if let Some(value) = spec_ref_name {
                 params.push(string_field("specRefName", value));
             }
@@ -1021,6 +1027,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             title,
             delivery_owner,
             brief,
+            owner_user_id,
         } => {
             let mut params = Vec::new();
             if let Some(value) = work_item_id {
@@ -1031,6 +1038,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             params.push(string_field("deliveryOwnerSessionKey", delivery_owner));
             params.push(string_field("brief", brief));
+            if let Some(value) = owner_user_id {
+                params.push(string_field("ownerUserId", value));
+            }
             Ok(request(identity, "work-item-handoff", vec![], params))
         }
         Command::WorkItemUpdate {

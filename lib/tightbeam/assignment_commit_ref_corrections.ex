@@ -21,8 +21,9 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
     commitRefs         TEXT NOT NULL CHECK (json_valid(commitRefs) AND json_type(commitRefs) = 'array'),
     reason             TEXT NOT NULL CHECK (length(trim(reason)) BETWEEN 1 AND 4000),
     evidenceArtifactId TEXT NOT NULL REFERENCES artifacts(artifactId),
-    actorKind          TEXT NOT NULL CHECK (actorKind IN ('user','session')),
+    actorKind          TEXT NOT NULL CHECK (actorKind IN ('user','session','process')),
     actorRef           TEXT NOT NULL,
+    actorSessionKey    TEXT,
     cause              TEXT NOT NULL CHECK (cause = '#{@cause}'),
     idempotencyKey     TEXT NOT NULL CHECK (length(trim(idempotencyKey)) BETWEEN 1 AND 200),
     requestFingerprint TEXT NOT NULL CHECK (length(requestFingerprint) = 64),
@@ -38,6 +39,104 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
   @doc false
+  def migrate_actor_attribution_in_txn(%Txn{} = txn) do
+    old_columns =
+      ~w(id assignmentId commitRefs reason evidenceArtifactId actorKind actorRef cause idempotencyKey requestFingerprint verifiedAt createdAt)
+
+    new_columns =
+      List.insert_at(
+        old_columns,
+        Enum.find_index(old_columns, &(&1 == "actorRef")) + 1,
+        "actorSessionKey"
+      )
+
+    columns =
+      Txn.q(txn, "PRAGMA table_info(assignment_commit_ref_corrections)")
+      |> Enum.map(&Enum.at(&1, 1))
+
+    case columns do
+      ^new_columns ->
+        :ok
+
+      ^old_columns ->
+        attached =
+          Txn.q(
+            txn,
+            "SELECT type,name,sql FROM sqlite_schema WHERE tbl_name='assignment_commit_ref_corrections' AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name"
+          )
+
+        expected_index =
+          "CREATE INDEX assignment_commit_ref_corrections_assignment ON assignment_commit_ref_corrections (assignmentId, createdAt, id)"
+
+        expected = [
+          [
+            "index",
+            "assignment_commit_ref_corrections_assignment",
+            normalize_schema_sql(expected_index)
+          ]
+        ]
+
+        actual =
+          Enum.map(attached, fn [type, name, sql] ->
+            [type, name, normalize_schema_sql(sql)]
+          end)
+
+        unless actual == expected,
+          do: raise(ArgumentError, "unexpected commit-ref correction schema objects")
+
+        previous_fk_violations =
+          Tightbeam.Schema.migration_foreign_keys_in_txn(
+            txn,
+            ["assignment_commit_ref_corrections"]
+          )
+
+        [[count]] = Txn.q(txn, "SELECT COUNT(*) FROM assignment_commit_ref_corrections")
+
+        :ok =
+          Txn.exec(
+            txn,
+            "CREATE TEMP TABLE assignment_commit_ref_corrections_actor_copy AS SELECT rowid AS __rowid__, * FROM assignment_commit_ref_corrections"
+          )
+
+        :ok = Txn.exec(txn, "DROP INDEX assignment_commit_ref_corrections_assignment")
+
+        :ok =
+          Txn.exec(
+            txn,
+            "ALTER TABLE assignment_commit_ref_corrections RENAME TO assignment_commit_ref_corrections_before_actor"
+          )
+
+        :ok = Txn.exec(txn, @ddl)
+
+        :ok =
+          Txn.exec(
+            txn,
+            "INSERT INTO assignment_commit_ref_corrections (rowid, #{Enum.join(new_columns, ",")}) SELECT __rowid__, id,assignmentId,commitRefs,reason,evidenceArtifactId,actorKind,actorRef,NULL,cause,idempotencyKey,requestFingerprint,verifiedAt,createdAt FROM assignment_commit_ref_corrections_actor_copy"
+          )
+
+        [[^count]] = Txn.q(txn, "SELECT COUNT(*) FROM assignment_commit_ref_corrections")
+        :ok = Txn.exec(txn, "DROP TABLE assignment_commit_ref_corrections_before_actor")
+        :ok = Txn.exec(txn, "DROP TABLE assignment_commit_ref_corrections_actor_copy")
+
+        unless Tightbeam.Schema.migration_foreign_keys_in_txn(
+                 txn,
+                 ["assignment_commit_ref_corrections"]
+               ) -- previous_fk_violations == [],
+               do:
+                 raise(
+                   ArgumentError,
+                   "commit-ref correction actor migration left invalid foreign keys"
+                 )
+
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "unknown commit-ref correction actor-attribution columns: #{inspect(other)}"
+    end
+  end
+
+  @doc false
   def __handle__(db, "assignment-commitref-correct", call), do: correct(db, call)
 
   @doc "List immutable corrections for one assignment in deterministic order."
@@ -50,7 +149,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
         db,
         """
         SELECT id, assignmentId, commitRefs, reason, evidenceArtifactId,
-               actorKind, actorRef, cause, idempotencyKey, verifiedAt, createdAt
+               actorKind, actorRef, actorSessionKey, cause, idempotencyKey, verifiedAt, createdAt
         FROM assignment_commit_ref_corrections
         WHERE assignmentId IN (SELECT value FROM json_each(?1))
         ORDER BY createdAt, id
@@ -65,7 +164,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
     params = Map.get(call, :params, %{})
 
     result =
-      with {:ok, actor} <- actor(Map.get(call, :principal)),
+      with {:ok, actor} <- actor(call),
            :ok <- valid_key(params[:idempotency_key]),
            :ok <- valid_reason(params[:reason]),
            :ok <- valid_artifact_id(params[:evidence_artifact_id]),
@@ -164,9 +263,9 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
                   """
                   INSERT INTO assignment_commit_ref_corrections
                     (id, assignmentId, commitRefs, reason, evidenceArtifactId,
-                     actorKind, actorRef, cause, idempotencyKey, requestFingerprint,
+                     actorKind, actorRef, actorSessionKey, cause, idempotencyKey, requestFingerprint,
                      verifiedAt, createdAt)
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                   """,
                   [
                     id,
@@ -176,6 +275,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
                     context.evidence_artifact_id,
                     actor.kind,
                     actor.ref,
+                    actor.session_key,
                     @cause,
                     call.params[:idempotency_key],
                     context.fingerprint,
@@ -251,6 +351,10 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
 
   defp authorized?(_txn, %{kind: "user", ref: user}, %{owner_user_id: owner}),
     do: user == owner
+
+  defp authorized?(_txn, %{kind: "process"}, %{work_item_id: work_item_id})
+       when is_binary(work_item_id),
+       do: true
 
   defp authorized?(txn, %{kind: "session", ref: caller}, %{
          holder: holder,
@@ -352,7 +456,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
         txn,
         """
         SELECT id, assignmentId, commitRefs, reason, evidenceArtifactId,
-               actorKind, actorRef, cause, idempotencyKey, verifiedAt, createdAt
+               actorKind, actorRef, actorSessionKey, cause, idempotencyKey, verifiedAt, createdAt
         FROM assignment_commit_ref_corrections WHERE id = ?1
         """,
         [id]
@@ -369,6 +473,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
          evidence_artifact_id,
          actor_kind,
          actor_ref,
+         actor_session_key,
          cause,
          idempotency_key,
          verified_at,
@@ -382,6 +487,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
       evidenceArtifactId: evidence_artifact_id,
       actorKind: actor_kind,
       actorRef: actor_ref,
+      actorSessionKey: actor_session_key,
       cause: cause,
       idempotencyKey: idempotency_key,
       verifiedAt: verified_at,
@@ -551,19 +657,26 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
 
   defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
 
-  defp actor({:user, ref}) when is_binary(ref), do: {:ok, %{kind: "user", ref: ref}}
-  defp actor({:session, ref}) when is_binary(ref), do: {:ok, %{kind: "session", ref: ref}}
+  defp actor(%{principal: {:user, ref}} = call) when is_binary(ref),
+    do: {:ok, %{kind: "user", ref: ref, session_key: actor_session_key(call)}}
 
-  defp actor({:process, _}),
-    do: {:error, error("process_denied", "process principals cannot correct commitRefs")}
+  defp actor(%{principal: {:session, ref}} = call) when is_binary(ref),
+    do: {:ok, %{kind: "session", ref: ref, session_key: actor_session_key(call)}}
+
+  defp actor(%{principal: {:process, ref}} = call) when is_binary(ref),
+    do: {:ok, %{kind: "process", ref: ref, session_key: actor_session_key(call)}}
 
   defp actor(_),
     do:
       {:error,
        error(
          "principal_required",
-         "commitRef correction requires a user credential or session token"
+         "commitRef correction requires a caller principal"
        )}
+
+  defp actor_session_key(%{transport_session_key: key}) when is_binary(key), do: key
+  defp actor_session_key(%{principal: {:session, key}}), do: key
+  defp actor_session_key(_call), do: nil
 
   defp valid_key(key) when is_binary(key) do
     if String.trim(key) != "" and String.length(key) <= 200,
@@ -603,4 +716,6 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
   end
 
   defp error(code, message), do: %{code: code, message: message}
+
+  defp normalize_schema_sql(sql), do: sql |> String.replace(~r/\s+/, " ") |> String.trim()
 end

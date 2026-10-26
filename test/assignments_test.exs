@@ -6217,7 +6217,19 @@ defmodule Tightbeam.AssignmentsTest do
     refute message =~ String.duplicate("c", 40)
   end
 
-  test "non-session commit-ref attestations remain refused", ctx do
+  test "non-session commit-ref attestations retain actor attribution", ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
     assignment =
       assign_call({:user, "flynn"}, "non-session evidence")
       |> put_in([:params, :effect_kind], "code")
@@ -6227,18 +6239,38 @@ defmodule Tightbeam.AssignmentsTest do
       %{"repo" => "testhost:/tmp/non-session-evidence", "commit" => String.duplicate("a", 40)}
     ]
 
+    review =
+      assign_call({:user, "flynn"}, "non-session review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], assignment.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, assignment.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{byUser: "flynn", byActorSession: nil}} =
+             attest_call({:user, "flynn"}, assignment.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], refs)
+             |> then(&handle(ctx, "attest", &1))
+
     completion =
       attest_call({:user, "flynn"}, assignment.id, "completion")
       |> put_in([:params, :commit_refs], refs)
 
-    assert %{code: "not_holder"} = handle(ctx, "attest", completion)
-
-    verification =
-      attest_call({:user, "flynn"}, assignment.id, "verdict")
-      |> put_in([:params, :verdict_kind], "verified")
-      |> put_in([:params, :commit_refs], refs)
-
-    assert %{code: "not_holder"} = handle(ctx, "attest", verification)
+    assert %{
+             attest: %{byUser: "flynn", byActorSession: nil},
+             assignment: %{outcome: "completed"}
+           } =
+             handle(ctx, "attest", completion)
   end
 
   test "a later review retraction before code completion defeats code completion", ctx do

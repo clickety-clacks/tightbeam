@@ -4481,6 +4481,58 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, key).handle == "builder"
     assert Org.get(ctx.db, key).model == Model.new("claude-fable-5")
 
+    assert %{code: "missing_owner_user"} =
+             spawn.(%{
+               origin: "process:cron",
+               principal: {:process, "cron"},
+               transport_session_key: "k1",
+               params: %{
+                 display_name: "Unowned Automation",
+                 handle: "unowned-automation",
+                 idempotency_key: "spawn-unowned-automation"
+               }
+             })
+
+    owner_user_id = ctx.device.user_id
+    process_work_item = create_work_item(ctx.db, "Process role creation")
+
+    assert %{ownerUserId: ^owner_user_id, deliveryOwnerSessionKey: "k1"} =
+             WorkItems.__handle__(ctx.db, "work-item-update", %{
+               verb: "work-item-update",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: nil,
+               params: %{
+                 work_item_id: process_work_item.id,
+                 delivery_owner_session_key: "k1"
+               }
+             })
+
+    process_created =
+      spawn.(%{
+        origin: "process:cron",
+        principal: {:process, "cron"},
+        transport_session_key: "k1",
+        params: %{
+          display_name: "Automation Builder",
+          handle: "automation-builder",
+          owner_user_id: owner_user_id,
+          work_item_id: process_work_item.id,
+          idempotency_key: "spawn-automation-builder"
+        }
+      })
+
+    assert %{name: "automation-builder", owner_user_id: ^owner_user_id} =
+             Roles.get(ctx.db, "automation-builder")
+
+    assert %{
+             created_by_user: nil,
+             created_by_session: nil,
+             created_by_process: "cron",
+             created_via_session_key: "k1",
+             owner_user_id: ^owner_user_id
+           } = Org.get(ctx.db, process_created.session_key)
+
     Roles.create!(ctx.db, "taken", "flynn", nil)
     {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
 
@@ -8630,7 +8682,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{ok: true} = Task.await(cancel)
   end
 
-  test "role verbs record mutations from any accountable caller and deny processes", ctx do
+  test "role verbs record mutations from users and processes", ctx do
     {:pending, _} =
       Devices.pair(ctx.db, %{
         device_id: "other-device",
@@ -8651,16 +8703,44 @@ defmodule Tightbeam.GatewayTest do
 
     Roles.create!(ctx.db, "other-office", "other", other.session_key)
 
-    for verb <- ["role-create", "role-bind", "role-rm"] do
-      params =
-        case verb do
-          "role-create" -> %{name: "process-office"}
-          "role-bind" -> %{name: "flynn-office", session_key: "k1"}
-          "role-rm" -> %{name: "flynn-office"}
-        end
+    assert %{code: "missing_owner_user"} =
+             handlers["role-create"].(%{
+               origin: "process:cron",
+               principal: {:process, "cron"},
+               params: %{name: "process-office"}
+             })
 
-      assert %{code: "denied"} = handlers[verb].(%{origin: "process:cron", params: params})
-    end
+    assert %{role: %{owner_user_id: "other"}} =
+             handlers["role-create"].(%{
+               origin: "process:cron",
+               principal: {:process, "cron"},
+               transport_session_key: "k1",
+               params: %{name: "process-office", owner_user_id: "other"}
+             })
+
+    assert {:ok, [[nil, nil, "cron", "k1"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT createdByUser,createdBySession,createdByProcess,createdViaSession FROM roles WHERE name='process-office'"
+             )
+
+    assert %{role: %{bound_session_key: bound_key}} =
+             handlers["role-bind"].(%{
+               origin: "process:cron",
+               principal: {:process, "cron"},
+               transport_session_key: "k1",
+               params: %{name: "process-office", session_key: other.session_key}
+             })
+
+    assert bound_key == other.session_key
+
+    assert %{removed: "process-office"} =
+             handlers["role-rm"].(%{
+               origin: "process:cron",
+               principal: {:process, "cron"},
+               transport_session_key: "k1",
+               params: %{name: "process-office"}
+             })
 
     assert %{role: %{bound_session_key: "agent:other"}} =
              handlers["role-bind"].(%{

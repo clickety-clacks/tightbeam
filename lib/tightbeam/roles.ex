@@ -78,6 +78,7 @@ defmodule Tightbeam.Roles do
           error
 
         role ->
+          record_creator_in_txn(txn, name, call)
           Publisher.maybe_accepted_in_txn(txn, call, %{role: firehose_role_in_txn(txn, name)})
           role
       end
@@ -91,6 +92,49 @@ defmodule Tightbeam.Roles do
       {:error, error} -> raise TransactionError, error: error
       role -> role
     end
+  end
+
+  @doc false
+  def create_in_txn!(%Txn{} = txn, name, owner_user_id, bound_session_key, call) do
+    case create!(txn, name, owner_user_id, bound_session_key) do
+      {:error, error} ->
+        raise TransactionError, error: error
+
+      role ->
+        record_creator_in_txn(txn, name, call)
+        role
+    end
+  end
+
+  @doc false
+  def migrate_actor_attribution_in_txn(%Txn{} = txn) do
+    columns = Txn.q(txn, "PRAGMA table_info(roles)") |> Enum.map(&Enum.at(&1, 1))
+
+    case columns do
+      ["name", "boundSessionKey", "ownerUserId", "createdAt", "updatedAt"] ->
+        :ok = Txn.exec(txn, "ALTER TABLE roles ADD COLUMN createdByUser TEXT")
+        :ok = Txn.exec(txn, "ALTER TABLE roles ADD COLUMN createdBySession TEXT")
+        :ok = Txn.exec(txn, "ALTER TABLE roles ADD COLUMN createdByProcess TEXT")
+        :ok = Txn.exec(txn, "ALTER TABLE roles ADD COLUMN createdViaSession TEXT")
+
+      [
+        "name",
+        "boundSessionKey",
+        "ownerUserId",
+        "createdAt",
+        "updatedAt",
+        "createdByUser",
+        "createdBySession",
+        "createdByProcess",
+        "createdViaSession"
+      ] ->
+        :ok
+
+      other ->
+        raise ArgumentError, "unknown roles actor-attribution columns: #{inspect(other)}"
+    end
+
+    :ok
   end
 
   @doc "Bind a role to an existing active session."
@@ -271,6 +315,46 @@ defmodule Tightbeam.Roles do
       created_at: created_at,
       updated_at: updated_at
     }
+  end
+
+  defp record_creator_in_txn(txn, name, call) do
+    {user, session, process} =
+      case call[:principal] do
+        {:user, actor} ->
+          {actor, nil, nil}
+
+        {:session, actor} ->
+          {nil, actor, nil}
+
+        {:process, actor} ->
+          {nil, nil, actor}
+
+        {:remedy, _} ->
+          case call[:origin] do
+            "process:" <> actor -> {nil, nil, actor}
+            "session:" <> actor -> {nil, actor, nil}
+            "user:" <> actor -> {actor, nil, nil}
+            _ -> {nil, nil, nil}
+          end
+
+        _ ->
+          {nil, nil, nil}
+      end
+
+    actor_session =
+      call[:transport_session_key] ||
+        case call[:principal] do
+          {:session, actor} -> actor
+          _ -> nil
+        end
+
+    Txn.q(
+      txn,
+      "UPDATE roles SET createdByUser=?2, createdBySession=?3, createdByProcess=?4, createdViaSession=?5 WHERE name=?1",
+      [name, user, session, process, actor_session]
+    )
+
+    :ok
   end
 
   defp transaction!(db, fun) do

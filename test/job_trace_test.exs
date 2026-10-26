@@ -245,7 +245,7 @@ defmodule Tightbeam.JobTraceTest do
 
     assert %{code: "not_found"} = trace(db, {:user, "other"}, "wi_trace")
     assert %{code: "not_found"} = trace(db, {:session, "other-session"}, "wi_trace")
-    assert %{code: "not_found"} = trace(db, {:process, "cron"}, "wi_trace")
+    assert trace == trace(db, {:process, "cron"}, "wi_trace")
     assert %{code: "not_found"} = trace(db, {:user, "owner"}, "wi_missing")
 
     assert_keys(trace, ~w(assignments timeline workItem)a)

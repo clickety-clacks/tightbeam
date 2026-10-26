@@ -41,8 +41,7 @@ defmodule Tightbeam.CheckTierTest do
       ["bad1", assignment.id, "verdict", nil, nil, "reviewer", nil, 1],
       ["bad2", assignment.id, "verdict", "tests-passed", nil, nil, nil, 1],
       ["bad3", assignment.id, "verdict", "tests-passed", nil, "reviewer", "other", 1],
-      ["bad4", assignment.id, "progress", "tests-passed", nil, "holder", nil, 1],
-      ["bad5", assignment.id, "progress", nil, nil, nil, "flynn", 1]
+      ["bad4", assignment.id, "progress", "tests-passed", nil, "holder", nil, 1]
     ]
 
     Enum.each(invalid, fn params ->
@@ -55,6 +54,20 @@ defmodule Tightbeam.CheckTierTest do
 
       assert message =~ "CHECK constraint"
     end)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO attests
+                 (id, assignmentId, kind, verdictKind, note, bySession, byUser, ts)
+               VALUES ('user-progress', ?1, 'progress', NULL, NULL, NULL, 'flynn', 1)
+               """,
+               [assignment.id]
+             )
+
+    assert {:ok, [["flynn"]]} =
+             DB.query(ctx.db, "SELECT byUser FROM attests WHERE id='user-progress'")
 
     progress = attest(ctx, {:session, "holder"}, assignment.id, "progress")
     assert progress.attest.verdictKind == nil
@@ -84,7 +97,11 @@ defmodule Tightbeam.CheckTierTest do
 
     assert length(Assignments.list_attests(ctx.db, assignment.id)) == 3
     assert Assignments.verdict_kinds(ctx.db, assignment.id) == ["tests-passed"]
-    assert %{code: "process_denied"} = verdict(ctx, {:process, "cron"}, assignment.id, "reviewed")
+
+    process_result = verdict(ctx, {:process, "cron"}, assignment.id, "reviewed")
+    assert process_result.attest.byProcess == "cron"
+    assert process_result.attest.byActorSession == nil
+    assert length(Assignments.list_attests(ctx.db, assignment.id)) == 4
     assert %{code: "principal_required"} = verdict(ctx, nil, assignment.id, "reviewed")
 
     assert %{code: "unknown_assignment"} =
@@ -156,7 +173,13 @@ defmodule Tightbeam.CheckTierTest do
     assert Enum.map(rows, & &1.id) == expected
     assert Enum.all?(rows, &Map.has_key?(&1, :verdictKind))
     assert %{attests: [_ | _]} = query_attests(ctx, {:user, "flynn"}, assignment.id)
-    assert %{code: "process_denied"} = query_attests(ctx, {:process, "cron"}, assignment.id)
+    process_result = verdict(ctx, {:process, "cron"}, assignment.id, "reviewed")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE attests SET ts = 7 WHERE id = ?1", [process_result.attest.id])
+
+    assert %{attests: rows} = query_attests(ctx, {:process, "cron"}, assignment.id)
+    assert Enum.map(rows, & &1.id) == Enum.sort(expected ++ [process_result.attest.id])
     assert %{code: "principal_required"} = query_attests(ctx, nil, assignment.id)
     assert %{code: "unknown_assignment"} = query_attests(ctx, {:user, "flynn"}, "missing")
   end

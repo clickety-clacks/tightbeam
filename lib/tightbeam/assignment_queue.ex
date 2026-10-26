@@ -99,6 +99,16 @@ defmodule Tightbeam.AssignmentQueue do
            user_id == opener_owner_user_id
 
   defp authorized?(
+         {:process, process},
+         _opened_by_user,
+         _opened_by_session,
+         _owner_user_id,
+         _opener_owner_user_id
+       )
+       when is_binary(process) and process != "",
+       do: true
+
+  defp authorized?(
          _principal,
          _opened_by_user,
          _opened_by_session,

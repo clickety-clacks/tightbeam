@@ -264,8 +264,24 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     )
   end
 
-  test "process principals and malformed requests cannot enter the correction ledger", ctx do
-    assert %{code: "process_denied"} = correct(ctx, {:process, "tightbeam"})
+  test "process corrections retain actor and acting session; malformed requests are refused",
+       ctx do
+    process_call = %{
+      principal: {:process, "scheduler"},
+      transport_session_key: "po-owner",
+      params: params(ctx)
+    }
+
+    assert %{correction: correction} =
+             AssignmentCommitRefCorrections.__handle__(
+               ctx.db,
+               "assignment-commitref-correct",
+               process_call
+             )
+
+    assert correction.actorKind == "process"
+    assert correction.actorRef == "scheduler"
+    assert correction.actorSessionKey == "po-owner"
 
     for {field, value, code} <- [
           {:idempotency_key, "", "invalid_idempotency_key"},

@@ -1,10 +1,11 @@
 defmodule Tightbeam.Toplines.Schema do
-  @moduledoc "The closed Toplines schema manifest and transactional V5-to-V6 activation rail."
+  @moduledoc "The closed Toplines schema manifest and transactional V5-to-V7 activation rail."
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
-  @shape "standalone-toplines-v6"
+  @shape "standalone-toplines-v7"
+  @v6_shape "standalone-toplines-v6"
   @previous_shape "standalone-toplines-v5"
 
   # Immutable released predecessor; only the two title CHECK groups change in V6.
@@ -371,27 +372,106 @@ defmodule Tightbeam.Toplines.Schema do
 
   @title_tables ["toplines", "topline_concerns"]
   @title_indexes ["toplines_id_owner", "topline_concerns_id_topline"]
-  @objects Enum.map(@v5_objects, fn object ->
-             if object.name in @title_tables do
-               # Unicode normalization and scalar limits are enforced by the
-               # product API. Persisted DDL must also work in bare SQLite.
-               sql =
-                 object.sql
-                 |> String.split("\n")
-                 |> Enum.reject(&String.contains?(&1, "tightbeam_"))
-                 |> Enum.join("\n")
+  @v6_objects Enum.map(@v5_objects, fn object ->
+                if object.name in @title_tables do
+                  # Unicode normalization and scalar limits are enforced by the
+                  # product API. Persisted DDL must also work in bare SQLite.
+                  sql =
+                    object.sql
+                    |> String.split("\n")
+                    |> Enum.reject(&String.contains?(&1, "tightbeam_"))
+                    |> Enum.join("\n")
 
-               %{object | sql: sql}
-             else
-               object
-             end
+                  %{object | sql: sql}
+                else
+                  object
+                end
+              end)
+
+  @objects Enum.map(@v6_objects, fn object ->
+             sql =
+               object.sql
+               |> String.replace(
+                 "createdActorKind IN ('user','session')",
+                 "createdActorKind IN ('user','session','process')"
+               )
+               |> String.replace(
+                 "createdActorRef  TEXT NOT NULL CHECK (length(trim(createdActorRef)) > 0),",
+                 "createdActorRef  TEXT NOT NULL CHECK (length(trim(createdActorRef)) > 0),\n  createdActorSessionKey TEXT,"
+               )
+               |> String.replace(
+                 "createdActorRef   TEXT NOT NULL CHECK (length(trim(createdActorRef)) > 0),",
+                 "createdActorRef   TEXT NOT NULL CHECK (length(trim(createdActorRef)) > 0),\n          createdActorSessionKey TEXT,"
+               )
+               |> String.replace(
+                 "linkedActorKind   TEXT NOT NULL CHECK (linkedActorKind IN ('user','session'))",
+                 "linkedActorKind   TEXT NOT NULL CHECK (linkedActorKind IN ('user','session','process'))"
+               )
+               |> String.replace(
+                 "linkedActorRef    TEXT NOT NULL CHECK (length(trim(linkedActorRef)) > 0),",
+                 "linkedActorRef    TEXT NOT NULL CHECK (length(trim(linkedActorRef)) > 0),\n          linkedActorSessionKey TEXT,"
+               )
+               |> String.replace(
+                 "unlinkedActorKind IN ('user','session')",
+                 "unlinkedActorKind IN ('user','session','process')"
+               )
+               |> String.replace(
+                 "unlinkedActorRef  TEXT,",
+                 "unlinkedActorRef  TEXT,\n          unlinkedActorSessionKey TEXT,"
+               )
+               |> String.replace(
+                 "taggedActorKind   TEXT NOT NULL CHECK (taggedActorKind IN ('user','session'))",
+                 "taggedActorKind   TEXT NOT NULL CHECK (taggedActorKind IN ('user','session','process'))"
+               )
+               |> String.replace(
+                 "taggedActorRef    TEXT NOT NULL CHECK (length(trim(taggedActorRef)) > 0),",
+                 "taggedActorRef    TEXT NOT NULL CHECK (length(trim(taggedActorRef)) > 0),\n          taggedActorSessionKey TEXT,"
+               )
+               |> String.replace(
+                 "actorKind           TEXT NOT NULL CHECK (actorKind IN ('user','session'))",
+                 "actorKind           TEXT NOT NULL CHECK (actorKind IN ('user','session','process'))"
+               )
+               |> String.replace(
+                 "actorRef            TEXT NOT NULL CHECK (length(trim(actorRef)) > 0),",
+                 "actorRef            TEXT NOT NULL CHECK (length(trim(actorRef)) > 0),\n          actorSessionKey TEXT,"
+               )
+               |> String.replace(
+                 "callerUserId       TEXT NOT NULL REFERENCES users(userId),",
+                 "callerActorKind TEXT NOT NULL CHECK (callerActorKind IN ('user','session','process')),\n          callerActorRef TEXT NOT NULL CHECK (length(trim(callerActorRef)) > 0),\n          callerSessionKey TEXT,\n          callerIdempotencyKind TEXT NOT NULL CHECK (callerIdempotencyKind IN ('user','process')),\n          callerIdempotencyRef TEXT NOT NULL CHECK (length(trim(callerIdempotencyRef)) > 0),"
+               )
+               |> String.replace(
+                 "PRIMARY KEY (callerUserId, operation, idempotencyKey)",
+                 "PRIMARY KEY (callerIdempotencyKind, callerIdempotencyRef, operation, idempotencyKey)"
+               )
+               |> String.replace(
+                 "openedActorRef           TEXT NOT NULL CHECK (length(trim(openedActorRef)) > 0),",
+                 "openedActorRef           TEXT NOT NULL CHECK (length(trim(openedActorRef)) > 0),\n          openedActorSessionKey TEXT,"
+               )
+               |> String.replace(
+                 "resolutionActorRef       TEXT,",
+                 "resolutionActorRef       TEXT,\n          resolutionActorSessionKey TEXT,"
+               )
+               |> String.replace(
+                 "(openedActorKind IN ('user','session') OR\n              (openedActorKind = 'process' AND openedActorRef = 'tightbeam'))",
+                 "openedActorKind IN ('user','session','process')"
+               )
+               |> String.replace(
+                 "openedActorKind IN ('user','session')",
+                 "openedActorKind IN ('user','session','process')"
+               )
+               |> String.replace(
+                 "resolutionActorKind IN ('user','session')",
+                 "resolutionActorKind IN ('user','session','process')"
+               )
+
+             %{object | sql: sql}
            end)
 
   @doc "Return the exact closed Toplines object manifest."
   @spec manifest() :: [map()]
   def manifest, do: @objects
 
-  @doc "Activate V6 or migrate its exact stamped V5 predecessor without inferring old state."
+  @doc "Activate V7 or migrate its exact stamped V5/V6 predecessor without inferring old state."
   @spec activate(DB.server(), non_neg_integer(), keyword()) :: :ok | {:error, map()}
   def activate(db, stamped_at \\ System.system_time(:millisecond), opts \\ [])
 
@@ -465,15 +545,32 @@ defmodule Tightbeam.Toplines.Schema do
           @shape ->
             if exact_manifest?(stored), do: :ok, else: refusal("schema_shape_mismatch")
 
+          @v6_shape ->
+            v6_stored = stored_objects(txn, @v6_objects)
+
+            if exact_manifest?(v6_stored, @v6_objects) and portable_actor_rebuild_allowed?(txn) do
+              if Keyword.get(opts, :defer_v6_migration, false),
+                do: :ok,
+                else: migrate_v6!(txn, activated_at, opts)
+            else
+              refusal("schema_shape_mismatch")
+            end
+
           @previous_shape ->
             if exact_manifest?(stored, @v5_objects) and portable_rebuild_allowed?(txn) do
               # Bootstrap must qualify the predecessor without rewriting it:
               # a later unrelated migration can still refuse this database.
               # Final activation repeats this qualification inside its rebuild
               # transaction after the other boot migrations have succeeded.
-              if Keyword.get(opts, :defer_v5_migration, false),
-                do: :ok,
-                else: migrate_v5!(txn, activated_at, opts)
+              if Keyword.get(opts, :defer_v5_migration, false) do
+                :ok
+              else
+                :ok = migrate_v5!(txn, activated_at, opts)
+
+                if Keyword.get(opts, :defer_v6_migration, false),
+                  do: :ok,
+                  else: migrate_v6!(txn, activated_at, opts)
+              end
             else
               refusal("schema_shape_mismatch")
             end
@@ -499,7 +596,7 @@ defmodule Tightbeam.Toplines.Schema do
       """)
 
     expected = Enum.sort(@title_tables ++ @title_indexes) |> Enum.map(&[&1])
-    known_tables = for object <- @objects, object.type == "table", do: object.name
+    known_tables = for object <- @v6_objects, object.type == "table", do: object.name
 
     attached == expected and
       Enum.all?(Txn.q(txn, "SELECT name FROM sqlite_schema WHERE type='table'"), fn [name] ->
@@ -513,7 +610,7 @@ defmodule Tightbeam.Toplines.Schema do
 
   defp migrate_v5!(txn, stamped_at, opts) do
     previous_fk_violations =
-      Enum.flat_map(@objects, fn
+      Enum.flat_map(@v6_objects, fn
         %{type: "table", name: name} -> Txn.q(txn, "PRAGMA foreign_key_check(#{name})")
         _ -> []
       end)
@@ -544,7 +641,7 @@ defmodule Tightbeam.Toplines.Schema do
     :ok = Txn.exec(txn, "PRAGMA defer_foreign_keys=ON")
 
     Enum.each(@title_tables, fn name ->
-      %{sql: sql} = Enum.find(@objects, &(&1.name == name))
+      %{sql: sql} = Enum.find(@v6_objects, &(&1.name == name))
       columns = Txn.q(txn, "PRAGMA table_info(#{name})") |> Enum.map(&Enum.at(&1, 1))
       columns = Enum.join(["rowid" | columns], ", ")
       copy = "toplines_v6_#{name}_copy"
@@ -554,7 +651,7 @@ defmodule Tightbeam.Toplines.Schema do
       :ok = Txn.exec(txn, sql)
 
       index = if name == "toplines", do: "toplines_id_owner", else: "topline_concerns_id_topline"
-      :ok = Txn.exec(txn, Enum.find(@objects, &(&1.name == index)).sql)
+      :ok = Txn.exec(txn, Enum.find(@v6_objects, &(&1.name == index)).sql)
       rejected = invalid_titles[name]
       rejected_sql = if rejected == [], do: "0", else: "rowid IN (#{Enum.join(rejected, ",")})"
 
@@ -584,10 +681,173 @@ defmodule Tightbeam.Toplines.Schema do
     end)
 
     # Only a new violation belongs to this migration.
-    for object <- @objects, object.type == "table" do
+    for object <- @v6_objects, object.type == "table" do
       unless Txn.q(txn, "PRAGMA foreign_key_check(#{object.name})") -- previous_fk_violations ==
                [],
              do: raise("Toplines migration found invalid foreign keys in #{object.name}")
+    end
+
+    verify_manifest!(txn, @v6_objects)
+
+    Txn.q(txn, "UPDATE topline_schema_stamp SET shape=?1, stampedAt=?2 WHERE singleton=1", [
+      @v6_shape,
+      stamped_at
+    ])
+
+    maybe_interrupt!(opts, :after_stamp)
+    :ok
+  end
+
+  @actor_tables ~w(
+    toplines
+    topline_work_memberships
+    topline_concerns
+    topline_concern_refs
+    topline_events
+    topline_idempotency
+    topline_placement_obligations
+  )
+
+  defp portable_actor_rebuild_allowed?(txn) do
+    attached =
+      Txn.q(txn, """
+      SELECT type, name, tbl_name FROM sqlite_schema
+      WHERE tbl_name IN (#{Enum.map_join(@actor_tables, ",", &("'" <> &1 <> "'"))})
+        AND type IN ('index', 'trigger') AND sql IS NOT NULL
+      ORDER BY type, name
+      """)
+
+    expected =
+      @v6_objects
+      |> Enum.filter(fn object ->
+        object.type in ["index", "trigger"] and
+          attached_to_actor_table?(object.sql)
+      end)
+      |> Enum.map(fn object ->
+        table =
+          if object.type == "trigger" do
+            case Regex.run(~r/\bON\s+([A-Za-z0-9_]+)/i, object.sql) do
+              [_, name] -> name
+            end
+          else
+            case Regex.run(~r/\bON\s+([A-Za-z0-9_]+)/i, object.sql) do
+              [_, name] -> name
+            end
+          end
+
+        [object.type, object.name, table]
+      end)
+      |> Enum.sort()
+
+    known_tables = for object <- @v6_objects, object.type == "table", do: object.name
+
+    attached == expected and
+      Enum.all?(Txn.q(txn, "SELECT name FROM sqlite_schema WHERE type='table'"), fn [name] ->
+        quoted = String.replace(name, "\"", "\"\"")
+        refs = Txn.q(txn, "PRAGMA foreign_key_list(\"#{quoted}\")")
+
+        name in known_tables or
+          Enum.all?(refs, fn row -> String.downcase(Enum.at(row, 2)) not in @actor_tables end)
+      end)
+  end
+
+  defp attached_to_actor_table?(sql) do
+    case Regex.run(~r/\bON\s+([A-Za-z0-9_]+)/i, sql) do
+      [_, table] -> table in @actor_tables
+      _ -> false
+    end
+  end
+
+  defp migrate_v6!(txn, stamped_at, opts) do
+    previous_fk_violations =
+      Enum.flat_map(@v6_objects, fn
+        %{type: "table", name: name} -> Txn.q(txn, "PRAGMA foreign_key_check(#{name})")
+        _ -> []
+      end)
+
+    counts =
+      Map.new(@actor_tables, fn name ->
+        [[count]] = Txn.q(txn, "SELECT COUNT(*) FROM #{name}")
+        {name, count}
+      end)
+
+    Enum.each(@actor_tables, fn name ->
+      copy = "toplines_v7_#{name}_copy"
+
+      :ok =
+        Txn.exec(txn, "CREATE TEMP TABLE #{copy} AS SELECT rowid AS __rowid__, * FROM #{name}")
+    end)
+
+    :ok = Txn.exec(txn, "PRAGMA defer_foreign_keys=ON")
+
+    Enum.each(@actor_tables, fn name ->
+      :ok = Txn.exec(txn, "DROP TABLE #{name}")
+    end)
+
+    @objects
+    |> Enum.filter(&(&1.type == "table" and &1.name in @actor_tables))
+    |> Enum.each(fn object ->
+      :ok = Txn.exec(txn, object.sql)
+    end)
+
+    Enum.each(@actor_tables, fn name ->
+      copy = "toplines_v7_#{name}_copy"
+      columns = Txn.q(txn, "PRAGMA table_info(#{name})") |> Enum.map(&Enum.at(&1, 1))
+      source_columns = Txn.q(txn, "PRAGMA table_info(#{copy})") |> Enum.map(&Enum.at(&1, 1))
+
+      if name == "topline_idempotency" do
+        expressions =
+          Enum.map(columns, fn column ->
+            cond do
+              column == "callerActorKind" -> "'user'"
+              column == "callerActorRef" -> "callerUserId"
+              column == "callerSessionKey" -> "NULL"
+              column == "callerIdempotencyKind" -> "'user'"
+              column == "callerIdempotencyRef" -> "callerUserId"
+              column in source_columns -> column
+              true -> "NULL"
+            end
+          end)
+
+        :ok =
+          Txn.exec(
+            txn,
+            "INSERT INTO #{name} (rowid, #{Enum.join(columns, ", ")}) SELECT __rowid__, #{Enum.join(expressions, ", ")} FROM #{copy}"
+          )
+      else
+        expressions =
+          Enum.map(columns, fn column ->
+            if column in source_columns, do: column, else: "NULL"
+          end)
+
+        :ok =
+          Txn.exec(
+            txn,
+            "INSERT INTO #{name} (rowid, #{Enum.join(columns, ", ")}) SELECT __rowid__, #{Enum.join(expressions, ", ")} FROM #{copy}"
+          )
+      end
+
+      [[count]] = Txn.q(txn, "SELECT COUNT(*) FROM #{name}")
+
+      unless count == counts[name],
+        do: raise("Toplines actor migration changed #{name} row count")
+
+      :ok = Txn.exec(txn, "DROP TABLE #{copy}")
+    end)
+
+    @objects
+    |> Enum.filter(&(&1.type in ["index", "trigger"]))
+    |> Enum.each(fn object ->
+      case Txn.q(txn, "SELECT 1 FROM sqlite_schema WHERE name=?1", [object.name]) do
+        [[1]] -> :ok
+        [] -> :ok = Txn.exec(txn, object.sql)
+      end
+    end)
+
+    for object <- @objects, object.type == "table" do
+      unless Txn.q(txn, "PRAGMA foreign_key_check(#{object.name})") -- previous_fk_violations ==
+               [],
+             do: raise("Toplines actor migration found invalid foreign keys in #{object.name}")
     end
 
     verify_manifest!(txn)
@@ -597,12 +857,12 @@ defmodule Tightbeam.Toplines.Schema do
       stamped_at
     ])
 
-    maybe_interrupt!(opts, :after_stamp)
+    maybe_interrupt!(opts, :after_actor_stamp)
     :ok
   end
 
-  defp stored_objects(txn) do
-    names = Enum.map(@objects, & &1.name)
+  defp stored_objects(txn, objects \\ @objects) do
+    names = Enum.map(objects, & &1.name)
     placeholders = names |> Enum.with_index(1) |> Enum.map_join(",", fn {_name, i} -> "?#{i}" end)
 
     txn
@@ -619,8 +879,8 @@ defmodule Tightbeam.Toplines.Schema do
     end)
   end
 
-  defp verify_manifest!(txn) do
-    unless exact_manifest?(stored_objects(txn)) do
+  defp verify_manifest!(txn, objects \\ @objects) do
+    unless exact_manifest?(stored_objects(txn, objects), objects) do
       raise "Toplines schema manifest did not round-trip through sqlite_schema"
     end
   end

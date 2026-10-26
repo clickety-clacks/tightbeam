@@ -38,6 +38,37 @@ defmodule Tightbeam.WorkItems do
   @origin "process:tightbeam"
   @default_triage_deadline_ms 86_400_000
 
+  @actor_work_items_ddl """
+  CREATE TABLE work_items (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL CHECK(length(trim(title)) BETWEEN 1 AND 2000),
+    specRefName TEXT NULL CHECK(specRefName IS NULL OR length(trim(specRefName)) BETWEEN 1 AND 2000),
+    specRefSha256 TEXT NULL CHECK(specRefSha256 IS NULL OR (length(specRefSha256) = 64 AND specRefSha256 NOT GLOB '*[^0-9a-f]*')),
+    isBug INTEGER NOT NULL DEFAULT 0 CHECK(isBug IN (0, 1)),
+    ownerUserId TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open','iceboxed','closed','failed')),
+    failReason TEXT NULL,
+    routingWakeId TEXT NULL,
+    slateWakeId TEXT NULL,
+    createdByUser TEXT NULL,
+    createdBySession TEXT NULL,
+    createdByProcess TEXT NULL,
+    createdByViaSessionKey TEXT NULL,
+    createdInTurnSeq INTEGER NULL,
+    createdContextKnown INTEGER NOT NULL DEFAULT 0,
+    createdAt INTEGER NOT NULL,
+    deliveryOwnerSessionKey TEXT NULL REFERENCES sessions(sessionKey),
+    CHECK((specRefName IS NULL) = (specRefSha256 IS NULL)),
+    CHECK((createdByUser IS NOT NULL) + (createdBySession IS NOT NULL) +
+          (createdByProcess IS NOT NULL) = 1)
+  )
+  """
+
+  @actor_work_item_columns "id,title,specRefName,specRefSha256,isBug,ownerUserId,state," <>
+                             "failReason,routingWakeId,slateWakeId,createdByUser,createdBySession,createdByProcess," <>
+                             "createdByViaSessionKey,createdInTurnSeq,createdContextKnown,createdAt," <>
+                             "deliveryOwnerSessionKey"
+
   defmodule CancellationRefused do
     @moduledoc false
     defexception [:wake_id]
@@ -61,11 +92,14 @@ defmodule Tightbeam.WorkItems do
     slateWakeId TEXT NULL,
     createdByUser TEXT NULL,
     createdBySession TEXT NULL,
+    createdByProcess TEXT NULL,
+    createdByViaSessionKey TEXT NULL,
     createdInTurnSeq INTEGER NULL,
     createdContextKnown INTEGER NOT NULL DEFAULT 0,
     createdAt INTEGER NOT NULL,
     CHECK((specRefName IS NULL) = (specRefSha256 IS NULL)),
-    CHECK((createdByUser IS NOT NULL) != (createdBySession IS NOT NULL))
+    CHECK((createdByUser IS NOT NULL) + (createdBySession IS NOT NULL) +
+          (createdByProcess IS NOT NULL) = 1)
   );
   CREATE TABLE IF NOT EXISTS work_item_versions (
     workItemId TEXT PRIMARY KEY REFERENCES work_items(id),
@@ -86,6 +120,78 @@ defmodule Tightbeam.WorkItems do
   def ensure_schema(db \\ Tightbeam.DB) do
     with :ok <- DB.execute(db, @ddl),
          :ok <- DB.execute(db, @priority_ddl) do
+      :ok
+    end
+  end
+
+  @doc false
+  def migrate_actor_attribution_in_txn(%Txn{} = txn) do
+    unless Txn.q(txn, "PRAGMA foreign_keys") == [[0]] and
+             Txn.q(txn, "PRAGMA legacy_alter_table") == [[1]],
+           do:
+             raise(
+               ArgumentError,
+               "work-item actor migration requires foreign_keys OFF and legacy_alter_table ON"
+             )
+
+    columns = String.split(@actor_work_item_columns, ",")
+    stored_columns = Txn.q(txn, "PRAGMA table_info(work_items)") |> Enum.map(&Enum.at(&1, 1))
+
+    if stored_columns == columns do
+      :ok
+    else
+      actor_columns = ["createdByProcess", "createdByViaSessionKey"]
+      predecessor_columns = Enum.reject(columns, &(&1 in actor_columns))
+
+      unless stored_columns == predecessor_columns,
+        do:
+          raise(
+            ArgumentError,
+            "unknown work-item actor-attribution columns: #{inspect(stored_columns)}"
+          )
+
+      Txn.q(txn, "SELECT #{Enum.join(predecessor_columns, ",")} FROM work_items LIMIT 0")
+      [[before_count]] = Txn.q(txn, "SELECT COUNT(*) FROM work_items")
+
+      objects =
+        Txn.q(txn, """
+        SELECT type,name,sql FROM sqlite_schema
+        WHERE tbl_name='work_items' AND type IN ('index','trigger') AND sql IS NOT NULL
+        ORDER BY type,name
+        """)
+
+      Enum.each(objects, fn [type, name, _sql] ->
+        quoted = "\"" <> String.replace(name, "\"", "\"\"") <> "\""
+        :ok = Txn.exec(txn, "DROP #{String.upcase(type)} #{quoted}")
+      end)
+
+      :ok = Txn.exec(txn, "ALTER TABLE work_items RENAME TO work_items_before_actor_attribution")
+      :ok = Txn.exec(txn, @actor_work_items_ddl)
+
+      insert_columns = "rowid," <> Enum.join(columns, ",")
+
+      select_columns =
+        [
+          "rowid"
+          | Enum.map(columns, fn column ->
+              if column in actor_columns, do: "NULL", else: column
+            end)
+        ]
+        |> Enum.join(",")
+
+      :ok =
+        Txn.exec(
+          txn,
+          "INSERT INTO work_items (#{insert_columns}) SELECT #{select_columns} FROM work_items_before_actor_attribution"
+        )
+
+      [[^before_count]] = Txn.q(txn, "SELECT COUNT(*) FROM work_items")
+      :ok = Txn.exec(txn, "DROP TABLE work_items_before_actor_attribution")
+      Enum.each(objects, fn [_type, _name, sql] -> :ok = Txn.exec(txn, sql) end)
+
+      unless Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(work_items)) == [],
+        do: raise(ArgumentError, "work-item actor migration left invalid foreign keys")
+
       :ok
     end
   end
@@ -115,8 +221,10 @@ defmodule Tightbeam.WorkItems do
          :ok <- valid_is_bug(is_bug),
          :ok <- valid_priority(call.params[:priority]),
          :ok <- valid_idempotency_key(key),
-         {:ok, owner} <- resolve_owner(db, call.principal) do
-      {created_by_user, created_by_session} = creator(call.principal)
+         {:ok, owner} <- resolve_owner(db, call.principal, call.params) do
+      {created_by_user, created_by_session, created_by_process, created_via_session} =
+        creator(call)
+
       snapshot = Rules.effective_snapshot()
 
       result =
@@ -133,7 +241,10 @@ defmodule Tightbeam.WorkItems do
                   )
 
                 id = "wi_" <> Tightbeam.Id.uuid4()
-                created_in_turn_seq = running_turn_seq(txn, created_by_session)
+
+                created_in_turn_seq =
+                  running_turn_seq(txn, created_by_session || created_via_session)
+
                 priority = call.params[:priority] || default_priority_in_txn(txn)
                 created_at = now()
 
@@ -142,9 +253,9 @@ defmodule Tightbeam.WorkItems do
                   """
                   INSERT INTO work_items
                     (id, title, specRefName, specRefSha256, isBug, ownerUserId,
-                     state, createdByUser, createdBySession, createdInTurnSeq,
-                     createdContextKnown, createdAt)
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, 1, ?10)
+                     state, createdByUser, createdBySession, createdByProcess,
+                     createdByViaSessionKey, createdInTurnSeq, createdContextKnown, createdAt)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, ?10, ?11, 1, ?12)
                   """,
                   [
                     id,
@@ -155,6 +266,8 @@ defmodule Tightbeam.WorkItems do
                     owner,
                     created_by_user,
                     created_by_session,
+                    created_by_process,
+                    created_via_session,
                     created_in_turn_seq,
                     created_at
                   ]
@@ -250,6 +363,7 @@ defmodule Tightbeam.WorkItems do
               call.params
               |> Map.put(:effort_config, Map.get(call, :effort_config, %{}))
               |> Map.put(:principal, call.principal)
+              |> Map.put(:transport_session_key, call[:transport_session_key])
             )
 
           case result do
@@ -287,8 +401,9 @@ defmodule Tightbeam.WorkItems do
     with :ok <- ensure_body_schema_for_use(db),
          :ok <- handoff_principal_allowed(call.principal),
          {:ok, mode} <- valid_handoff_input(params),
-         {:ok, item_owner} <- handoff_item_owner(db, call.principal, mode) do
-      {created_by_user, created_by_session} = creator(call.principal)
+         {:ok, item_owner} <- handoff_item_owner(db, call.principal, mode, params) do
+      {created_by_user, created_by_session, created_by_process, created_via_session} =
+        creator(call)
 
       result =
         transaction(db, fn txn ->
@@ -298,7 +413,9 @@ defmodule Tightbeam.WorkItems do
                  mode,
                  item_owner,
                  created_by_user,
-                 created_by_session
+                 created_by_session,
+                 created_by_process,
+                 created_via_session
                ) do
             {:error, error} ->
               {:refused, error}
@@ -361,8 +478,8 @@ defmodule Tightbeam.WorkItems do
   defp handoff_refusal(%{code: "ephemeral_obligation", message: message} = error),
     do: Map.put(error, :message, message <> "; choose a persistent delivery-owner session")
 
-  defp handoff_item_owner(_db, _principal, :existing), do: {:ok, nil}
-  defp handoff_item_owner(db, principal, :new), do: resolve_owner(db, principal)
+  defp handoff_item_owner(_db, _principal, :existing, _params), do: {:ok, nil}
+  defp handoff_item_owner(db, principal, :new, params), do: resolve_owner(db, principal, params)
 
   defp handoff_item_in_txn(
          txn,
@@ -370,7 +487,9 @@ defmodule Tightbeam.WorkItems do
          :existing,
          _item_owner,
          _created_by_user,
-         _created_by_session
+         _created_by_session,
+         _created_by_process,
+         _created_via_session
        ) do
     item = fetch_in_txn(txn, call.params[:work_item_id])
 
@@ -392,13 +511,15 @@ defmodule Tightbeam.WorkItems do
          :new,
          item_owner,
          created_by_user,
-         created_by_session
+         created_by_session,
+         created_by_process,
+         created_via_session
        ) do
     params = call.params
 
     with :ok <- valid_delivery_owner(txn, params) do
       id = "wi_" <> Tightbeam.Id.uuid4()
-      created_in_turn_seq = running_turn_seq(txn, created_by_session)
+      created_in_turn_seq = running_turn_seq(txn, created_by_session || created_via_session)
       priority = params[:priority] || default_priority_in_txn(txn)
       is_bug = Map.get(params, :is_bug, false)
       created_at = now()
@@ -408,9 +529,9 @@ defmodule Tightbeam.WorkItems do
         """
         INSERT INTO work_items
           (id, title, specRefName, specRefSha256, isBug, ownerUserId,
-           state, createdByUser, createdBySession, createdInTurnSeq,
+           state, createdByUser, createdBySession, createdByProcess, createdByViaSessionKey, createdInTurnSeq,
            createdContextKnown, createdAt)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, 1, ?10)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, ?10, ?11, 1, ?12)
         """,
         [
           id,
@@ -421,6 +542,8 @@ defmodule Tightbeam.WorkItems do
           item_owner,
           created_by_user,
           created_by_session,
+          created_by_process,
+          created_via_session,
           created_in_turn_seq,
           created_at
         ]
@@ -613,21 +736,34 @@ defmodule Tightbeam.WorkItems do
         if (current && current.body) === body do
           {:updated, fetch_in_txn(txn, item.id), false}
         else
-          {updated_by_user, updated_by_session} = body_attribution(params[:principal])
+          {updated_by_user, updated_by_session, updated_by_process, updated_via_session} =
+            body_attribution(params)
+
           updated_at = now()
 
           Txn.q(
             txn,
             """
             INSERT INTO work_item_bodies
-              (workItemId, body, updatedByUser, updatedBySession, updatedAt)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+              (workItemId, body, updatedByUser, updatedBySession, updatedByProcess,
+               updatedViaSessionKey, updatedAt)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             ON CONFLICT(workItemId) DO UPDATE SET
               body=excluded.body, updatedByUser=excluded.updatedByUser,
               updatedBySession=excluded.updatedBySession,
+              updatedByProcess=excluded.updatedByProcess,
+              updatedViaSessionKey=excluded.updatedViaSessionKey,
               updatedAt=excluded.updatedAt
             """,
-            [item.id, body, updated_by_user, updated_by_session, updated_at]
+            [
+              item.id,
+              body,
+              updated_by_user,
+              updated_by_session,
+              updated_by_process,
+              updated_via_session,
+              updated_at
+            ]
           )
 
           stamp_version_in_txn(txn, item.id, updated_at)
@@ -644,9 +780,16 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
-  defp body_attribution({:user, user}), do: {user, nil}
-  defp body_attribution({:session, session}), do: {nil, session}
-  defp body_attribution(_), do: {nil, "unknown"}
+  defp body_attribution(%{principal: {:user, user}} = params),
+    do: {user, nil, nil, params[:transport_session_key]}
+
+  defp body_attribution(%{principal: {:session, session}} = params),
+    do: {nil, session, nil, params[:transport_session_key] || session}
+
+  defp body_attribution(%{principal: {:process, process}} = params),
+    do: {nil, nil, process, params[:transport_session_key]}
+
+  defp body_attribution(_), do: {nil, nil, nil, nil}
 
   defp patch_updates(params, title, spec_ref_name, spec_ref_sha256, is_bug) do
     updates =
@@ -768,7 +911,7 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
-  ## Terminal dispositions (owner-or-admin) — icebox/reopen/close/fail
+  ## Work-item dispositions — icebox/reopen/close/fail
 
   defp dispose_result(db, call, verb) do
     with :ok <- ensure_body_schema_for_use(db),
@@ -934,6 +1077,8 @@ defmodule Tightbeam.WorkItems do
       _ -> false
     end
   end
+
+  defp disposition_allowed?(_txn, {:process, _process}, _item), do: true
 
   defp disposition_allowed?(_txn, _principal, _item), do: false
 
@@ -1269,6 +1414,8 @@ defmodule Tightbeam.WorkItems do
       _ -> false
     end
   end
+
+  defp trace_allowed?(_db, {:process, _process}, _item), do: true
 
   defp trace_allowed?(_db, _principal, _item), do: false
   defp trace_not_found, do: error("not_found", "work item not found")
@@ -1645,13 +1792,6 @@ defmodule Tightbeam.WorkItems do
   defp valid_idempotency_key(_),
     do: error("invalid_idempotency_key", "idempotencyKey must be text")
 
-  defp handoff_principal_allowed({:process, _}),
-    do:
-      error(
-        "process_denied",
-        "automated callers cannot hand off work items; use a user credential or session token"
-      )
-
   defp handoff_principal_allowed(nil),
     do:
       error(
@@ -1659,31 +1799,48 @@ defmodule Tightbeam.WorkItems do
         "work-item-handoff requires a user credential or session token"
       )
 
-  defp handoff_principal_allowed({kind, _}) when kind in [:session, :user], do: :ok
-
-  defp principal_allowed({:process, _}),
-    do: error("process_denied", "process principals cannot use work-item verbs")
+  defp handoff_principal_allowed({kind, _}) when kind in [:session, :user, :process], do: :ok
 
   defp principal_allowed(nil),
     do:
       error(
         "principal_required",
-        "work-item verbs require a user credential or a session token"
+        "work-item verbs require a user, process, or session principal"
       )
 
-  defp principal_allowed({kind, _}) when kind in [:session, :user], do: :ok
+  defp principal_allowed({kind, _}) when kind in [:session, :user, :process], do: :ok
 
-  defp resolve_owner(_db, {:user, user}), do: {:ok, user}
+  defp resolve_owner(_db, {:user, user}, _params), do: {:ok, user}
 
-  defp resolve_owner(db, {:session, session}) do
+  defp resolve_owner(db, {:session, session}, _params) do
     case Org.get(db, session) do
       %{owner_user_id: owner} when is_binary(owner) -> {:ok, owner}
       _ -> error("unknown_session", "creator session #{session} not found")
     end
   end
 
-  defp creator({:user, user}), do: {user, nil}
-  defp creator({:session, session}), do: {nil, session}
+  defp resolve_owner(db, {:process, _process}, params) do
+    case params[:owner_user_id] do
+      owner when is_binary(owner) and owner != "" ->
+        case DB.query(db, "SELECT 1 FROM users WHERE userId = ?1", [owner]) do
+          {:ok, [[1]]} -> {:ok, owner}
+          _ -> error("unknown_owner_user", "ownerUserId does not name an existing user")
+        end
+
+      _ ->
+        error("missing_owner_user", "ownerUserId is required for process-created work items")
+    end
+  end
+
+  defp creator(%{principal: {:user, user}} = call),
+    do: {user, nil, nil, call[:transport_session_key]}
+
+  defp creator(%{principal: {:session, session}} = call),
+    do: {nil, session, nil, call[:transport_session_key] || session}
+
+  defp creator(%{principal: {:process, process}} = call),
+    do: {nil, nil, process, call[:transport_session_key]}
+
   defp unknown(id), do: error("unknown_work_item", "unknown work item: #{id}")
   defp error(code, message), do: %{code: code, message: message}
 
@@ -1782,13 +1939,15 @@ defmodule Tightbeam.WorkItems do
   # response object (§Response shapes).
   defp columns do
     "id, title, specRefName, specRefSha256, isBug, ownerUserId, deliveryOwnerSessionKey, state, failReason, " <>
-      "routingWakeId, slateWakeId, createdByUser, createdBySession, createdAt, " <>
+      "routingWakeId, slateWakeId, createdByUser, createdBySession, createdByProcess, createdByViaSessionKey, createdAt, " <>
       "COALESCE((SELECT rowVersion FROM work_item_versions WHERE workItemId = work_items.id), createdAt), " <>
       "COALESCE((SELECT priority FROM work_item_priorities p WHERE p.workItemId=work_items.id), " <>
       "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)), " <>
       "(SELECT body FROM work_item_bodies b WHERE b.workItemId = work_items.id), " <>
       "(SELECT updatedByUser FROM work_item_bodies b WHERE b.workItemId = work_items.id), " <>
       "(SELECT updatedBySession FROM work_item_bodies b WHERE b.workItemId = work_items.id), " <>
+      "(SELECT updatedByProcess FROM work_item_bodies b WHERE b.workItemId = work_items.id), " <>
+      "(SELECT updatedViaSessionKey FROM work_item_bodies b WHERE b.workItemId = work_items.id), " <>
       "(SELECT updatedAt FROM work_item_bodies b WHERE b.workItemId = work_items.id)"
   end
 
@@ -1806,12 +1965,16 @@ defmodule Tightbeam.WorkItems do
          slate_wake_id,
          user,
          session,
+         process,
+         created_via_session,
          created_at,
          row_version,
          priority,
          body,
          body_updated_by_user,
          body_updated_by_session,
+         body_updated_by_process,
+         body_updated_via_session,
          body_updated_at
        ]) do
     %{
@@ -1828,12 +1991,16 @@ defmodule Tightbeam.WorkItems do
       slateWakeId: slate_wake_id,
       createdByUser: user,
       createdBySession: session,
+      createdByProcess: process,
+      createdByViaSessionKey: created_via_session,
       createdAt: created_at,
       rowVersion: row_version,
       priority: priority,
       body: body,
       bodyUpdatedByUser: body_updated_by_user,
       bodyUpdatedBySession: body_updated_by_session,
+      bodyUpdatedByProcess: body_updated_by_process,
+      bodyUpdatedViaSessionKey: body_updated_via_session,
       bodyUpdatedAt: body_updated_at
     }
   end
@@ -1850,6 +2017,8 @@ defmodule Tightbeam.WorkItems do
         :body,
         :bodyUpdatedByUser,
         :bodyUpdatedBySession,
+        :bodyUpdatedByProcess,
+        :bodyUpdatedViaSessionKey,
         :bodyUpdatedAt
       ])
 
@@ -1884,6 +2053,8 @@ defmodule Tightbeam.WorkItems do
       changed: changed?,
       updatedByUser: Map.get(item, :bodyUpdatedByUser),
       updatedBySession: Map.get(item, :bodyUpdatedBySession),
+      updatedByProcess: Map.get(item, :bodyUpdatedByProcess),
+      updatedViaSessionKey: Map.get(item, :bodyUpdatedViaSessionKey),
       updatedAt: Map.get(item, :bodyUpdatedAt)
     }
   end

@@ -73,6 +73,28 @@ defmodule Tightbeam.WorkStateTest do
     assert WorkState.status(ctx.db, abandoned.id) == "abandoned"
   end
 
+  test "process-created item views preserve actor and transport-session attribution", ctx do
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "process:scheduler",
+        principal: {:process, "scheduler"},
+        session_key: nil,
+        transport_session_key: "scheduler-session",
+        params: %{title: "Scheduled task", owner_user_id: "flynn"}
+      })
+
+    assert %{
+             workItem: %{
+               ownerUserId: "flynn",
+               createdByProcess: "scheduler",
+               createdByViaSessionKey: "scheduler-session"
+             }
+           } = WorkState.item_detail(ctx.db, item.id)
+
+    assert [%{workItem: ^item}] = WorkState.list_items(ctx.db, %{}).items
+  end
+
   test "both grains are random-access and event tables never feed non-cursor truth", ctx do
     item = create_item(ctx, "Feature")
     linked = assign(ctx, "holder", "linked", item.id)

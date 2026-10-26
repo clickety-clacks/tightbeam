@@ -1462,7 +1462,10 @@ defmodule Tightbeam.SchemaShapeTest do
              DB.query(db, "SELECT shape, stampedAt FROM schema_stamp")
 
     assert table_columns(db, "work_item_bodies") ==
-             ~w(workItemId body updatedByUser updatedBySession updatedAt)
+             ~w(
+               workItemId body updatedByUser updatedBySession updatedByProcess
+               updatedViaSessionKey updatedAt
+             )
 
     assert table_columns(db, "work_item_body_activation") ==
              ~w(id activatedAt cause principal)

@@ -87,6 +87,7 @@ defmodule Tightbeam.Org do
           owner_user_id: String.t(),
           origin: String.t(),
           spawned_by: String.t() | nil,
+          created_via_session_key: String.t() | nil,
           topology_parent: String.t() | nil,
           handle: String.t() | nil,
           archetype: String.t(),
@@ -428,11 +429,12 @@ defmodule Tightbeam.Org do
       txn,
       """
         INSERT INTO sessions (sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
-          ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName,
+          ownerUserId, origin, spawnedBy, createdByUser, createdBySession, createdByProcess,
+          createdViaSession, handle, archetype, overrides, identityName,
           identityRevision, cliToken,
           harness, provider, model, thinkingLevel, modelContext, host, state, createdAt, updatedAt)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-          ?15, ?16, ?17, ?18, ?19, ?20, ?21, 'active', ?22, ?22)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+          ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, 'active', ?26, ?26)
       """,
       [
         session_key,
@@ -444,6 +446,10 @@ defmodule Tightbeam.Org do
         Map.fetch!(input, :owner_user_id),
         Map.fetch!(input, :origin),
         Map.get(input, :spawned_by),
+        Map.get(input, :created_by_user),
+        Map.get(input, :created_by_session),
+        Map.get(input, :created_by_process),
+        Map.get(input, :created_via_session_key),
         Map.get(input, :handle),
         Map.fetch!(input, :archetype),
         encode_overrides(Map.get(input, :overrides)),
@@ -1704,7 +1710,8 @@ defmodule Tightbeam.Org do
   defp select_session_sql do
     """
     SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
-           ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName,
+           ownerUserId, origin, spawnedBy, createdByUser, createdBySession, createdByProcess,
+           createdViaSession, handle, archetype, overrides, identityName,
            identityRevision, identityRenderContract, identityGuidanceDigest, cliToken, harness, provider,
            model, thinkingLevel, modelContext, host, clearedThroughSeq, state,
            mechanicalStatus, createdAt, updatedAt, #{current_parent_sql("sessions")},
@@ -1723,6 +1730,10 @@ defmodule Tightbeam.Org do
          owner_user_id,
          origin,
          spawned_by,
+         created_by_user,
+         created_by_session,
+         created_by_process,
+         created_via_session_key,
          handle,
          archetype,
          overrides,
@@ -1755,6 +1766,10 @@ defmodule Tightbeam.Org do
       owner_user_id: owner_user_id,
       origin: origin,
       spawned_by: spawned_by,
+      created_by_user: created_by_user,
+      created_by_session: created_by_session,
+      created_by_process: created_by_process,
+      created_via_session_key: created_via_session_key,
       current_parent: current_parent,
       topology_parent: topology_parent,
       handle: handle,

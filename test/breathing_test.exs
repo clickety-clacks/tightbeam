@@ -223,12 +223,18 @@ defmodule Tightbeam.BreathingTest do
     refute inspect(result) =~ "att_only"
   end
 
-  test "the handler accepts user and session principals and refuses process principals", %{db: db} do
+  test "the handler accepts user, session and process principals", %{db: db} do
     call = %{principal: {:user, "owner"}, params: %{target_kind: "session", target_id: "active"}}
     assert %{schema: "breathing-v1"} = Breathing.handle(db, call)
 
-    assert %{code: "process_denied"} =
-             Breathing.handle(db, %{call | principal: {:process, "tightbeam"}})
+    assert %{schema: "breathing-v1"} =
+             Breathing.handle(db, %{call | principal: {:process, "cron"}})
+
+    assert %{schema: "breathing-v1", queue: %{count: 0}} =
+             Breathing.handle(db, %{
+               principal: {:process, "cron"},
+               params: %{target_kind: "assignment", target_id: "asg_active"}
+             })
   end
 
   test "assignment queue summaries are scoped, private, and read-only", %{db: db} do

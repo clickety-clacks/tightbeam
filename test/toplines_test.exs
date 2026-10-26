@@ -151,8 +151,8 @@ defmodule Tightbeam.ToplinesTest do
     assert Toplines.get(ctx.db, read_call({:user, "kay"}, %{topline_id: id})) ==
              Toplines.get(ctx.db, read_call({:user, "kay"}, %{topline_id: "tl_missing"}))
 
-    assert %{code: "process_denied"} =
-             Toplines.list(ctx.db, read_call({:process, "tightbeam"}))
+    assert %{toplines: [%{id: ^id}]} =
+             Toplines.list(ctx.db, read_call({:process, "cron"}))
 
     session_created =
       Toplines.create(
@@ -160,7 +160,11 @@ defmodule Tightbeam.ToplinesTest do
         call({:session, "s_flynn"}, %{title: "Session intent", idempotency_key: "create-2"}, 11)
       )
 
-    assert session_created.topline.createdActor == %{kind: "session", ref: "s_flynn"}
+    assert session_created.topline.createdActor == %{
+             kind: "session",
+             ref: "s_flynn",
+             actingSessionKey: "s_flynn"
+           }
   end
 
   test "membership episodes retain reasons, attribution, history, and keyed replay", ctx do
@@ -900,6 +904,7 @@ defmodule Tightbeam.ToplinesTest do
   test "leave-unlinked resolves the caller's pending placement idempotently and lists resolved placements",
        ctx do
     work_item!(ctx.db, "wi_leave", "flynn")
+    session!(ctx.db, "s_flynn", "flynn")
 
     :ok =
       DB.execute(
@@ -953,11 +958,53 @@ defmodule Tightbeam.ToplinesTest do
     assert %{placements: []} =
              Toplines.list_placements(ctx.db, read_call({:user, "kay"}, %{state: "all"}))
 
-    assert %{code: "process_denied"} =
-             Toplines.leave_unlinked(
-               ctx.db,
-               call({:process, "tightbeam"}, %{work_item_id: "wi_leave"}, 44)
-             )
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        INSERT INTO wakes
+          (wakeId, sessionKey, origin, prompt, consumer, dueAt, state, createdAt)
+        VALUES ('w_process_leave', 'agent:main:clawline:flynn:main', 'process:tightbeam',
+                'Choose placement', 'prompt', 44, 'pending', 44)
+        """
+      )
+
+    {:ok, _} =
+      DB.transaction(ctx.db, fn txn ->
+        Toplines.open_placement_in_txn(txn, %{
+          id: "tlp_process_leave",
+          work_item_id: "wi_leave",
+          owner_user_id: "flynn",
+          cause: "created",
+          cause_ref: "wi_leave",
+          source_causal_event_seq: nil,
+          actor_kind: "user",
+          actor_ref: "flynn",
+          at: 44,
+          prompt_wake_id: "w_process_leave"
+        })
+      end)
+
+    process_leave =
+      call(
+        {:process, "cron"},
+        %{
+          work_item_id: "wi_leave",
+          reason: "automation left unlinked",
+          idempotency_key: "process-leave"
+        },
+        44
+      )
+      |> Map.put(:transport_session_key, "s_flynn")
+      |> then(&Toplines.leave_unlinked(ctx.db, &1))
+
+    assert process_leave.placement.state == "left_unlinked"
+
+    assert process_leave.placement.resolutionActor == %{
+             kind: "process",
+             ref: "cron",
+             actingSessionKey: "s_flynn"
+           }
   end
 
   test "portable schema retains API normalization and scalar boundaries on every title write", %{
@@ -1013,7 +1060,7 @@ defmodule Tightbeam.ToplinesTest do
     end
   end
 
-  test "invalid, invisible, cross-owner, duplicate, and process operations refuse without writes",
+  test "invalid, invisible, cross-owner, duplicate, and ownerless operations refuse without writes",
        ctx do
     work_item!(ctx.db, "wi_mine", "flynn")
     work_item!(ctx.db, "wi_theirs", "kay")
@@ -1027,14 +1074,16 @@ defmodule Tightbeam.ToplinesTest do
                call({:user, "flynn"}, %{title: "Valid", idempotency_key: " ", extra: true})
              )
 
-    assert %{code: "process_denied"} =
+    assert %{code: "invalid_message", message: message} =
              Toplines.create(
                ctx.db,
-               call({:process, "tightbeam"}, %{title: "Valid", idempotency_key: "k"})
+               call({:process, "cron"}, %{title: "Valid", idempotency_key: "k"})
              )
 
-    assert %{code: "process_denied"} =
-             Toplines.create(ctx.db, call({:process, "tightbeam"}, %{unexpected: true}))
+    assert message =~ "ownerUserId"
+
+    assert %{code: "invalid_message"} =
+             Toplines.create(ctx.db, call({:process, "cron"}, %{unexpected: true}))
 
     topline =
       Toplines.create(
@@ -1062,6 +1111,62 @@ defmodule Tightbeam.ToplinesTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM topline_work_memberships")
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM topline_events")
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM topline_idempotency")
+  end
+
+  test "process-created Toplines take the requested owner and retain both actors", ctx do
+    session!(ctx.db, "acting-session", "flynn")
+
+    created =
+      call(
+        {:process, "scheduler"},
+        %{title: "Scheduled topline", idempotency_key: "scheduled", owner_user_id: "kay"},
+        21
+      )
+      |> Map.put(:transport_session_key, "acting-session")
+      |> then(&Toplines.create(ctx.db, &1))
+
+    assert created.topline.ownerUserId == "kay"
+
+    assert created.topline.createdActor == %{
+             kind: "process",
+             ref: "scheduler",
+             actingSessionKey: "acting-session"
+           }
+
+    assert %{code: "idempotency_conflict"} =
+             call(
+               {:process, "scheduler"},
+               %{
+                 title: "Scheduled topline",
+                 idempotency_key: "scheduled",
+                 owner_user_id: "flynn"
+               },
+               22
+             )
+             |> Map.put(:transport_session_key, "acting-session")
+             |> then(&Toplines.create(ctx.db, &1))
+  end
+
+  test "Topline idempotency keeps user scope while recording the submitting session", ctx do
+    session!(ctx.db, "topline-caller", "flynn")
+    params = %{title: "Shared request", idempotency_key: "same-owner-key"}
+
+    session_result =
+      call({:session, "topline-caller"}, params, 22)
+      |> Map.put(:transport_session_key, "topline-caller")
+      |> then(&Toplines.create(ctx.db, &1))
+
+    user_result = Toplines.create(ctx.db, call({:user, "flynn"}, params, 23))
+
+    assert user_result == session_result
+
+    assert {:ok, [["session", "topline-caller", "topline-caller", "user", "flynn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT callerActorKind,callerActorRef,callerSessionKey,callerIdempotencyKind,callerIdempotencyRef FROM topline_idempotency WHERE idempotencyKey='same-owner-key'"
+             )
+
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM toplines")
   end
 
   test "a late transaction failure rolls back state, event, and idempotency rows", ctx do

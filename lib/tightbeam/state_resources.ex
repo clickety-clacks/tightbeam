@@ -1610,11 +1610,15 @@ defmodule Tightbeam.StateResources do
   defp detail_principal(%{rest_principal: %{kind: "session", id: id}}),
     do: {"user", id, true}
 
+  defp detail_principal(%{rest_principal: %{kind: "process", id: id}}),
+    do: {"process", id, true}
+
   defp detail_principal(%{rest_principal: %{kind: kind, id: id, is_admin: is_admin}}),
     do: {kind, id, is_admin}
 
   defp detail_principal(%{principal: {:user, id}}), do: {"user", id, false}
   defp detail_principal(%{principal: {:session, id}}), do: {"user", id, true}
+  defp detail_principal(%{principal: {:process, id}}), do: {"process", id, true}
   defp detail_principal(%{principal: {:remedy, %{owner: id}}}), do: {"user", id, false}
 
   defp assignment_collection_scope(%{kind: "user", is_admin: true}), do: {"1 = 1", []}
@@ -1624,6 +1628,8 @@ defmodule Tightbeam.StateResources do
   end
 
   defp assignment_collection_scope(%{kind: "session"}), do: {"1 = 1", []}
+
+  defp assignment_collection_scope(%{kind: "process"}), do: {"1 = 1", []}
 
   defp assignment_collection_scope(_principal), do: {"0 = 1", []}
 

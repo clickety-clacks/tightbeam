@@ -398,7 +398,7 @@ defmodule Tightbeam.WorkState do
   defp item_columns,
     do:
       "id, title, specRefName, specRefSha256, isBug, ownerUserId, deliveryOwnerSessionKey, state, failReason, " <>
-        "createdByUser, createdBySession, createdAt, " <>
+        "createdByUser, createdBySession, createdByProcess, createdByViaSessionKey, createdAt, " <>
         "COALESCE((SELECT priority FROM work_item_priorities p WHERE p.workItemId=work_items.id), " <>
         "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)), " <>
         "COALESCE((SELECT rowVersion FROM work_item_versions WHERE workItemId=work_items.id), createdAt)"
@@ -461,6 +461,8 @@ defmodule Tightbeam.WorkState do
          fail_reason,
          user,
          session,
+         process,
+         via_session,
          created_at,
          priority,
          row_version
@@ -477,6 +479,8 @@ defmodule Tightbeam.WorkState do
       failReason: fail_reason,
       createdByUser: user,
       createdBySession: session,
+      createdByProcess: process,
+      createdByViaSessionKey: via_session,
       createdAt: created_at,
       priority: priority,
       rowVersion: row_version

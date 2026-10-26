@@ -1,7 +1,11 @@
 defmodule Tightbeam.EventLogTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, EventLog}
+  alias Tightbeam.{DB, EventLog, Schema}
+
+  @legacy_event_columns ~w(
+    id ts kind verb origin principal sessionKey payload
+  )
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
@@ -93,6 +97,88 @@ defmodule Tightbeam.EventLogTest do
     assert msg =~ "CHECK constraint"
   end
 
+  test "schema upgrade adds transport attribution without changing legacy event values" do
+    name = :"event_log_upgrade_#{System.unique_integer([:positive])}"
+
+    start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: name}, id: name))
+
+    :ok = EventLog.ensure_pre_actor_schema(name)
+
+    :ok =
+      DB.execute(
+        name,
+        "INSERT INTO events (ts,kind,verb,origin,principal,sessionKey,payload) " <>
+          "VALUES (1,'verb','wake','user:flynn','user:flynn','legacy-session','legacy-payload')"
+      )
+
+    :ok = Schema.ensure_all(name)
+
+    assert {:ok, [legacy_event]} =
+             DB.query(
+               name,
+               "SELECT id,ts,kind,verb,origin,principal,sessionKey,payload " <>
+                 "FROM events WHERE id=1"
+             )
+
+    assert Map.new(Enum.zip(@legacy_event_columns, legacy_event)) == %{
+             "id" => 1,
+             "ts" => 1,
+             "kind" => "verb",
+             "verb" => "wake",
+             "origin" => "user:flynn",
+             "principal" => "user:flynn",
+             "sessionKey" => "legacy-session",
+             "payload" => "legacy-payload"
+           }
+
+    assert {:ok, [[nil]]} =
+             DB.query(name, "SELECT transportSessionKey FROM events WHERE id=1")
+
+    {:ok, event_id} =
+      DB.transaction(name, fn txn ->
+        EventLog.append_event_in_txn(
+          txn,
+          "verb",
+          "wake",
+          "user:mike",
+          nil,
+          %{cancel_wake_id: "w_transport", canceled: true},
+          {:user, "mike"},
+          12_345,
+          "transport-session"
+        )
+      end)
+
+    assert {:ok, [["transport-session"]]} =
+             DB.query(name, "SELECT transportSessionKey FROM events WHERE id=?1", [event_id])
+  end
+
+  test "schema bootstrap runs event attribution migration before current appends" do
+    name = :"event_log_schema_bootstrap_#{System.unique_integer([:positive])}"
+
+    start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: name}, id: name))
+
+    :ok = Schema.ensure_all(name)
+
+    {:ok, event_id} =
+      DB.transaction(name, fn txn ->
+        EventLog.append_event_in_txn(
+          txn,
+          "verb",
+          "wake",
+          "user:mike",
+          nil,
+          %{cancel_wake_id: "w_bootstrap_transport", canceled: true},
+          {:user, "mike"},
+          12_346,
+          "bootstrap-session"
+        )
+      end)
+
+    assert {:ok, [["bootstrap-session"]]} =
+             DB.query(name, "SELECT transportSessionKey FROM events WHERE id=?1", [event_id])
+  end
+
   test "an accepted event can share its caller transaction and exact clock", %{db: db} do
     assert {:ok, event_id} =
              DB.transaction(db, fn txn ->
@@ -104,17 +190,34 @@ defmodule Tightbeam.EventLogTest do
                  nil,
                  %{cancel_wake_id: "w_public", canceled: true},
                  {:user, "mike"},
-                 12_345
+                 12_345,
+                 "transport-session"
                )
              end)
 
     assert is_integer(event_id) and event_id > 0
 
-    assert {:ok, [[^event_id, 12_345, "verb", "wake", "user:mike", "user:mike", nil, payload]]} =
+    assert {:ok, [event]} =
              DB.query(
                db,
-               "SELECT id,ts,kind,verb,origin,principal,sessionKey,payload FROM events"
+               "SELECT id,ts,kind,verb,origin,principal,sessionKey,payload " <>
+                 "FROM events WHERE id=?1",
+               [event_id]
              )
+
+    event_fields = Map.new(Enum.zip(@legacy_event_columns, event))
+    payload = event_fields["payload"]
+
+    assert event_fields == %{
+             "id" => event_id,
+             "ts" => 12_345,
+             "kind" => "verb",
+             "verb" => "wake",
+             "origin" => "user:mike",
+             "principal" => "user:mike",
+             "sessionKey" => nil,
+             "payload" => payload
+           }
 
     assert payload in [
              "%{cancel_wake_id: \"w_public\", canceled: true}",

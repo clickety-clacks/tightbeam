@@ -4672,29 +4672,52 @@ defmodule Tightbeam.Gateway do
         %{code: "unknown_caller"}
 
       %{owner_user_id: nil} ->
-        %{code: "denied", message: "processes cannot create roles"}
-
-      caller ->
-        with :ok <-
-               creation_binding_allowed(
-                 db,
-                 call.origin,
-                 caller.owner_user_id,
-                 call.params[:bind]
-               ) do
-          case Roles.create_with_firehose!(
-                 db,
-                 call.params[:name],
-                 caller.owner_user_id,
-                 call.params[:bind],
-                 call
-               ) do
-            {:error, error} -> error
-            role -> %{role: role}
-          end
-        else
+        case explicit_owner_user(db, call.params[:owner_user_id]) do
+          {:ok, owner} -> create_role_for_owner(db, call, owner)
           {:error, error} -> error
         end
+
+      caller ->
+        create_role_for_owner(db, call, caller.owner_user_id)
+    end
+  end
+
+  defp create_role_for_owner(db, call, owner_user_id) do
+    with :ok <-
+           creation_binding_allowed(
+             db,
+             call.origin,
+             owner_user_id,
+             call.params[:bind]
+           ) do
+      case Roles.create_with_firehose!(
+             db,
+             call.params[:name],
+             owner_user_id,
+             call.params[:bind],
+             call
+           ) do
+        {:error, error} -> error
+        role -> %{role: role}
+      end
+    else
+      {:error, error} -> error
+    end
+  end
+
+  defp explicit_owner_user(_db, owner) when not is_binary(owner) or owner == "" do
+    {:error,
+     %{code: "missing_owner_user", message: "ownerUserId is required for process-created records"}}
+  end
+
+  defp explicit_owner_user(db, owner) do
+    case DB.query(db, "SELECT 1 FROM users WHERE userId = ?1", [owner]) do
+      {:ok, [[1]]} ->
+        {:ok, owner}
+
+      _ ->
+        {:error,
+         %{code: "unknown_owner_user", message: "ownerUserId does not name an existing user"}}
     end
   end
 
@@ -6248,9 +6271,6 @@ defmodule Tightbeam.Gateway do
     %{roles: roles}
   end
 
-  defp role_mutation_allowed(_db, %{owner_user_id: nil}, _origin, _role),
-    do: {:error, %{code: "denied", message: "processes cannot mutate roles"}}
-
   defp role_mutation_allowed(_db, _caller, _origin, _role), do: :ok
 
   defp caller_for_role_mutation(db, origin) do
@@ -6276,10 +6296,9 @@ defmodule Tightbeam.Gateway do
     binding_owner_allowed(db, origin, %{owner_user_id: owner_user_id}, session_key)
   end
 
-  # Processes (cron/CI/automation) resolve as callers with NO owner and NO
-  # session: enough standing to wake, cancel their own wakes, and file
-  # org-owned condition facts; every
-  # owner- or admin-gated path falls through to denial naturally.
+  # Processes (cron/CI/automation) have no implicit owner or session. They may
+  # perform operations with process attribution; owner-bound creates receive
+  # their owner through ordinary request data.
   defp resolve_caller(_db, "user:" <> user_id), do: %{owner_user_id: user_id, caller_session: nil}
 
   defp resolve_caller(_db, "process:" <> name) when name != "",
@@ -7303,8 +7322,11 @@ defmodule Tightbeam.Gateway do
       nil ->
         %{code: "unknown_caller"}
 
+      {:error, error} ->
+        error
+
       %{owner_user_id: nil} ->
-        %{code: "forbidden", message: "processes cannot spawn sessions"}
+        %{code: "unknown_caller"}
 
       caller ->
         prior = Idempotency.get(db, caller.owner_user_id, "spawn", p.idempotency_key)
@@ -7327,7 +7349,52 @@ defmodule Tightbeam.Gateway do
        when is_binary(owner),
        do: %{owner_user_id: owner, caller_session: nil}
 
+  defp spawn_caller(db, %{principal: {:process, _process}} = call) do
+    case explicit_owner_user(db, call.params[:owner_user_id]) do
+      {:ok, owner} -> %{owner_user_id: owner, caller_session: nil}
+      {:error, error} -> {:error, error}
+    end
+  end
+
   defp spawn_caller(db, call), do: resolve_caller(db, call.origin)
+
+  defp spawn_actor_fields(call) do
+    actor =
+      case call[:principal] do
+        {:user, user} ->
+          %{created_by_user: user}
+
+        {:session, session} ->
+          %{created_by_session: session}
+
+        {:process, process} ->
+          %{created_by_process: process}
+
+        {:remedy, _} ->
+          case call.origin do
+            "process:" <> process -> %{created_by_process: process}
+            "session:" <> session -> %{created_by_session: session}
+            "user:" <> user -> %{created_by_user: user}
+            _ -> %{}
+          end
+
+        _ ->
+          %{}
+      end
+
+    actor_session =
+      call[:transport_session_key] ||
+        case call[:principal] do
+          {:session, session} -> session
+          _ -> nil
+        end
+
+    actor
+    |> Map.put_new(:created_by_user, nil)
+    |> Map.put_new(:created_by_session, nil)
+    |> Map.put_new(:created_by_process, nil)
+    |> Map.put(:created_via_session_key, actor_session)
+  end
 
   defp wake_principal_allowed?(_db, %{principal: {:remedy, %{action: "wake"}}}), do: true
   defp wake_principal_allowed?(db, call), do: not is_nil(resolve_caller(db, call.origin))
@@ -7691,22 +7758,25 @@ defmodule Tightbeam.Gateway do
     # Placement resolved the host FIRST, so the ref is judged against the account
     # that will actually run the turn (#88) — not the gateway's.
     with {:ok, {model, routed}} <- prepared do
-      input = %{
-        display_name: p.display_name,
-        kind: "custom",
-        owner_user_id: caller.owner_user_id,
-        origin: call.origin,
-        spawned_by: caller.caller_session && caller.caller_session.session_key,
-        handle: p[:handle],
-        order_index: length(sessions),
-        archetype: archetype.name,
-        overrides: overrides,
-        identity_name: identity_name,
-        host: host,
-        harness: harness_string,
-        provider: routed.provider,
-        model: model
-      }
+      input =
+        %{
+          display_name: p.display_name,
+          kind: "custom",
+          owner_user_id: caller.owner_user_id,
+          origin: call.origin,
+          spawned_by: caller.caller_session && caller.caller_session.session_key,
+          created_via_session_key: call[:transport_session_key],
+          handle: p[:handle],
+          order_index: length(sessions),
+          archetype: archetype.name,
+          overrides: overrides,
+          identity_name: identity_name,
+          host: host,
+          harness: harness_string,
+          provider: routed.provider,
+          model: model
+        }
+        |> Map.merge(spawn_actor_fields(call))
 
       session_result =
         DB.transaction(db, fn txn ->
@@ -7750,7 +7820,8 @@ defmodule Tightbeam.Gateway do
                           txn,
                           p.handle,
                           caller.owner_user_id,
-                          session.session_key
+                          session.session_key,
+                          call
                         )
                       end
 

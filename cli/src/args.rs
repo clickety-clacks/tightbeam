@@ -201,6 +201,7 @@ pub enum Command {
         handle: Option<String>,
         host: Option<String>,
         work_item_id: Option<String>,
+        owner_user_id: Option<String>,
     },
     List {
         identity: Identity,
@@ -348,6 +349,7 @@ pub enum Command {
         identity: Identity,
         mementos: Vec<(String, String)>,
         title: String,
+        owner_user_id: Option<String>,
         spec_ref_name: Option<String>,
         spec_ref_sha256: Option<String>,
         priority: Option<String>,
@@ -359,6 +361,7 @@ pub enum Command {
         title: Option<String>,
         delivery_owner: String,
         brief: String,
+        owner_user_id: Option<String>,
     },
     WorkItemUpdate {
         identity: Identity,
@@ -704,9 +707,8 @@ IDENTITY (optional inside a session workdir; otherwise required):
   --as-user <userId>   act as a human user (e.g. "flynn"). Use this for
                        operator/admin actions or when no agent identity applies.
   --as-process <name>  act as automation (cron, CI, a webhook — e.g.
-                       "cron"). Processes may wake, cancel-wake, and file
-                       condition facts ONLY — they cannot spawn, retire, or
-                       administer.
+                       "cron"). Commands record this process as the actor.
+                       Owner-bound creates require --owner-user <userId>.
   Pass at most ONE explicit identity. It is who the call is attributed to, NOT
   the target of the call. With no flag, the CLI walks up from the current
   directory for .tightbeam-session and the gateway derives the identity from
@@ -808,7 +810,7 @@ COMMANDS:
       [--limit <count>] [--cursor <cursor>]
       Read current declared values or their ordered history.
 
-  spawn --display "<name>" [--name <role>] [--archetype <a>]
+  spawn --display "<name>" [--name <role>] [--owner-user <userId>] [--archetype <a>]
         [--harness {{HARNESSES_PIPE}}] [--model <model>] [--effort <level>]
         [--context <variant>] [--host <host>] [--work-item <workItemId>]
         [--key <idempotencyKey>]
@@ -862,12 +864,12 @@ COMMANDS:
       refusal: omit --harness for a same-harness model change. --host moves the
       session workdir to an allowed host and keeps the Tightbeam session.
 
-  work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex>]
+  work-item-create --title "<title>" [--owner-user <userId>] [--spec-ref <name> --spec-sha256 <hex>]
                    [--priority <0..8>] [--key <idempotencyKey>]
       File a work item. Unrouted, it becomes YOUR problem on a deadline: file
       it, then route it (assign/dispatch) or icebox it. --key makes create
       idempotent (same key returns the same item).
-  work-item-handoff (--work-item <workItemId> | --title "<title>")
+  work-item-handoff (--work-item <workItemId> | --title "<title>") [--owner-user <userId>]
                     --delivery-owner <sessionKey> --brief "<text>"
       Create or bind a work item, set its delivery owner, and send them the
       brief in one operation.
@@ -918,7 +920,7 @@ COMMANDS:
       List your visible durable Toplines.
   topline <toplineId> [--history]
       Read one visible durable Topline; --history includes its event history.
-  topline-create --title <text> --key <idempotencyKey>
+  topline-create --title <text> --key <idempotencyKey> [--owner-user <userId>]
   topline-update <toplineId> --title <text> --reason <text> --key <idempotencyKey>
   topline-close <toplineId> --reason <text> --key <idempotencyKey>
   topline-reopen <toplineId> --reason <text> --key <idempotencyKey>
@@ -1602,7 +1604,7 @@ fn topline_mutation(
     flags: &HashMap<String, String>,
 ) -> Result<Command, String> {
     let allowed = match verb {
-        "topline-create" => &["title", "key"][..],
+        "topline-create" => &["title", "key", "owner-user"][..],
         "topline-update" => &["title", "reason", "key"][..],
         "topline-close" | "topline-reopen" => &["reason", "key"][..],
         "topline-link-work" => &["reason", "key"][..],
@@ -1630,7 +1632,11 @@ fn topline_mutation(
     let params = match verb {
         "topline-create" => {
             exact(1)?;
-            vec![title()?, key()?]
+            let mut params = vec![title()?, key()?];
+            if let Some(owner) = nonempty(flags, "owner-user") {
+                params.push(("ownerUserId".to_owned(), owner));
+            }
+            params
         }
         "topline-update" => {
             exact(2)?;
@@ -2455,6 +2461,7 @@ fn parse_with_optional_catalog(
                 handle: nonempty(flags, "name"),
                 host: nonempty(flags, "host"),
                 work_item_id: nonempty(flags, "work-item"),
+                owner_user_id: nonempty(flags, "owner-user"),
             })
         }
         "list" => Ok(Command::List {
@@ -2870,7 +2877,7 @@ fn parse_with_optional_catalog(
         }
         "work-item-create" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam work-item-create --title <title> [--spec-ref <name> --spec-sha256 <hex>]".to_owned());
+                return Err("usage: tightbeam work-item-create --title <title> [--owner-user <userId>] [--spec-ref <name> --spec-sha256 <hex>]".to_owned());
             }
             let spec_ref_name = nonempty(flags, "spec-ref");
             let spec_ref_sha256 = nonempty(flags, "spec-sha256");
@@ -2891,15 +2898,17 @@ fn parse_with_optional_catalog(
                 spec_ref_sha256,
                 priority: priority_flag(flags)?,
                 idempotency_key: nonempty(flags, "key"),
+                owner_user_id: nonempty(flags, "owner-user"),
             })
         }
         "work-item-handoff" => {
-            let usage = "usage: tightbeam work-item-handoff (--work-item <workItemId> | --title \"<title>\") --delivery-owner <sessionKey> --brief \"<text>\"";
+            let usage = "usage: tightbeam work-item-handoff (--work-item <workItemId> | --title \"<title>\") [--owner-user <userId>] --delivery-owner <sessionKey> --brief \"<text>\"";
             const ALLOWED: &[&str] = &[
                 "work-item",
                 "title",
                 "delivery-owner",
                 "brief",
+                "owner-user",
                 "as",
                 "as-user",
                 "as-process",
@@ -2933,6 +2942,7 @@ fn parse_with_optional_catalog(
                 title,
                 delivery_owner,
                 brief,
+                owner_user_id: nonempty(flags, "owner-user"),
             })
         }
         "work-item-update" => {
@@ -5031,7 +5041,7 @@ mod tests {
 
         let manual = render_help(None);
         assert!(
-            manual.contains("Processes may wake, cancel-wake, and file\n                       condition facts ONLY"),
+            manual.contains("Commands record this process as the actor.\n                       Owner-bound creates require --owner-user <userId>."),
             "{manual}"
         );
         assert!(!manual.contains("Processes may wake and cancel-wake ONLY"));
@@ -7263,6 +7273,7 @@ mod tests {
                     handle: Some("reviewer".to_owned()),
                     host: Some("testhost-c".to_owned()),
                     work_item_id: None,
+                    owner_user_id: None,
                 },
             ),
             (

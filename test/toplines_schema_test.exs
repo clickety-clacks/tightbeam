@@ -9,7 +9,7 @@ defmodule Tightbeam.ToplinesSchemaTest do
 
     assert :ok = ToplinesSchema.activate(db, 123)
 
-    assert {:ok, [[1, "standalone-toplines-v6", 123]]} =
+    assert {:ok, [[1, "standalone-toplines-v7", 123]]} =
              DB.query(db, "SELECT singleton, shape, stampedAt FROM topline_schema_stamp")
 
     expected =
@@ -69,7 +69,7 @@ defmodule Tightbeam.ToplinesSchemaTest do
     assert snapshot(db) == before
     assert :ok = Tightbeam.Toplines.ensure_schema(db)
 
-    assert {:ok, [["standalone-toplines-v6"]]} =
+    assert {:ok, [["standalone-toplines-v7"]]} =
              DB.query(db, "SELECT shape FROM topline_schema_stamp")
 
     assert {:ok, [["Café"]]} = DB.query(db, "SELECT title FROM toplines")
@@ -81,6 +81,90 @@ defmodule Tightbeam.ToplinesSchemaTest do
              Tightbeam.Toplines.ensure_historical_schema(db)
 
     assert snapshot(db) == before
+  end
+
+  test "V6 actor migration keeps legacy rows and the user-scoped idempotency namespace" do
+    db = base_db!()
+    :ok = DB.execute(db, File.read!("test/fixtures/toplines_v5.sql"))
+    insert_topline!(db, "Legacy")
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO topline_idempotency
+        (callerUserId,operation,idempotencyKey,requestFingerprint,canonicalResponse)
+      VALUES
+        ('mike','topline-create','legacy-key',
+         'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+         '{"topline":{"id":"tl_legacy"}}')
+      """)
+
+    assert :ok = ToplinesSchema.activate(db, 124, defer_v6_migration: true)
+
+    assert {:ok, [["standalone-toplines-v6"]]} =
+             DB.query(db, "SELECT shape FROM topline_schema_stamp")
+
+    {:ok, actual_attached} =
+      DB.query(db, """
+      SELECT type,name,tbl_name FROM sqlite_schema
+      WHERE tbl_name IN ('toplines','topline_work_memberships','topline_concerns',
+        'topline_concern_refs','topline_events','topline_idempotency',
+        'topline_placement_obligations')
+        AND type IN ('index','trigger') AND sql IS NOT NULL
+      ORDER BY type,name
+      """)
+
+    expected_attached =
+      ToplinesSchema.manifest()
+      |> Enum.filter(&(&1.type in ["index", "trigger"]))
+      |> Enum.map(fn object ->
+        [_, table] = Regex.run(~r/\bON\s+([A-Za-z0-9_]+)/i, object.sql)
+        [object.type, object.name, table]
+      end)
+      |> Enum.filter(fn [_, _, table] ->
+        table in ~w(toplines topline_work_memberships topline_concerns topline_concern_refs
+          topline_events topline_idempotency topline_placement_obligations)
+      end)
+      |> Enum.sort()
+
+    {:ok, tables} =
+      DB.query(db, "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+
+    foreign_key_targets =
+      tables
+      |> Enum.map(fn [name] ->
+        {:ok, refs} =
+          DB.query(db, "PRAGMA foreign_key_list(\"#{String.replace(name, "\"", "\"\"")}\")")
+
+        {name, Enum.map(refs, &Enum.at(&1, 2))}
+      end)
+
+    migration_result = ToplinesSchema.activate(db, 125)
+
+    assert migration_result == :ok,
+           inspect(
+             %{
+               result: migration_result,
+               actual_attached: actual_attached,
+               expected_attached: expected_attached,
+               foreign_key_targets: foreign_key_targets
+             },
+             limit: :infinity
+           )
+
+    assert {:ok, [["standalone-toplines-v7"]]} =
+             DB.query(db, "SELECT shape FROM topline_schema_stamp")
+
+    assert {:ok, [["user", "mike", nil, "user", "mike", "legacy-key"]]} =
+             DB.query(
+               db,
+               "SELECT callerActorKind,callerActorRef,callerSessionKey,callerIdempotencyKind,callerIdempotencyRef,idempotencyKey FROM topline_idempotency"
+             )
+
+    assert {:ok, [["Legacy", "user", "mike", nil]]} =
+             DB.query(
+               db,
+               "SELECT title,createdActorKind,createdActorRef,createdActorSessionKey FROM toplines"
+             )
   end
 
   test "an empty, unknown, or altered stamp refuses before any write" do
@@ -242,7 +326,7 @@ defmodule Tightbeam.ToplinesSchemaTest do
 
     assert {:ok, ^before} = DB.query(db, "SELECT id,title FROM toplines ORDER BY id")
 
-    assert {:ok, [["standalone-toplines-v6"]]} =
+    assert {:ok, [["standalone-toplines-v7"]]} =
              DB.query(db, "SELECT shape FROM topline_schema_stamp")
 
     assert {:ok, [[0]]} = DB.query(db, "PRAGMA ignore_check_constraints")
@@ -269,7 +353,7 @@ defmodule Tightbeam.ToplinesSchemaTest do
     assert {:ok, []} = DB.query(db, "SELECT name FROM sqlite_temp_schema")
   end
 
-  test "a pre-existing relationship violation cannot acquire a V6 success stamp" do
+  test "a pre-existing relationship violation cannot acquire a V7 success stamp" do
     db = base_db!()
     :ok = DB.execute(db, File.read!("test/fixtures/toplines_v5.sql"))
     :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
@@ -287,7 +371,7 @@ defmodule Tightbeam.ToplinesSchemaTest do
     assert {:ok, [["tlc_orphan", "tl_missing"]]} =
              DB.query(db, "SELECT id,toplineId FROM topline_concerns")
 
-    assert {:ok, [["standalone-toplines-v6"]]} =
+    assert {:ok, [["standalone-toplines-v7"]]} =
              DB.query(db, "SELECT shape FROM topline_schema_stamp")
 
     assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")

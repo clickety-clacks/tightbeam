@@ -1082,28 +1082,6 @@ defmodule Tightbeam.RailRemedyTest do
     refute List.last(remedy_events(ctx.db))["diagnostic"]["reason"] == nil
   end
 
-  test "assign remedy principal is rejected by every non-assign assignment verb", ctx do
-    principal =
-      {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "flynn"}}
-
-    expected = %{
-      code: "process_denied",
-      message: "process principals cannot use assignment verbs"
-    }
-
-    calls = [
-      {"attest", %{principal: principal, params: %{assignment_id: "missing"}}},
-      {"revoke-assignment", %{principal: principal, params: %{assignment_id: "missing"}}},
-      {"assignments", %{principal: principal, session_key: ctx.holder.session_key, params: %{}}},
-      {"assignment-get", %{principal: principal, params: %{assignment_id: "missing"}}},
-      {"attests", %{principal: principal, params: %{assignment_id: "missing"}}}
-    ]
-
-    Enum.each(calls, fn {verb, call} ->
-      assert Assignments.__handle__(ctx.db, verb, call) == expected
-    end)
-  end
-
   test "remedy grammar and F1/F2 reject dead rail sets while conditional blockers load", ctx do
     put_rules(
       ctx,

@@ -598,7 +598,8 @@ defmodule Tightbeam.EffortCheckin do
                      action,
                      actor,
                      call.principal,
-                     fresh
+                     fresh,
+                     actor_session_key(call)
                    )
 
                  if is_map(result) and not Map.has_key?(result, :code) do
@@ -916,7 +917,7 @@ defmodule Tightbeam.EffortCheckin do
     :ok
   end
 
-  defp rule_in_txn(txn, config, request, action, actor, principal, fresh) do
+  defp rule_in_txn(txn, config, request, action, actor, principal, fresh, actor_session_key) do
     current = request_for_id(txn, request.id)
 
     cond do
@@ -944,8 +945,8 @@ defmodule Tightbeam.EffortCheckin do
 
         Txn.q(
           txn,
-          "UPDATE decision_requests SET status = 'ruled', decision = ?2, ruledBy = ?3, ruledAt = ?4 WHERE id = ?1 AND status = 'open'",
-          [current.id, action, actor, ruled_at]
+          "UPDATE decision_requests SET status = 'ruled', decision = ?2, ruledBy = ?3, ruledAt = ?4, ruledByActorSessionKey = ?5 WHERE id = ?1 AND status = 'open'",
+          [current.id, action, actor, ruled_at, actor_session_key]
         )
 
         if Txn.changes(txn) == 1 do
@@ -1743,10 +1744,16 @@ defmodule Tightbeam.EffortCheckin do
 
   defp authorized?({:session, _key}, _request), do: true
   defp authorized?({:user, _user}, _request), do: true
+  defp authorized?({:process, _process}, _request), do: true
   defp authorized?(_, _request), do: false
+
+  defp actor_session_key(%{transport_session_key: key}) when is_binary(key), do: key
+  defp actor_session_key(%{principal: {:session, key}}), do: key
+  defp actor_session_key(_call), do: nil
 
   defp actor_id({:session, key}), do: "session:" <> key
   defp actor_id({:user, user}), do: "user:" <> user
+  defp actor_id({:process, process}), do: "process:" <> process
   defp actor_id(_principal), do: nil
 
   defp visible_request?(db, call, request) do
