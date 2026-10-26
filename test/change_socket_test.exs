@@ -195,7 +195,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
   end
 
   test "a first subscribe starts a credentialless observer for the connection lifetime", ctx do
-    observer_state =
+    {:push, {:text, ready}, observer_state} =
       subscribe(
         %{
           "type" => "subscribe",
@@ -205,6 +205,11 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
         },
         ctx.state
       )
+
+    assert JSON.decode!(ready) == %{
+             "type" => "subscription_ready",
+             "subscriptionId" => "observer"
+           }
 
     assert observer_state.phase == :live
     assert observer_state.principal_kind == :observer
