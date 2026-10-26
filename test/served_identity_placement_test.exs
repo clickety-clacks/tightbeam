@@ -28,8 +28,8 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
     old_local = Application.get_env(:tightbeam, :local_host_name)
     old_url = Application.get_env(:tightbeam, :advertised_url)
 
-    Application.put_env(:tightbeam, :local_host_name, "eezo")
-    Application.put_env(:tightbeam, :advertised_url, "http://eezo:4321")
+    Application.put_env(:tightbeam, :local_host_name, "lab1")
+    Application.put_env(:tightbeam, :advertised_url, "http://lab1:4321")
 
     register_hosts(db, %{
       "worker" => %{ssh: "agent@worker", base_dir: "/srv/tightbeam", cli_bin: "/srv/bin"}
@@ -197,14 +197,14 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
   # that Claude Code reads and rotates. What must still hold, and is the point of this test,
   # is that many sessions sharing one host put NO secret material into any launch plan.
   test "many Claude sessions share one host credential without it entering a launch plan", ctx do
-    token = Path.join([ctx.base, "homes", "eezo", "claude", ".credentials.json"])
+    token = Path.join([ctx.base, "homes", "lab1", "claude", ".credentials.json"])
     File.mkdir_p!(Path.dirname(token))
     File.write!(token, ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-shared"}}))
 
     config = %{base_dir: ctx.base, db: ctx.db, cwd: "/work", cli_bin: "/bin"}
 
     for _index <- 1..20 do
-      opts = Placement.adapter_opts!(config, {:claude, "shared", "eezo"})
+      opts = Placement.adapter_opts!(config, {:claude, "shared", "lab1"})
       assert Enum.any?(opts[:env], fn {name, _} -> name == "CLAUDE_CONFIG_DIR" end)
       refute Enum.any?(opts[:env], fn {name, _} -> name == "CLAUDE_CODE_OAUTH_TOKEN" end)
       refute inspect(opts) =~ "sk-ant-oat01-shared"

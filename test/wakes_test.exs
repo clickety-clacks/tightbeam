@@ -436,9 +436,9 @@ defmodule Tightbeam.WakesTest do
            provider, model, host, state, createdAt, updatedAt)
         VALUES
           ('retiring', 'retiring', 'flynn', 'user:flynn', 'default', 'claude',
-           'anthropic', 'fable', 'eezo', 'active', 1, 1),
+           'anthropic', 'fable', 'lab1', 'active', 1, 1),
           ('replacement', 'replacement', 'flynn', 'user:flynn', 'default',
-           'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1);
+           'claude', 'anthropic', 'fable', 'lab1', 'active', 1, 1);
         """
       )
 
@@ -719,7 +719,7 @@ defmodule Tightbeam.WakesTest do
     values =
       keys
       |> Enum.map(fn key ->
-        "('#{key}', '#{key}', 'flynn', 'user:flynn', 'default', 'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1)"
+        "('#{key}', '#{key}', 'flynn', 'user:flynn', 'default', 'claude', 'anthropic', 'fable', 'lab1', 'active', 1, 1)"
       end)
       |> Enum.join(",\n")
 
@@ -1736,9 +1736,9 @@ defmodule Tightbeam.WakesTest do
       DB.execute(db, """
       INSERT INTO users (userId,isAdmin,createdAt) VALUES ('parent-owner',0,1),('child-owner',0,1),('admin',1,1);
       INSERT INTO sessions (sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,host,state,createdAt,updatedAt) VALUES
-      ('independent-child','child','child-owner','user:child-owner','default','claude','anthropic','fable','eezo','active',1,1),
-      ('accountable-parent','parent','parent-owner','user:parent-owner','default','claude','anthropic','fable','eezo','active',1,1),
-      ('#{personal}','personal','parent-owner','user:parent-owner','default','claude','anthropic','fable','eezo','active',1,1);
+      ('independent-child','child','child-owner','user:child-owner','default','claude','anthropic','fable','lab1','active',1,1),
+      ('accountable-parent','parent','parent-owner','user:parent-owner','default','claude','anthropic','fable','lab1','active',1,1),
+      ('#{personal}','personal','parent-owner','user:parent-owner','default','claude','anthropic','fable','lab1','active',1,1);
       INSERT INTO work_items (id,title,ownerUserId,state,createdByUser,createdAt) VALUES ('wi_parent_relation','parent work','parent-owner','open','parent-owner',1);
       INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,workItemId) VALUES ('asg_parent_relation','independent child','independent-child','parent-owner',1,'wi_parent_relation');
       """)

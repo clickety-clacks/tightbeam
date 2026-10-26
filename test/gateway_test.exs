@@ -9879,12 +9879,12 @@ defmodule Tightbeam.GatewayTest do
     )
   end
 
-  # wi_263814d3 — the PROVISIONING SEAM, not just deliver_home: a real turn that
+  # The provisioning seam, beyond deliver_home: a real turn that
   # provisions a fresh harness session must pin the shared home to the SESSION'S
   # selected model (not the org default), so the adapter offers+accepts it at
   # session/new. Deleting the harness_session pin calls leaves settings.json
   # unwritten on the turn path and fails this — the coverage the deliver_home
-  # unit tests alone do not give (asg_6508eff5 finding #2).
+  # unit tests alone do not give.
   @tag timeout: 180_000
   @tag cold_gateway: true, gateway_home_pin: true, tmp_dir: true
   test "provisioning a turn pins the shared home to the session's selected model", ctx do
@@ -9993,7 +9993,7 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
-  # R1 (wi_3b4a20ce): a session-setup failure the adapter carries keeps its
+  # A session-setup failure the adapter carries keeps its
   # legacy reason for turns.error, the marker and health, while the
   # harness_turn_error record keeps the harness's own code, message and data.
   @tag cold_gateway: true, gateway_error_markers: true, tmp_dir: true
@@ -10091,7 +10091,7 @@ defmodule Tightbeam.GatewayTest do
     )
   end
 
-  # Error fidelity (wi_3b4a20ce): an open adapter circuit tells the caller why it
+  # Error fidelity: an open adapter circuit tells the caller why it
   # opened -- count, dying generation and redacted exit -- through the real runner,
   # lifecycle record and health observation, never the raw secret.
   @tag :cold_gateway

@@ -22,7 +22,7 @@ try do
   healthy =
     ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-fresh","refreshToken":"sk-ant-ort01-fresh","expiresAt":4102444800000,"refreshTokenExpiresAt":4102444800000,"scopes":["user:inference","user:sessions:claude_code"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}})
 
-  home = Tightbeam.Homes.home_path(base, "eezo", :claude)
+  home = Tightbeam.Homes.home_path(base, "lab1", :claude)
   other = Tightbeam.Homes.home_path(base, "other", :claude)
 
   for {path, bytes} <- [{home, hollow}, {other, healthy}] do

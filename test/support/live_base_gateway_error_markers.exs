@@ -126,7 +126,7 @@ defmodule GuardErrorMarkers do
         # EVERY failed turn speaks now. Adjudication used to route a failure into a
         # brief instead of the marker, so deleting the brief (2026-08-05) would have
         # left this class of failure with no channel at all — the "agent progress
-        # interrupted, no reason given" that Flynn hit on gibson twice.
+        # interrupted, no reason given" observed in two failed turns.
         frames = collect_pushes(9, [])
 
         expected =

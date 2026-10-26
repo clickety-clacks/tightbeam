@@ -101,12 +101,12 @@ defmodule Tightbeam.HomesTest do
   test "regeneration replaces only owned paths and preserves durable Codex state", %{
     base_dir: base_dir
   } do
-    auth = Path.join(Homes.home_path(base_dir, "eezo", :codex), "auth.json")
+    auth = Path.join(Homes.home_path(base_dir, "lab1", :codex), "auth.json")
     File.mkdir_p!(Path.dirname(auth))
     File.write!(auth, "old")
 
     projected =
-      Homes.project(base_dir, %{machine: "eezo", harness: :codex, rails: codex_rails("v1")})
+      Homes.project(base_dir, %{machine: "lab1", harness: :codex, rails: codex_rails("v1")})
 
     File.mkdir_p!(Path.join(projected.home_path, "sessions"))
     File.write!(Path.join(projected.home_path, "sessions/rollout.jsonl"), "rollout")
@@ -120,7 +120,7 @@ defmodule Tightbeam.HomesTest do
     File.write!(Path.join(projected.home_path, "auth.json"), "runtime-rotated")
 
     regenerated =
-      Homes.project(base_dir, %{machine: "eezo", harness: :codex, rails: codex_rails("v2")})
+      Homes.project(base_dir, %{machine: "lab1", harness: :codex, rails: codex_rails("v2")})
 
     assert File.read!(Path.join(regenerated.home_path, "sessions/rollout.jsonl")) == "rollout"
     assert File.read!(Path.join(regenerated.home_path, "history.jsonl")) == "history"
@@ -151,7 +151,7 @@ defmodule Tightbeam.HomesTest do
     File.write!(auth, "old")
 
     projected =
-      Homes.project(base_dir, %{machine: "eezo", harness: :codex, rails: codex_rails("v1")})
+      Homes.project(base_dir, %{machine: "lab1", harness: :codex, rails: codex_rails("v1")})
 
     entry = Path.join(projected.home_path, "auth.json")
     File.write!(entry, "runtime-rotated")
@@ -160,14 +160,14 @@ defmodule Tightbeam.HomesTest do
     Tightbeam.Harness.Codex.reconcile_home(
       %{
         base_dir: base_dir,
-        host_name: "eezo",
+        host_name: "lab1",
         host_config: %{ssh: nil, base_dir: base_dir},
         sh: fn _ -> flunk("local reconciliation must not invoke a command") end
       },
       projected.home_path,
       %{
         harness: :codex,
-        machine: "eezo",
+        machine: "lab1",
         rails: codex_rails("v1"),
         credential_home: projected.home_path
       }
@@ -179,16 +179,16 @@ defmodule Tightbeam.HomesTest do
   end
 
   test "regeneration preserves Claude projects and memory", %{base_dir: base_dir} do
-    token = Path.join(Homes.home_path(base_dir, "eezo", :claude), ".credentials.json")
+    token = Path.join(Homes.home_path(base_dir, "lab1", :claude), ".credentials.json")
     File.mkdir_p!(Path.dirname(token))
     File.write!(token, "token")
 
-    projected = Homes.project(base_dir, %{machine: "eezo", harness: :claude, rails: "v1"})
+    projected = Homes.project(base_dir, %{machine: "lab1", harness: :claude, rails: "v1"})
     File.mkdir_p!(Path.join(projected.home_path, "projects/repo/memory"))
     File.write!(Path.join(projected.home_path, "projects/repo/transcript.jsonl"), "chat")
     File.write!(Path.join(projected.home_path, "projects/repo/memory/notes.md"), "memory")
 
-    Homes.project(base_dir, %{machine: "eezo", harness: :claude, rails: "v2"})
+    Homes.project(base_dir, %{machine: "lab1", harness: :claude, rails: "v2"})
 
     assert File.read!(Path.join(projected.home_path, "projects/repo/transcript.jsonl")) == "chat"
     assert File.read!(Path.join(projected.home_path, "projects/repo/memory/notes.md")) == "memory"
@@ -199,7 +199,7 @@ defmodule Tightbeam.HomesTest do
   end
 
   test "observed local write set is exactly the owned projection", %{base_dir: base_dir} do
-    home = Homes.home_path(base_dir, "eezo", :codex)
+    home = Homes.home_path(base_dir, "lab1", :codex)
     auth_dir = Path.join([base_dir, "auth", "codex"])
     File.mkdir_p!(Path.join(home, ".tightbeam"))
     File.mkdir_p!(Path.join(home, "skills/custom"))
@@ -217,7 +217,7 @@ defmodule Tightbeam.HomesTest do
     end
 
     before = snapshot_files(home)
-    Homes.project(base_dir, %{machine: "eezo", harness: :codex, rails: codex_rails("new-rails")})
+    Homes.project(base_dir, %{machine: "lab1", harness: :codex, rails: codex_rails("new-rails")})
     after_snapshot = snapshot_files(home)
 
     changed =

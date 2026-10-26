@@ -22,7 +22,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "eezo" => %{
+      "lab1" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -322,7 +322,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
       archetype: archetype,
       harness: "codex",
       provider: "openai",
-      host: "eezo",
+      host: "lab1",
       model: Model.new("sonnet", effort: "medium"),
       spawned_by: nil,
       is_built_in: false

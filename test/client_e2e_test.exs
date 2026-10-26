@@ -78,7 +78,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "a preflight row is an automated row: its failure fails the leg" do
       leg =
-        Scorecard.add(%Leg{harness: "claude", host: "eezo"}, [
+        Scorecard.add(%Leg{harness: "claude", host: "lab1"}, [
           Scorecard.fail("P1", "auth claude", "OAuth session expired"),
           Scorecard.pass("3", "converse", journey: "J1")
         ])
@@ -97,7 +97,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "a leg of only manual rows is INCOMPLETE, never a pass" do
       leg =
-        Scorecard.add(%Leg{harness: "claude", host: "eezo"}, [
+        Scorecard.add(%Leg{harness: "claude", host: "lab1"}, [
           Scorecard.manual("16", "wakes", "not driven")
         ])
 
@@ -119,7 +119,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "a fail outranks an incomplete" do
       leg =
-        Scorecard.add(%Leg{harness: "codex", host: "eezo"}, [
+        Scorecard.add(%Leg{harness: "codex", host: "lab1"}, [
           Scorecard.incomplete("13b", "model change", "no second model", journey: "J6"),
           Scorecard.fail("3", "converse", "no assistant reply", journey: "J1")
         ])
@@ -140,11 +140,11 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "the run verdict is the worst leg verdict" do
-      good = Scorecard.add(%Leg{harness: "claude", host: "eezo"}, Scorecard.pass("3", "converse"))
+      good = Scorecard.add(%Leg{harness: "claude", host: "lab1"}, Scorecard.pass("3", "converse"))
 
       bad =
         Scorecard.add(
-          %Leg{harness: "codex", host: "eezo"},
+          %Leg{harness: "codex", host: "lab1"},
           Scorecard.fail("3", "converse", "no reply")
         )
 
@@ -1432,7 +1432,7 @@ defmodule Tightbeam.ClientE2ETest do
       preflight =
         Scorecard.incomplete("P-codex", "auth codex", "credential liveness unknown: :timeout")
 
-      leg = ClientE2E.blocked_leg("codex", "eezo", preflight)
+      leg = ClientE2E.blocked_leg("codex", "lab1", preflight)
 
       assert match?({:incomplete, [_preflight | _blocked]}, Scorecard.leg_verdict(leg))
 

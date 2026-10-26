@@ -24,7 +24,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "eezo" => %{
+      "lab1" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -297,7 +297,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: archetype,
-      host: "eezo",
+      host: "lab1",
       harness: "codex",
       provider: "openai",
       model: Model.new("test")
