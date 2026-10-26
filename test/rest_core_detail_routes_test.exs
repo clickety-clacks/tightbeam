@@ -2065,13 +2065,19 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     admin_marker_users =
       JSON.decode!(admin_markers.resp_body)["items"] |> Enum.map(& &1["userId"])
 
-    assert admin_marker_users == ["flynn"]
+    assert admin_marker_users == ["flynn", "flynn"]
+
+    admin_marker_scopes =
+      JSON.decode!(admin_markers.resp_body)["items"] |> Enum.map(& &1["scopeKey"])
+
+    assert admin_marker_scopes == ["chat:admin", "core-scope"]
 
     selected_admin_markers = get_without_authorization(ctx, "/api/read-markers?asUser=flynn")
     assert selected_admin_markers.status == 200
 
-    assert [%{"userId" => "flynn", "scopeKey" => "chat:admin"}] =
-             JSON.decode!(selected_admin_markers.resp_body)["items"]
+    selected_admin_items = JSON.decode!(selected_admin_markers.resp_body)["items"]
+    assert Enum.map(selected_admin_items, & &1["userId"]) == ["flynn", "flynn"]
+    assert Enum.map(selected_admin_items, & &1["scopeKey"]) == ["chat:admin", "core-scope"]
 
     assert get_without_authorization(ctx, "/api/read-markers?asUser=").resp_body ==
              all_markers.resp_body
@@ -2181,8 +2187,9 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     end
 
     for response <- [session_markers, get(ctx, "/api/read-markers", ctx.admin_device.token)] do
-      assert [%{"userId" => "flynn", "scopeKey" => "chat:admin"}] =
-               JSON.decode!(response.resp_body)["items"]
+      items = JSON.decode!(response.resp_body)["items"]
+      assert Enum.map(items, & &1["userId"]) == ["flynn", "flynn"]
+      assert Enum.map(items, & &1["scopeKey"]) == ["chat:admin", "core-scope"]
     end
 
     scoped_collection =
