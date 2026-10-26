@@ -465,8 +465,8 @@ The 0.1.8 GitHub E2E inventory is:
 | Probe states | Fixture probes prove `live`, `needs_onboarding`, `insufficient_scope`, `git_unready`, and timeout or provider failure as `unknown`. Unknown never authorizes work. |
 | Redaction and agreement | Rust and Elixir classify the same API failures. All outputs omit fixture secrets. Capability metadata and onboarding success JSON contain only the PATH-only `config_dir` or `configDir`; refusals and doctor output do not disclose bank paths. |
 
-The later installed-build live E2E should use **tars**, the sanctioned
-non-production macOS gateway test host. It must run only after separate authority
+The later installed-build live E2E should use a designated non-production macOS
+gateway test host. It must run only after separate authority
 permits packaging, installation, and a human device login. This fixture gate does
 not perform that row, and this producer does not install a build or touch a live
 credential.
