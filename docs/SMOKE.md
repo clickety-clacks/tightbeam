@@ -382,7 +382,7 @@ the same facade `tb wake` posts. Step 16b is J8's scheduled variant.
 ## Recording results — the scorecard
 
 Every run produces a SCORECARD. Run records live outside the repo, in
-`~/shared-workspace/tightbeam_ex/smoke-runs/`: copy `TEMPLATE.md` there to
+an external run-records directory: copy `TEMPLATE.md` there to
 `<date>-<short-sha>.md` and fill it in — one column per
 {harness x host} leg, one row per step (P1..P3, 1..33), each cell
 PASS / FAIL(note) / WAIVED(blocker) / N/A[harness-only]. The scorecard also

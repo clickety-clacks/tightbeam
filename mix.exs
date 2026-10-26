@@ -11,7 +11,7 @@ defmodule Tightbeam.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       name: "Tightbeam",
-      docs: [main: "Tightbeam", extras: ["docs/ARCHITECTURE.md", "docs/HANDOFF.md"]],
+      docs: [main: "Tightbeam", extras: ["docs/ARCHITECTURE.md"]],
       releases: releases()
     ]
   end
