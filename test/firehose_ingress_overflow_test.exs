@@ -57,6 +57,7 @@ defmodule Tightbeam.FirehoseIngressOverflowTest do
     _barrier = Hub.sequence(hub, self())
 
     refute_received :firehose_revoked
+
     assert %{overflowed: false, queued: 0, seq: 2, in_flight: false} =
              Hub.connection_stats(hub, self())
   end
