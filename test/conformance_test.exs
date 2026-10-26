@@ -2674,7 +2674,7 @@ defmodule Tightbeam.ConformanceSupport do
             "already-ruled-cancels-new-park" ->
               # Public seams can prove a ruling visible before the sweep creates
               # no park. The narrower schedule→recovered-check interleaving has
-              # no injection seam and is recorded in HANDOFF.md.
+              # no injection seam, so this case covers the already-ruled path.
               assert {:decision_pending, request_id} =
                        Escalation.escalate(db, turn_call, statute, Map.put(ctx, :dr_id, nil))
 
