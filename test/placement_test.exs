@@ -1158,11 +1158,8 @@ defmodule Tightbeam.PlacementTest do
            }
   end
 
-  # wi_263814d3 — accepted-then-dead: the claude adapter's offered/accepted model
-  # set follows the projected home's settings.json "model" pin (proven live —
-  # scripts/probe-opus5.mjs + scripts/probe-reread.mjs: a session/new re-reads the
-  # pin, so a home pinned to model X offers+accepts X and refuses everything
-  # else non-alias).
+  # The adapter reads the projected home's settings.json model pin for each new
+  # session. It offers and accepts the pinned model and rejects unrelated models.
   # The durable fix pins the SESSION'S RESOLVED model, not the fixed org default,
   # so acceptance tracks selection by construction. deliver_home must honour a
   # per-session :model; without it a session that SELECTED opus-5 gets a
