@@ -44,7 +44,7 @@
 # verification statutes (completion-requires-verification,
 # completion-requires-results-artifact) AND a `coder` archetype that admits this
 # host. Rules load once at gateway BOOT, so an org whose law changed under a
-# running gateway must be rebooted before the run. On shrdlu that means the
+# running gateway must be rebooted before the run. On the test host that means the
 # eb0ea2b org-law workaround must be REVERTED first: with it installed the
 # artifact statute never denies and the gate-chain group fails at its third
 # denial, which is exactly what keeps that leg falsifiable.
@@ -1160,7 +1160,7 @@ defmodule FeatureSmoke do
   #
   # THE HOST IS PINNED, and the seed depends on it. `Placement.resolve/3` reads a nil host
   # as "first of archetype.where" unless the archetype grants `["*"]`, and the shipped coder
-  # archetype is `where = ["eezo", "racter"]` — so an unpinned spawn on any other gateway
+  # archetype is a restricted `where` list — so an unpinned spawn on any other gateway
   # places the holder on a DIFFERENT machine while the seed is written locally. Where an
   # org's coder archetype does not admit this host the spawn is refused `host_not_allowed`
   # by name, which is the right failure: about the org's law, not about a file that

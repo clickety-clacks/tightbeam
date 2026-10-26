@@ -570,7 +570,7 @@ defmodule Tightbeam.Gateway do
   # is mis-signalled — a successor cannot also share our start time.
   #
   # LC_ALL=C is load-bearing, not tidiness: `lstart` is locale-formatted on macOS
-  # (measured on eezo — LC_TIME=de_DE.UTF-8 renders "Fr.  4 Sep. 23:20:39 2026"
+  # (measured on a test host — LC_TIME=de_DE.UTF-8 renders "Fr.  4 Sep. 23:20:39 2026"
   # for the same instant the C locale renders "Fri Sep  4 23:20:39 2026"). The
   # writer here and the `stop` shim both force C so they compare one spelling; an
   # operator shell in another locale must not be able to refuse a valid stop.
@@ -654,7 +654,7 @@ defmodule Tightbeam.Gateway do
         # un-onboarded, and the truth surfaced during OAuth as
         # `{:provider_runtime_start_failed, %{failed: [%{reason: :degraded}]}}`
         # — a credential written to disk and a verification that could never
-        # pass (Flynn, gibson, 2026-08-04). Present and runnable are two
+        # pass (a production session, 2026-08-04). Present and runnable are two
         # different facts; probing both and reporting one is the house defect.
         for {harness, {:error, reason}} <- results do
           Logger.warning(
@@ -3416,7 +3416,7 @@ defmodule Tightbeam.Gateway do
             #
             # What this replaced was not merely excess: the hold healed into
             # itself. Clearing it resumed the turn, the turn re-hit the same
-            # condition, and it re-raised — gibson livelocked Flynn's session
+            # condition, and it re-raised — a production gateway livelocked a session
             # behind a ruling whose only documented exit, `tightbeam adjudicate`,
             # was parsed in args.rs and never routed in dispatch.rs.
             # The refusal replaces the SENTENCE, never the evidence. `reason` is
@@ -3477,7 +3477,7 @@ defmodule Tightbeam.Gateway do
             # state cannot disagree. It runs only when the finish WON, which is
             # what stops a double-finish from double-recording.
             #
-            # The stage is the load-bearing half. Gibson's first production
+            # The stage is the load-bearing half. The first production
             # touch was misdiagnosed three times because "the turn failed" was
             # all the durable evidence there was: a checkout fault, a mid-engine
             # fault and a prompt-dispatch fault all read identically after the
