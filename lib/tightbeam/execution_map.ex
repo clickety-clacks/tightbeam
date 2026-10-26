@@ -822,6 +822,49 @@ defmodule Tightbeam.ExecutionMap do
     Enum.max([max(item.created_at, world.cutoff) | ended ++ attested ++ disposed])
   end
 
+  @doc false
+  def trace_parent_derivation(items, assignments, turns)
+      when is_list(items) and is_list(assignments) and is_list(turns) do
+    items_by_id = Map.new(items, &{&1.id, &1})
+    assignments_by_id = Map.new(assignments, &{&1.id, &1})
+    turns_by_seq = Map.new(turns, &{&1.seq, &1})
+
+    {resolved, assignment_chains} = resolve_all_with_chains(assignments, assignments_by_id)
+    candidates = candidate_edges(items, items_by_id, turns_by_seq, resolved)
+    {linked, cycle_participants} = retain_acyclic_with_cycles(items, candidates)
+
+    assignment_chains_by_item =
+      Map.new(items, fn item ->
+        chain =
+          if item.context_known do
+            case Map.get(turns_by_seq, item.created_in_turn_seq) do
+              %{job_ref: job_ref} when is_binary(job_ref) ->
+                []
+
+              %{assignment_id: assignment_id} when is_binary(assignment_id) ->
+                Map.get(assignment_chains, assignment_id, [])
+
+              _ ->
+                []
+            end
+          else
+            []
+          end
+
+        {item.id, chain}
+      end)
+
+    %{
+      resolved: resolved,
+      assignment_chains: assignment_chains,
+      assignment_chains_by_item: assignment_chains_by_item,
+      candidate_edges: candidates,
+      linked: linked,
+      parents: parents(items, linked),
+      cycle_participants: cycle_participants
+    }
+  end
+
   ## Parent derivation — total over missing, legacy and corrupt rows
 
   # The four statuses are exhaustive and mutually exclusive, and `linked` is the
@@ -883,16 +926,25 @@ defmodule Tightbeam.ExecutionMap do
   # functional: every cycle is simple and disjoint, and dropping the one edge
   # that closes it leaves a forest.
   defp retain_acyclic(items, candidates) do
-    {dropped, _settled} =
-      Enum.reduce(items, {MapSet.new(), MapSet.new()}, fn item, {dropped, settled} ->
+    {linked, _cycle_participants} = retain_acyclic_with_cycles(items, candidates)
+    linked
+  end
+
+  defp retain_acyclic_with_cycles(items, candidates) do
+    {dropped, _settled, cycle_participants} =
+      Enum.reduce(items, {MapSet.new(), MapSet.new(), %{}}, fn item, {dropped, settled, cycles} ->
         if MapSet.member?(settled, item.id) do
-          {dropped, settled}
+          {dropped, settled, cycles}
         else
-          walk(item.id, candidates, dropped, settled, MapSet.new())
+          {dropped, settled, discovered} =
+            walk(item.id, candidates, dropped, settled, MapSet.new())
+
+          {dropped, settled, Map.merge(cycles, discovered)}
         end
       end)
 
-    Map.reject(candidates, fn {child, _parent} -> MapSet.member?(dropped, child) end)
+    linked = Map.reject(candidates, fn {child, _parent} -> MapSet.member?(dropped, child) end)
+    {linked, cycle_participants}
   end
 
   defp walk(id, candidates, dropped, settled, ancestry) do
@@ -901,17 +953,35 @@ defmodule Tightbeam.ExecutionMap do
 
     case Map.get(candidates, id) do
       nil ->
-        {dropped, settled}
+        {dropped, settled, %{}}
 
       parent ->
         cond do
-          MapSet.member?(ancestry, parent) -> {MapSet.put(dropped, id), settled}
+          MapSet.member?(ancestry, parent) ->
+            {MapSet.put(dropped, id), settled, %{id => cycle_members(id, parent, candidates)}}
+
           # A chain merging into already-explored territory can close no new
           # cycle: that node's whole upward chain was resolved by an earlier walk.
-          MapSet.member?(settled, parent) -> {dropped, settled}
-          true -> walk(parent, candidates, dropped, settled, ancestry)
+          MapSet.member?(settled, parent) ->
+            {dropped, settled, %{}}
+
+          true ->
+            walk(parent, candidates, dropped, settled, ancestry)
         end
     end
+  end
+
+  defp cycle_members(closing_child, parent, candidates) do
+    collect_cycle_members(parent, closing_child, candidates, MapSet.new([closing_child]))
+  end
+
+  defp collect_cycle_members(current, closing_child, _candidates, members)
+       when current == closing_child,
+       do: MapSet.put(members, current)
+
+  defp collect_cycle_members(current, closing_child, candidates, members) do
+    next = Map.fetch!(candidates, current)
+    collect_cycle_members(next, closing_child, candidates, MapSet.put(members, current))
   end
 
   ## The world — every row this read needs, loaded once
@@ -2124,35 +2194,55 @@ defmodule Tightbeam.ExecutionMap do
   # is correct because entering a cycle at any point traverses it and returns
   # nil.
   defp resolve_all(assignments, by_id) do
-    Enum.reduce(assignments, %{}, fn assignment, memo ->
-      {value, memo} = resolve(by_id, assignment.id, MapSet.new(), memo)
-      Map.put(memo, assignment.id, value)
-    end)
+    {resolved, _chains} = resolve_all_with_chains(assignments, by_id)
+    resolved
   end
 
-  defp resolve(by_id, id, visited, memo) do
+  defp resolve_all_with_chains(assignments, by_id) do
+    {memo, chains} =
+      Enum.reduce(assignments, {%{}, %{}}, fn assignment, {memo, chains} ->
+        {_value, chain, memo} = resolve_with_chain(by_id, assignment.id, [], memo)
+        {memo, Map.put(chains, assignment.id, chain)}
+      end)
+
+    resolved = Map.new(memo, fn {id, {value, _chain}} -> {id, value} end)
+    {resolved, chains}
+  end
+
+  defp resolve_with_chain(by_id, id, stack, memo) do
     cond do
       Map.has_key?(memo, id) ->
-        {Map.fetch!(memo, id), memo}
+        {value, chain} = Map.fetch!(memo, id)
+        {value, chain, memo}
 
-      MapSet.member?(visited, id) ->
-        {nil, memo}
+      id in stack ->
+        {nil, cycle_assignment_chain(id, stack), memo}
 
       true ->
         case Map.get(by_id, id) do
           nil ->
-            {nil, memo}
+            {nil, [], memo}
 
           %{work_item_id: item_id} when not is_nil(item_id) ->
-            {item_id, Map.put(memo, id, item_id)}
+            chain = [id]
+            {item_id, chain, Map.put(memo, id, {item_id, chain})}
 
           %{reviews_assignment_id: nil} ->
-            {nil, Map.put(memo, id, nil)}
+            chain = [id]
+            {nil, chain, Map.put(memo, id, {nil, chain})}
 
           %{reviews_assignment_id: reviews} ->
-            {value, memo} = resolve(by_id, reviews, MapSet.put(visited, id), memo)
-            {value, Map.put(memo, id, value)}
+            {value, suffix, memo} = resolve_with_chain(by_id, reviews, [id | stack], memo)
+            chain = [id | Enum.reject(suffix, &(&1 == id))]
+            {value, chain, Map.put(memo, id, {value, chain})}
         end
+    end
+  end
+
+  defp cycle_assignment_chain(id, stack) do
+    case Enum.split_while(stack, &(&1 != id)) do
+      {before, [^id | _rest]} -> before ++ [id]
+      _ -> [id]
     end
   end
 
