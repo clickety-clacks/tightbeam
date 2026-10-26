@@ -102,11 +102,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
   defp route(%{"type" => "auth"} = message, %{phase: :unauthed} = state),
     do: authenticate(message, state)
 
-  defp route(%{"type" => "subscribe"} = message, %{phase: :unauthed} = state) do
-    state = observer_connection(state)
-    subscribe(message, state)
-  end
-
   defp route(_message, %{phase: :unauthed} = state),
     do: stop_with(auth_failure("auth_failed"), 1008, state)
 
@@ -355,20 +350,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
     %{state | heartbeat_timer: timer}
   end
 
-  defp observer_connection(state) do
-    :ok =
-      Hub.register(hub(state), self(), %{
-        mode: :filtered,
-        db: db(state),
-        principal_kind: :observer,
-        principal_id: "observer",
-        is_admin: false
-      })
-
-    %{state | phase: :live, principal_kind: :observer, principal_id: "observer", is_admin: false}
-    |> schedule_heartbeat()
-  end
-
   defp active_turn_notices(state, filters) do
     session_key = filters["sessionKey"]
 
@@ -446,8 +427,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
     end
   end
 
-  defp credential_current?(%{principal_kind: :observer}), do: true
-
   defp credential_current?(state) do
     case state.principal_kind do
       :session ->
@@ -483,9 +462,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
   defp visibility_principal(%{principal_kind: :session, principal_id: session_key}),
     do: %{kind: "session", id: session_key}
-
-  defp visibility_principal(%{principal_kind: :observer}),
-    do: %{kind: "observer"}
 
   defp visibility_principal(%{principal_kind: :user, principal_id: user_id, is_admin: is_admin}),
     do: %{kind: "user", id: user_id, is_admin: is_admin}

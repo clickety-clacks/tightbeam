@@ -23,8 +23,6 @@ defmodule Tightbeam.StateVisibility do
     end
   end
 
-  def visible?(_db, _notice, %{kind: "observer"}), do: true
-
   def visible?(db, notice, %{kind: "user", id: user_id, is_admin: is_admin}),
     do: visible?(db, notice, user_id, is_admin)
 

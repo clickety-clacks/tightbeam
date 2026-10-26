@@ -185,11 +185,6 @@ defmodule Tightbeam.StateResources do
   LEFT JOIN sessions AS session_owner ON session_owner.sessionKey=m.sessionKey
   """
 
-  @read_marker_select """
-  SELECT userId, scopeKey, marker, updatedAt
-  FROM read_markers
-  """
-
   alias Tightbeam.{
     AdminProjection,
     Artifacts,
@@ -758,7 +753,6 @@ defmodule Tightbeam.StateResources do
 
     {where, params} =
       cond do
-        principal.kind == "observer" -> {nil, []}
         principal.is_admin -> {nil, []}
         principal.kind == "session" -> {nil, []}
         true -> {"sessions.ownerUserId = ?", [principal.id]}
@@ -1397,45 +1391,6 @@ defmodule Tightbeam.StateResources do
     detail_selection(db, "read markers", principal, fn txn ->
       ReadMarkers.get_in_txn(txn, user_id, scope_key)
     end)
-  end
-
-  @doc "Return one bounded page of read markers for the selected user."
-  def query_read_markers_page(db, %{kind: "user", id: user_id} = principal, boundary, limit)
-      when is_binary(user_id) and user_id != "" do
-    trace_core_detail(principal, {:au4_visibility, "read markers"})
-
-    case DB.transaction(db, fn txn ->
-           query = fn sql, params -> observed_query(txn, principal, sql, params) end
-
-           Keyset.page(
-             query,
-             @read_marker_select,
-             "read_markers",
-             "read_markers.userId = ?",
-             [user_id],
-             ["read_markers.userId", "read_markers.scopeKey"],
-             boundary,
-             limit,
-             fn [row_user_id, scope_key, _marker, _updated_at] -> [row_user_id, scope_key] end
-           )
-         end) do
-      {:ok, page} ->
-        %{
-          rows:
-            Enum.map(page.rows, fn [row_user_id, scope_key, marker, updated_at] ->
-              %{
-                user_id: row_user_id,
-                scope_key: scope_key,
-                marker: marker,
-                updated_at: updated_at
-              }
-            end),
-          flags: page
-        }
-
-      {:error, error} ->
-        raise error
-    end
   end
 
   def query_read_marker(db, user_id, scope_key), do: ReadMarkers.get(db, user_id, scope_key)

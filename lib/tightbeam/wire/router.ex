@@ -626,10 +626,6 @@ defmodule Tightbeam.Wire.Router do
     d1_collection(conn, Map.fetch!(@d1_resources, :harness_processes))
   end
 
-  get "/api/read-markers" do
-    read_marker_index(conn)
-  end
-
   get "/api/read-markers/:scope_key" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :read_markers), scope_key)
   end
@@ -932,7 +928,7 @@ defmodule Tightbeam.Wire.Router do
 
     with {:ok, auth} <-
            core_detail_operation(conn, spec.resource, :bearer_auth, fn ->
-             core_detail_auth(conn, spec.resource)
+             state_bearer_auth(conn)
            end),
          {:ok, query} <-
            core_detail_operation(conn, spec.resource, :query_decode, fn ->
@@ -943,7 +939,7 @@ defmodule Tightbeam.Wire.Router do
              conn,
              spec.resource,
              :principal_resolution,
-             fn -> core_detail_route_principal(auth, query, conn, spec.resource) end
+             fn -> state_principal(auth, query, conn) end
            ),
          :ok <-
            core_detail_operation(
@@ -993,142 +989,10 @@ defmodule Tightbeam.Wire.Router do
       state_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
 
-  defp read_marker_index(conn) do
-    with {:ok, auth} <-
-           core_detail_operation(conn, "read markers", :bearer_auth, fn ->
-             core_detail_auth(conn, "read markers")
-           end),
-         {:ok, query} <-
-           core_detail_operation(conn, "read markers", :query_decode, fn ->
-             decode_state_query(conn)
-           end),
-         {:ok, principal} <-
-           core_detail_operation(conn, "read markers", :principal_resolution, fn ->
-             core_detail_route_principal(auth, query, conn, "read markers")
-           end),
-         :ok <-
-           core_detail_operation(conn, "read markers", :request_validation, fn ->
-             read_marker_collection_request(query)
-           end),
-         {:ok, limit, boundary} <-
-           state_page_request(
-             query,
-             "read_markers.collection",
-             "read markers",
-             %{},
-             principal,
-             &read_marker_tuple?/1,
-             @state_default_limit,
-             :earliest,
-             :earliest,
-             :latest
-           ),
-         :ok <- core_detail_probe(conn, "read markers", :lookup),
-         page_result <-
-           core_detail_operation(conn, "read markers", :row_lookup, fn ->
-             StateResources.query_read_markers_page(
-               db(conn),
-               core_detail_trace_principal(conn, principal),
-               boundary,
-               limit
-             )
-           end),
-         page <-
-           state_page_metadata(
-             page_result.rows,
-             page_result.flags,
-             &read_marker_tuple/1,
-             "read_markers.collection",
-             "read markers",
-             %{},
-             principal,
-             :asc
-           ),
-         :ok <- core_detail_probe(conn, "read markers", :schema),
-         :ok <- core_detail_probe(conn, "read markers", :serializer),
-         item_bytes <- read_marker_index_item_bytes(page_result.rows, state_catalog(conn)),
-         :ok <- core_detail_probe(conn, "read markers", :encoder),
-         :ok <- core_detail_probe(conn, "read markers", :envelope) do
-      core_detail_trace(conn, {:envelope, "read markers"})
-
-      body =
-        "{" <>
-          ~s("schemaVersion":1,"resource":"read markers","items":[#{item_bytes}],"page":#{JSON.encode!(page)}})
-
-      state_send(conn, 200, body)
-    else
-      {:error, status, code, message} -> state_error(conn, "read markers", status, code, message)
-    end
-  rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
-      state_error(conn, "read markers", 500, "projection_invalid", nil)
-  end
-
-  defp read_marker_index_item_bytes(rows, catalog) do
-    Enum.map_join(rows, ",", fn row ->
-      StateResources.encode_item("read markers", StateResources.read_marker(row), catalog)
-    end)
-  end
-
-  defp read_marker_tuple(%{user_id: user_id, scope_key: scope_key}), do: [user_id, scope_key]
-
-  defp read_marker_tuple?([user_id, scope_key]),
-    do: is_binary(user_id) and user_id != "" and is_binary(scope_key) and scope_key != ""
-
-  defp read_marker_tuple?(_tuple), do: false
-
-  defp read_marker_collection_request(query) do
-    if Enum.all?(Map.keys(query), &(&1 in ["asUser", "limit", "before", "after", "tail"])),
-      do: :ok,
-      else: {:error, 400, "invalid_filter", nil}
-  end
-
-  defp core_detail_auth(conn, resource)
-       when resource in ["sessions", "transcript messages", "read markers"] do
-    case Plug.Conn.get_req_header(conn, "authorization") do
-      [] -> {:ok, :observer}
-      _present -> state_bearer_auth(conn)
-    end
-  end
-
-  defp core_detail_auth(conn, _resource), do: state_bearer_auth(conn)
-
-  defp core_detail_route_principal(:observer, query, conn, "read markers"),
-    do: observer_marker_principal(query, conn)
-
-  defp core_detail_route_principal(:observer, query, _conn, _resource) do
-    if Map.has_key?(query, "asUser"),
-      do: {:error, 400, "invalid_as_user", nil},
-      else: {:ok, observer_principal()}
-  end
-
-  defp core_detail_route_principal(auth, query, conn, _resource),
-    do: state_principal(auth, query, conn)
-
-  defp observer_marker_principal(query, conn) do
-    case Map.get(query, "asUser", []) do
-      [user_id] when user_id != "" ->
-        with {:ok, {:user, resolved_user_id}} <- resolve_cli_as_user(:org, user_id) do
-          {:ok, state_principal_view({:user, resolved_user_id}, conn)}
-        end
-
-      [] ->
-        {:error, 400, "invalid_message", nil}
-
-      [""] ->
-        {:error, 400, "invalid_message", nil}
-
-      _repeated ->
-        {:error, 400, "invalid_as_user", nil}
-    end
-  end
-
-  defp observer_principal, do: %{kind: "observer", id: "observer", is_admin: false}
-
   defp session_index(conn) do
     with {:ok, auth} <-
            core_detail_operation(conn, "sessions", :bearer_auth, fn ->
-             core_detail_auth(conn, "sessions")
+             state_bearer_auth(conn)
            end),
          {:ok, query} <-
            core_detail_operation(conn, "sessions", :query_decode, fn ->
@@ -1136,14 +1000,14 @@ defmodule Tightbeam.Wire.Router do
            end),
          {:ok, principal} <-
            core_detail_operation(conn, "sessions", :principal_resolution, fn ->
-             core_detail_route_principal(auth, query, conn, "sessions")
+             state_principal(auth, query, conn)
            end),
          :ok <-
            core_detail_operation(conn, "sessions", :request_validation, fn ->
              session_index_request(query)
            end),
          {:ok, limit, boundary} <-
-           observer_aware_state_page_request(
+           state_page_request(
              query,
              "sessions.collection",
              "sessions",
@@ -1305,71 +1169,6 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
-  defp observer_aware_state_page_request(
-         query,
-         route,
-         resource,
-         filters,
-         principal,
-         tuple_valid?,
-         default_limit,
-         default,
-         head_boundary,
-         tail_boundary
-       ) do
-    result =
-      state_page_request(
-        query,
-        route,
-        resource,
-        filters,
-        principal,
-        tuple_valid?,
-        default_limit,
-        default,
-        head_boundary,
-        tail_boundary
-      )
-
-    case result do
-      {:error, 400, "invalid_cursor", nil} = error ->
-        if Map.get(principal, :kind) != "observer" and
-             observer_page_cursor?(query, route, resource, filters, tuple_valid?),
-           do: {:error, 404, "not_found", nil},
-           else: error
-
-      other ->
-        other
-    end
-  end
-
-  defp observer_page_cursor?(query, route, resource, filters, tuple_valid?) do
-    Enum.any?(["before", "after"], fn direction ->
-      case Map.get(query, direction, []) do
-        [cursor] when is_binary(cursor) and cursor != "" ->
-          with {:ok, bytes} <- Base.url_decode64(cursor, padding: false),
-               {:ok, payload} when is_map(payload) <- JSON.decode(bytes),
-               true <- Enum.sort(Map.keys(payload)) == d1_cursor_keys(),
-               true <- payload["version"] == @d1_cursor_version,
-               true <- payload["route"] == route and payload["resource"] == resource,
-               true <- payload["direction"] == direction,
-               true <- payload["filters"] == d1_filter_fingerprint(filters),
-               true <- payload["principalKind"] == "observer",
-               true <- payload["principalId"] == "observer",
-               true <- tuple_valid?.(payload["tuple"]) do
-            true
-          else
-            _ -> false
-          end
-
-        _ ->
-          false
-      end
-    end)
-  rescue
-    _error in [ArgumentError, KeyError, MatchError] -> false
-  end
-
   defp state_page_limit([], default), do: {:ok, default}
 
   defp state_page_limit([value], _default) do
@@ -1504,18 +1303,13 @@ defmodule Tightbeam.Wire.Router do
   defp work_tuple?(_tuple), do: false
 
   defp session_collection(conn, session_key, resource, query_fun, serializer) do
-    auth_result =
-      if resource == "transcript messages",
-        do: session_message_auth(conn),
-        else: selected_session_auth(conn)
-
-    with {:ok, auth} <- auth_result,
+    with {:ok, auth} <- selected_session_auth(conn),
          {:ok, request} <- decode_state_query(conn),
          {:ok, principal, request} <-
            session_collection_principal(auth, request, conn, session_key, resource),
          :ok <- session_collection_request(request, session_key),
          {:ok, limit, boundary} <-
-           observer_aware_state_page_request(
+           state_page_request(
              request,
              "session.#{resource}.collection:#{session_key}",
              resource,
@@ -1528,7 +1322,7 @@ defmodule Tightbeam.Wire.Router do
              :latest
            ),
          session when not is_nil(session) <-
-           session_collection_session(db(conn), session_key, principal),
+           StateResources.query_session(db(conn), %{key: session_key, principal: principal}),
          page_result <- apply(StateResources, query_fun, [db(conn), session_key, boundary, limit]),
          page <-
            state_page_metadata(
@@ -1559,19 +1353,6 @@ defmodule Tightbeam.Wire.Router do
       state_error(conn, resource, 500, "projection_invalid", nil)
   end
 
-  defp session_collection_session(db, session_key, %{kind: "observer"}),
-    do: StateResources.query_session(db, session_key)
-
-  defp session_collection_session(db, session_key, principal),
-    do: StateResources.query_session(db, %{key: session_key, principal: principal})
-
-  defp session_message_auth(conn) do
-    case Plug.Conn.get_req_header(conn, "authorization") do
-      [] -> {:ok, :observer}
-      _present -> selected_session_auth(conn)
-    end
-  end
-
   # Organization credentials can select a user for this session's collection.
   defp session_collection_principal(:org, query, conn, session_key, _resource) do
     case Map.get(query, "asUser", []) do
@@ -1594,14 +1375,6 @@ defmodule Tightbeam.Wire.Router do
 
       _ ->
         {:error, 400, "invalid_as_user", nil}
-    end
-  end
-
-  defp session_collection_principal(:observer, query, _conn, _session_key, "transcript messages") do
-    if Map.has_key?(query, "asUser") do
-      {:error, 400, "invalid_as_user", nil}
-    else
-      {:ok, observer_principal(), query}
     end
   end
 
@@ -1719,25 +1492,6 @@ defmodule Tightbeam.Wire.Router do
   defp core_detail_row(conn, %{query: query, resource: "read markers"}, scope_key, principal) do
     core_detail_trace(conn, {:shared_lookup, "read markers", query})
     apply(StateResources, query, [db(conn), %{key: scope_key, principal: principal}, %{}])
-  end
-
-  defp core_detail_row(conn, %{resource: "sessions"}, session_key, %{kind: "observer"}) do
-    core_detail_trace(conn, {:shared_lookup, "sessions", :query_session})
-    StateResources.query_session(db(conn), session_key)
-  end
-
-  defp core_detail_row(
-         conn,
-         %{resource: "transcript messages"},
-         {session_key, message_id},
-         %{kind: "observer"}
-       ) do
-    core_detail_trace(conn, {:shared_lookup, "transcript messages", :query_message})
-
-    case StateResources.query_message(db(conn), message_id) do
-      %{session_key: ^session_key} = row -> row
-      _ -> nil
-    end
   end
 
   defp core_detail_row(conn, %{query: query, resource: resource}, key, principal) do
