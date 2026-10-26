@@ -1,7 +1,7 @@
 defmodule Tightbeam.FirehoseColdLoopbackTest do
   use Tightbeam.TestCase, async: false
   @tag :tmp_dir
-  test "ordinary guarded Application delivers persistent work-item over real loopback", %{
+  test "guarded gateway serves credentialless Firehose and reads beside authenticated clients", %{
     tmp_dir: tmp
   } do
     Tightbeam.GuardRuntimeFixture.run!(
