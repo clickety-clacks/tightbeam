@@ -127,6 +127,9 @@ defmodule Tightbeam.RestHarnessProcessRoutesTest do
     assert earlier.status == 200, earlier.resp_body
     earlier_body = JSON.decode!(earlier.resp_body)
     assert Enum.map(earlier_body["items"], & &1["id"]) == ["launch-a"]
+    assert earlier.resp_body =~
+             ~s({"id":"launch-a","host":"alpha","harness":"codex","pid":null,"state":"launching","createdAt":10,"resolvedAt":null})
+
     assert earlier_body["page"]["hasMoreAfter"]
 
     later =
@@ -172,6 +175,16 @@ defmodule Tightbeam.RestHarnessProcessRoutesTest do
       created_at: 30,
       pid: 125,
       resolved_at: 40
+    })
+
+    insert_launch(ctx.db, %{
+      id: "other-host",
+      host: "beta",
+      harness: "codex",
+      state: "running",
+      created_at: 40,
+      pid: 126,
+      resolved_at: nil
     })
 
     filtered =
