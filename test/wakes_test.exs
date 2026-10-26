@@ -187,28 +187,28 @@ defmodule Tightbeam.WakesTest do
       DB.execute(
         db,
         """
-        INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1);
+        INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('tester', 1, 'admin_add', 1);
         INSERT INTO sessions
           (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
            operationalParent, archetype, harness,
            provider, model, host, state, createdAt, updatedAt)
         VALUES
-          ('agent:main:clawline:flynn:main', 'Main', 'main', 1, 'flynn', 'user:flynn',
-           'agent:main:clawline:flynn:main', 'default', 'claude',
+          ('agent:main:clawline:tester:main', 'Main', 'main', 1, 'tester', 'user:tester',
+           'agent:main:clawline:tester:main', 'default', 'claude',
            'anthropic', 'fable', 'host-b', 'active', 1, 1),
-          ('retiring', 'retiring', 'custom', 0, 'flynn', 'user:flynn',
-           'agent:main:clawline:flynn:main', 'default', 'claude',
+          ('retiring', 'retiring', 'custom', 0, 'tester', 'user:tester',
+           'agent:main:clawline:tester:main', 'default', 'claude',
            'anthropic', 'fable', 'host-b', 'active', 1, 1),
-          ('replacement', 'replacement', 'custom', 0, 'flynn', 'user:flynn',
-           'agent:main:clawline:flynn:main', 'default', 'claude', 'anthropic',
+          ('replacement', 'replacement', 'custom', 0, 'tester', 'user:tester',
+           'agent:main:clawline:tester:main', 'default', 'claude', 'anthropic',
            'fable', 'host-b', 'active', 1, 1);
         INSERT INTO work_items
           (id, title, ownerUserId, state, createdByUser, createdAt)
-        VALUES ('wi_retarget', 'Retarget work', 'flynn', 'open', 'flynn', 1);
+        VALUES ('wi_retarget', 'Retarget work', 'tester', 'open', 'tester', 1);
         INSERT INTO assignments
           (id, subject, holderKey, openedByUser, openedAt, workItemId)
         VALUES
-          ('asg_retarget', 'retarget me', 'retiring', 'flynn', 1,
+          ('asg_retarget', 'retarget me', 'retiring', 'tester', 1,
            'wi_retarget');
         INSERT INTO supervision_entitlements
           (assignmentId, generation, dueAt, state, lastAttemptGeneration,
@@ -257,7 +257,7 @@ defmodule Tightbeam.WakesTest do
         INSERT INTO turns
           (sessionKey,messageId,origin,prompt,assignmentId,status,createdAt,endedAt)
         VALUES
-          ('retiring','root-retarget','user:flynn','root','asg_retarget','delivered',1,2)
+          ('retiring','root-retarget','user:tester','root','asg_retarget','delivered',1,2)
         """
       )
 
@@ -467,12 +467,12 @@ defmodule Tightbeam.WakesTest do
   end
 
   defp active_sessions!(db, keys) do
-    main = "agent:main:clawline:flynn:main"
+    main = "agent:main:clawline:tester:main"
 
     values =
       keys
       |> Enum.map(fn key ->
-        "('#{key}', '#{key}', 'flynn', 'user:flynn', '#{main}', 'default', 'claude', 'anthropic', 'fable', 'host-b', 'active', 1, 1)"
+        "('#{key}', '#{key}', 'tester', 'user:tester', '#{main}', 'default', 'claude', 'anthropic', 'fable', 'host-b', 'active', 1, 1)"
       end)
       |> Enum.join(",\n")
 
@@ -480,13 +480,13 @@ defmodule Tightbeam.WakesTest do
       DB.execute(
         db,
         """
-        INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1);
+        INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('tester', 1, 'admin_add', 1);
         INSERT OR IGNORE INTO sessions
           (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
            operationalParent, archetype, harness, provider, model, host, state,
            createdAt, updatedAt)
         VALUES
-          ('#{main}', 'Main', 'main', 1, 'flynn', 'user:flynn', '#{main}',
+          ('#{main}', 'Main', 'main', 1, 'tester', 'user:tester', '#{main}',
            'default', 'claude', 'anthropic', 'fable', 'host-b', 'active', 1, 1);
         INSERT INTO sessions
           (sessionKey, displayName, ownerUserId, origin, operationalParent,

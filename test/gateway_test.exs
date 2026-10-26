@@ -8871,7 +8871,7 @@ defmodule Tightbeam.GatewayTest do
     # EVERY failed turn speaks now. Adjudication used to route a failure into a
     # brief instead of the marker, so deleting the brief (2026-08-05) would have
     # left this class of failure with no channel at all — the "agent progress
-    # interrupted, no reason given" that Flynn hit on host-a twice.
+    # interrupted, no reason given" that a production session encountered twice.
     frames = collect_pushes(9, [])
 
     assert Enum.any?(frames, fn frame ->
