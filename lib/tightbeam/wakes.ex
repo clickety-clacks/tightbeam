@@ -7080,9 +7080,17 @@ defmodule Tightbeam.Wakes do
           client_message_id: "wake-undeliverable:#{wake.wake_id}"
         })
 
-      if disposition in [:appended, :duplicate],
-        do: {wake.wake_id, recipient, owner, marker},
-        else: nil
+      case disposition do
+        :appended ->
+          Tightbeam.Firehose.Publisher.message_in_txn(txn, recipient, marker, owner)
+          {wake.wake_id, recipient, owner, marker}
+
+        :duplicate ->
+          {wake.wake_id, recipient, owner, marker}
+
+        _ ->
+          nil
+      end
     else
       _ -> nil
     end
