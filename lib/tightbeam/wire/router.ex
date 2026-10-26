@@ -95,7 +95,8 @@ defmodule Tightbeam.Wire.Router do
         "host" => :string,
         "harness" => :string,
         "state" =>
-          {:enum, ~w(launching running park_requested closed_gracefully killed kill_failed exited)}
+          {:enum,
+           ~w(launching running park_requested closed_gracefully killed kill_failed exited)}
       },
       order: [{:created_at, :integer}, {:launch_id, :string}]
     },

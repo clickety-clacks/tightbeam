@@ -413,7 +413,10 @@ defmodule Tightbeam.HarnessProcess do
           do: raise(ArgumentError, "invalid harness process collection filter")
 
       {"state", values} when is_list(values) ->
-        unless Enum.all?(values, &(&1 in ~w(launching running park_requested closed_gracefully killed kill_failed exited))),
+        unless Enum.all?(
+                 values,
+                 &(&1 in ~w(launching running park_requested closed_gracefully killed kill_failed exited))
+               ),
           do: raise(ArgumentError, "invalid harness process collection filter")
 
       _invalid ->

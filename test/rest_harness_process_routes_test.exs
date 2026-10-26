@@ -59,7 +59,8 @@ defmodule Tightbeam.RestHarnessProcessRoutesTest do
     %{db: db, opts: opts, admin_device: admin_device, reader_device: reader_device}
   end
 
-  test "admin collection emits the closed item in tuple order and pages by createdAt and id", ctx do
+  test "admin collection emits the closed item in tuple order and pages by createdAt and id",
+       ctx do
     insert_launch(ctx.db, %{
       id: "launch-a",
       host: "alpha",
@@ -101,7 +102,10 @@ defmodule Tightbeam.RestHarnessProcessRoutesTest do
     assert first.resp_body =~
              ~s({"id":"launch-b","host":"alpha","harness":"codex","pid":101,"state":"running","createdAt":20,"resolvedAt":null})
 
-    refute Enum.any?(["sessionKey", "provider", "model", "rowVersion"], &Map.has_key?(hd(body["items"]), &1))
+    refute Enum.any?(
+             ["sessionKey", "provider", "model", "rowVersion"],
+             &Map.has_key?(hd(body["items"]), &1)
+           )
 
     for marker <- [
           "private-ssh",
@@ -132,7 +136,10 @@ defmodule Tightbeam.RestHarnessProcessRoutesTest do
       )
 
     assert later.status == 200, later.resp_body
-    assert Enum.map(JSON.decode!(later.resp_body)["items"], & &1["id"]) == ["launch-b", "launch-c"]
+    assert Enum.map(JSON.decode!(later.resp_body)["items"], & &1["id"]) == [
+             "launch-b",
+             "launch-c"
+           ]
   end
 
   test "filters are exact and conjunctive, and non-admins see no launch rows", ctx do
