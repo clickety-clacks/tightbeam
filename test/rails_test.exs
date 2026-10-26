@@ -254,6 +254,7 @@ defmodule Tightbeam.RailsTest do
     log =
       raw_log
       |> String.replace_prefix("\e[33m\n", "\n")
+      |> String.trim_trailing()
       |> String.replace_suffix("\e[0m", "")
       |> String.trim()
 

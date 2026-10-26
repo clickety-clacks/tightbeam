@@ -2,12 +2,6 @@ defmodule Tightbeam.AssignmentProcessCloseR1MigrationTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @retained_columns ~w(
-    id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state
-    outcome closedAt closedByUser closedBySession closingAttestId workItemId reviewsAssignmentId
-    holderHarness holderProvider reminderState
-  )
-
   setup do
     db = start_supervised!({DB, name: :process_close_r1_db, path: ":memory:"})
     :ok = Schema.ensure_all(db)
@@ -139,8 +133,12 @@ defmodule Tightbeam.AssignmentProcessCloseR1MigrationTest do
   end
 
   defp retained(db) do
-    rows(db, "SELECT " <> Enum.join(@retained_columns, ",") <> " FROM assignments ORDER BY id")
-    |> Enum.map(&Map.new(Enum.zip(@retained_columns, &1)))
+    columns =
+      rows(db, "PRAGMA table_info(assignments)")
+      |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+    rows(db, "SELECT " <> Enum.join(columns, ",") <> " FROM assignments ORDER BY id")
+    |> Enum.map(&Map.new(Enum.zip(columns, &1)))
   end
 
   defp objects(db),

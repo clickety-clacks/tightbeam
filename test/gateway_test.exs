@@ -3714,6 +3714,18 @@ defmodule Tightbeam.GatewayTest do
     owner_user_id = ctx.device.user_id
     process_work_item = create_work_item(ctx.db, "Process role creation")
 
+    assert %{deliveryOwnerSessionKey: "k1"} =
+             WorkItems.__handle__(ctx.db, "work-item-update", %{
+               verb: "work-item-update",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: nil,
+               params: %{
+                 work_item_id: process_work_item.id,
+                 delivery_owner_session_key: "k1"
+               }
+             })
+
     process_created =
       spawn.(%{
         origin: "process:cron",
