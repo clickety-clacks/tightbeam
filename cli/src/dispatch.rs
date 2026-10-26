@@ -4654,13 +4654,13 @@ mod tests {
                 "--context",
                 "1m",
                 "--host",
-                "eezo",
+                "lab1",
                 "--key",
                 "k1",
                 "--as-user",
                 "flynn"
             ]),
-            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","effort":"high","context":"1m","handle":"reviewer","host":"eezo"}}"#
+            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","effort":"high","context":"1m","handle":"reviewer","host":"lab1"}}"#
         );
 
         // A flag NAMED but left empty is a real selection — "the vendor's
@@ -4966,7 +4966,7 @@ mod tests {
                 "assignment-commitref-correct",
                 "asg_1",
                 "--commit-refs",
-                r#"[{"repo":"gibson:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                r#"[{"repo":"node-a:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
                 "--evidence",
                 "art_1",
                 "--reason",
@@ -4976,7 +4976,7 @@ mod tests {
                 "--as",
                 "parent",
             ]),
-            r#"{"as":"parent","verb":"assignment-commitref-correct","params":{"assignmentId":"asg_1","commitRefs":[{"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"refs/heads/main","remote":"git@example/repo","repo":"gibson:/repo"}],"reason":"canonical historical backfill","evidenceArtifactId":"art_1","idempotencyKey":"backfill-1"}}"#
+            r#"{"as":"parent","verb":"assignment-commitref-correct","params":{"assignmentId":"asg_1","commitRefs":[{"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"refs/heads/main","remote":"git@example/repo","repo":"node-a:/repo"}],"reason":"canonical historical backfill","evidenceArtifactId":"art_1","idempotencyKey":"backfill-1"}}"#
         );
         assert_eq!(
             body(&[
@@ -5069,11 +5069,11 @@ mod tests {
                 "--kind",
                 "completion",
                 "--commit-refs",
-                r#"[{"repo":"eezo:/src/repo","commit":"abc123"}]"#,
+                r#"[{"repo":"lab1:/src/repo","commit":"abc123"}]"#,
                 "--as",
                 "builder",
             ]),
-            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","commitRefs":[{"commit":"abc123","repo":"eezo:/src/repo"}]}}"#
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","commitRefs":[{"commit":"abc123","repo":"lab1:/src/repo"}]}}"#
         );
     }
 
@@ -5503,39 +5503,39 @@ mod tests {
             body(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "node-a",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR=example",
                 "--as",
                 "operator",
             ]),
-            r#"{"as":"operator","verb":"host-env-set","params":{"host":"gibson","harness":"claude","name":"EXAMPLE_OVERLAY_VAR","value":"example"}}"#
+            r#"{"as":"operator","verb":"host-env-set","params":{"host":"node-a","harness":"claude","name":"EXAMPLE_OVERLAY_VAR","value":"example"}}"#
         );
         assert_eq!(
             body(&[
                 "host-env-list",
                 "--host",
-                "gibson",
+                "node-a",
                 "--harness",
                 "claude",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"host-env-list","params":{"host":"gibson","harness":"claude"}}"#
+            r#"{"asUser":"flynn","verb":"host-env-list","params":{"host":"node-a","harness":"claude"}}"#
         );
         assert_eq!(
             body(&[
                 "host-env-unset",
                 "--host",
-                "gibson",
+                "node-a",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"host-env-unset","params":{"host":"gibson","harness":"claude","name":"EXAMPLE_OVERLAY_VAR"}}"#
+            r#"{"asUser":"flynn","verb":"host-env-unset","params":{"host":"node-a","harness":"claude","name":"EXAMPLE_OVERLAY_VAR"}}"#
         );
     }
 
@@ -5605,13 +5605,13 @@ mod tests {
             body(&[
                 "host-toolchain-set",
                 "--host",
-                "gibson",
+                "node-a",
                 "--dirs",
                 r#"["/tools/one","/tools/two"]"#,
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"host-toolchain-set","params":{"host":"gibson","dirs":["/tools/one","/tools/two"]}}"#
+            r#"{"asUser":"flynn","verb":"host-toolchain-set","params":{"host":"node-a","dirs":["/tools/one","/tools/two"]}}"#
         );
     }
 
@@ -6083,11 +6083,11 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("tightbeam_cli_session_ws_{unique}"));
         let cases = [
-            ("ws", "ws://gibson:11373", "http://gibson:11373"),
-            ("wss", "wss://gibson:11373", "https://gibson:11373"),
+            ("ws", "ws://node-a:11373", "http://node-a:11373"),
+            ("wss", "wss://node-a:11373", "https://node-a:11373"),
             // http and https are already the dispatch scheme and pass through whole.
-            ("http", "http://gibson:11373", "http://gibson:11373"),
-            ("https", "https://gibson:11373", "https://gibson:11373"),
+            ("http", "http://node-a:11373", "http://node-a:11373"),
+            ("https", "https://node-a:11373", "https://node-a:11373"),
         ];
         for (name, written, expected) in cases {
             let dir = root.join(name);
@@ -6655,7 +6655,7 @@ mod tests {
         let body = serde_json::json!({
             "error": {
                 "code": "adapter_unavailable",
-                "message": "adapter for codex/luna on host racter is degraded",
+                "message": "adapter for codex/luna on host node-b is degraded",
                 "requestId": "req_9",
                 "diagnostic": {
                     "kind": "circuit_open",
@@ -6672,7 +6672,7 @@ mod tests {
 
         assert_eq!(
             human,
-            "adapter_unavailable: adapter for codex/luna on host racter is degraded (req_9)"
+            "adapter_unavailable: adapter for codex/luna on host node-b is degraded (req_9)"
         );
         assert_eq!(machine["httpStatus"], 503);
         assert_eq!(machine["ok"], false);

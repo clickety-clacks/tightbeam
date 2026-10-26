@@ -361,11 +361,11 @@ mod tests {
             verdict(
                 &requirements,
                 &parse("Darwin arm64\nnode /n\nnpm /np\nrsync /r\ncodex-cli /c\nbase-dir ABSENT\n"),
-                "eezo"
+                "lab1"
             ),
             Ok(())
         );
-        assert!(verdict(&requirements, &parse(""), "eezo").is_err());
+        assert!(verdict(&requirements, &parse(""), "lab1").is_err());
     }
 
     #[test]

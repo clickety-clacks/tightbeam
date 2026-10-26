@@ -2288,7 +2288,7 @@ mod tests {
     #[test]
     fn marker_codec_and_raw_policy() {
         let value = token_fields(Some(b"tb1-cmVzaWRlbnRAZWV6bw"));
-        assert_eq!(value.lineage.as_deref(), Some("resident@eezo"));
+        assert_eq!(value.lineage.as_deref(), Some("resident@lab1"));
         assert_eq!(
             value.raw_b64.as_deref(),
             Some("dGIxLWNtVnphV1JsYm5SQVpXVjZidw==")
@@ -2822,7 +2822,7 @@ mod tests {
             pid: 7,
             ppid: Some(1),
             pgid: Some(7),
-            lineage: Some("resident@eezo".to_owned()),
+            lineage: Some("resident@lab1".to_owned()),
             lineage_raw: Some("tb1-cmVzaWRlbnRAZWV6bw".to_owned()),
             lineage_raw_b64: Some("dGIxLWNtVnphV1JsYm5SQVpXVjZidw==".to_owned()),
             evidence: "environ_exact",
@@ -2956,7 +2956,7 @@ mod tests {
             raw,
             10_000,
             7,
-            "eezo".into(),
+            "lab1".into(),
             BaseDir {
                 path: "/srv/tightbeam".into(),
                 status: "present",
@@ -2973,7 +2973,7 @@ mod tests {
   "probed_at_ms": 10000,
   "collection_ms": 7,
   "host": {
-    "hostname": "eezo",
+    "hostname": "lab1",
     "platform": "linux",
     "probe_version": "PROBE_VERSION"
   },
