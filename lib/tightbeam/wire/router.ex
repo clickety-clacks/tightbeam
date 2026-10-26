@@ -55,6 +55,7 @@ defmodule Tightbeam.Wire.Router do
     ColdStart,
     Devices,
     Dispatch,
+    HarnessProcess,
     ModelCatalog,
     Org,
     Roles,
@@ -86,6 +87,17 @@ defmodule Tightbeam.Wire.Router do
         "state" => {:enum, ~w(in-workspace archived released)}
       },
       order: [{:created_at, :integer}, {:artifact_id, :string}]
+    },
+    harness_processes: %{
+      route: "harness_processes.collection",
+      resource: "harness processes",
+      filters: %{
+        "host" => :string,
+        "harness" => :string,
+        "state" =>
+          {:enum, ~w(launching running park_requested closed_gracefully killed kill_failed exited)}
+      },
+      order: [{:created_at, :integer}, {:launch_id, :string}]
     },
     attests: %{
       route: "attests.collection",
@@ -374,6 +386,10 @@ defmodule Tightbeam.Wire.Router do
     d2a_collection(conn, Map.fetch!(@state_read_specs, :attests))
   end
 
+  get "/api/harness-processes" do
+    d2e_collection(conn, Map.fetch!(@state_read_specs, :harness_processes))
+  end
+
   get "/api/assignments/:assignment_id/attests" do
     spec = Map.fetch!(@state_read_specs, :attests)
 
@@ -648,6 +664,36 @@ defmodule Tightbeam.Wire.Router do
            d2a_collection_rows(conn, spec, request.filters, principal, boundary, request.limit),
          {page_rows, page} <- state_page(rows, boundary, request, principal, spec),
          items <- d2a_serialize_rows(page_rows, spec) do
+      state_send(conn, 200, state_collection_envelope(conn, spec.resource, items, page))
+    else
+      {:error, 404, "not_found", _message} ->
+        state_not_found(conn, spec.resource, started_at)
+
+      {:error, status, code, message} ->
+        state_error(conn, spec.resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp d2e_collection(conn, spec) do
+    started_at = System.monotonic_time(:microsecond)
+
+    with {:ok, auth} <- state_bearer_auth(conn),
+         {:ok, query} <- decode_state_query(conn),
+         {:ok, principal} <- state_principal(auth, query, conn),
+         {:ok, request} <- state_collection_request(query, spec),
+         {:ok, boundary} <- state_cursor_boundary(request, principal, spec),
+         rows <-
+           HarnessProcess.query_rest_collection(db(conn), %{
+             filters: request.filters,
+             principal: principal,
+             boundary: boundary,
+             limit: request.limit
+           }),
+         {page_rows, page} <- state_page(rows, boundary, request, principal, spec),
+         items <- Enum.map(page_rows, &StateResources.harness_process/1) do
       state_send(conn, 200, state_collection_envelope(conn, spec.resource, items, page))
     else
       {:error, 404, "not_found", _message} ->

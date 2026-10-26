@@ -384,6 +384,158 @@ defmodule Tightbeam.HarnessProcess do
     Enum.map(rows, &decode_row/1)
   end
 
+  @doc "Admin-only REST projection of the launch ledger."
+  @spec query_rest_collection(DB.server(), map()) :: [map()]
+  def query_rest_collection(
+        db,
+        %{filters: filters, principal: principal, boundary: boundary, limit: limit}
+      )
+      when is_map(filters) and is_map(principal) and is_integer(limit) and limit > 0 do
+    validate_rest_filters!(filters)
+
+    if Map.get(principal, :is_admin) == true do
+      {filter_clauses, filter_params} = rest_filter_clauses(filters)
+      where = Enum.join(["1=1" | filter_clauses], " AND ")
+
+      {rows, reverse?} = rest_page_rows(db, where, filter_params, boundary, limit)
+      rows = if reverse?, do: Enum.reverse(rows), else: rows
+
+      rows ++ rest_opposite_probe(db, where, filter_params, boundary)
+    else
+      []
+    end
+  end
+
+  defp validate_rest_filters!(filters) do
+    Enum.each(filters, fn
+      {field, values} when field in ["host", "harness"] and is_list(values) ->
+        unless Enum.all?(values, &(is_binary(&1) and &1 != "")),
+          do: raise(ArgumentError, "invalid harness process collection filter")
+
+      {"state", values} when is_list(values) ->
+        unless Enum.all?(values, &(&1 in ~w(launching running park_requested closed_gracefully killed kill_failed exited))),
+          do: raise(ArgumentError, "invalid harness process collection filter")
+
+      _invalid ->
+        raise ArgumentError, "invalid harness process collection filter"
+    end)
+  end
+
+  defp rest_filter_clauses(filters) do
+    [{"host", "host"}, {"harness", "harness"}, {"state", "state"}]
+    |> Enum.reduce({[], []}, fn {field, column}, {clauses, params} ->
+      case Map.fetch(filters, field) do
+        {:ok, []} ->
+          {clauses ++ ["0=1"], params}
+
+        {:ok, values} when is_list(values) ->
+          index = length(params) + 1
+          placeholders = Enum.map_join(index..(index + length(values) - 1), ", ", &"?#{&1}")
+
+          condition =
+            if length(values) == 1,
+              do: "#{column} = #{placeholders}",
+              else: "#{column} IN (#{placeholders})"
+
+          {clauses ++ [condition], params ++ values}
+
+        :error ->
+          {clauses, params}
+      end
+    end)
+  end
+
+  defp rest_page_rows(db, where, params, :latest, limit),
+    do: {rest_rows(db, where, params, nil, "DESC", limit + 1), true}
+
+  defp rest_page_rows(db, where, params, {:before, [created_at, launch_id]}, limit),
+    do: {rest_rows(db, where, params, {:less, created_at, launch_id}, "DESC", limit + 1), true}
+
+  defp rest_page_rows(db, where, params, {:after, [created_at, launch_id]}, limit),
+    do: {rest_rows(db, where, params, {:greater, created_at, launch_id}, "ASC", limit + 1), false}
+
+  defp rest_rows(db, where, params, range, order, limit) do
+    {range_sql, range_params} = rest_range(range, length(params) + 1)
+    limit_index = length(params) + length(range_params) + 1
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT launchId, host, harness, osPid, state, createdAt, resolvedAt
+        FROM harness_processes
+        WHERE #{where}#{range_sql}
+        ORDER BY createdAt #{order}, launchId #{order}
+        LIMIT ?#{limit_index}
+        """,
+        params ++ range_params ++ [limit]
+      )
+
+    Enum.map(rows, &rest_row/1)
+  end
+
+  defp rest_opposite_probe(_db, _where, _params, :latest), do: []
+
+  defp rest_opposite_probe(db, where, params, {:before, [created_at, launch_id]}) do
+    rest_probe(db, where, params, {:greater_or_equal, created_at, launch_id}, "ASC")
+  end
+
+  defp rest_opposite_probe(db, where, params, {:after, [created_at, launch_id]}) do
+    rest_probe(db, where, params, {:less_or_equal, created_at, launch_id}, "DESC")
+  end
+
+  defp rest_probe(db, where, params, range, order) do
+    {range_sql, range_params} = rest_range(range, length(params) + 1)
+    limit_index = length(params) + length(range_params) + 1
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT createdAt, launchId
+        FROM harness_processes
+        WHERE #{where}#{range_sql}
+        ORDER BY createdAt #{order}, launchId #{order}
+        LIMIT ?#{limit_index}
+        """,
+        params ++ range_params ++ [1]
+      )
+
+    Enum.map(rows, fn [created_at, launch_id] ->
+      %{created_at: created_at, launch_id: launch_id}
+    end)
+  end
+
+  defp rest_range(nil, _first), do: {"", []}
+
+  defp rest_range({operator, created_at, launch_id}, first) do
+    {comparison, id_comparison} =
+      case operator do
+        :less -> {"<", "<"}
+        :greater -> {">", ">"}
+        :less_or_equal -> {"<", "<="}
+        :greater_or_equal -> {">", ">="}
+      end
+
+    {
+      " AND (createdAt #{comparison} ?#{first} OR " <>
+        "(createdAt = ?#{first} AND launchId #{id_comparison} ?#{first + 1}))",
+      [created_at, launch_id]
+    }
+  end
+
+  defp rest_row([launch_id, host, harness, pid, state, created_at, resolved_at]) do
+    %{
+      launch_id: launch_id,
+      host: host,
+      harness: harness,
+      os_pid: pid,
+      state: state,
+      created_at: created_at,
+      resolved_at: resolved_at
+    }
+  end
+
   defp reconcile_row(db, row, terminal_state \\ "killed") do
     with {:ok, row} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
       if reboot_orphan?(row) do
