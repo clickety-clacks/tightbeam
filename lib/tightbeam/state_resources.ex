@@ -1451,9 +1451,24 @@ defmodule Tightbeam.StateResources do
     end)
   end
 
-  @doc "Return one bounded page of read markers for the selected user."
+  @doc "Return one bounded page of read markers for the selected user or all markers for an observer/admin."
+  def query_read_markers_page(db, %{kind: "observer"} = principal, boundary, limit),
+    do: query_read_markers_page(db, principal, "1 = 1", [], boundary, limit)
+
+  def query_read_markers_page(
+        db,
+        %{kind: "user", is_admin: true} = principal,
+        boundary,
+        limit
+      ),
+      do: query_read_markers_page(db, principal, "1 = 1", [], boundary, limit)
+
   def query_read_markers_page(db, %{kind: "user", id: user_id} = principal, boundary, limit)
       when is_binary(user_id) and user_id != "" do
+    query_read_markers_page(db, principal, "read_markers.userId = ?", [user_id], boundary, limit)
+  end
+
+  defp query_read_markers_page(db, principal, where, params, boundary, limit) do
     trace_core_detail(principal, {:au4_visibility, "read markers"})
 
     case DB.transaction(db, fn txn ->
@@ -1463,8 +1478,8 @@ defmodule Tightbeam.StateResources do
              query,
              @read_marker_select,
              "read_markers",
-             "read_markers.userId = ?",
-             [user_id],
+             where,
+             params,
              ["read_markers.userId", "read_markers.scopeKey"],
              boundary,
              limit,

@@ -110,6 +110,9 @@ defmodule Tightbeam.Wire.ChangeSocket do
   defp route(_message, %{phase: :unauthed} = state),
     do: stop_with(auth_failure("auth_failed"), 1008, state)
 
+  defp route(%{"type" => "auth"}, %{phase: :live, principal_kind: :observer} = state),
+    do: {:ok, state}
+
   defp route(%{"type" => "subscribe"} = message, state), do: subscribe(message, state)
   defp route(%{"type" => "unsubscribe"} = message, state), do: unsubscribe(message, state)
   defp route(_message, state), do: invalid("unsupported request", state)

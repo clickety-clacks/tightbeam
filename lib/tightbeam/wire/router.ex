@@ -83,7 +83,6 @@ defmodule Tightbeam.Wire.Router do
                    "subtree-guidance-show"
                  ]
   @max_upload_bytes 32 * 1024 * 1024
-  @state_not_found_floor_us 3_000
   @state_malformed_percent_escape ~r/%(?![0-9A-Fa-f]{2})/
   @core_detail_fact_id ~r/\A[1-9][0-9]*\z/
   @core_detail_specs %{
@@ -945,8 +944,6 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp core_detail(conn, spec, raw_key) do
-    started_at = System.monotonic_time(:microsecond)
-
     with {:ok, auth} <-
            core_detail_operation(conn, spec.resource, :bearer_auth, fn ->
              core_detail_auth(conn, spec.resource)
@@ -997,10 +994,10 @@ defmodule Tightbeam.Wire.Router do
       state_send(conn, 200, state_detail_envelope(spec.resource, item_bytes))
     else
       false ->
-        state_not_found(conn, spec.resource, started_at)
+        state_not_found(conn, spec.resource)
 
       {:error, :not_found} ->
-        state_not_found(conn, spec.resource, started_at)
+        state_not_found(conn, spec.resource)
 
       {:error, status, code, message} ->
         state_error(conn, spec.resource, status, code, message)
@@ -1021,7 +1018,7 @@ defmodule Tightbeam.Wire.Router do
            end),
          {:ok, principal} <-
            core_detail_operation(conn, "read markers", :principal_resolution, fn ->
-             core_detail_route_principal(auth, query, conn, "read markers")
+             read_marker_collection_principal(auth, query, conn)
            end),
          :ok <-
            core_detail_operation(conn, "read markers", :request_validation, fn ->
@@ -1102,10 +1099,7 @@ defmodule Tightbeam.Wire.Router do
 
   defp core_detail_auth(conn, resource)
        when resource in ["sessions", "transcript messages", "read markers"] do
-    case Plug.Conn.get_req_header(conn, "authorization") do
-      [] -> {:ok, :observer}
-      _present -> state_bearer_auth(conn)
-    end
+    observer_read_auth(conn)
   end
 
   defp core_detail_auth(conn, _resource), do: state_bearer_auth(conn)
@@ -1113,30 +1107,52 @@ defmodule Tightbeam.Wire.Router do
   defp core_detail_route_principal(:observer, query, conn, "read markers"),
     do: observer_marker_principal(query, conn)
 
-  defp core_detail_route_principal(:observer, query, _conn, _resource) do
-    if Map.has_key?(query, "asUser"),
-      do: {:error, 400, "invalid_as_user", nil},
-      else: {:ok, observer_principal()}
-  end
+  defp core_detail_route_principal(:observer, query, conn, _resource),
+    do: observer_principal_for_query(query, conn)
 
   defp core_detail_route_principal(auth, query, conn, _resource),
     do: state_principal(auth, query, conn)
 
   defp observer_marker_principal(query, conn) do
+    observer_principal_for_query(query, conn)
+  end
+
+  defp read_marker_collection_principal(:observer, query, conn) do
+    case observer_as_user(query) do
+      nil -> {:ok, observer_principal()}
+      user_id -> observer_user_principal(user_id, conn)
+    end
+  end
+
+  defp read_marker_collection_principal(auth, query, conn),
+    do: core_detail_route_principal(auth, query, conn, "read markers")
+
+  defp observer_principal_for_query(query, conn) do
+    case observer_as_user(query) do
+      nil -> {:ok, observer_principal()}
+      user_id -> observer_user_principal(user_id, conn)
+    end
+  end
+
+  # Query values are accumulated in reverse order by decode_state_query/1, so
+  # the first value is the last asUser value supplied by the caller.
+  defp observer_as_user(query) do
     case Map.get(query, "asUser", []) do
-      [user_id] when user_id != "" ->
-        with {:ok, {:user, resolved_user_id}} <- resolve_cli_as_user(:org, user_id) do
-          {:ok, state_principal_view({:user, resolved_user_id}, conn)}
-        end
+      [user_id | _earlier] when is_binary(user_id) and user_id != "" -> user_id
+      _absent_or_unusable -> nil
+    end
+  end
 
-      [] ->
-        {:error, 400, "invalid_message", nil}
+  defp observer_user_principal(user_id, conn) do
+    with {:ok, principal} <- resolve_cli_as_user(:org, user_id) do
+      {:ok, state_principal_view(principal, conn)}
+    end
+  end
 
-      [""] ->
-        {:error, 400, "invalid_message", nil}
-
-      _repeated ->
-        {:error, 400, "invalid_as_user", nil}
+  defp observer_read_auth(conn) do
+    case state_bearer_auth(conn) do
+      {:error, 401, "auth_failed", _message} -> {:ok, :observer}
+      result -> result
     end
   end
 
@@ -1587,10 +1603,7 @@ defmodule Tightbeam.Wire.Router do
     do: StateResources.query_session(db, %{key: session_key, principal: principal})
 
   defp session_message_auth(conn) do
-    case Plug.Conn.get_req_header(conn, "authorization") do
-      [] -> {:ok, :observer}
-      _present -> selected_session_auth(conn)
-    end
+    observer_read_auth(conn)
   end
 
   # Organization credentials can select a user for this session's collection.
@@ -1618,11 +1631,19 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
-  defp session_collection_principal(:observer, query, _conn, _session_key, "transcript messages") do
-    if Map.has_key?(query, "asUser") do
-      {:error, 400, "invalid_as_user", nil}
-    else
-      {:ok, observer_principal(), query}
+  defp session_collection_principal(:observer, query, conn, session_key, "transcript messages") do
+    case observer_as_user(query) do
+      nil ->
+        {:ok, observer_principal(), Map.delete(query, "asUser")}
+
+      user_id ->
+        session_collection_principal(
+          :org,
+          Map.put(query, "asUser", [user_id]),
+          conn,
+          session_key,
+          "transcript messages"
+        )
     end
   end
 
@@ -2086,16 +2107,7 @@ defmodule Tightbeam.Wire.Router do
       ~s("schemaVersion":1,"resource":#{JSON.encode!(resource)},"item":#{item_bytes}})
   end
 
-  defp state_not_found(conn, resource, started_at) do
-    wait_for_state_not_found_floor(started_at + @state_not_found_floor_us)
-    state_error(conn, resource, 404, "not_found", nil)
-  end
-
-  defp wait_for_state_not_found_floor(deadline) do
-    remaining = deadline - System.monotonic_time(:microsecond)
-
-    if remaining > 0, do: wait_for_state_not_found_floor(deadline), else: :ok
-  end
+  defp state_not_found(conn, resource), do: state_error(conn, resource, 404, "not_found", nil)
 
   defp state_error(conn, resource, status, "identity_not_yours" = code, message) do
     bytes =
