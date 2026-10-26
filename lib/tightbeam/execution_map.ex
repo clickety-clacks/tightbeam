@@ -1017,9 +1017,9 @@ defmodule Tightbeam.ExecutionMap do
               ?1 = 1 OR
               (?2 = 'user' AND wi.ownerUserId = ?3) OR
               (?2 = 'session' AND (
-                wi.createdBySession = ?3 OR EXISTS (
-                  SELECT 1 FROM assignments AS held
-                  WHERE held.workItemId = wi.id AND held.holderKey = ?3
+                wi.createdBySession = ?3 OR wi.id IN (
+                  SELECT held.workItemId FROM assignments AS held
+                  WHERE held.holderKey = ?3
                 )
               ))
             )
