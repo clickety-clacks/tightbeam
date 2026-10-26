@@ -23,6 +23,8 @@ defmodule Tightbeam.StateVisibility do
     end
   end
 
+  def visible?(_db, _notice, %{kind: "observer"}), do: true
+
   def visible?(db, notice, %{kind: "user", id: user_id, is_admin: is_admin}),
     do: visible?(db, notice, user_id, is_admin)
 
@@ -57,6 +59,15 @@ defmodule Tightbeam.StateVisibility do
   def visible?(db, %{"class" => class} = notice, user_id, is_admin)
       when class in @topline_invalidation_classes do
     topline_visible?(db, notice, user_id, is_admin)
+  end
+
+  def visible?(db, %{"class" => class, "refs" => refs, "payload" => payload}, user_id, is_admin)
+      when class in ["transition.recorded", "tool_call.started", "tool_call.ended"] do
+    session_key = refs["sessionKey"] || payload["sessionKey"]
+
+    is_admin or
+      (is_binary(session_key) and
+         session_owner?(db, session_key, %{kind: "user", id: user_id}))
   end
 
   def visible?(db, %{"class" => "subagent_marker.appended"} = notice, user_id, is_admin) do

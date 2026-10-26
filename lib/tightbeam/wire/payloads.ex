@@ -33,8 +33,8 @@ defmodule Tightbeam.Wire.Payloads do
 
   MARKER MESSAGES (normative): structural boundaries carry
   `messageType=marker` plus a `marker` object with exactly `kind`, `from`,
-  and `to`. Current kinds are harness-switch, model-retune, and
-  session-restart. Writers supply those facts; `Tightbeam.Projection` owns
+  and `to`. Current kinds are harness-switch, model-retune, session-restart,
+  and context-compacted. Writers supply those facts; `Tightbeam.Projection` owns
   each readable content template. Never infer a marker from content. Ordinary
   Tightbeam notices, including turn failures and adapter state, carry
   `messageType=substrate` and remain readable records rather than boundaries.

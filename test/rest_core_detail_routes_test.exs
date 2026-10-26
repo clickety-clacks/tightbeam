@@ -525,7 +525,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert {:ok, [[""]]} =
              DB.query(ctx.db, "SELECT sender FROM messages WHERE id=?1", [empty_sender_message.id])
 
-    assert {:ok, [[nil]]} =
+    assert {:ok, [["user:outsider"]]} =
              DB.query(ctx.db, "SELECT sender FROM messages WHERE id=?1", [direct_id])
 
     history =
@@ -1661,6 +1661,202 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert_application_headers(alice_response)
   end
 
+  test "credentialless observers read sessions and their messages without changing bearer reads",
+       ctx do
+    session_key = ctx.admin_session.session_key
+    user_message_id = "observer-user-message"
+    reply_message_id = "observer-assistant-reply"
+
+    query!(
+      ctx.db,
+      """
+      INSERT INTO messages
+        (id, sessionKey, role, content, timestamp, sender, llmVisibleMessageId, attachments)
+      VALUES (?1, ?2, 'user', 'observer question', 1, 'user:flynn', ?1, '[]')
+      """,
+      [user_message_id, session_key]
+    )
+
+    query!(
+      ctx.db,
+      """
+      INSERT INTO messages
+        (id, sessionKey, role, content, timestamp, sender, replyToMessageId,
+         llmVisibleMessageId, attachments)
+      VALUES (?1, ?2, 'assistant', 'observer answer', 2, 'agent:main', ?3, ?1, '[]')
+      """,
+      [reply_message_id, session_key, user_message_id]
+    )
+
+    anonymous_sessions = get_without_authorization(ctx, "/api/sessions?limit=1")
+    org_sessions = get(ctx, "/api/sessions?limit=1", ctx.opts[:cli_token])
+
+    assert anonymous_sessions.status == 200
+    assert_application_headers(anonymous_sessions)
+
+    assert JSON.decode!(anonymous_sessions.resp_body)["items"] ==
+             JSON.decode!(org_sessions.resp_body)["items"]
+
+    session_cursor = JSON.decode!(anonymous_sessions.resp_body)["page"]["newestCursor"]
+
+    assert get_without_authorization(
+             ctx,
+             "/api/sessions?limit=1&after=#{URI.encode_www_form(session_cursor)}"
+           ).status == 200
+
+    assert_error(
+      get(
+        ctx,
+        "/api/sessions?limit=1&after=#{URI.encode_www_form(session_cursor)}",
+        ctx.opts[:cli_token]
+      ),
+      404,
+      "sessions",
+      "not_found"
+    )
+
+    anonymous_session = get_without_authorization(ctx, "/api/sessions/#{session_key}")
+    org_session = get(ctx, "/api/sessions/#{session_key}", ctx.opts[:cli_token])
+    assert anonymous_session.status == 200
+
+    assert JSON.decode!(anonymous_session.resp_body)["item"] ==
+             JSON.decode!(org_session.resp_body)["item"]
+
+    message_path = "/api/sessions/#{session_key}/messages"
+    anonymous_messages = get_without_authorization(ctx, message_path)
+    org_messages = get(ctx, message_path, ctx.opts[:cli_token])
+
+    assert anonymous_messages.status == 200
+    assert_application_headers(anonymous_messages)
+
+    assert JSON.decode!(anonymous_messages.resp_body)["items"] ==
+             JSON.decode!(org_messages.resp_body)["items"]
+
+    message_cursor = JSON.decode!(anonymous_messages.resp_body)["page"]["newestCursor"]
+
+    assert get_without_authorization(
+             ctx,
+             message_path <> "?limit=1&after=#{URI.encode_www_form(message_cursor)}"
+           ).status == 200
+
+    for message_id <- [user_message_id, reply_message_id] do
+      path = "/api/sessions/#{session_key}/messages/#{message_id}"
+      anonymous_message = get_without_authorization(ctx, path)
+      org_message = get(ctx, path, ctx.opts[:cli_token])
+
+      assert anonymous_message.status == 200
+
+      assert JSON.decode!(anonymous_message.resp_body)["item"] ==
+               JSON.decode!(org_message.resp_body)["item"]
+    end
+
+    assert_error(
+      get_without_authorization(ctx, "/api/sessions?asUser=flynn"),
+      400,
+      "sessions",
+      "invalid_as_user"
+    )
+
+    assert_error(
+      get_without_authorization(ctx, message_path <> "?asUser=flynn"),
+      400,
+      "transcript messages",
+      "invalid_as_user"
+    )
+
+    assert_error(
+      get_without_authorization(ctx, "/api/work-items"),
+      401,
+      "work items",
+      "auth_failed"
+    )
+
+    assert_error(
+      get_without_authorization(ctx, "/api/sessions", [{"authorization", ""}]),
+      401,
+      "sessions",
+      "auth_failed"
+    )
+  end
+
+  test "credentialless marker reads apply AU2 selection and page only that user's markers", ctx do
+    Devices.add_user(ctx.db, "alice", false)
+    Devices.add_user(ctx.db, "bob", false)
+
+    for scope_key <- ["chat:one", "chat:two", "chat:three"] do
+      assert {:ok, true, _marker} =
+               ReadMarkers.set(ctx.db, "alice", scope_key, "cursor-#{scope_key}")
+    end
+
+    assert {:ok, true, _marker} = ReadMarkers.set(ctx.db, "bob", "chat:other", "bob-cursor")
+
+    first = get_without_authorization(ctx, "/api/read-markers?asUser=alice&limit=1")
+    first_org = get(ctx, "/api/read-markers?asUser=alice&limit=1", ctx.opts[:cli_token])
+
+    assert first.status == 200
+    assert_application_headers(first)
+    assert first.resp_body == first_org.resp_body
+
+    first_body = JSON.decode!(first.resp_body)
+    assert [%{"userId" => "alice"} = first_item] = first_body["items"]
+    assert is_binary(first_body["page"]["newestCursor"])
+
+    second =
+      get_without_authorization(
+        ctx,
+        "/api/read-markers?asUser=alice&limit=1&after=#{URI.encode_www_form(first_body["page"]["newestCursor"])}"
+      )
+
+    assert second.status == 200
+    assert [%{"userId" => "alice"} = second_item] = JSON.decode!(second.resp_body)["items"]
+    refute first_item["scopeKey"] == second_item["scopeKey"]
+
+    all_alice_markers = get_without_authorization(ctx, "/api/read-markers?asUser=alice")
+    assert all_alice_markers.status == 200
+
+    assert Enum.all?(
+             JSON.decode!(all_alice_markers.resp_body)["items"],
+             &(&1["userId"] == "alice")
+           )
+
+    unknown_user_markers = get_without_authorization(ctx, "/api/read-markers?asUser=unregistered")
+    assert unknown_user_markers.status == 200
+    assert JSON.decode!(unknown_user_markers.resp_body)["items"] == []
+
+    assert_error(
+      get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=unregistered"),
+      404,
+      "read markers",
+      "not_found"
+    )
+
+    detail = get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=alice")
+    detail_org = get(ctx, "/api/read-markers/chat%3Aone?asUser=alice", ctx.opts[:cli_token])
+    assert detail.status == 200
+    assert detail.resp_body == detail_org.resp_body
+
+    assert_error(
+      get_without_authorization(ctx, "/api/read-markers"),
+      400,
+      "read markers",
+      "invalid_message"
+    )
+
+    assert_error(
+      get_without_authorization(ctx, "/api/read-markers?asUser="),
+      400,
+      "read markers",
+      "invalid_message"
+    )
+
+    assert_error(
+      get_without_authorization(ctx, "/api/read-markers?asUser=alice&asUser=alice"),
+      400,
+      "read markers",
+      "invalid_as_user"
+    )
+  end
+
   test "AC8 forces every shared failure stage to the closed projection error", ctx do
     for %{path: path, resource: resource} <- core_detail_cases(ctx),
         stage <- [:lookup, :schema, :serializer, :encoder] do
@@ -2466,6 +2662,13 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       put_req_header(conn, name, value)
     end)
     |> put_req_header("authorization", "Bearer #{bearer || ctx.token}")
+    |> Router.call(Router.init(ctx.opts))
+  end
+
+  defp get_without_authorization(ctx, path, headers \\ []) do
+    Enum.reduce(headers, conn(:get, path), fn {name, value}, conn ->
+      put_req_header(conn, name, value)
+    end)
     |> Router.call(Router.init(ctx.opts))
   end
 

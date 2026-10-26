@@ -58,6 +58,7 @@ defmodule Tightbeam.Wire.OperationRegistry do
     {{"GET", "/api/host-env/:host/:harness/:name"}, "http.api_host_env.get"},
     {{"GET", "/api/devices/:device_id"}, "http.api_devices.get"},
     {{"GET", "/api/artifacts/:artifact_id"}, "http.api_artifacts.get"},
+    {{"GET", "/api/read-markers"}, "http.api_read_markers.list"},
     {{"GET", "/api/read-markers/:scope_key"}, "http.api_read_markers.get"},
     {{"POST", "/api/streams"}, "http.api_streams.create"},
     {{"PATCH", "/api/streams/:key"}, "http.api_streams.update"},

@@ -255,7 +255,7 @@ defmodule Tightbeam.Firehose.Publisher do
             "refs=#{inspect(refs)}"
   end
 
-  @doc "Queue the existing message-created notice on the transaction that appended it."
+  @doc "Queue the canonical transcript-message or transition notice on its append transaction."
   @spec message_in_txn(Txn.t(), String.t(), map(), String.t() | nil) :: :ok
   def message_in_txn(%Txn{} = txn, session_key, message, owner_user_id \\ nil) do
     owner_user_id =
@@ -272,7 +272,12 @@ defmodule Tightbeam.Firehose.Publisher do
         StateResources.query_message(txn, message_id) ||
           raise ArgumentError, "committed transcript message is missing from its transaction"
 
-      committed_in_txn(txn, "message.created", canonical, %{
+      class =
+        if canonical[:message_type] == "marker",
+          do: "transition.recorded",
+          else: "message.created"
+
+      committed_in_txn(txn, class, canonical, %{
         "messageId" => message_id,
         "sessionKey" => session_key,
         "ownerUserId" => owner_user_id
@@ -688,8 +693,8 @@ defmodule Tightbeam.Firehose.Publisher do
   defp primary_param(_key), do: :id
 
   defp occurred_at(payload) do
-    payload["updatedAt"] || payload["createdAt"] || payload["openedAt"] || payload["ts"] ||
-      System.system_time(:millisecond)
+    payload["updatedAt"] || payload["createdAt"] || payload["openedAt"] || payload["endedAt"] ||
+      payload["startedAt"] || payload["ts"] || System.system_time(:millisecond)
   end
 
   defp principal(nil), do: nil

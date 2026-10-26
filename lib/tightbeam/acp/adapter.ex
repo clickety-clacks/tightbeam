@@ -53,6 +53,7 @@ defmodule Tightbeam.Acp.Adapter do
   @strict_model_call_timeout @strict_model_operation_timeout + @strict_model_reply_margin
 
   defstruct [
+    :db,
     :conn,
     :preset,
     :harness,
@@ -76,7 +77,9 @@ defmodule Tightbeam.Acp.Adapter do
     config_options: %{},
     operations: %{},
     operation_queue: [],
-    context_usage: %{}
+    context_usage: %{},
+    tool_turns: %{},
+    pending_tool_calls: %{}
   ]
 
   ## Client
@@ -499,6 +502,7 @@ defmodule Tightbeam.Acp.Adapter do
     end
 
     state = %__MODULE__{
+      db: Keyword.get(opts, :db, Tightbeam.DB),
       conn: conn,
       preset: preset,
       harness: harness,
@@ -826,6 +830,8 @@ defmodule Tightbeam.Acp.Adapter do
           | known: MapSet.delete(state.known, sid),
             models: Map.delete(state.models, sid),
             context_usage: Map.delete(state.context_usage, sid),
+            tool_turns: Map.delete(state.tool_turns, sid),
+            pending_tool_calls: drop_pending_tool_calls(state.pending_tool_calls, sid),
             unprompted: MapSet.delete(state.unprompted, sid),
             switchable_models: Map.delete(state.switchable_models, sid),
             config_options: Map.delete(state.config_options, sid),
@@ -1431,6 +1437,7 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp dispatch_prompt(state, sid, text, opts, from) do
     state = put_in(state.chunks[sid], [])
+    state = remember_tool_turn(state, sid, opts)
     # Per-turn progress channel: {fun, last_status, seq}. Deduped on text so
     # per-token thought chunks emit ONE "Thinking…" until something changes.
     state =
@@ -1574,6 +1581,7 @@ defmodule Tightbeam.Acp.Adapter do
     state = emit_progress(state, sid, update)
     state = remember_config_model(state, sid, update)
     state = remember_context_usage(state, sid, update)
+    state = record_tool_call(state, sid, update)
 
     if update["sessionUpdate"] == "agent_message_chunk" do
       text = get_in(update, ["content", "text"])
@@ -2019,6 +2027,121 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp remember_context_usage(state, _sid, _update), do: state
+
+  defp remember_tool_turn(state, sid, opts) do
+    case {Keyword.get(opts, :session_key), Keyword.get(opts, :turn_seq)} do
+      {session_key, turn_seq}
+      when is_binary(session_key) and is_integer(turn_seq) and turn_seq > 0 ->
+        put_in(state.tool_turns[sid], %{session_key: session_key, turn_seq: turn_seq})
+
+      _ ->
+        state
+    end
+  end
+
+  defp record_tool_call(state, sid, %{"sessionUpdate" => kind} = update)
+       when is_binary(sid) and kind in ["tool_call", "tool_call_update"] and
+              state.harness in [:claude, :codex] do
+    root_sid = Map.get(state.subagent_roots, sid, sid)
+
+    with %{session_key: session_key, turn_seq: turn_seq} <- state.tool_turns[root_sid],
+         id when is_binary(id) and id != "" <- update["toolCallId"] do
+      key = {root_sid, id}
+      pending = Map.get(state.pending_tool_calls, key, %{})
+
+      context_usage_before =
+        Map.get(pending, :context_usage_before) ||
+          context_usage_label(state.context_usage[sid])
+
+      context_compaction? = Tightbeam.ToolCalls.context_compaction?(update)
+
+      compaction_from =
+        Map.get(pending, :compaction_from) ||
+          if(context_compaction?, do: context_usage_before, else: nil)
+
+      fields = Tightbeam.ToolCalls.normalize_notification(update)
+      pending_fields = Map.get(pending, :fields, %{})
+
+      known? = Map.has_key?(state.pending_tool_calls, key)
+
+      if known? and not Tightbeam.ToolCalls.terminal_status?(Map.get(fields, :status)) do
+        # ACP can emit one update per output chunk or progress message. Once
+        # the row exists, keep nonterminal updates in adapter memory so only
+        # first sight and terminal updates take the database writer.
+        pending = %{
+          fields: Tightbeam.ToolCalls.merge_pending(pending_fields, fields),
+          context_usage_before: context_usage_before
+        }
+
+        pending =
+          if compaction_from,
+            do: Map.put(pending, :compaction_from, compaction_from),
+            else: pending
+
+        put_in(state.pending_tool_calls[key], pending)
+      else
+        case Tightbeam.ToolCalls.observe(
+               state.db,
+               session_key,
+               turn_seq,
+               id,
+               fields,
+               pending_fields,
+               compaction_from
+             ) do
+          {:ok, :started} ->
+            pending = %{fields: %{}, context_usage_before: context_usage_before}
+
+            pending =
+              if compaction_from,
+                do: Map.put(pending, :compaction_from, compaction_from),
+                else: pending
+
+            put_in(state.pending_tool_calls[key], pending)
+
+          {:ok, :buffered} ->
+            pending = %{
+              fields: Tightbeam.ToolCalls.merge_pending(pending_fields, fields),
+              context_usage_before: context_usage_before
+            }
+
+            pending =
+              if compaction_from,
+                do: Map.put(pending, :compaction_from, compaction_from),
+                else: pending
+
+            put_in(state.pending_tool_calls[key], pending)
+
+          {:ok, result} when result in [:ended, :unchanged] ->
+            update_in(state.pending_tool_calls, &Map.delete(&1, key))
+
+          {:error, reason} ->
+            Logger.error(
+              "tool-call persistence failed session=#{session_key} harness_call=#{id} reason=#{inspect(reason)}"
+            )
+
+            state
+        end
+      end
+    else
+      _ -> state
+    end
+  rescue
+    error ->
+      Logger.error("tool-call persistence failed reason=#{Exception.message(error)}")
+      state
+  end
+
+  defp record_tool_call(state, _sid, _update), do: state
+
+  defp context_usage_label({:ok, %{used: used, size: size}}),
+    do: "#{used}/#{size} tokens"
+
+  defp context_usage_label(_observation), do: "unknown"
+
+  defp drop_pending_tool_calls(pending_tool_calls, sid) do
+    Map.reject(pending_tool_calls, fn {{root_sid, _tool_call_id}, _pending} -> root_sid == sid end)
+  end
 
   defp apply_model_to_session(state, sid, model_ref) do
     apply_model_to_session(state, sid, model_ref, 60_000)
