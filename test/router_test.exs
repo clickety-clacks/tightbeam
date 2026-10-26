@@ -2615,6 +2615,26 @@ defmodule Tightbeam.Wire.RouterTest do
 
       refute Map.has_key?(params, :assignment_id)
     end
+
+    for timing <- [%{"afterMs" => 3_600_000}, %{"at" => 1_900_000_000_000}] do
+      params =
+        Router.atomize_params_for_test(
+          "wake",
+          Map.merge(timing, %{"assignmentId" => "asg_checkpoint", "requestRef" => "dr_forged"})
+        )
+
+      assert params.assignment_id == "asg_checkpoint"
+      refute Map.has_key?(params, :request_ref)
+    end
+
+    condition =
+      Router.atomize_params_for_test("wake", %{
+        "assignmentId" => "asg_condition",
+        "conditionKind" => "build-finished",
+        "afterMs" => 3_600_000
+      })
+
+    refute Map.has_key?(condition, :assignment_id)
   end
 
   test "operator ruling provenance is substrate-only" do

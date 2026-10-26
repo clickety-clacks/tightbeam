@@ -1238,13 +1238,13 @@ defmodule Tightbeam.JobForensicsTest do
       })
     end
 
-    # An AGENT supplying assignment_id gets it dropped: a conversational wake is
-    # NULL, and no forged carrier can reach the turn or the trace (Law 0).
-    %{wake_id: agent_wake} = forge.({:session, "agent-session"})
-    assert is_nil(Wakes.get(db, agent_wake).assignment_id)
+    # An agent-supplied timed assignment is admitted only as a bounded liveness
+    # checkpoint for that assignment's running turn. This fixture has no running
+    # turn, so it cannot forge attribution into a wake or trace.
+    assert %{code: "invalid_checkpoint"} = forge.({:session, "agent-session"})
 
-    # And the spec's pinned defence is at the BOUNDARY: the field never survives
-    # an agent/dispatch param map, so no handler has to remember to distrust it.
+    # Immediate conversational wakes still strip the field at the boundary;
+    # only an explicit timed shape can reach checkpoint admission.
     refute Map.has_key?(
              Tightbeam.Wire.Router.atomize_params_for_test("wake", %{
                "prompt" => "p",

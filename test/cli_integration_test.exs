@@ -24,6 +24,7 @@ defmodule Tightbeam.CliIntegrationTest do
     Rails,
     Roles,
     Rules,
+    Supervision,
     Wakes,
     WorkItems,
     WorkState
@@ -52,6 +53,192 @@ defmodule Tightbeam.CliIntegrationTest do
     end
 
     {:ok, binary: binary}
+  end
+
+  test "timed assignment checkpoints retain scope, pace liveness, deliver, and cancel", ctx do
+    run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+
+    assert {assigned, 0} =
+             run.([
+               "assign",
+               "--session",
+               "cli-holder",
+               "--subject",
+               "timed checkpoint",
+               "--as-user",
+               "flynn"
+             ])
+
+    assignment = JSON.decode!(assigned)["id"]
+
+    assert {:ok, seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: "cli-holder",
+               message_id: "timed-checkpoint-source",
+               origin: "agent:fixture",
+               prompt: "checkpoint source",
+               assignment_id: assignment
+             })
+
+    assert {:ok, %{seq: ^seq, owner_lease: owner_lease}} =
+             Ledger.claim_next(ctx.db, "cli-holder", "checkpoint-test")
+
+    assert {scheduled, 0} =
+             run.([
+               "wake",
+               "--session",
+               "cli-holder",
+               "--assignment",
+               assignment,
+               "--after",
+               "1h",
+               "--prompt",
+               "resume after the checkpoint"
+             ])
+
+    response = JSON.decode!(scheduled)
+    wake_id = response["wakeId"]
+    assert response["assignmentId"] == assignment
+    assert response["obligationRef"] == assignment
+    assert response["waitMode"] == "checkpoint"
+    assert response["eligible"] == false
+
+    assert_receive {:cli_call, %{verb: "wake", params: %{assignment_id: ^assignment}}}
+
+    assert %{
+             assignment_id: ^assignment,
+             obligation_ref: ^assignment,
+             wait_mode: "checkpoint",
+             originating_turn_seq: ^seq
+           } = Wakes.get(ctx.db, wake_id)
+
+    assert {:ok, [[^assignment, "cli-holder", ^seq]]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId,holderSessionKey,sourceTurnSeq FROM supervision_liveness_checkpoint_bindings WHERE wakeId=?1",
+               [wake_id]
+             )
+
+    assert {listed, 0} = run.(["list"])
+
+    assert %{
+             "assignmentId" => ^assignment,
+             "obligationRef" => ^assignment,
+             "waitMode" => "checkpoint"
+           } =
+             JSON.decode!(listed)["wakes"]
+             |> Enum.find(&(&1["wakeId"] == wake_id))
+
+    assert :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: owner_lease)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId=?1",
+               [assignment]
+             )
+
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "cli-holder", seq)
+
+    assert {:ok, [[2, checkpoint_due, "checkpoint", ^wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT e.generation,e.dueAt,r.sourceKind,r.sourceId FROM supervision_entitlements e JOIN supervision_liveness_receipts r ON r.assignmentId=e.assignmentId WHERE e.assignmentId=?1",
+               [assignment]
+             )
+
+    assert checkpoint_due > System.system_time(:millisecond)
+
+    assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake_id])
+
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+
+    start_supervised!(
+      {Wakes,
+       db: ctx.db,
+       name: Tightbeam.WakeScheduler,
+       tick_ms: 60_000,
+       delivery_opts: [conn_registry: Tightbeam.ConnRegistry, lane_manager: Tightbeam.LaneManager],
+       deliver: fn _wake -> flunk("timed checkpoint used the legacy delivery callback") end}
+    )
+
+    delivery = assert_cli_source_delivery!(ctx.db, wake_id, "cli-holder")
+    assert delivery.source.prompt == "resume after the checkpoint"
+    finish_cli_delivery!(ctx.db, "cli-holder", delivery.seq)
+
+    assert {:ok, seq2} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: "cli-holder",
+               message_id: "timed-checkpoint-cancel-source",
+               origin: "agent:fixture",
+               prompt: "checkpoint cancel source",
+               assignment_id: assignment
+             })
+
+    assert {:ok, %{seq: ^seq2, owner_lease: owner_lease2}} =
+             Ledger.claim_next(ctx.db, "cli-holder", "checkpoint-cancel-test")
+
+    assert {second, 0} =
+             run.([
+               "wake",
+               "--session",
+               "cli-holder",
+               "--assignment",
+               assignment,
+               "--after",
+               "2h",
+               "--prompt",
+               "cancel this checkpoint"
+             ])
+
+    second_id = JSON.decode!(second)["wakeId"]
+    assert {canceled, 0} = run.(["cancel-wake", second_id])
+    assert JSON.decode!(canceled)["canceled"] == true
+    assert Wakes.get(ctx.db, second_id).state == "canceled"
+    assert :ok = Ledger.finish(ctx.db, seq2, "delivered", nil, owner_lease: owner_lease2)
+
+    assert {unknown, unknown_status} =
+             run.([
+               "wake",
+               "--session",
+               "cli-holder",
+               "--assignment",
+               "asg_missing",
+               "--after",
+               "1h",
+               "--prompt",
+               "must refuse"
+             ])
+
+    assert unknown_status != 0
+    assert unknown =~ "unknown_assignment"
+
+    assert {_revoked, 0} =
+             run.([
+               "revoke-assignment",
+               assignment,
+               "--reason",
+               "closed checkpoint fixture",
+               "--as-user",
+               "flynn"
+             ])
+
+    assert {closed, closed_status} =
+             run.([
+               "wake",
+               "--session",
+               "cli-holder",
+               "--assignment",
+               assignment,
+               "--after",
+               "1h",
+               "--prompt",
+               "must refuse closed"
+             ])
+
+    assert closed_status != 0
+    assert closed =~ "unknown_assignment"
   end
 
   setup %{binary: binary} do
