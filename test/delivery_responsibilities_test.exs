@@ -38,6 +38,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
           {"peer", "owner", "coder"},
           {"consult-po", "owner", "product-owner"},
           {"intake-pdo", "owner", "pdo"},
+          {"office-orchestrator", "owner", "orchestrator"},
           {"reviewer", "owner", "reviewer"},
           {"foreign-pdo", "other", "pdo"},
           {"foreign-worker", "other", "coder"}
@@ -479,6 +480,85 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     assert {:ok, [[0]]} =
              DB.query(db, "SELECT COUNT(*) FROM assignments WHERE workItemId=?1", [item_id])
+  end
+
+  test "production and linked reviews refuse office archetypes while coder work and coordination remain available",
+       %{db: db} do
+    tmp =
+      Path.join(System.tmp_dir!(), "office-target-rules-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(tmp) end)
+    load_delivery_rules!(tmp)
+    handlers = assignment_handlers(db)
+    set_owner(db, {:user, "owner"}, "wi_a1", "pdo-a")
+
+    topology =
+      assign(db, {:session, "pdo-a"}, "lane-a", "wi_a1", effect_kind: "coordination")
+
+    assert %{attest: %{verdictKind: "topology-decided"}} =
+             attest_verdict(db, "lane-a", topology.id, "topology-decided")
+
+    assert {:ok, producer} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               production_call("assign", {:user, "owner"}, "worker-a", "wi_a1")
+             )
+
+    before = count(db, "assignments")
+    wakes_before = count(db, "wakes")
+
+    for {target, archetype} <- [
+          {"consult-po", "product-owner"},
+          {"intake-pdo", "pdo"},
+          {"office-orchestrator", "orchestrator"}
+        ],
+        verb <- ["assign", "dispatch"],
+        effect <- ["code", "review"] do
+      rule = "engineering-#{verb}-production-office-target-refused"
+
+      call =
+        production_call(verb, {:user, "owner"}, target, "wi_a1")
+        |> put_in([:params, :effect_kind], effect)
+
+      call =
+        if effect == "review",
+          do: put_in(call, [:params, :reviews_assignment_id], producer.id),
+          else: call
+
+      assert {:error, %{code: "rule_denied", rule: ^rule}} =
+               Dispatch.dispatch(db, handlers, call),
+             "#{archetype} #{verb} #{effect} must be refused"
+    end
+
+    assert count(db, "assignments") == before
+    assert count(db, "wakes") == wakes_before
+
+    assert {:ok, %{holderKey: "peer", effectKind: "code"}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               production_call("assign", {:user, "owner"}, "peer", "wi_a1")
+             )
+
+    assert {:ok, %{holderKey: "reviewer", effectKind: "review"}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               production_call("assign", {:user, "owner"}, "reviewer", "wi_a1")
+               |> put_in([:params, :effect_kind], "review")
+               |> put_in([:params, :reviews_assignment_id], producer.id)
+             )
+
+    for target <- ["consult-po", "intake-pdo", "office-orchestrator"] do
+      assert {:ok, %{holderKey: ^target, effectKind: "coordination"}} =
+               Dispatch.dispatch(
+                 db,
+                 handlers,
+                 production_call("assign", {:user, "owner"}, target, "wi_a1")
+                 |> put_in([:params, :effect_kind], "coordination")
+               )
+    end
   end
 
   test "loaded engineering rules require owner and topology even with an authentic routing bracket",
