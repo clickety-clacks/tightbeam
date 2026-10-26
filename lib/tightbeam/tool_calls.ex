@@ -15,6 +15,7 @@ defmodule Tightbeam.ToolCalls do
 
   @field_limit 65_536
   @shape "tool-call-transition-v1-011"
+  @schema_predecessor "launch-preparation-evidence-v1-0112"
   @terminal_statuses ["completed", "failed"]
   @truncation_order %{"rawInput" => 0, "rawOutput" => 1, "content" => 2}
 
@@ -194,7 +195,7 @@ defmodule Tightbeam.ToolCalls do
 
   defp migrate_unstamped_in_txn(txn) do
     case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-      [["launch-preparation-boot-v1-0110"]] ->
+      [[@schema_predecessor]] ->
         :ok
 
       rows ->
