@@ -83,7 +83,6 @@ defmodule Tightbeam.Wire.Router do
                    "subtree-guidance-show"
                  ]
   @max_upload_bytes 32 * 1024 * 1024
-  @state_not_found_floor_us 3_000
   @state_malformed_percent_escape ~r/%(?![0-9A-Fa-f]{2})/
   @core_detail_fact_id ~r/\A[1-9][0-9]*\z/
   @core_detail_specs %{
@@ -924,8 +923,6 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp core_detail(conn, spec, raw_key) do
-    started_at = System.monotonic_time(:microsecond)
-
     with {:ok, auth} <-
            core_detail_operation(conn, spec.resource, :bearer_auth, fn ->
              state_bearer_auth(conn)
@@ -976,10 +973,10 @@ defmodule Tightbeam.Wire.Router do
       state_send(conn, 200, state_detail_envelope(spec.resource, item_bytes))
     else
       false ->
-        state_not_found(conn, spec.resource, started_at)
+        state_not_found(conn, spec.resource)
 
       {:error, :not_found} ->
-        state_not_found(conn, spec.resource, started_at)
+        state_not_found(conn, spec.resource)
 
       {:error, status, code, message} ->
         state_error(conn, spec.resource, status, code, message)
@@ -988,6 +985,157 @@ defmodule Tightbeam.Wire.Router do
     _error in [ArgumentError, KeyError, MatchError] ->
       state_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
+
+  defp read_marker_index(conn) do
+    with {:ok, auth} <-
+           core_detail_operation(conn, "read markers", :bearer_auth, fn ->
+             core_detail_auth(conn, "read markers")
+           end),
+         {:ok, query} <-
+           core_detail_operation(conn, "read markers", :query_decode, fn ->
+             decode_state_query(conn)
+           end),
+         {:ok, principal} <-
+           core_detail_operation(conn, "read markers", :principal_resolution, fn ->
+             read_marker_collection_principal(auth, query, conn)
+           end),
+         :ok <-
+           core_detail_operation(conn, "read markers", :request_validation, fn ->
+             read_marker_collection_request(query)
+           end),
+         {:ok, limit, boundary} <-
+           state_page_request(
+             query,
+             "read_markers.collection",
+             "read markers",
+             %{},
+             principal,
+             &read_marker_tuple?/1,
+             @state_default_limit,
+             :earliest,
+             :earliest,
+             :latest
+           ),
+         :ok <- core_detail_probe(conn, "read markers", :lookup),
+         page_result <-
+           core_detail_operation(conn, "read markers", :row_lookup, fn ->
+             StateResources.query_read_markers_page(
+               db(conn),
+               core_detail_trace_principal(conn, principal),
+               boundary,
+               limit
+             )
+           end),
+         page <-
+           state_page_metadata(
+             page_result.rows,
+             page_result.flags,
+             &read_marker_tuple/1,
+             "read_markers.collection",
+             "read markers",
+             %{},
+             principal,
+             :asc
+           ),
+         :ok <- core_detail_probe(conn, "read markers", :schema),
+         :ok <- core_detail_probe(conn, "read markers", :serializer),
+         item_bytes <- read_marker_index_item_bytes(page_result.rows, state_catalog(conn)),
+         :ok <- core_detail_probe(conn, "read markers", :encoder),
+         :ok <- core_detail_probe(conn, "read markers", :envelope) do
+      core_detail_trace(conn, {:envelope, "read markers"})
+
+      body =
+        "{" <>
+          ~s("schemaVersion":1,"resource":"read markers","items":[#{item_bytes}],"page":#{JSON.encode!(page)}})
+
+      state_send(conn, 200, body)
+    else
+      {:error, status, code, message} -> state_error(conn, "read markers", status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, "read markers", 500, "projection_invalid", nil)
+  end
+
+  defp read_marker_index_item_bytes(rows, catalog) do
+    Enum.map_join(rows, ",", fn row ->
+      StateResources.encode_item("read markers", StateResources.read_marker(row), catalog)
+    end)
+  end
+
+  defp read_marker_tuple(%{user_id: user_id, scope_key: scope_key}), do: [user_id, scope_key]
+
+  defp read_marker_tuple?([user_id, scope_key]),
+    do: is_binary(user_id) and user_id != "" and is_binary(scope_key) and scope_key != ""
+
+  defp read_marker_tuple?(_tuple), do: false
+
+  defp read_marker_collection_request(query) do
+    if Enum.all?(Map.keys(query), &(&1 in ["asUser", "limit", "before", "after", "tail"])),
+      do: :ok,
+      else: {:error, 400, "invalid_filter", nil}
+  end
+
+  defp core_detail_auth(conn, resource)
+       when resource in ["sessions", "transcript messages", "read markers"] do
+    observer_read_auth(conn)
+  end
+
+  defp core_detail_auth(conn, _resource), do: state_bearer_auth(conn)
+
+  defp core_detail_route_principal(:observer, query, conn, "read markers"),
+    do: observer_marker_principal(query, conn)
+
+  defp core_detail_route_principal(:observer, query, conn, _resource),
+    do: observer_principal_for_query(query, conn)
+
+  defp core_detail_route_principal(auth, query, conn, _resource),
+    do: state_principal(auth, query, conn)
+
+  defp observer_marker_principal(query, conn) do
+    observer_principal_for_query(query, conn)
+  end
+
+  defp read_marker_collection_principal(:observer, query, conn) do
+    case observer_as_user(query) do
+      nil -> {:ok, observer_principal()}
+      user_id -> observer_user_principal(user_id, conn)
+    end
+  end
+
+  defp read_marker_collection_principal(auth, query, conn),
+    do: core_detail_route_principal(auth, query, conn, "read markers")
+
+  defp observer_principal_for_query(query, conn) do
+    case observer_as_user(query) do
+      nil -> {:ok, observer_principal()}
+      user_id -> observer_user_principal(user_id, conn)
+    end
+  end
+
+  # Query values are accumulated in reverse order by decode_state_query/1, so
+  # the first value is the last asUser value supplied by the caller.
+  defp observer_as_user(query) do
+    case Map.get(query, "asUser", []) do
+      [user_id | _earlier] when is_binary(user_id) and user_id != "" -> user_id
+      _absent_or_unusable -> nil
+    end
+  end
+
+  defp observer_user_principal(user_id, conn) do
+    with {:ok, principal} <- resolve_cli_as_user(:org, user_id) do
+      {:ok, state_principal_view(principal, conn)}
+    end
+  end
+
+  defp observer_read_auth(conn) do
+    case state_bearer_auth(conn) do
+      {:error, 401, "auth_failed", _message} -> {:ok, :observer}
+      result -> result
+    end
+  end
+
+  defp observer_principal, do: %{kind: "observer", id: "observer", is_admin: false}
 
   defp session_index(conn) do
     with {:ok, auth} <-
@@ -1353,6 +1501,16 @@ defmodule Tightbeam.Wire.Router do
       state_error(conn, resource, 500, "projection_invalid", nil)
   end
 
+  defp session_collection_session(db, session_key, %{kind: "observer"}),
+    do: StateResources.query_session(db, session_key)
+
+  defp session_collection_session(db, session_key, principal),
+    do: StateResources.query_session(db, %{key: session_key, principal: principal})
+
+  defp session_message_auth(conn) do
+    observer_read_auth(conn)
+  end
+
   # Organization credentials can select a user for this session's collection.
   defp session_collection_principal(:org, query, conn, session_key, _resource) do
     case Map.get(query, "asUser", []) do
@@ -1375,6 +1533,22 @@ defmodule Tightbeam.Wire.Router do
 
       _ ->
         {:error, 400, "invalid_as_user", nil}
+    end
+  end
+
+  defp session_collection_principal(:observer, query, conn, session_key, "transcript messages") do
+    case observer_as_user(query) do
+      nil ->
+        {:ok, observer_principal(), Map.delete(query, "asUser")}
+
+      user_id ->
+        session_collection_principal(
+          :org,
+          Map.put(query, "asUser", [user_id]),
+          conn,
+          session_key,
+          "transcript messages"
+        )
     end
   end
 
@@ -1709,16 +1883,7 @@ defmodule Tightbeam.Wire.Router do
       ~s("schemaVersion":1,"resource":#{JSON.encode!(resource)},"item":#{item_bytes}})
   end
 
-  defp state_not_found(conn, resource, started_at) do
-    wait_for_state_not_found_floor(started_at + @state_not_found_floor_us)
-    state_error(conn, resource, 404, "not_found", nil)
-  end
-
-  defp wait_for_state_not_found_floor(deadline) do
-    remaining = deadline - System.monotonic_time(:microsecond)
-
-    if remaining > 0, do: wait_for_state_not_found_floor(deadline), else: :ok
-  end
+  defp state_not_found(conn, resource), do: state_error(conn, resource, 404, "not_found", nil)
 
   defp state_error(conn, resource, status, "identity_not_yours" = code, message) do
     bytes =
