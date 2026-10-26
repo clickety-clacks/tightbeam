@@ -1624,47 +1624,45 @@ defmodule Tightbeam.ExecutionMap do
       (node.closing_attests
        |> Enum.sort_by(&Map.get(&1, :assignmentId))
        |> Enum.map_join(",", fn attest ->
-        exact_execution_map_keys!(
-          attest,
-          [:assignmentId, :attestId, :commitRefs],
-          "closingAttests"
-        )
+         exact_execution_map_keys!(
+           attest,
+           [:assignmentId, :attestId, :commitRefs],
+           "closingAttests"
+         )
 
-        refs =
-          case attest.commitRefs do
-            nil ->
-              "null"
+         refs =
+           case attest.commitRefs do
+             nil ->
+               "null"
 
-            rows when is_list(rows) ->
-              "[" <>
-                Enum.map_join(rows, ",", fn row ->
-                  encode_execution_map_string_object!(
-                    row,
-                    ~w(repo commit),
-                    "closingAttests.commitRefs"
-                  )
-                end) <> "]"
+             rows when is_list(rows) ->
+               "[" <>
+                 Enum.map_join(rows, ",", fn row ->
+                   encode_execution_map_string_object!(
+                     row,
+                     ~w(repo commit),
+                     "closingAttests.commitRefs"
+                   )
+                 end) <> "]"
 
-            _ ->
-              raise ArgumentError, "closingAttests.commitRefs must be an array or null"
-          end
+             _ ->
+               raise ArgumentError, "closingAttests.commitRefs must be an array or null"
+           end
 
-        "{" <>
-          execution_map_pair!(
-            "assignmentId",
-            JSON.encode!(
-              execution_map_string!(attest.assignmentId, "closingAttests.assignmentId")
-            )
-          ) <>
-          "," <>
-          execution_map_pair!(
-            "attestId",
-            JSON.encode!(
-              execution_map_string!(attest.attestId, "closingAttests.attestId")
-            )
-          ) <>
-          "," <>
-          execution_map_pair!("commitRefs", refs) <> "}"
+         "{" <>
+           execution_map_pair!(
+             "assignmentId",
+             JSON.encode!(
+               execution_map_string!(attest.assignmentId, "closingAttests.assignmentId")
+             )
+           ) <>
+           "," <>
+           execution_map_pair!(
+             "attestId",
+             JSON.encode!(execution_map_string!(attest.attestId, "closingAttests.attestId"))
+           ) <>
+           "," <>
+           execution_map_pair!("commitRefs", refs) <> "}"
        end)) <> "]"
   end
 
@@ -1686,11 +1684,11 @@ defmodule Tightbeam.ExecutionMap do
           Map.get(mind, :effort) || "", Map.get(mind, :harness) || ""}
        end)
        |> Enum.map_join(",", fn mind ->
-        execution_map_object!(
-          mind,
-          [model: "model", context: "context", effort: "effort", harness: "harness"],
-          "minds"
-        )
+         execution_map_object!(
+           mind,
+           [model: "model", context: "context", effort: "effort", harness: "harness"],
+           "minds"
+         )
        end)) <> "]"
   end
 
