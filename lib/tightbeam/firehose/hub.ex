@@ -532,6 +532,8 @@ defmodule Tightbeam.Firehose.Hub do
       )
   end
 
+  defp revoked?(_notice, %{principal_kind: :observer}), do: false
+
   defp revoked?(%{"class" => "device.revoked", "refs" => refs}, socket),
     do: refs["deviceId"] == socket.device_id
 
@@ -550,6 +552,9 @@ defmodule Tightbeam.Firehose.Hub do
 
   defp visible?(%{principal_kind: :session, principal_id: session_key, db: db}, notice),
     do: StateVisibility.visible?(db, notice, %{kind: "session", id: session_key})
+
+  defp visible?(%{principal_kind: :observer, db: db}, notice),
+    do: StateVisibility.visible?(db, notice, %{kind: "observer"})
 
   defp visible?(
          %{principal_kind: :user, principal_id: user_id, db: db, is_admin: is_admin},
