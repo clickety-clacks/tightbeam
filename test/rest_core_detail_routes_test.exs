@@ -1487,8 +1487,9 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     end
   end
 
-  test "AC6 applies the complete AU2 precedence table with exact bytes and headers", ctx do
-    for %{path: path, resource: resource} <- core_detail_cases(ctx) do
+  test "AC6 applies the AU2 precedence table outside observer reads", ctx do
+    for %{path: path, resource: resource} <- core_detail_cases(ctx),
+        resource not in ["sessions", "transcript messages", "read markers"] do
       cases = [
         {path, "", 401, "auth_failed", nil, [:bearer_auth]},
         {path, "invalid-token", 401, "auth_failed", nil, [:bearer_auth]},
@@ -1508,28 +1509,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
       for {request_path, bearer, status, code, message, operations} <- cases do
         {response, trace} = traced_get(ctx, request_path, bearer)
-
-        if resource in ["sessions", "transcript messages", "read markers"] and
-             bearer in ["", "invalid-token"] do
-          assert_application_headers(response)
-
-          if resource == "read markers" do
-            assert_error(response, 404, resource, "not_found")
-            assert response.resp_body ==
-                     get_without_authorization(ctx, request_path).resp_body
-          else
-            assert response.status == 200
-            assert JSON.decode!(response.resp_body)["resource"] == resource
-            assert :bearer_auth in operation_trace(trace, resource)
-            assert :principal_resolution in operation_trace(trace, resource)
-          end
-        else
-          assert_error(response, status, resource, code, message)
-          assert_application_headers(response)
-          assert operation_trace(trace, resource) == operations
-          refute Enum.any?(trace, &match?({:sql_query, _, _}, &1))
-          refute Enum.any?(trace, &match?({:shared_lookup, _, _}, &1))
-        end
+        assert_error(response, status, resource, code, message)
+        assert_application_headers(response)
+        assert operation_trace(trace, resource) == operations
+        refute Enum.any?(trace, &match?({:sql_query, _, _}, &1))
+        refute Enum.any?(trace, &match?({:shared_lookup, _, _}, &1))
       end
     end
 
@@ -1777,10 +1761,34 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert selected_session.status == 200
     assert selected_session.resp_body == selected_session_org.resp_body
 
+    selected_session_bearer =
+      get(ctx, "/api/sessions/#{session_key}?asUser=flynn", ctx.admin_session.cli_token)
+
+    assert selected_session_bearer.status == 200
+    assert selected_session_bearer.resp_body == selected_session_org.resp_body
+
+    assert get_without_authorization(ctx, "/api/sessions/#{session_key}?asUser=").resp_body ==
+             anonymous_session.resp_body
+
+    assert get_without_authorization(ctx, "/api/sessions/#{session_key}?asUser=flynn%zz").resp_body ==
+             anonymous_session.resp_body
+
+    repeated_session_last =
+      get_without_authorization(ctx, "/api/sessions/#{session_key}?asUser=alice&asUser=flynn")
+
+    assert repeated_session_last.status == 200
+    assert repeated_session_last.resp_body == selected_session_org.resp_body
+
     selected_messages = get_without_authorization(ctx, message_path <> "?asUser=flynn")
     selected_messages_org = get(ctx, message_path <> "?asUser=flynn", ctx.opts[:cli_token])
     assert selected_messages.status == 200
     assert selected_messages.resp_body == selected_messages_org.resp_body
+
+    selected_messages_bearer =
+      get(ctx, message_path <> "?asUser=flynn", ctx.admin_session.cli_token)
+
+    assert selected_messages_bearer.status == 200
+    assert selected_messages_bearer.resp_body == selected_messages_org.resp_body
 
     for message_id <- [user_message_id, reply_message_id] do
       path = message_path <> "/#{message_id}?asUser=flynn"
@@ -1793,8 +1801,27 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert get_without_authorization(ctx, "/api/sessions?asUser=").resp_body ==
              anonymous_sessions.resp_body
 
+    assert get_without_authorization(ctx, "/api/sessions?asUser=flynn%zz").resp_body ==
+             anonymous_sessions.resp_body
+
+    assert get_without_authorization(ctx, "/api/sessions?asUser=alice&asUser=").resp_body ==
+             anonymous_sessions.resp_body
+
     assert get_without_authorization(ctx, message_path <> "?asUser=").resp_body ==
              anonymous_messages.resp_body
+
+    assert get_without_authorization(ctx, message_path <> "?asUser=flynn%zz").resp_body ==
+             anonymous_messages.resp_body
+
+    for message_id <- [user_message_id, reply_message_id] do
+      path = message_path <> "/#{message_id}"
+
+      assert get_without_authorization(ctx, path <> "?asUser=").resp_body ==
+               get_without_authorization(ctx, path).resp_body
+
+      assert get_without_authorization(ctx, path <> "?asUser=flynn%zz").resp_body ==
+               get_without_authorization(ctx, path).resp_body
+    end
 
     Devices.add_user(ctx.db, "alice", false)
     ensure_main_session(ctx.db, "alice")
@@ -1811,6 +1838,45 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert repeated_messages_last.status == 200
     assert repeated_messages_last.resp_body == selected_messages_org.resp_body
 
+    mismatched_session_selector =
+      get(ctx, "/api/sessions/#{session_key}?asUser=mallory", ctx.admin_session.cli_token)
+
+    assert mismatched_session_selector.status == 200
+
+    assert mismatched_session_selector.resp_body ==
+             get(ctx, "/api/sessions/#{session_key}", ctx.admin_session.cli_token).resp_body
+
+    mismatched_message_selector =
+      get(ctx, message_path <> "?asUser=mallory", ctx.admin_session.cli_token)
+
+    assert mismatched_message_selector.status == 200
+
+    assert mismatched_message_selector.resp_body ==
+             get(ctx, message_path, ctx.admin_session.cli_token).resp_body
+
+    for {path, expected} <- [
+          {"/api/sessions/#{session_key}?asUser=mallory",
+           get(ctx, "/api/sessions/#{session_key}", ctx.admin_device.token)},
+          {message_path <> "?asUser=mallory", get(ctx, message_path, ctx.admin_device.token)}
+        ] do
+      response = get(ctx, path, ctx.admin_device.token)
+      assert response.status == 200
+      assert response.resp_body == expected.resp_body
+    end
+
+    for {path, token} <- [
+          {"/api/sessions/#{session_key}", ctx.admin_session.cli_token},
+          {message_path, ctx.admin_session.cli_token},
+          {"/api/sessions/#{session_key}", ctx.admin_device.token},
+          {message_path, ctx.admin_device.token}
+        ],
+        selector <- ["asUser=", "asUser=flynn%zz"] do
+      expected = get(ctx, path, token)
+      response = get(ctx, path <> "?" <> selector, token)
+      assert response.status == 200
+      assert response.resp_body == expected.resp_body
+    end
+
     for authorization <- ["", "Bearer ", "Basic malformed", "Bearer invalid-token"] do
       headers = [{"authorization", authorization}]
       session_response = get_without_authorization(ctx, "/api/sessions", headers)
@@ -1821,6 +1887,42 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       assert message_response.status == 200
       assert JSON.decode!(message_response.resp_body)["items"] ==
                JSON.decode!(anonymous_messages.resp_body)["items"]
+
+      selected_session_fallback =
+        get_without_authorization(ctx, "/api/sessions?asUser=flynn%zz", headers)
+
+      selected_message_fallback =
+        get_without_authorization(ctx, message_path <> "?asUser=flynn%zz", headers)
+
+      selected_session_with_bad_bearer =
+        get_without_authorization(ctx, "/api/sessions?asUser=flynn", headers)
+
+      selected_message_with_bad_bearer =
+        get_without_authorization(ctx, message_path <> "?asUser=flynn", headers)
+
+      assert selected_session_fallback.status == 200
+      assert selected_session_fallback.resp_body == anonymous_sessions.resp_body
+      assert selected_message_fallback.status == 200
+      assert JSON.decode!(selected_message_fallback.resp_body)["items"] ==
+               JSON.decode!(anonymous_messages.resp_body)["items"]
+      assert selected_session_with_bad_bearer.status == 200
+      assert selected_session_with_bad_bearer.resp_body == selected_sessions_org.resp_body
+      assert selected_message_with_bad_bearer.status == 200
+      assert selected_message_with_bad_bearer.resp_body == selected_messages_org.resp_body
+
+      session_detail =
+        get_without_authorization(ctx, "/api/sessions/#{session_key}", headers)
+
+      assert session_detail.status == 200
+      assert session_detail.resp_body == anonymous_session.resp_body
+
+      for message_id <- [user_message_id, reply_message_id] do
+        path = message_path <> "/#{message_id}"
+        detail = get_without_authorization(ctx, path, headers)
+        expected = get_without_authorization(ctx, path)
+        assert detail.status == 200
+        assert detail.resp_body == expected.resp_body
+      end
     end
 
     assert_error(
@@ -1841,18 +1943,32 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
                ReadMarkers.set(ctx.db, "alice", scope_key, "cursor-#{scope_key}")
     end
 
+    assert {:ok, true, _marker} = ReadMarkers.set(ctx.db, "bob", "chat:one", "bob-cursor-one")
     assert {:ok, true, _marker} = ReadMarkers.set(ctx.db, "bob", "chat:other", "bob-cursor")
 
     all_markers = get_without_authorization(ctx, "/api/read-markers")
     admin_markers = get(ctx, "/api/read-markers", ctx.opts[:cli_token])
     assert all_markers.status == 200
-    assert all_markers.resp_body == admin_markers.resp_body
+    assert JSON.decode!(all_markers.resp_body)["items"] ==
+             JSON.decode!(admin_markers.resp_body)["items"]
     all_marker_users = JSON.decode!(all_markers.resp_body)["items"] |> Enum.map(& &1["userId"])
     assert "alice" in all_marker_users
     assert "bob" in all_marker_users
 
     assert get_without_authorization(ctx, "/api/read-markers?asUser=").resp_body ==
              all_markers.resp_body
+
+    assert get_without_authorization(ctx, "/api/read-markers?asUser=alice%zz").resp_body ==
+             all_markers.resp_body
+
+    assert get_without_authorization(ctx, "/api/read-markers?asUser=alice&asUser=").resp_body ==
+             all_markers.resp_body
+
+    org_empty_selector =
+      get(ctx, "/api/read-markers?asUser=", ctx.opts[:cli_token])
+
+    assert org_empty_selector.status == 200
+    assert org_empty_selector.resp_body == admin_markers.resp_body
 
     repeated_last = get_without_authorization(ctx, "/api/read-markers?asUser=alice&asUser=bob")
     bob_only = get_without_authorization(ctx, "/api/read-markers?asUser=bob")
@@ -1904,16 +2020,96 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert detail.status == 200
     assert detail.resp_body == detail_org.resp_body
 
+    session_markers = get(ctx, "/api/read-markers", ctx.admin_session.cli_token)
+
+    mismatched_session_markers =
+      get(ctx, "/api/read-markers?asUser=mallory", ctx.admin_session.cli_token)
+
+    assert mismatched_session_markers.status == 200
+    assert mismatched_session_markers.resp_body == session_markers.resp_body
+
+    for {token, expected} <- [
+          {ctx.admin_session.cli_token, session_markers},
+          {ctx.admin_device.token, get(ctx, "/api/read-markers", ctx.admin_device.token)}
+        ],
+        selector <- ["asUser=", "asUser=alice%zz"] do
+      response = get(ctx, "/api/read-markers?" <> selector, token)
+      assert response.status == 200
+      assert response.resp_body == expected.resp_body
+    end
+
+    scoped_collection =
+      get_without_authorization(ctx, "/api/read-markers?scopeKey=chat%3Aone")
+
+    scoped_detail = get_without_authorization(ctx, "/api/read-markers/chat%3Aone")
+    assert scoped_collection.status == 200
+    assert scoped_detail.status == 200
+    assert scoped_detail.resp_body == scoped_collection.resp_body
+
+    scoped_rows = JSON.decode!(scoped_detail.resp_body)["items"]
+    assert Enum.map(scoped_rows, & &1["userId"]) == ["alice", "bob"]
+
+    empty_selector_detail =
+      get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=")
+
+    assert empty_selector_detail.status == 200
+    assert empty_selector_detail.resp_body == scoped_detail.resp_body
+
+    malformed_selector_detail =
+      get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=alice%zz")
+
+    assert malformed_selector_detail.status == 200
+    assert malformed_selector_detail.resp_body == scoped_detail.resp_body
+
+    repeated_selector_detail =
+      get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=alice&asUser=bob")
+
+    last_selector_detail =
+      get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=bob")
+
+    assert repeated_selector_detail.status == 200
+    assert repeated_selector_detail.resp_body == last_selector_detail.resp_body
+
     for authorization <- ["", "Bearer ", "Basic malformed", "Bearer invalid-token"] do
       response =
         get_without_authorization(ctx, "/api/read-markers", [{"authorization", authorization}])
 
       assert response.status == 200
       assert response.resp_body == all_markers.resp_body
+
+      detail_response =
+        get_without_authorization(ctx, "/api/read-markers/chat%3Aone", [
+          {"authorization", authorization}
+        ])
+
+      assert detail_response.status == 200
+      assert detail_response.resp_body == scoped_detail.resp_body
+
+      unusable_selector_detail =
+        get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=alice%zz", [
+          {"authorization", authorization}
+        ])
+
+      selected_with_bad_bearer =
+        get_without_authorization(ctx, "/api/read-markers?asUser=alice", [
+          {"authorization", authorization}
+        ])
+
+      selected_detail_with_bad_bearer =
+        get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=alice", [
+          {"authorization", authorization}
+        ])
+
+      assert unusable_selector_detail.status == 200
+      assert unusable_selector_detail.resp_body == scoped_detail.resp_body
+      assert selected_with_bad_bearer.status == 200
+      assert selected_with_bad_bearer.resp_body == all_alice_markers.resp_body
+      assert selected_detail_with_bad_bearer.status == 200
+      assert selected_detail_with_bad_bearer.resp_body == detail.resp_body
     end
 
     assert_error(
-      get_without_authorization(ctx, "/api/read-markers/chat%3Aone"),
+      get_without_authorization(ctx, "/api/read-markers/chat%3Amissing"),
       404,
       "read markers",
       "not_found"
