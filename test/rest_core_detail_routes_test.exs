@@ -913,7 +913,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         router
       )
 
-    assert length(matches) == 12
+    assert length(matches) == 13
   end
 
   defp core_detail_cases(ctx) do

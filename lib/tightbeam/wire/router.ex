@@ -570,6 +570,10 @@ defmodule Tightbeam.Wire.Router do
     state_collection(conn, Map.fetch!(@state_read_specs, :work_items))
   end
 
+  get "/api/work-items/:work_item_id/trace" do
+    work_item_trace_read(conn, work_item_id)
+  end
+
   get "/api/execution-map" do
     execution_map_read(conn, :flat, nil)
   end
@@ -845,6 +849,41 @@ defmodule Tightbeam.Wire.Router do
       state_error(conn, "execution map", 500, "projection_invalid", nil)
   end
 
+  defp work_item_trace_read(conn, work_item_id) do
+    resource = "work-item trace"
+    started_at = System.monotonic_time(:microsecond)
+
+    with {:ok, auth} <- state_bearer_auth(conn),
+         {:ok, query} <- decode_state_query(conn),
+         {:ok, principal} <- state_principal(auth, query, conn),
+         :ok <- state_detail_request(query) do
+      principal = core_detail_trace_principal(conn, principal)
+
+      case Tightbeam.WorkItems.query_work_item_trace(db(conn), %{
+             id: work_item_id,
+             principal: principal
+           }) do
+        {:error, 404, "not_found", _message} ->
+          state_not_found(conn, resource, started_at)
+
+        {:error, status, code, message} ->
+          state_error(conn, resource, status, code, message)
+
+        trace ->
+          state_send(conn, 200, work_item_trace_envelope(trace))
+      end
+    else
+      {:error, 404, "not_found", _message} ->
+        state_not_found(conn, resource, started_at)
+
+      {:error, status, code, message} ->
+        state_error(conn, resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, "work-item trace", 500, "projection_invalid", nil)
+  end
+
   defp execution_map_request(mode, query) when mode in [:flat, :tree, :subtree] do
     paging = if mode == :flat, do: ~w(before after limit), else: []
     allowed = @execution_map_filter_order ++ paging ++ ["asUser"]
@@ -1025,6 +1064,32 @@ defmodule Tightbeam.Wire.Router do
           Enum.map_join(result.items, ",", &Tightbeam.ExecutionMap.execution_map_node/1) <>
           ~s(],"noItem":) <> JSON.encode!(result.no_item) <> "}"
     end
+  end
+
+  defp work_item_trace_envelope(trace) do
+    encoded_assignments =
+      Enum.map_join(trace.assignments, ",", &StateResources.encode_item("assignments", &1))
+
+    attribution = trace.attribution
+
+    "{\"schemaVersion\":1,\"resource\":\"work-item trace\",\"item\":{" <>
+      "\"workItem\":" <>
+      StateResources.encode_item("work items", trace.work_item) <>
+      ",\"assignments\":[" <>
+      encoded_assignments <>
+      "],\"causalChildren\":" <>
+      JSON.encode!(trace.causal_children) <>
+      ",\"attribution\":{" <>
+      "\"provenanceStatus\":" <>
+      JSON.encode!(attribution.provenance_status) <>
+      ",\"reasonKind\":" <>
+      JSON.encode!(attribution.reason_kind) <>
+      ",\"primaryWorkKind\":" <>
+      JSON.encode!(attribution.primary_work_kind) <>
+      ",\"primaryWorkId\":" <>
+      JSON.encode!(attribution.primary_work_id) <>
+      "},\"dependencyVersion\":" <>
+      JSON.encode!(trace.dependency_version) <> "}}"
   end
 
   defp state_detail(conn, %{resource: "identity"} = spec, id) do
