@@ -127,6 +127,7 @@ defmodule Tightbeam.RestHarnessProcessRoutesTest do
     assert earlier.status == 200, earlier.resp_body
     earlier_body = JSON.decode!(earlier.resp_body)
     assert Enum.map(earlier_body["items"], & &1["id"]) == ["launch-a"]
+
     assert earlier.resp_body =~
              ~s({"id":"launch-a","host":"alpha","harness":"codex","pid":null,"state":"launching","createdAt":10,"resolvedAt":null})
 
