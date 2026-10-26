@@ -103,6 +103,11 @@ defmodule Tightbeam.Wire.Router do
       query: :query_message,
       serializer: :message
     },
+    tool_calls: %{
+      resource: "tool calls",
+      query: :query_tool_call,
+      serializer: :tool_call
+    },
     roles: %{resource: "roles", query: :query_role, serializer: :role},
     facts: %{
       resource: "condition facts",
@@ -572,6 +577,14 @@ defmodule Tightbeam.Wire.Router do
     )
   end
 
+  get "/api/sessions/:session_key/tool-calls/:tool_call_id" do
+    core_detail(
+      conn,
+      Map.fetch!(@core_detail_specs, :tool_calls),
+      {session_key, tool_call_id}
+    )
+  end
+
   get "/api/roles/:name" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :roles), name)
   end
@@ -600,6 +613,10 @@ defmodule Tightbeam.Wire.Router do
       :query_messages_for_session_page,
       :message
     )
+  end
+
+  get "/api/sessions/:session_key/tool-calls" do
+    tool_calls_collection(conn, session_key)
   end
 
   get "/api/sessions/:session_key/wakes" do
@@ -1469,6 +1486,7 @@ defmodule Tightbeam.Wire.Router do
 
   defp session_collection_tuple("transcript messages", %{seq: seq}), do: [seq]
   defp session_collection_tuple("turns", %{seq: seq}), do: [seq]
+  defp session_collection_tuple("tool calls", %{seq: seq, id: id}), do: [seq, id]
 
   defp session_collection_tuple("wakes", %{created_at: created_at, wake_id: wake_id}),
     do: [created_at, wake_id]
@@ -1476,6 +1494,9 @@ defmodule Tightbeam.Wire.Router do
   defp session_collection_tuple?(resource, [seq])
        when resource in ["transcript messages", "turns"] and is_integer(seq) and seq > 0,
        do: true
+
+  defp session_collection_tuple?("tool calls", [seq, id]),
+    do: is_integer(seq) and seq > 0 and is_binary(id) and id != ""
 
   defp session_collection_tuple?(
          "wakes",
@@ -1611,13 +1632,119 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp session_collection_request(query, session_key) do
-    valid_keys? =
-      Enum.all?(Map.keys(query), &(&1 in ["sessionKey", "limit", "before", "after", "tail"]))
+    session_collection_request(query, session_key, "transcript messages")
+  end
+
+  defp session_collection_request(query, session_key, resource) do
+    allowed = ["sessionKey", "limit", "before", "after", "tail"]
+
+    allowed =
+      if resource == "tool calls",
+        do: allowed ++ ["afterMessageSeqFromInclusive", "afterMessageSeqToExclusive"],
+        else: allowed
+
+    valid_keys? = Enum.all?(Map.keys(query), &(&1 in allowed))
 
     selected? = Map.get(query, "sessionKey", []) in [[], [session_key]]
 
     if valid_keys? and selected?, do: :ok, else: {:error, 400, "invalid_filter", nil}
   end
+
+  defp tool_calls_collection(conn, session_key) do
+    resource = "tool calls"
+    route = "session.tool_calls.collection:#{session_key}"
+
+    with {:ok, auth} <- selected_session_auth(conn),
+         {:ok, request} <- decode_state_query(conn),
+         {:ok, principal, request} <-
+           session_collection_principal(auth, request, conn, session_key, resource),
+         :ok <- session_collection_request(request, session_key, resource),
+         {:ok, after_from} <-
+           state_nonnegative_integer_filter(request, "afterMessageSeqFromInclusive"),
+         {:ok, after_to} <-
+           state_nonnegative_integer_filter(request, "afterMessageSeqToExclusive"),
+         filters <- %{
+           "afterMessageSeqFromInclusive" => cursor_filter_value(after_from),
+           "afterMessageSeqToExclusive" => cursor_filter_value(after_to)
+         },
+         {:ok, limit, boundary} <-
+           state_page_request(
+             request,
+             route,
+             resource,
+             filters,
+             principal,
+             &session_collection_tuple?(resource, &1),
+             @state_default_limit,
+             :latest,
+             :earliest,
+             :latest
+           ),
+         session when not is_nil(session) <-
+           StateResources.query_session(db(conn), %{key: session_key, principal: principal}),
+         page_result <-
+           StateResources.query_tool_calls_for_session_page(
+             db(conn),
+             session_key,
+             boundary,
+             limit,
+             after_from,
+             after_to
+           ),
+         page <-
+           state_page_metadata(
+             page_result.rows,
+             page_result.flags,
+             &session_collection_tuple(resource, &1),
+             route,
+             resource,
+             filters,
+             principal,
+             :asc
+           ),
+         items <- Enum.map(page_result.rows, &StateResources.tool_call/1),
+         item_bytes <-
+           Enum.map(items, &StateResources.encode_item(resource, &1, state_catalog(conn))) do
+      body =
+        "{" <>
+          ~s("schemaVersion":1,"resource":"tool calls","items":[) <>
+          Enum.join(item_bytes, ",") <>
+          "],\"page\":" <> JSON.encode!(page) <> "}"
+
+      state_send(conn, 200, body)
+    else
+      nil -> state_error(conn, resource, 404, "not_found", nil)
+      {:error, status, code, message} -> state_error(conn, resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, "tool calls", 500, "projection_invalid", nil)
+  end
+
+  defp state_nonnegative_integer_filter(query, key) do
+    with {:ok, value} <- one_query_value(query, key) do
+      case value do
+        nil ->
+          {:ok, nil}
+
+        text when is_binary(text) ->
+          if Regex.match?(~r/\A(?:0|[1-9][0-9]*)\z/, text) do
+            case Integer.parse(text) do
+              {integer, ""} when integer <= 9_223_372_036_854_775_807 -> {:ok, integer}
+              _ -> {:error, 400, "invalid_filter", nil}
+            end
+          else
+            {:error, 400, "invalid_filter", nil}
+          end
+
+        _ ->
+          {:error, 400, "invalid_filter", nil}
+      end
+    end
+  end
+
+  defp cursor_filter_value(nil), do: []
+  defp cursor_filter_value(value), do: [Integer.to_string(value)]
 
   defp selected_session_auth(conn) do
     case bearer_token(conn) do
@@ -1772,6 +1899,10 @@ defmodule Tightbeam.Wire.Router do
   defp core_detail_key("transcript messages", {session_key, message_id})
        when is_binary(session_key) and is_binary(message_id),
        do: {:ok, {session_key, message_id}}
+
+  defp core_detail_key("tool calls", {session_key, tool_call_id})
+       when is_binary(session_key) and is_binary(tool_call_id),
+       do: {:ok, {session_key, tool_call_id}}
 
   defp core_detail_key("host environment", {host, harness, name})
        when is_binary(host) and is_binary(harness) and is_binary(name),

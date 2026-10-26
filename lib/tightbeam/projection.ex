@@ -55,7 +55,7 @@ defmodule Tightbeam.Projection do
           marker: %{kind: String.t(), from: String.t(), to: String.t()} | nil
         }
 
-  @marker_kinds ["harness-switch", "model-retune", "session-restart"]
+  @marker_kinds ["harness-switch", "model-retune", "session-restart", "context-compacted"]
 
   @ddl """
   CREATE TABLE IF NOT EXISTS messages (
@@ -550,6 +550,11 @@ defmodule Tightbeam.Projection do
     "[context reset]\n\nThe agent's working memory was reset from #{marker_endpoint(from)} " <>
       "to #{marker_endpoint(to)} while handling the message above. Earlier messages stay " <>
       "visible here, but the agent no longer remembers them."
+  end
+
+  defp marker_content("context-compacted", from, _to) do
+    "[context compacted]\n\nThe session's working context was summarized after " <>
+      marker_endpoint(from) <> "."
   end
 
   defp marker_endpoint(value), do: value
