@@ -43,7 +43,7 @@ defmodule Tightbeam.MessageSenderRepairTest do
     end
 
     turn_message = human_message!(db, "turn-session", "turn-device", "turn-client")
-    wake_message = human_message!(db, "wake-session", "wake-device", "wake-client")
+    _wake_message = human_message!(db, "wake-session", "wake-device", "wake-client")
     _owner_message = human_message!(db, "owner-session", nil, nil)
     unresolved_message = human_message!(db, "no-session", nil, nil)
     ambiguous_message = human_message!(db, "no-session", nil, nil)
@@ -92,7 +92,7 @@ defmodule Tightbeam.MessageSenderRepairTest do
 
   test "schema startup repairs stored senders without advancing the root or effort epoch" do
     name = :"sender_repair_schema_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: ":memory:", name: name})
+    start_supervised!({DB, path: ":memory:", name: name}, id: name)
     :ok = ensure_all_schemas(name)
 
     {:appended, message} =
@@ -146,7 +146,7 @@ defmodule Tightbeam.MessageSenderRepairTest do
 
   defp add_source_wake!(db, wake_id, session_key, device_id, client_message_id, origin) do
     identity =
-      Tightbeam.JSON.encode!(%{
+      JSON.encode!(%{
         "targetSessionKey" => session_key,
         "deviceId" => device_id,
         "clientMessageId" => client_message_id,
