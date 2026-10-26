@@ -178,13 +178,11 @@ new yes before acting; read-only inventory can proceed while waiting.
 
 ## 0.1.8 to 0.1.9 database rehearsal
 
-The canonical standalone E2E migration procedure is
-[docs/e2e/0.1.9/migration.md](e2e/0.1.9/migration.md). It starts from a
-verified copy of a real 0.1.8 database, lets the verified 0.1.9 gateway migrate
-that copy once, and preserves the migrated result for separately runnable
-feature checks. The aggregate order and feature-area runbooks are in
-[docs/e2e/0.1.9/README.md](e2e/0.1.9/README.md). Do not use this rehearsal as
-permission to point a command at a live base.
+To rehearse this upgrade, start from a verified backup of the 0.1.8 database.
+Place a copy in a scratch base separate from every live base. Start the verified
+0.1.9 gateway once against that copy so it performs the migration, then run
+`PRAGMA quick_check` on the migrated copy. Never point a rehearsal command at a
+live base.
 
 For source-lineage context, canonical tag `v0.1.8+1343` (build 1343,
 `b2add64414b41606a713ed284abf01a0b4d125e6`, the reference production release) writes
@@ -192,10 +190,9 @@ For source-lineage context, canonical tag `v0.1.8+1343` (build 1343,
 This is a verified reference lineage, not presumed provenance for a later real
 0.1.8 database. The actual snapshot's manifest must establish its source tag,
 build, package provenance, commit, and stored stamp. If the actual build or
-stamp differs from this reference, stop for delivery's source-backed lineage
-adjudication; a different stamp does not automatically reject every 0.1.8
-release. See the [0.1.9 migration runbook](e2e/0.1.9/migration.md) for source
-qualification. The `pi-harness-v1` stamp below is the historical terminal
+stamp differs from this reference, stop and confirm which release produced the
+database before upgrading; a different stamp does not automatically reject
+every 0.1.8 release. The `pi-harness-v1` stamp below is the historical terminal
 stamp of the 0.1.8 package's own migration chain. It is not an accepted 0.1.9
 source stamp, and this document does not claim that current 0.1.9 migrates it.
 
