@@ -34,7 +34,7 @@
 # "A REAL AGENT WALKS THE GATES" was proven in the field, not dropped. Both legs
 # did the whole lifecycle autonomously and honestly on 2026-07-30 — claude
 # 11:19:56 open → 11:20:48 verified → 11:21:02 recorded → 11:21:07 closed, codex
-# the same shape at 12:09–12:12, landing art_0f26ec21 tool-call-observed with a
+# the same shape at 12:09–12:12, recording a tool-call-observed artifact with a
 # non-null edge. Driving that chain through a scripted holder is what the split
 # gives up, because a capable holder finishes it before any scripted denial can
 # fire; the shared gate-chain check retains the substrate half once per invocation,
@@ -531,7 +531,7 @@ defmodule FeatureSmoke do
   # rather than relocated. Those two field runs ARE the "a real agent walks the gates"
   # evidence, and they are stronger than the scripted version was: both holders verified
   # with grounded notes of their own, recorded over the real CLI — codex landed
-  # art_0f26ec21 `tool-call-observed` with a non-null edge, which is the R7 datum itself —
+  # a `tool-call-observed` artifact with a non-null edge, which is the R7 datum itself —
   # and completed, autonomously and honestly, on both harnesses. What remains under
   # assertion every run is the substrate half, in `check_carrier_on_real_turn/1` below,
   # which accepts the holder completing its own assignment as the legitimate outcome it is
@@ -888,7 +888,7 @@ defmodule FeatureSmoke do
       # `startedAt` IS NOT THE LINE EITHER, and the field disproved it before it ever ran.
       # The operator's row above came back `session-concurrent`, and that class is returned
       # only when `Ledger.running_turn_message_id/2` finds a turn at `status = 'running'` —
-      # the same UPDATE that writes `startedAt`. So on the run that produced art_d968e72a a
+      # the same UPDATE that writes `startedAt`. So in the observed run a
       # turn was ALREADY running, and an assertion on `startedAt` would have failed a group
       # that was otherwise behaving exactly as designed.
       #

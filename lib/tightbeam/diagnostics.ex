@@ -105,7 +105,7 @@ defmodule Tightbeam.Diagnostics do
     end
   end
 
-  # Ruled degraded startup, not boot refusal (att_4b05b3cb). `init/1` touches no
+  # Startup degrades rather than refusing boot. `init/1` touches no
   # filesystem: the sink is the first child of a `rest_for_one` supervisor, so a
   # directory it cannot create would otherwise stop the DB, the wake scheduler,
   # and the listener. Nothing here may raise into `Supervisor.start_link/2`.
@@ -321,7 +321,7 @@ defmodule Tightbeam.Diagnostics do
 
   # One spelling of the setup, on the path where raising is never the answer.
   # The earlier `ensure_file/1` bang spelling reserved the boot-refusal question
-  # to the spec owner; att_4b05b3cb ruled degraded startup, so the bang is gone
+  # to the spec owner; degraded startup was selected, so the bang is gone
   # rather than moved.
   #
   # Preparation is attempted per record until it succeeds. A sink whose

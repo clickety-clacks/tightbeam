@@ -3129,8 +3129,7 @@ defmodule Tightbeam.Wire.Router do
           # assignment: assign/dispatch BIND an obligation, and the owner's session
           # is not the requested role's holder — commonly not even its provider — so
           # the card lands on a session that cannot do the work while the requester
-          # believes it dispatched (wi_756153b7, specimens asg_6f380b79 and
-          # asg_388a5a54, the latter against a role whose bound session was retired).
+          # believes it dispatched, including when a role's bound session was retired.
           # Refuse HERE, the one place the fallback is still distinguishable: past
           # this seam only a boolean survives, and the handler sees an active session
           # it has no reason to doubt. Every other consumer keeps the fallback.

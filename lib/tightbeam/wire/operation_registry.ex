@@ -3,7 +3,7 @@ defmodule Tightbeam.Wire.OperationRegistry do
   Finite HTTP method/template operations for the current 0.1.9 router.
 
   The source check compares declared routes and rows in both directions. The
-  PO's att_32a752d1 retains semantic names while adding agent/terminal and the
+  The accepted route contract retains semantic names while adding agent/terminal and the
   current work-items parameter spelling. Concrete URLs never become labels.
   CLI command identity and allowed paths are implemented separately in Rust.
   """
