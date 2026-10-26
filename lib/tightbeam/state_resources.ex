@@ -185,6 +185,11 @@ defmodule Tightbeam.StateResources do
   LEFT JOIN sessions AS session_owner ON session_owner.sessionKey=m.sessionKey
   """
 
+  @read_marker_select """
+  SELECT userId, scopeKey, marker, updatedAt
+  FROM read_markers
+  """
+
   alias Tightbeam.{
     AdminProjection,
     Artifacts,
@@ -237,6 +242,8 @@ defmodule Tightbeam.StateResources do
     "read markers" => ~w(userId scopeKey marker updatedAt rowVersion),
     "transcript messages" =>
       ~w(id seq sessionKey role messageType marker content at sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier turnSeq turnIncludesHuman isBatchCarrier assignmentId jobRef harness provider model effort context rowVersion),
+    "tool calls" =>
+      ~w(id seq sessionKey turnSeq afterMessageSeq harnessToolCallId title kind toolName status rawInput rawOutput content truncated startedAt endedAt rowVersion),
     "condition facts" => ~w(id ts kind scope origin rowVersion),
     "critical state" =>
       ~w(sessionKey reason startedAt expiresAt hardDeadline updatedAt rowVersion),
@@ -364,6 +371,12 @@ defmodule Tightbeam.StateResources do
       nullable:
         ~w(sender deviceId clientMessageId replyToMessageId replyToClientMessageId assignmentId jobRef harness provider model effort turnSeq context)
     },
+    "tool calls" => %{
+      strings: ~w(id sessionKey harnessToolCallId title kind toolName status),
+      integers: ~w(seq turnSeq afterMessageSeq startedAt endedAt rowVersion),
+      booleans: [],
+      nullable: ~w(toolName rawInput rawOutput content endedAt)
+    },
     "condition facts" => %{
       strings: ~w(kind scope origin),
       integers: ~w(id ts rowVersion),
@@ -418,6 +431,10 @@ defmodule Tightbeam.StateResources do
     {"transcript messages", "attachments"} => {:array, :attachment, :preserve},
     {"transcript messages", "marker"} => :transition_marker,
     {"transcript messages", "context"} => :json,
+    {"tool calls", "rawInput"} => :json,
+    {"tool calls", "rawOutput"} => :json,
+    {"tool calls", "content"} => :json,
+    {"tool calls", "truncated"} => {:array, :tool_call_truncation, :preserve},
     {"identity", "sessionRevisions"} => :string_map,
     {"identity", "staleness"} => {:array, :string, :sort},
     {"identity", "conflicts"} => {:array, :string, :sort},
@@ -472,6 +489,7 @@ defmodule Tightbeam.StateResources do
     {"artifacts", "state"} => ~w(in-workspace archived released),
     {"transcript messages", "role"} => ~w(user assistant),
     {"transcript messages", "attentionTier"} => [-1, 0, 1],
+    {"tool calls", "status"} => ~w(pending in_progress completed failed),
     {"identity", "state"} => ~w(ready relearn_conflicted),
     {"kungfu", "status"} => ~w(available installed)
   }
@@ -753,6 +771,7 @@ defmodule Tightbeam.StateResources do
 
     {where, params} =
       cond do
+        principal.kind == "observer" -> {nil, []}
         principal.is_admin -> {nil, []}
         principal.kind == "session" -> {nil, []}
         true -> {"sessions.ownerUserId = ?", [principal.id]}
@@ -811,6 +830,45 @@ defmodule Tightbeam.StateResources do
     end)
     |> then(fn page -> %{rows: Enum.map(page.rows, &message_row/1), flags: page} end)
   end
+
+  @doc "Return one bounded page of visible tool-call records for a session."
+  def query_tool_calls_for_session_page(
+        source,
+        session_key,
+        boundary,
+        limit,
+        after_message_seq_from,
+        after_message_seq_to
+      ) do
+    page =
+      Tightbeam.ToolCalls.page_for_session(
+        source,
+        session_key,
+        boundary,
+        limit,
+        after_message_seq_from,
+        after_message_seq_to
+      )
+
+    %{rows: page.rows, flags: page.flags}
+  end
+
+  @doc "Return one tool-call record under the transcript-message AU4 detail grant."
+  def query_tool_call(source, %{key: {session_key, id}, principal: principal}) do
+    detail_selection(source, "transcript messages", principal, fn txn ->
+      case Tightbeam.ToolCalls.query_by_id_in_txn(txn, session_key, id) do
+        %{session_key: ^session_key} = row -> row
+        _ -> nil
+      end
+    end)
+  end
+
+  def query_tool_call(source, id) when is_binary(id),
+    do: Tightbeam.ToolCalls.query_by_id(source, id)
+
+  @doc false
+  def query_tool_call_for_rebuild(source, id),
+    do: Tightbeam.ToolCalls.query_for_rebuild(source, id)
 
   @doc "Return the complete wake projection for one session."
   def query_wakes_for_session(db, session_key),
@@ -1393,6 +1451,45 @@ defmodule Tightbeam.StateResources do
     end)
   end
 
+  @doc "Return one bounded page of read markers for the selected user."
+  def query_read_markers_page(db, %{kind: "user", id: user_id} = principal, boundary, limit)
+      when is_binary(user_id) and user_id != "" do
+    trace_core_detail(principal, {:au4_visibility, "read markers"})
+
+    case DB.transaction(db, fn txn ->
+           query = fn sql, params -> observed_query(txn, principal, sql, params) end
+
+           Keyset.page(
+             query,
+             @read_marker_select,
+             "read_markers",
+             "read_markers.userId = ?",
+             [user_id],
+             ["read_markers.userId", "read_markers.scopeKey"],
+             boundary,
+             limit,
+             fn [row_user_id, scope_key, _marker, _updated_at] -> [row_user_id, scope_key] end
+           )
+         end) do
+      {:ok, page} ->
+        %{
+          rows:
+            Enum.map(page.rows, fn [row_user_id, scope_key, marker, updated_at] ->
+              %{
+                user_id: row_user_id,
+                scope_key: scope_key,
+                marker: marker,
+                updated_at: updated_at
+              }
+            end),
+          flags: page
+        }
+
+      {:error, error} ->
+        raise error
+    end
+  end
+
   def query_read_marker(db, user_id, scope_key), do: ReadMarkers.get(db, user_id, scope_key)
 
   def query_critical_state(db, %{key: session_key, principal: principal}) do
@@ -1958,6 +2055,30 @@ defmodule Tightbeam.StateResources do
     exact!("transcript messages", item)
   end
 
+  def tool_call(row) do
+    item = %{
+      "id" => required_string!(row, :id),
+      "seq" => required_integer!(row, :seq),
+      "sessionKey" => required_string!(row, :session_key),
+      "turnSeq" => required_integer!(row, :turn_seq),
+      "afterMessageSeq" => required_integer!(row, :after_message_seq),
+      "harnessToolCallId" => required_string!(row, :harness_tool_call_id),
+      "title" => required_wire_string!(value(row, :title), "title"),
+      "kind" => required_wire_string!(value(row, :kind), "kind"),
+      "toolName" => nullable_string!(value(row, :tool_name), "toolName"),
+      "status" => required_wire_string!(value(row, :status), "status"),
+      "rawInput" => value(row, :raw_input),
+      "rawOutput" => value(row, :raw_output),
+      "content" => value(row, :content),
+      "truncated" => required_list!(value(row, :truncated), "truncated"),
+      "startedAt" => required_integer!(row, :started_at),
+      "endedAt" => nullable_integer!(value(row, :ended_at), "endedAt"),
+      "rowVersion" => required_integer!(row, :row_version)
+    }
+
+    exact!("tool calls", item)
+  end
+
   def condition_fact(row) do
     fields = ~w(id ts kind scope origin rowVersion)
 
@@ -2140,6 +2261,9 @@ defmodule Tightbeam.StateResources do
   def encode_item(resource, item) when is_binary(resource) and is_map(item) do
     encode_item(resource, item, %{})
   end
+
+  @doc "Encode one opaque JSON value with the canonical wire-schema J rules."
+  def encode_json_value(value), do: encode_j!(value)
 
   @doc """
   Encode one item. A projection serializes a stored record as recorded: its
@@ -2380,12 +2504,24 @@ defmodule Tightbeam.StateResources do
     validate_closed_wire_object!(
       value,
       %{
-        "kind" => {:enum, ~w(harness-switch model-retune session-restart)},
+        "kind" => :string,
         "from" => :string,
         "to" => :string
       },
       label
     )
+  end
+
+  defp validate_wire_value!(value, :tool_call_truncation, label) do
+    validate_closed_wire_object!(
+      value,
+      %{"field" => {:enum, ~w(rawInput rawOutput content)}, "originalBytes" => :positive_integer},
+      label
+    )
+
+    if value["originalBytes"] <= 65_536 do
+      raise ArgumentError, "#{label}.originalBytes must exceed the field bound"
+    end
   end
 
   defp validate_wire_value!(value, :commit_ref, label) do
@@ -2461,6 +2597,50 @@ defmodule Tightbeam.StateResources do
   defp validate_item_invariants!("condition facts", item) do
     unless item["id"] == item["rowVersion"] do
       raise ArgumentError, "condition facts id must equal rowVersion"
+    end
+  end
+
+  defp validate_item_invariants!("tool calls", item) do
+    truncated_order = %{"rawInput" => 0, "rawOutput" => 1, "content" => 2}
+    truncated_fields = Enum.map(item["truncated"], & &1["field"])
+    expected_order = Enum.sort_by(truncated_fields, &Map.fetch!(truncated_order, &1))
+
+    unless String.starts_with?(item["id"], "tc_") and
+             Regex.match?(
+               ~r/\Atc_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/,
+               item["id"]
+             ) do
+      raise ArgumentError, "tool calls id is not a tc_ UUIDv4"
+    end
+
+    unless truncated_fields == expected_order and
+             length(truncated_fields) == length(Enum.uniq(truncated_fields)) do
+      raise ArgumentError, "tool calls truncated fields are not unique and ordered"
+    end
+
+    Enum.each(
+      [
+        {"rawInput", item["rawInput"]},
+        {"rawOutput", item["rawOutput"]},
+        {"content", item["content"]}
+      ],
+      fn {field, value} ->
+        if field in truncated_fields do
+          unless is_binary(value) and byte_size(value) <= 65_536 do
+            raise ArgumentError, "tool calls truncated #{field} is not a bounded prefix string"
+          end
+        else
+          unless is_nil(value) or byte_size(encode_j!(value)) <= 65_536 do
+            raise ArgumentError, "tool calls #{field} exceeds the field bound without metadata"
+          end
+        end
+      end
+    )
+
+    terminal? = item["status"] in ~w(completed failed)
+
+    unless terminal? == is_integer(item["endedAt"]) do
+      raise ArgumentError, "tool calls endedAt does not match terminal status"
     end
   end
 
@@ -2558,6 +2738,13 @@ defmodule Tightbeam.StateResources do
     do: encode_closed_object!(value, ~w(kind from to), "transcript messages.marker")
 
   defp encode_item_field("transcript messages", "context", value), do: encode_j!(value)
+
+  defp encode_item_field("tool calls", field, value) when field in ~w(rawInput rawOutput content),
+    do: encode_j!(value)
+
+  defp encode_item_field("tool calls", "truncated", value) do
+    encode_closed_list!(value, ~w(field originalBytes), "tool calls.truncated")
+  end
 
   defp encode_item_field("attests", "commitRefs", nil), do: "null"
 
@@ -2810,10 +2997,6 @@ defmodule Tightbeam.StateResources do
 
       {kind, from, to}
       when is_binary(kind) and is_binary(from) and is_binary(to) ->
-        unless kind in ~w(harness-switch model-retune session-restart) do
-          raise ArgumentError, "message marker kind is projection_invalid"
-        end
-
         %{"kind" => kind, "from" => from, "to" => to}
 
       _incomplete ->

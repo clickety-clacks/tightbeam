@@ -1,8 +1,23 @@
+defmodule Tightbeam.Acp.ToolCallDbTrap do
+  use GenServer
+
+  def start_link(owner), do: GenServer.start_link(__MODULE__, owner)
+
+  @impl true
+  def init(owner), do: {:ok, owner}
+
+  @impl true
+  def handle_call(request, _from, owner) do
+    send(owner, {:unexpected_tool_call_db_request, request})
+    {:reply, {:error, :unexpected_database_request}, owner}
+  end
+end
+
 defmodule Tightbeam.Acp.ContextUsageTest do
   use ExUnit.Case, async: true
 
   alias Tightbeam.Acp.{Adapter, ContextUsage}
-  alias Tightbeam.Model
+  alias Tightbeam.{Model, ToolCalls}
 
   test "a reported context observation is not an authoritative submission allowance" do
     model = Model.new("gpt-5.6-sol")
@@ -117,6 +132,54 @@ defmodule Tightbeam.Acp.ContextUsageTest do
 
         state
     end
+  end
+
+  test "nonterminal updates to a started tool call stay in memory" do
+    db = start_supervised!({Tightbeam.Acp.ToolCallDbTrap, self()})
+    key = {"root", "call-1"}
+    initial_fields = %{title: "Run command"}
+
+    state = %Adapter{
+      db: db,
+      harness: :codex,
+      tool_turns: %{"root" => %{session_key: "session", turn_seq: 1}},
+      pending_tool_calls: %{
+        key => %{
+          fields: initial_fields,
+          context_usage_before: "80/100 tokens"
+        }
+      }
+    }
+
+    first_chunk = %{
+      "sessionUpdate" => "tool_call_update",
+      "toolCallId" => "call-1",
+      "status" => "in_progress",
+      "rawOutput" => "partial output"
+    }
+
+    {:noreply, state} = receive_update(state, "root", first_chunk)
+    refute_receive {:unexpected_tool_call_db_request, _request}, 0
+
+    progress = %{
+      "sessionUpdate" => "tool_call_update",
+      "toolCallId" => "call-1",
+      "status" => "in_progress",
+      "content" => %{"type" => "text", "text" => "still running"}
+    }
+
+    {:noreply, state} = receive_update(state, "root", progress)
+    refute_receive {:unexpected_tool_call_db_request, _request}, 0
+
+    expected_fields =
+      initial_fields
+      |> ToolCalls.merge_pending(ToolCalls.normalize_notification(first_chunk))
+      |> ToolCalls.merge_pending(ToolCalls.normalize_notification(progress))
+
+    assert state.pending_tool_calls[key] == %{
+             fields: expected_fields,
+             context_usage_before: "80/100 tokens"
+           }
   end
 
   defp receive_update(state, sid, update),
