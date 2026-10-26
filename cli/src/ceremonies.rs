@@ -2745,11 +2745,11 @@ mod tests {
             endpoint: &endpoint,
             deadline: Instant::now() + Duration::from_secs(30),
             load_harnesses: &|_, _| Ok(None),
-            identity: &Identity::User("mike".to_owned()),
+            identity: &Identity::User("sampleuser".to_owned()),
             send: &send,
             provider: "openai",
             machine: Some("node-c"),
-            owner_user_id: Some("mike".to_owned()),
+            owner_user_id: Some("sampleuser".to_owned()),
         };
 
         let mut emitted = false;
@@ -2771,7 +2771,7 @@ mod tests {
         assert_eq!(sent.len(), 1, "expected exactly one wake, got {sent:?}");
         let body = &sent[0];
         assert!(body.contains(r#""verb":"wake""#), "{body}");
-        assert!(body.contains(r#""userId":"mike""#), "{body}");
+        assert!(body.contains(r#""userId":"sampleuser""#), "{body}");
         // The real capture's code and URL, carried on the durable wake row.
         assert!(
             body.contains("VG6S-L35ON"),
@@ -2855,11 +2855,11 @@ mod tests {
             endpoint: &endpoint,
             deadline: Instant::now() + Duration::from_secs(30),
             load_harnesses: &load,
-            identity: &Identity::User("mike".to_owned()),
+            identity: &Identity::User("sampleuser".to_owned()),
             send: &send,
             provider: "openai",
             machine: Some("node-c"),
-            owner_user_id: Some("mike".to_owned()),
+            owner_user_id: Some("sampleuser".to_owned()),
         };
 
         let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2941,11 +2941,11 @@ mod tests {
             endpoint: &endpoint,
             deadline: Instant::now() + Duration::from_millis(200),
             load_harnesses: &|_, _| Ok(None),
-            identity: &Identity::User("mike".to_owned()),
+            identity: &Identity::User("sampleuser".to_owned()),
             send: &|_, _, _| panic!("a ceremony that emitted nothing must send no wake"),
             provider: "openai",
             machine: Some("node-c"),
-            owner_user_id: Some("mike".to_owned()),
+            owner_user_id: Some("sampleuser".to_owned()),
         };
 
         let mut emitted = false;
@@ -3030,8 +3030,8 @@ mod tests {
 
     #[test]
     fn owner_user_id_reads_the_begin_reply_field() {
-        let present = serde_json::json!({ "stagingPath": "/s", "ownerUserId": "mike" });
-        assert_eq!(owner_user_id(&present), Some("mike".to_owned()));
+        let present = serde_json::json!({ "stagingPath": "/s", "ownerUserId": "sampleuser" });
+        assert_eq!(owner_user_id(&present), Some("sampleuser".to_owned()));
         // Absent (an older gateway) or empty -> None, so the CLI degrades loudly.
         assert_eq!(
             owner_user_id(&serde_json::json!({ "stagingPath": "/s" })),
@@ -3059,11 +3059,11 @@ mod tests {
             endpoint: &endpoint,
             deadline: Instant::now() + Duration::from_secs(60),
             load_harnesses: &|_, _| Ok(None),
-            identity: &Identity::User("mike".to_owned()),
+            identity: &Identity::User("sampleuser".to_owned()),
             send: &send,
             provider: "openai",
             machine: Some("node-c"),
-            owner_user_id: Some("mike".to_owned()),
+            owner_user_id: Some("sampleuser".to_owned()),
         };
         let deliverable = Deliverable::DeviceCode {
             url: "https://auth.openai.com/codex/device".to_owned(),
@@ -3075,13 +3075,13 @@ mod tests {
         assert_eq!(
             notified,
             Notified::Waked {
-                user_id: "mike".to_owned(),
+                user_id: "sampleuser".to_owned(),
                 wake_id: Some("w_test".to_owned()),
             }
         );
         let body = &sent.borrow()[0];
         assert!(body.contains(r#""verb":"wake""#), "{body}");
-        assert!(body.contains(r#""userId":"mike""#), "{body}");
+        assert!(body.contains(r#""userId":"sampleuser""#), "{body}");
         // The wake row carries the code text itself -- it IS the durable delivery record.
         assert!(body.contains("VG6S-L35ON"), "{body}");
     }
