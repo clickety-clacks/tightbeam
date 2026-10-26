@@ -103,7 +103,7 @@ helper script or edit queue rows.
 7. After the carrier turn finishes and H is idle, O sends one ordinary first
    wake. **Assert:** it starts one delivery immediately, without waiting for a
    timed batching window. This journey is part of the core-flow smoke before
-   the initial Gibson install.
+   the initial production install.
 
 ## Retirement at the readiness boundary
 

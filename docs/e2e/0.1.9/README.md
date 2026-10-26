@@ -38,7 +38,7 @@ applicable exact-build evidence. Each runbook can run on its own; the
   its payload `buildIdentity`, the host, and each harness CLI version. Record
   the migration manifest digest for every area that starts from the migrated
   result.
-- Nothing runs against a live base, and nothing is installed on Gibson. Every
+- Nothing runs against a live base, and nothing is installed on the production host. Every
   base is a new directory under the environment's scratch space, with an
   unused loopback port.
 - A check whose real prerequisite is absent (an incident, a failed turn, a
@@ -558,7 +558,7 @@ needed. An extension below adds distinct evidence to the owner's result.
 
 `scripts/feature_smoke.exs` drives most area checks over HTTP. It runs from a
 source checkout of the same commit as the package, against a gateway already
-started on a fresh online base, never on Gibson:
+started on a fresh online base, never on the production host:
 
 ```sh
 env -u TIGHTBEAM_URL -u TIGHTBEAM_TOKEN -u TIGHTBEAM_HOME -u RELEASE_NODE -u RELEASE_COOKIE \

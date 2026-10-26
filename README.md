@@ -561,10 +561,10 @@ meet the requirements above. `UserName` keeps the process off root.
   <key>WorkingDirectory</key><string>/Users/you</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>TIGHTBEAM_LOCAL_HOST_NAME</key><string>gibson</string>
+    <key>TIGHTBEAM_LOCAL_HOST_NAME</key><string>gateway-host</string>
     <key>TIGHTBEAM_BASE_DIR</key><string>/Users/you/.tightbeam</string>
     <key>TIGHTBEAM_PORT</key><string>11373</string>
-    <key>TIGHTBEAM_ADVERTISED_URL</key><string>ws://gibson.local:11373</string>
+    <key>TIGHTBEAM_ADVERTISED_URL</key><string>ws://gateway-host.local:11373</string>
     <key>PATH</key><string>/opt/tightbeam/current/tightbeam/bin:/Users/you/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>
@@ -603,10 +603,10 @@ User=you
 Group=you
 WorkingDirectory=/home/you
 ExecStart=/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway
-Environment=TIGHTBEAM_LOCAL_HOST_NAME=gibson
+Environment=TIGHTBEAM_LOCAL_HOST_NAME=gateway-host
 Environment=TIGHTBEAM_BASE_DIR=/home/you/.tightbeam
 Environment=TIGHTBEAM_PORT=11373
-Environment=TIGHTBEAM_ADVERTISED_URL=ws://gibson.local:11373
+Environment=TIGHTBEAM_ADVERTISED_URL=ws://gateway-host.local:11373
 Environment=PATH=/opt/tightbeam/current/tightbeam/bin:/usr/local/bin:/usr/bin:/bin
 # Daemon-owned OpenCode Go key (optional): systemd copies the source file into
 # $CREDENTIALS_DIRECTORY/opencode-go-api-key, the fixed name the gateway reads.

@@ -23,7 +23,7 @@
 # shared stage uses one selected fixture leg; it does not prove parity for the
 # other selected or filtered legs. Per-harness local deployment and carrier checks
 # preflight and exercise every selected leg. A filtered run reports
-# INCOMPLETE(parity) by design; the gibson gate still wants both legs green
+# INCOMPLETE(parity) by design; the production acceptance gate still wants both legs green
 # (artifact-carrier-proposal-v1 §7.3).
 #
 # The artifact area retains two different checks: `check_gate_chain_enforced/1`
