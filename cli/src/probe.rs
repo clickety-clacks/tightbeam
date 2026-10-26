@@ -2287,11 +2287,11 @@ mod tests {
 
     #[test]
     fn marker_codec_and_raw_policy() {
-        let value = token_fields(Some(b"tb1-cmVzaWRlbnRAZWV6bw"));
+        let value = token_fields(Some(b"tb1-cmVzaWRlbnRAbGFiMQ"));
         assert_eq!(value.lineage.as_deref(), Some("resident@lab1"));
         assert_eq!(
             value.raw_b64.as_deref(),
-            Some("dGIxLWNtVnphV1JsYm5SQVpXVjZidw==")
+            Some("dGIxLWNtVnphV1JsYm5SQWJHRmlNUQ==")
         );
         assert_eq!(token_fields(Some(b"tb2-any")).lineage, None);
         assert_eq!(token_fields(Some(b"tb1-!!!")).lineage, None);
@@ -2823,8 +2823,8 @@ mod tests {
             ppid: Some(1),
             pgid: Some(7),
             lineage: Some("resident@lab1".to_owned()),
-            lineage_raw: Some("tb1-cmVzaWRlbnRAZWV6bw".to_owned()),
-            lineage_raw_b64: Some("dGIxLWNtVnphV1JsYm5SQVpXVjZidw==".to_owned()),
+            lineage_raw: Some("tb1-cmVzaWRlbnRAbGFiMQ".to_owned()),
+            lineage_raw_b64: Some("dGIxLWNtVnphV1JsYm5SQWJHRmlNUQ==".to_owned()),
             evidence: "environ_exact",
             executable: Some("/usr/local/bin/codex".to_owned()),
             elapsed_s: Some(9),
