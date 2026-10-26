@@ -245,7 +245,7 @@ defmodule Tightbeam.ArtifactsTest do
         params: %{
           kind: "report",
           title: "Remote",
-          origin_path: "shrdlu:/srv/result.txt",
+          origin_path: "host-d:/srv/result.txt",
           content_sha256: actual,
           work_item_id: "wi_banana"
         }
@@ -786,12 +786,12 @@ defmodule Tightbeam.ArtifactsTest do
     on_exit(fn -> File.rm_rf(workspace) end)
 
     # The exact form the operating manual teaches for remote work. Resolving it
-    # against the workspace would make "shrdlu:" a missing directory and raise.
+    # against the workspace would make "host-d:" a missing directory and raise.
     row =
       record(ctx.db, ctx.child.session_key, %{
         kind: "report",
         title: "Remote vhost",
-        origin_path: "shrdlu:/etc/nginx/sites-enabled/app"
+        origin_path: "host-d:/etc/nginx/sites-enabled/app"
       })
 
     assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)

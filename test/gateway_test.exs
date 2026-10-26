@@ -4421,15 +4421,15 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "spawn uses the next where host when the first cannot run the requested harness", ctx do
-    base_dir = placement_test_base("later-eligible", ["eurisko", "racter"])
+    base_dir = placement_test_base("later-eligible", ["eurisko", "host-c"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
       "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "host-c" => %{ssh: "host-c", base_dir: "/srv/host-c", cli_bin: nil}
     })
 
-    await_host_catalog("racter", "codex")
+    await_host_catalog("host-c", "codex")
 
     config =
       gateway_config(base_dir, ctx.db, 0)
@@ -4437,7 +4437,7 @@ defmodule Tightbeam.GatewayTest do
       |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
       |> Map.put(:credential_status, fn
         :openai, "eurisko" -> {:needs_onboarding, :missing}
-        :openai, "racter" -> :onboarded
+        :openai, "host-c" -> :onboarded
       end)
       |> Map.put(:sh, fn _command -> {"", 0} end)
 
@@ -4451,20 +4451,20 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "racter"
+    assert Org.get(ctx.db, session_key).host == "host-c"
   end
 
   test "spawn uses the next where host when the first has no usable catalog", ctx do
-    base_dir = placement_test_base("later-catalog", ["eurisko", "racter"])
+    base_dir = placement_test_base("later-catalog", ["eurisko", "host-c"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
       "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "host-c" => %{ssh: "host-c", base_dir: "/srv/host-c", cli_bin: nil}
     })
 
     await_host_catalog("eurisko", "codex")
-    await_host_catalog("racter", "codex")
+    await_host_catalog("host-c", "codex")
     degrade_host_catalog("eurisko", "codex", :ssh_unreachable)
 
     config =
@@ -4484,19 +4484,19 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "racter"
+    assert Org.get(ctx.db, session_key).host == "host-c"
   end
 
   test "spawn refusal relays each where host's catalog cause and remedy", ctx do
-    base_dir = placement_test_base("catalog-causes", ["eurisko", "racter"])
+    base_dir = placement_test_base("catalog-causes", ["eurisko", "host-c"])
 
     register_hosts(ctx.db, %{
       "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "host-c" => %{ssh: "host-c", base_dir: "/srv/host-c", cli_bin: nil}
     })
 
     await_host_catalog("eurisko", "codex")
-    await_host_catalog("racter", "codex")
+    await_host_catalog("host-c", "codex")
 
     degrade_host_catalog(
       "eurisko",
@@ -4504,7 +4504,7 @@ defmodule Tightbeam.GatewayTest do
       {:empty_catalog_for_client_version, "0.145.0"}
     )
 
-    degrade_host_catalog("racter", "codex", {:needs_onboarding, :missing})
+    degrade_host_catalog("host-c", "codex", {:needs_onboarding, :missing})
 
     config =
       gateway_config(base_dir, ctx.db, 0)
@@ -4524,21 +4524,21 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "eurisko: cannot route gpt-5.6-sol (effort medium) on eurisko"
     assert message =~ "upgrade codex on eurisko"
-    assert message =~ "racter: cannot route gpt-5.6-sol (effort medium) on racter"
-    assert message =~ "run tightbeam onboard openai on racter"
+    assert message =~ "host-c: cannot route gpt-5.6-sol (effort medium) on host-c"
+    assert message =~ "run tightbeam onboard openai on host-c"
   end
 
   test "spawn uses the next where host when the first fails live spinup", ctx do
-    base_dir = placement_test_base("later-spinup", ["eurisko", "racter"])
+    base_dir = placement_test_base("later-spinup", ["eurisko", "host-c"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
       "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "host-c" => %{ssh: "host-c", base_dir: "/srv/host-c", cli_bin: nil}
     })
 
     await_host_catalog("eurisko", "codex")
-    await_host_catalog("racter", "codex")
+    await_host_catalog("host-c", "codex")
 
     sh = fn command ->
       if List.last(command) == "true" and Enum.member?(command, "eurisko") do
@@ -4565,25 +4565,25 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "racter"
+    assert Org.get(ctx.db, session_key).host == "host-c"
   end
 
   test "spawn stops after the first ready where host and probes it once", ctx do
-    base_dir = placement_test_base("first-ready-once", ["eurisko", "racter"])
+    base_dir = placement_test_base("first-ready-once", ["eurisko", "host-c"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
       "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "host-c" => %{ssh: "host-c", base_dir: "/srv/host-c", cli_bin: nil}
     })
 
     await_host_catalog("eurisko", "codex")
-    await_host_catalog("racter", "codex")
+    await_host_catalog("host-c", "codex")
     parent = self()
 
     sh = fn command ->
       if List.last(command) == "true" do
-        host = Enum.find(["eurisko", "racter"], &Enum.member?(command, &1))
+        host = Enum.find(["eurisko", "host-c"], &Enum.member?(command, &1))
         send(parent, {:spinup_probe, host})
       end
 
@@ -4613,16 +4613,16 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "spawn acts on the routed answer from the candidate decision", ctx do
-    base_dir = placement_test_base("one-route-answer", ["eurisko", "racter"])
+    base_dir = placement_test_base("one-route-answer", ["eurisko", "host-c"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
       "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "host-c" => %{ssh: "host-c", base_dir: "/srv/host-c", cli_bin: nil}
     })
 
     await_host_catalog("eurisko", "codex")
-    await_host_catalog("racter", "codex")
+    await_host_catalog("host-c", "codex")
     degraded = :atomics.new(1, [])
 
     sh = fn command ->
@@ -4678,11 +4678,11 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "spawn refusal names every where host, harness, cause, and remedy", ctx do
-    base_dir = placement_test_base("all-ineligible", ["eurisko", "racter"])
+    base_dir = placement_test_base("all-ineligible", ["eurisko", "host-c"])
 
     register_hosts(ctx.db, %{
       "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "host-c" => %{ssh: "host-c", base_dir: "/srv/host-c", cli_bin: nil}
     })
 
     config =
@@ -4707,7 +4707,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "no host in archetype default's where can run codex"
 
-    for {host, _base} <- [{"eurisko", "/srv/eurisko"}, {"racter", "/srv/racter"}] do
+    for {host, _base} <- [{"eurisko", "/srv/eurisko"}, {"host-c", "/srv/host-c"}] do
       assert message =~ "Tightbeam has no credential for openai on #{host}"
       assert message =~ "Run on #{host}: tightbeam onboard openai --as-user <userId>"
     end
@@ -8871,7 +8871,7 @@ defmodule Tightbeam.GatewayTest do
     # EVERY failed turn speaks now. Adjudication used to route a failure into a
     # brief instead of the marker, so deleting the brief (2026-08-05) would have
     # left this class of failure with no channel at all — the "agent progress
-    # interrupted, no reason given" that Flynn hit on gibson twice.
+    # interrupted, no reason given" that Flynn hit on host-a twice.
     frames = collect_pushes(9, [])
 
     assert Enum.any?(frames, fn frame ->

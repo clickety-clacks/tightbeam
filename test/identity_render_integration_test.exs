@@ -5,7 +5,7 @@ defmodule Tightbeam.IdentityRenderIntegrationTest do
 
   @fixture_root Path.expand("fixtures/identity-universal-root", __DIR__)
 
-  test "snapshots for every harness deliver rendered real universal-root fixtures and stamps" do
+  test "snapshots for every harness deliver rendered universal-root fixtures and stamps" do
     base =
       Path.join(
         System.tmp_dir!(),
@@ -19,13 +19,13 @@ defmodule Tightbeam.IdentityRenderIntegrationTest do
     expected = git!(dir, ["rev-parse", "tightbeam/live"])
 
     specs = File.read!(Path.join(@fixture_root, "specs-home.md"))
-    dev = File.read!(Path.join(@fixture_root, "dev-on-gibson.md"))
+    dev = File.read!(Path.join(@fixture_root, "development-host.md"))
     File.write!(Path.join(guidance, "specs-home.md"), specs)
-    File.write!(Path.join(guidance, "dev-on-gibson.md"), dev)
+    File.write!(Path.join(guidance, "development-host.md"), dev)
 
     File.write!(
       Path.join(guidance, "operating-model.md"),
-      "model-before\n#include \"dev-on-gibson.md\"\nmodel-after\n"
+      "model-before\n#include \"development-host.md\"\nmodel-after\n"
     )
 
     File.write!(
@@ -34,7 +34,7 @@ defmodule Tightbeam.IdentityRenderIntegrationTest do
     )
 
     git!(dir, ["add", "-A"])
-    git!(dir, ["commit", "-m", "test: real universal-root fixtures"])
+    git!(dir, ["commit", "-m", "test: universal-root fixtures"])
     candidate = git!(dir, ["rev-parse", "main"])
 
     assert {:ok, ^candidate} =

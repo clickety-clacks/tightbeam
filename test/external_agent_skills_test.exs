@@ -63,7 +63,7 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
         harness: "claude",
         provider: "anthropic",
         model: Model.new("fable"),
-        host: "eezo"
+        host: "host-b"
       })
 
     Roles.create!(db, "external-skill-agent", device.user_id, session.session_key)

@@ -5,14 +5,14 @@ defmodule Tightbeam.IdentityRendererTest do
 
   @fixture_root Path.expand("fixtures/identity-universal-root", __DIR__)
 
-  test "real Gibson fragment fixtures render in universal-root directive position" do
+  test "synthetic fragment fixtures render in universal-root directive position" do
     specs = File.read!(Path.join(@fixture_root, "specs-home.md"))
-    dev = File.read!(Path.join(@fixture_root, "dev-on-gibson.md"))
+    dev = File.read!(Path.join(@fixture_root, "development-host.md"))
 
     catalog = %{
       "specs-home.md" => specs,
-      "dev-on-gibson.md" => dev,
-      "operating-model.md" => "model-before\n#include \"dev-on-gibson.md\"\nmodel-after",
+      "development-host.md" => dev,
+      "operating-model.md" => "model-before\n#include \"development-host.md\"\nmodel-after",
       "operating-manual.md" => "manual-before\n#include \"specs-home.md\"\nmanual-after"
     }
 
