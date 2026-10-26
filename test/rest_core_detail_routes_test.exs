@@ -525,7 +525,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert {:ok, [[""]]} =
              DB.query(ctx.db, "SELECT sender FROM messages WHERE id=?1", [empty_sender_message.id])
 
-    assert {:ok, [[nil]]} =
+    assert {:ok, [["user:outsider"]]} =
              DB.query(ctx.db, "SELECT sender FROM messages WHERE id=?1", [direct_id])
 
     history =
