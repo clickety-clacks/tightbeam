@@ -1495,9 +1495,10 @@ defmodule Tightbeam.Gateway do
       end,
       {"critical", ["critical_lease.updated"]} => fn call -> critical_result(config, db, call) end,
       {"spawn", ["session.spawned"]} => fn call -> spawn_result(config, db, call) end,
-      {"tune", ["message.created", "session.updated", "session.harness_changed"]} => fn call ->
-        tune_result(config, db, call)
-      end,
+      {"tune", ["transition.recorded", "session.updated", "session.harness_changed"]} =>
+        fn call ->
+          tune_result(config, db, call)
+        end,
       {"session-reparent", []} => fn call -> Tightbeam.SessionReparent.handle(db, call) end,
       {"session-po-set", ["wake.scheduled"]} => fn call ->
         SessionPoAssociations.handle(db, call)
@@ -1509,7 +1510,7 @@ defmodule Tightbeam.Gateway do
     |> compile_handler_specs!()
   end
 
-  @direct_state_classes ~w(message.created wake.fired turn.started turn.ended artifact.archived artifact.released decision_request.consumed decision_request.superseded decision_request.updated)
+  @direct_state_classes ~w(message.created transition.recorded tool_call.started tool_call.ended wake.fired turn.started turn.ended artifact.archived artifact.released decision_request.consumed decision_request.superseded decision_request.updated)
 
   @doc false
   @spec compile_handler_specs!(map()) ::
@@ -3368,7 +3369,9 @@ defmodule Tightbeam.Gateway do
                      })
                    end,
                    progress:
-                     progress_fun(db, turn.session_key, session.owner_user_id, correlation)
+                     progress_fun(db, turn.session_key, session.owner_user_id, correlation),
+                   session_key: turn.session_key,
+                   turn_seq: turn.seq
                  ),
                  active_session
                ) do
@@ -10462,7 +10465,7 @@ defmodule Tightbeam.Gateway do
 
   # Substrate notices ride replay and live push as ordinary records. They
   # are not structural markers; only Projection.append_marker stamps one of
-  # the three structured boundary kinds.
+  # the four structured boundary kinds.
   defp append_substrate(db, session_key, content) do
     case Projection.append_substrate(db, session_key, content) do
       {:appended, notice} -> publish_message(db, session_key, notice)
