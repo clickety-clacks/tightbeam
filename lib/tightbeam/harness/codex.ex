@@ -1031,6 +1031,7 @@ defmodule Tightbeam.Harness.Codex do
       remote_rails_env: "CODEX_CONFIG='#{~s({"bypass_hook_trust":true})}'",
       railed_probe: true,
       always_probe: true,
+      probe_model: nil,
       adapter_bin: "codex-acp",
       adapter_package: @adapter_package,
       adapter_bundle: @adapter_bundle,
