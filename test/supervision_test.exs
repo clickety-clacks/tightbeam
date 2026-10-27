@@ -150,7 +150,15 @@ defmodule Tightbeam.SupervisionTest do
     assert holder == ctx.holder.session_key
   end
 
-  test "off reminders withdraws existing deadlines, climbs, and pending reminder prompts", ctx do
+  test "off reminders retract prompts and leave one silent deadline", ctx do
+    prior_interval = Application.get_env(:tightbeam, :supervision_interval_ms)
+
+    on_exit(fn ->
+      if is_nil(prior_interval),
+        do: Application.delete_env(:tightbeam, :supervision_interval_ms),
+        else: Application.put_env(:tightbeam, :supervision_interval_ms, prior_interval)
+    end)
+
     opened_at = System.system_time(:millisecond) - 5_000
 
     assert {:ok, _} =
@@ -169,17 +177,36 @@ defmodule Tightbeam.SupervisionTest do
       end)
 
     assert is_map(reminder)
+    old_deadline = pending_deadline!(ctx.db, "asg_inactive")
+    Application.put_env(:tightbeam, :supervision_interval_ms, :off)
 
     assert :ok = Supervision.migrate_open_assignments(ctx.db, :off)
     assert Wakes.get(ctx.db, reminder.wake_id).state == "canceled"
+    new_deadline = pending_deadline!(ctx.db, "asg_inactive")
+    assert Wakes.get(ctx.db, old_deadline.wake_id).state == "canceled"
+    refute old_deadline.wake_id == new_deadline.wake_id
 
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
-                 "AND state='pending' AND consumer IN " <>
-                 "('assignment_inactivity_deadline','assignment_inactivity_climb')"
+                 "AND state='pending' AND consumer='assignment_inactivity_climb'"
              )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND state='pending' AND consumer='prompt' " <>
+                 "AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1 AND state='pending'", [
+               new_deadline.wake_id
+             ])
+
+    assert {:ok, true} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, new_deadline.wake_id))
 
     assert {:ok, [[0]]} =
              DB.query(

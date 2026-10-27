@@ -205,7 +205,31 @@ defmodule Tightbeam.Supervision do
                    configured_off? = default_interval_ms == :off
 
                    if configured_off? do
-                     cancel_boot_sources_in_txn(txn, assignment_id, holder, nil, true)
+                     interval_ms = @default_interval_ms
+
+                     activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
+
+                     last_activity =
+                       current_activity_time_in_txn(txn, assignment_id, holder, activity_start)
+
+                     disabled_deadline =
+                       schedule_deadline_in_txn(
+                         txn,
+                         assignment_id,
+                         holder,
+                         work_item_id,
+                         last_activity,
+                         interval_ms,
+                         now() + interval_ms
+                       )
+
+                     cancel_boot_sources_in_txn(
+                       txn,
+                       assignment_id,
+                       holder,
+                       disabled_deadline.wake_id,
+                       true
+                     )
                    else
                      interval_ms = default_interval_ms
                      activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
