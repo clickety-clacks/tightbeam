@@ -130,7 +130,9 @@ defmodule Tightbeam.EffortCheckinTest do
            ) == 0
 
     # Historical rows remain, unchanged; the scheduler never queries them.
-    assert [["armed", probe.wake_id]] =
+    probe_wake_id = probe.wake_id
+
+    assert [["armed", ^probe_wake_id]] =
              rows(
                ctx.db,
                "SELECT state,wakeId FROM effort_checkin_generations WHERE assignmentId=?1",
