@@ -119,8 +119,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
         # process death, and reconnect path remain real.
         {~c"ERL_FLAGS", ~c"+S 4:4 +SDcpu 2 +SDio 2"},
         {~c"TIGHTBEAM_BASE_DIR", to_charlist(base_dir)},
-        {~c"TIGHTBEAM_PORT", to_charlist(Integer.to_string(port))},
-        {~c"TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS", ~c"2500"}
+        {~c"TIGHTBEAM_PORT", to_charlist(Integer.to_string(port))}
       ] ++ extra_env(opts)
 
     command = "exec mix run --no-halt >> #{Path.expand(log_path)} 2>&1"
