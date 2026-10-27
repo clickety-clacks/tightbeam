@@ -5179,6 +5179,7 @@ defmodule Tightbeam.Gateway do
 
     identity
     |> Map.put(:sessions, sessions)
+    |> Map.merge(Map.take(Rules.status(), [:recording_available, :unavailable_verbs, :skipped_policies]))
     |> maybe_put_guidance(guidance)
   end
 

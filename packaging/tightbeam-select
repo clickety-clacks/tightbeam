@@ -478,7 +478,14 @@ function rulePreflight(candidate, baseDir) {
       return;
     }
 
-    if (!report || report.complete !== true || !Array.isArray(report.warnings)) {
+    if (
+      !report ||
+      report.complete !== true ||
+      typeof report.recording_available !== 'boolean' ||
+      !Array.isArray(report.warnings) ||
+      !Array.isArray(report.unavailable_verbs) ||
+      !Array.isArray(report.skipped_policies)
+    ) {
       warning('rule check could not complete: the target release returned an incomplete result');
       return;
     }
@@ -486,16 +493,6 @@ function rulePreflight(candidate, baseDir) {
     for (const message of report.warnings) {
       if (typeof message === 'string' && message.length > 0) warning(message);
     }
-    for (const item of report.unavailable_verbs || []) {
-      if (item && typeof item.verb === 'string' && typeof item.file === 'string') {
-        warning(`${item.file}: rule for verb "${item.verb}" is unavailable`);
-      }
-    }
-
-    const extraOutput = output
-      .split(/\r?\n/)
-      .filter((line) => line.length > 0 && !line.startsWith(marker));
-    for (const line of extraOutput) warning(`rule checker: ${line}`);
   } catch (error) {
     warning(`rule check could not complete: ${error.message}`);
   } finally {

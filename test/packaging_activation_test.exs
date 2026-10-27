@@ -237,7 +237,7 @@ defmodule Tightbeam.PackagingActivationTest do
         "      case \"$2\" in *Tightbeam.RulePreflight.run*) ;; *) exit 43 ;; esac\n" <>
         "      [ -r \"$TIGHTBEAM_BASE_DIR/identity/rules/preflight.toml\" ] || exit 44\n" <>
         "      [ ! -w \"$TIGHTBEAM_BASE_DIR/identity/rules\" ] || exit 45\n" <>
-        "      printf '%s\\n' 'TIGHTBEAM_RULE_PREFLIGHT_JSON:{\"complete\":true,\"warnings\":[\"rules/preflight.toml: policy \\\"legacy\\\": purpose \\\"retired\\\" is retired; policy has no effect\"],\"unavailable_verbs\":[]}'\n" <>
+        "      printf '%s\\n' 'TIGHTBEAM_RULE_PREFLIGHT_JSON:{\"complete\":true,\"recording_available\":true,\"warnings\":[\"rules/preflight.toml: policy \\\"legacy\\\": purpose \\\"retired\\\" is retired; policy has no effect\"],\"unavailable_verbs\":[],\"skipped_policies\":[]}'\n" <>
         "      exit 0 ;;\n" <>
         "  esac\n" <>
         "fi\n" <>
