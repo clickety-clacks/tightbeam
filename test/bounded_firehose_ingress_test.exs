@@ -56,10 +56,19 @@ defmodule Tightbeam.BoundedFirehoseIngressTest do
   end
 
   test "matching subscriptions fan out without per-notice visibility reads", %{hub: hub} do
-    :ok = Hub.register(hub, self(), %{mode: :subscribed, db: :unavailable_database})
+    :ok =
+      Hub.register(hub, self(), %{
+        mode: :subscribed,
+        db: :unavailable_database,
+        user_id: "flynn",
+        principal_kind: :user,
+        principal_id: "flynn",
+        is_admin: false
+      })
     :ok = Hub.subscribe(hub, self(), "one", %{"classes" => ["work_item."]})
     :ok = Hub.subscribe(hub, self(), "two", %{"classes" => ["work_item."]})
     Code.ensure_loaded!(Tightbeam.StateVisibility)
+    assert :erlang.trace_pattern({Tightbeam.StateVisibility, :visible?, 3}, true, []) == 1
     assert :erlang.trace_pattern({Tightbeam.StateVisibility, :visible?, 4}, true, []) == 1
     :erlang.trace(hub, true, [:call])
 
@@ -70,6 +79,7 @@ defmodule Tightbeam.BoundedFirehoseIngressTest do
       refute_receive {:trace, ^hub, :call, {Tightbeam.StateVisibility, :visible?, _}}
     after
       :erlang.trace(hub, false, [:call])
+      :erlang.trace_pattern({Tightbeam.StateVisibility, :visible?, 3}, false, [])
       :erlang.trace_pattern({Tightbeam.StateVisibility, :visible?, 4}, false, [])
     end
   end
