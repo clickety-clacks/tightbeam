@@ -182,7 +182,8 @@ defmodule Tightbeam.EffortCheckinTest do
   end
 
   @tag :effort_checkin_disabled_behavior
-  test "an already armed generation stays silent when its probe becomes due while disabled", ctx do
+  test "an already armed generation stays silent when its probe becomes due while disabled",
+       ctx do
     disabled = real_default_context!(ctx)
     enabled = %{disabled | config: Map.put(disabled.config, :effort_checkins_enabled, true)}
 
@@ -228,7 +229,8 @@ defmodule Tightbeam.EffortCheckinTest do
   end
 
   @tag :effort_checkin_disabled_behavior
-  test "disabled check-ins ignore old probes and deadlines but keep open requests answerable", ctx do
+  test "disabled check-ins ignore old probes and deadlines but keep open requests answerable",
+       ctx do
     enabled = %{ctx | config: Map.put(ctx.config, :effort_checkins_enabled, true)}
 
     assigned =
