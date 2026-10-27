@@ -98,6 +98,66 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     assert assignment.subject == "prepare the bounded implementation"
   end
 
+  test "policy dispatch to an existing spec author opens each assignment with a rumination warning",
+       ctx do
+    item = work_item(ctx)
+    spec_author = session(ctx.db, "spec-author", "spec-writer")
+
+    call =
+      dispatch_call(
+        ctx.pdo.session_key,
+        spec_author.session_key,
+        item.id,
+        "prepare the policy analysis"
+      )
+      |> put_in([:params, :effect_kind], "policy")
+
+    assert {:ok,
+            %{
+              id: first_assignment_id,
+              rumination_required: true,
+              rumination_status: :scheduled,
+              workItemId: work_item_id
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+    assert work_item_id == item.id
+
+    assert {:ok,
+            %{
+              id: second_assignment_id,
+              rumination_required: true,
+              rumination_status: :pending,
+              workItemId: ^work_item_id
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+    refute second_assignment_id == first_assignment_id
+
+    for assignment_id <- [first_assignment_id, second_assignment_id] do
+      assert {:ok, [["open", "spec-author", "policy"]]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT a.state,a.holderKey,e.effectKind
+                 FROM assignments a
+                 JOIN assignment_effects e ON e.assignmentId=a.id
+                 WHERE a.id=?1 AND a.workItemId=?2
+                 """,
+                 [assignment_id, item.id]
+               )
+    end
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT count(*) FROM wakes
+               WHERE rumination=1 AND work_item_id=?1 AND creatorSessionKey=?2
+                 AND state IN ('pending','staged')
+               """,
+               [item.id, ctx.pdo.session_key]
+             )
+  end
+
   test "the product owner can still record current intent judgment on the same item", ctx do
     item = work_item(ctx)
 
