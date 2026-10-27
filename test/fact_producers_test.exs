@@ -17,6 +17,7 @@ defmodule Tightbeam.FactProducersTest do
           {"three", "acme.done", nil, "pending"},
           {"four", "other.x", "a", "pending"},
           {"five", "acme.done", "job-9", "fired"},
+          {"seven", "acme.done", "job-10", "canceled"},
           {"six", nil, nil, "pending"}
         ] do
       {:ok, _} =
@@ -35,8 +36,6 @@ defmodule Tightbeam.FactProducersTest do
 
     assert length(FactProducers.demand(db).demand) == 3
     assert FactProducers.demand(db, ["Acme."]).demand == []
-    {:ok, _} = DB.query(db, "UPDATE wakes SET state='canceled' WHERE conditionScope='job-7'")
-    assert FactProducers.demand(db, ["acme."]).demand == [%{kind: "acme.done", scope: nil}]
   end
 
   test "renewal replaces kinds, and lapsed claims no longer serve waits", %{db: db} do
