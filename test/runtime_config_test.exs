@@ -12,6 +12,7 @@ defmodule Tightbeam.RuntimeConfigTest do
     "TIGHTBEAM_DEFAULT_EFFORT" => "high",
     "TIGHTBEAM_DEFAULT_CONTEXT" => "large",
     "TIGHTBEAM_WAKE_TICK_MS" => "101",
+    "TIGHTBEAM_SUPERVISION_INTERVAL_MS" => "off",
     "TIGHTBEAM_PROD_LIMIT" => "7",
     "TIGHTBEAM_ESCALATION_DECISION_DEADLINE_MS" => "202",
     "TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS" => "not-a-duration",
@@ -59,6 +60,7 @@ defmodule Tightbeam.RuntimeConfigTest do
           context: "large"
         },
         wake_tick_ms: 101,
+        supervision_interval_ms: :off,
         prod_limit: 7,
         escalation_decision_deadline_ms: 202,
         work_item_triage_deadline_ms: 404,
@@ -76,5 +78,27 @@ defmodule Tightbeam.RuntimeConfigTest do
     assert production == expected
     refute Keyword.has_key?(Keyword.fetch!(development, :tightbeam), :effort_checkin_horizon_ms)
     refute Keyword.has_key?(Keyword.fetch!(production, :tightbeam), :effort_checkin_horizon_ms)
+  end
+
+  test "production supervision interval default does not follow the wake tick" do
+    previous_interval = Application.get_env(:tightbeam, :supervision_interval_ms)
+    previous_tick = Application.get_env(:tightbeam, :wake_tick_ms)
+    Application.delete_env(:tightbeam, :supervision_interval_ms)
+    Application.put_env(:tightbeam, :wake_tick_ms, 101)
+
+    on_exit(fn ->
+      if is_nil(previous_interval),
+        do: Application.delete_env(:tightbeam, :supervision_interval_ms),
+        else: Application.put_env(:tightbeam, :supervision_interval_ms, previous_interval)
+
+      if is_nil(previous_tick),
+        do: Application.delete_env(:tightbeam, :wake_tick_ms),
+        else: Application.put_env(:tightbeam, :wake_tick_ms, previous_tick)
+    end)
+
+    {Tightbeam.Boot, config} =
+      Enum.find(Tightbeam.Application.children(), &match?({Tightbeam.Boot, _}, &1))
+
+    assert Map.fetch!(config, :supervision_interval_ms) == 1_800_000
   end
 end
