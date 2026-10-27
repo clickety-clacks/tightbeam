@@ -407,6 +407,26 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     _ = observed_classes()
 
+    :ok =
+      Hub.register(Hub, self(), %{
+        mode: :filtered,
+        db: db,
+        user_id: "flynn",
+        is_admin: true
+      })
+
+    :ok =
+      Hub.subscribe(Hub, self(), "dispatch-effects", %{
+        "classes" => [
+          "verb.accepted",
+          "assignment.opened",
+          "message.created",
+          "session.updated",
+          "wake.scheduled",
+          "wake.fired"
+        ]
+      })
+
     dispatch = %{
       verb: "dispatch",
       origin: "user:flynn",
@@ -452,7 +472,15 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert work_item_id == work_item.id
     rumination_classes = observed_classes()
-    assert rumination_classes == ["verb.accepted", "wake.scheduled"]
+
+    assert Enum.sort(Enum.uniq(rumination_classes)) ==
+             Enum.sort([
+               "verb.accepted",
+               "assignment.opened",
+               "message.created",
+               "session.updated",
+               "wake.scheduled"
+             ])
 
     assert :ok = Wakes.fire_due(scheduler)
     dispatch_delivery_effects = observed_state_classes()
@@ -471,6 +499,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
     )
 
     _rumination_turn = finish_next_turn!(db, "effect-dispatcher", "lane:effects")
+
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
 
     tests_passed = %{
       verb: "attest",
