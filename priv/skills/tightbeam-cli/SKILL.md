@@ -5,7 +5,7 @@ description: Work an assigned Tightbeam card through the tightbeam CLI. Use when
 
 # Work an assigned card through the Tightbeam CLI
 
-Written for Tightbeam 0.1.12. If `tightbeam --version` prints a different version, run
+Written for Tightbeam 0.1.13. If `tightbeam --version` prints a different version, run
 `tightbeam skill install` to replace this skill with the edition that ships with the
 installed CLI, then start a fresh agent session.
 
