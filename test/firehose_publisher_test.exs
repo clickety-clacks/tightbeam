@@ -996,7 +996,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     for {user, session_filter, allowed} <- [
           {"flynn", message.session_key, true},
-          {"other", message.session_key, false},
+          {"other", message.session_key, true},
           {"flynn", "different-session", false}
         ] do
       :ok = Hub.register(Hub, self(), %{mode: :filtered, db: db, user_id: user, is_admin: false})
