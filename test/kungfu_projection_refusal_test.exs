@@ -609,7 +609,8 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
 
   test "queue overflow and owned process cleanup remain bounded", %{hub: hub} do
     small = start_supervised!({Hub, name: nil}, id: :small)
-    :ok = register(small)
+    backlog_counter = :atomics.new(1, signed: false)
+    :ok = register(small, %{backlog_counter: backlog_counter})
 
     under_limit =
       Map.put(notice(), "payload", %{"value" => String.duplicate("x", 63 * 1_024 * 1_024)})
