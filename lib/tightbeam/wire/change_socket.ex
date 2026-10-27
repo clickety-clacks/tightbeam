@@ -2,7 +2,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
   @moduledoc "State-change authentication and delivery; router activation is composed separately."
   @behaviour WebSock
   alias Tightbeam.Firehose.{Hub, Publisher}
-  alias Tightbeam.{StateResources, StateVisibility}
+  alias Tightbeam.StateResources
   alias Tightbeam.Devices
   alias Tightbeam.Org
   alias Tightbeam.Wire.OperatorSession
@@ -377,10 +377,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
         class = if turn.status == "queued", do: "turn.queued", else: "turn.started"
         Publisher.committed_notice(class, turn, %{"sessionKey" => session_key})
       end)
-      |> Enum.filter(fn notice ->
-        class_filter_matches?(filters["classes"], notice["class"]) and
-          StateVisibility.visible?(db(state), notice, visibility_principal(state))
-      end)
+      |> Enum.filter(&class_filter_matches?(filters["classes"], &1["class"]))
     else
       []
     end
@@ -479,18 +476,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
   end
 
   defp credential_digest(token), do: :crypto.hash(:sha256, token)
-
-  defp visibility_principal(%{principal_kind: :session, principal_id: session_key}),
-    do: %{kind: "session", id: session_key}
-
-  defp visibility_principal(%{principal_kind: :observer}),
-    do: %{kind: "observer"}
-
-  defp visibility_principal(%{principal_kind: :user, principal_id: user_id, is_admin: is_admin}),
-    do: %{kind: "user", id: user_id, is_admin: is_admin}
-
-  defp visibility_principal(state),
-    do: %{kind: "user", id: state.user_id, is_admin: state.is_admin}
 
   defp await_delivery_release(state, notice) do
     case Map.get(state.deps, :firehose_delivery_barrier) do
