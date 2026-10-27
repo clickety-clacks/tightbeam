@@ -4095,7 +4095,6 @@ mod tests {
                 "transcript",
                 "turn-trace",
                 "unlearn",
-                "visitor",
                 "execution-map",
                 "execution-map-select",
                 "toplines",
