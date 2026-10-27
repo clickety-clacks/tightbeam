@@ -608,13 +608,20 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
   end
 
   test "queue overflow and owned process cleanup remain bounded", %{hub: hub} do
-    small = start_supervised!({Hub, name: nil, queue_limit: 1}, id: :small)
+    small = start_supervised!({Hub, name: nil}, id: :small)
     :ok = register(small)
-    Hub.publish(small, notice())
-    Hub.publish(small, notice())
+
+    under_limit =
+      Map.put(notice(), "payload", %{"value" => String.duplicate("x", 63 * 1_024 * 1_024)})
+
+    over_limit =
+      Map.put(notice(), "payload", %{"value" => String.duplicate("y", 2 * 1_024 * 1_024)})
+
+    Hub.publish(small, under_limit)
+    Hub.publish(small, over_limit)
     assert %{queued: 2, overflowed: true} = Hub.connection_stats(small, self())
     assert_receive {:firehose_notice, frame}
-    assert frame == notice()
+    assert frame == under_limit
     assert_receive :firehose_overflow
 
     pid =
