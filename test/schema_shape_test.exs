@@ -1556,6 +1556,71 @@ defmodule Tightbeam.SchemaShapeTest do
     assert "supervision_lineage_fire_requires_sidecar" in owned_activation_objects(db)
   end
 
+  test "the preceding continuation guard upgrades without promoting an old reminder", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO users(userId,isAdmin,createdAt) VALUES('dated-owner',1,1);
+             INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,createdAt,updatedAt)
+               VALUES('dated-holder','holder','dated-owner','user:dated-owner','default','claude','anthropic','fable',1,1);
+             INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state)
+               VALUES('dated-assignment','dated work','dated-holder','dated-owner',1,'open');
+             """)
+
+    assert {:ok, [[current_guard]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='supervision_liveness_sidecar_insert_coherent'"
+             )
+
+    preceding_guard =
+      Regex.replace(
+        ~r/AND w\.prompt IS NOT NULL AND \(\s*w\.waitMode IN \('dependency','after-turn'\) OR\s*\(w\.waitMode IS NULL AND w\.conditionKind IS NULL AND w\.targetRole IS NULL\s*AND w\.creatorSessionKey=a\.holderKey AND w\.dueAt>w\.createdAt\)\s*\)/,
+        current_guard,
+        "AND w.waitMode IN ('dependency','after-turn') AND w.prompt IS NOT NULL"
+      )
+
+    refute preceding_guard == current_guard
+
+    assert :ok =
+             DB.execute(
+               db,
+               "DROP TRIGGER supervision_liveness_sidecar_insert_coherent; #{preceding_guard};"
+             )
+
+    input = %{
+      session_key: "dated-holder",
+      creator_session_key: "dated-holder",
+      assignment_id: "dated-assignment",
+      origin: "session:dated-holder",
+      prompt: "resume later",
+      due_at: System.system_time(:millisecond) + 60_000,
+      sender_scheduled: true
+    }
+
+    historical = Wakes.schedule(db, input)
+    assert historical.obligation_ref == nil
+    assert :ok = Schema.ensure_all(db)
+    assert Wakes.get(db, historical.wake_id).obligation_ref == nil
+
+    dated =
+      Wakes.schedule(db, Map.put(input, :dated_continuation_assignment_id, "dated-assignment"))
+
+    assert dated.obligation_ref == "dated-assignment"
+
+    assert {:ok, [["pending"]]} =
+             DB.query(
+               db,
+               "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1 AND controllerOrigin='holder_continuation'",
+               [dated.wake_id]
+             )
+
+    assert :ok = Schema.ensure_all(db)
+    assert Wakes.get(db, historical.wake_id).obligation_ref == nil
+    assert Wakes.get(db, dated.wake_id).obligation_ref == "dated-assignment"
+  end
+
   test "only Tightbeam supervision lineage firing requires a sidecar", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 

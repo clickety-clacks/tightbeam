@@ -427,6 +427,88 @@ defmodule Tightbeam.CliIntegrationTest do
     end
   end
 
+  test "holder's dated CLI wake admits one exact assignment continuation", ctx do
+    {assignment_output, 0} =
+      System.cmd(
+        ctx.binary,
+        ["assign", "--session", "cli-holder", "--subject", "dated continuation"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assignment = JSON.decode!(assignment_output)["id"]
+    future = Integer.to_string(System.system_time(:millisecond) + 3_600_000)
+
+    for timing <- [["--after", "1h"], ["--at", future]] do
+      {output, 0} =
+        System.cmd(
+          ctx.binary,
+          ["wake", "--session", "cli-holder", "--assignment", assignment] ++
+            timing ++ ["--prompt", "continue the same assignment"],
+          cd: ctx.workdir,
+          stderr_to_stdout: true
+        )
+
+      wake = Wakes.get(ctx.db, JSON.decode!(output)["wakeId"])
+      assert wake.assignment_id == assignment
+      assert wake.obligation_ref == assignment
+      assert wake.creator_session_key == "cli-holder"
+      assert wake.wait_mode == nil
+      assert wake.due_at > wake.created_at
+
+      assert {:ok, [["pending"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1 AND controllerOrigin='holder_continuation'",
+                 [wake.wake_id]
+               )
+    end
+
+    {output, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-worker",
+          "--assignment",
+          assignment,
+          "--after",
+          "1h",
+          "--prompt",
+          "ordinary reminder"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    other_target = Wakes.get(ctx.db, JSON.decode!(output)["wakeId"])
+    assert other_target.assignment_id == assignment
+    assert other_target.obligation_ref == nil
+
+    {output, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-holder",
+          "--assignment",
+          assignment,
+          "--at",
+          "1",
+          "--prompt",
+          "past reminder"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    past = Wakes.get(ctx.db, JSON.decode!(output)["wakeId"])
+    assert past.assignment_id == assignment
+    assert past.obligation_ref == nil
+  end
+
   test "manual obligation continuation examples register rows and deliver intact prompts", ctx do
     {help, 0} = System.cmd(ctx.binary, ["wake", "--help"])
     assert help =~ "--after-turn"

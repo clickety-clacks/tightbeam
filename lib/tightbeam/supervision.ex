@@ -406,6 +406,8 @@ defmodule Tightbeam.Supervision do
               latest_activity =
                 current_activity_time_in_txn(txn, assignment_id, holder, activity_start)
 
+              covered_until = Wakes.dated_continuation_due_in_txn(txn, assignment_id, now)
+
               cond do
                 latest_activity > activity_at ->
                   replacement =
@@ -416,6 +418,26 @@ defmodule Tightbeam.Supervision do
                       work_item_id,
                       latest_activity,
                       interval_ms
+                    )
+
+                  fire_internal_in_txn(txn, wake.wake_id, @deadline_consumer, now)
+
+                  cancel_assignment_sources_in_txn(
+                    txn,
+                    assignment_id,
+                    {:replacement, replacement.wake_id}
+                  )
+
+                is_integer(covered_until) ->
+                  replacement =
+                    schedule_deadline_in_txn(
+                      txn,
+                      assignment_id,
+                      holder,
+                      work_item_id,
+                      latest_activity,
+                      interval_ms,
+                      covered_until
                     )
 
                   fire_internal_in_txn(txn, wake.wake_id, @deadline_consumer, now)
@@ -660,9 +682,10 @@ defmodule Tightbeam.Supervision do
          holder,
          work_item_id,
          activity_at,
-         interval_ms
+         interval_ms,
+         due_override \\ nil
        ) do
-    due_at = activity_at + interval_ms
+    due_at = due_override || activity_at + interval_ms
 
     reusable_deadline_in_txn(
       txn,

@@ -1518,6 +1518,8 @@ defmodule Tightbeam.Wakes do
     {class, class_election} = elected_class(input)
 
     {delivery_rule, due_at} = apply_delivery_policy(txn, input, class, created_at, condition_kind)
+    dated_assignment_id = Map.get(input, :dated_continuation_assignment_id)
+    dated_continuation? = is_binary(dated_assignment_id) and due_at > created_at
 
     wake = %{
       wake_id: Map.get(input, :wake_id, "w_" <> Tightbeam.Id.uuid4()),
@@ -1553,7 +1555,8 @@ defmodule Tightbeam.Wakes do
       digest: Map.get(input, :digest, false),
       summon: Map.get(input, :summon, false),
       owner_user_id: owner_user_id,
-      obligation_ref: Map.get(input, :obligation_ref),
+      obligation_ref:
+        if(dated_continuation?, do: dated_assignment_id, else: Map.get(input, :obligation_ref)),
       wait_mode: Map.get(input, :wait_mode),
       predicate: Map.get(input, :predicate),
       resolver_kind: Map.get(input, :resolver_kind),
@@ -1654,6 +1657,10 @@ defmodule Tightbeam.Wakes do
         encode_optional(wake.recognition_transition)
       ]
     )
+
+    if dated_continuation? do
+      admit_continuation_in_txn(txn, wake)
+    end
 
     if schedule = Map.get(input, :cron) do
       Txn.q(txn, "INSERT INTO cron_wake_schedules(wakeId,schedule) VALUES(?1,?2)", [
@@ -1899,6 +1906,28 @@ defmodule Tightbeam.Wakes do
     )
 
     wake
+  end
+
+  @doc false
+  def dated_continuation_due_in_txn(%Txn{} = txn, assignment_id, at) do
+    [[due_at]] =
+      Txn.q(
+        txn,
+        """
+        SELECT MAX(w.dueAt) FROM wakes w
+        JOIN assignments a ON a.id=w.assignmentId AND a.state='open'
+        JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
+          AND s.assignmentId=a.id AND s.controllerOrigin='holder_continuation'
+          AND s.controllerState='pending'
+        WHERE a.id=?1 AND w.obligationRef=a.id AND w.sessionKey=a.holderKey
+          AND w.creatorSessionKey=a.holderKey AND w.consumer='prompt'
+          AND w.state='pending' AND w.waitMode IS NULL AND w.conditionKind IS NULL
+          AND w.targetRole IS NULL AND w.dueAt>w.createdAt AND w.dueAt>?2
+        """,
+        [assignment_id, at]
+      )
+
+    due_at
   end
 
   defp reconcile_wait_relief_in_txn(txn, assignment_id, at) do
