@@ -299,7 +299,15 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     refute StateVisibility.visible?(ctx.db, unresolved_notice, "flynn", false)
     refute StateVisibility.visible?(ctx.db, unresolved_notice, "root", true)
 
-    assert_quiet(ctx.hub)
+    assert_receive {:firehose_notice, delivered_notice}
+
+    assert_source_notice(
+      delivered_notice,
+      "subagent_marker.appended",
+      %{"markerId" => Integer.to_string(unresolved_id), "sessionKey" => "s_flynn"},
+      unresolved_id,
+      701
+    )
   end
 
   test "maintenance rename close and reopen retain events without inventing invalidations", ctx do

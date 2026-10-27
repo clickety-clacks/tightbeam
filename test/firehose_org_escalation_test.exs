@@ -437,7 +437,6 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     assert refs["sessionKey"] == "firehose-owner"
     refute Map.has_key?(refs, "assignmentId")
     refute Tightbeam.StateVisibility.visible?(db, notice, "synthetic-owner", true)
-    GenServer.cast(hub, {:publish, notice})
     assert_receive {:firehose_notice, %{"class" => "subagent_marker.appended"}}
 
     assert {:ok, %{appended: false, assignment_id: nil}} =

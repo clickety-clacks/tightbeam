@@ -500,7 +500,13 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert %{in_flight: false, overflowed: true, queued: 1_001, seq: 1_001} =
              Hub.connection_stats(ctx.hub, self())
 
-    assert_receive {:firehose_notice, %{"seq" => 1}}
+    notices =
+      for seq <- 1..1_000 do
+        assert_receive {:firehose_notice, %{"seq" => ^seq}}
+        seq
+      end
+
+    assert notices == Enum.to_list(1..1_000)
     assert_receive :firehose_overflow
     refute_receive :firehose_overflow, 50
     refute_receive {:firehose_notice, _notice}, 50
