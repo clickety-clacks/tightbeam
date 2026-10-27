@@ -5114,10 +5114,18 @@ mod tests {
         }
 
         let manual = render_help(None);
+        let normalized = manual.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            manual.contains("Processes may wake, cancel-wake, and file\n                       condition facts ONLY"),
+            normalized.contains("Processes may wake, cancel-wake, file condition facts, and use fact producer commands — they cannot spawn, retire, or administer."),
             "{manual}"
         );
+        for command in ["fact-demand", "fact-producer-claim", "fact-producers"] {
+            assert!(
+                render_command_help(None, command).is_some(),
+                "missing help for {command}"
+            );
+        }
+        assert!(!manual.contains("condition facts ONLY"));
         assert!(!manual.contains("Processes may wake and cancel-wake ONLY"));
     }
 
