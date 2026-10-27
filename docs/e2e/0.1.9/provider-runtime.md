@@ -99,7 +99,7 @@ reconfigure a production satellite or print a bearer to fill this prerequisite.
 From S's own satellite workdir, with stdin held open, run:
 
 ```sh
-"$PKG/bin/tightbeam" session-connect --session "$session_key"
+"$PKG/bin/tightbeam" session-connect --session "$session_key" --as-process satellite-e2e
 ```
 
 Keep output in private scratch. Require `snapshot.begin`, `snapshot.item`
