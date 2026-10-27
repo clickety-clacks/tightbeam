@@ -3396,20 +3396,7 @@ defmodule Tightbeam.AssignmentsTest do
                  String.starts_with?(wake.obligation_ref || "", "assignment-inactivity-episode-v1:")
              end)
 
-    assert {:ok, {:appended, _, _, _}} =
-             DB.transaction(ctx.db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 holder_notice.session_key,
-                 holder_notice.origin,
-                 holder_notice.prompt,
-                 wake_id: holder_notice.wake_id,
-                 sender: holder_notice.origin,
-                 target_gate: holder_notice,
-                 fire_wake_in_txn: true,
-                 assignment_id: holder_notice.assignment_id
-               )
-             end)
+    assert :appended = deliver_terminal_notice(ctx.db, holder_notice)
 
     drain_queued_turns(ctx.db, "opener", "flynn")
     Process.sleep(1_100)
@@ -3420,20 +3407,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert escalation.session_key == "parent-a"
 
-    assert {:ok, {:appended, _, _, _}} =
-             DB.transaction(ctx.db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 escalation.session_key,
-                 escalation.origin,
-                 escalation.prompt,
-                 wake_id: escalation.wake_id,
-                 sender: escalation.origin,
-                 target_gate: escalation,
-                 fire_wake_in_txn: true,
-                 assignment_id: escalation.assignment_id
-               )
-             end)
+    assert :appended = deliver_terminal_notice(ctx.db, escalation)
 
     assert Wakes.get(ctx.db, escalation.wake_id).state == "fired"
 
