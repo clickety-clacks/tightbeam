@@ -299,6 +299,73 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, nil} = covered.()
   end
 
+  test "canceling a continuation restores the inactivity deadline after deferral", ctx do
+    holder = ctx.holder.session_key
+    origin = "agent:#{holder}"
+    open_deadline!(ctx.db, "asg_inactive", System.system_time(:millisecond), 1_000)
+
+    schedule = fn prompt, offset ->
+      Wakes.schedule(ctx.db, %{
+        session_key: holder,
+        creator_session_key: holder,
+        assignment_id: "asg_inactive",
+        dated_continuation_assignment_id: "asg_inactive",
+        origin: origin,
+        prompt: prompt,
+        due_at: System.system_time(:millisecond) + offset,
+        sender_scheduled: true
+      })
+    end
+
+    cancel = fn wake ->
+      command = %{
+        wake_id: wake.wake_id,
+        expected_origin: origin,
+        requester: %{kind: "session", id: holder},
+        reason_kind: "requester_withdrew",
+        causal_source: %{
+          kind: "verb_call",
+          accepted_event: %{origin: origin, session_key: holder, principal: {:session, holder}}
+        },
+        outcome: %{kind: "no_replacement"}
+      }
+
+      assert {:ok, {:accepted_in_txn, _, %{canceled: true}}} =
+               DB.transaction(ctx.db, fn txn ->
+                 {:ok, outcome} = Wakes.public_cancellation_outcome_in_txn(txn, command)
+                 Wakes.cancel_in_txn(txn, %{command | outcome: outcome})
+               end)
+    end
+
+    earlier = schedule.("resume earlier", 60_000)
+    later = schedule.("resume later", 120_000)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at == later.due_at
+
+    cancel.(later)
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at == earlier.due_at
+
+    cancel.(earlier)
+    restored = pending_deadline!(ctx.db, "asg_inactive")
+    assert restored.due_at < earlier.due_at
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [restored.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, restored.wake_id))
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+  end
+
   test "dated continuation delivery is one notification and no work receipt", ctx do
     registry = :"dated_registry_#{System.unique_integer([:positive])}"
     lane = :"dated_lane_#{System.unique_integer([:positive])}"

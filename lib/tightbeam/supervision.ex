@@ -131,6 +131,58 @@ defmodule Tightbeam.Supervision do
 
   def activity_in_txn(_txn, _assignment_id, _actor_session_key, _at), do: :ignored
 
+  @doc false
+  def dated_continuation_canceled_in_txn(%Txn{} = txn, assignment_id, at)
+      when is_binary(assignment_id) and is_integer(at) do
+    case Txn.q(
+           txn,
+           "SELECT holderKey,workItemId FROM assignments WHERE id=?1 AND state='open'",
+           [assignment_id]
+         ) do
+      [[holder, work_item_id]] ->
+        case pending_deadline_wake_id(txn, assignment_id) do
+          nil ->
+            :ok
+
+          wake_id ->
+            deadline = Wakes.get_in_txn(txn, wake_id)
+            {:ok, payload} = decode_payload(deadline, @deadline_consumer)
+            {:ok, ^assignment_id, interval_ms, activity_at} = deadline_payload(payload, deadline)
+            true = deadline.session_key == holder and deadline.work_item_id == work_item_id
+            ordinary_due = activity_at + interval_ms
+
+            if deadline.due_at > ordinary_due do
+              remaining_due = Wakes.dated_continuation_due_in_txn(txn, assignment_id, at)
+              next_due = max(ordinary_due, remaining_due || ordinary_due)
+
+              if next_due < deadline.due_at do
+                replacement =
+                  schedule_deadline_in_txn(
+                    txn,
+                    assignment_id,
+                    holder,
+                    work_item_id,
+                    activity_at,
+                    interval_ms,
+                    next_due
+                  )
+
+                cancel_assignment_sources_in_txn(
+                  txn,
+                  assignment_id,
+                  {:replacement, replacement.wake_id}
+                )
+              end
+            end
+
+            :ok
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
   @doc """
   Close open assignments whose holder is already retired.
 

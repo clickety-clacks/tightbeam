@@ -1914,12 +1914,12 @@ defmodule Tightbeam.Wakes do
       Txn.q(
         txn,
         """
-        SELECT MAX(w.dueAt) FROM wakes w
+        SELECT MAX(w.dueAt) FROM wakes w INDEXED BY wakes_assignment
         JOIN assignments a ON a.id=w.assignmentId AND a.state='open'
         JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
           AND s.assignmentId=a.id AND s.controllerOrigin='holder_continuation'
           AND s.controllerState='pending'
-        WHERE a.id=?1 AND w.obligationRef=a.id AND w.sessionKey=a.holderKey
+        WHERE w.assignmentId=?1 AND w.obligationRef=a.id AND w.sessionKey=a.holderKey
           AND w.creatorSessionKey=a.holderKey AND w.consumer='prompt'
           AND w.state='pending' AND w.waitMode IS NULL AND w.conditionKind IS NULL
           AND w.targetRole IS NULL AND w.dueAt>w.createdAt AND w.dueAt>?2
@@ -5412,6 +5412,19 @@ defmodule Tightbeam.Wakes do
         """,
         [wake.wake_id]
       )
+
+      dated_continuation_canceled? =
+        Txn.changes(txn) == 1 and wake.consumer == "prompt" and
+          is_binary(wake.assignment_id) and wake.obligation_ref == wake.assignment_id and
+          Txn.q(
+            txn,
+            "SELECT 1 FROM wakes WHERE wakeId=?1 AND waitMode IS NULL AND conditionKind IS NULL AND targetRole IS NULL AND dueAt>createdAt",
+            [wake.wake_id]
+          ) == [[1]]
+
+      if dated_continuation_canceled? do
+        Supervision.dated_continuation_canceled_in_txn(txn, wake.assignment_id, canceled_at)
+      end
 
       if is_binary(wake.assignment_id) do
         Tightbeam.ReminderDelivery.canceled_in_txn(txn, wake.assignment_id, wake.wake_id)
