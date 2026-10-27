@@ -1473,7 +1473,7 @@ defmodule Tightbeam.HarnessProcessFixture do
 
   defp scenario(35, ctx) do
     key = {:claude, "shared", "legacy-absent-host"}
-    independent_fence = {:codex, "shared", "independent-host"}
+    orphan_fence = {:codex, "shared", "independent-host"}
     unsupported_helper = Path.join(ctx.test_dir, "unsupported-legacy-helper")
     helper_invocation = Path.join(ctx.test_dir, "unsupported-helper-invoked")
 
@@ -1532,8 +1532,8 @@ defmodule Tightbeam.HarnessProcessFixture do
         [unrelated_id]
       )
 
-    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, independent_fence)
-    assert HarnessProcess.fenced?(ctx.db, independent_fence)
+    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, orphan_fence)
+    assert HarnessProcess.fenced?(ctx.db, orphan_fence)
     refute File.exists?(legacy.identity_path)
     refute File.exists?(legacy.identity_path <> ".authority")
 
@@ -1551,7 +1551,7 @@ defmodule Tightbeam.HarnessProcessFixture do
     assert resolved.kill_sent_at == nil
     assert resolved.last_error == "legacy helper refused missing authority"
     refute HarnessProcess.fenced?(ctx.db, key)
-    assert HarnessProcess.fenced?(ctx.db, independent_fence)
+    refute HarnessProcess.fenced?(ctx.db, orphan_fence)
     refute File.exists?(helper_invocation)
 
     kept = Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == unrelated_id))
@@ -1570,7 +1570,7 @@ defmodule Tightbeam.HarnessProcessFixture do
            end) == 1
 
     assert Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == launch_id)) == resolved
-    assert HarnessProcess.fenced?(ctx.db, independent_fence)
+    refute HarnessProcess.fenced?(ctx.db, orphan_fence)
     refute File.exists?(helper_invocation)
   end
 

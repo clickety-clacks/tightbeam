@@ -337,7 +337,7 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 33)
   end
 
-  test "boot settles an absent legacy record through coordinator init and preserves history across restart",
+  test "boot settles an absent legacy record, clears orphan fences, and preserves history across restart",
        %{tmp_dir: tmp} do
     Tightbeam.HarnessProcessFixture.run!(tmp, 35)
   end

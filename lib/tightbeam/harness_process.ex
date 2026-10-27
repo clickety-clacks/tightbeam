@@ -473,7 +473,7 @@ defmodule Tightbeam.HarnessProcess do
     :ok
   end
 
-  @doc "Retry failed parks and release completed orphan fences without replacing a coordinator."
+  @doc "Retry failed parks and clear orphan fences, preserving open rate-limit incident fences without replacing a coordinator."
   @spec reconcile_failed_parks(DB.server()) :: {:ok, [String.t()]}
   def reconcile_failed_parks(db) do
     recovered =
