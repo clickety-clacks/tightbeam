@@ -282,7 +282,7 @@ defmodule Tightbeam.Firehose.Hub do
     occupied = socket_queue_length(pid) + :queue.len(socket.pending_notices)
 
     if occupied + 1 > limit do
-      overflow(socket, pid)
+      overflow(socket, pid, occupied + 1, limit)
     else
       %{socket | pending_notices: :queue.in(notice, socket.pending_notices)}
     end
@@ -295,7 +295,7 @@ defmodule Tightbeam.Firehose.Hub do
     occupied = socket_queue_length(pid) + :queue.len(socket.pending_notices)
 
     if occupied + length(frames) > limit do
-      overflow(socket, pid)
+      overflow(socket, pid, occupied + length(frames), limit)
     else
       Enum.each(frames, &send_frame(pid, &1))
       socket
@@ -309,16 +309,26 @@ defmodule Tightbeam.Firehose.Hub do
     end
   end
 
-  defp overflow(socket, pid) do
+  defp overflow(socket, pid, backlog, limit) do
     if not socket.overflowed do
       Logger.warning(
-        "firehose subscriber #{inspect(pid)} queue overflow; closing connection (4008)"
+        "firehose app dropped #{inspect(app_identity(socket))} reason=outbound_queue_overflow " <>
+          "backlog=#{backlog} queue_limit=#{limit} close_code=4008 connection=#{inspect(pid)}"
       )
 
       send(pid, :firehose_overflow)
     end
 
     %{socket | pending_notices: :queue.new(), overflowed: true}
+  end
+
+  defp app_identity(socket) do
+    %{
+      principal_kind: socket.principal_kind,
+      principal_id: socket.principal_id,
+      user_id: socket.user_id,
+      device_id: socket.device_id
+    }
   end
 
   defp send_frame(pid, %{"type" => "subscription_ready"} = frame),
