@@ -257,9 +257,10 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
              "[from user:#{owner_id}]\n\n[assignment: #{dispatch_id}]\n\nship the smoke feature"
 
     terminal = Tightbeam.Wakes.get(ctx.db, terminal_source)
+    personal_session = Org.personal_session_key(owner_id)
 
     assert %{
-             session_key: ^owner_session,
+             session_key: ^personal_session,
              prompt: ^terminal_raw,
              origin: "process:tightbeam",
              consumer: "prompt",
