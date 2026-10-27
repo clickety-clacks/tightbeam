@@ -328,9 +328,10 @@ defmodule Tightbeam.FirehoseColdRestartTest do
               dispatch!(plan, new["port"], device, "assignment-get", %{"assignmentId" => id})
 
             assert Enum.map(history, & &1["reason"]) == ["First restart", "After restart"]
-            # The reopened assignment's ordinary holder wake may be running when
-            # shutdown begins. Let that turn settle before checking the socket close.
-            assert_holder_turn_ended!(holder_turns, id, previous_turn)
+            # A fresh quiet interval starts at reopening; shutdown must not
+            # depend on another inactivity reminder arriving immediately.
+            assert {:error, :timeout, _} = WS.recv(holder_turns, 300)
+            assert latest_turn_seq!(new["port"], device.token, fixture["holder"]) == previous_turn
             File.write!(Path.join(plan.base, "second-stop"), "stop\n")
             assert {:ok, {:closed, 1012}, _} = WS.recv_event(resumed, 5_000)
             assert exit!(second, plan, "second") == 0

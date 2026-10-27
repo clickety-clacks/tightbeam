@@ -91,8 +91,14 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
         assert [%{"state" => "pending", "wakeId" => deadline_id}] =
                  Enum.filter(before_wakes, deadline?)
 
-        assert [%{"state" => "fired", "wakeId" => ^deadline_id}] =
+        assert [
+                 %{"state" => "canceled", "wakeId" => ^deadline_id},
+                 %{"state" => "fired", "wakeId" => replacement_id, "prompt" => replacement_prompt}
+               ] =
                  Enum.filter(after_wakes, deadline?)
+
+        refute replacement_id == deadline_id
+        assert %{"intervalMs" => 1_000} = JSON.decode!(replacement_prompt)
 
         assert [notice] =
                  Enum.filter(after_wakes, fn wake ->
