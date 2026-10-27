@@ -2732,7 +2732,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert Wakes.get(ctx.db, filed.decisionWake.wake_id).state == "canceled"
 
-    assert {:ok, [["cannot_proceed_released", 0]]} =
+    assert {:ok, [["cannot_proceed_released", 1]]} =
              DB.query(
                ctx.db,
                "SELECT reasonKind,actionNeeded FROM wake_cancellations WHERE wakeId=?1",
@@ -3384,7 +3384,35 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert Supervision.ladder_target(ctx.db, "opener", 1) == "parent-a"
 
+    # This fixture configures a one-second reminder interval. Let the quiet
+    # period elapse, then finish the holder notice before exercising the climb.
+    Process.sleep(1_100)
     assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_deadline", opener_work.id)
+
+    assert [holder_notice] =
+             Enum.filter(Wakes.list_pending(ctx.db), fn wake ->
+               wake.assignment_id == opener_work.id and wake.session_key == "opener" and
+                 wake.consumer == "prompt" and
+                 String.starts_with?(wake.obligation_ref || "", "assignment-inactivity-episode-v1:")
+             end)
+
+    assert {:ok, {:appended, _, _, _}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 holder_notice.session_key,
+                 holder_notice.origin,
+                 holder_notice.prompt,
+                 wake_id: holder_notice.wake_id,
+                 sender: holder_notice.origin,
+                 target_gate: holder_notice,
+                 fire_wake_in_txn: true,
+                 assignment_id: holder_notice.assignment_id
+               )
+             end)
+
+    drain_queued_turns(ctx.db, "opener", "flynn")
+    Process.sleep(1_100)
     assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_climb", opener_work.id)
 
     assert [escalation] =
