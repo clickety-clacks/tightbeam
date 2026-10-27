@@ -42,8 +42,8 @@ def digest(path):
     return h.hexdigest()
 
 
-def command(args, env, timeout=60):
-    done = subprocess.run(args, env=env, text=True, capture_output=True, timeout=timeout)
+def command(args, env, timeout=60, cwd=None):
+    done = subprocess.run(args, env=env, text=True, capture_output=True, timeout=timeout, cwd=cwd)
     if done.returncode:
         raise AcceptanceError(f"{args[0]} exited {done.returncode}: {done.stderr.strip()}")
     return done
@@ -191,6 +191,7 @@ def run_acceptance(args, cli, gateway, watcher, source, gh_env, scratch):
                    "HOME": str(scratch), "TIGHTBEAM_BASE_DIR": str(base),
                    "TIGHTBEAM_PORT": str(args.port)}
     watcher_env = {**gateway_env, "GH_CONFIG_DIR": str(Path(args.gh_config_dir).resolve()),
+                   "LANDING_WATCH_AS_PROCESS": "package-pr-acceptance",
                    "GH_AUDIT_LOG": str(scratch / "gh-reads.jsonl"),
                    "REAL_GH": shutil.which("gh", path=gh_env["PATH"])}
     shim_dir = gh_shim(scratch, watcher_env["REAL_GH"])
@@ -199,9 +200,19 @@ def run_acceptance(args, cli, gateway, watcher, source, gh_env, scratch):
     server = None
     producer = None
     stopped = False
+
+    def scratch_cli(*options):
+        return command([str(cli), *options], gateway_env, cwd=scratch)
+
+    def claim_until():
+        data = json.loads(scratch_cli("fact-producers", "--as-user", "acceptance").stdout)
+        matches = [item for item in data["producers"] if item["producer"] == "landing-watch"
+                   and item["live"] and "pr.checks-completed" in item["kinds"]]
+        return matches[0]["liveUntil"] if matches else None
+
     try:
         server = subprocess.Popen([str(gateway), "start"], env=gateway_env,
-                                  stdout=gateway_log, stderr=subprocess.STDOUT)
+                                  cwd=scratch, stdout=gateway_log, stderr=subprocess.STDOUT)
 
         def version_ready():
             try:
@@ -216,20 +227,14 @@ def run_acceptance(args, cli, gateway, watcher, source, gh_env, scratch):
         require(isinstance(stamped_sha, str) and len(stamped_sha) >= 7
                 and source.startswith(stamped_sha),
                 "running gateway source differs from package")
-        command([str(cli), "add-user", "acceptance"], gateway_env)
+        scratch_cli("add-user", "acceptance")
         producer = subprocess.Popen([str(watcher)], env=watcher_env,
-                                    stdout=watcher_log, stderr=subprocess.STDOUT)
+                                    cwd=scratch, stdout=watcher_log, stderr=subprocess.STDOUT)
 
-        def claim_live():
-            data = json.loads(command([str(cli), "fact-producers"], gateway_env).stdout)
-            return any(item["producer"] == "landing-watch" and item["live"]
-                       and "pr.checks-completed" in item["kinds"] for item in data["producers"])
-
-        wait_until("live watcher claim", claim_live, 60)
-        wake = command([str(cli), "wake", "--user", "acceptance", "--when-fact",
-                        "pr.checks-completed", "--when-scope", scope, "--fallback-after", "2h",
-                        "--prompt", "Read the completed required checks", "--as-user", "acceptance"],
-                       gateway_env)
+        wait_until("live watcher claim", claim_until, 60)
+        wake = scratch_cli("wake", "--user", "acceptance", "--when-fact",
+                           "pr.checks-completed", "--when-scope", scope, "--fallback-after", "2h",
+                           "--prompt", "Read the completed required checks", "--as-user", "acceptance")
         wake_result = json.loads(wake.stdout)
         require(not wake_result.get("warnings"),
                 "wait creation warned that no producer was live")
@@ -249,15 +254,23 @@ def run_acceptance(args, cli, gateway, watcher, source, gh_env, scratch):
         require(github_pr(scope, gh_env) == head, "PR head changed during acceptance")
 
         def demand_gone():
-            data = json.loads(command([str(cli), "fact-demand", "--kind-prefix", "pr."],
-                                      gateway_env).stdout)
+            data = json.loads(scratch_cli("fact-demand", "--kind-prefix", "pr.",
+                                          "--as-user", "acceptance").stdout)
             return not any(item["kind"] == "pr.checks-completed" and item["scope"] == scope
                            for item in data["demand"])
 
         wait_until("demand to clear", demand_gone, 30)
+        prior_claim = claim_until()
         reads = scratch / "gh-reads.jsonl"
         before = reads.read_text().splitlines()
-        time.sleep(75)
+        log_before = (scratch / "watcher.log").read_text().splitlines()
+        wait_until("watcher poll after demand cleared",
+                   lambda: (claim_until() or 0) > prior_claim, 180)
+        # One demand read follows each forced claim renewal and has a 60s timeout.
+        # With no configured branches or remaining PR wait, it ends this poll.
+        time.sleep(65)
+        require("poll failed" not in "\n".join((scratch / "watcher.log").read_text().splitlines()[len(log_before):]),
+                "watcher poll after demand cleared failed")
         after = reads.read_text().splitlines()
         later = [json.loads(line) for line in after[len(before):]]
         number = scope.rsplit("#", 1)[1]
@@ -275,7 +288,7 @@ def run_acceptance(args, cli, gateway, watcher, source, gh_env, scratch):
                 stopped = False
         if server is not None:
             try:
-                command([str(gateway), "stop"], gateway_env, timeout=30)
+                command([str(gateway), "stop"], gateway_env, timeout=30, cwd=scratch)
                 server.wait(timeout=30)
             except (AcceptanceError, subprocess.TimeoutExpired):
                 stopped = False
