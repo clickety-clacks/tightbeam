@@ -1595,7 +1595,7 @@ defmodule Tightbeam.Wire.Router do
            session_collection_principal(auth, request, conn, session_key, resource),
          :ok <- session_collection_request(request, session_key),
          {:ok, limit, boundary} <-
-           state_page_request(
+           observer_aware_state_page_request(
              request,
              "session.#{resource}.collection:#{session_key}",
              resource,
