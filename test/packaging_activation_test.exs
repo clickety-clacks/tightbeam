@@ -168,6 +168,36 @@ defmodule Tightbeam.PackagingActivationTest do
     assert File.ls!(Path.join(install_root, ".staging")) != []
   end
 
+  test "selection warns about skipped policies and continues when the rule check fails" do
+    root = fixture_root()
+    install_root = Path.join(root, "installation")
+    previous = package_fixture(root, "0.1.9", String.duplicate("f", 40))
+    previous_stage = stage!(previous, install_root)
+    select!(install_root, previous_stage["buildId"])
+
+    candidate = package_fixture(root, "0.1.10", String.duplicate("1", 40))
+    candidate_stage = stage!(candidate, install_root)
+    rule_file = Path.join([install_root, "installed-base", "identity", "rules", "preflight.toml"])
+    original_rules = File.read!(rule_file)
+    original_sha = :crypto.hash(:sha256, original_rules)
+
+    {output, status} = select(install_root, candidate_stage["buildId"], "ok")
+
+    assert status == 0
+    assert output =~ ~s(rules/preflight.toml: policy "legacy": purpose "retired" is retired)
+    assert selected_link(install_root) == "builds/#{candidate_stage["buildId"]}"
+    assert :crypto.hash(:sha256, File.read!(rule_file)) == original_sha
+
+    fallback = package_fixture(root, "0.1.11", String.duplicate("2", 40))
+    fallback_stage = stage!(fallback, install_root)
+
+    {incomplete_output, incomplete_status} = select(install_root, fallback_stage["buildId"], "fail")
+
+    assert incomplete_status == 0
+    assert incomplete_output =~ "rule check could not complete"
+    assert selected_link(install_root) == "builds/#{fallback_stage["buildId"]}"
+  end
+
   defp fixture_root do
     name = "tightbeam-package-activation-#{System.unique_integer([:positive, :monotonic])}"
     root = Path.join(System.tmp_dir!(), name)
@@ -196,7 +226,23 @@ defmodule Tightbeam.PackagingActivationTest do
       "#!/bin/sh\nprintf '%s\\n' '#{version}'\n"
     )
 
-    File.write!(Path.join(package_root, "bin/tightbeam-gateway"), "#!/bin/sh\nexit 0\n")
+    File.write!(
+      Path.join(package_root, "bin/tightbeam-gateway"),
+      "#!/bin/sh\n" <>
+        "if [ \"$1\" = eval ]; then\n" <>
+        "  case \"${TB_RULE_PREFLIGHT_MODE:-ok}\" in\n" <>
+        "    fail) printf '%s\\n' 'checker failed' >&2; exit 42 ;;\n" <>
+        "    silent) exit 0 ;;\n" <>
+        "    *)\n" <>
+        "      case \"$2\" in *Tightbeam.RulePreflight.run*) ;; *) exit 43 ;; esac\n" <>
+        "      [ -r \"$TIGHTBEAM_BASE_DIR/identity/rules/preflight.toml\" ] || exit 44\n" <>
+        "      [ ! -w \"$TIGHTBEAM_BASE_DIR/identity/rules\" ] || exit 45\n" <>
+        "      printf '%s\\n' 'TIGHTBEAM_RULE_PREFLIGHT_JSON:{\"complete\":true,\"warnings\":[\"rules/preflight.toml: policy \\\"legacy\\\": purpose \\\"retired\\\" is retired; policy has no effect\"],\"unavailable_verbs\":[]}'\n" <>
+        "      exit 0 ;;\n" <>
+        "  esac\n" <>
+        "fi\n" <>
+        "exit 0\n"
+    )
     File.write!(Path.join(package_root, "release/bin/tightbeam_gateway"), "#!/bin/sh\nexit 0\n")
     File.write!(Path.join(package_root, "release/releases/start_erl.data"), "28.5 #{version}\n")
 
@@ -278,18 +324,36 @@ defmodule Tightbeam.PackagingActivationTest do
     JSON.decode!(output)
   end
 
-  defp select(install_root, build_id) do
+  defp select(install_root, build_id, mode \\ "ok") do
+    base_dir = Path.join(install_root, "installed-base")
+    rule_file = Path.join([base_dir, "identity", "rules", "preflight.toml"])
+    File.mkdir_p!(Path.dirname(rule_file))
+    File.write!(rule_file, "[[rule]]\nname = \"preflight-sample\"\n")
+
     System.cmd(
       System.find_executable("node") ||
         flunk("Node.js 20 or later is required for package staging"),
-      [@selector, "select", "--root", install_root, "--build", build_id],
+      [
+        @selector,
+        "select",
+        "--root",
+        install_root,
+        "--build",
+        build_id,
+        "--base-dir",
+        base_dir
+      ],
+      env: [{"TB_RULE_PREFLIGHT_MODE", mode}],
       stderr_to_stdout: true
     )
   end
 
   defp select!(install_root, build_id) do
     {output, 0} = select(install_root, build_id)
-    JSON.decode!(output)
+    output
+    |> String.split(~r/\r?\n/, trim: true)
+    |> Enum.find(&String.starts_with?(&1, "{"))
+    |> JSON.decode!()
   end
 
   defp selected_link(install_root) do

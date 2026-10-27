@@ -633,7 +633,33 @@ Keep source builds outside every service-selected path; `git pull` and
 would load. Stage the complete release package first, select only its reported
 build ID after verification and authorization, and restart the service as a
 separate operation. If the process exits before that restart, the service still
-starts the currently selected complete build.
+starts the currently selected complete build. For exact package staging and
+selection commands, follow the [release package route in README](../README.md#install).
+
+## Recovering from a failed 0.1.11 patch upgrade
+
+If any step fails, or you abandon the upgrade, after stopping the gateway and
+before verifying the patch build serving, restore the previously selected build
+and start the service. This applies even if the patch build has already started:
+the 0.1.11 patch changes no database schema, so the previous build can serve the
+database it left behind.
+
+If selection changed, use the retained previous build's selector to restore its
+build ID:
+
+```sh
+PREVIOUS_BUILD_ID=sha256-<previous-package-digest>
+"/opt/tightbeam/builds/$PREVIOUS_BUILD_ID/tightbeam/bin/tightbeam-select" select \
+  --root /opt/tightbeam --build "$PREVIOUS_BUILD_ID"
+```
+
+Then start the gateway through its service manager. Do not run a second gateway
+if it is already running. Do not withhold the restart for an additional
+precondition check; the selector operation and service start are the recovery
+steps. This recovery promise is specific to the schema-free 0.1.11 patch. For a
+later release that changes the database schema, follow the rollback limit below:
+switch to retained executable bytes only after confirming that build supports
+the current schema, or restore from the documented backup.
 
 ## What the stop actually does
 
@@ -711,6 +737,11 @@ faster than the work in flight would explain, treat it as a kill and check
    sender's decision — so anything that mattered has to be re-asked.
 4. **Queued work is moving.** `SELECT count(*) FROM turns WHERE status='queued';`
    should fall as lanes pick it up. If it does not, the lanes are not claiming.
+5. **Recording availability.** Run `tightbeam identity status`. It reports
+   whether recording is available and lists unavailable verbs and skipped
+   policies with their file, name and reason. If it reports recording
+   unavailable, do not claim that recording works. Rule findings are warnings;
+   they do not roll back or stop the new build.
 
 ### Fresh-agent deploy readiness is a separate proof
 

@@ -220,15 +220,22 @@ sudo env "PATH=$PATH" "$TOOLS/tightbeam/bin/tightbeam-select" stage \
 version, CLI version, and gateway version. It writes a complete versioned build
 and file manifest without changing `current`, and prints its `buildId`. After
 reviewing and authorizing that candidate, set `BUILD_ID` to that exact value and
-run the helper from the staged build:
+set `BASE_DIR` to the base directory used by the service. The fallback below
+matches the CLI when neither base-directory environment variable is set:
 
 ```sh
 BUILD_ID=sha256-<package-digest>
+BASE_DIR=${TIGHTBEAM_BASE_DIR:-${TIGHTBEAM_HOME:-$HOME/.tightbeam}}
 sudo env "PATH=$PATH" "/opt/tightbeam/builds/$BUILD_ID/tightbeam/bin/tightbeam-select" select \
-  --root /opt/tightbeam --build "$BUILD_ID"
+  --root /opt/tightbeam --build "$BUILD_ID" --base-dir "$BASE_DIR"
 ```
 
-Selection rechecks the staged files and atomically replaces `/opt/tightbeam/current`.
+Before changing `current`, selection checks the target release's rule support
+against a read-only copy of the installed identity. Unsupported or retired
+policies, unavailable rules, and a rule check that cannot complete are warnings;
+they do not stop selection. The check does not change the installed identity or
+database. Selection then rechecks the staged files and atomically replaces
+`/opt/tightbeam/current`.
 The result prints the previous build ID. Builds stay in `/opt/tightbeam/builds/`;
 select that ID to switch back after confirming its database compatibility. On a
 fresh install there is no previous build to switch back to. For a service-managed
@@ -520,6 +527,7 @@ The service must **start with no interactive login**, **survive logout**,
 | `TIGHTBEAM_BASE_DIR` | The org: `auth/`, `identity/`, `homes/`, `state.db`, `work/`. Defaults to `TIGHTBEAM_HOME`, else `~/.tightbeam`. |
 | `TIGHTBEAM_LIVE_BASE_TRANSITION` | Optional exact JSON transition for an approved non-automatic transition; supported 0.1.8 and earlier 0.1.9 upgrades derive it automatically. Malformed, mismatched, or schema-incompatible values are refused. |
 | `TIGHTBEAM_PORT` | Rewritten into `gateway.json` at every boot. |
+| `TIGHTBEAM_SUPERVISION_INTERVAL_MS` | Assignment inactivity reminder interval in milliseconds. Defaults to `1800000` (30 minutes); set to `off` to disable these reminders. Other notices are unaffected. |
 | `TIGHTBEAM_NODE` | The release's Erlang node name. Defaults to `tightbeam_gateway_<port>`, which is already unique per instance — set it only if you want to choose the name. |
 | `TIGHTBEAM_ADVERTISED_URL` | The URL clients are told to connect back on. `mix tightbeam.doctor` fails without it. |
 | `TIGHTBEAM_DEFAULT_MODEL` | The default model itself, undecorated (`claude-sonnet-5`). Must be live for the default harness. It is a single global, so on a two-harness host one harness will report its default as unselectable — that is expected, not a fault. |
