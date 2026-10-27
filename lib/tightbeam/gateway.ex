@@ -136,7 +136,6 @@ defmodule Tightbeam.Gateway do
           supervision_interval_ms: pos_integer(),
           prod_limit: non_neg_integer(),
           escalation_decision_deadline_ms: pos_integer(),
-          effort_checkin_horizon_ms: pos_integer(),
           critical_lease_hard_cap_ms: pos_integer(),
           onboarding_lease_ms: pos_integer(),
           credentials_directory: String.t() | nil
@@ -332,8 +331,11 @@ defmodule Tightbeam.Gateway do
           deliver: deliver,
           delivery_opts: delivery_config,
           internal_consumers: %{
-            "effort_probe" => &EffortCheckin.probe(db, config, &1),
-            "effort_deadline" => &EffortCheckin.deadline(db, config, &1),
+            # These internal consumers remain only to drain wakes persisted by
+            # pre-removal releases. They intentionally neither read generations
+            # nor send effort-check-in decisions/notices.
+            "effort_probe" => &EffortCheckin.ignore_retired_wake(db, &1),
+            "effort_deadline" => &EffortCheckin.ignore_retired_wake(db, &1),
             "assignment_inactivity_deadline" => &Supervision.deadline(db, &1),
             "assignment_inactivity_climb" => &Supervision.climb(db, &1)
           },
@@ -1341,7 +1343,6 @@ defmodule Tightbeam.Gateway do
           "work-item-update",
           call
           |> Map.put(:on_work_item_change, item_change)
-          |> Map.put(:effort_config, config)
         )
       end,
       {"work-item-icebox", ["work_item.iceboxed"]} =>
@@ -1358,7 +1359,6 @@ defmodule Tightbeam.Gateway do
           |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:on_work_item_change, item_change)
-          |> Map.put(:effort_config, config)
 
         Assignments.__handle__(db, "assign", call)
       end,
@@ -1369,7 +1369,6 @@ defmodule Tightbeam.Gateway do
             |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
             |> Map.put(:on_assignment_change, assignment_change)
             |> Map.put(:on_work_item_change, item_change)
-            |> Map.put(:effort_config, config)
             |> Map.put(:on_dispatch_delivery, fn delivery, _ ->
               complete_delivery(db, delivery)
             end)
@@ -1385,8 +1384,8 @@ defmodule Tightbeam.Gateway do
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:wake_scheduler, Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
           # Referent verification reaches hosts, so it needs the same placement
-          # config (and the same injectable runner) the effort probe uses.
-          |> Map.put(:effort_config, config)
+          # config and injectable runner as the gateway.
+          |> Map.put(:placement_config, config)
         )
       end,
       {"attests", []} => fn call -> Assignments.__handle__(db, "attests", call) end,
@@ -1411,7 +1410,6 @@ defmodule Tightbeam.Gateway do
           "reopen-assignment",
           call
           |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
-          |> Map.put(:effort_config, config)
           |> Map.put(:on_assignment_change, assignment_change)
         )
       end,
@@ -7809,7 +7807,7 @@ defmodule Tightbeam.Gateway do
                   :ok ->
                     case Placement.move_workdir(config, call.session_key, session.host, host) do
                       :ok ->
-                        case commit_host_rearm(config, db, session, host, 8) do
+                        case commit_host_update(db, session, host) do
                           :ok ->
                             %{ok: true, host: host}
 
@@ -10110,17 +10108,7 @@ defmodule Tightbeam.Gateway do
   defp describe_engine(harness, nil), do: "#{harness}"
   defp describe_engine(harness, model), do: "#{harness} (#{Model.describe(model)})"
 
-  defp commit_host_rearm(_config, _db, _session, _host, 0),
-    do: {:error, "holder assignments kept changing while the workspace moved"}
-
-  defp commit_host_rearm(config, db, session, host, attempts) do
-    prepared =
-      EffortCheckin.prepare_holder_rearms(
-        db,
-        config,
-        %{session | host: host}
-      )
-
+  defp commit_host_update(db, session, host) do
     case DB.transaction_then(
            db,
            fn txn ->
@@ -10129,29 +10117,11 @@ defmodule Tightbeam.Gateway do
                  session.session_key
                ])
 
-             cond do
-               current_host != session.host ->
-                 :placement_changed
-
-               EffortCheckin.enabled?(config) and
-                   not EffortCheckin.prepared_rearms_current?(
-                     txn,
-                     session.session_key,
-                     prepared
-                   ) ->
-                 :retry
-
-               true ->
-                 Org.set_host_in_txn(txn, session.session_key, host)
-
-                 EffortCheckin.apply_prepared_rearms_in_txn(
-                   txn,
-                   config,
-                   session.session_key,
-                   prepared
-                 )
-
-                 :ok
+             if current_host != session.host do
+               :placement_changed
+             else
+               Org.set_host_in_txn(txn, session.session_key, host)
+               :ok
              end
            end,
            fn txn, result ->
@@ -10162,9 +10132,6 @@ defmodule Tightbeam.Gateway do
       {:ok, :ok} ->
         :ok
 
-      {:ok, :retry} ->
-        commit_host_rearm(config, db, session, host, attempts - 1)
-
       {:ok, :placement_changed} ->
         {:error, "holder placement changed concurrently"}
 
@@ -10173,7 +10140,7 @@ defmodule Tightbeam.Gateway do
         {:error,
          ErrorDiagnostic.diagnosed(
            Exception.message(error),
-           ErrorDiagnostic.from_reason(error, operation: "commit_host_rearm")
+           ErrorDiagnostic.from_reason(error, operation: "commit_host_update")
          )}
     end
   end

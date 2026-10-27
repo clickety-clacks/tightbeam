@@ -1275,14 +1275,6 @@ defmodule Tightbeam.Org do
       raise "typed retirement cancellation refused for #{wake_id}"
     end
 
-    if consumer == "effort_probe" do
-      Txn.q(
-        txn,
-        "UPDATE effort_checkin_generations SET state='canceled' WHERE wakeId=?1 AND state='armed'",
-        [wake_id]
-      )
-    end
-
     finalize_retirement_replacement_in_txn!(txn, after_cancellation)
   end
 

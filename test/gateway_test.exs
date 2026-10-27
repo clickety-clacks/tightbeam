@@ -1533,6 +1533,8 @@ defmodule Tightbeam.GatewayTest do
           gateway_config(base_dir, ctx.db, 0)
           |> Map.delete(:wake_tick_ms)
           |> Map.merge(cadence)
+          # Former settings are intentionally ignored after E's removal.
+          |> Map.put(:effort_checkins_enabled, true)
           |> Map.put(:effort_checkin_horizon_ms, 123)
         )
 
@@ -1563,14 +1565,28 @@ defmodule Tightbeam.GatewayTest do
                  })
                )
 
-      assert {:ok, [[123, effort_root]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT baseHorizonMs,root FROM effort_checkin_generations WHERE assignmentId=?1",
-                 [assign_id]
-               )
+      for assignment_id <- [assign_id, dispatch_id] do
+        assert {:ok, [[0]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1",
+                   [assignment_id]
+                 )
 
-      assert Path.dirname(effort_root) == Path.join(base_dir, "work")
+        assert {:ok, [[0]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer IN ('effort_probe','effort_deadline')",
+                   [assignment_id]
+                 )
+
+        assert {:ok, [[0]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1 AND kind='effort'",
+                   [assignment_id]
+                 )
+      end
 
       for assignment_id <- [assign_id, dispatch_id] do
         assert {:ok, [[^expected_interval, ^expected_interval]]} =
