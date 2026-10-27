@@ -241,9 +241,10 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                terminal_at: terminal_at
              })
 
-    # The script retires both the holder and its accountable owner. Admission
-    # before owner retirement leaves immutable delivery; retirement first must
-    # leave a typed cancellation, never invented fired history.
+    # The holder and topology owner retire in sequence. Terminal-event admission
+    # can race that sequence, so the immutable wake may target the owner before
+    # retirement or the owner's personal session afterward. A canceled wake
+    # must retain typed cancellation evidence and never synthesize fired history.
     NoticeBatcher.recover(ctx.db)
 
     assert {:ok, [[dispatch_prompt]]} =
@@ -258,9 +259,12 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
 
     terminal = Tightbeam.Wakes.get(ctx.db, terminal_source)
     personal_session = Org.personal_session_key(owner_id)
+    recipient = terminal.session_key
+
+    assert recipient in [owner_session, personal_session]
 
     assert %{
-             session_key: ^personal_session,
+             session_key: ^recipient,
              prompt: ^terminal_raw,
              origin: "process:tightbeam",
              consumer: "prompt",
@@ -279,7 +283,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                 [
                   [
                     terminal_carrier,
-                    ^owner_session,
+                    ^recipient,
                     terminal_prompt,
                     terminal_envelope,
                     terminal_hash
@@ -332,7 +336,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                     "tightbeam:retirement",
                     "target_retired",
                     "session_transition",
-                    ^owner_session,
+                    ^recipient,
                     "no_replacement",
                     nil,
                     nil,
