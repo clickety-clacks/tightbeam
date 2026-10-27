@@ -86,7 +86,7 @@ defmodule Tightbeam.RulesTest do
       end)
 
     assert log =~
-             "policy \"justified-unresolved-dependency\" skipped: purpose wait-effort-relief is retired"
+             "rules/verification.toml: policy \"justified-unresolved-dependency\": purpose \"wait-effort-relief\" is retired in this version; the policy has no effect"
 
     assert Rules.evaluate(ctx.db, call()) == :ok
   end

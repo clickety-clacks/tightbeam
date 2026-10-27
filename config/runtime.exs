@@ -46,7 +46,8 @@ if config_env() != :test do
   end
 
   if value = System.get_env("TIGHTBEAM_SUPERVISION_INTERVAL_MS") do
-    config :tightbeam, :supervision_interval_ms, String.to_integer(value)
+    interval = if value == "off", do: :off, else: String.to_integer(value)
+    config :tightbeam, :supervision_interval_ms, interval
   end
 
   if value = System.get_env("TIGHTBEAM_PROD_LIMIT") do

@@ -133,7 +133,7 @@ defmodule Tightbeam.Gateway do
           default_model: Model.t(),
           max_live_sessions_per_user: pos_integer() | nil,
           wake_tick_ms: pos_integer(),
-          supervision_interval_ms: pos_integer(),
+          supervision_interval_ms: pos_integer() | :off,
           prod_limit: non_neg_integer(),
           escalation_decision_deadline_ms: pos_integer(),
           critical_lease_hard_cap_ms: pos_integer(),
@@ -5177,6 +5177,7 @@ defmodule Tightbeam.Gateway do
 
     identity
     |> Map.put(:sessions, sessions)
+    |> Map.merge(Map.take(Rules.status(), [:recording_available, :unavailable_verbs, :skipped_policies]))
     |> maybe_put_guidance(guidance)
   end
 
@@ -6584,7 +6585,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp supervision_interval_ms(config) do
-    Map.get(config, :supervision_interval_ms, Map.get(config, :wake_tick_ms, 1_000))
+    Map.get(config, :supervision_interval_ms, 1_800_000)
   end
 
   defp cancel_wake_result(db, call, wake_id) do
