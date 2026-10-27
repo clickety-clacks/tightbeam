@@ -233,6 +233,7 @@ defmodule Tightbeam.EffortCheckinTest do
         origin: "user:owner",
         principal: {:user, "owner"},
         session_key: "holder",
+      supervision_interval_ms: 1_000,
         params: %{subject: "retired check-in proof", brief: "exercise assignment behavior"}
       })
 
