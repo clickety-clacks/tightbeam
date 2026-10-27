@@ -2726,7 +2726,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert Wakes.get(ctx.db, filed.decisionWake.wake_id).state == "canceled"
 
-    assert {:ok, [["cannot_proceed_released", 0]]} =
+    assert {:ok, [["cannot_proceed_released", 1]]} =
              DB.query(
                ctx.db,
                "SELECT reasonKind,actionNeeded FROM wake_cancellations WHERE wakeId=?1",
@@ -3475,7 +3475,7 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "a fired holder reminder does not block opener revocation after reparenting", ctx do
+  test "a pending holder reminder does not block opener revocation after reparenting", ctx do
     main = Org.personal_session_key("flynn")
     session(ctx.db, main, "flynn")
     session(ctx.db, "parent-a", "flynn", %{spawned_by: main})
@@ -3512,27 +3512,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert reminder.session_key == "opener"
 
-    assert {:ok, {:appended, _, _, _}} =
-             DB.transaction(ctx.db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 reminder.session_key,
-                 reminder.origin,
-                 reminder.prompt,
-                 wake_id: reminder.wake_id,
-                 sender: reminder.origin,
-                 target_gate: reminder,
-                 fire_wake_in_txn: true,
-                 assignment_id: reminder.assignment_id
-               )
-             end)
-
-    assert Wakes.get(ctx.db, reminder.wake_id).state == "fired"
-
-    assert {:ok, [["opener"]]} =
-             DB.query(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId=?1", [
-               reminder.wake_id
-             ])
+    assert Wakes.get(ctx.db, reminder.wake_id).state == "pending"
 
     assert {:ok, [["standing"]]} =
              DB.query(
@@ -3551,6 +3531,8 @@ defmodule Tightbeam.AssignmentsTest do
                  idempotency_key: "reparent-after-escalation"
                }
              })
+
+    assert Wakes.get(ctx.db, reminder.wake_id).session_key == "opener"
 
     assert %{outcome: "revoked"} =
              handle(

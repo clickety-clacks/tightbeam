@@ -663,7 +663,8 @@ defmodule Tightbeam.Supervision do
     last_activity =
       current_activity_time_in_txn(txn, assignment_id, holder, activity_start)
 
-    reminder_count = reminder_count_since_activity_in_txn(txn, assignment_id, holder, last_activity)
+    reminder_count =
+      reminder_count_since_activity_in_txn(txn, assignment_id, holder, last_activity)
 
     if reminder_count < 3 do
       schedule_climb_in_txn(
@@ -706,19 +707,19 @@ defmodule Tightbeam.Supervision do
                assignment_id
              ]) do
           [[^origin_holder, "open", work_item_id]] ->
-        quiet_climb_result(
-          txn,
-          wake,
-          assignment_id,
-          episode_ref,
-          origin_holder,
-          rung,
-          interval_ms,
-          previous_wake_id,
-          visited,
-          work_item_id,
-          now
-        )
+            quiet_climb_result(
+              txn,
+              wake,
+              assignment_id,
+              episode_ref,
+              origin_holder,
+              rung,
+              interval_ms,
+              previous_wake_id,
+              visited,
+              work_item_id,
+              now
+            )
 
           _ ->
             fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
@@ -835,7 +836,9 @@ defmodule Tightbeam.Supervision do
           )
 
         fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
-        next_count = reminder_count_since_activity_in_txn(txn, assignment_id, holder, latest_activity)
+
+        next_count =
+          reminder_count_since_activity_in_txn(txn, assignment_id, holder, latest_activity)
 
         if next_count < 3 do
           schedule_climb_in_txn(
@@ -1121,7 +1124,9 @@ defmodule Tightbeam.Supervision do
            """,
            [assignment_id, holder, activity_at, @episode_ref]
          ) do
-      [[count]] when is_integer(count) -> count
+      [[count]] when is_integer(count) ->
+        count
+
       other ->
         Logger.warning("assignment inactivity reminder history unavailable: #{inspect(other)}")
         3
