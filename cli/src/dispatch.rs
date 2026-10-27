@@ -248,6 +248,33 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "condition", vec![], params))
         }
+        Command::FactDemand { identity, prefixes } => Ok(request(
+            identity,
+            "fact-demand",
+            vec![],
+            vec![format!(
+                "\"kindPrefixes\":{}",
+                serde_json::to_string(prefixes).unwrap()
+            )],
+        )),
+        Command::FactProducerClaim {
+            identity,
+            producer,
+            kinds,
+            live_for_ms,
+        } => Ok(request(
+            identity,
+            "fact-producer-claim",
+            vec![],
+            vec![
+                string_field("producer", producer),
+                format!("\"kinds\":{}", serde_json::to_string(kinds).unwrap()),
+                format!("\"liveForMs\":{live_for_ms}"),
+            ],
+        )),
+        Command::FactProducers { identity } => {
+            Ok(request(identity, "fact-producers", vec![], vec![]))
+        }
         Command::HarnessHealthObserveOther {
             identity,
             harness,
@@ -3623,6 +3650,15 @@ where
             }
             let request = build_request(&command)?;
             if let Some(result) = send_request(&endpoint, &request, None)? {
+                if matches!(command, Command::Wake { .. }) {
+                    if let Some(warnings) = result.get("warnings").and_then(Value::as_array) {
+                        for warning in warnings {
+                            if let Some(message) = warning.get("message").and_then(Value::as_str) {
+                                eprintln!("{message}");
+                            }
+                        }
+                    }
+                }
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&result).expect("JSON value serializes")
@@ -3700,6 +3736,9 @@ fn command_identity(command: &Command) -> Option<&Identity> {
     match command {
         Command::Wake { identity, .. }
         | Command::Condition { identity, .. }
+        | Command::FactDemand { identity, .. }
+        | Command::FactProducerClaim { identity, .. }
+        | Command::FactProducers { identity }
         | Command::HarnessHealthObserveOther { identity, .. }
         | Command::HarnessHealthResolveOther { identity, .. }
         | Command::HarnessHealthReviewOther { identity, .. }

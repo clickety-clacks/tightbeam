@@ -3,7 +3,7 @@
 
 Settings (environment):
   GH_CONFIG_DIR             required; the gh config directory holding the login.
-  LANDING_REPOS             required; whitespace-separated entries
+  LANDING_REPOS             optional; whitespace-separated entries
                             <owner>/<repo>@<branch>=<owner role>,
                             for example example/repo@main=pdo:example.
   LANDING_WATCH_AS_PROCESS  optional; adds --as-process <value> to each
@@ -17,7 +17,7 @@ check fails on the branch tip. Keys make every filing replayable, so repeated
 polls and restarts file nothing new.
 
 Usage: landing-watch [--once]
-  --once  run one poll of every configured branch and exit; the exit status is
+  --once  run one poll of demanded scopes and configured branch tips; the exit status is
           0 when every poll completed and its state was saved, 1 otherwise.
 """
 
@@ -56,6 +56,8 @@ EXIT_LOGIN = 3
 
 NAME = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?"
 ENTRY = re.compile(r"^(" + NAME + r")/(" + r"[A-Za-z0-9._-]+" + r")@([^\s=@]+)=(\S+)$")
+PR_SCOPE = re.compile(r"^(" + NAME + r")/([A-Za-z0-9._-]+)#([1-9][0-9]*)$")
+BRANCH_SCOPE = re.compile(r"^(" + NAME + r")/([A-Za-z0-9._-]+)@([^\s=@]+)$")
 QUEUE_BRANCH = "gh-readonly-queue/"
 
 ROLLUP_NODES = """
@@ -231,8 +233,6 @@ def parse_settings(env) -> tuple[list[Branch], str | None]:
     if not os.path.isdir(config_dir):
         raise SettingsError("GH_CONFIG_DIR is not a directory")
     entries = env.get("LANDING_REPOS", "").split()
-    if not entries:
-        raise SettingsError("LANDING_REPOS is required")
     branches: list[Branch] = []
     seen = set()
     for entry in entries:
@@ -318,6 +318,24 @@ class Runner:
         except (OSError, subprocess.TimeoutExpired) as error:
             return False, str(error)
         return done.returncode == 0, one_line(done.stderr if done.returncode else done.stdout)
+
+    def tightbeam_json(self, args: list[str]) -> dict:
+        argv = ["tightbeam", *args]
+        if self.as_process:
+            argv += ["--as-process", self.as_process]
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=TIGHTBEAM_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ReadError(f"tightbeam failed: {error}") from error
+        if done.returncode:
+            raise ReadError(f"tightbeam exited {done.returncode}: {one_line(done.stderr)}")
+        try:
+            value = json.loads(done.stdout)
+        except json.JSONDecodeError as error:
+            raise ReadError(f"tightbeam returned malformed JSON: {error}") from error
+        if not isinstance(value, dict):
+            raise ReadError("tightbeam returned a non-object")
+        return value
 
 
 def one_line(text: str) -> str:
@@ -925,6 +943,102 @@ class Watcher:
         return ok
 
 
+def demanded_scopes(runner, log: Log) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    data = runner.tightbeam_json(["fact-demand", "--kind-prefix", "landing.", "--kind-prefix", "pr."])
+    pairs = data.get("demand")
+    if not isinstance(pairs, list):
+        raise ReadError("fact-demand returned no demand array")
+    prs: dict[str, set[str]] = {}
+    branches: dict[str, set[str]] = {}
+    served = {SETTLED, CHECKS_COMPLETED, BRANCH_ATTENTION}
+    for pair in pairs:
+        if not isinstance(pair, dict) or not isinstance(pair.get("kind"), str):
+            raise ReadError("fact-demand returned a malformed pair")
+        kind, scope = pair["kind"], pair.get("scope")
+        if kind not in served:
+            continue
+        pattern = BRANCH_SCOPE if kind == BRANCH_ATTENTION else PR_SCOPE
+        if not isinstance(scope, str) or not pattern.fullmatch(scope):
+            log.episode(f"invalid-demand:{kind}:{scope}", f"ignored invalid demand kind={kind} scope={scope!r}")
+            continue
+        (branches if kind == BRANCH_ATTENTION else prs).setdefault(scope, set()).add(kind)
+    return prs, branches
+
+
+def renew_claim(runner) -> None:
+    runner.tightbeam_json([
+        "fact-producer-claim", "--producer", "landing-watch",
+        "--kind", SETTLED, "--kind", CHECKS_COMPLETED, "--kind", BRANCH_ATTENTION,
+        "--live-for", "1h",
+    ])
+
+
+def unavailable_scope(error: ReadError) -> bool:
+    detail = str(error)
+    return "null node at repository.pullRequest" in detail or "null node at repository.ref" in detail or "HTTP 404" in detail
+
+
+def poll_demanded_pr(scope: str, kinds: set[str], runner, log: Log) -> bool:
+    owner, repo, number_text = PR_SCOPE.fullmatch(scope).groups()
+    number = int(number_text)
+    watcher = Watcher(Branch(owner, repo, "", ""), runner, "", log)
+    pull: dict = {}
+    try:
+        watcher.read_pull(number, None, pull)
+        if SETTLED in kinds and blocked_candidate(pull):
+            pull["checks"] = watcher.read_pull_checks(number, pull["headRefOid"])
+        head = pull.get("headRefOid")
+        if CHECKS_COMPLETED in kinds and pull.get("state") == "OPEN" and pull.get("mergeQueueEntry") is None and head:
+            pull["head_checks"] = watcher.read_head_checks(number, head)
+    except ReadError as error:
+        log.line(f"unreadable demanded pr={scope} reason={error}")
+        return unavailable_scope(error)
+
+    ok = True
+    if SETTLED in kinds:
+        merge = pull.get("mergeCommit") or {}
+        if pull.get("merged") is True and merge.get("oid"):
+            ok &= watcher.condition(SETTLED, scope, f"landing-fact:{scope}:merged:{merge['oid']}")
+        for event in pull.get("events", []):
+            event_kind = event.get("__typename")
+            if event_kind == "RemovedFromMergeQueueEvent":
+                suffix = f"removed:{event['id']}"
+            elif pull.get("merged") is False and event_kind == "AutoMergeDisabledEvent":
+                suffix = f"automerge-disabled:{event['id']}"
+            elif pull.get("merged") is False and event_kind == "ClosedEvent":
+                suffix = f"closed:{event['id']}"
+            else:
+                continue
+            ok &= watcher.condition(SETTLED, scope, f"landing-fact:{scope}:{suffix}")
+        if blocked_candidate(pull) and pull.get("checks") is not None:
+            for failure in pr_failures(pull["checks"]):
+                key = f"landing-fact:{scope}:blocked:{pull['autoMergeRequest']['enabledAt']}:{check_identity(failure)}"
+                ok &= watcher.condition(SETTLED, scope, key)
+    if CHECKS_COMPLETED in kinds and head and pull.get("head_checks") is not None:
+        outcome = checks_outcome(pull["head_checks"])
+        if outcome is not None:
+            ok &= watcher.condition(CHECKS_COMPLETED, scope, f"pr-checks:{scope}:{head}:{outcome}")
+    return ok
+
+
+def poll_branch(scope: str, role: str | None, runner, log: Log) -> bool:
+    owner, repo, branch = BRANCH_SCOPE.fullmatch(scope).groups()
+    watcher = Watcher(Branch(owner, repo, branch, role or ""), runner, "", log)
+    try:
+        tip, results = watcher.read_tip()
+        requirements = watcher.read_requirements()
+    except ReadError as error:
+        log.line(f"unreadable branch={scope} reason={error}")
+        return role is None and unavailable_scope(error)
+    if role is not None:
+        return watcher.file_tip(tip, results, requirements)
+    ok = True
+    for failure in tip_failures(requirements, results):
+        episode = f"{scope}:red:{tip}:{check_identity(failure)}"
+        ok &= watcher.condition(BRANCH_ATTENTION, scope, f"landing-fact:{episode}")
+    return ok
+
+
 def run(argv, env, runner=None, log=None, sleep=time.sleep) -> int:
     log = log or Log()
     once = "--once" in argv[1:]
@@ -938,14 +1052,6 @@ def run(argv, env, runner=None, log=None, sleep=time.sleep) -> int:
         log.line(f"exit reason={error}")
         return EXIT_SETTINGS
     runner = runner or Runner(as_process)
-    directory = state_dir(env)
-    watchers = [Watcher(branch, runner, directory, log) for branch in branches]
-    try:
-        for watcher in watchers:
-            watcher.load()
-    except SettingsError as error:
-        log.line(f"exit reason={error}")
-        return EXIT_SETTINGS
     try:
         login = runner.login()
         log.line(f"start login={login} branches={' '.join(b.scope for b in branches)}")
@@ -958,15 +1064,24 @@ def run(argv, env, runner=None, log=None, sleep=time.sleep) -> int:
     failures = 0
     while True:
         complete = True
-        for watcher in watchers:
+        try:
+            renew_claim(runner)
+            prs, demanded_branches = demanded_scopes(runner, log)
+        except ReadError as error:
+            complete = False
+            log.line(f"poll failed reason={error}")
+        else:
             try:
-                complete &= watcher.poll()
-            except SettingsError as error:
-                log.line(f"exit reason={error}")
-                return EXIT_SETTINGS
-            except OSError as error:
+                for scope, kinds in prs.items():
+                    renew_claim(runner)
+                    complete &= poll_demanded_pr(scope, kinds, runner, log)
+                static = {branch.scope: branch.role for branch in branches}
+                for scope in set(demanded_branches) | set(static):
+                    renew_claim(runner)
+                    complete &= poll_branch(scope, static.get(scope), runner, log)
+            except ReadError as error:
                 complete = False
-                log.line(f"poll failed branch={watcher.branch.scope} reason=state write: {error}")
+                log.line(f"poll failed reason={error}")
         if once:
             return 0 if complete else 1
         failures = 0 if complete else failures + 1

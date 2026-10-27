@@ -4195,6 +4195,9 @@ defmodule Tightbeam.Wire.Router do
     "execution-map-select" =>
       ~w(assignments under origin owner state spec spec_sha session quiet_over)a,
     "facts-read" => ~w(after kind limit scope)a,
+    "fact-demand" => ~w(kind_prefixes)a,
+    "fact-producer-claim" => ~w(producer kinds live_for_ms)a,
+    "fact-producers" => ~w()a,
     "harness-health-close-promotion" =>
       ~w(candidate_commit idempotency_key named_class promotion_id review_artifact_id review_assignment_id review_attest_id spec_artifact_id spec_ref spec_sha256)a,
     "harness-health-evidence-other" => ~w(incident_id)a,

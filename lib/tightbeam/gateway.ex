@@ -68,6 +68,7 @@ defmodule Tightbeam.Gateway do
     ArtifactContent,
     Assignments,
     ConditionFacts,
+    FactProducers,
     CriticalLeases,
     Placement,
     DB,
@@ -876,6 +877,18 @@ defmodule Tightbeam.Gateway do
           end
         end,
       {"facts-read", []} => fn call -> facts_read_result(db, call) end,
+      {"fact-demand", []} => fn call ->
+        prefixes = call.params[:kind_prefixes] || []
+
+        if is_list(prefixes) and Enum.all?(prefixes, &(is_binary(&1) and &1 != "")),
+          do: FactProducers.demand(db, prefixes),
+          else: %{code: "invalid", message: "--kind-prefix requires nonempty strings"}
+      end,
+      {"fact-producer-claim", []} => fn call ->
+        p = call.params
+        FactProducers.claim(db, p[:producer], p[:kinds], p[:live_for_ms])
+      end,
+      {"fact-producers", []} => fn _call -> FactProducers.list(db) end,
       {"memento-set", []} => fn call -> Tightbeam.Mementos.__handle__(db, "memento-set", call) end,
       {"mementos", []} => fn call -> Tightbeam.Mementos.__handle__(db, "mementos", call) end,
       {"artifact-record", ["artifact.recorded"]} => fn call ->
@@ -6867,6 +6880,7 @@ defmodule Tightbeam.Gateway do
 
         if is_map(wake) and is_binary(wake[:wake_id]) do
           wake_response(wake)
+          |> maybe_add_producer_warning(wake)
           |> maybe_add_after_fact_hint(db, p)
         else
           wake
@@ -6912,9 +6926,28 @@ defmodule Tightbeam.Gateway do
       if is_map(wake) and is_binary(wake[:wake_id]),
         do: Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, wake)
 
-      wake
+      maybe_warn_unserved_in_txn(txn, wake, p[:condition_kind])
     end
   end
+
+  defp maybe_warn_unserved_in_txn(txn, %{wake_id: _} = wake, kind) when is_binary(kind) do
+    if ConditionFacts.substrate_defined_kind?(kind) or FactProducers.served_in_txn?(txn, kind) do
+      wake
+    else
+      message =
+        "warning: no running producer has claimed fact kind '#{kind}'. Your wait is scheduled. " <>
+          "It wakes you if something files '#{kind}' for this scope; otherwise it wakes you at its fallback."
+
+      Map.put(wake, :warnings, [%{code: "no-live-producer", kind: kind, message: message}])
+    end
+  end
+
+  defp maybe_warn_unserved_in_txn(_txn, wake, _kind), do: wake
+
+  defp maybe_add_producer_warning(response, %{warnings: warnings}),
+    do: Map.put(response, :warnings, warnings)
+
+  defp maybe_add_producer_warning(response, _wake), do: response
 
   defp schedule_wake_in_txn(txn, call, session_key, due_at) do
     case replacement_assignment_id_in_txn(txn, call, session_key) do

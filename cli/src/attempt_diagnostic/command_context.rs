@@ -56,6 +56,9 @@ impl CommandContext {
             Doctor { .. } => ("cli.doctor", CatalogAndDispatch),
             Wake { .. } => ("cli.wake", DispatchPath),
             Condition { .. } => ("cli.condition", DispatchPath),
+            FactDemand { .. } => ("cli.fact_demand", DispatchPath),
+            FactProducerClaim { .. } => ("cli.fact_producer_claim", DispatchPath),
+            FactProducers { .. } => ("cli.fact_producers", DispatchPath),
             HarnessHealthObserveOther { .. } => ("cli.harness_health_observe_other", DispatchPath),
             HarnessHealthResolveOther { .. } => ("cli.harness_health_resolve_other", DispatchPath),
             HarnessHealthReviewOther { .. } => ("cli.harness_health_review_other", DispatchPath),
@@ -308,6 +311,8 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | HarnessHealthEvidenceOther { .. }
         | ArtifactContentFetch { .. }
         | Artifacts { .. }
+        | FactDemand { .. }
+        | FactProducers { .. }
         | List { .. }
         | DecisionRequests { .. }
         | DecisionRequest { .. }
@@ -423,6 +428,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         },
 
         ArtifactRecord { .. }
+        | FactProducerClaim { .. }
         | HarklightSend { .. }
         | ToolCallObserved
         | Tune { .. }

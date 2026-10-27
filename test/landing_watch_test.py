@@ -163,6 +163,14 @@ class FakeRunner:
         self.filed = []
         self.checks = []
         self.refuse = None  # callable(args) -> bool
+        self.demand = []
+
+    def tightbeam_json(self, args):
+        if args[0] == 'fact-demand':
+            return {'demand': self.demand}
+        if args[0] == 'fact-producer-claim':
+            return {'producer': 'landing-watch'}
+        raise AssertionError(args)
 
     def graphql(self, query, variables):
         return self.github.graphql(query, variables)
@@ -229,7 +237,6 @@ class Settings(unittest.TestCase):
         bad = [
             {'LANDING_REPOS': 'example/repo@main=pdo:x'},
             {'GH_CONFIG_DIR': os.path.join(self.tmp.name, 'absent'), 'LANDING_REPOS': 'example/repo@main=pdo:x'},
-            {'GH_CONFIG_DIR': self.tmp.name},
             self.env(LANDING_REPOS='example/repo=pdo:x'),
             self.env(LANDING_REPOS='example/repo@main'),
             self.env(LANDING_REPOS='repo@main=pdo:x'),
@@ -241,6 +248,9 @@ class Settings(unittest.TestCase):
         for env in bad:
             with self.subTest(env=env), self.assertRaises(lw.SettingsError):
                 lw.parse_settings(env)
+
+    def test_repositories_are_optional(self):
+        self.assertEqual(lw.parse_settings({'GH_CONFIG_DIR': self.tmp.name}), ([], None))
 
     def test_state_directory_follows_xdg(self):
         self.assertEqual(lw.state_dir({'XDG_STATE_HOME': '/s', 'HOME': '/h'}), '/s/landing-watch')
@@ -746,6 +756,10 @@ FAKE_TIGHTBEAM = r'''#!{python}
 import sys
 with open({log!r}, 'a') as handle:
     handle.write(' '.join(sys.argv[1:]) + '\n')
+if sys.argv[1] == 'fact-demand':
+    print('{{"demand": []}}')
+else:
+    print('{{}}')
 '''
 
 
@@ -785,13 +799,47 @@ class Process(unittest.TestCase):
         self.assertEqual(done.returncode, 3, done.stderr)
         self.assertIn('Bad credentials', done.stderr)
 
-    def test_once_polls_and_saves_state(self):
+    def test_once_claims_and_checks_static_tip(self):
         done = self.run_program('--once', LANDING_WATCH_AS_PROCESS='landing-watch')
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn('start login=example-bot branches=example/repo@main', done.stderr)
-        state = json.loads((Path(self.tmp.name) / 'state/landing-watch/example-repo-main.json').read_text())
-        self.assertEqual((state['version'], state['tracked']), (2, []))
-        self.assertFalse(self.calls.exists())  # nothing to file on an empty repository
+        calls = self.calls.read_text()
+        self.assertIn('fact-producer-claim', calls)
+        self.assertIn('fact-demand --kind-prefix landing. --kind-prefix pr.', calls)
+
+    def test_once_without_static_repositories(self):
+        done = self.run_program('--once', LANDING_REPOS='')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn('fact-demand', self.calls.read_text())
+
+
+class DemandDriven(WatcherCase):
+    def test_unconfigured_pr_is_read_and_filed_only_while_demanded(self):
+        self.github.add(pull(7, checks=[check_run('pass', 'build', 'SUCCESS', required=True)]))
+        self.runner.demand = [{'kind': lw.CHECKS_COMPLETED, 'scope': 'Example/Repo#7'}]
+        prs, branches = lw.demanded_scopes(self.runner, self.log)
+        self.assertEqual(branches, {})
+        self.assertEqual(prs, {'Example/Repo#7': {lw.CHECKS_COMPLETED}})
+        self.assertTrue(lw.poll_demanded_pr('Example/Repo#7', prs['Example/Repo#7'], self.runner, self.log))
+        self.assertEqual(len(self.runner.checks), 1)
+        before = len(self.github.calls)
+        self.runner.demand = []
+        prs, _ = lw.demanded_scopes(self.runner, self.log)
+        for scope, kinds in prs.items():
+            lw.poll_demanded_pr(scope, kinds, self.runner, self.log)
+        self.assertEqual(len(self.github.calls), before)
+
+    def test_invalid_demand_is_logged_once_and_other_pr_continues(self):
+        self.runner.demand = [
+            {'kind': lw.CHECKS_COMPLETED, 'scope': None},
+            {'kind': lw.CHECKS_COMPLETED, 'scope': 'Example/Repo#7'},
+        ]
+        self.github.add(pull(7, checks=[check_run('pass', 'build', 'SUCCESS', required=True)]))
+        for _ in range(2):
+            prs, _ = lw.demanded_scopes(self.runner, self.log)
+            for scope, kinds in prs.items():
+                self.assertTrue(lw.poll_demanded_pr(scope, kinds, self.runner, self.log))
+        self.assertEqual(self.stream.getvalue().count('ignored invalid demand'), 1)
 
 
 class ChecksCompletedCase(WatcherCase):

@@ -801,7 +801,9 @@ defmodule Tightbeam.ConditionFactsTest do
     }
 
     first = wake_handler.(base_call)
-    assert first == wake_handler.(base_call)
+    assert [%{code: "no-live-producer", kind: "deploy-succeeded"}] = first.warnings
+    assert %{wake_id: wake_id} = wake_handler.(base_call)
+    assert wake_id == first.wake_id
     assert Wakes.get(ctx.db, first.wake_id).creator_session_key == "agent:creator:app"
 
     assert {:ok, [[1]]} =
