@@ -822,6 +822,67 @@ defmodule Tightbeam.Wire.RouterTest do
     assert agent_verbs -- handler_keys == []
   end
 
+  test "fact producer verbs cross agent dispatch for sessions, users and processes", ctx do
+    session = create_session(ctx.db, "fact-wire-reader", ctx.device.user_id)
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    for kind <- ["acme.done", "other.done"] do
+      Wakes.schedule(ctx.db, %{
+        session_key: session.session_key,
+        origin: "user:#{ctx.device.user_id}",
+        prompt: "Read the result",
+        due_at: System.system_time(:millisecond) + 60_000,
+        condition_kind: kind,
+        condition_scope: "job-7"
+      })
+    end
+
+    for {name, bearer, identity} <- [
+          {"session", session.cli_token, %{}},
+          {"user", "tbc_test", %{asUser: ctx.device.user_id}},
+          {"process", "tbc_test", %{asProcess: "fact-feed"}}
+        ] do
+      request = fn verb, params ->
+        dispatch_cli(ctx, bearer, Map.merge(identity, %{verb: verb, params: params}))
+      end
+
+      producer = "feed-#{name}"
+
+      claim =
+        request.("fact-producer-claim", %{
+          producer: producer,
+          kinds: ["acme.done"],
+          liveForMs: 60_000
+        })
+
+      assert claim.status == 200, claim.resp_body
+
+      assert %{"producer" => ^producer, "kinds" => ["acme.done"], "liveUntil" => until} =
+               JSON.decode!(claim.resp_body)["result"]
+
+      assert until > System.system_time(:millisecond)
+
+      listed = request.("fact-producers", %{})
+      assert listed.status == 200, listed.resp_body
+      producers = JSON.decode!(listed.resp_body)["result"]["producers"]
+
+      assert Enum.find(producers, &(&1["producer"] == producer)) == %{
+               "producer" => producer,
+               "kinds" => ["acme.done"],
+               "liveUntil" => until,
+               "live" => true
+             }
+
+      demand = request.("fact-demand", %{kindPrefixes: ["acme."]})
+      assert demand.status == 200, demand.resp_body
+
+      assert JSON.decode!(demand.resp_body)["result"] == %{
+               "demand" => [%{"kind" => "acme.done", "scope" => "job-7"}]
+             }
+    end
+  end
+
   test "other health review and evidence cross agent dispatch with their existing authorization",
        ctx do
     owner = ctx.device.user_id
