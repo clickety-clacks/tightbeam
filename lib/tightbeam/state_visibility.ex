@@ -23,6 +23,8 @@ defmodule Tightbeam.StateVisibility do
     end
   end
 
+  def visible?(_db, _notice, %{kind: "observer"}), do: true
+
   def visible?(db, notice, %{kind: "user", id: user_id, is_admin: is_admin}),
     do: visible?(db, notice, user_id, is_admin)
 
@@ -234,6 +236,8 @@ defmodule Tightbeam.StateVisibility do
     do: value(row, :user_id) == user_id
 
   defp do_core_detail_visible?(_db, "read markers", _row, _principal), do: false
+
+  defp do_core_detail_visible?(_db, "sessions", _row, %{kind: "observer"}), do: true
 
   defp do_core_detail_visible?(_db, "sessions", row, principal) do
     owner_user_id = value(row, :owner_user_id)

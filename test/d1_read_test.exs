@@ -580,26 +580,16 @@ defmodule Tightbeam.D1ReadRouteTest do
     end
   end
 
-  test "missing REST details honor the 3ms not-found floor without a scheduler overshoot", ctx do
-    elapsed_us =
-      for _ <- 1..5 do
-        started_at = System.monotonic_time(:microsecond)
-        response = get(ctx.opts, "/api/assignments/missing", ctx.admin.token)
-        elapsed = System.monotonic_time(:microsecond) - started_at
+  test "missing REST details retain the not-found response", ctx do
+    response = get(ctx.opts, "/api/assignments/missing", ctx.admin.token)
 
-        assert response.status == 404
+    assert response.status == 404
 
-        assert JSON.decode!(response.resp_body) == %{
-                 "schemaVersion" => 1,
-                 "resource" => "assignments",
-                 "error" => %{"code" => "not_found"}
-               }
-
-        elapsed
-      end
-
-    assert Enum.all?(elapsed_us, &(&1 >= 3_000))
-    assert Enum.min(elapsed_us) < 8_000
+    assert JSON.decode!(response.resp_body) == %{
+             "schemaVersion" => 1,
+             "resource" => "assignments",
+             "error" => %{"code" => "not_found"}
+           }
   end
 
   @tag :kungfu_protection

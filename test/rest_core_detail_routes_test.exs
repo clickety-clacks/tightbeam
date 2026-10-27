@@ -627,8 +627,12 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         ctx.admin_device.token
       )
 
-    assert wrong_principal.status == 400
-    assert JSON.decode!(wrong_principal.resp_body)["error"]["code"] == "invalid_cursor"
+    admin_first_page =
+      get(ctx, "/api/sessions?limit=2", ctx.admin_device.token)
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert wrong_principal.status == 200
+    assert JSON.decode!(wrong_principal.resp_body)["items"] == admin_first_page["items"]
 
     append_history = fn index, extra ->
       {:appended, row} =
@@ -1487,8 +1491,9 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     end
   end
 
-  test "AC6 applies the complete AU2 precedence table with exact bytes and headers", ctx do
-    for %{path: path, resource: resource} <- core_detail_cases(ctx) do
+  test "AC6 applies the AU2 precedence table outside observer reads", ctx do
+    for %{path: path, resource: resource} <- core_detail_cases(ctx),
+        resource not in ["sessions", "transcript messages", "read markers"] do
       cases = [
         {path, "", 401, "auth_failed", nil, [:bearer_auth]},
         {path, "invalid-token", 401, "auth_failed", nil, [:bearer_auth]},
@@ -1659,6 +1664,800 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     refute flynn_response.resp_body == alice_response.resp_body
     assert_application_headers(flynn_response)
     assert_application_headers(alice_response)
+  end
+
+  test "credentialless observers read sessions and their messages without changing bearer reads",
+       ctx do
+    session_key = ctx.admin_session.session_key
+    user_message_id = "observer-user-message"
+    reply_message_id = "observer-assistant-reply"
+
+    query!(
+      ctx.db,
+      """
+      INSERT INTO messages
+        (id, sessionKey, role, content, timestamp, sender, llmVisibleMessageId, attachments)
+      VALUES (?1, ?2, 'user', 'observer question', 1, 'user:flynn', ?1, '[]')
+      """,
+      [user_message_id, session_key]
+    )
+
+    query!(
+      ctx.db,
+      """
+      INSERT INTO messages
+        (id, sessionKey, role, content, timestamp, sender, replyToMessageId,
+         llmVisibleMessageId, attachments)
+      VALUES (?1, ?2, 'assistant', 'observer answer', 2, 'agent:main', ?3, ?1, '[]')
+      """,
+      [reply_message_id, session_key, user_message_id]
+    )
+
+    anonymous_sessions = get_without_authorization(ctx, "/api/sessions?limit=1")
+    anonymous_all_sessions = get_without_authorization(ctx, "/api/sessions")
+    org_sessions = get(ctx, "/api/sessions?limit=1", ctx.opts[:cli_token])
+
+    assert anonymous_sessions.status == 200
+    assert_application_headers(anonymous_sessions)
+
+    assert JSON.decode!(anonymous_sessions.resp_body)["items"] ==
+             JSON.decode!(org_sessions.resp_body)["items"]
+
+    session_cursor = JSON.decode!(anonymous_sessions.resp_body)["page"]["newestCursor"]
+
+    assert get_without_authorization(
+             ctx,
+             "/api/sessions?limit=1&after=#{URI.encode_www_form(session_cursor)}"
+           ).status == 200
+
+    admin_with_observer_cursor =
+      get(
+        ctx,
+        "/api/sessions?limit=1&after=#{URI.encode_www_form(session_cursor)}",
+        ctx.opts[:cli_token]
+      )
+
+    assert admin_with_observer_cursor.status == 200
+
+    assert JSON.decode!(admin_with_observer_cursor.resp_body)["items"] ==
+             JSON.decode!(org_sessions.resp_body)["items"]
+
+    org_session_cursor = JSON.decode!(org_sessions.resp_body)["page"]["newestCursor"]
+
+    observer_with_admin_cursor =
+      get_without_authorization(
+        ctx,
+        "/api/sessions?limit=1&after=#{URI.encode_www_form(org_session_cursor)}"
+      )
+
+    assert observer_with_admin_cursor.status == 200
+
+    assert JSON.decode!(observer_with_admin_cursor.resp_body)["items"] ==
+             JSON.decode!(anonymous_sessions.resp_body)["items"]
+
+    anonymous_session = get_without_authorization(ctx, "/api/sessions/#{session_key}")
+    org_session = get(ctx, "/api/sessions/#{session_key}", ctx.opts[:cli_token])
+    assert anonymous_session.status == 200
+
+    assert JSON.decode!(anonymous_session.resp_body)["item"] ==
+             JSON.decode!(org_session.resp_body)["item"]
+
+    message_path = "/api/sessions/#{session_key}/messages"
+    anonymous_messages = get_without_authorization(ctx, message_path)
+    org_messages = get(ctx, message_path, ctx.opts[:cli_token])
+
+    assert anonymous_messages.status == 200
+    assert_application_headers(anonymous_messages)
+
+    assert JSON.decode!(anonymous_messages.resp_body)["items"] ==
+             JSON.decode!(org_messages.resp_body)["items"]
+
+    anonymous_message_page = get_without_authorization(ctx, message_path <> "?limit=1")
+    org_message_page = get(ctx, message_path <> "?limit=1", ctx.opts[:cli_token])
+
+    anonymous_message_cursor =
+      JSON.decode!(anonymous_message_page.resp_body)["page"]["newestCursor"]
+
+    org_message_cursor = JSON.decode!(org_message_page.resp_body)["page"]["newestCursor"]
+
+    observer_with_org_message_cursor =
+      get_without_authorization(
+        ctx,
+        message_path <> "?limit=1&after=#{URI.encode_www_form(org_message_cursor)}"
+      )
+
+    org_with_observer_message_cursor =
+      get(
+        ctx,
+        message_path <> "?limit=1&after=#{URI.encode_www_form(anonymous_message_cursor)}",
+        ctx.opts[:cli_token]
+      )
+
+    assert observer_with_org_message_cursor.status == 200
+    assert org_with_observer_message_cursor.status == 200
+
+    assert JSON.decode!(observer_with_org_message_cursor.resp_body)["items"] ==
+             JSON.decode!(anonymous_message_page.resp_body)["items"]
+
+    assert JSON.decode!(org_with_observer_message_cursor.resp_body)["items"] ==
+             JSON.decode!(org_message_page.resp_body)["items"]
+
+    message_cursor = JSON.decode!(anonymous_messages.resp_body)["page"]["newestCursor"]
+
+    assert get_without_authorization(
+             ctx,
+             message_path <> "?limit=1&after=#{URI.encode_www_form(message_cursor)}"
+           ).status == 200
+
+    for message_id <- [user_message_id, reply_message_id] do
+      path = "/api/sessions/#{session_key}/messages/#{message_id}"
+      anonymous_message = get_without_authorization(ctx, path)
+      org_message = get(ctx, path, ctx.opts[:cli_token])
+
+      assert anonymous_message.status == 200
+
+      assert JSON.decode!(anonymous_message.resp_body)["item"] ==
+               JSON.decode!(org_message.resp_body)["item"]
+    end
+
+    selected_sessions = get_without_authorization(ctx, "/api/sessions?asUser=flynn")
+    selected_sessions_org = get(ctx, "/api/sessions?asUser=flynn", ctx.opts[:cli_token])
+    assert selected_sessions.status == 200
+    assert selected_sessions.resp_body == selected_sessions_org.resp_body
+
+    selected_session = get_without_authorization(ctx, "/api/sessions/#{session_key}?asUser=flynn")
+
+    selected_session_org =
+      get(ctx, "/api/sessions/#{session_key}?asUser=flynn", ctx.opts[:cli_token])
+
+    assert selected_session.status == 200
+    assert selected_session.resp_body == selected_session_org.resp_body
+
+    selected_session_bearer =
+      get(ctx, "/api/sessions/#{session_key}?asUser=flynn", ctx.admin_session.cli_token)
+
+    assert selected_session_bearer.status == 200
+    assert selected_session_bearer.resp_body == selected_session_org.resp_body
+
+    assert get_without_authorization(ctx, "/api/sessions/#{session_key}?asUser=").resp_body ==
+             anonymous_session.resp_body
+
+    assert get_without_authorization(ctx, "/api/sessions/#{session_key}?asUser=flynn%zz").resp_body ==
+             anonymous_session.resp_body
+
+    repeated_session_last =
+      get_without_authorization(ctx, "/api/sessions/#{session_key}?asUser=alice&asUser=flynn")
+
+    assert repeated_session_last.status == 200
+    assert repeated_session_last.resp_body == selected_session_org.resp_body
+
+    selected_messages = get_without_authorization(ctx, message_path <> "?asUser=flynn")
+    selected_messages_org = get(ctx, message_path <> "?asUser=flynn", ctx.opts[:cli_token])
+    assert selected_messages.status == 200
+    assert selected_messages.resp_body == selected_messages_org.resp_body
+
+    selected_messages_bearer =
+      get(ctx, message_path <> "?asUser=flynn", ctx.admin_session.cli_token)
+
+    assert selected_messages_bearer.status == 200
+    assert selected_messages_bearer.resp_body == selected_messages_org.resp_body
+
+    for message_id <- [user_message_id, reply_message_id] do
+      path = message_path <> "/#{message_id}?asUser=flynn"
+      selected = get_without_authorization(ctx, path)
+      selected_org = get(ctx, path, ctx.opts[:cli_token])
+      assert selected.status == 200
+      assert selected.resp_body == selected_org.resp_body
+    end
+
+    assert get_without_authorization(ctx, "/api/sessions?asUser=").resp_body ==
+             anonymous_sessions.resp_body
+
+    assert get_without_authorization(ctx, "/api/sessions?asUser=flynn%zz").resp_body ==
+             anonymous_sessions.resp_body
+
+    assert get_without_authorization(ctx, "/api/sessions?asUser=alice&asUser=").resp_body ==
+             anonymous_sessions.resp_body
+
+    assert get_without_authorization(ctx, message_path <> "?asUser=").resp_body ==
+             anonymous_messages.resp_body
+
+    assert get_without_authorization(ctx, message_path <> "?asUser=flynn%zz").resp_body ==
+             anonymous_messages.resp_body
+
+    for message_id <- [user_message_id, reply_message_id] do
+      path = message_path <> "/#{message_id}"
+
+      assert get_without_authorization(ctx, path <> "?asUser=").resp_body ==
+               get_without_authorization(ctx, path).resp_body
+
+      assert get_without_authorization(ctx, path <> "?asUser=flynn%zz").resp_body ==
+               get_without_authorization(ctx, path).resp_body
+    end
+
+    Devices.add_user(ctx.db, "alice", false)
+    ensure_main_session(ctx.db, "alice")
+
+    flynn_session_page =
+      get_without_authorization(ctx, "/api/sessions?asUser=flynn&limit=1")
+
+    alice_session_page =
+      get_without_authorization(ctx, "/api/sessions?asUser=alice&limit=1")
+
+    flynn_with_alice_session_cursor =
+      get_without_authorization(
+        ctx,
+        "/api/sessions?asUser=flynn&limit=1&after=#{URI.encode_www_form(JSON.decode!(alice_session_page.resp_body)["page"]["newestCursor"])}"
+      )
+
+    alice_with_flynn_session_cursor =
+      get_without_authorization(
+        ctx,
+        "/api/sessions?asUser=alice&limit=1&after=#{URI.encode_www_form(JSON.decode!(flynn_session_page.resp_body)["page"]["newestCursor"])}"
+      )
+
+    assert flynn_with_alice_session_cursor.status == 200
+    assert alice_with_flynn_session_cursor.status == 200
+
+    assert JSON.decode!(flynn_with_alice_session_cursor.resp_body)["items"] ==
+             JSON.decode!(flynn_session_page.resp_body)["items"]
+
+    assert JSON.decode!(alice_with_flynn_session_cursor.resp_body)["items"] ==
+             JSON.decode!(alice_session_page.resp_body)["items"]
+
+    repeated_last =
+      get_without_authorization(ctx, "/api/sessions?asUser=flynn&asUser=alice")
+
+    repeated_last_org = get(ctx, "/api/sessions?asUser=alice", ctx.opts[:cli_token])
+    assert repeated_last.status == 200
+    assert repeated_last.resp_body == repeated_last_org.resp_body
+
+    repeated_messages_last =
+      get_without_authorization(ctx, message_path <> "?asUser=alice&asUser=flynn")
+
+    assert repeated_messages_last.status == 200
+    assert repeated_messages_last.resp_body == selected_messages_org.resp_body
+
+    mismatched_session_selector =
+      get(ctx, "/api/sessions/#{session_key}?asUser=mallory", ctx.admin_session.cli_token)
+
+    assert mismatched_session_selector.status == 200
+
+    assert mismatched_session_selector.resp_body ==
+             get(ctx, "/api/sessions/#{session_key}", ctx.admin_session.cli_token).resp_body
+
+    mismatched_message_selector =
+      get(ctx, message_path <> "?asUser=mallory", ctx.admin_session.cli_token)
+
+    assert mismatched_message_selector.status == 200
+
+    assert mismatched_message_selector.resp_body ==
+             get(ctx, message_path, ctx.admin_session.cli_token).resp_body
+
+    for {path, expected} <- [
+          {"/api/sessions/#{session_key}?asUser=mallory",
+           get(ctx, "/api/sessions/#{session_key}", ctx.admin_device.token)},
+          {message_path <> "?asUser=mallory", get(ctx, message_path, ctx.admin_device.token)}
+        ] do
+      response = get(ctx, path, ctx.admin_device.token)
+      assert response.status == 200
+      assert response.resp_body == expected.resp_body
+    end
+
+    for {path, token} <- [
+          {"/api/sessions/#{session_key}", ctx.admin_session.cli_token},
+          {message_path, ctx.admin_session.cli_token},
+          {"/api/sessions/#{session_key}", ctx.admin_device.token},
+          {message_path, ctx.admin_device.token}
+        ],
+        selector <- ["asUser=", "asUser=flynn%zz"] do
+      expected = get(ctx, path, token)
+      response = get(ctx, path <> "?" <> selector, token)
+      assert response.status == 200
+      assert response.resp_body == expected.resp_body
+    end
+
+    current_selected_sessions_org =
+      get(ctx, "/api/sessions?asUser=flynn", ctx.opts[:cli_token])
+
+    for authorization <- ["", "Bearer ", "Basic malformed", "Bearer invalid-token"] do
+      headers = [{"authorization", authorization}]
+      session_response = get_without_authorization(ctx, "/api/sessions", headers)
+      message_response = get_without_authorization(ctx, message_path, headers)
+      current_observer_sessions = get_without_authorization(ctx, "/api/sessions")
+      assert session_response.status == 200
+
+      assert Enum.map(JSON.decode!(session_response.resp_body)["items"], & &1["sessionKey"]) ==
+               Enum.map(
+                 JSON.decode!(current_observer_sessions.resp_body)["items"],
+                 & &1["sessionKey"]
+               )
+
+      assert message_response.status == 200
+
+      assert JSON.decode!(message_response.resp_body)["items"] ==
+               JSON.decode!(anonymous_messages.resp_body)["items"]
+
+      selected_session_fallback =
+        get_without_authorization(ctx, "/api/sessions?asUser=flynn%zz", headers)
+
+      selected_message_fallback =
+        get_without_authorization(ctx, message_path <> "?asUser=flynn%zz", headers)
+
+      selected_session_with_bad_bearer =
+        get_without_authorization(ctx, "/api/sessions?asUser=flynn", headers)
+
+      selected_message_with_bad_bearer =
+        get_without_authorization(ctx, message_path <> "?asUser=flynn", headers)
+
+      assert selected_session_fallback.status == 200
+
+      current_observer_session_keys =
+        get_without_authorization(ctx, "/api/sessions")
+        |> then(&JSON.decode!(&1.resp_body))
+        |> Map.fetch!("items")
+        |> Enum.map(& &1["sessionKey"])
+
+      assert Enum.map(
+               JSON.decode!(selected_session_fallback.resp_body)["items"],
+               & &1["sessionKey"]
+             ) ==
+               current_observer_session_keys
+
+      assert selected_message_fallback.status == 200
+
+      assert JSON.decode!(selected_message_fallback.resp_body)["items"] ==
+               JSON.decode!(anonymous_messages.resp_body)["items"]
+
+      assert selected_session_with_bad_bearer.status == 200
+
+      assert JSON.decode!(selected_session_with_bad_bearer.resp_body)["items"] ==
+               JSON.decode!(current_selected_sessions_org.resp_body)["items"]
+
+      assert selected_message_with_bad_bearer.status == 200
+      assert selected_message_with_bad_bearer.resp_body == selected_messages_org.resp_body
+
+      session_detail =
+        get_without_authorization(ctx, "/api/sessions/#{session_key}", headers)
+
+      assert session_detail.status == 200
+      assert session_detail.resp_body == anonymous_session.resp_body
+
+      for message_id <- [user_message_id, reply_message_id] do
+        path = message_path <> "/#{message_id}"
+        detail = get_without_authorization(ctx, path, headers)
+        expected = get_without_authorization(ctx, path)
+        assert detail.status == 200
+        assert detail.resp_body == expected.resp_body
+      end
+    end
+
+    assert_error(
+      get_without_authorization(ctx, "/api/work-items"),
+      401,
+      "work items",
+      "auth_failed"
+    )
+  end
+
+  test "credentialless and authenticated clients read and receive changes through a real gateway",
+       ctx do
+    session_key = ctx.admin_session.session_key
+    user_message_id = "loopback-observer-question"
+    reply_message_id = "loopback-observer-answer"
+
+    query!(
+      ctx.db,
+      """
+      INSERT INTO messages
+        (id, sessionKey, role, content, timestamp, sender, llmVisibleMessageId, attachments)
+      VALUES (?1, ?2, 'user', 'loopback question', 1, 'user:flynn', ?1, '[]')
+      """,
+      [user_message_id, session_key]
+    )
+
+    query!(
+      ctx.db,
+      """
+      INSERT INTO messages
+        (id, sessionKey, role, content, timestamp, sender, replyToMessageId,
+         llmVisibleMessageId, attachments)
+      VALUES (?1, ?2, 'assistant', 'loopback answer', 2, 'agent:main', ?3, ?1, '[]')
+      """,
+      [reply_message_id, session_key, user_message_id]
+    )
+
+    Devices.add_user(ctx.db, "loopback-observer", false)
+
+    assert {:ok, true, _marker} =
+             ReadMarkers.set(ctx.db, "loopback-observer", "core-scope", "observer-cursor")
+
+    bandit =
+      start_supervised!(
+        {Bandit,
+         plug: {Router, Router.init(ctx.opts)}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
+      )
+
+    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    {:ok, observer_ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
+
+    :ok =
+      WS.send_text(
+        observer_ws,
+        JSON.encode!(%{
+          "type" => "subscribe",
+          "protocolVersion" => 2,
+          "subscriptionId" => "credentialless-observer",
+          "filters" => %{"classes" => ["work_item.created"]}
+        })
+      )
+
+    {:ok, {:text, observer_ready}, observer_ws} = WS.recv(observer_ws, 2_000)
+    assert JSON.decode!(observer_ready)["type"] == "subscription_ready"
+
+    {:ok, authenticated_ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
+
+    :ok =
+      WS.send_text(
+        authenticated_ws,
+        JSON.encode!(%{"type" => "auth", "token" => ctx.token})
+      )
+
+    {:ok, {:text, auth_result}, authenticated_ws} = WS.recv(authenticated_ws, 2_000)
+    assert JSON.decode!(auth_result)["success"] == true
+
+    :ok =
+      WS.send_text(
+        authenticated_ws,
+        JSON.encode!(%{
+          "type" => "subscribe",
+          "protocolVersion" => 2,
+          "subscriptionId" => "authenticated-client",
+          "filters" => %{"classes" => ["work_item.created"]}
+        })
+      )
+
+    {:ok, {:text, authenticated_ready}, authenticated_ws} = WS.recv(authenticated_ws, 2_000)
+    assert JSON.decode!(authenticated_ready)["type"] == "subscription_ready"
+
+    {observer_sessions_status, _headers, observer_sessions_body} =
+      http_get_without_authorization(port, "/api/sessions")
+
+    {authenticated_sessions_status, _headers, authenticated_sessions_body} =
+      http_get(port, "/api/sessions", ctx.opts[:cli_token])
+
+    assert observer_sessions_status == 200
+    assert authenticated_sessions_status == 200
+
+    assert JSON.decode!(observer_sessions_body)["items"] ==
+             JSON.decode!(authenticated_sessions_body)["items"]
+
+    message_path = "/api/sessions/#{session_key}/messages"
+
+    {observer_messages_status, _headers, observer_messages_body} =
+      http_get_without_authorization(port, message_path)
+
+    {authenticated_messages_status, _headers, authenticated_messages_body} =
+      http_get(port, message_path, ctx.opts[:cli_token])
+
+    assert observer_messages_status == 200
+    assert authenticated_messages_status == 200
+
+    observer_message_ids =
+      JSON.decode!(observer_messages_body)["items"] |> Enum.map(& &1["id"])
+
+    assert user_message_id in observer_message_ids
+    assert reply_message_id in observer_message_ids
+
+    assert JSON.decode!(observer_messages_body)["items"] ==
+             JSON.decode!(authenticated_messages_body)["items"]
+
+    {observer_detail_status, _headers, observer_detail_body} =
+      http_get_without_authorization(port, message_path <> "/#{reply_message_id}")
+
+    {authenticated_detail_status, _headers, authenticated_detail_body} =
+      http_get(port, message_path <> "/#{reply_message_id}", ctx.opts[:cli_token])
+
+    assert observer_detail_status == 200
+    assert authenticated_detail_status == 200
+
+    assert JSON.decode!(observer_detail_body)["item"] ==
+             JSON.decode!(authenticated_detail_body)["item"]
+
+    {observer_markers_status, _headers, observer_markers_body} =
+      http_get_without_authorization(port, "/api/read-markers")
+
+    {authenticated_markers_status, _headers, authenticated_markers_body} =
+      http_get(port, "/api/read-markers", ctx.opts[:cli_token])
+
+    assert observer_markers_status == 200
+    assert authenticated_markers_status == 200
+
+    observer_marker_users =
+      JSON.decode!(observer_markers_body)["items"] |> Enum.map(& &1["userId"])
+
+    assert "flynn" in observer_marker_users
+    assert "loopback-observer" in observer_marker_users
+
+    authenticated_marker_users =
+      JSON.decode!(authenticated_markers_body)["items"] |> Enum.map(& &1["userId"])
+
+    assert authenticated_marker_users == ["flynn"]
+
+    {observer_marker_detail_status, _headers, observer_marker_detail_body} =
+      http_get_without_authorization(port, "/api/read-markers/core-scope")
+
+    {authenticated_marker_detail_status, _headers, authenticated_marker_detail_body} =
+      http_get(port, "/api/read-markers/core-scope", ctx.opts[:cli_token])
+
+    assert observer_marker_detail_status == 200
+    assert authenticated_marker_detail_status == 200
+
+    observer_detail_users =
+      JSON.decode!(observer_marker_detail_body)["items"] |> Enum.map(& &1["userId"])
+
+    assert observer_detail_users == ["flynn", "loopback-observer"]
+    assert JSON.decode!(authenticated_marker_detail_body)["item"]["userId"] == "flynn"
+
+    work =
+      WorkItems.__handle__(
+        ctx.db,
+        "work-item-create",
+        firehose_call("work-item-create", nil, %{title: "Credentialless loopback event"})
+      )
+
+    {observer_raw, observer_ws} = receive_raw_change(observer_ws, "work_item.created")
+
+    {authenticated_raw, authenticated_ws} =
+      receive_raw_change(authenticated_ws, "work_item.created")
+
+    assert JSON.decode!(observer_raw)["refs"]["workItemId"] == work.id
+    assert JSON.decode!(authenticated_raw)["refs"]["workItemId"] == work.id
+
+    :ok = WS.close(observer_ws)
+    :ok = WS.close(authenticated_ws)
+  end
+
+  test "credentialless marker reads apply AU2 selection and all-user collection", ctx do
+    Devices.add_user(ctx.db, "alice", false)
+    Devices.add_user(ctx.db, "bob", false)
+
+    for scope_key <- ["chat:one", "chat:two", "chat:three"] do
+      assert {:ok, true, _marker} =
+               ReadMarkers.set(ctx.db, "alice", scope_key, "cursor-#{scope_key}")
+    end
+
+    assert {:ok, true, _marker} = ReadMarkers.set(ctx.db, "bob", "chat:one", "bob-cursor-one")
+    assert {:ok, true, _marker} = ReadMarkers.set(ctx.db, "bob", "chat:other", "bob-cursor")
+    assert {:ok, true, _marker} = ReadMarkers.set(ctx.db, "flynn", "chat:admin", "admin-cursor")
+
+    all_markers = get_without_authorization(ctx, "/api/read-markers")
+    admin_markers = get(ctx, "/api/read-markers", ctx.opts[:cli_token])
+    assert all_markers.status == 200
+
+    all_marker_users = JSON.decode!(all_markers.resp_body)["items"] |> Enum.map(& &1["userId"])
+    assert "alice" in all_marker_users
+    assert "bob" in all_marker_users
+    assert "flynn" in all_marker_users
+
+    admin_marker_users =
+      JSON.decode!(admin_markers.resp_body)["items"] |> Enum.map(& &1["userId"])
+
+    assert admin_marker_users == ["flynn", "flynn"]
+
+    admin_marker_scopes =
+      JSON.decode!(admin_markers.resp_body)["items"] |> Enum.map(& &1["scopeKey"])
+
+    assert admin_marker_scopes == ["chat:admin", "core-scope"]
+
+    selected_admin_markers = get_without_authorization(ctx, "/api/read-markers?asUser=flynn")
+    assert selected_admin_markers.status == 200
+
+    selected_admin_items = JSON.decode!(selected_admin_markers.resp_body)["items"]
+    assert Enum.map(selected_admin_items, & &1["userId"]) == ["flynn", "flynn"]
+    assert Enum.map(selected_admin_items, & &1["scopeKey"]) == ["chat:admin", "core-scope"]
+
+    selected_admin_org =
+      get(ctx, "/api/read-markers?asUser=flynn", ctx.opts[:cli_token])
+
+    assert selected_admin_org.status == 200
+    assert selected_admin_org.resp_body == selected_admin_markers.resp_body
+
+    assert get_without_authorization(ctx, "/api/read-markers?asUser=").resp_body ==
+             all_markers.resp_body
+
+    assert get_without_authorization(ctx, "/api/read-markers?asUser=alice%zz").resp_body ==
+             all_markers.resp_body
+
+    assert get_without_authorization(ctx, "/api/read-markers?asUser=alice&asUser=").resp_body ==
+             all_markers.resp_body
+
+    org_empty_selector =
+      get(ctx, "/api/read-markers?asUser=", ctx.opts[:cli_token])
+
+    assert org_empty_selector.status == 200
+    assert org_empty_selector.resp_body == admin_markers.resp_body
+
+    repeated_last = get_without_authorization(ctx, "/api/read-markers?asUser=alice&asUser=bob")
+    bob_only = get_without_authorization(ctx, "/api/read-markers?asUser=bob")
+    assert repeated_last.status == 200
+    assert repeated_last.resp_body == bob_only.resp_body
+
+    first = get_without_authorization(ctx, "/api/read-markers?asUser=alice&limit=1")
+    first_org = get(ctx, "/api/read-markers?asUser=alice&limit=1", ctx.opts[:cli_token])
+
+    assert first.status == 200
+    assert_application_headers(first)
+    assert first.resp_body == first_org.resp_body
+
+    first_body = JSON.decode!(first.resp_body)
+    assert [%{"userId" => "alice"} = first_item] = first_body["items"]
+    assert is_binary(first_body["page"]["newestCursor"])
+
+    bob_first = get_without_authorization(ctx, "/api/read-markers?asUser=bob&limit=1")
+    bob_first_body = JSON.decode!(bob_first.resp_body)
+    assert [%{"userId" => "bob"}] = bob_first_body["items"]
+
+    bob_with_alice_cursor =
+      get_without_authorization(
+        ctx,
+        "/api/read-markers?asUser=bob&limit=1&after=#{URI.encode_www_form(first_body["page"]["newestCursor"])}"
+      )
+
+    alice_with_bob_cursor =
+      get_without_authorization(
+        ctx,
+        "/api/read-markers?asUser=alice&limit=1&after=#{URI.encode_www_form(bob_first_body["page"]["newestCursor"])}"
+      )
+
+    assert bob_with_alice_cursor.status == 200
+    assert alice_with_bob_cursor.status == 200
+
+    assert JSON.decode!(bob_with_alice_cursor.resp_body)["items"] ==
+             bob_first_body["items"]
+
+    assert JSON.decode!(alice_with_bob_cursor.resp_body)["items"] == first_body["items"]
+
+    second =
+      get_without_authorization(
+        ctx,
+        "/api/read-markers?asUser=alice&limit=1&after=#{URI.encode_www_form(first_body["page"]["newestCursor"])}"
+      )
+
+    assert second.status == 200
+    assert [%{"userId" => "alice"} = second_item] = JSON.decode!(second.resp_body)["items"]
+    refute first_item["scopeKey"] == second_item["scopeKey"]
+
+    all_alice_markers = get_without_authorization(ctx, "/api/read-markers?asUser=alice")
+    assert all_alice_markers.status == 200
+
+    assert Enum.all?(
+             JSON.decode!(all_alice_markers.resp_body)["items"],
+             &(&1["userId"] == "alice")
+           )
+
+    unknown_user_markers = get_without_authorization(ctx, "/api/read-markers?asUser=unregistered")
+    assert unknown_user_markers.status == 200
+    assert JSON.decode!(unknown_user_markers.resp_body)["items"] == []
+
+    assert_error(
+      get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=unregistered"),
+      404,
+      "read markers",
+      "not_found"
+    )
+
+    detail = get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=alice")
+    detail_org = get(ctx, "/api/read-markers/chat%3Aone?asUser=alice", ctx.opts[:cli_token])
+    assert detail.status == 200
+    assert detail.resp_body == detail_org.resp_body
+
+    session_markers = get(ctx, "/api/read-markers", ctx.admin_session.cli_token)
+
+    mismatched_session_markers =
+      get(ctx, "/api/read-markers?asUser=mallory", ctx.admin_session.cli_token)
+
+    assert mismatched_session_markers.status == 200
+    assert mismatched_session_markers.resp_body == session_markers.resp_body
+
+    for {token, expected} <- [
+          {ctx.admin_session.cli_token, session_markers},
+          {ctx.admin_device.token, get(ctx, "/api/read-markers", ctx.admin_device.token)}
+        ],
+        selector <- ["asUser=", "asUser=alice%zz"] do
+      response = get(ctx, "/api/read-markers?" <> selector, token)
+      assert response.status == 200
+      assert response.resp_body == expected.resp_body
+    end
+
+    for response <- [session_markers, get(ctx, "/api/read-markers", ctx.admin_device.token)] do
+      items = JSON.decode!(response.resp_body)["items"]
+      assert Enum.map(items, & &1["userId"]) == ["flynn", "flynn"]
+      assert Enum.map(items, & &1["scopeKey"]) == ["chat:admin", "core-scope"]
+    end
+
+    scoped_collection =
+      get_without_authorization(ctx, "/api/read-markers?scopeKey=chat%3Aone")
+
+    scoped_detail = get_without_authorization(ctx, "/api/read-markers/chat%3Aone")
+    assert scoped_collection.status == 200
+    assert scoped_detail.status == 200
+    assert scoped_detail.resp_body == scoped_collection.resp_body
+
+    scoped_rows = JSON.decode!(scoped_detail.resp_body)["items"]
+    assert Enum.map(scoped_rows, & &1["userId"]) == ["alice", "bob"]
+
+    empty_selector_detail =
+      get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=")
+
+    assert empty_selector_detail.status == 200
+    assert empty_selector_detail.resp_body == scoped_detail.resp_body
+
+    malformed_selector_detail =
+      get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=alice%zz")
+
+    assert malformed_selector_detail.status == 200
+    assert malformed_selector_detail.resp_body == scoped_detail.resp_body
+
+    repeated_selector_detail =
+      get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=alice&asUser=bob")
+
+    last_selector_detail =
+      get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=bob")
+
+    assert repeated_selector_detail.status == 200
+    assert repeated_selector_detail.resp_body == last_selector_detail.resp_body
+
+    for authorization <- ["", "Bearer ", "Basic malformed", "Bearer invalid-token"] do
+      response =
+        get_without_authorization(ctx, "/api/read-markers", [{"authorization", authorization}])
+
+      assert response.status == 200
+      assert response.resp_body == all_markers.resp_body
+
+      detail_response =
+        get_without_authorization(ctx, "/api/read-markers/chat%3Aone", [
+          {"authorization", authorization}
+        ])
+
+      missing_detail_response =
+        get_without_authorization(ctx, "/api/read-markers/chat%3Amissing", [
+          {"authorization", authorization}
+        ])
+
+      assert detail_response.status == 200
+      assert detail_response.resp_body == scoped_detail.resp_body
+      assert_error(missing_detail_response, 404, "read markers", "not_found")
+
+      unusable_selector_detail =
+        get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=alice%zz", [
+          {"authorization", authorization}
+        ])
+
+      selected_with_bad_bearer =
+        get_without_authorization(ctx, "/api/read-markers?asUser=alice", [
+          {"authorization", authorization}
+        ])
+
+      selected_detail_with_bad_bearer =
+        get_without_authorization(ctx, "/api/read-markers/chat%3Aone?asUser=alice", [
+          {"authorization", authorization}
+        ])
+
+      assert unusable_selector_detail.status == 200
+      assert unusable_selector_detail.resp_body == scoped_detail.resp_body
+      assert selected_with_bad_bearer.status == 200
+      assert selected_with_bad_bearer.resp_body == all_alice_markers.resp_body
+      assert selected_detail_with_bad_bearer.status == 200
+      assert selected_detail_with_bad_bearer.resp_body == detail.resp_body
+    end
+
+    assert_error(
+      get_without_authorization(ctx, "/api/read-markers/chat%3Amissing"),
+      404,
+      "read markers",
+      "not_found"
+    )
   end
 
   test "AC8 forces every shared failure stage to the closed projection error", ctx do
@@ -2469,6 +3268,13 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     |> Router.call(Router.init(ctx.opts))
   end
 
+  defp get_without_authorization(ctx, path, headers \\ []) do
+    Enum.reduce(headers, conn(:get, path), fn {name, value}, conn ->
+      put_req_header(conn, name, value)
+    end)
+    |> Router.call(Router.init(ctx.opts))
+  end
+
   defp traced_get(ctx, path, bearer) do
     flush_core_detail_trace()
     traced = %{ctx | opts: Keyword.put(ctx.opts, :core_detail_trace, self())}
@@ -2985,6 +3791,15 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     {status, headers, body}
   end
 
+  defp http_get_without_authorization(port, path) do
+    url = String.to_charlist("http://127.0.0.1:#{port}#{path}")
+
+    {:ok, {{_version, status, _reason}, headers, body}} =
+      :httpc.request(:get, {url, []}, [{:timeout, 2_000}], body_format: :binary)
+
+    {status, headers, body}
+  end
+
   defp application_header(headers, name) do
     name = String.downcase(name)
 
@@ -3381,7 +4196,14 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       assert raw_json_value(as_user.resp_body, "item") == item_bytes
 
       unauthenticated = get(ctx, path, "")
-      assert_error(unauthenticated, 401, resource, "auth_failed")
+
+      if resource == "transcript messages" do
+        assert unauthenticated.status == 200
+        assert unauthenticated.resp_body == get_without_authorization(ctx, path).resp_body
+      else
+        assert_error(unauthenticated, 401, resource, "auth_failed")
+      end
+
       assert_application_headers(unauthenticated)
 
       unsupported_filter = get(ctx, path <> "?unsupported=value", List.first(bearers))
