@@ -3358,7 +3358,7 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "a fired parent escalation does not block opener revocation after reparenting", ctx do
+  test "a fired holder reminder does not block opener revocation after reparenting", ctx do
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
 
@@ -3385,10 +3385,8 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :note], "awaiting the opener's disposition")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Supervision.ladder_target(ctx.db, "opener", 1) == "parent-a"
-
-    # This fixture configures a one-second reminder interval. Let the quiet
-    # period elapse, then finish the holder notice before exercising the climb.
+    # This fixture configures a one-second reminder interval, so let its quiet
+    # period elapse before delivering the holder reminder.
     Process.sleep(1_100)
     assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_deadline", opener_work.id)
 
@@ -3400,24 +3398,20 @@ defmodule Tightbeam.AssignmentsTest do
              end)
 
     assert :appended = deliver_terminal_notice(ctx.db, holder_notice)
-
     drain_queued_turns(ctx.db, "opener", "flynn")
-    Process.sleep(1_100)
-    assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_climb", opener_work.id)
 
-    assert [escalation] =
-             Enum.filter(Wakes.list_pending(ctx.db), &(&1.assignment_id == opener_work.id))
+    assert %{state: "fired", session_key: "opener"} =
+             Wakes.get(ctx.db, holder_notice.wake_id)
 
-    assert escalation.session_key == "parent-a"
+    assert [[_, "opener", "delivered", _carrier_id]] =
+             source_delivery_turns(ctx.db, holder_notice.wake_id)
 
-    assert :appended = deliver_terminal_notice(ctx.db, escalation)
-
-    assert Wakes.get(ctx.db, escalation.wake_id).state == "fired"
-
-    assert {:ok, [["parent-a"]]} =
-             DB.query(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId=?1", [
-               escalation.wake_id
-             ])
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt' AND sessionKey<>'opener' AND obligationRef GLOB 'assignment-inactivity-episode-v1:*'",
+               [opener_work.id]
+             )
 
     assert {:ok, [["standing"]]} =
              DB.query(
