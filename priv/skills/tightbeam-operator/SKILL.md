@@ -6,8 +6,9 @@ description: Operate a Tightbeam organization from outside it on behalf of a nam
 # Operate a Tightbeam organization as an outside operator
 
 Written for Tightbeam 0.1.12. If `tightbeam --version` prints a different version, run
-`tightbeam skill install` to replace this skill with the edition that ships with the
-installed CLI, then start a fresh agent session.
+`tightbeam skill install` locally, without `--as-user`, to replace this skill with the
+edition that ships with the installed CLI, then start a fresh agent session. This command
+installs local skill files; it does not act on the organization.
 
 You are not a Tightbeam session. You act for one human user of the organization and
 reach it only through the `tightbeam` CLI. Use this skill when the person asks about
@@ -15,9 +16,11 @@ Tightbeam work, decision requests, agent sessions, or messages to a session.
 
 ## Identity and authority
 
-Pass `--as-user <userId>` on every command, with the user identifier the person gave
-you. Never guess it. Everything you run is attributed to that person, so make only the
-changes they asked for. Reading is normally fine.
+Pass `--as-user <userId>` on every command that acts on or reads the organization, with
+the user identifier the person gave you. Never guess it. Everything you run is attributed
+to that person, so make only the changes they asked for. Reading is normally fine.
+Local CLI-only commands such as `tightbeam skill list` and `tightbeam skill install` do
+not take `--as-user` and do not act on the organization.
 
 Creating work, waking sessions, ruling or withdrawing decisions, revoking or reopening
 assignments, spawning, retiring or tuning sessions, onboarding credentials, learning
