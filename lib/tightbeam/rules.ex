@@ -67,6 +67,7 @@ defmodule Tightbeam.Rules do
 
   @persist_key __MODULE__
   @policy_key {__MODULE__, :policies}
+  @diagnostics_key {__MODULE__, :diagnostics}
   @rule_keys MapSet.new([
                "name",
                "verb",
@@ -85,6 +86,7 @@ defmodule Tightbeam.Rules do
   @policy_keys MapSet.new(["name", "purpose", "when", "verification"])
   @verification_keys MapSet.new(["trigger", "terminal", "fallback"])
   @policy_purposes ~w(wait-verification-admission)
+  @retired_policy_purposes ~w(wait-prod-coverage wait-effort-relief)
   @recurrence_keys MapSet.new([
                      "scope",
                      "fingerprint",
@@ -344,6 +346,7 @@ defmodule Tightbeam.Rules do
     identity_manifest_sha = revision || identity_manifest_sha(base_dir)
 
     :persistent_term.put({__MODULE__, :unavailable_verbs}, %{})
+    :persistent_term.put(@diagnostics_key, %{unavailable_verbs: [], skipped_policies: []})
 
     entries =
       law_base
@@ -356,7 +359,8 @@ defmodule Tightbeam.Rules do
         rescue
           error ->
             require Logger
-            Logger.warning("rule file #{path} unavailable: #{Exception.message(error)}")
+            reason = Exception.message(error) |> String.replace_prefix("#{path}: ", "")
+            Logger.warning("rule file #{path} unavailable: #{reason}")
 
             affected =
               case File.read(path) do
@@ -392,6 +396,15 @@ defmodule Tightbeam.Rules do
               {__MODULE__, :unavailable_verbs},
               Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
             )
+
+            Enum.each(affected, fn verb ->
+              record_unavailable_verb(%{
+                verb: verb,
+                file: diagnostic_file(path, law_base),
+                name: "<file>",
+                reason: reason
+              })
+            end)
 
             []
         end
@@ -435,13 +448,21 @@ defmodule Tightbeam.Rules do
       Enum.reject(rules, fn rule ->
         if duplicates[rule.name] > 1 do
           require Logger
-          Logger.warning("rule #{rule.name} unavailable: duplicate name in #{rule.source}")
+          reason = "duplicate name"
+          Logger.warning("rule #{rule.name} unavailable: #{reason} in #{rule.source}")
           unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
 
           :persistent_term.put(
             {__MODULE__, :unavailable_verbs},
             Map.put(unavailable, rule.verb, rule.source)
           )
+
+          record_unavailable_verb(%{
+            verb: rule.verb,
+            file: diagnostic_file(rule.source, law_base),
+            name: rule.name,
+            reason: reason
+          })
 
           true
         else
@@ -452,12 +473,7 @@ defmodule Tightbeam.Rules do
     policies =
       Enum.reject(policies, fn policy ->
         if duplicates[policy.name] > 1 do
-          unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
-
-          :persistent_term.put(
-            {__MODULE__, :unavailable_verbs},
-            Enum.reduce(verbs, unavailable, &Map.put(&2, &1, policy.source))
-          )
+          record_skipped_policy(policy.source, law_base, policy.name, "duplicate policy name")
 
           true
         else
@@ -478,13 +494,21 @@ defmodule Tightbeam.Rules do
         rescue
           error ->
             require Logger
-            Logger.warning("rule #{rule.name} unavailable: #{Exception.message(error)}")
+            reason = Exception.message(error)
+            Logger.warning("rule #{rule.name} unavailable: #{reason}")
             unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
 
             :persistent_term.put(
               {__MODULE__, :unavailable_verbs},
               Map.put(unavailable, rule.verb, rule.source)
             )
+
+            record_unavailable_verb(%{
+              verb: rule.verb,
+              file: diagnostic_file(rule.source, law_base),
+              name: rule.name,
+              reason: reason
+            })
 
             false
         end
@@ -503,6 +527,22 @@ defmodule Tightbeam.Rules do
     })
 
     rules
+  end
+
+  @doc "Return the rule availability diagnostics from the most recent load."
+  def status do
+    diagnostics =
+      :persistent_term.get(@diagnostics_key, %{unavailable_verbs: [], skipped_policies: []})
+
+    unavailable =
+      diagnostics.unavailable_verbs
+      |> Enum.sort_by(&{&1.verb, &1.file, &1.name || ""})
+
+    skipped =
+      diagnostics.skipped_policies
+      |> Enum.sort_by(&{&1.file, &1.name})
+
+    %{recording_available: unavailable == [], unavailable_verbs: unavailable, skipped_policies: skipped}
   end
 
   @doc "Select the bytewise-smallest matching predicate-only policy for one snapshot."
@@ -1295,24 +1335,15 @@ defmodule Tightbeam.Rules do
           raise ArgumentError, "#{path}: [[rule]] must be a non-empty array of tables"
       end
 
-    policy_entries = Map.get(manifest, "policy", [])
-
     policies =
       case Map.fetch(manifest, "policy") do
         {:ok, policies} when is_list(policies) and policies != [] ->
           policies
           |> Enum.with_index(1)
           |> Enum.flat_map(fn {policy, ordinal} ->
-            if retired_policy?(policy) do
-              require Logger
-
-              Logger.warning(
-                "#{path}: policy #{inspect(Map.get(policy, "name"))} skipped: purpose wait-effort-relief is retired"
-              )
-
-              []
-            else
-              [{:policy, validate_policy!(path, ordinal, policy, identity_manifest_sha)}]
+            case load_policy_entry(path, ordinal, policy, identity_manifest_sha, base_dir) do
+              nil -> []
+              validated -> [validated]
             end
           end)
 
@@ -1323,17 +1354,99 @@ defmodule Tightbeam.Rules do
           raise ArgumentError, "#{path}: [[policy]] must be a non-empty array of tables"
       end
 
-    only_retired_policies? =
-      rules == [] and policy_entries != [] and Enum.all?(policy_entries, &retired_policy?/1)
+    has_entries? =
+      Enum.any?(["rule", "policy"], fn key ->
+        case Map.fetch(manifest, key) do
+          {:ok, entries} when is_list(entries) and entries != [] -> true
+          _ -> false
+        end
+      end)
 
-    if rules == [] and policies == [] and not only_retired_policies?,
+    unless has_entries?,
       do: raise(ArgumentError, "#{path}: must contain one or more [[rule]] or [[policy]] tables")
 
     rules ++ policies
   end
 
-  defp retired_policy?(policy),
-    do: is_map(policy) and Map.get(policy, "purpose") == "wait-effort-relief"
+  defp load_policy_entry(path, ordinal, policy, identity_manifest_sha, base_dir) do
+    raw_name = if is_map(policy), do: Map.get(policy, "name"), else: nil
+    name = if valid_name?(raw_name), do: raw_name, else: "##{ordinal}"
+    purpose = if is_map(policy), do: Map.get(policy, "purpose"), else: nil
+
+    cond do
+      not is_map(policy) ->
+        record_skipped_policy(path, base_dir, name, "policy must be a table")
+        nil
+
+      purpose in @retired_policy_purposes ->
+        record_skipped_policy(
+          path,
+          base_dir,
+          name,
+          ~s(purpose "#{purpose}" is retired in this version; the policy has no effect)
+        )
+
+        nil
+
+      purpose not in @policy_purposes ->
+        record_skipped_policy(
+          path,
+          base_dir,
+          name,
+          "unsupported purpose: #{inspect(purpose)}"
+        )
+
+        nil
+
+      true ->
+        try do
+          {:policy, validate_policy!(path, ordinal, policy, identity_manifest_sha)}
+        rescue
+          error ->
+            label =
+              if valid_name?(raw_name),
+                do: "policy #{inspect(raw_name)}",
+                else: "policy ##{ordinal}"
+
+            prefix = "#{path}: #{label}: "
+            reason = Exception.message(error) |> String.replace_prefix(prefix, "")
+            record_skipped_policy(path, base_dir, name, reason)
+            nil
+        end
+    end
+  end
+
+  defp record_skipped_policy(path, base_dir, name, reason) do
+    file = diagnostic_file(path, base_dir)
+    warning = ~s(#{file}: policy "#{name}": #{reason})
+    require Logger
+    Logger.warning(warning)
+    item = %{file: file, name: name, reason: reason, message: warning}
+
+    update_diagnostics(fn diagnostics ->
+      %{diagnostics | skipped_policies: [item | diagnostics.skipped_policies]}
+    end)
+  end
+
+  defp record_unavailable_verb(diagnostic) do
+    update_diagnostics(fn diagnostics ->
+      update_in(diagnostics.unavailable_verbs, &[diagnostic | &1])
+    end)
+  end
+
+  defp update_diagnostics(fun) do
+    current =
+      :persistent_term.get(@diagnostics_key, %{unavailable_verbs: [], skipped_policies: []})
+
+    :persistent_term.put(@diagnostics_key, fun.(current))
+  end
+
+  defp diagnostic_file(path, law_base) do
+    identity_root = Path.expand(Path.join(law_base, "identity"))
+    relative = Path.relative_to(Path.expand(path), identity_root)
+
+    if String.starts_with?(relative, "../"), do: Path.basename(path), else: relative
+  end
 
   defp validate_policy!(path, ordinal, policy, identity_manifest_sha) when is_map(policy) do
     raw_name = Map.get(policy, "name")
