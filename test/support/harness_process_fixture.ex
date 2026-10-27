@@ -1819,6 +1819,47 @@ defmodule Tightbeam.HarnessProcessFixture do
            end)
   end
 
+  defp scenario(43, ctx) do
+    key = {:claude, "shared", "live-identity-nil-pid"}
+    {_port, row} = launch_stubborn(ctx, key)
+
+    assert row.state == "running"
+    assert process_alive?(row.os_pid)
+    assert File.exists?(row.identity_path)
+    assert File.exists?(row.identity_path <> ".authority")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE harness_processes SET osPid = NULL, processGroupId = NULL WHERE launchId = ?1",
+        [row.launch_id]
+      )
+
+    assert [%{os_pid: nil, process_group_id: nil, state: "running"}] =
+             HarnessProcess.list(ctx.db)
+
+    boot_coordinator_once(ctx)
+
+    assert [
+             %{
+               state: "killed",
+               os_pid: pid,
+               process_group_id: process_group_id,
+               kill_sent_at: sent_at,
+               resolved_at: resolved_at
+             }
+           ] = HarnessProcess.list(ctx.db)
+
+    assert pid == row.os_pid
+    assert process_group_id == row.process_group_id
+    assert is_integer(sent_at)
+    assert is_integer(resolved_at)
+    refute process_alive?(pid)
+    refute HarnessProcess.fenced?(ctx.db, key)
+    refute File.exists?(row.identity_path)
+    refute File.exists?(row.identity_path <> ".authority")
+  end
+
   defp boot_coordinator_once(ctx) do
     {:ok, coordinator} =
       AdapterCoordinator.start_link(

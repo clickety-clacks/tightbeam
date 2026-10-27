@@ -687,6 +687,12 @@ defmodule Tightbeam.HarnessProcess do
           {:error, reason} -> unidentified(db, row, reason)
         end
 
+      {:error, :termination_unproved} ->
+        case recover_boot_identity(db, row) do
+          {:ok, recovered} -> reconcile_boot_row(db, recovered)
+          {:error, reason} -> unidentified(db, row, reason)
+        end
+
       {:error, reason} ->
         boot_uncertain(db, row, reason)
     end
