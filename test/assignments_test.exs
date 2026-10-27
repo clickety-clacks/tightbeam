@@ -50,6 +50,24 @@ defmodule Tightbeam.AssignmentsTest do
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
+  test "gateway opens and retires with supervision reminders off", ctx do
+    handlers = Gateway.handlers(%{db: ctx.db, supervision_interval_ms: :off, wake_tick_ms: 101})
+
+    assignment = handlers["assign"].(assign_call({:session, "holder"}, "off interval"))
+    assert assignment.id
+
+    retired =
+      handlers["retire"].(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: "holder",
+        params: %{}
+      })
+
+    assert retired.retired_session_keys == ["holder"]
+    assert Org.get(ctx.db, "holder").state == "retired"
+  end
+
   describe "attest notices to assignment openers" do
     test "an opener does not receive a separate notice for its own attest", ctx do
       assignment = handle(ctx, "assign", assign_call({:session, "holder"}, "self-opened"))

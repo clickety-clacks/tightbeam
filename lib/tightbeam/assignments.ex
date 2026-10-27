@@ -4432,14 +4432,15 @@ defmodule Tightbeam.Assignments do
   def effective_effect_kind(nil, nil), do: "code"
   def effective_effect_kind(nil, requested), do: requested
 
-  defp valid_supervision_interval(interval) when is_integer(interval) and interval > 0,
+  defp valid_supervision_interval(interval)
+       when (is_integer(interval) and interval > 0) or interval == :off,
     do: :ok
 
   defp valid_supervision_interval(_interval),
     do:
       error(
         "invalid_supervision_interval",
-        "supervisionIntervalMs must be a positive integer"
+        "supervisionIntervalMs must be a positive integer or off"
       )
 
   defp valid_brief(brief) when is_binary(brief) and brief != "", do: :ok
