@@ -577,10 +577,10 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
-  test "a pending dated continuation defers only its assignment's inactivity notice until due",
+  test "a pending dated continuation defers its assignment's inactivity notice",
        ctx do
     open_deadline!(ctx.db, "asg_inactive", System.system_time(:millisecond), 1_000)
-    due_at = System.system_time(:millisecond) + 60_000
+    due_at = System.system_time(:millisecond) + 3_600_000
 
     wake =
       Wakes.schedule(ctx.db, %{
@@ -627,11 +627,14 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, next_deadline.wake_id))
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
              )
+
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at >=
+             System.system_time(:millisecond) + 29 * 60_000
   end
 
   test "cancellation and assignment disposition end dated continuation coverage", ctx do
@@ -744,8 +747,8 @@ defmodule Tightbeam.SupervisionTest do
                end)
     end
 
-    earlier = schedule.("resume earlier", 60_000)
-    later = schedule.("resume later", 120_000)
+    earlier = schedule.("resume earlier", 3_600_000)
+    later = schedule.("resume later", 7_200_000)
     deadline = pending_deadline!(ctx.db, "asg_inactive")
 
     assert {:ok, _} =
@@ -760,13 +763,14 @@ defmodule Tightbeam.SupervisionTest do
     cancel.(earlier)
     restored = pending_deadline!(ctx.db, "asg_inactive")
     assert restored.due_at < earlier.due_at
+    assert restored.due_at >= System.system_time(:millisecond) + 29 * 60_000
 
     assert {:ok, _} =
              DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [restored.wake_id])
 
     assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, restored.wake_id))
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
