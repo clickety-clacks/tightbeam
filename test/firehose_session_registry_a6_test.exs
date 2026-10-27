@@ -294,6 +294,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
 
     _ = Org.rename(ctx.db, ctx.worker.session_key, "Hidden worker")
     sync_hub()
+
     assert_receive {:firehose_notice,
                     %{
                       "class" => "session.updated",

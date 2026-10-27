@@ -198,16 +198,19 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
       record(ctx.db, "eezo:/tmp/hidden")
       assert Hub.sequence(Hub, self()) == 1
       assert_receive {:trace, ^hub, :call, {Hub, :matches?, _}}
+
       assert_receive {:firehose_notice,
                       %{
                         "class" => "artifact.recorded",
                         "subscriptionId" => "matching",
                         "seq" => 1
                       }}
+
       :ok = Hub.delivered(Hub, self())
       :ok = Hub.register(Hub, self(), %{user_id: "flynn"})
       :ok = Artifacts.archive_session(ctx.db, "al_owner", ctx.work, ctx.archive)
       assert_receive {:trace, ^hub, :call, {Hub, :matches?, _}}
+
       assert_receive {:firehose_notice,
                       %{
                         "class" => "artifact.released",

@@ -427,6 +427,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     first_notice = put_in(first_notice, ["payload", "title"], large_title)
     Hub.publish(ctx.hub, first_notice)
     assert Hub.sequence(ctx.hub, self()) == 1
+
     assert %{in_flight: false, overflowed: false, queued: 1, seq: 1} =
              Hub.connection_stats(ctx.hub, self())
 
@@ -434,11 +435,11 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     second_notice = put_in(second_notice, ["payload", "title"], large_title)
     Hub.publish(ctx.hub, second_notice)
     assert Hub.sequence(ctx.hub, self()) == 2
+
     assert %{in_flight: false, overflowed: true, queued: 2, seq: 2} =
              Hub.connection_stats(ctx.hub, self())
 
-    assert_receive {:firehose_notice,
-                    %{"seq" => 1, "refs" => %{"workItemId" => "wi_large_1"}}}
+    assert_receive {:firehose_notice, %{"seq" => 1, "refs" => %{"workItemId" => "wi_large_1"}}}
     assert_receive :firehose_overflow
     refute_receive :firehose_overflow, 50
     refute_receive {:firehose_notice, _notice}, 50

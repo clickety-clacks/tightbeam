@@ -226,7 +226,8 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM devices")
   end
 
-  test "organization bearer subscriptions use their filters without user visibility checks", ctx do
+  test "organization bearer subscriptions use their filters without user visibility checks",
+       ctx do
     changes = connect(ctx, "/ws/changes?protocolVersion=2")
     send_frame(changes, %{type: "auth", token: "operator-fixture", asUser: "reader"})
     {auth_result, changes} = recv_frame(changes)
