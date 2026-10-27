@@ -6383,7 +6383,7 @@ defmodule Tightbeam.AssignmentsTest do
              )
 
     completion_call = attest_call({:session, "holder"}, producer.id, "completion")
-    assert :proceed = Rules.evaluate(ctx.db, completion_call)
+    assert :ok = Rules.evaluate(ctx.db, completion_call)
 
     unlinked_other_clean =
       assign_call({:user, "flynn"}, "later unlinked clean review", nil, work_item.id)
@@ -6405,7 +6405,7 @@ defmodule Tightbeam.AssignmentsTest do
                producer_refs
              )
 
-    assert :proceed = Rules.evaluate(ctx.db, completion_call)
+    assert :ok = Rules.evaluate(ctx.db, completion_call)
 
     completion_log =
       ExUnit.CaptureLog.capture_log(fn ->
