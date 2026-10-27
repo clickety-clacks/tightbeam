@@ -178,7 +178,7 @@ defmodule Tightbeam.EffortCheckinTest do
                  deadline.wake_id,
                  now,
                  now + 86_400_000,
-                 Tightbeam.JSON.encode!(["continue", "dismiss"])
+                 JSON.encode!(["continue", "dismiss"])
                ]
              )
 
