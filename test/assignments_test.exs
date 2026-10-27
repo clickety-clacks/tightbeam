@@ -3385,7 +3385,10 @@ defmodule Tightbeam.AssignmentsTest do
              Enum.filter(Wakes.list_pending(ctx.db), fn wake ->
                wake.assignment_id == opener_work.id and wake.session_key == "opener" and
                  wake.consumer == "prompt" and
-                 String.starts_with?(wake.obligation_ref || "", "assignment-inactivity-episode-v1:")
+                String.starts_with?(
+                  wake.obligation_ref || "",
+                  "assignment-inactivity-episode-v1:"
+                )
              end)
 
     assert :appended = deliver_terminal_notice(ctx.db, holder_notice)
