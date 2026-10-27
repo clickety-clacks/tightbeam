@@ -1183,6 +1183,16 @@ COMMANDS:
       After: add the host to an archetype's `where`.
         tightbeam assimilate work-1.local --as-user flynn
 
+  skill list | skill install [--skill <name>] [--dir <skillsDir>]
+      Runs locally; needs no gateway. list shows the agent skills shipped with
+      this CLI and the Tightbeam version each one was written for.
+      install copies this release's agent skills into the user skills
+      directory of each supported agent harness configured in your home
+      directory, or into --dir only. Harnesses that are not set up are
+      skipped, never created. It replaces earlier copies of the same skills
+      and reports the version each replaced copy was written for. Start a
+      fresh agent session afterwards.
+
 DISCOVERY: the CLI walks up from cwd for .tightbeam-session first, then uses
   TIGHTBEAM_URL + TIGHTBEAM_TOKEN, then
   <TIGHTBEAM_BASE_DIR|TIGHTBEAM_HOME|~/.tightbeam>/gateway.json.
@@ -5702,6 +5712,7 @@ mod tests {
                 "sentinel",
                 "session-connect",
                 "session-reparent",
+                "skill",
                 "session-po-set",
                 "settle-turn",
                 "repair-assignment",

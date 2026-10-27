@@ -1,12 +1,17 @@
 ---
 name: tightbeam-cli
-description: Operate an existing Tightbeam organization through its current-line CLI. Use when an external agent has the tightbeam executable and must read assigned work, record results, or contact Main without a served Tightbeam identity.
+description: Work an assigned Tightbeam card through the tightbeam CLI. Use when an external agent holds a Tightbeam session credential in its worktree and must read its assignment, record results, ask its owner for decisions, or contact Main without a served Tightbeam identity.
 ---
 
-# Operate Tightbeam through the CLI
+# Work an assigned card through the Tightbeam CLI
+
+Written for Tightbeam 0.1.12. If `tightbeam --version` prints a different version, run
+`tightbeam skill install` to replace this skill with the edition that ships with the
+installed CLI, then start a fresh agent session.
 
 Use Tightbeam as the record and coordination layer for the assignment. Run only the
 operations that the assignment authorizes. Ask Main to perform broader organization work.
+Main is the root session of the human who owns the work.
 
 ## Records
 
@@ -20,10 +25,12 @@ custody across lost context; recover from them before acting.
 
 Run the CLI from the assignment worktree. Let it discover the nearest
 `.tightbeam-session`. Do not print, parse, copy, replace, or commit that credential.
+`tightbeam identity current` prints this session's key without the credential.
 
 Before the first operation in a session, run `tightbeam --help`. Run it again whenever
-you need command or flag syntax. The `tightbeam` executable writes JSON results to stdout.
-A nonzero exit writes the failure to stderr.
+you need command or flag syntax; `tightbeam help <command>` prints one command's entry.
+The `tightbeam` executable writes JSON results to stdout. A nonzero exit writes the
+failure to stderr.
 
 Use a session credential whose session holds exactly one role. Omit `--as`, `--as-user`,
 and `--as-process`; the CLI and gateway derive the session principal and its one role. If
@@ -40,8 +47,10 @@ Recover the card in this order:
 3. Use `tightbeam work-item-get <work-item-id>` and read its returned assignments.
 4. Use `tightbeam attests <assignment-id>` and `tightbeam artifacts --work-item
    <work-item-id>` to read the evidence already on record.
-5. Use `tightbeam work-item-trace <work-item-id>` when you need the full durable timeline.
-6. Use `tightbeam list` only to inspect the visible organization and current session
+5. Use `tightbeam assignment-get <assignment-id>` when you need the assignment's current
+   state or an open cannot-proceed block.
+6. Use `tightbeam work-item-trace <work-item-id>` when you need the full durable timeline.
+7. Use `tightbeam list` only to inspect the visible organization and current session
    context. Do not derive the owner from it. Read `workItem.ownerUserId` from the named
    `work-item-get` result.
 
@@ -72,15 +81,18 @@ Use `tightbeam attest <assignment-id> --kind ... --note "..."` for the assignmen
   assignment to close.
 - File `cannot-proceed` with the exact reason when the obligation cannot move under current
   authority. The card stays open and routes one decision to its opener.
-- File a `verdict` only when the assignment authorizes that review judgment.
+- File a `verdict` only when the assignment authorizes that review judgment. A verdict note
+  is capped at 2,000 characters; record a longer judgment as an artifact and cite it.
 
 Name the operation, observed result, relevant identifiers, and non-secret evidence. Do not
 claim success from process output alone when the durable row should show the effect. Read
-the assignment again after a mutation when the effect matters.
+the assignment again after a mutation when the effect matters. Pass `--commit-refs` when
+the result is a commit that the record must name.
 
 Use `tightbeam artifact-record` when required evidence lives outside the assignment
 worktree. Record the evidence kind, title, absolute host path, work-item identifier, and
-SHA-256 digest. Keep the file in the custody location that the assignment requires. Use
+SHA-256 digest; add `--produced-by-assignment <assignment-id>` when this assignment
+produced it. Keep the file in the custody location that the assignment requires. Use
 `tightbeam artifacts` to recover its pointer later.
 
 Keep tokens and session-file contents out of prose, stdout, stderr, transcripts, committed
@@ -94,9 +106,14 @@ identifiers and one bounded request. Do not infer the owner from `tightbeam list
 
 Target another agent by role when its office should answer. Target a session only when that
 exact session incarnation matters. A wake carries a prompt; it is not an empty notification.
+Send a wake only when no record already carries the fact to the recipient; every wake costs
+its recipient a turn. `--class` labels urgency for the recipient's batch; it does not make
+the recipient run sooner. When your instruction to an assignment's holder changes, send the
+correction with `--assignment <assignment-id> --replace-queued`, or withdraw a pending wake
+with `tightbeam cancel-wake <wake-id>`.
 
 Use `tightbeam operator-ask --question "..." --note "..." --assignment <assignment-id>`
-when work needs an owner decision. Follow the operating manual's Authority section:
+when work needs an owner decision:
 the question contains everything needed to understand the choice; the note holds
 supporting technical detail and references. For example, substitute the actual
 assignment and supporting references in this illustrative product choice:
@@ -117,13 +134,16 @@ answer. Do not bury a decision need in an attest or poll a human.
 Choose the wait instrument by what can observe the event:
 
 1. For an in-organization row, subscribe with a condition wake that names the existing fact
-   kind and scope. Supply a fallback. Do not poll the row on a timer. Ask Main when no
-   established fact names the event.
+   kind and scope (`--when-fact <kind> --when-scope <scope>`), or a dependency wait
+   (`--assignment <assignment-id> --predicate '<JSON>'`). Supply a fallback; three hours
+   (`--fallback-after 3h`) is the usual default. Do not poll the row on a timer. Ask Main
+   when no established fact names the event.
 2. For an external system that Tightbeam cannot observe, schedule a timed wake to this
    session with the exact probe to run. Record each probe result. After three unchanged
    probes, report the stuck boundary to the assignment opener.
 3. For a human answer, use a decision request. Do not schedule a human poll.
-4. To resume your own work at a chosen time, schedule a timed wake to this session.
+4. To resume your own work, wake this session: `--after-turn` continues as soon as the
+   current turn ends, and `--after <duration>` resumes at a chosen time.
 
 Before a turn ends with the assignment open, leave one valid liveness receipt: a material
 progress row, a bounded checkpoint, a completion, a cannot-proceed filing, or a concrete continuation
