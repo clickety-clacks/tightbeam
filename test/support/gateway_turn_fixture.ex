@@ -107,7 +107,7 @@ defmodule Tightbeam.GatewayTurnFixture do
 
     def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, false, parent}
 
-    def handle_call({:current_model, "harness-1"}, _from, parent),
+    def handle_call({:current_model, _sid}, _from, parent),
       do: {:reply, {:ok, Model.new("gpt-5.6-sol", effort: "medium")}, parent}
 
     def handle_call({:load_session, _sid, _model, _cwd, _mcp_servers, _guidance}, _from, parent),
