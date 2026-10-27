@@ -2040,6 +2040,184 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     )
   end
 
+  test "credentialless and authenticated clients read and receive changes through a real gateway",
+       ctx do
+    session_key = ctx.admin_session.session_key
+    user_message_id = "loopback-observer-question"
+    reply_message_id = "loopback-observer-answer"
+
+    query!(
+      ctx.db,
+      """
+      INSERT INTO messages
+        (id, sessionKey, role, content, timestamp, sender, llmVisibleMessageId, attachments)
+      VALUES (?1, ?2, 'user', 'loopback question', 1, 'user:flynn', ?1, '[]')
+      """,
+      [user_message_id, session_key]
+    )
+
+    query!(
+      ctx.db,
+      """
+      INSERT INTO messages
+        (id, sessionKey, role, content, timestamp, sender, replyToMessageId,
+         llmVisibleMessageId, attachments)
+      VALUES (?1, ?2, 'assistant', 'loopback answer', 2, 'agent:main', ?3, ?1, '[]')
+      """,
+      [reply_message_id, session_key, user_message_id]
+    )
+
+    Devices.add_user(ctx.db, "loopback-observer", false)
+
+    assert {:ok, true, _marker} =
+             ReadMarkers.set(ctx.db, "loopback-observer", "core-scope", "observer-cursor")
+
+    bandit =
+      start_supervised!(
+        {Bandit,
+         plug: {Router, Router.init(ctx.opts)}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
+      )
+
+    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    {:ok, observer_ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
+
+    :ok =
+      WS.send_text(
+        observer_ws,
+        JSON.encode!(%{
+          "type" => "subscribe",
+          "protocolVersion" => 2,
+          "subscriptionId" => "credentialless-observer",
+          "filters" => %{"classes" => ["work_item.created"]}
+        })
+      )
+
+    {:ok, {:text, observer_ready}, observer_ws} = WS.recv(observer_ws, 2_000)
+    assert JSON.decode!(observer_ready)["type"] == "subscription_ready"
+
+    {:ok, authenticated_ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
+
+    :ok =
+      WS.send_text(
+        authenticated_ws,
+        JSON.encode!(%{"type" => "auth", "token" => ctx.token})
+      )
+
+    {:ok, {:text, auth_result}, authenticated_ws} = WS.recv(authenticated_ws, 2_000)
+    assert JSON.decode!(auth_result)["success"] == true
+
+    :ok =
+      WS.send_text(
+        authenticated_ws,
+        JSON.encode!(%{
+          "type" => "subscribe",
+          "protocolVersion" => 2,
+          "subscriptionId" => "authenticated-client",
+          "filters" => %{"classes" => ["work_item.created"]}
+        })
+      )
+
+    {:ok, {:text, authenticated_ready}, authenticated_ws} = WS.recv(authenticated_ws, 2_000)
+    assert JSON.decode!(authenticated_ready)["type"] == "subscription_ready"
+
+    {observer_sessions_status, _headers, observer_sessions_body} =
+      http_get_without_authorization(port, "/api/sessions")
+
+    {authenticated_sessions_status, _headers, authenticated_sessions_body} =
+      http_get(port, "/api/sessions", ctx.opts[:cli_token])
+
+    assert observer_sessions_status == 200
+    assert authenticated_sessions_status == 200
+
+    assert JSON.decode!(observer_sessions_body)["items"] ==
+             JSON.decode!(authenticated_sessions_body)["items"]
+
+    message_path = "/api/sessions/#{session_key}/messages"
+
+    {observer_messages_status, _headers, observer_messages_body} =
+      http_get_without_authorization(port, message_path)
+
+    {authenticated_messages_status, _headers, authenticated_messages_body} =
+      http_get(port, message_path, ctx.opts[:cli_token])
+
+    assert observer_messages_status == 200
+    assert authenticated_messages_status == 200
+
+    observer_message_ids =
+      JSON.decode!(observer_messages_body)["items"] |> Enum.map(& &1["id"])
+
+    assert user_message_id in observer_message_ids
+    assert reply_message_id in observer_message_ids
+
+    assert JSON.decode!(observer_messages_body)["items"] ==
+             JSON.decode!(authenticated_messages_body)["items"]
+
+    {observer_detail_status, _headers, observer_detail_body} =
+      http_get_without_authorization(port, message_path <> "/#{reply_message_id}")
+
+    {authenticated_detail_status, _headers, authenticated_detail_body} =
+      http_get(port, message_path <> "/#{reply_message_id}", ctx.opts[:cli_token])
+
+    assert observer_detail_status == 200
+    assert authenticated_detail_status == 200
+
+    assert JSON.decode!(observer_detail_body)["item"] ==
+             JSON.decode!(authenticated_detail_body)["item"]
+
+    {observer_markers_status, _headers, observer_markers_body} =
+      http_get_without_authorization(port, "/api/read-markers")
+
+    {authenticated_markers_status, _headers, authenticated_markers_body} =
+      http_get(port, "/api/read-markers", ctx.opts[:cli_token])
+
+    assert observer_markers_status == 200
+    assert authenticated_markers_status == 200
+
+    observer_marker_users =
+      JSON.decode!(observer_markers_body)["items"] |> Enum.map(& &1["userId"])
+
+    assert "flynn" in observer_marker_users
+    assert "loopback-observer" in observer_marker_users
+
+    authenticated_marker_users =
+      JSON.decode!(authenticated_markers_body)["items"] |> Enum.map(& &1["userId"])
+
+    assert authenticated_marker_users == ["flynn"]
+
+    {observer_marker_detail_status, _headers, observer_marker_detail_body} =
+      http_get_without_authorization(port, "/api/read-markers/core-scope")
+
+    {authenticated_marker_detail_status, _headers, authenticated_marker_detail_body} =
+      http_get(port, "/api/read-markers/core-scope", ctx.opts[:cli_token])
+
+    assert observer_marker_detail_status == 200
+    assert authenticated_marker_detail_status == 200
+
+    observer_detail_users =
+      JSON.decode!(observer_marker_detail_body)["items"] |> Enum.map(& &1["userId"])
+
+    assert observer_detail_users == ["flynn", "loopback-observer"]
+    assert JSON.decode!(authenticated_marker_detail_body)["item"]["userId"] == "flynn"
+
+    work =
+      WorkItems.__handle__(
+        ctx.db,
+        "work-item-create",
+        firehose_call("work-item-create", nil, %{title: "Credentialless loopback event"})
+      )
+
+    {observer_raw, observer_ws} = receive_raw_change(observer_ws, "work_item.created")
+
+    {authenticated_raw, authenticated_ws} =
+      receive_raw_change(authenticated_ws, "work_item.created")
+
+    assert JSON.decode!(observer_raw)["refs"]["workItemId"] == work.id
+    assert JSON.decode!(authenticated_raw)["refs"]["workItemId"] == work.id
+
+    :ok = WS.close(observer_ws)
+    :ok = WS.close(authenticated_ws)
+  end
+
   test "credentialless marker reads apply AU2 selection and all-user collection", ctx do
     Devices.add_user(ctx.db, "alice", false)
     Devices.add_user(ctx.db, "bob", false)
@@ -3090,6 +3268,13 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     |> Router.call(Router.init(ctx.opts))
   end
 
+  defp get_without_authorization(ctx, path, headers \\ []) do
+    Enum.reduce(headers, conn(:get, path), fn {name, value}, conn ->
+      put_req_header(conn, name, value)
+    end)
+    |> Router.call(Router.init(ctx.opts))
+  end
+
   defp traced_get(ctx, path, bearer) do
     flush_core_detail_trace()
     traced = %{ctx | opts: Keyword.put(ctx.opts, :core_detail_trace, self())}
@@ -3602,6 +3787,15 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         [{:timeout, 2_000}],
         body_format: :binary
       )
+
+    {status, headers, body}
+  end
+
+  defp http_get_without_authorization(port, path) do
+    url = String.to_charlist("http://127.0.0.1:#{port}#{path}")
+
+    {:ok, {{_version, status, _reason}, headers, body}} =
+      :httpc.request(:get, {url, []}, [{:timeout, 2_000}], body_format: :binary)
 
     {status, headers, body}
   end

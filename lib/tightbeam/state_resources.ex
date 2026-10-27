@@ -696,6 +696,16 @@ defmodule Tightbeam.StateResources do
   defp wake_projection_in_txn(txn, id),
     do: Wakes.delivery_projection_in_txn(txn, id)
 
+  def query_session(db, %{key: id, principal: %{kind: "observer"} = principal})
+      when is_binary(id) do
+    trace_core_detail(principal, {:au4_visibility, "sessions"})
+
+    case observed_query(db, principal, @session_select <> " WHERE sessions.sessionKey = ?1", [id]) do
+      [row] -> session_query_row(row)
+      [] -> nil
+    end
+  end
+
   def query_session(
         db,
         %{key: id, principal: %{kind: kind, id: principal_id, is_admin: is_admin} = principal}
@@ -753,6 +763,7 @@ defmodule Tightbeam.StateResources do
 
     {where, params} =
       cond do
+        principal.kind == "observer" -> {nil, []}
         principal.is_admin -> {nil, []}
         principal.kind == "session" -> {nil, []}
         true -> {"sessions.ownerUserId = ?", [principal.id]}

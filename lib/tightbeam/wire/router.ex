@@ -625,6 +625,10 @@ defmodule Tightbeam.Wire.Router do
     d1_collection(conn, Map.fetch!(@d1_resources, :harness_processes))
   end
 
+  get "/api/read-markers" do
+    read_marker_index(conn)
+  end
+
   get "/api/read-markers/:scope_key" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :read_markers), scope_key)
   end
@@ -925,7 +929,7 @@ defmodule Tightbeam.Wire.Router do
   defp core_detail(conn, spec, raw_key) do
     with {:ok, auth} <-
            core_detail_operation(conn, spec.resource, :bearer_auth, fn ->
-             state_bearer_auth(conn)
+             core_detail_auth(conn, spec.resource)
            end),
          {:ok, query} <-
            core_detail_operation(conn, spec.resource, :query_decode, fn ->
@@ -936,7 +940,7 @@ defmodule Tightbeam.Wire.Router do
              conn,
              spec.resource,
              :principal_resolution,
-             fn -> state_principal(auth, query, conn) end
+             fn -> core_detail_route_principal(auth, query, conn, spec.resource) end
            ),
          :ok <-
            core_detail_operation(
@@ -1194,7 +1198,7 @@ defmodule Tightbeam.Wire.Router do
   defp session_index(conn) do
     with {:ok, auth} <-
            core_detail_operation(conn, "sessions", :bearer_auth, fn ->
-             state_bearer_auth(conn)
+             core_detail_auth(conn, "sessions")
            end),
          {:ok, query} <-
            core_detail_operation(conn, "sessions", :query_decode, fn ->
@@ -1202,7 +1206,7 @@ defmodule Tightbeam.Wire.Router do
            end),
          {:ok, principal} <-
            core_detail_operation(conn, "sessions", :principal_resolution, fn ->
-             state_principal(auth, query, conn)
+             core_detail_route_principal(auth, query, conn, "sessions")
            end),
          :ok <-
            core_detail_operation(conn, "sessions", :request_validation, fn ->
@@ -1604,7 +1608,7 @@ defmodule Tightbeam.Wire.Router do
              :latest
            ),
          session when not is_nil(session) <-
-           StateResources.query_session(db(conn), %{key: session_key, principal: principal}),
+           session_collection_session(db(conn), session_key, principal),
          page_result <- apply(StateResources, query_fun, [db(conn), session_key, boundary, limit]),
          page <-
            state_page_metadata(
