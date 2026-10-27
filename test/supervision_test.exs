@@ -150,6 +150,34 @@ defmodule Tightbeam.SupervisionTest do
     assert holder == ctx.holder.session_key
   end
 
+  test "boot reconciliation ignores a stored one-second entitlement", ctx do
+    opened_at = System.system_time(:millisecond) - 29 * 60_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
+               "asg_inactive",
+               opened_at
+             ])
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO supervision_entitlements
+                 (assignmentId,generation,dueAt,state,basisKind,basisId,cause,principal,supervisionIntervalMs)
+               VALUES ('asg_inactive',1,?1,'armed','assignment_open','asg_inactive',
+                 'assignment_open','process:tightbeam',1000)
+               """,
+               [opened_at + 1_000]
+             )
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+    assert deadline.due_at == opened_at + 1_800_000
+    assert {:ok, %{"intervalMs" => 1_800_000}} = JSON.decode(deadline.prompt)
+    assert deadline.due_at > System.system_time(:millisecond)
+  end
+
   test "off reminders retract prompts and leave one silent deadline", ctx do
     prior_interval = Application.get_env(:tightbeam, :supervision_interval_ms)
 
