@@ -444,7 +444,7 @@ function rulePreflight(candidate, baseDir) {
     makeReadOnly(identityCopy);
 
     const marker = 'TIGHTBEAM_RULE_PREFLIGHT_JSON:';
-    const expression = `IO.puts(${JSON.stringify(marker)} <> Jason.encode!(Tightbeam.RulePreflight.run()))`;
+    const expression = `IO.puts(${JSON.stringify(marker)} <> JSON.encode!(Tightbeam.RulePreflight.run()))`;
     const env = { ...process.env };
     for (const name of Object.keys(env)) {
       if (/^(TIGHTBEAM_|RELEASE_|ERL_|ERTS_)/.test(name)) delete env[name];

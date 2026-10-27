@@ -6585,7 +6585,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp supervision_interval_ms(config) do
-    Map.get(config, :supervision_interval_ms, Map.get(config, :wake_tick_ms, 1_000))
+    Map.get(config, :supervision_interval_ms, Map.get(config, :wake_tick_ms, 1_800_000))
   end
 
   defp cancel_wake_result(db, call, wake_id) do
