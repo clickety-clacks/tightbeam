@@ -185,6 +185,11 @@ defmodule Tightbeam.StateResources do
   LEFT JOIN sessions AS session_owner ON session_owner.sessionKey=m.sessionKey
   """
 
+  @read_marker_select """
+  SELECT userId, scopeKey, marker, updatedAt
+  FROM read_markers
+  """
+
   alias Tightbeam.{
     AdminProjection,
     Artifacts,
