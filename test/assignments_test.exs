@@ -3376,15 +3376,6 @@ defmodule Tightbeam.AssignmentsTest do
       |> Map.put(:session_key, "opener")
       |> then(&handle(ctx, "assign", &1))
 
-    blocked_assignment =
-      assign_call({:session, "opener"}, "blocked work", nil, item.id)
-      |> then(&handle(ctx, "assign", &1))
-
-    blocked =
-      attest_call({:session, "holder"}, blocked_assignment.id, "cannot-proceed")
-      |> put_in([:params, :note], "awaiting the opener's disposition")
-      |> then(&handle(ctx, "attest", &1))
-
     # This fixture configures a one-second reminder interval, so let its quiet
     # period elapse before delivering the holder reminder.
     Process.sleep(1_100)
@@ -3394,7 +3385,10 @@ defmodule Tightbeam.AssignmentsTest do
              Enum.filter(Wakes.list_pending(ctx.db), fn wake ->
                wake.assignment_id == opener_work.id and wake.session_key == "opener" and
                  wake.consumer == "prompt" and
-                 String.starts_with?(wake.obligation_ref || "", "assignment-inactivity-episode-v1:")
+                 String.starts_with?(
+                   wake.obligation_ref || "",
+                   "assignment-inactivity-episode-v1:"
+                 )
              end)
 
     assert :appended = deliver_terminal_notice(ctx.db, holder_notice)
@@ -3412,6 +3406,19 @@ defmodule Tightbeam.AssignmentsTest do
                "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt' AND sessionKey<>'opener' AND obligationRef GLOB 'assignment-inactivity-episode-v1:*'",
                [opener_work.id]
              )
+
+    # Keep the decision wake out of the reminder carrier so this case exercises
+    # cancellation of a still-pending wake after the opener's topology changes.
+    blocked_assignment =
+      assign_call({:session, "opener"}, "blocked work", nil, item.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    blocked =
+      attest_call({:session, "holder"}, blocked_assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "awaiting the opener's disposition")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Wakes.get(ctx.db, blocked.decisionWake.wake_id).state == "pending"
 
     assert {:ok, [["standing"]]} =
              DB.query(
