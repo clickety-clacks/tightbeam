@@ -2292,7 +2292,12 @@ defmodule Tightbeam.Acp.Adapter do
 
     case Map.fetch(state.models, sid) do
       {:ok, %Model{} = cached} ->
-        if readback_confirms_model?(%{"configOptions" => options}, state.preset, cached, state.harness) do
+        if readback_confirms_model?(
+             %{"configOptions" => options},
+             state.preset,
+             cached,
+             state.harness
+           ) do
           remember_confirmed_config_model(state, sid, cached, options)
         else
           remember_reported_config_model(state, sid, options)
