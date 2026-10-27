@@ -1013,7 +1013,7 @@ defmodule Tightbeam.Acp.Adapter do
           {:ok, verified_result} ->
             case confirmed_public_model(verified_result, state.preset, model) do
               %Model{} = public ->
-                {:ok, %{model | context: public.context || model.context}}
+                {:ok, %{model | context: public.context}}
 
               nil ->
                 verified_model_mismatch(
@@ -1261,7 +1261,7 @@ defmodule Tightbeam.Acp.Adapter do
            apply_verified_effort(state, sid, model.effort, model_result, request_timeout) do
       case confirmed_public_model(verified_result, state.preset, model) do
         %Model{} = public ->
-          {:ok, %{model | context: public.context || model.context}}
+          {:ok, %{model | context: public.context}}
 
         nil ->
           verified_model_mismatch(verified_result, state.preset, "model", Model.to_ref(model))
@@ -2061,7 +2061,7 @@ defmodule Tightbeam.Acp.Adapter do
               {:ok,
                %{
                  model_ref
-                 | context: public_model.context || model_ref.context,
+                 | context: public_model.context,
                    effort: applied_model.effort
                }}
 
