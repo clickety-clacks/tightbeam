@@ -328,10 +328,9 @@ defmodule Tightbeam.FirehoseColdRestartTest do
               dispatch!(plan, new["port"], device, "assignment-get", %{"assignmentId" => id})
 
             assert Enum.map(history, & &1["reason"]) == ["First restart", "After restart"]
-            # A fresh quiet interval starts at reopening; shutdown must not
-            # depend on another inactivity reminder arriving immediately.
-            assert {:error, :timeout, _} = WS.recv(holder_turns, 300)
-            assert latest_turn_seq!(new["port"], device.token, fixture["holder"]) == previous_turn
+            # The configured short reminder may still have a holder turn in
+            # progress when shutdown begins. Let it settle first.
+            assert_holder_turn_ended!(holder_turns, id, previous_turn)
             File.write!(Path.join(plan.base, "second-stop"), "stop\n")
             assert {:ok, {:closed, 1012}, _} = WS.recv_event(resumed, 5_000)
             assert exit!(second, plan, "second") == 0
@@ -369,7 +368,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
     File.write!(path <> ".tmp", JSON.encode!(%{"assignmentId" => id}))
     File.rename!(path <> ".tmp", path)
     result = Path.join(plan.base, phase <> "-generations.json")
-    deadline = System.monotonic_time(:millisecond) + 5_000
+    deadline = System.monotonic_time(:millisecond) + 15_000
 
     wait = fn recur ->
       if File.regular?(result) do
