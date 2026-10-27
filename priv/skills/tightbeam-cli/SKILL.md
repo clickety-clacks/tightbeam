@@ -113,7 +113,7 @@ correction with `--assignment <assignment-id> --replace-queued`, or withdraw a p
 with `tightbeam cancel-wake <wake-id>`.
 
 Use `tightbeam operator-ask --question "..." --note "..." --assignment <assignment-id>`
-when work needs an owner decision. Follow the operating manual's Authority section:
+when work needs an owner decision:
 the question contains everything needed to understand the choice; the note holds
 supporting technical detail and references. For example, substitute the actual
 assignment and supporting references in this illustrative product choice:
