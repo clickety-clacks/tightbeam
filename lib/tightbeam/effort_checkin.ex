@@ -168,7 +168,7 @@ defmodule Tightbeam.EffortCheckin do
     Map.get(
       config,
       :effort_checkins_enabled,
-      Application.get_env(:tightbeam, :effort_checkins_enabled, true)
+      Application.get_env(:tightbeam, :effort_checkins_enabled, false)
     ) == true
   end
 
@@ -525,10 +525,14 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   @spec deadline(DB.server(), map(), Wakes.wake()) :: :ok
-  def deadline(db, _config, wake) do
-    case DB.transaction(db, fn txn -> deadline_in_txn(txn, wake) end) do
-      {:ok, _request} -> :ok
-      {:error, error} -> raise error
+  def deadline(db, config, wake) do
+    if enabled?(config) do
+      case DB.transaction(db, fn txn -> deadline_in_txn(txn, wake) end) do
+        {:ok, _request} -> :ok
+        {:error, error} -> raise error
+      end
+    else
+      :ok
     end
   end
 
@@ -554,9 +558,6 @@ defmodule Tightbeam.EffortCheckin do
 
       not authorized?(call.principal, request) ->
         error("not_authorized", "current expecter required")
-
-      not enabled?(config) ->
-        error("disabled", "effort check-ins are disabled")
 
       request.status == "ruled" and request.decision == action and request.ruled_by == actor ->
         {:ok, :ok} =
@@ -927,7 +928,7 @@ defmodule Tightbeam.EffortCheckin do
           current.ruled_by == actor ->
         current
 
-      action == "dismiss" and
+      action == "dismiss" and enabled?(config) and
           not prepared_rearms_current?(
             txn,
             generation_for_assignment_in_txn(
@@ -976,27 +977,31 @@ defmodule Tightbeam.EffortCheckin do
 
           case action do
             "continue" ->
-              session = session_in_txn(txn, generation.holder_key)
+              if enabled?(config) do
+                session = session_in_txn(txn, generation.holder_key)
 
-              insert_generation(
-                txn,
-                config,
-                current.assignment_id,
-                session,
-                generation.root,
-                generation.baseline,
-                generation.generation + 1,
-                min(generation.multiplier * 2, 4),
-                generation.agent_prodded
-              )
+                insert_generation(
+                  txn,
+                  config,
+                  current.assignment_id,
+                  session,
+                  generation.root,
+                  generation.baseline,
+                  generation.generation + 1,
+                  min(generation.multiplier * 2, 4),
+                  generation.agent_prodded
+                )
+              end
 
             "dismiss" ->
-              apply_prepared_rearms_in_txn(
-                txn,
-                config,
-                generation.holder_key,
-                fresh
-              )
+              if enabled?(config) do
+                apply_prepared_rearms_in_txn(
+                  txn,
+                  config,
+                  generation.holder_key,
+                  fresh
+                )
+              end
           end
 
           request_for_id(txn, current.id)

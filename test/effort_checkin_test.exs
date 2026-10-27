@@ -115,7 +115,7 @@ defmodule Tightbeam.EffortCheckinTest do
       Tightbeam.Application.children()
       |> Enum.find(&match?({Tightbeam.Boot, _}, &1))
 
-    assert production_config.effort_checkins_enabled
+    refute production_config.effort_checkins_enabled
     assert production_config.effort_checkin_horizon_ms == 86_400_000
     refute Application.get_env(:tightbeam, :effort_checkins_enabled)
     refute Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
@@ -127,7 +127,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     refute Map.has_key?(config, :effort_checkins_enabled)
     refute Map.has_key?(config, :effort_checkin_horizon_ms)
-    assert EffortCheckin.enabled?(config)
+    refute EffortCheckin.enabled?(config)
 
     %{ctx | config: config}
   end
@@ -146,222 +146,89 @@ defmodule Tightbeam.EffortCheckinTest do
     assert "assignmentId" in Enum.map(columns, &Enum.at(&1, 1))
   end
 
-  @tag :real_default_effort_checkin
-  test "the real default stays silent after an unassigned holder turn", ctx do
+  @tag :effort_checkin_disabled_behavior
+  test "the real default does not arm check-ins for new assignments", ctx do
     ctx = real_default_context!(ctx)
-    item = work_item!(ctx.db, "default check-in with holder activity")
+    item = work_item!(ctx.db, "default check-ins are disabled")
 
     assigned =
       assignment(ctx, "assign", {:user, "h1"}, "holder", %{
-        subject: "default check-in with holder activity",
-        brief: "default check-in with holder activity",
+        subject: "default check-ins are disabled",
+        brief: "default check-ins are disabled",
         work_item_id: item.id
       })
 
     assert is_binary(assigned.id)
 
-    assert [
-             [
-               1,
-               "armed",
-               wake_id,
-               watermark,
-               artifact_watermark,
-               attest_watermark,
-               work_item_watermark,
-               armed_at,
-               horizon,
-               multiplier,
-               due_at
-             ]
-           ] =
-             rows(
-               ctx.db,
-               """
-               SELECT g.generation,g.state,g.wakeId,g.terminalSeqWatermark,
-                      g.artifactWatermark,g.attestWatermark,g.workItemWatermark,
-                      g.armedAt,g.baseHorizonMs,g.multiplier,w.dueAt
-               FROM effort_checkin_generations AS g
-               JOIN wakes AS w ON w.wakeId=g.wakeId
-               WHERE g.assignmentId=?1 AND g.generation=1
-               """,
-               [assigned.id]
-             )
-
-    assert horizon == 86_400_000
-    assert multiplier == 1
-    assert due_at - armed_at == horizon * multiplier
-    assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1",
+             [assigned.id]
+           ) == [[0]]
 
     assert rows(
              ctx.db,
-             "SELECT COUNT(*) FROM artifacts WHERE workItemId=?1 AND createdBySession=?2 AND rowid>?3",
-             [item.id, "holder", artifact_watermark]
+             "SELECT COUNT(*) FROM wakes WHERE consumer='effort_probe' AND assignmentId=?1",
+             [assigned.id]
            ) == [[0]]
-
-    assert rows(ctx.db, "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND rowid>?2", [
-             assigned.id,
-             attest_watermark
-           ]) == [[0]]
 
     assert rows(
              ctx.db,
-             "SELECT COUNT(*) FROM work_item_events WHERE workItemId=?1 AND id>?2 AND kind='metadata'",
-             [item.id, work_item_watermark]
+             "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1 AND kind='effort'",
+             [assigned.id]
            ) == [[0]]
 
-    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND seq>?2", [
-             "holder",
-             watermark
-           ]) == [[0]]
-
-    terminal_turn(ctx.db, "holder", "delivered")
-
-    assert [[nil, "delivered", turn_seq]] =
-             rows(
-               ctx.db,
-               "SELECT assignmentId,status,seq FROM turns WHERE sessionKey=?1 AND seq>?2 ORDER BY seq",
-               ["holder", watermark]
-             )
-
-    assert turn_seq > watermark
-    assert System.system_time(:millisecond) - armed_at < horizon
-
-    scheduler = start_default_checkin_scheduler!(ctx.config)
-    # The persisted wake above proves the default 24-hour deadline. Move only
-    # that deadline into the past to exercise the real due callback promptly.
-    make_wake_due!(ctx.db, wake_id)
-    assert :ok = Wakes.fire_due(scheduler)
-
-    assert %{state: "fired"} = Wakes.get(ctx.db, wake_id)
-
-    assert [[1, "probed"], [2, "armed"]] ==
-             rows(
-               ctx.db,
-               "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
-               [assigned.id]
-             )
-
-    assert silent_rearm(ctx.db, assigned.id)
     assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assigned.id)) == []
-
-    assert [[rearmed_at, rearmed_horizon, rearmed_due_at]] =
-             rows(
-               ctx.db,
-               """
-               SELECT g.armedAt,g.baseHorizonMs,w.dueAt
-               FROM effort_checkin_generations AS g
-               JOIN wakes AS w ON w.wakeId=g.wakeId
-               WHERE g.assignmentId=?1 AND g.generation=2
-               """,
-               [assigned.id]
-             )
-
-    assert rearmed_horizon == horizon
-    assert rearmed_due_at - rearmed_at == horizon
   end
 
-  @tag :real_default_effort_checkin
-  test "the real default checks in once after 24 hours without activity", ctx do
-    ctx = real_default_context!(ctx)
-    item = work_item!(ctx.db, "default check-in with no activity")
+  @tag :effort_checkin_disabled_behavior
+  test "an already armed generation stays silent when its probe becomes due while disabled", ctx do
+    disabled = real_default_context!(ctx)
+    enabled = %{disabled | config: Map.put(disabled.config, :effort_checkins_enabled, true)}
 
     assigned =
-      assignment(ctx, "assign", {:user, "h1"}, "holder", %{
-        subject: "default check-in with no activity",
-        brief: "default check-in with no activity",
-        work_item_id: item.id
+      assignment(enabled, "assign", {:user, "h1"}, "holder", %{
+        subject: "armed before upgrade",
+        brief: "armed before upgrade"
       })
 
-    assert is_binary(assigned.id)
+    wake = current_wake(ctx.db, assigned.id)
 
-    assert [
-             [
-               1,
-               "armed",
-               wake_id,
-               watermark,
-               artifact_watermark,
-               attest_watermark,
-               work_item_watermark,
-               armed_at,
-               horizon,
-               multiplier,
-               due_at
-             ]
-           ] =
+    wake_id = wake.wake_id
+
+    assert [[1, "armed", ^wake_id]] =
              rows(
                ctx.db,
-               """
-               SELECT g.generation,g.state,g.wakeId,g.terminalSeqWatermark,
-                      g.artifactWatermark,g.attestWatermark,g.workItemWatermark,
-                      g.armedAt,g.baseHorizonMs,g.multiplier,w.dueAt
-               FROM effort_checkin_generations AS g
-               JOIN wakes AS w ON w.wakeId=g.wakeId
-               WHERE g.assignmentId=?1 AND g.generation=1
-               """,
+               "SELECT generation,state,wakeId FROM effort_checkin_generations WHERE assignmentId=?1",
                [assigned.id]
              )
 
-    assert horizon == 86_400_000
-    assert multiplier == 1
-    assert due_at - armed_at == horizon * multiplier
-    assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
+    assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake.wake_id)
 
-    assert rows(
-             ctx.db,
-             "SELECT COUNT(*) FROM artifacts WHERE workItemId=?1 AND createdBySession=?2 AND rowid>?3",
-             [item.id, "holder", artifact_watermark]
-           ) == [[0]]
-
-    assert rows(ctx.db, "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND rowid>?2", [
-             assigned.id,
-             attest_watermark
-           ]) == [[0]]
-
-    assert rows(
-             ctx.db,
-             "SELECT COUNT(*) FROM work_item_events WHERE workItemId=?1 AND id>?2 AND kind='metadata'",
-             [item.id, work_item_watermark]
-           ) == [[0]]
-
-    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND seq>?2", [
-             "holder",
-             watermark
-           ]) == [[0]]
-
-    scheduler = start_default_checkin_scheduler!(ctx.config)
-    # No holder activity occurred before the persisted 24-hour deadline.
-    # Advance only the scheduler wake to exercise its real due callback now.
-    make_wake_due!(ctx.db, wake_id)
+    scheduler = start_default_checkin_scheduler!(disabled.config)
+    make_wake_due!(ctx.db, wake.wake_id)
     assert :ok = Wakes.fire_due(scheduler)
 
-    assert %{state: "fired"} = Wakes.get(ctx.db, wake_id)
+    assert %{state: "fired"} = Wakes.get(ctx.db, wake.wake_id)
+
+    assert [[1, "armed"]] =
+             rows(
+               ctx.db,
+               "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1",
+               [assigned.id]
+             )
 
     assert rows(
              ctx.db,
-             "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+             "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1 AND kind='effort'",
              [assigned.id]
-           ) == [[1, "probed"], [2, "armed"]]
+           ) == [[0]]
 
-    assert rows(
-             ctx.db,
-             "SELECT agentProdded FROM effort_checkin_generations WHERE assignmentId=?1 AND generation=2",
-             [assigned.id]
-           ) == [[1]]
-
-    assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [
-             assigned.id
-           ]) == [[0]]
-
-    assert [prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assigned.id))
-    assert prod.state == "pending"
-    assert prod.prompt =~ "no artifacts, attests, or work-item updates"
-    assert prod.prompt =~ "0 completed holder turns"
-    assert length(Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assigned.id))) == 1
+    assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assigned.id)) == []
   end
 
-  test "turning effort check-ins off stops probes and leaves unexpired requests untouched", ctx do
+  @tag :effort_checkin_disabled_behavior
+  test "disabled check-ins ignore old probes and deadlines but keep open requests answerable", ctx do
     enabled = %{ctx | config: Map.put(ctx.config, :effort_checkins_enabled, true)}
 
     assigned =
@@ -389,22 +256,24 @@ defmodule Tightbeam.EffortCheckinTest do
     assert nil == fire_probe(enabled, assigned.id)
     open_request = fire_probe(enabled, assigned.id)
     assert open_request.status == "open"
-    request_deadline = Wakes.get(ctx.db, open_request.deadline_wake_id)
 
-    assert :ok = EffortCheckin.deadline(ctx.db, disabled_config, request_deadline)
+    scheduler = start_default_checkin_scheduler!(disabled_config)
+    make_request_deadline_due!(ctx.db, open_request)
+    assert :ok = Wakes.fire_due(scheduler)
 
     assert request(ctx.db, open_request.id).status == "open"
+    assert Wakes.get(ctx.db, open_request.deadline_wake_id).state == "fired"
+    assert expiry_notice_wakes(ctx.db, assigned.id) == []
 
-    assert %{code: "disabled", message: "effort check-ins are disabled"} =
+    assert %{status: "ruled", decision: "continue"} =
              EffortCheckin.rule(
                ctx.db,
                disabled_config,
                effort_call(open_request.id, "continue", {:session, "parent"})
              )
 
-    assert request(ctx.db, open_request.id).status == "open"
-    assert [prod] = prods(ctx.db, "holder")
-    assert prod.assignment_id == assigned.id
+    assert request(ctx.db, open_request.id).status == "ruled"
+    assert Wakes.get(ctx.db, open_request.deadline_wake_id).state == "fired"
 
     assert rows(
              ctx.db,
@@ -412,42 +281,37 @@ defmodule Tightbeam.EffortCheckinTest do
              [assigned.id]
            ) == [[1, "probed"], [2, "probed"]]
 
-    assert rows(
-             ctx.db,
-             "SELECT wakeId FROM wakes WHERE consumer='effort_deadline' AND assignmentId=?1",
-             [assigned.id]
-           ) == [[open_request.deadline_wake_id]]
+    assert expiry_notice_wakes(ctx.db, assigned.id) == []
   end
 
-  test "an outstanding request still expires after check-ins are disabled", ctx do
+  @tag :effort_checkin_disabled_behavior
+  test "an existing effort request can be dismissed while check-ins are disabled", ctx do
     enabled = %{ctx | config: Map.put(ctx.config, :effort_checkins_enabled, true)}
 
     assigned =
       assignment(enabled, "dispatch", {:session, "parent"}, "holder", %{
-        subject: "expiry survives check-in opt-out",
-        brief: "expiry survives check-in opt-out"
+        subject: "dismiss after opt-out",
+        brief: "dismiss after opt-out"
       })
 
     assert nil == fire_probe(enabled, assigned.id)
     open_request = fire_probe(enabled, assigned.id)
     disabled_config = Map.put(ctx.config, :effort_checkins_enabled, false)
-    make_request_deadline_due!(ctx.db, open_request)
 
-    assert :ok =
-             EffortCheckin.deadline(
+    assert %{status: "ruled", decision: "dismiss"} =
+             EffortCheckin.rule(
                ctx.db,
                disabled_config,
-               Wakes.get(ctx.db, open_request.deadline_wake_id)
+               effort_call(open_request.id, "dismiss", {:session, "parent"})
              )
 
-    assert request(ctx.db, open_request.id).status == "withdrawn"
+    assert request(ctx.db, open_request.id).status == "ruled"
 
-    assert rows(ctx.db, "SELECT withdrawnReason FROM decision_requests WHERE id=?1", [
-             open_request.id
-           ]) == [["expired-no-decision"]]
-
-    assert Wakes.get(ctx.db, open_request.deadline_wake_id).state == "fired"
-    assert [%{session_key: "holder"}] = expiry_notice_wakes(ctx.db, assigned.id)
+    assert rows(
+             ctx.db,
+             "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+             [assigned.id]
+           ) == [[1, "probed"], [2, "probed"]]
   end
 
   test "a new effort request follows corrected coordination while preserving its opener", ctx do
@@ -2410,7 +2274,8 @@ defmodule Tightbeam.EffortCheckinTest do
        tick_ms: 60_000,
        deliver: fn _wake -> :retry end,
        internal_consumers: %{
-         "effort_probe" => &EffortCheckin.probe(config.db, config, &1)
+         "effort_probe" => &EffortCheckin.probe(config.db, config, &1),
+         "effort_deadline" => &EffortCheckin.deadline(config.db, config, &1)
        }},
       id: scheduler
     )
