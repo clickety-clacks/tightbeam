@@ -152,6 +152,13 @@ defmodule Tightbeam.SupervisionTest do
 
   test "off reminders withdraws existing deadlines, climbs, and pending reminder prompts", ctx do
     opened_at = System.system_time(:millisecond) - 5_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
+               "asg_inactive",
+               opened_at
+             ])
+
     open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
     assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
 
@@ -185,6 +192,13 @@ defmodule Tightbeam.SupervisionTest do
 
   test "startup cancels all climbs and wrong-holder reminders but keeps the holder notice", ctx do
     opened_at = System.system_time(:millisecond) - 5_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
+               "asg_inactive",
+               opened_at
+             ])
+
     open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
     assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
 
@@ -397,7 +411,7 @@ defmodule Tightbeam.SupervisionTest do
 
     assert :ok = Supervision.migrate_open_assignments(ctx.db)
     deadline = pending_deadline!(ctx.db, "asg_inactive")
-    assert {:ok, :ok} = Supervision.deadline(ctx.db, deadline)
+    assert {:ok, true} = Supervision.deadline(ctx.db, deadline)
 
     assert {:ok, [[3]]} =
              DB.query(
