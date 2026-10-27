@@ -110,8 +110,16 @@ defmodule Tightbeam.Wire.ChangeSocket do
   defp route(%{"type" => "auth"} = message, %{phase: :unauthed} = state),
     do: authenticate(message, state)
 
+  defp route(%{"type" => "subscribe"} = message, %{phase: :unauthed} = state) do
+    state = observer_connection(state)
+    subscribe(message, state)
+  end
+
   defp route(_message, %{phase: :unauthed} = state),
     do: stop_with(auth_failure("auth_failed"), 1008, state)
+
+  defp route(%{"type" => "auth"}, %{phase: :live, principal_kind: :observer} = state),
+    do: {:ok, state}
 
   defp route(%{"type" => "subscribe"} = message, state), do: subscribe(message, state)
   defp route(%{"type" => "unsubscribe"} = message, state), do: unsubscribe(message, state)
@@ -188,16 +196,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
         )
 
       true ->
-        known = Devices.by_id(db(state), string(message["deviceId"]))
-
-        reason =
-          case known do
-            %{status: "pending"} -> "device_not_approved"
-            %{status: "allowlisted"} -> "token_revoked"
-            _ -> "auth_failed"
-          end
-
-        stop_with(auth_failure(reason), 1008, state)
+        {:ok, observer_connection(state)}
     end
   end
 
@@ -355,6 +354,20 @@ defmodule Tightbeam.Wire.ChangeSocket do
     %{state | heartbeat_timer: timer}
   end
 
+  defp observer_connection(state) do
+    :ok =
+      Hub.register(hub(state), self(), %{
+        mode: :filtered,
+        db: db(state),
+        principal_kind: :observer,
+        principal_id: "observer",
+        is_admin: false
+      })
+
+    %{state | phase: :live, principal_kind: :observer, principal_id: "observer", is_admin: false}
+    |> schedule_heartbeat()
+  end
+
   defp active_turn_notices(state, filters) do
     session_key = filters["sessionKey"]
 
@@ -428,6 +441,8 @@ defmodule Tightbeam.Wire.ChangeSocket do
       _ -> false
     end
   end
+
+  defp credential_current?(%{principal_kind: :observer}), do: true
 
   defp credential_current?(state) do
     case state.principal_kind do

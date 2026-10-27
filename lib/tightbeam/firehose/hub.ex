@@ -415,6 +415,8 @@ defmodule Tightbeam.Firehose.Hub do
       )
   end
 
+  defp revoked?(_notice, %{principal_kind: :observer}), do: false
+
   defp revoked?(%{"class" => "device.revoked", "refs" => refs}, socket),
     do: refs["deviceId"] == socket.device_id
 

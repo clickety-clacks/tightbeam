@@ -185,6 +185,11 @@ defmodule Tightbeam.StateResources do
   LEFT JOIN sessions AS session_owner ON session_owner.sessionKey=m.sessionKey
   """
 
+  @read_marker_select """
+  SELECT userId, scopeKey, marker, updatedAt
+  FROM read_markers
+  """
+
   alias Tightbeam.{
     AdminProjection,
     Artifacts,
@@ -696,6 +701,16 @@ defmodule Tightbeam.StateResources do
   defp wake_projection_in_txn(txn, id),
     do: Wakes.delivery_projection_in_txn(txn, id)
 
+  def query_session(db, %{key: id, principal: %{kind: "observer"} = principal})
+      when is_binary(id) do
+    trace_core_detail(principal, {:au4_visibility, "sessions"})
+
+    case observed_query(db, principal, @session_select <> " WHERE sessions.sessionKey = ?1", [id]) do
+      [row] -> session_query_row(row)
+      [] -> nil
+    end
+  end
+
   def query_session(
         db,
         %{key: id, principal: %{kind: kind, id: principal_id, is_admin: is_admin} = principal}
@@ -753,6 +768,7 @@ defmodule Tightbeam.StateResources do
 
     {where, params} =
       cond do
+        principal.kind == "observer" -> {nil, []}
         principal.is_admin -> {nil, []}
         principal.kind == "session" -> {nil, []}
         true -> {"sessions.ownerUserId = ?", [principal.id]}
@@ -1391,6 +1407,75 @@ defmodule Tightbeam.StateResources do
     detail_selection(db, "read markers", principal, fn txn ->
       ReadMarkers.get_in_txn(txn, user_id, scope_key)
     end)
+  end
+
+  @doc "Return one bounded page of read markers for the selected user or all markers for an observer."
+  def query_read_markers_page(db, principal, boundary, limit),
+    do: query_read_markers_page(db, principal, nil, boundary, limit)
+
+  def query_read_markers_page(db, %{kind: "observer"} = principal, scope_key, boundary, limit) do
+    {where, params} = marker_scope_filter(scope_key)
+    query_read_markers_page(db, principal, where, params, boundary, limit)
+  end
+
+  def query_read_markers_page(
+        db,
+        %{kind: "user", id: user_id} = principal,
+        scope_key,
+        boundary,
+        limit
+      )
+      when is_binary(user_id) and user_id != "" do
+    {where, params} = marker_user_scope_filter(user_id, scope_key)
+    query_read_markers_page(db, principal, where, params, boundary, limit)
+  end
+
+  defp marker_scope_filter(nil), do: {"1 = 1", []}
+
+  defp marker_scope_filter(scope_key) when is_binary(scope_key),
+    do: {"read_markers.scopeKey = ?", [scope_key]}
+
+  defp marker_user_scope_filter(user_id, nil),
+    do: {"read_markers.userId = ?", [user_id]}
+
+  defp marker_user_scope_filter(user_id, scope_key) when is_binary(scope_key),
+    do: {"read_markers.userId = ? AND read_markers.scopeKey = ?", [user_id, scope_key]}
+
+  defp query_read_markers_page(db, principal, where, params, boundary, limit) do
+    trace_core_detail(principal, {:au4_visibility, "read markers"})
+
+    case DB.transaction(db, fn txn ->
+           query = fn sql, params -> observed_query(txn, principal, sql, params) end
+
+           Keyset.page(
+             query,
+             @read_marker_select,
+             "read_markers",
+             where,
+             params,
+             ["read_markers.userId", "read_markers.scopeKey"],
+             boundary,
+             limit,
+             fn [row_user_id, scope_key, _marker, _updated_at] -> [row_user_id, scope_key] end
+           )
+         end) do
+      {:ok, page} ->
+        %{
+          rows:
+            Enum.map(page.rows, fn [row_user_id, scope_key, marker, updated_at] ->
+              %{
+                user_id: row_user_id,
+                scope_key: scope_key,
+                marker: marker,
+                updated_at: updated_at
+              }
+            end),
+          flags: page
+        }
+
+      {:error, error} ->
+        raise error
+    end
   end
 
   def query_read_marker(db, user_id, scope_key), do: ReadMarkers.get(db, user_id, scope_key)
