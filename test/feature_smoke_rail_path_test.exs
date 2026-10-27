@@ -241,10 +241,10 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                terminal_at: terminal_at
              })
 
-    # The holder and topology owner retire in sequence. Terminal-event admission
-    # can race that sequence, so the immutable wake may target the owner before
-    # retirement or the owner's personal session afterward. A canceled wake
-    # must retain typed cancellation evidence and never synthesize fired history.
+    # Holder retirement admits the terminal notice to the active work-item
+    # owner. If that owner retires before delivery, the pending wake is
+    # readdressed to its nearest active ancestor (the primary session here).
+    # Recovery may leave it pending until the scheduler's next tick.
     NoticeBatcher.recover(ctx.db)
 
     assert {:ok, [[dispatch_prompt]]} =
@@ -322,54 +322,26 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                    terminal_source
                  ])
 
-      "canceled" ->
+      "pending" ->
+        assert recipient == personal_session
         assert terminal.fired_at == nil
         assert terminal.fired_by == nil
-        canceled_at = terminal.canceled_at
-        assert is_integer(canceled_at)
+        assert terminal.canceled_at == nil
 
-        assert {:ok,
-                [
-                  [
-                    ^canceled_at,
-                    "process",
-                    "tightbeam:retirement",
-                    "target_retired",
-                    "session_transition",
-                    ^recipient,
-                    "no_replacement",
-                    nil,
-                    nil,
-                    nil,
-                    "work_item",
-                    ^dispatch_work_item,
-                    "linked_work_open",
-                    "routing_bracket",
-                    ^dispatch_work_item,
-                    1
-                  ]
-                ]} =
-                 DB.query(
-                   ctx.db,
-                   """
-                   SELECT canceledAt,requesterKind,requesterId,reasonKind,
-                     causalSourceKind,causalSourceId,outcomeKind,replacementWakeId,
-                     dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,
-                     workImpactKind,livenessTriggerKind,livenessTriggerId,actionNeeded
-                   FROM wake_cancellations WHERE wakeId=?1 AND wakeState='canceled'
-                   """,
-                   [terminal_source]
-                 )
+        assert {:ok, [[nil]]} =
+                 DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [
+                   terminal_source
+                 ])
 
         assert {:ok, [[0]]} =
-                 DB.query(
-                   ctx.db,
-                   "SELECT count(*) FROM (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL) WHERE sourceWakeId=?1",
-                   [terminal_source]
-                 )
+                 DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [
+                   terminal_source
+                 ])
 
         assert {:ok, [[0]]} =
-                 DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [terminal_source])
+                 DB.query(ctx.db, "SELECT count(*) FROM wake_cancellations WHERE wakeId=?1", [
+                   terminal_source
+                 ])
     end
 
     # Detailed member corruption/replay/privacy checks belong to the focused
