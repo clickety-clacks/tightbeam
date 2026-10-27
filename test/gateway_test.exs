@@ -271,6 +271,8 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:current_model, sid}, _from, {_parent, models} = state),
       do: {:reply, Map.fetch(models, sid), state}
 
+    def handle_call({:current_model_label, _sid}, _from, state), do: {:reply, nil, state}
+
     def handle_call({:knows_session?, sid}, _from, {_parent, models} = state),
       do: {:reply, Map.has_key?(models, sid), state}
 
@@ -315,20 +317,28 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
-  defmodule MismatchedCandidateAdapterStub do
+  defmodule ReportedCandidateAdapterStub do
     use GenServer
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
     def init(parent), do: {:ok, parent}
 
     def handle_call({:new_candidate_session, requested, _cwd, _mcp, _guidance}, _from, parent) do
       actual = Model.new("claude-sonnet-4-6")
-      send(parent, {:mismatched_candidate_closed, "candidate-mismatch", requested, actual})
-
-      {:reply,
-       {:error,
-        {:session_prepare_failed, {:runtime_config_mismatch, actual}, "candidate-mismatch",
-         %{status: "verified", reason: nil}}}, parent}
+      send(parent, {:candidate_selected, requested, actual})
+      {:reply, {:ok, "candidate-reported"}, parent}
     end
+
+    def handle_call({:knows_session?, "candidate-reported"}, _from, parent),
+      do: {:reply, true, parent}
+
+    def handle_call({:current_model, "candidate-reported"}, _from, parent),
+      do: {:reply, {:ok, Model.new("claude-sonnet-4-6")}, parent}
+
+    def handle_call({:current_model_label, "candidate-reported"}, _from, parent),
+      do: {:reply, "Sonnet 4.6", parent}
+
+    def handle_call({:fast_status, "candidate-reported"}, _from, parent),
+      do: {:reply, {:error, :fast_unsupported}, parent}
   end
 
   defmodule CloseErrorAdapterStub do
@@ -368,6 +378,8 @@ defmodule Tightbeam.GatewayTest do
 
     def handle_call({:current_model, _sid}, _from, {_parent, opts} = state),
       do: {:reply, {:ok, Keyword.get(opts, :current_model, Model.new("fable"))}, state}
+
+    def handle_call({:current_model_label, _sid}, _from, state), do: {:reply, nil, state}
 
     def handle_call({:close_session, sid, _opts}, from, state),
       do: handle_call({:close_session, sid}, from, state)
@@ -417,6 +429,8 @@ defmodule Tightbeam.GatewayTest do
 
     def handle_call({:current_model, _sid}, _from, state),
       do: {:reply, {:ok, Model.new("fable")}, state}
+
+    def handle_call({:current_model_label, _sid}, _from, state), do: {:reply, nil, state}
 
     def handle_call({:apply_fast, sid, requested}, _from, {parent, _fast}) do
       send(parent, {:fast_applied, sid, requested})
@@ -3871,30 +3885,40 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:candidate_created, _sid, %Model{family: "claude-opus-5-5", effort: "high"}}
   end
 
-  test "a catalog missing for want of a GATEWAY credential says so, with the repair", ctx do
+  test "a missing credential remains a refusal when the model catalog is unavailable", ctx do
     base_dir = role_test_base("catalog-cred-legible")
     Archetypes.load!(base_dir)
-    config = gateway_config(base_dir, ctx.db, 0)
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:credential_status, fn :openai, _host ->
+        {:needs_onboarding, :missing}
+      end)
+
     Org.set_harness(ctx.db, "k1", "codex", "openai", Model.new("gpt-5.6-sol"))
 
     # Force the session host's OWN derivation to have failed for a missing
     # credential — the catalog belongs to the host that will run the turn.
     empty_catalog({:needs_onboarding, :no_credential})
 
-    assert %{code: "catalog_unavailable", message: message} =
-             Gateway.handlers(config)["tune"].(%{
+    assert %{message: message} =
+             Gateway.handlers(config)["spawn"].(%{
                origin: "user:flynn",
-               session_key: "k1",
-               params: %{setting: "set_model", model: "gpt-5.6-sol"}
+               session_key: nil,
+               params: %{
+                 display_name: "Credential check",
+                 idempotency_key: "missing-credential-model",
+                 harness: "codex",
+                 model: "gpt-5.6-sol"
+               }
              })
 
     # Names what is missing, on WHICH HOST, for which provider, and the repair —
     # and the host is the SESSION's, not the gateway's. Before per-host catalogs
     # this line sent the operator to the gateway to fix a satellite's grant.
-    assert message =~ "openai has no usable credential on testhost"
-    assert message =~ ":no_credential"
-    assert message =~ "run tightbeam onboard openai --as-user <userId> on testhost"
-    refute message =~ "GATEWAY host"
+    assert message =~ "openai"
+    assert message =~ "no credential"
+    refute message =~ "model catalog"
 
     # ...and never regresses to the bare inspected health term, which named
     # neither the provider, the host, nor the fix (sat-e2e mac-0726a S2).
@@ -4908,14 +4932,14 @@ defmodule Tightbeam.GatewayTest do
     assert tombstone.marker == %{
              kind: "harness-switch",
              from: "claude (before-model)",
-             to: "codex (gpt-5.6-sol (effort medium))"
+             to: "codex (gpt-5.6-sol)"
            }
 
     # It names the change, both ends of it, and explains the context restart
     # without claiming that earlier transcript rows are hidden.
     assert tombstone.content =~ "[engine swap]"
     assert tombstone.content =~ "claude (before-model)"
-    assert tombstone.content =~ "codex (gpt-5.6-sol (effort medium))"
+    assert tombstone.content =~ "codex (gpt-5.6-sol)"
     assert tombstone.content =~ "remain visible in this transcript"
     assert tombstone.content =~ "fresh working context"
     refute tombstone.content =~ "no longer shown"
@@ -5074,6 +5098,25 @@ defmodule Tightbeam.GatewayTest do
       })
 
     assert Org.get(ctx.db, fallback.session_key).archetype == "default"
+    assert fallback.requested.model == Org.get(ctx.db, fallback.session_key).model.family
+
+    assert fallback.running_status ==
+             "not reported by #{Org.get(ctx.db, fallback.session_key).harness}"
+
+    assert %{
+             session_key: replayed_key,
+             requested: replayed_request,
+             running_status: replayed_status
+           } =
+             spawn.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{display_name: "Fallback", idempotency_key: "spawn-fallback"}
+             })
+
+    assert replayed_key == fallback.session_key
+    assert replayed_request == fallback.requested
+    assert replayed_status == fallback.running_status
 
     assert %{code: "unknown_archetype", message: "no such archetype: missing"} =
              config.(%{
@@ -5287,7 +5330,7 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, session_key).host == "testhost-b"
   end
 
-  test "spawn uses the next where host when the first has no usable catalog", ctx do
+  test "spawn uses the first ready where host despite a degraded catalog", ctx do
     base_dir = placement_test_base("later-catalog", ["testhost-d", "testhost-b"])
     ensure_global_registry()
 
@@ -5317,7 +5360,7 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "testhost-b"
+    assert Org.get(ctx.db, session_key).host == "testhost-d"
   end
 
   test "spawn records one real redirect when an open exact key is skipped", ctx do
@@ -5426,8 +5469,9 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
-  test "spawn refusal relays each where host's catalog cause and remedy", ctx do
+  test "spawn does not gate a named model on a degraded host catalog", ctx do
     base_dir = placement_test_base("catalog-causes", ["testhost-d", "testhost"])
+    ensure_global_registry()
 
     register_hosts(ctx.db, %{
       "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
@@ -5450,8 +5494,9 @@ defmodule Tightbeam.GatewayTest do
       |> Map.put(:default_harness, :codex)
       |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
       |> Map.put(:credential_status, fn :openai, _host -> :onboarded end)
+      |> Map.put(:sh, fn _command -> {"", 0} end)
 
-    assert %{code: "placement_denied", detail: %{code: "host_unready"}, message: message} =
+    assert %{session_key: spawned} =
              Gateway.handlers(config)["spawn"].(%{
                origin: "user:flynn",
                session_key: nil,
@@ -5461,10 +5506,8 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert message =~ "testhost-d: cannot route gpt-5.6-sol (effort medium) on testhost-d"
-    assert message =~ "upgrade codex on testhost-d"
-    assert message =~ "testhost: cannot route gpt-5.6-sol (effort medium) on testhost"
-    assert message =~ "run tightbeam onboard openai --as-user <userId> on testhost"
+    assert Org.get(ctx.db, spawned).host == "testhost-d"
+    assert Org.get(ctx.db, spawned).model == Model.new("gpt-5.6-sol", effort: "medium")
   end
 
   test "spawn uses the next where host when the first fails live spinup", ctx do
@@ -6514,13 +6557,7 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:spinup_command, ["ssh" | _]}
   end
 
-  # Task #88 / per-host-catalogs-v1 acceptance 1. Both failure directions of one
-  # defect: the catalog used to be the GATEWAY account's, applied to every host,
-  # so a ref was validated against entitlements that had nothing to do with the
-  # account the turn would run under. On the old tree this test is red twice —
-  # the gateway-only ref spawns onto the satellite, and the satellite-only ref is
-  # refused there.
-  test "spawn validates the model against the TARGET host's catalog, not the gateway's", ctx do
+  test "explicit spawn and tune do not gate model names on either host catalog", ctx do
     base_dir = move_test_base(ctx.db, "per-host-validate", "worker")
     parent = self()
     sh = fn command -> send(parent, {:spinup_command, command}) && {"", 0} end
@@ -6536,7 +6573,7 @@ defmodule Tightbeam.GatewayTest do
 
     await_host_catalog("worker", "claude")
 
-    # Two accounts, two entitlements. Neither ref is offered by the other host.
+    # Two discovery catalogs disagree. Neither is selection authority.
     put_host_catalog("testhost", "claude", ["gateway-only-model"])
     put_host_catalog("worker", "claude", ["worker-only-model"])
 
@@ -6550,20 +6587,14 @@ defmodule Tightbeam.GatewayTest do
       })
     end
 
-    # Refused-though-runnable: worker CAN run this, and now says so.
     assert %{session_key: on_worker} = place.("worker", "worker-only-model", "k-worker-ok")
     assert Org.get(ctx.db, on_worker).host == "worker"
 
-    # Masquerading (#81): the gateway's grant covers this ref, worker's does not.
-    assert %{code: "model_unavailable", message: message} =
-             place.("worker", "gateway-only-model", "k-worker-bad")
+    assert %{session_key: other_worker} =
+             place.("worker", "gateway-only-model", "k-worker-other")
 
-    assert message =~ ~s("gateway-only-model" is not offered by claude on host worker)
-    assert message =~ "worker-only-model"
+    assert %Model{family: "gateway-only-model"} = Org.get(ctx.db, other_worker).model
 
-    # Symmetrically, on the gateway's own host (session k1) the gateway's ref is
-    # good and the satellite's is not — tune, because it judges the ref against
-    # the session's host without going through spinup.
     candidate = start_supervised!({CandidateAdapterStub, self()})
     start_supervised!({CoordinatorStub, candidate})
     tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["tune"]
@@ -6577,17 +6608,11 @@ defmodule Tightbeam.GatewayTest do
       })
     end
 
-    assert %{ok: true} = retune.("gateway-only-model")
-
-    assert %{code: "model_unavailable", message: gateway_message} = retune.("worker-only-model")
-
-    assert gateway_message =~ "on host testhost"
+    assert %{ok: true} = retune.("worker-only-model")
+    assert %Model{family: "worker-only-model"} = Org.get(ctx.db, "k1").model
   end
 
-  # The codex models endpoint filters by client_version and reports nothing about
-  # it — a too-old binary yields 200 with an empty list. The refusal must not
-  # blame the grant, because re-onboarding will not change a thing.
-  test "an empty catalog from a client_version filter blames the binary, not the grant", ctx do
+  test "an empty catalog does not hide a missing destination credential", ctx do
     base_dir = role_test_base("client-version-empty")
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
@@ -6598,7 +6623,7 @@ defmodule Tightbeam.GatewayTest do
       {:empty_catalog_for_client_version, "0.99.0"}
     )
 
-    assert %{code: "catalog_unavailable", message: message} =
+    assert %{code: "host_unready", message: message} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
@@ -6610,10 +6635,8 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert message =~ "EMPTY model list for client_version \"0.99.0\""
-    assert message =~ "upgrade codex on testhost"
-    assert message =~ "credential is not implicated"
-    refute message =~ "onboard"
+    assert message =~ "no credential for openai on testhost"
+    refute message =~ "client_version"
   end
 
   # Acceptance 2: the gateway no longer needs a credential for a harness it does
@@ -6637,7 +6660,16 @@ defmodule Tightbeam.GatewayTest do
     put_host_catalog("worker", "claude", ["worker-only-model"])
     degrade_host_catalog("testhost", "claude", {:needs_onboarding, :no_credential})
 
-    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
+    credential_status = fn :anthropic, host ->
+      if host == "worker", do: :onboarded, else: {:needs_onboarding, :missing}
+    end
+
+    spawn =
+      Gateway.handlers(
+        gateway_config(base_dir, ctx.db, 0)
+        |> Map.put(:sh, sh)
+        |> Map.put(:credential_status, credential_status)
+      )["spawn"]
 
     assert %{session_key: session_key} =
              spawn.(%{
@@ -6655,7 +6687,7 @@ defmodule Tightbeam.GatewayTest do
 
     # The gateway's own host still refuses, and blames ITSELF rather than
     # demanding a grant for a machine that already has one.
-    assert %{code: "catalog_unavailable", message: message} =
+    assert %{message: message} =
              spawn.(%{
                origin: "user:flynn",
                session_key: nil,
@@ -6667,8 +6699,8 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert message =~ "anthropic has no usable credential on testhost"
-    assert message =~ "run tightbeam onboard anthropic --as-user <userId> on testhost"
+    assert message =~ "no credential for anthropic on testhost"
+    assert message =~ "tightbeam onboard anthropic --as-user <userId>"
     refute message =~ "GATEWAY host"
     refute message =~ "onboard anthropic on worker"
   end
@@ -7116,28 +7148,40 @@ defmodule Tightbeam.GatewayTest do
     Org.append_pointer(ctx.db, "k1", "resident-session", "created")
     start_lane!(ctx.db, "k1")
 
+    raw = %{
+      "code" => -32602,
+      "message" => "Invalid value for config option model: claude-sonnet-4-6"
+    }
+
+    refusal =
+      Tightbeam.ErrorDiagnostic.diagnosed(
+        raw,
+        Tightbeam.ErrorDiagnostic.from_reason(raw,
+          operation: "session/set_config_option",
+          phase: "model",
+          config_id: "model",
+          offered_options: [%{"value" => "opus[1m]", "name" => "Opus 5.5"}]
+        )
+      )
+
     adapter =
       start_supervised!(
         {TuneAdapterStub,
-         {self(),
-          resident: true, switch_result: {:error, {:model_apply_failed, :model_unavailable}}}}
+         {self(), resident: true, switch_result: {:error, {:model_apply_failed, refusal}}}}
       )
 
     start_supervised!({CoordinatorStub, adapter})
     put_host_catalog(local_host, "claude", ["claude-sonnet-4-6"])
 
-    # The reason rides an honest sentence. The frozen offered-set refusal is gone;
-    # this case is a real reload failure and the selected model stays unchanged.
-    assert %{ok: false, code: "model_unavailable", message: message} =
+    assert %{ok: false, code: "model_apply_failed", message: message, offeredOptions: options} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
                params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
 
-    assert message =~ "installed local client rejected"
-    assert message =~ "unsupported"
-    assert message =~ "could not prepare the new model"
+    assert message == raw["message"]
+    assert options == [%{"value" => "opus[1m]", "name" => "Opus 5.5"}]
 
     assert_receive {:tune_session_switched, "resident-session",
                     %Model{family: "claude-sonnet-4-6"}, _cwd, _mcp_servers, _guidance}
@@ -7147,55 +7191,50 @@ defmodule Tightbeam.GatewayTest do
     refute_receive {:tune_session_closed, "resident-session"}
   end
 
-  test "set_model reports successful but nonconfirming readback without claiming rejection",
+  test "set_model succeeds without claiming a running model when the harness reports none",
        ctx do
     base_dir = role_test_base("resident-set-model-unconfirmed")
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
-    before = Org.get(ctx.db, "k1").model
     local_host = Placement.local_host_name()
     Org.set_host(ctx.db, "k1", local_host)
     Org.append_pointer(ctx.db, "k1", "resident-session", "created")
     start_lane!(ctx.db, "k1")
 
     adapter =
-      start_supervised!(
-        {TuneAdapterStub,
-         {self(),
-          resident: true,
-          switch_result: {:error, {:model_apply_failed, :model_readback_unavailable}}}}
-      )
+      start_supervised!({TuneAdapterStub, {self(), resident: true, current_model: nil}})
 
     start_supervised!({CoordinatorStub, adapter})
 
-    assert %{ok: false, code: "model_apply_failed", message: message} =
+    assert %{
+             ok: true,
+             model: nil,
+             running_status: "not reported by claude",
+             requested: %{model: "claude-sonnet-4-6"}
+           } =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
                params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
 
-    assert message =~ "reported success but did not confirm"
-    refute message =~ "rejected"
-    refute message =~ "unsupported"
-    assert Org.get(ctx.db, "k1").model == before
+    assert %Model{family: "claude-sonnet-4-6"} = Org.get(ctx.db, "k1").model
   end
 
-  test "initial set_model does not commit a requested ref when candidate actual differs", ctx do
+  test "initial set_model reports the harness selection when it differs from the request", ctx do
     base_dir = role_test_base("initial-set-model-mismatch")
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
-    before = Org.get(ctx.db, "k1").model
-    candidate = start_supervised!({MismatchedCandidateAdapterStub, self()})
+    candidate = start_supervised!({ReportedCandidateAdapterStub, self()})
     start_supervised!({CoordinatorStub, candidate})
     start_lane!(ctx.db, "k1")
 
     assert %{
-             ok: false,
-             code: "runtime_config_mismatch",
+             ok: true,
              model: "claude-sonnet-4-6",
-             projection_committed: false,
-             message: message
+             running_label: "Sonnet 4.6",
+             requested: %{model: "claude-opus-5-5"},
+             projection_committed: true
            } =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
@@ -7203,14 +7242,11 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "claude-opus-5-5"}
              })
 
-    assert message =~ "different model"
-    assert message =~ "not committed"
+    assert_receive {:candidate_selected, %Model{family: "claude-opus-5-5"},
+                    %Model{family: "claude-sonnet-4-6"}}
 
-    assert_receive {:mismatched_candidate_closed, "candidate-mismatch",
-                    %Model{family: "claude-opus-5-5"}, %Model{family: "claude-sonnet-4-6"}}
-
-    assert Org.get(ctx.db, "k1").model == before
-    assert Org.current_pointer(ctx.db, "k1") == nil
+    assert %Model{family: "claude-opus-5-5"} = Org.get(ctx.db, "k1").model
+    assert Org.current_pointer(ctx.db, "k1").harness_session_id == "candidate-reported"
   end
 
   test "set_model refuses while the lane owns a running turn", ctx do
@@ -7462,10 +7498,9 @@ defmodule Tightbeam.GatewayTest do
     assert %{session_key: neither} = spawn_with.(%{}, "k-neither")
     assert Org.get(ctx.db, neither).model == Model.new("claude-fable-5", effort: "low")
 
-    # A model alone carries the default's tier forward, composed against what
-    # that model actually offers — one mechanism decides effort.
+    # Naming only a model leaves effort absent for the harness to choose.
     assert %{session_key: only_model} = spawn_with.(%{model: "claude-sonnet-4-6"}, "k-model")
-    assert Org.get(ctx.db, only_model).model == Model.new("claude-sonnet-4-6", effort: "low")
+    assert Org.get(ctx.db, only_model).model == Model.new("claude-sonnet-4-6")
   end
 
   # The OTHER half of the omitted-versus-explicit distinction, and it only
@@ -7575,10 +7610,7 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
-  # A refusal has to name the right cause. An effort-only selection whose
-  # EFFORT is the invalid part was reported as a broken configured default,
-  # sending the operator to change a setting that was never the problem.
-  test "an invalid caller effort is not blamed on the configured default", ctx do
+  test "a named effort and an unlisted default are recorded without a catalog gate", ctx do
     base_dir = role_test_base("effort-not-default")
     Archetypes.load!(base_dir)
 
@@ -7594,37 +7626,25 @@ defmodule Tightbeam.GatewayTest do
       |> gateway_config(ctx.db, 0)
       |> Map.put(:default_model, Model.new("claude-fable-5", effort: "low"))
 
-    log =
-      ExUnit.CaptureLog.capture_log(fn ->
-        assert %{code: "invalid"} =
-                 Gateway.handlers(config)["spawn"].(%{
-                   origin: "user:flynn",
-                   session_key: nil,
-                   params: %{
-                     display_name: "Blame",
-                     idempotency_key: "k-blame",
-                     effort: "bogus"
-                   }
-                 })
-      end)
+    assert %{session_key: named} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{display_name: "Named", idempotency_key: "k-blame", effort: "bogus"}
+             })
 
-    refute log =~ "configured default model",
-           "the caller's effort was invalid; the configured default is fine"
+    assert Org.get(ctx.db, named).model == Model.new("claude-fable-5", effort: "bogus")
 
-    # And the genuine case still warns — the flag means "entirely from policy".
     dead = Map.put(config, :default_model, Model.new("not-in-catalog", effort: "low"))
 
-    log =
-      ExUnit.CaptureLog.capture_log(fn ->
-        assert %{code: "model_unavailable"} =
-                 Gateway.handlers(dead)["spawn"].(%{
-                   origin: "user:flynn",
-                   session_key: nil,
-                   params: %{display_name: "Blame", idempotency_key: "k-blame-2"}
-                 })
-      end)
+    assert %{session_key: unlisted} =
+             Gateway.handlers(dead)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{display_name: "Unlisted", idempotency_key: "k-blame-2"}
+             })
 
-    assert log =~ "configured default model"
+    assert Org.get(ctx.db, unlisted).model == Model.new("not-in-catalog", effort: "low")
   end
 
   # An archetype default is a `%Model{}` internally. Publishing it raw put
@@ -7741,16 +7761,10 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "claude-fable-5", context: "1m"}
              })
 
-    assert Org.get(ctx.db, "k-wire").model ==
-             Model.new("claude-fable-5", context: "1m", effort: "low")
+    assert Org.get(ctx.db, "k-wire").model == Model.new("claude-fable-5", context: "1m")
   end
 
-  # THE OTHER DIRECTION of the round trip, and a silent-retain if the two are
-  # confused: a session ON the 1M variant, whose client selects the DEFAULT
-  # row. `resolve_issued/3` resolves that id to `context: nil` — an explicit
-  # "the default window" — but a nil that also means "the caller said nothing"
-  # gets inherited over, and the tune reports success while the session stays
-  # on the 1M model. Explicit-default and omitted must not share a slot.
+  # A bare model choice leaves both context and effort unspecified.
   test "selecting the default-context row leaves the 1M variant, not inherits it", ctx do
     Archetypes.load!(role_test_base("wire-default-context"))
     put_host_catalog("testhost", "claude", [{"claude-fable-5", ["low"]}])
@@ -7789,20 +7803,12 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: default_row.ref}
              })
 
-    assert Org.get(ctx.db, "k-wide").model ==
-             Model.new("claude-fable-5", effort: "low"),
-           "selecting the default-window row must LEAVE the 1M variant"
+    assert Org.get(ctx.db, "k-wide").model == Model.new("claude-fable-5")
   end
 
-  # The identity this seam ISSUES is what a client echoes back, so it has to
-  # come home to the same row. Resolution is a catalog lookup, never a regex:
-  # a lookup cannot invent a context the host does not offer.
-  #
-  # THIS TEST IS THE GUARD on `wire_identity/1` rendering family and context
-  # ONLY. It is what fails if effort is ever rendered into the wire id, which
-  # would silently restore the 1M collision by giving that slot two meanings
-  # again. It reads as redundant beside the catalog tests. It is not.
-  test "an issued row identity echoed back resolves to that row's fields", ctx do
+  # The picker emits a wire ref, which the gateway sends unchanged. The
+  # harness interprets the bracketed context when it applies the selection.
+  test "an issued row identity echoed back is passed through as named", ctx do
     Archetypes.load!(role_test_base("wire-echo"))
     put_host_catalog("testhost", "claude", [{"claude-fable-5", ["low"]}])
 
@@ -7841,15 +7847,10 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: issued}
              })
 
-    # THE Q1 CONTRACT IN ONE ASSERTION. The bracket in an issued id can only
-    # ever mean context, because effort is never rendered into it — so the
-    # round trip must land the context in `context` and leave effort alone.
-    # Losing the context, or growing an effort out of the bracket, are the two
-    # ways this seam can be wrong, and both are pinned here.
     stored = Org.get(ctx.db, "k-echo").model
-    assert stored.family == "claude-fable-5"
-    assert stored.context == "1m"
-    assert stored.effort == "low", "the effort came from the session, never from the id"
+    assert stored.family == issued
+    assert stored.context == nil
+    assert stored.effort == nil
 
     # And the identity it publishes for that row is the one it was handed.
     assert Gateway.session_status("k-echo", ctx.db).display.model == issued
@@ -7961,6 +7962,28 @@ defmodule Tightbeam.GatewayTest do
            }
   end
 
+  test "session status shows the latest turn refusal without claiming a running model", ctx do
+    Archetypes.load!(role_test_base("session-status-refusal"))
+    refusal = "Invalid value for config option model: future-model"
+
+    assert {:ok, seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: "k1",
+               message_id: "status-model-refusal",
+               origin: "user:flynn",
+               prompt: "use future-model"
+             })
+
+    assert {:ok, %{seq: ^seq, owner_lease: lease}} = Ledger.claim_next(ctx.db, "k1", "test")
+    assert :ok = Ledger.finish(ctx.db, seq, "failed", refusal, owner_lease: lease)
+
+    status = Gateway.session_status("k1", ctx.db)
+    assert status.lastTurnError == refusal
+    assert status.runtimeStatus == "unknown"
+    assert status.runningStatus == "not reported by claude"
+    assert status.display.model == "unknown"
+  end
+
   test "session_status marks setReasoning unsupported for a model with no effort tiers", ctx do
     Archetypes.load!(role_test_base("session-status-untiered"))
 
@@ -8064,7 +8087,7 @@ defmodule Tightbeam.GatewayTest do
 
     stored = Org.get(ctx.db, "k-round-trip").model
     assert {stored.family, stored.context} == {"gpt-5.6-terra", nil}
-    assert stored.effort in ["low", "high"]
+    assert stored.effort == nil
     assert Org.get(ctx.db, "k-round-trip").provider == "openai"
   end
 
@@ -8124,13 +8147,12 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: offered.ref}
              })
 
-    assert Org.get(ctx.db, "k-provider-offered").model ==
-             Model.new(provider_model, effort: "medium")
+    assert Org.get(ctx.db, "k-provider-offered").model == Model.new(provider_model)
 
     assert Org.get(ctx.db, "k-provider-offered").provider == "openai"
   end
 
-  test "set_model with a bare model id keeps the current effort tier", ctx do
+  test "set_model with a bare model id omits the current effort tier", ctx do
     base_dir = role_test_base("set-model-bare-keeps-effort")
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
@@ -8158,10 +8180,10 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "gpt-5.6-sol"}
              })
 
-    assert Org.get(ctx.db, "k-codex").model == Model.new("gpt-5.6-sol", effort: "xhigh")
+    assert Org.get(ctx.db, "k-codex").model == Model.new("gpt-5.6-sol")
   end
 
-  test "set_model with a bare model id falls back to the new model's first tier when the current effort doesn't apply",
+  test "set_model with a bare model id does not select a tier from the catalog",
        ctx do
     base_dir = role_test_base("set-model-bare-falls-back")
     Archetypes.load!(base_dir)
@@ -8190,13 +8212,10 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "gpt-5.6-terra"}
              })
 
-    # gpt-5.6-terra only offers low/high (in that catalog order); xhigh
-    # doesn't carry over and terra has no "medium" either, so this lands on
-    # its first listed tier.
-    assert Org.get(ctx.db, "k-codex-fallback").model == Model.new("gpt-5.6-terra", effort: "low")
+    assert Org.get(ctx.db, "k-codex-fallback").model == Model.new("gpt-5.6-terra")
   end
 
-  test "set_model with a bare model id prefers 'medium' when the current effort doesn't apply but medium does",
+  test "set_model with a bare model id never fills medium from the catalog",
        ctx do
     base_dir = role_test_base("set-model-bare-prefers-medium")
     Archetypes.load!(base_dir)
@@ -8225,9 +8244,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "gpt-5.6-sol"}
              })
 
-    # "turbo" doesn't exist on sol, but sol does offer "medium", so that's
-    # preferred over just taking the first listed tier.
-    assert Org.get(ctx.db, "k-codex-medium").model == Model.new("gpt-5.6-sol", effort: "medium")
+    assert Org.get(ctx.db, "k-codex-medium").model == Model.new("gpt-5.6-sol")
   end
 
   test "set_model with a bare model id switching to an untiered model drops the effort qualifier",
@@ -8327,21 +8344,22 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, "k-codex-reasoning").model == Model.new("gpt-5.6-sol", effort: "xhigh")
   end
 
-  test "set_reasoning rejects a level the current model does not offer", ctx do
+  test "set_reasoning passes an unlisted effort to the harness", ctx do
     base_dir = role_test_base("set-reasoning-invalid")
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
-    before = Org.get(ctx.db, "k1")
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    start_lane!(ctx.db, "k1")
 
-    assert %{code: code} =
+    assert %{ok: true} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
                params: %{setting: "set_reasoning", reasoningLevel: "nonexistent"}
              })
 
-    assert code in ["model_unavailable", "catalog_unavailable"]
-    assert Org.get(ctx.db, "k1") == before
+    assert Org.get(ctx.db, "k1").model.effort == "nonexistent"
   end
 
   test "cancel addresses the overridden adapter key", ctx do
@@ -8847,15 +8865,15 @@ defmodule Tightbeam.GatewayTest do
     assert %{
              "ok" => true,
              "status" => %{
-               "display" => %{
-                 "harness" => "codex",
-                 "modelFamily" => "gpt-5.6-sol",
-                 "reasoningLevel" => "low"
+               "display" => %{"harness" => "codex"},
+               "configuredProjection" => %{
+                 "model" => "gpt-5.6-sol",
+                 "effort" => "medium"
                }
              }
            } = post.(%{"action" => "set_harness", "harness" => "codex"})
 
-    assert Org.get(ctx.db, "k1").model == Model.new("gpt-5.6-sol", effort: "low")
+    assert Org.get(ctx.db, "k1").model == Model.new("gpt-5.6-sol", effort: "medium")
 
     [codex_marker] =
       Projection.list_after(
@@ -8868,35 +8886,37 @@ defmodule Tightbeam.GatewayTest do
 
     assert codex_marker.content =~
              "changed from claude (source-claude (effort high)) to " <>
-               "codex (gpt-5.6-sol (effort low))"
+               "codex (gpt-5.6-sol (effort medium))"
 
     assert %{
              "ok" => true,
              "status" => %{
-               "display" => %{
-                 "harness" => "claude",
-                 "modelFamily" => "claude-sonnet-5",
-                 "reasoningLevel" => nil
+               "display" => %{"harness" => "claude"},
+               "configuredProjection" => %{
+                 "model" => "claude-sonnet-5",
+                 "effort" => "medium"
                }
              }
            } = post.(%{"action" => "set_harness", "harness" => "claude"})
 
-    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-5")
-
-    before_missing_default = Org.get(ctx.db, "k1")
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-5", effort: "medium")
 
     {:ok, [[before_message_count]]} =
       DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", ["k1"])
 
     put_host_catalog(local_host, "codex", [{"other-codex-model", ["low"]}])
 
-    assert %{"ok" => false, "code" => "model_unavailable"} =
+    assert %{"ok" => true, "status" => %{"configuredProjection" => %{"model" => "gpt-5.6-sol"}}} =
              post.(%{"action" => "set_harness", "harness" => "codex"})
 
-    assert Org.get(ctx.db, "k1") == before_missing_default
+    assert Org.get(ctx.db, "k1").model == Model.new("gpt-5.6-sol", effort: "medium")
 
-    assert {:ok, [[^before_message_count]]} =
+    assert {:ok, [[after_message_count]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", ["k1"])
+
+    assert after_message_count == before_message_count + 1
+
+    assert %{"ok" => true} = post.(%{"action" => "set_harness", "harness" => "claude"})
 
     put_host_catalog(local_host, "codex", [])
 
@@ -8918,13 +8938,13 @@ defmodule Tightbeam.GatewayTest do
                "display" => %{"harness" => "codex"},
                "configuredProjection" => %{
                  "context" => nil,
-                 "effort" => "low",
+                 "effort" => "medium",
                  "model" => "gpt-5.6-sol"
                }
              }
            } = post.(%{"action" => "set_harness", "harness" => "codex"})
 
-    assert Org.get(ctx.db, "k1").model == Model.new("gpt-5.6-sol", effort: "low")
+    assert Org.get(ctx.db, "k1").model == Model.new("gpt-5.6-sol", effort: "medium")
 
     assert %{"ok" => true} = post.(%{"action" => "set_harness", "harness" => "claude"})
 
@@ -8952,9 +8972,7 @@ defmodule Tightbeam.GatewayTest do
            |> Map.take([:session_key, :display_name, :owner_user_id, :origin, :archetype]) ==
              stable_identity
 
-    before_refusal = Org.get(ctx.db, "k1")
-
-    assert %{"ok" => false, "code" => "model_unavailable"} =
+    assert %{"ok" => true} =
              post.(%{
                "action" => "set_harness",
                "harness" => "claude",
@@ -8962,7 +8980,7 @@ defmodule Tightbeam.GatewayTest do
                "effort" => "high"
              })
 
-    assert Org.get(ctx.db, "k1") == before_refusal
+    assert Org.get(ctx.db, "k1").model == Model.new("not-a-claude-model", effort: "high")
   end
 
   @tag timeout: 180_000
@@ -9431,13 +9449,10 @@ defmodule Tightbeam.GatewayTest do
            end)
   end
 
-  # The value a client is TOLD to send must be a value this accepts. `setModel.options`
-  # and `modelCatalog.models` advertise one row per model with a base ref, deliberately
-  # — the effort tier belongs to the reasoning picker — while the catalog only holds an
-  # effort-bearing model as `id[effort]`. `set_model` composes the two and has since
-  # cbc8d2e; `set_harness` did not, so the same bare id round-tripped through one verb
-  # and was refused by the other as "not offered by codex on testhost" (#69).
-  test "set_harness resolves the bare model id advertised by its destination catalog", ctx do
+  # A picker ref is passed through to the destination harness without filling
+  # an effort tier from the discovery catalog.
+  test "set_harness passes through the bare model id advertised by its destination catalog",
+       ctx do
     base_dir = role_test_base("harness-bare-model")
     codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(codex_auth)
@@ -9478,9 +9493,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_harness", harness: "codex", model: provider_model}
              })
 
-    # Composed, not passed through: the tier is real information and the session must
-    # end up on a ref the catalog actually offers.
-    assert Org.get(ctx.db, "k1").model == Model.new(provider_model, effort: "medium")
+    assert Org.get(ctx.db, "k1").model == Model.new(provider_model)
 
     # And the value under test is one the picker really does advertise for this
     # session, so the case cannot keep passing if the advertised shape drifts. Read

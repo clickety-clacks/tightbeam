@@ -2391,8 +2391,17 @@ fn refusal_sentence(status: u16, fields: &serde_json::Map<String, Value>) -> Str
         None => format!("HTTP {status} error without a code"),
     };
     let rendered = match text("message") {
+        Some(message) if code == "model_apply_failed" || code == "model_unavailable" => {
+            message.to_owned()
+        }
         Some(message) => format!("{code}: {message}"),
         None => code,
+    };
+    let rendered = match fields.get("offeredOptions") {
+        Some(Value::Array(options)) if !options.is_empty() => {
+            format!("{rendered}\n{}", Value::Array(options.clone()))
+        }
+        _ => rendered,
     };
     match text("requestId") {
         Some(request_id) => format!("{rendered} ({request_id})"),
@@ -3899,6 +3908,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn model_refusal_keeps_harness_text_and_reported_options_in_human_output() {
+        let fields = serde_json::json!({
+            "code": "model_apply_failed",
+            "message": "Invalid value for config option model: future-model",
+            "offeredOptions": [
+                {"value": "opus[1m]", "name": "Opus 5.5"},
+                {"value": "sonnet", "name": "Sonnet"}
+            ]
+        });
+        let human = refusal_sentence(400, fields.as_object().unwrap());
+        assert!(human.starts_with("Invalid value for config option model: future-model\n"));
+        assert!(human.contains("\"value\":\"opus[1m]\""));
+        assert!(human.contains("\"value\":\"sonnet\""));
+    }
     use crate::args;
     use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
