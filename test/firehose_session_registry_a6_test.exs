@@ -278,7 +278,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     assert SessionPoAssociations.get(ctx.db, ctx.worker.session_key) == result["association"]
   end
 
-  test "visibility and exact session filtering run before delivery", ctx do
+  test "exact session filters apply without per-user visibility checks", ctx do
     other = create_session(ctx.db, "a6-other", "Other worker")
     _ = Org.rename(ctx.db, other.session_key, "Filtered worker")
     sync_hub()
@@ -294,7 +294,12 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
 
     _ = Org.rename(ctx.db, ctx.worker.session_key, "Hidden worker")
     sync_hub()
-    refute_receive {:firehose_notice, _notice}, 50
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "session.updated",
+                      "subscriptionId" => "session",
+                      "payload" => %{"displayName" => "Hidden worker"}
+                    }}
 
     :ok =
       Hub.register(Hub, self(), %{
