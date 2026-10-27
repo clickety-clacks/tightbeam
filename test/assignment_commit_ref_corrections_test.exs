@@ -343,18 +343,55 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
   end
 
   defp insert_closed_assignment!(db, assignment_id) do
-    {:ok, []} =
-      DB.query(
-        db,
-        """
-        INSERT INTO assignments
-          (id, subject, holderKey, openedBySession, openedAt, state, outcome,
-           closedAt, closedBySession, workItemId)
-        VALUES (?1, 'unverified correction', 'holder-owner', 'po-owner', 2,
-                'closed', 'revoked', 3, 'po-owner', 'wi_history')
-        """,
-        [assignment_id]
-      )
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        revocation_id = "history-revocation-#{assignment_id}"
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          """
+          INSERT INTO assignments
+            (id, subject, holderKey, openedBySession, openedAt, state, outcome,
+             closedAt, closedBySession, workItemId)
+          VALUES (?1, 'unverified correction', 'holder-owner', 'po-owner', 2,
+                  'open', NULL, NULL, NULL, 'wi_history')
+          """,
+          [assignment_id]
+        )
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          """
+          INSERT INTO assignment_revocations
+            (id, assignmentId, revokedAt, revokedBySession, reason)
+          VALUES (?1, ?2, 3, 'po-owner', 'historical correction fixture')
+          """,
+          [revocation_id, assignment_id]
+        )
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          """
+          INSERT INTO assignment_revocation_generations
+            (revocationId, assignmentId, reopeningId)
+          VALUES (?1, ?2, NULL)
+          """,
+          [revocation_id, assignment_id]
+        )
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          """
+          UPDATE assignments
+          SET state='closed', outcome='revoked', closedAt=3, closedBySession='po-owner'
+          WHERE id=?1
+          """,
+          [assignment_id]
+        )
+
+        if Tightbeam.DB.Txn.changes(txn) != 1, do: raise("fixture assignment missing")
+        :ok
+      end)
   end
 
   defp recreate_legacy_correction_table!(db) do

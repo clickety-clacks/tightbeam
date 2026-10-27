@@ -844,7 +844,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert {:ok, [[1]]} =
              DB.query(
                db,
-               "SELECT count(*) FROM wakes WHERE rumination=1 AND work_item_id='wi_a1' AND creatorSessionKey='pdo-a' AND state='pending'"
+               "SELECT count(*) FROM wakes WHERE rumination=1 AND work_item_id='wi_a1' AND creatorSessionKey='pdo-a' AND state='fired'"
              )
 
     assert {:ok, [[1]]} =
