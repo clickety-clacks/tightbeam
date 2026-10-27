@@ -2455,9 +2455,9 @@ fn parse_with_optional_catalog(
         "session-connect" => {
             let usage = "usage: tightbeam session-connect --session <sessionKey> (--as-user <userId> | --as-process <name>)";
             if parsed.positional.len() != 1
-                || flags.keys().any(|flag| {
-                    !matches!(flag.as_str(), "session" | "as-user" | "as-process")
-                })
+                || flags
+                    .keys()
+                    .any(|flag| !matches!(flag.as_str(), "session" | "as-user" | "as-process"))
             {
                 return Err(usage.to_owned());
             }
@@ -2467,9 +2467,9 @@ fn parse_with_optional_catalog(
                 flags.contains_key("as-user"),
                 flags.contains_key("as-process"),
             ) {
-                (true, false) => Identity::User(
-                    nonempty(flags, "as-user").ok_or_else(|| usage.to_owned())?,
-                ),
+                (true, false) => {
+                    Identity::User(nonempty(flags, "as-user").ok_or_else(|| usage.to_owned())?)
+                }
                 (false, true) => Identity::Process(
                     nonempty(flags, "as-process").ok_or_else(|| usage.to_owned())?,
                 ),
@@ -5440,8 +5440,7 @@ mod tests {
     #[test]
     fn session_connect_requires_exactly_one_user_or_process_identity() {
         let session_key = "agent:main/example";
-        let usage =
-            "usage: tightbeam session-connect --session <sessionKey> (--as-user <userId> | --as-process <name>)";
+        let usage = "usage: tightbeam session-connect --session <sessionKey> (--as-user <userId> | --as-process <name>)";
 
         assert_eq!(
             parse(strings(&[
