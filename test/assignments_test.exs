@@ -2201,7 +2201,7 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "reopen restores custody, records the close, and rearms every existing monitor", ctx do
+  test "reopen restores custody and records the close without retired effort check-ins", ctx do
     item = create_work_item(ctx, "reopen lifecycle")
     set_delivery_owner(ctx, item.id, "holder")
 
@@ -2271,7 +2271,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert is_binary(deadline_wake_id)
 
-    assert {:ok, [[1, "canceled"], [2, "armed"]]} =
+    assert {:ok, []} =
              DB.query(
                ctx.db,
                "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
@@ -2513,63 +2513,6 @@ defmodule Tightbeam.AssignmentsTest do
     refute Map.has_key?(state, "nextEligibleAt")
   end
 
-  test "Firehose reopening rejects a stale effort arm and rolls back its transaction", ctx do
-    alias Tightbeam.EffortCheckin
-    assignment = handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "generation fence"))
-
-    assert %{assignment: %{state: "closed"}} =
-             handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
-
-    config = %{db: ctx.db, base_dir: System.tmp_dir!(), effort_checkin_horizon_ms: 14_400_000}
-    prepared = EffortCheckin.prepare_reopen_arm(ctx.db, config, assignment.id)
-    assert prepared.prior_generation == 1
-
-    reopened =
-      handle(
-        ctx,
-        "reopen-assignment",
-        reopen_call({:user, "flynn"}, assignment.id, "fresh generation")
-      )
-
-    assert reopened.state == "open"
-    before = reopen_mutation_snapshot(ctx.db, assignment.id)
-
-    assert {:ok, effort_before} =
-             DB.query(
-               ctx.db,
-               "SELECT * FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
-               [assignment.id]
-             )
-
-    assert {:ok, wakes_before} = DB.query(ctx.db, "SELECT * FROM wakes ORDER BY wakeId")
-
-    assert {:error, %RuntimeError{message: "effort generation changed before reopen commit"}} =
-             DB.transaction(ctx.db, fn txn ->
-               DB.Txn.q(txn, "UPDATE assignments SET subject='must roll back' WHERE id=?1", [
-                 assignment.id
-               ])
-
-               EffortCheckin.arm_reopened_in_txn(txn, config, reopened, prepared)
-             end)
-
-    assert reopen_mutation_snapshot(ctx.db, assignment.id) == before
-
-    assert {:ok, ^effort_before} =
-             DB.query(
-               ctx.db,
-               "SELECT * FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
-               [assignment.id]
-             )
-
-    assert {:ok, ^wakes_before} = DB.query(ctx.db, "SELECT * FROM wakes ORDER BY wakeId")
-
-    assert {:ok, [[subject]]} =
-             DB.query(ctx.db, "SELECT subject FROM assignments WHERE id=?1", [assignment.id])
-
-    assert subject == assignment.subject
-    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
-  end
-
   test "Firehose opening publishes once and keyed Dispatch replay emits observation only", ctx do
     alias Tightbeam.Firehose.Hub
     hub = start_supervised!({Hub, name: nil})
@@ -2598,7 +2541,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, [[2]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM events WHERE verb='assign' AND kind='verb'")
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1",
@@ -2954,14 +2897,12 @@ defmodule Tightbeam.AssignmentsTest do
                filed.decisionRequest.id
              ])
 
-    assert {:ok, [[relief_started]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT reliefStartedAt FROM effort_checkin_generations WHERE assignmentId=?1",
+               "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1",
                [first.id]
              )
-
-    assert is_integer(relief_started)
 
     assert {:ok, fact} =
              DB.transaction(ctx.db, fn txn ->
@@ -3001,20 +2942,17 @@ defmodule Tightbeam.AssignmentsTest do
              |> put_in([:params, :note], "The verdict blocker actually cleared")
              |> then(&handle(ctx, "attest", &1))
 
-    assert {:ok, [["withdrawn", "canceled", nil, excluded]]} =
+    assert {:ok, [["withdrawn", "canceled"]]} =
              DB.query(
                ctx.db,
                """
-               SELECT dr.status,w.state,e.reliefStartedAt,e.reliefExcludedMs
+               SELECT dr.status,w.state
                FROM decision_requests dr
                JOIN wakes w ON w.wakeId=?2
-               JOIN effort_checkin_generations e ON e.assignmentId=?3
                WHERE dr.id=?1
                """,
-               [filed.decisionRequest.id, filed.decisionWake.wake_id, first.id]
+               [filed.decisionRequest.id, filed.decisionWake.wake_id]
              )
-
-    assert excluded >= 0
 
     assert %{assignment: %{state: "closed", outcome: "completed"}} =
              handle(
