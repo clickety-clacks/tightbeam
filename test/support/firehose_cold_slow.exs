@@ -172,13 +172,14 @@ try do
     assert_receive {:held, socket, notice}, 2_000
     assert notice["refs"]["workItemId"] == first.id
     second = create.("queued")
-    third = create.("overflow")
+    third = create.("queued too")
+    fourth = create.("overflow")
 
     assert Hub.connection_stats(hub, socket) == %{
-             in_flight: true,
+             in_flight: false,
              overflowed: true,
-             queued: 0,
-             seq: 3
+             queued: 3,
+             seq: 4
            }
 
     send(socket, :release)

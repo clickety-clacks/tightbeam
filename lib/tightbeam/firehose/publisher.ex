@@ -59,11 +59,30 @@ defmodule Tightbeam.Firehose.Publisher do
   @doc "Queue accepted notices on the transaction that committed their state."
   @spec accepted_in_txn(Txn.t(), map(), term()) :: :ok
   def accepted_in_txn(%Txn{} = txn, call, result) do
-    Txn.handoff(
-      txn,
-      Hub.destination(hub(call)),
-      {:accepted, nil, call, canonical_in_txn(txn, call, result)}
-    )
+    result = canonical_in_txn(txn, call, result)
+
+    notices =
+      case call do
+        %{verb: "wake", params: %{cancel_wake_id: wake_id}} when is_binary(wake_id) ->
+          [
+            observation_notice("verb.accepted", call),
+            build(
+              "wake.canceled",
+              call,
+              Tightbeam.Wakes.get(txn, wake_id) || %{wake_id: wake_id},
+              &StateResources.wake/1
+            )
+          ]
+
+        _ ->
+          accepted_notices(nil, call, result)
+      end
+
+    Enum.each(notices, fn notice ->
+      Txn.handoff(txn, Hub.destination(hub(call)), {:publish, notice})
+    end)
+
+    :ok
   end
 
   defp canonical_in_txn(txn, %{verb: verb} = call, result)
@@ -130,7 +149,11 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @spec denied_in_txn(Txn.t(), map(), map()) :: :ok
   def denied_in_txn(%Txn{} = txn, call, error) do
-    Txn.handoff(txn, Hub.destination(hub(call)), {:denied, call, error})
+    Enum.each(denied_notices(call, error), fn notice ->
+      Txn.handoff(txn, Hub.destination(hub(call)), {:publish, notice})
+    end)
+
+    :ok
   end
 
   @spec observed_accepted(map()) :: :ok
@@ -177,11 +200,8 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @doc false
   def committed_in_txn(%Txn{} = txn, class, payload, refs, hub) do
-    if class == "kungfu.updated" do
-      Txn.handoff(txn, Hub.destination(hub), {:publish, committed_notice(class, payload, refs)})
-    else
-      Txn.handoff(txn, Hub.destination(hub), {:committed, class, payload, refs})
-    end
+    notice = committed_notice(class, payload, refs)
+    Txn.handoff(txn, Hub.destination(hub), {:publish, notice})
   end
 
   @doc "Capture one artifact lifecycle snapshot independently of dispatch flags."
@@ -192,7 +212,11 @@ defmodule Tightbeam.Firehose.Publisher do
       "workItemId" => snapshot.work_item_id
     }
 
-    Txn.handoff(txn, Hub.destination(hub(call)), {:committed, class, snapshot, refs})
+    Txn.handoff(
+      txn,
+      Hub.destination(hub(call)),
+      {:publish, committed_notice(class, snapshot, refs)}
+    )
   end
 
   @doc "Queue one exact source-invalidation notice on its committing transaction."

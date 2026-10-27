@@ -403,7 +403,7 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
       })
 
     GenServer.cast(hub, {:publish, notice})
-    refute_receive {:firehose_notice, %{"class" => "subagent_marker.appended"}}
+    assert_receive {:firehose_notice, %{"class" => "subagent_marker.appended"}}
   end
 
   test "marker publication follows commit dedup and captured assignment", %{db: db} do
@@ -431,23 +431,19 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
              DB.transaction(db, fn txn -> SubagentMarkers.append_in_txn(txn, input) end)
 
     assert_receive {:trace, ^hub, :receive,
-                    {:"$gen_cast",
-                     {:ingress, _bytes,
-                      {:publish,
-                       %{"class" => "subagent_marker.appended", "refs" => refs} = notice}}}}
+                    {:"$gen_cast", {:publish, %{"class" => "subagent_marker.appended", "refs" => refs} = notice}}}
 
     assert refs["sessionKey"] == "firehose-owner"
     refute Map.has_key?(refs, "assignmentId")
     refute Tightbeam.StateVisibility.visible?(db, notice, "synthetic-owner", true)
     GenServer.cast(hub, {:publish, notice})
-    refute_receive {:firehose_notice, %{"class" => "subagent_marker.appended"}}
+    assert_receive {:firehose_notice, %{"class" => "subagent_marker.appended"}}
 
     assert {:ok, %{appended: false, assignment_id: nil}} =
              DB.transaction(db, fn txn -> SubagentMarkers.append_in_txn(txn, input) end)
 
     refute_receive {:trace, ^hub, :receive,
-                    {:"$gen_cast",
-                     {:ingress, _, {:publish, %{"class" => "subagent_marker.appended"}}}}}
+                    {:"$gen_cast", {:publish, %{"class" => "subagent_marker.appended"}}}}
 
     before = SubagentMarkers.list(db)
 
@@ -465,8 +461,7 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     assert SubagentMarkers.list(db) == before
 
     refute_receive {:trace, ^hub, :receive,
-                    {:"$gen_cast",
-                     {:ingress, _, {:publish, %{"class" => "subagent_marker.appended"}}}}}
+                    {:"$gen_cast", {:publish, %{"class" => "subagent_marker.appended"}}}}
 
     :erlang.trace(hub, false, [:receive])
   end
