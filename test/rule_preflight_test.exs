@@ -3,8 +3,8 @@ defmodule Tightbeam.RulePreflightTest do
 
   alias Tightbeam.{Assignments, DB, Gateway, Model, Org, Rules, Schema}
 
-  @legacy_fixture "fixtures/legacy_0.1.9-verification.toml"
-  @legacy_sha "abbb6f6929eb95a73794322b1a22b48334084b25e5b15c74d5b364751f68b2b2"
+  @legacy_fixture "fixtures/predecessor-verification.toml"
+  @legacy_sha "cf2755a6933c8b81fd4beb6b7343e9fc3b0c4a054fcdaecd7fd954d1df4f9241"
 
   setup do
     db = :"rule_preflight_#{System.unique_integer([:positive])}"
@@ -27,7 +27,7 @@ defmodule Tightbeam.RulePreflightTest do
     %{db: db, base_dir: base_dir, handlers: handlers}
   end
 
-  test "the retained predecessor rules are skipped safely and remain visible", ctx do
+  test "predecessor rules skip retired policies safely and remain visible", ctx do
     legacy = File.read!(Path.expand(@legacy_fixture, __DIR__))
     assert sha256(legacy) == @legacy_sha
     put_rules(ctx, legacy)
