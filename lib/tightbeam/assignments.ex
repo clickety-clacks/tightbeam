@@ -4011,7 +4011,8 @@ defmodule Tightbeam.Assignments do
       allow_closed: allow_closed,
       artifact_id: call.params[:artifact_id],
       content_sha256: call.params[:content_sha256],
-      wait_id: call.params[:wait_id]
+      wait_id: call.params[:wait_id],
+      supervision_interval_ms: Map.get(call, :supervision_interval_ms)
     })
   end
 
@@ -4055,7 +4056,13 @@ defmodule Tightbeam.Assignments do
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
 
     if is_binary(attrs.by_session) do
-      Supervision.activity_in_txn(txn, attrs.assignment_id, attrs.by_session, ts)
+      Supervision.activity_in_txn(
+        txn,
+        attrs.assignment_id,
+        attrs.by_session,
+        ts,
+        Map.get(attrs, :supervision_interval_ms)
+      )
     end
 
     attest([
