@@ -677,6 +677,7 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
 
         assert %{"code" => -32602, "message" => "Invalid params"} =
                  ErrorDiagnostic.classified(not_selectable_reason)
+
         assert %{"phase" => "model"} = ErrorDiagnostic.of(not_selectable_reason)
 
         assert %{"code" => -32602, "message" => "Invalid params"} =
