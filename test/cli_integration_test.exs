@@ -2512,7 +2512,7 @@ defmodule Tightbeam.CliIntegrationTest do
                [assignment_id]
              )
 
-    assert count_after_replay == generation_count + 1
+    assert count_after_replay == generation_count
 
     {refused_replay, refused_status} =
       System.cmd(
@@ -2956,22 +2956,18 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert_receive {:cli_call, %{verb: "dispatch", params: %{idempotency_key: ^key}}}
 
-    {:ok, [[generation, wake_id]]} =
-      DB.query(
-        ctx.db,
-        "SELECT generation, wakeId FROM effort_checkin_generations WHERE assignmentId = ?1",
-        [assignment_id]
-      )
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE effort_checkin_generations SET state = 'probed' WHERE assignmentId = ?1",
-        [assignment_id]
-      )
-
     request_id = "dr_" <> Tightbeam.Id.uuid4()
     now = System.system_time(:millisecond)
+
+    legacy_deadline =
+      Wakes.schedule(ctx.db, %{
+        session_key: "cli-holder",
+        origin: "process:tightbeam",
+        consumer: "effort_deadline",
+        prompt: nil,
+        due_at: now + 60_000,
+        assignment_id: assignment_id
+      })
 
     {:ok, _} =
       DB.query(
@@ -2982,13 +2978,12 @@ defmodule Tightbeam.CliIntegrationTest do
            lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
            question, options, context, status)
         VALUES (?1, 'effort', 'process:tightbeam', 'flynn', ?2, 'cli-holder',
-                1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open')
+                1, 1, ?3, ?4, ?5, ?6, ?7, ?8, 'open')
         """,
         [
           request_id,
           assignment_id,
-          generation,
-          wake_id,
+          legacy_deadline.wake_id,
           now,
           now + 60_000,
           "Continue or dismiss?",

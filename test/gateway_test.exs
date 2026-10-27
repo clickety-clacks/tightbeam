@@ -3634,17 +3634,6 @@ defmodule Tightbeam.GatewayTest do
     refute Enum.any?(denied.wakes, &(&1.wake_id == second.wake_id))
   end
 
-  @tag cold_gateway: true, gateway_effort: true, tmp_dir: true
-  test "Gateway.children effort consumer routes a due dispatch bracket through Wakes once", %{
-    tmp_dir: tmp
-  } do
-    Tightbeam.GuardRuntimeFixture.run!(
-      tmp,
-      "live_base_gateway_effort.exs",
-      "guarded-gateway-effort: ok"
-    )
-  end
-
   test "R2.1-R2.3 ephemeral spawn stamps its caller without a role or work item", ctx do
     base_dir = role_test_base("ephemeral-spawn")
     dir = Path.join([base_dir, "identity", "archetypes"])

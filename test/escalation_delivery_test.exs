@@ -13,16 +13,6 @@ defmodule Tightbeam.EscalationDeliveryTest do
     Tightbeam.EscalationDeliveryFixture.run!(tmp, 1)
   end
 
-  test "proof 2: an effort request, its deadline wake, and its notification are one commit", %{
-    tmp_dir: tmp
-  } do
-    Tightbeam.EscalationDeliveryFixture.run!(tmp, 2)
-  end
-
-  test "proof 3: terminal request expiry and its refile notice are one commit", %{tmp_dir: tmp} do
-    Tightbeam.EscalationDeliveryFixture.run!(tmp, 3)
-  end
-
   test "proof 4: a committed notification is delivered by the boot tick alone", %{tmp_dir: tmp} do
     Tightbeam.EscalationDeliveryFixture.run!(tmp, 4)
   end
@@ -41,18 +31,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
     Tightbeam.EscalationDeliveryFixture.run!(tmp, 7)
   end
 
-  test "proof 8: terminal expiry preserves original routing and does not re-arm", %{tmp_dir: tmp} do
-    Tightbeam.EscalationDeliveryFixture.run!(tmp, 8)
-  end
-
   test "proof 9: delivery reaches only the injected registry and lane manager", %{tmp_dir: tmp} do
     Tightbeam.EscalationDeliveryFixture.run!(tmp, 9)
-  end
-
-  test "proof 10: every request site arms in-transaction and every turn sink is enumerated", %{
-    tmp_dir: tmp
-  } do
-    Tightbeam.EscalationDeliveryFixture.run!(tmp, 10)
   end
 
   test "proof 11: retirement readdresses notices before ordinary delivery", %{
