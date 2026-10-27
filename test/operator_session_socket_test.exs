@@ -201,22 +201,45 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
       # becomes the named user just because asUser was supplied.
       socket = connect(ctx, path)
       send_frame(socket, auth() |> Map.put(:deviceId, "browser") |> Map.merge(overrides))
-      {reply, socket} = recv_frame(socket)
+      if path == "/ws/changes?protocolVersion=2" and overrides[:token] == "bad" do
+        send_frame(socket, %{
+          type: "subscribe",
+          protocolVersion: 2,
+          subscriptionId: "observer",
+          filters: %{classes: ["session."]}
+        })
 
-      org_wide_identity? = Map.has_key?(overrides, :sessionKey) and is_nil(overrides.sessionKey)
+        {ready, socket} = recv_frame(socket)
+        assert ready == %{"type" => "subscription_ready", "subscriptionId" => "observer"}
 
-      if path == "/ws/changes?protocolVersion=2" and
-           (overrides[:token] == ctx.selected.cli_token or org_wide_identity?) do
-        assert reply["success"] == true
-        assert reply["userId"] == "reader"
+        Hub.publish(ctx.hub, %{
+          "class" => "session.updated",
+          "refs" => %{"sessionKey" => "foreign"},
+          "payload" => %{"sessionKey" => "foreign", "rowVersion" => 1}
+        })
 
-        if overrides[:token] == ctx.selected.cli_token do
-          assert reply["sessionKey"] == "selected"
-        else
-          refute Map.has_key?(reply, "sessionKey")
-        end
+        {change, socket} = recv_frame(socket)
+        assert change["type"] == "change"
+        assert change["subscriptionId"] == "observer"
+        assert change["class"] == "session.updated"
+        assert change["refs"]["sessionKey"] == "foreign"
       else
-        assert reply["success"] == false
+        {reply, socket} = recv_frame(socket)
+        org_wide_identity? = Map.has_key?(overrides, :sessionKey) and is_nil(overrides.sessionKey)
+
+        if path == "/ws/changes?protocolVersion=2" and
+             (overrides[:token] == ctx.selected.cli_token or org_wide_identity?) do
+          assert reply["success"] == true
+          assert reply["userId"] == "reader"
+
+          if overrides[:token] == ctx.selected.cli_token do
+            assert reply["sessionKey"] == "selected"
+          else
+            refute Map.has_key?(reply, "sessionKey")
+          end
+        else
+          assert reply["success"] == false
+        end
       end
 
       WS.close(socket)
