@@ -170,6 +170,244 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
+  test "a pending dated continuation defers only its assignment's inactivity notice until due",
+       ctx do
+    open_deadline!(ctx.db, "asg_inactive", System.system_time(:millisecond), 1_000)
+    due_at = System.system_time(:millisecond) + 60_000
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        creator_session_key: ctx.holder.session_key,
+        assignment_id: "asg_inactive",
+        dated_continuation_assignment_id: "asg_inactive",
+        origin: "session:#{ctx.holder.session_key}",
+        prompt: "continue later",
+        due_at: due_at,
+        sender_scheduled: true
+      })
+
+    assert wake.obligation_ref == "asg_inactive"
+
+    assert {:ok, max_due} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.dated_continuation_due_in_txn(txn, "asg_inactive", wake.created_at)
+             end)
+
+    assert max_due == due_at
+
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at == due_at
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+
+    # The due boundary ends coverage even if notification delivery has not run.
+    assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
+    next_deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [next_deadline.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, next_deadline.wake_id))
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+  end
+
+  test "cancellation and assignment disposition end dated continuation coverage", ctx do
+    holder = ctx.holder.session_key
+    origin = "session:#{holder}"
+
+    schedule = fn prompt ->
+      Wakes.schedule(ctx.db, %{
+        session_key: holder,
+        creator_session_key: holder,
+        assignment_id: "asg_inactive",
+        dated_continuation_assignment_id: "asg_inactive",
+        origin: origin,
+        prompt: prompt,
+        due_at: System.system_time(:millisecond) + 60_000,
+        sender_scheduled: true
+      })
+    end
+
+    covered = fn ->
+      DB.transaction(ctx.db, fn txn ->
+        Wakes.dated_continuation_due_in_txn(txn, "asg_inactive", System.system_time(:millisecond))
+      end)
+    end
+
+    first = schedule.("resume once")
+    assert {:ok, due_at} = covered.()
+    assert due_at == first.due_at
+
+    command = %{
+      wake_id: first.wake_id,
+      expected_origin: origin,
+      requester: %{kind: "session", id: holder},
+      reason_kind: "requester_withdrew",
+      causal_source: %{
+        kind: "verb_call",
+        accepted_event: %{origin: origin, session_key: holder, principal: {:session, holder}}
+      },
+      outcome: %{kind: "no_replacement"}
+    }
+
+    assert {:ok, {:accepted_in_txn, _, %{canceled: true}}} =
+             DB.transaction(ctx.db, fn txn ->
+               {:ok, outcome} = Wakes.public_cancellation_outcome_in_txn(txn, command)
+               Wakes.cancel_in_txn(txn, %{command | outcome: outcome})
+             end)
+
+    assert {:ok, nil} = covered.()
+
+    second = schedule.("resume again")
+    assert {:ok, second.due_at} == covered.()
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               closed_at = System.system_time(:millisecond)
+
+               Txn.q(
+                 txn,
+                 "INSERT INTO attests(id,assignmentId,kind,bySession,ts) VALUES('att_dated_closed','asg_inactive','completion',?1,?2)",
+                 [holder, closed_at]
+               )
+
+               Txn.q(
+                 txn,
+                 "UPDATE assignments SET state='closed',outcome='completed',closedAt=?1,closedBySession=?2,closingAttestId='att_dated_closed' WHERE id='asg_inactive'",
+                 [closed_at, holder]
+               )
+
+               Supervision.assignment_closed_in_txn(txn, "asg_inactive")
+             end)
+
+    assert {:ok, nil} = covered.()
+  end
+
+  test "canceling a continuation restores the inactivity deadline after deferral", ctx do
+    holder = ctx.holder.session_key
+    origin = "agent:#{holder}"
+    open_deadline!(ctx.db, "asg_inactive", System.system_time(:millisecond), 1_000)
+
+    schedule = fn prompt, offset ->
+      Wakes.schedule(ctx.db, %{
+        session_key: holder,
+        creator_session_key: holder,
+        assignment_id: "asg_inactive",
+        dated_continuation_assignment_id: "asg_inactive",
+        origin: origin,
+        prompt: prompt,
+        due_at: System.system_time(:millisecond) + offset,
+        sender_scheduled: true
+      })
+    end
+
+    cancel = fn wake ->
+      command = %{
+        wake_id: wake.wake_id,
+        expected_origin: origin,
+        requester: %{kind: "session", id: holder},
+        reason_kind: "requester_withdrew",
+        causal_source: %{
+          kind: "verb_call",
+          accepted_event: %{origin: origin, session_key: holder, principal: {:session, holder}}
+        },
+        outcome: %{kind: "no_replacement"}
+      }
+
+      assert {:ok, {:accepted_in_txn, _, %{canceled: true}}} =
+               DB.transaction(ctx.db, fn txn ->
+                 {:ok, outcome} = Wakes.public_cancellation_outcome_in_txn(txn, command)
+                 Wakes.cancel_in_txn(txn, %{command | outcome: outcome})
+               end)
+    end
+
+    earlier = schedule.("resume earlier", 60_000)
+    later = schedule.("resume later", 120_000)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at == later.due_at
+
+    cancel.(later)
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at == earlier.due_at
+
+    cancel.(earlier)
+    restored = pending_deadline!(ctx.db, "asg_inactive")
+    assert restored.due_at < earlier.due_at
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [restored.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, restored.wake_id))
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+  end
+
+  test "dated continuation delivery is one notification and no work receipt", ctx do
+    registry = :"dated_registry_#{System.unique_integer([:positive])}"
+    lane = :"dated_lane_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
+    delivery_opts = [conn_registry: registry, lane_manager: lane]
+    holder = ctx.holder.session_key
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: holder,
+        creator_session_key: holder,
+        assignment_id: "asg_inactive",
+        dated_continuation_assignment_id: "asg_inactive",
+        origin: "agent:#{holder}",
+        prompt: "resume at the scheduled time",
+        due_at: System.system_time(:millisecond) + 60_000,
+        sender_scheduled: true
+      })
+
+    assert wake.obligation_ref == "asg_inactive"
+    [carrier_id] = Tightbeam.NoticeBatcher.recover(ctx.db, wake.due_at + 1, delivery_opts)
+    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id='asg_inactive'")
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM attests WHERE assignmentId='asg_inactive'")
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert [] == Tightbeam.NoticeBatcher.recover(ctx.db, wake.due_at + 1, delivery_opts)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM attests WHERE assignmentId='asg_inactive'")
+  end
+
   test "holder wake registration moves its deadline from registration time, not future due time",
        ctx do
     opened_at = System.system_time(:millisecond)

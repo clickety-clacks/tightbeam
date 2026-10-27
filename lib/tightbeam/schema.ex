@@ -4020,7 +4020,8 @@ defmodule Tightbeam.Schema do
              normalize_schema_sql(current.sql),
              normalize_schema_sql(recorded_continuation_retry_guard(previous).sql),
              normalize_schema_sql(owner_scoped_continuation_guard(previous).sql),
-             normalize_schema_sql(cross_owner_continuation_guard(previous).sql)
+             normalize_schema_sql(cross_owner_continuation_guard(previous).sql),
+             normalize_schema_sql(dated_continuation_guard(previous).sql)
            ],
            do: incompatible_supervision_liveness!("malformed owned object #{previous.name}")
 
@@ -4064,6 +4065,29 @@ defmodule Tightbeam.Schema do
     %{recorded | sql: Regex.replace(ancestry, recorded.sql, "")}
   end
 
+  defp dated_continuation_guard(previous) do
+    previous = cross_owner_continuation_guard(previous)
+    wait_mode = "AND w.waitMode IN ('dependency','after-turn') AND w.prompt IS NOT NULL"
+    true = String.contains?(previous.sql, wait_mode)
+
+    %{
+      previous
+      | sql:
+          String.replace(
+            previous.sql,
+            wait_mode,
+            """
+            AND w.prompt IS NOT NULL AND (
+              w.waitMode IN ('dependency','after-turn') OR
+              (w.waitMode IS NULL AND w.conditionKind IS NULL AND w.targetRole IS NULL
+               AND w.creatorSessionKey=a.holderKey AND w.dueAt>w.createdAt)
+            )
+            """,
+            global: false
+          )
+    }
+  end
+
   defp migrate_continuation_retry_guard(db) do
     previous =
       Enum.find(
@@ -4071,13 +4095,14 @@ defmodule Tightbeam.Schema do
         &(&1.name == "supervision_liveness_sidecar_insert_coherent")
       )
 
-    current = cross_owner_continuation_guard(previous)
+    current = dated_continuation_guard(previous)
 
     supported = [
       previous,
       continuation_retry_guard(previous),
       recorded_continuation_retry_guard(previous),
       owner_scoped_continuation_guard(previous),
+      cross_owner_continuation_guard(previous),
       current
     ]
 

@@ -7146,6 +7146,8 @@ defmodule Tightbeam.Gateway do
         reresolve: p[:reresolve],
         reresolve_seed: p[:reresolve_seed],
         reresolve_rung: p[:reresolve_rung],
+        dated_continuation_assignment_id:
+          dated_continuation_assignment_id_in_txn(txn, call, session_key),
         # Immediate conversational wakes have their assignment link stripped by the
         # router. Timed and fact-triggered registrations retain the explicit link;
         # typed waits validate it through register_wait_in_txn/2. Internal process
@@ -7224,6 +7226,29 @@ defmodule Tightbeam.Gateway do
          is_binary(params[:condition_kind]),
        do: params[:assignment_id],
        else: nil
+  end
+
+  defp dated_continuation_assignment_id_in_txn(txn, call, session_key) do
+    p = call.params
+
+    with {:session, ^session_key} <- call.principal,
+         true <- is_nil(Map.get(call, :target_role)),
+         assignment_id when is_binary(assignment_id) and assignment_id != "" <- p[:assignment_id],
+         true <- is_integer(p[:at]) or is_integer(p[:after_ms]),
+         true <-
+           is_nil(p[:condition_kind]) and is_nil(p[:predicate]) and
+             p[:after_turn] != true and is_nil(p[:cron]) and
+             p[:replace_queued] != true,
+         [[1]] <-
+           DB.Txn.q(
+             txn,
+             "SELECT 1 FROM assignments WHERE id=?1 AND holderKey=?2 AND state='open'",
+             [assignment_id, session_key]
+           ) do
+      assignment_id
+    else
+      _ -> nil
+    end
   end
 
   defp creator_session_key({:session, key}), do: key
