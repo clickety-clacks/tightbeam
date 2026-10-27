@@ -1651,7 +1651,7 @@ defmodule Tightbeam.Assignments do
       case replayed_assignment(db, call) do
         nil ->
           case Org.get(db, call.session_key) do
-            %{state: "active"} = holder ->
+            %{state: "active"} ->
               open_assignment_result(
                 db,
                 call,
@@ -2802,7 +2802,7 @@ defmodule Tightbeam.Assignments do
     close_completed_assignment_in_txn(txn, call, assignment, attest)
   end
 
-  defp close_completed_assignment_in_txn(txn, call, assignment, attest) do
+  defp close_completed_assignment_in_txn(txn, _call, assignment, attest) do
     Txn.q(
       txn,
       """

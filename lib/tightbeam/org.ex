@@ -1270,7 +1270,7 @@ defmodule Tightbeam.Org do
 
   defp put_liveness_trigger(outcome, nil), do: outcome
 
-  defp cancel_retired_notice!(txn, wake_id, consumer, command, after_cancellation) do
+  defp cancel_retired_notice!(txn, wake_id, _consumer, command, after_cancellation) do
     unless Wakes.cancel_in_txn(txn, Map.put(command, :wake_id, wake_id)) do
       raise "typed retirement cancellation refused for #{wake_id}"
     end

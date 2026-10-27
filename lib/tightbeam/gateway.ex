@@ -3626,7 +3626,7 @@ defmodule Tightbeam.Gateway do
   # the CAS-then-kill; here we broadcast the terminal frames and best-effort
   # tell the harness to stop generating (ACP session/cancel notification —
   # fire-and-forget; the substrate's truth is the ledger row either way).
-  defp clear_stranded_result(config, db, call) do
+  defp clear_stranded_result(config, _db, call) do
     p = call.params
 
     with {:ok, seq} <- clear_seq(p[:turn_seq]),
