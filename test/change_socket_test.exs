@@ -423,14 +423,20 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     Enum.each(1..1_500, fn index ->
       Hub.publish(ctx.hub, notice(ctx, "wi_#{index}"))
-      # Drain ingress so this test isolates the per-connection delivery queue.
+      # Wait for the hub to process each notice so only this socket can overflow.
       Hub.sequence(ctx.hub, self())
     end)
 
-    assert %{in_flight: true, overflowed: true, queued: 0, seq: 1_001} =
+    assert %{in_flight: false, overflowed: true, queued: 1_001, seq: 1_001} =
              Hub.connection_stats(ctx.hub, self())
 
-    assert_receive {:firehose_notice, %{"seq" => 1}}
+    notices =
+      for seq <- 1..1_000 do
+        assert_receive {:firehose_notice, %{"seq" => ^seq}}
+        seq
+      end
+
+    assert notices == Enum.to_list(1..1_000)
     assert_receive :firehose_overflow
     refute_receive :firehose_overflow, 50
     refute_receive {:firehose_notice, _notice}, 50
@@ -439,10 +445,11 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
              ChangeSocket.handle_info(:firehose_overflow, state)
   end
 
-  test "ingress overflow closes the authenticated socket with retryable code", ctx do
-    {:push, {:text, _auth}, state} =
+  test "a shared burst does not close a subscriber with no matching events", ctx do
+    {:push, {:text, _auth}, _state} =
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
 
+    :ok = Hub.subscribe(ctx.hub, self(), "quiet", %{"classes" => ["never."]})
     :ok = :sys.suspend(ctx.hub)
 
     try do
@@ -459,11 +466,10 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       :ok = :sys.resume(ctx.hub)
     end
 
-    assert_receive :firehose_overflow, 5_000
+    assert Hub.sequence(ctx.hub, self()) == 0
     assert is_pid(Process.whereis(ctx.hub))
-
-    assert {:stop, :normal, 4008, ^state} =
-             ChangeSocket.handle_info(:firehose_overflow, state)
+    refute_receive :firehose_overflow
+    refute_receive {:firehose_notice, _}
   end
 
   test "gateway shutdown closes change sockets with restarting code", ctx do
