@@ -1002,6 +1002,18 @@ defmodule Tightbeam.Acp.AdapterTest do
                request["cwd"] == "/tmp"
            end)
 
+    fork_index = Enum.find_index(requests, &(&1["method"] == "session/fork"))
+
+    child_config_index =
+      Enum.find_index(requests, fn request ->
+        request["method"] == "session/set_config_option" and
+          request["sessionId"] == "sess-fork-1"
+      end)
+
+    assert is_integer(fork_index)
+    assert is_integer(child_config_index)
+    assert fork_index < child_config_index
+
     model_writes =
       Enum.filter(requests, fn request ->
         request["method"] == "session/set_config_option" and
