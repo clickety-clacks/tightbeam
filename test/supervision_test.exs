@@ -177,14 +177,14 @@ defmodule Tightbeam.SupervisionTest do
       end)
 
     assert is_map(reminder)
-    old_deadline = pending_deadline!(ctx.db, "asg_inactive")
+    old_climb = pending_climb!(ctx.db, "asg_inactive")
     Application.put_env(:tightbeam, :supervision_interval_ms, :off)
 
     assert :ok = Supervision.migrate_open_assignments(ctx.db, :off)
     assert Wakes.get(ctx.db, reminder.wake_id).state == "canceled"
     new_deadline = pending_deadline!(ctx.db, "asg_inactive")
-    assert Wakes.get(ctx.db, old_deadline.wake_id).state == "canceled"
-    refute old_deadline.wake_id == new_deadline.wake_id
+    assert Wakes.get(ctx.db, old_climb.wake_id).state == "canceled"
+    refute old_climb.wake_id == new_deadline.wake_id
 
     assert {:ok, [[0]]} =
              DB.query(
