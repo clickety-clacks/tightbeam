@@ -4094,7 +4094,6 @@ defmodule Tightbeam.Assignments do
 
         if Txn.changes(txn) != 1, do: raise(TransitionRace)
 
-
         case fetch_assignment(txn, assignment_id) do
           %{holderKey: holder} ->
             append_substrate(txn, holder, "[cannot-proceed settled by opener answer]")

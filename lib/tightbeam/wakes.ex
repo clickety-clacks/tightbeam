@@ -1928,6 +1928,7 @@ defmodule Tightbeam.Wakes do
 
     due_at
   end
+
   defp continuation_facts_in_txn(txn, wake, assignment_id) do
     obligation =
       Txn.q(
