@@ -6188,6 +6188,24 @@ defmodule Tightbeam.AssignmentsTest do
       {"", 0}
     end)
 
+    rules_base =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-assignment-review-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(rules_base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+
+    completion_rules =
+      File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+      |> String.split("\n# Posture gate", parts: 2)
+      |> hd()
+
+    File.write!(Path.join(rules_dir, "engineering.toml"), completion_rules)
+    Rules.load!(rules_base, Map.keys(ctx.handlers))
+    on_exit(fn -> File.rm_rf!(rules_base) end)
+
     work_item = create_work_item(ctx, "unlinked review completion")
     other_work_item = create_work_item(ctx, "unrelated review work")
     commit = String.duplicate("a", 40)

@@ -1001,6 +1001,24 @@ defmodule Tightbeam.WorkItems do
     :ok
   end
 
+  @doc false
+  @spec cancel_slate_bracket_in_txn(Txn.t(), String.t(), map()) :: :ok
+  def cancel_slate_bracket_in_txn(%Txn{} = txn, work_item_id, transition) do
+    case Txn.q(txn, "SELECT slateWakeId FROM work_items WHERE id = ?1", [work_item_id]) do
+      [[slate]] when is_binary(slate) ->
+        cancel_bracket_in_txn(txn, slate, transition)
+        Txn.q(txn, "UPDATE work_items SET slateWakeId = NULL WHERE id = ?1", [work_item_id])
+
+      [[nil]] ->
+        :ok
+
+      [] ->
+        :ok
+    end
+
+    :ok
+  end
+
   defp cancel_bracket_in_txn(txn, wake_id, transition) do
     case Txn.q(txn, "SELECT state FROM wakes WHERE wakeId = ?1", [wake_id]) do
       [["pending"]] ->

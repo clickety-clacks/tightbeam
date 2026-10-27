@@ -35,6 +35,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     holder = session(db, "impl-holder", "coder")
     owner = session(db, "po-holder", "product-owner")
     pdo = session(db, "delivery-owner", "pdo")
+    reviewer = session(db, "review-holder", "reviewer")
 
     Roles.create!(db, "product-owner:spirit", "flynn", owner.session_key)
 
@@ -73,6 +74,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
       holder: holder,
       owner: owner,
       pdo: pdo,
+      reviewer: reviewer,
       rules: rules,
       base_dir: base_dir
     }
@@ -156,7 +158,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     for round <- 1..3 do
       call =
         user_assign_call(
-          ctx.owner.session_key,
+          ctx.reviewer.session_key,
           item.id,
           "independent conclusion #{round}",
           reviews_assignment_id: subject.id
@@ -168,7 +170,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
         Dispatch.dispatch(
           ctx.db,
           ctx.handlers,
-          verdict_call(ctx.owner.session_key, review.id, "changes-requested")
+          verdict_call(ctx.reviewer.session_key, review.id, "changes-requested")
         )
 
       if round < 3,

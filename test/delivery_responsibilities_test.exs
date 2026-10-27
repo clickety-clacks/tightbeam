@@ -760,6 +760,12 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     before = count(db, "assignments")
     wakes_before = count(db, "wakes")
 
+    {:ok, []} =
+      DB.query(
+        db,
+        "INSERT OR IGNORE INTO hosts(name,baseDir) VALUES('synthetic-host','/synthetic-only')"
+      )
+
     for caller <- ["peer", "foreign-worker"] do
       assert {:error, %{code: "delivery_owner_required", message: message}} =
                Dispatch.dispatch(
@@ -840,12 +846,6 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                db,
                "SELECT count(*) FROM wakes WHERE rumination=1 AND work_item_id='wi_a1' AND creatorSessionKey='pdo-a' AND state='pending'"
              )
-
-    {:ok, []} =
-      DB.query(
-        db,
-        "INSERT OR IGNORE INTO hosts(name,baseDir) VALUES('synthetic-host','/synthetic-only')"
-      )
 
     assert {:ok, [[1]]} =
              DB.query(

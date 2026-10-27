@@ -2549,12 +2549,14 @@ defmodule Tightbeam.Assignments do
           call.supervision_interval_ms
         )
 
-        # This assign/dispatch routed the item: cancel bracket 1 (and bracket 2
-        # if a prior last-close armed a slate wake — the slate is no longer clear).
+        # A dispatch that opens work while delivery ownership is still unset does
+        # not satisfy the owner's routing bracket. It only satisfies a slate
+        # bracket left by a prior last-close. Other assignment transitions route
+        # the item and cancel both brackets.
         if work_item_id do
           bracket_trigger = liveness_trigger!(txn, {:work_item, work_item_id})
 
-          Tightbeam.WorkItems.cancel_brackets_in_txn(txn, work_item_id, %{
+          bracket_transition = %{
             causal_source: %{kind: "assignment_transition", id: id},
             outcome: %{
               kind: "disposition",
@@ -2562,7 +2564,17 @@ defmodule Tightbeam.Assignments do
               disposition_id: id,
               liveness_trigger: bracket_trigger
             }
-          })
+          }
+
+          if preserves_owner_routing_bracket?(txn, verb, work_item_id) do
+            Tightbeam.WorkItems.cancel_slate_bracket_in_txn(
+              txn,
+              work_item_id,
+              bracket_transition
+            )
+          else
+            Tightbeam.WorkItems.cancel_brackets_in_txn(txn, work_item_id, bracket_transition)
+          end
         end
 
         if key do
@@ -4979,6 +4991,20 @@ defmodule Tightbeam.Assignments do
       :none -> raise "#{inspect(primary)} has no liveness trigger"
     end
   end
+
+  defp preserves_owner_routing_bracket?(txn, "dispatch", work_item_id) do
+    case Txn.q(
+           txn,
+           "SELECT deliveryOwnerSessionKey FROM work_items WHERE id = ?1",
+           [work_item_id]
+         ) do
+      [[nil]] -> true
+      [[_delivery_owner_session_key]] -> false
+      [] -> raise "assignment references missing work item #{work_item_id}"
+    end
+  end
+
+  defp preserves_owner_routing_bracket?(_txn, _verb, _work_item_id), do: false
 
   defp assignment_disposition_command(assignment_id, requester_id, liveness_trigger) do
     outcome = %{

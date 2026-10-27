@@ -343,8 +343,8 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
   end
 
   defp insert_closed_assignment!(db, assignment_id) do
-    :ok =
-      DB.execute(
+    {:ok, []} =
+      DB.query(
         db,
         """
         INSERT INTO assignments
