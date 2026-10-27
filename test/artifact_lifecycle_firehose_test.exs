@@ -175,7 +175,7 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
     refute_receive {:firehose_notice, _}
   end
 
-  test "AL13 matching subscriptions still require visibility", ctx do
+  test "AL13 matching subscriptions deliver without per-user visibility checks", ctx do
     :ok =
       Hub.register(Hub, self(), %{
         mode: :subscribed,
@@ -196,13 +196,27 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
 
     try do
       record(ctx.db, "eezo:/tmp/hidden")
-      assert Hub.sequence(Hub, self()) == 0
+      assert Hub.sequence(Hub, self()) == 1
       assert_receive {:trace, ^hub, :call, {Hub, :matches?, _}}
-      refute_receive {:firehose_notice, _}
+
+      assert_receive {:firehose_notice,
+                      %{
+                        "class" => "artifact.recorded",
+                        "subscriptionId" => "matching",
+                        "seq" => 1
+                      }}
+
+      :ok = Hub.delivered(Hub, self())
       :ok = Hub.register(Hub, self(), %{user_id: "flynn"})
       :ok = Artifacts.archive_session(ctx.db, "al_owner", ctx.work, ctx.archive)
       assert_receive {:trace, ^hub, :call, {Hub, :matches?, _}}
-      assert_receive {:firehose_notice, %{"class" => "artifact.released"}}
+
+      assert_receive {:firehose_notice,
+                      %{
+                        "class" => "artifact.released",
+                        "subscriptionId" => "matching",
+                        "seq" => 2
+                      }}
     after
       :erlang.trace(hub, false, [:call])
       :erlang.trace_pattern({Hub, :matches?, 2}, false, [:local])

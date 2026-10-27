@@ -415,28 +415,31 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert_receive {:firehose_notice, %{"refs" => %{"workItemId" => "wi_after"}, "seq" => 1}}
   end
 
-  test "the per-connection queue is exact and overflow closes once", ctx do
+  test "a per-connection backlog over 64 MiB overflows once", ctx do
     {:push, {:text, _auth}, state} =
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
 
     :ok = Hub.subscribe(ctx.hub, self(), "work", %{})
 
-    Enum.each(1..1_500, fn index ->
-      Hub.publish(ctx.hub, notice(ctx, "wi_#{index}"))
-      # Wait for the hub to process each notice so only this socket can overflow.
-      Hub.sequence(ctx.hub, self())
-    end)
+    large_title = :binary.copy("x", 33 * 1_024 * 1_024)
 
-    assert %{in_flight: false, overflowed: true, queued: 1_001, seq: 1_001} =
+    first_notice = notice(ctx, "wi_large_1")
+    first_notice = put_in(first_notice, ["payload", "title"], large_title)
+    Hub.publish(ctx.hub, first_notice)
+    assert Hub.sequence(ctx.hub, self()) == 1
+
+    assert %{in_flight: false, overflowed: false, queued: 1, seq: 1} =
              Hub.connection_stats(ctx.hub, self())
 
-    notices =
-      for seq <- 1..1_000 do
-        assert_receive {:firehose_notice, %{"seq" => ^seq}}
-        seq
-      end
+    second_notice = notice(ctx, "wi_large_2")
+    second_notice = put_in(second_notice, ["payload", "title"], large_title)
+    Hub.publish(ctx.hub, second_notice)
+    assert Hub.sequence(ctx.hub, self()) == 2
 
-    assert notices == Enum.to_list(1..1_000)
+    assert %{in_flight: false, overflowed: true, queued: 2, seq: 2} =
+             Hub.connection_stats(ctx.hub, self())
+
+    assert_receive {:firehose_notice, %{"seq" => 1, "refs" => %{"workItemId" => "wi_large_1"}}}
     assert_receive :firehose_overflow
     refute_receive :firehose_overflow, 50
     refute_receive {:firehose_notice, _notice}, 50

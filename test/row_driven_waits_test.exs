@@ -17,7 +17,6 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     ConditionFacts,
     ConnRegistry,
     DB,
-    EffortCheckin,
     Escalation,
     Gateway,
     Ledger,
@@ -1385,204 +1384,31 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
   end
 
-  test "missing relief runtime rolls back admission and schema initialization reinstalls it",
-       ctx do
-    qualification_policy(ctx)
+  test "retired wait relief policy does not block dependency registration", ctx do
+    File.write!(Path.join(ctx.base, "identity/rules/qualification.toml"), """
+    [[policy]]
+    name = "fixture-relief"
+    purpose = "wait-effort-relief"
+    when = [{fact="resolver.owed_by_other",op="eq",value=true}]
+    """)
 
-    assert {:ok, _} =
-             DB.transaction(ctx.db, fn txn ->
-               EffortCheckin.arm_in_txn(txn, %{base_dir: ctx.base}, %{
-                 id: "A",
-                 holderKey: "holder"
-               })
-             end)
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        Rules.load!(ctx.base, ~w(wake attest))
+        wake = register_wait(ctx.db, due_after(), predicate("R"))
+        assert %{state: "pending"} = Wakes.get(ctx.db, wake.wake_id)
+      end)
 
-    before = effort_snapshot(ctx.db)
-    {:ok, wake_count} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
-    {:ok, sidecar_count} = DB.query(ctx.db, "SELECT COUNT(*) FROM supervision_liveness_sidecar")
-    key = {Tightbeam.RuleRuntime, :wait_relief}
-    installed = :persistent_term.get(key)
+    assert log =~ "policy \"fixture-relief\" skipped: purpose wait-effort-relief is retired"
 
-    try do
-      :persistent_term.erase(key)
-
-      assert {:error, %RuntimeError{message: "wait relief accounting runtime is not installed"}} =
-               DB.transaction(ctx.db, fn txn ->
-                 Wakes.register_wait_in_txn(txn, %{
-                   session_key: "holder",
-                   origin: "agent:holder",
-                   prompt: "Continue after resolution.",
-                   due_at: due_after(),
-                   assignment_id: "A",
-                   predicate: predicate("R"),
-                   registrant_session_key: "holder",
-                   owner_user_id: "owner-a"
-                 })
-               end)
-
-      assert {:ok, ^wake_count} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
-
-      assert {:ok, ^sidecar_count} =
-               DB.query(ctx.db, "SELECT COUNT(*) FROM supervision_liveness_sidecar")
-
-      assert effort_snapshot(ctx.db) == before
-      assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
-      wake = register_wait(ctx.db, due_after(), predicate("R"))
-
-      assert {:ok, [[started]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT reliefStartedAt FROM effort_checkin_generations WHERE assignmentId='A'"
-               )
-
-      assert started == wake.created_at
-    after
-      :persistent_term.put(key, installed)
-    end
-  end
-
-  @tag tmp_dir: true
-  test "overlapping provisional waits pause one generation and challenge resumes its remainder",
-       %{tmp_dir: tmp} do
-    Tightbeam.GuardRuntimeFixture.run!(tmp, "row_wait_relief_runtime.exs", "row-wait-relief: ok")
-  end
-
-  test "C5: ready-now uses normal effort and self-owed relief requires a policy election", ctx do
-    qualification_policy(ctx)
-
-    assert {:ok, _} =
-             DB.transaction(ctx.db, fn txn ->
-               EffortCheckin.arm_in_txn(txn, %{base_dir: ctx.base}, %{
-                 id: "A",
-                 holderKey: "holder"
-               })
-             end)
-
-    register_wait(ctx.db, due_after(), predicate("R", "open"))
-    refute effort_relief_active?(ctx.db, "A")
-
-    assert {:ok, [[nil, 0]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
+               "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId='A'"
              )
-
-    assignment(ctx.db, "self-R", "holder")
-    register_wait(ctx.db, due_after(), predicate("self-R"))
-
-    assert {:ok, [[nil, 0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
-             )
-
-    qualification_policy(ctx, false)
-    elected = register_wait(ctx.db, due_after(), predicate("self-R"))
-
-    assert {:ok, [[started, 0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
-             )
-
-    assert started == elected.created_at
-  end
-
-  test "success, resolver termination, fallback and cancellation each end relief once",
-       ctx do
-    qualification_policy(ctx)
-
-    assert {:ok, _} =
-             DB.transaction(ctx.db, fn txn ->
-               EffortCheckin.arm_in_txn(txn, %{base_dir: ctx.base}, %{
-                 id: "A",
-                 holderKey: "holder"
-               })
-             end)
-
-    before = effort_snapshot(ctx.db)
-
-    for ending <- ~w(success terminal fallback cancel) do
-      resolver = "R-#{ending}"
-      assignment(ctx.db, resolver, "resolver")
-      due = if ending == "fallback", do: System.system_time(:millisecond) - 1, else: due_after()
-      wake = register_wait(ctx.db, due, predicate(resolver))
-
-      assert {:ok, [[started, prior]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
-               )
-
-      interval_start = started - 1_000
-
-      assert {:ok, _} =
-               DB.query(
-                 ctx.db,
-                 "UPDATE effort_checkin_generations SET reliefStartedAt=?1 WHERE assignmentId='A'",
-                 [interval_start]
-               )
-
-      case ending do
-        "success" ->
-          assert %{assignment: _} = attest(ctx.db, resolver, "resolver", "completion")
-
-        "terminal" ->
-          assert %{outcome: "revoked"} = revoke(ctx.db, resolver)
-
-        "fallback" ->
-          assert :ok = Wakes.fire_due(ctx.scheduler)
-
-        "cancel" ->
-          assert {:ok, {:accepted_in_txn, _, %{canceled: true}}} =
-                   DB.transaction(ctx.db, fn txn ->
-                     Wakes.cancel_in_txn(txn, %{
-                       wake_id: wake.wake_id,
-                       expected_origin: wake.origin,
-                       requester: %{kind: "session", id: "holder"},
-                       reason_kind: "requester_withdrew",
-                       causal_source: %{
-                         kind: "verb_call",
-                         accepted_event: %{
-                           origin: wake.origin,
-                           session_key: "holder",
-                           principal: {:session, "holder"}
-                         }
-                       },
-                       outcome: %{kind: "no_replacement"}
-                     })
-                   end)
-      end
-
-      ended = Wakes.get(ctx.db, wake.wake_id)
-      endpoint = ended.canceled_at || ended.recognition_at
-      expected = prior + endpoint - interval_start
-
-      assert {:ok, [[nil, ^expected]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
-               )
-
-      assert {:ok, :ok} =
-               DB.transaction(
-                 ctx.db,
-                 &EffortCheckin.reconcile_wait_relief_in_txn(&1, "A", endpoint + 100)
-               )
-
-      assert {:ok, [[nil, ^expected]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
-               )
-
-      assert effort_snapshot(ctx.db) == before
-    end
   end
 
   test "failed and unknown continuation outcomes do not answer work", ctx do
-    qualification_policy(ctx)
-
     for status <- ~w(failed failed_unknown) do
       wake = register_wait(ctx.db, due_after(), predicate("R", "open"))
       assert :ok = Wakes.fire_due(ctx.scheduler)
@@ -1606,7 +1432,6 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  owner_lease: turn.owner_lease
                )
 
-      refute effort_relief_active?(ctx.db, "A")
       assert {attest_count(ctx.db, "A"), supervision_counts(ctx.db, "A")} == before
 
       assert {:ok, [["open", nil]]} =
@@ -1653,33 +1478,6 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     :ok = :sys.suspend(pid)
     on_exit(fn -> if Process.alive?(pid), do: :sys.resume(pid) end)
     pid
-  end
-
-  defp qualification_policy(ctx, other \\ true) do
-    File.write!(Path.join(ctx.base, "identity/rules/qualification.toml"), """
-    [[policy]]
-    name = "fixture-relief"
-    purpose = "wait-effort-relief"
-    when = [{fact="resolver.owed_by_other",op="eq",value=#{other}}]
-    """)
-
-    Rules.load!(ctx.base, ~w(wake attest))
-  end
-
-  defp effort_relief_active?(db, id) do
-    assert {:ok, active} = DB.transaction(db, &Wakes.effort_relief_in_txn?(&1, id))
-    active
-  end
-
-  defp effort_snapshot(db) do
-    {:ok, rows} =
-      DB.query(db, """
-      SELECT generation,state,baseHorizonMs,multiplier,armedAt,terminalSeqWatermark,
-        wakeId,agentProdded,artifactWatermark,attestWatermark,workItemWatermark
-      FROM effort_checkin_generations WHERE assignmentId='A'
-      """)
-
-    rows
   end
 
   defp register_wait(db, due_at, predicate) do

@@ -57,10 +57,6 @@ if config_env() != :test do
     config :tightbeam, :escalation_decision_deadline_ms, String.to_integer(value)
   end
 
-  if value = System.get_env("TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS") do
-    config :tightbeam, :effort_checkin_horizon_ms, String.to_integer(value)
-  end
-
   if value = System.get_env("TIGHTBEAM_WORK_ITEM_TRIAGE_DEADLINE_MS") do
     config :tightbeam, :work_item_triage_deadline_ms, String.to_integer(value)
   end

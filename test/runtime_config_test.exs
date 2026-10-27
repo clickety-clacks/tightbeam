@@ -14,7 +14,7 @@ defmodule Tightbeam.RuntimeConfigTest do
     "TIGHTBEAM_WAKE_TICK_MS" => "101",
     "TIGHTBEAM_PROD_LIMIT" => "7",
     "TIGHTBEAM_ESCALATION_DECISION_DEADLINE_MS" => "202",
-    "TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS" => "303",
+    "TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS" => "not-a-duration",
     "TIGHTBEAM_WORK_ITEM_TRIAGE_DEADLINE_MS" => "404",
     "TIGHTBEAM_ADVERTISED_URL" => "ws://runtime-poison:9999",
     "TIGHTBEAM_DRAIN_TIMEOUT_MS" => "505",
@@ -42,7 +42,7 @@ defmodule Tightbeam.RuntimeConfigTest do
              @runtime_env["TIGHTBEAM_ADVERTISED_URL"]
   end
 
-  test "development and production still read every runtime config variable" do
+  test "development and production ignore the retired effort horizon setting" do
     expected = [
       tightbeam: [
         base_dir: "/tmp/tightbeam-runtime-poison",
@@ -61,7 +61,6 @@ defmodule Tightbeam.RuntimeConfigTest do
         wake_tick_ms: 101,
         prod_limit: 7,
         escalation_decision_deadline_ms: 202,
-        effort_checkin_horizon_ms: 303,
         work_item_triage_deadline_ms: 404,
         advertised_url: "ws://runtime-poison:9999",
         drain_timeout_ms: 505,
@@ -70,7 +69,12 @@ defmodule Tightbeam.RuntimeConfigTest do
       ]
     ]
 
-    assert Config.Reader.read!("config/runtime.exs", env: :dev) == expected
-    assert Config.Reader.read!("config/runtime.exs", env: :prod) == expected
+    development = Config.Reader.read!("config/runtime.exs", env: :dev)
+    production = Config.Reader.read!("config/runtime.exs", env: :prod)
+
+    assert development == expected
+    assert production == expected
+    refute Keyword.has_key?(Keyword.fetch!(development, :tightbeam), :effort_checkin_horizon_ms)
+    refute Keyword.has_key?(Keyword.fetch!(production, :tightbeam), :effort_checkin_horizon_ms)
   end
 end
