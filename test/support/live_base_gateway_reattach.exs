@@ -9,6 +9,9 @@ defmodule GuardLoadWithoutOwnerReadAdapterStub do
     {:reply, false, parent}
   end
 
+  def handle_call({:current_model, "load-apply-session"}, _from, parent),
+    do: {:reply, {:ok, Tightbeam.Model.new("fable")}, parent}
+
   def handle_call({:load_session, sid, model, _cwd, _mcp, _guidance}, _from, parent) do
     send(parent, {:canonical_model_pushed_on_load, sid, model})
     {:reply, {:ok, model}, parent}

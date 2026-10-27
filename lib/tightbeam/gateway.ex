@@ -2745,6 +2745,16 @@ defmodule Tightbeam.Gateway do
             [session_key]
           )
 
+        last_turn_error =
+          case DB.query(
+                 db,
+                 "SELECT status,error FROM turns WHERE sessionKey = ?1 ORDER BY seq DESC LIMIT 1",
+                 [session_key]
+               ) do
+            {:ok, [[status, error]]} when status in ["failed", "failed_unknown"] -> error
+            _ -> nil
+          end
+
         archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
 
         model_preferences =
@@ -2806,6 +2816,7 @@ defmodule Tightbeam.Gateway do
             model: (runtime_model && wire_identity(runtime_model)) || "unknown",
             modelFamily: runtime_model && runtime_model.family,
             modelContext: runtime_model && runtime_model.context,
+            modelLabel: runtime_projection.label,
             modelPreferences: model_preferences,
             provider: session.provider,
             harness: session.harness,
@@ -2867,6 +2878,12 @@ defmodule Tightbeam.Gateway do
               )
           },
           runtimeStatus: runtime_projection.status,
+          lastTurnError: last_turn_error,
+          runningStatus:
+            if(runtime_projection.status == "known",
+              do: "known",
+              else: "not reported by #{session.harness}"
+            ),
           fastStatus: fast_projection.fast_status,
           fast: fast_projection.fast,
           fastPersistence: "ephemeral",
@@ -2888,9 +2905,9 @@ defmodule Tightbeam.Gateway do
          {:ok, adapter, _generation} <- resident_adapter(session),
          true <- Adapter.knows_session?(adapter, sid),
          {:ok, %Model{} = model} <- Adapter.current_model(adapter, sid) do
-      %{status: "known", model: model}
+      %{status: "known", model: model, label: Adapter.current_model_label(adapter, sid)}
     else
-      _ -> %{status: "unknown", model: nil}
+      _ -> %{status: "unknown", model: nil, label: nil}
     end
   end
 
@@ -2937,15 +2954,13 @@ defmodule Tightbeam.Gateway do
   @doc false
   # THE WIRE SEAM's projection of a model identity, both halves in one place.
   #
-  # `model`/`context`/`efforts` are the named fields the ruling requires: they
-  # are the payload's meaning, and `resolve_selection/3` reads them back.
+  # `model`/`context`/`efforts` are the named fields the caller receives.
   #
   # `id`/`ref` is one line of text because the client's decoder has ONE slot for
   # a model's stable identity and must tell two context variants of one family
   # apart. It is this seam's line format and nothing downstream parses it — a
-  # value coming back is RESOLVED against the catalog that issued it, never
-  # split with a regex. It is spelled the way the vendor spells the model
-  # because that is what a human should see in a picker.
+  # value coming back is sent as named, without a catalog lookup. It is spelled
+  # the way the vendor spells the model so a human can use it in a picker.
   # ASSUMED, and it is the vendor's to keep: a family name contains no literal
   # bracket. The `model` slot's two readings — a family, or a family carrying a
   # context variant — both depend on it. A vendor that broke it would have
@@ -2967,50 +2982,12 @@ defmodule Tightbeam.Gateway do
   # The inbound half of `wire_model/1`, and the one place a caller's named
   # fields become an identity.
   #
-  # Two steps. RESOLVE: a client sends back the row identity this seam issued,
-  # so it is looked up in the catalog that issued it — a lookup cannot invent a
-  # context the host does not offer, and cannot mistake one of our effort
-  # levels for the vendor's variant. An explicit `context` skips it.
-  #
-  # THE PROPERTY, because it is what to go looking for elsewhere: this function
-  # CANNOT DISTINGUISH A MISS FROM A HIT. Both return fields, and no caller can
-  # tell which happened. The disambiguation is downstream, and only there.
-  #
-  # RESOLUTION IS DELIBERATELY LENIENT: an id it cannot find passes through as
-  # if it were a family, and NOTHING here refuses it. That is safe only because
-  # resolve-then-validate is ONE PIPELINE — every caller hands the result to
-  # `validate_catalog_model/4`, which is where an unknown selection is refused
-  # by name against the host's live catalog. The gate lives there, once, at the
-  # boundary that knows the host. A future caller that resolves without
-  # validating reintroduces silent acceptance of an unknown model.
-  #
-  # COMPLETE: fields the caller omitted inherit the default, which is what the
-  # CLI promises. `--effort high` alone is the default model at high effort,
-  # not a flag accepted and dropped. Context and effort belong to a MODEL, so
-  # neither carries across a change of model — when the family changes they are
-  # left open for `compose_model_selection/4`, the one place that decides which
-  # tier a newly chosen model runs at.
-  defp resolve_selection(host, harness, params, base) do
-    params |> Model.named_fields() |> resolve_issued(host, harness) |> complete(base)
+  # A named model is sent in the caller's spelling. Omitted effort and context
+  # stay omitted for that selection; a partial effort-only selection still
+  # completes against the configured default model.
+  defp resolve_selection(_host, _harness, params, base) do
+    params |> Model.named_fields() |> complete(base)
   end
-
-  defp resolve_issued(%{family: family} = fields, host, harness)
-       when is_binary(family) and not is_map_key(fields, :context) do
-    {catalog, _health} = ModelCatalog.get(host, harness, ModelCatalog)
-
-    case Enum.find(catalog, &(wire_identity(&1) == family)) do
-      nil ->
-        fields
-
-      entry ->
-        # A resolved row states its context EXPLICITLY, `nil` included — the
-        # row for the default window is a real selection, not a silence. The
-        # key is put unconditionally so completion can tell the two apart.
-        fields |> Map.put(:family, entry.family) |> Map.put(:context, entry.context)
-    end
-  end
-
-  defp resolve_issued(fields, _host, _harness), do: fields
 
   # Inheritance fills only what the caller left ABSENT. A key that is present
   # — even holding nil — is the caller's answer and is taken as given.
@@ -3030,13 +3007,11 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp complete(%{family: family} = fields, base) do
-    inherits? = match?(%Model{}, base) and base.family == family
-
+  defp complete(%{family: family} = fields, _base) do
     %Model{
       family: family,
-      effort: named_or(fields, :effort, inherits? && base.effort),
-      context: named_or(fields, :context, inherits? && base.context)
+      effort: Map.get(fields, :effort),
+      context: Map.get(fields, :context)
     }
   end
 
@@ -3430,7 +3405,7 @@ defmodule Tightbeam.Gateway do
             reason =
               case turn_credential_refusal(active_session) do
                 {:refused, message} -> message
-                :not_applicable -> classified_reason
+                :not_applicable -> selection_refusal_text(reason) || classified_reason
               end
 
             failure_publish = fn _terminal ->
@@ -4068,6 +4043,12 @@ defmodule Tightbeam.Gateway do
         {:ok, sid} ->
           persist_configured_turn_selection(db, session, attempt_session, model)
 
+          running =
+            case Adapter.current_model_for_turn(attempt_adapter, sid) do
+              {:ok, %Model{} = actual} -> model_selection_snapshot(actual)
+              _ -> "not reported by #{attempt_session.harness}"
+            end
+
           if attempt_session.harness != session.harness do
             close_superseded_turn_runtime(
               db,
@@ -4085,7 +4066,7 @@ defmodule Tightbeam.Gateway do
             %{
               status: "accepted",
               harness: attempt_session.harness,
-              readback: model_selection_snapshot(model)
+              readback: running
             }
           )
 
@@ -5686,7 +5667,48 @@ defmodule Tightbeam.Gateway do
   # site's error made legible.
   # Message text is fixed by the pre-diagnostic reason; carried evidence goes
   # to the response's `diagnostic`, never into this text.
-  defp apply_failure(reason), do: apply_failure_text(ErrorDiagnostic.classified(reason))
+  defp apply_failure(reason),
+    do: selection_refusal_text(reason) || apply_failure_text(ErrorDiagnostic.classified(reason))
+
+  defp selection_refusal_text(reason) do
+    case selection_refusal(reason) do
+      %{text: text} -> text
+      nil -> nil
+    end
+  end
+
+  defp selection_refusal_options(reason) do
+    case selection_refusal(reason) do
+      %{options: options} -> options
+      nil -> nil
+    end
+  end
+
+  defp selection_refusal(reason) do
+    reason
+    |> ErrorDiagnostic.of()
+    |> selection_config_node()
+    |> case do
+      %{"reason" => raw} = node when is_map(raw) ->
+        data = raw["data"] || %{}
+        text = (is_map(data) && data["details"]) || raw["message"]
+
+        if is_binary(text),
+          do: %{text: text, options: node["offeredOptions"]},
+          else: nil
+
+      _ ->
+        nil
+    end
+  end
+
+  defp selection_config_node(%{"operation" => "session/set_config_option"} = node), do: node
+
+  defp selection_config_node(node) when is_map(node) do
+    selection_config_node(node["cause"]) || selection_config_node(node["reasonCause"])
+  end
+
+  defp selection_config_node(_), do: nil
 
   defp apply_failure_text(:model_unavailable),
     do: "the installed local client rejected the requested model as unsupported"
@@ -7640,8 +7662,7 @@ defmodule Tightbeam.Gateway do
     harness_atom = module.id()
     sessions = Org.list_for_user(db, caller.owner_user_id, false)
 
-    # One mechanism decides the tier, here as at tune: an effort the caller did
-    # not name is composed against what the chosen model actually offers.
+    # A named model carries only the effort the caller explicitly supplied.
     default_model = archetype.defaults[:model] || defaults.model
 
     identity_name = Placement.identity_name(config, archetype, overrides, harness_atom)
@@ -7679,8 +7700,8 @@ defmodule Tightbeam.Gateway do
           end
       end
 
-    # Placement resolved the host FIRST, so the ref is judged against the account
-    # that will actually run the turn (#88) — not the gateway's.
+    # Placement resolves the host before checking credentials and runtime
+    # readiness for the session's selected harness.
     with {:ok, {model, routed}} <- prepared do
       input = %{
         display_name: p.display_name,
@@ -7867,11 +7888,22 @@ defmodule Tightbeam.Gateway do
   defp finish_spawn(db, _call, caller, session) do
     stream = Payloads.stream_session(session)
     broadcast(db, caller.owner_user_id, Payloads.stream_created(stream))
-    %{stream: stream, session_key: session.session_key, handle: session.handle}
+    spawn_result(session, stream)
   end
 
   defp spawn_replay(db, session_key) do
-    %{stream: db |> Org.get(session_key) |> Payloads.stream_session(), session_key: session_key}
+    session = Org.get(db, session_key)
+    spawn_result(session, Payloads.stream_session(session))
+  end
+
+  defp spawn_result(session, stream) do
+    %{
+      stream: stream,
+      session_key: session.session_key,
+      handle: session.handle,
+      requested: published_identity(session.model),
+      running_status: "not reported by #{session.harness}"
+    }
   end
 
   defp tune_result(config, db, call) do
@@ -7912,15 +7944,15 @@ defmodule Tightbeam.Gateway do
               true ->
                 harness_atom = module.id()
 
-                # A harness boundary never inherits the source model or effort.
-                # The target catalog composes its own supported default effort.
+                # A harness boundary uses the destination's named default and
+                # never inherits the source model or effort.
 
                 named = Model.named_fields(p)
 
                 selection_base =
                   if Map.has_key?(named, :family),
                     do: nil,
-                    else: %{module.default_model() | effort: nil}
+                    else: module.default_model()
 
                 model =
                   compose_model_selection(
@@ -8175,14 +8207,24 @@ defmodule Tightbeam.Gateway do
 
   defp runtime_success(db, session_key, engine_context, projection_committed, cleanup_status) do
     session = Org.get(db, session_key)
+    runtime = live_runtime_projection(db, session)
+    running = runtime.model
 
     %{
       ok: true,
       session_key: session_key,
       harness: session.harness,
-      model: session.model && session.model.family,
-      effort: session.model && session.model.effort,
-      context: session.model && session.model.context,
+      model: running && running.family,
+      effort: running && running.effort,
+      context: running && running.context,
+      running_model: running && Model.to_ref(running),
+      running_label: runtime.label,
+      running_status:
+        if(runtime.status == "known",
+          do: "known",
+          else: "not reported by #{session.harness}"
+        ),
+      requested: published_identity(session.model),
       fast: nil,
       fast_status: "unknown",
       fast_persistence: "ephemeral",
@@ -8299,34 +8341,7 @@ defmodule Tightbeam.Gateway do
     ErrorDiagnostic.diagnosed(:runtime_config_unknown, node)
   end
 
-  # A selection that names a model but no effort (the ordinary case from
-  # `setModel.options`, which offers models rather than tiers) takes the
-  # session's current effort, falling back to "medium" or the first available
-  # tier when the current one doesn't apply to the newly selected model. An
-  # explicit effort is honoured as given.
-  defp compose_model_selection(host, harness, current, %Model{effort: nil} = selected) do
-    case efforts_for(host, harness, selected) do
-      [] -> selected
-      efforts -> %{selected | effort: pick_effort(efforts, current && current.effort)}
-    end
-  end
-
   defp compose_model_selection(_host, _harness, _current, %Model{} = selected), do: selected
-
-  defp pick_effort(efforts, current_effort) do
-    cond do
-      current_effort in efforts -> current_effort
-      "medium" in efforts -> "medium"
-      true -> List.first(efforts)
-    end
-  end
-
-  defp efforts_for(host, harness, %Model{} = selected) do
-    case ModelCatalog.entry(host, harness, selected, ModelCatalog) do
-      {nil, _health} -> []
-      {entry, _health} -> entry.efforts
-    end
-  end
 
   # Model changes, adjudication rulings, and adapter heals for one session share
   # this high-tier lock. The supervised worker survives its wire caller, while
@@ -8541,22 +8556,24 @@ defmodule Tightbeam.Gateway do
 
         tune_error(
           "model_apply_failed",
-          "the destination harness did not accept and verify the requested runtime: #{apply_failure(reason)}",
+          apply_failure(reason),
           ErrorDiagnostic.with_facts(reason,
             operation: "tune",
             phase: "prepare",
             cleanup: {:node, cleanup_node(cleanup, sid)}
           )
         )
+        |> with_selection_options(reason)
         |> Map.put(:cleanup_status, cleanup.status)
         |> Map.merge(Map.drop(cleanup, [:status, :diagnostic]))
 
       {:error, reason} ->
         tune_error(
           "model_apply_failed",
-          "the destination harness did not accept and verify the requested runtime: #{apply_failure(reason)}",
+          apply_failure(reason),
           ErrorDiagnostic.for_reason(reason, operation: "tune", phase: "prepare")
         )
+        |> with_selection_options(reason)
     end
   end
 
@@ -8910,12 +8927,10 @@ defmodule Tightbeam.Gateway do
                 do: "model_unavailable",
                 else: "model_apply_failed"
               ),
-            message:
-              "could not switch this session to #{Model.describe(new_ref)}: " <>
-                "#{apply_failure(reason)} (the session could not prepare the new model " <>
-                "for its next turn)"
+            message: apply_failure(boundary)
           }
           |> ErrorDiagnostic.put(diagnostic)
+          |> with_selection_options(boundary)
 
         # Busy = a turn is in flight; the switch cannot land mid-turn, so the change
         # was NOT applied. The honest remedy after this fix is to retry at the
@@ -8936,6 +8951,13 @@ defmodule Tightbeam.Gateway do
       context: model.context,
       engine_context: "preserved"
     }
+  end
+
+  defp with_selection_options(result, reason) do
+    case selection_refusal_options(reason) do
+      options when is_list(options) -> Map.put(result, :offeredOptions, options)
+      _ -> result
+    end
   end
 
   defp model_unsupported_reason?({:diagnosed, reason, node}) when is_map(node),
@@ -8975,58 +8997,40 @@ defmodule Tightbeam.Gateway do
                  {harness, "shared", session.host}
                ) do
           case Adapter.knows_session?(adapter, pointer.harness_session_id) do
-            # RESIDENT: Claude binds model availability when it creates this
-            # session. The adapter moves the conversation to a fresh fork,
-            # sends the exact requested id, and returns success only after the
-            # harness reads the same model back. Harnesses
-            # with a live model set update in place. The caller holds the turn
+            # Claude moves the conversation to a fresh fork; harnesses with a
+            # live model set update in place. The caller holds the turn
             # boundary, so no switch can land mid-turn. The old Claude session
-            # remains resident until the verified model and replacement
-            # pointer commit together below.
+            # remains resident until the replacement pointer commits below.
             true ->
-              case Adapter.current_model(adapter, pointer.harness_session_id) do
-                {:ok, ^new_ref} ->
+              cwd = Placement.holder_workdir(config, session)
+              revision = session.identity_revision || Identity.live_revision!(config.base_dir)
+              snapshot = served_snapshot(config, session, harness, revision)
+
+              with_home_pin_lock(harness, session.host, fn ->
+                pin_home_to_session_model(config, Map.put(session, :model, new_ref), harness)
+
+                with {:ok, switched_sid} <-
+                       AdapterCoordinator.with_load_slot(coordinator, session.host, fn ->
+                         Adapter.switch_model_session(
+                           adapter,
+                           pointer.harness_session_id,
+                           new_ref,
+                           cwd,
+                           mcp_servers_for_archetype(session.archetype),
+                           snapshot.guidance
+                         )
+                       end) do
                   project_tuned_model(
                     db,
                     session,
                     adapter,
                     pointer.harness_session_id,
-                    pointer.harness_session_id,
+                    switched_sid,
                     new_ref,
                     provider
                   )
-
-                _not_exact ->
-                  cwd = Placement.holder_workdir(config, session)
-                  revision = session.identity_revision || Identity.live_revision!(config.base_dir)
-                  snapshot = served_snapshot(config, session, harness, revision)
-
-                  with_home_pin_lock(harness, session.host, fn ->
-                    pin_home_to_session_model(config, Map.put(session, :model, new_ref), harness)
-
-                    with {:ok, switched_sid} <-
-                           AdapterCoordinator.with_load_slot(coordinator, session.host, fn ->
-                             Adapter.switch_model_session(
-                               adapter,
-                               pointer.harness_session_id,
-                               new_ref,
-                               cwd,
-                               mcp_servers_for_archetype(session.archetype),
-                               snapshot.guidance
-                             )
-                           end) do
-                      project_tuned_model(
-                        db,
-                        session,
-                        adapter,
-                        pointer.harness_session_id,
-                        switched_sid,
-                        new_ref,
-                        provider
-                      )
-                    end
-                  end)
-              end
+                end
+              end)
 
             false ->
               cwd = Placement.holder_workdir(config, session)
@@ -9036,7 +9040,7 @@ defmodule Tightbeam.Gateway do
               with_home_pin_lock(harness, session.host, fn ->
                 pin_home_to_session_model(config, Map.put(session, :model, new_ref), harness)
 
-                with {:ok, ^new_ref} <-
+                with {:ok, _reported} <-
                        AdapterCoordinator.with_load_slot(coordinator, session.host, fn ->
                          Adapter.load_session(
                            adapter,
@@ -9069,9 +9073,9 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # A session with no harness pointer has no live runtime whose acceptance can
-  # be inferred from the stored projection. Prepare and verify the first
-  # runtime before committing the model and pointer together.
+  # A session with no harness pointer has no live runtime whose answer can be
+  # inferred from the stored projection. Prepare the first runtime before
+  # committing the model and pointer together.
   defp prepare_initial_tuned_model(config, db, session, new_ref, provider, principal) do
     harness = Harness.parse!(session.harness).id()
     destination = %{session | model: new_ref, provider: provider}
@@ -9340,38 +9344,15 @@ defmodule Tightbeam.Gateway do
     )
   end
 
-  # A harness may make its installed local client authoritative for an exact
-  # model id. Remote inventory cannot establish whether that client accepts the
-  # id, so no remote-catalog state gates the existing local launch path.
-  defp route_requested_model(host, harness, %Model{} = model) do
-    cond do
-      Harness.local_client_model_authority?(harness, model) and
-          not Model.valid_effort?(model.effort) ->
-        {:error,
-         %{
-           code: "invalid",
-           message: "unknown reasoning effort: #{inspect(model.effort)}"
-         }}
-
-      Harness.local_client_model_authority?(harness, model) ->
-        module = Harness.parse!(harness)
-
-        {:ok,
-         %{
-           harness: harness,
-           provider: Atom.to_string(module.credential_provider())
-         }}
-
-      true ->
-        ModelCatalog.route(host, harness, model, ModelCatalog)
-    end
+  # The selected harness owns model and effort acceptance. Its provider is
+  # known from the harness module; discovery data never gates a named request.
+  defp route_requested_model(_host, harness, %Model{}) do
+    module = Harness.parse!(harness)
+    {:ok, %{harness: harness, provider: Atom.to_string(module.credential_provider())}}
   end
 
-  # A RELAY, not a second opinion. `route_requested_model/3` owns which
-  # selections reach the local client and which remain catalog-routed.
-  #
-  # It returns the ROUTED answer, so its callers no longer look the entry up a
-  # second time to learn the provider.
+  # Keep the existing result shape for placement callers without consulting
+  # the catalog. Missing model remains a syntax error at this boundary.
   defp validate_catalog_model(host, harness, model, configured_default?) do
     with %Model{} <- model,
          {:ok, routed} <- route_requested_model(host, harness, model) do

@@ -301,57 +301,33 @@ defmodule Tightbeam.ReadinessTest do
     assert line =~ "tightbeam onboard cursor --api-key --as-user <userId>"
   end
 
-  test "a default model outside the live catalog is named by its fields", ctx do
+  test "a default model outside the live catalog is still selectable at boot", ctx do
     [module | _] = Harness.all()
     install_adapter!(ctx.base, module)
     catalog = catalog!(%{module.wire_name() => live("something-else", ["low"])})
 
-    line =
-      ctx.config
-      |> Readiness.summary(catalog)
-      |> Readiness.render(ctx.config)
-      |> Enum.find(&(&1 =~ "default model"))
+    summary = Readiness.summary(ctx.config, catalog)
+    assert Enum.find(summary.harnesses, &(&1.harness == module.wire_name())).model == :selectable
 
-    # Named by FIELDS. The old rendering spelled this `m[medium]`, which is the
-    # same syntax Anthropic uses for a context window — the collision this
-    # refactor removed.
-    assert line =~ "m (effort medium)"
-    assert line =~ "TIGHTBEAM_DEFAULT_MODEL"
+    refute Enum.any?(
+             Readiness.render(summary, ctx.config),
+             &String.contains?(&1, "default model")
+           )
   end
 
-  # THE WRONG CAUSE (task #12). A tiered model named with no effort IS in the
-  # live catalog; what is missing is the tier. Blaming the catalog sends the
-  # operator to `catalog.diff` to hunt for a model that is already there — the
-  # same defect class adjudication was fixed for, surviving in a second copy
-  # because readiness derived its own narrower answer.
-  test "a default model missing only its effort tier is refused by the tier, not the catalog",
+  test "a default model with no named effort remains selectable at boot",
        ctx do
     [module | _] = Harness.all()
     install_adapter!(ctx.base, module)
     catalog = catalog!(%{module.wire_name() => live("tiered-model", ["low", "medium", "high"])})
     config = %{ctx.config | default_model: Model.new("tiered-model")}
 
-    line =
-      config
-      |> Readiness.summary(catalog)
-      |> Readiness.render(config)
-      |> Enum.find(&(&1 =~ "tiered-model"))
-
-    assert line, "the tier gap must be named at all"
-    assert line =~ "effort tiers"
-    assert line =~ "low|medium|high"
-    assert line =~ "TIGHTBEAM_DEFAULT_EFFORT"
-
-    # The lie: the model IS in the live catalog, so this must not be the refusal.
-    refute line =~ "is not in #{module.wire_name()}'s live catalog"
+    summary = Readiness.summary(config, catalog)
+    assert Enum.find(summary.harnesses, &(&1.harness == module.wire_name())).model == :selectable
+    refute Enum.any?(Readiness.render(summary, config), &String.contains?(&1, "effort tiers"))
   end
 
-  # The catalog can fail for its OWN reason, with a working credential: the codex
-  # models endpoint drops every model for a too-old client_version and returns
-  # 200. No other row says that — the credential row calls it "degraded" — so a
-  # model row that defers here is how the one honest diagnosis failed to reach
-  # boot at all.
-  test "a catalog emptied by a client_version filter blames the binary at boot", ctx do
+  test "a catalog emptied by a client version filter does not gate the default", ctx do
     [module | _] = Harness.all()
     install_adapter!(ctx.base, module)
 
@@ -360,40 +336,24 @@ defmodule Tightbeam.ReadinessTest do
         module.wire_name() => {[], {:unavailable, {:empty_catalog_for_client_version, "0.99.0"}}}
       })
 
-    line =
-      ctx.config
-      |> Readiness.summary(catalog)
-      |> Readiness.render(ctx.config)
-      |> Enum.find(&(&1 =~ "default model"))
+    summary = Readiness.summary(ctx.config, catalog)
+    assert Enum.find(summary.harnesses, &(&1.harness == module.wire_name())).model == :selectable
 
-    assert line, "the catalog's own failure must be named"
-    assert line =~ ~s(EMPTY model list for client_version "0.99.0")
-    assert line =~ "credential is not implicated"
-    assert line =~ "upgrade #{module.wire_name()}"
-
-    # …and boot adds no remedy of its own, because re-picking a model cannot
-    # repair a catalog that was never derived.
-    refute line =~ "TIGHTBEAM_DEFAULT_MODEL"
-    refute line =~ "TIGHTBEAM_DEFAULT_EFFORT"
+    refute Enum.any?(
+             Readiness.render(summary, ctx.config),
+             &String.contains?(&1, "default model")
+           )
   end
 
-  test "a model with no tiers is told to UNSET the effort, not to pick one", ctx do
+  test "a model with no catalog tiers does not trigger an effort gate at boot", ctx do
     [module | _] = Harness.all()
     install_adapter!(ctx.base, module)
     # ctx.config's default is `m` at effort medium; this entry offers no tiers.
     catalog = catalog!(%{module.wire_name() => live("m", [])})
 
-    line =
-      ctx.config
-      |> Readiness.summary(catalog)
-      |> Readiness.render(ctx.config)
-      |> Enum.find(&(&1 =~ "default model"))
-
-    assert line =~ "has no effort tiers"
-    assert line =~ "unset TIGHTBEAM_DEFAULT_EFFORT"
-
-    # The remedy that cannot work: there is no tier to name.
-    refute line =~ "to one of the tiers it offers"
+    summary = Readiness.summary(ctx.config, catalog)
+    assert Enum.find(summary.harnesses, &(&1.harness == module.wire_name())).model == :selectable
+    refute Enum.any?(Readiness.render(summary, ctx.config), &String.contains?(&1, "effort tiers"))
   end
 
   test "an archetype whose where names no registered host is called out", ctx do

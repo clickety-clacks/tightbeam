@@ -46,10 +46,6 @@ defmodule Tightbeam.Harness.Codex do
   # near-miss would be the silent-downgrade `harness/claude.ex` refuses. Hence
   # provider IDs are intersected with the selected engine's offered IDs.
 
-  # The gate probe's own model, as fields — it crosses the adapter seam like any
-  # other selection.
-  @probe_model %Tightbeam.Model{family: "gpt-5.6-sol", effort: "medium", context: nil}
-
   @adapter_bundle "index.js"
 
   @doc false
@@ -120,7 +116,7 @@ defmodule Tightbeam.Harness.Codex do
       ensure_opts
     )
 
-    probe = [probe_cwd: probe_cwd, probe_model: @probe_model]
+    probe = [probe_cwd: probe_cwd]
 
     launch =
       if Support.local?(target) do
