@@ -431,7 +431,9 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
              DB.transaction(db, fn txn -> SubagentMarkers.append_in_txn(txn, input) end)
 
     assert_receive {:trace, ^hub, :receive,
-                    {:"$gen_cast", {:publish, %{"class" => "subagent_marker.appended", "refs" => refs} = notice}}}
+                    {:"$gen_cast",
+                     {:publish,
+                      %{"class" => "subagent_marker.appended", "refs" => refs} = notice}}}
 
     assert refs["sessionKey"] == "firehose-owner"
     refute Map.has_key?(refs, "assignmentId")
