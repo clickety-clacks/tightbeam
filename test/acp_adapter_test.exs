@@ -2766,14 +2766,14 @@ defmodule Tightbeam.Acp.AdapterTest do
            end)
   end
 
-  test "a resident switch refuses a variant when the default context was requested" do
+  test "a resident switch records the context selected by the harness" do
     {adapter, capture_path} =
       start_adapter(harness: :codex, fail_mode: "resident-default-context-variant")
 
     assert {:ok, "sess-1"} =
              Adapter.new_session(adapter, Model.new("gpt-5.6-sol"), "/tmp", [], "guidance")
 
-    assert {:error, {:runtime_config_mismatch, %Model{family: "orbit-9", context: "1m"}}} =
+    assert {:ok, "sess-1"} =
              Adapter.switch_model_session(
                adapter,
                "sess-1",
@@ -2785,6 +2785,11 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:ok, %Model{family: "orbit-9", context: "1m"}} =
              Adapter.current_model(adapter, "sess-1")
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and
+               request["configId"] == "model" and request["value"] == "orbit-9"
+           end)
 
     refute Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
   end
