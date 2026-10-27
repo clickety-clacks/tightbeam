@@ -1898,6 +1898,7 @@ defmodule Tightbeam.Schema do
       Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
       Tightbeam.NoticeBatcher -> :ok
       Tightbeam.HarnessProcess -> :ok = Tightbeam.HarnessProcess.ensure_historical_schema(db)
+      Tightbeam.Supervision -> :ok
       module -> :ok = module.ensure_schema(db)
     end)
 
@@ -1910,6 +1911,7 @@ defmodule Tightbeam.Schema do
       Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
       Tightbeam.NoticeBatcher -> :ok
       Tightbeam.HarnessProcess -> :ok
+      Tightbeam.Supervision -> :ok
       module -> :ok = module.ensure_schema(db)
     end)
 
@@ -1942,6 +1944,7 @@ defmodule Tightbeam.Schema do
     :ok = ensure_rest_collection_indexes(db)
     :ok = ensure_decision_request_collection_indexes(db)
     :ok = ensure_rest_wake_collection_indexes(db)
+    :ok = Tightbeam.Supervision.ensure_schema(db)
 
     # Batch-aware supervision guards reference notice_batches, so install them
     # only after all predecessor migrations and refusal checks have completed
@@ -5297,6 +5300,13 @@ defmodule Tightbeam.Schema do
   # Delivery responsibility is additive current-build storage. Do not write it
   # until every exact predecessor migration has succeeded.
   defp bootstrap_module(_db, Tightbeam.DeliveryResponsibilities, _current?), do: :ok
+
+  # Inactivity-deadline provenance is additive current-build storage, same as
+  # DeliveryResponsibilities above: writing it here would mutate a refused
+  # predecessor migration's schema before the refusal is even raised. Built
+  # later, with the other additive access paths, once every exact predecessor
+  # migration and refusal check has succeeded.
+  defp bootstrap_module(_db, Tightbeam.Supervision, _current?), do: :ok
 
   defp bootstrap_module(db, Tightbeam.AdminProjection, _current?),
     do: Tightbeam.AdminProjection.ensure_storage(db)
