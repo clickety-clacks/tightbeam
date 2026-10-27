@@ -503,8 +503,8 @@ defmodule Tightbeam.Wire.RouterTest do
         dispatch_cli(ctx, session.cli_token, %{verb: verb, asProcess: "cron", params: params})
 
       assert response.status == 403
-      assert JSON.decode!(response.resp_body)["error"]["code"] == "identity_not_yours"
-      refute_receive {:body_auth_handler, _, _, _}
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "process_denied"
+      assert_receive {:body_auth_handler, ^verb, "process:cron", {:process, "cron"}}
     end
 
     for {verb, body} <- [{"work-item-get", nil}, {"work-item-update", "denied-held-role"}] do
@@ -2910,8 +2910,9 @@ defmodule Tightbeam.Wire.RouterTest do
     end
   end
 
-  test "org CLI reserves process:tightbeam while other process origins still attribute", ctx do
+  test "session and org credentials reserve process:tightbeam while other process origins attribute", ctx do
     target = create_session(ctx.db, "reserved-origin-target", "flynn")
+    session_credential = create_session(ctx.db, "process-wake-session", "flynn")
 
     wake_handler = fn call ->
       wake =
@@ -2950,6 +2951,25 @@ defmodule Tightbeam.Wire.RouterTest do
     refute_received {:persisted_wake, _}
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wakes")
 
+    session_rejected =
+      dispatch_cli(ctx, session_credential.cli_token, %{
+        verb: "wake",
+        asProcess: "tightbeam",
+        sessionKey: target.session_key,
+        params: %{prompt: "forged"}
+      })
+
+    assert session_rejected.status == 403
+
+    assert JSON.decode!(session_rejected.resp_body) == %{
+             "error" => %{
+               "code" => "reserved_origin",
+               "message" => "process:tightbeam is reserved to the substrate"
+             }
+           }
+
+    refute_received {:persisted_wake, _}
+
     accepted =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "wake",
@@ -2963,6 +2983,20 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert {:ok, [["process:ci", "pending"]]} =
              DB.query(ctx.db, "SELECT origin, state FROM wakes")
+
+    session_accepted =
+      dispatch_cli(ctx, session_credential.cli_token, %{
+        verb: "wake",
+        asProcess: "satellite-e2e",
+        sessionKey: target.session_key,
+        params: %{prompt: "build finished"}
+      })
+
+    assert session_accepted.status == 200
+    assert_receive {:persisted_wake, %{origin: "process:satellite-e2e", state: "pending"}}
+
+    assert {:ok, [["process:ci", "pending"], ["process:satellite-e2e", "pending"]]} =
+             DB.query(ctx.db, "SELECT origin, state FROM wakes ORDER BY id")
   end
 
   test "assign resolves a live-bound role and refuses unusable references", ctx do
@@ -3532,15 +3566,20 @@ defmodule Tightbeam.Wire.RouterTest do
            }
 
     process = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asProcess: "cron"})
-    assert process.status == 403
-    assert JSON.decode!(process.resp_body)["error"]["code"] == "identity_not_yours"
+    assert process.status == 200
+    assert_receive {:call,
+                    %{
+                      origin: "process:cron",
+                      principal: {:process, "cron"},
+                      transport_session_key: "holder-token"
+                    }}
 
     reserved = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asProcess: "tightbeam"})
     assert reserved.status == 403
 
     assert JSON.decode!(reserved.resp_body)["error"] == %{
-             "code" => "identity_not_yours",
-             "message" => "a session token cannot act as a process"
+             "code" => "reserved_origin",
+             "message" => "process:tightbeam is reserved to the substrate"
            }
 
     roleless_key = roleless.session_key
