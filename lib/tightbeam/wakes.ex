@@ -1712,7 +1712,8 @@ defmodule Tightbeam.Wakes do
         txn,
         wake.assignment_id,
         wake.creator_session_key,
-        wake.created_at
+        wake.created_at,
+        :wake
       )
     end
 

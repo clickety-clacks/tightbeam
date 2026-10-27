@@ -822,7 +822,8 @@ defmodule Tightbeam.Escalation do
                 txn,
                 assignment_id,
                 raiser_session_key,
-                now
+                now,
+                :decision_request
               )
             end
 
@@ -1336,7 +1337,8 @@ defmodule Tightbeam.Escalation do
         txn,
         resolved_input.assignment_id,
         resolved_input.asker_session_key,
-        raised_at
+        raised_at,
+        :decision_request
       )
 
       EventLog.lifecycle_in_txn(
@@ -2629,7 +2631,8 @@ defmodule Tightbeam.Escalation do
       txn,
       ask.assignment_id,
       session_key,
-      raised_at
+      raised_at,
+      :decision_request
     )
 
     request = request_in_txn(txn, request_id)

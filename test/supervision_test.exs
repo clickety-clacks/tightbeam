@@ -446,7 +446,8 @@ defmodule Tightbeam.SupervisionTest do
                  txn,
                  "asg_inactive",
                  ctx.parent.session_key,
-                 wake.created_at + interval_ms
+                 wake.created_at + interval_ms,
+                 :attest
                )
              end)
 
@@ -766,7 +767,8 @@ defmodule Tightbeam.SupervisionTest do
                  txn,
                  "asg_inactive",
                  ctx.holder.session_key,
-                 event_at
+                 event_at,
+                 :attest
                )
              end)
 
@@ -779,7 +781,8 @@ defmodule Tightbeam.SupervisionTest do
                  txn,
                  "asg_inactive",
                  ctx.holder.session_key,
-                 event_at
+                 event_at,
+                 :attest
                )
              end)
 
@@ -806,7 +809,14 @@ defmodule Tightbeam.SupervisionTest do
     assert {:error, _} =
              DB.transaction(ctx.db, fn txn ->
                Txn.exec(txn, "UPDATE assignments SET subject='changed' WHERE id='asg_inactive'")
-               Supervision.activity_in_txn(txn, "asg_inactive", ctx.holder.session_key, opened_at)
+
+               Supervision.activity_in_txn(
+                 txn,
+                 "asg_inactive",
+                 ctx.holder.session_key,
+                 opened_at,
+                 :attest
+               )
              end)
 
     assert subject(ctx.db) == "ship it"
@@ -831,6 +841,151 @@ defmodule Tightbeam.SupervisionTest do
              DB.query(ctx.db, "SELECT state FROM assignments WHERE id='asg_inactive'")
 
     assert pending_deadline!(ctx.db, "asg_inactive").wake_id == deadline.wake_id
+  end
+
+  test "an opened assignment's deadline carries initial generation provenance with no qualifying activity",
+       ctx do
+    opened_at = System.system_time(:millisecond)
+    interval_ms = 1_000
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert %{
+             wake_id: wake_id,
+             assignment_id: "asg_inactive",
+             generator_source: "assignment_opened",
+             activity_start: ^opened_at,
+             qualifying_activity_source: nil,
+             qualifying_activity_at: nil,
+             effective_activity_at: ^opened_at,
+             interval_ms: ^interval_ms,
+             cancellation: %{reason_kind: nil}
+           } = Supervision.inactivity_provenance(ctx.db, deadline.wake_id)
+
+    assert wake_id == deadline.wake_id
+  end
+
+  test "activity resets the deadline with the caller's qualifying source and watermark, and typed-cancels the prior one",
+       ctx do
+    opened_at = System.system_time(:millisecond) - 5_000
+    interval_ms = 1_000
+    open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
+    original = pending_deadline!(ctx.db, "asg_inactive")
+
+    event_at = System.system_time(:millisecond)
+
+    assert {:ok, :reset} =
+             DB.transaction(ctx.db, fn txn ->
+               Supervision.activity_in_txn(
+                 txn,
+                 "asg_inactive",
+                 ctx.holder.session_key,
+                 event_at,
+                 :artifact
+               )
+             end)
+
+    reset = pending_deadline!(ctx.db, "asg_inactive")
+    assert reset.wake_id != original.wake_id
+
+    assert %{
+             generator_source: "activity",
+             qualifying_activity_source: "artifact",
+             qualifying_activity_at: ^event_at,
+             effective_activity_at: ^event_at
+           } = Supervision.inactivity_provenance(ctx.db, reset.wake_id)
+
+    # The provenance table never substitutes for the existing typed
+    # cancellation: the retired deadline's own reason/causal source/outcome
+    # still come from wake_cancellations, unaffected by this table's addition.
+    assert %{
+             cancellation: %{
+               reason_kind: "superseded",
+               outcome_kind: "replacement",
+               replacement_wake_id: replacement_wake_id
+             }
+           } = Supervision.inactivity_provenance(ctx.db, original.wake_id)
+
+    assert replacement_wake_id == reset.wake_id
+  end
+
+  test "a migrated deadline's provenance names the migration generator and its winning activity candidate",
+       ctx do
+    opened_at = System.system_time(:millisecond) - 10_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
+               "asg_inactive",
+               opened_at
+             ])
+
+    attested_at = opened_at + 500
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests (id,assignmentId,bySession,kind,ts) VALUES ('att_1','asg_inactive',?1,'progress',?2)",
+               [ctx.holder.session_key, attested_at]
+             )
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db, 1_000)
+
+    migrated = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert %{
+             generator_source: "migration",
+             qualifying_activity_source: "attest",
+             qualifying_activity_at: ^attested_at,
+             effective_activity_at: ^attested_at
+           } = Supervision.inactivity_provenance(ctx.db, migrated.wake_id)
+  end
+
+  test "a deadline wake predating this provenance table reads back truthful nulls, never fabricated values",
+       ctx do
+    legacy =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        assignment_id: "asg_inactive",
+        origin: "process:tightbeam",
+        consumer: "assignment_inactivity_deadline",
+        prompt:
+          JSON.encode!(%{
+            "version" => 1,
+            "assignmentId" => "asg_inactive",
+            "activityAt" => System.system_time(:millisecond),
+            "intervalMs" => 1_000
+          }),
+        due_at: System.system_time(:millisecond) + 1_000
+      })
+
+    assert %{
+             wake_id: wake_id,
+             assignment_id: "asg_inactive",
+             consumer: "assignment_inactivity_deadline",
+             generator_source: nil,
+             activity_start: nil,
+             qualifying_activity_source: nil,
+             qualifying_activity_at: nil,
+             effective_activity_at: nil,
+             interval_ms: nil,
+             cancellation: %{reason_kind: nil}
+           } = Supervision.inactivity_provenance(ctx.db, legacy.wake_id)
+
+    assert wake_id == legacy.wake_id
+    assert Supervision.inactivity_provenance(ctx.db, "w_never_existed") == nil
+  end
+
+  test "inactivity provenance retrieval never carries the notice's free-text prompt", ctx do
+    opened_at = System.system_time(:millisecond)
+    interval_ms = 1_000
+    open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    provenance = Supervision.inactivity_provenance(ctx.db, deadline.wake_id)
+
+    refute Map.has_key?(provenance, :prompt)
+    refute Enum.any?(Map.values(provenance), &(&1 == "ship it"))
   end
 
   defp refuse!(db, condition) do

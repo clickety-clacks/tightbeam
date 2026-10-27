@@ -4310,7 +4310,7 @@ defmodule Tightbeam.Assignments do
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
 
     if is_binary(attrs.by_session) do
-      Supervision.activity_in_txn(txn, attrs.assignment_id, attrs.by_session, ts)
+      Supervision.activity_in_txn(txn, attrs.assignment_id, attrs.by_session, ts, :attest)
     end
 
     attest([
