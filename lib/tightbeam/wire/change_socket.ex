@@ -48,25 +48,17 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
   def handle_info({:firehose_notice, notice}, %{phase: :live} = state) do
     await_delivery_release(state, notice)
-    Hub.delivered(hub(state), self())
 
-    if StateVisibility.visible?(state.deps[:db], notice, visibility_principal(state)) do
-      try do
-        push(notice, state)
-      rescue
-        ArgumentError -> {:stop, :normal, 1008, state}
-      end
-    else
-      {:stop, :normal, 1008, state}
+    try do
+      push(notice, state)
+    rescue
+      ArgumentError -> {:stop, :normal, 1008, state}
     end
   end
 
   def handle_info({:firehose_notice, _}, state), do: {:ok, state}
 
-  def handle_info({:firehose_control, frame}, %{phase: :live} = state) do
-    Hub.delivered(hub(state), self())
-    push(frame, state)
-  end
+  def handle_info({:firehose_control, frame}, %{phase: :live} = state), do: push(frame, state)
 
   def handle_info({:firehose_control, _}, state), do: {:ok, state}
 
@@ -128,7 +120,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
         :ok =
           Hub.register(hub(state), self(), %{
             mode: :filtered,
-            db: db(state),
             user_id: session.owner_user_id,
             principal_kind: :session,
             principal_id: session.session_key,
@@ -160,7 +151,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
         :ok =
           Hub.register(hub(state), self(), %{
             mode: :filtered,
-            db: db(state),
             user_id: device.user_id,
             device_id: device.device_id,
             principal_kind: :user,
@@ -200,7 +190,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
       :ok =
         Hub.register(hub(state), self(), %{
           mode: :filtered,
-          db: db(state),
           user_id: user.user_id,
           principal_kind: :user,
           principal_id: user.user_id,
@@ -374,7 +363,8 @@ defmodule Tightbeam.Wire.ChangeSocket do
       end)
       |> Enum.filter(fn notice ->
         class_filter_matches?(filters["classes"], notice["class"]) and
-          StateVisibility.visible?(db(state), notice, visibility_principal(state))
+          (state.principal_kind != :observer or
+             StateVisibility.visible?(db(state), notice, visibility_principal(state)))
       end)
     else
       []
