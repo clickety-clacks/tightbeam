@@ -22,7 +22,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
 
   _children = Gateway.children(config |> Map.put(:wake_tick_ms, 1_234) |> Map.merge(%{}))
 
-  assert {:ok, [[1235, 1234, 1, "k1"]]} =
+  assert {:ok, [[1_800_001, 1_800_000, 1, "k1"]]} =
            DB.query(db, """
            SELECT dueAt, json_extract(prompt, '$.intervalMs'), json_extract(prompt, '$.activityAt'),
                   sessionKey
