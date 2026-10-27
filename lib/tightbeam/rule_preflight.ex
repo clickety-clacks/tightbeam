@@ -4,8 +4,10 @@ defmodule Tightbeam.RulePreflight do
   alias Tightbeam.{Gateway, Rules}
 
   @doc false
-  def run do
-    base_dir = System.fetch_env!("TIGHTBEAM_BASE_DIR")
+  def run, do: run(System.fetch_env!("TIGHTBEAM_BASE_DIR"))
+
+  @doc false
+  def run(base_dir) when is_binary(base_dir) do
     config = %{base_dir: base_dir}
     verbs = config |> Gateway.handlers() |> Map.keys()
 
