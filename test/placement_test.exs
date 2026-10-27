@@ -1171,7 +1171,7 @@ defmodule Tightbeam.PlacementTest do
 
     # The identity hook is mandatory even when this org has no statutes.
     assert opts[:probe_cwd] == Path.join(base_dir, "work/gate-probe")
-    assert opts[:probe_model] == Model.new("gpt-5.6-sol", effort: "medium")
+    refute Keyword.has_key?(opts, :probe_model)
     assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
     refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
     refute_receive {:unexpected_sh, _}
@@ -1645,8 +1645,7 @@ defmodule Tightbeam.PlacementTest do
     assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
     refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
     assert opts[:probe_cwd] == probe_cwd
-    assert opts[:probe_model] == Model.new("gpt-5.6-sol", effort: "medium")
-    refute opts[:probe_model] == config.default_model
+    refute Keyword.has_key?(opts, :probe_model)
     refute File.exists?(Path.join(probe_cwd, "stale"))
 
     claude_opts = Placement.adapter_opts!(config, {:claude, "default", "testhost"})
@@ -1794,7 +1793,7 @@ defmodule Tightbeam.PlacementTest do
     opts = Placement.adapter_opts!(config, {:codex, "default", "worker"})
     assert ~s(CODEX_CONFIG='{"bypass_hook_trust":true}') in opts[:cmd]
     assert opts[:probe_cwd] == "/srv/tb/work/gate-probe"
-    assert opts[:probe_model] == Model.new("gpt-5.6-sol", effort: "medium")
+    refute Keyword.has_key?(opts, :probe_model)
 
     assert Enum.any?(collect_remote_gate_commands([]), fn command ->
              List.last(command) == "/srv/tb/work/gate-probe" and "rm" in command and
@@ -1811,7 +1810,7 @@ defmodule Tightbeam.PlacementTest do
     lawless_opts = Placement.adapter_opts!(config, {:codex, "default", "worker"})
     assert ~s(CODEX_CONFIG='{"bypass_hook_trust":true}') in lawless_opts[:cmd]
     assert lawless_opts[:probe_cwd] == "/srv/tb/work/gate-probe"
-    assert lawless_opts[:probe_model] == Model.new("gpt-5.6-sol", effort: "medium")
+    refute Keyword.has_key?(lawless_opts, :probe_model)
   end
 
   test "adapter lineage identifies the shared harness runtime", %{base_dir: base_dir, db: db} do
