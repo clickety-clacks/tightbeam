@@ -19,7 +19,6 @@ defmodule Tightbeam.WorkItems do
   alias Tightbeam.{
     CausalEvents,
     DB,
-    EffortCheckin,
     ExecutionMap,
     Org,
     StateResources,
@@ -222,7 +221,6 @@ defmodule Tightbeam.WorkItems do
             update_in_txn(
               txn,
               call.params
-              |> Map.put(:effort_config, Map.get(call, :effort_config, %{}))
               |> Map.put(:principal, call.principal)
             )
 
@@ -542,13 +540,6 @@ defmodule Tightbeam.WorkItems do
 
       if priority != item.priority do
         put_priority_in_txn(txn, item.id, priority)
-
-        EffortCheckin.reprioritize_work_item_in_txn(
-          txn,
-          Map.get(params, :effort_config, %{}),
-          item.id,
-          priority
-        )
       end
 
       updated = fetch_in_txn(txn, item.id)
