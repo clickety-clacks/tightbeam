@@ -460,7 +460,6 @@ defmodule Tightbeam.EscalationDeliveryFixture do
 
     assert Enum.map(notification_wakes(ctx.db), & &1.wake_id) == [wake.wake_id]
     assert {message_count(ctx.db), turn_count(ctx.db)} == before
-
   end
 
   ## Proof 9 — configured delivery dependencies only
