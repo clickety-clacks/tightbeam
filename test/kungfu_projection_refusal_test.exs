@@ -613,10 +613,18 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     :ok = register(small, %{backlog_counter: backlog_counter})
 
     under_limit =
-      Map.put(notice(), "payload", %{"value" => String.duplicate("x", 63 * 1_024 * 1_024)})
+      Publisher.committed_notice(
+        "kungfu.updated",
+        Map.put(item(), "purpose", String.duplicate("x", 63 * 1_024 * 1_024)),
+        %{}
+      )
 
     over_limit =
-      Map.put(notice(), "payload", %{"value" => String.duplicate("y", 2 * 1_024 * 1_024)})
+      Publisher.committed_notice(
+        "kungfu.updated",
+        Map.put(item(), "purpose", String.duplicate("y", 2 * 1_024 * 1_024)),
+        %{}
+      )
 
     Hub.publish(small, under_limit)
     Hub.publish(small, over_limit)
