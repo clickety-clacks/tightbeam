@@ -5681,6 +5681,8 @@ defmodule Tightbeam.Gateway do
   defp apply_failure(reason),
     do: selection_refusal_text(reason) || apply_failure_text(ErrorDiagnostic.classified(reason))
 
+  defp selection_refusal_text(%{code: "model_selection_exhausted"}), do: nil
+
   defp selection_refusal_text(reason) do
     case selection_refusal(reason) do
       %{text: text} -> text

@@ -349,6 +349,12 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
 
         [cross_harness_reason] = production_model_use_failures([cross_harness], :codex)
 
+        assert %{"code" => -32602, "message" => "Invalid params"} =
+                 ErrorDiagnostic.classified(cross_harness_reason)
+
+        assert %{"phase" => "model", "configId" => "model"} =
+                 ErrorDiagnostic.of(cross_harness_reason)
+
         {:ok, catalog} =
           CatalogStub.start_link(%{
             {"testhost", "codex"} => [
@@ -469,7 +475,7 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
           RingDownAdapter.start_link(
             parent: self(),
             outcomes: %{cross_harness.family => {:ok, "cross-harness-session"}},
-            readback: %{}
+            readback: %{"cross-harness-session" => cross_harness}
           )
 
         coordinator = fn
@@ -582,7 +588,7 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
             parent: self(),
             outcomes: %{cross_harness.family => {:ok, "cross-harness-health-session"}},
             prompt_outcome: {:error, rate_limit},
-            readback: %{}
+            readback: %{"cross-harness-health-session" => cross_harness}
           )
 
         coordinator = fn
