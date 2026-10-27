@@ -500,12 +500,14 @@ defmodule Tightbeam.HarnessProcess do
           end
       end
 
-    {:ok, Enum.uniq(recovered)}
+    {:ok, Enum.uniq(recovered ++ clear_orphan_fence_names(db))}
   end
 
   @doc "Reconcile every unresolved launch left by an earlier coordinator."
   @spec reconcile(DB.server()) :: :ok
   def reconcile(db) do
+    :ok = clear_orphan_fences(db)
+
     Enum.each(unresolved(db), fn row ->
       :ok = ensure_fence(db, row.adapter_key)
       reconcile_boot_row(db, row)
@@ -666,9 +668,27 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp reconcile_boot_row(db, %{os_pid: nil, process_group_id: nil} = row) do
-    case recover_boot_identity(db, row) do
-      {:ok, recovered} -> reconcile_boot_row(db, recovered)
-      {:error, reason} -> unidentified(db, row, reason)
+    case Tightbeam.HarnessProcess.Recovery.settle(
+           db,
+           row.launch_id,
+           row.adapter_key,
+           "automatic-reconcile",
+           nil
+         ) do
+      {:ok, _settled} ->
+        :settled
+
+      :already_resolved ->
+        :already_resolved
+
+      {:error, {:termination_unproved, _reason}} ->
+        case recover_boot_identity(db, row) do
+          {:ok, recovered} -> reconcile_boot_row(db, recovered)
+          {:error, reason} -> unidentified(db, row, reason)
+        end
+
+      {:error, reason} ->
+        boot_uncertain(db, row, reason)
     end
   end
 
@@ -1662,6 +1682,34 @@ defmodule Tightbeam.HarnessProcess do
       ])
 
     count > 0
+  end
+
+  defp clear_orphan_fences(db) do
+    _released = clear_orphan_fence_names(db)
+    :ok
+  end
+
+  defp clear_orphan_fence_names(db) do
+    incident_guard = rate_limit_incident_guard(db)
+
+    {:ok, released} =
+      DB.query(
+        db,
+        """
+        DELETE FROM harness_park_fences
+         WHERE NOT EXISTS (
+           SELECT 1
+             FROM harness_processes
+            WHERE harness_processes.adapterKey = harness_park_fences.adapterKey
+              AND state IN ('launching','running','park_requested','kill_failed')
+              AND resolvedAt IS NULL
+         )
+         #{incident_guard}
+         RETURNING adapterKey
+        """
+      )
+
+    Enum.map(released, fn [adapter_key] -> adapter_key end)
   end
 
   defp rate_limit_incident_guard(db) do

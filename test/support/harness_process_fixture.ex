@@ -439,13 +439,20 @@ defmodule Tightbeam.HarnessProcessFixture do
   end
 
   defp scenario(15, ctx) do
-    key = {:codex, "shared", "testhost"}
+    boot_key = {:codex, "shared", "testhost"}
 
-    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, key)
-    assert HarnessProcess.fenced?(ctx.db, key)
+    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, boot_key)
+    assert HarnessProcess.fenced?(ctx.db, boot_key)
 
     assert :ok = HarnessProcess.reconcile(ctx.db)
-    assert HarnessProcess.fenced?(ctx.db, key)
+    refute HarnessProcess.fenced?(ctx.db, boot_key)
+
+    retry_key = {:claude, "shared", "retry-testhost"}
+    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, retry_key)
+    assert HarnessProcess.fenced?(ctx.db, retry_key)
+
+    assert {:ok, _released} = HarnessProcess.reconcile_failed_parks(ctx.db)
+    refute HarnessProcess.fenced?(ctx.db, retry_key)
   end
 
   defp scenario(16, ctx) do
@@ -998,8 +1005,9 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     assert Enum.any?(
              EventLog.lifecycle_events(ctx.db),
-             &(&1.kind == "harness_launch_settled" and
-                 &1.subject == "claude:shared@testhost" and &1.detail =~ "identity_boot_ended")
+             &(&1.kind == "harness_launch_process_absent" and
+                 &1.subject == "claude:shared@testhost" and
+                 &1.detail =~ "complete_process_snapshot_absent")
            )
   end
 
@@ -1775,6 +1783,40 @@ defmodule Tightbeam.HarnessProcessFixture do
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
              event.kind == "harness_launch_process_state_uncertain" and
                event.detail =~ row.launch_id and event.detail =~ "process_snapshot_failed"
+           end)
+  end
+
+  defp scenario(42, ctx) do
+    key = {:claude, "shared", "terminal-before-identity"}
+
+    HarnessProcess.prepare_launch(
+      [
+        cmd: [System.find_executable("false")],
+        stderr_path: Path.join(ctx.test_dir, "terminal-before-identity.stderr"),
+        process_helper: @helper
+      ],
+      ctx.db,
+      key
+    )
+
+    assert [%{launch_id: launch_id, identity_path: identity_path}] =
+             HarnessProcess.list(ctx.db)
+
+    File.write!(
+      identity_path <> ".failed",
+      "tightbeam-launch-failed-v1\t#{launch_id}\tfork\t1\n"
+    )
+
+    boot_coordinator_once(ctx)
+
+    assert [%{state: "exited", resolved_at: resolved_at}] = HarnessProcess.list(ctx.db)
+    assert is_integer(resolved_at)
+    refute HarnessProcess.fenced?(ctx.db, key)
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "harness_launch_settled" and
+               event.subject == "claude:shared@terminal-before-identity" and
+               event.detail =~ "terminal_pre_identity"
            end)
   end
 

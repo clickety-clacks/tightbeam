@@ -369,6 +369,10 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 41)
   end
 
+  test "boot settles a launcher terminal record before identity capture", %{tmp_dir: tmp} do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 42)
+  end
+
   defp start_process_db do
     db = String.to_atom("satellite_harness_process_#{System.unique_integer([:positive])}")
     start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: db}, id: db))
