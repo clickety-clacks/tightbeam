@@ -44,7 +44,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     holder = session(db, "holder", "flynn")
     other = session(db, "other-session", "other")
-    gateway_config = %{db: db, wake_tick_ms: 1_000}
+    gateway_config = %{db: db, wake_tick_ms: 1_000, supervision_interval_ms: 1_000}
     handlers = Gateway.handlers(gateway_config)
     Rules.load!(System.tmp_dir!(), Map.keys(handlers))
     %{db: db, holder: holder, other: other, handlers: handlers}
@@ -2671,7 +2671,7 @@ defmodule Tightbeam.AssignmentsTest do
              |> then(&handle(ctx, "attest", &1))
   end
 
-  test "a cannot-proceed block held past inactivity ladder end still releases on its fact",
+  test "cannot-proceed suppresses inactivity reminders and still releases on its fact",
        ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
 
@@ -2696,10 +2696,19 @@ defmodule Tightbeam.AssignmentsTest do
          else: {:halt, nil}
     end)
 
-    assert {:ok, :none} =
-             DB.transaction(ctx.db, fn txn ->
-               Supervision.inactivity_deadline_trigger_in_txn(txn, {:assignment, blocked.id})
-             end)
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               [blocked.id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt' AND obligationRef GLOB 'assignment-inactivity-episode-v1:*'",
+               [blocked.id]
+             )
 
     assert Wakes.get(ctx.db, filed.decisionWake.wake_id).state == "pending"
 
