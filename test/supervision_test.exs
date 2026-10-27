@@ -274,10 +274,14 @@ defmodule Tightbeam.SupervisionTest do
       })
 
     deadline = pending_deadline!(ctx.db, "asg_inactive")
-    assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
     assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
 
     assert Wakes.get(ctx.db, follow_up.wake_id).state == "pending"
+
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
@@ -305,8 +309,80 @@ defmodule Tightbeam.SupervisionTest do
              })
 
     deadline = pending_deadline!(ctx.db, "asg_inactive")
-    assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
     assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+  end
+
+  test "an inactive holder suppresses inactivity reminders", ctx do
+    opened_at = System.system_time(:millisecond) - 5_000
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+               ctx.holder.session_key
+             ])
+
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at > System.system_time(:millisecond)
+  end
+
+  test "a queued turn for another assignment suppresses inactivity reminders", ctx do
+    opened_at = System.system_time(:millisecond) - 5_000
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state) " <>
+                 "VALUES ('asg_queued_turn','other work',?1,'flynn',?2,'open')",
+               [ctx.holder.session_key, opened_at]
+             )
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: ctx.holder.session_key,
+               message_id: "queued-session-turn",
+               origin: "process:supervision-test",
+               prompt: "work on a different assignment",
+               assignment_id: "asg_queued_turn"
+             })
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+
+    assert {:ok, [["queued"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM turns WHERE sessionKey=?1 AND assignmentId='asg_queued_turn'",
+               [ctx.holder.session_key]
+             )
 
     assert {:ok, [[0]]} =
              DB.query(
@@ -360,8 +436,10 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, due.wake_id))
 
     rescheduled = pending_deadline!(ctx.db, "asg_inactive")
+
     assert {:ok, %{"activityAt" => ^resolution_at, "intervalMs" => 1_000}} =
              JSON.decode(rescheduled.prompt)
+
     assert rescheduled.due_at >= resolution_at + 1_000
 
     assert {:ok, [[0]]} =
@@ -397,7 +475,10 @@ defmodule Tightbeam.SupervisionTest do
 
     open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
     deadline = pending_deadline!(ctx.db, "asg_inactive")
-    assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
     assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
 
     assert {:ok, [["running"]]} =
@@ -447,7 +528,6 @@ defmodule Tightbeam.SupervisionTest do
                  "AND consumer='prompt' " <>
                  "AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
              )
-
   end
 
   test "legacy controller cleanup reconciles stored intervals on each startup", ctx do
