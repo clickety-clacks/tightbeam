@@ -65,6 +65,7 @@ defmodule Tightbeam.BoundedFirehoseIngressTest do
         principal_id: "flynn",
         is_admin: false
       })
+
     :ok = Hub.subscribe(hub, self(), "one", %{"classes" => ["work_item."]})
     :ok = Hub.subscribe(hub, self(), "two", %{"classes" => ["work_item."]})
     Code.ensure_loaded!(Tightbeam.StateVisibility)
