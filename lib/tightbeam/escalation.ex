@@ -4459,6 +4459,9 @@ defmodule Tightbeam.Escalation do
 
   defp owner_user_id!(_db, %{principal: {:user, user_id}}), do: user_id
 
+  defp owner_user_id!(db, %{principal: {:process, _process}} = call),
+    do: org_owner_user_id!(db, call)
+
   defp owner_user_id!(_db, %{origin: "user:" <> user_id}), do: user_id
 
   defp owner_user_id!(db, %{origin: "agent:" <> role}) do
@@ -4470,8 +4473,31 @@ defmodule Tightbeam.Escalation do
     end
   end
 
+  defp owner_user_id!(db, %{origin: "process:" <> _process} = call),
+    do: org_owner_user_id!(db, call)
+
   defp owner_user_id!(_db, call),
     do: raise(ArgumentError, "raiser has no accountable owner: #{call.origin}")
+
+  # Process-originated requests use the same stable first-admin owner selection
+  # as the gateway's existing organization-owner notifications.
+  defp org_owner_user_id!(db, call) do
+    case DB.query(
+           db,
+           "SELECT userId FROM users WHERE isAdmin = 1 ORDER BY createdAt, userId LIMIT 1",
+           []
+         ) do
+      {:ok, [[owner_user_id]]} ->
+        owner_user_id
+
+      {:ok, []} ->
+        raise ArgumentError, "process request has no organization owner: #{call.origin}"
+
+      {:error, reason} ->
+        raise ArgumentError,
+              "cannot resolve organization owner for process request #{call.origin}: #{inspect(reason)}"
+    end
+  end
 
   defp statute_name(statute), do: Map.get(statute, :name) || Map.fetch!(statute, "name")
 

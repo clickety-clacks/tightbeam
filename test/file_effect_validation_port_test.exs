@@ -486,7 +486,8 @@ defmodule Tightbeam.FileEffectValidationPortTest do
     assert Mementos.current(ctx.db, "attest", attest_id, "example/progress") == ["observed"]
   end
 
-  test "verified without commit refs still refuses outside selected operational evidence", ctx do
+  test "verified accepts artifact-only evidence without git refs and still refuses an empty claim",
+       ctx do
     {:ok, _} =
       DB.query(
         ctx.db,
@@ -536,6 +537,27 @@ defmodule Tightbeam.FileEffectValidationPortTest do
         ]
       )
 
+    captured = capture(ctx, "artifact-only operation and result")
+
+    artifact_only =
+      call
+      |> put_in([:params, :artifact_id], captured.id)
+      |> put_in([:params, :content_sha256], captured.hash)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert %{attest: %{verdictKind: "verified", commitRefs: nil} = attest} =
+                 file.(artifact_only)
+
+        assert attest.artifactId == captured.id
+        assert attest.contentSha256 == captured.hash
+      end)
+
+    assert log =~ "verified_artifact_only assignmentId=#{ctx.assignment_id}"
+
+    assert %{code: "operational_evidence_invalid"} =
+             file.(put_in(artifact_only, [:params, :content_sha256], String.duplicate("f", 64)))
+
     {:ok, _} =
       DB.query(
         ctx.db,
@@ -546,7 +568,7 @@ defmodule Tightbeam.FileEffectValidationPortTest do
       )
 
     assert %{code: "invalid_commit_refs"} = file.(call)
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM attests")
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM attests")
   end
 
   test "verified filing binds captured evidence and inline metadata in one transaction", ctx do

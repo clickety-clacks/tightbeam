@@ -263,7 +263,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
   end
 
   defp dispatch_after_rumination(ctx, call) do
-    assert {:ok, %{rumination_required: true}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert {:ok, %{id: assignment_id, rumination_required: true}} =
+             result = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
     assert {:ok, []} =
              DB.query(
@@ -275,7 +276,10 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
                [call.params.work_item_id, elem(call.principal, 1)]
              )
 
-    Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE id=?1", [assignment_id])
+
+    result
   end
 
   defp no_diagnosis_assignments(db, work_item_id) do

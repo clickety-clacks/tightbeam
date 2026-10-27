@@ -121,7 +121,7 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
     assert_refused(ctx, other)
   end
 
-  test "effort parent keeps its identity, item, and real rumination before both dispatches",
+  test "effort parent keeps its identity, item, and advisory rumination for both dispatches",
        ctx do
     call = fn verb, params -> ok!(ctx, nil, verb, params) end
     call_as = fn key, verb, params -> ok!(ctx, key, verb, params) end
@@ -136,12 +136,17 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
       "parent"
     )
 
-    assert %{"ruminationRequired" => true} = call_as.("parent", "dispatch", staffing(wi))
+    assert %{
+             "id" => first_id,
+             "workItemId" => ^wi,
+             "openedBySession" => "parent",
+             "ruminationRequired" => true
+           } = call_as.("parent", "dispatch", staffing(wi))
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1, ^first_id]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM assignments WHERE workItemId=?1 AND holderKey='worker'",
+               "SELECT count(*),MIN(id) FROM assignments WHERE workItemId=?1 AND holderKey='worker'",
                [wi]
              )
 

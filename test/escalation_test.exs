@@ -96,6 +96,26 @@ defmodule Tightbeam.EscalationTest do
     assert {:deny, %{code: "escalation_denied"}} = Escalation.resolve(ctx.db, call, statute)
   end
 
+  test "a process-only request is owned by the organization admin", ctx do
+    process_call = %{
+      verb: "attest",
+      origin: "process:maintenance",
+      principal: {:process, "maintenance"},
+      session_key: nil,
+      params: %{assignment_id: "process-only", kind: "completion"}
+    }
+
+    {:decision_pending, id} = open(ctx, process_call, statute())
+
+    assert %{owner_user_id: "flynn", raiser_id: "process:maintenance", raiser_session_key: nil} =
+             request(ctx, id)
+
+    assert Enum.any?(notification_wakes(ctx), fn wake ->
+             wake.owner_user_id == "flynn" and
+               wake.session_key == Org.personal_session_key("flynn")
+           end)
+  end
+
   test "statute open, ruling, and consume publish their committed decision snapshots", ctx do
     alias Tightbeam.Firehose.Hub
 
