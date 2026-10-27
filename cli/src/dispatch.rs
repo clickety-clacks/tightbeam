@@ -355,7 +355,6 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         | Command::CommandHelp(_)
         | Command::IdentityCurrent
         | Command::Doctor { .. }
-        | Command::VisitorKeyringInit { .. }
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
@@ -1945,7 +1944,6 @@ where
         }
         Command::IdentityCurrent => print_current_session_identity(),
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
-        Command::VisitorKeyringInit { base_dir } => crate::visitor::keyring_init(base_dir),
         Command::AddUser {
             identity,
             user_id,
@@ -2135,7 +2133,6 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::CommandHelp(_)
         | Command::IdentityCurrent
         | Command::Doctor { .. }
-        | Command::VisitorKeyringInit { .. }
         | Command::ToolCallObserved
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => None,

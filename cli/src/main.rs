@@ -12,7 +12,6 @@ mod lease;
 mod onboard_emit;
 mod preflight;
 mod probe;
-mod visitor;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
