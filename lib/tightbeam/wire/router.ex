@@ -1213,7 +1213,7 @@ defmodule Tightbeam.Wire.Router do
              session_index_request(query)
            end),
          {:ok, limit, boundary} <-
-           state_page_request(
+           observer_aware_state_page_request(
              query,
              "sessions.collection",
              "sessions",
