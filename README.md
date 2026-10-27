@@ -520,6 +520,7 @@ The service must **start with no interactive login**, **survive logout**,
 | `TIGHTBEAM_BASE_DIR` | The org: `auth/`, `identity/`, `homes/`, `state.db`, `work/`. Defaults to `TIGHTBEAM_HOME`, else `~/.tightbeam`. |
 | `TIGHTBEAM_LIVE_BASE_TRANSITION` | Optional exact JSON transition for an approved non-automatic transition; supported 0.1.8 and earlier 0.1.9 upgrades derive it automatically. Malformed, mismatched, or schema-incompatible values are refused. |
 | `TIGHTBEAM_PORT` | Rewritten into `gateway.json` at every boot. |
+| `TIGHTBEAM_SUPERVISION_INTERVAL_MS` | Assignment inactivity reminder interval in milliseconds. Defaults to `1800000` (30 minutes); set to `off` to disable these reminders. Other notices are unaffected. |
 | `TIGHTBEAM_NODE` | The release's Erlang node name. Defaults to `tightbeam_gateway_<port>`, which is already unique per instance — set it only if you want to choose the name. |
 | `TIGHTBEAM_ADVERTISED_URL` | The URL clients are told to connect back on. `mix tightbeam.doctor` fails without it. |
 | `TIGHTBEAM_DEFAULT_MODEL` | The default model itself, undecorated (`claude-sonnet-5`). Must be live for the default harness. It is a single global, so on a two-harness host one harness will report its default as unselectable — that is expected, not a fault. |
