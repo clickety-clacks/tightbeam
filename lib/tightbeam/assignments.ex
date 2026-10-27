@@ -2836,7 +2836,7 @@ defmodule Tightbeam.Assignments do
     close_completed_assignment_in_txn(txn, call, assignment, attest)
   end
 
-  defp close_completed_assignment_in_txn(txn, _call, assignment, attest) do
+  defp close_completed_assignment_in_txn(txn, call, assignment, attest) do
     Txn.q(
       txn,
       """
