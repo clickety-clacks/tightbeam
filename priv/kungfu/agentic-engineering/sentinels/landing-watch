@@ -978,7 +978,13 @@ def renew_claim(runner) -> None:
 
 def unavailable_scope(error: ReadError) -> bool:
     detail = str(error)
-    return "null node at repository.pullRequest" in detail or "null node at repository.ref" in detail or "HTTP 404" in detail
+    return any(marker in detail for marker in (
+        "null node at repository.pullRequest",
+        "null node at repository.ref",
+        "HTTP 404",
+        "Could not resolve to a Repository",
+        "Resource not accessible",
+    ))
 
 
 def poll_demanded_pr(scope: str, kinds: set[str], runner, log: Log) -> bool:

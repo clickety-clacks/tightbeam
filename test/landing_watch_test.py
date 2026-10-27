@@ -817,6 +817,12 @@ class Process(unittest.TestCase):
 
 
 class DemandDriven(WatcherCase):
+    def test_unavailable_scope_does_not_delay_other_demand(self):
+        self.github.add(pull(7, checks=[check_run('pass', 'build', 'SUCCESS', required=True)]))
+        self.assertTrue(lw.poll_demanded_pr('Example/Repo#8', {lw.CHECKS_COMPLETED}, self.runner, self.log))
+        self.assertTrue(lw.poll_demanded_pr('Example/Repo#7', {lw.CHECKS_COMPLETED}, self.runner, self.log))
+        self.assertEqual(len(self.runner.checks), 1)
+
     def test_unconfigured_pr_is_read_and_filed_only_while_demanded(self):
         self.github.add(pull(7, checks=[check_run('pass', 'build', 'SUCCESS', required=True)]))
         self.runner.demand = [{'kind': lw.CHECKS_COMPLETED, 'scope': 'Example/Repo#7'}]
