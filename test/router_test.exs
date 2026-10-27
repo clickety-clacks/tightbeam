@@ -2910,7 +2910,8 @@ defmodule Tightbeam.Wire.RouterTest do
     end
   end
 
-  test "session and org credentials reserve process:tightbeam while other process origins attribute", ctx do
+  test "session and org credentials reserve process:tightbeam while other process origins attribute",
+       ctx do
     target = create_session(ctx.db, "reserved-origin-target", "flynn")
     session_credential = create_session(ctx.db, "process-wake-session", "flynn")
 
@@ -3567,6 +3568,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     process = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asProcess: "cron"})
     assert process.status == 200
+
     assert_receive {:call,
                     %{
                       origin: "process:cron",
