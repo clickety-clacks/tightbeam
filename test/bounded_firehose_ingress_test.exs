@@ -102,7 +102,15 @@ defmodule Tightbeam.BoundedFirehoseIngressTest do
       if Process.alive?(fast), do: send(fast, :stop)
     end)
 
-    :ok = Hub.register(hub, self(), %{mode: :subscribed})
+    :ok =
+      Hub.register(hub, self(), %{
+        mode: :subscribed,
+        user_id: "slow-user",
+        device_id: "slow-device",
+        principal_kind: :user,
+        principal_id: "slow-user"
+      })
+
     :ok = Hub.subscribe(hub, self(), "slow", %{})
     :ok = Hub.register(hub, fast, %{mode: :subscribed})
     :ok = Hub.subscribe(hub, fast, "fast", %{})
@@ -118,7 +126,10 @@ defmodule Tightbeam.BoundedFirehoseIngressTest do
         assert_receive {:fast_notice, 2}
       end)
 
-    assert log =~ "firehose subscriber #{inspect(self())} queue overflow"
+    assert log =~ "principal_kind: :user"
+    assert log =~ "principal_id: \"slow-user\""
+    assert log =~ "device_id: \"slow-device\""
+    assert log =~ "reason=outbound_queue_overflow backlog=2 queue_limit=1 close_code=4008"
 
     assert_receive {:firehose_notice, %{"seq" => 1}}
     assert_receive :firehose_overflow
