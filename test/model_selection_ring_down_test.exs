@@ -675,7 +675,8 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
         [not_selectable_reason, effort_reason] =
           production_model_use_failures([not_selectable, unsupported_effort])
 
-        assert :model_unavailable == ErrorDiagnostic.classified(not_selectable_reason)
+        assert %{"code" => -32602, "message" => "Invalid params"} =
+                 ErrorDiagnostic.classified(not_selectable_reason)
         assert %{"phase" => "model"} = ErrorDiagnostic.of(not_selectable_reason)
 
         assert %{"code" => -32602, "message" => "Invalid params"} =
