@@ -1079,6 +1079,7 @@ defmodule Tightbeam.EffortCheckin do
       """,
       [work_item_id, priority]
     )
+
     :ok
   end
 

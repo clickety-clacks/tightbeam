@@ -2071,6 +2071,7 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_reopen_reason(call.params[:reason]) do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
+
       result =
         transaction_with_row_commits(
           db,

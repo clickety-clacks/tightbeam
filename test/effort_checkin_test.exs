@@ -31,9 +31,13 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assignment = assign(ctx.db)
 
-    assert count(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
-             assignment.id
-           ]) == 0
+    assert count(
+             ctx.db,
+             "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1",
+             [
+               assignment.id
+             ]
+           ) == 0
 
     assert count(
              ctx.db,
@@ -127,9 +131,13 @@ defmodule Tightbeam.EffortCheckinTest do
 
     # Historical rows remain, unchanged; the scheduler never queries them.
     assert [["armed", probe.wake_id]] =
-             rows(ctx.db, "SELECT state,wakeId FROM effort_checkin_generations WHERE assignmentId=?1", [
-               assignment.id
-             ])
+             rows(
+               ctx.db,
+               "SELECT state,wakeId FROM effort_checkin_generations WHERE assignmentId=?1",
+               [
+                 assignment.id
+               ]
+             )
 
     assert count(
              ctx.db,
@@ -142,7 +150,12 @@ defmodule Tightbeam.EffortCheckinTest do
     assignment = assign(ctx.db)
 
     deadline =
-      old_wake(ctx.db, assignment.id, "effort_deadline", System.system_time(:millisecond) + 60_000)
+      old_wake(
+        ctx.db,
+        assignment.id,
+        "effort_deadline",
+        System.system_time(:millisecond) + 60_000
+      )
 
     request_id = "dr_legacy_effort"
     now = System.system_time(:millisecond)
@@ -196,9 +209,13 @@ defmodule Tightbeam.EffortCheckinTest do
                params: %{request_id: request_id}
              })
 
-    assert count(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
-             assignment.id
-           ]) == 0
+    assert count(
+             ctx.db,
+             "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1",
+             [
+               assignment.id
+             ]
+           ) == 0
 
     assert count(
              ctx.db,

@@ -1305,6 +1305,7 @@ defmodule Tightbeam.Rules do
           |> Enum.flat_map(fn {policy, ordinal} ->
             if retired_policy?(policy) do
               require Logger
+
               Logger.warning(
                 "#{path}: policy #{inspect(Map.get(policy, "name"))} skipped: purpose wait-effort-relief is retired"
               )

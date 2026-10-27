@@ -71,6 +71,7 @@ defmodule Tightbeam.RulesTest do
       )
 
     put_raw(ctx, shipped)
+
     log =
       ExUnit.CaptureLog.capture_log(fn ->
         loaded = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -84,7 +85,9 @@ defmodule Tightbeam.RulesTest do
                  )
       end)
 
-    assert log =~ "policy \"justified-unresolved-dependency\" skipped: purpose wait-effort-relief is retired"
+    assert log =~
+             "policy \"justified-unresolved-dependency\" skipped: purpose wait-effort-relief is retired"
+
     assert Rules.evaluate(ctx.db, call()) == :ok
   end
 
