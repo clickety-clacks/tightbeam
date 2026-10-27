@@ -20,6 +20,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
             subscriptions: %{},
             heartbeat_timer: nil,
             hub_monitor: nil,
+            backlog_counter: nil,
             deps: %{}
 
   @impl true
@@ -27,8 +28,9 @@ defmodule Tightbeam.Wire.ChangeSocket do
     state = %__MODULE__{deps: Map.new(deps)}
     pid = GenServer.whereis(hub(state))
     ref = Process.monitor(pid)
-    :ok = Hub.register(pid, self(), %{mode: :pending})
-    {:ok, %{state | hub_monitor: ref}}
+    backlog_counter = :atomics.new(1, signed: false)
+    :ok = Hub.register(pid, self(), %{mode: :pending, backlog_counter: backlog_counter})
+    {:ok, %{state | hub_monitor: ref, backlog_counter: backlog_counter}}
   end
 
   @impl true
@@ -47,6 +49,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
     do: {:stop, :normal, 1012, state}
 
   def handle_info({:firehose_notice, notice}, %{phase: :live} = state) do
+    state = release_backlog_bytes(state, {:firehose_notice, notice})
     await_delivery_release(state, notice)
 
     try do
@@ -56,11 +59,16 @@ defmodule Tightbeam.Wire.ChangeSocket do
     end
   end
 
-  def handle_info({:firehose_notice, _}, state), do: {:ok, state}
+  def handle_info({:firehose_notice, _} = message, state),
+    do: {:ok, release_backlog_bytes(state, message)}
 
-  def handle_info({:firehose_control, frame}, %{phase: :live} = state), do: push(frame, state)
+  def handle_info({:firehose_control, frame} = message, %{phase: :live} = state) do
+    state = release_backlog_bytes(state, message)
+    push(frame, state)
+  end
 
-  def handle_info({:firehose_control, _}, state), do: {:ok, state}
+  def handle_info({:firehose_control, _} = message, state),
+    do: {:ok, release_backlog_bytes(state, message)}
 
   def handle_info(:firehose_heartbeat, %{phase: :live} = state) do
     if credential_current?(state) do
@@ -90,6 +98,14 @@ defmodule Tightbeam.Wire.ChangeSocket do
     Hub.unregister(hub(state), self())
     :ok
   end
+
+  defp release_backlog_bytes(%{backlog_counter: counter} = state, message)
+       when not is_nil(counter) do
+    :atomics.sub(counter, 1, :erlang.external_size(message))
+    state
+  end
+
+  defp release_backlog_bytes(state, _message), do: state
 
   defp route(%{"type" => "auth"} = message, %{phase: :unauthed} = state),
     do: authenticate(message, state)

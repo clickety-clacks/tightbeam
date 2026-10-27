@@ -88,6 +88,7 @@ defmodule Tightbeam.BoundedFirehoseIngressTest do
   test "one slow subscriber overflows without closing a draining subscriber" do
     hub = start_supervised!({Hub, name: nil}, id: :isolated_hub)
     parent = self()
+    fast_backlog_counter = :atomics.new(1, signed: false)
 
     fast =
       spawn(fn ->
@@ -96,7 +97,8 @@ defmodule Tightbeam.BoundedFirehoseIngressTest do
             :stop ->
               :ok
 
-            {:firehose_notice, %{"seq" => seq}} ->
+            {:firehose_notice, %{"seq" => seq}} = message ->
+              :atomics.sub(fast_backlog_counter, 1, :erlang.external_size(message))
               send(parent, {:fast_notice, seq})
               receive_notice.(receive_notice)
 
@@ -113,9 +115,12 @@ defmodule Tightbeam.BoundedFirehoseIngressTest do
       if Process.alive?(fast), do: send(fast, :stop)
     end)
 
+    slow_backlog_counter = :atomics.new(1, signed: false)
+
     :ok =
       Hub.register(hub, self(), %{
         mode: :subscribed,
+        backlog_counter: slow_backlog_counter,
         user_id: "slow-user",
         device_id: "slow-device",
         principal_kind: :user,
@@ -123,7 +128,7 @@ defmodule Tightbeam.BoundedFirehoseIngressTest do
       })
 
     :ok = Hub.subscribe(hub, self(), "slow", %{})
-    :ok = Hub.register(hub, fast, %{mode: :subscribed})
+    :ok = Hub.register(hub, fast, %{mode: :subscribed, backlog_counter: fast_backlog_counter})
     :ok = Hub.subscribe(hub, fast, "fast", %{})
 
     under_limit_value = String.duplicate("x", 63 * 1_024 * 1_024)

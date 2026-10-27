@@ -20,6 +20,8 @@ defmodule Tightbeam.Firehose.Hub do
               subscriptions: %{},
               pending_subscriptions: %{},
               pending_notices: :queue.new(),
+              pending_notice_bytes: 0,
+              backlog_counter: nil,
               seq: 0,
               overflowed: false
   end
@@ -111,7 +113,8 @@ defmodule Tightbeam.Firehose.Hub do
             :user_id,
             :device_id,
             :principal_kind,
-            :principal_id
+            :principal_id,
+            :backlog_counter
           ])
         )
 
@@ -136,10 +139,19 @@ defmodule Tightbeam.Firehose.Hub do
             {:reply, :ok, state}
 
           filters ->
-            {pending_notices, remaining_notices} =
+            {pending_notices, remaining_notices, pending_notice_bytes} =
               socket.pending_notices
               |> :queue.to_list()
-              |> Enum.split_with(fn {subscription_id, _notice} -> subscription_id == id end)
+              |> Enum.reduce({[], [], socket.pending_notice_bytes}, fn
+                {^id, _notice} = entry, {pending, remaining, bytes} ->
+                  {[entry | pending], remaining, bytes - :erlang.external_size(entry)}
+
+                entry, {pending, remaining, bytes} ->
+                  {pending, [entry | remaining], bytes}
+              end)
+
+            pending_notices = Enum.reverse(pending_notices)
+            remaining_notices = Enum.reverse(remaining_notices)
 
             {snapshot_frames, seq} = matching_notice_frames(notices, id, filters, socket.seq)
 
@@ -158,6 +170,7 @@ defmodule Tightbeam.Firehose.Hub do
               | subscriptions: Map.put(socket.subscriptions, id, filters),
                 pending_subscriptions: Map.delete(socket.pending_subscriptions, id),
                 pending_notices: :queue.from_list(remaining_notices),
+                pending_notice_bytes: pending_notice_bytes,
                 seq: seq
             }
 
@@ -274,12 +287,17 @@ defmodule Tightbeam.Firehose.Hub do
   defp enqueue_pending_notice(socket, _, _) when socket.overflowed, do: socket
 
   defp enqueue_pending_notice(socket, pid, notice) do
-    backlog_bytes = socket_backlog_bytes(socket, pid) + :erlang.external_size(notice)
+    pending_bytes = :erlang.external_size(notice)
+    backlog_bytes = socket_backlog_bytes(socket) + pending_bytes
 
     if backlog_bytes > @max_app_backlog_bytes do
       overflow(socket, pid, backlog_bytes)
     else
-      %{socket | pending_notices: :queue.in(notice, socket.pending_notices)}
+      %{
+        socket
+        | pending_notices: :queue.in(notice, socket.pending_notices),
+          pending_notice_bytes: socket.pending_notice_bytes + pending_bytes
+      }
     end
   end
 
@@ -288,14 +306,12 @@ defmodule Tightbeam.Firehose.Hub do
 
   defp enqueue(socket, pid, frames) do
     messages = Enum.map(frames, &outbound_message/1)
-
-    backlog_bytes =
-      socket_backlog_bytes(socket, pid) +
-        Enum.reduce(messages, 0, fn message, bytes ->
-          bytes + :erlang.external_size(message)
-        end)
+    outbound_bytes = Enum.reduce(messages, 0, &(&2 + :erlang.external_size(&1)))
+    queued_bytes = reserve_backlog_bytes(socket.backlog_counter, outbound_bytes)
+    backlog_bytes = queued_bytes + socket.pending_notice_bytes
 
     if backlog_bytes > @max_app_backlog_bytes do
+      release_backlog_bytes(socket.backlog_counter, outbound_bytes)
       overflow(socket, pid, backlog_bytes)
     else
       Enum.each(messages, &send(pid, &1))
@@ -303,27 +319,18 @@ defmodule Tightbeam.Firehose.Hub do
     end
   end
 
-  defp socket_backlog_bytes(socket, pid) do
-    queued_bytes =
-      case Process.info(pid, :messages) do
-        {:messages, messages} ->
-          Enum.reduce(messages, 0, fn
-            {:firehose_notice, _} = message, bytes -> bytes + :erlang.external_size(message)
-            {:firehose_control, _} = message, bytes -> bytes + :erlang.external_size(message)
-            _, bytes -> bytes
-          end)
+  defp socket_backlog_bytes(socket),
+    do: current_backlog_bytes(socket.backlog_counter) + socket.pending_notice_bytes
 
-        nil ->
-          0
-      end
+  # The socket updates this shared count as it consumes frames, so fanout never scans its mailbox.
+  defp current_backlog_bytes(nil), do: 0
+  defp current_backlog_bytes(counter), do: :atomics.get(counter, 1)
 
-    pending_bytes =
-      socket.pending_notices
-      |> :queue.to_list()
-      |> Enum.reduce(0, fn notice, bytes -> bytes + :erlang.external_size(notice) end)
+  defp reserve_backlog_bytes(nil, bytes), do: bytes
+  defp reserve_backlog_bytes(counter, bytes), do: :atomics.add_get(counter, 1, bytes)
 
-    queued_bytes + pending_bytes
-  end
+  defp release_backlog_bytes(nil, _bytes), do: :ok
+  defp release_backlog_bytes(counter, bytes), do: :atomics.sub(counter, 1, bytes)
 
   defp socket_queue_length(pid) do
     case Process.info(pid, :message_queue_len) do
@@ -343,7 +350,7 @@ defmodule Tightbeam.Firehose.Hub do
       send(pid, :firehose_overflow)
     end
 
-    %{socket | pending_notices: :queue.new(), overflowed: true}
+    %{socket | pending_notices: :queue.new(), pending_notice_bytes: 0, overflowed: true}
   end
 
   defp app_identity(socket) do
