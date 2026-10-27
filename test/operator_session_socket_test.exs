@@ -201,6 +201,7 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
       # becomes the named user just because asUser was supplied.
       socket = connect(ctx, path)
       send_frame(socket, auth() |> Map.put(:deviceId, "browser") |> Map.merge(overrides))
+
       if path == "/ws/changes?protocolVersion=2" and overrides[:token] == "bad" do
         send_frame(socket, %{
           type: "subscribe",
