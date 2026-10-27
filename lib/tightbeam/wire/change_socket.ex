@@ -16,6 +16,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
             principal_id: nil,
             credential_digest: nil,
             selected_session_key: nil,
+            operator_default_read_principal: false,
             is_admin: false,
             subscriptions: %{},
             heartbeat_timer: nil,
@@ -201,7 +202,14 @@ defmodule Tightbeam.Wire.ChangeSocket do
   end
 
   defp authenticate_operator(message, token, state) do
-    with {:ok, user} <- OperatorSession.resolve_user(db(state), message["asUser"]),
+    default_read_principal = not Map.has_key?(message, "asUser")
+
+    user_result =
+      if default_read_principal,
+        do: OperatorSession.resolve_default_read_principal(db(state)),
+        else: OperatorSession.resolve_user(db(state), message["asUser"])
+
+    with {:ok, user} <- user_result,
          {:ok, selected_session_key} <- operator_selected_session(db(state), user, message) do
       :ok =
         Hub.register(hub(state), self(), %{
@@ -219,6 +227,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
           principal_kind: :user,
           principal_id: user.user_id,
           is_admin: user.is_admin,
+          operator_default_read_principal: default_read_principal,
           selected_session_key: selected_session_key,
           credential_digest: credential_digest(token)
       }
@@ -456,7 +465,13 @@ defmodule Tightbeam.Wire.ChangeSocket do
         end
 
       :user when is_nil(state.device_id) ->
-        with {:ok, user} <- OperatorSession.resolve_user(db(state), state.user_id),
+        user_result =
+          if state.operator_default_read_principal,
+            do: OperatorSession.resolve_default_read_principal(db(state)),
+            else: OperatorSession.resolve_user(db(state), state.user_id)
+
+        with {:ok, user} <- user_result,
+             true <- user.user_id == state.user_id,
              true <- user.is_admin == state.is_admin,
              token when is_binary(token) <- state.deps[:cli_token] do
           credential_digest(token) == state.credential_digest
