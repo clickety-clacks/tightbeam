@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+# A published-package acceptance uses this gate without starting Mix or Cargo.
+# Ordinary source-test callers continue through the existing preflight below.
+if [ "${1:-}" = "--package-input" ]; then
+  shift
+  script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+  exec python3 "$script_dir/package_pr_acceptance.py" "$@"
+fi
+
 refuse_preflight() {
   printf 'tightbeam-gate-preflight: {"schema":"tightbeam-gate-preflight-refusal/v1","cause":"%s"}\n' "$1" >&2
   exit 78
