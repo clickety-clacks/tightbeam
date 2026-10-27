@@ -4434,7 +4434,7 @@ defmodule Tightbeam.Assignments do
 
   defp valid_supervision_interval(interval)
        when (is_integer(interval) and interval > 0) or interval == :off,
-    do: :ok
+       do: :ok
 
   defp valid_supervision_interval(_interval),
     do:

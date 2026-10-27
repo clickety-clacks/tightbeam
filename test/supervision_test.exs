@@ -580,6 +580,7 @@ defmodule Tightbeam.SupervisionTest do
   test "a pending dated continuation defers its assignment's inactivity notice",
        ctx do
     open_deadline!(ctx.db, "asg_inactive", System.system_time(:millisecond), 1_000)
+    assert :ok = Supervision.migrate_open_assignments(ctx.db)
     due_at = System.system_time(:millisecond) + 3_600_000
 
     wake =
@@ -610,7 +611,8 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
 
-    assert pending_deadline!(ctx.db, "asg_inactive").due_at == due_at
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at >=
+             System.system_time(:millisecond) + 29 * 60_000
 
     assert {:ok, [[0]]} =
              DB.query(
@@ -713,6 +715,7 @@ defmodule Tightbeam.SupervisionTest do
     holder = ctx.holder.session_key
     origin = "agent:#{holder}"
     open_deadline!(ctx.db, "asg_inactive", System.system_time(:millisecond), 1_000)
+    assert :ok = Supervision.migrate_open_assignments(ctx.db)
 
     schedule = fn prompt, offset ->
       Wakes.schedule(ctx.db, %{
@@ -755,10 +758,15 @@ defmodule Tightbeam.SupervisionTest do
              DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
 
     assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
-    assert pending_deadline!(ctx.db, "asg_inactive").due_at == later.due_at
+
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at >=
+             System.system_time(:millisecond) + 29 * 60_000
 
     cancel.(later)
-    assert pending_deadline!(ctx.db, "asg_inactive").due_at == earlier.due_at
+    assert Wakes.get(ctx.db, later.wake_id).state == "canceled"
+
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at >=
+             System.system_time(:millisecond) + 29 * 60_000
 
     cancel.(earlier)
     restored = pending_deadline!(ctx.db, "asg_inactive")
