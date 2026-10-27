@@ -409,6 +409,23 @@ class RunningPath(WatcherCase):
         self.assertEqual(self.github.calls, [])
         self.assertIn('poll failed reason=gateway read failed', self.stream.getvalue())
 
+    def test_failed_demand_read_uses_backoff(self):
+        class StopPoll(Exception):
+            pass
+
+        delays = []
+
+        def stop_after_sleep(seconds):
+            delays.append(seconds)
+            raise StopPoll
+
+        self.runner.login = lambda: 'example-bot'
+        self.runner.demand_error = lw.ReadError('gateway read failed')
+        with self.assertRaises(StopPoll):
+            lw.run(['landing-watch'], {'GH_CONFIG_DIR': self.tmp.name},
+                   runner=self.runner, log=self.log, sleep=stop_after_sleep)
+        self.assertEqual(delays, [120])
+
     def test_real_missing_pr_error_is_skipped_and_other_pr_proceeds(self):
         self.github.add(pull(7, checks=[check_run('C1', 'build', 'SUCCESS', required=True)]))
         self.runner.demand = [{'kind': lw.CHECKS_COMPLETED, 'scope': f'example/repo#{n}'} for n in (8, 7)]
