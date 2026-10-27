@@ -241,9 +241,10 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                terminal_at: terminal_at
              })
 
-    # The script retires both the holder and its accountable owner. Admission
-    # before owner retirement leaves immutable delivery; retirement first must
-    # leave a typed cancellation, never invented fired history.
+    # Holder retirement admits the terminal notice to the active work-item
+    # owner. If that owner retires before delivery, the pending wake is
+    # readdressed to its nearest active ancestor (the primary session here).
+    # Recovery may leave it pending until the scheduler's next tick.
     NoticeBatcher.recover(ctx.db)
 
     assert {:ok, [[dispatch_prompt]]} =
@@ -257,9 +258,13 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
              "[from user:#{owner_id}]\n\n[assignment: #{dispatch_id}]\n\nship the smoke feature"
 
     terminal = Tightbeam.Wakes.get(ctx.db, terminal_source)
+    personal_session = Org.personal_session_key(owner_id)
+    recipient = terminal.session_key
+
+    assert recipient in [owner_session, personal_session]
 
     assert %{
-             session_key: ^owner_session,
+             session_key: ^recipient,
              prompt: ^terminal_raw,
              origin: "process:tightbeam",
              consumer: "prompt",
@@ -278,7 +283,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                 [
                   [
                     terminal_carrier,
-                    ^owner_session,
+                    ^recipient,
                     terminal_prompt,
                     terminal_envelope,
                     terminal_hash
@@ -317,54 +322,26 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                    terminal_source
                  ])
 
-      "canceled" ->
+      "pending" ->
+        assert recipient == personal_session
         assert terminal.fired_at == nil
         assert terminal.fired_by == nil
-        canceled_at = terminal.canceled_at
-        assert is_integer(canceled_at)
+        assert terminal.canceled_at == nil
 
-        assert {:ok,
-                [
-                  [
-                    ^canceled_at,
-                    "process",
-                    "tightbeam:retirement",
-                    "target_retired",
-                    "session_transition",
-                    ^owner_session,
-                    "no_replacement",
-                    nil,
-                    nil,
-                    nil,
-                    "work_item",
-                    ^dispatch_work_item,
-                    "linked_work_open",
-                    "routing_bracket",
-                    ^dispatch_work_item,
-                    1
-                  ]
-                ]} =
-                 DB.query(
-                   ctx.db,
-                   """
-                   SELECT canceledAt,requesterKind,requesterId,reasonKind,
-                     causalSourceKind,causalSourceId,outcomeKind,replacementWakeId,
-                     dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,
-                     workImpactKind,livenessTriggerKind,livenessTriggerId,actionNeeded
-                   FROM wake_cancellations WHERE wakeId=?1 AND wakeState='canceled'
-                   """,
-                   [terminal_source]
-                 )
+        assert {:ok, [[nil]]} =
+                 DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [
+                   terminal_source
+                 ])
 
         assert {:ok, [[0]]} =
-                 DB.query(
-                   ctx.db,
-                   "SELECT count(*) FROM (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL) WHERE sourceWakeId=?1",
-                   [terminal_source]
-                 )
+                 DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [
+                   terminal_source
+                 ])
 
         assert {:ok, [[0]]} =
-                 DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [terminal_source])
+                 DB.query(ctx.db, "SELECT count(*) FROM wake_cancellations WHERE wakeId=?1", [
+                   terminal_source
+                 ])
     end
 
     # Detailed member corruption/replay/privacy checks belong to the focused
