@@ -289,6 +289,7 @@ class Runner:
             raise
 
     def graphql(self, query: str, variables: dict) -> dict:
+        renew_claim(self)
         args = ["api", "graphql", "-f", f"query={query}"]
         for key, value in variables.items():
             if value is None:
@@ -304,12 +305,14 @@ class Runner:
         return body["data"]
 
     def rest(self, path: str):
+        renew_claim(self)
         try:
             return json.loads(self._gh(["api", path]))
         except json.JSONDecodeError as error:
             raise ReadError(f"gh returned malformed JSON: {error}") from error
 
     def tightbeam(self, args: list[str]) -> tuple[bool, str]:
+        renew_claim(self)
         argv = ["tightbeam", *args]
         if self.as_process:
             argv += ["--as-process", self.as_process]

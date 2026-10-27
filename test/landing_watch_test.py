@@ -271,8 +271,10 @@ class Settings(unittest.TestCase):
             lw.Runner(None).tightbeam(['condition', '--kind', 'k'])
         finally:
             lw.subprocess.run = original
-        self.assertEqual(seen[0], ['tightbeam', 'condition', '--kind', 'k', '--as-process', 'landing-watch'])
-        self.assertEqual(seen[1], ['tightbeam', 'condition', '--kind', 'k'])
+        self.assertEqual(seen[0][1], 'fact-producer-claim')
+        self.assertEqual(seen[1], ['tightbeam', 'condition', '--kind', 'k', '--as-process', 'landing-watch'])
+        self.assertEqual(seen[2][1], 'fact-producer-claim')
+        self.assertEqual(seen[3], ['tightbeam', 'condition', '--kind', 'k'])
 
     def test_runner_passes_numbers_and_strings_and_omits_nulls(self):
         seen = []
@@ -283,12 +285,13 @@ class Settings(unittest.TestCase):
             stderr = ''
 
         original = lw.subprocess.run
-        lw.subprocess.run = lambda argv, **kw: seen.append((argv, kw['env'])) or Done()
+        lw.subprocess.run = lambda argv, **kw: seen.append((argv, kw.get('env'))) or Done()
         try:
             lw.Runner(None).graphql('query Q { x }', {'owner': 'o', 'number': 3, 'cursor': None})
         finally:
             lw.subprocess.run = original
-        argv, env = seen[0]
+        self.assertEqual(seen[0][0][1], 'fact-producer-claim')
+        argv, env = seen[1]
         self.assertIn('owner=o', argv[argv.index('-f', 4) + 1:])
         self.assertEqual(argv[argv.index('-F') + 1], 'number=3')
         self.assertFalse(any(a.startswith('cursor=') for a in argv))
