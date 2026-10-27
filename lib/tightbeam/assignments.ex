@@ -1153,9 +1153,12 @@ defmodule Tightbeam.Assignments do
   @doc """
   Return the current independent clean review for a submitted result.
 
-  When the producer's latest verification includes commit refs, the winning
-  clean review must include every verified producer commit. Additional reviewed
-  commits do not disqualify it.
+  A linked review conclusion for this producer takes precedence over unlinked
+  review conclusions on the same work item. An unlinked same-item review can
+  qualify only when no linked conclusion exists. When the selected clean review
+  and the producer's latest verification include commit refs, the review must
+  include every verified producer commit; additional reviewed commits do not
+  disqualify it.
   """
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
           [String.t()]
@@ -1189,7 +1192,8 @@ defmodule Tightbeam.Assignments do
             AND v.kind = 'verdict'
             AND v.bySession = r.holderKey
             AND v.verdictKind IN ('reviewed-clean', 'changes-requested')
-          ORDER BY v.ts DESC, v.rowid DESC
+          ORDER BY CASE WHEN r.reviewsAssignmentId = producer.id THEN 0 ELSE 1 END,
+            v.ts DESC, v.rowid DESC
           LIMIT 1
         )
         SELECT reviewHolderKey, verdictKind, commitRefs
@@ -2566,15 +2570,7 @@ defmodule Tightbeam.Assignments do
             }
           }
 
-          if preserves_owner_routing_bracket?(txn, verb, work_item_id) do
-            Tightbeam.WorkItems.cancel_slate_bracket_in_txn(
-              txn,
-              work_item_id,
-              bracket_transition
-            )
-          else
-            Tightbeam.WorkItems.cancel_brackets_in_txn(txn, work_item_id, bracket_transition)
-          end
+          Tightbeam.WorkItems.cancel_brackets_in_txn(txn, work_item_id, bracket_transition)
         end
 
         if key do
@@ -4736,7 +4732,8 @@ defmodule Tightbeam.Assignments do
              AND v.kind='verdict'
              AND v.bySession=r.holderKey
              AND v.verdictKind IN ('reviewed-clean','changes-requested')
-           ORDER BY v.ts DESC,v.rowid DESC
+           ORDER BY CASE WHEN r.reviewsAssignmentId=producer.id THEN 0 ELSE 1 END,
+             v.ts DESC,v.rowid DESC
            LIMIT 1
            """,
            [assignment_id]
@@ -4991,20 +4988,6 @@ defmodule Tightbeam.Assignments do
       :none -> raise "#{inspect(primary)} has no liveness trigger"
     end
   end
-
-  defp preserves_owner_routing_bracket?(txn, "dispatch", work_item_id) do
-    case Txn.q(
-           txn,
-           "SELECT deliveryOwnerSessionKey FROM work_items WHERE id = ?1",
-           [work_item_id]
-         ) do
-      [[nil]] -> true
-      [[_delivery_owner_session_key]] -> false
-      [] -> raise "assignment references missing work item #{work_item_id}"
-    end
-  end
-
-  defp preserves_owner_routing_bracket?(_txn, _verb, _work_item_id), do: false
 
   defp assignment_disposition_command(assignment_id, requester_id, liveness_trigger) do
     outcome = %{
