@@ -294,9 +294,10 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert {:ok, _} =
              DB.query(
                ctx.db,
-               "INSERT INTO turns (sessionKey, messageId, origin, prompt, status, createdAt) " <>
-                 "VALUES (?1, ?2, ?3, ?4, 'queued', ?5)",
-               [target.session_key, "target-message", "user:flynn", "queued prompt", 1]
+               "INSERT INTO turns " <>
+                 "(sessionKey, messageId, origin, prompt, status, createdAt, startedAt) " <>
+                 "VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6)",
+               [target.session_key, "target-message", "user:flynn", "active prompt", 1, 1]
              )
 
     {:push, {:text, auth}, state} =
@@ -322,13 +323,13 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     assert JSON.decode!(ready)["subscriptionId"] == "other-session-turn"
     assert_receive {:firehose_notice, notice}
-    assert notice["class"] == "turn.queued"
+    assert notice["class"] == "turn.started"
     assert notice["refs"]["sessionKey"] == target.session_key
 
     assert {:push, {:text, turn_event}, state} =
              ChangeSocket.handle_info({:firehose_notice, notice}, state)
 
-    assert JSON.decode!(turn_event)["class"] == "turn.queued"
+    assert JSON.decode!(turn_event)["class"] == "turn.started"
     ChangeSocket.terminate(:normal, state)
   end
 
