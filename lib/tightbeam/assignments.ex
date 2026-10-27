@@ -3928,8 +3928,6 @@ defmodule Tightbeam.Assignments do
 
         if Txn.changes(txn) != 1, do: raise(TransitionRace)
 
-        :ok = EffortCheckin.reconcile_wait_relief_in_txn(txn, assignment_id, settled_at)
-
         case fetch_assignment(txn, assignment_id) do
           %{holderKey: holder} ->
             append_substrate(txn, holder, "[cannot-proceed settled by opener answer]")
