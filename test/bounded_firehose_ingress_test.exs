@@ -5,7 +5,7 @@ defmodule Tightbeam.BoundedFirehoseIngressTest do
   alias Tightbeam.Firehose.Hub
 
   setup do
-    hub = start_supervised!({Hub, name: nil, queue_limit: 10_000})
+    hub = start_supervised!({Hub, name: nil})
     :ok = Hub.register(hub, self(), %{mode: :all, user_id: "owner"})
     %{hub: hub}
   end
@@ -75,7 +75,7 @@ defmodule Tightbeam.BoundedFirehoseIngressTest do
   end
 
   test "one slow subscriber overflows without closing a draining subscriber" do
-    hub = start_supervised!({Hub, name: nil, queue_limit: 1}, id: :isolated_hub)
+    hub = start_supervised!({Hub, name: nil}, id: :isolated_hub)
     parent = self()
 
     fast =
@@ -115,13 +115,25 @@ defmodule Tightbeam.BoundedFirehoseIngressTest do
     :ok = Hub.register(hub, fast, %{mode: :subscribed})
     :ok = Hub.subscribe(hub, fast, "fast", %{})
 
-    Hub.publish(hub, notice("work_item.updated", %{"id" => "first"}))
+    under_limit_value = String.duplicate("x", 63 * 1_024 * 1_024)
+    over_limit_value = String.duplicate("y", 2 * 1_024 * 1_024)
+
+    Hub.publish(
+      hub,
+      notice("work_item.updated", %{"id" => "first", "value" => under_limit_value})
+    )
+
     assert Hub.sequence(hub, self()) == 1
     assert_receive {:fast_notice, 1}
+    refute_receive :firehose_overflow
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        Hub.publish(hub, notice("work_item.updated", %{"id" => "second"}))
+        Hub.publish(
+          hub,
+          notice("work_item.updated", %{"id" => "second", "value" => over_limit_value})
+        )
+
         assert Hub.sequence(hub, self()) == 2
         assert_receive {:fast_notice, 2}
       end)
@@ -129,7 +141,10 @@ defmodule Tightbeam.BoundedFirehoseIngressTest do
     assert log =~ "principal_kind: :user"
     assert log =~ "principal_id: \"slow-user\""
     assert log =~ "device_id: \"slow-device\""
-    assert log =~ "reason=outbound_queue_overflow backlog=2 queue_limit=1 close_code=4008"
+    assert log =~ "reason=outbound_queue_overflow"
+    assert log =~ "limit_bytes=67108864 close_code=4008"
+    assert [_, backlog_bytes] = Regex.run(~r/backlog_bytes=(\d+)/, log)
+    assert String.to_integer(backlog_bytes) > 64 * 1_024 * 1_024
 
     assert_receive {:firehose_notice, %{"seq" => 1}}
     assert_receive :firehose_overflow

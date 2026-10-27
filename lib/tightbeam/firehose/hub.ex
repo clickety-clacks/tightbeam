@@ -4,6 +4,9 @@ defmodule Tightbeam.Firehose.Hub do
   require Logger
   alias Tightbeam.Firehose.Publisher
 
+  # An approximately 2 GB held-backlog budget across 30 stalled apps gives each app about 64 MB.
+  @max_app_backlog_bytes 64 * 1_024 * 1_024
+
   defmodule Socket do
     @moduledoc false
     defstruct monitor: nil,
@@ -19,10 +22,7 @@ defmodule Tightbeam.Firehose.Hub do
               overflowed: false
   end
 
-  defstruct sockets: %{},
-            queue_limit: 1_000,
-            shutting_down: false,
-            shutdown_waiter: nil
+  defstruct sockets: %{}, shutting_down: false, shutdown_waiter: nil
 
   # Committed outboxes use the same admission path as direct publications.
   def destination(server), do: server
@@ -89,7 +89,7 @@ defmodule Tightbeam.Firehose.Hub do
   end
 
   @impl true
-  def init(opts), do: {:ok, %__MODULE__{queue_limit: Keyword.get(opts, :queue_limit, 1_000)}}
+  def init(_opts), do: {:ok, %__MODULE__{}}
 
   @impl true
   def handle_call({:register, pid, opts}, _from, state) do
@@ -159,12 +159,7 @@ defmodule Tightbeam.Firehose.Hub do
             }
 
             socket =
-              enqueue(
-                socket,
-                pid,
-                [ready | snapshot_frames ++ pending_frames],
-                state.queue_limit
-              )
+              enqueue(socket, pid, [ready | snapshot_frames ++ pending_frames])
 
             {:reply, :ok, put_in(state.sockets[pid], socket)}
         end
@@ -223,25 +218,25 @@ defmodule Tightbeam.Firehose.Hub do
   defp fanout(state, notice) do
     sockets =
       Map.new(state.sockets, fn {pid, socket} ->
-        {pid, deliver_notice(socket, pid, notice, state.queue_limit)}
+        {pid, deliver_notice(socket, pid, notice)}
       end)
 
     %{state | sockets: sockets}
   end
 
-  defp deliver_notice(%{mode: :pending} = socket, _, _, _), do: socket
-  defp deliver_notice(%{overflowed: true} = socket, _, _, _), do: socket
+  defp deliver_notice(%{mode: :pending} = socket, _, _), do: socket
+  defp deliver_notice(%{overflowed: true} = socket, _, _), do: socket
 
-  defp deliver_notice(socket, pid, notice, limit) do
+  defp deliver_notice(socket, pid, notice) do
     if revoked?(notice, socket) do
       send(pid, :firehose_revoked)
       socket
     else
-      deliver_matching_notice(socket, pid, notice, limit)
+      deliver_matching_notice(socket, pid, notice)
     end
   end
 
-  defp deliver_matching_notice(socket, pid, notice, limit) do
+  defp deliver_matching_notice(socket, pid, notice) do
     pending_subscriptions =
       socket.pending_subscriptions
       |> Enum.filter(fn {_id, filters} -> matches?(notice, filters) end)
@@ -256,7 +251,7 @@ defmodule Tightbeam.Firehose.Hub do
     else
       socket =
         Enum.reduce(pending_subscriptions, socket, fn {id, _filters}, socket ->
-          enqueue_pending_notice(socket, pid, {id, notice}, limit)
+          enqueue_pending_notice(socket, pid, {id, notice})
         end)
 
       if socket.overflowed do
@@ -267,35 +262,63 @@ defmodule Tightbeam.Firehose.Hub do
             do: socket.seq,
             else: List.last(frames)["seq"]
 
-        enqueue(%{socket | seq: seq}, pid, frames, limit)
+        enqueue(%{socket | seq: seq}, pid, frames)
       end
     end
   end
 
-  defp enqueue_pending_notice(socket, _, _, _) when socket.overflowed, do: socket
+  defp enqueue_pending_notice(socket, _, _) when socket.overflowed, do: socket
 
-  defp enqueue_pending_notice(socket, pid, notice, limit) do
-    occupied = socket_queue_length(pid) + :queue.len(socket.pending_notices)
+  defp enqueue_pending_notice(socket, pid, notice) do
+    backlog_bytes = socket_backlog_bytes(socket, pid) + :erlang.external_size(notice)
 
-    if occupied + 1 > limit do
-      overflow(socket, pid, occupied + 1, limit)
+    if backlog_bytes > @max_app_backlog_bytes do
+      overflow(socket, pid, backlog_bytes)
     else
       %{socket | pending_notices: :queue.in(notice, socket.pending_notices)}
     end
   end
 
-  defp enqueue(socket, _pid, [], _limit), do: socket
-  defp enqueue(%{overflowed: true} = socket, _pid, _frames, _limit), do: socket
+  defp enqueue(socket, _pid, []), do: socket
+  defp enqueue(%{overflowed: true} = socket, _pid, _frames), do: socket
 
-  defp enqueue(socket, pid, frames, limit) do
-    occupied = socket_queue_length(pid) + :queue.len(socket.pending_notices)
+  defp enqueue(socket, pid, frames) do
+    messages = Enum.map(frames, &outbound_message/1)
 
-    if occupied + length(frames) > limit do
-      overflow(socket, pid, occupied + length(frames), limit)
+    backlog_bytes =
+      socket_backlog_bytes(socket, pid) +
+        Enum.reduce(messages, 0, fn message, bytes ->
+          bytes + :erlang.external_size(message)
+        end)
+
+    if backlog_bytes > @max_app_backlog_bytes do
+      overflow(socket, pid, backlog_bytes)
     else
-      Enum.each(frames, &send_frame(pid, &1))
+      Enum.each(messages, &send(pid, &1))
       socket
     end
+  end
+
+  defp socket_backlog_bytes(socket, pid) do
+    queued_bytes =
+      case Process.info(pid, :messages) do
+        {:messages, messages} ->
+          Enum.reduce(messages, 0, fn
+            {:firehose_notice, _} = message, bytes -> bytes + :erlang.external_size(message)
+            {:firehose_control, _} = message, bytes -> bytes + :erlang.external_size(message)
+            _, bytes -> bytes
+          end)
+
+        nil ->
+          0
+      end
+
+    pending_bytes =
+      socket.pending_notices
+      |> :queue.to_list()
+      |> Enum.reduce(0, fn notice, bytes -> bytes + :erlang.external_size(notice) end)
+
+    queued_bytes + pending_bytes
   end
 
   defp socket_queue_length(pid) do
@@ -305,11 +328,12 @@ defmodule Tightbeam.Firehose.Hub do
     end
   end
 
-  defp overflow(socket, pid, backlog, limit) do
+  defp overflow(socket, pid, backlog_bytes) do
     if not socket.overflowed do
       Logger.warning(
         "firehose app dropped #{inspect(app_identity(socket))} reason=outbound_queue_overflow " <>
-          "backlog=#{backlog} queue_limit=#{limit} close_code=4008 connection=#{inspect(pid)}"
+          "backlog_bytes=#{backlog_bytes} limit_bytes=#{@max_app_backlog_bytes} " <>
+          "close_code=4008 connection=#{inspect(pid)}"
       )
 
       send(pid, :firehose_overflow)
@@ -327,11 +351,10 @@ defmodule Tightbeam.Firehose.Hub do
     }
   end
 
-  defp send_frame(pid, %{"type" => "subscription_ready"} = frame),
-    do: send(pid, {:firehose_control, frame})
+  defp outbound_message(%{"type" => "subscription_ready"} = frame),
+    do: {:firehose_control, frame}
 
-  defp send_frame(pid, frame),
-    do: send(pid, {:firehose_notice, Publisher.wire_notice(frame)})
+  defp outbound_message(frame), do: {:firehose_notice, Publisher.wire_notice(frame)}
 
   defp matching_notice_frames(notices, id, filters, seq) do
     {frames, seq} =
