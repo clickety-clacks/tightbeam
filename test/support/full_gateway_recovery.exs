@@ -186,14 +186,12 @@ defmodule Tightbeam.RecoveryScenario do
             "SELECT state FROM wakes WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY wakeId"
           ) == [["fired"], ["fired"]] and
           rows(
-            "SELECT state FROM wakes WHERE assignmentId='asg_recovery_preserve' AND digest=0 AND consumer='prompt'"
-          ) ==
-            [
-              ["fired"]
-            ] and
-          rows("SELECT status FROM turns WHERE assignmentId='asg_recovery_preserve'") == [
-            ["delivered"]
-          ]
+            "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_recovery_preserve' AND consumer='assignment_inactivity_deadline' AND state='pending'"
+          ) == [[1]] and
+          rows(
+            "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_recovery_preserve' AND consumer='prompt' AND obligationRef GLOB 'assignment-inactivity-episode-v1:*'"
+          ) == [[0]] and
+          rows("SELECT status FROM turns WHERE assignmentId='asg_recovery_preserve'") == []
       end,
       nil,
       &recovery_barrier_state/0

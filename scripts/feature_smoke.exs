@@ -214,7 +214,7 @@ defmodule FeatureSmoke do
       Enum.flat_map(areas, fn
         "provider" -> ["provider/onboard surface"]
         "work" -> ["work records and dispatch"]
-        "decisions" -> ["effort check-in"]
+        "decisions" -> ["decision and evidence workflows"]
         "telemetry" -> ["telemetry queries and execution-map assertions"]
         "artifacts" -> []
       end)

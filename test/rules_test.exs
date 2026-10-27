@@ -86,12 +86,13 @@ defmodule Tightbeam.RulesTest do
       end)
 
     assert log =~
-             "rules/verification.toml: policy \"justified-unresolved-dependency\": purpose \"wait-effort-relief\" is retired in this version; the policy has no effect"
+             "rules/rule.toml: policy \"justified-unresolved-dependency\": purpose \"wait-effort-relief\" is retired in this version; the policy has no effect"
 
     assert Rules.evaluate(ctx.db, call()) == :ok
   end
 
-  test "predicate policy loading refuses incomplete verification and invalid conditions", ctx do
+  test "invalid verification policies are warned and skipped while recording stays available",
+       ctx do
     valid = """
     [[policy]]
     name = "verifier"
@@ -100,22 +101,39 @@ defmodule Tightbeam.RulesTest do
     verification = { trigger = "registration", terminal = "bound-verdict-or-obligation-terminal", fallback = "wake-due-at" }
     """
 
-    for contents <- [
-          String.replace(valid, ~r/^verification.*$/m, ""),
-          String.replace(valid, "registration", "never"),
-          String.replace(valid, "verifier.open", "verifier.unknown"),
-          String.replace(valid, "value = true", "value = 1"),
-          String.replace(valid, ~r/when = .*\n/, "when = []\n"),
-          valid <> "effect = \"deny\"\n",
-          valid <> "\n" <> valid
+    healthy_sibling =
+      rule("healthy-sibling", "post", "caller.origin_class", "eq", "system")
+
+    for {contents, skipped_count} <- [
+          {String.replace(valid, ~r/^verification.*$/m, ""), 1},
+          {String.replace(valid, "registration", "never"), 1},
+          {String.replace(valid, "verifier.open", "verifier.unknown"), 1},
+          {String.replace(valid, "value = true", "value = 1"), 1},
+          {String.replace(valid, ~r/when = .*\n/, "when = []\n"), 1},
+          {valid <> "effect = \"deny\"\n", 1},
+          {valid <> "\n" <> valid, 2}
         ] do
-      path = put_raw(ctx, contents)
+      put_raw(ctx, contents <> healthy_sibling)
 
-      error =
-        assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          loaded = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+          assert Enum.any?(loaded, &(&1.name == "healthy-sibling"))
+          refute Enum.any?(loaded, &(&1.name == "verifier"))
+        end)
 
-      assert error.message =~ path
-      assert error.message =~ "verifier"
+      assert log =~ "rules/rule.toml: policy \"verifier\":"
+      refute log =~ "unavailable"
+
+      assert length(Regex.scan(~r/rules\/rule\.toml: policy "verifier":/, log)) ==
+               skipped_count
+
+      status = Rules.status()
+      assert status.recording_available
+      assert status.unavailable_verbs == []
+      assert length(status.skipped_policies) == skipped_count
+      assert Enum.all?(status.skipped_policies, &(&1.name == "verifier"))
+      assert Rules.evaluate(ctx.db, call()) == :ok
     end
   end
 

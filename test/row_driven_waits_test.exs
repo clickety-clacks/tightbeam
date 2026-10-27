@@ -1399,7 +1399,8 @@ defmodule Tightbeam.RowDrivenWaitsTest do
         assert %{state: "pending"} = Wakes.get(ctx.db, wake.wake_id)
       end)
 
-    assert log =~ "policy \"fixture-relief\" skipped: purpose wait-effort-relief is retired"
+    assert log =~
+             "rules/qualification.toml: policy \"fixture-relief\": purpose \"wait-effort-relief\" is retired in this version; the policy has no effect"
 
     assert {:ok, [[0]]} =
              DB.query(

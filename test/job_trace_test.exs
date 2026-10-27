@@ -63,10 +63,10 @@ defmodule Tightbeam.JobTraceTest do
 
       INSERT INTO wakes
         (wakeId, sessionKey, origin, prompt, dueAt, state, createdAt, firedAt,
-         conditionKind, conditionScope, conditionAfterId, firedBy)
+         conditionKind, conditionScope, conditionAfterId, firedBy, assignmentId)
       VALUES
         ('w_condition', 'holder', 'user:owner', 'condition', 500, 'fired', 100, 100,
-         'quota-recovered', 'asg_direct', 0, 'condition');
+         'quota-recovered', 'asg_direct', 0, 'condition', 'asg_direct');
 
       INSERT INTO wakes
         (wakeId, sessionKey, origin, prompt, dueAt, state, createdAt, firedAt,
@@ -366,7 +366,6 @@ defmodule Tightbeam.JobTraceTest do
              "wake_scheduled",
              "wake_fired",
              "decision_request",
-             "effort_generation",
              "attest",
              "attest",
              "attest",

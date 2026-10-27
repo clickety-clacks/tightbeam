@@ -551,8 +551,8 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
       {:ok, _} = DB.transaction(ctx.db, &Wakes.consume_internal_in_txn(&1, wake.wake_id))
     end
 
-    pid = scheduler(ctx, internal_consumers: %{"effort_probe" => consumer})
-    scheduled = wake(ctx.db, System.system_time(:millisecond), %{consumer: "effort_probe"})
+    pid = scheduler(ctx, internal_consumers: %{"test_retry" => consumer})
+    scheduled = wake(ctx.db, System.system_time(:millisecond), %{consumer: "test_retry"})
     assert_receive {:attempt, 1, first}, 5_000
     assert_receive {:attempt, 2, second}, 5_000
     assert second - first >= 1_000
@@ -569,14 +569,14 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     pid =
       scheduler(ctx,
         internal_consumers: %{
-          "effort_deadline" => fn _ ->
+          "test_retry_cap" => fn _ ->
             send(parent, :attempted)
             raise "temporary"
           end
         }
       )
 
-    scheduled = wake(ctx.db, System.system_time(:millisecond), %{consumer: "effort_deadline"})
+    scheduled = wake(ctx.db, System.system_time(:millisecond), %{consumer: "test_retry_cap"})
     assert_receive :attempted, 1_000
     :sys.get_state(pid)
 

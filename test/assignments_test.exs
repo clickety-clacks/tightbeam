@@ -44,7 +44,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     holder = session(db, "holder", "flynn")
     other = session(db, "other-session", "other")
-    gateway_config = %{db: db, wake_tick_ms: 1_000}
+    gateway_config = %{db: db, wake_tick_ms: 1_000, supervision_interval_ms: 1_000}
     handlers = Gateway.handlers(gateway_config)
     Rules.load!(System.tmp_dir!(), Map.keys(handlers))
     %{db: db, holder: holder, other: other, handlers: handlers}
@@ -2671,7 +2671,7 @@ defmodule Tightbeam.AssignmentsTest do
              |> then(&handle(ctx, "attest", &1))
   end
 
-  test "a cannot-proceed block held past inactivity ladder end still releases on its fact",
+  test "cannot-proceed suppresses inactivity reminders and still releases on its fact",
        ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
 
@@ -2696,10 +2696,19 @@ defmodule Tightbeam.AssignmentsTest do
          else: {:halt, nil}
     end)
 
-    assert {:ok, :none} =
-             DB.transaction(ctx.db, fn txn ->
-               Supervision.inactivity_deadline_trigger_in_txn(txn, {:assignment, blocked.id})
-             end)
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               [blocked.id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt' AND obligationRef GLOB 'assignment-inactivity-episode-v1:*'",
+               [blocked.id]
+             )
 
     assert Wakes.get(ctx.db, filed.decisionWake.wake_id).state == "pending"
 
@@ -2723,7 +2732,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert Wakes.get(ctx.db, filed.decisionWake.wake_id).state == "canceled"
 
-    assert {:ok, [["cannot_proceed_released", 0]]} =
+    assert {:ok, [["cannot_proceed_released", 1]]} =
              DB.query(
                ctx.db,
                "SELECT reasonKind,actionNeeded FROM wake_cancellations WHERE wakeId=?1",
@@ -3349,7 +3358,10 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "a fired parent escalation does not block opener revocation after reparenting", ctx do
+  test "a fired holder reminder does not block opener revocation after reparenting", ctx do
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+
     main = Org.personal_session_key("flynn")
     session(ctx.db, main, "flynn")
     session(ctx.db, "parent-a", "flynn", %{spawned_by: main})
@@ -3373,37 +3385,33 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :note], "awaiting the opener's disposition")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Supervision.ladder_target(ctx.db, "opener", 1) == "parent-a"
-
+    # This fixture configures a one-second reminder interval, so let its quiet
+    # period elapse before delivering the holder reminder.
+    Process.sleep(1_100)
     assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_deadline", opener_work.id)
-    assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_climb", opener_work.id)
 
-    assert [escalation] =
-             Enum.filter(Wakes.list_pending(ctx.db), &(&1.assignment_id == opener_work.id))
-
-    assert escalation.session_key == "parent-a"
-
-    assert {:ok, {:appended, _, _, _}} =
-             DB.transaction(ctx.db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 escalation.session_key,
-                 escalation.origin,
-                 escalation.prompt,
-                 wake_id: escalation.wake_id,
-                 sender: escalation.origin,
-                 target_gate: escalation,
-                 fire_wake_in_txn: true,
-                 assignment_id: escalation.assignment_id
-               )
+    assert [holder_notice] =
+             Enum.filter(Wakes.list_pending(ctx.db), fn wake ->
+               wake.assignment_id == opener_work.id and wake.session_key == "opener" and
+                 wake.consumer == "prompt" and
+                 String.starts_with?(wake.obligation_ref || "", "assignment-inactivity-episode-v1:")
              end)
 
-    assert Wakes.get(ctx.db, escalation.wake_id).state == "fired"
+    assert :appended = deliver_terminal_notice(ctx.db, holder_notice)
+    drain_queued_turns(ctx.db, "opener", "flynn")
 
-    assert {:ok, [["parent-a"]]} =
-             DB.query(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId=?1", [
-               escalation.wake_id
-             ])
+    assert %{state: "fired", session_key: "opener"} =
+             Wakes.get(ctx.db, holder_notice.wake_id)
+
+    assert [[_, "opener", "delivered", _carrier_id]] =
+             source_delivery_turns(ctx.db, holder_notice.wake_id)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt' AND sessionKey<>'opener' AND obligationRef GLOB 'assignment-inactivity-episode-v1:*'",
+               [opener_work.id]
+             )
 
     assert {:ok, [["standing"]]} =
              DB.query(
