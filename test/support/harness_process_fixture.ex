@@ -1005,9 +1005,8 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     assert Enum.any?(
              EventLog.lifecycle_events(ctx.db),
-             &(&1.kind == "harness_launch_process_absent" and
-                 &1.subject == "claude:shared@testhost" and
-                 &1.detail =~ "complete_process_snapshot_absent")
+             &(&1.kind == "harness_launch_settled" and
+                 &1.subject == "claude:shared@testhost" and &1.detail =~ "identity_boot_ended")
            )
   end
 
