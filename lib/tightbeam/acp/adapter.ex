@@ -1011,7 +1011,7 @@ defmodule Tightbeam.Acp.Adapter do
                request_timeout
              ) do
           {:ok, verified_result} ->
-            case confirmed_public_model(verified_result, state.preset, model) do
+            case confirmed_public_model(verified_result, state.preset, model, state.harness) do
               %Model{} = public ->
                 {:ok, %{model | context: public.context || model.context}}
 
@@ -1054,7 +1054,7 @@ defmodule Tightbeam.Acp.Adapter do
 
     case result do
       {:ok, model_result} ->
-        if readback_confirms_model?(model_result, state.preset, model),
+        if readback_confirms_model?(model_result, state.preset, model, state.harness),
           do: {:ok, model_result},
           else: verified_model_mismatch(model_result, state.preset, "model", value)
 
@@ -1094,7 +1094,7 @@ defmodule Tightbeam.Acp.Adapter do
         with :ok <- project_guidance(state, sid, guidance),
              {:ok, applied_model} <-
                establish_new_session_model(state, sid, model, result, request_timeout),
-             :ok <- verify_candidate_model(report_cleanup?, model, applied_model),
+             :ok <- verify_candidate_model(report_cleanup?, state.harness, model, applied_model),
              :ok <- set_mode(state, sid, request_timeout) do
           state =
             state
@@ -1134,13 +1134,13 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  defp verify_candidate_model(true, %Model{} = requested, %Model{} = actual)
+  defp verify_candidate_model(true, harness, %Model{} = requested, %Model{} = actual)
        when requested.family != actual.family or
-              requested.context != actual.context or
+              (harness != :claude and requested.context != actual.context) or
               (not is_nil(requested.effort) and requested.effort != actual.effort),
        do: {:error, {:runtime_config_mismatch, actual}}
 
-  defp verify_candidate_model(_report_cleanup?, _requested, _actual), do: :ok
+  defp verify_candidate_model(_report_cleanup?, _harness, _requested, _actual), do: :ok
 
   defp load_session_reply(state, sid, model, cwd, mcp_servers, guidance, request_timeout) do
     with :ok <- project_guidance(state, sid, guidance) do
@@ -1260,9 +1260,9 @@ defmodule Tightbeam.Acp.Adapter do
            apply_fork_model_candidates(state, sid, model, offered, request_timeout),
          {:ok, verified_result} <-
            apply_verified_effort(state, sid, model.effort, model_result, request_timeout) do
-      case confirmed_public_model(verified_result, state.preset, model) do
-        %Model{} ->
-          {:ok, model}
+      case confirmed_public_model(verified_result, state.preset, model, state.harness) do
+        %Model{} = public ->
+          {:ok, %{model | context: public.context || model.context}}
 
         nil ->
           verified_model_mismatch(verified_result, state.preset, "model", Model.to_ref(model))
@@ -1301,7 +1301,7 @@ defmodule Tightbeam.Acp.Adapter do
 
     case result do
       {:ok, model_result} ->
-        if readback_confirms_model?(model_result, state.preset, model) do
+        if readback_confirms_model?(model_result, state.preset, model, state.harness) do
           {:ok, model_result}
         else
           unconfirmed = readback_node(model_result, "model", value, "readback")
@@ -2056,8 +2056,8 @@ defmodule Tightbeam.Acp.Adapter do
         {:ok, applied_model} ->
           # Some clients return an opaque wire alias after accepting a public
           # model ref. Trust the selected offered option only when it names the
-          # requested model and context; never infer identity from the alias.
-          case confirmed_public_model(effort_result, state.preset, model_ref) do
+          # requested model family; never infer identity from the alias.
+          case confirmed_public_model(effort_result, state.preset, model_ref, state.harness) do
             %Model{} = public_model ->
               {:ok,
                %{
@@ -2292,7 +2292,7 @@ defmodule Tightbeam.Acp.Adapter do
 
     case Map.fetch(state.models, sid) do
       {:ok, %Model{} = cached} ->
-        if readback_confirms_model?(%{"configOptions" => options}, state.preset, cached) do
+        if readback_confirms_model?(%{"configOptions" => options}, state.preset, cached, state.harness) do
           remember_confirmed_config_model(state, sid, cached, options)
         else
           remember_reported_config_model(state, sid, options)
@@ -2482,16 +2482,16 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp model_option_values(_result), do: []
 
-  defp readback_confirms_model?(result, preset, %Model{} = model) do
-    match?(%Model{}, confirmed_public_model(result, preset, model))
+  defp readback_confirms_model?(result, preset, %Model{} = model, harness) do
+    match?(%Model{}, confirmed_public_model(result, preset, model, harness))
   end
 
-  defp confirmed_public_model(result, preset, %Model{} = model) do
+  defp confirmed_public_model(result, preset, %Model{} = model, harness) do
     with %{} = config <- model_config_option(result),
          value when is_binary(value) <- config["currentValue"] || config["value"],
          %{} = option <- selected_model_option(config, value),
          %Model{} = public_model <- public_option_model(preset, option),
-         true <- public_option_confirms_model?(option, public_model, model) do
+         true <- public_option_confirms_model?(option, public_model, model, harness) do
       public_model
     else
       _ -> nil
@@ -2597,9 +2597,9 @@ defmodule Tightbeam.Acp.Adapter do
     end)
   end
 
-  defp public_option_confirms_model?(_option, %Model{} = public, %Model{} = requested) do
+  defp public_option_confirms_model?(_option, %Model{} = public, %Model{} = requested, harness) do
     public.family == requested.family and
-      public.context == requested.context
+      (harness == :claude or public.context == requested.context)
   end
 
   defp remember_reported_config_model(state, sid, options) do

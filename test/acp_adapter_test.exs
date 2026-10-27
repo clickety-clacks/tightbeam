@@ -2740,14 +2740,11 @@ defmodule Tightbeam.Acp.AdapterTest do
            end)
   end
 
-  test "a default-context candidate refuses a different selected context variant" do
+  test "a Claude candidate records the selected context when none was requested" do
     {adapter, capture_path} =
       start_adapter(harness: :claude, fail_mode: "default-context-variant")
 
-    assert {:error,
-            {:session_prepare_failed,
-             {:runtime_config_mismatch, %Model{family: "claude-fable-5", context: "1m"}},
-             "sess-1", %{status: "verified"}}} =
+    assert {:ok, "sess-1"} =
              Adapter.new_candidate_session(
                adapter,
                Model.new("claude-fable-5"),
@@ -2756,7 +2753,15 @@ defmodule Tightbeam.Acp.AdapterTest do
                "guidance"
              )
 
+    assert {:ok, %Model{family: "claude-fable-5", context: "1m"}} =
+             Adapter.current_model(adapter, "sess-1")
+
     assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and
+               request["configId"] == "model" and request["value"] == "claude-fable-5"
+           end)
+
+    refute Enum.any?(captured_requests(capture_path), fn request ->
              request["method"] == "session/close" and request["sessionId"] == "sess-1"
            end)
   end
@@ -2812,14 +2817,11 @@ defmodule Tightbeam.Acp.AdapterTest do
            end)
   end
 
-  test "an opaque Claude alias refuses a variant when default context was requested" do
+  test "an opaque Claude alias reports its context without requiring a matching request" do
     {adapter, capture_path} =
       start_adapter(harness: :claude, fail_mode: "canonical-opus55-alias")
 
-    assert {:error,
-            {:session_prepare_failed,
-             {:runtime_config_mismatch, %Model{family: "opus", context: "1m"}}, "sess-1",
-             %{status: "verified"}}} =
+    assert {:ok, "sess-1"} =
              Adapter.new_candidate_session(
                adapter,
                Model.new("claude-opus-5-5"),
@@ -2828,9 +2830,45 @@ defmodule Tightbeam.Acp.AdapterTest do
                "guidance"
              )
 
+    assert {:ok, %Model{family: "claude-opus-5-5", context: "1m"}} =
+             Adapter.current_model(adapter, "sess-1")
+
     assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and
+               request["configId"] == "model" and request["value"] == "claude-opus-5-5"
+           end)
+
+    refute Enum.any?(captured_requests(capture_path), fn request ->
              request["method"] == "session/close" and request["sessionId"] == "sess-1"
            end)
+  end
+
+  test "Claude new, load, and fork keep the context selected by the harness" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "canonical-opus55-alias")
+
+    requested = Model.new("claude-opus-5-5")
+    selected = Model.new("claude-opus-5-5", context: "1m")
+
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, requested, "/tmp", [], "guidance")
+    assert {:ok, ^selected} = Adapter.current_model(adapter, "sess-1")
+
+    assert {:ok, ^selected} =
+             Adapter.load_session(adapter, "sess-1", requested, "/tmp", [], "guidance")
+
+    assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
+
+    assert {:ok, "sess-fork-1"} =
+             Adapter.switch_model_session(adapter, "sess-1", requested, "/tmp", [], "guidance")
+
+    assert {:ok, ^selected} = Adapter.current_model(adapter, "sess-fork-1")
+
+    model_writes =
+      captured_requests(capture_path)
+      |> Enum.filter(&(&1["method"] == "session/set_config_option" and &1["configId"] == "model"))
+
+    assert Enum.map(model_writes, & &1["value"]) ==
+             ["claude-opus-5-5", "claude-opus-5-5", "claude-opus-5-5"]
   end
 
   test "an unseen offered Claude model verifies across harnesses and after a same-harness fork" do
