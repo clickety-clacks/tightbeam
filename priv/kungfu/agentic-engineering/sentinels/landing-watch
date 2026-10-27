@@ -3,7 +3,7 @@
 
 Settings (environment):
   GH_CONFIG_DIR             required; the gh config directory holding the login.
-  LANDING_REPOS             required; whitespace-separated entries
+  LANDING_REPOS             optional; whitespace-separated entries
                             <owner>/<repo>@<branch>=<owner role>,
                             for example example/repo@main=pdo:example.
   LANDING_WATCH_AS_PROCESS  optional; adds --as-process <value> to each
@@ -17,8 +17,8 @@ check fails on the branch tip. Keys make every filing replayable, so repeated
 polls and restarts file nothing new.
 
 Usage: landing-watch [--once]
-  --once  run one poll of every configured branch and exit; the exit status is
-          0 when every poll completed and its state was saved, 1 otherwise.
+  --once  run one poll of demanded scopes and configured branch tips; the exit status is
+          0 when every poll completed, 1 otherwise.
 """
 
 from __future__ import annotations
@@ -29,16 +29,12 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.parse
 
-STATE_VERSION = 2
-PREVIOUS_STATE_VERSION = 1
 POLL_SECONDS = 60
 MAX_BACKOFF_SECONDS = 900
-OVERLAP = dt.timedelta(minutes=10)
-COLD_START = dt.timedelta(hours=24)
+CLAIM_RENEW_SECONDS = 900
 WAKE_FALLBACK = "10m"
 GH_TIMEOUT = 120
 TIGHTBEAM_TIMEOUT = 60
@@ -56,6 +52,8 @@ EXIT_LOGIN = 3
 
 NAME = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?"
 ENTRY = re.compile(r"^(" + NAME + r")/(" + r"[A-Za-z0-9._-]+" + r")@([^\s=@]+)=(\S+)$")
+PR_SCOPE = re.compile(r"^(" + NAME + r")/([A-Za-z0-9._-]+)#([1-9][0-9]*)$")
+BRANCH_SCOPE = re.compile(r"^(" + NAME + r")/([A-Za-z0-9._-]+)@([^\s=@]+)$")
 QUEUE_BRANCH = "gh-readonly-queue/"
 
 ROLLUP_NODES = """
@@ -67,29 +65,6 @@ ROLLUP_NODES = """
           ... on StatusContext {
             id context state createdAt targetUrl %(required)s
           }
-"""
-
-Q_OPEN = """
-query LandingOpen($owner: String!, $name: String!, $base: String!, $cursor: String) {
-  repository(owner: $owner, name: $name) {
-    pullRequests(states: [OPEN], baseRefName: $base, first: 100, after: $cursor) {
-      pageInfo { hasNextPage endCursor }
-      nodes { number updatedAt }
-    }
-  }
-}
-"""
-
-Q_RECENT = """
-query LandingRecent($owner: String!, $name: String!, $base: String!, $cursor: String) {
-  repository(owner: $owner, name: $name) {
-    pullRequests(baseRefName: $base, orderBy: {field: UPDATED_AT, direction: DESC},
-                 first: 100, after: $cursor) {
-      pageInfo { hasNextPage endCursor }
-      nodes { number updatedAt }
-    }
-  }
-}
 """
 
 Q_PULL = """
@@ -197,10 +172,6 @@ def iso(moment: dt.datetime) -> str:
     return moment.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def parse_time(text: str) -> dt.datetime:
-    return dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
-
-
 class Branch:
     def __init__(self, owner: str, repo: str, branch: str, role: str):
         self.owner = owner
@@ -219,11 +190,6 @@ class Branch:
     def pr_scope(self, number: int) -> str:
         return f"{self.slug}#{number}"
 
-    @property
-    def state_name(self) -> str:
-        return f"{self.owner.lower()}-{self.repo.lower()}-{self.branch}".replace("/", "-") + ".json"
-
-
 def parse_settings(env) -> tuple[list[Branch], str | None]:
     config_dir = env.get("GH_CONFIG_DIR", "")
     if not config_dir.strip():
@@ -231,8 +197,6 @@ def parse_settings(env) -> tuple[list[Branch], str | None]:
     if not os.path.isdir(config_dir):
         raise SettingsError("GH_CONFIG_DIR is not a directory")
     entries = env.get("LANDING_REPOS", "").split()
-    if not entries:
-        raise SettingsError("LANDING_REPOS is required")
     branches: list[Branch] = []
     seen = set()
     for entry in entries:
@@ -253,16 +217,12 @@ def parse_settings(env) -> tuple[list[Branch], str | None]:
     return branches, as_process
 
 
-def state_dir(env) -> str:
-    base = env.get("XDG_STATE_HOME") or os.path.join(env.get("HOME", ""), ".local", "state")
-    return os.path.join(base, "landing-watch")
-
-
 class Runner:
     """Runs gh and tightbeam. Tests replace it with a fake."""
 
     def __init__(self, as_process: str | None):
         self.as_process = as_process
+        self.last_claim_at = None
 
     def _gh(self, args: list[str]) -> str:
         try:
@@ -289,6 +249,7 @@ class Runner:
             raise
 
     def graphql(self, query: str, variables: dict) -> dict:
+        renew_claim(self)
         args = ["api", "graphql", "-f", f"query={query}"]
         for key, value in variables.items():
             if value is None:
@@ -304,12 +265,17 @@ class Runner:
         return body["data"]
 
     def rest(self, path: str):
+        renew_claim(self)
         try:
             return json.loads(self._gh(["api", path]))
         except json.JSONDecodeError as error:
             raise ReadError(f"gh returned malformed JSON: {error}") from error
 
     def tightbeam(self, args: list[str]) -> tuple[bool, str]:
+        try:
+            renew_claim(self)
+        except ReadError as error:
+            print(f"claim renewal failed before filing: {error}", file=sys.stderr)
         argv = ["tightbeam", *args]
         if self.as_process:
             argv += ["--as-process", self.as_process]
@@ -318,6 +284,24 @@ class Runner:
         except (OSError, subprocess.TimeoutExpired) as error:
             return False, str(error)
         return done.returncode == 0, one_line(done.stderr if done.returncode else done.stdout)
+
+    def tightbeam_json(self, args: list[str]) -> dict:
+        argv = ["tightbeam", *args]
+        if self.as_process:
+            argv += ["--as-process", self.as_process]
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=TIGHTBEAM_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ReadError(f"tightbeam failed: {error}") from error
+        if done.returncode:
+            raise ReadError(f"tightbeam exited {done.returncode}: {one_line(done.stderr)}")
+        try:
+            value = json.loads(done.stdout)
+        except json.JSONDecodeError as error:
+            raise ReadError(f"tightbeam returned malformed JSON: {error}") from error
+        if not isinstance(value, dict):
+            raise ReadError("tightbeam returned a non-object")
+        return value
 
 
 def one_line(text: str) -> str:
@@ -492,13 +476,6 @@ def checks_outcome(results: list[dict]) -> str | None:
     return "fail" if any(failing(result) for result in latest.values()) else "pass"
 
 
-def valid_head_key(value) -> bool:
-    if not isinstance(value, str):
-        return False
-    number, separator, head = value.partition(":")
-    return bool(separator and number.isdecimal() and int(number) > 0 and head and ":" not in head)
-
-
 class Log:
     def __init__(self, stream=sys.stderr):
         self.stream = stream
@@ -514,93 +491,15 @@ class Log:
 
 
 class Watcher:
-    def __init__(self, branch: Branch, runner, directory: str, log: Log, clock=now_utc):
+    def __init__(self, branch: Branch, runner, log: Log):
         self.branch = branch
         self.runner = runner
-        self.directory = directory
         self.log = log
-        self.clock = clock
-        self.path = os.path.join(directory, branch.state_name)
-        self.checked_heads: set[str] = set()
-        self.pending_checks: dict[str, str] = {}
-        self._state_watermark = self.clock() - COLD_START
-        self._state_tracked: set[int] = set()
-
-    # State
-
-    def load(self) -> tuple[dt.datetime, set[int], set[str], dict[str, str]]:
-        try:
-            with open(self.path, encoding="utf-8") as handle:
-                data = json.load(handle)
-        except FileNotFoundError:
-            return self.clock() - COLD_START, set(), set(), {}
-        except (OSError, json.JSONDecodeError) as error:
-            raise SettingsError(f"state file {self.path} is unreadable: {error}") from error
-        try:
-            if data["version"] not in (PREVIOUS_STATE_VERSION, STATE_VERSION):
-                raise ValueError("unknown version")
-            tracked = data["tracked"]
-            if not isinstance(tracked, list) or not all(isinstance(n, int) for n in tracked):
-                raise ValueError("tracked must be a list of numbers")
-            checked_heads = data.get("checked_heads", [])
-            if not isinstance(checked_heads, list) or not all(valid_head_key(head) for head in checked_heads):
-                raise ValueError("checked_heads must be a list of strings")
-            pending_checks = data.get("pending_checks", {})
-            if not isinstance(pending_checks, dict) or not all(
-                valid_head_key(head) and outcome in ("pass", "fail")
-                for head, outcome in pending_checks.items()
-            ):
-                raise ValueError("pending_checks must map head keys to pass or fail")
-            if set(checked_heads) & set(pending_checks):
-                raise ValueError("a head cannot be both checked and pending")
-            return parse_time(data["watermark"]), set(tracked), set(checked_heads), pending_checks
-        except (KeyError, TypeError, ValueError) as error:
-            raise SettingsError(f"state file {self.path} is malformed: {error}") from error
-
-    def save(self, watermark: dt.datetime, tracked: set[int]) -> None:
-        os.makedirs(self.directory, exist_ok=True)
-        data = {"version": STATE_VERSION, "watermark": iso(watermark), "tracked": sorted(tracked)}
-        if self.checked_heads:
-            data["checked_heads"] = sorted(self.checked_heads)
-        if self.pending_checks:
-            data["pending_checks"] = dict(sorted(self.pending_checks.items()))
-        body = json.dumps(data)
-        handle, temporary = tempfile.mkstemp(dir=self.directory, prefix=".landing-watch-")
-        try:
-            with os.fdopen(handle, "w", encoding="utf-8") as stream:
-                stream.write(body + "\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
-        except BaseException:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-            raise
 
     # Reads
 
     def _repo_vars(self) -> dict:
         return {"owner": self.branch.owner, "name": self.branch.repo}
-
-    def list_pulls(self, query: str, stop_before: dt.datetime | None) -> list[int]:
-        numbers: list[int] = []
-        cursor = None
-        while True:
-            data = self.runner.graphql(query, {**self._repo_vars(), "base": self.branch.branch, "cursor": cursor})
-            connection = dig(data, "repository", "pullRequests")
-            more, cursor = page_info(connection)
-            reached = False
-            for node in connection["nodes"]:
-                if not isinstance(node, dict) or not isinstance(node.get("number"), int):
-                    raise ReadError("pull request list returned a null node")
-                if stop_before is not None and parse_time(node["updatedAt"]) < stop_before:
-                    reached = True
-                    break
-                numbers.append(node["number"])
-            if not more or reached:
-                return numbers
 
     def read_pull(self, number: int, since: dt.datetime | None, pull: dict) -> None:
         """Fill `pull` as far as reads succeed; raise ReadError when incomplete."""
@@ -766,144 +665,6 @@ class Watcher:
             self.log.line(f"refused wake key={key} reason={detail}")
         return ok
 
-    # Poll
-
-    def poll(self) -> bool:
-        """One poll. Returns True when it completed and its state was saved."""
-        started = self.clock()
-        watermark, tracked, checked_heads, pending_checks = self.load()
-        self.checked_heads = checked_heads
-        self.pending_checks = pending_checks
-        self._state_watermark = watermark
-        self._state_tracked = tracked
-        horizon = watermark - OVERLAP
-        pulls: dict[int, dict] = {}
-        complete = True
-        open_numbers: set[int] = set()
-        tip = None
-        try:
-            open_numbers = set(self.list_pulls(Q_OPEN, None))
-            candidates = sorted(open_numbers | tracked)
-            candidates += [n for n in self.list_pulls(Q_RECENT, horizon) if n not in candidates]
-            for number in candidates:
-                pull: dict = {}
-                pulls[number] = pull
-                try:
-                    self.read_pull(number, horizon if number in tracked else None, pull)
-                    if blocked_candidate(pull):
-                        pull["checks"] = self.read_pull_checks(number, pull["headRefOid"])
-                    head = pull.get("headRefOid")
-                    check_key = f"{number}:{head}" if head else None
-                    if (
-                        pull.get("state") == "OPEN"
-                        and pull.get("mergeQueueEntry") is None
-                        and head
-                        and check_key not in self.checked_heads
-                        and check_key not in self.pending_checks
-                    ):
-                        pull["head_checks"] = self.read_head_checks(number, head)
-                except ReadError as error:
-                    # One unreadable pull request must not withhold another's merge.
-                    complete = False
-                    self.log.line(f"poll failed branch={self.branch.scope} pr={number} reason={error}")
-            requirements = self.read_requirements()
-            tip = self.read_tip() + (requirements,)
-        except ReadError as error:
-            complete = False
-            self.log.line(f"poll failed branch={self.branch.scope} reason={error}")
-
-        # Every read finished before any fact that depends on absence is filed.
-        accepted = True
-        for check_key in list(self.pending_checks):
-            accepted &= self.file_pending_check(check_key)
-        for number, pull in pulls.items():
-            accepted &= self.file_positive(number, pull)
-        if complete:
-            for number, pull in pulls.items():
-                accepted &= self.file_absence(number, pull)
-            accepted &= self.file_tip(*tip)
-        if not (complete and accepted):
-            return False
-        still_open = {n for n in open_numbers if pulls.get(n, {}).get("state") == "OPEN"}
-        self.save(started, still_open)
-        return True
-
-    def file_positive(self, number: int, pull: dict) -> bool:
-        scope = self.branch.pr_scope(number)
-        ok = True
-        merge = pull.get("mergeCommit") or {}
-        if pull.get("merged") is True and merge.get("oid"):
-            key = f"landing-fact:{scope}:merged:{merge['oid']}"
-            self.log.episode(key, f"episode merged pr={scope} commit={merge['oid']}")
-            ok &= self.condition(SETTLED, scope, key)
-        for event in pull.get("events", []):
-            if event.get("__typename") == "RemovedFromMergeQueueEvent":
-                key = f"landing-fact:{scope}:removed:{event['id']}"
-                reason = event.get("reason") or "unspecified"
-                self.log.episode(key, f"episode removed pr={scope} event={event['id']} reason={reason}")
-                ok &= self.condition(SETTLED, scope, key)
-        head = pull.get("headRefOid")
-        results = pull.get("head_checks")
-        if head and results is not None:
-            check_key = f"{number}:{head}"
-            if check_key not in self.checked_heads and check_key not in self.pending_checks:
-                outcome = checks_outcome(results)
-                if outcome is not None:
-                    self.pending_checks[check_key] = outcome
-                    try:
-                        self.save(self._state_watermark, self._state_tracked)
-                    except OSError as error:
-                        self.log.line(f"failed to save pending checks pr={scope} head={head} reason={error}")
-                        return False
-        if head:
-            check_key = f"{number}:{head}"
-            if check_key in self.pending_checks:
-                ok &= self.file_pending_check(check_key)
-        return ok
-
-    def file_pending_check(self, check_key: str) -> bool:
-        number_text, head = check_key.split(":", 1)
-        number = int(number_text)
-        scope = self.branch.pr_scope(number)
-        outcome = self.pending_checks[check_key]
-        key = f"pr-checks:{scope}:{head}:{outcome}"
-        self.log.episode(key, f"episode checks-completed pr={scope} head={head} outcome={outcome}")
-        if not self.condition(CHECKS_COMPLETED, scope, key):
-            return False
-        self.pending_checks.pop(check_key)
-        self.checked_heads.add(check_key)
-        return True
-
-    def file_absence(self, number: int, pull: dict) -> bool:
-        scope = self.branch.pr_scope(number)
-        if pull.get("merged") is not False:
-            return True
-        ok = True
-        for event in pull.get("events", []):
-            kind = event.get("__typename")
-            if kind == "AutoMergeDisabledEvent":
-                key = f"landing-fact:{scope}:automerge-disabled:{event['id']}"
-                self.log.episode(key, f"episode automerge-disabled pr={scope} event={event['id']}")
-                ok &= self.condition(SETTLED, scope, key)
-            elif kind == "ClosedEvent":
-                key = f"landing-fact:{scope}:closed:{event['id']}"
-                self.log.episode(key, f"episode closed pr={scope} event={event['id']}")
-                ok &= self.condition(SETTLED, scope, key)
-        if blocked_candidate(pull):
-            auto = pull["autoMergeRequest"]
-            results = pull["checks"]
-            if results is None:
-                return ok  # The effective subject is unknown.
-            for failure in pr_failures(results):
-                identity = check_identity(failure)
-                key = f"landing-fact:{scope}:blocked:{auto['enabledAt']}:{identity}"
-                self.log.episode(
-                    key,
-                    f"episode blocked pr={scope} head={pull['headRefOid']} check={context_name(failure)} identity={identity}",
-                )
-                ok &= self.condition(SETTLED, scope, key)
-        return ok
-
     def file_tip(self, oid: str, results: list[dict], requirements: list[dict]) -> bool:
         scope = self.branch.scope
         ok = True
@@ -925,6 +686,114 @@ class Watcher:
         return ok
 
 
+def demanded_scopes(runner, log: Log) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    data = runner.tightbeam_json(["fact-demand", "--kind-prefix", "landing.", "--kind-prefix", "pr."])
+    pairs = data.get("demand")
+    if not isinstance(pairs, list):
+        raise ReadError("fact-demand returned no demand array")
+    prs: dict[str, set[str]] = {}
+    branches: dict[str, set[str]] = {}
+    served = {SETTLED, CHECKS_COMPLETED, BRANCH_ATTENTION}
+    for pair in pairs:
+        if not isinstance(pair, dict) or not isinstance(pair.get("kind"), str):
+            raise ReadError("fact-demand returned a malformed pair")
+        kind, scope = pair["kind"], pair.get("scope")
+        if kind not in served:
+            continue
+        pattern = BRANCH_SCOPE if kind == BRANCH_ATTENTION else PR_SCOPE
+        if not isinstance(scope, str) or not pattern.fullmatch(scope):
+            log.episode(f"invalid-demand:{kind}:{scope}", f"ignored invalid demand kind={kind} scope={scope!r}")
+            continue
+        (branches if kind == BRANCH_ATTENTION else prs).setdefault(scope, set()).add(kind)
+    return prs, branches
+
+
+def renew_claim(runner, force: bool = False) -> None:
+    now = time.monotonic()
+    last = getattr(runner, "last_claim_at", None)
+    if not force and last is not None and now - last < CLAIM_RENEW_SECONDS:
+        return
+    runner.tightbeam_json([
+        "fact-producer-claim", "--producer", "landing-watch",
+        "--kind", SETTLED, "--kind", CHECKS_COMPLETED, "--kind", BRANCH_ATTENTION,
+        "--live-for", "1h",
+    ])
+    runner.last_claim_at = time.monotonic()
+
+
+def unavailable_scope(error: ReadError) -> bool:
+    detail = str(error)
+    return any(marker in detail for marker in (
+        "null node at repository.pullRequest",
+        "null node at repository.ref",
+        "HTTP 404",
+        "Could not resolve to a Repository",
+        "Could not resolve to a PullRequest",
+        "Resource not accessible",
+    ))
+
+
+def poll_demanded_pr(scope: str, kinds: set[str], runner, log: Log) -> bool:
+    owner, repo, number_text = PR_SCOPE.fullmatch(scope).groups()
+    number = int(number_text)
+    watcher = Watcher(Branch(owner, repo, "", ""), runner, log)
+    pull: dict = {}
+    try:
+        watcher.read_pull(number, None, pull)
+        if SETTLED in kinds and blocked_candidate(pull):
+            pull["checks"] = watcher.read_pull_checks(number, pull["headRefOid"])
+        head = pull.get("headRefOid")
+        if CHECKS_COMPLETED in kinds and pull.get("state") == "OPEN" and pull.get("mergeQueueEntry") is None and head:
+            pull["head_checks"] = watcher.read_head_checks(number, head)
+    except ReadError as error:
+        log.line(f"unreadable demanded pr={scope} reason={error}")
+        return unavailable_scope(error)
+
+    ok = True
+    if SETTLED in kinds:
+        merge = pull.get("mergeCommit") or {}
+        if pull.get("merged") is True and merge.get("oid"):
+            ok &= watcher.condition(SETTLED, scope, f"landing-fact:{scope}:merged:{merge['oid']}")
+        for event in pull.get("events", []):
+            event_kind = event.get("__typename")
+            if event_kind == "RemovedFromMergeQueueEvent":
+                suffix = f"removed:{event['id']}"
+            elif pull.get("merged") is False and event_kind == "AutoMergeDisabledEvent":
+                suffix = f"automerge-disabled:{event['id']}"
+            elif pull.get("merged") is False and event_kind == "ClosedEvent":
+                suffix = f"closed:{event['id']}"
+            else:
+                continue
+            ok &= watcher.condition(SETTLED, scope, f"landing-fact:{scope}:{suffix}")
+        if blocked_candidate(pull) and pull.get("checks") is not None:
+            for failure in pr_failures(pull["checks"]):
+                key = f"landing-fact:{scope}:blocked:{pull['autoMergeRequest']['enabledAt']}:{check_identity(failure)}"
+                ok &= watcher.condition(SETTLED, scope, key)
+    if CHECKS_COMPLETED in kinds and head and pull.get("head_checks") is not None:
+        outcome = checks_outcome(pull["head_checks"])
+        if outcome is not None:
+            ok &= watcher.condition(CHECKS_COMPLETED, scope, f"pr-checks:{scope}:{head}:{outcome}")
+    return ok
+
+
+def poll_branch(scope: str, role: str | None, runner, log: Log) -> bool:
+    owner, repo, branch = BRANCH_SCOPE.fullmatch(scope).groups()
+    watcher = Watcher(Branch(owner, repo, branch, role or ""), runner, log)
+    try:
+        tip, results = watcher.read_tip()
+        requirements = watcher.read_requirements()
+    except ReadError as error:
+        log.line(f"unreadable branch={scope} reason={error}")
+        return role is None and unavailable_scope(error)
+    if role is not None:
+        return watcher.file_tip(tip, results, requirements)
+    ok = True
+    for failure in tip_failures(requirements, results):
+        episode = f"{scope}:red:{tip}:{check_identity(failure)}"
+        ok &= watcher.condition(BRANCH_ATTENTION, scope, f"landing-fact:{episode}")
+    return ok
+
+
 def run(argv, env, runner=None, log=None, sleep=time.sleep) -> int:
     log = log or Log()
     once = "--once" in argv[1:]
@@ -938,14 +807,6 @@ def run(argv, env, runner=None, log=None, sleep=time.sleep) -> int:
         log.line(f"exit reason={error}")
         return EXIT_SETTINGS
     runner = runner or Runner(as_process)
-    directory = state_dir(env)
-    watchers = [Watcher(branch, runner, directory, log) for branch in branches]
-    try:
-        for watcher in watchers:
-            watcher.load()
-    except SettingsError as error:
-        log.line(f"exit reason={error}")
-        return EXIT_SETTINGS
     try:
         login = runner.login()
         log.line(f"start login={login} branches={' '.join(b.scope for b in branches)}")
@@ -958,15 +819,24 @@ def run(argv, env, runner=None, log=None, sleep=time.sleep) -> int:
     failures = 0
     while True:
         complete = True
-        for watcher in watchers:
+        try:
+            renew_claim(runner, force=True)
+            prs, demanded_branches = demanded_scopes(runner, log)
+        except ReadError as error:
+            complete = False
+            log.line(f"poll failed reason={error}")
+        else:
             try:
-                complete &= watcher.poll()
-            except SettingsError as error:
-                log.line(f"exit reason={error}")
-                return EXIT_SETTINGS
-            except OSError as error:
+                for scope, kinds in prs.items():
+                    renew_claim(runner)
+                    complete &= poll_demanded_pr(scope, kinds, runner, log)
+                static = {branch.scope: branch.role for branch in branches}
+                for scope in set(demanded_branches) | set(static):
+                    renew_claim(runner)
+                    complete &= poll_branch(scope, static.get(scope), runner, log)
+            except ReadError as error:
                 complete = False
-                log.line(f"poll failed branch={watcher.branch.scope} reason=state write: {error}")
+                log.line(f"poll failed reason={error}")
         if once:
             return 0 if complete else 1
         failures = 0 if complete else failures + 1

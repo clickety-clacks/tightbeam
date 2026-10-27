@@ -84,6 +84,19 @@ pub enum Command {
         idempotency_key: Option<String>,
         payload: Option<String>,
     },
+    FactDemand {
+        identity: Identity,
+        prefixes: Vec<String>,
+    },
+    FactProducerClaim {
+        identity: Identity,
+        producer: String,
+        kinds: Vec<String>,
+        live_for_ms: String,
+    },
+    FactProducers {
+        identity: Identity,
+    },
     HarnessHealthObserveOther {
         identity: Identity,
         harness: String,
@@ -704,8 +717,8 @@ IDENTITY (optional inside a session workdir; otherwise required):
   --as-user <userId>   act as a human user (e.g. "flynn"). Use this for
                        operator/admin actions or when no agent identity applies.
   --as-process <name>  act as automation (cron, CI, a webhook — e.g.
-                       "cron"). Processes may wake, cancel-wake, and file
-                       condition facts ONLY — they cannot spawn, retire, or
+                       "cron"). Processes may wake, cancel-wake, file
+                       condition facts, and use fact producer commands — they cannot spawn, retire, or
                        administer.
   Pass at most ONE explicit identity. It is who the call is attributed to, NOT
   the target of the call. With no flag, the CLI walks up from the current
@@ -763,6 +776,15 @@ COMMANDS:
   condition --kind <kind> [--scope <scope>] [--key <idempotencyKey>]
       File an observable fact. Matching condition wakes receive the fact as a new
       notification turn; they never resume or replay prior work.
+
+  fact-demand [--kind-prefix <prefix>]...
+      List distinct fact kinds and scopes demanded by pending condition waits.
+  fact-producer-claim --producer <name> --kind <kind> [--kind <kind>]...
+      --live-for 1s|5m|1h
+      Advertise the exact fact kinds this producer serves for a bounded time.
+      Repeating the claim replaces its kinds and renews its live period.
+  fact-producers
+      List producer claims and whether each is live now.
 
   harness-health-observe-other --harness <harness> --host <host>
       --source-session <session> --description <text> --evidence-mode exact_error|probe_digest
@@ -1284,7 +1306,7 @@ fn split_args(args: Vec<String>) -> Flags {
                     missing_values.insert(name.to_owned());
                 }
                 let value = next.cloned().unwrap_or_default();
-                if name == "memento" || name == "value" {
+                if matches!(name, "memento" | "value" | "kind-prefix" | "kind") {
                     repeated
                         .entry(name.to_owned())
                         .or_default()
@@ -2083,6 +2105,58 @@ fn parse_with_optional_catalog(
                 scope: nonempty(flags, "scope"),
                 idempotency_key: nonempty(flags, "key"),
                 payload: nonempty(flags, "payload"),
+            })
+        }
+        "fact-demand" => {
+            closed_command_flags("fact-demand", flags, &["kind-prefix"])?;
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam fact-demand [--kind-prefix <prefix>]...".to_owned());
+            }
+            let prefixes = parsed
+                .repeated
+                .get("kind-prefix")
+                .cloned()
+                .unwrap_or_default();
+            if prefixes.iter().any(String::is_empty) {
+                return Err("--kind-prefix requires a nonempty prefix".to_owned());
+            }
+            Ok(Command::FactDemand {
+                identity: identity(flags)?,
+                prefixes,
+            })
+        }
+        "fact-producer-claim" => {
+            closed_command_flags(
+                "fact-producer-claim",
+                flags,
+                &["producer", "kind", "live-for"],
+            )?;
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam fact-producer-claim --producer <name> --kind <kind> [--kind <kind>]... --live-for <duration>".to_owned());
+            }
+            let producer = nonempty(flags, "producer").ok_or("--producer is required")?;
+            let kinds = parsed.repeated.get("kind").cloned().unwrap_or_default();
+            if kinds.is_empty() || kinds.iter().any(|kind| kind.trim().is_empty()) {
+                return Err("--kind requires one or more nonblank kinds".to_owned());
+            }
+            let live_for_ms = parse_duration(
+                "live-for",
+                &nonempty(flags, "live-for").ok_or("--live-for is required")?,
+            )?;
+            Ok(Command::FactProducerClaim {
+                identity: identity(flags)?,
+                producer,
+                kinds,
+                live_for_ms,
+            })
+        }
+        "fact-producers" => {
+            closed_command_flags("fact-producers", flags, &[])?;
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam fact-producers".to_owned());
+            }
+            Ok(Command::FactProducers {
+                identity: identity(flags)?,
             })
         }
         "harness-health-observe-other" => {
@@ -3609,7 +3683,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -5593,6 +5667,9 @@ mod tests {
                 "breathing",
                 "cancel-wake",
                 "condition",
+                "fact-demand",
+                "fact-producer-claim",
+                "fact-producers",
                 "config",
                 "decision-request",
                 "decision-requests",
@@ -6053,6 +6130,42 @@ mod tests {
                 scope: None,
                 idempotency_key: None,
                 payload: None,
+            })
+        );
+    }
+
+    #[test]
+    fn fact_producer_commands_keep_repeated_prefixes_and_kinds() {
+        assert_eq!(
+            parse(strings(&[
+                "fact-demand",
+                "--kind-prefix",
+                "landing.",
+                "--kind-prefix",
+                "pr."
+            ])),
+            Ok(Command::FactDemand {
+                identity: Identity::Session,
+                prefixes: vec!["landing.".to_owned(), "pr.".to_owned()],
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "fact-producer-claim",
+                "--producer",
+                "feed",
+                "--kind",
+                "a.done",
+                "--kind",
+                "a.failed",
+                "--live-for",
+                "2m"
+            ])),
+            Ok(Command::FactProducerClaim {
+                identity: Identity::Session,
+                producer: "feed".to_owned(),
+                kinds: vec!["a.done".to_owned(), "a.failed".to_owned()],
+                live_for_ms: "120000".to_owned(),
             })
         );
     }
@@ -6576,7 +6689,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 

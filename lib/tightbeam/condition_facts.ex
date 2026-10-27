@@ -32,6 +32,11 @@ defmodule Tightbeam.ConditionFacts do
   )
   @agent_only_kinds ~w(work-blocked work-unblocked)
 
+  def substrate_defined_kind?(kind) when is_binary(kind),
+    do:
+      kind in @reserved_kinds or kind in @agent_only_kinds or
+        String.starts_with?(kind, "subagent_")
+
   @standing_pairs %{
     "work-blocked" => "work-unblocked",
     "user-alerted" => "user-alert-cleared",
