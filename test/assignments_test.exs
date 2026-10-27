@@ -3359,6 +3359,9 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "a fired parent escalation does not block opener revocation after reparenting", ctx do
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+
     main = Org.personal_session_key("flynn")
     session(ctx.db, main, "flynn")
     session(ctx.db, "parent-a", "flynn", %{spawned_by: main})
