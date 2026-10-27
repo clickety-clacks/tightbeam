@@ -108,7 +108,7 @@ class FakeGitHub:
         if self.fail and self.fail(operation, variables):
             raise lw.ReadError(f'injected failure in {operation}')
         repo = variables['owner'], variables['name']
-        assert repo == ('Example', 'Repo'), repo
+        assert tuple(part.lower() for part in repo) == ('example', 'repo'), repo
         if operation == 'LandingOpen':
             items = [{'number': p['number'], 'updatedAt': p['updatedAt']}
                      for p in sorted(self.pulls.values(), key=lambda p: p['number']) if p['state'] == 'OPEN']
@@ -120,7 +120,10 @@ class FakeGitHub:
         if operation == 'LandingPull':
             item = self.pulls.get(variables['number'])
             if item is None:
-                return {'repository': {'pullRequest': None}}
+                raise lw.ReadError(
+                    'gh exited 1: gh: Could not resolve to a PullRequest with the number of '
+                    f"{variables['number']}."
+                )
             since = variables.get('since')
             events = [e for e in item['events'] if since is None or e['createdAt'] >= since]
             node = {k: item[k] for k in ('number', 'state', 'merged', 'mergeCommit', 'headRefOid',
@@ -153,7 +156,7 @@ class FakeGitHub:
         self.calls.append(('rest', path))
         if self.fail and self.fail('rest', path):
             raise lw.ReadError('injected rules failure')
-        assert path.startswith('repos/Example/Repo/rules/branches/main?per_page=100&page='), path
+        assert path.lower().startswith('repos/example/repo/rules/branches/main?per_page=100&page='), path
         return self.rules if path.endswith('page=1') else []
 
 
@@ -164,11 +167,18 @@ class FakeRunner:
         self.checks = []
         self.refuse = None  # callable(args) -> bool
         self.demand = []
+        self.demand_error = None
+        self.operations = []
+        self.claims = 0
 
     def tightbeam_json(self, args):
+        self.operations.append(args[0])
         if args[0] == 'fact-demand':
+            if self.demand_error:
+                raise self.demand_error
             return {'demand': self.demand}
         if args[0] == 'fact-producer-claim':
+            self.claims += 1
             return {'producer': 'landing-watch'}
         raise AssertionError(args)
 
@@ -202,18 +212,11 @@ class WatcherCase(unittest.TestCase):
         self.branch = lw.Branch('Example', 'Repo', 'main', 'pdo:example')
         self.clock = NOW
 
-    def watcher(self):
-        return lw.Watcher(self.branch, self.runner, self.tmp.name, self.log, clock=lambda: self.clock)
-
-    def save_state(self, watermark_minutes_ago=30, tracked=()):
-        self.watcher().save(NOW - dt.timedelta(minutes=watermark_minutes_ago), set(tracked))
-
-    def state(self):
-        with open(os.path.join(self.tmp.name, 'example-repo-main.json')) as handle:
-            return json.load(handle)
-
-    def poll(self):
-        return self.watcher().poll()
+    def run_once(self, static=''):
+        self.runner.login = lambda: 'example-bot'
+        return lw.run(['landing-watch', '--once'],
+                      {'GH_CONFIG_DIR': self.tmp.name, 'LANDING_REPOS': static},
+                      runner=self.runner, log=self.log)
 
 
 class Settings(unittest.TestCase):
@@ -230,7 +233,6 @@ class Settings(unittest.TestCase):
             LANDING_WATCH_AS_PROCESS='landing-watch'))
         self.assertEqual([b.scope for b in branches], ['example/repo@main', 'example/other@release/1.2'])
         self.assertEqual(branches[0].pr_scope(7), 'example/repo#7')
-        self.assertEqual(branches[1].state_name, 'example-other-release-1.2.json')
         self.assertEqual(process, 'landing-watch')
 
     def test_missing_or_malformed_settings_refuse(self):
@@ -251,10 +253,6 @@ class Settings(unittest.TestCase):
 
     def test_repositories_are_optional(self):
         self.assertEqual(lw.parse_settings({'GH_CONFIG_DIR': self.tmp.name}), ([], None))
-
-    def test_state_directory_follows_xdg(self):
-        self.assertEqual(lw.state_dir({'XDG_STATE_HOME': '/s', 'HOME': '/h'}), '/s/landing-watch')
-        self.assertEqual(lw.state_dir({'HOME': '/h'}), '/h/.local/state/landing-watch')
 
     def test_runner_adds_process_identity_only_when_configured(self):
         seen = []
@@ -298,435 +296,197 @@ class Settings(unittest.TestCase):
         self.assertEqual(env['GH_PROMPT_DISABLED'], '1')
 
 
-class PullFacts(WatcherCase):
-    def test_merge_files_settled_with_merge_commit_key(self):
-        self.github.add(pull(123, state='MERGED', merged=True, merge_oid='ab12'))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.filed, [['condition', '--kind', 'landing.settled', '--scope',
-                                              'example/repo#123', '--key',
-                                              'landing-fact:example/repo#123:merged:ab12']])
-        self.assertIn('episode merged pr=example/repo#123 commit=ab12', self.stream.getvalue())
+class RunningPath(WatcherCase):
+    def demand_pr(self, number, *kinds):
+        self.runner.demand = [{'kind': kind, 'scope': f'example/repo#{number}'} for kind in kinds]
 
-    def test_each_queue_removal_is_its_own_fact_and_reason_is_logged_verbatim(self):
-        self.github.add(pull(123, events=[
-            event('RemovedFromMergeQueueEvent', 'RM_1', reason='The merge commit could not be created'),
-            event('RemovedFromMergeQueueEvent', 'RM_2', reason=None)]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(), ['landing-fact:example/repo#123:removed:RM_1',
-                                              'landing-fact:example/repo#123:removed:RM_2'])
-        log = self.stream.getvalue()
-        self.assertIn('reason=The merge commit could not be created', log)
-        self.assertIn('event=RM_2 reason=unspecified', log)
+    def demand_branch(self):
+        self.runner.demand = [{'kind': lw.BRANCH_ATTENTION, 'scope': 'example/repo@main'}]
 
-    def test_automerge_disabled_and_closed_repeat_per_event_when_not_merged(self):
-        self.github.add(pull(123, state='CLOSED', events=[
-            event('AutoMergeDisabledEvent', 'AD_1', 9), event('AutoMergeDisabledEvent', 'AD_2', 8),
-            event('ClosedEvent', 'CE_1', 7), event('ClosedEvent', 'CE_2', 3)]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(), [
-            'landing-fact:example/repo#123:automerge-disabled:AD_1',
-            'landing-fact:example/repo#123:automerge-disabled:AD_2',
-            'landing-fact:example/repo#123:closed:CE_1',
-            'landing-fact:example/repo#123:closed:CE_2'])
+    def keys(self):
+        return self.runner.keys()
 
-    def test_merged_pull_files_no_disabled_or_closed_fact(self):
-        self.github.add(pull(123, state='MERGED', merged=True, merge_oid='ab12', events=[
-            event('AutoMergeDisabledEvent', 'AD_1'), event('ClosedEvent', 'CE_1')]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(), ['landing-fact:example/repo#123:merged:ab12'])
+    def check_keys(self):
+        return [args[args.index('--key') + 1] for args in self.runner.checks]
 
-    def test_one_occurrence_with_two_events_files_both(self):
-        self.github.add(pull(123, events=[event('RemovedFromMergeQueueEvent', 'RM_1'),
-                                          event('AutoMergeDisabledEvent', 'AD_1')]))
-        self.assertTrue(self.poll())
-        self.assertEqual(sorted(self.runner.keys()), ['landing-fact:example/repo#123:automerge-disabled:AD_1',
-                                                      'landing-fact:example/repo#123:removed:RM_1'])
+    def test_claim_precedes_demand_and_only_demanded_pr_is_read(self):
+        self.github.add(pull(7, checks=[check_run('C1', 'build', 'SUCCESS', required=True)]))
+        self.demand_pr(7, lw.CHECKS_COMPLETED)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.runner.operations[:2], ['fact-producer-claim', 'fact-demand'])
+        self.assertEqual(self.runner.claims, 1)
+        self.assertEqual(self.check_keys(), ['pr-checks:example/repo#7:head1:pass'])
+        self.assertFalse(any(op in ('LandingOpen', 'LandingRecent', 'LandingTip') for op, _ in self.github.calls))
+        before = len(self.github.calls)
+        self.runner.demand = []
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(len(self.github.calls), before)
 
-    def test_blocked_on_failing_required_check(self):
-        self.github.add(pull(123, auto='2026-09-26T11:00:00Z', checks=[
-            check_run('CR_1', 'linux', required=True), check_run('CR_2', 'macos', 'SUCCESS', required=True)]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(),
-                         ['landing-fact:example/repo#123:blocked:2026-09-26T11:00:00Z:CR_1'])
+    def test_merged_fact_uses_merge_commit(self):
+        self.github.add(pull(7, state='MERGED', merged=True, merge_oid='abc'))
+        self.demand_pr(7, lw.SETTLED)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.keys(), ['landing-fact:example/repo#7:merged:abc'])
 
-    def test_blocked_by_failing_required_status_uses_context_and_time(self):
-        self.github.add(pull(123, auto='2026-09-26T11:00:00Z', checks=[status('ci/legacy', 'ERROR', 4, True)]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(), [
-            f'landing-fact:example/repo#123:blocked:2026-09-26T11:00:00Z:ci/legacy@{ts(4)}'])
+    def test_every_queue_removal_has_own_fact(self):
+        self.github.add(pull(7, events=[event('RemovedFromMergeQueueEvent', 'RM1'),
+                                        event('RemovedFromMergeQueueEvent', 'RM2')]))
+        self.demand_pr(7, lw.SETTLED)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.keys(), ['landing-fact:example/repo#7:removed:RM1',
+                                       'landing-fact:example/repo#7:removed:RM2'])
 
-    def test_effective_test_merge_failure_overrides_successful_head(self):
-        self.github.add(pull(123, auto='E',
-                             checks=[check_run('H', 'linux', 'SUCCESS', required=True)],
-                             merge_checks=[status('linux', 'FAILURE', 2, True)]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(), [f'landing-fact:example/repo#123:blocked:E:linux@{ts(2)}'])
+    def test_automerge_disabled_and_closed_are_settled(self):
+        self.github.add(pull(7, state='CLOSED', events=[event('AutoMergeDisabledEvent', 'AD'),
+                                                       event('ClosedEvent', 'CE')]))
+        self.demand_pr(7, lw.SETTLED)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.keys(), ['landing-fact:example/repo#7:automerge-disabled:AD',
+                                       'landing-fact:example/repo#7:closed:CE'])
 
-    def test_effective_test_merge_success_overrides_failing_head(self):
-        self.github.add(pull(123, auto='E', checks=[check_run('H', 'linux', required=True)],
-                             merge_checks=[status('linux', 'SUCCESS', 2, True)]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.filed, [])
+    def test_blocked_required_check_uses_effective_subject(self):
+        self.github.add(pull(7, auto=ts(3), checks=[check_run('head', 'build', 'SUCCESS', required=True)],
+                             merge_checks=[check_run('merge', 'build', 'FAILURE', required=True)]))
+        self.demand_pr(7, lw.SETTLED)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.keys(), ['landing-fact:example/repo#7:blocked:' + ts(3) + ':merge'])
 
-    def test_head_is_effective_when_test_merge_has_no_status(self):
-        self.github.add(pull(123, auto='E', checks=[check_run('H', 'linux', required=True)]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(), ['landing-fact:example/repo#123:blocked:E:H'])
+    def test_unknown_test_merge_does_not_claim_blocked(self):
+        self.github.add(pull(7, auto=ts(3), checks=[check_run('head', 'build', 'FAILURE', required=True)],
+                             test_merge=None))
+        self.demand_pr(7, lw.SETTLED)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.keys(), [])
 
-    def test_required_check_only_on_test_merge_is_observed(self):
-        self.github.add(pull(123, auto='E', merge_checks=[check_run('M', 'linux', required=True)]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(), ['landing-fact:example/repo#123:blocked:E:M'])
+    def test_queued_pull_does_not_file_checks_or_blocked(self):
+        self.github.add(pull(7, queued=True, auto=ts(3),
+                             checks=[check_run('C1', 'build', 'FAILURE', required=True)]))
+        self.demand_pr(7, lw.SETTLED, lw.CHECKS_COMPLETED)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.keys(), [])
+        self.assertEqual(self.check_keys(), [])
 
-    def test_missing_or_stale_test_merge_is_unknown(self):
-        cases = (
-            pull(123, auto='E', checks=[check_run('H', 'linux', required=True)], test_merge=None),
-            pull(123, auto='E', checks=[check_run('H', 'linux', required=True)], merge_parent='old-head'),
-        )
-        for item in cases:
-            with self.subTest(test_merge=item['test_merge']):
-                self.runner.filed.clear()
-                self.github.add(item)
-                self.assertTrue(self.poll())
-                self.assertEqual(self.runner.filed, [])
+    def test_checks_completed_pass_fail_and_pending(self):
+        self.github.add(pull(7, checks=[check_run('C1', 'build', 'SUCCESS', required=True)]),
+                        pull(8, checks=[check_run('C2', 'build', 'FAILURE', required=True)]),
+                        pull(9, checks=[check_run('C3', 'build', status='IN_PROGRESS', required=True)]))
+        self.runner.demand = [{'kind': lw.CHECKS_COMPLETED, 'scope': f'example/repo#{n}'} for n in (7, 8, 9)]
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.check_keys(), ['pr-checks:example/repo#7:head1:pass',
+                                             'pr-checks:example/repo#8:head1:fail'])
 
-    def test_required_check_run_and_status_with_same_name_both_count(self):
-        self.github.add(pull(123, auto='E', merge_checks=[
-            status('linux', 'FAILURE', 9, True),
-            check_run('C', 'linux', 'SUCCESS', started=2, required=True),
-        ]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(), [f'landing-fact:example/repo#123:blocked:E:linux@{ts(9)}'])
+    def test_new_head_has_new_checks_fact_key(self):
+        self.github.add(pull(7, checks=[check_run('C1', 'build', 'FAILURE', required=True)]))
+        self.demand_pr(7, lw.CHECKS_COMPLETED)
+        self.assertEqual(self.run_once(), 0)
+        self.github.add(pull(7, head='head2', checks=[check_run('C2', 'build', 'SUCCESS', required=True)]))
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.check_keys(), ['pr-checks:example/repo#7:head1:fail',
+                                             'pr-checks:example/repo#7:head2:pass'])
 
-    def test_not_blocked_cases(self):
-        cases = {
-            'optional check fails': pull(1, auto='E', checks=[check_run('C', 'lint', required=False),
-                                                              check_run('D', 'linux', 'SUCCESS', required=True)]),
-            'required check pending': pull(2, auto='E', checks=[check_run('C', 'linux', status='IN_PROGRESS',
-                                                                          required=True)]),
-            'rerun queued after failure': pull(3, auto='E', checks=[
-                check_run('C', 'linux', started=9, required=True),
-                check_run('D', 'linux', status='QUEUED', started=None, required=True)]),
-            'rerun passed after failure': pull(4, auto='E', checks=[
-                check_run('C', 'linux', started=9, required=True),
-                check_run('D', 'linux', 'SUCCESS', started=3, required=True)]),
-            'already queued': pull(5, auto='E', queued=True, checks=[check_run('C', 'linux', required=True)]),
-            'auto-merge off': pull(6, checks=[check_run('C', 'linux', required=True)]),
-            'no results': pull(7, auto='E'),
-            'rollup is for another commit': pull(8, auto='E', checks_oid='old',
-                                                 checks=[check_run('C', 'linux', required=True)]),
-            'expected status': pull(9, auto='E', checks=[status('ci/legacy', 'EXPECTED', required=True)]),
-        }
-        self.github.add(*cases.values())
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.filed, [])
-
-    def test_rerun_failure_and_reenable_make_new_blocked_episodes(self):
-        item = pull(123, auto='2026-09-26T11:00:00Z', checks=[check_run('CR_1', 'linux', started=20,
-                                                                        required=True)])
-        self.github.add(item)
-        self.assertTrue(self.poll())
-        item['checks'].append(check_run('CR_2', 'linux', started=4, required=True))
-        self.assertTrue(self.poll())
-        item['autoMergeRequest'] = {'enabledAt': '2026-09-26T11:50:00Z'}
-        self.assertTrue(self.poll())
-        self.assertEqual(sorted(set(self.runner.keys())), [
-            'landing-fact:example/repo#123:blocked:2026-09-26T11:00:00Z:CR_1',
-            'landing-fact:example/repo#123:blocked:2026-09-26T11:00:00Z:CR_2',
-            'landing-fact:example/repo#123:blocked:2026-09-26T11:50:00Z:CR_2'])
-
-    def test_only_the_two_fact_kinds_and_no_other_wakes(self):
-        self.github.add(pull(1, state='MERGED', merged=True, merge_oid='m'),
-                        pull(2, auto='E', checks=[check_run('C', 'linux', required=True)]),
-                        pull(3, auto='E', checks=[check_run('G', 'linux', 'SUCCESS', required=True)]))
+    def test_demand_only_branch_files_fact_without_owner_wake(self):
         self.github.rules = [{'type': 'required_status_checks',
-                              'parameters': {'required_status_checks': [{'context': 'linux'}]}}]
-        self.github.tip_results = [check_run('T', 'linux', 'SUCCESS')]
-        self.assertTrue(self.poll())
-        kinds = {a[a.index('--kind') + 1] for a in self.runner.filed if a[0] == 'condition'}
-        self.assertEqual(kinds, {'landing.settled'})
-        self.assertEqual([a for a in self.runner.filed if a[0] == 'wake'], [])
+                              'parameters': {'required_status_checks': [{'context': 'build'}]}}]
+        self.github.tip_results = [check_run('C1', 'build', 'FAILURE')]
+        self.demand_branch()
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.keys(), ['landing-fact:example/repo@main:red:tip1:C1'])
+        self.assertFalse(any(args[0] == 'wake' for args in self.runner.filed))
 
+    def test_static_branch_reads_tip_only_and_wakes_owner(self):
+        self.github.rules = [{'type': 'required_status_checks',
+                              'parameters': {'required_status_checks': [{'context': 'build'}]}}]
+        self.github.tip_results = [check_run('C1', 'build', 'FAILURE')]
+        self.github.add(pull(7, state='MERGED', merged=True, merge_oid='abc'))
+        self.assertEqual(self.run_once('Example/Repo@main=pdo:example'), 0)
+        self.assertEqual([op for op, _ in self.github.calls if op != 'rest'], ['LandingTip'])
+        self.assertEqual(self.runner.filed[0][0], 'wake')
+        self.assertEqual(self.runner.filed[1][0], 'condition')
 
-class TipFacts(WatcherCase):
-    def require(self, *checks):
-        self.github.rules = [{'type': 'pull_request', 'parameters': {}},
-                             {'type': 'required_status_checks',
-                              'parameters': {'required_status_checks': list(checks)}}]
+    def test_failed_demand_read_fails_poll_without_github_read(self):
+        self.runner.demand_error = lw.ReadError('gateway read failed')
+        self.assertEqual(self.run_once(), 1)
+        self.assertEqual(self.github.calls, [])
+        self.assertIn('poll failed reason=gateway read failed', self.stream.getvalue())
 
-    def test_red_tip_wakes_owner_before_filing_fact_with_distinct_keys(self):
-        self.require({'context': 'linux'}, {'context': 'macos'})
-        self.github.tip_oid = 'cd34'
-        self.github.tip_results = [check_run('CR_9', 'macos'), check_run('CR_8', 'linux', 'SUCCESS'),
-                                   check_run('CR_7', 'docs')]
-        self.assertTrue(self.poll())
-        wake, fact = self.runner.filed
-        self.assertEqual(wake[:9], ['wake', '--role', 'pdo:example', '--when-fact', 'landing.branch-attention',
-                                    '--when-scope', 'example/repo@main', '--fallback-after', '10m'])
-        self.assertEqual(wake[wake.index('--key') + 1], 'landing-wake:example/repo@main:red:cd34:CR_9')
-        prompt = wake[wake.index('--prompt') + 1]
-        for part in ('example/repo@main', 'cd34', 'macos', 'https://example.test/runs/CR_9'):
-            self.assertIn(part, prompt)
-        self.assertEqual(fact, ['condition', '--kind', 'landing.branch-attention', '--scope',
-                                'example/repo@main', '--key', 'landing-fact:example/repo@main:red:cd34:CR_9'])
-        self.assertNotEqual(wake[wake.index('--key') + 1], fact[-1])
+    def test_real_missing_pr_error_is_skipped_and_other_pr_proceeds(self):
+        self.github.add(pull(7, checks=[check_run('C1', 'build', 'SUCCESS', required=True)]))
+        self.runner.demand = [{'kind': lw.CHECKS_COMPLETED, 'scope': f'example/repo#{n}'} for n in (8, 7)]
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.check_keys(), ['pr-checks:example/repo#7:head1:pass'])
+        self.assertIn('Could not resolve to a PullRequest', self.stream.getvalue())
 
-    def test_rerun_on_same_tip_fails_again_as_new_episode(self):
-        self.require({'context': 'macos'})
-        self.github.tip_results = [check_run('CR_1', 'macos', started=20)]
-        self.assertTrue(self.poll())
-        self.github.tip_results.append(check_run('CR_2', 'macos', started=3))
-        self.assertTrue(self.poll())
-        self.assertEqual(sorted(set(self.runner.keys())), ['landing-fact:example/repo@main:red:tip1:CR_1',
-                                                           'landing-fact:example/repo@main:red:tip1:CR_2'])
+    def test_read_failure_for_existing_pr_fails_poll(self):
+        self.github.add(pull(7))
+        self.github.fail = lambda op, variables: op == 'LandingPull'
+        self.demand_pr(7, lw.SETTLED)
+        self.assertEqual(self.run_once(), 1)
 
-    def test_unrequired_missing_and_pending_results_file_nothing(self):
-        self.require({'context': 'linux'}, {'context': 'macos'})
-        self.github.tip_results = [check_run('A', 'docs'), check_run('B', 'linux', status='IN_PROGRESS')]
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.filed, [])
-
-    def test_failing_commit_status_counts_on_the_tip(self):
-        self.require({'context': 'ci/legacy'})
-        self.github.tip_results = [status('ci/legacy', 'FAILURE', 6)]
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(), [f'landing-fact:example/repo@main:red:tip1:ci/legacy@{ts(6)}'])
-
-    def test_required_status_failure_is_not_masked_by_same_name_check_success(self):
-        self.require({'context': 'linux'})
-        self.github.tip_results = [status('linux', 'FAILURE', 9),
-                                   check_run('C', 'linux', 'SUCCESS', started=2)]
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(), [f'landing-fact:example/repo@main:red:tip1:linux@{ts(9)}'])
-
-    def test_required_app_passes_then_other_app_fails_files_nothing(self):
-        self.require({'context': 'linux', 'integration_id': 15368})
-        self.github.tip_results = [check_run('A', 'linux', 'SUCCESS', started=9, app=15368),
-                                   check_run('B', 'linux', 'FAILURE', started=2, app=999)]
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.filed, [])
-
-    def test_required_app_fails_then_other_app_passes_files_fact(self):
-        self.require({'context': 'linux', 'integration_id': 15368})
-        self.github.tip_results = [check_run('A', 'linux', 'FAILURE', started=9, app=15368),
-                                   check_run('B', 'linux', 'SUCCESS', started=2, app=999)]
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(), ['landing-fact:example/repo@main:red:tip1:A'])
-
-    def test_unprovable_source_with_required_app_is_unknown(self):
-        self.require({'context': 'linux', 'integration_id': 15368})
-        for other in (status('linux', 'SUCCESS', 2), check_run('N', 'linux', 'SUCCESS', started=2, app=None)):
-            with self.subTest(other=other['__typename']):
-                self.runner.filed.clear()
-                self.github.tip_results = [check_run('A', 'linux', 'FAILURE', started=9, app=15368), other]
-                self.assertTrue(self.poll())
-                self.assertEqual(self.runner.filed, [])
-
-    def test_requirement_without_app_matches_by_name_from_any_source(self):
-        self.require({'context': 'linux'})
-        self.github.tip_results = [check_run('A', 'linux', 'SUCCESS', started=9, app=15368),
-                                   check_run('B', 'linux', 'FAILURE', started=2, app=999)]
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(), ['landing-fact:example/repo@main:red:tip1:B'])
-
-    def test_refused_wake_skips_its_fact_and_holds_the_watermark(self):
-        self.require({'context': 'macos'})
-        self.github.tip_results = [check_run('CR_9', 'macos')]
-        self.save_state(30)
-        before = self.state()
-        self.runner.refuse = lambda args: args[0] == 'wake'
-        self.assertFalse(self.poll())
-        self.assertEqual(self.runner.filed, [])
-        self.assertEqual(self.state(), before)
-        self.assertIn('refused wake key=landing-wake:example/repo@main:red:tip1:CR_9', self.stream.getvalue())
+    def test_refused_fact_fails_poll_and_retries_with_same_key(self):
+        self.github.add(pull(7, state='MERGED', merged=True, merge_oid='abc'))
+        self.demand_pr(7, lw.SETTLED)
+        self.runner.refuse = lambda args: args[0] == 'condition'
+        self.assertEqual(self.run_once(), 1)
         self.runner.refuse = None
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(), ['landing-fact:example/repo@main:red:tip1:CR_9'])
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.keys(), ['landing-fact:example/repo#7:merged:abc'])
+
+    def test_invalid_demand_logged_once_and_other_pr_continues(self):
+        self.runner.demand = [
+            {'kind': lw.CHECKS_COMPLETED, 'scope': None},
+            {'kind': lw.CHECKS_COMPLETED, 'scope': 'example/repo#7'},
+        ]
+        self.github.add(pull(7, checks=[check_run('pass', 'build', 'SUCCESS', required=True)]))
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.stream.getvalue().count('ignored invalid demand'), 1)
 
 
-class Observation(WatcherCase):
-    def test_every_page_of_every_connection_is_read(self):
-        self.github.page = 2
-        self.github.add(*[pull(n, auto='E', events=[event('AutoMergeDisabledEvent', f'AD_{n}_{i}')
-                                                    for i in range(3)],
-                               checks=[check_run(f'C{n}_{i}', 'x', 'SUCCESS', required=True)
-                                       for i in range(2)] + [check_run(f'F{n}', 'linux', required=True)])
-                          for n in range(1, 6)])
-        self.github.rules = [{'type': 'required_status_checks',
-                              'parameters': {'required_status_checks': [{'context': 'linux'}]}}]
-        self.github.tip_results = [check_run('T1', 'x', 'SUCCESS'), check_run('T2', 'y', 'SUCCESS'),
-                                   check_run('T3', 'linux')]
-        self.assertTrue(self.poll())
-        keys = self.runner.keys()
-        self.assertEqual(len([k for k in keys if ':automerge-disabled:' in k]), 15)
-        self.assertEqual(len([k for k in keys if ':blocked:' in k]), 5)
-        self.assertIn('landing-fact:example/repo@main:red:tip1:T3', keys)
+class ClaimRenewal(unittest.TestCase):
+    def test_time_gate_and_forced_poll_start(self):
+        class Claims:
+            last_claim_at = None
+            calls = 0
 
-    def test_recent_read_stops_at_the_watermark_overlap(self):
-        self.github.page = 1
-        self.github.add(pull(1, state='CLOSED', updated=5), pull(2, state='CLOSED', updated=35),
-                        pull(3, state='CLOSED', updated=50), pull(4, state='CLOSED', updated=500))
-        self.save_state(30)
-        self.assertTrue(self.poll())
-        recent = [v for op, v in self.github.calls if op == 'LandingRecent']
-        self.assertEqual(len(recent), 3)  # stops on the page holding PR 3, older than watermark - 10 minutes
-        read = [v['number'] for op, v in self.github.calls if op == 'LandingPull']
-        self.assertEqual(read, [1, 2])
+            def tightbeam_json(self, args):
+                self.calls += 1
+                return {}
 
-    def test_recent_read_keeps_cutoff_boundary_and_excludes_older_nodes_on_same_page(self):
-        self.github.add(pull(1, state='CLOSED', updated=39), pull(2, state='CLOSED', updated=40),
-                        pull(3, state='CLOSED', updated=41), pull(4, state='CLOSED', updated=42))
-        self.save_state(30)
-        self.assertTrue(self.poll())
-        recent = [v for op, v in self.github.calls if op == 'LandingRecent']
-        self.assertEqual(len(recent), 1)
-        read = [v['number'] for op, v in self.github.calls if op == 'LandingPull']
-        self.assertEqual(read, [1, 2])
-
-    def test_since_applies_to_tracked_pulls_and_first_seen_pulls_read_all_history(self):
-        self.github.add(pull(1, auto='E', events=[event('AutoMergeDisabledEvent', 'OLD', 600)]),
-                        pull(2, events=[event('AutoMergeDisabledEvent', 'OLD2', 600)]))
-        self.save_state(30, tracked=[1])
-        self.assertTrue(self.poll())
-        since = {v['number']: v.get('since') for op, v in self.github.calls if op == 'LandingPull'}
-        self.assertEqual(since, {1: ts(40), 2: None})
-        self.assertEqual(self.runner.keys(), ['landing-fact:example/repo#2:automerge-disabled:OLD2'])
-
-    def test_partial_read_files_only_positive_facts_and_holds_the_watermark(self):
-        self.github.page = 1
-        self.github.add(pull(1, state='MERGED', merged=True, merge_oid='m1', updated=1),
-                        pull(2, auto='E', events=[event('RemovedFromMergeQueueEvent', 'RM'),
-                                                  event('AutoMergeDisabledEvent', 'AD')],
-                             checks=[check_run('C', 'linux', required=True)], updated=2))
-        self.github.fail = lambda op, v: op == 'LandingPull' and v['number'] == 2 and v.get('cursor') == '1'
-        self.save_state(30)
-        before = self.state()
-        self.assertFalse(self.poll())
-        self.assertEqual(sorted(self.runner.keys()), ['landing-fact:example/repo#1:merged:m1',
-                                                      'landing-fact:example/repo#2:removed:RM'])
-        self.assertEqual(self.state(), before)
-        self.assertIn('poll failed branch=example/repo@main', self.stream.getvalue())
-
-    def test_error_in_a_late_read_withholds_every_absence_fact(self):
-        self.github.add(pull(1, state='CLOSED', events=[event('ClosedEvent', 'CE')]),
-                        pull(2, auto='E', checks=[check_run('C', 'linux', required=True)]))
-        self.github.rules = [{'type': 'required_status_checks',
-                              'parameters': {'required_status_checks': [{'context': 'linux'}]}}]
-        self.github.tip_results = [check_run('T', 'linux')]
-        self.github.fail = lambda op, v: op == 'LandingTip'
-        self.assertFalse(self.poll())
-        self.assertEqual(self.runner.filed, [])
-
-    def test_null_nodes_are_incomplete_reads(self):
-        for operation in ('LandingOpen', 'LandingPull', 'LandingTip'):
-            with self.subTest(operation=operation):
-                self.runner.filed.clear()
-                github = FakeGitHub()
-                github.add(pull(1, state='CLOSED', events=[event('ClosedEvent', 'CE')]))
-                original = github.graphql
-
-                def nulling(query, variables, original=original, operation=operation):
-                    data = original(query, variables)
-                    if query.split('query ', 1)[1].startswith(operation):
-                        if operation == 'LandingOpen':
-                            data['repository']['pullRequests']['nodes'].append(None)
-                        elif operation == 'LandingPull':
-                            data['repository']['pullRequest'] = None
-                        else:
-                            data['repository']['ref'] = None
-                    return data
-
-                github.graphql = nulling
-                self.runner.github = github
-                self.assertFalse(self.poll())
-                self.assertEqual(self.runner.filed, [])
-
-    def test_rules_error_withholds_absence_facts(self):
-        self.github.add(pull(1, state='CLOSED', events=[event('ClosedEvent', 'CE')]))
-        self.github.fail = lambda op, v: op == 'rest'
-        self.assertFalse(self.poll())
-        self.assertEqual(self.runner.filed, [])
-
-
-class State(WatcherCase):
-    def test_cold_start_uses_24_hours_and_saves_open_pulls(self):
-        self.github.page = 1
-        self.github.add(pull(1), pull(2, state='CLOSED', updated=23 * 60),
-                        pull(3, state='CLOSED', updated=25 * 60), pull(4, state='CLOSED', updated=30 * 60))
-        self.assertTrue(self.poll())
-        read = [v['number'] for op, v in self.github.calls if op == 'LandingPull']
-        self.assertEqual(read, [1, 2])  # the recent read excludes the first pull older than 24 hours + overlap
-        self.assertEqual(self.state(), {'version': 2, 'watermark': lw.iso(NOW), 'tracked': [1]})
-
-    def test_cold_start_excludes_old_nodes_from_the_first_recent_page(self):
-        self.github.add(pull(1, state='CLOSED', updated=23 * 60),
-                        pull(2, state='CLOSED', updated=24 * 60),
-                        pull(3, state='CLOSED', updated=25 * 60))
-        self.assertTrue(self.poll())
-        recent = [v for op, v in self.github.calls if op == 'LandingRecent']
-        self.assertEqual(len(recent), 1)
-        read = [v['number'] for op, v in self.github.calls if op == 'LandingPull']
-        self.assertEqual(read, [1, 2])
-
-    def test_resume_reads_tracked_pull_that_merged_during_an_outage(self):
-        self.github.add(pull(7, state='MERGED', merged=True, merge_oid='mm', updated=3 * 24 * 60))
-        self.save_state(3 * 24 * 60 + 30, tracked=[7])
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(), ['landing-fact:example/repo#7:merged:mm'])
-        self.assertEqual(self.state()['tracked'], [])
-
-    def test_refused_fact_holds_watermark_and_retries(self):
-        self.github.add(pull(1, state='CLOSED', events=[event('ClosedEvent', 'CE')]))
-        self.save_state(30)
-        before = self.state()
-        self.runner.refuse = lambda args: True
-        self.assertFalse(self.poll())
-        self.assertEqual(self.state(), before)
-        self.assertIn('refused fact key=landing-fact:example/repo#1:closed:CE reason=refused by fake gateway',
-                      self.stream.getvalue())
-        self.runner.refuse = None
-        self.assertTrue(self.poll())
-        self.assertEqual(self.state()['watermark'], lw.iso(NOW))
-
-    def test_repeat_polls_reuse_keys_and_log_each_episode_once(self):
-        self.github.add(pull(1, state='CLOSED', events=[event('ClosedEvent', 'CE')]))
-        self.assertTrue(self.poll())
-        self.clock = NOW + dt.timedelta(minutes=1)
-        self.assertTrue(self.poll())
-        self.assertEqual(self.runner.keys(), ['landing-fact:example/repo#1:closed:CE'] * 2)
-        self.assertEqual(self.stream.getvalue().count('episode closed'), 1)
-
-    def test_state_write_is_atomic_and_leaves_no_temporary_file(self):
-        self.save_state(30, tracked=[3, 1])
-        self.assertEqual(os.listdir(self.tmp.name), ['example-repo-main.json'])
-        self.assertEqual(self.state()['tracked'], [1, 3])
-        original = os.replace
-        os.replace = lambda *a: (_ for _ in ()).throw(OSError('disk full'))
+        runner = Claims()
+        original = lw.time.monotonic
+        clock = [1000]
+        lw.time.monotonic = lambda: clock[0]
         try:
-            with self.assertRaises(OSError):
-                self.save_state(1, tracked=[9])
+            lw.renew_claim(runner, force=True)
+            clock[0] += lw.CLAIM_RENEW_SECONDS - 1
+            lw.renew_claim(runner)
+            self.assertEqual(runner.calls, 1)
+            clock[0] += 1
+            lw.renew_claim(runner)
+            self.assertEqual(runner.calls, 2)
+            lw.renew_claim(runner, force=True)
+            self.assertEqual(runner.calls, 3)
         finally:
-            os.replace = original
-        self.assertEqual(os.listdir(self.tmp.name), ['example-repo-main.json'])
-        self.assertEqual(self.state()['tracked'], [1, 3])
+            lw.time.monotonic = original
 
-    def test_version_one_state_loads_and_migrates_on_save(self):
-        path = os.path.join(self.tmp.name, 'example-repo-main.json')
-        with open(path, 'w') as handle:
-            json.dump({'version': 1, 'watermark': lw.iso(NOW), 'tracked': []}, handle)
-        self.assertTrue(self.poll())
-        self.assertEqual(self.state()['version'], 2)
+    def test_renewal_failure_does_not_abort_filing(self):
+        seen = []
+        original_renew = lw.renew_claim
+        original_run = lw.subprocess.run
 
-    def test_malformed_state_refuses(self):
-        path = os.path.join(self.tmp.name, 'example-repo-main.json')
-        for body in ('not json', '{"version": 3, "watermark": "2026-09-26T00:00:00Z", "tracked": []}',
-                     '{"version": 1, "watermark": "yesterday", "tracked": []}',
-                     '{"version": 1, "watermark": "2026-09-26T00:00:00Z", "tracked": ["1"]}'):
-            with self.subTest(body=body):
-                with open(path, 'w') as handle:
-                    handle.write(body)
-                with self.assertRaises(lw.SettingsError):
-                    self.watcher().load()
+        class Done:
+            returncode = 0
+            stdout = '{}'
+            stderr = ''
+
+        lw.renew_claim = lambda runner: (_ for _ in ()).throw(lw.ReadError('claim unavailable'))
+        lw.subprocess.run = lambda argv, **kw: seen.append(argv) or Done()
+        try:
+            self.assertEqual(lw.Runner(None).tightbeam(['condition', '--kind', lw.SETTLED]), (True, '{}'))
+            self.assertEqual(seen, [['tightbeam', 'condition', '--kind', lw.SETTLED]])
+        finally:
+            lw.renew_claim = original_renew
+            lw.subprocess.run = original_run
 
 
 FAKE_GH = r'''#!{python}
@@ -814,135 +574,6 @@ class Process(unittest.TestCase):
         done = self.run_program('--once', LANDING_REPOS='')
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn('fact-demand', self.calls.read_text())
-
-
-class DemandDriven(WatcherCase):
-    def test_unavailable_scope_does_not_delay_other_demand(self):
-        self.github.add(pull(7, checks=[check_run('pass', 'build', 'SUCCESS', required=True)]))
-        self.assertTrue(lw.poll_demanded_pr('Example/Repo#8', {lw.CHECKS_COMPLETED}, self.runner, self.log))
-        self.assertTrue(lw.poll_demanded_pr('Example/Repo#7', {lw.CHECKS_COMPLETED}, self.runner, self.log))
-        self.assertEqual(len(self.runner.checks), 1)
-
-    def test_unconfigured_pr_is_read_and_filed_only_while_demanded(self):
-        self.github.add(pull(7, checks=[check_run('pass', 'build', 'SUCCESS', required=True)]))
-        self.runner.demand = [{'kind': lw.CHECKS_COMPLETED, 'scope': 'Example/Repo#7'}]
-        prs, branches = lw.demanded_scopes(self.runner, self.log)
-        self.assertEqual(branches, {})
-        self.assertEqual(prs, {'Example/Repo#7': {lw.CHECKS_COMPLETED}})
-        self.assertTrue(lw.poll_demanded_pr('Example/Repo#7', prs['Example/Repo#7'], self.runner, self.log))
-        self.assertEqual(len(self.runner.checks), 1)
-        before = len(self.github.calls)
-        self.runner.demand = []
-        prs, _ = lw.demanded_scopes(self.runner, self.log)
-        for scope, kinds in prs.items():
-            lw.poll_demanded_pr(scope, kinds, self.runner, self.log)
-        self.assertEqual(len(self.github.calls), before)
-
-    def test_invalid_demand_is_logged_once_and_other_pr_continues(self):
-        self.runner.demand = [
-            {'kind': lw.CHECKS_COMPLETED, 'scope': None},
-            {'kind': lw.CHECKS_COMPLETED, 'scope': 'Example/Repo#7'},
-        ]
-        self.github.add(pull(7, checks=[check_run('pass', 'build', 'SUCCESS', required=True)]))
-        for _ in range(2):
-            prs, _ = lw.demanded_scopes(self.runner, self.log)
-            for scope, kinds in prs.items():
-                self.assertTrue(lw.poll_demanded_pr(scope, kinds, self.runner, self.log))
-        self.assertEqual(self.stream.getvalue().count('ignored invalid demand'), 1)
-
-
-class ChecksCompletedCase(WatcherCase):
-    def checks_keys(self):
-        return [args[args.index('--key') + 1] for args in self.runner.checks]
-
-    def check_reads(self, number):
-        return [
-            variables
-            for operation, variables in self.github.calls
-            if operation == 'LandingPullChecks' and variables['number'] == number
-        ]
-
-    def test_all_required_passed_files_once_and_remembers_head_after_restart(self):
-        self.save_state()
-        self.github.add(pull(7, checks=[check_run('C1', 'linux', 'SUCCESS', required=True),
-                                        check_run('C2', 'macos', 'SUCCESS', required=True)]))
-        self.assertTrue(self.watcher().poll())
-        self.assertTrue(self.watcher().poll())
-        self.assertEqual(self.checks_keys(), ['pr-checks:example/repo#7:head1:pass'])
-        self.assertEqual(len(self.check_reads(7)), 1)
-        fact = self.runner.checks[0]
-        self.assertEqual(fact[:3], ['condition', '--kind', 'pr.checks-completed'])
-        self.assertEqual(fact[fact.index('--scope') + 1], 'example/repo#7')
-        self.assertEqual(self.state()['checked_heads'], ['7:head1'])
-
-    def test_required_failure_files_fail(self):
-        self.save_state()
-        self.github.add(pull(8, checks=[check_run('C1', 'linux', 'SUCCESS', required=True),
-                                        check_run('C2', 'macos', 'FAILURE', required=True)]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.checks_keys(), ['pr-checks:example/repo#8:head1:fail'])
-
-    def test_running_required_check_files_nothing(self):
-        self.save_state()
-        self.github.add(pull(9, checks=[check_run('C1', 'linux', 'SUCCESS', required=True),
-                                        check_run('C2', 'macos', status='IN_PROGRESS', required=True)]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.checks_keys(), [])
-
-    def test_optional_checks_alone_file_nothing(self):
-        self.save_state()
-        self.github.add(pull(10, checks=[check_run('C1', 'lint', 'SUCCESS', required=False)]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.checks_keys(), [])
-
-    def test_latest_terminal_rerun_decides(self):
-        self.save_state()
-        self.github.add(pull(11, checks=[check_run('C1', 'macos', 'FAILURE', started=20, required=True),
-                                         check_run('C2', 'macos', 'SUCCESS', started=5, required=True)]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.checks_keys(), ['pr-checks:example/repo#11:head1:pass'])
-
-    def test_pending_rerun_without_timestamp_blocks_completion(self):
-        self.save_state()
-        self.github.add(pull(14, checks=[check_run('C1', 'linux', 'SUCCESS', started=20, required=True),
-                                         check_run('C2', 'linux', status='QUEUED', started=None, required=True)]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.checks_keys(), [])
-
-    def test_new_head_files_again(self):
-        self.save_state()
-        watcher = self.watcher()
-        self.github.add(pull(12, checks=[check_run('C1', 'linux', 'FAILURE', required=True)]))
-        self.assertTrue(watcher.poll())
-        self.github.add(pull(12, head='head2', checks=[check_run('C3', 'linux', 'SUCCESS', required=True)]))
-        self.assertTrue(watcher.poll())
-        self.assertEqual(self.checks_keys(), ['pr-checks:example/repo#12:head1:fail',
-                                              'pr-checks:example/repo#12:head2:pass'])
-
-    def test_queued_pull_is_not_read(self):
-        self.save_state()
-        self.github.add(pull(13, queued=True, auto=ts(3),
-                             checks=[check_run('C1', 'linux', 'SUCCESS', required=True)]))
-        self.assertTrue(self.poll())
-        self.assertEqual(self.checks_keys(), [])
-        self.assertEqual(self.check_reads(13), [])
-
-    def test_refused_fact_retries_saved_outcome_without_reading_head_again(self):
-        self.save_state()
-        self.github.add(pull(15, checks=[check_run('C1', 'linux', 'SUCCESS', required=True)]))
-        self.runner.refuse = lambda args: (
-            '--kind' in args and args[args.index('--kind') + 1] == lw.CHECKS_COMPLETED
-        )
-        self.assertFalse(self.watcher().poll())
-        self.assertEqual(self.state()['pending_checks'], {'15:head1': 'pass'})
-        self.assertEqual(len(self.check_reads(15)), 1)
-
-        self.runner.refuse = None
-        self.assertTrue(self.watcher().poll())
-        self.assertEqual(self.checks_keys(), ['pr-checks:example/repo#15:head1:pass'])
-        self.assertEqual(len(self.check_reads(15)), 1)
-        self.assertEqual(self.state()['checked_heads'], ['15:head1'])
-        self.assertNotIn('pending_checks', self.state())
 
 
 if __name__ == '__main__':
