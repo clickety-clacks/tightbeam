@@ -4347,7 +4347,7 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE id = ?1", [assignment.id])
   end
 
-  test "unowned dispatch defers through its exact routing bracket, then admits exact fired rumination",
+  test "unowned dispatch opens with advisory rumination and cancels its routing bracket",
        ctx do
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
@@ -4378,6 +4378,13 @@ defmodule Tightbeam.AssignmentsTest do
         "work-item-create",
         work_item_call("work-item-create", {:user, "flynn"}, %{title: "Rumination rail"})
       )
+
+    assert {:ok, [[routing_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT routingWakeId FROM work_items WHERE id = ?1",
+               [work_item.id]
+             )
 
     call =
       dispatch_call(
@@ -4410,27 +4417,40 @@ defmodule Tightbeam.AssignmentsTest do
             %{
               rumination_required: true,
               work_item_id: work_item_id,
-              message: message
+              message: message,
+              id: assignment_id,
+              workItemId: assignment_work_item_id,
+              state: "open"
             }} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
     assert work_item_id == work_item.id
+    assert assignment_work_item_id == work_item.id
 
     assert message ==
-             "Sent you to ruminate on #{work_item.id} first — re-dispatch when you're done thinking."
+             "Rumination is scheduled for #{work_item.id}; this dispatch opened the assignment anyway."
 
-    assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'ship the rail'")
+    assert {:ok, [[1, ^assignment_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*),MIN(id) FROM assignments WHERE subject = 'ship the rail'"
+             )
 
-    # Two wakes are pending: the bracket-1 routing nag armed at create (on the
-    # owner's personal session) and the rumination wake on the dispatcher.
+    # Dispatch opened the assignment, so its owner-routing bracket is canceled;
+    # the advisory rumination wake remains pending on the dispatcher.
     pending = Wakes.list_pending(ctx.db)
     wake = Enum.find(pending, & &1.rumination)
     assert wake
 
-    assert Enum.any?(pending, fn w ->
+    refute Enum.any?(pending, fn w ->
              not w.rumination and w.work_item_id == work_item.id and
                w.session_key == Org.personal_session_key("flynn")
            end)
+
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id = ?1", [work_item.id])
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId = ?1", [routing_wake_id])
 
     assert wake.session_key == "dispatcher"
     assert wake.creator_session_key == "dispatcher"
@@ -4439,13 +4459,13 @@ defmodule Tightbeam.AssignmentsTest do
     assert wake.work_item_id == work_item.id
 
     assert wake.prompt ==
-             "digest: Ruminate on work-item #{work_item.id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=ship the rail brief=Implement the ratified behavior. When you've thought it through, re-issue the dispatch."
+             "digest: Ruminate on work-item #{work_item.id} against the whole spec and its spirit. The assignment has already been dispatched: subject=ship the rail brief=Implement the ratified behavior. When you've thought it through, review the open assignment and adjust it if needed."
 
     assert wake.delivery_rule == NoticeBatcher.rule()
 
-    # A repeated attempt in this same active turn keeps the gate closed while
-    # reusing the one pending rumination source.
-    assert {:ok, %{rumination_required: true}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    # The same idempotency key replays the already-opened assignment while the
+    # one rumination source remains pending.
+    assert {:ok, %{id: ^assignment_id}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -4570,8 +4590,9 @@ defmodule Tightbeam.AssignmentsTest do
                Wakes.rumination_status_in_txn(txn, work_item.id, "dispatcher")
              end)
 
-    # F7 amendment: the re-dispatch persists workItemId exactly as assign does.
+    # Rumination is advisory: the first dispatch already opened this assignment.
     assert {:ok, assignment} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert assignment.id == assignment_id
     assert assignment.workItemId == work_item.id
     assert assignment.openedBySession == "dispatcher"
 
@@ -4731,7 +4752,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     baseline = assignment_count(ctx.db)
 
-    assert {:ok, %{rumination_required: true}} =
+    assert {:ok, %{rumination_required: true, workItemId: work_item_id}} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
@@ -4744,7 +4765,8 @@ defmodule Tightbeam.AssignmentsTest do
                )
              )
 
-    assert assignment_count(ctx.db) == baseline
+    assert work_item_id == work_item.id
+    assert assignment_count(ctx.db) == baseline + 1
   end
 
   test "unowned dispatch rejects canceled and mismatched routing brackets", ctx do
@@ -6164,6 +6186,234 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert %{code: "inapplicable_code_evidence"} =
              handle(ctx, "attest", attest_call({:session, "holder"}, unreviewed.id, "completion"))
+  end
+
+  test "same-item independent unlinked review can qualify code completion", ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    rules_base =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-assignment-review-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(rules_base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+
+    completion_rules =
+      File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+      |> String.split("\n# Posture gate", parts: 2)
+      |> hd()
+
+    File.write!(Path.join(rules_dir, "engineering.toml"), completion_rules)
+    Rules.load!(rules_base, Map.keys(ctx.handlers))
+    on_exit(fn -> File.rm_rf!(rules_base) end)
+
+    work_item = create_work_item(ctx, "unlinked review completion")
+    other_work_item = create_work_item(ctx, "unrelated review work")
+    commit = String.duplicate("a", 40)
+    producer_refs = [%{"repo" => "testhost:/tmp/producer", "commit" => commit}]
+    review_refs = [%{"repo" => "testhost:/tmp/reviewer", "commit" => commit}]
+
+    producer =
+      assign_call({:user, "flynn"}, "producer", nil, work_item.id)
+      |> put_in([:params, :effect_kind], "code")
+      |> then(&handle(ctx, "assign", &1))
+
+    unrelated_review =
+      assign_call({:user, "flynn"}, "unrelated review", nil, other_work_item.id)
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :effect_kind], "review")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert unrelated_review.reviewsAssignmentId == nil
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, unrelated_review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], review_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], producer_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(
+             ctx.db,
+             producer.id,
+             "holder",
+             producer_refs
+           ) == []
+
+    assert {:deny, %{rule: "completion-requires-review"}} =
+             Rules.evaluate(ctx.db, attest_call({:session, "holder"}, producer.id, "completion"))
+
+    review =
+      assign_call({:user, "flynn"}, "same-item review", nil, work_item.id)
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :effect_kind], "review")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert review.reviewsAssignmentId == nil
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], review_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(
+             ctx.db,
+             producer.id,
+             "holder",
+             producer_refs
+           ) == [
+             "reviewed-clean"
+           ]
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
+                 Dispatch.dispatch(
+                   ctx.db,
+                   ctx.handlers,
+                   attest_call({:session, "holder"}, producer.id, "completion")
+                 )
+      end)
+
+    assert log =~ "completion_review_missing_link accepted"
+  end
+
+  test "linked review conclusions take precedence over later unlinked same-item reviews", ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    rules_base =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-linked-review-precedence-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(rules_base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+
+    completion_rules =
+      File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+      |> String.split("\n# Posture gate", parts: 2)
+      |> hd()
+
+    File.write!(Path.join(rules_dir, "engineering.toml"), completion_rules)
+    Rules.load!(rules_base, Map.keys(ctx.handlers))
+    on_exit(fn -> File.rm_rf!(rules_base) end)
+
+    work_item = create_work_item(ctx, "linked review remains authoritative")
+    commit_a = String.duplicate("a", 40)
+    commit_b = String.duplicate("b", 40)
+    producer_refs = [%{"repo" => "testhost:/tmp/producer", "commit" => commit_a}]
+    matching_review_refs = [%{"repo" => "testhost:/tmp/linked-review", "commit" => commit_a}]
+    other_review_refs = [%{"repo" => "testhost:/tmp/unlinked-review", "commit" => commit_b}]
+
+    producer =
+      assign_call({:user, "flynn"}, "linked producer", nil, work_item.id)
+      |> put_in([:params, :effect_kind], "code")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], producer_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    linked_clean =
+      assign_call({:user, "flynn"}, "linked clean review", nil, work_item.id)
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :effect_kind], "review")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert linked_clean.reviewsAssignmentId == producer.id
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, linked_clean.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], matching_review_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    unlinked_changes =
+      assign_call({:user, "flynn"}, "later unlinked changes request", nil, work_item.id)
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :effect_kind], "review")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert unlinked_changes.reviewsAssignmentId == nil
+
+    assert %{attest: %{verdictKind: "changes-requested"}} =
+             attest_call({:session, "other-session"}, unlinked_changes.id, "verdict")
+             |> put_in([:params, :verdict_kind], "changes-requested")
+             |> put_in([:params, :commit_refs], matching_review_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert ["reviewed-clean"] ==
+             Assignments.qualifying_review_verdict_kinds(
+               ctx.db,
+               producer.id,
+               "holder",
+               producer_refs
+             )
+
+    completion_call = attest_call({:session, "holder"}, producer.id, "completion")
+    assert :ok = Rules.evaluate(ctx.db, completion_call)
+
+    unlinked_other_clean =
+      assign_call({:user, "flynn"}, "later unlinked clean review", nil, work_item.id)
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :effect_kind], "review")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, unlinked_other_clean.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], other_review_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert ["reviewed-clean"] ==
+             Assignments.qualifying_review_verdict_kinds(
+               ctx.db,
+               producer.id,
+               "holder",
+               producer_refs
+             )
+
+    assert :ok = Rules.evaluate(ctx.db, completion_call)
+
+    completion_log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
+                 Dispatch.dispatch(ctx.db, ctx.handlers, completion_call)
+      end)
+
+    refute completion_log =~ "completion_review_missing_link accepted"
   end
 
   test "code completion refusal names uncovered verified producer commits", ctx do

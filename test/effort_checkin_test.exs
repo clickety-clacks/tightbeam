@@ -1746,7 +1746,8 @@ defmodule Tightbeam.EffortCheckinTest do
       params: params
     }
 
-    assert %{rumination_required: true} = handlers["dispatch"].(call)
+    assignment = handlers["dispatch"].(call)
+    assert %{id: assignment_id, rumination_required: true} = assignment
 
     :ok =
       DB.execute(
@@ -1754,7 +1755,7 @@ defmodule Tightbeam.EffortCheckinTest do
         "UPDATE wakes SET state='fired' WHERE rumination=1 AND work_item_id='#{item.id}'"
       )
 
-    assignment = handlers["dispatch"].(call)
+    assert assignment.id == assignment_id
 
     # The gateway's composition doorbell fired for THIS dispatch — the row the
     # bracket would have read as the holder's work.
@@ -2457,20 +2458,20 @@ defmodule Tightbeam.EffortCheckinTest do
     assignment(ctx, "dispatch", principal, holder, %{subject: subject, brief: subject})
   end
 
-  # A session's FIRST dispatch against a work item is sent to ruminate; the
-  # re-issue is the dispatch. These proofs are about the bracket, not that rung.
+  # The dispatch opens the assignment immediately and sends rumination as an
+  # advisory wake. These proofs are about the bracket, not that reminder.
   defp dispatch_for_item(ctx, principal, holder, subject, work_item_id) do
     params = %{subject: subject, brief: subject, work_item_id: work_item_id}
 
     case assignment(ctx, "dispatch", principal, holder, params) do
-      %{rumination_required: true} ->
+      %{rumination_required: true} = opened ->
         :ok =
           DB.execute(
             ctx.db,
             "UPDATE wakes SET state='fired' WHERE rumination=1 AND work_item_id='#{work_item_id}'"
           )
 
-        assignment(ctx, "dispatch", principal, holder, params)
+        opened
 
       result ->
         result
