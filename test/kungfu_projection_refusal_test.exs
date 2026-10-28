@@ -486,22 +486,41 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
       ChangeSocket.handle_in({JSON.encode!(message), opcode: :text}, state)
     end
 
-    for {id, token, reason} <- [
-          {"missing", "invalid", "auth_failed"},
-          {"synthetic-pending", "invalid", "device_not_approved"}
+    for {id, token} <- [
+          {"missing", "invalid"},
+          {"synthetic-pending", "invalid"}
         ] do
       assert {:ok, pending} = ChangeSocket.init(deps)
 
-      assert {:stop, :normal, 1008, {:text, bytes}, ^pending} =
+      assert {:ok, observer} =
                send_frame.(pending, %{"type" => "auth", "deviceId" => id, "token" => token})
 
-      assert JSON.decode!(bytes) == %{
-               "type" => "auth_result",
-               "success" => false,
-               "reason" => reason
+      assert observer.phase == :live
+      assert observer.principal_kind == :observer
+
+      subscription_id = "observer-#{id}"
+
+      assert {:ok, subscribed} =
+               send_frame.(observer, %{
+                 "type" => "subscribe",
+                 "subscriptionId" => subscription_id,
+                 "filters" => %{"classes" => ["kungfu."]}
+               })
+
+      assert_receive {:firehose_control, ready_frame}
+
+      assert {:push, {:text, ready}, ^subscribed} =
+               ChangeSocket.handle_info({:firehose_control, ready_frame}, subscribed)
+
+      :ok = Hub.delivered(hub, self())
+
+      assert JSON.decode!(ready) == %{
+               "type" => "subscription_ready",
+               "subscriptionId" => subscription_id
              }
 
-      assert :ok = ChangeSocket.terminate(:normal, pending)
+      assert subscribed.subscriptions == %{subscription_id => %{"classes" => ["kungfu."]}}
+      assert :ok = ChangeSocket.terminate(:normal, subscribed)
     end
 
     assert {:ok, pending} = ChangeSocket.init(deps)

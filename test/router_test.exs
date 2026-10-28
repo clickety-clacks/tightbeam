@@ -769,12 +769,30 @@ defmodule Tightbeam.Wire.RouterTest do
 
       assert get_resp_header(missing, "cache-control") == ["no-store"]
 
-      for {query, token, status, code} <- [
-            {"?bad=%ZZ", "invalid", 401, "auth_failed"},
-            {"?bad=%ZZ", ctx.device.token, 400, "malformed_query"},
-            {"?filter=unknown", ctx.device.token, 400, "invalid_filter"},
-            {"?asUser=flynn&asUser=other", "tbc_test", 400, "invalid_as_user"}
-          ] do
+      observer_read? = path in ["sessions", "read-markers"]
+
+      invalid_bearer_case =
+        if observer_read? do
+          {"?bad=%ZZ", "invalid", 400, "malformed_query"}
+        else
+          {"?bad=%ZZ", "invalid", 401, "auth_failed"}
+        end
+
+      # Repeated asUser values are valid on observer reads and are covered by
+      # OperatorHistoryTest; retain the malformed-selector case elsewhere.
+      repeated_selector_cases =
+        if observer_read? do
+          []
+        else
+          [{"?asUser=flynn&asUser=other", "tbc_test", 400, "invalid_as_user"}]
+        end
+
+      for {query, token, status, code} <-
+            [
+              invalid_bearer_case,
+              {"?bad=%ZZ", ctx.device.token, 400, "malformed_query"},
+              {"?filter=unknown", ctx.device.token, 400, "invalid_filter"}
+            ] ++ repeated_selector_cases do
         refusal = request.(url <> query, token, guarded)
         assert refusal.status == status
         assert JSON.decode!(refusal.resp_body)["error"]["code"] == code
