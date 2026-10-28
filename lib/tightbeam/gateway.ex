@@ -4225,7 +4225,6 @@ defmodule Tightbeam.Gateway do
     diagnostic = ErrorDiagnostic.of(reason)
 
     model_selection_classified_failure?(classified) or
-      adapter_model_refusal?(classified, diagnostic) or
       adapter_effort_refusal?(classified, diagnostic)
   end
 
@@ -4243,16 +4242,6 @@ defmodule Tightbeam.Gateway do
     do: model_selection_classified_failure?(ErrorDiagnostic.classified(reason))
 
   defp model_selection_classified_failure?(_classification), do: false
-
-  # The adapter retains ACP's own invalid-model error. The preference ring
-  # advances on that recorded refusal without changing what the caller sees.
-  defp adapter_model_refusal?(%{"code" => -32_602}, diagnostic) when is_map(diagnostic) do
-    phase = Map.get(diagnostic, "phase") || Map.get(diagnostic, :phase)
-    config_id = Map.get(diagnostic, "configId") || Map.get(diagnostic, :config_id)
-    phase == "model" and config_id == "model"
-  end
-
-  defp adapter_model_refusal?(_classified, _diagnostic), do: false
 
   # The adapter's config failure carries phase and the actual harness option
   # identifier. Codex reports reasoning_effort, Pi reports thought_level, and

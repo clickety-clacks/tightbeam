@@ -213,68 +213,60 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     end
   end
 
-  test "turn advances from a refused configured entry to the next exact model and readback" do
-    with_gateway(fn %{db: db, config: config, lane: lane} ->
-      first = Model.new("synthetic-first", effort: "low")
-      second = Model.new("synthetic-second", effort: "high")
+  test "a raw ACP model refusal reaches the failed turn unchanged" do
+    with_gateway(
+      fn %{db: db, config: config, lane: lane} ->
+        first = Model.new("synthetic-first", effort: "low")
 
-      Org.create(db, %{
-        session_key: "ring-success",
-        display_name: "Synthetic ring success",
-        owner_user_id: "synthetic-owner",
-        origin: "user:synthetic-owner",
-        archetype: "synthetic-ring",
-        host: "testhost",
-        harness: "fixture",
-        provider: "fixture_provider",
-        model: first
-      })
+        Org.create(db, %{
+          session_key: "ring-success",
+          display_name: "Synthetic ring success",
+          owner_user_id: "synthetic-owner",
+          origin: "user:synthetic-owner",
+          archetype: "synthetic-ring",
+          host: "testhost",
+          harness: "fixture",
+          provider: "fixture_provider",
+          model: first
+        })
 
-      [first_reason] = production_model_use_failures([first])
+        [first_reason] = production_model_use_failures([first])
 
-      {:ok, adapter} =
-        RingDownAdapter.start_link(
-          parent: self(),
-          outcomes: %{
-            first.family => {:error, first_reason},
-            second.family => {:ok, "synthetic-session"}
-          },
-          readback: %{"synthetic-session" => second}
-        )
+        {:ok, adapter} =
+          RingDownAdapter.start_link(
+            parent: self(),
+            outcomes: %{first.family => {:error, first_reason}},
+            readback: %{}
+          )
 
-      {:ok, _coordinator} = CoordinatorStub.start_link({adapter, self()})
-      runner = runner(config)
+        {:ok, _coordinator} = CoordinatorStub.start_link({adapter, self()})
+        runner = runner(config)
 
-      assert :appended =
-               Gateway.deliver_prompt("ring-success", "user:synthetic-owner", "select",
-                 db: db,
-                 lane_manager: lane,
-                 conn_registry: ConnRegistry,
-                 client_message_id: "ring-success-client"
-               )
+        assert :appended =
+                 Gateway.deliver_prompt("ring-success", "user:synthetic-owner", "select",
+                   db: db,
+                   lane_manager: lane,
+                   conn_registry: ConnRegistry,
+                   client_message_id: "ring-success-client"
+                 )
 
-      assert {:ok, turn} = Ledger.claim_next(db, "ring-success", "ring-test")
+        assert {:ok, turn} = Ledger.claim_next(db, "ring-success", "ring-test")
 
-      assert {:ok, %{terminal_publish: publish}} =
-               runner.(Map.put(turn, :session_key, "ring-success"))
+        assert {:error, %{reason: "Invalid params"}} =
+                 runner.(Map.put(turn, :session_key, "ring-success"))
 
-      assert_receive {:model_attempt, ^first}
-      assert_receive {:model_attempt, ^second}
-      assert Org.get(db, "ring-success").model == second
+        assert_receive {:model_attempt, ^first}
+        assert Org.get(db, "ring-success").model == first
 
-      attempts =
-        EventLog.lifecycle_events(db)
-        |> Enum.filter(&(&1.kind == "model_selection_attempt"))
+        attempts =
+          EventLog.lifecycle_events(db)
+          |> Enum.filter(&(&1.kind == "model_selection_attempt"))
 
-      assert Enum.map(attempts, & &1.detail) |> Enum.join("\n") =~ "synthetic-first"
-      assert Enum.map(attempts, & &1.detail) |> Enum.join("\n") =~ "not selectable"
-      assert Enum.map(attempts, & &1.detail) |> Enum.join("\n") =~ "diagnostic"
-      assert Enum.map(attempts, & &1.detail) |> Enum.join("\n") =~ "synthetic-second"
-
-      assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
-
-      publish.("delivered")
-    end)
+        assert length(attempts) == 1
+        assert Enum.map(attempts, & &1.detail) |> Enum.join("\n") =~ "not selectable"
+      end,
+      [{"synthetic-first", "low", nil}]
+    )
   end
 
   test "turn exhaustion stops at the configured entries and keeps the typed refusal" do
@@ -335,7 +327,7 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     end)
   end
 
-  test "cross-harness configured candidates are tried before clear exhaustion" do
+  test "cross-harness final raw refusal stays unchanged after a typed ring advance" do
     preferences = [
       {"synthetic-first", "low", nil},
       {"gpt-cross-harness-failure", "medium", nil}
@@ -413,11 +405,8 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
 
         assert {:ok, turn} = Ledger.claim_next(db, session_key, "ring-test")
 
-        assert {:error, %{reason: %{code: "model_selection_exhausted", message: message}}} =
+        assert {:error, %{reason: "Invalid params"}} =
                  runner.(Map.put(turn, :session_key, session_key))
-
-        assert message =~ "all configured model preferences were exhausted"
-        assert message =~ "gpt-cross-harness-failure"
 
         assert_receive {:adapter_key, {:fixture, "shared", "testhost"}}
         assert_receive {:adapter_key, {:codex, "shared", "testhost"}}
@@ -664,7 +653,7 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     )
   end
 
-  test "turn advances through production model and effort carriers and preserves evidence" do
+  test "turn advances through typed model and ACP effort carriers and preserves evidence" do
     preferences = [
       {"synthetic-not-selectable", "low", nil},
       {"synthetic-unsupported-effort", "medium", nil},
@@ -678,13 +667,7 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
         selected = Model.new("synthetic-success", effort: "max", context: "wide")
         session_key = "ring-typed"
 
-        [not_selectable_reason, effort_reason] =
-          production_model_use_failures([not_selectable, unsupported_effort])
-
-        assert %{"code" => -32602, "message" => "Invalid params"} =
-                 ErrorDiagnostic.classified(not_selectable_reason)
-
-        assert %{"phase" => "model"} = ErrorDiagnostic.of(not_selectable_reason)
+        [effort_reason] = production_model_use_failures([unsupported_effort])
 
         assert %{"code" => -32602, "message" => "Invalid params"} =
                  ErrorDiagnostic.classified(effort_reason)
@@ -707,7 +690,7 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
           RingDownAdapter.start_link(
             parent: self(),
             outcomes: %{
-              not_selectable.family => {:error, not_selectable_reason},
+              not_selectable.family => {:error, :model_unavailable},
               unsupported_effort.family => {:error, effort_reason},
               selected.family => {:ok, "synthetic-typed-session"}
             },
@@ -742,7 +725,7 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
           |> Enum.map(& &1.detail)
           |> Enum.join("\n")
 
-        assert details =~ "not selectable"
+        assert details =~ "model_unavailable"
         assert details =~ "Invalid params"
         assert details =~ "classification"
         assert details =~ "original_reason"
