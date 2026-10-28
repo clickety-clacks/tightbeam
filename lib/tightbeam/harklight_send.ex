@@ -18,12 +18,17 @@ defmodule Tightbeam.HarklightSend do
             prepare_and_execute(db, call, input, prepared, op_id, runner, opts)
 
           {:error, code, reason, outcome} ->
-            failure("send", code, reason, outcome, %{op_id: op_id})
+            failure("send", code, "The message was not sent. " <> reason, outcome, %{op_id: op_id})
         end
       else
         id when is_binary(id) -> unresolved_result("send", id)
         {:error, reason} -> failure("send", reason, early_reason(reason), "failed")
       end
+
+    result =
+      if is_binary(call.params[:sender_id]),
+        do: Map.put_new(result, :sender_id, call.params.sender_id),
+        else: result
 
     unchanged_targets(result, call.params[:supersedes])
   end
@@ -170,6 +175,7 @@ defmodule Tightbeam.HarklightSend do
                     "failed",
                     identity(record)
                   )
+                  |> unchanged_targets(record.request["message"]["supersedes"])
               end
 
             record ->

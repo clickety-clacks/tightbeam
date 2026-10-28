@@ -1306,6 +1306,8 @@ defmodule Tightbeam.HarklightWakesTest do
 
     refute Map.has_key?(result, :message_id)
     assert reason =~ "could not complete"
+    assert reason =~ "not sent"
+    assert result.sender_id == "sender"
   end
 
   test "conversation completion ends a failed-ack subscription without retrying it", %{
