@@ -1308,6 +1308,50 @@ defmodule Tightbeam.HarklightWakesTest do
     assert reason =~ "could not complete"
   end
 
+  test "conversation completion ends a failed-ack subscription without retrying it", %{
+    db: db,
+    call: call
+  } do
+    runner =
+      lifecycle_runner(db,
+        ack_failure: true,
+        before_commit: fn ->
+          HarklightWakes.capture_line(db, @handle, terminal(1, "request"))
+        end
+      )
+
+    assert %{outcome: "committed"} =
+             HarklightSend.send_request(
+               db,
+               %{
+                 call
+                 | params: %{
+                     harklight_session: @handle,
+                     sender_id: "sender",
+                     title: "Replacement",
+                     supersedes: ["request"]
+                   }
+               },
+               runner: runner
+             )
+
+    assert_receive {:acked, "1"}
+    parent = self()
+
+    listener = fn manager, handle, _ ->
+      assert :ok = GenServer.call(manager, {:finished, handle, :complete})
+      send(parent, :conversation_finished)
+    end
+
+    start_supervised!({HarklightWakes, db: db, listener: listener, send_runner: runner})
+    assert_receive :conversation_finished, 2000
+
+    assert {:ok, [["ended", "failed"]]} =
+             DB.query(db, "SELECT state,acknowledgment FROM harklight_subscription_ends")
+
+    refute_receive {:acked, _}
+  end
+
   defp frame(value), do: {JSON.encode!(value) <> "\n", 0}
 
   defp bind_extra(db, call, message) do

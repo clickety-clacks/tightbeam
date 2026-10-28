@@ -467,7 +467,7 @@ defmodule Tightbeam.HarklightLifecycle do
   def complete_in_txn(txn, handle) do
     Txn.q(
       txn,
-      "UPDATE harklight_subscription_ends SET state='ended',acknowledgment='not_needed' WHERE handle=?1 AND acknowledgment='pending' AND ackEventId IS NULL",
+      "UPDATE harklight_subscription_ends SET state='ended',acknowledgment=CASE WHEN acknowledgment='pending' AND ackEventId IS NULL THEN 'not_needed' ELSE acknowledgment END WHERE handle=?1",
       [handle]
     )
   end
