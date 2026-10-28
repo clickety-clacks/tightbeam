@@ -416,6 +416,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             description,
             work_item_id,
             content_sha256,
+            produced_by_assignment_id,
         } => {
             let mut params = vec![
                 string_field("kind", kind),
@@ -426,6 +427,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 ("description", description),
                 ("workItemId", work_item_id),
                 ("contentSha256", content_sha256),
+                ("producedByAssignmentId", produced_by_assignment_id),
             ] {
                 if let Some(value) = value {
                     params.push(string_field(name, value));
@@ -857,6 +859,28 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "repair-assignment", vec![], params))
         }
+        Command::AssignmentCommitRefCorrect {
+            identity,
+            assignment_id,
+            commit_refs,
+            reason,
+            evidence_artifact_id,
+            idempotency_key,
+        } => Ok(request(
+            identity,
+            "assignment-commitref-correct",
+            vec![],
+            vec![
+                string_field("assignmentId", assignment_id),
+                format!(
+                    "\"commitRefs\":{}",
+                    serde_json::to_string(commit_refs).expect("commit refs are JSON serializable")
+                ),
+                string_field("reason", reason),
+                string_field("evidenceArtifactId", evidence_artifact_id),
+                string_field("idempotencyKey", idempotency_key),
+            ],
+        )),
         Command::WorkItemCreate {
             identity,
             title,
@@ -2088,6 +2112,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::RevokeAssignment { identity, .. }
         | Command::ReopenAssignment { identity, .. }
         | Command::RepairAssignment { identity, .. }
+        | Command::AssignmentCommitRefCorrect { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
@@ -3311,6 +3336,24 @@ mod tests {
         );
         assert_eq!(
             body(&[
+                "artifact-record",
+                "--kind",
+                "report",
+                "--title",
+                "Review report",
+                "--path",
+                "reports/review.md",
+                "--work-item",
+                "wi_1",
+                "--produced-by-assignment",
+                "asg_review",
+                "--as",
+                "writer",
+            ]),
+            r#"{"as":"writer","verb":"artifact-record","params":{"kind":"report","title":"Review report","originPath":"reports/review.md","workItemId":"wi_1","producedByAssignmentId":"asg_review"}}"#
+        );
+        assert_eq!(
+            body(&[
                 "artifacts",
                 "--work-item",
                 "wi_1",
@@ -3422,6 +3465,23 @@ mod tests {
                 "parent",
             ]),
             r#"{"as":"parent","verb":"reopen-assignment","params":{"assignmentId":"asg_1","reason":"the verdict this card owes was wrong"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "assignment-commitref-correct",
+                "asg_1",
+                "--commit-refs",
+                r#"[{"repo":"sirius:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                "--evidence",
+                "art_1",
+                "--reason",
+                "canonical historical correction",
+                "--key",
+                "correction-1",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"assignment-commitref-correct","params":{"assignmentId":"asg_1","commitRefs":[{"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"refs/heads/main","remote":"git@example/repo","repo":"sirius:/repo"}],"reason":"canonical historical correction","evidenceArtifactId":"art_1","idempotencyKey":"correction-1"}}"#
         );
         assert_eq!(
             body(&[

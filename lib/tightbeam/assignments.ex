@@ -110,6 +110,25 @@ defmodule Tightbeam.Assignments do
   )
   """
 
+  @reviewed_revisions_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_reviewed_revisions (
+    attestId             TEXT PRIMARY KEY,
+    producerAssignmentId TEXT NOT NULL,
+    subjectRevision      TEXT NOT NULL
+      CHECK(json_valid(subjectRevision) AND json_type(subjectRevision) = 'array'),
+    createdAt            INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS assignment_reviewed_revisions_producer
+    ON assignment_reviewed_revisions (producerAssignmentId, createdAt, attestId);
+
+  CREATE TABLE IF NOT EXISTS artifact_assignment_producers (
+    artifactId   TEXT PRIMARY KEY REFERENCES artifacts(artifactId),
+    assignmentId TEXT NOT NULL REFERENCES assignments(id)
+  );
+  CREATE INDEX IF NOT EXISTS artifact_assignment_producers_assignment
+    ON artifact_assignment_producers (assignmentId, artifactId);
+  """
+
   @cannot_proceed_ddl """
   CREATE TABLE IF NOT EXISTS assignment_cannot_proceed (
     id TEXT PRIMARY KEY,
@@ -390,6 +409,7 @@ defmodule Tightbeam.Assignments do
     # SQLite permits the referenced table to arrive in the following DDL.
     :ok = DB.execute(db, @assignments_ddl)
     :ok = DB.execute(db, @attests_ddl)
+    :ok = DB.execute(db, @reviewed_revisions_ddl)
     :ok = DB.execute(db, @cannot_proceed_ddl)
     :ok = DB.execute(db, @cannot_proceed_release_observations_ddl)
     :ok = DB.execute(db, @assignment_files_ddl)
@@ -1125,6 +1145,127 @@ defmodule Tightbeam.Assignments do
     end
   end
 
+  @doc "Return the current independent clean review only when it names the submitted result."
+  @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t(), term()) ::
+          [String.t()]
+  def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, commit_refs) do
+    qualifying_review_trace(db, assignment_id, assignment_holder_key, commit_refs).resolved_fact
+  end
+
+  @doc "Return bounded resolver inputs and stage outcomes without changing review selection."
+  @spec qualifying_review_trace(DB.server(), String.t(), String.t(), term()) :: map()
+  def qualifying_review_trace(db, assignment_id, assignment_holder_key, commit_refs) do
+    submitted = canonical_trace_input(commit_refs)
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT r.id,v.id,r.holderKey,r.state,r.outcome,v.verdictKind,v.commitRefs,rr.subjectRevision
+        FROM attests v
+        JOIN assignments r ON r.id=v.assignmentId
+        LEFT JOIN assignment_reviewed_revisions rr ON rr.attestId=v.id
+        WHERE r.reviewsAssignmentId=?1
+          AND v.kind='verdict'
+          AND v.bySession=r.holderKey
+          AND v.verdictKind IN ('reviewed-clean','changes-requested')
+        ORDER BY v.ts DESC,v.rowid DESC
+        LIMIT 1
+        """,
+        [assignment_id]
+      )
+
+    corrected_refs = effective_subject_refs(db, assignment_id)
+    effective_refs = corrected_refs || submitted
+
+    case rows do
+      [[review_id, attest_id, holder, state, outcome, verdict, encoded_refs, reviewed_revision]] ->
+        stored_refs = canonical_stored_commit_refs(encoded_refs)
+        independent? = holder != assignment_holder_key
+        clean? = verdict == "reviewed-clean"
+
+        valid_lifecycle? =
+          (state == "open" and is_nil(outcome)) or
+            (state == "closed" and outcome == "completed")
+
+        decoded_revision = decode_trace_revision(reviewed_revision)
+
+        subject_bound? =
+          case corrected_refs do
+            refs when is_list(refs) ->
+              decoded_revision == Enum.map(refs, &Map.drop(&1, ["verifiedRefCommit"]))
+
+            _ ->
+              true
+          end
+
+        qualification_passed? = independent? and clean? and valid_lifecycle? and subject_bound?
+
+        expected_compatibility_refs =
+          case effective_refs do
+            refs when is_list(refs) ->
+              Enum.map(refs, &Map.take(&1, ["repo", "commit"]))
+              |> Enum.sort_by(&{&1["repo"], &1["commit"]})
+
+            _ ->
+              effective_refs
+          end
+
+        preflight_passed? =
+          match?({:ok, [_ | _]}, canonical_commit_refs(commit_refs)) and
+            submitted == stored_refs and submitted == expected_compatibility_refs
+
+        %{
+          resolver_arity: 4,
+          normalized_submitted_refs: trace_commit_refs(submitted),
+          effective_refs: trace_commit_refs(effective_refs),
+          selected_review_assignment_id: review_id,
+          selected_review_attest_id: attest_id,
+          selected_review_holder_key: holder,
+          selected_review_state: state,
+          selected_review_outcome: outcome,
+          selected_verdict_kind: verdict,
+          reviewed_revision: trace_commit_refs(decoded_revision),
+          qualification_stage: %{
+            status: if(qualification_passed?, do: "passed", else: "failed"),
+            reason:
+              cond do
+                not valid_lifecycle? -> "review_assignment_invalid_lifecycle"
+                not independent? -> "holder_not_independent"
+                not clean? -> "verdict_not_reviewed_clean"
+                not subject_bound? -> "reviewed_subject_mismatch"
+                true -> nil
+              end
+          },
+          preflight_stage: %{
+            status: if(preflight_passed?, do: "passed", else: "failed"),
+            reason: if(preflight_passed?, do: nil, else: "canonical_ref_mismatch")
+          },
+          transition_stage: %{status: "not_attempted", reason: "rule_evaluation"},
+          resolved_fact:
+            if(qualification_passed? and preflight_passed?, do: ["reviewed-clean"], else: [])
+        }
+
+      [] ->
+        %{
+          resolver_arity: 4,
+          normalized_submitted_refs: trace_commit_refs(submitted),
+          effective_refs: trace_commit_refs(effective_refs),
+          selected_review_assignment_id: nil,
+          selected_review_attest_id: nil,
+          selected_review_holder_key: nil,
+          selected_review_state: nil,
+          selected_review_outcome: nil,
+          selected_verdict_kind: nil,
+          reviewed_revision: nil,
+          qualification_stage: %{status: "failed", reason: "no_review_conclusion"},
+          preflight_stage: %{status: "not_reached", reason: "qualification_failed"},
+          transition_stage: %{status: "not_attempted", reason: "rule_evaluation"},
+          resolved_fact: []
+        }
+    end
+  end
+
   @doc "Return the declared file paths for an assignment."
   @spec declared_files(DB.server(), String.t()) :: [String.t()]
   def declared_files(db, assignment_id) do
@@ -1226,7 +1367,14 @@ defmodule Tightbeam.Assignments do
         params ++ range_params ++ [limit]
       )
 
-    Enum.map(rows, &attest/1)
+    Enum.map(rows, fn row ->
+      filed = attest(row)
+
+      case reviewed_revision(db, filed.id) do
+        nil -> filed
+        revision -> Map.put(filed, :reviewedRevision, revision)
+      end
+    end)
   end
 
   defp attest_opposite_probe(_db, _where, _params, :latest), do: []
@@ -1758,8 +1906,8 @@ defmodule Tightbeam.Assignments do
 
   defp unkeyed_attest_result(db, call) do
     with :ok <- completion_filing_allowed(db, call),
-         :ok <- commit_ref_filing_allowed(db, call),
-         :ok <- valid_commit_refs(db, call.params[:kind], call.params[:commit_refs]) do
+         {:ok, call} <- prepare_attest_commit_refs(db, call),
+         :ok <- commit_ref_filing_allowed(db, call) do
       supplied = call.params[:assignment_id]
 
       from =
@@ -1862,8 +2010,8 @@ defmodule Tightbeam.Assignments do
 
           :miss ->
             with :ok <- completion_filing_allowed(db, call),
-                 :ok <- commit_ref_filing_allowed(db, call),
-                 :ok <- valid_commit_refs(db, "completion", call.params[:commit_refs]) do
+                 {:ok, call} <- prepare_attest_commit_refs(db, call),
+                 :ok <- commit_ref_filing_allowed(db, call) do
               artifact_cursor = artifact_cursor(db)
 
               result =
@@ -2871,9 +3019,184 @@ defmodule Tightbeam.Assignments do
   end
 
   defp attest_in_txn(txn, call) do
-    if call.params[:kind] == "verdict",
-      do: verdict_in_txn(txn, call),
-      else: lifecycle_attest_in_txn(txn, call)
+    if review_subject_revision_claim?(call) do
+      verdict_in_txn(txn, call)
+    else
+      with :ok <- validate_revision_binding_in_txn(txn, call) do
+        if call.params[:kind] == "verdict",
+          do: verdict_in_txn(txn, call),
+          else: lifecycle_attest_in_txn(txn, call)
+      end
+    end
+  end
+
+  defp validate_revision_binding_in_txn(txn, call) do
+    artifact_id = call.params[:artifact_id]
+    hash = call.params[:content_sha256]
+
+    cond do
+      is_nil(artifact_id) and is_nil(hash) ->
+        :ok
+
+      is_nil(artifact_id) or is_nil(hash) ->
+        error("invalid_revision_binding", "artifact and sha256 must be supplied together")
+
+      call.params[:kind] != "verdict" ->
+        error(
+          "invalid_revision_binding",
+          "artifact revision binding is valid only for verdict attests"
+        )
+
+      not (is_binary(artifact_id) and artifact_id != "" and is_binary(hash) and hash != "") ->
+        error("invalid_revision_binding", "artifact and sha256 must be nonblank text")
+
+      true ->
+        validate_legacy_revision_binding_in_txn(txn, call, artifact_id, hash)
+    end
+  end
+
+  defp validate_legacy_revision_binding_in_txn(txn, call, artifact_id, hash) do
+    case Txn.q(
+           txn,
+           """
+           SELECT 1
+           FROM assignments review
+           JOIN artifacts art ON art.artifactId=?2
+           JOIN artifact_assignment_producers binding ON binding.artifactId=art.artifactId
+           JOIN assignments producer ON producer.id=binding.assignmentId
+           JOIN work_items wi ON wi.id=art.workItemId
+           JOIN sessions rs ON rs.sessionKey=review.holderKey
+           JOIN sessions ps ON ps.sessionKey=producer.holderKey
+           WHERE review.id=?1
+             AND review.reviewsAssignmentId=binding.assignmentId
+             AND art.contentSha256=?3
+             AND rs.ownerUserId=wi.ownerUserId
+             AND ps.ownerUserId=wi.ownerUserId
+           """,
+           [call.params[:assignment_id], artifact_id, hash]
+         ) do
+      [[1]] ->
+        :ok
+
+      [] ->
+        error(
+          "invalid_revision_binding",
+          "artifact revision must match the assignment reviewed by this review card"
+        )
+    end
+  end
+
+  defp validate_review_revision_binding_in_txn(txn, call, assignment) do
+    artifact_id = call.params[:artifact_id]
+    hash = call.params[:content_sha256]
+
+    with true <-
+           is_binary(artifact_id) and String.trim(artifact_id) != "" and is_binary(hash) and
+             String.trim(hash) != "",
+         {:ok, [_ | _] = submitted} <- canonical_native_commit_refs(call.params[:commit_refs]),
+         :ok <- validate_review_report_in_txn(txn, assignment, artifact_id, hash),
+         {:ok, effective} <-
+           authoritative_subject_revision_in_txn(txn, assignment.reviewsAssignmentId),
+         true <- submitted == effective do
+      :ok
+    else
+      false ->
+        error(
+          "invalid_revision_binding",
+          "submitted subject revision does not match the producer's authoritative native commitRef"
+        )
+
+      :error ->
+        error(
+          "invalid_revision_binding",
+          "review verdict requires a producer-bound native commitRef subject revision"
+        )
+
+      {:error, :report_binding} ->
+        error(
+          "invalid_revision_binding",
+          "review report must be SHA-bound, produced by this review assignment, and share its work item"
+        )
+
+      {:error, :owner_binding} ->
+        error(
+          "invalid_revision_binding",
+          "review and producer holders must own their shared work item"
+        )
+
+      {:error, :missing_subject_revision} ->
+        error(
+          "invalid_revision_binding",
+          "producer assignment has no authoritative native commitRef"
+        )
+    end
+  end
+
+  defp validate_review_report_in_txn(txn, assignment, artifact_id, hash) do
+    case Txn.q(
+           txn,
+           """
+           SELECT binding.assignmentId,art.workItemId,art.contentSha256,
+                  review.workItemId,producer.workItemId,
+                  rs.ownerUserId,ps.ownerUserId,wi.ownerUserId
+           FROM assignments review
+           JOIN assignments producer ON producer.id=review.reviewsAssignmentId
+           JOIN sessions rs ON rs.sessionKey=review.holderKey
+           JOIN sessions ps ON ps.sessionKey=producer.holderKey
+           LEFT JOIN work_items wi ON wi.id=review.workItemId
+           JOIN artifacts art ON art.artifactId=?2
+           LEFT JOIN artifact_assignment_producers binding ON binding.artifactId=art.artifactId
+           WHERE review.id=?1
+           """,
+           [assignment.id, artifact_id]
+         ) do
+      [
+        [
+          produced_by,
+          artifact_work_item,
+          stored_hash,
+          review_work_item,
+          producer_work_item,
+          review_owner,
+          producer_owner,
+          work_item_owner
+        ]
+      ] ->
+        cond do
+          produced_by != assignment.id or stored_hash != hash or
+            artifact_work_item != review_work_item or producer_work_item != review_work_item or
+              is_nil(review_work_item) ->
+            {:error, :report_binding}
+
+          review_owner != work_item_owner or producer_owner != work_item_owner ->
+            {:error, :owner_binding}
+
+          true ->
+            :ok
+        end
+
+      [] ->
+        {:error, :report_binding}
+    end
+  end
+
+  defp authoritative_subject_revision_in_txn(txn, producer_id) do
+    case Txn.q(
+           txn,
+           "SELECT commitRefs FROM assignment_commit_ref_corrections WHERE assignmentId=?1",
+           [producer_id]
+         ) do
+      [[encoded]] ->
+        with {:ok, decoded} <- JSON.decode(encoded),
+             {:ok, [_ | _] = canonical} <- canonical_authoritative_commit_refs(decoded) do
+          {:ok, canonical}
+        else
+          _ -> {:error, :missing_subject_revision}
+        end
+
+      [] ->
+        {:error, :missing_subject_revision}
+    end
   end
 
   defp lifecycle_attest_in_txn(txn, call) do
@@ -3224,17 +3547,85 @@ defmodule Tightbeam.Assignments do
 
           true ->
             with :ok <- valid_verdict_kind(call.params[:verdict_kind]),
-                 :ok <- valid_note(call.params[:note]) do
+                 :ok <- valid_note(call.params[:note]),
+                 :ok <- validate_verdict_revision_binding_in_txn(txn, call, assignment) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
                  ]) != [[1]],
                  do: raise(TransitionRace)
 
-              attest = insert_attest(txn, call, assignment_id)
+              {insert_call, reviewed_revision} = review_verdict_storage(call, assignment)
+              attest = insert_attest(txn, insert_call, assignment_id)
+              :ok = persist_reviewed_revision_in_txn(txn, attest, assignment, reviewed_revision)
+
+              attest =
+                if reviewed_revision,
+                  do: Map.put(attest, :reviewedRevision, reviewed_revision),
+                  else: attest
+
               append_attest_marker(txn, attest)
               %{assignment: assignment, attest: attest}
             end
         end
+    end
+  end
+
+  defp review_verdict_storage(call, assignment) do
+    if is_binary(assignment.reviewsAssignmentId) and
+         call.params[:verdict_kind] in ["reviewed-clean", "changes-requested"] do
+      case canonical_native_commit_refs(call.params[:commit_refs]) do
+        {:ok, canonical} ->
+          compatibility_refs =
+            Enum.map(canonical, fn ref ->
+              %{"repo" => ref["repo"], "commit" => ref["commit"]}
+            end)
+
+          {put_in(call, [:params, :commit_refs], compatibility_refs), canonical}
+
+        :error ->
+          {call, nil}
+      end
+    else
+      {call, nil}
+    end
+  end
+
+  defp persist_reviewed_revision_in_txn(_txn, _attest, _assignment, nil), do: :ok
+
+  defp persist_reviewed_revision_in_txn(txn, attest, assignment, revision) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO assignment_reviewed_revisions
+        (attestId,producerAssignmentId,subjectRevision,createdAt)
+      VALUES (?1,?2,?3,?4)
+      """,
+      [attest.id, assignment.reviewsAssignmentId, JSON.encode!(revision), attest.ts]
+    )
+
+    if Txn.changes(txn) == 1, do: :ok, else: raise(TransitionRace)
+  end
+
+  defp reviewed_revision(db, attest_id) do
+    case DB.query(
+           db,
+           "SELECT subjectRevision FROM assignment_reviewed_revisions WHERE attestId=?1",
+           [attest_id]
+         ) do
+      {:ok, [[encoded]]} -> JSON.decode!(encoded)
+      {:ok, []} -> nil
+    end
+  end
+
+  defp validate_verdict_revision_binding_in_txn(txn, call, assignment) do
+    if is_binary(assignment.reviewsAssignmentId) and
+         call.params[:verdict_kind] in ["reviewed-clean", "changes-requested"] do
+      case authoritative_subject_revision_in_txn(txn, assignment.reviewsAssignmentId) do
+        {:ok, _effective} -> validate_review_revision_binding_in_txn(txn, call, assignment)
+        {:error, :missing_subject_revision} -> :ok
+      end
+    else
+      :ok
     end
   end
 
@@ -3819,6 +4210,33 @@ defmodule Tightbeam.Assignments do
         "commitRefs are only valid on producing completion or review-link verdict attests"
       )
 
+  defp prepare_attest_commit_refs(db, call) do
+    refs = call.params[:commit_refs]
+
+    if review_subject_revision_claim?(call) do
+      case canonical_native_commit_refs(refs) do
+        {:ok, canonical} -> {:ok, put_in(call, [:params, :commit_refs], canonical)}
+        :error -> {:ok, call}
+      end
+    else
+      with :ok <- valid_commit_refs(db, call.params[:kind], refs),
+           {:ok, canonical} <- canonical_commit_refs(refs) do
+        {:ok, put_in(call, [:params, :commit_refs], canonical)}
+      else
+        :error ->
+          error("invalid_commit_refs", "commitRefs must be unique full immutable commit refs")
+
+        %{code: _} = error ->
+          error
+      end
+    end
+  end
+
+  defp review_subject_revision_claim?(call) do
+    call.params[:kind] == "verdict" and
+      call.params[:verdict_kind] in ["reviewed-clean", "changes-requested"]
+  end
+
   defp commit_ref_filing_allowed(db, call) do
     case {call.params[:kind], call.params[:commit_refs]} do
       {_kind, nil} ->
@@ -3979,6 +4397,217 @@ defmodule Tightbeam.Assignments do
 
   defp validate_commit_ref(_db, _ref),
     do: error("unverifiable_commit_ref", "commitRefs contains an unverifiable commit")
+
+  defp canonical_commit_refs(nil), do: {:ok, nil}
+
+  defp canonical_commit_refs(refs) when is_list(refs) do
+    with {:ok, canonical} <-
+           Enum.reduce_while(refs, {:ok, []}, fn
+             ref, {:ok, acc} when is_map(ref) ->
+               ref = normalize_commit_ref(ref)
+
+               case {Map.keys(ref) |> Enum.sort(), ref["repo"], ref["commit"]} do
+                 {["commit", "repo"], repo, commit}
+                 when is_binary(repo) and is_binary(commit) and byte_size(commit) in 1..64 ->
+                   if Regex.match?(~r/\A[0-9a-fA-F]+\z/u, commit) do
+                     {:cont,
+                      {:ok, [%{"repo" => repo, "commit" => String.downcase(commit)} | acc]}}
+                   else
+                     {:halt, :error}
+                   end
+
+                 _ ->
+                   {:halt, :error}
+               end
+
+             _, _ ->
+               {:halt, :error}
+           end) do
+      canonical = Enum.sort_by(canonical, &{&1["repo"], &1["commit"]})
+      if length(canonical) == length(Enum.uniq(canonical)), do: {:ok, canonical}, else: :error
+    end
+  end
+
+  defp canonical_commit_refs(_), do: :error
+
+  defp canonical_stored_commit_refs(nil), do: nil
+
+  defp canonical_stored_commit_refs(encoded) when is_binary(encoded) do
+    with {:ok, decoded} <- JSON.decode(encoded),
+         {:ok, refs} <- canonical_commit_refs(decoded) do
+      refs
+    else
+      _ -> nil
+    end
+  end
+
+  defp canonical_trace_input(refs) do
+    case canonical_commit_refs(refs) do
+      {:ok, value} -> value
+      :error -> %{status: "invalid"}
+    end
+  end
+
+  defp effective_subject_refs(db, assignment_id) do
+    case DB.query(
+           db,
+           "SELECT commitRefs FROM assignment_commit_ref_corrections WHERE assignmentId=?1",
+           [assignment_id]
+         ) do
+      {:ok, [[encoded]]} -> decode_effective_trace_refs(encoded)
+      {:ok, []} -> nil
+    end
+  end
+
+  defp decode_effective_trace_refs(encoded) do
+    with {:ok, refs} when is_list(refs) <- JSON.decode(encoded),
+         true <- length(refs) <= 32,
+         {:ok, normalized} <-
+           Enum.reduce_while(refs, {:ok, []}, fn ref, {:ok, acc} ->
+             ref = normalize_commit_ref(ref)
+             keys = Map.keys(ref) |> Enum.sort()
+
+             if keys in [
+                  ["commit", "ref", "remote", "repo"],
+                  ["commit", "ref", "remote", "repo", "verifiedRefCommit"]
+                ] and Enum.all?(Map.values(ref), &(is_binary(&1) and byte_size(&1) <= 4096)) and
+                  valid_verified_ref_commit?(ref) do
+               {:cont, {:ok, [ref | acc]}}
+             else
+               {:halt, :error}
+             end
+           end) do
+      Enum.reverse(normalized)
+    else
+      _ -> %{status: "invalid"}
+    end
+  end
+
+  defp decode_trace_revision(nil), do: nil
+
+  defp decode_trace_revision(encoded) do
+    with {:ok, decoded} <- JSON.decode(encoded),
+         {:ok, canonical} <- canonical_native_commit_refs(decoded) do
+      canonical
+    else
+      _ -> %{status: "invalid"}
+    end
+  end
+
+  @trace_repo_bytes 256
+
+  defp trace_commit_refs(refs) when is_list(refs), do: Enum.map(refs, &trace_commit_ref/1)
+  defp trace_commit_refs(value), do: value
+
+  defp trace_commit_ref(%{"repo" => repo} = ref) when is_binary(repo) do
+    original_bytes = byte_size(repo)
+
+    ref
+    |> Map.put("repo", utf8_prefix(repo, @trace_repo_bytes))
+    |> Map.put("repoOriginalBytes", original_bytes)
+    |> Map.put("repoTruncated", original_bytes > @trace_repo_bytes)
+    |> Map.put("repoSha256", sha256(repo))
+  end
+
+  defp trace_commit_ref(ref), do: ref
+
+  defp utf8_prefix(value, max_bytes) when byte_size(value) <= max_bytes, do: value
+
+  defp utf8_prefix(value, max_bytes) do
+    prefix = binary_part(value, 0, max_bytes)
+    valid_utf8_prefix(prefix)
+  end
+
+  defp valid_utf8_prefix(value) do
+    if String.valid?(value),
+      do: value,
+      else: value |> binary_part(0, byte_size(value) - 1) |> valid_utf8_prefix()
+  end
+
+  defp sha256(value),
+    do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
+
+  defp canonical_native_commit_refs(refs) when is_list(refs) and refs != [] do
+    refs
+    |> Enum.reduce_while({:ok, []}, fn
+      ref, {:ok, acc} when is_map(ref) ->
+        normalized = normalize_commit_ref(ref)
+
+        case normalized do
+          %{"repo" => repo, "remote" => remote, "ref" => ref_name, "commit" => commit}
+          when map_size(normalized) == 4 and is_binary(repo) and repo != "" and
+                 is_binary(remote) and remote != "" and is_binary(ref_name) and
+                 is_binary(commit) and byte_size(commit) in [40, 64] ->
+            if Regex.match?(~r/\Arefs\/(?:heads|tags)\/[A-Za-z0-9._\/-]+\z/u, ref_name) and
+                 Regex.match?(~r/\A[0-9a-fA-F]+\z/u, commit) do
+              canonical = %{
+                "repo" => repo,
+                "remote" => remote,
+                "ref" => ref_name,
+                "commit" => String.downcase(commit)
+              }
+
+              {:cont, {:ok, [canonical | acc]}}
+            else
+              {:halt, :error}
+            end
+
+          _ ->
+            {:halt, :error}
+        end
+
+      _, _ ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, canonical} ->
+        canonical =
+          Enum.sort_by(canonical, &{&1["repo"], &1["remote"], &1["ref"], &1["commit"]})
+
+        if length(canonical) == length(Enum.uniq(canonical)), do: {:ok, canonical}, else: :error
+
+      :error ->
+        :error
+    end
+  end
+
+  defp canonical_native_commit_refs(_), do: :error
+
+  defp canonical_authoritative_commit_refs(refs) when is_list(refs) and refs != [] do
+    refs
+    |> Enum.reduce_while({:ok, []}, fn
+      ref, {:ok, acc} when is_map(ref) ->
+        normalized = normalize_commit_ref(ref)
+        keys = Map.keys(normalized) |> Enum.sort()
+
+        if keys in [
+             ["commit", "ref", "remote", "repo"],
+             ["commit", "ref", "remote", "repo", "verifiedRefCommit"]
+           ] and valid_verified_ref_commit?(normalized) do
+          {:cont, {:ok, [Map.drop(normalized, ["verifiedRefCommit"]) | acc]}}
+        else
+          {:halt, :error}
+        end
+
+      _, _ ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, projected} -> canonical_native_commit_refs(Enum.reverse(projected))
+      :error -> :error
+    end
+  end
+
+  defp canonical_authoritative_commit_refs(_), do: :error
+
+  defp valid_verified_ref_commit?(%{"verifiedRefCommit" => commit})
+       when is_binary(commit) and byte_size(commit) in [40, 64],
+       do: Regex.match?(~r/\A[0-9a-fA-F]+\z/u, commit)
+
+  defp valid_verified_ref_commit?(ref), do: not Map.has_key?(ref, "verifiedRefCommit")
+
+  defp normalize_commit_ref(ref),
+    do: Map.new(ref, fn {key, value} -> {to_string(key), value} end)
 
   defp run_git_cat_file(db, host, path, commit) do
     base_dir =

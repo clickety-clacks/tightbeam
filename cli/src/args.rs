@@ -196,6 +196,7 @@ pub enum Command {
         description: Option<String>,
         work_item_id: Option<String>,
         content_sha256: Option<String>,
+        produced_by_assignment_id: Option<String>,
     },
     Artifacts {
         identity: Identity,
@@ -340,6 +341,14 @@ pub enum Command {
         context: Option<String>,
         outcome: Option<String>,
         turn_seq: Option<String>,
+        idempotency_key: String,
+    },
+    AssignmentCommitRefCorrect {
+        identity: Identity,
+        assignment_id: String,
+        commit_refs: Vec<serde_json::Value>,
+        reason: String,
+        evidence_artifact_id: String,
         idempotency_key: String,
     },
     WorkItemCreate {
@@ -676,6 +685,7 @@ COMMANDS:
 
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
+                  [--produced-by-assignment <assignmentId>]
       Record a deliberate artifact pointer for the calling session.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
@@ -916,6 +926,11 @@ COMMANDS:
   repair-assignment <assignmentId> --action tune|restart|rerun|resume|relaunch --key <key>
       Repair a failed or never-launched holder without revoking its work.
       tune also requires --model; rerun requires --outcome not-completed.
+  assignment-commitref-correct <assignmentId>
+      --commit-refs '[{"repo":"host:/repo","remote":"<origin>",
+                       "ref":"refs/heads/main","commit":"<sha>"}]'
+      --evidence <artifactId> --reason "..." --key <idempotencyKey>
+      Append one canonical commitRef correction without rewriting lifecycle history.
   attest <assignmentId> --kind progress|completion|cannot-proceed|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
          [--verdict <kind>] [--note "..."]
@@ -1993,7 +2008,7 @@ fn parse_with_optional_catalog(
         }
         "artifact-record" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]".to_owned());
+                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>] [--produced-by-assignment <assignmentId>]".to_owned());
             }
             Ok(Command::ArtifactRecord {
                 identity: identity(flags)?,
@@ -2004,6 +2019,7 @@ fn parse_with_optional_catalog(
                 description: nonempty(flags, "description"),
                 work_item_id: nonempty(flags, "work-item"),
                 content_sha256: nonempty(flags, "sha256"),
+                produced_by_assignment_id: nonempty(flags, "produced-by-assignment"),
             })
         }
         "tool-call-observed" => {
@@ -2459,6 +2475,29 @@ fn parse_with_optional_catalog(
                 turn_seq: nonempty(flags, "turn")
                     .map(|value| js_number_json(number_coercion(&value))),
                 idempotency_key: key.expect("checked above"),
+            })
+        }
+        "assignment-commitref-correct" => {
+            let usage = "usage: tightbeam assignment-commitref-correct <assignmentId> --commit-refs <json> --evidence <artifactId> --reason <text> --key <idempotencyKey>";
+            if parsed.positional.len() != 2 {
+                return Err(usage.to_owned());
+            }
+            let commit_refs = nonempty(flags, "commit-refs")
+                .ok_or_else(|| "--commit-refs is required".to_owned())
+                .and_then(|encoded| {
+                    serde_json::from_str::<Vec<serde_json::Value>>(&encoded)
+                        .map_err(|error| format!("--commit-refs must be a JSON array: {error}"))
+                })?;
+            Ok(Command::AssignmentCommitRefCorrect {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+                commit_refs,
+                reason: nonempty(flags, "reason")
+                    .ok_or_else(|| "--reason is required".to_owned())?,
+                evidence_artifact_id: nonempty(flags, "evidence")
+                    .ok_or_else(|| "--evidence is required".to_owned())?,
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
             })
         }
         "work-item-create" => {
@@ -3042,7 +3081,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, breathing, attend, transcript, turn-trace, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, breathing, attend, transcript, turn-trace, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process"
         )),
     }
 }
@@ -4047,6 +4086,7 @@ mod tests {
                 "ask",
                 "assimilate",
                 "assign",
+                "assignment-commitref-correct",
                 "assignments",
                 "artifact-record",
                 "artifacts",
@@ -4757,7 +4797,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, breathing, attend, transcript, turn-trace, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, breathing, attend, transcript, turn-trace, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process".to_owned())
         );
     }
 
