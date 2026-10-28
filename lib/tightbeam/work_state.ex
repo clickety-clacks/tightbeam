@@ -4,6 +4,7 @@ defmodule Tightbeam.WorkState do
   alias Tightbeam.DB
   alias Tightbeam.Keyset
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Mementos
 
   @ddl """
   CREATE TABLE IF NOT EXISTS work_state_events (
@@ -160,7 +161,7 @@ defmodule Tightbeam.WorkState do
         txn
         |> item_rows(filters)
         |> Enum.map(fn row ->
-          item = work_item(row)
+          item = Mementos.attach(txn, "work_item", work_item(row))
           %{workItem: item, assignments: assignments_for_item(txn, item.id)}
         end)
 
@@ -178,7 +179,7 @@ defmodule Tightbeam.WorkState do
 
         [row] ->
           %{
-            workItem: work_item(row),
+            workItem: Mementos.attach(txn, "work_item", work_item(row)),
             assignments: assignments_for_item(txn, work_item_id),
             cursor: cursors(txn)
           }

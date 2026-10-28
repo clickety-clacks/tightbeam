@@ -191,7 +191,7 @@ defmodule Tightbeam.JobForensicsTest do
       fetch_item(db, "wi_disp").workItem,
       ~w(body bodyUpdatedAt bodyUpdatedBySession bodyUpdatedByUser createdAt
          createdBySession createdByUser deliveryOwnerSessionKey failReason id isBug ownerUserId priority
-         rowVersion specRefName specRefSha256 state title)a
+         mementos rowVersion specRefName specRefSha256 state title)a
     )
   end
 

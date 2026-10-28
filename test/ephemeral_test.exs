@@ -184,7 +184,11 @@ defmodule Tightbeam.EphemeralTest do
       identity_manifest_sha: "test-identity"
     }
 
-    :persistent_term.put(Tightbeam.Rules, [rule])
+    snapshot = %{
+      Tightbeam.Rules.effective_snapshot()
+      | rules: [rule],
+        revision: "test-identity"
+    }
 
     call = %{
       verb: "inspect",
@@ -195,7 +199,9 @@ defmodule Tightbeam.EphemeralTest do
     }
 
     assert {:error, %{code: "rule_denied", reason: "rule_denied"}} =
-             Dispatch.dispatch(db, %{"inspect" => fn _ -> flunk("must deny") end}, call)
+             Tightbeam.Rules.with_snapshot(snapshot, fn ->
+               Dispatch.dispatch(db, %{"inspect" => fn _ -> flunk("must deny") end}, call)
+             end)
 
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
   end
