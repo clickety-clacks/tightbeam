@@ -285,7 +285,7 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
       |> Base.url_decode64!(padding: false)
       |> JSON.decode!()
 
-    assert changed_cursor["principalKind"] == "user"
+    assert changed_cursor["principalKind"] == "user-admin"
     assert changed_cursor["principalId"] == ctx.admin.user_id
   end
 
