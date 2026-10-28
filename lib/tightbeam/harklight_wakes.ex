@@ -7,7 +7,7 @@ defmodule Tightbeam.HarklightWakes do
   """
 
   use GenServer
-  alias Tightbeam.{DB, Org, Placement, Supervision, Wakes}
+  alias Tightbeam.{DB, HarklightLifecycle, Org, Placement, Supervision, Wakes}
   alias Tightbeam.DB.Txn
 
   @ddl """
@@ -67,7 +67,9 @@ defmodule Tightbeam.HarklightWakes do
 
   @uuid4 ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
 
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    with :ok <- DB.execute(db, @ddl), do: HarklightLifecycle.ensure_schema(db)
+  end
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -144,16 +146,31 @@ defmodule Tightbeam.HarklightWakes do
                    [op_id, result, handle, sender_id, message_id, now]
                  )
 
-                 register_in_txn(
-                   txn,
-                   handle,
-                   session_key,
-                   host,
-                   sender_id,
-                   message_id,
-                   vendor_id,
-                   now
-                 )
+                 case register_in_txn(
+                        txn,
+                        handle,
+                        session_key,
+                        host,
+                        sender_id,
+                        message_id,
+                        vendor_id,
+                        now
+                      ) do
+                   {:ok, registration} ->
+                     effects =
+                       HarklightLifecycle.send_committed_in_txn(
+                         txn,
+                         session_key,
+                         op_id,
+                         payload,
+                         result
+                       )
+
+                     {:ok, Map.merge(registration, effects)}
+
+                   error ->
+                     error
+                 end
 
                [
                  [
@@ -167,16 +184,31 @@ defmodule Tightbeam.HarklightWakes do
                    "bound"
                  ]
                ] ->
-                 register_in_txn(
-                   txn,
-                   handle,
-                   session_key,
-                   host,
-                   sender_id,
-                   message_id,
-                   vendor_id,
-                   now
-                 )
+                 case register_in_txn(
+                        txn,
+                        handle,
+                        session_key,
+                        host,
+                        sender_id,
+                        message_id,
+                        vendor_id,
+                        now
+                      ) do
+                   {:ok, registration} ->
+                     effects =
+                       HarklightLifecycle.send_committed_in_txn(
+                         txn,
+                         session_key,
+                         op_id,
+                         payload,
+                         result
+                       )
+
+                     {:ok, Map.merge(registration, effects)}
+
+                   error ->
+                     error
+                 end
 
                _ ->
                  {:error, "harklight_send_mismatch"}
@@ -237,7 +269,7 @@ defmodule Tightbeam.HarklightWakes do
   def pending_send_attempts(db) do
     DB.query(
       db,
-      "SELECT opId,sessionKey,payload FROM harklight_send_operations WHERE state='pending' AND attemptedAt IS NOT NULL ORDER BY attemptedAt,opId"
+      "SELECT opId,sessionKey,payload FROM harklight_send_operations WHERE state='pending' AND attemptedAt IS NOT NULL AND opId NOT IN (SELECT opId FROM harklight_command_results) ORDER BY attemptedAt,opId"
     )
   end
 
@@ -401,6 +433,7 @@ defmodule Tightbeam.HarklightWakes do
 
     Task.start(fn ->
       Tightbeam.HarklightSend.recover_pending(state.db, runner: state.send_runner)
+      HarklightLifecycle.process_terminals(state.db, runner: state.send_runner)
     end)
 
     {:noreply, Enum.reduce(rows, state, fn [handle], acc -> start_worker(acc, handle) end)}
@@ -527,6 +560,9 @@ defmodule Tightbeam.HarklightWakes do
         do: capture_line(state.db, handle, line),
         else: {:error, "listener_fenced"}
 
+    if result == :ok,
+      do: HarklightLifecycle.acknowledge_pending(state.db, runner: state.send_runner)
+
     {:reply, result, state}
   end
 
@@ -579,6 +615,8 @@ defmodule Tightbeam.HarklightWakes do
           "UPDATE harklight_wake_handles SET state=?2,lastError=?3,updatedAt=?4 WHERE handle=?1",
           [handle, next_state, error, now]
         )
+
+        if completed, do: HarklightLifecycle.complete_in_txn(txn, handle)
 
         if not completed,
           do:
@@ -951,7 +989,28 @@ defmodule Tightbeam.HarklightWakes do
           do: :ok,
           else: {:error, "event_identity_mismatch"}
 
+      HarklightLifecycle.hold_terminal_in_txn?(txn, handle, sender_id, message_id, event_id, line) ->
+        Txn.q(
+          txn,
+          "UPDATE harklight_wake_handles SET lastCursor=MAX(lastCursor,?2) WHERE handle=?1",
+          [handle, cursor]
+        )
+
+        :ok
+
+      HarklightLifecycle.ended_in_txn?(txn, sender_id, message_id) ->
+        Txn.q(
+          txn,
+          "UPDATE harklight_wake_handles SET lastCursor=MAX(lastCursor,?2) WHERE handle=?1",
+          [handle, cursor]
+        )
+
+        :ok
+
       true ->
+        held = HarklightLifecycle.held_in_txn?(txn, handle, event_id)
+        prior_cursor = if held, do: cursor - 1, else: prior_cursor
+
         request =
           Txn.q(
             txn,
@@ -1033,7 +1092,7 @@ defmodule Tightbeam.HarklightWakes do
 
       Txn.q(
         txn,
-        "UPDATE harklight_wake_handles SET lastCursor=?2,updatedAt=?3 WHERE handle=?1",
+        "UPDATE harklight_wake_handles SET lastCursor=MAX(lastCursor,?2),updatedAt=?3 WHERE handle=?1",
         [handle, cursor, now]
       )
 

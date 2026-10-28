@@ -633,6 +633,15 @@ defmodule Tightbeam.Ledger do
                     [session_key]
                   )
 
+                decorated_prompt =
+                  Tightbeam.HarklightLifecycle.decorate_turn_in_txn(txn, wake_id, prompt)
+
+                if decorated_prompt != prompt do
+                  Txn.q(txn, "UPDATE turns SET prompt=?2 WHERE seq=?1", [seq, decorated_prompt])
+                end
+
+                prompt = decorated_prompt
+
                 owner_lease =
                   "ol_" <> Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)
 
