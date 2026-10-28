@@ -8,7 +8,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
   alias Tightbeam.Wire.OperatorSession
   @max_subscriptions 100
   @turn_classes ~w(turn.queued turn.started turn.ended)
-  @filter_keys ~w(classes sessionKey workItemId origin principal)
+  @filter_keys ~w(classes sessionKey workItemId origin principal archetype)
   defstruct phase: :unauthed,
             user_id: nil,
             device_id: nil,
