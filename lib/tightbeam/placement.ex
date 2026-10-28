@@ -11,7 +11,7 @@ defmodule Tightbeam.Placement do
   before any DB exists. The gateway's own machine is under its
   REAL hostname (`local_host_name/0`; ssh: nil) — never under an indexical
   like "local", because the org's vocabulary must match the operator's
-  ("spawn on test-host" has to resolve on test-host, including on test-host itself). Which
+  ("spawn on host-a" has to resolve on host-a, including on host-a itself). Which
   machine is local is carried by `ssh: nil`, not by a special name. Host
   names are what archetype `where` lists and session rows refer to; the ssh
   destination is how to reach one. WHY a host set contains what it does is
@@ -150,7 +150,7 @@ defmodule Tightbeam.Placement do
   redefine. `base_dir` is still an argument because that own entry IS the
   gateway's base_dir; it no longer says where the registry lives.
 
-  There was a second source: a `TIGHTBEAM_HOSTS` env var merged
+  There was a second source until 2026-07-28: a `TIGHTBEAM_HOSTS` env var merged
   in ON TOP of the registry, so a stale env entry silently won over what
   assimilate had just written for the same name, and the gateway then dialled a
   different ssh destination than the one it had reported installing. Removed —

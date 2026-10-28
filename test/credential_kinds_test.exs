@@ -11,8 +11,10 @@ defmodule Tightbeam.CredentialKindsTest do
   boundary: which route is called, which header is sent, which environment
   variable carries the credential, that no secret reaches a command line. That a
   VALID api key returns 200 from either vendor is not proven anywhere in the
-  suite. The recorded fixtures used below are vendor-shaped 401 responses; they
-  do not prove that a valid API key returns 200.
+  suite, because no api key was reachable from this fleet on 2026-07-28 to record
+  one — see credential-kinds-v1 and the unproven row in docs/SMOKE.md. The
+  recorded fixtures used below are real 401s, captured live; nothing here is a
+  200 anyone invented.
   """
 
   use Tightbeam.TestCase, async: false
@@ -51,7 +53,7 @@ defmodule Tightbeam.CredentialKindsTest do
 
   describe "the credential store records the kind" do
     test "an API key banks with the kind recorded and no expiry", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(staging, ".credentials.json"), "sk-ant-api03-staged")
@@ -77,7 +79,7 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "a subscription banks with its kind and keeps its expiry", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
 
@@ -101,7 +103,7 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "no credential is its own state, not a kind", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
       assert Credentials.kind(:anthropic, server) == :none
       assert Credentials.kind(:openai, server) == :none
@@ -109,7 +111,7 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "both providers on one host can hold different kinds", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
       {:ok, claude_staging, claude_lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(claude_staging, ".credentials.json"), "sk-ant-api03-staged")
@@ -328,8 +330,11 @@ defmodule Tightbeam.CredentialKindsTest do
       assert entry.provider == :openai
     end
 
-    # The fixture includes one platform model id accepted by the adapter and one
-    # rejected by it, so the catalog filter is exercised in both directions.
+    # Recorded reality, the #89/#99 api-key exercise (2026-07-28): the platform
+    # route listed 125 bare ids; codex-acp REFUSED the platform id
+    # `gpt-5.1-codex` at session/set_config_option (-32602 Invalid params) and
+    # ACCEPTED `gpt-5.6-sol`, which ran a real turn on the same adapter+auth.
+    # The fixture is that payload's shape trimmed to those two adjudicated ids.
     test "an api-key codex catalog withholds platform ids the adapter refuses", ctx do
       stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"sk-proj-selectable"}))
       sh = fn _command -> {platform_fixture_body() <> "\n200", 0} end
@@ -556,7 +561,7 @@ defmodule Tightbeam.CredentialKindsTest do
         if String.contains?(script, "api.openai.com") do
           {~s({"data":[{"id":"gpt-5.6-sol","object":"model"}]}) <> "\n200", 0}
         else
-          {~s({"models":[{"slug":"gpt-5.6-sol","display_name":"Example Model","supported_reasoning_levels":[{"effort":"medium"}]}]}) <>
+          {~s({"models":[{"slug":"gpt-5.6-sol","display_name":"GPT-5.6 Sol","supported_reasoning_levels":[{"effort":"medium"}]}]}) <>
              "\n200 0.145.0", 0}
         end
       end
@@ -639,6 +644,7 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "a rejected api key is dead, from the vendor's own recorded refusal" do
+      # RECORDED LIVE 2026-07-28 against api.anthropic.com with an invalid key.
       # The vendor's answer to `x-api-key` ("API key is invalid.") is a different
       # sentence from its answer to a bearer token ("Invalid bearer token"), which
       # is the evidence that the header is not interchangeable.

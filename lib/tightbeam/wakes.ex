@@ -25,7 +25,17 @@ defmodule Tightbeam.Wakes do
   use GenServer
   require Logger
 
-  alias Tightbeam.{ConditionFacts, DB, Escalation, EventLog, Gateway, NoticeBatcher}
+  alias Tightbeam.{
+    ConditionFacts,
+    DB,
+    Escalation,
+    EventLog,
+    Gateway,
+    NoticeBatcher,
+    StateResources,
+    StateVisibility
+  }
+
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -104,7 +114,8 @@ defmodule Tightbeam.Wakes do
     -- elected by any sender or the classifier, and claiming 'sender' here
     -- would be an untrue audit fact. Members
     -- keep their own true election; only the carrier row uses this value.
-    -- `'batcher'` is a SHAPE change:
+    -- `'batcher'` is a SHAPE change (schema.ex's `@shape` bumped to
+    -- `coordination-fabric-classes-v2`):
     -- `CREATE TABLE IF NOT EXISTS` cannot widen this CHECK on a table that
     -- already exists, so a database from the OLD shape is refused by name
     -- rather than dying on a raw CHECK violation at the first carrier insert.
@@ -646,7 +657,8 @@ defmodule Tightbeam.Wakes do
   # is how every wake predating the fabric keeps behaving exactly as it did.
   #
   # A DIGEST CARRIER is neither of those: the batcher built the row, so
-  # `classify/1`'s "sender" stamp would be a false audit fact — checked first because `:digest` always carries
+  # `classify/1`'s "sender" stamp would be a false audit fact. It is checked
+  # first because `:digest` always carries
   # `:class` too and would otherwise be read as a sender election.
   defp elected_class(input) do
     cond do
@@ -678,7 +690,8 @@ defmodule Tightbeam.Wakes do
       Map.get(input, :digest, false) ->
         {Map.get(input, :delivery_rule, @digest_rule), Map.fetch!(input, :due_at)}
 
-      # THE CLASS CHECK PRECEDES THE INHIBITION BRANCH. `immediate` and `bypass` classes were never the batcher's
+      # THE CLASS CHECK PRECEDES THE INHIBITION BRANCH. `immediate` and `bypass`
+      # classes were never the batcher's
       # to hold in the first place — §7: algedonic "bypasses every bone...
       # never batched, never digested, never triaged" — so there is nothing
       # for `batcher-inhibited` to name here. A sender's own --after/--at on
@@ -890,7 +903,8 @@ defmodule Tightbeam.Wakes do
   # never destroy WHAT the sender elected or what the row IS. The INSERT
   # above now carries all five columns verbatim.
   #
-  # `deliveryRule`/`dueAt` are carried VERBATIM too, and deliberately: the CEILING anchors on
+  # `deliveryRule`/`dueAt` are carried VERBATIM too, and deliberately: the
+  # CEILING anchors on
   # the wake's own CREATION, never on when it happened to get retargeted.
   # `created_at + ceiling_ms`, computed against the RETARGET moment, was
   # this function's first draft and it was wrong — it RESTARTS the ceiling,
@@ -1870,7 +1884,8 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc """
-  Recent digest carriers targeting a session, regardless of pending state. `list_pending/1` is scoped to PENDING
+  Recent digest carriers targeting a session, regardless of pending state (O5
+  follow-up. `list_pending/1` is scoped to PENDING
   work, and a delivered carrier is not that — it already fired. But its own
   wake id is the only sanctioned key into `digest_members/2`, and the
   delivered digest MESSAGE that ordinarily names it (`digest_prompt/3`) stops
@@ -1987,7 +2002,7 @@ defmodule Tightbeam.Wakes do
   per member: a member with no named reason is left pending, never
   materialized under an empty `trigger=`.
 
-  SOURCE ROWS ARE PRESERVED. A member is consumed
+  SOURCE ROWS ARE PRESERVED (Law 2). A member is consumed
   through the typed cancellation seam as `superseded` with the digest named as
   its REPLACEMENT — the same shape re-resolution already uses. Its prompt, its
   sender, its class and its election all stay on the row; the digest-member
@@ -2051,7 +2066,8 @@ defmodule Tightbeam.Wakes do
     kind, reason -> file_materialization_failure(db, group_key, inspect({kind, reason}))
   end
 
-  # SIGNED LIKE THE SUCCESS PATH: `wake_digest_materialized` names `rule=` alongside its
+  # SIGNED LIKE THE SUCCESS PATH — §8
+  # legibility): `wake_digest_materialized` names `rule=` alongside its
   # target/class/trigger, and a FAILURE is exactly the row an agent most
   # needs to know which reflex to inhibit — `@digest_rule` names the batcher
   # revision that was attempting this materialization when it failed, not
@@ -2138,7 +2154,7 @@ defmodule Tightbeam.Wakes do
       # Candidate group, but not ONE of its current members has reached its
       # own ceiling or seen a boundary since it was filed. Nothing is due —
       # refuse silently rather than materialize under a reason nobody can
-      # name: every member simply waits for its own trigger.
+      # name : every member simply waits for its own trigger.
       [] ->
         nil
 
@@ -2173,12 +2189,12 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  # A member's OWN eligibility: its own class
+  # A member's OWN eligibility : its own class
   # ceiling, or a turn of the target's own that ended STRICTLY AFTER THIS
   # member's own filing time — never another member's ceiling or another
   # member's boundary.
   #
-  # STRICT `>`, not `>=`: timestamps
+  # STRICT `>`, not `>=` : timestamps
   # here are millisecond-resolution wall-clock reads. A wake filed in the
   # SAME millisecond a turn ended is not provably filed BEFORE that turn's
   # end — the ordering is ambiguous, and ambiguous is not "the boundary
@@ -2194,7 +2210,7 @@ defmodule Tightbeam.Wakes do
   end
 
   # THE LATEST turn end for this session, or nil if none has ever ended. A
-  # turn boundary is the moment an in-flight turn ENDS — nothing
+  # turn boundary is the moment an in-flight turn ENDS  — nothing
   # here judges whether the session is otherwise busy; queued or running work
   # behind the boundary is not a reason to hold what already crossed it.
   defp latest_turn_end(txn, session_key) do
@@ -2212,7 +2228,9 @@ defmodule Tightbeam.Wakes do
     {class, target_label, carrier_fields, pinned_owner} = carrier_shape(txn, group_key)
     {work_item_id, assignment_id} = shared_work(members)
 
-    # MINTED HERE, not left to `schedule_in_txn`'s default. Minting it before the prompt is built is
+    # MINTED HERE, not left to `schedule_in_txn`'s default: `digest-members`
+    # needs a wake id no agent
+    # could otherwise discover). Minting it before the prompt is built is
     # what lets the delivered digest sign itself with its OWN id.
     carrier_wake_id = "w_" <> Tightbeam.Id.uuid4()
 
@@ -2270,14 +2288,16 @@ defmodule Tightbeam.Wakes do
     digest.wake_id
   end
 
-  # PIN THE PAST:
+  # PIN THE PAST (specs roles-registry-v1.md:31 — ):
   # a role carrier's authority fact is decided HERE, once, in the SAME
   # transaction as the carrier itself, and never re-derived from a live role
   # lookup later. `nil` for a session group (there is no role to pin; the
   # carrier's own `sessionKey` already IS the pinned fact, durably, since
   # sessions are never hard-deleted).
   #
-  # `URI.encode_www_form/1`: a user id is opaque text, not a token — a raw
+  # `URI.encode_www_form/1` — the same convention
+  # `client_e2e/sim_client.ex` already uses for embedding an opaque value in
+  # a `key=value` text field): a user id is opaque text, not a token — a raw
   # `ownerUserId=#{owner}` was LOSSY for one containing a space, and lossy in
   # a way that transfers authority: "alice bob" pinned and read back as
   # bare "alice" would hand the OLD carrier's audit to a real user named
@@ -2424,6 +2444,61 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  @doc "Read a visible digest carrier's members with their shared R9 dependency version."
+  @spec query_digest_members(db(), map()) :: [map()] | nil
+  def query_digest_members(db, %{key: digest_wake_id, principal: principal})
+      when is_binary(digest_wake_id) and is_map(principal) do
+    carrier =
+      StateResources.query_wake(db, %{key: digest_wake_id, principal: principal})
+
+    if not is_nil(carrier) and StateVisibility.digest_member_visible?(db, carrier, principal) do
+      members =
+        db
+        |> digest_members(digest_wake_id)
+        |> Enum.sort_by(&{Map.fetch!(&1, :created_at), Map.fetch!(&1, :wake_id)})
+
+      dependency_version = digest_members_dependency_version(db, digest_wake_id, members)
+
+      Enum.map(members, &Map.put(&1, :dependency_version, dependency_version))
+    else
+      nil
+    end
+  end
+
+  defp digest_members_dependency_version(db, digest_wake_id, members) do
+    wake_ids =
+      [digest_wake_id | Enum.map(members, &Map.fetch!(&1, :wake_id))]
+      |> Enum.uniq()
+
+    placeholders = Enum.map_join(1..length(wake_ids), ",", &"?#{&1}")
+
+    {:ok, wake_rows} =
+      DB.query(
+        db,
+        """
+        SELECT wakeId, createdAt, firedAt, canceledAt
+        FROM wakes
+        WHERE wakeId IN (#{placeholders})
+        """,
+        wake_ids
+      )
+
+    entries =
+      Enum.map(wake_rows, fn [wake_id, created_at, fired_at, canceled_at] ->
+        {"wakes", wake_id,
+         [created_at, fired_at, canceled_at]
+         |> Enum.filter(&is_integer/1)
+         |> Enum.max(fn -> raise ArgumentError, "wake dependency has no natural version" end)}
+      end)
+
+    vector =
+      entries
+      |> Enum.map(fn {resource, key, version} -> [resource, key, version] end)
+      |> Enum.sort_by(fn [resource, key, _version] -> {resource, JSON.encode!(key)} end)
+
+    :crypto.hash(:sha256, JSON.encode!(vector)) |> Base.encode16(case: :lower)
+  end
+
   ## The classed-row read (fabric §12 Q5; §11 acceptance 1)
 
   @doc """
@@ -2460,7 +2535,8 @@ defmodule Tightbeam.Wakes do
           -- the share this query exists to measure — a wake-materialized turn
           -- counts here whether or not the fabric ever stamped it.
           --
-          -- `w.wakeId IS NOT NULL` — not `t.wakeId IS NOT NULL`: the LEFT JOIN's `w.*` columns are also
+          -- `w.wakeId IS NOT NULL` — not `t.wakeId IS NOT NULL`: the LEFT JOIN's
+          -- `w.*` columns are also
           -- NULL when `t.wakeId` names a wake that does not exist (a dangling
           -- reference), and a naive `COALESCE(w.class, '') <> 'algedonic'`
           -- treats a JOIN MISS exactly like a real unclassed wake — counting
@@ -2739,9 +2815,8 @@ defmodule Tightbeam.Wakes do
   # pending branch, drain SCHEDULES a wake, and this sweep FIRES it — so a
   # work-blocked fact asserted after the drain's recheck but before the fire
   # still has one effectful edge left to recognize at. Only supervision's own
-  # wakes are eligible: reserved process principal origin AND an assignmentId
-  # AND the prompt consumer AND NOT a digest carrier — today that combination
-  # is
+  # wakes are eligible: origin `process:tightbeam` AND an assignmentId AND the
+  # prompt consumer AND NOT a digest carrier — today that combination is
   # scheduled nowhere else (the escalation decision notices carry no
   # assignmentId), and it must stay that way or this discriminator learns to
   # suppress someone else's mail. The `not wake.digest` guard is load-bearing

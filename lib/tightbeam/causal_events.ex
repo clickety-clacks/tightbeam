@@ -38,7 +38,7 @@ defmodule Tightbeam.CausalEvents do
 
   # The v2-EPOCH CUTOFF: when causal_events first came into existence. Attests
   # filed before it are pre-v2 history that this table was never going to record,
-  # and the spec forbids retroactively emitting events for them (cross-review F5).
+  # and the spec forbids retroactively emitting events for them.
   # One row, written only at first creation, so it is stable across every later boot.
   @epoch_ddl """
   CREATE TABLE IF NOT EXISTS causal_events_epoch (
@@ -125,7 +125,7 @@ defmodule Tightbeam.CausalEvents do
   BOUNDED to attests filed at/after the v2-epoch cutoff — the moment
   causal_events was created. Scanning an assignment's whole attest history would
   make the FIRST post-migration attest retroactively emit an event for every
-  historical one, which the spec forbids outright (cross-review F5). A hard
+  historical one, which the spec forbids outright. A hard
   timestamp floor is the bound rather than "how many arrived since the last
   evaluation", because `attestCount` is a mutable aggregate and cannot be trusted
   to fence pre-v2 rows.

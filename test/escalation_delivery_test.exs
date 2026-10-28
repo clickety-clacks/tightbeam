@@ -921,7 +921,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
   # A retarget is the expecter/deadline rotation CAS, not a ruling or withdrawal.
   #
   # This is INTENTIONALLY not what the pre-r2 check matched, in two cases the
-  # cross-review found, and both changes are the point rather than a side effect:
+  # both changes are deliberate parts of the behavior rather than side effects:
   #
   #   `UPDATE decision_requests SET expecterSessionKey=?1` — no space before `=`.
   #   Was NOT matched, now IS. SQL does not require that space, so the old check

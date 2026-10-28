@@ -843,7 +843,7 @@ defmodule Tightbeam.ActivationsTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "test-host"
+      host: "host-b"
     })
   end
 end

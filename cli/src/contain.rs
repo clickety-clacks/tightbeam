@@ -716,7 +716,7 @@ mod platform {
             let _ = writeln!(out, "    {path}: {}", enforcement_trace(path));
         }
 
-        // stage() END-TO-END: the wrapper's actual entry, on multi-root profiles that
+        // stage END-TO-END: the wrapper's actual entry, on multi-root profiles that
         // mirror a real rail profile (a fresh scratch dir + the fixed /dev/null grant). If
         // the single-root trace above succeeds but a multi-root stage refuses, the bug is
         // in accumulating rules on one ruleset, not in any single grant.
@@ -1557,7 +1557,7 @@ mod tests {
     fn timeout_does_not_join_a_reader_held_open_by_an_escaped_descendant() {
         let dir = temp_dir();
         let escaped_pid_path = dir.join("escaped.pid");
-        // setsid() takes the child out of the process group, so the wrapper's group kill
+        // setsid takes the child out of the process group, so the wrapper's group kill
         // cannot reach it and it holds the inherited stdout open for far longer than a
         // loaded runner needs to fork, exec and time out. It records its own pid, which is
         // what makes its survival checkable instead of inferred from a stopwatch.
@@ -1574,7 +1574,7 @@ mod tests {
         //     escape latency  <  BUDGET  <  descendant lifetime (30s)
         //
         // The left side is why the siblings' 40ms will not do — at 40ms the group kill
-        // lands before perl reaches setsid(), nothing escapes to hold the reader open, and
+        // lands before perl reaches setsid, nothing escapes to hold the reader open, and
         // the test passes without exercising the seam. The right side is what makes the
         // wrapper time out at all rather than returning when the pipe closes.
         //

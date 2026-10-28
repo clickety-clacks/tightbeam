@@ -64,7 +64,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "test-host" => %{
+      "host-b" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -78,7 +78,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
       )
 
     # Owners are always users; bracket wakes target the owner's personal session.
-    example_main = session(db, Org.personal_session_key("sample-user"), "sample-user")
+    sample-user_main = session(db, Org.personal_session_key("sample-user"), "sample-user")
     _dana_main = session(db, Org.personal_session_key("dana"), "dana")
     holder = session(db, "holder", "sample-user")
     dsession = session(db, "dsession", "dana")
@@ -92,7 +92,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     %{
       db: db,
       handlers: handlers,
-      example_main: example_main,
+      sample-user_main: sample-user_main,
       holder: holder,
       dsession: dsession
     }
@@ -118,9 +118,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     original_routing = routing_wake_id(ctx.db, keyed.id)
     assert is_binary(original_routing)
 
-    replay =
-      create(ctx, {:user, "sample-user"}, %{title: "Different title", idempotency_key: "kc"})
-
+    replay = create(ctx, {:user, "sample-user"}, %{title: "Different title", idempotency_key: "kc"})
     assert replay.id == keyed.id
     # Replay arms NOTHING new: same routing wake, still exactly one pending wake.
     assert routing_wake_id(ctx.db, keyed.id) == original_routing
@@ -362,10 +360,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     # cannot-proceed keeps the assignment open, so it must not arm a slate wake.
     blocked_item = create(ctx, {:user, "sample-user"}, %{title: "Blocked"})
-
-    {:ok, blocked} =
-      disp_assign(ctx, {:user, "sample-user"}, "holder", "blocked", blocked_item.id)
-
+    {:ok, blocked} = disp_assign(ctx, {:user, "sample-user"}, "holder", "blocked", blocked_item.id)
     cannot_proceed(ctx, "holder", blocked.id)
     assert slate_wake_id(ctx.db, blocked_item.id) == nil
 
@@ -551,9 +546,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     for work_item_id <- [item.id, other.id, nil, "wi_unknown"] do
       assert {:ok, replay} =
-               disp_dispatch(ctx, {:user, "sample-user"}, "holder", "ship", work_item_id,
-                 key: "dk"
-               )
+               disp_dispatch(ctx, {:user, "sample-user"}, "holder", "ship", work_item_id, key: "dk")
 
       assert replay.id == orig.id
       assert replay.workItemId == item.id
@@ -612,9 +605,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     item = create(ctx, {:user, "sample-user"}, %{title: "Reasoned"})
 
     assert %{workItem: %{failReason: "cannot repro"}} =
-             dispose(ctx, "work-item-fail", {:user, "sample-user"}, item.id, %{
-               reason: "cannot repro"
-             })
+             dispose(ctx, "work-item-fail", {:user, "sample-user"}, item.id, %{reason: "cannot repro"})
 
     assert get(ctx, item.id).workItem.failReason == "cannot repro"
     assert Enum.find(list(ctx).workItems, &(&1.id == item.id)).failReason == "cannot repro"
@@ -668,19 +659,19 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   test "Proof 15: an actual create publishes to the owner's board (unassigned); replay is silent",
        ctx do
-    sample_user = observe("sample-user")
+    sample-user = observe("sample-user")
     eve = observe("eve")
 
     # An UNASSIGNED item has no holders: the doorbell must still reach its owner.
     item = create(ctx, {:user, "sample-user"}, %{title: "Doorbell", idempotency_key: "dk"})
     assert doorbell_count(ctx.db, item.id) == 1
-    assert [%{"type" => "work_item_event", "kind" => "metadata"}] = Observer.drain(sample_user)
+    assert [%{"type" => "work_item_event", "kind" => "metadata"}] = Observer.drain(sample-user)
     assert Observer.drain(eve) == []
 
     replay = create(ctx, {:user, "sample-user"}, %{title: "Doorbell", idempotency_key: "dk"})
     assert replay.id == item.id
     assert doorbell_count(ctx.db, item.id) == 1
-    assert Observer.drain(sample_user) == []
+    assert Observer.drain(sample-user) == []
 
     assert item.id in item_ids(WorkState.list_items(ctx.db, %{owner_user_id: "sample-user"}))
     refute item.id in item_ids(WorkState.list_items(ctx.db, %{owner_user_id: "eve"}))
@@ -775,15 +766,15 @@ defmodule Tightbeam.WorkItemBracketsTest do
     base = doorbell_count(ctx.db, item.id)
 
     # A disposition on an UNASSIGNED item still reaches the owner's board.
-    sample_user = observe("sample-user")
+    sample-user = observe("sample-user")
     dispose(ctx, "work-item-icebox", {:user, "sample-user"}, item.id)
     assert doorbell_count(ctx.db, item.id) == base + 1
-    assert [%{"type" => "work_item_event", "kind" => "metadata"}] = Observer.drain(sample_user)
+    assert [%{"type" => "work_item_event", "kind" => "metadata"}] = Observer.drain(sample-user)
 
     # Same-state no-op: no doorbell, no publish.
     dispose(ctx, "work-item-icebox", {:user, "sample-user"}, item.id)
     assert doorbell_count(ctx.db, item.id) == base + 1
-    assert Observer.drain(sample_user) == []
+    assert Observer.drain(sample-user) == []
 
     dispose(ctx, "work-item-reopen", {:user, "sample-user"}, item.id)
     assert doorbell_count(ctx.db, item.id) == base + 2
@@ -884,19 +875,12 @@ defmodule Tightbeam.WorkItemBracketsTest do
       )
 
   defp list(ctx),
-    do:
-      ctx.handlers["work-item-list"].(
-        work_item_call("work-item-list", {:user, "sample-user"}, %{})
-      )
+    do: ctx.handlers["work-item-list"].(work_item_call("work-item-list", {:user, "sample-user"}, %{}))
 
   defp update(ctx, id, patch),
     do:
       ctx.handlers["work-item-update"].(
-        work_item_call(
-          "work-item-update",
-          {:user, "sample-user"},
-          Map.put(patch, :work_item_id, id)
-        )
+        work_item_call("work-item-update", {:user, "sample-user"}, Map.put(patch, :work_item_id, id))
       )
 
   defp work_item_call(verb, principal, params) do
@@ -1120,7 +1104,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "test-host"
+      host: "host-b"
     })
   end
 end

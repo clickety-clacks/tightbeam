@@ -1,8 +1,9 @@
 defmodule Tightbeam.ApplicationRefusalTest do
   # AN EXPECTED REFUSAL MUST EXIT WITH ITS SENTENCE; A DEFECT MUST STILL CRASH.
   #
-  # A no-harness-CLI refusal must not produce "Kernel pid terminated
-  # (application_controller)" or an erl_crash.dump — a release runs the app as
+  # Measured on host-d from the npm tarball, before the fix: the no-harness-CLI refusal
+  # printed the right words and then produced "Kernel pid terminated
+  # (application_controller)" plus an erl_crash.dump — a release runs the app as
   # permanent, so `{:error, _}` from start/2 escalates into a kernel panic.
   #
   # This boots the application IN A SUBPROCESS rather than asserting against a seam.
@@ -164,7 +165,7 @@ defmodule Tightbeam.ApplicationRefusalTest do
     #    Asserted as "no dump APPEARED OR CHANGED", not "no dump exists": the VM writes
     #    erl_crash.dump into its working directory, which for `mix run` is the project
     #    root, and this repository already carries an unrelated one from a crash on
-    # A bare existence check therefore failed on a stale file and would
+    #    2026-07-28. A bare existence check therefore failed on a stale file and would
     #    equally have PASSED for the wrong reason on a machine where someone had just
     #    deleted one.
     assert dump_stamps(dirs_to_watch(parent)) == dump_before,

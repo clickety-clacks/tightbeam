@@ -16,7 +16,7 @@ defmodule Tightbeam.CredentialsTest do
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
-        machine: "test-host",
+        machine: "host-b",
         onboarders: %{
           openai: fn _state ->
             send(owner, {:step, :obtain})
@@ -61,7 +61,7 @@ defmodule Tightbeam.CredentialsTest do
     refute_receive {:step, :credential_present}
 
     store = Path.join([ctx.base, "auth", "codex", "auth.json"])
-    home = Path.join([ctx.base, "homes", "test-host", "codex", "auth.json"])
+    home = Path.join([ctx.base, "homes", "host-b", "codex", "auth.json"])
     metadata = Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"])
     assert File.stat!(store).mode |> Bitwise.band(0o777) == 0o600
     assert File.stat!(metadata).mode |> Bitwise.band(0o777) == 0o600
@@ -76,7 +76,7 @@ defmodule Tightbeam.CredentialsTest do
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
-        machine: "test-host",
+        machine: "host-b",
         onboarders: %{openai: fn _ -> {:error, :human_unavailable} end},
         gate: fn _ ->
           send(owner, :gate)
@@ -110,7 +110,7 @@ defmodule Tightbeam.CredentialsTest do
 
   test "an absent credential store is missing rather than unreadable", ctx do
     store = Path.join([ctx.base, "auth", "codex"])
-    {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
+    {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
     refute File.exists?(store)
     assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
@@ -126,7 +126,7 @@ defmodule Tightbeam.CredentialsTest do
     File.mkdir_p!(Path.dirname(store))
     File.ln_s!(target, store)
 
-    {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
+    {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
     reason =
       {:credential_store_unreadable, %{path: store, found: :symlink, expected: :directory}}
@@ -141,7 +141,7 @@ defmodule Tightbeam.CredentialsTest do
     File.mkdir_p!(Path.dirname(metadata))
     File.write!(metadata, "not json")
 
-    {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
+    {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
     assert Credentials.status(:openai, server) ==
              {:needs_onboarding,
@@ -181,7 +181,7 @@ defmodule Tightbeam.CredentialsTest do
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
-        machine: "test-host",
+        machine: "host-b",
         onboarders: %{openai: fn _ -> flunk("onboarder ran while runtime was live") end},
         stop: fn :openai -> {:error, :runtime_live} end
       )
@@ -195,7 +195,7 @@ defmodule Tightbeam.CredentialsTest do
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
-        machine: "test-host",
+        machine: "host-b",
         now: fn -> 100 end,
         onboarders: %{
           anthropic: fn _ ->
@@ -257,7 +257,7 @@ defmodule Tightbeam.CredentialsTest do
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
-        machine: "test-host",
+        machine: "host-b",
         onboarders: %{
           openai: fn _ -> {:ok, %{bytes: "replacement", expires_at: nil}} end
         },
@@ -330,7 +330,7 @@ defmodule Tightbeam.CredentialsTest do
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
-        machine: "test-host",
+        machine: "host-b",
         park_edge: Tightbeam.CommandEdge.request_to(park_receiver),
         capture_sessions: fn :openai -> [:captured_session] end,
         publish_sessions: fn captured, transition ->
@@ -350,7 +350,7 @@ defmodule Tightbeam.CredentialsTest do
 
     assert Process.alive?(server)
     assert Credentials.status(:openai, server) == {:needs_onboarding, :revoked}
-    assert_receive {:log_event, "credential_park_unconfirmed", "openai@test-host", detail}
+    assert_receive {:log_event, "credential_park_unconfirmed", "openai@host-b", detail}
     assert detail =~ "park_unconfirmed"
     refute_receive {:publish, _, _}
 
@@ -376,7 +376,7 @@ defmodule Tightbeam.CredentialsTest do
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
-        machine: "test-host",
+        machine: "host-b",
         onboarders: %{openai: fn _ -> {:ok, %{bytes: "replacement", expires_at: nil}} end},
         park_edge: Tightbeam.CommandEdge.request_to(park_receiver)
       )
@@ -410,7 +410,7 @@ defmodule Tightbeam.CredentialsTest do
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
-        machine: "test-host",
+        machine: "host-b",
         capture_sessions: fn :openai -> Agent.get(membership, & &1) end,
         park_edge: Tightbeam.CommandEdge.request_to(park_receiver),
         publish_sessions: fn captured, transition ->
@@ -433,7 +433,7 @@ defmodule Tightbeam.CredentialsTest do
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
-        machine: "test-host",
+        machine: "host-b",
         onboarders: %{
           openai: fn _state -> {:ok, %{bytes: "replacement", expires_at: nil}} end
         },
@@ -457,7 +457,7 @@ defmodule Tightbeam.CredentialsTest do
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
-        machine: "test-host",
+        machine: "host-b",
         onboarders: %{anthropic: fn _ -> {:error, {:unsupported, :no_subscription}} end}
       )
 
@@ -477,7 +477,7 @@ defmodule Tightbeam.CredentialsTest do
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
-        machine: "test-host",
+        machine: "host-b",
         gate: fn _ ->
           send(owner, :gate)
           :ok
@@ -549,7 +549,7 @@ defmodule Tightbeam.CredentialsTest do
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
-        machine: "test-host",
+        machine: "host-b",
         stop: fn provider ->
           Agent.update(prior_runtime, fn _ -> :parked end)
           send(owner, {:forbidden_stop, provider})
@@ -641,7 +641,7 @@ defmodule Tightbeam.CredentialsTest do
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
-        machine: "test-host",
+        machine: "host-b",
         publish_sessions: fn _captured, transition ->
           send(owner, {:forbidden_cancel_publish, transition})
         end
@@ -672,7 +672,7 @@ defmodule Tightbeam.CredentialsTest do
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
-        machine: "test-host",
+        machine: "host-b",
         stop: fn provider ->
           send(owner, {:stop, provider})
           :ok
@@ -699,7 +699,7 @@ defmodule Tightbeam.CredentialsTest do
 
   test "a stale cancel does not cancel the successor's lease", ctx do
     {:ok, server} =
-      Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
+      Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
     assert {:ok, _abandoned, stale_lease_id} = Credentials.begin_onboard(:anthropic, server)
     assert {:ok, fresh, current_lease_id} = Credentials.begin_onboard(:anthropic, server)
@@ -715,7 +715,7 @@ defmodule Tightbeam.CredentialsTest do
 
   test "an operator whose CLI died can immediately begin again", ctx do
     {:ok, server} =
-      Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
+      Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
     assert {:ok, abandoned, _abandoned_id} = Credentials.begin_onboard(:anthropic, server)
     assert {:ok, fresh, _fresh_id} = Credentials.begin_onboard(:anthropic, server)
@@ -735,7 +735,7 @@ defmodule Tightbeam.CredentialsTest do
       Credentials.start_link(
         name: nil,
         base_dir: ctx.base,
-        machine: "test-host",
+        machine: "host-b",
         onboarding_lease_ms: 60_000,
         now: fn -> :counters.get(clock, 1) end,
         log_event: fn kind, subject, detail ->
@@ -755,7 +755,7 @@ defmodule Tightbeam.CredentialsTest do
     # the condition an explicit cancel would have left — staging gone, pending cleared —
     # and the expiry is logged as its own lifecycle event carrying `lease_expired`.
     assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
-    assert_received {:event, "credential_lease_expired", "openai@test-host", nil}
+    assert_received {:event, "credential_lease_expired", "openai@host-b", nil}
     refute File.exists?(staging)
 
     # And the next begin succeeds on fresh staging without a restart.
@@ -771,7 +771,7 @@ defmodule Tightbeam.CredentialsTest do
         Credentials.start_link(
           name: nil,
           base_dir: ctx.base,
-          machine: "test-host",
+          machine: "host-b",
           stop: fn :openai ->
             assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
                      ~S({"token":"candidate"})
@@ -821,7 +821,7 @@ defmodule Tightbeam.CredentialsTest do
         Credentials.start_link(
           name: nil,
           base_dir: ctx.base,
-          machine: "test-host",
+          machine: "host-b",
           start: fn :openai, :subscription ->
             send(owner, {:finish_step, :start})
             :ok
@@ -871,7 +871,7 @@ defmodule Tightbeam.CredentialsTest do
         Credentials.start_link(
           name: nil,
           base_dir: ctx.base,
-          machine: "test-host",
+          machine: "host-b",
           start: fn :openai, :subscription -> {:error, :runtime_start_failed} end,
           on_credential_present: fn _ -> send(owner, :forbidden_credential_present) end,
           resume: fn _ -> send(owner, :forbidden_resume) end,
@@ -886,7 +886,7 @@ defmodule Tightbeam.CredentialsTest do
 
       # The operator's credential stays where they put it: the substrate holds no
       # opinion about a vendor login, and reverting one silently resumes spend on
-      # an account the operator believes is disconnected.
+      # an account the operator believes is disconnected (Mike, 2026-08-14).
       assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
                ~S({"token":"candidate"})
 
@@ -908,7 +908,7 @@ defmodule Tightbeam.CredentialsTest do
         Credentials.start_link(
           name: nil,
           base_dir: ctx.base,
-          machine: "test-host",
+          machine: "host-b",
           start: fn :openai, :subscription -> {:error, :runtime_start_failed} end
         )
 
@@ -920,7 +920,7 @@ defmodule Tightbeam.CredentialsTest do
 
       # A fresh server reads only durable state: the marker, not the memory.
       {:ok, restarted} =
-        Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
+        Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
       assert {:needs_onboarding, {:present_but_unverified, cause}} =
                Credentials.status(:openai, restarted)
@@ -946,7 +946,7 @@ defmodule Tightbeam.CredentialsTest do
           Credentials.start_link(
             name: nil,
             base_dir: base,
-            machine: "test-host",
+            machine: "host-b",
             start: fn :openai, :subscription -> fail_start.() end,
             on_credential_present: fn _ -> send(owner, :forbidden_credential_present) end,
             resume: fn _ -> send(owner, :forbidden_resume) end,
@@ -979,7 +979,7 @@ defmodule Tightbeam.CredentialsTest do
       refute_receive :forbidden_publish
     end
 
-    # The prior contract restored the previous
+    # THE INCIDENT TEST (2026-08-14). The prior contract restored the previous
     # credential when activation failed, which meant an operator who watched a
     # login fail — and may have chosen to stay logged out, "I was running out of
     # tokens anyway" — silently kept spending on the account they believed was
@@ -1001,7 +1001,7 @@ defmodule Tightbeam.CredentialsTest do
         Credentials.start_link(
           name: nil,
           base_dir: ctx.base,
-          machine: "test-host",
+          machine: "host-b",
           start: fn :openai, :subscription -> {:error, :runtime_start_failed} end,
           on_credential_present: fn _ -> send(owner, :forbidden_credential_present) end
         )
@@ -1033,7 +1033,7 @@ defmodule Tightbeam.CredentialsTest do
     test "a satellite metadata failure refuses without transporting credential bytes", ctx do
       owner = self()
 
-      # Seed a PRIOR onboarded credential, so the stale-health scenario reviewer
+      # Seed a PRIOR onboarded credential, so the stale-health scenario Sol
       # named has something stale to leave behind if the ordering regresses.
       prior_credential = "prior-satellite-secret"
       credential_path = Path.join([ctx.base, "auth", "codex", "auth.json"])
@@ -1078,7 +1078,7 @@ defmodule Tightbeam.CredentialsTest do
       # Nothing was installed, so the prior state stays coherent: the prior
       # credential and its prior metadata still describe each other. The stale
       # `onboarded: true` can never come to describe a candidate that was never
-      # activated.
+      # activated candidate.
       assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) == prior_credential
 
       # And a restarted gateway reads the same thing from disk, not from memory.
@@ -1255,7 +1255,7 @@ defmodule Tightbeam.CredentialsTest do
 
   describe "credential kind" do
     test "an API key banks with its kind recorded and no expiry", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(staging, ".credentials.json"), "sk-ant-api03-staged")
@@ -1278,7 +1278,7 @@ defmodule Tightbeam.CredentialsTest do
     end
 
     test "a subscription banks with its kind and keeps its expiry", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
 
@@ -1298,7 +1298,7 @@ defmodule Tightbeam.CredentialsTest do
     end
 
     test "no credential is its own state, not a kind", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
       assert Credentials.kind(:anthropic, server) == :none
       assert Credentials.kind(:openai, server) == :none
@@ -1306,7 +1306,7 @@ defmodule Tightbeam.CredentialsTest do
     end
 
     test "one host holds a different kind per provider", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
 
       {:ok, claude_staging, claude_lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(claude_staging, ".credentials.json"), "sk-ant-api03-staged")
@@ -1337,11 +1337,15 @@ defmodule Tightbeam.CredentialsTest do
   # THE ARTIFACT, NOT AN IDEALISED VERSION OF IT.
   #
   # The key SET is captured from the vendor's own writer, not invented: three independent
-  # Captured `.credentials.json` examples carry exactly these seven keys, in this
-  # order. Keeping the full shape ensures the guard handles the complete vendor record.
+  # Claude-Code-written `.credentials.json` files on host-a (the live one plus the two
+  # rename-aside backups `.pre-harvest-*` and `.stale-*`) carry exactly these seven keys, in
+  # this order. An earlier version of these tests used a four-key subset, which is a
+  # hand-drawn fixture wearing the incident's clothes: it would stay green against a guard
+  # that only ever handled the tidy shape, and the file that actually broke host-b has three
+  # more keys than that.
   #
-  # The sample has empty `accessToken` and `refreshToken` fields and `expiresAt` 0.
-  # The remaining fields preserve the vendor record's shape; the
+  # PROVENANCE, stated exactly. File-verified from the incident: `accessToken` empty,
+  # `refreshToken` empty, `expiresAt` 0. Captured from the vendor's live key set: the
   # remaining four keys and their types. The zeroed/emptied VALUES for those four are the
   # inference — a cleared record keeps its keys — and they are deliberately the part under
   # test, because the guard must not depend on which of them happen to be present.
@@ -1354,7 +1358,7 @@ defmodule Tightbeam.CredentialsTest do
   describe "banking refuses a hollow credential" do
     test "harvesting a hollow vendor record refuses, names it, and banks nothing", ctx do
       store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
-      home = Path.join([ctx.base, "homes", "test-host", "claude"])
+      home = Path.join([ctx.base, "homes", "host-b", "claude"])
       File.mkdir_p!(Path.dirname(store))
       File.mkdir_p!(home)
 
@@ -1363,7 +1367,7 @@ defmodule Tightbeam.CredentialsTest do
 
       File.write!(store, good)
 
-      # The fixture preserves every key, with empty or zero values.
+      # The shape observed on host-a: every key present, every value empty or zero.
       File.write!(
         Path.join(home, ".credentials.json"),
         @hollow_vendor_record
@@ -1450,7 +1454,7 @@ defmodule Tightbeam.CredentialsTest do
     # every api_key install on this path.
     test "a bare api key still harvests — it is not an OAuth record", ctx do
       store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
-      home = Path.join([ctx.base, "homes", "test-host", "claude"])
+      home = Path.join([ctx.base, "homes", "host-b", "claude"])
       File.mkdir_p!(Path.dirname(store))
       File.mkdir_p!(home)
       File.write!(store, "sk-ant-api03-old")
@@ -1462,7 +1466,7 @@ defmodule Tightbeam.CredentialsTest do
 
     test "a healthy vendor rotation still harvests", ctx do
       store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
-      home = Path.join([ctx.base, "homes", "test-host", "claude"])
+      home = Path.join([ctx.base, "homes", "host-b", "claude"])
       File.mkdir_p!(Path.dirname(store))
       File.mkdir_p!(home)
 
@@ -1489,7 +1493,7 @@ defmodule Tightbeam.CredentialsTest do
     # this path later, which a test aimed at `sweep_auth` alone would sail straight past.
     test "a hollow home does not stop the gateway from composing its boot children", ctx do
       store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
-      home = Path.join([ctx.base, "homes", "test-host", "claude"])
+      home = Path.join([ctx.base, "homes", "host-b", "claude"])
       File.mkdir_p!(Path.dirname(store))
       File.mkdir_p!(home)
       File.write!(store, @healthy_vendor_record)
@@ -1527,7 +1531,7 @@ defmodule Tightbeam.CredentialsTest do
     # this one goes through `write_credential!/3` and `atomic_write!`, a different mechanism
     # from the harvest route above, and a guard that is never exercised is not a guard.
     test "the onboarding ceremony refuses to bank a hollow credential", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "test-host")
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "host-b")
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
 
       File.write!(
@@ -1560,7 +1564,7 @@ defmodule Tightbeam.CredentialsTest do
 
       File.write!(store, good)
 
-      home = Tightbeam.Homes.home_path(ctx.base, "test-host", :claude)
+      home = Tightbeam.Homes.home_path(ctx.base, "host-b", :claude)
       File.mkdir_p!(home)
 
       # A REGULAR file in the home, not the symlink reconcile normally leaves: that is
@@ -1571,7 +1575,7 @@ defmodule Tightbeam.CredentialsTest do
       )
 
       assert_raise RuntimeError, fn ->
-        Tightbeam.Homes.project(ctx.base, %{harness: :claude, machine: "test-host", rails: nil})
+        Tightbeam.Homes.project(ctx.base, %{harness: :claude, machine: "host-b", rails: nil})
       end
 
       assert File.read!(store) == good

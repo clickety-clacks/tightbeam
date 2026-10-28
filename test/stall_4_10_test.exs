@@ -15,22 +15,19 @@ defmodule Tightbeam.Stall410Test do
         "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('mike',0,'admin_add',1),('other',0,'admin_add',1)"
       )
 
-    example_session = session(db, Org.personal_session_key("mike"), "mike")
+    mike_session = session(db, Org.personal_session_key("mike"), "mike")
     _other_session = session(db, Org.personal_session_key("other"), "other")
-    %{db: db, example_session: example_session}
+    %{db: db, mike_session: mike_session}
   end
 
-  test "direct and relayed user provenance qualify; another user's item does not", ctx do
+  test "direct and relayed Mike provenance qualify; another user's item does not", ctx do
     direct = create(ctx.db, {:user, "mike"}, "direct")
-    relayed = create(ctx.db, {:session, ctx.example_session.session_key}, "relayed")
+    relayed = create(ctx.db, {:session, ctx.mike_session.session_key}, "relayed")
     other = create(ctx.db, {:user, "other"}, "other")
     behind = create(ctx.db, {:user, "mike"}, "behind")
 
-    assert %{mode: "notice"} =
-             deprioritize(ctx.db, {:user, "mike"}, direct.id, behind.id, "d1")
-
-    assert %{mode: "notice"} =
-             deprioritize(ctx.db, {:user, "mike"}, relayed.id, behind.id, "d2")
+    assert %{mode: "notice"} = deprioritize(ctx.db, {:user, "mike"}, direct.id, behind.id, "d1")
+    assert %{mode: "notice"} = deprioritize(ctx.db, {:user, "mike"}, relayed.id, behind.id, "d2")
 
     assert %{code: "not_mike_sourced"} =
              deprioritize(ctx.db, {:user, "other"}, other.id, other.id, "o1")
@@ -67,7 +64,7 @@ defmodule Tightbeam.Stall410Test do
              WorkItems.__handle__(
                ctx.db,
                "work-item-deprioritize",
-               call({:session, ctx.example_session.session_key}, %{
+               call({:session, ctx.mike_session.session_key}, %{
                  work_item_id: item.id,
                  behind_work_item_id: behind.id,
                  mode: :ask,
@@ -82,7 +79,7 @@ defmodule Tightbeam.Stall410Test do
              WorkItems.__handle__(
                ctx.db,
                "work-item-deprioritize",
-               call({:session, ctx.example_session.session_key}, %{
+               call({:session, ctx.mike_session.session_key}, %{
                  work_item_id: item.id,
                  behind_work_item_id: behind.id,
                  mode: :ask,
@@ -348,7 +345,7 @@ defmodule Tightbeam.Stall410Test do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "test-host"
+      host: "host-b"
     })
   end
 end

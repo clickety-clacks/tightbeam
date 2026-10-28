@@ -73,7 +73,7 @@ defmodule Tightbeam.ModelCatalogTest do
     assert Enum.map(codex, & &1.family) == ["gpt-5.6-sol"]
 
     codex_sol = Enum.find(codex, &(&1.family == "gpt-5.6-sol"))
-    assert codex_sol.display_name == "GPT-5.6-Example"
+    assert codex_sol.display_name == "GPT-5.6-Sol"
     assert codex_sol.max_input_tokens == 272_000
     assert codex_sol.efforts == ["low", "medium", "high", "xhigh", "max", "ultra"]
 
@@ -148,7 +148,7 @@ defmodule Tightbeam.ModelCatalogTest do
     %{
       "type" => "model",
       "id" => id,
-      "display_name" => "Claude Example Model 5",
+      "display_name" => "Claude Fable 5",
       "max_input_tokens" => 1_000_000,
       "capabilities" => %{
         "effort" => %{
@@ -561,7 +561,7 @@ defmodule Tightbeam.ModelCatalogTest do
     assert is_map(Gateway.org_options())
   end
 
-  # Credential rotation can replace `.credentials.json` inside the harness home
+  # Issue #9: Claude Code rotates `.credentials.json` inside the harness home
   # (write-temp-then-rename), which severs the symlink to the store copy. The
   # store copy freezes on the pre-rotation token and the provider revokes it,
   # so every refresh 401s "revoked" against a token that is fine everywhere
@@ -805,7 +805,7 @@ defmodule Tightbeam.ModelCatalogTest do
     # not a slope: it waits out `GenServer.call`'s 5s and then comes back in the
     # shape the match above already refuses. So the number only has to separate
     # "served while the fetch hangs" from that floor. Three ordered quantities,
-    # measured on a four-core Linux box: served costs 44-122us idle and
+    # measured on a 4-core linux box 2026-07-29: served costs 44-122us idle and
     # 12ms (read) / 74ms (list) with the four cores 3x oversubscribed; the bound
     # below is 1s; the blocked floor is 5s. The old 100_000 sat inside the loaded
     # range, so a busy runner failed it with nothing wrong — and a wall-clock
@@ -1236,7 +1236,7 @@ defmodule Tightbeam.ModelCatalogTest do
       {local, :fresh} = ModelCatalog.get(@host, "claude", catalog)
       refute Enum.any?(local, &(&1.family == "satellite-only"))
 
-      # The remote-host method: the credential is read by the shell ON the owning
+      # The test-host method: the credential is read by the shell ON the owning
       # host, so no byte of it is in the argv, and each script says so literally.
       # The shell variable is `credential`, not `token`: this file holds whichever
       # KIND the host was onboarded on.
@@ -1348,12 +1348,12 @@ defmodule Tightbeam.ModelCatalogTest do
       # The real one is the ONLY external process the catalog suite spawns, and a
       # spawn on a shared runner has an unbounded tail, so the test says when it
       # returned instead of guessing how long it takes. Three ordered quantities,
-      # measured in CI: the spawn itself is 24-38ms on Linux and
+      # measured 2026-07-29: the spawn itself is 24-38ms on the linux runner and
       # 128-168ms on the macOS one; the poll below then covers only the
       # Task -> GenServer hop that follows it (<1ms) inside its 100 x 5ms = 500ms
       # budget; the spawn gets the 10s bound of an external wait. Before this, the
       # 500ms poll covered the spawn as well — 13x the linux cost but only 3x the
-      # macOS one — and one Linux excursion past 500ms reported
+      # macOS one — and one linux excursion past 500ms (run 30430140506) reported
       # it as "condition did not become true", the shape of a broken verdict
       # rather than of a slow runner.
       parent = self()
@@ -1503,10 +1503,10 @@ defmodule Tightbeam.ModelCatalogTest do
     end
   end
 
-  # The catalog must not advertise a model the adapter will refuse, and no
+  # . The catalog must not advertise a model the adapter will refuse, and no
   # substitution may be smuggled in at the only place a mapping could live.
   describe "claude selectable-model pin" do
-    test "keeps Example Model 5.1 default and 1m vendor identities", ctx do
+    test "keeps Fable 5.1 default and 1m vendor identities", ctx do
       fetch = fn "/v1/models?limit=100", _headers ->
         {:ok,
          JSON.encode!(%{
@@ -1553,9 +1553,13 @@ defmodule Tightbeam.ModelCatalogTest do
 
       # Only selectable models survive, and the fixture's refused ones are gone.
       assert "claude-haiku-4-5-20251001" in families
-      # The configured home offers Opus 5, so it remains in the derived catalog.
+      # Re-measured 2026-08-06 on host-a (production grant): a pin-probed home
+      # offered and accepted claude-opus-5 and it answered a live prompt — the
+      # earlier REJECTED row was the default-pin vocabulary, not the grant.
       assert "claude-opus-5" in families
-      # Example Model is offered by this configured home.
+      # Re-measured 2026-08-05 on host-a (CLI 2.1.221, production grant):
+      # fable answers a real prompt; the July REJECTED row was one
+      # environment's snapshot. Fable is now offered.
       assert "claude-fable-5" in families
       refute "claude-sonnet-4-6" in families
 
@@ -1782,8 +1786,8 @@ defmodule Tightbeam.ModelCatalogTest do
       assert_receive {:fetch_started, 2}, 2_000
     end
 
-    # A completed one-shot ceremony must not leave placement refused with
-    # `:in_progress` after `status`
+    # The host-b production repro (orchestrator, 2026-08-06): a CLEAN one-shot
+    # ceremony, yet placement refused with `:in_progress` MINUTES after `status`
     # read onboarded. `credential_status/2` returns `:in_progress` only while the
     # onboarding lease stands (credentials.ex), and `finish_onboard` clears the
     # lease on completion — so the refusal minutes later is the CATALOG holding

@@ -1,0 +1,193 @@
+{
+  "provenance": {
+    "kind": "synthetic",
+    "selection": "A specification assignment, two review assignments, their terminal timeline, and a completion claim. The record relationships are preserved for this test."
+  },
+  "workItem": {
+    "createdAt": 1787638374003,
+    "createdBySession": "agent:main:sample:fixture:main s_11111111-1111-4111-8111-111111111111",
+    "createdByUser": null,
+    "failReason": null,
+    "id": "wi_166776b5-681a-5a8a-b9f6-99e0beee2805",
+    "isBug": false,
+    "ownerUserId": "tester",
+    "specRefName": "reviewed-example.md",
+    "specRefSha256": "c54714a67eefcdded572bfd116d2644f64b6602e0c26040d7409110ef63184cb",
+    "state": "closed",
+    "title": "Reviewed specification alone does not complete implementation"
+  },
+  "assignments": [
+    {
+      "id": "asg_1e52696f-413d-5fa0-b37d-84d136fea357",
+      "effectKind": "evidence",
+      "workItemId": "wi_166776b5-681a-5a8a-b9f6-99e0beee2805",
+      "reviewsAssignmentId": null,
+      "closingAttestId": "att_4c76e508-23b8-5a5a-8e66-224797fdd3a5",
+      "outcome": "completed",
+      "state": "closed"
+    },
+    {
+      "id": "asg_295031f3-f187-5675-99c3-f6f01f676a45",
+      "effectKind": "policy",
+      "subject": "Prepare a reviewed example specification without claiming implementation",
+      "workItemId": "wi_166776b5-681a-5a8a-b9f6-99e0beee2805",
+      "reviewsAssignmentId": null,
+      "closingAttestId": "att_3bdeaa72-7555-530d-867c-062c0ab56bf4",
+      "outcome": "completed",
+      "state": "closed"
+    },
+    {
+      "id": "asg_1d8f17aa-5dd4-5201-b405-5bd71f156534",
+      "effectKind": "review",
+      "workItemId": "wi_166776b5-681a-5a8a-b9f6-99e0beee2805",
+      "reviewsAssignmentId": "asg_295031f3-f187-5675-99c3-f6f01f676a45",
+      "closingAttestId": "att_7bc064b5-82a9-5990-b032-27f52a23a0c9",
+      "outcome": "completed",
+      "state": "closed"
+    },
+    {
+      "id": "asg_401435f8-b97b-59b2-976d-15e9fbdd430e",
+      "effectKind": "review",
+      "workItemId": "wi_166776b5-681a-5a8a-b9f6-99e0beee2805",
+      "reviewsAssignmentId": "asg_295031f3-f187-5675-99c3-f6f01f676a45",
+      "closingAttestId": "att_b98da6fa-bddd-56b4-91c0-f7deffcafdfd",
+      "outcome": "completed",
+      "state": "closed"
+    }
+  ],
+  "attests": [
+    {
+      "assignmentId": "asg_1e52696f-413d-5fa0-b37d-84d136fea357",
+      "id": "att_62bebf59-52ab-5505-829e-718e6c2afcf9",
+      "kind": "verdict",
+      "verdictKind": "spirit-approved",
+      "note": "Product review accepts the example specification scope.",
+      "commitRefs": null
+    },
+    {
+      "assignmentId": "asg_1d8f17aa-5dd4-5201-b405-5bd71f156534",
+      "id": "att_f58c707d-fe15-5fce-bb74-1e07171b3954",
+      "kind": "verdict",
+      "verdictKind": "changes-requested",
+      "commitRefs": [
+        {
+          "commit": "411a7ab10aaa621afa394ec3dce7b1e6953efa42",
+          "repo": "testhost:/tmp/synthetic-review-1"
+        }
+      ]
+    },
+    {
+      "assignmentId": "asg_401435f8-b97b-59b2-976d-15e9fbdd430e",
+      "id": "att_81260e09-0359-598e-9759-f9e43934c714",
+      "kind": "verdict",
+      "verdictKind": "reviewed-clean",
+      "commitRefs": [
+        {
+          "commit": "9b09091e08371122dfa5992558f020e6fa168b7d",
+          "repo": "testhost:/tmp/synthetic-review-2"
+        }
+      ]
+    },
+    {
+      "assignmentId": "asg_295031f3-f187-5675-99c3-f6f01f676a45",
+      "id": "att_3bdeaa72-7555-530d-867c-062c0ab56bf4",
+      "kind": "completion",
+      "verdictKind": null,
+      "note": "The example specification is complete; implementation remains separate.",
+      "commitRefs": [
+        {
+          "commit": "9b09091e08371122dfa5992558f020e6fa168b7d",
+          "repo": "testhost:/tmp/synthetic-review-3"
+        }
+      ]
+    }
+  ],
+  "trace": {
+    "workItem": {
+      "failReason": null,
+      "id": "wi_166776b5-681a-5a8a-b9f6-99e0beee2805",
+      "ownerUserId": "tester",
+      "state": "closed",
+      "title": "Reviewed specification alone does not complete implementation"
+    },
+    "assignments": [
+      {
+        "id": "asg_401435f8-b97b-59b2-976d-15e9fbdd430e",
+        "reviewsAssignmentId": "asg_295031f3-f187-5675-99c3-f6f01f676a45",
+        "state": "closed"
+      },
+      {
+        "id": "asg_295031f3-f187-5675-99c3-f6f01f676a45",
+        "reviewsAssignmentId": null,
+        "state": "closed"
+      },
+      {
+        "id": "asg_1e52696f-413d-5fa0-b37d-84d136fea357",
+        "reviewsAssignmentId": null,
+        "state": "closed"
+      },
+      {
+        "id": "asg_1d8f17aa-5dd4-5201-b405-5bd71f156534",
+        "reviewsAssignmentId": "asg_295031f3-f187-5675-99c3-f6f01f676a45",
+        "state": "closed"
+      }
+    ],
+    "terminalTimeline": [
+      {
+        "assignmentId": "asg_1e52696f-413d-5fa0-b37d-84d136fea357",
+        "id": "att_62bebf59-52ab-5505-829e-718e6c2afcf9",
+        "kind": "verdict",
+        "type": "attest",
+        "verdict": "spirit-approved"
+      },
+      {
+        "assignmentId": "asg_1e52696f-413d-5fa0-b37d-84d136fea357",
+        "id": "att_4c76e508-23b8-5a5a-8e66-224797fdd3a5",
+        "kind": "completion",
+        "type": "attest",
+        "verdict": null
+      },
+      {
+        "assignmentId": "asg_1d8f17aa-5dd4-5201-b405-5bd71f156534",
+        "id": "att_f58c707d-fe15-5fce-bb74-1e07171b3954",
+        "kind": "verdict",
+        "type": "attest",
+        "verdict": "changes-requested"
+      },
+      {
+        "assignmentId": "asg_1d8f17aa-5dd4-5201-b405-5bd71f156534",
+        "id": "att_7bc064b5-82a9-5990-b032-27f52a23a0c9",
+        "kind": "completion",
+        "type": "attest",
+        "verdict": null
+      },
+      {
+        "assignmentId": "asg_401435f8-b97b-59b2-976d-15e9fbdd430e",
+        "id": "att_81260e09-0359-598e-9759-f9e43934c714",
+        "kind": "verdict",
+        "type": "attest",
+        "verdict": "reviewed-clean"
+      },
+      {
+        "assignmentId": "asg_401435f8-b97b-59b2-976d-15e9fbdd430e",
+        "id": "att_b98da6fa-bddd-56b4-91c0-f7deffcafdfd",
+        "kind": "completion",
+        "type": "attest",
+        "verdict": null
+      },
+      {
+        "assignmentId": "asg_295031f3-f187-5675-99c3-f6f01f676a45",
+        "id": "att_3bdeaa72-7555-530d-867c-062c0ab56bf4",
+        "kind": "completion",
+        "type": "attest",
+        "verdict": null
+      },
+      {
+        "assignmentId": null,
+        "id": "ce:12839",
+        "kind": "disposition_transition",
+        "type": "causal_event"
+      }
+    ]
+  }
+}

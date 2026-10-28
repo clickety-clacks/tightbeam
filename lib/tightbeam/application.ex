@@ -79,8 +79,9 @@ defmodule Tightbeam.Application do
   # Returning `{:error, _}` from `start/2` is correct OTP, and under `mix run` it reads
   # fine. In a RELEASE it does not: the app is permanent, so application_controller
   # escalates the failed start into "Kernel pid terminated", an {exit,terminating,...}
-  # stacktrace, and an `erl_crash.dump` in the install directory. With no harness CLI on
-  # PATH, an expected first-run refusal would otherwise look like a kernel panic.
+  # stacktrace, and an `erl_crash.dump` in the install directory. Measured on a test host from
+  # the npm tarball with no harness CLI on PATH — the most ordinary first-run state there
+  # is ("I installed tightbeam before I installed claude") presented as a kernel panic.
   #
   # So: say the sentence, exit non-zero, write no dump. `System.halt/1` with an integer
   # status does not dump. Nothing has started at this point — preflight refuses before
@@ -118,8 +119,12 @@ defmodule Tightbeam.Application do
     Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
       # THE GATEWAY INSTALLS ITS OWN ADAPTERS, before it judges readiness.
       #
-      # Install adapters before onboarding, because onboarding verifies a runtime
-      # and therefore needs the adapter to be present already.
+      # This used to be deferred to "the next session spawn", which on a fresh
+      # org is a moment that never arrives: you cannot spawn until you have
+      # onboarded, onboarding VERIFIES by starting a runtime, and that runtime
+      # needs the adapter only a spawn would have installed. Circular, and every
+      # fresh installs hit it: the onboarding runtime needs an adapter that was
+      # previously installed only by a later session spawn. Boot now installs it.
       #
       # In the readiness task, not inline: a cold npm install is minutes and boot
       # must not block on the network. Failures log and never stop the gateway —
@@ -174,11 +179,15 @@ defmodule Tightbeam.Application do
   # THE DEFAULTS COME FROM WHAT THE BOX CAN ACTUALLY RUN — a harness whose CLI
   # is installed AND whose credential is onboarded — not merely what is on PATH.
   #
-  # `default_harness` was `hd(Harness.all())` — registry order — and
-  # An installed executable is not necessarily configured for use. Select the
-  # default from onboarded providers rather than PATH or registry order, so the
-  # first turn does not target a provider without usable credentials. Onboarded
-  # state is read synchronously from disk
+  # `default_harness` was `hd(Harness.all)` — registry order — and
+  # `default_model` was the literal claude-sonnet-5, whatever harness that
+  # implied. A codex-only machine therefore placed its first turn on a harness
+  # it had never installed, with a model it cannot run, and refused naming a
+  # vendor the operator never chose. The first repair special-cased exactly one INSTALLED binary,
+  # but a tester with BOTH CLIs on PATH and ONLY codex onboarded still fell to
+  # registry-order claude + claude-sonnet-5 — a dead default whose first turn
+  # cannot run (observed in production). Installed is not runnable;
+  # installed-AND-onboarded is. Onboarded-ness is read synchronously from disk
   # here (Credentials.kind_at), before the async catalog exists.
   #
   # An operator's explicit choice still wins; this only decides what "no
@@ -228,8 +237,7 @@ defmodule Tightbeam.Application do
     %{
       base_dir: Application.get_env(:tightbeam, :base_dir, default_base_dir()),
       cwd: Application.get_env(:tightbeam, :cwd, File.cwd!()),
-      # Keep the default port aligned with the client and packaged service
-      # configuration so a bare `tightbeam-gateway` boot accepts client connections.
+      # 11373 is the established default port used by the clients.
       port: Application.get_env(:tightbeam, :port, 11_373),
       default_harness: Tightbeam.Harness.default().id(),
       default_model:

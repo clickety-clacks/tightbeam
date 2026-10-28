@@ -1,8 +1,7 @@
 defmodule Tightbeam.ApplicationDefaultsTest do
   # apply_installed_defaults/2 must derive the no-preference boot default from
   # what the box can ACTUALLY RUN (installed AND onboarded), not merely what is
-  # on PATH. A machine can have multiple CLIs installed but only one configured;
-  # defaults must account for configured credentials as well as installed binaries.
+  # on PATH. A reproduced failure had BOTH
   # CLIs installed, ONLY codex onboarded -> registry-order claude + claude-sonnet-5,
   # a dead default whose first turn cannot run.
   use Tightbeam.TestCase, async: false

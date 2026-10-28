@@ -433,7 +433,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
       owner_user_id: "sample-user",
       origin: "user:sample-user",
       archetype: archetype,
-      host: "test-host",
+      host: "host-b",
       harness: harness,
       provider: provider,
       model: Model.new("test")

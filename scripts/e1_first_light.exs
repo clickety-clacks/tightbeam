@@ -2,7 +2,7 @@
 # a REAL claude adapter: DB + Ledger + reconciler + SessionLane + Acp.Adapter.
 # No wire, no client — the E1 exit criterion (supervised prompt round-trip).
 #
-# Run in an isolated test environment:  mix run scripts/e1_first_light.exs
+# Run on a configured macOS test host: mix run scripts/e1_first_light.exs
 # Uses the TS repo's installed claude adapter binary + real ~/.claude creds.
 
 alias Tightbeam.{DB, Ledger, EventLog, SessionLane, LaneManager}

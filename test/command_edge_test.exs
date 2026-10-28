@@ -512,15 +512,15 @@ defmodule Tightbeam.CommandEdgeTest do
   test "credential parks carry inert adapter keys for one captured machine" do
     command = %CredentialPark{
       provider: :openai,
-      machine: "test-host",
-      adapter_keys: [{:codex, "shared", "test-host"}],
+      machine: "host-b",
+      adapter_keys: [{:codex, "shared", "host-b"}],
       observed_at: 123
     }
 
     assert CommandEdge.validate_command!(command) == command
 
     assert_raise ArgumentError, ~r/invalid CredentialPark/, fn ->
-      CommandEdge.validate_command!(%{command | adapter_keys: [{:codex, "shared", "mac-host"}]})
+      CommandEdge.validate_command!(%{command | adapter_keys: [{:codex, "shared", "lab2"}]})
     end
   end
 

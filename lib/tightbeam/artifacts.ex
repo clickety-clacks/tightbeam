@@ -24,7 +24,7 @@ defmodule Tightbeam.Artifacts do
   through `recorded_kinds/3`, which reads neither column.
   """
 
-  alias Tightbeam.{DB, IdPrefix, Org, Placement, TurnObservations}
+  alias Tightbeam.{DB, IdPrefix, Org, Placement, StateVisibility, TurnObservations}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -280,6 +280,132 @@ defmodule Tightbeam.Artifacts do
       [row] -> artifact(row)
       [] -> nil
     end
+  end
+
+  @doc false
+  @spec query_artifact(DB.server(), map()) :: [map()]
+  def query_artifact(
+        db,
+        %{filters: filters, principal: principal, boundary: boundary, limit: limit}
+      )
+      when is_map(filters) and is_map(principal) and is_integer(limit) and limit > 0 do
+    {visibility_sql, visibility_params} = StateVisibility.artifact_collection_scope(principal)
+
+    {filter_clauses, filter_params} =
+      artifact_filter_clauses(filters, length(visibility_params))
+
+    where = Enum.join([visibility_sql | filter_clauses], " AND ")
+    base_params = visibility_params ++ filter_params
+
+    {rows, reverse?} = artifact_page_rows(db, where, base_params, boundary, limit)
+    rows = if reverse?, do: Enum.reverse(rows), else: rows
+
+    rows ++ artifact_opposite_probe(db, where, base_params, boundary)
+  end
+
+  defp artifact_filter_clauses(filters, parameter_offset) do
+    columns = %{
+      "workItemId" => "artifact.workItemId",
+      "createdBySession" => "artifact.createdBySession",
+      "kind" => "artifact.kind",
+      "state" => "artifact.state"
+    }
+
+    filters
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.reduce({[], []}, fn {field, values}, {clauses, params} ->
+      case {Map.get(columns, field), values} do
+        {column, values} when is_binary(column) and is_list(values) and values != [] ->
+          first = parameter_offset + length(params) + 1
+          placeholders = Enum.map_join(first..(first + length(values) - 1), ", ", &"?#{&1}")
+          {clauses ++ ["#{column} IN (#{placeholders})"], params ++ values}
+
+        {column, []} when is_binary(column) ->
+          {clauses ++ ["0=1"], params}
+
+        _ ->
+          {clauses ++ ["0=1"], params}
+      end
+    end)
+  end
+
+  defp artifact_page_rows(db, where, params, :latest, limit),
+    do: {artifact_rows(db, where, params, nil, "DESC", limit + 1), true}
+
+  defp artifact_page_rows(db, where, params, {:before, [ts, id]}, limit),
+    do: {artifact_rows(db, where, params, {:less, ts, id}, "DESC", limit + 1), true}
+
+  defp artifact_page_rows(db, where, params, {:after, [ts, id]}, limit),
+    do: {artifact_rows(db, where, params, {:greater, ts, id}, "ASC", limit + 1), false}
+
+  defp artifact_rows(db, where, params, range, order, limit) do
+    {range_sql, range_params} = artifact_range(range, length(params) + 1)
+    limit_index = length(params) + length(range_params) + 1
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT #{columns()}
+        FROM artifacts AS artifact
+        WHERE #{where}#{range_sql}
+        ORDER BY artifact.createdAt #{order}, artifact.artifactId #{order}
+        LIMIT ?#{limit_index}
+        """,
+        params ++ range_params ++ [limit]
+      )
+
+    Enum.map(rows, &artifact/1)
+  end
+
+  defp artifact_opposite_probe(_db, _where, _params, :latest), do: []
+
+  defp artifact_opposite_probe(db, where, params, {:before, [ts, id]}) do
+    artifact_probe(db, where, params, {:greater_or_equal, ts, id}, "ASC")
+  end
+
+  defp artifact_opposite_probe(db, where, params, {:after, [ts, id]}) do
+    artifact_probe(db, where, params, {:less_or_equal, ts, id}, "DESC")
+  end
+
+  defp artifact_probe(db, where, params, range, order) do
+    {range_sql, range_params} = artifact_range(range, length(params) + 1)
+    limit_index = length(params) + length(range_params) + 1
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT artifact.createdAt, artifact.artifactId
+        FROM artifacts AS artifact
+        WHERE #{where}#{range_sql}
+        ORDER BY artifact.createdAt #{order}, artifact.artifactId #{order}
+        LIMIT ?#{limit_index}
+        """,
+        params ++ range_params ++ [1]
+      )
+
+    Enum.map(rows, fn [created_at, artifact_id] ->
+      %{created_at: created_at, artifact_id: artifact_id}
+    end)
+  end
+
+  defp artifact_range(nil, _first), do: {"", []}
+
+  defp artifact_range({operator, ts, id}, first) do
+    {comparison, id_comparison} =
+      case operator do
+        :less -> {"<", "<"}
+        :greater -> {">", ">"}
+        :less_or_equal -> {"<", "<="}
+        :greater_or_equal -> {">", ">="}
+      end
+
+    {
+      " AND (artifact.createdAt #{comparison} ?#{first} OR " <>
+        "(artifact.createdAt = ?#{first} AND artifact.artifactId #{id_comparison} ?#{first + 1}))",
+      [ts, id]
+    }
   end
 
   @doc """

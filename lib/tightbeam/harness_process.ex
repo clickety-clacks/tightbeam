@@ -363,7 +363,7 @@ defmodule Tightbeam.HarnessProcess do
     result
   end
 
-  @doc "user-facing launch ledger, newest first."
+  @doc "Operator-facing launch ledger, newest first."
   @spec list(DB.server()) :: [row()]
   def list(db \\ DB) do
     :ok = ensure_schema(db)
@@ -423,7 +423,7 @@ defmodule Tightbeam.HarnessProcess do
   # pid may be reused by an unrelated process — the refusal is right) but the
   # refusal was recorded as kill_failed, which fences the key forever: a
   # machine reboot whose only job was recovery permanently disabled the
-  # harness indefinitely after a reboot.
+  # harness (production host, 2026-08-05, fence standing since the morning's restart).
   #
   # LOCAL rows only: a remote row's boot identity belongs to the REMOTE
   # machine, and comparing it to ours would resolve a possibly-live process.
@@ -450,7 +450,7 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   # The comparison value comes from the SAME code that recorded it: the Rust
-  # launcher's boot_identity(), via the helper's `boot-identity` subcommand on
+  # launcher's boot_identity, via the helper's `boot-identity` subcommand on
   # the row's own helper_path. Deliberately NOT reimplemented in Elixir —
   # darwin's value includes st_birthtime, which the BEAM cannot read, and any
   # format drift would read live processes as reboot orphans and resolve

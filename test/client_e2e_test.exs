@@ -71,7 +71,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "a preflight row is an automated row: its failure fails the leg" do
       leg =
-        Scorecard.add(%Leg{harness: "claude", host: "test-host"}, [
+        Scorecard.add(%Leg{harness: "claude", host: "host-b"}, [
           Scorecard.fail("P1", "auth claude", "OAuth session expired"),
           Scorecard.pass("3", "converse", journey: "J1")
         ])
@@ -90,7 +90,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "a leg of only manual rows is INCOMPLETE, never a pass" do
       leg =
-        Scorecard.add(%Leg{harness: "claude", host: "test-host"}, [
+        Scorecard.add(%Leg{harness: "claude", host: "host-b"}, [
           Scorecard.manual("16", "wakes", "not driven")
         ])
 
@@ -112,7 +112,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "a fail outranks an incomplete" do
       leg =
-        Scorecard.add(%Leg{harness: "codex", host: "test-host"}, [
+        Scorecard.add(%Leg{harness: "codex", host: "host-b"}, [
           Scorecard.incomplete("13b", "model change", "no second model", journey: "J6"),
           Scorecard.fail("3", "converse", "no assistant reply", journey: "J1")
         ])
@@ -134,11 +134,11 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "the run verdict is the worst leg verdict" do
       good =
-        Scorecard.add(%Leg{harness: "claude", host: "test-host"}, Scorecard.pass("3", "converse"))
+        Scorecard.add(%Leg{harness: "claude", host: "host-b"}, Scorecard.pass("3", "converse"))
 
       bad =
         Scorecard.add(
-          %Leg{harness: "codex", host: "test-host"},
+          %Leg{harness: "codex", host: "host-b"},
           Scorecard.fail("3", "converse", "no reply")
         )
 
@@ -246,7 +246,7 @@ defmodule Tightbeam.ClientE2ETest do
     test "REGRESSION: a stale clear cannot vouch for an indicator left ON" do
       # false → true → reply. The old oracle matched the leading `false` as
       # "cleared" and started its lingering check after the final `true`, so it
-      # passed with the indicator active. This is the bug the cross-review found.
+      # passed with the indicator active. This is the regression this test guards.
       frames = [echo("c_1"), typing(false), typing(true), reply("c_1")]
 
       assert oracle(frames) =~ "left ON"
@@ -406,7 +406,7 @@ defmodule Tightbeam.ClientE2ETest do
       sequential = [%{"a" => 1}, %{}, %{"b" => 1}]
       together = [%{"a" => 1}, %{"a" => 1, "b" => 1}, %{"b" => 1}]
 
-      # This is the laundering the cross-review found: per-session maxima are
+      # This is the attribution error this test guards: per-session maxima are
       # 1 and 1 in BOTH lists, so a maxima-based witness calls sequential
       # execution concurrent.
       refute Substrate.simultaneous?(sequential, ["a", "b"])
@@ -642,8 +642,8 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "REGRESSION: a lane whose reply commits LAST is not a delivery failure" do
-      # One run had B's trivial turn take longer than Main's, so B's reply
-      # committed after Main's turn had
+      # The field case (codex leg, 2026-08-04): B's trivial turn took 20.4s
+      # against Main's 12.6s, so B's reply committed 8.2s after Main's turn had
       # already ended — publish->arrival measured 0ms on all three frames. The
       # old rule asked only whether B's bubble preceded Main's and reported "a
       # delayed client frame", blaming the wire for which prompt the model
@@ -666,7 +666,7 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "out-of-order ARRIVAL with truthful seqs is not a defect" do
-      # The contract is that delivery is a hint and the store is
+      # The contract change (ruled 2026-08-04): delivery is a hint, the store is
       # truth, and ConnRegistry no longer filters — so frames may arrive in an
       # order the store never committed, carrying the seq that lets the client
       # settle them. Main's store committed done(1) -> slow(2); the frames
@@ -1376,7 +1376,7 @@ defmodule Tightbeam.ClientE2ETest do
       preflight =
         Scorecard.incomplete("P-codex", "auth codex", "credential liveness unknown: :timeout")
 
-      leg = ClientE2E.blocked_leg("codex", "test-host", preflight)
+      leg = ClientE2E.blocked_leg("codex", "host-b", preflight)
 
       assert match?({:incomplete, [_preflight | _blocked]}, Scorecard.leg_verdict(leg))
 
@@ -1784,7 +1784,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "J0 passes: the wire pairs, authenticates, seeds Main and syncs", ctx do
       {:ok, %{token: token}} =
-        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "Sample User")
+        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "sample-user")
 
       {:ok, client} = SimClient.connect("127.0.0.1", ctx.port, token, device_id: "sim-j0")
 
@@ -1804,10 +1804,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "posting with a malformed id is refused on the wire, not silently dropped", ctx do
       {:ok, %{token: token}} =
-        SimClient.pair("127.0.0.1", ctx.port,
-          device_id: "sim-bad-id",
-          claimed_name: "Sample User"
-        )
+        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-bad-id", claimed_name: "sample-user")
 
       {:ok, client} = SimClient.connect("127.0.0.1", ctx.port, token, device_id: "sim-bad-id")
       watermark = SimClient.mark(client)

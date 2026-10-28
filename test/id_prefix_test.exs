@@ -122,7 +122,7 @@ defmodule Tightbeam.IdPrefixOperationsTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "test-host"
+      host: "host-b"
     })
 
     %{db: db, handlers: Gateway.handlers(%{db: db})}

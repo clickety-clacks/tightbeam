@@ -21,7 +21,6 @@ the room. The DB owner is the deliberate exception that proves the rule: it
 serializes on purpose and is safe ONLY because every operation through it is
 prepared-statement-fast by construction. When an operation's cost class
 changes (a local file write grows an rsync), its location must change with
-it — this exact miss wedged the AdapterCoordinator behind a dead host once
-and is the failure mode this rule exists
+it — this exact miss wedged the AdapterCoordinator behind a dead host once, which is the failure mode this rule exists
 to prevent. BEAM bounds the blast radius of this mistake; it does not
 prevent it. The discipline is ours.

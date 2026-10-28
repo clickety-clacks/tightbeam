@@ -895,7 +895,7 @@ defmodule Tightbeam.EffortCheckinTest do
     # Nothing is ever written in this workdir: the work is on another machine and
     # every horizon's worth of it is DECLARED, which is all the substrate needs.
     for horizon <- 1..3 do
-      artifact!(ctx.db, "holder", item.id, "test-host:/etc/nginx/sites-enabled/app.#{horizon}")
+      artifact!(ctx.db, "holder", item.id, "host-d:/etc/nginx/sites-enabled/app.#{horizon}")
       terminal_turn(ctx.db, "holder", "delivered")
       assert nil == fire_probe(ctx, remote.id)
       assert silent_rearm(ctx.db, remote.id, horizon + 1)
@@ -1691,9 +1691,8 @@ defmodule Tightbeam.EffortCheckinTest do
   # renamed the public surrender transition to cannot-proceed AND made it
   # NON-terminal (it re-arms and files a decision request), so `surrendered` is
   # unreachable as a terminal close on main; holder-retire is the third distinct
-  # terminal transition (outcome=revoked, durable principal). The associated question (repo
-  # migration authority) and the c321d74a rename are settled adjudications; this
-  # suite implements them, it does not re-file them.
+  # terminal transition (outcome=revoked, durable principal). This suite checks
+  # the settled behavior; it does not initiate a decision.
   # ==================================================================
 
   # The retirement SET (EGR-3) = {max unretired generation} UNION {source
@@ -2342,7 +2341,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert wake_cancellations(ctx.db, b_hc.wake_id) == []
 
     # EGR-8 forbids retirement from rewriting the fired wake or its turn. The
-    # sibling queued-turn amendment — which would dispose the queued
+    # separate queued-turn change — which would dispose the queued
     # turn at close — is ABSENT from this checkout and owns a separate acceptance
     # lane per the spec's Architecture section ("runs beside, not inside ... Neither
     # owns the other's tables or acceptance lane"), so A3 asserts only that MY

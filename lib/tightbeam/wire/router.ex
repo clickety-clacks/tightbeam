@@ -55,11 +55,13 @@ defmodule Tightbeam.Wire.Router do
     ColdStart,
     Devices,
     Dispatch,
+    ExecutionMap,
     ModelCatalog,
     Org,
     Roles,
     StateResources,
     StateVisibility,
+    Wakes,
     WorkState
   }
 
@@ -75,7 +77,46 @@ defmodule Tightbeam.Wire.Router do
   @state_max_limit 500
   @state_not_found_floor_us 3_000
   @state_malformed_percent_escape ~r/%(?![0-9A-Fa-f]{2})/
+  @execution_map_filter_order ~w(origin ownerUserId state quietOverMs specRefName specRefSha256 sessionKey)
   @state_read_specs %{
+    execution_map: %{
+      route: "execution_map.collection",
+      resource: "execution map",
+      filters: %{
+        "origin" => {:enum, ~w(user session all)},
+        "ownerUserId" => :string,
+        "state" => {:enum, ~w(open iceboxed closed failed)},
+        "quietOverMs" => :integer,
+        "specRefName" => :string,
+        "specRefSha256" => :sha256,
+        "sessionKey" => :string
+      },
+      order: [{:created_at, :integer}, {:id, :string}]
+    },
+    artifacts: %{
+      route: "artifacts.collection",
+      resource: "artifacts",
+      filters: %{
+        "workItemId" => :string,
+        "createdBySession" => :string,
+        "kind" => :string,
+        "state" => {:enum, ~w(in-workspace archived released)}
+      },
+      order: [{:created_at, :integer}, {:artifact_id, :string}]
+    },
+    attests: %{
+      route: "attests.collection",
+      resource: "attests",
+      filters: %{
+        "assignmentId" => :string,
+        "workItemId" => :string,
+        "kind" => :string,
+        "verdictKind" => :string,
+        "bySession" => :string,
+        "byUser" => :string
+      },
+      order: [{:ts, :integer}, {:id, :string}]
+    },
     work_items: %{
       route: "work_items.collection",
       resource: "work items",
@@ -342,12 +383,36 @@ defmodule Tightbeam.Wire.Router do
     state_detail(conn, Map.fetch!(@state_read_specs, :kungfu), name)
   end
 
+  get "/api/artifacts" do
+    d2a_collection(conn, Map.fetch!(@state_read_specs, :artifacts))
+  end
+
+  get "/api/attests" do
+    d2a_collection(conn, Map.fetch!(@state_read_specs, :attests))
+  end
+
+  get "/api/assignments/:assignment_id/attests" do
+    spec = Map.fetch!(@state_read_specs, :attests)
+
+    d2a_collection(
+      conn,
+      Map.merge(spec, %{
+        route: "assignments.attests.collection",
+        parent_assignment_id: assignment_id
+      })
+    )
+  end
+
   get "/api/assignments/:assignment_id" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :assignments), assignment_id)
   end
 
   get "/api/wakes/:wake_id" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :wakes), wake_id)
+  end
+
+  get "/api/wakes/:wake_id/digest-members" do
+    d2d_digest_members(conn, wake_id)
   end
 
   get "/api/turns/:turn_seq" do
@@ -364,6 +429,10 @@ defmodule Tightbeam.Wire.Router do
 
   get "/api/sessions/:session_key" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :sessions), session_key)
+  end
+
+  get "/api/sessions/:session_key/coordination-share" do
+    d2d_coordination_share(conn, session_key)
   end
 
   get "/api/devices/:device_id" do
@@ -501,6 +570,26 @@ defmodule Tightbeam.Wire.Router do
     state_collection(conn, Map.fetch!(@state_read_specs, :work_items))
   end
 
+  get "/api/work-items/:work_item_id/trace" do
+    work_item_trace_read(conn, work_item_id)
+  end
+
+  get "/api/execution-map" do
+    execution_map_read(conn, :flat, nil)
+  end
+
+  get "/api/execution-map/tree" do
+    execution_map_read(conn, :tree, nil)
+  end
+
+  get "/api/execution-map/subtrees/:work_item_id" do
+    execution_map_read(conn, :subtree, work_item_id)
+  end
+
+  get "/api/execution-map/assignments" do
+    execution_map_read(conn, :assignments, nil)
+  end
+
   get "/api/work-items/:work_item_id" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :work_items), work_item_id)
   end
@@ -588,6 +677,419 @@ defmodule Tightbeam.Wire.Router do
   rescue
     _error in [ArgumentError, KeyError, MatchError] ->
       state_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp d2a_collection(conn, spec) do
+    started_at = System.monotonic_time(:microsecond)
+
+    with {:ok, auth} <- state_bearer_auth(conn),
+         {:ok, query} <- decode_state_query(conn),
+         {:ok, principal} <- state_principal(auth, query, conn),
+         {:ok, request} <- state_collection_request(query, spec),
+         request <- d2a_collection_parent_scope(request, spec),
+         {:ok, boundary} <- state_cursor_boundary(request, principal, spec),
+         :ok <- d2a_collection_parent_visible(conn, spec, principal),
+         rows <-
+           d2a_collection_rows(conn, spec, request.filters, principal, boundary, request.limit),
+         {page_rows, page} <- state_page(rows, boundary, request, principal, spec),
+         items <- d2a_serialize_rows(page_rows, spec) do
+      state_send(conn, 200, state_collection_envelope(conn, spec.resource, items, page))
+    else
+      {:error, 404, "not_found", _message} ->
+        state_not_found(conn, spec.resource, started_at)
+
+      {:error, status, code, message} ->
+        state_error(conn, spec.resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp d2a_collection_parent_scope(request, %{parent_assignment_id: assignment_id}) do
+    filters =
+      Map.update(request.filters, "assignmentId", [assignment_id], fn values ->
+        Enum.filter(values, &(&1 == assignment_id))
+      end)
+
+    %{request | filters: filters, filter_fingerprint: state_filter_fingerprint(filters)}
+  end
+
+  defp d2a_collection_parent_scope(request, _spec), do: request
+
+  defp d2a_collection_parent_visible(conn, %{parent_assignment_id: assignment_id}, principal) do
+    if StateVisibility.attest_visible?(db(conn), %{assignment_id: assignment_id}, principal),
+      do: :ok,
+      else: {:error, 404, "not_found", nil}
+  end
+
+  defp d2a_collection_parent_visible(_conn, _spec, _principal), do: :ok
+
+  defp d2a_collection_rows(
+         conn,
+         %{resource: "artifacts"} = spec,
+         filters,
+         principal,
+         boundary,
+         limit
+       ) do
+    rows =
+      StateResources.query_artifact(db(conn), %{
+        filters: filters,
+        principal: principal,
+        boundary: boundary,
+        limit: limit
+      })
+
+    d2a_sort_rows!(rows, spec.order)
+  end
+
+  defp d2a_collection_rows(
+         conn,
+         %{resource: "attests"} = spec,
+         filters,
+         principal,
+         boundary,
+         limit
+       ) do
+    rows =
+      StateResources.query_attest(db(conn), %{
+        filters: filters,
+        principal: principal,
+        boundary: boundary,
+        limit: limit
+      })
+
+    d2a_sort_rows!(rows, spec.order)
+  end
+
+  defp d2a_serialize_rows(rows, %{resource: "artifacts"}),
+    do: Enum.map(rows, &StateResources.artifact/1)
+
+  defp d2a_serialize_rows(rows, %{resource: "attests"}),
+    do: Enum.map(rows, &StateResources.attest/1)
+
+  defp d2a_sort_rows!(rows, order) when is_list(rows) do
+    Enum.each(rows, fn row ->
+      tuple = state_row_tuple(row, order)
+
+      unless Enum.zip(tuple, order)
+             |> Enum.all?(fn
+               {value, {_field, :string}} -> is_binary(value) and value != ""
+               {value, {_field, :integer}} -> is_integer(value)
+             end) do
+        raise ArgumentError, "D2 resource row has an invalid order tuple"
+      end
+    end)
+
+    rows
+    |> Enum.uniq_by(&state_row_tuple(&1, order))
+    |> Enum.sort_by(&state_row_tuple(&1, order))
+  end
+
+  defp d2a_sort_rows!(_rows, _order),
+    do: raise(ArgumentError, "D2 resource query did not return a list")
+
+  defp execution_map_read(conn, mode, parent_id) do
+    spec = Map.fetch!(@state_read_specs, :execution_map)
+    started_at = System.monotonic_time(:microsecond)
+
+    with {:ok, auth} <- state_bearer_auth(conn),
+         {:ok, query} <- decode_state_query(conn),
+         {:ok, principal} <- state_principal(auth, query, conn),
+         {:ok, request} <- execution_map_request(mode, query),
+         {:ok, boundary} <- execution_map_boundary(mode, request, principal, spec) do
+      principal = core_detail_trace_principal(conn, principal)
+      core_detail_trace(conn, {:shared_lookup, spec.resource, :query_execution_map})
+      core_detail_trace(conn, {:operation, spec.resource, mode})
+
+      call = %{
+        filters: request.filters,
+        principal: principal,
+        boundary: boundary,
+        limit: request.limit,
+        work_item_id: parent_id,
+        assignment_ids: request.assignment_ids
+      }
+
+      result =
+        case mode do
+          :flat -> Tightbeam.ExecutionMap.list_execution_map(db(conn), call)
+          :tree -> Tightbeam.ExecutionMap.query_execution_map_tree(db(conn), call)
+          :subtree -> Tightbeam.ExecutionMap.query_execution_map_subtree(db(conn), call)
+          :assignments -> Tightbeam.ExecutionMap.query_execution_map_assignments(db(conn), call)
+        end
+
+      case result do
+        {:error, 404, "not_found", _message} ->
+          state_not_found(conn, spec.resource, started_at)
+
+        {:error, 400, "ambiguous_id", candidate_ids} ->
+          execution_map_ambiguous(conn, candidate_ids)
+
+        {:error, status, code, message} ->
+          state_error(conn, spec.resource, status, code, message)
+
+        result when mode == :flat ->
+          page = execution_map_page(result, request, principal, spec)
+          state_send(conn, 200, execution_map_envelope(:flat, result, page))
+
+        result ->
+          state_send(conn, 200, execution_map_envelope(mode, result, nil))
+      end
+    else
+      {:error, 404, "not_found", _message} ->
+        state_not_found(conn, spec.resource, started_at)
+
+      {:error, status, code, message} ->
+        state_error(conn, spec.resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, "execution map", 500, "projection_invalid", nil)
+  end
+
+  defp work_item_trace_read(conn, work_item_id) do
+    resource = "work-item trace"
+    started_at = System.monotonic_time(:microsecond)
+
+    with {:ok, auth} <- state_bearer_auth(conn),
+         {:ok, query} <- decode_state_query(conn),
+         {:ok, principal} <- state_principal(auth, query, conn),
+         :ok <- state_detail_request(query) do
+      principal = core_detail_trace_principal(conn, principal)
+
+      case Tightbeam.WorkItems.query_work_item_trace(db(conn), %{
+             id: work_item_id,
+             principal: principal
+           }) do
+        {:error, 404, "not_found", _message} ->
+          state_not_found(conn, resource, started_at)
+
+        {:error, status, code, message} ->
+          state_error(conn, resource, status, code, message)
+
+        trace ->
+          state_send(conn, 200, work_item_trace_envelope(trace))
+      end
+    else
+      {:error, 404, "not_found", _message} ->
+        state_not_found(conn, resource, started_at)
+
+      {:error, status, code, message} ->
+        state_error(conn, resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, "work-item trace", 500, "projection_invalid", nil)
+  end
+
+  defp execution_map_request(mode, query) when mode in [:flat, :tree, :subtree] do
+    paging = if mode == :flat, do: ~w(before after limit), else: []
+    allowed = @execution_map_filter_order ++ paging ++ ["asUser"]
+
+    with true <- Enum.all?(Map.keys(query), &(&1 in allowed)),
+         true <- Enum.all?(@execution_map_filter_order, &(length(Map.get(query, &1, [])) <= 1)),
+         {:ok, before_cursor} <- state_single_value(query, "before"),
+         {:ok, after_cursor} <- state_single_value(query, "after"),
+         true <- is_nil(before_cursor) or is_nil(after_cursor),
+         {:ok, limit_value} <- state_single_value(query, "limit"),
+         {:ok, limit} <- state_limit(limit_value),
+         {:ok, filters} <- execution_map_filters(query) do
+      {:ok,
+       %{
+         before: before_cursor,
+         after: after_cursor,
+         limit: limit,
+         filters: filters,
+         filter_fingerprint: execution_map_filter_fingerprint(filters),
+         assignment_ids: []
+       }}
+    else
+      _ -> {:error, 400, "invalid_filter", nil}
+    end
+  end
+
+  defp execution_map_request(:assignments, query) do
+    with true <- Enum.all?(Map.keys(query), &(&1 in ["assignmentId", "asUser"])),
+         [_ | _] = ids <- Map.get(query, "assignmentId", []),
+         true <- Enum.all?(ids, &(&1 != "")) do
+      {:ok,
+       %{
+         before: nil,
+         after: nil,
+         limit: @state_default_limit,
+         filters: %{},
+         filter_fingerprint: nil,
+         assignment_ids: Enum.reverse(ids)
+       }}
+    else
+      _ -> {:error, 400, "invalid_filter", nil}
+    end
+  end
+
+  defp execution_map_filters(query) do
+    with {:ok, origin} <- state_single_value(query, "origin"),
+         true <- is_nil(origin) or origin in ~w(user session all),
+         {:ok, owner_user_id} <- state_single_value(query, "ownerUserId"),
+         true <- is_nil(owner_user_id) or owner_user_id != "",
+         {:ok, state} <- state_single_value(query, "state"),
+         true <- is_nil(state) or state in ~w(open iceboxed closed failed),
+         {:ok, quiet_value} <- state_single_value(query, "quietOverMs"),
+         {:ok, quiet_over_ms} <- execution_map_nonnegative_integer(quiet_value),
+         {:ok, spec_ref_name} <- state_single_value(query, "specRefName"),
+         true <- is_nil(spec_ref_name) or spec_ref_name != "",
+         {:ok, spec_ref_sha256} <- state_single_value(query, "specRefSha256"),
+         true <- is_nil(spec_ref_sha256) or is_binary(spec_ref_name),
+         true <- is_nil(spec_ref_sha256) or Regex.match?(~r/^[0-9a-f]{64}$/, spec_ref_sha256),
+         {:ok, session_key} <- state_single_value(query, "sessionKey"),
+         true <- is_nil(session_key) or session_key != "" do
+      fields = [
+        {"origin", origin},
+        {"ownerUserId", owner_user_id},
+        {"state", state},
+        {"quietOverMs", quiet_over_ms},
+        {"specRefName", spec_ref_name},
+        {"specRefSha256", spec_ref_sha256},
+        {"sessionKey", session_key}
+      ]
+
+      {:ok, Map.new(Enum.reject(fields, fn {_key, value} -> is_nil(value) end))}
+    else
+      _ -> {:error, 400, "invalid_filter", nil}
+    end
+  end
+
+  defp execution_map_nonnegative_integer(nil), do: {:ok, nil}
+
+  defp execution_map_nonnegative_integer(value) when is_binary(value) do
+    if Regex.match?(~r/^(0|[1-9][0-9]*)$/, value),
+      do: {:ok, String.to_integer(value)},
+      else: :error
+  end
+
+  defp execution_map_nonnegative_integer(_value), do: :error
+
+  defp execution_map_filter_fingerprint(filters) do
+    @execution_map_filter_order
+    |> Enum.map(&Map.get(filters, &1))
+    |> JSON.encode!()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp execution_map_boundary(:flat, request, principal, spec),
+    do: state_cursor_boundary(request, principal, spec)
+
+  defp execution_map_boundary(_mode, _request, _principal, _spec), do: {:ok, :latest}
+
+  defp execution_map_page(result, request, principal, spec) do
+    case result.items do
+      [] ->
+        %{
+          oldest_cursor: nil,
+          newest_cursor: nil,
+          has_more_before: result.flags.has_more_before,
+          has_more_after: result.flags.has_more_after
+        }
+
+      items ->
+        oldest = hd(items)
+        newest = List.last(items)
+
+        %{
+          oldest_cursor:
+            encode_state_cursor(
+              [oldest.created_at, oldest.id],
+              "before",
+              request.filter_fingerprint,
+              principal,
+              spec
+            ),
+          newest_cursor:
+            encode_state_cursor(
+              [newest.created_at, newest.id],
+              "after",
+              request.filter_fingerprint,
+              principal,
+              spec
+            ),
+          has_more_before: result.flags.has_more_before,
+          has_more_after: result.flags.has_more_after
+        }
+    end
+  end
+
+  defp execution_map_ambiguous(conn, candidate_ids) do
+    body =
+      ~s({"schemaVersion":1,"resource":"execution map","error":{"code":"ambiguous_id","candidateIds":) <>
+        JSON.encode!(candidate_ids) <> "}}"
+
+    state_send(conn, 400, body)
+  end
+
+  defp execution_map_envelope(mode, result, page) do
+    prefix =
+      ~s({"schemaVersion":1,"resource":"execution map","edgeBasis":"concurrent_turn","coverage":{"attributionCutoff":) <>
+        JSON.encode!(result.attribution_cutoff) <>
+        ~s(,"basis":"conservative_shared"},"dependencyVersion":) <>
+        JSON.encode!(result.dependency_version)
+
+    case mode do
+      :flat ->
+        prefix <>
+          ~s(,"items":[) <>
+          Enum.map_join(result.items, ",", &Tightbeam.ExecutionMap.execution_map_node/1) <>
+          ~s(],"page":{"oldestCursor":) <>
+          JSON.encode!(page.oldest_cursor) <>
+          ~s(,"newestCursor":) <>
+          JSON.encode!(page.newest_cursor) <>
+          ~s(,"hasMoreBefore":) <>
+          JSON.encode!(page.has_more_before) <>
+          ~s(,"hasMoreAfter":) <> JSON.encode!(page.has_more_after) <> "}}"
+
+      :tree ->
+        prefix <>
+          ~s(,"roots":[) <>
+          Enum.map_join(result.roots, ",", &Tightbeam.ExecutionMap.execution_map_node/1) <> "]}"
+
+      :subtree ->
+        prefix <>
+          ~s(,"roots":[) <>
+          Enum.map_join(result.roots, ",", &Tightbeam.ExecutionMap.execution_map_node/1) <> "]}"
+
+      :assignments ->
+        prefix <>
+          ~s(,"items":[) <>
+          Enum.map_join(result.items, ",", &Tightbeam.ExecutionMap.execution_map_node/1) <>
+          ~s(],"noItem":) <> JSON.encode!(result.no_item) <> "}"
+    end
+  end
+
+  defp work_item_trace_envelope(trace) do
+    encoded_assignments =
+      Enum.map_join(trace.assignments, ",", &StateResources.encode_item("assignments", &1))
+
+    attribution = trace.attribution
+
+    "{\"schemaVersion\":1,\"resource\":\"work-item trace\",\"item\":{" <>
+      "\"workItem\":" <>
+      StateResources.encode_item("work items", trace.work_item) <>
+      ",\"assignments\":[" <>
+      encoded_assignments <>
+      "],\"causalChildren\":" <>
+      JSON.encode!(trace.causal_children) <>
+      ",\"attribution\":{" <>
+      "\"provenanceStatus\":" <>
+      JSON.encode!(attribution.provenance_status) <>
+      ",\"reasonKind\":" <>
+      JSON.encode!(attribution.reason_kind) <>
+      ",\"primaryWorkKind\":" <>
+      JSON.encode!(attribution.primary_work_kind) <>
+      ",\"primaryWorkId\":" <>
+      JSON.encode!(attribution.primary_work_id) <>
+      "},\"dependencyVersion\":" <>
+      JSON.encode!(trace.dependency_version) <> "}}"
   end
 
   defp state_detail(conn, %{resource: "identity"} = spec, id) do
@@ -706,6 +1208,93 @@ defmodule Tightbeam.Wire.Router do
     _error in [ArgumentError, KeyError, MatchError] ->
       state_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
+
+  defp d2d_coordination_share(conn, raw_session_key) do
+    resource = "coordination share"
+    started_at = System.monotonic_time(:microsecond)
+
+    with {:ok, auth} <- state_bearer_auth(conn),
+         {:ok, query} <- decode_state_query(conn),
+         {:ok, principal} <- state_principal(auth, query, conn),
+         {:ok, {from, to}} <- d2d_coordination_window(query),
+         share when is_map(share) <-
+           ExecutionMap.query_coordination_share(db(conn), %{
+             key: raw_session_key,
+             from: from,
+             to: to,
+             principal: principal
+           }),
+         item <- StateResources.coordination_share(share),
+         item_bytes <- StateResources.encode_item(resource, item, state_catalog(conn)) do
+      state_send(conn, 200, state_detail_envelope(resource, item_bytes))
+    else
+      nil ->
+        state_not_found(conn, resource, started_at)
+
+      {:error, 404, "not_found", _message} ->
+        state_not_found(conn, resource, started_at)
+
+      {:error, status, code, message} ->
+        state_error(conn, resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, "coordination share", 500, "projection_invalid", nil)
+  end
+
+  defp d2d_digest_members(conn, raw_wake_id) do
+    resource = "digest members"
+    started_at = System.monotonic_time(:microsecond)
+
+    with {:ok, auth} <- state_bearer_auth(conn),
+         {:ok, query} <- decode_state_query(conn),
+         {:ok, principal} <- state_principal(auth, query, conn),
+         :ok <- state_detail_request(query),
+         members when is_list(members) <-
+           Wakes.query_digest_members(db(conn), %{key: raw_wake_id, principal: principal}),
+         items <- Enum.map(members, &StateResources.digest_member/1) do
+      state_send(conn, 200, state_collection_envelope(conn, resource, items, nil))
+    else
+      nil ->
+        state_not_found(conn, resource, started_at)
+
+      {:error, 404, "not_found", _message} ->
+        state_not_found(conn, resource, started_at)
+
+      {:error, status, code, message} ->
+        state_error(conn, resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, "digest members", 500, "projection_invalid", nil)
+  end
+
+  defp d2d_coordination_window(query) do
+    with true <- Enum.all?(Map.keys(query), &(&1 in ~w(asUser from to))),
+         {:ok, from_text} <- state_single_value(query, "from"),
+         {:ok, to_text} <- state_single_value(query, "to"),
+         {:ok, from} <- d2d_epoch_milliseconds(from_text),
+         {:ok, to} <- d2d_epoch_milliseconds(to_text),
+         true <- from < to do
+      {:ok, {from, to}}
+    else
+      _ -> {:error, 400, "invalid_filter", nil}
+    end
+  end
+
+  defp d2d_epoch_milliseconds(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {milliseconds, ""}
+      when milliseconds >= -9_223_372_036_854_775_808 and
+             milliseconds <= 9_223_372_036_854_775_807 ->
+        {:ok, milliseconds}
+
+      _ ->
+        {:error, :invalid}
+    end
+  end
+
+  defp d2d_epoch_milliseconds(_value), do: {:error, :invalid}
 
   defp core_detail_serialize(conn, spec, row) do
     core_detail_trace(conn, {:serializer, spec.resource, spec.serializer})
@@ -1290,12 +1879,17 @@ defmodule Tightbeam.Wire.Router do
     catalog = state_catalog(conn)
     item_bytes = Enum.map_join(items, ",", &StateResources.encode_item(resource, &1, catalog))
 
-    "{" <>
-      ~s("schemaVersion":1,"resource":#{JSON.encode!(resource)},"items":[#{item_bytes}],) <>
-      ~s("page":{"oldestCursor":#{JSON.encode!(page.oldest_cursor)},) <>
-      ~s("newestCursor":#{JSON.encode!(page.newest_cursor)},) <>
-      ~s("hasMoreBefore":#{JSON.encode!(page.has_more_before)},) <>
-      ~s("hasMoreAfter":#{JSON.encode!(page.has_more_after)}}})
+    if is_nil(page) do
+      "{" <>
+        ~s("schemaVersion":1,"resource":#{JSON.encode!(resource)},"items":[#{item_bytes}]})
+    else
+      "{" <>
+        ~s("schemaVersion":1,"resource":#{JSON.encode!(resource)},"items":[#{item_bytes}],) <>
+        ~s("page":{"oldestCursor":#{JSON.encode!(page.oldest_cursor)},) <>
+        ~s("newestCursor":#{JSON.encode!(page.newest_cursor)},) <>
+        ~s("hasMoreBefore":#{JSON.encode!(page.has_more_before)},) <>
+        ~s("hasMoreAfter":#{JSON.encode!(page.has_more_after)}}})
+    end
   end
 
   defp state_detail_envelope(resource, item_bytes) do
@@ -1712,7 +2306,7 @@ defmodule Tightbeam.Wire.Router do
   # Plug decodes %20 in path segments but leaves '+' literal (that's a query-string
   # convention, not a path one) — session keys carry a space, never a literal '+'.
   #
-  # The clawline iOS client sometimes double-percent-encodes the :key segment (a
+  # An iOS client sometimes double-percent-encodes the :key segment (a
   # space becomes %2520 instead of %20). Plug's router decodes the segment once
   # before we see it, so three additional passes preserve the four-pass wire cap.
   # Stop at the first fixed point. The "+" -> " " replacement runs first so an
@@ -2050,7 +2644,7 @@ defmodule Tightbeam.Wire.Router do
   # SUBSTRATE-INTERNAL params, PER VERB: fields a client may not set on that verb
   # because the substrate is their only legitimate author. `wake.assignmentId` is
   # the wake's attribution CARRIER — a client-supplied one would forge
-  # wake -> turn -> trace attribution, which Law 0 forbids (cross-review F6), so
+  # wake -> turn -> trace attribution, which Law 0 forbids, so
   # it is stripped before the handler sees it.
   #
   # Scoped per verb deliberately: `assignmentId` is an ORDINARY caller param on

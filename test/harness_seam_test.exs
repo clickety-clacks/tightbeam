@@ -146,7 +146,7 @@ defmodule Tightbeam.HarnessSeamTest do
              )
   end
 
-  # The adapter accepts a
+  #  (sample-user: "hard code it and leave a note"). The claude adapter accepts a
   # NARROWER model vocabulary than the derived catalog, and every substitution for a
   # refused model is a silent downgrade — `claude-opus-5` -> `opus` delivers Opus 4.8,
   # and `claude-fable-5` has no equivalent at all. This pins the recorded table AND the
@@ -155,15 +155,21 @@ defmodule Tightbeam.HarnessSeamTest do
   test "the recorded claude model vocabulary never substitutes a refused model" do
     selectable = Tightbeam.Harness.Claude.adapter_selectable_models()
 
-    # The offered model set depends on the configured home; the catalog must
-    # remain aligned with values the adapter can select.
+    # Recorded live 2026-07-26 (claude CLI 2.1.220 / claude-agent-acp 0.59.0);
+    # fable added 2026-08-05 after a live re-measurement on host-a (CLI 2.1.221,
+    # the production grant) answered a real prompt on claude-fable-5 — the July
+    # REJECTED row was one environment's snapshot, not an account property.
     assert Enum.sort(selectable) ==
              Enum.sort(~w(default sonnet opus haiku fable claude-sonnet-5 claude-opus-4-8
                           claude-haiku-4-5-20251001 claude-fable-5 claude-opus-5
                           claude-fable-5-1 claude-fable-5-1[1m]))
 
-    # Values the adapter refuses must never appear here, or the gateway could
-    # offer a model the adapter cannot select.
+    # Values the adapter REFUSES must never appear here — listing one would make the
+    # gateway offer a model the adapter cannot select. Fable left this list
+    # 2026-08-05: measured answering a real prompt on host-a with the production
+    # grant, so the July refusal was environmental, not categorical. Opus 5 left
+    # 2026-08-06 the same way: pin-probed offered+accepted and answered a live
+    # prompt on host-a with the production grant.
     for refused <- ~w(claude-opus-4-7 claude-sonnet-4-6
                       claude-opus-4-6 claude-opus-4-5-20251101 claude-sonnet-4-5-20250929
                       claude-opus-4-1-20250805) do
@@ -175,11 +181,14 @@ defmodule Tightbeam.HarnessSeamTest do
 
     # The note is the load-bearing half — it must carry the version it was probed at.
     source = File.read!(Path.join(File.cwd!(), "lib/tightbeam/harness/claude.ex"))
-    assert source =~ "Candidate vocabulary only. Adapter readback"
-    assert source =~ "0.59 mappings here preserves fallback"
+    assert source =~ "claude CLI 2.1.220"
+    assert source =~ "claude-agent-acp 0.59.0"
     assert source =~ ~s(@adapter_version "0.73.0")
+    assert source =~ "SDK 0.3.257"
+    assert source =~ "Claude Code 2.1.257"
+    assert source =~ "silent downgrade"
 
-    # The codex half is probed now, and kind-scoped: the api-key
+    # The codex half is PROBED now, and kind-scoped: the 2026-07-28 api-key
     # exercise (#99) recorded the codex adapter refusing a platform id at
     # set_config_option (-32602), so the note must carry that evidence — and it
     # must never grow back into a wholesale "cannot diverge" claim, which the
@@ -190,7 +199,7 @@ defmodule Tightbeam.HarnessSeamTest do
     refute source =~ "divergence is structurally unlikely"
   end
 
-  test "claude 0.73.0 aliases select Example Model 5.1 at both context widths" do
+  test "claude 0.73.0 aliases select Fable 5.1 at both context widths" do
     config = Tightbeam.Harness.Claude.session_config(%{}, "guidance")
 
     assert config.model_option_aliases["fable"] == "claude-fable-5-1"

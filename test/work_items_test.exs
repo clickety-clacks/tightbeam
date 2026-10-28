@@ -220,9 +220,7 @@ defmodule Tightbeam.WorkItemsTest do
     assert %{code: "unknown_work_item"} = update(ctx, {:user, "sample-user"}, "missing", %{})
 
     unpinned = create(ctx, {:user, "sample-user"}, %{title: "Original"})
-
-    assert %{code: "invalid_title"} =
-             update(ctx, {:user, "sample-user"}, unpinned.id, %{title: " "})
+    assert %{code: "invalid_title"} = update(ctx, {:user, "sample-user"}, unpinned.id, %{title: " "})
 
     assert %{code: "invalid_spec_ref"} =
              update(ctx, {:user, "sample-user"}, unpinned.id, %{spec_ref_name: "spec.md"})
@@ -519,10 +517,7 @@ defmodule Tightbeam.WorkItemsTest do
 
   defp revoke_call(id),
     do:
-      call("revoke-assignment", {:user, "sample-user"}, %{
-        assignment_id: id,
-        reason: "test revocation"
-      })
+      call("revoke-assignment", {:user, "sample-user"}, %{assignment_id: id, reason: "test revocation"})
 
   defp dispatch!(ctx, call) do
     assert {:ok, result} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
@@ -549,7 +544,7 @@ defmodule Tightbeam.WorkItemsTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "test-host"
+      host: "host-b"
     })
   end
 end

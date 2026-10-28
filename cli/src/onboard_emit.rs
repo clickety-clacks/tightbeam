@@ -340,7 +340,7 @@ mod tests {
         };
         let line = structured_line(
             "openai",
-            "test-host",
+            "node-c",
             &deliverable,
             Some("w_1"),
             Some("/w/onboard-delivery-openai-1.json"),
@@ -349,7 +349,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid json");
         let d = &parsed["onboardingDelivery"];
         assert_eq!(d["provider"], "openai");
-        assert_eq!(d["machine"], "test-host");
+        assert_eq!(d["machine"], "node-c");
         assert_eq!(d["kind"], "device_code");
         assert_eq!(d["url"], "https://auth.openai.com/codex/device");
         assert_eq!(d["code"], "VG6S-L35ON");
@@ -362,7 +362,7 @@ mod tests {
         let deliverable = Deliverable::SignInUrl {
             url: "https://claude.ai/oauth/authorize?x=1".to_owned(),
         };
-        let line = structured_line("anthropic", "test-host", &deliverable, None, None);
+        let line = structured_line("anthropic", "node-c", &deliverable, None, None);
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid json");
         let d = &parsed["onboardingDelivery"];
         assert_eq!(d["kind"], "paste_back");
@@ -377,12 +377,12 @@ mod tests {
             code: "VG6S-L35ON".to_owned(),
         };
         let notified = Notified::Waked {
-            user_id: "operator".to_owned(),
+            user_id: "sampleuser".to_owned(),
             wake_id: Some("w_1".to_owned()),
         };
         let file = delivery_file_json(
             "openai",
-            "test-host",
+            "node-c",
             &deliverable,
             1000,
             Some(901_000),
@@ -394,7 +394,7 @@ mod tests {
         assert_eq!(d["mintedAtMs"], 1000);
         assert_eq!(d["expiresAtMs"], 901_000);
         assert_eq!(d["notification"]["notified"], true);
-        assert_eq!(d["notification"]["userId"], "operator");
+        assert_eq!(d["notification"]["userId"], "sampleuser");
         assert_eq!(d["notification"]["wakeId"], "w_1");
     }
 
@@ -406,7 +406,7 @@ mod tests {
         let notified = Notified::NotNotified {
             reason: "gateway did not supply ownerUserId".to_owned(),
         };
-        let file = delivery_file_json("anthropic", "test-host", &deliverable, 5, None, &notified);
+        let file = delivery_file_json("anthropic", "node-c", &deliverable, 5, None, &notified);
         let parsed: serde_json::Value = serde_json::from_str(&file).expect("valid json");
         let n = &parsed["onboardingDelivery"]["notification"];
         assert_eq!(n["notified"], false);

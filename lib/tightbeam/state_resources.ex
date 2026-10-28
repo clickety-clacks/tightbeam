@@ -60,6 +60,7 @@ defmodule Tightbeam.StateResources do
 
   alias Tightbeam.{
     AdminProjection,
+    Assignments,
     Artifacts,
     DB,
     Devices,
@@ -85,8 +86,11 @@ defmodule Tightbeam.StateResources do
       ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon rowVersion),
     "turns" =>
       ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt rowVersion),
+    "coordination share" =>
+      ~w(sessionKey from to turns wakeTurns classedTurns coordinationTurns summons algedonic byClass share dependencyVersion),
+    "digest members" => ~w(wakeId prompt class classElection createdAt dependencyVersion),
     "decision requests" =>
-      ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
+      ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt returnedBy returnReason returnedAt rowVersion),
     "sessions" =>
       ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion),
     "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
@@ -162,14 +166,26 @@ defmodule Tightbeam.StateResources do
       nullable:
         ~w(messageId wakeId roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness owner adapterGen requestRef error startedAt endedAt publishedAt)
     },
+    "coordination share" => %{
+      strings: ~w(sessionKey dependencyVersion),
+      integers: ~w(from to turns wakeTurns classedTurns coordinationTurns summons algedonic),
+      booleans: [],
+      nullable: ~w(share)
+    },
+    "digest members" => %{
+      strings: ~w(wakeId prompt class classElection dependencyVersion),
+      integers: ~w(createdAt),
+      booleans: [],
+      nullable: ~w(class classElection)
+    },
     "decision requests" => %{
       strings:
-        ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId statuteName question status decision rationale ruledBy withdrawnBy withdrawnReason askedOfRole answer answeredBy),
+        ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId statuteName question status decision rationale ruledBy withdrawnBy withdrawnReason askedOfRole answer answeredBy returnedBy returnReason),
       integers:
-        ~w(lineageRung effortGeneration raisedAt deadlineAt ruledAt consumedAt withdrawnAt answeredAt rowVersion),
+        ~w(lineageRung effortGeneration raisedAt deadlineAt ruledAt consumedAt withdrawnAt answeredAt returnedAt rowVersion),
       booleans: [],
       nullable:
-        ~w(raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId deadlineAt statuteName decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt context)
+        ~w(raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId deadlineAt statuteName decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt returnedBy returnReason returnedAt context)
     },
     "sessions" => %{
       strings:
@@ -263,6 +279,8 @@ defmodule Tightbeam.StateResources do
   }
 
   @item_complex_types %{
+    {"coordination share", "byClass"} => :integer_map,
+    {"coordination share", "share"} => :number,
     {"assignments", "files"} => {:array, :string, :preserve},
     {"attests", "commitRefs"} => {:array, :commit_ref, :preserve},
     {"decision requests", "options"} => {:array, :decision_option, :preserve},
@@ -335,9 +353,11 @@ defmodule Tightbeam.StateResources do
     {"wakes", "reresolve"} => ~w(lineage),
     {"wakes", "firedBy"} => ~w(condition fallback),
     {"wakes", "classElection"} => ~w(sender classifier batcher),
+    {"digest members", "classElection"} => ~w(sender classifier batcher),
     {"turns", "status"} => ~w(queued running delivered canceled failed failed_unknown),
     {"decision requests", "kind"} => ~w(statute effort agent),
-    {"decision requests", "status"} => ~w(open ruled consumed withdrawn superseded answered),
+    {"decision requests", "status"} =>
+      ~w(open ruled consumed withdrawn superseded answered returned),
     {"sessions", "kind"} => ~w(main dm custom),
     {"sessions", "state"} => ~w(active retired),
     {"sessions", "mechanicalStatus"} => ~w(idle running),
@@ -582,18 +602,21 @@ defmodule Tightbeam.StateResources do
   defp decision_request_query_row(nil), do: nil
 
   defp decision_request_query_row(row) do
-    row
-    |> Map.drop([
-      :action_key,
-      :ruled_via_session_key,
-      :ruled_via_principal,
-      :ruled_via_session_state,
-      :ruling_fact_id,
-      :park_wake_id,
-      :returned_by,
-      :return_reason,
-      :returned_at
-    ])
+    row =
+      Map.drop(row, [
+        :action_key,
+        :ruled_via_session_key,
+        :ruled_via_principal,
+        :ruled_via_session_state,
+        :ruling_fact_id,
+        :park_wake_id
+      ])
+
+    if Map.get(row, :kind) == "agent" do
+      row
+    else
+      Map.drop(row, [:returned_by, :return_reason, :returned_at])
+    end
   end
 
   defp detail_principal(%{rest_principal: %{kind: kind, id: id, is_admin: is_admin}}),
@@ -742,11 +765,37 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  def query_artifact(
+        db,
+        %{filters: filters, principal: principal, boundary: boundary, limit: limit}
+      )
+      when is_map(filters) and is_map(principal) and is_integer(limit) and limit > 0,
+      do:
+        Artifacts.query_artifact(db, %{
+          filters: filters,
+          principal: principal,
+          boundary: boundary,
+          limit: limit
+        })
+
   def query_artifact(db, %{key: id, principal: principal}) do
     detail_selection(db, "artifacts", principal, &Artifacts.get_in_txn(&1, id))
   end
 
   def query_artifact(db, id), do: Artifacts.get(db, id)
+
+  def query_attest(
+        db,
+        %{filters: filters, principal: principal, boundary: boundary, limit: limit}
+      )
+      when is_map(filters) and is_map(principal) and is_integer(limit) and limit > 0,
+      do:
+        Assignments.list_attests(db, %{
+          filters: filters,
+          principal: principal,
+          boundary: boundary,
+          limit: limit
+        })
 
   def query_attest(db, id) do
     {:ok, rows} =
@@ -1286,6 +1335,40 @@ defmodule Tightbeam.StateResources do
   def wake(row), do: public(row)
   def production(row), do: row |> public() |> correlate("eventId", "seq")
 
+  def coordination_share(row) do
+    exact!(
+      "coordination share",
+      %{
+        "sessionKey" => required_string!(row, :session_key),
+        "from" => required_integer!(row, :from),
+        "to" => required_integer!(row, :to),
+        "turns" => required_integer!(row, :turns),
+        "wakeTurns" => required_integer!(row, :wake_turns),
+        "classedTurns" => required_integer!(row, :classed_turns),
+        "coordinationTurns" => required_integer!(row, :coordination_turns),
+        "summons" => required_integer!(row, :summon_turns),
+        "algedonic" => required_integer!(row, :algedonic_turns),
+        "byClass" => required_map!(row, :by_class),
+        "share" => nullable_number!(value(row, :share), "share"),
+        "dependencyVersion" => required_string!(row, :dependency_version)
+      }
+    )
+  end
+
+  def digest_member(row) do
+    exact!(
+      "digest members",
+      %{
+        "wakeId" => required_string!(row, :wake_id),
+        "prompt" => required_string_value!(row, :prompt),
+        "class" => nullable_string!(value(row, :class), "class"),
+        "classElection" => nullable_string!(value(row, :class_election), "classElection"),
+        "createdAt" => required_integer!(row, :created_at),
+        "dependencyVersion" => required_string!(row, :dependency_version)
+      }
+    )
+  end
+
   def turn(row) do
     case value(row, :prompt) do
       prompt when is_binary(prompt) ->
@@ -1565,12 +1648,7 @@ defmodule Tightbeam.StateResources do
 
     case Map.fetch(@item_field_order, resource) do
       {:ok, fields} ->
-        fields =
-          if resource == "transcript messages" and not Map.has_key?(item, "messageType") do
-            List.delete(fields, "messageType")
-          else
-            fields
-          end
+        fields = item_shape_fields(resource, fields, item)
 
         Enum.sort(Map.keys(item)) == Enum.sort(fields)
 
@@ -1582,7 +1660,7 @@ defmodule Tightbeam.StateResources do
   @doc false
   def item_shape_superset?(resource, item) when is_binary(resource) and is_map(item) do
     resource = Map.get(@item_resource_aliases, resource, resource)
-    fields = Map.fetch!(@item_field_order, resource)
+    fields = item_shape_fields(resource, Map.fetch!(@item_field_order, resource), item)
 
     required =
       if resource == "transcript messages", do: List.delete(fields, "messageType"), else: fields
@@ -1681,7 +1759,9 @@ defmodule Tightbeam.StateResources do
   end
 
   defp closed_projection(row, resource) do
-    fields = Map.fetch!(@item_field_order, resource)
+    fields =
+      conditional_projection_fields!(resource, Map.fetch!(@item_field_order, resource), row)
+
     row |> Map.take(fields) |> then(&exact!(resource, &1))
   end
 
@@ -1699,6 +1779,7 @@ defmodule Tightbeam.StateResources do
       |> public()
       |> Map.update!("options", fn _filtered_options -> decision_options!(stored_options) end)
 
+    validate_decision_return_triplet!(row)
     validate_decision_deadline!(row)
 
     row =
@@ -1741,6 +1822,22 @@ defmodule Tightbeam.StateResources do
 
   defp validate_decision_deadline!(_row), do: :ok
 
+  defp validate_decision_return_triplet!(%{"kind" => "agent"} = row) do
+    return_fields = ~w(returnedBy returnReason returnedAt)
+    all_nil? = Enum.all?(return_fields, &(Map.fetch!(row, &1) == nil))
+    all_present? = Enum.all?(return_fields, &(not is_nil(Map.fetch!(row, &1))))
+
+    valid? =
+      (row["status"] == "returned" and all_present?) or
+        (row["status"] != "returned" and all_nil?)
+
+    unless valid? do
+      raise ArgumentError, "decision request return fields are projection_invalid"
+    end
+  end
+
+  defp validate_decision_return_triplet!(_row), do: :ok
+
   defp decision_options!(nil), do: []
 
   defp decision_options!(options) when is_list(options) do
@@ -1760,7 +1857,8 @@ defmodule Tightbeam.StateResources do
     do: raise(ArgumentError, "decision request options are projection_invalid")
 
   defp exact!(resource, item) do
-    expected = Map.fetch!(@item_field_order, resource)
+    expected =
+      conditional_projection_fields!(resource, Map.fetch!(@item_field_order, resource), item)
 
     if Enum.sort(Map.keys(item)) == Enum.sort(expected) do
       item
@@ -1865,6 +1963,13 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  defp required_string_value!(row, field) do
+    case value(row, field) do
+      value when is_binary(value) -> value
+      _ -> raise ArgumentError, "#{field} must be a string"
+    end
+  end
+
   defp nullable_string!(nil, _field), do: nil
   defp nullable_string!(value, _field) when is_binary(value), do: value
 
@@ -1877,6 +1982,19 @@ defmodule Tightbeam.StateResources do
       _ -> raise ArgumentError, "#{field} must be an integer"
     end
   end
+
+  defp required_map!(row, field) do
+    case value(row, field) do
+      value when is_map(value) -> value
+      _ -> raise ArgumentError, "#{field} must be an object"
+    end
+  end
+
+  defp nullable_number!(nil, _field), do: nil
+  defp nullable_number!(value, _field) when is_number(value), do: value
+
+  defp nullable_number!(_value, field),
+    do: raise(ArgumentError, "#{field} must be a number or null")
 
   defp required_version!(row) do
     case value(row, :row_version) do
@@ -1925,7 +2043,30 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  defp conditional_fields!("decision requests", fields, item),
+    do: decision_request_fields(fields, item)
+
   defp conditional_fields!(_resource, fields, _item), do: fields
+
+  defp item_shape_fields("transcript messages", fields, item) do
+    if Map.has_key?(item, "messageType"), do: fields, else: List.delete(fields, "messageType")
+  end
+
+  defp item_shape_fields("decision requests", fields, item) do
+    decision_request_fields(fields, item)
+  end
+
+  defp item_shape_fields(_resource, fields, _item), do: fields
+
+  defp conditional_projection_fields!("decision requests", fields, item),
+    do: decision_request_fields(fields, item)
+
+  defp conditional_projection_fields!(_resource, fields, _item), do: fields
+
+  defp decision_request_fields(fields, %{"kind" => "agent"}), do: fields
+
+  defp decision_request_fields(fields, _item),
+    do: Enum.reject(fields, &(&1 in ~w(returnedBy returnReason returnedAt)))
 
   defp exact_item_keys!(resource, item, fields) do
     unless Enum.sort(Map.keys(item)) == Enum.sort(fields) do
@@ -1951,6 +2092,9 @@ defmodule Tightbeam.StateResources do
     type =
       cond do
         field == "rowVersion" ->
+          :positive_integer
+
+        resource == "decision requests" and field == "returnedAt" ->
           :positive_integer
 
         resource == "condition facts" and field == "id" ->
@@ -1988,6 +2132,7 @@ defmodule Tightbeam.StateResources do
 
   defp validate_wire_value!(value, :string, _label) when is_binary(value), do: :ok
   defp validate_wire_value!(value, :integer, _label) when is_integer(value), do: :ok
+  defp validate_wire_value!(value, :number, _label) when is_number(value), do: :ok
 
   defp validate_wire_value!(value, :positive_integer, _label)
        when is_integer(value) and value > 0,
@@ -2059,6 +2204,14 @@ defmodule Tightbeam.StateResources do
     :ok
   end
 
+  defp validate_wire_value!(value, :integer_map, label) when is_map(value) do
+    unless Enum.all?(value, fn {key, item} -> is_binary(key) and is_integer(item) end) do
+      raise ArgumentError, "#{label} must be a string-to-integer map"
+    end
+
+    :ok
+  end
+
   defp validate_wire_value!(value, :json, label), do: validate_json_value!(value, label)
 
   defp validate_wire_value!(_value, _type, label),
@@ -2118,6 +2271,16 @@ defmodule Tightbeam.StateResources do
       raise ArgumentError, "condition facts id must equal rowVersion"
     end
   end
+
+  defp validate_item_invariants!(
+         "decision requests",
+         %{"kind" => kind, "status" => "returned"}
+       )
+       when kind != "agent",
+       do: raise(ArgumentError, "non-agent decision requests cannot be returned")
+
+  defp validate_item_invariants!("decision requests", %{"kind" => "agent"} = item),
+    do: validate_decision_return_triplet!(item)
 
   defp validate_item_invariants!(
          "attests",
@@ -2257,6 +2420,15 @@ defmodule Tightbeam.StateResources do
       |> Enum.map_join(",", fn {key, item} ->
         JSON.encode!(key) <> ":" <> JSON.encode!(item)
       end)
+
+    "{" <> encoded <> "}"
+  end
+
+  defp encode_item_field("coordination share", "byClass", value) do
+    encoded =
+      value
+      |> Enum.sort_by(fn {key, _count} -> key end)
+      |> Enum.map_join(",", fn {key, count} -> JSON.encode!(key) <> ":" <> JSON.encode!(count) end)
 
     "{" <> encoded <> "}"
   end

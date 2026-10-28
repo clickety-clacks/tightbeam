@@ -26,8 +26,11 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
       ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon rowVersion),
     "turns" =>
       ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt rowVersion),
+    "coordination share" =>
+      ~w(sessionKey from to turns wakeTurns classedTurns coordinationTurns summons algedonic byClass share dependencyVersion),
+    "digest members" => ~w(wakeId prompt class classElection createdAt dependencyVersion),
     "decision requests" =>
-      ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
+      ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt returnedBy returnReason returnedAt rowVersion),
     "sessions" =>
       ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion),
     "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
@@ -49,6 +52,11 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
       ~w(name purpose phrases rootArchetype installedRevision status documents rowVersion)
   }
 
+  # These REST list resources use the shared item encoder but do not emit
+  # rebuildable Firehose rows.
+  @rest_read_resources ["coordination share", "digest members"]
+  @firehose_field_order Map.drop(@field_order, @rest_read_resources)
+
   @resource_aliases %{
     "work-items" => "work items",
     "decision-requests" => "decision requests",
@@ -67,9 +75,9 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
       |> Enum.map(&Map.get(@resource_aliases, &1, &1))
       |> MapSet.new()
 
-    assert registry_resources == MapSet.new(Map.keys(@field_order))
+    assert registry_resources == MapSet.new(Map.keys(@firehose_field_order))
 
-    for {resource, fields} <- @field_order do
+    for {resource, fields} <- @firehose_field_order do
       item = item(resource, fields)
 
       assert StateResources.encode_item(resource, item, @catalog) ==
@@ -144,7 +152,7 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     end)
   end
 
-  test "messageType is the sole conditional omission and is never encoded as null" do
+  test "messageType is conditional and is never encoded as null" do
     fields = Map.fetch!(@field_order, "transcript messages")
     item = item("transcript messages", fields)
     omitted = Map.delete(item, "messageType")
@@ -157,6 +165,86 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
 
     assert StateResources.encode_item("messages", Map.put(item, "messageType", "")) =~
              ~s("messageType":"")
+  end
+
+  test "decision return fields are present for agents and omitted for other kinds" do
+    fields = Map.fetch!(@field_order, "decision requests")
+    return_fields = ~w(returnedBy returnReason returnedAt)
+    agent = item("decision requests", fields)
+
+    assert agent["kind"] == "agent"
+    assert Enum.all?(return_fields, &(Map.fetch!(agent, &1) == nil))
+    assert StateResources.item_shape_complete?("decision-requests", agent)
+    assert StateResources.complete_item?("decision-requests", agent)
+
+    agent_bytes = StateResources.encode_item("decision-requests", agent, @catalog)
+    assert agent_bytes == expected_bytes("decision requests", fields, agent)
+    assert JSON.decode!(agent_bytes)["returnedBy"] == nil
+
+    non_agent =
+      agent
+      |> Map.put("kind", "statute")
+      |> Map.drop(return_fields)
+
+    non_agent_fields = Enum.reject(fields, &(&1 in return_fields))
+    non_agent_bytes = StateResources.encode_item("decision-requests", non_agent, @catalog)
+
+    assert StateResources.item_shape_complete?("decision-requests", non_agent)
+    refute StateResources.item_shape_superset?("decision-requests", non_agent)
+    assert non_agent_bytes == expected_bytes("decision requests", non_agent_fields, non_agent)
+    refute Enum.any?(return_fields, &String.contains?(non_agent_bytes, &1))
+
+    with_return_fields = Map.merge(non_agent, Map.take(agent, return_fields))
+    refute StateResources.item_shape_complete?("decision-requests", with_return_fields)
+    assert StateResources.item_shape_superset?("decision-requests", with_return_fields)
+
+    assert_raise ArgumentError, ~r/extra or missing field/, fn ->
+      StateResources.encode_item("decision-requests", with_return_fields, @catalog)
+    end
+
+    assert_raise ArgumentError, ~r/non-agent decision requests cannot be returned/, fn ->
+      StateResources.encode_item(
+        "decision-requests",
+        Map.put(non_agent, "status", "returned"),
+        @catalog
+      )
+    end
+
+    populated_before_return =
+      agent
+      |> Map.put("returnedBy", "session:fixture")
+      |> Map.put("returnReason", "Missing authority")
+      |> Map.put("returnedAt", 1)
+
+    assert_raise ArgumentError, ~r/return fields are projection_invalid/, fn ->
+      StateResources.encode_item("decision-requests", populated_before_return, @catalog)
+    end
+
+    returned =
+      agent
+      |> Map.put("status", "returned")
+      |> Map.put("returnedBy", "session:fixture")
+      |> Map.put("returnReason", "Missing authority")
+      |> Map.put("returnedAt", 1)
+
+    assert StateResources.encode_item("decision-requests", returned, @catalog) ==
+             expected_bytes("decision requests", fields, returned)
+
+    assert_raise ArgumentError, ~r/return fields are projection_invalid/, fn ->
+      StateResources.encode_item(
+        "decision-requests",
+        Map.put(returned, "returnReason", nil),
+        @catalog
+      )
+    end
+
+    assert_raise ArgumentError, fn ->
+      StateResources.encode_item(
+        "decision-requests",
+        Map.put(returned, "returnedAt", 0),
+        @catalog
+      )
+    end
   end
 
   test "the closed field table rejects extra and missing R7 input" do
@@ -545,6 +633,7 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
 
   defp value("decision requests", "options"), do: [%{"label" => "one"}]
   defp value("decision requests", "context"), do: opaque_json()
+  defp value("decision requests", "kind"), do: "agent"
   defp value("identity", "sessionRevisions"), do: %{"z" => "2", "a" => "1"}
   defp value("identity", "staleness"), do: ["zeta", "alpha"]
   defp value("identity", "conflicts"), do: ["zeta", "alpha"]
@@ -569,6 +658,8 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
   defp valid_value({:nullable, _type}, _field), do: nil
   defp valid_value(:string, field), do: field
   defp valid_value(:integer, _field), do: 1
+  defp valid_value(:integer_map, _field), do: %{"fyi" => 1}
+  defp valid_value(:number, _field), do: 0.5
   defp valid_value(:positive_integer, _field), do: 1
   defp valid_value(:boolean, _field), do: false
   defp valid_value({:enum, values}, _field), do: hd(values)
@@ -624,6 +715,8 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
   defp invalid_value({:enum, [value | _values]}) when is_integer(value), do: 99
   defp invalid_value({:enum, _values}), do: "outside-enum"
   defp invalid_value({:array, _type, _order}), do: %{}
+  defp invalid_value(:integer_map), do: []
+  defp invalid_value(:number), do: "not-a-number"
   defp invalid_value(:session_overrides), do: %{}
   defp invalid_value(:string_map), do: []
   defp invalid_value(:json), do: :not_json

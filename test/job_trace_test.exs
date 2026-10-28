@@ -87,7 +87,7 @@ defmodule Tightbeam.JobTraceTest do
         (assignmentId, generation, state, baseHorizonMs, multiplier, armedAt,
          terminalSeqWatermark, holderKey, host, root, baseline, wakeId, evidence)
       VALUES
-        ('asg_direct', 1, 'probed', 10, 1, 100, 0, 'holder', 'test-host', '/tmp',
+        ('asg_direct', 1, 'probed', 10, 1, 100, 0, 'holder', 'host-b', '/tmp',
          '{"status":"available","observation":{"stamp":"/tmp/effort.stamp","prior":"observed","writes":0,"entries":1,"digest":"same"}}',
          'w_condition', '{"outcome":"zero_effect"}');
 
@@ -424,7 +424,7 @@ defmodule Tightbeam.JobTraceTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "test-host"
+      host: "host-b"
     })
   end
 

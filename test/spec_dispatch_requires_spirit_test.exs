@@ -15,8 +15,10 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     WorkItems
   }
 
-  # This rule requires spec-backed work to receive product-owner review before
-  # implementation. These tests prove it summons and releases, and
+  # The adjudication postmortem's wiring fix (spec production-machine-v1 era,
+  # decisions ledger 2026-08-05): an 11-round spec pipeline ran
+  # spec->review->implementation with no product-owner edge to cross. This
+  # statute creates the edge; these tests prove it summons and releases, and
   # that unspecced work never crosses it.
   setup do
     db = :"spirit_gate_db_#{System.unique_integer([:positive])}"
@@ -24,7 +26,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "test-host" => %{
+      "host-b" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -85,7 +87,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
       archetype: archetype,
       harness: harness,
       provider: provider,
-      host: "test-host",
+      host: "host-b",
       model: Model.new("sonnet", effort: "medium"),
       spawned_by: nil,
       is_built_in: false

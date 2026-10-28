@@ -9,7 +9,7 @@ defmodule Tightbeam.Readiness do
   past ABOVE that line, so the closing statement was the only one that read like
   a verdict and it was the wrong one.
 
-  Serving with nothing configured stays correct (user: "if it can run at all").
+  Serving with nothing configured stays correct.
   This does not refuse a boot, gate anything, or return a status. It only makes
   the closing statement true.
 
@@ -299,8 +299,8 @@ defmodule Tightbeam.Readiness do
       ["", "Diagnose further with: mix tightbeam.doctor (base_dir #{config.base_dir})"]
   end
 
-  # No credential kind carries a readable expiry, so there is NO pre-expiry wake —
-  # and this module is where that subtraction is made
+  # O7/I8 (PO ruling 2026-08-06): no credential kind carries a readable expiry, so
+  # there is NO pre-expiry wake — and this module is where that subtraction is made
   # HONEST rather than silent. For every credential that is present and working (a
   # live inventory), readiness states plainly that no pre-expiry warning is
   # available: the credential self-rotates or never expires, so an observed 401 in
@@ -345,7 +345,9 @@ defmodule Tightbeam.Readiness do
   # us with (systemd exports INVOCATION_ID; launchd is reached through
   # XPC_SERVICE_NAME). Foreground means no restart after a reboot and, worse, no
   # log — a foreground launcher usually redirects with `tee`, which truncates on
-  # restart, so a crash log may not survive the restart.
+  # restart, so the run you need after a crash is destroyed by the restart.
+  # Measured on a production host 2026-08-05: the host rebooted, the gateway stayed down
+  # until noticed by hand, and the crash log had already been overwritten.
   #
   # A line, not a refusal: running in the foreground is exactly right while
   # installing or debugging. The gateway states the fact and lets the operator
@@ -421,8 +423,8 @@ defmodule Tightbeam.Readiness do
   end
 
   # The executability gap the vendor CLI cannot cover. `:not_found` (not on PATH)
-  # and `{:exec_failed, _}` (on PATH but unable to run because its interpreter
-  # is unavailable) are both executability failures a
+  # and `{:exec_failed, _}` (on PATH but will not run — the production
+  # codex-as-`.js`-without-node incident) are both executability failures a
   # credential cannot fix; naming them here is O5's whole point.
   defp binary_line(%{binary: :runnable}), do: nil
   defp binary_line(%{binary: {:unknown, _reason}}), do: nil

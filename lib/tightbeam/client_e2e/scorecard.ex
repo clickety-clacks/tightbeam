@@ -1,7 +1,7 @@
 defmodule Tightbeam.ClientE2E.Scorecard do
   @moduledoc """
   The v1 SCORECARD — one row per SMOKE.md step, per {harness × host} leg, and
-  the verdict algebra over them (client-e2e-v1 §Architecture, r2 F3 / r3).
+  the verdict algebra over them (client-e2e-v1 §Architecture).
 
   The algebra is the whole point of putting this in `lib` rather than in the
   runner script: a verdict that is computed differently by each run is not a

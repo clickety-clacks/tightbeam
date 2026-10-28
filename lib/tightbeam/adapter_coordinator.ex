@@ -37,7 +37,7 @@ defmodule Tightbeam.AdapterCoordinator do
   - FAILURE MEMORY is ATTEMPT-SCOPED: `last_failure` records {generation, reason}
     and is only served to a caller asking about that same generation. A
     replacement adapter's death must never be labelled with its predecessor's
-    reason (cross-review F4).
+    reason.
   """
 
   use GenServer
@@ -685,7 +685,7 @@ defmodule Tightbeam.AdapterCoordinator do
         end
 
       # The message NAMES THE INSTANCE that booted. `on_ready` runs in the
-      # adapter's own process, so self() here is that adapter. Without it the
+      # adapter's own process, so self here is that adapter. Without it the
       # coordinator can only credit whichever pid the entry holds when the
       # message is finally processed — and an adapter that dies between
       # announcing readiness and being heard would hand its credit to the

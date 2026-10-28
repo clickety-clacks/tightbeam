@@ -5,7 +5,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   Provisions, boots and tears down the run-local gateway ONE LEG uses.
 
   A leg gets its own org, not a shared one. The reason is the client, not
-  tidiness (client-e2e-v1 r2 F1): the app persists its device identity in the
+  tidiness: the app persists its device identity in the
   Keychain, so a reused org takes the known-device path instead of J0's
   first-user bootstrap, and every prior leg's rows are still in the catalog.
   Leg isolation therefore means a fresh `base_dir` provisioned AND torn down
@@ -35,7 +35,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   What is NOT copied: `state.db`, `gateway.json`, logs, `work/`. Those are the
   org's history, and history is the thing a fresh leg must not have.
 
-  Teardown is existing operations only (r1 F8): SIGTERM the captured pid, wait
+  Teardown uses existing operations only: SIGTERM the captured pid, wait
   for exit, remove the run-local directory.
   """
 
@@ -349,8 +349,8 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   to exit AND for the health endpoint to go unreachable, then boot again on the
   SAME port and base_dir and confirm a NEW pid.
 
-  J7's proof is executable precisely because each of those is checked (spec
-  r1 F4). Killing a wrapper, or dropping a socket, or restarting on a fresh
+  J7's proof is executable precisely because each of those is checked. Killing
+  a wrapper, dropping a socket, or restarting on a fresh
   base_dir would all "pass" a weaker check while proving nothing about deploy
   semantics — so the old pid must be gone, the port must actually stop
   answering, and the new pid must differ.

@@ -244,7 +244,7 @@ defmodule Tightbeam.Acp.Adapter do
   call must be caught like every other adapter-boundary call: otherwise the turn
   task exits and the lane records a bare `:task_crash`, skipping the
   adjudication closure entirely — no hold, no cause, nothing to heal
-  (cross-review F1; the spec names runtime failures an adapter-fault form).
+  (the spec names runtime failures an adapter-fault form).
   """
   @spec prompt(adapter(), String.t(), String.t(), keyword()) ::
           {:ok,

@@ -59,6 +59,22 @@ defmodule Tightbeam.StateVisibility do
     do_core_detail_visible?(db, resource, row, principal)
   end
 
+  @doc "Apply the existing target-session, owner, or admin grant to coordination share."
+  @spec coordination_share_visible?(DB.server(), map(), map()) :: boolean()
+  def coordination_share_visible?(db, row, principal) when is_map(row) and is_map(principal),
+    do: core_detail_visible?(db, "sessions", row, principal)
+
+  def coordination_share_visible?(_db, _row, _principal), do: false
+
+  @doc "Apply the parent digest-carrier wake grant before selecting digest members."
+  @spec digest_member_visible?(DB.server(), map(), map()) :: boolean()
+  def digest_member_visible?(db, row, principal) when is_map(row) and is_map(principal) do
+    (value(row, :digest) == true or value(row, :digest) == 1) and
+      core_detail_visible?(db, "wakes", row, principal)
+  end
+
+  def digest_member_visible?(_db, _row, _principal), do: false
+
   defp do_core_detail_visible?(_db, resource, _row, _principal)
        when resource in ["work items", "assignments"],
        do: true
@@ -123,10 +139,125 @@ defmodule Tightbeam.StateVisibility do
     work_item_id = value(row, :work_item_id)
     work_item = work_item_visible?(db, work_item_id, principal)
 
-    session_principal?(principal, creator) or work_item
+    principal.is_admin or session_principal?(principal, creator) or work_item
   end
 
   defp do_core_detail_visible?(_db, _resource, _row, _principal), do: false
+
+  @doc "Apply the existing AU4 creator-session, linked-work-item, or admin grant to an artifact."
+  @spec artifact_visible?(DB.server(), map(), map()) :: boolean()
+  def artifact_visible?(db, row, principal),
+    do: core_detail_visible?(db, "artifacts", row, principal)
+
+  @doc "Compose the work-item grant for an ExecutionMap node."
+  def execution_map_node_visible?(source, work_item_id, principal)
+      when is_binary(work_item_id) and is_map(principal) do
+    trace_core_detail(principal, {:au4_visibility, "work items"})
+
+    not is_nil(
+      Tightbeam.StateResources.query_work_item(source, work_item_id, %{
+        rest_principal: principal
+      })
+    )
+  end
+
+  def execution_map_node_visible?(_source, _work_item_id, _principal), do: false
+
+  @doc "Compose the assignment grant before selecting an ExecutionMap node."
+  def execution_map_assignment_visible?(source, assignment_id, principal)
+      when is_binary(assignment_id) and is_map(principal) do
+    trace_core_detail(principal, {:au4_visibility, "assignments"})
+
+    not is_nil(
+      Tightbeam.StateResources.query_assignment(source, assignment_id, %{
+        rest_principal: principal
+      })
+    )
+  end
+
+  def execution_map_assignment_visible?(_source, _assignment_id, _principal), do: false
+
+  @doc false
+  @spec artifact_collection_scope(map()) :: {String.t(), [term()]}
+  def artifact_collection_scope(%{is_admin: true}), do: {"1=1", []}
+
+  def artifact_collection_scope(%{kind: "session", id: session_key})
+      when is_binary(session_key) do
+    {
+      """
+      (artifact.createdBySession = ?1 OR artifact.workItemId IN (
+        SELECT artifact_work_item.id
+        FROM work_items AS artifact_work_item
+        WHERE artifact_work_item.createdBySession = ?2
+        UNION
+        SELECT artifact_assignment.workItemId
+        FROM assignments AS artifact_assignment
+        WHERE artifact_assignment.holderKey = ?3
+      ))
+      """,
+      [session_key, session_key, session_key]
+    }
+  end
+
+  def artifact_collection_scope(%{kind: "user", id: user_id}) when is_binary(user_id) do
+    {
+      """
+      EXISTS (
+        SELECT 1 FROM work_items AS artifact_work_item
+        WHERE artifact_work_item.id = artifact.workItemId
+          AND artifact_work_item.ownerUserId = ?1
+      )
+      """,
+      [user_id]
+    }
+  end
+
+  def artifact_collection_scope(_principal), do: {"0=1", []}
+
+  @doc "Apply the AU4 parent-assignment grant to an attest or nested attest collection."
+  @spec attest_visible?(DB.server(), map(), map()) :: boolean()
+  def attest_visible?(db, row, principal) when is_map(row) do
+    assignment_id =
+      case value(row, :assignment) do
+        assignment when is_map(assignment) -> value(assignment, :id)
+        _ -> value(row, :assignment_id)
+      end
+
+    case assignment_id do
+      assignment_id when is_binary(assignment_id) ->
+        {scope_sql, scope_params} = attest_collection_scope(principal)
+        assignment_index = length(scope_params) + 1
+
+        query_rows(
+          db,
+          """
+          SELECT 1
+          FROM assignments AS assignment
+          LEFT JOIN work_items AS wi ON wi.id = assignment.workItemId
+          WHERE #{scope_sql} AND assignment.id = ?#{assignment_index}
+          """,
+          scope_params ++ [assignment_id]
+        ) != []
+
+      _ ->
+        false
+    end
+  end
+
+  @doc false
+  @spec attest_collection_scope(map()) :: {String.t(), [term()]}
+  def attest_collection_scope(%{is_admin: true}), do: {"1=1", []}
+
+  def attest_collection_scope(%{kind: "session", id: session_key})
+      when is_binary(session_key) do
+    {"(assignment.holderKey = ?1 OR assignment.openedBySession = ?2)", [session_key, session_key]}
+  end
+
+  def attest_collection_scope(%{kind: "user", id: user_id}) when is_binary(user_id) do
+    {"(assignment.openedByUser = ?1 OR wi.ownerUserId = ?2)", [user_id, user_id]}
+  end
+
+  def attest_collection_scope(_principal), do: {"0=1", []}
 
   defp trace_core_detail(%{core_detail_trace: nil}, _event), do: :ok
 

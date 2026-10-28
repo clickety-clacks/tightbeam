@@ -46,7 +46,7 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
     {:paired, device} =
       claim_org(db, %{
         device_id: "external-skills",
-        claimed_name: "Sample User",
+        claimed_name: "sample-user",
         platform: nil,
         model: nil
       })
@@ -63,7 +63,7 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
         harness: "claude",
         provider: "anthropic",
         model: Model.new("fable"),
-        host: "test-host"
+        host: "host-b"
       })
 
     Roles.create!(db, "external-skill-agent", device.user_id, session.session_key)

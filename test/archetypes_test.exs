@@ -143,7 +143,7 @@ defmodule Tightbeam.ArchetypesTest do
   end
 
   test "the neutral default's elected baseline skills prescribe no bundle archetype before learn" do
-    # Read the SEEDED default, not builtin_default() -- the latter carries skills: [],
+    # Read the SEEDED default, not builtin_default -- the latter carries skills: [],
     # so looping over it iterates nothing and the assertion passes unconditionally. That
     # is how bundle content ("spawn a product owner") shipped in an elected skill with
     # this very test green.
@@ -172,7 +172,7 @@ defmodule Tightbeam.ArchetypesTest do
 
       pre_learn = body |> String.split("## AFTER LEARNING A KUNGFU", parts: 2) |> hd()
 
-      # BOUNDED BY DESIGN: this catches CARELESSNESS, not an adversary.
+      # BOUNDED BY DESIGN (reviewer-ruled): this catches CARELESSNESS, not an adversary.
       # Paraphrases get through ("ask a delivery specialist to take ownership") and that
       # residual is acceptable. What is NOT acceptable is blocking honest text, and a
       # hand-built verb list did exactly that: "spawn a product" rejected "spawn a
@@ -797,7 +797,7 @@ defmodule Tightbeam.ArchetypesTest do
   test "where wildcard must stand alone and where must be non-empty", ctx do
     path = Path.join(manifests_dir!(ctx.base_dir), "bad.toml")
 
-    File.write!(path, "name = \"bad\"\nwhere = [\"*\", \"test-host\"]\n")
+    File.write!(path, "name = \"bad\"\nwhere = [\"*\", \"host-b\"]\n")
 
     assert_raise ArgumentError, ~r/must be the only element/, fn ->
       Archetypes.load!(ctx.base_dir)

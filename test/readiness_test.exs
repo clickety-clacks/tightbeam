@@ -125,7 +125,7 @@ defmodule Tightbeam.ReadinessTest do
     # for GAPS holds: no adapter/credential/model/foreground line leaks here.
     assert first == "READY: #{names} can run turns."
 
-    # …but the readiness contract requires pre-expiry absence to be NAMED for every
+    # …but O7/I8 (PO ruling) require the pre-expiry-absence to be NAMED for every
     # onboarded credential, so a healthy install is no longer literally one line:
     # it carries exactly one advisory per live credential, and NOTHING else.
     advisory = Enum.reject(rest, &(&1 == ""))
@@ -138,8 +138,11 @@ defmodule Tightbeam.ReadinessTest do
   end
 
   test "a ready install with NO service manager says so — the install is not finished", ctx do
-    # A foreground gateway does not survive a reboot, and a redirected log may
-    # be truncated on restart. The readiness summary must state that limitation.
+    # The gap that cost a production host its uptime and its crash log (host-a,
+    # 2026-08-05): a gateway running foreground in tmux does not survive a
+    # reboot, and its `tee` log truncates on restart, so the run you need after
+    # a crash is destroyed by the restart. READY is exactly when an operator
+    # stops paying attention, so it is exactly where this has to be said.
     for module <- Harness.all(), do: install_adapter!(ctx.base, module)
     catalog = catalog!(Map.new(Harness.all(), &{&1.wire_name(), live("m")}))
 
@@ -217,7 +220,7 @@ defmodule Tightbeam.ReadinessTest do
       |> Enum.find(&(&1 =~ "Tightbeam has no credential"))
 
     # The CLI's `onboard` takes the credential PROVIDER (anthropic|openai), not the
-    # harness (claude|codex). This assertion used to pin wire_name(), so it stayed
+    # harness (claude|codex). This assertion used to pin wire_name, so it stayed
     # green while the summary printed a command the CLI rejects outright — on the
     # one surface the operator is told to act on. Assert the provider, and assert
     # the harness name is NOT what gets handed to the verb.
@@ -247,7 +250,7 @@ defmodule Tightbeam.ReadinessTest do
     assert line =~ "TIGHTBEAM_DEFAULT_MODEL"
   end
 
-  # THE WRONG CAUSE. A tiered model named with no effort IS in the
+  # THE WRONG CAUSE . A tiered model named with no effort IS in the
   # live catalog; what is missing is the tier. Blaming the catalog sends the
   # operator to `catalog.diff` to hunt for a model that is already there — the
   # same defect class adjudication was fixed for, surviving in a second copy
@@ -329,7 +332,7 @@ defmodule Tightbeam.ReadinessTest do
 
     archetypes = %{
       "default" => %{name: "default", where: ["testhost"]},
-      "recon" => %{name: "recon", where: ["test-host", "remote-runner"]}
+      "recon" => %{name: "recon", where: ["host-b", "host-c"]}
     }
 
     lines =
@@ -339,8 +342,8 @@ defmodule Tightbeam.ReadinessTest do
 
     line = Enum.find(lines, &(&1 =~ "archetype recon"))
     assert line, "the dangling archetype must be named"
-    assert line =~ "test-host"
-    assert line =~ "remote-runner"
+    assert line =~ "host-b"
+    assert line =~ "host-c"
     assert line =~ "cannot be placed"
     refute Enum.any?(lines, &(&1 =~ "archetype default"))
   end
@@ -351,7 +354,7 @@ defmodule Tightbeam.ReadinessTest do
     catalog = catalog!(%{})
 
     archetypes = %{
-      "mixed" => %{name: "mixed", where: ["testhost", "test-host"]},
+      "mixed" => %{name: "mixed", where: ["testhost", "host-b"]},
       "roamer" => %{name: "roamer", where: ["*"]}
     }
 
@@ -458,7 +461,8 @@ defmodule Tightbeam.ReadinessTest do
 
   ## Executability is a distinct axis (O5/I6), and the pre-expiry absence is named (O7/I8)
 
-  # With the vendor CLI installed but unable to execute, boot must say only
+  # AC5, the real fail-before: with the vendor CLI installed but unable to
+  # execute (the host-a codex-as-`.js`-without-node incident), boot said only
   # "Tightbeam has no credential for openai" — true and useless, since onboarding
   # a credential cannot start a binary that cannot run. Readiness must name the
   # EXECUTABILITY gap and must NOT lead with the credential remedy.

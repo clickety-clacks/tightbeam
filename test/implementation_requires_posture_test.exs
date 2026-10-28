@@ -13,7 +13,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     WorkItems
   }
 
-  # The posture gate ensures implementation runs under a posture the
+  # The posture gate (Mike, 2026-08-31): implementation runs under a posture the
   # orchestrator rules on receiving the slice, heavy or light, filed as a verdict on
   # a card on the work item. These tests prove the two rails refuse to open a coder
   # card without that verdict, on assign and on dispatch alike, that the verdict
@@ -24,7 +24,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "test-host" => %{
+      "host-b" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -86,7 +86,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
       archetype: archetype,
       harness: harness,
       provider: provider,
-      host: "test-host",
+      host: "host-b",
       model: Model.new("sonnet", effort: "medium"),
       spawned_by: nil,
       is_built_in: false

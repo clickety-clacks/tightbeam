@@ -813,7 +813,10 @@ defmodule Tightbeam.SupervisionTest do
     end
   end
 
-  # Prods fired into a dead harness become failed turns. The ladder measures the HOLDER's
+  # THE OUTAGE REGRESSION (2026-08-15). During the 2026-08-10 claude outage,
+  # prods fired into a dead harness became failed turns, the stored counter
+  # climbed anyway, ladders exhausted into a dead tree (127 stalls in one day),
+  # and nothing re-armed them at recovery. The ladder measures the HOLDER's
   # unaccountability, so only prods that were DELIVERED — heard, then ignored —
   # may advance it. A failed prod turn is evidence about the transport.
   test "a prod whose wake-turn failed does not advance the ladder; a delivered one does",
@@ -852,7 +855,7 @@ defmodule Tightbeam.SupervisionTest do
 
     # The harness recovered: the RETRY prod's turn is genuinely delivered — a
     # failed turn is terminal in production and never becomes delivered; the
-    # recovery path is a new wake with a new turn.
+    # recovery path is a new wake with a new turn .
     assert [retry_wake] = Wakes.list_pending(ctx.db)
 
     {:ok, _} =
@@ -880,7 +883,7 @@ defmodule Tightbeam.SupervisionTest do
     assert stalled != nil
   end
 
-  # THE REPAIR-SEAM REGRESSION. A typed liveness
+  # THE REPAIR-SEAM REGRESSION . A typed liveness
   # receipt is the holder's lawful repair verb; heard-prod history from before
   # it must never resurrect a rung. Without the epoch boundary, one delivered
   # pre-receipt prod at n=1 re-escalated an accountable holder immediately.
@@ -972,7 +975,7 @@ defmodule Tightbeam.SupervisionTest do
     assert %{stalledAt: nil} = Supervision.prod_state(ctx.db, "asg_1")
   end
 
-  # THE LEGACY-TRANSFER REGRESSION. Retirement-era
+  # THE LEGACY-TRANSFER REGRESSION (Sol confirmation round). Retirement-era
   # sidecar rows carry transfer evidence but a NULL chargedGeneration. Before
   # any receipt exists they are real heard evidence (NULL fails >= silently);
   # after a receipt they belong to history like everything else pre-repair.
@@ -1069,14 +1072,15 @@ defmodule Tightbeam.SupervisionTest do
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
   end
 
-  test "durable filings rebase liveness", ctx do
+  test "the August 31 Cards 1, 3, 4, and 5 durable filings rebase liveness", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq1 = terminal!(ctx.db, "holder")
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
     [wake] = Wakes.list_pending(ctx.db)
     cancel_wake!(ctx.db, wake)
 
-    # Deterministic examples cover progress, verdict, and dependency receipts.
+    # These cases distinguish repeated filings, dependency fallback, and
+    # durable progress. The earlier dependency receipt remains valid.
     # This receipt-selection fixture deliberately does not model stale
     # post-closure state or unexpired-wake eligibility, which have separate
     # boundaries.
@@ -1086,14 +1090,14 @@ defmodule Tightbeam.SupervisionTest do
         """
         INSERT INTO attests (id, assignmentId, kind, bySession, ts)
         VALUES
-          ('att_00000000-0000-4000-8000-000000000114','asg_1','progress','holder',2),
-          ('att_00000000-0000-4000-8000-000000000115','asg_1','progress','holder',3),
-          ('att_00000000-0000-4000-8000-000000000116','asg_1','progress','holder',4),
-          ('att_00000000-0000-4000-8000-000000000117','asg_1','progress','holder',5),
-          ('att_00000000-0000-4000-8000-000000000118','asg_1','progress','holder',6),
-          ('att_00000000-0000-4000-8000-000000000119','asg_1','progress','holder',7),
-          ('att_00000000-0000-4000-8000-000000000120','asg_1','progress','holder',8),
-          ('att_00000000-0000-4000-8000-000000000113','asg_1','progress','holder',9)
+          ('att_44706a9f','asg_1','progress','holder',2),
+          ('att_38a1a229','asg_1','progress','holder',3),
+          ('att_f0f735ae','asg_1','progress','holder',4),
+          ('att_7b4d29c1','asg_1','progress','holder',5),
+          ('att_a6051dd2','asg_1','progress','holder',6),
+          ('att_c532a60d','asg_1','progress','holder',7),
+          ('att_de16e957','asg_1','progress','holder',8),
+          ('att_99c4c115','asg_1','progress','holder',9)
         """
       )
 
@@ -1103,10 +1107,10 @@ defmodule Tightbeam.SupervisionTest do
         """
         INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts)
         VALUES
-          ('att_00000000-0000-4000-8000-000000000121','asg_1','verdict','cannot-proceed-external-main-red','sample-user',10),
-          ('att_00000000-0000-4000-8000-000000000122','asg_1','verdict','liveness-crediting-false-stall','sample-user',11),
-          ('att_00000000-0000-4000-8000-000000000123','asg_1','verdict','liveness-crediting-false-stall','sample-user',12),
-          ('att_00000000-0000-4000-8000-000000000124','asg_1','verdict','liveness-crediting-false-stall','sample-user',13)
+          ('att_cc66ba00','asg_1','verdict','cannot-proceed-external-main-red','sample-user',10),
+          ('att_c4f2d593','asg_1','verdict','liveness-crediting-false-stall','sample-user',11),
+          ('att_46f3b9a5','asg_1','verdict','liveness-crediting-false-stall','sample-user',12),
+          ('att_8ca4dfcd','asg_1','verdict','liveness-crediting-false-stall','sample-user',13)
         """
       )
 
@@ -1125,14 +1129,14 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok,
             [
-              ["progress", "att_00000000-0000-4000-8000-000000000114"],
-              ["progress", "att_00000000-0000-4000-8000-000000000115"],
-              ["progress", "att_00000000-0000-4000-8000-000000000116"],
-              ["progress", "att_00000000-0000-4000-8000-000000000117"],
-              ["progress", "att_00000000-0000-4000-8000-000000000118"],
-              ["progress", "att_00000000-0000-4000-8000-000000000119"],
-              ["progress", "att_00000000-0000-4000-8000-000000000120"],
-              ["progress", "att_00000000-0000-4000-8000-000000000113"]
+              ["progress", "att_44706a9f"],
+              ["progress", "att_38a1a229"],
+              ["progress", "att_f0f735ae"],
+              ["progress", "att_7b4d29c1"],
+              ["progress", "att_a6051dd2"],
+              ["progress", "att_c532a60d"],
+              ["progress", "att_de16e957"],
+              ["progress", "att_99c4c115"]
             ]} =
              DB.query(
                ctx.db,
@@ -1141,10 +1145,10 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok,
             [
-              ["verdict", "att_00000000-0000-4000-8000-000000000121"],
-              ["verdict", "att_00000000-0000-4000-8000-000000000122"],
-              ["verdict", "att_00000000-0000-4000-8000-000000000123"],
-              ["verdict", "att_00000000-0000-4000-8000-000000000124"]
+              ["verdict", "att_cc66ba00"],
+              ["verdict", "att_c4f2d593"],
+              ["verdict", "att_46f3b9a5"],
+              ["verdict", "att_8ca4dfcd"]
             ]} =
              DB.query(
                ctx.db,
@@ -2058,7 +2062,7 @@ defmodule Tightbeam.SupervisionTest do
     assert Supervision.ladder_target(ctx.db, "holder", 2) == nil
   end
 
-  # The watermark row says "escalation"; retiring it as
+  # . The watermark row says "escalation"; retiring it as
   # terminus must clear THAT row. Clearing against a rewritten branch loses the
   # CAS silently, and a watermark that never clears re-enters this path — and
   # re-logs it — on every one-second sweep, forever.
@@ -2091,8 +2095,7 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   # The reproduction, end to end: this is the exact shape of the six orphans —
-  # The reserved process principal re-resolving a lineage whose owner has no
-  # main session.
+  # `process:tightbeam` re-resolving a lineage whose owner has no main session.
   test "a lineage notice for an owner with no main session enqueues nothing and is named", ctx do
     retire!(ctx.db, "supervisor")
     retire!(ctx.db, ctx.main.session_key)
@@ -2119,7 +2122,7 @@ defmodule Tightbeam.SupervisionTest do
     assert Ledger.non_terminal_older_than(ctx.db, -1) == []
   end
 
-  # On the gate-less arm — the one path that reaches the echo,
+  # , on the GATE-LESS arm — the one path that reaches the echo,
   # because it accepts its session key without re-resolving anything. The echo
   # commits in the same transaction and cannot be taken back, so a refused
   # delivery must write NOTHING: a message with no turn is history nobody can
@@ -2511,7 +2514,7 @@ defmodule Tightbeam.SupervisionTest do
            ] = rail_sweep_details(ctx.db, "holder")
   end
 
-  # The sweep is the second actor, so the mechanism contract has
+  # The sweep is the second actor, so the ruling of 2026-07-29 (rails-mechanism §A3) has
   # to reach it too: a rail-check timeout summons a mind here as well. What it must NOT do
   # is park the session — parking is the escalate EFFECT's consequence, and the ruling
   # changed what a timeout additionally does, not what it decides. So the sweep outcome
@@ -3849,7 +3852,7 @@ defmodule Tightbeam.SupervisionTest do
 
     # The rung is REFUNDED: schedule claimed prodCount 1, the suppressed fire
     # voided it. Without this, suppressed prods consume the ladder and a
-    # blocked holder gets escalated over.
+    # blocked holder gets escalated over — the SMOKE 42 host-d finding.
     assert %{prodCount: 0} = Supervision.prod_state(ctx.db, "asg_1")
 
     # An agent's own wake to the SAME blocked session still delivers — the
@@ -4342,9 +4345,8 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   # Agent origin on purpose: work-blocked is an agent-only kind, and
-  # ConditionFacts refuses it from the reserved process principal — the
-  # substrate never decides a session is blocked (spec production-machine-v1
-  # §Standing facts).
+  # ConditionFacts refuses it from process:tightbeam — the substrate never
+  # decides a session is blocked (spec production-machine-v1 §Standing facts).
   defp file_fact(db, kind, scope) do
     {:ok, %{fact_id: _}} =
       DB.transaction(
@@ -4358,7 +4360,7 @@ defmodule Tightbeam.SupervisionTest do
   defp open_rate_limit_incident!(ctx) do
     first = %{
       harness: "claude",
-      host: "test-host",
+      host: "host-b",
       failure_class: "rate-limit-dead",
       evidence_kind: "terminal-failure",
       session_key: ctx.holder.session_key,
@@ -4383,12 +4385,12 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   defp resolve_rate_limit_incident!(ctx, terminal_seq) do
-    :ok = HarnessProcess.complete_park(ctx.db, {:claude, "shared", "test-host"})
+    :ok = HarnessProcess.complete_park(ctx.db, {:claude, "shared", "host-b"})
 
     assert {:resolved, _} =
              HarnessHealth.resolve(ctx.db, %{
                harness: "claude",
-               host: "test-host",
+               host: "host-b",
                failure_class: "rate-limit-dead",
                session_key: ctx.holder.session_key,
                assignment_id: "asg_1",
@@ -4405,7 +4407,7 @@ defmodule Tightbeam.SupervisionTest do
     assert {:opened, _} =
              HarnessHealth.observe(ctx.db, %{
                harness: "claude",
-               host: "test-host",
+               host: "host-b",
                failure_class: failure_class,
                evidence_kind: "authoritative-provider",
                session_key: ctx.holder.session_key,
@@ -4421,13 +4423,13 @@ defmodule Tightbeam.SupervisionTest do
 
   defp resolve_harness_incident!(ctx, failure_class, index) do
     if failure_class == "rate-limit-dead" do
-      :ok = HarnessProcess.complete_park(ctx.db, {:claude, "shared", "test-host"})
+      :ok = HarnessProcess.complete_park(ctx.db, {:claude, "shared", "host-b"})
     end
 
     assert {:resolved, _} =
              HarnessHealth.resolve(ctx.db, %{
                harness: "claude",
-               host: "test-host",
+               host: "host-b",
                failure_class: failure_class,
                session_key: ctx.holder.session_key,
                assignment_id: "asg_1",
@@ -4583,7 +4585,7 @@ defmodule Tightbeam.SupervisionTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "test-host"
+      host: "host-b"
     })
   end
 

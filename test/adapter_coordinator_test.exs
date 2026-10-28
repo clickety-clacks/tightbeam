@@ -994,7 +994,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     assert [%{kind: "adapter_down"}] = EventLog.lifecycle_events(ctx.db)
 
-    # A message a clawline client renders and replays — the counterpart of the
+    # A message a client renders and replays — the counterpart of the
     # "[adapter recovered]" probe that already reaches this reader.
     assert [marker] = Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10)
     assert marker.content =~ "[adapter down]"

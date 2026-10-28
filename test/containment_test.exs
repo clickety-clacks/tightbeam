@@ -58,8 +58,8 @@ defmodule Tightbeam.ContainmentTest do
   # script is not a harness turn, so a grant added for a harness must never widen the
   # rail wall again — and on linux `/dev` in a rail profile means `/dev/shm`, a
   # world-writable tmpfs, which is a durable write channel outside the scratch root that
-  # survives its rm_rf. A rail script must not write to /dev/shm and return PASS. The
-  # harness-addition seam itself is deleted; the
+  # survives its rm_rf. Proven reachable on host-d before the split: the script wrote
+  # /dev/shm and returned PASS. The harness-addition seam itself is deleted (#36); the
   # paths it once granted (`/private/tmp`, `/dev`) stay pinned here as the guard.
   test "a rail profile grants no harness addition, and no writable /dev tree" do
     profile = Containment.rail_profile(["/org/work"])

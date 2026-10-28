@@ -1090,7 +1090,7 @@ defmodule Tightbeam.JobForensicsTest do
     assert List.last(timeline).type == "turn_end"
   end
 
-  ## Cross-review regressions
+  ## Regression coverage
 
   test "F5: the retired prod_answered writer does not reinterpret attest history", ctx do
     db = ctx.db

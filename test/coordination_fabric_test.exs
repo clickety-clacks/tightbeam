@@ -383,7 +383,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert detail =~ "trigger=ceiling"
     assert Wakes.get(db, digest_id).prompt =~ "coalesced by #{Wakes.digest_rule()}"
 
-    # O5 follow-up: `digest-members` needs a
+    # `digest-members` needs a
     # wake id no other sanctioned surface hands an agent — the delivered
     # digest signs itself with its OWN id, right after the rule signature.
     assert Wakes.get(db, digest_id).prompt =~ "wake #{digest_id}"
@@ -1110,7 +1110,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert {:error, %{code: "invalid"}} = verb(db, {:user, "owner"}, "digest-members", %{})
   end
 
-  test "O5 follow-up: an orphaned role carrier (no active resolution) stays readable by the role's owner",
+  test "an orphaned role carrier (no active resolution) stays readable by the role's owner",
        %{db: db} do
     # : a role-addressed carrier built while its
     # role has NO active resolution (no bound session, and the owner's
@@ -1160,7 +1160,7 @@ defmodule Tightbeam.CoordinationFabricTest do
              verb(db, {:user, "outsider2"}, "digest-members", %{wake_id: digest_id})
   end
 
-  test "O5 follow-up (round 2): a role-rm'd carrier stays readable by its pinned owner and by admin",
+  test "a role-rm'd carrier stays readable by its pinned owner and by admin",
        %{db: db} do
     # : a LIVE `Roles.get/2` at read time bound audit
     # authority to a deletable row — after `role-rm`, that lookup returns
@@ -1206,7 +1206,7 @@ defmodule Tightbeam.CoordinationFabricTest do
              verb(db, {:user, "outsider3"}, "digest-members", %{wake_id: digest_id})
   end
 
-  test "O5 follow-up (round 2): a role deleted then recreated under a different owner does not carry the old carrier's audit",
+  test "a role deleted then recreated under a different owner does not carry the old carrier's audit",
        %{db: db} do
     # THE NAME-REUSE ATTACK reviewer proved against the prior fix: a live
     # `Roles.get(db, role)` by NAME silently handed a NEW owner read access
@@ -1246,7 +1246,7 @@ defmodule Tightbeam.CoordinationFabricTest do
              verb(db, {:user, "new-owner"}, "digest-members", %{wake_id: digest_id})
   end
 
-  test "O5 follow-up (round 2): a resolved role carrier reads through its pinned sessionKey, never a live role lookup",
+  test "a resolved role carrier reads through its pinned sessionKey, never a live role lookup",
        %{db: db} do
     # REGRESSION PIN: a role that RESOLVED at
     # materialization was readable through the carrier's own pinned
@@ -1290,7 +1290,7 @@ defmodule Tightbeam.CoordinationFabricTest do
              verb(db, {:user, "outsider5"}, "digest-members", %{wake_id: digest_id})
   end
 
-  test "O5 follow-up (round 3): the pinned owner round-trips exactly — a space-containing id never collides with its own prefix",
+  test "the pinned owner round-trips exactly — a space-containing id never collides with its own prefix",
        %{db: db} do
     # : the pin was written as raw text
     # (`ownerUserId=#{owner}`) and read back with `\S+` — an owner id
@@ -1481,6 +1481,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       rule_operator_request_in_txn: "operator",
       operator_withdraw_in_txn: "operator",
       open_counts_by_assignment: "statute,effort",
+      open_statute_effort_ids_for_assignments_in_txn: "statute,effort",
       consume: "any",
       withdraw_for_retired: "any",
       withdraw_episodes: "any",
@@ -1552,6 +1553,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       rule_operator_request_in_txn: 6,
       operator_withdraw_in_txn: 4,
       open_counts_by_assignment: 1,
+      open_statute_effort_ids_for_assignments_in_txn: 2,
       consume: 2,
       withdraw_for_retired: 2,
       withdraw_episodes: 3,
@@ -1655,7 +1657,13 @@ defmodule Tightbeam.CoordinationFabricTest do
     # (visibility-filter and IN-list placeholder text, never a table name);
     # any function joining this set is new dynamic SQL that has not been
     # reviewed and fails closed, by name, until it is.
-    pinned_dynamic_queries = MapSet.new([{:list, 4}, {:get, 4}, {:decision_trace_rows, 2}])
+    pinned_dynamic_queries =
+      MapSet.new([
+        {:list, 4},
+        {:get, 4},
+        {:decision_trace_rows, 2},
+        {:open_statute_effort_ids_for_assignments_in_txn, 2}
+      ])
 
     found_dynamic_queries = dynamic_query_refs("lib/tightbeam/escalation.ex")
 
@@ -1697,6 +1705,7 @@ defmodule Tightbeam.CoordinationFabricTest do
         {"lib/tightbeam/state_resources.ex", "query_decision_request/2"}
       ],
       raw_by_id_in_txn: [
+        {"lib/tightbeam/execution_map.ex", "rest_allowed_open_requests/3"},
         {"lib/tightbeam/state_resources.ex", "query_decision_request/2"}
       ],
       raw_by_id_in_txn!: [{"lib/tightbeam/effort_checkin.ex", "request_for_id/2"}],
@@ -2204,7 +2213,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   # A module reference at the AST level, in EITHER shape a caller can write
   # it: `Mod.fun` syntax (an `__aliases__` node, resolved through this
   # file's aliases) or the ATOM form — `apply(:"Elixir.Tightbeam.Escalation",
-  # ...)` or the equivalent `:"Elixir...".fun()` — which is already fully
+  # ...)` or the equivalent `:"Elixir...".fun` — which is already fully
   # qualified and evades an `__aliases__`-only match outright.
   defp resolves_module_ref_to_escalation?({:__aliases__, _, parts}, aliases),
     do: resolves_to_escalation?(parts, aliases)

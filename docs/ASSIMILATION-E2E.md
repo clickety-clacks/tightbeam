@@ -38,6 +38,7 @@ of:
    writes into a base dir and installs npm packages; it touches nothing else, but
    "touches nothing else" is a claim you should be able to make about the host.
 
+Choose an authorized host from the deployment environment; this runbook does not assign hosts.
 
 ## Prerequisites, checked first
 
@@ -207,9 +208,9 @@ diagnostic that sends the operator to the wrong machine is a FINDING.
 
 ## 7. End of run — retain or return, deliberately
 
-**Default: retain.** An installation stays so later runbooks have something to run
-against, and this satellite is the prerequisite for
-`INTER-NODE-COMMS.md`. Clean only temporary artifacts: scratch clones, `/tmp`
+**Default: retain.** An installation stays so later
+runbooks have something to run against, and this satellite is the prerequisite for
+cross-host journeys. Clean only temporary artifacts: scratch clones, `/tmp`
 staging, probe output outside the base dir.
 
 **Returning a host to unassimilated is a separately authorized action**, not a
@@ -223,7 +224,9 @@ Re-verify unrelated workloads are still running, on both hosts.
 
 ## Scorecard
 
-One row per section §1–§7 with PASS / FAIL(note) / WAIVED(blocker) / NOT VERIFIED(reason) /
+`<external-run-records-dir>/<date>-<short-sha>-assimilation-<host-name>.md`
+(run records live outside the repo), one row per
+section §1–§7 with PASS / FAIL(note) / WAIVED(blocker) / NOT VERIFIED(reason) /
 BLOCKED(blocker). Header carries gateway commit, gateway host, satellite host,
 harnesses assimilated, and the retain-or-return decision.
 

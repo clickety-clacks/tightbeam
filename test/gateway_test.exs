@@ -14,10 +14,10 @@ defmodule Tightbeam.GatewayTest do
   #
   # MEASURED: at 1s this failed 2 of 5 samples on loaded macOS CI while the SAME
   # runner Task went on to complete (the Task.await below it passes), so the
-  # message is sent and received, just later than 1s. A bare `node`
-  # handshake 1s for the same reason; a full turn needs more.
+  # message is sent and received, just later than 1s. #56 gave a bare `node`
+  # handshake 1s for the same reason (fdb2a21); a full turn needs more.
   #
-  # Re-measured under a five-lane load,
+  # RE-MEASURED 2026-07-29 under a 5-lane load (load average ~93 on 16 cores),
   # which moved both the number and the explanation:
   #
   #   at 1_000:  4 of 4 runs failed here, and 5 of 5 at the mcp-servers wait
@@ -575,7 +575,7 @@ defmodule Tightbeam.GatewayTest do
         data: [
           %{
             id: "claude-fable-5",
-            display_name: "Claude Example Model 5",
+            display_name: "Claude Fable 5",
             max_input_tokens: 200_000,
             capabilities: %{effort: %{}}
           },
@@ -621,7 +621,7 @@ defmodule Tightbeam.GatewayTest do
     {:paired, device} =
       claim_org(db, %{
         device_id: "sample-user-device",
-        claimed_name: "Sample User",
+        claimed_name: "sample-user",
         platform: nil,
         model: nil
       })
@@ -1694,7 +1694,7 @@ defmodule Tightbeam.GatewayTest do
 
     register_hosts(ctx.db, %{
       "already-assimilated" => %{
-        ssh: "remote-user@already-assimilated",
+        ssh: "clu@already-assimilated",
         base_dir: "/remote/tb",
         cli_bin: nil
       }
@@ -1857,7 +1857,7 @@ defmodule Tightbeam.GatewayTest do
              ModelCatalog.route("testhost", "claude", Model.new("tiered-here"))
   end
 
-  # A model the adapter cannot select must be refused by name and the
+  # . A model the adapter cannot select must be refused by NAME and the
   # operator told what IS available — before, this died deep in the adapter as
   # "Invalid value for config option model", on every session/new and session/load.
   test "an unavailable model is refused by name and names what is offered", ctx do
@@ -2189,7 +2189,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "children installs the CLI from the RELEASE layout when there is no source tree", ctx do
     # The release-install defect both first-install agents found within minutes
-    # of each other on macOS and Linux: the seeding knew only
+    # of each other (macOS and linux, 2026-08-04): the seeding knew only
     # cli/target/release, so every npm install got a bin/tightbeam telling a
     # toolchain-free customer to run cargo. In a release, the compiled CLI is
     # the npm package's own bin — a sibling of RELEASE_ROOT.
@@ -2982,7 +2982,7 @@ defmodule Tightbeam.GatewayTest do
              Path.join(auth_dir, "fixture.json")
   end
 
-  # THE STALE-ELECTION SEAM. Each test pauses a
+  # THE STALE-ELECTION SEAM . Each test pauses a
   # tune at `on_tune_elected` — election done, commit not begun — commits a
   # competing write, releases, and asserts the transaction refuses BY NAME
   # rather than committing a decision that no longer describes the session.
@@ -3133,7 +3133,7 @@ defmodule Tightbeam.GatewayTest do
           # The retune's model was validated against TESTHOST's catalog, and
           # its fork would be built with testhost placement. Moving the host
           # under the election makes both stale; the harness alone matching
-          # must NOT be enough.
+          # must NOT be enough .
           {:ok, _} =
             DB.transaction(ctx.db, fn txn ->
               DB.Txn.q(txn, "UPDATE sessions SET host='otherhost' WHERE sessionKey=?1", [
@@ -3183,7 +3183,7 @@ defmodule Tightbeam.GatewayTest do
           # set_reasoning DERIVED its target from the snapshot's model — a
           # RELATIVE election. A concurrent model change makes that derivation
           # stale: committing it would silently revert the model family the
-          # other request just elected (blocking).
+          # other request just elected .
           {:ok, _} =
             DB.transaction(ctx.db, fn txn ->
               DB.Txn.q(txn, "UPDATE sessions SET model='other-family' WHERE sessionKey=?1", [
@@ -3379,7 +3379,7 @@ defmodule Tightbeam.GatewayTest do
     assert total == 3, "the two earlier rows must still exist beneath the barrier"
   end
 
-  # THE ADJUDICATION BOUNDARY, proved at the seam: a live
+  # THE ADJUDICATION BOUNDARY (v0.2 program §4), proved at the seam: a live
   # switch happens because a CALLER named one, and every way it can fail is a
   # NAMED refusal that leaves the session exactly as it was. Nothing here
   # initiates a switch, holds one pending, or picks an engine on the caller's
@@ -3484,7 +3484,7 @@ defmodule Tightbeam.GatewayTest do
     end
 
     test "the SAME gate covers every legacy tune mutation: rename, adopt, set_host", ctx do
-      # F3: `set_harness`/`set_model`/`set_reasoning` were
+      # : `set_harness`/`set_model`/`set_reasoning` were
       # the only settings gated by `tunable_session/2`. The legacy actions
       # performed NO owner-or-admin check at all — a non-owner's session
       # token could rename, adopt, or relocate a victim session it merely
@@ -3509,7 +3509,7 @@ defmodule Tightbeam.GatewayTest do
 
     test "authorization uses the router's immutable principal, not a live re-resolution of the role's holder",
          ctx do
-      # F8: the router captures `{:session, key}` — the
+      # : the router captures `{:session, key}` — the
       # session that PROVED it held the role AT AUTHENTICATION TIME — as an
       # immutable principal. `tunable_session/2` used to re-derive "who
       # holds this role" itself from `call.origin`, which answers a
@@ -3649,7 +3649,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "a prompt racing the merged swap transaction lands after it, never buried, on the new engine",
        ctx do
-    # F1: the pending-count check, the harness swap, and
+    # : the pending-count check, the harness swap, and
     # the barrier now share ONE transaction with prompt acceptance
     # (`deliver_prompt`'s echo+enqueue). `DB` is single-writer and serializes
     # one `transaction/2` at a time in its owner process, so a concurrent
@@ -3755,7 +3755,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "two racing identical swaps: one succeeds, one refuses same_harness, exactly one tombstone",
        ctx do
-    # F5: the distinct-harness snapshot used to be taken
+    # : the distinct-harness snapshot used to be taken
     # BEFORE the lane and the mutation lock, from `tunable_session`'s
     # pre-lane read. Two concurrent identical swap requests both saw the
     # session on "claude" and both passed that check; the second then
@@ -4279,8 +4279,7 @@ defmodule Tightbeam.GatewayTest do
              spawn.(%{
                verb: "spawn",
                origin: "remedy:wrong-action",
-               principal:
-                 {:remedy, %{statute: "wrong-action", action: "wake", owner: "sample-user"}},
+               principal: {:remedy, %{statute: "wrong-action", action: "wake", owner: "sample-user"}},
                session_key: nil,
                params: %{
                  display_name: "Rejected",
@@ -4422,23 +4421,23 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "spawn uses the next where host when the first cannot run the requested harness", ctx do
-    base_dir = placement_test_base("later-eligible", ["remote-host", "remote-runner"])
+    base_dir = placement_test_base("later-eligible", ["test-host", "host-c"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "remote-host" => %{ssh: "remote-host", base_dir: "/srv/remote-host", cli_bin: nil},
-      "remote-runner" => %{ssh: "remote-runner", base_dir: "/srv/remote-runner", cli_bin: nil}
+      "test-host" => %{ssh: "test-host", base_dir: "/srv/test-host", cli_bin: nil},
+      "host-c" => %{ssh: "host-c", base_dir: "/srv/host-c", cli_bin: nil}
     })
 
-    await_host_catalog("remote-runner", "codex")
+    await_host_catalog("host-c", "codex")
 
     config =
       gateway_config(base_dir, ctx.db, 0)
       |> Map.put(:default_harness, :codex)
       |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
       |> Map.put(:credential_status, fn
-        :openai, "remote-host" -> {:needs_onboarding, :missing}
-        :openai, "remote-runner" -> :onboarded
+        :openai, "test-host" -> {:needs_onboarding, :missing}
+        :openai, "host-c" -> :onboarded
       end)
       |> Map.put(:sh, fn _command -> {"", 0} end)
 
@@ -4452,21 +4451,21 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "remote-runner"
+    assert Org.get(ctx.db, session_key).host == "host-c"
   end
 
   test "spawn uses the next where host when the first has no usable catalog", ctx do
-    base_dir = placement_test_base("later-catalog", ["remote-host", "remote-runner"])
+    base_dir = placement_test_base("later-catalog", ["test-host", "host-c"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "remote-host" => %{ssh: "remote-host", base_dir: "/srv/remote-host", cli_bin: nil},
-      "remote-runner" => %{ssh: "remote-runner", base_dir: "/srv/remote-runner", cli_bin: nil}
+      "test-host" => %{ssh: "test-host", base_dir: "/srv/test-host", cli_bin: nil},
+      "host-c" => %{ssh: "host-c", base_dir: "/srv/host-c", cli_bin: nil}
     })
 
-    await_host_catalog("remote-host", "codex")
-    await_host_catalog("remote-runner", "codex")
-    degrade_host_catalog("remote-host", "codex", :ssh_unreachable)
+    await_host_catalog("test-host", "codex")
+    await_host_catalog("host-c", "codex")
+    degrade_host_catalog("test-host", "codex", :ssh_unreachable)
 
     config =
       gateway_config(base_dir, ctx.db, 0)
@@ -4485,27 +4484,27 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "remote-runner"
+    assert Org.get(ctx.db, session_key).host == "host-c"
   end
 
   test "spawn refusal relays each where host's catalog cause and remedy", ctx do
-    base_dir = placement_test_base("catalog-causes", ["remote-host", "remote-runner"])
+    base_dir = placement_test_base("catalog-causes", ["test-host", "host-c"])
 
     register_hosts(ctx.db, %{
-      "remote-host" => %{ssh: "remote-host", base_dir: "/srv/remote-host", cli_bin: nil},
-      "remote-runner" => %{ssh: "remote-runner", base_dir: "/srv/remote-runner", cli_bin: nil}
+      "test-host" => %{ssh: "test-host", base_dir: "/srv/test-host", cli_bin: nil},
+      "host-c" => %{ssh: "host-c", base_dir: "/srv/host-c", cli_bin: nil}
     })
 
-    await_host_catalog("remote-host", "codex")
-    await_host_catalog("remote-runner", "codex")
+    await_host_catalog("test-host", "codex")
+    await_host_catalog("host-c", "codex")
 
     degrade_host_catalog(
-      "remote-host",
+      "test-host",
       "codex",
       {:empty_catalog_for_client_version, "0.145.0"}
     )
 
-    degrade_host_catalog("remote-runner", "codex", {:needs_onboarding, :missing})
+    degrade_host_catalog("host-c", "codex", {:needs_onboarding, :missing})
 
     config =
       gateway_config(base_dir, ctx.db, 0)
@@ -4523,30 +4522,27 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert message =~ "remote-host: cannot route gpt-5.6-sol (effort medium) on remote-host"
-    assert message =~ "upgrade codex on remote-host"
-
-    assert message =~
-             "remote-runner: cannot route gpt-5.6-sol (effort medium) on remote-runner"
-
-    assert message =~ "run tightbeam onboard openai on remote-runner"
+    assert message =~ "test-host: cannot route gpt-5.6-sol (effort medium) on test-host"
+    assert message =~ "upgrade codex on test-host"
+    assert message =~ "host-c: cannot route gpt-5.6-sol (effort medium) on host-c"
+    assert message =~ "run tightbeam onboard openai on host-c"
   end
 
   test "spawn uses the next where host when the first fails live spinup", ctx do
-    base_dir = placement_test_base("later-spinup", ["remote-host", "remote-runner"])
+    base_dir = placement_test_base("later-spinup", ["test-host", "host-c"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "remote-host" => %{ssh: "remote-host", base_dir: "/srv/remote-host", cli_bin: nil},
-      "remote-runner" => %{ssh: "remote-runner", base_dir: "/srv/remote-runner", cli_bin: nil}
+      "test-host" => %{ssh: "test-host", base_dir: "/srv/test-host", cli_bin: nil},
+      "host-c" => %{ssh: "host-c", base_dir: "/srv/host-c", cli_bin: nil}
     })
 
-    await_host_catalog("remote-host", "codex")
-    await_host_catalog("remote-runner", "codex")
+    await_host_catalog("test-host", "codex")
+    await_host_catalog("host-c", "codex")
 
     sh = fn command ->
-      if List.last(command) == "true" and Enum.member?(command, "remote-host") do
-        {"ssh: connect to host remote-host port 22: Connection refused", 255}
+      if List.last(command) == "true" and Enum.member?(command, "test-host") do
+        {"ssh: connect to host test-host port 22: Connection refused", 255}
       else
         {"", 0}
       end
@@ -4569,25 +4565,25 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "remote-runner"
+    assert Org.get(ctx.db, session_key).host == "host-c"
   end
 
   test "spawn stops after the first ready where host and probes it once", ctx do
-    base_dir = placement_test_base("first-ready-once", ["remote-host", "remote-runner"])
+    base_dir = placement_test_base("first-ready-once", ["test-host", "host-c"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "remote-host" => %{ssh: "remote-host", base_dir: "/srv/remote-host", cli_bin: nil},
-      "remote-runner" => %{ssh: "remote-runner", base_dir: "/srv/remote-runner", cli_bin: nil}
+      "test-host" => %{ssh: "test-host", base_dir: "/srv/test-host", cli_bin: nil},
+      "host-c" => %{ssh: "host-c", base_dir: "/srv/host-c", cli_bin: nil}
     })
 
-    await_host_catalog("remote-host", "codex")
-    await_host_catalog("remote-runner", "codex")
+    await_host_catalog("test-host", "codex")
+    await_host_catalog("host-c", "codex")
     parent = self()
 
     sh = fn command ->
       if List.last(command) == "true" do
-        host = Enum.find(["remote-host", "remote-runner"], &Enum.member?(command, &1))
+        host = Enum.find(["test-host", "host-c"], &Enum.member?(command, &1))
         send(parent, {:spinup_probe, host})
       end
 
@@ -4611,28 +4607,28 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "remote-host"
-    assert_receive {:spinup_probe, "remote-host"}
+    assert Org.get(ctx.db, session_key).host == "test-host"
+    assert_receive {:spinup_probe, "test-host"}
     refute_receive {:spinup_probe, _host}
   end
 
   test "spawn acts on the routed answer from the candidate decision", ctx do
-    base_dir = placement_test_base("one-route-answer", ["remote-host", "remote-runner"])
+    base_dir = placement_test_base("one-route-answer", ["test-host", "host-c"])
     ensure_global_registry()
 
     register_hosts(ctx.db, %{
-      "remote-host" => %{ssh: "remote-host", base_dir: "/srv/remote-host", cli_bin: nil},
-      "remote-runner" => %{ssh: "remote-runner", base_dir: "/srv/remote-runner", cli_bin: nil}
+      "test-host" => %{ssh: "test-host", base_dir: "/srv/test-host", cli_bin: nil},
+      "host-c" => %{ssh: "host-c", base_dir: "/srv/host-c", cli_bin: nil}
     })
 
-    await_host_catalog("remote-host", "codex")
-    await_host_catalog("remote-runner", "codex")
+    await_host_catalog("test-host", "codex")
+    await_host_catalog("host-c", "codex")
     degraded = :atomics.new(1, [])
 
     sh = fn command ->
-      if List.last(command) == "true" and Enum.member?(command, "remote-host") and
+      if List.last(command) == "true" and Enum.member?(command, "test-host") and
            :atomics.compare_exchange(degraded, 1, 0, 1) == :ok do
-        degrade_host_catalog("remote-host", "codex", :catalog_refreshed)
+        degrade_host_catalog("test-host", "codex", :catalog_refreshed)
       end
 
       {"", 0}
@@ -4655,11 +4651,11 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert Org.get(ctx.db, session_key).host == "remote-host"
+    assert Org.get(ctx.db, session_key).host == "test-host"
   end
 
   test "spawn refusal gives an unconfigured where host its assimilation remedy", ctx do
-    base_dir = placement_test_base("missing-host-remedy", ["remote-host"])
+    base_dir = placement_test_base("missing-host-remedy", ["test-host"])
 
     config =
       gateway_config(base_dir, ctx.db, 0)
@@ -4677,16 +4673,16 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert message =~ "no host in archetype default's where can run codex"
-    assert message =~ "remote-host: host remote-host is not configured"
-    assert message =~ "tightbeam assimilate <ssh-dest> --name remote-host"
+    assert message =~ "test-host: host test-host is not configured"
+    assert message =~ "tightbeam assimilate <ssh-dest> --name test-host"
   end
 
   test "spawn refusal names every where host, harness, cause, and remedy", ctx do
-    base_dir = placement_test_base("all-ineligible", ["remote-host", "remote-runner"])
+    base_dir = placement_test_base("all-ineligible", ["test-host", "host-c"])
 
     register_hosts(ctx.db, %{
-      "remote-host" => %{ssh: "remote-host", base_dir: "/srv/remote-host", cli_bin: nil},
-      "remote-runner" => %{ssh: "remote-runner", base_dir: "/srv/remote-runner", cli_bin: nil}
+      "test-host" => %{ssh: "test-host", base_dir: "/srv/test-host", cli_bin: nil},
+      "host-c" => %{ssh: "host-c", base_dir: "/srv/host-c", cli_bin: nil}
     })
 
     config =
@@ -4711,10 +4707,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "no host in archetype default's where can run codex"
 
-    for {host, _base} <- [
-          {"remote-host", "/srv/remote-host"},
-          {"remote-runner", "/srv/remote-runner"}
-        ] do
+    for {host, _base} <- [{"test-host", "/srv/test-host"}, {"host-c", "/srv/host-c"}] do
       assert message =~ "Tightbeam has no credential for openai on #{host}"
       assert message =~ "Run on #{host}: tightbeam onboard openai --as-user <userId>"
     end
@@ -5048,16 +5041,16 @@ defmodule Tightbeam.GatewayTest do
 
     {:pending, _operator_device} =
       Devices.pair(ctx.db, %{
-        device_id: "non-admin-device",
-        claimed_name: "Non Admin",
+        device_id: "operator-device",
+        claimed_name: "Operator",
         platform: nil,
         model: nil
       })
 
-    assert %{is_admin: false} = Devices.user(ctx.db, "non-admin")
+    assert %{is_admin: false} = Devices.user(ctx.db, "operator")
 
-    non_admin = create_session(ctx.db, "non-admin-session", "non-admin")
-    Roles.create!(ctx.db, "sample-role", "non-admin", non_admin.session_key)
+    operator = create_session(ctx.db, "operator-session", "operator")
+    Roles.create!(ctx.db, "operator", "operator", operator.session_key)
 
     assert %{host_environment: %{"valuePresent" => true}, changed: true} =
              handlers["host-env-set"].(%{
@@ -5072,7 +5065,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{code: "forbidden", message: "admin required"} =
              handlers["host-env-set"].(%{
-               origin: "agent:sample-role",
+               origin: "agent:operator",
                params: %{
                  host: host,
                  harness: "claude",
@@ -5083,13 +5076,13 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{code: "forbidden", message: "admin required"} =
              handlers["host-env-unset"].(%{
-               origin: "agent:sample-role",
+               origin: "agent:operator",
                params: %{host: host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR"}
              })
 
     assert %{code: "forbidden", message: "admin required"} =
              handlers["host-env-list"].(%{
-               origin: "agent:sample-role",
+               origin: "agent:operator",
                params: %{host: host, harness: "claude"}
              })
   end
@@ -5281,7 +5274,7 @@ defmodule Tightbeam.GatewayTest do
                session_key: nil,
                params: %{
                  name: local,
-                 ssh: "remote-user@#{local}",
+                 ssh: "clu@#{local}",
                  base_dir: "/remote/definitely-elsewhere"
                }
              })
@@ -5455,7 +5448,7 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:spinup_command, ["ssh" | _]}
   end
 
-  # Both failure directions of one
+  # per-host-catalogs-v1 acceptance 1. Both failure directions of one
   # defect: the catalog used to be the GATEWAY account's, applied to every host,
   # so a ref was validated against entitlements that had nothing to do with the
   # account the turn would run under. On the old tree this test is red twice —
@@ -6522,8 +6515,8 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{supported: true, options: model_options} = status.capabilities.setModel
     refute Enum.any?(model_options, fn o -> String.contains?(o.value, "[") end)
-    reviewer = Enum.find(model_options, &(&1.value == "gpt-5.6-sol"))
-    assert reviewer.title == "GPT-5.6 reviewer"
+    sol = Enum.find(model_options, &(&1.value == "gpt-5.6-sol"))
+    assert sol.title == "GPT-5.6 Sol"
     assert length(Enum.filter(model_options, &(&1.value == "gpt-5.6-sol"))) == 1
 
     # modelCatalog.models is the client picker's PRIMARY data source
@@ -6534,7 +6527,7 @@ defmodule Tightbeam.GatewayTest do
     refute Enum.any?(catalog_models, &String.contains?(&1.id, "["))
     assert Enum.map(catalog_models, & &1.ref) == Enum.uniq(Enum.map(catalog_models, & &1.ref))
     assert Enum.map(catalog_models, & &1.name) == Enum.uniq(Enum.map(catalog_models, & &1.name))
-    assert %{name: "GPT-5.6 reviewer"} = Enum.find(catalog_models, &(&1.ref == "gpt-5.6-sol"))
+    assert %{name: "GPT-5.6 Sol"} = Enum.find(catalog_models, &(&1.ref == "gpt-5.6-sol"))
 
     # display.model must match a catalog row (the footer shows it verbatim
     # otherwise, leaking the machine ref) and reasoningLevel carries the tier.
@@ -6635,7 +6628,7 @@ defmodule Tightbeam.GatewayTest do
     emitted = Gateway.session_status("k-round-trip", ctx.db).modelCatalog.models
     terra_ref = Enum.find(emitted, &(&1.name == "GPT-5.6 Terra")).ref
 
-    # F2: terra offers tiers, so the ref alone is refused
+    # : terra offers tiers, so the ref alone is refused
     # (the substrate no longer picks one) — an explicit --effort completes
     # the same round trip the ref proves: the FAMILY comes back from the
     # catalog's own identity, and the tier is the caller's own election.
@@ -6692,7 +6685,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "set_model with a bare model id to a different tiered family refuses effort_required, naming the tiers",
        ctx do
-    # F2: the substrate never elects an
+    # The v0.2 program §4 rule is that the substrate never elects an
     # effort tier on TUNE's behalf. This used to fall back to the new
     # model's first listed tier when the outgoing effort didn't apply
     # (`pick_effort`, deleted) — that was the substrate choosing, not
@@ -6730,8 +6723,7 @@ defmodule Tightbeam.GatewayTest do
     assert message =~ "high"
 
     # Nothing applied: the session is still on its prior model.
-    assert Org.get(ctx.db, "k-codex-fallback").model ==
-             Model.new("gpt-5.6-sol", effort: "xhigh")
+    assert Org.get(ctx.db, "k-codex-fallback").model == Model.new("gpt-5.6-sol", effort: "xhigh")
   end
 
   test "set_model with a bare model id and an explicit --effort still applies cleanly", ctx do
@@ -6764,8 +6756,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "gpt-5.6-sol", effort: "medium"}
              })
 
-    assert Org.get(ctx.db, "k-codex-medium").model ==
-             Model.new("gpt-5.6-sol", effort: "medium")
+    assert Org.get(ctx.db, "k-codex-medium").model == Model.new("gpt-5.6-sol", effort: "medium")
   end
 
   test "set_model with a bare model id switching to an untiered model drops the effort qualifier",
@@ -6831,8 +6822,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "gpt-5.6-sol", effort: "low"}
              })
 
-    assert Org.get(ctx.db, "k-codex-full-ref").model ==
-             Model.new("gpt-5.6-sol", effort: "low")
+    assert Org.get(ctx.db, "k-codex-full-ref").model == Model.new("gpt-5.6-sol", effort: "low")
   end
 
   test "set_reasoning composes the current model with the newly selected effort tier", ctx do
@@ -6863,8 +6853,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_reasoning", reasoningLevel: "xhigh"}
              })
 
-    assert Org.get(ctx.db, "k-codex-reasoning").model ==
-             Model.new("gpt-5.6-sol", effort: "xhigh")
+    assert Org.get(ctx.db, "k-codex-reasoning").model == Model.new("gpt-5.6-sol", effort: "xhigh")
   end
 
   test "set_reasoning rejects a level the current model does not offer", ctx do
@@ -7589,7 +7578,7 @@ defmodule Tightbeam.GatewayTest do
   # and `modelCatalog.models` advertise one row per model with a base ref, deliberately
   # — the effort tier belongs to the reasoning picker — while the catalog only holds an
   # effort-bearing model as `id[effort]`. `set_model` composes the two and has since
-  # `set_harness` did not, so the same bare id round-tripped through one verb
+  # cbc8d2e; `set_harness` did not, so the same bare id round-tripped through one verb
   # and was refused by the other as "not offered by codex on testhost" (#69).
   test "set_harness accepts the bare model id the picker advertises", ctx do
     base_dir = role_test_base("harness-bare-model")
@@ -7610,7 +7599,7 @@ defmodule Tightbeam.GatewayTest do
 
     start_lane!(ctx.db, "k1")
 
-    # F2: reviewer offers reasoning tiers, so a bare id with NO
+    # : sol offers reasoning tiers, so a bare id with NO
     # `--effort` is refused (`effort_required`) rather than composed onto
     # "medium" — the substrate no longer picks a tier on the caller's
     # behalf. This test's actual subject is the BARE ID acceptance (#69: the
@@ -8083,11 +8072,11 @@ defmodule Tightbeam.GatewayTest do
         name: :placement_refusal_lane_manager
       })
 
-    Org.set_host(ctx.db, "k1", "remote-host")
+    Org.set_host(ctx.db, "k1", "test-host")
 
     expected =
-      "host remote-host is not configured for claude; run tightbeam assimilate <ssh-dest> " <>
-        "--name remote-host --as-user <adminUserId>"
+      "host test-host is not configured for claude; run tightbeam assimilate <ssh-dest> " <>
+        "--name test-host --as-user <adminUserId>"
 
     assert :appended =
              Gateway.deliver_prompt("k1", "user:sample-user", "try vanished host",
@@ -8232,7 +8221,7 @@ defmodule Tightbeam.GatewayTest do
       models: [
         %{
           slug: "gpt-5.6-sol",
-          display_name: "GPT-5.6 reviewer",
+          display_name: "GPT-5.6 Sol",
           supported_reasoning_levels: [
             %{effort: "low"},
             %{effort: "medium"},
@@ -8437,7 +8426,7 @@ defmodule Tightbeam.GatewayTest do
     publish.("delivered")
   end
 
-  # The PROVISIONING SEAM, not just deliver_home: a real turn that
+  # The provisioning seam, beyond deliver_home: a real turn that
   # provisions a fresh harness session must pin the shared home to the SESSION'S
   # selected model (not the org default), so the adapter offers+accepts it at
   # session/new. Deleting the harness_session pin calls leaves settings.json
@@ -8880,9 +8869,9 @@ defmodule Tightbeam.GatewayTest do
            ]
 
     # EVERY failed turn speaks now. Adjudication used to route a failure into a
-    # brief instead of the marker, so deleting the brief would have
+    # brief instead of the marker, so deleting the brief (2026-08-05) would have
     # left this class of failure with no channel at all — the "agent progress
-    # interrupted, no reason given" that occurs when a failed turn has no marker.
+    # interrupted, no reason given" that a production session encountered twice.
     frames = collect_pushes(9, [])
 
     assert Enum.any?(frames, fn frame ->
@@ -9375,7 +9364,7 @@ defmodule Tightbeam.GatewayTest do
     assert Projection.list_after(ctx.db, owner_session, nil, 100) == []
   end
 
-  # AC6. O6 RATIFIES the existing turn-path refuse-by-name
+  # AC6 (spec 1ae8fa52 §O6/I7+I9). O6 RATIFIES the existing turn-path refuse-by-name
   # (`unonboarded_refusal`): a turn onto a {host, harness} whose catalog health is
   # `unavailable({:needs_onboarding, :missing})` is refused with the EXACT
   # `tightbeam onboard <provider> --as-user <userId>` remedy — the same sentence boot
@@ -9513,7 +9502,7 @@ defmodule Tightbeam.GatewayTest do
     refute_received {:prompt_started, _}
   end
 
-  # AC6, the present-but-unverified clause: a host whose credential
+  # AC6 (spec 1ae8fa52 §O6), the present-but-unverified clause: a host whose credential
   # is present-and-live but whose harness cannot execute surfaces as catalog `fresh` +
   # broken executability (spec O1/AC1), which is NOT `needs_onboarding`. Such a turn MUST
   # NOT be refused with the onboarding remedy — "run onboard" would be false, the
@@ -9587,7 +9576,7 @@ defmodule Tightbeam.GatewayTest do
     refute reason =~ "--as-user"
   end
 
-  # AC6 / I7, the r4.2 narrowing guard: I7 refuses ONLY on `:missing`
+  # AC6 / I7 (spec 1ae8fa52 §O6), the r4.2 narrowing guard: I7 refuses ONLY on `:missing`
   # (the credential store AFFIRMATIVELY answering "absent"), NEVER on the wildcard
   # `{:needs_onboarding, _}`. The `:credential_server_unavailable` transient means "could
   # not ASK" — the Credentials server was momentarily unreachable — and MUST NOT be
@@ -9669,10 +9658,11 @@ defmodule Tightbeam.GatewayTest do
     refute reason =~ "--as-user"
   end
 
-  # O6 reactive path (G3 flatten). Guards A/B/C all force
-  # :checkout, but an expired/rejected credential returns 401 at :prompt:
+  # O6 reactive fix (spec 1ae8fa52) — THE INCIDENT PATH (G3 flatten). Guards A/B/C all force
+  # :checkout, but the incident 401s at :prompt: an expired/rejected credential 401s at
   # API-call time, so checkout AND session SUCCEED (the harness holds a token) and catalog
-  # health is still `:fresh` — a health lookup is blind to it. The common-path guarantee here: the operator reads the auth error as
+  # health is still `:fresh` — a health lookup is blind to it (reviewer-3 confirmed real expiry
+  # is storage-blind). The common-path guarantee here: the operator reads the auth error as
   # human PROSE, never a raw inspected ACP map (G3 error_sentence flatten). RED-before-green:
   # without the flatten, error_sentence inspects the map (`=>`/`%{` markers reach chat). The
   # precise re-onboard NAMING of this health-blind :prompt 401 is the HELD option-a piece
@@ -9739,7 +9729,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:error, %{reason: reason, terminal_publish: publish, record_in_txn: record}} =
              runner.(Map.put(turn, :session_key, "k1"))
 
-    # It genuinely failed at :prompt — checkout and session succeeded (the path, not a
+    # It genuinely failed at :prompt — checkout + session succeeded (the incident path, not a
     # pre-engine refusal). The record keeps the stage.
     # reason is the raw ACP map here (health :fresh -> :not_applicable, no reclassify); the lane
     # stringifies it via error_text before the ledger, and the OPERATOR-facing marker flattens
@@ -11843,7 +11833,7 @@ defmodule Tightbeam.GatewayTest do
     Path.join([base_dir, "work", digest])
   end
 
-  # `SessionLane.init/1` ends `send(self(), :nudge)` and returns, so
+  # `SessionLane.init/1` ends `send(self, :nudge)` and returns, so
   # `start_supervised!` hands back a lane that has NOT yet claimed its turn.
   # The nudge sits ahead of this call in the lane's own mailbox, so a reply
   # here proves the claim ran and the runner task was spawned — collapsing

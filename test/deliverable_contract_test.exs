@@ -94,27 +94,27 @@ defmodule Tightbeam.DeliverableContractTest do
       |> File.read!()
 
     assert :sha256 |> :crypto.hash(archive) |> Base.encode16(case: :lower) ==
-             "523d481af38922910a175ccc21f6d750adfe369e3a8b7c0442a2eec8f91fecb8"
+             "282fa3bb92c0eb6795a26722c14092ba3b4a4edbbdca80d26d7a3fb9faaacc64"
 
     assert {:ok, entries} = :erl_tar.extract({:binary, archive}, [:memory, :compressed])
 
-    captured_sources =
+    fixed_base_sources =
       Map.new(entries, fn {path, bytes} -> {List.to_string(path), bytes} end)
 
-    # This sanitized archive contains the complete lib/ source tree used for
-    # the contract checks. Local attribution has been removed from its comments.
-    # Inspecting every production source file makes an empty optional-rail set
-    # an exact-source result, not an inference from a test that happened not to
-    # configure one.
-    captured_source =
-      captured_sources
+    # This archive is produced from the complete lib/ tree at exact base
+    # 724e5c96f9513b37e937dc52eb014ba1ef2d1b5e (tree
+    # 41da8ae7ddee96e01c42ac482052862fba7041e9). Inspecting every production
+    # source file makes an empty optional-rail set an exact-source result, not
+    # an inference from a test that happened not to configure one.
+    exact_source =
+      fixed_base_sources
       |> Enum.sort()
       |> Enum.map_join("\n", fn {path, bytes} -> path <> "\n" <> bytes end)
 
-    refute captured_source =~ "CompletionEscalation"
-    refute captured_source =~ "completion_escalation"
+    refute exact_source =~ "CompletionEscalation"
+    refute exact_source =~ "completion_escalation"
 
-    assert captured_sources
+    assert fixed_base_sources
            |> Map.keys()
            |> Enum.filter(&String.starts_with?(&1, "lib/tightbeam/productions/"))
            |> Enum.sort() == [
@@ -123,11 +123,11 @@ defmodule Tightbeam.DeliverableContractTest do
              "lib/tightbeam/productions/catalog_rederive.ex"
            ]
 
-    assignments = Map.fetch!(captured_sources, "lib/tightbeam/assignments.ex")
-    work_items = Map.fetch!(captured_sources, "lib/tightbeam/work_items.ex")
-    supervision = Map.fetch!(captured_sources, "lib/tightbeam/supervision.ex")
-    effort = Map.fetch!(captured_sources, "lib/tightbeam/effort_checkin.ex")
-    schema = Map.fetch!(captured_sources, "lib/tightbeam/schema.ex")
+    assignments = Map.fetch!(fixed_base_sources, "lib/tightbeam/assignments.ex")
+    work_items = Map.fetch!(fixed_base_sources, "lib/tightbeam/work_items.ex")
+    supervision = Map.fetch!(fixed_base_sources, "lib/tightbeam/supervision.ex")
+    effort = Map.fetch!(fixed_base_sources, "lib/tightbeam/effort_checkin.ex")
+    schema = Map.fetch!(fixed_base_sources, "lib/tightbeam/schema.ex")
 
     contract =
       File.read!(Path.join([__DIR__, "..", "lib", "tightbeam", "deliverable_contract.ex"]))
@@ -1000,12 +1000,7 @@ defmodule Tightbeam.DeliverableContractTest do
     close_first_completion = complete(ctx, close_first_assignment.id, nil)
 
     assert %{ok: true, workItem: %{state: "closed"}} =
-             close(
-               ctx,
-               {:user, "sample-user"},
-               close_first_card.id,
-               close_first_completion.attest.id
-             )
+             close(ctx, {:user, "sample-user"}, close_first_card.id, close_first_completion.attest.id)
 
     completion_first_card = create_card(ctx, "Completion probe before close")
 
@@ -1015,12 +1010,7 @@ defmodule Tightbeam.DeliverableContractTest do
     completion_first = complete(ctx, completion_first_assignment.id, nil)
 
     assert %{ok: true, workItem: %{state: "closed"}} =
-             close(
-               ctx,
-               {:user, "sample-user"},
-               completion_first_card.id,
-               completion_first.attest.id
-             )
+             close(ctx, {:user, "sample-user"}, completion_first_card.id, completion_first.attest.id)
 
     for card_id <- [close_first_card.id, completion_first_card.id] do
       assert {:ok, [[1, 1]]} =
@@ -1047,9 +1037,7 @@ defmodule Tightbeam.DeliverableContractTest do
     revoke_before_completion =
       assign(ctx, create_card(ctx, "Revoke before completion").id, "R then C", true)
 
-    assert %{outcome: "revoked"} =
-             revoke(ctx, {:user, "sample-user"}, revoke_before_completion.id)
-
+    assert %{outcome: "revoked"} = revoke(ctx, {:user, "sample-user"}, revoke_before_completion.id)
     assert %{code: "assignment_closed"} = complete(ctx, revoke_before_completion.id, nil)
     assert {:ok, [[0, 0]]} = completion_counts(ctx.db, revoke_before_completion.id)
   end
@@ -1170,20 +1158,21 @@ defmodule Tightbeam.DeliverableContractTest do
              )
   end
 
-  test "an example record graph cannot recur without explicit ruling", ctx do
-    example = example_fixture!()
-    example_assignments = example["assignments"]
-    example_attests = example["attests"]
+  test "reviewed specification alone cannot complete implementation without explicit ruling",
+       ctx do
+    captured = synthetic_reviewed_spec_fixture!()
+    captured_assignments = captured["assignments"]
+    captured_attests = captured["attests"]
 
     spec_row =
-      Enum.find(example_assignments, &(&1["id"] == "asg_00000000-0000-4000-8000-000000000002"))
+      Enum.find(captured_assignments, &(&1["id"] == "asg_295031f3-f187-5675-99c3-f6f01f676a45"))
 
     completion_row =
-      Enum.find(example_attests, &(&1["id"] == "att_00000000-0000-4000-8000-000000000004"))
+      Enum.find(captured_attests, &(&1["id"] == "att_3bdeaa72-7555-530d-867c-062c0ab56bf4"))
 
     fixture = %{
-      work_item_id: example["workItem"]["id"],
-      title: example["workItem"]["title"],
+      work_item_id: captured["workItem"]["id"],
+      title: captured["workItem"]["title"],
       assignment_id: spec_row["id"],
       subject: spec_row["subject"],
       completion_attest_id: completion_row["id"],
@@ -1194,26 +1183,26 @@ defmodule Tightbeam.DeliverableContractTest do
       }
     }
 
-    assert fixture.work_item_id == "wi_00000000-0000-4000-8000-000000000001"
-    assert fixture.assignment_id == "asg_00000000-0000-4000-8000-000000000002"
-    assert fixture.completion_attest_id == "att_00000000-0000-4000-8000-000000000004"
+    assert fixture.work_item_id == "wi_166776b5-681a-5a8a-b9f6-99e0beee2805"
+    assert fixture.assignment_id == "asg_295031f3-f187-5675-99c3-f6f01f676a45"
+    assert fixture.completion_attest_id == "att_3bdeaa72-7555-530d-867c-062c0ab56bf4"
 
-    assert Enum.map(example_assignments, & &1["effectKind"]) |> Enum.sort() ==
+    assert Enum.map(captured_assignments, & &1["effectKind"]) |> Enum.sort() ==
              ~w(evidence policy review review)
 
-    refute Enum.any?(example_assignments, &(&1["effectKind"] == "code"))
+    refute Enum.any?(captured_assignments, &(&1["effectKind"] == "code"))
 
-    assert Enum.sort(Enum.map(example["trace"]["assignments"], & &1["id"])) ==
-             Enum.sort(Enum.map(example_assignments, & &1["id"]))
+    assert Enum.sort(Enum.map(captured["trace"]["assignments"], & &1["id"])) ==
+             Enum.sort(Enum.map(captured_assignments, & &1["id"]))
 
-    assert Enum.map(example["trace"]["terminalTimeline"], & &1["verdict"])
+    assert Enum.map(captured["trace"]["terminalTimeline"], & &1["verdict"])
            |> Enum.reject(&is_nil/1) ==
              ["spirit-approved", "changes-requested", "reviewed-clean"]
 
-    assert List.last(example["trace"]["terminalTimeline"])["kind"] ==
+    assert List.last(captured["trace"]["terminalTimeline"])["kind"] ==
              "disposition_transition"
 
-    repo = example_commit_repo!()
+    repo = synthetic_reviewed_spec_commit_repo!()
     fixture = put_in(fixture, [:commit_ref, :repo], "testhost:#{repo}")
 
     register_hosts(ctx.db, %{
@@ -2198,7 +2187,7 @@ defmodule Tightbeam.DeliverableContractTest do
       assert is_binary(source)
 
       assert :crypto.hash(:sha256, source) |> Base.encode16(case: :lower) ==
-               "b93d96b63190e561a07328b6f4726fd13a58de0a53cbb37742c0bcb46f03960d"
+               "cbaa8a3f2aabde64e20cb372be343f8d583d08219a6e95d92d73ad7e93de008a"
 
       renamed =
         String.replace(
@@ -2217,42 +2206,45 @@ defmodule Tightbeam.DeliverableContractTest do
     module
   end
 
-  defp example_fixture! do
-    path = Path.expand("fixtures/deliverable_contract/example_work_item.json", __DIR__)
+  defp synthetic_reviewed_spec_fixture! do
+    path =
+      Path.expand("fixtures/deliverable_contract/synthetic_reviewed_spec_history.json", __DIR__)
+
     bytes = File.read!(path)
 
     assert :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower) ==
-             "6c0ecbcfc6d14aef3d07659ae64f9203bf71bf0a27ec0bb7fc1509368e6be622"
+             "7a9dc3a05a21f5c9cf1ecfe3c20e4ff49057501b5e27c817718fe61b2faf06b9"
 
     JSON.decode!(bytes)
   end
 
-  defp example_commit_repo! do
+  defp synthetic_reviewed_spec_commit_repo! do
     repo =
       Path.join(
         System.tmp_dir!(),
-        "example-commit-#{System.unique_integer([:positive])}"
+        "synthetic-reviewed-spec-commit-#{System.unique_integer([:positive])}"
       )
 
     git_dir = Path.join(repo, ".git")
-    object_dir = Path.join([git_dir, "objects", "fc"])
+    object_dir = Path.join([git_dir, "objects", "9b"])
     File.mkdir_p!(object_dir)
     File.mkdir_p!(Path.join(git_dir, "refs"))
     File.write!(Path.join(git_dir, "HEAD"), "ref: refs/heads/main\n")
 
     body =
-      "tree 0000000000000000000000000000000000000000\n" <>
-        "author Example Author <author@example.invalid> 1 +0000\n" <>
-        "committer Example Author <author@example.invalid> 1 +0000\n\n" <>
-        "example: preserve a delivered commit reference\n"
+      "tree 1111111111111111111111111111111111111111\n" <>
+        "parent 2222222222222222222222222222222222222222\n" <>
+        "author Test Fixture <fixture@example.invalid> 1700000000 +0000\n" <>
+        "committer Test Fixture <fixture@example.invalid> 1700000000 +0000\n\n" <>
+        "spec: reviewed example revision\n"
 
     object = "commit #{byte_size(body)}\0" <> body
 
     assert :crypto.hash(:sha, object) |> Base.encode16(case: :lower) ==
-             "fc2d1e824ccf5e4e4761ba06928cb4a2d7a47602"
+             "9b09091e08371122dfa5992558f020e6fa168b7d"
 
     File.write!(
-      Path.join(object_dir, "2d1e824ccf5e4e4761ba06928cb4a2d7a47602"),
+      Path.join(object_dir, "09091e08371122dfa5992558f020e6fa168b7d"),
       :zlib.compress(object)
     )
 

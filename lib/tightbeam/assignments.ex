@@ -18,6 +18,7 @@ defmodule Tightbeam.Assignments do
     Projection,
     Productions.CompletionEscalation,
     Supervision,
+    StateVisibility,
     Wakes
   }
 
@@ -242,7 +243,7 @@ defmodule Tightbeam.Assignments do
     WHERE reopeningId IS NOT NULL;
   """
 
-  # The first revision of this table used SQLite's one-argument trim(), which
+  # The first revision of this table used SQLite's one-argument trim, which
   # did not reject every String.trim/1 whitespace code point. A receipt makes
   # this a one-time upgrade rather than a startup repair loop: migrate the
   # known predecessor once, then refuse malformed historic provenance instead
@@ -1149,8 +1150,134 @@ defmodule Tightbeam.Assignments do
   end
 
   @doc "List every attest filed against an assignment in deterministic order."
-  @spec list_attests(DB.server(), String.t()) :: [map()]
+  @spec list_attests(DB.server(), String.t() | map()) :: [map()]
+  def list_attests(
+        db,
+        %{filters: filters, principal: principal, boundary: boundary, limit: limit}
+      )
+      when is_map(filters) and is_map(principal) and is_integer(limit) and limit > 0 do
+    {visibility_sql, visibility_params} = StateVisibility.attest_collection_scope(principal)
+    {filter_clauses, filter_params} = attest_filter_clauses(filters, length(visibility_params))
+    where = Enum.join([visibility_sql | filter_clauses], " AND ")
+    base_params = visibility_params ++ filter_params
+
+    {rows, reverse?} = attest_page_rows(db, where, base_params, boundary, limit)
+    rows = if reverse?, do: Enum.reverse(rows), else: rows
+
+    rows ++ attest_opposite_probe(db, where, base_params, boundary)
+  end
+
   def list_attests(db, assignment_id), do: list_attests(db, assignment_id, nil, nil)
+
+  defp attest_filter_clauses(filters, parameter_offset) do
+    columns = %{
+      "assignmentId" => "a.assignmentId",
+      "workItemId" => "assignment.workItemId",
+      "kind" => "a.kind",
+      "verdictKind" => "a.verdictKind",
+      "bySession" => "a.bySession",
+      "byUser" => "a.byUser"
+    }
+
+    filters
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.reduce({[], []}, fn {field, values}, {clauses, params} ->
+      case {Map.get(columns, field), values} do
+        {column, values} when is_binary(column) and is_list(values) and values != [] ->
+          first = parameter_offset + length(params) + 1
+          placeholders = Enum.map_join(first..(first + length(values) - 1), ", ", &"?#{&1}")
+          {clauses ++ ["#{column} IN (#{placeholders})"], params ++ values}
+
+        {column, []} when is_binary(column) ->
+          {clauses ++ ["0=1"], params}
+
+        _ ->
+          {clauses ++ ["0=1"], params}
+      end
+    end)
+  end
+
+  defp attest_page_rows(db, where, params, :latest, limit),
+    do: {attest_rows(db, where, params, nil, "DESC", limit + 1), true}
+
+  defp attest_page_rows(db, where, params, {:before, [ts, id]}, limit),
+    do: {attest_rows(db, where, params, {:less, ts, id}, "DESC", limit + 1), true}
+
+  defp attest_page_rows(db, where, params, {:after, [ts, id]}, limit),
+    do: {attest_rows(db, where, params, {:greater, ts, id}, "ASC", limit + 1), false}
+
+  defp attest_rows(db, where, params, range, order, limit) do
+    {range_sql, range_params} = attest_range(range, length(params) + 1)
+    limit_index = length(params) + length(range_params) + 1
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT a.id, a.assignmentId, a.kind, a.verdictKind, a.note, a.bySession, a.byUser,
+               a.producer, a.producerCommand, a.byHarness, a.byProvider, a.commitRefs, a.ts
+        FROM attests AS a
+        JOIN assignments AS assignment ON assignment.id = a.assignmentId
+        LEFT JOIN work_items AS wi ON wi.id = assignment.workItemId
+        WHERE #{where}#{range_sql}
+        ORDER BY a.ts #{order}, a.id #{order}
+        LIMIT ?#{limit_index}
+        """,
+        params ++ range_params ++ [limit]
+      )
+
+    Enum.map(rows, &attest/1)
+  end
+
+  defp attest_opposite_probe(_db, _where, _params, :latest), do: []
+
+  defp attest_opposite_probe(db, where, params, {:before, [ts, id]}) do
+    attest_probe(db, where, params, {:greater_or_equal, ts, id}, "ASC")
+  end
+
+  defp attest_opposite_probe(db, where, params, {:after, [ts, id]}) do
+    attest_probe(db, where, params, {:less_or_equal, ts, id}, "DESC")
+  end
+
+  defp attest_probe(db, where, params, range, order) do
+    {range_sql, range_params} = attest_range(range, length(params) + 1)
+    limit_index = length(params) + length(range_params) + 1
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT a.ts, a.id
+        FROM attests AS a
+        JOIN assignments AS assignment ON assignment.id = a.assignmentId
+        LEFT JOIN work_items AS wi ON wi.id = assignment.workItemId
+        WHERE #{where}#{range_sql}
+        ORDER BY a.ts #{order}, a.id #{order}
+        LIMIT ?#{limit_index}
+        """,
+        params ++ range_params ++ [1]
+      )
+
+    Enum.map(rows, fn [ts, id] -> %{ts: ts, id: id} end)
+  end
+
+  defp attest_range(nil, _first), do: {"", []}
+
+  defp attest_range({operator, ts, id}, first) do
+    {comparison, id_comparison} =
+      case operator do
+        :less -> {"<", "<"}
+        :greater -> {">", ">"}
+        :less_or_equal -> {"<", "<="}
+        :greater_or_equal -> {">", ">="}
+      end
+
+    {
+      " AND (a.ts #{comparison} ?#{first} OR " <>
+        "(a.ts = ?#{first} AND a.id #{id_comparison} ?#{first + 1}))",
+      [ts, id]
+    }
+  end
 
   @doc """
   The same list, paged by a `(ts, id)` KEYSET (fabric §13 Phase 1 seam ④,
@@ -2323,7 +2450,7 @@ defmodule Tightbeam.Assignments do
 
   defp valid_reopen_reason(reason) when is_binary(reason) do
     # Unicode CODE POINTS, matching the `assignment_reopenings` CHECK's
-    # `length(trim(reason))` — SQLite's `length()` on TEXT counts code points,
+    # `length(trim(reason))` — SQLite's `length` on TEXT counts code points,
     # not grapheme clusters. `String.length/1` counts graphemes, so a reason
     # built of multi-codepoint grapheme clusters (e.g. family-emoji ZWJ
     # sequences) could pass this guard while still tripping the table's CHECK,
