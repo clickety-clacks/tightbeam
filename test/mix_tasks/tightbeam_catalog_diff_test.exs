@@ -3,6 +3,50 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
 
   alias Mix.Tasks.Tightbeam.Catalog.Diff
 
+  test "fetch_live waits for local host discovery before accepting a degraded catalog" do
+    parent = self()
+    host = Tightbeam.Placement.local_host_name()
+    latch = :ets.new(:catalog_discovery, [:public, :set])
+    base = Path.join(System.tmp_dir!(), "catalog-discovery-#{System.unique_integer([:positive])}")
+
+    task =
+      Task.async(fn ->
+        Diff.fetch_live(base, 5_000,
+          name: :"catalog_discovery_#{System.unique_integer([:positive])}",
+          hosts: fn ->
+            if :ets.insert_new(latch, {:discovery, true}) do
+              send(parent, {:discovering, self()})
+
+              receive do
+                :resolve -> :ok
+              after
+                2_000 -> raise "host discovery was not released"
+              end
+            end
+
+            %{host => %{ssh: nil, base_dir: base, cli_bin: nil}}
+          end,
+          credential_status: fn _provider -> {:needs_onboarding, :fixture} end
+        )
+      end)
+
+    assert_receive {:discovering, worker}
+    ref = task.ref
+
+    try do
+      refute_receive {^ref, _result}
+    after
+      send(worker, :resolve)
+    end
+
+    assert {:ok, _inventories, degraded} = Task.await(task, 5_000)
+    assert map_size(degraded) > 0
+
+    assert Enum.all?(degraded, fn {_harness, reason} ->
+             reason == {:unavailable, {:needs_onboarding, :fixture}}
+           end)
+  end
+
   test "working-set model absent from the live catalog is drift" do
     with_guidance(["known", "vanished"], fn path ->
       {status, diff} = Diff.evaluate(inventories(["known"]), path)

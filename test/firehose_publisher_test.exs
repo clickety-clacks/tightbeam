@@ -447,12 +447,21 @@ defmodule Tightbeam.Firehose.PublisherTest do
       }
     }
 
-    assert {:ok, %{rumination_required: true, work_item_id: work_item_id}} =
+    assert {:ok, %{state: "open", rumination_required: true, work_item_id: work_item_id}} =
              Dispatch.dispatch(db, handlers, rumination_dispatch)
 
     assert work_item_id == work_item.id
     rumination_classes = observed_classes()
-    assert rumination_classes == ["verb.accepted", "wake.scheduled"]
+
+    assert rumination_classes == [
+             "wake.scheduled",
+             "wake.canceled",
+             "message.created",
+             "session.updated",
+             "message.created",
+             "verb.accepted",
+             "assignment.opened"
+           ]
 
     assert :ok = Wakes.fire_due(scheduler)
     dispatch_delivery_effects = observed_state_classes()

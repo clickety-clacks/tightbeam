@@ -468,7 +468,9 @@ defmodule Tightbeam.TranscriptTest do
   test "turns_message_id boot preserves transcript rows and selects the named index", ctx do
     turns =
       for index <- 1..250 do
-        prompt_id = message!(ctx.db, "owned", "user", "indexed prompt #{index}")
+        prompt_id =
+          message!(ctx.db, "owned", "user", "indexed prompt #{index}", sender: "user:flynn")
+
         seq = turn!(ctx.db, "owned", prompt_id, model: "fable", harness: "claude")
         %{id: prompt_id, seq: seq}
       end

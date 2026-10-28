@@ -127,11 +127,13 @@ defmodule Tightbeam.Harness do
 
   @doc "Whether this harness's installed local client owns acceptance of an uncataloged model id."
   @callback local_client_model_authority?(Tightbeam.Model.t()) :: boolean()
+  @callback records_tool_calls?() :: boolean()
 
   @optional_callbacks preflight_launch: 3,
                       warm_home: 2,
                       materialize_legacy_credential_link: 2,
                       local_client_model_authority?: 1,
+                      records_tool_calls?: 0,
                       submission_text_limit: 0,
                       project_session_identity: 3,
                       verify_session_identity_hook: 2
@@ -199,6 +201,12 @@ defmodule Tightbeam.Harness do
 
     function_exported?(module, :local_client_model_authority?, 1) and
       module.local_client_model_authority?(model)
+  end
+
+  def records_tool_calls?(harness) do
+    module = module!(harness)
+    Code.ensure_loaded!(module)
+    function_exported?(module, :records_tool_calls?, 0) and module.records_tool_calls?()
   end
 
   @callback conformance_vectors() :: %{

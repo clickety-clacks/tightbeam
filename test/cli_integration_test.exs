@@ -401,8 +401,7 @@ defmodule Tightbeam.CliIntegrationTest do
           ctx.binary,
           ["wake", "--session", "cli-holder", "--assignment", assignment] ++
             timing_args ++ ["--prompt", prompt],
-          cd: ctx.workdir,
-          stderr_to_stdout: true
+          cd: ctx.workdir
         )
 
       assert_receive {:cli_call, %{verb: "wake", params: wire_params}}

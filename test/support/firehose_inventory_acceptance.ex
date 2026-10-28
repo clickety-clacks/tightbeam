@@ -3,7 +3,18 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
   import ExUnit.Assertions
   alias Tightbeam.ClientE2E.WS
   alias Tightbeam.{ConditionFacts, Devices, Dispatch, Gateway, Harness, Org, Placement}
-  alias Tightbeam.{Projection, ReadMarkers, StateResources, SubagentMarkers, Toplines, Wakes}
+
+  alias Tightbeam.{
+    Ledger,
+    Projection,
+    ReadMarkers,
+    StateResources,
+    SubagentMarkers,
+    ToolCalls,
+    Toplines,
+    Wakes
+  }
+
   alias Tightbeam.Firehose.{Hub, Rebuild, Registry}
   alias Tightbeam.FirehoseAcceptanceFixture, as: Fixture
   @a4_replay_seed {7_913, 10_007, 65_537}
@@ -342,6 +353,56 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
              )
 
     assert fresh_harness == harness_notice["payload"]
+
+    {:appended, tool_prompt} =
+      Projection.append(fixture.db, %{
+        session_key: main.session_key,
+        role: "user",
+        sender: "user:#{fixture.user_id}",
+        content: "Exercise tool-call and transition rebuilds."
+      })
+
+    {:ok, tool_turn} =
+      Ledger.enqueue(fixture.db, %{
+        session_key: main.session_key,
+        message_id: tool_prompt.id,
+        origin: "user:#{fixture.user_id}",
+        prompt: tool_prompt.content
+      })
+
+    notices =
+      capture_classes(fixture, notices, ["tool_call.started"], fn ->
+        assert {:ok, :started} =
+                 ToolCalls.observe(
+                   fixture.db,
+                   main.session_key,
+                   tool_turn,
+                   "inventory-running-call",
+                   ToolCalls.normalize_notification(%{
+                     "title" => "Read",
+                     "status" => "in_progress"
+                   }),
+                   %{},
+                   nil
+                 )
+      end)
+
+    notices =
+      capture_classes(fixture, notices, ["tool_call.ended", "transition.recorded"], fn ->
+        assert {:ok, :ended} =
+                 ToolCalls.observe(
+                   fixture.db,
+                   main.session_key,
+                   tool_turn,
+                   "inventory-compaction-call",
+                   ToolCalls.normalize_notification(%{
+                     "title" => "Compact",
+                     "status" => "completed"
+                   }),
+                   %{},
+                   "100/200 tokens"
+                 )
+      end)
 
     notices =
       capture_classes(fixture, notices, ["session.updated"], fn ->
