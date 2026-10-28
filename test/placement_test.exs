@@ -305,7 +305,7 @@ defmodule Tightbeam.PlacementTest do
   end
 
   test "origin checks name a disappeared host", %{base_dir: base_dir, db: db} do
-    assert %{ "/work/file" => {:error, "no host named eurisko is registered"} } =
+    assert %{"/work/file" => {:error, "no host named eurisko is registered"}} =
              Placement.check_origins(%{base_dir: base_dir, db: db}, "eurisko", ["/work/file"])
   end
 

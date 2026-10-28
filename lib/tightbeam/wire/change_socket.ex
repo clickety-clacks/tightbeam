@@ -204,7 +204,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
       :ok =
         Hub.register(hub(state), self(), %{
           mode: :filtered,
-            user_id: user.user_id,
+          user_id: user.user_id,
           principal_kind: :user,
           principal_id: user.user_id
         })

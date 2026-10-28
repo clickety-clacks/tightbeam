@@ -103,6 +103,7 @@ defmodule Tightbeam.FirehoseAppBacklogTest do
     healthy_app =
       spawn(fn ->
         counter = :atomics.new(1, signed: false)
+
         :ok =
           Hub.register(hub, self(), %{
             mode: :filtered,
@@ -111,12 +112,14 @@ defmodule Tightbeam.FirehoseAppBacklogTest do
             user_id: "healthy-app",
             backlog_counter: counter
           })
+
         :ok = Hub.subscribe(hub, self(), "small", %{"classes" => ["small.created"]})
         send(parent, {:healthy_ready, self()})
 
         receive do
           {:firehose_notice, notice} ->
             send(parent, {:healthy_notice, notice})
+
             receive do
               :stop -> :ok
             end

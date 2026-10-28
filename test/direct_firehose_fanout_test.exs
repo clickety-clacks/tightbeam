@@ -27,6 +27,7 @@ defmodule Tightbeam.DirectFirehoseFanoutTest do
     assert_receive {:firehose_notice, %{"subscriptionId" => "one", "seq" => 1}}
     assert_receive {:firehose_notice, %{"subscriptionId" => "two", "seq" => 2}}
     refute_received :firehose_overflow
+
     assert %{overflowed: false, queued: 0, seq: 2, in_flight: false} =
              Hub.connection_stats(hub, self())
   end

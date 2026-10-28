@@ -219,6 +219,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     Hub.publish(ctx.hub, notice(ctx, "wi_observer_delivery"))
     assert_receive {:firehose_notice, notice_frame}
+
     assert {:push, {:text, notice_bytes}, observer_state} =
              ChangeSocket.handle_info({:firehose_notice, notice_frame}, observer_state)
 
