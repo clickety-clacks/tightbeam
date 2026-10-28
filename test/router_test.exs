@@ -769,13 +769,24 @@ defmodule Tightbeam.Wire.RouterTest do
 
       assert get_resp_header(missing, "cache-control") == ["no-store"]
 
-      for {query, token, status, code} <- [
-            {"?bad=%ZZ", "invalid", 401, "auth_failed"},
-            {"?bad=%ZZ", ctx.device.token, 400, "malformed_query"},
-            {"?filter=unknown", ctx.device.token, 400, "invalid_filter"},
-            {"?asUser=flynn&asUser=other", "tbc_test", 400, "invalid_as_user"}
+      observer_read? = resource in ["sessions", "read markers"]
+
+      {invalid_bearer_status, invalid_bearer_code} =
+        if observer_read?,
+          do: {400, "malformed_query"},
+          else: {401, "auth_failed"}
+
+      {repeated_as_user_status, repeated_as_user_code} =
+        if observer_read?, do: {404, "not_found"}, else: {400, "invalid_as_user"}
+
+      for {query, token, status, code, request_options} <- [
+            {"?bad=%ZZ", "invalid", invalid_bearer_status, invalid_bearer_code, guarded},
+            {"?bad=%ZZ", ctx.device.token, 400, "malformed_query", guarded},
+            {"?filter=unknown", ctx.device.token, 400, "invalid_filter", guarded},
+            {"?asUser=flynn&asUser=other", "tbc_test", repeated_as_user_status,
+             repeated_as_user_code, if(observer_read?, do: opts, else: guarded)}
           ] do
-        refusal = request.(url <> query, token, guarded)
+        refusal = request.(url <> query, token, request_options)
         assert refusal.status == status
         assert JSON.decode!(refusal.resp_body)["error"]["code"] == code
       end

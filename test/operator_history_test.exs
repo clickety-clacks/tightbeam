@@ -214,9 +214,32 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
     assert organization_read.status == 200
     assert Enum.map(body(organization_read)["items"], & &1["id"]) == [selected_message.id]
 
-    for query <- ["asUser=", "asUser=owner&asUser=owner", "asUser=owner&asUser=other"] do
-      assert_error(read(ctx, ctx.selected, query), 400, "invalid_as_user")
-    end
+    # REST state API v1 AU1a treats unusable selection as absent and uses the observer principal.
+    organization_identity =
+      body(organization_read)["page"]["oldestCursor"]
+      |> Base.url_decode64!(padding: false)
+      |> JSON.decode!()
+
+    assert organization_identity["principalKind"] == "observer"
+    assert organization_identity["principalId"] == "observer"
+
+    empty_selection = read(ctx, ctx.selected, "asUser=") |> body()
+    assert empty_selection["items"] == body(organization_read)["items"]
+
+    empty_selection_identity =
+      empty_selection["page"]["oldestCursor"]
+      |> Base.url_decode64!(padding: false)
+      |> JSON.decode!()
+
+    assert empty_selection_identity["principalKind"] == "observer"
+    assert empty_selection_identity["principalId"] == "observer"
+
+    repeated_owner = read(ctx, ctx.selected, "asUser=owner&asUser=owner") |> body()
+    assert Enum.map(repeated_owner["items"], & &1["id"]) == [selected_message.id]
+
+    repeated_other = read(ctx, ctx.selected, "asUser=owner&asUser=other")
+    assert_error(repeated_other, 404, "not_found")
+    refute repeated_other.resp_body =~ "private selected content"
 
     for {selection, user} <- [
           {ctx.selected, "unknown"},
@@ -228,7 +251,17 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
       refute response.resp_body =~ "private selected content"
     end
 
-    assert_error(read(ctx, ctx.selected, "asUser=owner", "invalid-token"), 401, "auth_failed")
+    invalid_bearer_read = read(ctx, ctx.selected, "asUser=owner", "invalid-token")
+    assert invalid_bearer_read.status == 200
+    assert Enum.map(body(invalid_bearer_read)["items"], & &1["id"]) == [selected_message.id]
+
+    invalid_bearer_identity =
+      body(invalid_bearer_read)["page"]["oldestCursor"]
+      |> Base.url_decode64!(padding: false)
+      |> JSON.decode!()
+
+    assert invalid_bearer_identity["principalKind"] == "user"
+    assert invalid_bearer_identity["principalId"] == "owner"
 
     for query <- [
           "asUser=owner&sessionKey=another",
@@ -268,11 +301,19 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
     assert identity["principalId"] == "owner"
     assert_error(read(ctx, ctx.sibling, "asUser=owner&before=" <> cursor), 400, "invalid_cursor")
 
-    assert_error(
-      read(ctx, ctx.selected, "asUser=" <> ctx.admin.user_id <> "&before=" <> cursor),
-      400,
-      "invalid_cursor"
-    )
+    mismatched_principal =
+      read(ctx, ctx.selected, "asUser=" <> ctx.admin.user_id <> "&before=" <> cursor)
+
+    assert mismatched_principal.status == 200
+    assert Enum.map(body(mismatched_principal)["items"], & &1["content"]) == ["one", "two"]
+
+    changed_cursor =
+      body(mismatched_principal)["page"]["oldestCursor"]
+      |> Base.url_decode64!(padding: false)
+      |> JSON.decode!()
+
+    assert changed_cursor["principalKind"] == "user-admin"
+    assert changed_cursor["principalId"] == ctx.admin.user_id
   end
 
   test "org reads expose session collections with unchanged owner and admin visibility", ctx do
@@ -299,7 +340,17 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
     assert read(ctx, ctx.selected, "", ctx.owner.token).status == 200
 
     for token <- [ctx.selected.cli_token, ctx.owner.token] do
-      assert_error(read(ctx, ctx.selected, "asUser=owner", token), 400, "invalid_as_user")
+      response = read(ctx, ctx.selected, "asUser=owner", token)
+      assert response.status == 200, response.resp_body
+      assert Enum.any?(body(response)["items"], &(&1["content"] == "ordinary reads"))
+
+      identity =
+        body(response)["page"]["oldestCursor"]
+        |> Base.url_decode64!(padding: false)
+        |> JSON.decode!()
+
+      assert identity["principalKind"] == "user"
+      assert identity["principalId"] == "owner"
     end
 
     assert_error(read(ctx, ctx.hidden, "", ctx.owner.token), 404, "not_found")
