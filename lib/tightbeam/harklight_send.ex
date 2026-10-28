@@ -29,6 +29,9 @@ defmodule Tightbeam.HarklightSend do
         other -> %{code: "harklight_send_pending", op_id: op_id, detail: inspect(other)}
       end
     else
+      {:error, {:invalid_harklight_send, message}} ->
+        %{code: "invalid_harklight_send", message: message}
+
       {:error, reason} -> %{code: reason}
     end
   end
@@ -82,28 +85,67 @@ defmodule Tightbeam.HarklightSend do
     choices = params[:choices] || []
     files = params[:files] || []
     vendor = params[:vendor_session_id]
+    unknown = Enum.find(Map.keys(params), &(&1 not in allowed))
 
-    if Enum.all?(Map.keys(params), &(&1 in allowed)) and
-         (session == "new" or (is_binary(session) and Regex.match?(@uuid4, session))) and
-         is_binary(sender) and sender != "" and is_binary(title) and title != "" and
-         (is_nil(body) or is_binary(body)) and
-         (is_nil(vendor) or is_binary(vendor)) and
-         is_list(choices) and Enum.all?(choices, &(is_binary(&1) and &1 != "")) and
-         is_list(files) and Enum.all?(files, &(is_binary(&1) and &1 != "")) do
-      {:ok,
-       %{
-         session: session,
-         sender: sender,
-         title: title,
-         body: body,
-         choices: choices,
-         files: files,
-         vendor: vendor
-       }}
-    else
-      {:error, "invalid_harklight_send"}
+    cond do
+      not is_nil(unknown) ->
+        invalid_parameter("unrecognized", unknown)
+
+      not Map.has_key?(params, :harklight_session) ->
+        invalid_parameter("missing required", :harklight_session)
+
+      not (session == "new" or (is_binary(session) and Regex.match?(@uuid4, session))) ->
+        invalid_parameter("invalid", :harklight_session)
+
+      not Map.has_key?(params, :sender_id) ->
+        invalid_parameter("missing required", :sender_id)
+
+      not (is_binary(sender) and sender != "") ->
+        invalid_parameter("invalid", :sender_id)
+
+      not Map.has_key?(params, :title) ->
+        invalid_parameter("missing required", :title)
+
+      not (is_binary(title) and title != "") ->
+        invalid_parameter("invalid", :title)
+
+      not (is_nil(body) or is_binary(body)) ->
+        invalid_parameter("invalid", :body)
+
+      not (is_nil(vendor) or is_binary(vendor)) ->
+        invalid_parameter("invalid", :vendor_session_id)
+
+      not (is_list(choices) and Enum.all?(choices, &(is_binary(&1) and &1 != ""))) ->
+        invalid_parameter("invalid", :choices)
+
+      not (is_list(files) and Enum.all?(files, &(is_binary(&1) and &1 != ""))) ->
+        invalid_parameter("invalid", :files)
+
+      true ->
+        {:ok,
+         %{
+           session: session,
+           sender: sender,
+           title: title,
+           body: body,
+           choices: choices,
+           files: files,
+           vendor: vendor
+         }}
     end
   end
+
+  defp invalid_parameter(kind, parameter) do
+    {:error,
+     {:invalid_harklight_send, "#{kind} parameter: #{parameter_name(parameter)}"}}
+  end
+
+  defp parameter_name(:harklight_session), do: "harklightSession"
+  defp parameter_name(:sender_id), do: "senderId"
+  defp parameter_name(:vendor_session_id), do: "vendorSessionId"
+  defp parameter_name(parameter) when is_atom(parameter), do: Atom.to_string(parameter)
+  defp parameter_name(parameter) when is_binary(parameter), do: parameter
+  defp parameter_name(_parameter), do: "unknown"
 
   defp prepare_args(input, op_id) do
     args = [

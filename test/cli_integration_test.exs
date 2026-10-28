@@ -113,17 +113,22 @@ defmodule Tightbeam.CliIntegrationTest do
 
     Roles.create!(db, "cli-worker", "flynn", worker.session_key)
 
+    test_pid = self()
+
     gateway_config = %{
       db: db,
       base_dir: base_dir,
       cwd: base_dir,
-      wake_tick_ms: 1_000
+      wake_tick_ms: 1_000,
+      harklight_send_runner: fn args ->
+        send(test_pid, {:harklight_send_runner, args})
+        {"", 1}
+      end
     }
 
     Archetypes.load!(base_dir)
     real_handlers = Gateway.handlers(gateway_config)
     Rules.load!(base_dir, Map.keys(real_handlers))
-    test_pid = self()
 
     handlers =
       Map.new(real_handlers, fn
@@ -178,6 +183,57 @@ defmodule Tightbeam.CliIntegrationTest do
       workdir: workdir,
       outside: outside
     }
+  end
+
+  test "harklight-send CLI camelCase parameters reach the gateway handler", ctx do
+    {output, status} =
+      System.cmd(
+        ctx.binary,
+        [
+          "harklight-send",
+          "--session",
+          "new",
+          "--sender-id",
+          "wire-sender",
+          "--title",
+          "Wire question"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status == 1
+    assert output =~ "harklight_result_unconfirmed"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "harklight-send",
+                      principal: {:session, "cli-holder"},
+                      params: %{
+                        harklight_session: "new",
+                        sender_id: "wire-sender",
+                        title: "Wire question"
+                      }
+                    }}
+
+    assert_receive {:harklight_send_runner,
+                    [
+                      "send",
+                      "--prepare",
+                      "--op-id",
+                      op_id,
+                      "--session",
+                      "new",
+                      "--sender-id",
+                      "wire-sender",
+                      "--title",
+                      "Wire question",
+                      "--route",
+                      "other",
+                      "--controller"
+                    ]}
+
+    assert String.match?(op_id, ~r/\A[0-9a-f-]{36}\z/)
   end
 
   test "session reparent crosses the real CLI wire and preserves assignment continuity", ctx do

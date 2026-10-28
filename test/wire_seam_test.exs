@@ -378,7 +378,27 @@ defmodule Tightbeam.Wire.SeamTest do
     session = create_session(ctx.db, "send-origin", "flynn")
     Org.set_host(ctx.db, session.session_key, Tightbeam.Placement.local_host_name())
     local = dispatch_cli(ctx, session.cli_token, %{body | params: %{}})
-    assert JSON.decode!(local.resp_body)["error"]["code"] == "invalid_harklight_send"
+
+    assert JSON.decode!(local.resp_body)["error"] == %{
+             "code" => "invalid_harklight_send",
+             "message" => "missing required parameter: harklightSession"
+           }
+
+    malformed =
+      dispatch_cli(ctx, session.cli_token, %{
+        body
+        | params: %{
+            "harklightSession" => "new",
+            "senderId" => "sender",
+            "title" => "Question",
+            "extraOption" => "unexpected"
+          }
+      })
+
+    assert JSON.decode!(malformed.resp_body)["error"] == %{
+             "code" => "invalid_harklight_send",
+             "message" => "unrecognized parameter: extraOption"
+           }
   end
 
   test "assignment-stop-turn crosses dispatch and refuses a non-opener", ctx do
