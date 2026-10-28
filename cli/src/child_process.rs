@@ -243,7 +243,7 @@ extern "C" fn forward_to_active_group(signal: libc::c_int) {
     }
 
     unsafe {
-        *errno_slot = errno;
+        *errno_slot() = errno;
     }
 }
 
@@ -1128,7 +1128,7 @@ mod tests {
 
         const SENTINEL: libc::c_int = libc::EDOM;
         unsafe {
-            *errno_slot = SENTINEL;
+            *errno_slot() = SENTINEL;
         }
 
         forward_to_active_group(libc::SIGTERM);
