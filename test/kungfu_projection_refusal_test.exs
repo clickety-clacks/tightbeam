@@ -573,15 +573,16 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     assert :ok = Devices.revoke(db, admin.device_id)
     assert {:ok, pending} = ChangeSocket.init(deps)
 
-    assert {:stop, :normal, 1008, {:text, revoked}, ^pending} =
+    assert {:ok, revoked_observer} =
              send_frame.(pending, %{
                "type" => "auth",
                "deviceId" => admin.device_id,
                "token" => admin.token
              })
 
-    assert JSON.decode!(revoked)["reason"] == "token_revoked"
-    assert :ok = ChangeSocket.terminate(:normal, pending)
+    assert revoked_observer.phase == :live
+    assert revoked_observer.principal_kind == :observer
+    assert :ok = ChangeSocket.terminate(:normal, revoked_observer)
   end
 
   test "final ChangeSocket preserves valid bytes and rejects malformed or unauthenticated frames",
