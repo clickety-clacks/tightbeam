@@ -412,6 +412,32 @@ defmodule Tightbeam.Schema do
   @cursor_provider_previous_shape @addressed_po_shape
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @cannot_proceed_shape "cannot-proceed-v1-019"
+  @artifact_durability_objects ~w(
+    artifact_contents
+    artifacts_released_requires_content_insert
+    artifacts_released_requires_content_update
+    artifact_contents_released_immutable
+    artifact_contents_released_retained
+  )
+  @artifact_durability_current_shapes [
+    @legacy_cursor_provider_shape,
+    @cannot_proceed_shape,
+    @addressed_po_shape,
+    @pi_shape,
+    @durability_shape,
+    @cursor_provider_shape,
+    @settlement_shape,
+    @terminal_credential_shape,
+    @agent_reparent_shape,
+    @artifact_origin_shape,
+    @identity_publication_denial_diagnostic_shape,
+    @notice_source_payload_shape,
+    @launch_preparation_boot_shape,
+    @evidence_release_shape,
+    @decision_request_row_schema_shape,
+    @assignment_source_replacement_shape,
+    @work_item_owner_link_shape
+  ]
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -1827,6 +1853,7 @@ defmodule Tightbeam.Schema do
     :ok = ensure_stamp_table(db)
     :ok = ensure_fresh_owner_link_origin(db)
     :ok = check_shape(db)
+    :ok = preflight_artifact_durability(db)
     :ok = upgrade_o2(db)
     {:ok, [[predecessor]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
@@ -5520,59 +5547,35 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  # Refuse an unexpected artifact-content schema before bootstrap modules can
+  # write other objects to a predecessor database.
+  defp preflight_artifact_durability(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[shape]] when shape in @artifact_durability_current_shapes ->
+               validate_artifact_content_schema!(txn)
+
+             _ ->
+               ensure_artifact_content_schema_absent!(txn)
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
   @doc false
   # Artifact durability successor over session-reparent-v1-019. Creates the
   # captured-content store only; every historical module DDL is left alone.
   def upgrade_artifact_durability(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[shape]]
-             when shape in [
-                    @cursor_provider_shape,
-                    @settlement_shape,
-                    @terminal_credential_shape,
-                    @agent_reparent_shape,
-                    @artifact_origin_shape,
-                    @identity_publication_denial_diagnostic_shape,
-                    @notice_source_payload_shape,
-                    @launch_preparation_boot_shape,
-                    @evidence_release_shape,
-                    @decision_request_row_schema_shape,
-                    @assignment_source_replacement_shape,
-                    @work_item_owner_link_shape
-                  ] ->
-               validate_artifact_content_schema!(txn)
-
-             [[@legacy_cursor_provider_shape]] ->
-               validate_artifact_content_schema!(txn)
-
-             [[@cannot_proceed_shape]] ->
-               validate_artifact_content_schema!(txn)
-
-             [[@addressed_po_shape]] ->
-               validate_artifact_content_schema!(txn)
-
-             [[@pi_shape]] ->
-               validate_artifact_content_schema!(txn)
-
-             [[@durability_shape]] ->
+             [[shape]] when shape in @artifact_durability_current_shapes ->
                validate_artifact_content_schema!(txn)
 
              [[@reparent_shape]] ->
-               previous_fk_violations =
-                 []
-
-               existing =
-                 Txn.q(
-                   txn,
-                   "SELECT name FROM sqlite_master WHERE name IN ('artifact_contents', 'artifacts_released_requires_content_insert', 'artifacts_released_requires_content_update', 'artifact_contents_released_immutable', 'artifact_contents_released_retained') ORDER BY name"
-                 )
-
-               if existing != [],
-                 do:
-                   raise(ShapeError,
-                     message: "incompatible artifact durability objects: #{inspect(existing)}"
-                   )
+               ensure_artifact_content_schema_absent!(txn)
+               previous_fk_violations = []
 
                :ok = Tightbeam.ArtifactContent.schema_in_txn(txn)
 
@@ -5606,6 +5609,24 @@ defmodule Tightbeam.Schema do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
     end
+  end
+
+  defp ensure_artifact_content_schema_absent!(txn) do
+    object_names = Enum.map_join(@artifact_durability_objects, ",", &"'#{&1}'")
+
+    existing =
+      Txn.q(
+        txn,
+        "SELECT name FROM sqlite_master WHERE name IN (#{object_names}) ORDER BY name"
+      )
+
+    if existing != [],
+      do:
+        raise(ShapeError,
+          message: "incompatible artifact durability objects: #{inspect(existing)}"
+        )
+
+    :ok
   end
 
   defp validate_artifact_content_schema!(txn) do
