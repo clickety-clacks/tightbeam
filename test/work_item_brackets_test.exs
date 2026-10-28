@@ -78,7 +78,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
       )
 
     # Owners are always users; bracket wakes target the owner's personal session.
-    sample-user_main = session(db, Org.personal_session_key("sample-user"), "sample-user")
+    sample_user_main = session(db, Org.personal_session_key("sample-user"), "sample-user")
     _dana_main = session(db, Org.personal_session_key("dana"), "dana")
     holder = session(db, "holder", "sample-user")
     dsession = session(db, "dsession", "dana")
@@ -92,7 +92,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     %{
       db: db,
       handlers: handlers,
-      sample-user_main: sample-user_main,
+      sample_user_main: sample_user_main,
       holder: holder,
       dsession: dsession
     }
