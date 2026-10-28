@@ -798,6 +798,8 @@ defmodule Tightbeam.NoticeBatcher do
       WHERE w.state='pending' AND w.consumer='prompt' AND w.digest=0
         AND (?2 IS NULL OR w.sessionKey=?2 OR w.targetRole IS NOT NULL OR w.targetGate<>0)
         AND COALESCE(w.deliveryRule,'')<>'turn-boundary-digest r1'
+        AND COALESCE(w.obligationRef,'') NOT LIKE 'effort-holder-prod:%'
+        AND COALESCE(w.prompt,'') NOT LIKE 'Effort check-in % expired after 24 hours%'
         AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
         AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
         AND (w.dueAt<=?1 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)

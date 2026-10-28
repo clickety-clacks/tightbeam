@@ -1876,7 +1876,6 @@ defmodule Tightbeam.Wakes do
 
       wake = recognize_from_snapshot_in_txn(txn, wake, evaluation, resolver, nil)
       admit_continuation_in_txn(txn, wake)
-      reconcile_wait_relief_in_txn(txn, obligation.id, wake.created_at)
 
       if is_nil(wake.recognition_path) do
         verifier_wake = schedule_verifier_notice_in_txn(txn, wake, verifier)
@@ -1928,58 +1927,6 @@ defmodule Tightbeam.Wakes do
       )
 
     due_at
-  end
-
-  defp reconcile_wait_relief_in_txn(txn, assignment_id, at) do
-    case Txn.q(
-           txn,
-           "SELECT 1 FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed' LIMIT 1",
-           [assignment_id]
-         ) do
-      [] ->
-        :ok
-
-      [[1]] ->
-        qualifies = effort_relief_in_txn?(txn, assignment_id)
-        RuleRuntime.apply_wait_relief_in_txn(txn, assignment_id, at, qualifies)
-    end
-  end
-
-  @doc false
-  def effort_relief_in_txn?(%Txn{} = txn, assignment_id) do
-    Tightbeam.Assignments.cannot_proceed_standing_in_txn?(txn, assignment_id) or
-      qualifying_wait_in_txn?(txn, assignment_id, "wait-effort-relief")
-  end
-
-  # Candidate selection does not confer qualification. Both purposes use the
-  # same checked snapshot, then the common Rules policy evaluator.
-  defp qualifying_wait_in_txn?(txn, assignment_id, purpose) do
-    Txn.q(
-      txn,
-      """
-      SELECT w.wakeId FROM wakes w
-      JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
-        AND s.assignmentId=w.assignmentId AND s.controllerOrigin='holder_continuation'
-      WHERE w.assignmentId=?1 AND w.obligationRef=?1
-        AND ((w.state='pending' AND s.controllerState='pending') OR
-             (w.state='fired' AND s.controllerState='settled'))
-      """,
-      [assignment_id]
-    )
-    |> Enum.any?(fn [wake_id] ->
-      wake = wait_in_txn(txn, wake_id)
-      facts = continuation_facts_in_txn(txn, wake, assignment_id)
-
-      mechanical =
-        facts["wait.obligation_matches"] and facts["wait.admitted"] and
-          facts["wait.continuation_state"] == "pending" and
-          not facts["wait.recognized"] and facts["resolver.open"] and
-          facts["wait.declaration_complete"] and facts["wait.verification_accountable"] and
-          facts["wait.coverage_valid"]
-
-      mechanical and
-        match?({:ok, _}, RuleRuntime.select_policy_in_txn(txn, purpose, %{wait_facts: facts}))
-    end)
   end
 
   defp continuation_facts_in_txn(txn, wake, assignment_id) do
@@ -2734,7 +2681,6 @@ defmodule Tightbeam.Wakes do
     )
 
     if Txn.changes(txn) == 1 do
-      reconcile_wait_relief_in_txn(txn, wake.assignment_id, recognized_at)
       schedule_changed_in_txn(txn, :wake_ready)
 
       EventLog.lifecycle_in_txn(
@@ -2813,8 +2759,6 @@ defmodule Tightbeam.Wakes do
     case attrs[:verdict_kind] do
       kind when kind in ~w(wait-verified wait-challenged) ->
         apply_verification_verdict_in_txn(txn, attrs)
-        wake = wait_in_txn(txn, attrs.wait_id)
-        reconcile_wait_relief_in_txn(txn, wake.assignment_id, now())
 
       _ ->
         :ok
@@ -4246,8 +4190,8 @@ defmodule Tightbeam.Wakes do
 
   @requester_kinds ~w(user session process)
   @reason_kinds ~w(requester_withdrew superseded obligation_disposed cannot_proceed_released routing_bracket_satisfied target_retired production_unmatched consumer_unavailable target_unresolvable condition_cleared)
-  @source_kinds ~w(verb_call wake progress_attest condition_fact assignment_transition work_item_transition decision_request monitor_generation routing_bracket session_transition scheduler_delivery sentinel_transition harness_health_transition)
-  @disposition_kinds ~w(assignment_transition work_item_transition decision_request_transition monitor_generation_transition)
+  @source_kinds ~w(verb_call wake progress_attest condition_fact assignment_transition work_item_transition decision_request routing_bracket session_transition scheduler_delivery sentinel_transition harness_health_transition)
+  @disposition_kinds ~w(assignment_transition work_item_transition decision_request_transition)
   @liveness_kinds ~w(pending_wake routing_bracket)
 
   @process_reasons %{
@@ -4412,6 +4356,18 @@ defmodule Tightbeam.Wakes do
          %{wake_id: wake_id, consumer: "prompt"}
        )
        when reason_kind in ["target_unresolvable", "consumer_unavailable"],
+       do: true
+
+  defp scheduler_delivery_without_source?(
+         %{
+           requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+           reason_kind: "consumer_unavailable",
+           causal_source: %{kind: "scheduler_delivery", id: wake_id},
+           outcome: %{kind: "no_replacement"}
+         },
+         %{wake_id: wake_id, consumer: consumer}
+       )
+       when consumer in ["effort_probe", "effort_deadline"],
        do: true
 
   defp scheduler_delivery_without_source?(_command, _wake), do: false
@@ -4819,9 +4775,6 @@ defmodule Tightbeam.Wakes do
 
   defp validate_source(txn, "decision_request", source_id, _wake),
     do: row_exists(txn, "SELECT 1 FROM decision_requests WHERE id=?1", source_id)
-
-  defp validate_source(txn, "monitor_generation", source_id, _wake),
-    do: generation_exists(txn, source_id)
 
   defp validate_source(txn, "routing_bracket", source_id, _wake),
     do: row_exists(txn, "SELECT 1 FROM work_items WHERE id=?1", source_id)
@@ -5258,9 +5211,6 @@ defmodule Tightbeam.Wakes do
   defp validate_disposition(txn, "decision_request_transition", id),
     do: row_exists(txn, "SELECT 1 FROM decision_requests WHERE id=?1", id)
 
-  defp validate_disposition(txn, "monitor_generation_transition", id),
-    do: generation_exists(txn, id)
-
   # A work item can remain live through an open child assignment after the
   # assignment whose effort wake is being disposed has closed. In that case
   # the child's pending inactivity deadline is the canonical liveness proof
@@ -5321,29 +5271,6 @@ defmodule Tightbeam.Wakes do
   end
 
   defp validate_liveness(_txn, _kind, _id, _wake, _primary), do: :error
-
-  defp generation_exists(txn, id) do
-    with {:ok, assignment_id, generation} <- split_generation(id) do
-      row_exists(
-        txn,
-        "SELECT 1 FROM effort_checkin_generations WHERE assignmentId=?1 AND generation=?2",
-        [assignment_id, generation]
-      )
-    end
-  end
-
-  defp split_generation(id) do
-    case String.split(id, "#", parts: 2) do
-      [assignment_id, generation] ->
-        case Integer.parse(generation) do
-          {value, ""} -> {:ok, assignment_id, value}
-          _ -> :error
-        end
-
-      _ ->
-        :error
-    end
-  end
 
   defp row_exists(txn, sql, value) when not is_list(value),
     do: row_exists(txn, sql, [value])
@@ -5428,7 +5355,6 @@ defmodule Tightbeam.Wakes do
 
       if is_binary(wake.assignment_id) do
         Tightbeam.ReminderDelivery.canceled_in_txn(txn, wake.assignment_id, wake.wake_id)
-        reconcile_wait_relief_in_txn(txn, wake.assignment_id, canceled_at)
       end
 
       if is_binary(wake.condition_kind) do
@@ -5771,6 +5697,7 @@ defmodule Tightbeam.Wakes do
   @doc false
   @spec materialize_digests(db(), integer()) :: [String.t()]
   def materialize_digests(db, at) do
+    cancel_retired_effort_wakes(db)
     NoticeBatcher.recover(db, at) ++ legacy_materialize_digests(db, at)
   end
 
@@ -5786,6 +5713,8 @@ defmodule Tightbeam.Wakes do
         FROM wakes
         WHERE state = 'pending' AND consumer = 'prompt' AND digest = 0
           AND deliveryRule = ?1
+          AND COALESCE(obligationRef,'') NOT LIKE 'effort-holder-prod:%'
+          AND COALESCE(prompt,'') NOT LIKE 'Effort check-in % expired after 24 hours%'
         """,
         [@legacy_digest_rule]
       )
@@ -5861,6 +5790,8 @@ defmodule Tightbeam.Wakes do
       FROM wakes
       WHERE state = 'pending' AND consumer = 'prompt' AND digest = 0
         AND deliveryRule = ?1 AND targetRole = ?2 AND class = ?3
+        AND COALESCE(obligationRef,'') NOT LIKE 'effort-holder-prod:%'
+        AND COALESCE(prompt,'') NOT LIKE 'Effort check-in % expired after 24 hours%'
       ORDER BY createdAt ASC, rowid ASC
       """,
       [@legacy_digest_rule, role, class]
@@ -5876,6 +5807,8 @@ defmodule Tightbeam.Wakes do
       FROM wakes
       WHERE state = 'pending' AND consumer = 'prompt' AND digest = 0
         AND deliveryRule = ?1 AND targetRole IS NULL AND sessionKey = ?2 AND class = ?3
+        AND COALESCE(obligationRef,'') NOT LIKE 'effort-holder-prod:%'
+        AND COALESCE(prompt,'') NOT LIKE 'Effort check-in % expired after 24 hours%'
       ORDER BY createdAt ASC, rowid ASC
       """,
       [@legacy_digest_rule, session_key, class]
@@ -6555,6 +6488,7 @@ defmodule Tightbeam.Wakes do
 
   def handle_cast({:recipient_ready, session_key}, state) do
     DB.background_pass(fn ->
+      cancel_retired_effort_wakes(state.db)
       deliver_eligible_waits(state.db, state.delivery_opts, session_key)
       NoticeBatcher.recover(state.db, now(), state.delivery_opts, session_key)
     end)
@@ -6572,6 +6506,7 @@ defmodule Tightbeam.Wakes do
     # Recognize overdue conditions before recovery forms a carrier. Otherwise
     # a timed source can occupy the recipient ahead of its due condition peers.
     DB.background_pass(fn -> evaluate_conditions(state, :tick) end)
+    cancel_retired_effort_wakes(state.db)
     # Release pre-crash, unclaimed memberships once. Later drains are driven
     # only by recipient readiness and due events.
     NoticeBatcher.recover(state.db, now(), state.delivery_opts)
@@ -6664,6 +6599,8 @@ defmodule Tightbeam.Wakes do
   defp prompt_eligibility_sql do
     """
     digest=0 AND COALESCE(deliveryRule,'')<>'turn-boundary-digest r1'
+    AND COALESCE(obligationRef,'') NOT LIKE 'effort-holder-prod:%'
+    AND COALESCE(prompt,'') NOT LIKE 'Effort check-in % expired after 24 hours%'
     AND (conditionKind IS NULL OR firedAt IS NOT NULL)
     AND (waitMode IS NULL OR recognitionAt IS NOT NULL)
     AND (originatingTurnSeq IS NULL OR EXISTS (
@@ -6730,6 +6667,11 @@ defmodule Tightbeam.Wakes do
     Tightbeam.CronWake.fire_due(db, now())
     recognize_due_dependency_waits(db)
     evaluate_conditions(state, :tick)
+
+    # E's old generations are historical data, not scheduler input. Retire
+    # their pending wake rows without consulting effort_checkin_generations so
+    # an upgrade cannot probe a generation or expire an existing request.
+    cancel_retired_effort_wakes(db)
 
     (deliver_eligible_waits(db, state.delivery_opts) ++ due_prompt_recipients(db))
     |> Enum.uniq()
@@ -6821,6 +6763,42 @@ defmodule Tightbeam.Wakes do
           clear_retry(state, wake.wake_id)
         end
       end
+    end)
+  end
+
+  defp cancel_retired_effort_wakes(db) do
+    transaction!(db, fn txn ->
+      wake_ids =
+        Txn.q(
+          txn,
+          """
+          SELECT wakeId FROM wakes
+          WHERE state='pending' AND (
+            consumer IN ('effort_probe','effort_deadline') OR
+            (consumer='prompt' AND (
+              COALESCE(obligationRef,'') LIKE 'effort-holder-prod:%' OR
+              COALESCE(prompt,'') LIKE 'Effort check-in % expired after 24 hours%'
+            ))
+          )
+          ORDER BY rowid
+          """,
+          []
+        )
+        |> Enum.map(&hd/1)
+
+      Enum.each(wake_ids, fn wake_id ->
+        command = %{
+          requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+          reason_kind: "consumer_unavailable",
+          causal_source: %{kind: "scheduler_delivery", id: wake_id},
+          outcome: %{kind: "no_replacement"},
+          wake_id: wake_id
+        }
+
+        if not cancel_in_txn(txn, command) do
+          raise "retired effort wake could not be canceled: #{wake_id}"
+        end
+      end)
     end)
   end
 
@@ -7904,6 +7882,7 @@ defmodule Tightbeam.Wakes do
           end)
 
         if ready do
+          cancel_retired_effort_wakes(state.db)
           deliver_eligible_waits(state.db, state.delivery_opts, recipient)
           NoticeBatcher.recover(state.db, at, state.delivery_opts, recipient)
 

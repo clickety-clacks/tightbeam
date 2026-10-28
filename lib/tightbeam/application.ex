@@ -303,9 +303,6 @@ defmodule Tightbeam.Application do
       prod_limit: Application.get_env(:tightbeam, :prod_limit, 3),
       escalation_decision_deadline_ms:
         Application.get_env(:tightbeam, :escalation_decision_deadline_ms, 86_400_000),
-      effort_checkin_horizon_ms:
-        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 86_400_000),
-      effort_checkins_enabled: Application.get_env(:tightbeam, :effort_checkins_enabled, true),
       critical_lease_hard_cap_ms:
         Application.get_env(:tightbeam, :critical_lease_hard_cap_ms, 14_400_000),
       onboarding_lease_ms: Application.get_env(:tightbeam, :onboarding_lease_ms, 1_800_000),

@@ -10,7 +10,6 @@ defmodule Tightbeam.Assignments do
     AttestEvidence,
     ConditionFacts,
     Dispatch,
-    EffortCheckin,
     Escalation,
     EventLog,
     Mementos,
@@ -656,13 +655,6 @@ defmodule Tightbeam.Assignments do
 
       RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
 
-      EffortCheckin.cancel_in_txn(
-        txn,
-        assignment_id,
-        disposition,
-        %{verb: "retire", principal: principal}
-      )
-
       Supervision.assignment_closed_in_txn(txn, assignment_id)
 
       DB.record_row_commit(txn, %{
@@ -868,8 +860,6 @@ defmodule Tightbeam.Assignments do
             "process:tightbeam",
             "cannot-proceed released by condition fact #{fact.fact_id}"
           )
-
-        :ok = EffortCheckin.reconcile_wait_relief_in_txn(txn, assignment_id, fact.ts)
 
         case fetch_assignment(txn, assignment_id) do
           %{holderKey: holder} ->
@@ -1524,15 +1514,10 @@ defmodule Tightbeam.Assignments do
   def __handle__(db, "assignments", call), do: assignments_result(db, call)
 
   defp assign_result(db, call) do
-    config = effort_config(db, call)
-
     open_assignment_result(
       db,
       call,
-      fn txn, assignment ->
-        EffortCheckin.arm_in_txn(txn, config, assignment)
-        {:created, assignment, nil}
-      end,
+      fn _txn, assignment -> {:created, assignment, nil} end,
       fn -> :ok end,
       "assign"
     )
@@ -1751,21 +1736,15 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_subject(call.params[:subject]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
          {:ok, _files} <- assignment_files("dispatch", call.params),
-         :ok <- valid_brief(call.params[:brief]),
-         :ok <- normalize_root_validation(call.params[:workdir_root]) do
+         :ok <- valid_brief(call.params[:brief]) do
       case replayed_assignment(db, call) do
         nil ->
           case Org.get(db, call.session_key) do
-            %{state: "active"} = holder ->
-              config = effort_config(db, call)
-              prepared = EffortCheckin.prepare_arm(config, holder, call.params[:workdir_root])
-
+            %{state: "active"} ->
               open_assignment_result(
                 db,
                 call,
                 fn txn, assignment ->
-                  EffortCheckin.arm_in_txn(txn, config, assignment, prepared)
-
                   prompt = "[assignment: #{assignment.id}]\n\n" <> call.params.brief
 
                   delivery =
@@ -1951,8 +1930,7 @@ defmodule Tightbeam.Assignments do
   defp attest_result(db, call) do
     with :ok <- principal_allowed(call.principal, "attest"),
          :ok <- commit_ref_filing_allowed(db, call),
-         {:ok, call} <- prepare_attest_commit_refs(db, call),
-         {:ok, call} <- prepare_review_reopen_arm(db, call) do
+         {:ok, call} <- prepare_attest_commit_refs(db, call) do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
 
@@ -2053,7 +2031,7 @@ defmodule Tightbeam.Assignments do
   defp referents(_db, _call, _assignment, {:error, reason}), do: [unreadable_registry(reason)]
 
   defp referents(db, call, assignment, {:ok, artifact_cursor}) do
-    config = effort_config(db, call)
+    config = placement_config(db, call)
     holder = Org.get(db, assignment.holderKey)
 
     case DB.query(
@@ -2166,31 +2144,6 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  defp prepare_review_reopen_arm(
-         db,
-         %{params: %{kind: "verdict", verdict_kind: "changes-requested"}} = call
-       ) do
-    case DB.query(
-           db,
-           "SELECT reviewsAssignmentId FROM assignments WHERE id=?1",
-           [call.params[:assignment_id]]
-         ) do
-      {:ok, [[producer_id]]} when is_binary(producer_id) ->
-        config = effort_config(db, call)
-        prepared = EffortCheckin.prepare_reopen_arm(db, config, producer_id)
-
-        {:ok,
-         call
-         |> Map.put(:effort_config, config)
-         |> Map.put(:prepared_effort_arm, prepared)}
-
-      _ ->
-        {:ok, call}
-    end
-  end
-
-  defp prepare_review_reopen_arm(_db, call), do: {:ok, call}
-
   defp local_origin_path(config, holder, origin) do
     if Path.type(origin) == :absolute,
       do: origin,
@@ -2245,23 +2198,12 @@ defmodule Tightbeam.Assignments do
   end
 
   # Reopening is an agent-reachable repair for a closed assignment. It records
-  # the prior close, restores the existing custody row, and re-arms the same
-  # monitoring and work-item seams used when the assignment first opened.
+  # the prior close, restores the existing custody row, and reopens supervision.
   defp reopen_result(db, call) do
     with :ok <- principal_allowed(call.principal, "reopen-assignment"),
          :ok <- valid_reopen_reason(call.params[:reason]) do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
-      effort_config = effort_config(db, call)
-
-      prepared_effort_arm =
-        may_prepare_reopen_effort?(db, assignment_id) &&
-          EffortCheckin.prepare_reopen_arm(db, effort_config, assignment_id)
-
-      call =
-        call
-        |> Map.put(:effort_config, effort_config)
-        |> Map.put(:prepared_effort_arm, prepared_effort_arm)
 
       result =
         transaction_with_row_commits(
@@ -3000,7 +2942,6 @@ defmodule Tightbeam.Assignments do
 
     attest = insert_attest(txn, admitted, assignment.id)
     Mementos.append_inline!(txn, "attest", attest.id, admitted)
-    EffortCheckin.holder_activity_in_txn(txn, assignment.id, holder, attest)
     Wakes.record_terminal_handoff_action_in_txn(txn, holder, attest)
     result = apply_lifecycle_attest(txn, admitted, assignment, attest)
 
@@ -3097,13 +3038,6 @@ defmodule Tightbeam.Assignments do
 
     RailRemedy.dispose_assignment_in_txn(txn, assignment.id, disposition)
 
-    EffortCheckin.cancel_in_txn(
-      txn,
-      assignment.id,
-      disposition,
-      %{verb: "attest", principal: principal_id(call.principal)}
-    )
-
     Supervision.assignment_closed_in_txn(txn, assignment.id)
 
     append_attest_marker(txn, attest)
@@ -3168,7 +3102,6 @@ defmodule Tightbeam.Assignments do
           ]
         )
 
-        :ok = EffortCheckin.reconcile_wait_relief_in_txn(txn, assignment.id, attest.ts)
         append_attest_marker(txn, attest)
 
         %{
@@ -3801,13 +3734,6 @@ defmodule Tightbeam.Assignments do
 
     RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
 
-    EffortCheckin.cancel_in_txn(
-      txn,
-      assignment_id,
-      disposition,
-      %{verb: "revoke-assignment", principal: principal_id(call.principal)}
-    )
-
     Supervision.assignment_closed_in_txn(txn, assignment_id)
 
     append_assignment_marker(txn, revoked_assignment, :revoked)
@@ -3946,13 +3872,6 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
     reopened = fetch_assignment!(txn, assignment_id)
-
-    EffortCheckin.arm_reopened_in_txn(
-      txn,
-      call.effort_config,
-      reopened,
-      call.prepared_effort_arm
-    )
 
     Supervision.assignment_opened_in_txn(
       txn,
@@ -4162,7 +4081,7 @@ defmodule Tightbeam.Assignments do
            """,
            [request_id]
          ) do
-      [[condition_id, assignment_id]] ->
+      [[condition_id, _assignment_id]] ->
         Txn.q(
           txn,
           """
@@ -4174,8 +4093,6 @@ defmodule Tightbeam.Assignments do
         )
 
         if Txn.changes(txn) != 1, do: raise(TransitionRace)
-
-        :ok = EffortCheckin.reconcile_wait_relief_in_txn(txn, assignment_id, settled_at)
 
         case fetch_assignment(txn, assignment_id) do
           %{holderKey: holder} ->
@@ -4239,12 +4156,6 @@ defmodule Tightbeam.Assignments do
 
   defp append_substrate(txn, session_key, text) do
     best_effort(fn -> Projection.append_substrate_in_txn(txn, session_key, text) end)
-  end
-
-  defp may_prepare_reopen_effort?(db, assignment_id) do
-    transaction(db, fn txn ->
-      match?(%{state: "closed"}, fetch_assignment(txn, assignment_id))
-    end)
   end
 
   defp insert_attest(txn, call, assignment_id, allow_closed \\ false) do
@@ -4438,24 +4349,14 @@ defmodule Tightbeam.Assignments do
   defp valid_brief(brief) when is_binary(brief) and brief != "", do: :ok
   defp valid_brief(_), do: error("invalid", "a dispatch must carry a brief")
 
-  defp normalize_root_validation(root) do
-    case EffortCheckin.valid_workdir_root(root) do
-      :ok -> :ok
-      {:error, error} -> error
-    end
-  end
-
-  defp effort_config(db, call) do
+  defp placement_config(db, call) do
     defaults = %{
       base_dir: Application.get_env(:tightbeam, :base_dir, System.tmp_dir!()),
       db: db,
-      port: Application.get_env(:tightbeam, :port, 11_373),
-      effort_checkins_enabled: Application.get_env(:tightbeam, :effort_checkins_enabled, true),
-      effort_checkin_horizon_ms:
-        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 86_400_000)
+      port: Application.get_env(:tightbeam, :port, 11_373)
     }
 
-    Map.merge(defaults, Map.get(call, :effort_config, %{}))
+    Map.merge(defaults, Map.get(call, :placement_config, %{}))
   end
 
   defp valid_note(nil), do: :ok

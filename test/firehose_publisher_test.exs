@@ -319,7 +319,6 @@ defmodule Tightbeam.Firehose.PublisherTest do
       db: db,
       wake_scheduler: scheduler,
       wake_tick_ms: 1_000,
-      effort_checkin_horizon_ms: 60_000,
       base_dir: System.tmp_dir!()
     }
 

@@ -238,7 +238,7 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM devices")
   end
 
-  test "organization bearer subscribes org-wide and per session with user visibility", ctx do
+  test "organization bearer receives matching events for each subscribed filter", ctx do
     changes = connect(ctx, "/ws/changes?protocolVersion=2")
     send_frame(changes, %{type: "auth", token: "operator-fixture", asUser: "reader"})
     {auth_result, changes} = recv_frame(changes)
@@ -283,6 +283,11 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
       "refs" => %{"sessionKey" => "sibling"},
       "payload" => %{"sessionKey" => "sibling", "rowVersion" => 1}
     })
+
+    {foreign_change, changes} = recv_frame(changes)
+    assert foreign_change["type"] == "change"
+    assert foreign_change["subscriptionId"] == "all"
+    assert foreign_change["refs"]["sessionKey"] == "foreign"
 
     {all_change, changes} = recv_frame(changes)
     assert all_change["type"] == "change"

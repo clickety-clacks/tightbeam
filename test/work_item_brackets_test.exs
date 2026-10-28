@@ -480,19 +480,19 @@ defmodule Tightbeam.WorkItemBracketsTest do
     refute wake.session_key == "dsession"
   end
 
-  ## Proof 7 — effort-checkin coexistence: both machineries close in one transaction.
+  ## Proof 7 — assignment close still arms the work-item slate without retired check-ins.
 
-  test "Proof 7: a dispatched assignment closes through effort-cancel and slate-arm together",
+  test "Proof 7: a dispatched assignment closes and arms the slate without effort check-ins",
        ctx do
     item = create(ctx, {:user, "flynn"}, %{title: "Coexist"})
     {:ok, d} = disp_dispatch(ctx, {:user, "flynn"}, "holder", "w", item.id)
 
-    assert effort_state(ctx.db, d.id) == "armed"
+    assert effort_state(ctx.db, d.id) == nil
 
     complete(ctx, "holder", d.id)
 
-    # Both effects land in the one close transaction: effort canceled, slate armed.
-    assert effort_state(ctx.db, d.id) == "canceled"
+    # Ordinary assignment closure and the work-item slate still proceed.
+    assert effort_state(ctx.db, d.id) == nil
     assert is_binary(slate_wake_id(ctx.db, item.id))
     assert assignment_state(ctx.db, d.id) == "closed"
   end

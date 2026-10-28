@@ -217,6 +217,14 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert is_nil(observer_state.credential_digest)
     assert observer_state.subscriptions == %{"observer" => %{"classes" => ["work_item."]}}
 
+    Hub.publish(ctx.hub, notice(ctx, "wi_observer_delivery"))
+    assert_receive {:firehose_notice, notice_frame}
+    assert {:push, {:text, notice_bytes}, observer_state} =
+             ChangeSocket.handle_info({:firehose_notice, notice_frame}, observer_state)
+
+    assert %{"class" => "work_item.updated", "subscriptionId" => "observer"} =
+             JSON.decode!(notice_bytes)
+
     assert {:ok, ^observer_state} =
              inbound(%{"type" => "auth", "token" => "ignored-after-observer"}, observer_state)
 
@@ -485,55 +493,57 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert_receive {:firehose_notice, %{"refs" => %{"workItemId" => "wi_after"}, "seq" => 1}}
   end
 
-  test "the per-connection queue is exact and overflow closes once", ctx do
+  test "a matching event over the byte backlog closes the connection with retryable code", ctx do
     {:push, {:text, _auth}, state} =
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
 
-    :ok = Hub.subscribe(ctx.hub, self(), "work", %{})
+    :ok = Hub.subscribe(ctx.hub, self(), "work", %{"classes" => ["work_item."]})
 
-    Enum.each(1..1_500, fn index ->
-      Hub.publish(ctx.hub, notice(ctx, "wi_#{index}"))
-      # Drain ingress so this test isolates the per-connection delivery queue.
-      Hub.sequence(ctx.hub, self())
-    end)
+    Hub.publish(ctx.hub, %{
+      "class" => "work_item.updated",
+      "refs" => %{"workItemId" => "large-item"},
+      "payload" => %{"id" => String.duplicate("x", 65 * 1_024 * 1_024)}
+    })
 
-    assert %{in_flight: true, overflowed: true, queued: 0, seq: 1_001} =
-             Hub.connection_stats(ctx.hub, self())
-
-    assert_receive {:firehose_notice, %{"seq" => 1}}
-    assert_receive :firehose_overflow
-    refute_receive :firehose_overflow, 50
-    refute_receive {:firehose_notice, _notice}, 50
+    assert Hub.sequence(ctx.hub, self()) == 1
+    assert %{overflowed: true, seq: 1} = Hub.connection_stats(ctx.hub, self())
+    assert_receive :firehose_overflow, 5_000
+    refute_receive {:firehose_notice, _notice}
 
     assert {:stop, :normal, 4008, ^state} =
              ChangeSocket.handle_info(:firehose_overflow, state)
+
+    ChangeSocket.terminate(:normal, state)
   end
 
-  test "ingress overflow closes the authenticated socket with retryable code", ctx do
+  test "more than 1,000 matching notices fit below the byte backlog limit", ctx do
     {:push, {:text, _auth}, state} =
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
 
+    :ok = Hub.subscribe(ctx.hub, self(), "work", %{"classes" => ["work_item."]})
     :ok = :sys.suspend(ctx.hub)
 
     try do
       Enum.each(1..1_500, fn index ->
-        id = "overflow-#{index}"
+        id = "work-#{index}"
 
         Hub.publish(ctx.hub, %{
           "class" => "work_item.updated",
-          "refs" => %{"workItemId" => id, "ownerUserId" => ctx.device.user_id},
-          "payload" => %{"id" => id, "ownerUserId" => ctx.device.user_id}
+          "refs" => %{"workItemId" => id},
+          "payload" => %{"id" => id}
         })
       end)
     after
       :ok = :sys.resume(ctx.hub)
     end
 
-    assert_receive :firehose_overflow, 5_000
-    assert is_pid(Process.whereis(ctx.hub))
+    assert Hub.sequence(ctx.hub, self()) == 1_500
+    assert %{overflowed: false, queued: 1_500, seq: 1_500} = Hub.connection_stats(ctx.hub, self())
+    refute_received :firehose_overflow
+    assert_receive {:firehose_notice, %{"seq" => 1}}
+    assert_receive {:firehose_notice, %{"seq" => 1_500}}
 
-    assert {:stop, :normal, 4008, ^state} =
-             ChangeSocket.handle_info(:firehose_overflow, state)
+    ChangeSocket.terminate(:normal, state)
   end
 
   test "gateway shutdown closes change sockets with restarting code", ctx do

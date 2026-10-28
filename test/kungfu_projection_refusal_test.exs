@@ -623,15 +623,15 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
            }
   end
 
-  test "queue overflow and owned process cleanup remain bounded", %{hub: hub} do
-    small = start_supervised!({Hub, name: nil, queue_limit: 1}, id: :small)
-    :ok = register(small)
-    Hub.publish(small, notice())
-    Hub.publish(small, notice())
-    assert %{queued: 0, overflowed: true} = Hub.connection_stats(small, self())
+  test "direct fanout and owned process cleanup do not need a queue limit", %{hub: hub} do
+    direct = start_supervised!({Hub, name: nil}, id: :direct)
+    :ok = register(direct)
+    Hub.publish(direct, notice())
+    Hub.publish(direct, notice())
     assert_receive {:firehose_notice, frame}
     assert frame == notice()
-    assert_receive :firehose_overflow
+    assert_receive {:firehose_notice, frame}
+    assert frame == notice()
 
     pid =
       spawn(fn ->
