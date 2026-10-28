@@ -50,6 +50,24 @@ defmodule Tightbeam.AssignmentsTest do
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
+  test "gateway opens and retires with supervision reminders off", ctx do
+    handlers = Gateway.handlers(%{db: ctx.db, supervision_interval_ms: :off, wake_tick_ms: 101})
+
+    assignment = handlers["assign"].(assign_call({:session, "holder"}, "off interval"))
+    assert assignment.id
+
+    retired =
+      handlers["retire"].(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: "holder",
+        params: %{}
+      })
+
+    assert retired.retired_session_keys == ["holder"]
+    assert Org.get(ctx.db, "holder").state == "retired"
+  end
+
   describe "attest notices to assignment openers" do
     test "an opener does not receive a separate notice for its own attest", ctx do
       assignment = handle(ctx, "assign", assign_call({:session, "holder"}, "self-opened"))
@@ -2653,7 +2671,7 @@ defmodule Tightbeam.AssignmentsTest do
              |> then(&handle(ctx, "attest", &1))
   end
 
-  test "a cannot-proceed block held past inactivity ladder end still releases on its fact",
+  test "a standing cannot-proceed block suppresses reminders and still releases on its fact",
        ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
 
@@ -2670,18 +2688,21 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :release_fact_principal_ref], "agent:holder")
       |> then(&handle(ctx, "attest", &1))
 
-    # Nobody answers: the deadline fires and the climb runs until no rung remains.
-    Enum.reduce_while(1..20, nil, fn _, _ ->
-      if fire_inactivity_wake!(ctx.db, "assignment_inactivity_deadline", blocked.id) or
-           fire_inactivity_wake!(ctx.db, "assignment_inactivity_climb", blocked.id),
-         do: {:cont, nil},
-         else: {:halt, nil}
-    end)
+    assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_deadline", blocked.id)
 
-    assert {:ok, :none} =
+    assert {:ok, {:ok, %{kind: "pending_wake"}}} =
              DB.transaction(ctx.db, fn txn ->
                Supervision.inactivity_deadline_trigger_in_txn(txn, {:assignment, blocked.id})
              end)
+
+    refute fire_inactivity_wake!(ctx.db, "assignment_inactivity_climb", blocked.id)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'",
+               [blocked.id]
+             )
 
     assert Wakes.get(ctx.db, filed.decisionWake.wake_id).state == "pending"
 
@@ -2705,7 +2726,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert Wakes.get(ctx.db, filed.decisionWake.wake_id).state == "canceled"
 
-    assert {:ok, [["cannot_proceed_released", 0]]} =
+    assert {:ok, [["cannot_proceed_released", 1]]} =
              DB.query(
                ctx.db,
                "SELECT reasonKind,actionNeeded FROM wake_cancellations WHERE wakeId=?1",
@@ -3454,7 +3475,7 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "a fired parent escalation does not block opener revocation after reparenting", ctx do
+  test "a pending holder reminder does not block opener revocation after reparenting", ctx do
     main = Org.personal_session_key("flynn")
     session(ctx.db, main, "flynn")
     session(ctx.db, "parent-a", "flynn", %{spawned_by: main})
@@ -3467,6 +3488,7 @@ defmodule Tightbeam.AssignmentsTest do
     opener_work =
       assign_call({:user, "flynn"}, "opener has continuing work", nil, item.id)
       |> Map.put(:session_key, "opener")
+      |> Map.put(:supervision_interval_ms, 1)
       |> then(&handle(ctx, "assign", &1))
 
     blocked_assignment =
@@ -3481,34 +3503,16 @@ defmodule Tightbeam.AssignmentsTest do
     assert Supervision.ladder_target(ctx.db, "opener", 1) == "parent-a"
 
     assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_deadline", opener_work.id)
-    assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_climb", opener_work.id)
 
-    assert [escalation] =
-             Enum.filter(Wakes.list_pending(ctx.db), &(&1.assignment_id == opener_work.id))
+    assert [reminder] =
+             Enum.filter(
+               Wakes.list_pending(ctx.db),
+               &(&1.assignment_id == opener_work.id and &1.consumer == "prompt")
+             )
 
-    assert escalation.session_key == "parent-a"
+    assert reminder.session_key == "opener"
 
-    assert {:ok, {:appended, _, _, _}} =
-             DB.transaction(ctx.db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 escalation.session_key,
-                 escalation.origin,
-                 escalation.prompt,
-                 wake_id: escalation.wake_id,
-                 sender: escalation.origin,
-                 target_gate: escalation,
-                 fire_wake_in_txn: true,
-                 assignment_id: escalation.assignment_id
-               )
-             end)
-
-    assert Wakes.get(ctx.db, escalation.wake_id).state == "fired"
-
-    assert {:ok, [["parent-a"]]} =
-             DB.query(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId=?1", [
-               escalation.wake_id
-             ])
+    assert Wakes.get(ctx.db, reminder.wake_id).state == "pending"
 
     assert {:ok, [["standing"]]} =
              DB.query(
@@ -3527,6 +3531,8 @@ defmodule Tightbeam.AssignmentsTest do
                  idempotency_key: "reparent-after-escalation"
                }
              })
+
+    assert Wakes.get(ctx.db, reminder.wake_id).session_key == "opener"
 
     assert %{outcome: "revoked"} =
              handle(

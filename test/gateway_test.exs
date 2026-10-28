@@ -2284,8 +2284,8 @@ defmodule Tightbeam.GatewayTest do
   end
 
   for {cadence, expected_interval} <- [
-        {%{}, 1_000},
-        {%{wake_tick_ms: 1_234}, 1_234},
+        {%{}, 1_800_000},
+        {%{wake_tick_ms: 1_234}, 1_800_000},
         {%{wake_tick_ms: 10, supervision_interval_ms: 4_321}, 4_321},
         {%{wake_tick_ms: 900, supervision_interval_ms: 4_321}, 4_321}
       ] do
