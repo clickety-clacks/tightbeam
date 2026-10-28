@@ -302,6 +302,32 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, [[0]]} = DB.query(db, "PRAGMA legacy_alter_table")
   end
 
+  # A current predecessor that is missing the additive inactivity-provenance
+  # table, with a retry-source migration refusal raised later in ensure_all/1:
+  # the refusal must leave no trace, not just of wake_retry_attempts (covered
+  # above) but of this table too. assignment_inactivity_provenance is purely
+  # additive current-build storage with no predecessor shape of its own, so
+  # its only correctness obligation here is to not exist until every fallible
+  # migration this far into ensure_all/1 has already succeeded.
+  test "a late retry-source refusal leaves the inactivity provenance table uncreated",
+       %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    assert table?(db, "assignment_inactivity_provenance")
+
+    assert :ok = DB.execute(db, "DROP TABLE assignment_inactivity_provenance")
+
+    assert :ok =
+             DB.execute(
+               db,
+               "ALTER TABLE wake_retry_attempts ADD COLUMN unknownRetryContract TEXT"
+             )
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "incompatible_wake_retry_source_scope: malformed retry table"
+
+    refute table?(db, "assignment_inactivity_provenance")
+  end
+
   @tag firehose_final_stamp: true
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)

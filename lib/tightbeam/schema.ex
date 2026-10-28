@@ -1926,6 +1926,7 @@ defmodule Tightbeam.Schema do
       Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
       Tightbeam.NoticeBatcher -> :ok
       Tightbeam.HarnessProcess -> :ok = Tightbeam.HarnessProcess.ensure_historical_schema(db)
+      Tightbeam.Supervision -> :ok
       module -> :ok = module.ensure_schema(db)
     end)
 
@@ -1938,6 +1939,7 @@ defmodule Tightbeam.Schema do
       Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
       Tightbeam.NoticeBatcher -> :ok
       Tightbeam.HarnessProcess -> :ok
+      Tightbeam.Supervision -> :ok
       module -> :ok = module.ensure_schema(db)
     end)
 
@@ -2015,6 +2017,14 @@ defmodule Tightbeam.Schema do
     end
 
     :ok = Tightbeam.ToolCalls.ensure_schema(db)
+
+    # Built last, after every fallible migration above (upgrade_*/migrate_*
+    # calls that can still raise ShapeError this far into ensure_all/1,
+    # including migrate_wake_retry_source_scope and upgrade_notice_source_payload):
+    # a refused predecessor must retain its exact schema, and this table is
+    # purely additive current-build storage with no predecessor shape of its
+    # own to preserve.
+    :ok = Tightbeam.Supervision.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> Tightbeam.Recognition.activate(db)
@@ -5325,6 +5335,12 @@ defmodule Tightbeam.Schema do
   # Delivery responsibility is additive current-build storage. Do not write it
   # until every exact predecessor migration has succeeded.
   defp bootstrap_module(_db, Tightbeam.DeliveryResponsibilities, _current?), do: :ok
+
+  # Inactivity-deadline provenance is additive current-build storage, same as
+  # DeliveryResponsibilities above: writing it here would mutate a refused
+  # predecessor migration's schema before the refusal is even raised. Built
+  # last, after every fallible migration in ensure_all/1 has already succeeded.
+  defp bootstrap_module(_db, Tightbeam.Supervision, _current?), do: :ok
 
   defp bootstrap_module(db, Tightbeam.AdminProjection, _current?),
     do: Tightbeam.AdminProjection.ensure_storage(db)

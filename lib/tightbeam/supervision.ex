@@ -33,8 +33,31 @@ defmodule Tightbeam.Supervision do
   )
   """
 
+  # Append-only generation-time provenance for an inactivity deadline wake.
+  # Structural/typed fields only — never the free-text notice prompt, which
+  # may name the assignment's subject or holder. A row's absence is a
+  # truthful null: no row is backfilled for a wake this table predates.
+  @provenance_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_inactivity_provenance (
+    wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId) DEFERRABLE INITIALLY DEFERRED,
+    assignmentId TEXT NOT NULL,
+    generatorSource TEXT NOT NULL CHECK (generatorSource IN (
+      'assignment_opened','activity','dated_continuation_canceled','migration',
+      'deadline_activity_caught_up','deadline_continuation_covered'
+    )),
+    activityStart INTEGER NOT NULL,
+    qualifyingActivitySource TEXT,
+    qualifyingActivityAt INTEGER,
+    effectiveActivityAt INTEGER NOT NULL,
+    intervalMs INTEGER NOT NULL,
+    createdAt INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS assignment_inactivity_provenance_assignment
+    ON assignment_inactivity_provenance (assignmentId, createdAt);
+  """
+
   @doc false
-  def ensure_schema(_db), do: :ok
+  def ensure_schema(db), do: DB.execute(db, @provenance_ddl)
 
   @doc false
   def watermarks_ddl, do: @watermarks_ddl
@@ -62,6 +85,15 @@ defmodule Tightbeam.Supervision do
           interval_ms
         )
 
+      record_inactivity_provenance_in_txn(txn, deadline, assignment_id, %{
+        generator: "assignment_opened",
+        activity_start: opened_at,
+        qualifying_source: nil,
+        qualifying_at: nil,
+        effective_at: opened_at,
+        interval_ms: interval_ms
+      })
+
       cancel_assignment_sources_in_txn(txn, assignment_id, {:replacement, deadline.wake_id})
       :ok
     else
@@ -87,8 +119,13 @@ defmodule Tightbeam.Supervision do
   def assignment_closed_in_txn(_txn, _assignment_id), do: :ok
 
   @doc false
-  def activity_in_txn(%Txn{} = txn, assignment_id, actor_session_key, at)
-      when is_binary(assignment_id) and is_binary(actor_session_key) and is_integer(at) do
+  # `source` is provenance only — the caller already knows which qualifying
+  # channel this activity came through (an attest, an artifact, a decision
+  # request, or a creator's own wake); it never changes the reset decision
+  # below, only what gets recorded about it.
+  def activity_in_txn(%Txn{} = txn, assignment_id, actor_session_key, at, source)
+      when is_binary(assignment_id) and is_binary(actor_session_key) and is_integer(at) and
+             is_atom(source) do
     case Txn.q(
            txn,
            "SELECT holderKey,workItemId,openedAt,state FROM assignments WHERE id=?1",
@@ -113,6 +150,15 @@ defmodule Tightbeam.Supervision do
             interval_ms
           )
 
+        record_inactivity_provenance_in_txn(txn, deadline, assignment_id, %{
+          generator: "activity",
+          activity_start: activity_start,
+          qualifying_source: Atom.to_string(source),
+          qualifying_at: at,
+          effective_at: effective_at,
+          interval_ms: interval_ms
+        })
+
         # Stamp the replacement at the activity itself: cancellation also
         # settles effort relief, which must start when a wait was registered.
         cancel_assignment_sources_in_txn(
@@ -129,7 +175,7 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  def activity_in_txn(_txn, _assignment_id, _actor_session_key, _at), do: :ignored
+  def activity_in_txn(_txn, _assignment_id, _actor_session_key, _at, _source), do: :ignored
 
   @doc false
   def dated_continuation_canceled_in_txn(%Txn{} = txn, assignment_id, at)
@@ -166,6 +212,15 @@ defmodule Tightbeam.Supervision do
                     interval_ms,
                     next_due
                   )
+
+                record_inactivity_provenance_in_txn(txn, replacement, assignment_id, %{
+                  generator: "dated_continuation_canceled",
+                  activity_start: activity_at,
+                  qualifying_source: nil,
+                  qualifying_at: nil,
+                  effective_at: activity_at,
+                  interval_ms: interval_ms
+                })
 
                 cancel_assignment_sources_in_txn(
                   txn,
@@ -243,8 +298,10 @@ defmodule Tightbeam.Supervision do
 
                      activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
 
-                     last_activity =
-                       current_activity_time_in_txn(txn, assignment_id, holder, activity_start)
+                     {qualifying_source, last_activity} =
+                       qualifying_activity_in_txn(txn, assignment_id, holder, activity_start)
+
+                     effective_at = max(opened_at, last_activity)
 
                      deadline =
                        schedule_deadline_in_txn(
@@ -252,9 +309,18 @@ defmodule Tightbeam.Supervision do
                          assignment_id,
                          holder,
                          work_item_id,
-                         max(opened_at, last_activity),
+                         effective_at,
                          interval_ms
                        )
+
+                     record_inactivity_provenance_in_txn(txn, deadline, assignment_id, %{
+                       generator: "migration",
+                       activity_start: activity_start,
+                       qualifying_source: qualifying_source,
+                       qualifying_at: if(qualifying_source, do: last_activity),
+                       effective_at: effective_at,
+                       interval_ms: interval_ms
+                     })
 
                      cancel_assignment_sources_in_txn(
                        txn,
@@ -455,8 +521,8 @@ defmodule Tightbeam.Supervision do
             if assignment_work_item_id == work_item_id do
               activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
 
-              latest_activity =
-                current_activity_time_in_txn(txn, assignment_id, holder, activity_start)
+              {qualifying_source, latest_activity} =
+                qualifying_activity_in_txn(txn, assignment_id, holder, activity_start)
 
               covered_until = Wakes.dated_continuation_due_in_txn(txn, assignment_id, now)
 
@@ -471,6 +537,15 @@ defmodule Tightbeam.Supervision do
                       latest_activity,
                       interval_ms
                     )
+
+                  record_inactivity_provenance_in_txn(txn, replacement, assignment_id, %{
+                    generator: "deadline_activity_caught_up",
+                    activity_start: activity_start,
+                    qualifying_source: qualifying_source,
+                    qualifying_at: if(qualifying_source, do: latest_activity),
+                    effective_at: latest_activity,
+                    interval_ms: interval_ms
+                  })
 
                   fire_internal_in_txn(txn, wake.wake_id, @deadline_consumer, now)
 
@@ -491,6 +566,15 @@ defmodule Tightbeam.Supervision do
                       interval_ms,
                       covered_until
                     )
+
+                  record_inactivity_provenance_in_txn(txn, replacement, assignment_id, %{
+                    generator: "deadline_continuation_covered",
+                    activity_start: activity_start,
+                    qualifying_source: qualifying_source,
+                    qualifying_at: if(qualifying_source, do: latest_activity),
+                    effective_at: latest_activity,
+                    interval_ms: interval_ms
+                  })
 
                   fire_internal_in_txn(txn, wake.wake_id, @deadline_consumer, now)
 
@@ -1028,30 +1112,49 @@ defmodule Tightbeam.Supervision do
   end
 
   defp current_activity_time_in_txn(txn, assignment_id, holder, opened_at) do
+    {_source, value} = qualifying_activity_in_txn(txn, assignment_id, holder, opened_at)
+    value
+  end
+
+  # Same candidates and same winning value as current_activity_time_in_txn/4
+  # (opened_at is the floor; a strictly greater candidate wins) — this just
+  # also names which qualifying channel produced it, for provenance capture
+  # only. A tie keeps the earliest-listed source; the VALUE is unaffected.
+  defp qualifying_activity_in_txn(txn, assignment_id, holder, opened_at) do
     candidates = [
-      max_row(
-        txn,
-        "SELECT MAX(ts) FROM attests WHERE assignmentId=?1 AND bySession=?2 AND ts>=?3",
-        [assignment_id, holder, opened_at]
-      ),
-      max_row(
-        txn,
-        "SELECT MAX(createdAt) FROM artifacts WHERE producedByAssignmentId=?1 AND createdBySession=?2 AND createdAt>=?3",
-        [assignment_id, holder, opened_at]
-      ),
-      max_row(
-        txn,
-        "SELECT MAX(createdAt) FROM wakes WHERE assignmentId=?1 AND creatorSessionKey=?2 AND createdAt>=?3",
-        [assignment_id, holder, opened_at]
-      ),
-      max_row(
-        txn,
-        "SELECT MAX(raisedAt) FROM decision_requests WHERE assignmentId=?1 AND raiserSessionKey=?2 AND raisedAt>=?3",
-        [assignment_id, holder, opened_at]
-      )
+      {"attest",
+       max_row(
+         txn,
+         "SELECT MAX(ts) FROM attests WHERE assignmentId=?1 AND bySession=?2 AND ts>=?3",
+         [assignment_id, holder, opened_at]
+       )},
+      {"artifact",
+       max_row(
+         txn,
+         "SELECT MAX(createdAt) FROM artifacts WHERE producedByAssignmentId=?1 AND createdBySession=?2 AND createdAt>=?3",
+         [assignment_id, holder, opened_at]
+       )},
+      {"wake",
+       max_row(
+         txn,
+         "SELECT MAX(createdAt) FROM wakes WHERE assignmentId=?1 AND creatorSessionKey=?2 AND createdAt>=?3",
+         [assignment_id, holder, opened_at]
+       )},
+      {"decision_request",
+       max_row(
+         txn,
+         "SELECT MAX(raisedAt) FROM decision_requests WHERE assignmentId=?1 AND raiserSessionKey=?2 AND raisedAt>=?3",
+         [assignment_id, holder, opened_at]
+       )}
     ]
 
-    [opened_at | Enum.filter(candidates, &is_integer/1)] |> Enum.max()
+    Enum.reduce(candidates, {nil, opened_at}, fn
+      {source, value}, {_best_source, best_value} when is_integer(value) and value > best_value ->
+        {source, value}
+
+      _candidate, best ->
+        best
+    end)
   end
 
   defp activity_start_in_txn(txn, assignment_id, opened_at) do
@@ -1083,6 +1186,117 @@ defmodule Tightbeam.Supervision do
 
       other ->
         Logger.warning("assignment activity time unavailable: #{inspect(other)}")
+        nil
+    end
+  end
+
+  # Idempotent on wakeId: schedule_deadline_in_txn/7 may return an existing
+  # reusable wake rather than a new one (reusable_deadline_in_txn/7), and the
+  # ON CONFLICT DO NOTHING here means that reuse never overwrites the row the
+  # wake was actually generated with.
+  defp record_inactivity_provenance_in_txn(txn, wake, assignment_id, fields) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO assignment_inactivity_provenance
+        (wakeId, assignmentId, generatorSource, activityStart, qualifyingActivitySource,
+         qualifyingActivityAt, effectiveActivityAt, intervalMs, createdAt)
+      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+      ON CONFLICT(wakeId) DO NOTHING
+      """,
+      [
+        wake.wake_id,
+        assignment_id,
+        fields.generator,
+        fields.activity_start,
+        Map.get(fields, :qualifying_source),
+        Map.get(fields, :qualifying_at),
+        fields.effective_at,
+        fields.interval_ms,
+        now()
+      ]
+    )
+
+    :ok
+  end
+
+  @doc """
+  Read-only, truthful-null retrieval of this inactivity deadline wake's
+  provenance: the generation-time facts this module captured, plus the
+  wake's own identity/timing/delivery fields and its typed cancellation (if
+  any) joined from the existing substrate rows. A field this wake predates,
+  or that was never captured, reads back as `nil` — it is never inferred or
+  backfilled. The free-text notice prompt is deliberately excluded; every
+  field returned is structural/typed.
+  """
+  @spec inactivity_provenance(DB.server(), String.t()) :: map() | nil
+  def inactivity_provenance(db, wake_id) when is_binary(wake_id) do
+    case DB.query(
+           db,
+           """
+           SELECT
+             w.wakeId, w.assignmentId, w.consumer, w.state, w.dueAt, w.createdAt,
+             w.firedAt, w.canceledAt,
+             p.generatorSource, p.activityStart, p.qualifyingActivitySource,
+             p.qualifyingActivityAt, p.effectiveActivityAt, p.intervalMs,
+             c.reasonKind, c.causalSourceKind, c.causalSourceId, c.outcomeKind,
+             c.replacementWakeId
+           FROM wakes w
+           LEFT JOIN assignment_inactivity_provenance p ON p.wakeId = w.wakeId
+           LEFT JOIN wake_cancellations c ON c.wakeId = w.wakeId
+           WHERE w.wakeId = ?1
+           """,
+           [wake_id]
+         ) do
+      {:ok,
+       [
+         [
+           wake_id,
+           assignment_id,
+           consumer,
+           state,
+           due_at,
+           created_at,
+           fired_at,
+           canceled_at,
+           generator_source,
+           activity_start,
+           qualifying_activity_source,
+           qualifying_activity_at,
+           effective_activity_at,
+           interval_ms,
+           cancel_reason_kind,
+           cancel_causal_source_kind,
+           cancel_causal_source_id,
+           cancel_outcome_kind,
+           cancel_replacement_wake_id
+         ]
+       ]} ->
+        %{
+          wake_id: wake_id,
+          assignment_id: assignment_id,
+          consumer: consumer,
+          state: state,
+          due_at: due_at,
+          created_at: created_at,
+          fired_at: fired_at,
+          canceled_at: canceled_at,
+          generator_source: generator_source,
+          activity_start: activity_start,
+          qualifying_activity_source: qualifying_activity_source,
+          qualifying_activity_at: qualifying_activity_at,
+          effective_activity_at: effective_activity_at,
+          interval_ms: interval_ms,
+          cancellation: %{
+            reason_kind: cancel_reason_kind,
+            causal_source_kind: cancel_causal_source_kind,
+            causal_source_id: cancel_causal_source_id,
+            outcome_kind: cancel_outcome_kind,
+            replacement_wake_id: cancel_replacement_wake_id
+          }
+        }
+
+      {:ok, []} ->
         nil
     end
   end

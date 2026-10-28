@@ -350,7 +350,8 @@ defmodule Tightbeam.Artifacts do
                        txn,
                        producer_id,
                        session_key,
-                       now
+                       now,
+                       :artifact
                      )
                    end
 
