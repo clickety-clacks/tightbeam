@@ -187,6 +187,24 @@ pub enum Command {
         choices: Vec<String>,
         files: Vec<String>,
         vendor_session_id: Option<String>,
+        supersedes: Vec<String>,
+    },
+    HarklightRevise {
+        identity: Identity,
+        message: String,
+        base_revision: u64,
+        title: String,
+        body: Option<String>,
+        choices: Vec<String>,
+        clear_choices: bool,
+    },
+    HarklightRetract {
+        identity: Identity,
+        message: String,
+    },
+    HarklightSettle {
+        identity: Identity,
+        message: String,
     },
     /// Substrate-reserved: the PreToolUse hook reporting that this session is
     /// about to run `artifact-record`. Carries no identity flag because the
@@ -817,7 +835,13 @@ COMMANDS:
       Record a deliberate artifact pointer for the calling session.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
+  harklight-revise --message <id> --base-revision <n> --title <text>
+      [--body <text>] [--choices-json <array>] [--clear-choices]
+  harklight-retract --message <id>
+  harklight-settle --message <id>
+      Settle one unresolved send using its original operation and inputs.
   harklight-send --session new|<handle> --sender-id <id> --title <text>
+      [--supersedes <id>]...
       [--body <text>] [--choices-json <array>] [--files-json <array>]
       [--vendor-session-id <id>]
       Send from the authenticated local session and register its reply wake.
@@ -1260,6 +1284,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "replace-queued",
     "api-key",
     "clear-spec-ref",
+    "clear-choices",
     "clear-delivery-owner",
     "clear",
     "daemon-credential",
@@ -1316,7 +1341,10 @@ fn split_args(args: Vec<String>) -> Flags {
                     missing_values.insert(name.to_owned());
                 }
                 let value = next.cloned().unwrap_or_default();
-                if matches!(name, "memento" | "value" | "kind-prefix" | "kind") {
+                if matches!(
+                    name,
+                    "memento" | "value" | "kind-prefix" | "kind" | "supersedes"
+                ) {
                     repeated
                         .entry(name.to_owned())
                         .or_default()
@@ -2482,6 +2510,7 @@ fn parse_with_optional_catalog(
                             | "choices-json"
                             | "files-json"
                             | "vendor-session-id"
+                            | "supersedes"
                     )
                 })
             {
@@ -2510,7 +2539,66 @@ fn parse_with_optional_catalog(
                 choices: list("choices-json")?,
                 files: list("files-json")?,
                 vendor_session_id: nonempty(flags, "vendor-session-id"),
+                supersedes: parsed
+                    .repeated
+                    .get("supersedes")
+                    .cloned()
+                    .unwrap_or_default(),
             })
+        }
+        "harklight-revise" | "harklight-retract" | "harklight-settle" => {
+            let command = command.expect("checked above");
+            let revise = command == "harklight-revise";
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| {
+                    !matches!(flag.as_str(), "as" | "message")
+                        && !(revise
+                            && matches!(
+                                flag.as_str(),
+                                "base-revision"
+                                    | "title"
+                                    | "body"
+                                    | "choices-json"
+                                    | "clear-choices"
+                            ))
+                })
+            {
+                return Err("invalid Harklight command flags".to_owned());
+            }
+            let identity = identity(flags)?;
+            let message = nonempty(flags, "message").ok_or("--message is required")?;
+            match command {
+                "harklight-retract" => Ok(Command::HarklightRetract { identity, message }),
+                "harklight-settle" => Ok(Command::HarklightSettle { identity, message }),
+                _ => {
+                    let base_revision = nonempty(flags, "base-revision")
+                        .ok_or("--base-revision is required")?
+                        .parse::<u64>()
+                        .map_err(|_| "--base-revision must be a positive integer")?;
+                    if base_revision == 0 {
+                        return Err("--base-revision must be a positive integer".to_owned());
+                    }
+                    let choices = flags
+                        .get("choices-json")
+                        .map(|v| serde_json::from_str::<Vec<String>>(v))
+                        .transpose()
+                        .map_err(|_| "--choices-json must be a JSON array of strings")?
+                        .unwrap_or_default();
+                    let clear_choices = flags.contains_key("clear-choices");
+                    if clear_choices && !choices.is_empty() {
+                        return Err("use choices or --clear-choices, not both".to_owned());
+                    }
+                    Ok(Command::HarklightRevise {
+                        identity,
+                        message,
+                        base_revision,
+                        title: nonempty(flags, "title").ok_or("--title is required")?,
+                        body: flags.get("body").cloned(),
+                        choices,
+                        clear_choices,
+                    })
+                }
+            }
         }
         "spawn" => {
             let display_name =
@@ -4411,6 +4499,7 @@ mod tests {
                 choices: vec!["Yes".to_owned(), "No".to_owned()],
                 files: vec!["/tmp/request.txt".to_owned()],
                 vendor_session_id: None,
+                supersedes: vec![],
             })
         );
 

@@ -903,6 +903,19 @@ defmodule Tightbeam.Gateway do
       {"harklight-send", []} => fn call ->
         HarklightSend.send_request(db, call, runner: Map.get(config, :harklight_send_runner))
       end,
+      {"harklight-revise", []} => fn call ->
+        HarklightSend.change_request(db, call, "revise",
+          runner: Map.get(config, :harklight_send_runner)
+        )
+      end,
+      {"harklight-retract", []} => fn call ->
+        HarklightSend.change_request(db, call, "retract",
+          runner: Map.get(config, :harklight_send_runner)
+        )
+      end,
+      {"harklight-settle", []} => fn call ->
+        HarklightSend.settle(db, call, runner: Map.get(config, :harklight_send_runner))
+      end,
       {"artifacts", []} => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
       {"rule", ["decision_request.ruled"]} => fn call ->
         Escalation.rule(db, call,

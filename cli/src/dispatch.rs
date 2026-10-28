@@ -519,8 +519,13 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             choices,
             files,
             vendor_session_id,
+            supersedes,
         } => {
             let mut params = vec![
+                format!(
+                    "\"supersedes\":{}",
+                    serde_json::to_string(supersedes).expect("message IDs are JSON serializable")
+                ),
                 string_field("harklightSession", session),
                 string_field("senderId", sender_id),
                 string_field("title", title),
@@ -541,6 +546,42 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "harklight-send", vec![], params))
         }
+        Command::HarklightRevise {
+            identity,
+            message,
+            base_revision,
+            title,
+            body,
+            choices,
+            clear_choices,
+        } => {
+            let mut params = vec![
+                string_field("messageId", message),
+                string_field("title", title),
+                format!("\"baseRevision\":{base_revision}"),
+                format!("\"clearChoices\":{clear_choices}"),
+                format!(
+                    "\"choices\":{}",
+                    serde_json::to_string(choices).expect("choices are JSON serializable")
+                ),
+            ];
+            if let Some(body) = body {
+                params.push(string_field("body", body));
+            }
+            Ok(request(identity, "harklight-revise", vec![], params))
+        }
+        Command::HarklightRetract { identity, message } => Ok(request(
+            identity,
+            "harklight-retract",
+            vec![],
+            vec![string_field("messageId", message)],
+        )),
+        Command::HarklightSettle { identity, message } => Ok(request(
+            identity,
+            "harklight-settle",
+            vec![],
+            vec![string_field("messageId", message)],
+        )),
         // Not a verb and not on /agent/dispatch: it changes no domain state, it
         // tells the gateway to look at this session's running turn NOW, while the
         // command it observed has not run yet.
@@ -3748,6 +3789,9 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::ArtifactContentFetch { identity, .. }
         | Command::Artifacts { identity, .. }
         | Command::HarklightSend { identity, .. }
+        | Command::HarklightRevise { identity, .. }
+        | Command::HarklightRetract { identity, .. }
+        | Command::HarklightSettle { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::Retire { identity, .. }
@@ -3911,6 +3955,70 @@ fn current_session_key_from(cwd: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn harklight_lifecycle_wire_fields_and_order() {
+        let commands = [
+            (
+                vec![
+                    "harklight-send",
+                    "--session",
+                    "new",
+                    "--sender-id",
+                    "s",
+                    "--title",
+                    "t",
+                    "--supersedes",
+                    "one",
+                    "--supersedes",
+                    "two",
+                    "--supersedes",
+                    "one",
+                ],
+                "harklight-send",
+            ),
+            (
+                vec![
+                    "harklight-revise",
+                    "--message",
+                    "m",
+                    "--base-revision",
+                    "2",
+                    "--title",
+                    "new",
+                    "--clear-choices",
+                ],
+                "harklight-revise",
+            ),
+            (
+                vec!["harklight-retract", "--message", "m"],
+                "harklight-retract",
+            ),
+            (
+                vec!["harklight-settle", "--message", "m"],
+                "harklight-settle",
+            ),
+        ];
+        for (args, verb) in commands {
+            let command =
+                crate::args::parse(args.into_iter().map(str::to_owned).collect()).unwrap();
+            let request = build_request(&command).unwrap();
+            let body: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+            assert_eq!(body["verb"], verb);
+            if verb == "harklight-send" {
+                assert_eq!(
+                    body["params"]["supersedes"],
+                    serde_json::json!(["one", "two", "one"])
+                );
+            } else {
+                assert_eq!(body["params"]["messageId"], "m");
+            }
+            if verb == "harklight-revise" {
+                assert_eq!(body["params"]["baseRevision"], 2);
+                assert_eq!(body["params"]["clearChoices"], true);
+            }
+        }
+    }
+
     #[test]
     fn builds_agent_decision_bodies() {
         assert_eq!(
