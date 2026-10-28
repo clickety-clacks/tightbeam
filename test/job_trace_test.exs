@@ -258,7 +258,7 @@ defmodule Tightbeam.JobTraceTest do
     Enum.each(trace.assignments, fn assignment ->
       assert_keys(
         assignment,
-        ~w(commitRefCorrections currentCoordinationParentRef files holderKey id openerRef reviewsAssignmentId state)a
+        ~w(commitRefCorrections currentCoordinationParentRef files holderKey id mementos openerRef reviewsAssignmentId state)a
       )
     end)
 
