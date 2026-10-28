@@ -1944,7 +1944,6 @@ defmodule Tightbeam.Schema do
     :ok = ensure_rest_collection_indexes(db)
     :ok = ensure_decision_request_collection_indexes(db)
     :ok = ensure_rest_wake_collection_indexes(db)
-    :ok = Tightbeam.Supervision.ensure_schema(db)
 
     # Batch-aware supervision guards reference notice_batches, so install them
     # only after all predecessor migrations and refusal checks have completed
@@ -1990,6 +1989,14 @@ defmodule Tightbeam.Schema do
     end
 
     :ok = Tightbeam.ToolCalls.ensure_schema(db)
+
+    # Built last, after every fallible migration above (upgrade_*/migrate_*
+    # calls that can still raise ShapeError this far into ensure_all/1,
+    # including migrate_wake_retry_source_scope and upgrade_notice_source_payload):
+    # a refused predecessor must retain its exact schema, and this table is
+    # purely additive current-build storage with no predecessor shape of its
+    # own to preserve.
+    :ok = Tightbeam.Supervision.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> Tightbeam.Recognition.activate(db)
@@ -5304,8 +5311,7 @@ defmodule Tightbeam.Schema do
   # Inactivity-deadline provenance is additive current-build storage, same as
   # DeliveryResponsibilities above: writing it here would mutate a refused
   # predecessor migration's schema before the refusal is even raised. Built
-  # later, with the other additive access paths, once every exact predecessor
-  # migration and refusal check has succeeded.
+  # last, after every fallible migration in ensure_all/1 has already succeeded.
   defp bootstrap_module(_db, Tightbeam.Supervision, _current?), do: :ok
 
   defp bootstrap_module(db, Tightbeam.AdminProjection, _current?),
