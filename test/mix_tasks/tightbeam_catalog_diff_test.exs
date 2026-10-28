@@ -26,7 +26,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
 
             %{host => %{ssh: nil, base_dir: base, cli_bin: nil}}
           end,
-          credential_status: fn _provider -> {:needs_onboarding, :fixture} end
+          credential_status: fn _provider -> {:needs_onboarding, :missing} end
         )
       end)
 
@@ -43,7 +43,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
     assert map_size(degraded) > 0
 
     assert Enum.all?(degraded, fn {_harness, reason} ->
-             reason == {:unavailable, {:needs_onboarding, :fixture}}
+             reason == {:unavailable, {:needs_onboarding, :missing}}
            end)
   end
 

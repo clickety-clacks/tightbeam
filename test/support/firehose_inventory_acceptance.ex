@@ -370,6 +370,11 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
         prompt: tool_prompt.content
       })
 
+    tool_session_notice =
+      receive_classes(fixture.hub, %{}, MapSet.new(["session.updated"]))["session.updated"]
+
+    assert tool_session_notice["payload"] == assert_a4_fresh!(fixture, tool_session_notice)
+
     notices =
       capture_classes(fixture, notices, ["tool_call.started"], fn ->
         assert {:ok, :started} =
@@ -422,18 +427,20 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
     assert Registry.fetch("prod.fired") == :error
 
     # The class inventory above has one representative per Registry class.
-    # Assignment and attest writes also commit distinct transcript messages;
+    # Assignment and attest writes also commit distinct transcript messages,
+    # and enqueueing the tool turn commits another session update;
     # include them in the socket model and replay proof instead of counting
     # classes as frames or dropping legitimate messages from the expected state.
     notices =
       Map.merge(notices, %{
         "assignment marker" => assignment_notice,
-        "attest marker" => attest_notices["message.created"]
+        "attest marker" => attest_notices["message.created"],
+        "tool turn session" => tool_session_notice
       })
 
-    # This notice predates the rename and was checked against its commit-time
-    # rebuild above; the final database row has since advanced one version.
-    for {class, notice} <- Map.delete(notices, "session.harness_changed") do
+    # These notices predate the rename and were checked against their commit-time
+    # rebuilds above; the final database row has since advanced.
+    for {class, notice} <- Map.drop(notices, ["session.harness_changed", "tool turn session"]) do
       assert {:ok, fresh} =
                Rebuild.fetch(fixture.db, notice["class"], notice["refs"], fixture.user_id, true)
 
