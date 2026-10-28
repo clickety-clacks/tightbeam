@@ -1776,11 +1776,18 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert observer_with_org_message_cursor.status == 200
     assert org_with_observer_message_cursor.status == 200
 
-    assert JSON.decode!(observer_with_org_message_cursor.resp_body)["items"] ==
-             JSON.decode!(anonymous_message_page.resp_body)["items"]
+    # Without `asUser`, both reads use the same observer principal, so these
+    # cursors are valid across both reads and continue after the newest message.
+    observer_after_org_cursor = JSON.decode!(observer_with_org_message_cursor.resp_body)
+    org_after_observer_cursor = JSON.decode!(org_with_observer_message_cursor.resp_body)
 
-    assert JSON.decode!(org_with_observer_message_cursor.resp_body)["items"] ==
-             JSON.decode!(org_message_page.resp_body)["items"]
+    assert observer_after_org_cursor["items"] == []
+    assert observer_after_org_cursor["page"]["hasMoreBefore"] == true
+    assert observer_after_org_cursor["page"]["hasMoreAfter"] == false
+
+    assert org_after_observer_cursor["items"] == []
+    assert org_after_observer_cursor["page"]["hasMoreBefore"] == true
+    assert org_after_observer_cursor["page"]["hasMoreAfter"] == false
 
     message_cursor = JSON.decode!(anonymous_messages.resp_body)["page"]["newestCursor"]
 
