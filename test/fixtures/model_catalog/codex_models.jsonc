@@ -8,7 +8,7 @@
   "models": [
     {
       "slug": "gpt-5.6-sol",
-      "display_name": "GPT-5.6-Example",
+      "display_name": "GPT-5.6-Sol",
       "supported_reasoning_levels": [
         {
           "effort": "low",
