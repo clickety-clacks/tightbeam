@@ -201,22 +201,34 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
       # becomes the named user just because asUser was supplied.
       socket = connect(ctx, path)
       send_frame(socket, auth() |> Map.put(:deviceId, "browser") |> Map.merge(overrides))
-      {reply, socket} = recv_frame(socket)
 
-      org_wide_identity? = Map.has_key?(overrides, :sessionKey) and is_nil(overrides.sessionKey)
+      if path == "/ws/changes?protocolVersion=2" and overrides[:token] == "bad" do
+        send_frame(socket, %{
+          type: "subscribe",
+          protocolVersion: 2,
+          subscriptionId: "observer",
+          filters: %{}
+        })
 
-      if path == "/ws/changes?protocolVersion=2" and
-           (overrides[:token] == ctx.selected.cli_token or org_wide_identity?) do
-        assert reply["success"] == true
-        assert reply["userId"] == "reader"
-
-        if overrides[:token] == ctx.selected.cli_token do
-          assert reply["sessionKey"] == "selected"
-        else
-          refute Map.has_key?(reply, "sessionKey")
-        end
+        {reply, socket} = recv_frame(socket)
+        assert reply == %{"type" => "subscription_ready", "subscriptionId" => "observer"}
       else
-        assert reply["success"] == false
+        {reply, socket} = recv_frame(socket)
+        org_wide_identity? = Map.has_key?(overrides, :sessionKey) and is_nil(overrides.sessionKey)
+
+        if path == "/ws/changes?protocolVersion=2" and
+             (overrides[:token] == ctx.selected.cli_token or org_wide_identity?) do
+          assert reply["success"] == true
+          assert reply["userId"] == "reader"
+
+          if overrides[:token] == ctx.selected.cli_token do
+            assert reply["sessionKey"] == "selected"
+          else
+            refute Map.has_key?(reply, "sessionKey")
+          end
+        else
+          assert reply["success"] == false
+        end
       end
 
       WS.close(socket)
