@@ -31,7 +31,7 @@ if System.get_env("TIGHTBEAM_AUTHORITATIVE_GATE") == "1" do
 
     This authoritative Mix gate is not isolated:
 
-    #{problems |> Enum.reverse |> Enum.map_join("\n", &"  - #{&1}")}
+    #{problems |> Enum.reverse() |> Enum.map_join("\n", &"  - #{&1}")}
 
     Run scripts/verify_mix.sh instead of marking a direct mix test as authoritative.
     """)
@@ -171,7 +171,7 @@ if missing != [] do
 
   This suite cannot run here. #{length(missing)} declared prerequisite(s) missing:
 
-  #{missing |> Enum.reverse |> Enum.with_index(1) |> Enum.map_join("\n\n  ", fn {text, i} -> "#{i}. #{text}" end)}
+  #{missing |> Enum.reverse() |> Enum.with_index(1) |> Enum.map_join("\n\n  ", fn {text, i} -> "#{i}. #{text}" end)}
 
   Nothing is skipped and nothing is faked around this: each of these changes what
   the suite observes, so a run without them would report a verdict it has not earned.

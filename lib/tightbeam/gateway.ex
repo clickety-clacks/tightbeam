@@ -2758,8 +2758,8 @@ defmodule Tightbeam.Gateway do
 
           {:error, {failed_stage, reason}} ->
             # A FAILED TURN FAILS. It does not freeze the session behind a
-          # ruling. Model choice is judgment and belongs to inference, not to
-          # a substrate mechanism.
+            # ruling. Model choice is judgment and belongs to inference, not to
+            # a substrate mechanism.
             #
             # The substrate owes three things here and owes nothing else: the
             # truth (a `failed` turn row), the named reason (`turns.error` and

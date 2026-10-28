@@ -4279,7 +4279,8 @@ defmodule Tightbeam.GatewayTest do
              spawn.(%{
                verb: "spawn",
                origin: "remedy:wrong-action",
-               principal: {:remedy, %{statute: "wrong-action", action: "wake", owner: "sample-user"}},
+               principal:
+                 {:remedy, %{statute: "wrong-action", action: "wake", owner: "sample-user"}},
                session_key: nil,
                params: %{
                  display_name: "Rejected",

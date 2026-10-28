@@ -22,7 +22,12 @@ defmodule Tightbeam.RulesTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     {:paired, _device} =
-      claim_org(db, %{device_id: "rules-device", claimed_name: "sample-user", platform: nil, model: nil})
+      claim_org(db, %{
+        device_id: "rules-device",
+        claimed_name: "sample-user",
+        platform: nil,
+        model: nil
+      })
 
     Enum.each(~w(mike other reviewer), &ensure_main_session(db, &1))
 

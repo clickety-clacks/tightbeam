@@ -1000,7 +1000,12 @@ defmodule Tightbeam.DeliverableContractTest do
     close_first_completion = complete(ctx, close_first_assignment.id, nil)
 
     assert %{ok: true, workItem: %{state: "closed"}} =
-             close(ctx, {:user, "sample-user"}, close_first_card.id, close_first_completion.attest.id)
+             close(
+               ctx,
+               {:user, "sample-user"},
+               close_first_card.id,
+               close_first_completion.attest.id
+             )
 
     completion_first_card = create_card(ctx, "Completion probe before close")
 
@@ -1010,7 +1015,12 @@ defmodule Tightbeam.DeliverableContractTest do
     completion_first = complete(ctx, completion_first_assignment.id, nil)
 
     assert %{ok: true, workItem: %{state: "closed"}} =
-             close(ctx, {:user, "sample-user"}, completion_first_card.id, completion_first.attest.id)
+             close(
+               ctx,
+               {:user, "sample-user"},
+               completion_first_card.id,
+               completion_first.attest.id
+             )
 
     for card_id <- [close_first_card.id, completion_first_card.id] do
       assert {:ok, [[1, 1]]} =
@@ -1037,7 +1047,9 @@ defmodule Tightbeam.DeliverableContractTest do
     revoke_before_completion =
       assign(ctx, create_card(ctx, "Revoke before completion").id, "R then C", true)
 
-    assert %{outcome: "revoked"} = revoke(ctx, {:user, "sample-user"}, revoke_before_completion.id)
+    assert %{outcome: "revoked"} =
+             revoke(ctx, {:user, "sample-user"}, revoke_before_completion.id)
+
     assert %{code: "assignment_closed"} = complete(ctx, revoke_before_completion.id, nil)
     assert {:ok, [[0, 0]]} = completion_counts(ctx.db, revoke_before_completion.id)
   end

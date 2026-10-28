@@ -32,7 +32,12 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     :ok = Schema.ensure_all(db)
 
     {:paired, admin_device} =
-      claim_org(db, %{device_id: "d2-admin", claimed_name: "sample-user", platform: nil, model: nil})
+      claim_org(db, %{
+        device_id: "d2-admin",
+        claimed_name: "sample-user",
+        platform: nil,
+        model: nil
+      })
 
     admin_session = ensure_main_session(db, admin_device.user_id)
     Devices.add_user(db, "observer", false)
