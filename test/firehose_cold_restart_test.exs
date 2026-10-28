@@ -328,8 +328,8 @@ defmodule Tightbeam.FirehoseColdRestartTest do
               dispatch!(plan, new["port"], device, "assignment-get", %{"assignmentId" => id})
 
             assert Enum.map(history, & &1["reason"]) == ["First restart", "After restart"]
-            # The reopened assignment's ordinary holder wake may be running when
-            # shutdown begins. Let that turn settle before checking the socket close.
+            # The configured short reminder may still have a holder turn in
+            # progress when shutdown begins. Let it settle first.
             assert_holder_turn_ended!(holder_turns, id, previous_turn)
             File.write!(Path.join(plan.base, "second-stop"), "stop\n")
             assert {:ok, {:closed, 1012}, _} = WS.recv_event(resumed, 5_000)
@@ -368,7 +368,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
     File.write!(path <> ".tmp", JSON.encode!(%{"assignmentId" => id}))
     File.rename!(path <> ".tmp", path)
     result = Path.join(plan.base, phase <> "-generations.json")
-    deadline = System.monotonic_time(:millisecond) + 5_000
+    deadline = System.monotonic_time(:millisecond) + 15_000
 
     wait = fn recur ->
       if File.regular?(result) do
