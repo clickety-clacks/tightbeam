@@ -465,10 +465,22 @@ defmodule Tightbeam.Mementos do
   def ensure_schema(db), do: DB.execute(db, @ddl)
   def schema_in_txn(%Txn{} = txn), do: Txn.exec(txn, @ddl)
 
+  def attach(%Txn{} = txn, kind, %{id: id} = record),
+    do: Map.put(record, :mementos, current(txn, kind, id))
+
   def attach(db, kind, %{id: id} = record),
     do: Map.put(record, :mementos, current(db, kind, id))
 
   @doc "Read current lists by an indexed record range, including cleared names."
+  def current(%Txn{} = txn, kind, id) do
+    txn
+    |> Txn.q(
+      "SELECT name,valueJson FROM memento_current WHERE recordKind=?1 AND recordId=?2 ORDER BY name",
+      [kind, id]
+    )
+    |> Map.new(fn [name, values] -> {name, JSON.decode!(values)} end)
+  end
+
   def current(db, kind, id) do
     {:ok, rows} =
       query(

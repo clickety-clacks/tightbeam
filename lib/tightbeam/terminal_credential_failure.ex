@@ -214,7 +214,8 @@ defmodule Tightbeam.TerminalCredentialFailure do
                  "notice-source-storage-v1-019",
                  "decision-request-row-schema-v2-019",
                  "work-item-delivery-owner-v1-019",
-                 "launch-preparation-boot-v1-0110"
+                 "launch-preparation-boot-v1-0110",
+                 "launch-preparation-evidence-v1-0112"
                ] ->
             readonly_views_from_conn(conn)
 
