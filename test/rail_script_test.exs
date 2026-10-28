@@ -636,16 +636,22 @@ defmodule Tightbeam.RailScriptTest do
   test "decide is dry and evaluate preserves its collapsing legacy contract", ctx do
     put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}))
     [loaded] = Rules.load!(ctx.base_dir, ["post"])
-    :persistent_term.put(Rules, [put_in(loaded.check.effects["pass"], "escalate")])
 
-    assert {{:escalate, %{name: "script-escalate"}, %{question: "fixture"}, nil}, [], []} =
-             Rules.decide(ctx.db, call())
+    snapshot = %{
+      Rules.effective_snapshot()
+      | rules: [put_in(loaded.check.effects["pass"], "escalate")]
+    }
 
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
-    assert [%{kind: "rail_script"}] = EventLog.lifecycle_events(ctx.db)
+    Rules.with_snapshot(snapshot, fn ->
+      assert {{:escalate, %{name: "script-escalate"}, %{question: "fixture"}, nil}, [], []} =
+               Rules.decide(ctx.db, call())
 
-    assert {:deny, %{reason: "escalated"}} = Rules.evaluate(ctx.db, call())
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
+      assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
+      assert [%{kind: "rail_script"}] = EventLog.lifecycle_events(ctx.db)
+
+      assert {:deny, %{reason: "escalated"}} = Rules.evaluate(ctx.db, call())
+      assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests")
+    end)
   end
 
   test "a contained check gates a real dispatch and rail_denials projects its payload", ctx do

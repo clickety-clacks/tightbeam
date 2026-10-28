@@ -519,7 +519,7 @@ defmodule Tightbeam.DispatchTest do
       identity_manifest_sha: "identity-sha"
     }
 
-    snapshot = %{Rules.effective_snapshot() | rules: [rule, rule]}
+    snapshot = %{Rules.effective_snapshot() | rules: [rule, rule], revision: "identity-sha"}
     action_key = Escalation.digest(call)
 
     {:ok, _} =

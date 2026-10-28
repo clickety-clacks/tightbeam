@@ -249,7 +249,7 @@ defmodule Tightbeam.JobTraceTest do
     assert %{code: "not_found"} = trace(db, {:user, "owner"}, "wi_missing")
 
     assert_keys(trace, ~w(assignments timeline workItem)a)
-    assert_keys(trace.workItem, ~w(failReason id ownerUserId state title)a)
+    assert_keys(trace.workItem, ~w(failReason id mementos ownerUserId state title)a)
 
     assert Enum.map(trace.assignments, & &1.id) == ["asg_bad", "asg_direct", "asg_review"]
     assert trace.workItem.state == "open"
@@ -258,7 +258,7 @@ defmodule Tightbeam.JobTraceTest do
     Enum.each(trace.assignments, fn assignment ->
       assert_keys(
         assignment,
-        ~w(commitRefCorrections currentCoordinationParentRef files holderKey id openerRef reviewsAssignmentId state)a
+        ~w(commitRefCorrections currentCoordinationParentRef files holderKey id mementos openerRef reviewsAssignmentId state)a
       )
     end)
 
@@ -445,7 +445,7 @@ defmodule Tightbeam.JobTraceTest do
           ~w(assignmentId at context effort harness id jobRef model status type)a
 
         "attest" ->
-          ~w(assignmentId at commitRefs id kind type verdict)a
+          ~w(assignmentId at commitRefs id kind mementos type verdict)a
 
         "wake_scheduled" ->
           ~w(assignmentId at dueAt id type)a
