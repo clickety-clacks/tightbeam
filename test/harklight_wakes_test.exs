@@ -793,7 +793,9 @@ defmodule Tightbeam.HarklightWakesTest do
              HarklightSend.change_request(
                db,
                %{call | params: %{message_id: "request"}},
-               "retract", runner: runner)
+               "retract",
+               runner: runner
+             )
 
     assert :ok = HarklightWakes.capture_line(db, @handle, event(2, "discussion", "too late"))
 
@@ -893,7 +895,9 @@ defmodule Tightbeam.HarklightWakesTest do
               title: "Replacement",
               supersedes: ["request"]
             }
-        }, runner: runner)
+        },
+        runner: runner
+      )
 
     assert [%{acknowledgment: "failed", subscription_state: "open", reason: reason}] =
              result.supersedes
@@ -935,7 +939,9 @@ defmodule Tightbeam.HarklightWakesTest do
              HarklightSend.change_request(
                db,
                %{call | params: %{message_id: "replacement"}},
-               "retract", runner: no_op)
+               "retract",
+               runner: no_op
+             )
 
     assert reason =~ "harklight-settle"
 
@@ -974,7 +980,9 @@ defmodule Tightbeam.HarklightWakesTest do
         %{
           call
           | params: %{harklight_session: @handle, sender_id: "sender", title: "Replacement"}
-        }, runner: runner)
+        },
+        runner: runner
+      )
 
     assert %{outcome: "refused", message_id: "replacement", wake_effect: "none", reason: reason} =
              result
@@ -1067,6 +1075,237 @@ defmodule Tightbeam.HarklightWakesTest do
              HarklightSend.change_request(db, revised, "revise",
                runner: fn _ -> {"request is at revision 2", 2} end
              )
+  end
+
+  test "a sealed batch gets the pre-retract statement at claim without another wake", %{
+    db: db,
+    call: call
+  } do
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "sealed reply"))
+    [carrier] = Tightbeam.NoticeBatcher.recover(db, System.system_time(:millisecond) + 1000)
+
+    assert {:ok, [["queued"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE wakeId=?1", [carrier])
+
+    runner = fn args ->
+      frame(%{kind: "committed", operation: "withdraw", op_id: List.last(args), response: %{}})
+    end
+
+    assert %{pending_delivery: [%{event_id: "1"}]} =
+             HarklightSend.change_request(
+               db,
+               %{call | params: %{message_id: "request"}},
+               "retract",
+               runner: runner
+             )
+
+    assert {:ok, turn} = Tightbeam.Ledger.claim_next(db, call.session_key, "sealed-test")
+    assert turn.prompt =~ "sealed reply"
+    assert turn.prompt =~ "received before message request was retracted"
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "sealed reply"))
+    assert [] = Tightbeam.NoticeBatcher.recover(db, System.system_time(:millisecond) + 1000)
+    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM turns")
+  end
+
+  test "an unresolved terminal cannot be overtaken and refusal releases it in feed order", %{
+    db: db,
+    call: call
+  } do
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+    bind_extra(db, call, "second")
+
+    runner =
+      lifecycle_runner(db,
+        unknown: true,
+        before_commit: fn ->
+          assert :ok = HarklightWakes.capture_line(db, @handle, terminal(1, "request"))
+
+          assert :ok =
+                   HarklightWakes.capture_line(
+                     db,
+                     @handle,
+                     event(2, "discussion", "second entry", "second")
+                   )
+        end
+      )
+
+    assert %{outcome: "outcome_unknown"} =
+             HarklightSend.send_request(
+               db,
+               %{
+                 call
+                 | params: %{
+                     harklight_session: @handle,
+                     sender_id: "sender",
+                     title: "Replacement",
+                     supersedes: ["request"]
+                   }
+               },
+               runner: runner
+             )
+
+    assert [] = Tightbeam.NoticeBatcher.recover(db, System.system_time(:millisecond) + 1000)
+
+    assert %{outcome: "refused"} =
+             HarklightSend.settle(db, %{call | params: %{message_id: "replacement"}},
+               runner: lifecycle_runner(db, refused: true)
+             )
+
+    [_carrier] = Tightbeam.NoticeBatcher.recover(db, System.system_time(:millisecond) + 1000)
+    assert {:ok, turn} = Tightbeam.Ledger.claim_next(db, call.session_key, "ordered-test")
+    assert [before, _after] = String.split(turn.prompt, "second entry")
+    assert before =~ "superseded"
+    refute_receive {:acked, _}
+  end
+
+  test "startup completes a pending self-terminal acknowledgment without a wake", %{
+    db: db,
+    call: call
+  } do
+    op = Tightbeam.Id.uuid4()
+
+    request = %{
+      session_handle: @handle,
+      message: %{sender_id: "sender", message_id: "replacement", supersedes: ["request"]}
+    }
+
+    payload = JSON.encode!(%{request: request, files: []})
+    HarklightWakes.prepare_send(db, call, op, payload)
+    assert :ok = HarklightWakes.capture_line(db, @handle, terminal(1, "request"))
+    HarklightWakes.bind_send(db, call, op, payload, "{}", @handle, "sender", "replacement")
+    parent = self()
+
+    runner = fn ["ack", "--session", @handle, "--event", "1"] ->
+      send(parent, :recovered_ack)
+      frame(%{kind: "acknowledged", event_id: "1", status: "already_delivered"})
+    end
+
+    listener = fn manager, _, _ ->
+      ref = Process.monitor(manager)
+
+      receive do
+        {:DOWN, ^ref, :process, ^manager, _} -> :ok
+      end
+    end
+
+    start_supervised!({HarklightWakes, db: db, listener: listener, send_runner: runner})
+    assert_receive :recovered_ack, 2000
+    stop_supervised(HarklightWakes)
+    start_supervised!({HarklightWakes, db: db, listener: listener, send_runner: runner})
+    refute_receive :recovered_ack
+
+    assert {:ok, [["acknowledged", "ended"]]} =
+             DB.query(db, "SELECT acknowledgment,state FROM harklight_subscription_ends")
+
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_entries")
+  end
+
+  test "superseding another session leaves its terminal wake and never acknowledges it", %{
+    db: db,
+    call: call,
+    main: main
+  } do
+    other_handle = "e0205d95-f840-460f-951e-2a0f995be13d"
+
+    other_call = %{
+      call
+      | session_key: main.session_key,
+        principal: {:session, main.session_key},
+        transport_session_key: main.session_key
+    }
+
+    op = Tightbeam.Id.uuid4()
+
+    payload =
+      JSON.encode!(%{
+        request: %{
+          session_handle: other_handle,
+          message: %{sender_id: "sender", message_id: "foreign"}
+        }
+      })
+
+    HarklightWakes.prepare_send(db, other_call, op, payload)
+
+    assert %{state: "registered"} =
+             HarklightWakes.bind_send(
+               db,
+               other_call,
+               op,
+               payload,
+               "{}",
+               other_handle,
+               "sender",
+               "foreign"
+             )
+
+    terminal =
+      terminal(1, "foreign")
+      |> JSON.decode!()
+      |> Map.put("session_handle", other_handle)
+      |> JSON.encode!()
+
+    runner =
+      lifecycle_runner(db,
+        before_commit: fn ->
+          assert :ok = HarklightWakes.capture_line(db, other_handle, terminal)
+        end
+      )
+
+    assert %{supersedes: [%{effect: "other_session"}]} =
+             HarklightSend.send_request(
+               db,
+               %{
+                 call
+                 | params: %{
+                     harklight_session: @handle,
+                     sender_id: "sender",
+                     title: "Replacement",
+                     supersedes: ["foreign"]
+                   }
+               },
+               runner: runner
+             )
+
+    refute_receive {:acked, _}
+
+    assert {:ok, [[recipient, prompt]]} =
+             DB.query(db, "SELECT sessionKey,prompt FROM wakes WHERE wakeId LIKE 'w_harklight_%'")
+
+    assert recipient == main.session_key
+    assert prompt =~ "superseded"
+  end
+
+  test "a prepare failure has no invented message ID and shows unchanged supersede effects", %{
+    db: db,
+    call: call
+  } do
+    result =
+      HarklightSend.send_request(
+        db,
+        %{
+          call
+          | params: %{
+              harklight_session: @handle,
+              sender_id: "sender",
+              title: "Replacement",
+              supersedes: ["request", "request"]
+            }
+        },
+        runner: fn _ -> raise "executable unavailable" end
+      )
+
+    assert %{
+             outcome: "failed",
+             wake_effect: "none",
+             supersedes: [%{message_id: "request", effect: "unchanged"}],
+             reason: reason
+           } = result
+
+    refute Map.has_key?(result, :message_id)
+    assert reason =~ "could not complete"
   end
 
   defp frame(value), do: {JSON.encode!(value) <> "\n", 0}

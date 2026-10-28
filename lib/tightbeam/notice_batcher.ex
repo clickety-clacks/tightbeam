@@ -814,6 +814,7 @@ defmodule Tightbeam.NoticeBatcher do
       [at, recipient]
     )
     |> Enum.map(&hd/1)
+    |> then(&Tightbeam.HarklightLifecycle.ready_sources_in_txn(txn, &1))
   end
 
   defp prepared_source_in_txn(txn, wake_id) do

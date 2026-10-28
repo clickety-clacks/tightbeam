@@ -6,20 +6,26 @@ defmodule Tightbeam.HarklightSend do
   @uuid4 ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
 
   def send_request(db, call, opts \\ []) do
-    with :ok <- origin!(db, call),
-         {:ok, input} <- inputs(call.params),
-         nil <- HarklightLifecycle.unresolved(db, input.supersedes),
-         {:ok, runner} <- runner(opts) do
-      op_id = Id.uuid4()
+    result =
+      with :ok <- origin!(db, call),
+           {:ok, input} <- inputs(call.params),
+           nil <- HarklightLifecycle.unresolved(db, input.supersedes),
+           {:ok, runner} <- runner(opts) do
+        op_id = Id.uuid4()
 
-      case invoke(runner, prepare_args(input, op_id), "prepared", op_id) do
-        {:ok, prepared} -> prepare_and_execute(db, call, input, prepared, op_id, runner, opts)
-        {:error, code, reason, outcome} -> failure("send", code, reason, outcome, %{op_id: op_id})
+        case invoke(runner, prepare_args(input, op_id), "prepared", op_id) do
+          {:ok, prepared} ->
+            prepare_and_execute(db, call, input, prepared, op_id, runner, opts)
+
+          {:error, code, reason, outcome} ->
+            failure("send", code, reason, outcome, %{op_id: op_id})
+        end
+      else
+        id when is_binary(id) -> unresolved_result("send", id)
+        {:error, reason} -> failure("send", reason, early_reason(reason), "failed")
       end
-    else
-      id when is_binary(id) -> unresolved_result("send", id)
-      {:error, reason} -> failure("send", reason, early_reason(reason), "failed")
-    end
+
+    unchanged_targets(result, call.params[:supersedes])
   end
 
   defp prepare_and_execute(db, call, input, prepared, op_id, runner, opts) do
@@ -54,44 +60,59 @@ defmodule Tightbeam.HarklightSend do
   defp finish_send(db, call, op_id, payload, request, response, command, opts) do
     identity = prepared_identity(%{"request" => request}) |> Map.put(:op_id, op_id)
 
-    case response do
-      {:ok, committed} ->
-        with {:ok, result} <- confirmed_result(committed, request, op_id),
-             %{state: "registered"} = registration <-
-               bind(db, call, op_id, payload, result, request) do
+    result =
+      case response do
+        {:ok, committed} ->
+          with {:ok, result} <- confirmed_result(committed, request, op_id),
+               %{state: "registered"} = registration <-
+                 bind(db, call, op_id, payload, result, request) do
+            HarklightLifecycle.process_terminals(db, opts)
+
+            registration
+            |> Map.merge(identity)
+            |> Map.merge(%{command: command, outcome: "committed", result: committed})
+            |> HarklightLifecycle.refresh_acknowledgments_result(db)
+          else
+            error ->
+              failure(
+                command,
+                "harklight_result_unconfirmed",
+                unknown_reason(identity.message_id) <>
+                  " Binding was not confirmed: #{inspect(error)}",
+                "outcome_unknown",
+                identity
+              )
+          end
+
+        {:error, code, reason, "refused"} ->
+          HarklightLifecycle.record_refused(db, op_id)
           HarklightLifecycle.process_terminals(db, opts)
+          failure(command, code, "The message was not sent. " <> reason, "refused", identity)
 
-          registration
-          |> Map.merge(identity)
-          |> Map.merge(%{command: command, outcome: "committed", result: committed})
-          |> HarklightLifecycle.refresh_acknowledgments_result(db)
-        else
-          error ->
-            failure(
-              command,
-              "harklight_result_unconfirmed",
-              unknown_reason(identity.message_id) <>
-                " Binding was not confirmed: #{inspect(error)}",
-              "outcome_unknown",
-              identity
-            )
-        end
+        {:error, code, reason, _outcome} ->
+          failure(
+            command,
+            code,
+            unknown_reason(identity.message_id) <> " " <> reason,
+            "outcome_unknown",
+            identity
+          )
+      end
 
-      {:error, code, reason, "refused"} ->
-        HarklightLifecycle.record_refused(db, op_id)
-        HarklightLifecycle.process_terminals(db, opts)
-        failure(command, code, "The message was not sent. " <> reason, "refused", identity)
-
-      {:error, code, reason, _outcome} ->
-        failure(
-          command,
-          code,
-          unknown_reason(identity.message_id) <> " " <> reason,
-          "outcome_unknown",
-          identity
-        )
-    end
+    unchanged_targets(result, request["message"]["supersedes"])
   end
+
+  defp unchanged_targets(%{outcome: "committed"} = result, _ids), do: result
+
+  defp unchanged_targets(result, ids) when is_list(ids) and ids != [] do
+    Map.put(
+      result,
+      :supersedes,
+      Enum.map(Enum.uniq(ids), &%{message_id: &1, effect: "unchanged"})
+    )
+  end
+
+  defp unchanged_targets(result, _ids), do: result
 
   # Both entry points use the original operation and the immutable prepared
   # bytes. Recovery never prepares a second send or changes its inputs.
@@ -277,9 +298,12 @@ defmodule Tightbeam.HarklightSend do
         when status in ["delivered", "already_delivered"] ->
           :ok
 
-        other ->
+        {:error, _code, reason, _outcome} ->
+          {:error, reason <> " The subscription is still open."}
+
+        _ ->
           {:error,
-           "Harklight acknowledgment failed: #{inspect(other)}; the subscription is still open."}
+           "Harklight did not confirm the acknowledgment; the subscription is still open."}
       end
     else
       {:error, code} -> {:error, early_reason(code) <> " The subscription is still open."}

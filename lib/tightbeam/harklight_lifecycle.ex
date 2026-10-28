@@ -107,6 +107,7 @@ defmodule Tightbeam.HarklightLifecycle do
       JSON.encode!(effects)
     ])
 
+    Tightbeam.Wakes.schedule_changed_in_txn(txn, :wake_ready)
     effects
   end
 
@@ -234,9 +235,20 @@ defmodule Tightbeam.HarklightLifecycle do
   # The claim transaction is the final presentation boundary, shared with
   # command commits. Even an already sealed envelope gets its context before
   # the recipient receives it; no correction wake or second entry is created.
-  def decorate_turn_in_txn(txn, wake_id, prompt) when is_binary(wake_id) do
-    ids = [wake_id | NoticeBatcher.carrier_source_ids_in_txn(txn, wake_id)]
+  def decorate_turn_in_txn(txn, "w_harklight_" <> _ = wake_id, prompt),
+    do: decorate_sources_in_txn(txn, [wake_id], prompt)
 
+  def decorate_turn_in_txn(txn, "w_nb_" <> _ = wake_id, prompt) do
+    ids =
+      NoticeBatcher.carrier_source_ids_in_txn(txn, wake_id)
+      |> Enum.filter(&String.starts_with?(&1, "w_harklight_"))
+
+    decorate_sources_in_txn(txn, ids, prompt)
+  end
+
+  def decorate_turn_in_txn(_txn, _wake_id, prompt), do: prompt
+
+  defp decorate_sources_in_txn(txn, ids, prompt) do
     statements =
       Enum.flat_map(ids, fn id ->
         Txn.q(txn, "SELECT statement FROM harklight_entry_context WHERE wakeId=?1", [id])
@@ -245,8 +257,6 @@ defmodule Tightbeam.HarklightLifecycle do
 
     if statements == [], do: prompt, else: prompt <> "\n\n" <> Enum.join(statements, "\n")
   end
-
-  def decorate_turn_in_txn(_txn, _wake_id, prompt), do: prompt
 
   def ended_in_txn?(txn, sender, message) do
     Txn.q(txn, "SELECT 1 FROM harklight_subscription_ends WHERE senderId=?1 AND messageId=?2", [
@@ -310,6 +320,61 @@ defmodule Tightbeam.HarklightLifecycle do
     end
   end
 
+  # A held terminal must not be overtaken by later entries on its handle.
+  # Releasing it can create its wake later than those entries, so retain feed
+  # order within that handle without changing the order of unrelated notices.
+  def ready_sources_in_txn(txn, ids) do
+    tagged =
+      Enum.map(ids, fn id ->
+        if String.starts_with?(id, "w_harklight_") do
+          case Txn.q(
+                 txn,
+                 "SELECT handle,feedCursor FROM harklight_wake_entries WHERE wakeId=?1",
+                 [id]
+               ) do
+            [[handle, cursor]] -> {id, handle, cursor}
+            [] -> {id, nil, nil}
+          end
+        else
+          {id, nil, nil}
+        end
+      end)
+
+    ready =
+      Enum.reject(tagged, fn {_id, handle, cursor} ->
+        is_binary(handle) and
+          Txn.q(
+            txn,
+            """
+            SELECT 1 FROM harklight_held_terminals t
+            WHERE t.handle=?1 AND CAST(t.eventId AS INTEGER)<?2
+              AND NOT EXISTS (SELECT 1 FROM harklight_subscription_ends e WHERE e.senderId=t.senderId AND e.messageId=t.messageId)
+              AND NOT EXISTS (SELECT 1 FROM harklight_wake_entries e WHERE e.handle=t.handle AND e.eventId=t.eventId)
+            LIMIT 1
+            """,
+            [handle, cursor]
+          ) != []
+      end)
+
+    groups =
+      ready
+      |> Enum.reject(fn {_, h, _} -> is_nil(h) end)
+      |> Enum.group_by(&elem(&1, 1))
+      |> Map.new(fn {h, entries} -> {h, Enum.sort_by(entries, &elem(&1, 2))} end)
+
+    {ordered, _} =
+      Enum.map_reduce(ready, groups, fn
+        {id, nil, _}, groups ->
+          {id, groups}
+
+        {_, handle, _}, groups ->
+          [{id, _, _} | rest] = Map.fetch!(groups, handle)
+          {id, Map.put(groups, handle, rest)}
+      end)
+
+    ordered
+  end
+
   def held_in_txn?(txn, handle, event) do
     Txn.q(txn, "SELECT 1 FROM harklight_held_terminals WHERE handle=?1 AND eventId=?2", [
       handle,
@@ -321,7 +386,13 @@ defmodule Tightbeam.HarklightLifecycle do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT handle,eventId,rawLine FROM harklight_held_terminals ORDER BY CAST(eventId AS INTEGER)"
+        """
+        SELECT t.handle,t.eventId,t.rawLine FROM harklight_held_terminals t
+        LEFT JOIN harklight_subscription_ends e ON e.senderId=t.senderId AND e.messageId=t.messageId
+        WHERE (e.messageId IS NULL OR (e.acknowledgment='pending' AND e.ackEventId IS NULL))
+          AND NOT EXISTS (SELECT 1 FROM harklight_wake_entries w WHERE w.handle=t.handle AND w.eventId=t.eventId)
+        ORDER BY CAST(t.eventId AS INTEGER)
+        """
       )
 
     Enum.each(rows, fn [handle, _event, line] -> HarklightWakes.capture_line(db, handle, line) end)
