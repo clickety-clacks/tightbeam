@@ -659,9 +659,14 @@ defmodule Tightbeam.NoticeBatcher do
               publish_undeliverable_outcome(db, wake_id, source_recipient, notice)
             end)
 
-            Enum.map(chunks, fn {:delivered, wake_id, delivery} ->
-              Gateway.complete_delivery(db, delivery)
-              wake_id
+            Enum.map(chunks, fn
+              {:delivered, wake_id, delivery} ->
+                Gateway.complete_delivery(db, delivery)
+                wake_id
+
+              {:harklight_held, wake_id, notice} ->
+                Gateway.complete_delivery(db, {:harklight_held, notice})
+                wake_id
             end)
 
           {:ok, _} ->
@@ -1208,6 +1213,9 @@ defmodule Tightbeam.NoticeBatcher do
         mark_delivered_in_txn(txn, wake_id, at)
         {:delivered, wake_id, delivery}
 
+      {:harklight_held, notice} ->
+        {:harklight_held, wake_id, notice}
+
       other ->
         raise DB.Error, message: "notice_session_admission_refused: #{inspect(other)}"
     end
@@ -1566,8 +1574,13 @@ defmodule Tightbeam.NoticeBatcher do
   defp source_delivery_target(txn, %{target_role: role}) when is_binary(role),
     do: Gateway.delivery_target(txn, nil, %{target_role: role})
 
-  defp source_delivery_target(txn, %{session_key: session_key} = wake),
-    do: Gateway.delivery_target(txn, session_key, wake)
+  defp source_delivery_target(txn, %{session_key: session_key, wake_id: wake_id} = wake) do
+    if Tightbeam.Harklight.captured_wake_in_txn?(txn, wake_id) do
+      {session_key, nil, false}
+    else
+      Gateway.delivery_target(txn, session_key, wake)
+    end
+  end
 
   defp recipient_lane(recipient) do
     target_role = recipient[:target_role]

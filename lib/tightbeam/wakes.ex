@@ -7175,7 +7175,10 @@ defmodule Tightbeam.Wakes do
 
   defp attempt_delivery(delivery) do
     try do
-      {:ok, delivery.()}
+      case delivery.() do
+        {:retry, _reason} -> :retry
+        result -> {:ok, result}
+      end
     rescue
       _ -> :retry
     catch

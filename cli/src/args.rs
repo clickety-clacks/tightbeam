@@ -77,6 +77,12 @@ pub enum Command {
         /// CLI validates only that a supplied name is non-empty.
         class: Option<String>,
     },
+    HarklightRegister {
+        identity: Identity,
+        handle: String,
+        sender_id: String,
+        message_id: String,
+    },
     Condition {
         identity: Identity,
         kind: String,
@@ -715,6 +721,12 @@ COMMANDS:
       Condition:
         tightbeam wake --session agent:owner:app --when-fact assignment-landed \
           --when-scope asg_123 --fallback-after 2h --prompt "re-read the card" --as coder
+
+  harklight-register --handle <H> --sender-id <S> --message-id <M>
+      Register this Tightbeam session to receive entries for a Harklight request
+      it sent. Use the identifiers returned by `harklight-agent send`, after
+      that CLI declares its supported controller route. The gateway listens;
+      this command always binds to the current session and accepts no target.
 
   condition --kind <kind> [--scope <scope>] [--key <idempotencyKey>]
       File an observable fact. Matching condition wakes receive the fact as a new
@@ -1968,6 +1980,38 @@ fn parse_with_optional_catalog(
                 replace_queued,
                 idempotency_key,
                 class: nonempty(flags, "class"),
+            })
+        }
+        "harklight-register" => {
+            const ALLOWED: &[&str] = &[
+                "handle",
+                "sender-id",
+                "message-id",
+                "as",
+                "as-user",
+                "as-process",
+            ];
+
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| !ALLOWED.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam harklight-register --handle <H> --sender-id <S> --message-id <M>".to_owned());
+            }
+
+            let identity = identity(flags)?;
+
+            if !matches!(identity, Identity::Session) {
+                return Err("harklight-register must run from the Tightbeam session that sent the request; omit identity overrides".to_owned());
+            }
+
+            Ok(Command::HarklightRegister {
+                identity,
+                handle: nonempty(flags, "handle")
+                    .ok_or_else(|| "--handle is required".to_owned())?,
+                sender_id: nonempty(flags, "sender-id")
+                    .ok_or_else(|| "--sender-id is required".to_owned())?,
+                message_id: nonempty(flags, "message-id")
+                    .ok_or_else(|| "--message-id is required".to_owned())?,
             })
         }
         "condition" => {
@@ -5283,6 +5327,7 @@ mod tests {
                 "harness-health-review-other",
                 "harness-health-close-promotion",
                 "harness-health-evidence-other",
+                "harklight-register",
                 "host-env-list",
                 "host-env-set",
                 "host-env-unset",
@@ -5906,6 +5951,57 @@ mod tests {
                 "--predicate must be a JSON object: EOF while parsing a value at line 1 column 9"
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn parses_harklight_registration_only_for_the_current_session() {
+        assert_eq!(
+            parse(strings(&[
+                "harklight-register",
+                "--handle",
+                "H1",
+                "--sender-id",
+                "S1",
+                "--message-id",
+                "M1",
+            ])),
+            Ok(Command::HarklightRegister {
+                identity: Identity::Session,
+                handle: "H1".to_owned(),
+                sender_id: "S1".to_owned(),
+                message_id: "M1".to_owned(),
+            })
+        );
+
+        assert!(
+            parse(strings(&[
+                "harklight-register",
+                "--handle",
+                "H1",
+                "--sender-id",
+                "S1",
+                "--message-id",
+                "M1",
+                "--session",
+                "agent:other",
+            ]))
+            .is_err()
+        );
+
+        assert!(
+            parse(strings(&[
+                "harklight-register",
+                "--handle",
+                "H1",
+                "--sender-id",
+                "S1",
+                "--message-id",
+                "M1",
+                "--as",
+                "another-role",
+            ]))
+            .is_err()
         );
     }
 
