@@ -4133,10 +4133,6 @@ defmodule Tightbeam.Gateway do
 
   defp configured_turn_candidate(_config, session, nil), do: {:ok, session}
 
-  defp configured_turn_candidate(_config, session, %Model{} = model)
-       when model == session.model,
-       do: {:ok, %{session | model: model}}
-
   defp configured_turn_candidate(config, session, %Model{} = model) do
     candidate = %{session | model: model}
     catalog = Map.get(config, :model_catalog, ModelCatalog)
@@ -4146,8 +4142,8 @@ defmodule Tightbeam.Gateway do
       when is_binary(harness) and is_binary(provider) ->
         {:ok, %{candidate | harness: harness, provider: provider}}
 
-      {:error, %Unroutable{} = refusal} ->
-        {:error, refusal}
+      {:error, %Unroutable{}} ->
+        {:ok, candidate}
     end
   end
 
@@ -4225,6 +4221,7 @@ defmodule Tightbeam.Gateway do
     diagnostic = ErrorDiagnostic.of(reason)
 
     model_selection_classified_failure?(classified) or
+      adapter_model_refusal?(classified, diagnostic) or
       adapter_effort_refusal?(classified, diagnostic)
   end
 
@@ -4242,6 +4239,18 @@ defmodule Tightbeam.Gateway do
     do: model_selection_classified_failure?(ErrorDiagnostic.classified(reason))
 
   defp model_selection_classified_failure?(_classification), do: false
+
+  # A raw ACP refusal for the requested model advances the configured
+  # preference ring. Keep the adapter's reason intact for the turn and log.
+  defp adapter_model_refusal?(classified, diagnostic) when is_map(diagnostic) do
+    phase = Map.get(diagnostic, "phase") || Map.get(diagnostic, :phase)
+    config_id = Map.get(diagnostic, "configId") || Map.get(diagnostic, :config_id)
+
+    phase == "model" and config_id == "model" and
+      not terminal_effort_failure?(classified)
+  end
+
+  defp adapter_model_refusal?(_classified, _diagnostic), do: false
 
   # The adapter's config failure carries phase and the actual harness option
   # identifier. Codex reports reasoning_effort, Pi reports thought_level, and
@@ -7553,10 +7562,9 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # A spawn with no explicit harness/model may use the archetype's ordered
-  # preferences. Each entry is routed against the host's complete catalog
-  # before credential/readiness checks, so a foreign-harness entry is never
-  # offered to the default adapter or persisted under the wrong harness.
+  # A spawn with no explicit harness/model starts with the archetype's first
+  # preference. No harness call occurs until its first turn; that turn may
+  # advance the ring after a harness refusal.
   defp spawn_preference_ring?(archetype, params) do
     is_nil(params[:harness]) and
       Model.named_fields(params) == %{} and
@@ -7564,69 +7572,46 @@ defmodule Tightbeam.Gateway do
   end
 
   defp resolve_spawn_preference_for_host(config, db, archetype, host) do
-    result =
-      Enum.reduce_while(archetype.model_preferences, [], fn model, failures ->
-        case resolve_spawn_preference_candidate(config, db, host, model) do
-          {:ok, placement} ->
-            {:halt, {:ok, placement}}
-
-          {:error, %Unroutable{} = refusal} ->
-            {:cont, [{model, routing_error(refusal)} | failures]}
-
-          {:error, %{incident: _incident} = denial} ->
-            {:halt, {:error, denial}}
-
-          {:error, denial} ->
-            {:halt, {:error, denial}}
-        end
-      end)
-
-    case result do
-      {:ok, placement} ->
-        {:ok, placement}
-
-      {:error, denial} ->
-        {:error, denial}
-
-      failures when is_list(failures) ->
-        details =
-          failures
-          |> Enum.reverse()
-          |> Enum.map_join("; ", fn {model, denial} ->
-            "#{Model.describe(model)}: #{denial.message}"
-          end)
-
-        models =
-          failures
-          |> Enum.reverse()
-          |> Enum.map(fn {model, _denial} -> model_selection_snapshot(model) end)
-
-        {:error,
-         %{
-           code: "model_selection_exhausted",
-           message:
-             "no configured model preference can run on host #{host}; " <>
-               "tried: #{details}",
-           attempted: models
-         }}
-    end
+    [model | _] = archetype.model_preferences
+    resolve_spawn_preference_candidate(config, db, archetype, host, model)
   end
 
-  defp resolve_spawn_preference_candidate(config, db, host, %Model{} = model) do
-    catalog = Map.get(config, :model_catalog, ModelCatalog)
+  defp resolve_spawn_preference_candidate(config, db, archetype, host, %Model{} = model) do
+    named_harness = archetype.defaults[:harness] || defaults(config, db).harness
 
-    with {:ok, %{harness: harness, provider: provider} = routed} <-
-           ModelCatalog.route(host, model, catalog),
-         nil <- TerminalCredentialFailure.get_open(db, host, harness),
-         :ok <- validate_credential(config, harness, host, model),
+    module =
+      if is_atom(named_harness),
+        do: Harness.module!(named_harness),
+        else: Harness.parse!(named_harness)
+
+    harness = module.wire_name()
+
+    routed =
+      case ModelCatalog.route(host, model, Map.get(config, :model_catalog, ModelCatalog)) do
+        {:ok, route} -> route
+        {:error, %Unroutable{}} -> elem(route_requested_model(host, harness, model), 1)
+      end
+
+    route_harness = routed.harness
+    route_module = Harness.parse!(route_harness)
+
+    with nil <- TerminalCredentialFailure.get_open(db, host, route_harness),
+         :ok <- validate_credential(config, route_harness, host, model),
          :ok <-
            Spinup.ensure_ready(
              config,
-             Harness.parse!(harness).id(),
+             route_module.id(),
              host,
-             spinup_opts(config, db, harness, host, model)
+             spinup_opts(config, db, route_harness, host, model)
            ) do
-      {:ok, %{host: host, harness: harness, provider: provider, model: model, routed: routed}}
+      {:ok,
+       %{
+         host: host,
+         harness: route_harness,
+         provider: routed.provider,
+         model: model,
+         routed: routed
+       }}
     else
       %{} = open_incident ->
         {:error,
@@ -7635,9 +7620,6 @@ defmodule Tightbeam.Gateway do
            message: "catalog suppressed by incident #{open_incident.id}",
            incident: open_incident
          }}
-
-      {:error, %Unroutable{} = refusal} ->
-        {:error, refusal}
 
       {:error, denial} ->
         {:error, denial}
