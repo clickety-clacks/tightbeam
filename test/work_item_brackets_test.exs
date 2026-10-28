@@ -362,6 +362,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     # cannot-proceed keeps the assignment open, so it must not arm a slate wake.
     blocked_item = create(ctx, {:user, "sample-user"}, %{title: "Blocked"})
+
     {:ok, blocked} =
       disp_assign(ctx, {:user, "sample-user"}, "holder", "blocked", blocked_item.id)
 
