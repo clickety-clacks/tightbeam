@@ -109,6 +109,7 @@ defmodule Tightbeam.RecoveryScenario do
         origin: "agent:recovery:a",
         principal: {:session, "agent:recovery:a"},
         session_key: "agent:recovery:a",
+        supervision_interval_ms: 1_000,
         params: %{
           assignment_id: "asg_recovery_preserve",
           kind: "progress",
@@ -451,6 +452,7 @@ Application.put_env(
   Tightbeam.Model.new("fixture-model")
 )
 
+Application.put_env(:tightbeam, :supervision_interval_ms, 1_000)
 Application.put_env(:tightbeam, :autostart, true)
 File.mkdir_p!(Path.join(arena, "work"))
 arena_tmp = Path.join(arena, "tmp")
