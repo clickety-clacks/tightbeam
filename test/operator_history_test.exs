@@ -214,8 +214,24 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
     assert organization_read.status == 200
     assert Enum.map(body(organization_read)["items"], & &1["id"]) == [selected_message.id]
 
+    organization_identity =
+      body(organization_read)["page"]["oldestCursor"]
+      |> Base.url_decode64!(padding: false)
+      |> JSON.decode!()
+
+    assert organization_identity["principalKind"] == "observer"
+    assert organization_identity["principalId"] == "observer"
+
     empty_selection = read(ctx, ctx.selected, "asUser=") |> body()
     assert empty_selection["items"] == body(organization_read)["items"]
+
+    empty_selection_identity =
+      empty_selection["page"]["oldestCursor"]
+      |> Base.url_decode64!(padding: false)
+      |> JSON.decode!()
+
+    assert empty_selection_identity["principalKind"] == "observer"
+    assert empty_selection_identity["principalId"] == "observer"
 
     repeated_owner = read(ctx, ctx.selected, "asUser=owner&asUser=owner") |> body()
     assert Enum.map(repeated_owner["items"], & &1["id"]) == [selected_message.id]

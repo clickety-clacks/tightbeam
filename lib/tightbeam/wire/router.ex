@@ -1653,10 +1653,15 @@ defmodule Tightbeam.Wire.Router do
   end
 
   # Organization credentials can select a user for this session's collection.
-  defp session_collection_principal(:org, query, conn, session_key, _resource) do
+  defp session_collection_principal(:org, query, conn, session_key, resource) do
     case Map.get(query, "asUser", []) do
       [] ->
-        {:ok, org_read_principal(conn), Map.delete(query, "asUser")}
+        principal =
+          if resource == "transcript messages",
+            do: observer_principal(),
+            else: org_read_principal(conn)
+
+        {:ok, principal, Map.delete(query, "asUser")}
 
       [user_id] when user_id != "" ->
         case Tightbeam.Wire.OperatorSession.resolve(db(conn), %{
