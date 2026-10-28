@@ -4081,7 +4081,7 @@ defmodule Tightbeam.Assignments do
            """,
            [request_id]
          ) do
-      [[condition_id, _assignment_id]] ->
+      [[condition_id, assignment_id]] ->
         Txn.q(
           txn,
           """
