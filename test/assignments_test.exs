@@ -144,6 +144,7 @@ defmodule Tightbeam.AssignmentsTest do
   test "assign validates principals, input, liveness, opener typing, and idempotent races", ctx do
     assert %{code: "process_denied"} = handle(ctx, "assign", assign_call({:process, "cron"}))
     assert %{code: "principal_required"} = handle(ctx, "assign", assign_call(nil))
+
     assert %{code: "invalid_subject"} =
              handle(ctx, "assign", assign_call({:user, "sample-user"}, " "))
 
