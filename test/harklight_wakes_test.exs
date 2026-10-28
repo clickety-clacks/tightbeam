@@ -1310,6 +1310,92 @@ defmodule Tightbeam.HarklightWakesTest do
     assert result.sender_id == "sender"
   end
 
+  test "completion before terminal capture needs no acknowledgment, including after restart", %{
+    db: db,
+    call: call
+  } do
+    ack_count = :atomics.new(1, [])
+    base_runner = lifecycle_runner(db)
+
+    runner = fn args ->
+      if hd(args) == "ack", do: :atomics.add_get(ack_count, 1, 1)
+      base_runner.(args)
+    end
+
+    result =
+      HarklightSend.send_request(
+        db,
+        %{
+          call
+          | params: %{
+              harklight_session: @handle,
+              sender_id: "sender",
+              title: "Replacement",
+              supersedes: ["request"]
+            }
+        },
+        runner: runner
+      )
+
+    assert %{outcome: "committed", supersedes: [%{effect: "ended", acknowledgment: "pending"}]} =
+             result
+
+    parent = self()
+
+    listener = fn manager, handle, _ ->
+      assert :ok = GenServer.call(manager, {:finished, handle, :complete})
+      send(parent, :conversation_finished_before_terminal)
+    end
+
+    # Observe the return of the actual asynchronous startup recovery task.
+    # A manager call alone cannot fence that task, and elapsed silence cannot
+    # establish that it has finished considering acknowledgments.
+    recovery = {Tightbeam.HarklightLifecycle, :process_terminals, 2}
+    :erlang.trace_pattern(recovery, [{:_, [], [{:return_trace}]}], [:local])
+    :erlang.trace(self(), true, [:call, :set_on_spawn])
+
+    try do
+      for iteration <- 1..2 do
+        {:ok, manager} =
+          HarklightWakes.start_link(db: db, listener: listener, send_runner: runner)
+
+        assert_receive {:trace, task, :call,
+                        {Tightbeam.HarklightLifecycle, :process_terminals, [^db, _]}},
+                       2000
+
+        assert_receive {:trace, ^task, :return_from, ^recovery, :ok}, 2000
+
+        if iteration == 1, do: assert_receive(:conversation_finished_before_terminal, 2000)
+
+        assert {:ok, [["not_needed", "ended", nil, nil]]} =
+                 DB.query(
+                   db,
+                   "SELECT acknowledgment,state,reason,ackEventId FROM harklight_subscription_ends WHERE messageId='request'"
+                 )
+
+        assert %{
+                 supersedes: [
+                   %{acknowledgment: "not_needed", subscription_state: "ended", reason: nil}
+                 ]
+               } =
+                 Tightbeam.HarklightLifecycle.refresh_acknowledgments(db, result)
+
+        assert :atomics.get(ack_count, 1) == 0
+        assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM harklight_held_terminals")
+        assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_entries")
+
+        assert {:ok, [[0]]} =
+                 DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [call.session_key])
+
+        GenServer.stop(manager)
+      end
+    after
+      if manager = Process.whereis(HarklightWakes), do: GenServer.stop(manager)
+      :erlang.trace(self(), false, [:call, :set_on_spawn])
+      :erlang.trace_pattern(recovery, false, [:local])
+    end
+  end
+
   test "conversation completion ends a failed-ack subscription without retrying it", %{
     db: db,
     call: call
