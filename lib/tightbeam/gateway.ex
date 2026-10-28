@@ -1406,20 +1406,26 @@ defmodule Tightbeam.Gateway do
 
         Assignments.__handle__(db, "assign", call)
       end,
-      {"dispatch", ["assignment.opened", "message.created", "wake.scheduled", "session.updated"]} =>
-        fn call ->
-          call =
-            call
-            |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
-            |> Map.put(:on_assignment_change, assignment_change)
-            |> Map.put(:on_work_item_change, item_change)
-            |> Map.put(:effort_config, config)
-            |> Map.put(:on_dispatch_delivery, fn delivery, _ ->
-              complete_delivery(db, delivery)
-            end)
+      {"dispatch",
+       [
+         "assignment.opened",
+         "message.created",
+         "wake.scheduled",
+         "wake.canceled",
+         "session.updated"
+       ]} => fn call ->
+        call =
+          call
+          |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
+          |> Map.put(:on_assignment_change, assignment_change)
+          |> Map.put(:on_work_item_change, item_change)
+          |> Map.put(:effort_config, config)
+          |> Map.put(:on_dispatch_delivery, fn delivery, _ ->
+            complete_delivery(db, delivery)
+          end)
 
-          Assignments.__handle__(db, "dispatch", call)
-        end,
+        Assignments.__handle__(db, "dispatch", call)
+      end,
       {"attest", ["attest.filed", "assignment.closed", "wake.canceled"]} => fn call ->
         Assignments.__handle__(
           db,

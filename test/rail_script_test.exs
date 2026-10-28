@@ -1552,7 +1552,7 @@ defmodule Tightbeam.RailScriptTest do
              |> Enum.filter(&(&1.kind == "decision_request_failed"))
 
     assert detail =~ "summons failed"
-    assert detail =~ "no accountable owner"
+    assert detail =~ "process request has no organization owner: process:tightbeam"
   end
 
   # Dedup binds only LIVE requests (§B3). A mind ruling on the WORK does not repair the

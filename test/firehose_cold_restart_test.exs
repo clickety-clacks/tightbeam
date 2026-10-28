@@ -399,13 +399,32 @@ defmodule Tightbeam.FirehoseColdRestartTest do
     end
   end
 
+  test "holder settlement consumes start and end frames received together" do
+    frame = fn event ->
+      payload = JSON.encode!(event)
+      <<0x81, 126, byte_size(payload)::16, payload::binary>>
+    end
+
+    events =
+      for {class, status} <- [{"turn.started", "running"}, {"turn.ended", "delivered"}] do
+        frame.(%{
+          "class" => class,
+          "refs" => %{"assignmentId" => "coalesced-assignment", "turnSeq" => 2},
+          "payload" => %{"status" => status}
+        })
+      end
+
+    ws = %WS{socket: nil, buffer: IO.iodata_to_binary(events)}
+    assert :ok = assert_holder_turn_ended!(ws, "coalesced-assignment", 1)
+  end
+
   defp assert_holder_turn_ended!(ws, assignment_id, after_seq) do
     deadline = System.monotonic_time(:millisecond) + 5_000
 
-    await = fn recur ->
+    await = fn recur, current_ws ->
       remaining = deadline - System.monotonic_time(:millisecond)
       assert remaining > 0, "holder turn settlement deadline"
-      {:ok, {:text, raw}, _} = WS.recv(ws, remaining)
+      {:ok, {:text, raw}, next_ws} = WS.recv(current_ws, remaining)
 
       case JSON.decode!(raw) do
         %{
@@ -417,11 +436,11 @@ defmodule Tightbeam.FirehoseColdRestartTest do
           :ok
 
         _ ->
-          recur.(recur)
+          recur.(recur, next_ws)
       end
     end
 
-    await.(await)
+    await.(await, ws)
   end
 
   defp dispatch!(plan, port, device, verb, params, extra \\ %{}) do

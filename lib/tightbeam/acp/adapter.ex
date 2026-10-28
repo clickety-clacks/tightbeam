@@ -2040,11 +2040,11 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp record_tool_call(state, sid, %{"sessionUpdate" => kind} = update)
-       when is_binary(sid) and kind in ["tool_call", "tool_call_update"] and
-              state.harness in [:claude, :codex] do
+       when is_binary(sid) and kind in ["tool_call", "tool_call_update"] do
     root_sid = Map.get(state.subagent_roots, sid, sid)
 
-    with %{session_key: session_key, turn_seq: turn_seq} <- state.tool_turns[root_sid],
+    with true <- Harness.records_tool_calls?(state.harness),
+         %{session_key: session_key, turn_seq: turn_seq} <- state.tool_turns[root_sid],
          id when is_binary(id) and id != "" <- update["toolCallId"] do
       key = {root_sid, id}
       pending = Map.get(state.pending_tool_calls, key, %{})

@@ -3,7 +3,18 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
   import ExUnit.Assertions
   alias Tightbeam.ClientE2E.WS
   alias Tightbeam.{ConditionFacts, Devices, Dispatch, Gateway, Harness, Org, Placement}
-  alias Tightbeam.{Projection, ReadMarkers, StateResources, SubagentMarkers, Toplines, Wakes}
+
+  alias Tightbeam.{
+    Ledger,
+    Projection,
+    ReadMarkers,
+    StateResources,
+    SubagentMarkers,
+    ToolCalls,
+    Toplines,
+    Wakes
+  }
+
   alias Tightbeam.Firehose.{Hub, Rebuild, Registry}
   alias Tightbeam.FirehoseAcceptanceFixture, as: Fixture
   @a4_replay_seed {7_913, 10_007, 65_537}
@@ -343,6 +354,61 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
 
     assert fresh_harness == harness_notice["payload"]
 
+    {:appended, tool_prompt} =
+      Projection.append(fixture.db, %{
+        session_key: main.session_key,
+        role: "user",
+        sender: "user:#{fixture.user_id}",
+        content: "Exercise tool-call and transition rebuilds."
+      })
+
+    {:ok, tool_turn} =
+      Ledger.enqueue(fixture.db, %{
+        session_key: main.session_key,
+        message_id: tool_prompt.id,
+        origin: "user:#{fixture.user_id}",
+        prompt: tool_prompt.content
+      })
+
+    tool_session_notice =
+      receive_classes(fixture.hub, %{}, MapSet.new(["session.updated"]))["session.updated"]
+
+    assert tool_session_notice["payload"] == assert_a4_fresh!(fixture, tool_session_notice)
+
+    notices =
+      capture_classes(fixture, notices, ["tool_call.started"], fn ->
+        assert {:ok, :started} =
+                 ToolCalls.observe(
+                   fixture.db,
+                   main.session_key,
+                   tool_turn,
+                   "inventory-running-call",
+                   ToolCalls.normalize_notification(%{
+                     "title" => "Read",
+                     "status" => "in_progress"
+                   }),
+                   %{},
+                   nil
+                 )
+      end)
+
+    notices =
+      capture_classes(fixture, notices, ["tool_call.ended", "transition.recorded"], fn ->
+        assert {:ok, :ended} =
+                 ToolCalls.observe(
+                   fixture.db,
+                   main.session_key,
+                   tool_turn,
+                   "inventory-compaction-call",
+                   ToolCalls.normalize_notification(%{
+                     "title" => "Compact",
+                     "status" => "completed"
+                   }),
+                   %{},
+                   "100/200 tokens"
+                 )
+      end)
+
     notices =
       capture_classes(fixture, notices, ["session.updated"], fn ->
         updated = Org.rename(fixture.db, main.session_key, "A4 authoritative rebuild")
@@ -361,18 +427,20 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
     assert Registry.fetch("prod.fired") == :error
 
     # The class inventory above has one representative per Registry class.
-    # Assignment and attest writes also commit distinct transcript messages;
+    # Assignment and attest writes also commit distinct transcript messages,
+    # and enqueueing the tool turn commits another session update;
     # include them in the socket model and replay proof instead of counting
     # classes as frames or dropping legitimate messages from the expected state.
     notices =
       Map.merge(notices, %{
         "assignment marker" => assignment_notice,
-        "attest marker" => attest_notices["message.created"]
+        "attest marker" => attest_notices["message.created"],
+        "tool turn session" => tool_session_notice
       })
 
-    # This notice predates the rename and was checked against its commit-time
-    # rebuild above; the final database row has since advanced one version.
-    for {class, notice} <- Map.delete(notices, "session.harness_changed") do
+    # These notices predate the rename and were checked against their commit-time
+    # rebuilds above; the final database row has since advanced.
+    for {class, notice} <- Map.drop(notices, ["session.harness_changed", "tool turn session"]) do
       assert {:ok, fresh} =
                Rebuild.fetch(fixture.db, notice["class"], notice["refs"], fixture.user_id, true)
 
