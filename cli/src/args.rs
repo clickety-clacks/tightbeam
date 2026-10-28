@@ -3454,7 +3454,12 @@ mod tests {
     #[test]
     fn harness_process_operator_command_lists_launches() {
         assert_eq!(
-            parse(strings(&["harness-process", "list", "--as-user", "sample-user"])),
+            parse(strings(&[
+                "harness-process",
+                "list",
+                "--as-user",
+                "sample-user"
+            ])),
             Ok(Command::HarnessProcesses {
                 identity: Identity::User("sample-user".to_owned()),
             })
@@ -3945,7 +3950,13 @@ mod tests {
 
         // No session named.
         assert_eq!(
-            tune(&["tune", "--model", "claude-fable-5", "--as-user", "sample-user"]),
+            tune(&[
+                "tune",
+                "--model",
+                "claude-fable-5",
+                "--as-user",
+                "sample-user"
+            ]),
             Err(TUNE_USAGE.to_owned())
         );
 
@@ -4705,7 +4716,13 @@ mod tests {
     fn reopen_assignment_requires_an_id_and_a_reason() {
         for args in [
             strings(&["reopen-assignment", "--as-user", "sample-user"]),
-            strings(&["reopen-assignment", "asg_1", "asg_2", "--as-user", "sample-user"]),
+            strings(&[
+                "reopen-assignment",
+                "asg_1",
+                "asg_2",
+                "--as-user",
+                "sample-user",
+            ]),
             strings(&["reopen-assignment", "asg_1", "--as-user", "sample-user"]),
         ] {
             assert_eq!(
@@ -5441,7 +5458,12 @@ mod tests {
                 "--as-user",
                 "sample-user",
             ]),
-            strings(&["topline-placement-list", "--history", "--as-user", "sample-user"]),
+            strings(&[
+                "topline-placement-list",
+                "--history",
+                "--as-user",
+                "sample-user",
+            ]),
         ] {
             assert!(parse(args).unwrap_err().contains("does not accept"));
         }

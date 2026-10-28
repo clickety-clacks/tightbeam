@@ -3617,7 +3617,13 @@ mod tests {
             r#"{"asUser":"sample-user","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null}}"#
         );
         assert_eq!(
-            body(&["breathing", "assignment", "asg_1", "--as-user", "sample-user"]),
+            body(&[
+                "breathing",
+                "assignment",
+                "asg_1",
+                "--as-user",
+                "sample-user"
+            ]),
             r#"{"asUser":"sample-user","verb":"breathing","params":{"targetKind":"assignment","targetId":"asg_1"}}"#
         );
         assert_eq!(
@@ -3870,7 +3876,13 @@ mod tests {
     #[test]
     fn builds_byte_exact_config_bodies() {
         assert_eq!(
-            body(&["config", "get", "default-archetype", "--as-user", "sample-user"]),
+            body(&[
+                "config",
+                "get",
+                "default-archetype",
+                "--as-user",
+                "sample-user"
+            ]),
             r#"{"asUser":"sample-user","verb":"config","params":{"action":"get","setting":"default-archetype"}}"#
         );
         assert_eq!(
@@ -3885,7 +3897,13 @@ mod tests {
             r#"{"asUser":"sample-user","verb":"config","params":{"action":"set","setting":"default-archetype","value":"coder"}}"#
         );
         assert_eq!(
-            body(&["config", "get", "default-priority", "--as-user", "sample-user"]),
+            body(&[
+                "config",
+                "get",
+                "default-priority",
+                "--as-user",
+                "sample-user"
+            ]),
             r#"{"asUser":"sample-user","verb":"config","params":{"action":"get","setting":"default-priority"}}"#
         );
         assert_eq!(
@@ -4010,7 +4028,13 @@ mod tests {
                 r#"{"asUser":"sample-user","verb":"identity-status","params":{}}"#,
             ),
             (
-                &["identity", "apply", "agent:coder:app", "--as-user", "sample-user"][..],
+                &[
+                    "identity",
+                    "apply",
+                    "agent:coder:app",
+                    "--as-user",
+                    "sample-user",
+                ][..],
                 r#"{"asUser":"sample-user","verb":"identity-apply","params":{"all":false,"sessionKey":"agent:coder:app"}}"#,
             ),
             (
