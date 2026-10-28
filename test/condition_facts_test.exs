@@ -561,6 +561,7 @@ defmodule Tightbeam.ConditionFactsTest do
         )
 
       fire = Task.async(fn -> Wakes.fire_due(ctx.scheduler) end)
+
       retire =
         Task.async(fn -> Org.retire(ctx.db, target.session_key, "user:sample-user", 1_000) end)
 
