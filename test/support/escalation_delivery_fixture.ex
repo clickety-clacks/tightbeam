@@ -884,7 +884,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
 
   ## Helpers — closure law
 
-+  @sinks %{
+  @sinks %{
     {:deliver_prompt, 4} => "Gateway.deliver_prompt/4",
     {:deliver_prompt_in_txn, 5} => "Gateway.deliver_prompt_in_txn/5",
     {:notify_session, 4} => "Gateway.notify_session/4",
