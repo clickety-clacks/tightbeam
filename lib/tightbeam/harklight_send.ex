@@ -32,7 +32,8 @@ defmodule Tightbeam.HarklightSend do
       {:error, {:invalid_harklight_send, message}} ->
         %{code: "invalid_harklight_send", message: message}
 
-      {:error, reason} -> %{code: reason}
+      {:error, reason} ->
+        %{code: reason}
     end
   end
 
@@ -136,8 +137,7 @@ defmodule Tightbeam.HarklightSend do
   end
 
   defp invalid_parameter(kind, parameter) do
-    {:error,
-     {:invalid_harklight_send, "#{kind} parameter: #{parameter_name(parameter)}"}}
+    {:error, {:invalid_harklight_send, "#{kind} parameter: #{parameter_name(parameter)}"}}
   end
 
   defp parameter_name(:harklight_session), do: "harklightSession"
