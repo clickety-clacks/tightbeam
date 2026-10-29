@@ -3630,7 +3630,7 @@ fn parse_with_optional_catalog(
             let normalized_turn_seq = turn_seq
                 .parse::<i64>()
                 .map(|value| value.to_string())
-                .ok_or_else(|| "--seq must be a positive integer".to_owned())?;
+                .map_err(|_| "--seq must be a positive integer".to_owned())?;
 
             Ok(Command::SettleTurn {
                 identity: identity(flags)?,
