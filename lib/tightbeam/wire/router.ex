@@ -49,6 +49,8 @@ defmodule Tightbeam.Wire.Router do
 
   use Plug.Router
 
+  @websocket_read_timeout :infinity
+
   alias Tightbeam.{
     Assets,
     CliCompatibility,
@@ -238,7 +240,11 @@ defmodule Tightbeam.Wire.Router do
     if Plug.Conn.get_req_header(conn, "upgrade") == ["websocket"] and
          conn.query_params["protocolVersion"] == "2" do
       conn = Tightbeam.Wire.ResponseObservationAdapter.unwrap(conn)
-      WebSockAdapter.upgrade(conn, ChangeSocket, deps(conn), max_frame_size: 2 * 1024 * 1024)
+
+      WebSockAdapter.upgrade(conn, ChangeSocket, deps(conn),
+        max_frame_size: 2 * 1024 * 1024,
+        timeout: @websocket_read_timeout
+      )
     else
       Plug.Conn.send_resp(conn, 426, "")
     end
@@ -247,7 +253,11 @@ defmodule Tightbeam.Wire.Router do
   defp upgrade_socket(conn) do
     if Plug.Conn.get_req_header(conn, "upgrade") == ["websocket"] do
       conn = Tightbeam.Wire.ResponseObservationAdapter.unwrap(conn)
-      WebSockAdapter.upgrade(conn, Socket, deps(conn), max_frame_size: 2 * 1024 * 1024)
+
+      WebSockAdapter.upgrade(conn, Socket, deps(conn),
+        max_frame_size: 2 * 1024 * 1024,
+        timeout: @websocket_read_timeout
+      )
     else
       error(conn, 404, "not_found")
     end
