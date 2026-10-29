@@ -80,6 +80,7 @@ defmodule Tightbeam.RetireOwnershipTest do
 
     assert %{deleted_session_key: "process-target"} =
              retire(ctx, "process:cron", {:process, "cron"}, "process-target")
+
     assert Org.get(ctx.db, "process-target").state == "retired"
   end
 
