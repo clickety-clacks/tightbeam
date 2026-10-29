@@ -207,11 +207,23 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
           type: "subscribe",
           protocolVersion: 2,
           subscriptionId: "observer",
-          filters: %{}
+          filters: %{classes: ["session."]}
         })
 
-        {reply, socket} = recv_frame(socket)
-        assert reply == %{"type" => "subscription_ready", "subscriptionId" => "observer"}
+        {ready, socket} = recv_frame(socket)
+        assert ready == %{"type" => "subscription_ready", "subscriptionId" => "observer"}
+
+        Hub.publish(ctx.hub, %{
+          "class" => "session.updated",
+          "refs" => %{"sessionKey" => "foreign"},
+          "payload" => %{"sessionKey" => "foreign", "rowVersion" => 1}
+        })
+
+        {change, socket} = recv_frame(socket)
+        assert change["type"] == "change"
+        assert change["subscriptionId"] == "observer"
+        assert change["class"] == "session.updated"
+        assert change["refs"]["sessionKey"] == "foreign"
       else
         {reply, socket} = recv_frame(socket)
         org_wide_identity? = Map.has_key?(overrides, :sessionKey) and is_nil(overrides.sessionKey)

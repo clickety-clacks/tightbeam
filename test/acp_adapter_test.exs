@@ -231,6 +231,9 @@ defmodule Tightbeam.Acp.AdapterTest do
     "default", "opus[1m]", "claude-fable-5[1m]", "nova[1m]", "sonnet", "haiku",
     "gpt-old", "gpt-new", "gpt-blocking", "gpt-5.6-sol", "orbit-9"
   ];
+  const offeredModelMenu = failMode === "selected-context-absent"
+    ? [...defaultOfferedModels, "opus"]
+    : defaultOfferedModels;
   // Cursor's live grammar, recorded 2026-08-24: a closed enum of decorated
   // wire values whose option name is the public ref; anything else is -32602.
   const cursorWireOptions = [
@@ -253,6 +256,8 @@ defmodule Tightbeam.Acp.AdapterTest do
           return { value, name: "Opus (1M context)", description: "Opus 5" };
         }
         return { value, name: "Opus (1M context)", description: opus5Vocabulary ? "Opus 5 with 1M context" : "Opus 4.8 with 1M context" };
+      case "opus":
+        return { value, name: "Opus 5.5", description: "Opus 5.5" };
       case "sonnet":
         return { value, name: "Sonnet", description: "Sonnet 5" };
       case "haiku":
@@ -315,7 +320,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         capture(m);
         const sid = gateMode !== "none" && gateMode !== "delay-setup" && newCalls === 1 ? "probe-sess" : "sess-1";
         models[sid] = models[sid] || "haiku";
-        offeredModels[sid] = [...defaultOfferedModels];
+        offeredModels[sid] = [...offeredModelMenu];
         if (failMode === "resident-default-context-variant") offeredModels[sid].push("orbit-9[1m]");
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } }), 75);
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
@@ -327,7 +332,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         }
         capture(m);
         models[m.params.sessionId] = failMode === "load-owner" ? "owner-model" : (models[m.params.sessionId] || "haiku");
-        offeredModels[m.params.sessionId] = [...defaultOfferedModels];
+        offeredModels[m.params.sessionId] = [...offeredModelMenu];
         return send({ id: m.id, result: configOptions(m.params.sessionId) });
       }
       case "session/fork": {
@@ -338,7 +343,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         forkCalls += 1;
         const sid = "sess-fork-" + forkCalls;
         models[sid] = models[m.params.sessionId] || "haiku";
-        offeredModels[sid] = [...defaultOfferedModels];
+        offeredModels[sid] = [...offeredModelMenu];
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
       case "session/close": capture(m); return send({ id: m.id, result: {} });
@@ -438,6 +443,16 @@ defmodule Tightbeam.Acp.AdapterTest do
             m.params.configId === "model" &&
             ["claude-opus-5-5", "claude-opus-5-5[1m]"].includes(m.params.value)) {
           models[m.params.sessionId] = "opus[1m]";
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
+        if (failMode === "selected-context-absent" && m.params.configId === "model" &&
+            m.params.value === "claude-opus-5-5[1m]") {
+          models[m.params.sessionId] = "opus";
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
+        if (failMode === "selected-context-absent" && m.params.configId === "model" &&
+            m.params.value === "orbit-9[1m]") {
+          models[m.params.sessionId] = "orbit-9";
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
         if (failMode === "resident-default-context-variant" &&
@@ -2740,14 +2755,11 @@ defmodule Tightbeam.Acp.AdapterTest do
            end)
   end
 
-  test "a default-context candidate refuses a different selected context variant" do
+  test "a Claude candidate records the selected context when none was requested" do
     {adapter, capture_path} =
       start_adapter(harness: :claude, fail_mode: "default-context-variant")
 
-    assert {:error,
-            {:session_prepare_failed,
-             {:runtime_config_mismatch, %Model{family: "claude-fable-5", context: "1m"}},
-             "sess-1", %{status: "verified"}}} =
+    assert {:ok, "sess-1"} =
              Adapter.new_candidate_session(
                adapter,
                Model.new("claude-fable-5"),
@@ -2756,19 +2768,27 @@ defmodule Tightbeam.Acp.AdapterTest do
                "guidance"
              )
 
+    assert {:ok, %Model{family: "claude-fable-5", context: "1m"}} =
+             Adapter.current_model(adapter, "sess-1")
+
     assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and
+               request["configId"] == "model" and request["value"] == "claude-fable-5"
+           end)
+
+    refute Enum.any?(captured_requests(capture_path), fn request ->
              request["method"] == "session/close" and request["sessionId"] == "sess-1"
            end)
   end
 
-  test "a resident switch refuses a variant when the default context was requested" do
+  test "a resident switch records the context selected by the harness" do
     {adapter, capture_path} =
       start_adapter(harness: :codex, fail_mode: "resident-default-context-variant")
 
     assert {:ok, "sess-1"} =
              Adapter.new_session(adapter, Model.new("gpt-5.6-sol"), "/tmp", [], "guidance")
 
-    assert {:error, {:runtime_config_mismatch, %Model{family: "orbit-9", context: "1m"}}} =
+    assert {:ok, "sess-1"} =
              Adapter.switch_model_session(
                adapter,
                "sess-1",
@@ -2780,6 +2800,11 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:ok, %Model{family: "orbit-9", context: "1m"}} =
              Adapter.current_model(adapter, "sess-1")
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and
+               request["configId"] == "model" and request["value"] == "orbit-9"
+           end)
 
     refute Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
   end
@@ -2812,14 +2837,11 @@ defmodule Tightbeam.Acp.AdapterTest do
            end)
   end
 
-  test "an opaque Claude alias refuses a variant when default context was requested" do
+  test "an opaque Claude alias reports its context without requiring a matching request" do
     {adapter, capture_path} =
       start_adapter(harness: :claude, fail_mode: "canonical-opus55-alias")
 
-    assert {:error,
-            {:session_prepare_failed,
-             {:runtime_config_mismatch, %Model{family: "opus", context: "1m"}}, "sess-1",
-             %{status: "verified"}}} =
+    assert {:ok, "sess-1"} =
              Adapter.new_candidate_session(
                adapter,
                Model.new("claude-opus-5-5"),
@@ -2828,8 +2850,98 @@ defmodule Tightbeam.Acp.AdapterTest do
                "guidance"
              )
 
+    assert {:ok, %Model{family: "claude-opus-5-5", context: "1m"}} =
+             Adapter.current_model(adapter, "sess-1")
+
     assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and
+               request["configId"] == "model" and request["value"] == "claude-opus-5-5"
+           end)
+
+    refute Enum.any?(captured_requests(capture_path), fn request ->
              request["method"] == "session/close" and request["sessionId"] == "sess-1"
+           end)
+  end
+
+  test "Claude new, load, and fork keep the context selected by the harness" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "canonical-opus55-alias")
+
+    requested = Model.new("claude-opus-5-5")
+    selected = Model.new("claude-opus-5-5", context: "1m")
+
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, requested, "/tmp", [], "guidance")
+    assert {:ok, ^selected} = Adapter.current_model(adapter, "sess-1")
+
+    assert {:ok, ^selected} =
+             Adapter.load_session(adapter, "sess-1", requested, "/tmp", [], "guidance")
+
+    assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
+
+    assert {:ok, "sess-fork-1"} =
+             Adapter.switch_model_session(adapter, "sess-1", requested, "/tmp", [], "guidance")
+
+    assert {:ok, ^selected} = Adapter.current_model(adapter, "sess-fork-1")
+
+    model_writes =
+      captured_requests(capture_path)
+      |> Enum.filter(&(&1["method"] == "session/set_config_option" and &1["configId"] == "model"))
+
+    assert Enum.map(model_writes, & &1["value"]) ==
+             ["claude-opus-5-5", "claude-opus-5-5", "claude-opus-5-5"]
+  end
+
+  test "Claude new, load, and fork report no context when the selected option has none" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "selected-context-absent")
+
+    requested = Model.new("claude-opus-5-5", context: "1m")
+    selected = Model.new("claude-opus-5-5")
+
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, requested, "/tmp", [], "guidance")
+    assert {:ok, ^selected} = Adapter.current_model(adapter, "sess-1")
+
+    assert {:ok, ^selected} =
+             Adapter.load_session(adapter, "sess-1", requested, "/tmp", [], "guidance")
+
+    assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
+
+    assert {:ok, "sess-fork-1"} =
+             Adapter.switch_model_session(adapter, "sess-1", requested, "/tmp", [], "guidance")
+
+    assert {:ok, ^selected} = Adapter.current_model(adapter, "sess-fork-1")
+
+    model_writes =
+      captured_requests(capture_path)
+      |> Enum.filter(&(&1["method"] == "session/set_config_option" and &1["configId"] == "model"))
+
+    assert Enum.map(model_writes, & &1["value"]) ==
+             ["claude-opus-5-5[1m]", "claude-opus-5-5[1m]", "claude-opus-5-5[1m]"]
+  end
+
+  test "a resident switch reports no context when the selected option has none" do
+    {adapter, capture_path} =
+      start_adapter(harness: :codex, fail_mode: "selected-context-absent")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("gpt-5.6-sol"), "/tmp", [], "guidance")
+
+    assert {:ok, "sess-1"} =
+             Adapter.switch_model_session(
+               adapter,
+               "sess-1",
+               Model.new("orbit-9", context: "1m"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert {:ok, %Model{family: "orbit-9", context: nil}} =
+             Adapter.current_model(adapter, "sess-1")
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and
+               request["configId"] == "model" and request["value"] == "orbit-9[1m]"
            end)
   end
 
