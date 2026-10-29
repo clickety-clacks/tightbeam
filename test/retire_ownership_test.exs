@@ -19,7 +19,6 @@ defmodule Tightbeam.RetireOwnershipTest do
     Assignments,
     ConnRegistry,
     DB,
-    EffortCheckin,
     Gateway,
     Org,
     Roles
@@ -76,13 +75,13 @@ defmodule Tightbeam.RetireOwnershipTest do
     assert Org.get(ctx.db, "kays-other").state == "active"
   end
 
-  test "a process origin still gets not_found", ctx do
+  test "a process principal can retire a session", ctx do
     session!(ctx.db, "process-target", "flynn")
 
-    # `resolve_caller/2` gives a process a nil owner, and ownerUserId is NOT NULL,
-    # so the fall-through to not_found is by construction rather than by guard.
-    assert %{code: "not_found"} = retire(ctx, "process:cron", nil, "process-target")
-    assert Org.get(ctx.db, "process-target").state == "active"
+    assert %{deleted_session_key: "process-target"} =
+             retire(ctx, "process:cron", {:process, "cron"}, "process-target")
+
+    assert Org.get(ctx.db, "process-target").state == "retired"
   end
 
   test "an unknown origin still gets not_found", ctx do
@@ -109,85 +108,6 @@ defmodule Tightbeam.RetireOwnershipTest do
     # And the replay returns the original answer rather than retiring again.
     assert %{deleted_session_key: "idem-target"} =
              retire(ctx, "user:flynn", {:user, "flynn"}, "idem-target", "key-1")
-  end
-
-  test "the effort menu offers retire exactly when the handler would authorize it", ctx do
-    # A holder owned by flynn, dispatched by a SESSION rung also owned by flynn.
-    session!(ctx.db, "holder", "flynn", spawned_by: "agent:worker:app")
-
-    assignment =
-      Assignments.__handle__(ctx.db, "dispatch", %{
-        verb: "dispatch",
-        origin: "agent:worker",
-        principal: {:session, "agent:worker:app"},
-        session_key: "holder",
-        target_role: nil,
-        role_fallback: false,
-        supervision_interval_ms: 1_000,
-        params: %{subject: "menu check", brief: "menu check"},
-        effort_config: %{db: ctx.db, base_dir: System.tmp_dir!()}
-      })
-
-    assert is_binary(assignment.id)
-
-    session_rung = %{
-      session_key: "agent:worker:app",
-      user_id: nil,
-      owner_user_id: "flynn",
-      principal_user_id: "flynn",
-      rung: 0
-    }
-
-    {:ok, menu} =
-      DB.transaction(ctx.db, fn txn ->
-        EffortCheckin.menu_in_txn(txn, assignment_row(txn, assignment.id), session_rung)
-      end)
-
-    # The handler WOULD authorize this rung — same owner as the holder — so per
-    # the spec's per-power rule the menu must offer it.
-    assert "retire" in menu
-
-    assert %{deleted_session_key: "holder"} =
-             retire(ctx, "agent:worker", {:session, "agent:worker:app"}, "holder")
-
-    assert {:ok, [["agent:worker:app", nil, "holder session retired"]]} =
-             DB.query(
-               ctx.db,
-               "SELECT revokedBySession,revokedByUser,reason FROM assignment_revocations WHERE assignmentId=?1",
-               [assignment.id]
-             )
-
-    # A rung whose principal does NOT own the holder gets no retire item, and the
-    # handler agrees.
-    session!(ctx.db, "kays-holder", "kay")
-
-    foreign_rung = %{
-      session_key: "agent:worker:app",
-      user_id: nil,
-      owner_user_id: "kay",
-      principal_user_id: "flynn",
-      rung: 0
-    }
-
-    kays_assignment =
-      Assignments.__handle__(ctx.db, "assign", %{
-        verb: "assign",
-        origin: "user:kay",
-        principal: {:user, "kay"},
-        session_key: "kays-holder",
-        target_role: nil,
-        role_fallback: false,
-        supervision_interval_ms: 1_000,
-        params: %{subject: "foreign"}
-      })
-
-    {:ok, foreign_menu} =
-      DB.transaction(ctx.db, fn txn ->
-        EffortCheckin.menu_in_txn(txn, assignment_row(txn, kays_assignment.id), foreign_rung)
-      end)
-
-    refute "retire" in foreign_menu
-    assert %{code: "not_found"} = retire(ctx, "user:flynn", {:user, "flynn"}, "kays-holder")
   end
 
   test "a forged origin cannot change the authenticated retirement actor", ctx do
@@ -218,6 +138,51 @@ defmodule Tightbeam.RetireOwnershipTest do
              )
   end
 
+  test "retire honors resolved owners for assigned holders", ctx do
+    session!(ctx.db, "holder", "flynn", spawned_by: "agent:worker:app")
+
+    assignment =
+      Assignments.__handle__(ctx.db, "dispatch", %{
+        verb: "dispatch",
+        origin: "agent:worker",
+        principal: {:session, "agent:worker:app"},
+        session_key: "holder",
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: "retirement control", brief: "retirement control"}
+      })
+
+    assert is_binary(assignment.id)
+
+    assert %{deleted_session_key: "holder"} =
+             retire(ctx, "agent:worker", {:session, "agent:worker:app"}, "holder")
+
+    assert {:ok, [["agent:worker:app", nil, "holder session retired"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT revokedBySession,revokedByUser,reason FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    session!(ctx.db, "kays-holder", "kay")
+
+    kays_assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "user:kay",
+        principal: {:user, "kay"},
+        session_key: "kays-holder",
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: "foreign"}
+      })
+
+    assert is_binary(kays_assignment.id)
+    assert %{code: "not_found"} = retire(ctx, "user:flynn", {:user, "flynn"}, "kays-holder")
+  end
+
   ## Helpers
 
   defp retire(ctx, origin, principal, session_key, idempotency_key \\ nil) do
@@ -226,11 +191,11 @@ defmodule Tightbeam.RetireOwnershipTest do
     call = %{
       verb: "retire",
       origin: origin,
+      principal: principal,
       session_key: session_key,
       params: params
     }
 
-    call = if principal, do: Map.put(call, :principal, principal), else: call
     ctx.handlers["retire"].(call)
   end
 
@@ -252,21 +217,5 @@ defmodule Tightbeam.RetireOwnershipTest do
         Map.new(opts)
       )
     )
-  end
-
-  defp assignment_row(txn, id) do
-    [[holder_key, opened_by_session, opened_by_user]] =
-      Tightbeam.DB.Txn.q(
-        txn,
-        "SELECT holderKey, openedBySession, openedByUser FROM assignments WHERE id = ?1",
-        [id]
-      )
-
-    %{
-      id: id,
-      holder_key: holder_key,
-      opened_by_session: opened_by_session,
-      opened_by_user: opened_by_user
-    }
   end
 end

@@ -217,6 +217,15 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert is_nil(observer_state.credential_digest)
     assert observer_state.subscriptions == %{"observer" => %{"classes" => ["work_item."]}}
 
+    Hub.publish(ctx.hub, notice(ctx, "wi_observer_delivery"))
+    assert_receive {:firehose_notice, notice_frame}
+
+    assert {:push, {:text, notice_bytes}, observer_state} =
+             ChangeSocket.handle_info({:firehose_notice, notice_frame}, observer_state)
+
+    assert %{"class" => "work_item.updated", "subscriptionId" => "observer"} =
+             JSON.decode!(notice_bytes)
+
     assert {:ok, ^observer_state} =
              inbound(%{"type" => "auth", "token" => "ignored-after-observer"}, observer_state)
 
@@ -227,6 +236,110 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert heartbeat_state.principal_kind == :observer
     assert heartbeat_state.subscriptions == observer_state.subscriptions
     ChangeSocket.terminate(:normal, heartbeat_state)
+  end
+
+  test "credentialless observer remains connected on session retirement without owner", ctx do
+    {:push, {:text, ready}, observer_state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "protocolVersion" => 2,
+          "subscriptionId" => "observer-retirement",
+          "filters" => %{"classes" => ["session.retired"]}
+        },
+        ctx.state
+      )
+
+    assert JSON.decode!(ready)["subscriptionId"] == "observer-retirement"
+
+    Hub.publish(ctx.hub, %{
+      "class" => "session.retired",
+      "refs" => %{"sessionKey" => "agent:retired"},
+      "payload" => %{"sessionKey" => "agent:retired"}
+    })
+
+    assert_receive {:firehose_notice, notice}
+    assert notice["class"] == "session.retired"
+
+    assert {:push, {:text, retired}, live_state} =
+             ChangeSocket.handle_info({:firehose_notice, notice}, observer_state)
+
+    assert JSON.decode!(retired)["class"] == "session.retired"
+    assert live_state.phase == :live
+    assert live_state.principal_kind == :observer
+    refute_receive :firehose_revoked
+    ChangeSocket.terminate(:normal, live_state)
+  end
+
+  test "a non-admin session receives another session's active-turn snapshot", ctx do
+    Devices.add_user(ctx.db, "other", false)
+
+    subscriber =
+      Org.create(ctx.db, %{
+        session_key: "agent:other-subscriber",
+        display_name: "Other subscriber",
+        owner_user_id: "other",
+        origin: "user:other",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    target =
+      Org.create(ctx.db, %{
+        session_key: "agent:flynn-target",
+        display_name: "Flynn target",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO turns " <>
+                 "(sessionKey, messageId, origin, prompt, status, createdAt, startedAt) " <>
+                 "VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6)",
+               [target.session_key, "target-message", "user:flynn", "active prompt", 1, 1]
+             )
+
+    {:push, {:text, auth}, state} =
+      inbound(%{"type" => "auth", "token" => subscriber.cli_token}, ctx.state)
+
+    assert JSON.decode!(auth)["success"]
+    assert state.principal_kind == :session
+    assert state.is_admin == false
+
+    {:push, {:text, ready}, state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "protocolVersion" => 2,
+          "subscriptionId" => "other-session-turn",
+          "filters" => %{
+            "sessionKey" => target.session_key,
+            "classes" => ["turn."]
+          }
+        },
+        state
+      )
+
+    assert JSON.decode!(ready)["subscriptionId"] == "other-session-turn"
+    assert_receive {:firehose_notice, notice}
+    assert notice["class"] == "turn.started"
+    assert notice["refs"]["sessionKey"] == target.session_key
+
+    assert {:push, {:text, turn_event}, state} =
+             ChangeSocket.handle_info({:firehose_notice, notice}, state)
+
+    assert JSON.decode!(turn_event)["class"] == "turn.started"
+    ChangeSocket.terminate(:normal, state)
   end
 
   test "an unusable first auth frame continues as an observer", ctx do
@@ -485,55 +598,57 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert_receive {:firehose_notice, %{"refs" => %{"workItemId" => "wi_after"}, "seq" => 1}}
   end
 
-  test "the per-connection queue is exact and overflow closes once", ctx do
+  test "a matching event over the byte backlog closes the connection with retryable code", ctx do
     {:push, {:text, _auth}, state} =
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
 
-    :ok = Hub.subscribe(ctx.hub, self(), "work", %{})
+    :ok = Hub.subscribe(ctx.hub, self(), "work", %{"classes" => ["work_item."]})
 
-    Enum.each(1..1_500, fn index ->
-      Hub.publish(ctx.hub, notice(ctx, "wi_#{index}"))
-      # Drain ingress so this test isolates the per-connection delivery queue.
-      Hub.sequence(ctx.hub, self())
-    end)
+    Hub.publish(ctx.hub, %{
+      "class" => "work_item.updated",
+      "refs" => %{"workItemId" => "large-item"},
+      "payload" => %{"id" => String.duplicate("x", 65 * 1_024 * 1_024)}
+    })
 
-    assert %{in_flight: true, overflowed: true, queued: 0, seq: 1_001} =
-             Hub.connection_stats(ctx.hub, self())
-
-    assert_receive {:firehose_notice, %{"seq" => 1}}
-    assert_receive :firehose_overflow
-    refute_receive :firehose_overflow, 50
-    refute_receive {:firehose_notice, _notice}, 50
+    assert Hub.sequence(ctx.hub, self()) == 1
+    assert %{overflowed: true, seq: 1} = Hub.connection_stats(ctx.hub, self())
+    assert_receive :firehose_overflow, 5_000
+    refute_receive {:firehose_notice, _notice}
 
     assert {:stop, :normal, 4008, ^state} =
              ChangeSocket.handle_info(:firehose_overflow, state)
+
+    ChangeSocket.terminate(:normal, state)
   end
 
-  test "ingress overflow closes the authenticated socket with retryable code", ctx do
+  test "more than 1,000 matching notices fit below the byte backlog limit", ctx do
     {:push, {:text, _auth}, state} =
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
 
+    :ok = Hub.subscribe(ctx.hub, self(), "work", %{"classes" => ["work_item."]})
     :ok = :sys.suspend(ctx.hub)
 
     try do
       Enum.each(1..1_500, fn index ->
-        id = "overflow-#{index}"
+        id = "work-#{index}"
 
         Hub.publish(ctx.hub, %{
           "class" => "work_item.updated",
-          "refs" => %{"workItemId" => id, "ownerUserId" => ctx.device.user_id},
-          "payload" => %{"id" => id, "ownerUserId" => ctx.device.user_id}
+          "refs" => %{"workItemId" => id},
+          "payload" => %{"id" => id}
         })
       end)
     after
       :ok = :sys.resume(ctx.hub)
     end
 
-    assert_receive :firehose_overflow, 5_000
-    assert is_pid(Process.whereis(ctx.hub))
+    assert Hub.sequence(ctx.hub, self()) == 1_500
+    assert %{overflowed: false, queued: 1_500, seq: 1_500} = Hub.connection_stats(ctx.hub, self())
+    refute_received :firehose_overflow
+    assert_receive {:firehose_notice, %{"seq" => 1}}
+    assert_receive {:firehose_notice, %{"seq" => 1_500}}
 
-    assert {:stop, :normal, 4008, ^state} =
-             ChangeSocket.handle_info(:firehose_overflow, state)
+    ChangeSocket.terminate(:normal, state)
   end
 
   test "gateway shutdown closes change sockets with restarting code", ctx do

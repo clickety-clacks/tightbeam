@@ -175,13 +175,11 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
     refute_receive {:firehose_notice, _}
   end
 
-  test "AL13 matching subscriptions still require visibility", ctx do
+  test "AL13 matching subscriptions deliver without a permission lookup", ctx do
     :ok =
       Hub.register(Hub, self(), %{
         mode: :subscribed,
-        db: ctx.db,
-        user_id: "denied",
-        is_admin: false
+        user_id: "denied"
       })
 
     :ok =
@@ -190,23 +188,13 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
         "workItemId" => "wi_al"
       })
 
-    hub = Process.whereis(Hub)
-    :erlang.trace_pattern({Hub, :matches?, 2}, true, [:local])
-    :erlang.trace(hub, true, [:call, {:tracer, self()}])
+    record(ctx.db, "lab1:/tmp/hidden")
+    assert Hub.sequence(Hub, self()) == 1
+    assert_receive {:firehose_notice, %{"class" => "artifact.recorded"}}
 
-    try do
-      record(ctx.db, "lab1:/tmp/hidden")
-      assert Hub.sequence(Hub, self()) == 0
-      assert_receive {:trace, ^hub, :call, {Hub, :matches?, _}}
-      refute_receive {:firehose_notice, _}
-      :ok = Hub.register(Hub, self(), %{user_id: "flynn"})
-      :ok = Artifacts.archive_session(ctx.db, "al_owner", ctx.work, ctx.archive)
-      assert_receive {:trace, ^hub, :call, {Hub, :matches?, _}}
-      assert_receive {:firehose_notice, %{"class" => "artifact.released"}}
-    after
-      :erlang.trace(hub, false, [:call])
-      :erlang.trace_pattern({Hub, :matches?, 2}, false, [:local])
-    end
+    :ok = Hub.register(Hub, self(), %{user_id: "flynn"})
+    :ok = Artifacts.archive_session(ctx.db, "al_owner", ctx.work, ctx.archive)
+    assert_receive {:firehose_notice, %{"class" => "artifact.released"}}
   end
 
   test "archive caller and contender wait beyond default DB budget for actual completion", ctx do

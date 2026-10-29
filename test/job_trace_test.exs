@@ -63,10 +63,10 @@ defmodule Tightbeam.JobTraceTest do
 
       INSERT INTO wakes
         (wakeId, sessionKey, origin, prompt, dueAt, state, createdAt, firedAt,
-         conditionKind, conditionScope, conditionAfterId, firedBy)
+         conditionKind, conditionScope, conditionAfterId, firedBy, assignmentId)
       VALUES
         ('w_condition', 'holder', 'user:owner', 'condition', 500, 'fired', 100, 100,
-         'quota-recovered', 'asg_direct', 0, 'condition');
+         'quota-recovered', 'asg_direct', 0, 'condition', 'asg_direct');
 
       INSERT INTO wakes
         (wakeId, sessionKey, origin, prompt, dueAt, state, createdAt, firedAt,
@@ -82,21 +82,6 @@ defmodule Tightbeam.JobTraceTest do
         ('dr_trace', 'statute', 'user:owner', 'owner', 'asg_direct', 100, 500,
          'trace-rule', 'trace-action', 'Choose', '{}', 'ruled', 'allow');
       """)
-
-    {:ok, _rows} =
-      DB.query(
-        db,
-        """
-        INSERT INTO effort_checkin_generations
-          (assignmentId, generation, state, baseHorizonMs, multiplier, armedAt,
-           terminalSeqWatermark, holderKey, host, root, baseline, wakeId, evidence)
-        VALUES
-          ('asg_direct', 1, 'probed', 10, 1, 100, 0, 'holder', ?1, '/tmp',
-           '{"status":"available","observation":{"stamp":"/tmp/effort.stamp","prior":"observed","writes":0,"entries":1,"digest":"same"}}',
-           'w_condition', '{"outcome":"zero_effect"}')
-        """,
-        [Tightbeam.Placement.local_host_name()]
-      )
 
     Enum.each([{"asg_direct", 2}, {"asg_bad", 3}, {"asg_review", 4}], fn
       {assignment_id, opened_at} ->
@@ -245,7 +230,7 @@ defmodule Tightbeam.JobTraceTest do
 
     assert %{code: "not_found"} = trace(db, {:user, "other"}, "wi_trace")
     assert %{code: "not_found"} = trace(db, {:session, "other-session"}, "wi_trace")
-    assert %{code: "not_found"} = trace(db, {:process, "cron"}, "wi_trace")
+    assert trace(db, {:process, "cron"}, "wi_trace") == trace
     assert %{code: "not_found"} = trace(db, {:user, "owner"}, "wi_missing")
 
     assert_keys(trace, ~w(assignments timeline workItem)a)
@@ -366,7 +351,6 @@ defmodule Tightbeam.JobTraceTest do
              "wake_scheduled",
              "wake_fired",
              "decision_request",
-             "effort_generation",
              "attest",
              "attest",
              "attest",
@@ -455,9 +439,6 @@ defmodule Tightbeam.JobTraceTest do
 
         "decision_request" ->
           ~w(assignmentId at id ruling state type)a
-
-        "effort_generation" ->
-          ~w(assignmentId at evidence id state type)a
 
         "commit_ref_correction" ->
           ~w(assignmentId at actorKind actorRef cause commitRefs evidenceArtifactId id type verifiedAt)a

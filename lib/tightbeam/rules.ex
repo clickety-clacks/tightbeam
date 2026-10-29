@@ -1390,13 +1390,25 @@ defmodule Tightbeam.Rules do
           raise ArgumentError, "#{path}: [[rule]] must be a non-empty array of tables"
       end
 
+    policy_entries = Map.get(manifest, "policy", [])
+
     policies =
       case Map.fetch(manifest, "policy") do
         {:ok, policies} when is_list(policies) and policies != [] ->
           policies
           |> Enum.with_index(1)
-          |> Enum.map(fn {policy, ordinal} ->
-            {:policy, validate_policy!(path, ordinal, policy, identity_manifest_sha)}
+          |> Enum.flat_map(fn {policy, ordinal} ->
+            if retired_policy?(policy) do
+              require Logger
+
+              Logger.warning(
+                "#{path}: policy #{inspect(Map.get(policy, "name"))} skipped: purpose wait-effort-relief is retired"
+              )
+
+              []
+            else
+              [{:policy, validate_policy!(path, ordinal, policy, identity_manifest_sha)}]
+            end
           end)
 
         :error ->
@@ -1406,11 +1418,17 @@ defmodule Tightbeam.Rules do
           raise ArgumentError, "#{path}: [[policy]] must be a non-empty array of tables"
       end
 
-    if rules == [] and policies == [],
+    only_retired_policies? =
+      rules == [] and policy_entries != [] and Enum.all?(policy_entries, &retired_policy?/1)
+
+    if rules == [] and policies == [] and not only_retired_policies?,
       do: raise(ArgumentError, "#{path}: must contain one or more [[rule]] or [[policy]] tables")
 
     rules ++ policies
   end
+
+  defp retired_policy?(policy),
+    do: is_map(policy) and Map.get(policy, "purpose") == "wait-effort-relief"
 
   defp validate_policy!(path, ordinal, policy, identity_manifest_sha) when is_map(policy) do
     raw_name = Map.get(policy, "name")

@@ -50,6 +50,24 @@ defmodule Tightbeam.AssignmentsTest do
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
+  test "gateway opens and retires with supervision reminders off", ctx do
+    handlers = Gateway.handlers(%{db: ctx.db, supervision_interval_ms: :off, wake_tick_ms: 101})
+
+    assignment = handlers["assign"].(assign_call({:session, "holder"}, "off interval"))
+    assert assignment.id
+
+    retired =
+      handlers["retire"].(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: "holder",
+        params: %{}
+      })
+
+    assert retired.retired_session_keys == ["holder"]
+    assert Org.get(ctx.db, "holder").state == "retired"
+  end
+
   describe "attest notices to assignment openers" do
     test "an opener does not receive a separate notice for its own attest", ctx do
       assignment = handle(ctx, "assign", assign_call({:session, "holder"}, "self-opened"))
@@ -2201,7 +2219,7 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "reopen restores custody, records the close, and rearms every existing monitor", ctx do
+  test "reopen restores custody and records the close without retired effort check-ins", ctx do
     item = create_work_item(ctx, "reopen lifecycle")
     set_delivery_owner(ctx, item.id, "holder")
 
@@ -2271,7 +2289,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert is_binary(deadline_wake_id)
 
-    assert {:ok, [[1, "canceled"], [2, "armed"]]} =
+    assert {:ok, []} =
              DB.query(
                ctx.db,
                "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
@@ -2528,63 +2546,6 @@ defmodule Tightbeam.AssignmentsTest do
     refute Map.has_key?(state, "nextEligibleAt")
   end
 
-  test "Firehose reopening rejects a stale effort arm and rolls back its transaction", ctx do
-    alias Tightbeam.EffortCheckin
-    assignment = handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "generation fence"))
-
-    assert %{assignment: %{state: "closed"}} =
-             handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
-
-    config = %{db: ctx.db, base_dir: System.tmp_dir!(), effort_checkin_horizon_ms: 14_400_000}
-    prepared = EffortCheckin.prepare_reopen_arm(ctx.db, config, assignment.id)
-    assert prepared.prior_generation == 1
-
-    reopened =
-      handle(
-        ctx,
-        "reopen-assignment",
-        reopen_call({:user, "flynn"}, assignment.id, "fresh generation")
-      )
-
-    assert reopened.state == "open"
-    before = reopen_mutation_snapshot(ctx.db, assignment.id)
-
-    assert {:ok, effort_before} =
-             DB.query(
-               ctx.db,
-               "SELECT * FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
-               [assignment.id]
-             )
-
-    assert {:ok, wakes_before} = DB.query(ctx.db, "SELECT * FROM wakes ORDER BY wakeId")
-
-    assert {:error, %RuntimeError{message: "effort generation changed before reopen commit"}} =
-             DB.transaction(ctx.db, fn txn ->
-               DB.Txn.q(txn, "UPDATE assignments SET subject='must roll back' WHERE id=?1", [
-                 assignment.id
-               ])
-
-               EffortCheckin.arm_reopened_in_txn(txn, config, reopened, prepared)
-             end)
-
-    assert reopen_mutation_snapshot(ctx.db, assignment.id) == before
-
-    assert {:ok, ^effort_before} =
-             DB.query(
-               ctx.db,
-               "SELECT * FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
-               [assignment.id]
-             )
-
-    assert {:ok, ^wakes_before} = DB.query(ctx.db, "SELECT * FROM wakes ORDER BY wakeId")
-
-    assert {:ok, [[subject]]} =
-             DB.query(ctx.db, "SELECT subject FROM assignments WHERE id=?1", [assignment.id])
-
-    assert subject == assignment.subject
-    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
-  end
-
   test "Firehose opening publishes once and keyed Dispatch replay emits observation only", ctx do
     alias Tightbeam.Firehose.Hub
     hub = start_supervised!({Hub, name: nil})
@@ -2613,7 +2574,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, [[2]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM events WHERE verb='assign' AND kind='verb'")
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1",
@@ -2725,7 +2686,7 @@ defmodule Tightbeam.AssignmentsTest do
              |> then(&handle(ctx, "attest", &1))
   end
 
-  test "a cannot-proceed block held past inactivity ladder end still releases on its fact",
+  test "a standing cannot-proceed block suppresses reminders and still releases on its fact",
        ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
 
@@ -2742,18 +2703,21 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :release_fact_principal_ref], "agent:holder")
       |> then(&handle(ctx, "attest", &1))
 
-    # Nobody answers: the deadline fires and the climb runs until no rung remains.
-    Enum.reduce_while(1..20, nil, fn _, _ ->
-      if fire_inactivity_wake!(ctx.db, "assignment_inactivity_deadline", blocked.id) or
-           fire_inactivity_wake!(ctx.db, "assignment_inactivity_climb", blocked.id),
-         do: {:cont, nil},
-         else: {:halt, nil}
-    end)
+    assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_deadline", blocked.id)
 
-    assert {:ok, :none} =
+    assert {:ok, {:ok, %{kind: "pending_wake"}}} =
              DB.transaction(ctx.db, fn txn ->
                Supervision.inactivity_deadline_trigger_in_txn(txn, {:assignment, blocked.id})
              end)
+
+    refute fire_inactivity_wake!(ctx.db, "assignment_inactivity_climb", blocked.id)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'",
+               [blocked.id]
+             )
 
     assert Wakes.get(ctx.db, filed.decisionWake.wake_id).state == "pending"
 
@@ -2777,7 +2741,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert Wakes.get(ctx.db, filed.decisionWake.wake_id).state == "canceled"
 
-    assert {:ok, [["cannot_proceed_released", 0]]} =
+    assert {:ok, [["cannot_proceed_released", 1]]} =
              DB.query(
                ctx.db,
                "SELECT reasonKind,actionNeeded FROM wake_cancellations WHERE wakeId=?1",
@@ -2969,14 +2933,12 @@ defmodule Tightbeam.AssignmentsTest do
                filed.decisionRequest.id
              ])
 
-    assert {:ok, [[relief_started]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT reliefStartedAt FROM effort_checkin_generations WHERE assignmentId=?1",
+               "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1",
                [first.id]
              )
-
-    assert is_integer(relief_started)
 
     assert {:ok, fact} =
              DB.transaction(ctx.db, fn txn ->
@@ -3016,20 +2978,17 @@ defmodule Tightbeam.AssignmentsTest do
              |> put_in([:params, :note], "The verdict blocker actually cleared")
              |> then(&handle(ctx, "attest", &1))
 
-    assert {:ok, [["withdrawn", "canceled", nil, excluded]]} =
+    assert {:ok, [["withdrawn", "canceled"]]} =
              DB.query(
                ctx.db,
                """
-               SELECT dr.status,w.state,e.reliefStartedAt,e.reliefExcludedMs
+               SELECT dr.status,w.state
                FROM decision_requests dr
                JOIN wakes w ON w.wakeId=?2
-               JOIN effort_checkin_generations e ON e.assignmentId=?3
                WHERE dr.id=?1
                """,
-               [filed.decisionRequest.id, filed.decisionWake.wake_id, first.id]
+               [filed.decisionRequest.id, filed.decisionWake.wake_id]
              )
-
-    assert excluded >= 0
 
     assert %{assignment: %{state: "closed", outcome: "completed"}} =
              handle(
@@ -3531,7 +3490,7 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "a fired parent escalation does not block opener revocation after reparenting", ctx do
+  test "a pending holder reminder does not block opener revocation after reparenting", ctx do
     main = Org.personal_session_key("flynn")
     session(ctx.db, main, "flynn")
     session(ctx.db, "parent-a", "flynn", %{spawned_by: main})
@@ -3544,6 +3503,7 @@ defmodule Tightbeam.AssignmentsTest do
     opener_work =
       assign_call({:user, "flynn"}, "opener has continuing work", nil, item.id)
       |> Map.put(:session_key, "opener")
+      |> Map.put(:supervision_interval_ms, 1)
       |> then(&handle(ctx, "assign", &1))
 
     blocked_assignment =
@@ -3558,34 +3518,16 @@ defmodule Tightbeam.AssignmentsTest do
     assert Supervision.ladder_target(ctx.db, "opener", 1) == "parent-a"
 
     assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_deadline", opener_work.id)
-    assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_climb", opener_work.id)
 
-    assert [escalation] =
-             Enum.filter(Wakes.list_pending(ctx.db), &(&1.assignment_id == opener_work.id))
+    assert [reminder] =
+             Enum.filter(
+               Wakes.list_pending(ctx.db),
+               &(&1.assignment_id == opener_work.id and &1.consumer == "prompt")
+             )
 
-    assert escalation.session_key == "parent-a"
+    assert reminder.session_key == "opener"
 
-    assert {:ok, {:appended, _, _, _}} =
-             DB.transaction(ctx.db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 escalation.session_key,
-                 escalation.origin,
-                 escalation.prompt,
-                 wake_id: escalation.wake_id,
-                 sender: escalation.origin,
-                 target_gate: escalation,
-                 fire_wake_in_txn: true,
-                 assignment_id: escalation.assignment_id
-               )
-             end)
-
-    assert Wakes.get(ctx.db, escalation.wake_id).state == "fired"
-
-    assert {:ok, [["parent-a"]]} =
-             DB.query(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId=?1", [
-               escalation.wake_id
-             ])
+    assert Wakes.get(ctx.db, reminder.wake_id).state == "pending"
 
     assert {:ok, [["standing"]]} =
              DB.query(
@@ -3604,6 +3546,8 @@ defmodule Tightbeam.AssignmentsTest do
                  idempotency_key: "reparent-after-escalation"
                }
              })
+
+    assert Wakes.get(ctx.db, reminder.wake_id).session_key == "opener"
 
     assert %{outcome: "revoked"} =
              handle(

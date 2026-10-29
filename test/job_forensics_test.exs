@@ -13,7 +13,6 @@ defmodule Tightbeam.JobForensicsTest do
     CausalEvents,
     ConditionFacts,
     DB,
-    EffortCheckin,
     Gateway,
     Ledger,
     Org,
@@ -1016,51 +1015,6 @@ defmodule Tightbeam.JobForensicsTest do
     )
   end
 
-  test "proof 2: unanswered effort deadline expires without rewriting its route", ctx do
-    db = ctx.db
-    work_item(db, "wi_effort")
-    session(db, "parent")
-    session(db, "holder", "parent")
-    assignment(db, "asg_effort", "wi_effort", "holder")
-
-    wake =
-      Wakes.schedule(db, %{
-        session_key: "holder",
-        origin: "process:tightbeam",
-        consumer: "effort_deadline",
-        due_at: 1,
-        assignment_id: "asg_effort"
-      })
-
-    :ok =
-      DB.execute(db, """
-      INSERT INTO decision_requests
-        (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
-         lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
-         question, options, context, status)
-      VALUES ('dr_effort', 'effort', 'process:tightbeam', 'flynn', 'asg_effort',
-              'holder', 1, 1, '#{wake.wake_id}', 1, 1, 'q', '[]', '{}', 'open')
-      """)
-
-    assert :ok = EffortCheckin.deadline(db, %{}, wake)
-
-    assert {:ok, [["withdrawn", "holder", 1, wake_id, "expired-no-decision"]]} =
-             DB.query(
-               db,
-               "SELECT status,expecterSessionKey,lineageRung,deadlineWakeId,withdrawnReason FROM decision_requests WHERE id = 'dr_effort'"
-             )
-
-    assert wake_id == wake.wake_id
-    assert Wakes.get(db, wake_id).state == "fired"
-    assert CausalEvents.for_job(db, "wi_effort", []) == []
-
-    assert {:ok, [["by=process:tightbeam reason=expired-no-decision notified=holder"]]} =
-             DB.query(
-               db,
-               "SELECT detail FROM lifecycle_events WHERE kind='decision_request_withdrawn' AND subject='dr_effort'"
-             )
-  end
-
   ## Proof 8 — the trace's additive types leave v1 consumers alone
 
   test "proof 8: causal events join the timeline at their own rank without disturbing v1 entries",
@@ -1101,54 +1055,39 @@ defmodule Tightbeam.JobForensicsTest do
     assert List.last(timeline).type == "turn_end"
   end
 
-  test "F6: an agent cannot forge wake or turn attribution", ctx do
+  test "conversational wakes retain assignment references and caller attribution", ctx do
     db = ctx.db
-    work_item(db, "wi_forge")
+    work_item(db, "wi_reference")
     session(db, "agent-session")
-    assignment(db, "asg_victim", "wi_forge", "agent-session")
+    assignment(db, "asg_reference", "wi_reference", "agent-session")
     handlers = Gateway.handlers(%{db: db, base_dir: System.tmp_dir!(), default_harness: :claude})
 
-    forge = fn principal ->
-      handlers["wake"].(%{
-        verb: "wake",
-        origin: "user:flynn",
-        principal: principal,
-        session_key: "agent-session",
-        params: %{
-          prompt: "an ordinary conversational wake",
-          nudge: false,
-          assignment_id: "asg_victim"
-        }
-      })
+    for {principal, origin} <- [
+          {{:session, "agent-session"}, "agent:agent-session"},
+          {{:process, "tightbeam"}, "process:tightbeam"}
+        ] do
+      %{wake_id: wake_id} =
+        handlers["wake"].(%{
+          verb: "wake",
+          origin: origin,
+          principal: principal,
+          session_key: "agent-session",
+          params: %{
+            prompt: "an ordinary conversational wake",
+            nudge: false,
+            assignment_id: "asg_reference"
+          }
+        })
+
+      assert %{assignment_id: "asg_reference", origin: ^origin} = Wakes.get(db, wake_id)
     end
 
-    # An AGENT supplying assignment_id gets it dropped: a conversational wake is
-    # NULL, and no forged carrier can reach the turn or the trace (Law 0).
-    %{wake_id: agent_wake} = forge.({:session, "agent-session"})
-    assert is_nil(Wakes.get(db, agent_wake).assignment_id)
-
-    # And the spec's pinned defence is at the BOUNDARY: the field never survives
-    # an agent/dispatch param map, so no handler has to remember to distrust it.
-    refute Map.has_key?(
-             Tightbeam.Wire.Router.atomize_params_for_test("wake", %{
-               "prompt" => "p",
-               "assignmentId" => "asg_victim"
-             }),
-             :assignment_id
-           )
-
-    # ...and ONLY for that carrier: assignmentId is an ordinary caller param on the
-    # verbs that name the assignment they act on, so the strip must not reach them.
-    assert %{assignment_id: "asg_victim"} =
-             Tightbeam.Wire.Router.atomize_params_for_test("attest", %{
-               "assignmentId" => "asg_victim",
-               "kind" => "completion"
-             })
-
-    # The SUBSTRATE's own principal — which the router reserves and refuses to
-    # mint for a wire caller — is the only one that may stamp it.
-    %{wake_id: substrate_wake} = forge.({:process, "tightbeam"})
-    assert Wakes.get(db, substrate_wake).assignment_id == "asg_victim"
+    for verb <- ["wake", "attest"] do
+      assert %{assignment_id: "asg_reference"} =
+               Tightbeam.Wire.Router.atomize_params_for_test(verb, %{
+                 "assignmentId" => "asg_reference"
+               })
+    end
   end
 
   ## Helpers

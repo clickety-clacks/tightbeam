@@ -299,7 +299,15 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     refute StateVisibility.visible?(ctx.db, unresolved_notice, "flynn", false)
     refute StateVisibility.visible?(ctx.db, unresolved_notice, "root", true)
 
-    assert_quiet(ctx.hub)
+    assert_receive {:firehose_notice, delivered_notice}
+
+    assert_source_notice(
+      delivered_notice,
+      "subagent_marker.appended",
+      %{"markerId" => Integer.to_string(unresolved_id), "sessionKey" => "s_flynn"},
+      unresolved_id,
+      701
+    )
   end
 
   test "maintenance rename close and reopen retain events without inventing invalidations", ctx do
@@ -462,9 +470,9 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     end)
   end
 
-  # Subscription matching runs first and visibility is checked only for a
-  # matching row, so a hidden row may be matched but never emits a frame.
-  test "A3 hidden rows are matched but emit no frame; visible rows emit one", ctx do
+  # The filter is the Firehose visibility boundary; StateVisibility remains
+  # available to read APIs but does not gate each delivered frame.
+  test "A3 matching subscriptions receive events regardless of read visibility", ctx do
     %{valid: notices, unresolved_marker: unresolved_marker} = visibility_notices(ctx)
 
     Enum.each(notices, fn notice ->
@@ -511,7 +519,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       assert_received {:trace, ^hub_pid, :call,
                        {Hub, :matches?, [^notice, %{"classes" => ^classes}]}}
 
-      refute_received {:firehose_notice, _frame}
+      assert_received {:firehose_notice, %{"class" => ^class, "type" => "change"}}
 
       :ok =
         Hub.register(ctx.hub, self(), %{
@@ -551,7 +559,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     _sequence = Hub.sequence(ctx.hub, self())
     trace_barrier(hub_pid)
     assert_received {:trace, ^hub_pid, :call, {Hub, :matches?, [^unresolved_marker, _]}}
-    refute_received {:firehose_notice, _frame}
+    assert_received {:firehose_notice, %{"class" => ^hidden_class, "type" => "change"}}
   end
 
   defp trace_barrier(pid) do

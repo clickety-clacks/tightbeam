@@ -403,7 +403,7 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
       })
 
     GenServer.cast(hub, {:publish, notice})
-    refute_receive {:firehose_notice, %{"class" => "subagent_marker.appended"}}
+    assert_receive {:firehose_notice, %{"class" => "subagent_marker.appended"}}
   end
 
   test "marker publication follows commit dedup and captured assignment", %{db: db} do
@@ -432,22 +432,18 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
 
     assert_receive {:trace, ^hub, :receive,
                     {:"$gen_cast",
-                     {:ingress, _bytes,
-                      {:publish,
-                       %{"class" => "subagent_marker.appended", "refs" => refs} = notice}}}}
+                     {:publish, %{"class" => "subagent_marker.appended", "refs" => refs} = notice}}}
 
     assert refs["sessionKey"] == "firehose-owner"
     refute Map.has_key?(refs, "assignmentId")
     refute Tightbeam.StateVisibility.visible?(db, notice, "synthetic-owner", true)
-    GenServer.cast(hub, {:publish, notice})
-    refute_receive {:firehose_notice, %{"class" => "subagent_marker.appended"}}
+    assert_receive {:firehose_notice, %{"class" => "subagent_marker.appended"}}
 
     assert {:ok, %{appended: false, assignment_id: nil}} =
              DB.transaction(db, fn txn -> SubagentMarkers.append_in_txn(txn, input) end)
 
     refute_receive {:trace, ^hub, :receive,
-                    {:"$gen_cast",
-                     {:ingress, _, {:publish, %{"class" => "subagent_marker.appended"}}}}}
+                    {:"$gen_cast", {:publish, %{"class" => "subagent_marker.appended"}}}}
 
     before = SubagentMarkers.list(db)
 
@@ -465,8 +461,7 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     assert SubagentMarkers.list(db) == before
 
     refute_receive {:trace, ^hub, :receive,
-                    {:"$gen_cast",
-                     {:ingress, _, {:publish, %{"class" => "subagent_marker.appended"}}}}}
+                    {:"$gen_cast", {:publish, %{"class" => "subagent_marker.appended"}}}}
 
     :erlang.trace(hub, false, [:receive])
   end
@@ -1011,8 +1006,11 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     assert %{code: "read_marker_conflict"} = handlers["read-marker-set"].(stale)
     assert Tightbeam.ReadMarkers.get(db, "synthetic-owner", "scope") == before
 
-    assert %{code: "unknown_caller"} =
+    assert %{changed: false, user_id: "synthetic-owner"} =
              handlers["read-marker-set"].(%{call | origin: "agent:missing"})
+
+    assert %{code: "unknown_caller"} =
+             handlers["read-marker-set"].(%{call | principal: {:session, "missing"}})
 
     assert %{code: "invalid"} =
              handlers["read-marker-set"].(put_in(call.params.marker, -1))

@@ -101,7 +101,7 @@ end
 db_owner = Process.whereis(DB)
 :ok = Supervisor.terminate_child(Tightbeam.RuntimeSupervisor, Hub)
 :ok = Supervisor.delete_child(Tightbeam.RuntimeSupervisor, Hub)
-{:ok, hub} = Supervisor.start_child(Tightbeam.RuntimeSupervisor, {Hub, name: Hub, queue_limit: 2})
+{:ok, hub} = Supervisor.start_child(Tightbeam.RuntimeSupervisor, {Hub, name: Hub})
 ^db_owner = Process.whereis(DB)
 :ok = DB.assert_base_admitted!(DB, base)
 %{"cliToken" => token} = base |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
@@ -174,12 +174,14 @@ try do
     second = create.("queued")
     third = create.("overflow")
 
-    assert Hub.connection_stats(hub, socket) == %{
-             in_flight: true,
-             overflowed: true,
-             queued: 0,
-             seq: 3
-           }
+    Hub.publish(hub, %{
+      "class" => "work_item.created",
+      "refs" => %{"workItemId" => "oversized"},
+      "payload" => %{"id" => "oversized", "title" => String.duplicate("x", 65 * 1_024 * 1_024)}
+    })
+
+    assert Hub.sequence(hub, socket) == 4
+    assert %{overflowed: true, seq: 4} = Hub.connection_stats(hub, socket)
 
     send(socket, :release)
 

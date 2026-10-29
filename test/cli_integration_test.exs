@@ -182,6 +182,80 @@ defmodule Tightbeam.CliIntegrationTest do
     }
   end
 
+  test "session-connect composes explicit organization identity with automatic session identity",
+       ctx do
+    start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+
+    env = [
+      {"TIGHTBEAM_URL", "http://127.0.0.1:#{ctx.port}"},
+      {"TIGHTBEAM_TOKEN", "tbc_cli_integration"}
+    ]
+
+    args = ["session-connect", "--session", ctx.worker.session_key]
+
+    assert {error, 1} =
+             System.cmd(ctx.binary, args, cd: ctx.outside, env: env, stderr_to_stdout: true)
+
+    assert error =~ "organization credential requires exactly one of --as-user or --as-process"
+    refute_received {:cli_call, _}
+
+    for {cwd, flags, origin, principal} <- [
+          {ctx.workdir, [], "agent:cli-holder", {:session, "cli-holder"}},
+          {ctx.outside, ["--as-user", "flynn"], "user:flynn", {:user, "flynn"}},
+          {ctx.outside, ["--as-process", "external-client"], "process:external-client",
+           {:process, "external-client"}}
+        ] do
+      port =
+        Port.open({:spawn_executable, ctx.binary}, [
+          :binary,
+          :exit_status,
+          :stderr_to_stdout,
+          {:line, 1_048_576},
+          {:cd, cwd},
+          {:args, args ++ flags},
+          {:env,
+           Enum.map(env, fn {key, value} ->
+             {String.to_charlist(key), String.to_charlist(value)}
+           end)}
+        ])
+
+      try do
+        session_connect_frame(port, "ready")
+
+        Port.command(
+          port,
+          JSON.encode!(%{
+            type: "send",
+            protocolVersion: 1,
+            requestId: "identity",
+            content: "identity composition"
+          }) <> "\n"
+        )
+
+        assert %{"wakeId" => wake_id} = session_connect_frame(port, "send.accepted")
+        assert_receive {:cli_call, %{verb: "wake", origin: ^origin, principal: ^principal}}
+        assert %{origin: ^origin} = Wakes.get(ctx.db, wake_id)
+      after
+        if Port.info(port), do: Port.close(port)
+      end
+    end
+  end
+
+  defp session_connect_frame(port, wanted) do
+    receive do
+      {^port, {:data, {:eol, line}}} ->
+        frame = JSON.decode!(line)
+        refute frame["type"] in ["fatal", "send.rejected"], inspect(frame)
+        if frame["type"] == wanted, do: frame, else: session_connect_frame(port, wanted)
+
+      {^port, {:exit_status, status}} ->
+        flunk("session-connect exited with #{status} before #{wanted}")
+    after
+      5_000 -> flunk("session-connect did not emit #{wanted}")
+    end
+  end
+
   test "session reparent crosses the real CLI wire and preserves assignment continuity", ctx do
     run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
 
@@ -230,10 +304,10 @@ defmodule Tightbeam.CliIntegrationTest do
     assert {:ok, [[nil]]} =
              DB.query(ctx.db, "SELECT spawnedBy FROM sessions WHERE sessionKey='cli-holder'")
 
-    assert {:ok, [["flynn", "cli-holder", "open"]]} =
+    assert {:ok, [[nil, "cli-holder", "cli-holder", "open"]]} =
              DB.query(
                ctx.db,
-               "SELECT openedByUser,holderKey,state FROM assignments WHERE id=?1",
+               "SELECT openedByUser,openedBySession,holderKey,state FROM assignments WHERE id=?1",
                [assignment]
              )
 
@@ -1161,7 +1235,11 @@ defmodule Tightbeam.CliIntegrationTest do
 
     {foreign_output, foreign_status} =
       System.cmd(ctx.binary, cancel_args.(foreign.session_key),
-        cd: owner_workdir,
+        cd: ctx.outside,
+        env: [
+          {"TIGHTBEAM_URL", "http://127.0.0.1:#{ctx.port}"},
+          {"TIGHTBEAM_TOKEN", "tbc_cli_integration"}
+        ],
         stderr_to_stdout: true
       )
 
@@ -1215,8 +1293,8 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call,
                     %{
                       verb: "cancel",
-                      origin: "user:owner",
-                      principal: {:user, "owner"},
+                      origin: "agent:cancel-owner-main",
+                      principal: {:session, "cancel-owner-main"},
                       session_key: "cancel-owner-worker",
                       params: %{}
                     }}
@@ -1733,14 +1811,14 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    assert_receive {:cli_call, %{origin: "user:flynn", principal: {:user, "flynn"}}}
+    assert_receive {:cli_call, %{origin: "agent:cli-holder", principal: {:session, "cli-holder"}}}
 
     Org.retire(ctx.db, ctx.session.session_key, "user:flynn", 1_000)
     {refused, 1} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
     assert refused =~ "auth_failed"
   end
 
-  test "session-auth --as-user attributes verdicts to the user and grants admin revocation",
+  test "session-auth --as-user retains agent attribution for verdicts and revocation",
        ctx do
     {:ok, _} =
       DB.query(
@@ -1803,11 +1881,11 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call,
                     %{
                       verb: "attest",
-                      origin: "user:flynn",
-                      principal: {:user, "flynn"}
+                      origin: "agent:cli-holder",
+                      principal: {:session, "cli-holder"}
                     }}
 
-    assert {:ok, [["flynn", nil]]} =
+    assert {:ok, [[nil, "cli-holder"]]} =
              DB.query(
                ctx.db,
                "SELECT byUser, bySession FROM attests WHERE assignmentId = ?1 AND verdictKind = 'tests-passed'",
@@ -1824,10 +1902,10 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert revoked =~ "revoked"
 
-    assert {:ok, [["cli-other", "cli-worker", "flynn", "flynn"]]} =
+    assert {:ok, [["cli-other", "cli-worker", nil, "cli-holder", nil, "cli-holder"]]} =
              DB.query(
                ctx.db,
-               "SELECT a.openedBySession,a.holderKey,a.closedByUser,r.revokedByUser FROM assignments a JOIN assignment_revocations r ON r.assignmentId=a.id WHERE a.id=?1",
+               "SELECT a.openedBySession,a.holderKey,a.closedByUser,a.closedBySession,r.revokedByUser,r.revokedBySession FROM assignments a JOIN assignment_revocations r ON r.assignmentId=a.id WHERE a.id=?1",
                [assignment_id]
              )
 
@@ -1841,8 +1919,8 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call,
                     %{
                       verb: "revoke-assignment",
-                      origin: "user:flynn",
-                      principal: {:user, "flynn"}
+                      origin: "agent:cli-holder",
+                      principal: {:session, "cli-holder"}
                     }}
 
     assert {:ok, [["closed", "revoked"]]} =
@@ -2201,7 +2279,11 @@ defmodule Tightbeam.CliIntegrationTest do
           "--as-user",
           "flynn"
         ],
-        cd: ctx.workdir,
+        cd: ctx.outside,
+        env: [
+          {"TIGHTBEAM_URL", "http://127.0.0.1:#{ctx.port}"},
+          {"TIGHTBEAM_TOKEN", "tbc_cli_integration"}
+        ],
         stderr_to_stdout: true
       )
 
@@ -2969,7 +3051,7 @@ defmodule Tightbeam.CliIntegrationTest do
                [assignment_id]
              )
 
-    assert count_after_replay == generation_count + 1
+    assert count_after_replay == generation_count
 
     {refused_replay, refused_status} =
       System.cmd(
@@ -3572,22 +3654,18 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert_receive {:cli_call, %{verb: "dispatch", params: %{idempotency_key: ^key}}}
 
-    {:ok, [[generation, wake_id]]} =
-      DB.query(
-        ctx.db,
-        "SELECT generation, wakeId FROM effort_checkin_generations WHERE assignmentId = ?1",
-        [assignment_id]
-      )
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE effort_checkin_generations SET state = 'probed' WHERE assignmentId = ?1",
-        [assignment_id]
-      )
-
     request_id = "dr_" <> Tightbeam.Id.uuid4()
     now = System.system_time(:millisecond)
+
+    legacy_deadline =
+      Wakes.schedule(ctx.db, %{
+        session_key: "cli-holder",
+        origin: "process:tightbeam",
+        consumer: "effort_deadline",
+        prompt: nil,
+        due_at: now + 60_000,
+        assignment_id: assignment_id
+      })
 
     {:ok, _} =
       DB.query(
@@ -3598,13 +3676,12 @@ defmodule Tightbeam.CliIntegrationTest do
            lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
            question, options, context, status)
         VALUES (?1, 'effort', 'process:tightbeam', 'flynn', ?2, 'cli-holder',
-                1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open')
+                1, 1, ?3, ?4, ?5, ?6, ?7, ?8, 'open')
         """,
         [
           request_id,
           assignment_id,
-          generation,
-          wake_id,
+          legacy_deadline.wake_id,
           now,
           now + 60_000,
           "Continue or dismiss?",
