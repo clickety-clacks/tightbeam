@@ -440,9 +440,6 @@ defmodule Tightbeam.JobTraceTest do
         "decision_request" ->
           ~w(assignmentId at id ruling state type)a
 
-        "effort_generation" ->
-          ~w(assignmentId at evidence id state type)a
-
         "commit_ref_correction" ->
           ~w(assignmentId at actorKind actorRef cause commitRefs evidenceArtifactId id type verifiedAt)a
 

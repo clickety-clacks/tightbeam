@@ -194,11 +194,13 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     owner_id = ctx.state.user_id
     assert Org.get(ctx.db, dispatch_holder).owner_user_id == owner_id
 
-    assert {:ok, [[revocation_id, terminal_at, dispatch_work_item, ^owner_id]]} =
+    assert {:ok,
+            [[revocation_id, terminal_at, dispatch_work_item, ^owner_id, ^owner_id, nil, nil]]} =
              DB.query(
                ctx.db,
                """
-               SELECT revocation.id,revocation.revokedAt,assignment.workItemId,assignment.openedByUser
+               SELECT revocation.id,revocation.revokedAt,assignment.workItemId,assignment.openedByUser,
+                 revocation.revokedByUser,revocation.revokedBySession,revocation.revokedByProcess
                FROM assignments assignment
                JOIN assignment_revocation_generations generation ON generation.assignmentId=assignment.id
                  AND generation.reopeningId IS (
