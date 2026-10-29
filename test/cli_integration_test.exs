@@ -3147,6 +3147,60 @@ defmodule Tightbeam.CliIntegrationTest do
     assert pairing =~ "supplied together"
   end
 
+  test "real CLI records an out-of-range priority as a gateway denial", ctx do
+    {refusal, status} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-create", "--title", "Priority refusal", "--priority", "9"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0, refusal
+    assert refusal =~ "invalid_priority"
+
+    assert_receive {:cli_call, %{verb: "work-item-create", params: %{priority: 9}}}
+
+    assert {:ok, [[payload]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload FROM events WHERE kind='denied' AND verb='work-item-create' ORDER BY id DESC LIMIT 1"
+             )
+
+    assert JSON.decode!(payload)["code"] == "invalid_priority"
+  end
+
+  test "real CLI records an unknown spawn harness as a gateway denial", ctx do
+    {refusal, status} =
+      System.cmd(
+        ctx.binary,
+        [
+          "spawn",
+          "--display",
+          "Unknown harness",
+          "--harness",
+          "not-supported",
+          "--key",
+          "unknown-harness"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0, refusal
+    assert refusal =~ "unknown_harness"
+
+    assert_receive {:cli_call, %{verb: "spawn", params: %{harness: "not-supported"}}}
+
+    assert {:ok, [[payload]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload FROM events WHERE kind='denied' AND verb='spawn' ORDER BY id DESC LIMIT 1"
+             )
+
+    assert JSON.decode!(payload)["code"] == "unknown_harness"
+  end
+
   test "real CLI composes priority and metadata in one work-item update", ctx do
     sha = String.duplicate("a", 64)
     sha2 = String.duplicate("b", 64)
