@@ -724,19 +724,36 @@ defmodule Tightbeam.Gateway do
     local = Placement.local_host_name()
 
     for module <- Harness.all() do
-      case Tightbeam.Spinup.ensure_ready(config, module.id(), local, db: gateway_db(config)) do
-        :ok ->
-          :ok
+      credential_status = fn provider -> local_credential_status(provider, local) end
 
-        {:error, denial} ->
-          Logger.warning(
-            "adapter provisioning for #{module.wire_name()} on #{local} did not complete: " <>
-              denial.message
-          )
+      unless Harness.optional_unconfigured?(module, credential_status) do
+        case Tightbeam.Spinup.ensure_ready(config, module.id(), local, db: gateway_db(config)) do
+          :ok ->
+            :ok
+
+          {:error, denial} ->
+            Logger.warning(
+              "adapter provisioning for #{module.wire_name()} on #{local} did not complete: " <>
+                denial.message
+            )
+        end
       end
     end
 
     :ok
+  end
+
+  defp local_credential_status(provider, host) do
+    server = Tightbeam.Credentials.server(host)
+
+    try do
+      case GenServer.whereis(server) do
+        nil -> {:unavailable, :credential_server_unavailable}
+        _pid -> Tightbeam.Credentials.status(provider, server)
+      end
+    catch
+      :exit, _reason -> {:unavailable, :credential_server_unavailable}
+    end
   end
 
   defp handler_specs(config) do

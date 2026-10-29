@@ -81,6 +81,50 @@ defmodule Tightbeam.GatewayTest do
              Tightbeam.Gateway.compile_handler_specs!(%{{"valid", []} => handler})
   end
 
+  test "boot skips provisioning an unconfigured optional harness", ctx do
+    host = "testhost"
+    Application.put_env(:tightbeam, :local_host_name, host)
+
+    start_supervised!(
+      {Tightbeam.Credentials,
+       name: Tightbeam.Credentials, base_dir: ctx.catalog_base, machine: host}
+    )
+
+    original_path = System.get_env("PATH")
+    fake_bin = Path.join(ctx.catalog_base, "fake-bin")
+    File.mkdir_p!(fake_bin)
+    npm = Path.join(fake_bin, "npm")
+    File.write!(npm, "#!/bin/sh\nprintf 'registry unavailable\\n' >&2\nexit 1\n")
+    File.chmod!(npm, 0o755)
+    System.put_env("PATH", Enum.join([fake_bin, original_path || ""], ":"))
+
+    on_exit(fn ->
+      if is_binary(original_path),
+        do: System.put_env("PATH", original_path),
+        else: System.delete_env("PATH")
+    end)
+
+    claude_home = Path.join([ctx.catalog_base, "homes", host, "claude"])
+    File.mkdir_p!(claude_home)
+    File.write!(Path.join(claude_home, ".credentials.json"), "{}")
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok =
+                 Tightbeam.Gateway.install_local_adapters(%{
+                   base_dir: ctx.catalog_base,
+                   db: ctx.db
+                 })
+      end)
+
+    assert log =~ "adapter provisioning for claude on #{host} did not complete"
+    refute log =~ "adapter provisioning for pi on #{host} did not complete"
+
+    lifecycle = Tightbeam.EventLog.lifecycle_events(ctx.db)
+    assert Enum.any?(lifecycle, &(&1.subject == "claude@#{host}"))
+    refute Enum.any?(lifecycle, &(&1.subject == "pi@#{host}"))
+  end
+
   # How long a COLD runner Task is allowed to take to reach `Adapter.prompt`.
   #
   # One budget rather than three literals, because the three sites that wait on
