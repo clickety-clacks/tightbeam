@@ -3069,7 +3069,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:persisted_wake, %{origin: "process:satellite-e2e", state: "pending"}}
 
     assert {:ok, [["process:ci", "pending"], ["process:satellite-e2e", "pending"]]} =
-             DB.query(ctx.db, "SELECT origin, state FROM wakes ORDER BY id")
+             DB.query(ctx.db, "SELECT origin, state FROM wakes ORDER BY origin")
   end
 
   test "assign resolves a live-bound role and refuses unusable references", ctx do
