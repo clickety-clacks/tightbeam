@@ -556,21 +556,18 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert live_message["sender"] == detail["item"]["sender"]
   end
 
-  test "fresh transcript history includes rail denials with stable identity and order", ctx do
+  test "fresh transcript history includes rail denials with full identity and order", ctx do
     session = ctx.admin_session
-
-    {:appended, before_message} =
-      Projection.append(ctx.db, %{
-        session_key: session.session_key,
-        role: "user",
-        content: "before refusal",
-        timestamp: 100,
-        attachments: []
-      })
-
     origin = "session:#{session.session_key}"
+    call = %{
+      verb: "assign",
+      origin: origin,
+      principal: {:session, session.session_key},
+      session_key: session.session_key,
+      params: %{}
+    }
 
-    source_payloads =
+    live_samples =
       for index <- 1..2 do
         payload = %{
           "code" => "rule_denied",
@@ -578,6 +575,24 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           "rule" => "sample-rule-#{index}"
         }
 
+        [_, live_frame] = Publisher.denied_notices(call, payload)
+        {payload, live_frame}
+      end
+
+    first_live_timestamp = live_samples |> hd() |> elem(1) |> Map.fetch!("occurredAt")
+    event_timestamp = first_live_timestamp - 1_000
+
+    {:appended, before_message} =
+      Projection.append(ctx.db, %{
+        session_key: session.session_key,
+        role: "user",
+        content: "before refusal",
+        timestamp: event_timestamp - 1_000,
+        attachments: []
+      })
+
+    source_payloads =
+      for {payload, _live_frame} <- live_samples do
         {:ok, event_id} =
           DB.transaction(ctx.db, fn txn ->
             EventLog.append_event_in_txn(
@@ -588,7 +603,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
               session.session_key,
               JSON.encode!(payload),
               {:session, session.session_key},
-              200
+              event_timestamp
             )
           end)
 
@@ -610,7 +625,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           session.session_key,
           JSON.encode!(legacy_payload),
           {:session, session.session_key},
-          250
+          event_timestamp + 500
         )
       end)
 
@@ -625,7 +640,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     all_event_ids = event_ids ++ [legacy_event_id]
 
     assert Enum.map(denials, & &1.id) == all_event_ids
-    assert Enum.map(denials, & &1.ts) == [200, 200, 250]
+    assert Enum.map(denials, & &1.ts) == [
+             event_timestamp,
+             event_timestamp,
+             event_timestamp + 500
+           ]
     assert Enum.map(denials, & &1.verb) == ["assign", "assign", "assign"]
 
     assert Enum.map(denials, & &1.origin) == [origin, origin, origin]
@@ -650,7 +669,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         session_key: session.session_key,
         role: "assistant",
         content: "after refusal",
-        timestamp: 300,
+        timestamp: event_timestamp + 3_000,
         attachments: []
       })
 
@@ -687,7 +706,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
              "legacy-rule"
            ]
 
-    assert Enum.map(rail_denials, & &1["occurredAt"]) == [200, 200, 250]
+    assert Enum.map(rail_denials, & &1["occurredAt"]) == [
+             event_timestamp,
+             event_timestamp,
+             event_timestamp + 500
+           ]
     assert Enum.map(rail_denials, & &1["payload"]) == expected_payloads ++ [legacy_payload]
 
     assert Enum.map(rail_denials, & &1["afterMessageSeq"]) == [
@@ -702,8 +725,23 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
              nil
            ]
 
-    assert Enum.map(rail_denials, & &1["order"]["occurredAt"]) == [200, 200, 250]
+    assert Enum.map(rail_denials, & &1["order"]["occurredAt"]) == [
+             event_timestamp,
+             event_timestamp,
+             event_timestamp + 500
+           ]
     assert Enum.map(rail_denials, & &1["order"]["eventId"]) == all_event_ids
+
+    for {{_source_payload, live_frame}, history_denial} <-
+          Enum.zip(live_samples, Enum.take(rail_denials, 2)) do
+      assert history_denial["sessionKey"] == live_frame["refs"]["sessionKey"]
+      assert history_denial["origin"] == live_frame["refs"]["origin"]
+      assert history_denial["principal"] == live_frame["refs"]["principal"]
+      assert history_denial["verb"] == live_frame["payload"]["verb"]
+      assert history_denial["rule"] == live_frame["payload"]["rule"]
+      assert history_denial["payload"] == Map.delete(live_frame["payload"], "verb")
+      assert abs(history_denial["occurredAt"] - live_frame["occurredAt"]) <= 2_000
+    end
 
     items = Map.new(history["items"], &{&1["id"], &1})
     first_denial_at = hd(rail_denials)["occurredAt"]
