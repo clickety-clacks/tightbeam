@@ -1025,8 +1025,21 @@ defmodule Tightbeam.SessionLane do
             true -> nil
           end
 
+        owner_opened =
+          case principal do
+            {:process, _} ->
+              true
+
+            {:session, key} when is_binary(opened_by_user) ->
+              DB.Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [key]) ==
+                [[opened_by_user]]
+
+            _ ->
+              false
+          end
+
         cond do
-          not is_binary(principal_ref) or opened_by != principal_ref ->
+          not is_binary(principal_ref) or (opened_by != principal_ref and not owner_opened) ->
             {:error, :not_assignment_opener}
 
           assignment_state != "open" ->
@@ -1051,7 +1064,7 @@ defmodule Tightbeam.SessionLane do
             {:error, :turn_owner_changed}
 
           principal != {:user, opened_by_user} and
-              principal != {:session, opened_by_session} ->
+            principal != {:session, opened_by_session} and not owner_opened ->
             {:error, :not_assignment_opener}
 
           true ->
@@ -1068,6 +1081,8 @@ defmodule Tightbeam.SessionLane do
 
   defp assignment_stop_principal_ref({:session, session_key}) when is_binary(session_key),
     do: "session:" <> session_key
+
+  defp assignment_stop_principal_ref({:process, name}), do: "process:" <> name
 
   defp assignment_stop_principal_ref(_), do: nil
 

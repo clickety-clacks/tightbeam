@@ -3,7 +3,7 @@ defmodule Tightbeam.EvidenceSchemaReleaseTest do
 
   alias Tightbeam.{DB, Schema}
 
-  @successor "launch-preparation-evidence-v1-0112"
+  @successor "session-identity-v1-0114"
 
   test "fresh and repeated boot retain the exact release successor and evidence objects" do
     db = start_supervised!({DB, path: ":memory:", name: nil})
@@ -35,6 +35,9 @@ defmodule Tightbeam.EvidenceSchemaReleaseTest do
                db,
                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('artifact_contents','memento_current','memento_history','memento_judgment_index_version','memento_judgments') ORDER BY name"
              )
+
+    assert {:ok, [["events_process_assignment"]]} =
+             DB.query(db, "SELECT name FROM sqlite_master WHERE name='events_process_assignment'")
 
     assert :ok = Schema.ensure_all(db)
     assert {:ok, [[@successor]]} = DB.query(db, "SELECT shape FROM schema_stamp")

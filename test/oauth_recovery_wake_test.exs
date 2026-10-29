@@ -141,6 +141,51 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     refute_received {:lane_started, ^other_main}
   end
 
+  for actor <- [:session, :process] do
+    @actor actor
+    test "onboarding notification owner remains separate from #{@actor} actor", ctx do
+      session_key = "agent:onboarding-caller"
+      create_session(ctx.db, session_key, @owner)
+      start_credentials!(ctx)
+      scheduler = start_real_scheduler!(ctx)
+      onboard = onboard_handler(ctx, scheduler)
+
+      principal =
+        if @actor == :session, do: {:session, session_key}, else: {:process, "automation"}
+
+      owner_data = if @actor == :session, do: "ignored-owner", else: @owner
+
+      caller = %{
+        origin: "process:automation",
+        principal: principal,
+        session_key: nil,
+        params: %{
+          provider: "openai",
+          phase: "begin",
+          kind: "subscription",
+          owner_user_id: owner_data
+        }
+      }
+
+      assert %{status: "ready", owner_user_id: @owner, staging_path: staging, lease_id: lease_id} =
+               onboard.(caller)
+
+      {filename, bytes} = staged_credential("openai", "subscription")
+      File.write!(Path.join(staging, filename), bytes)
+
+      finish = %{
+        caller
+        | params: Map.merge(caller.params, %{phase: "finish", lease_id: lease_id})
+      }
+
+      assert %{status: "onboarded"} = onboard.(finish)
+      assert_receive {:lane_started, @main}
+      assert {:ok, [[wake_id]]} = DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE digest=0")
+      creator = if @actor == :session, do: session_key, else: nil
+      assert_main_wake!(ctx, wake_id, "openai", creator)
+    end
+  end
+
   test "API-key completion for both OAuth providers does not schedule recovery wakes", ctx do
     start_credentials!(ctx)
     scheduler = start_noop_scheduler!()
@@ -157,7 +202,8 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     end
   end
 
-  test "failed finish and process principals never schedule from an untrusted origin", ctx do
+  test "failed finish and ownerless processes do not derive notification ownership from origin",
+       ctx do
     start_credentials!(ctx)
     scheduler = start_noop_scheduler!()
     onboard = onboard_handler(ctx, scheduler)
@@ -182,7 +228,12 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
         }
       })
 
-    assert %{code: "forbidden", message: "admin required"} = result
+    assert %{
+             code: "credential_recovered_wake_failed",
+             credential_recovered: true,
+             wake_scheduled: false
+           } = result
+
     assert_wake_count(ctx.db, 0)
     refute_received {:lane_started, _}
   end

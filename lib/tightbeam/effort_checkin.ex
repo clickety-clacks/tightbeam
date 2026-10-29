@@ -644,7 +644,7 @@ defmodule Tightbeam.EffortCheckin do
         expecter.user_id && assignment.opened_by_user == expecter.user_id ->
           ["revoke-assignment", "dispatch"]
 
-        expecter.user_id && admin_user?(txn, expecter.user_id) ->
+        expecter.principal_user_id && admin_user?(txn, expecter.principal_user_id) ->
           ["revoke-assignment", "dispatch"]
 
         true ->
@@ -1451,9 +1451,21 @@ defmodule Tightbeam.EffortCheckin do
           }
         end
 
-      true ->
+      assignment.opened_by_session ->
         opener = session_in_txn(txn, assignment.opened_by_session)
         route_session(txn, opener.session_key, opener.owner_user_id, 0, assignment.holder_key)
+
+      true ->
+        {_recipient, owner} =
+          Tightbeam.Assignments.process_notification_recipient_in_txn(txn, assignment.id)
+
+        %{
+          session_key: nil,
+          user_id: owner,
+          owner_user_id: owner,
+          principal_user_id: owner,
+          rung: 0
+        }
     end
   end
 
@@ -1743,10 +1755,12 @@ defmodule Tightbeam.EffortCheckin do
 
   defp authorized?({:session, _key}, _request), do: true
   defp authorized?({:user, _user}, _request), do: true
+  defp authorized?({:process, _}, _request), do: true
   defp authorized?(_, _request), do: false
 
   defp actor_id({:session, key}), do: "session:" <> key
   defp actor_id({:user, user}), do: "user:" <> user
+  defp actor_id({:process, name}), do: "process:" <> name
   defp actor_id(_principal), do: nil
 
   defp visible_request?(db, call, request) do

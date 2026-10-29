@@ -132,6 +132,48 @@ defmodule Tightbeam.SessionReparent do
     end
   end
 
+  def handle(db, %{principal: {:process, name}, params: params}) do
+    case DB.transaction(db, fn txn ->
+           child = params[:session_key]
+           parent = params[:parent_session_key]
+           assignment = params[:assignment_id]
+           key = params[:idempotency_key]
+
+           with true <- valid_key?(key),
+                true <- Enum.all?([child, parent, assignment], &(is_binary(&1) and &1 != "")),
+                [[owner]] <-
+                  Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [child]) do
+             fingerprint =
+               :crypto.hash(
+                 :sha256,
+                 JSON.encode!(["process:" <> name, child, parent, assignment])
+               )
+               |> Base.encode16(case: :lower)
+
+             case Idempotency.reparent_result_in_txn(txn, owner, key) do
+               %{fingerprint: ^fingerprint, response: response} ->
+                 response
+
+               nil ->
+                 correct_in_txn(txn, owner, child, parent, assignment, key, fingerprint, %{
+                   kind: "process",
+                   ref: "process:" <> name,
+                   cause: "owner_topology_correction"
+                 })
+
+               _ ->
+                 refusal("idempotency_conflict")
+             end
+           else
+             false -> refusal("invalid_message")
+             _ -> refusal("not_authorized")
+           end
+         end) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
   def handle(_db, _call), do: refusal("user_principal_required")
 
   @doc false
@@ -330,7 +372,19 @@ defmodule Tightbeam.SessionReparent do
              ) do
           [[^assignment]] ->
             {kind, ref} =
-              if user, do: {"user", "user:" <> user}, else: {"session", "session:" <> session}
+              cond do
+                user ->
+                  {"user", "user:" <> user}
+
+                session ->
+                  {"session", "session:" <> session}
+
+                true ->
+                  principal =
+                    Tightbeam.Assignments.process_event_in_txn(txn, assignment)["principal"]
+
+                  {"process", principal}
+              end
 
             {:ok, item, kind, ref}
 

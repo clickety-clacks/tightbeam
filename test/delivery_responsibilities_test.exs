@@ -102,8 +102,10 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
       params: %{work_item_id: "wi_a1", delivery_owner_session_key: "pdo-a"}
     }
 
-    assert %{code: "process_denied"} = WorkItems.__handle__(db, "work-item-update", call)
-    assert is_nil(DeliveryResponsibilities.current_owner(db, "wi_a1"))
+    assert %{deliveryOwnerSessionKey: "pdo-a"} =
+             WorkItems.__handle__(db, "work-item-update", call)
+
+    assert DeliveryResponsibilities.current_owner(db, "wi_a1")["accountableSessionKey"] == "pdo-a"
   end
 
   test "owner remedy text describes explicit update without an owner-admin permission claim", %{
@@ -145,11 +147,11 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     {:ok, _} = DB.query(db, "UPDATE sessions SET spawnedBy='pdo-a' WHERE sessionKey='peer'")
 
     for caller <- ["peer", "foreign-worker"] do
-      assert %{code: "delivery_owner_required", message: message} =
+      assert %{openedBySession: ^caller, holderKey: "worker-a"} =
                assign(db, {:session, caller}, "worker-a", "wi_a1")
 
-      assert message =~ "session:pdo-a"
-      assert message =~ "active holder of an open assignment on this exact item"
+      assert DeliveryResponsibilities.current_owner(db, "wi_a1")["accountableSessionKey"] ==
+               "pdo-a"
     end
   end
 
@@ -281,16 +283,17 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert unavailable =~ "replace the link with work-item-update --delivery-owner"
   end
 
-  test "an echoed owner reference is not authority and denial creates no assignment", %{db: db} do
+  test "sessions can staff without becoming the delivery owner", %{db: db} do
     set_owner(db, {:user, "owner"}, "wi_a1", "pdo-a")
     before = count(db, "assignments")
 
-    assert %{code: "delivery_owner_required"} =
+    assert %{openedBySession: "peer", holderKey: "worker-a"} =
              assign(db, {:session, "peer"}, "worker-a", "wi_a1",
                delivery_owner_ref: "session:pdo-a"
              )
 
-    assert count(db, "assignments") == before
+    assert count(db, "assignments") == before + 1
+    assert DeliveryResponsibilities.responsibility(db, "peer", "wi_a1") == "none"
 
     assert %{holderKey: "worker-a"} = assign(db, {:session, "pdo-a"}, "worker-a", "wi_a1")
   end
@@ -303,7 +306,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert DeliveryResponsibilities.responsibility(db, "lane-a", "wi_a1") == "delegated"
     assert DeliveryResponsibilities.responsibility(db, "lane-a", "wi_b1") == "none"
 
-    assert %{code: "delivery_owner_required"} =
+    assert %{openedBySession: "lane-a", holderKey: "worker-a"} =
              assign(db, {:session, "lane-a"}, "worker-a", "wi_b1")
 
     child = assign(db, {:session, "lane-a"}, "worker-a", "wi_a1")
@@ -313,7 +316,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     assert DeliveryResponsibilities.responsibility(db, "lane-a", "wi_a1") == "none"
 
-    assert %{code: "delivery_owner_required"} =
+    assert %{openedBySession: "lane-a", holderKey: "lane-b"} =
              assign(db, {:session, "lane-a"}, "lane-b", "wi_a1")
 
     assert %{holderKey: "peer"} = assign(db, {:session, "worker-a"}, "peer", "wi_a1")
@@ -348,7 +351,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert DeliveryResponsibilities.responsibility(db, "lane-b", "wi_a1") == "none"
 
     for holder <- ["lane-a", "lane-b"] do
-      assert %{code: "delivery_owner_required"} =
+      assert %{openedBySession: ^holder, holderKey: "worker-a"} =
                assign(db, {:session, holder}, "worker-a", "wi_a1")
     end
   end
@@ -376,7 +379,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     assert %{holderKey: "worker-a"} = assign(db, {:session, "lane-a"}, "worker-a", "wi_a1")
 
-    assert %{code: "delivery_owner_required"} =
+    assert %{openedBySession: "pdo-a", holderKey: "peer"} =
              assign(db, {:session, "pdo-a"}, "peer", "wi_a1")
 
     assert {:ok, [["pdo-a", "lane-a"]]} =
@@ -767,17 +770,18 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
       )
 
     for caller <- ["peer", "foreign-worker"] do
-      assert {:error, %{code: "delivery_owner_required", message: message}} =
+      assert {:ok, %{openedBySession: ^caller, holderKey: "worker-a"}} =
                Dispatch.dispatch(
                  db,
                  handlers,
                  production_call("assign", {:session, caller}, "worker-a", "wi_a1")
                )
-
-      assert message =~ "session:pdo-a"
-      assert count(db, "assignments") == before
-      assert count(db, "wakes") == wakes_before
     end
+
+    assert count(db, "assignments") == before + 2
+    assert count(db, "wakes") >= wakes_before
+    before = count(db, "assignments")
+    wakes_before = count(db, "wakes")
 
     set_owner(db, {:user, "owner"}, "wi_a2", "pdo-b")
     {:ok, _} = DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='pdo-b'")

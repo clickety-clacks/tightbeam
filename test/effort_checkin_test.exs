@@ -488,6 +488,97 @@ defmodule Tightbeam.EffortCheckinTest do
            ]) == [["h2", nil]]
   end
 
+  for corrected <- [false, true] do
+    @corrected corrected
+    test "process opener effort routes through existing owner relations, corrected=#{@corrected}",
+         ctx do
+      main = Org.personal_session_key("h2")
+      session(ctx.db, main, "h2", Placement.local_host_name(), %{kind: "main"})
+      session(ctx.db, "process-parent", "h2", Placement.local_host_name())
+
+      item =
+        WorkItems.__handle__(ctx.db, "work-item-create", %{
+          verb: "work-item-create",
+          origin: "process:automation",
+          principal: {:process, "automation"},
+          session_key: nil,
+          params: %{title: "Process effort", owner_user_id: "h2"}
+        })
+
+      assert %{deliveryOwnerSessionKey: "process-parent"} =
+               WorkItems.__handle__(ctx.db, "work-item-update", %{
+                 verb: "work-item-update",
+                 origin: "process:automation",
+                 principal: {:process, "automation"},
+                 session_key: nil,
+                 params: %{work_item_id: item.id, delivery_owner_session_key: "process-parent"}
+               })
+
+      call = %{
+        verb: "assign",
+        origin: "process:automation",
+        principal: {:process, "automation"},
+        session_key: "holder",
+        params: %{
+          subject: "Process task",
+          work_item_id: item.id,
+          effect_kind: "coordination"
+        },
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: ctx.config.wake_tick_ms,
+        effort_config: ctx.config,
+        accepted_event_in_txn: true
+      }
+
+      assert {:accepted_in_txn, event_id, %{assignment: assigned}} =
+               Assignments.__handle__(ctx.db, "assign", call)
+
+      assert rows(ctx.db, "SELECT principal,origin FROM events WHERE id=?1", [event_id]) == [
+               ["process:automation", "process:automation"]
+             ]
+
+      if @corrected do
+        result =
+          Tightbeam.SessionReparent.handle(ctx.db, %{
+            principal: {:process, "automation"},
+            params: %{
+              session_key: "holder",
+              parent_session_key: "process-parent",
+              assignment_id: assigned.id,
+              idempotency_key: "process-reparent"
+            }
+          })
+
+        assert result["assignment"]["originOpenerRef"] == "process:automation"
+      end
+
+      request = escalate(ctx, assigned.id)
+      assert request.expecter_session_key == if(@corrected, do: "process-parent", else: nil)
+      assert request.expecter_user_id == if(@corrected, do: nil, else: "h2")
+
+      assert rows(ctx.db, "SELECT ownerUserId,raiserId FROM decision_requests WHERE id=?1", [
+               request.id
+             ]) == [["h2", "process:tightbeam"]]
+
+      assert request.assignment_id == assigned.id
+
+      assert rows(ctx.db, "SELECT openedByUser,openedBySession FROM assignments WHERE id=?1", [
+               assigned.id
+             ]) == [[nil, nil]]
+
+      assert rows(
+               ctx.db,
+               "SELECT principalKind,principalRef,originAssignmentOpenerKind,originAssignmentOpenerRef FROM session_reparent_events WHERE assignmentId=?1",
+               [assigned.id]
+             ) ==
+               if(@corrected,
+                 do: [["process", "process:automation", "process", "process:automation"]],
+                 else: []
+               )
+    end
+  end
+
   test "proof 1: assign and dispatch each arm one bracket; roots validate; all closes cancel",
        ctx do
     bare = assignment(ctx, "assign", {:user, "h1"}, "holder", %{subject: "bare"})
@@ -1451,7 +1542,7 @@ defmodule Tightbeam.EffortCheckinTest do
              )
   end
 
-  test "sessions and users may rule an open effort check-in but processes cannot", ctx do
+  test "processes and users may rule an open effort check-in with their own attribution", ctx do
     item = dispatch(ctx, {:user, "h1"}, "holder", "open ruling")
     request = escalate(ctx, item.id)
     assert request.expecter_user_id == "h1"
@@ -1463,7 +1554,11 @@ defmodule Tightbeam.EffortCheckinTest do
       params: %{request_id: request.id, action: "continue"}
     }
 
-    assert %{code: "not_authorized"} = EffortCheckin.rule(ctx.db, ctx.config, process_call)
+    assert %{status: "ruled", decision: "continue", ruled_by: "process:test-process"} =
+             EffortCheckin.rule(ctx.db, ctx.config, process_call)
+
+    assert request(ctx.db, request.id).ruled_by == "process:test-process"
+    request = escalate(ctx, item.id)
 
     assert %{status: "ruled", decision: "continue", ruled_by: "user:h2"} =
              EffortCheckin.rule(

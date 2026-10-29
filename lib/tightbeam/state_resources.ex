@@ -1643,6 +1643,8 @@ defmodule Tightbeam.StateResources do
   defp detail_principal(%{rest_principal: %{kind: kind, id: id, is_admin: is_admin}}),
     do: {kind, id, is_admin}
 
+  defp detail_principal(%{principal: {:process, id}}), do: {"user", id, true}
+
   defp detail_principal(%{principal: {:user, id}}), do: {"user", id, false}
   defp detail_principal(%{principal: {:session, id}}), do: {"user", id, true}
   defp detail_principal(%{principal: {:remedy, %{owner: id}}}), do: {"user", id, false}

@@ -2427,6 +2427,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{code: "denied", message: message} =
              handlers["retire"].(%{
                origin: "user:flynn",
+               principal: {:user, "flynn"},
                session_key: Org.personal_session_key("flynn"),
                params: %{}
              })
@@ -3900,7 +3901,7 @@ defmodule Tightbeam.GatewayTest do
     # this line sent the operator to the gateway to fix a satellite's grant.
     assert message =~ "openai has no usable credential on testhost"
     assert message =~ ":no_credential"
-    assert message =~ "run tightbeam onboard openai --as-user <userId> on testhost"
+    assert message =~ "run tightbeam onboard openai on testhost"
     refute message =~ "GATEWAY host"
 
     # ...and never regresses to the bare inspected health term, which named
@@ -4144,7 +4145,10 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
   end
 
-  test "process inspect returns exactly its own pending wakes", ctx do
+  test "process inspect includes ordinary session and wake visibility", ctx do
+    base_dir = role_test_base("process-inspect")
+    Archetypes.load!(base_dir)
+
     own =
       Wakes.schedule(ctx.db, %{
         session_key: "k1",
@@ -4153,26 +4157,35 @@ defmodule Tightbeam.GatewayTest do
         due_at: 2_000
       })
 
-    Wakes.schedule(ctx.db, %{
-      session_key: "k1",
-      origin: "process:other",
-      prompt: "other wake",
-      due_at: 1_000
-    })
+    other =
+      Wakes.schedule(ctx.db, %{
+        session_key: "k1",
+        origin: "process:other",
+        prompt: "other wake",
+        due_at: 1_000
+      })
 
-    inspect_handler = Gateway.handlers(gateway_config("/tmp", ctx.db, 0))["inspect"]
+    inspect_handler = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["inspect"]
 
-    assert inspect_handler.(%{origin: "process:scheduler", params: %{}, session_key: nil}) == %{
-             roles: [],
-             wakes: [
-               %{
-                 wake_id: own.wake_id,
-                 session_key: "k1",
-                 due_at: 2_000,
-                 prompt: "own wake"
-               }
-             ]
-           }
+    result =
+      inspect_handler.(%{
+        origin: "process:scheduler",
+        principal: {:process, "scheduler"},
+        params: %{},
+        session_key: nil
+      })
+
+    assert Enum.any?(result.sessions, &(&1.session_key == "k1"))
+
+    assert Enum.any?(
+             result.wakes,
+             &(&1.wake_id == own.wake_id and &1.origin == "process:scheduler")
+           )
+
+    assert Enum.any?(
+             result.wakes,
+             &(&1.wake_id == other.wake_id and &1.origin == "process:other")
+           )
   end
 
   test "sender cancel-wake retracts only its own pending notices", ctx do
@@ -5484,7 +5497,7 @@ defmodule Tightbeam.GatewayTest do
     assert message =~ "testhost-d: cannot route gpt-5.6-sol (effort medium) on testhost-d"
     assert message =~ "upgrade codex on testhost-d"
     assert message =~ "testhost: cannot route gpt-5.6-sol (effort medium) on testhost"
-    assert message =~ "run tightbeam onboard openai --as-user <userId> on testhost"
+    assert message =~ "run tightbeam onboard openai on testhost"
   end
 
   test "spawn uses the next where host when the first fails live spinup", ctx do
@@ -5668,7 +5681,7 @@ defmodule Tightbeam.GatewayTest do
 
     for {host, _base} <- [{"testhost-d", "/srv/testhost-d"}, {"testhost-b", "/srv/testhost-b"}] do
       assert message =~ "Tightbeam has no credential for openai on #{host}"
-      assert message =~ "Run on #{host}: tightbeam onboard openai --as-user <userId>"
+      assert message =~ "Run on #{host}: tightbeam onboard openai"
     end
   end
 
@@ -5879,7 +5892,7 @@ defmodule Tightbeam.GatewayTest do
     assert message =~ "normal CLI login"
 
     assert message =~
-             "Run on #{machine}: tightbeam onboard anthropic --as-user <userId>"
+             "Run on #{machine}: tightbeam onboard anthropic"
   end
 
   test "host env verbs set, list, and unset one identity-attributed row with explicit timing",
@@ -6688,7 +6701,7 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert message =~ "anthropic has no usable credential on testhost"
-    assert message =~ "run tightbeam onboard anthropic --as-user <userId> on testhost"
+    assert message =~ "run tightbeam onboard anthropic on testhost"
     refute message =~ "GATEWAY host"
     refute message =~ "onboard anthropic on worker"
   end
@@ -8631,7 +8644,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{ok: true} = Task.await(cancel)
   end
 
-  test "role verbs record mutations from any accountable caller and deny processes", ctx do
+  test "role verbs record mutations from session, user and process callers", ctx do
     {:pending, _} =
       Devices.pair(ctx.db, %{
         device_id: "other-device",
@@ -8652,16 +8665,20 @@ defmodule Tightbeam.GatewayTest do
 
     Roles.create!(ctx.db, "other-office", "other", other.session_key)
 
-    for verb <- ["role-create", "role-bind", "role-rm"] do
-      params =
-        case verb do
-          "role-create" -> %{name: "process-office"}
-          "role-bind" -> %{name: "flynn-office", session_key: "k1"}
-          "role-rm" -> %{name: "flynn-office"}
-        end
+    process = %{origin: "process:cron", principal: {:process, "cron"}}
 
-      assert %{code: "denied"} = handlers[verb].(%{origin: "process:cron", params: params})
-    end
+    assert %{role: %{owner_user_id: "flynn"}} =
+             handlers["role-create"].(
+               Map.put(process, :params, %{name: "process-office", owner_user_id: "flynn"})
+             )
+
+    assert %{role: %{bound_session_key: "k1"}} =
+             handlers["role-bind"].(
+               Map.put(process, :params, %{name: "process-office", session_key: "k1"})
+             )
+
+    assert %{removed: "process-office"} =
+             handlers["role-rm"].(Map.put(process, :params, %{name: "process-office"}))
 
     assert %{role: %{bound_session_key: "agent:other"}} =
              handlers["role-bind"].(%{
@@ -10032,7 +10049,7 @@ defmodule Tightbeam.GatewayTest do
   # AC6 (spec 1ae8fa52 §O6/I7+I9). O6 RATIFIES the existing turn-path refuse-by-name
   # (`unonboarded_refusal`): a turn onto a {host, harness} whose catalog health is
   # `unavailable({:needs_onboarding, :missing})` is refused with the EXACT
-  # `tightbeam onboard <provider> --as-user <userId>` remedy — the same sentence boot
+  # `tightbeam onboard <provider>` remedy — the same sentence boot
   # prints — and that refusal FAILS-TELLS-RECORDS (I9): a failed turn (the runner returns
   # an error with a terminal publish, never a hold/park), the named reason in the
   # `[turn failed]` chat marker, and a `harness_turn_error` lifecycle event, with the
@@ -12225,6 +12242,60 @@ defmodule Tightbeam.GatewayTest do
   # Driven through real spawns rather than hand-built session maps: the point of
   # the assertion is that the classes the CREATION paths actually stamp are the
   # ones the wire can name, and a fabricated origin proves nothing about that.
+  test "direct process spawn and retirement retain actor and explicit ownership", ctx do
+    base_dir = role_test_base("process-lifecycle")
+    Archetypes.load!(base_dir)
+    ensure_global_registry()
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+    Rules.load!(base_dir, Map.keys(handlers))
+
+    call = %{
+      verb: "spawn",
+      origin: "process:automation",
+      principal: {:process, "automation"},
+      session_key: nil,
+      params: %{
+        display_name: "Process worker",
+        handle: "process-worker",
+        owner_user_id: "flynn",
+        idempotency_key: "process-spawn"
+      }
+    }
+
+    assert {:ok, created} = Dispatch.dispatch(ctx.db, handlers, call)
+    session = Org.get(ctx.db, created.session_key)
+    assert session.owner_user_id == "flynn"
+    assert session.origin == "process:automation"
+    assert session.spawned_by == nil
+    assert Roles.get(ctx.db, "process-worker").owner_user_id == "flynn"
+    assert {:ok, replayed} = Dispatch.dispatch(ctx.db, handlers, call)
+    assert replayed.session_key == created.session_key
+
+    retirement = %{
+      call
+      | verb: "retire",
+        session_key: created.session_key,
+        params: %{idempotency_key: "process-retire"}
+    }
+
+    assert {:ok, retired} = Dispatch.dispatch(ctx.db, handlers, retirement)
+    assert created.session_key in retired.retired_session_keys
+    assert Org.get(ctx.db, created.session_key).state == "retired"
+
+    assert {:ok, events} =
+             DB.query(
+               ctx.db,
+               "SELECT verb,principal,origin,payload FROM events WHERE verb IN ('spawn','retire') AND kind='verb'"
+             )
+
+    for verb <- ["spawn", "retire"] do
+      assert Enum.any?(events, fn [v, principal, origin, payload] ->
+               v == verb and principal == "process:automation" and origin == "process:automation" and
+                 String.contains?(payload, created.session_key)
+             end)
+    end
+  end
+
   test "startedBy names who started each session the spawn path can create", ctx do
     base_dir = role_test_base("started-by")
     Archetypes.load!(base_dir)

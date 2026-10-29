@@ -205,7 +205,7 @@ defmodule Tightbeam.Placement do
       code: "unknown_host",
       message:
         "host #{host} is not configured#{harness_scope}; run tightbeam assimilate " <>
-          "<ssh-dest> --name #{host} --as-user <adminUserId>"
+          "<ssh-dest> --name #{host}"
     }
   end
 

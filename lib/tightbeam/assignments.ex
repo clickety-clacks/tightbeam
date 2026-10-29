@@ -765,7 +765,7 @@ defmodule Tightbeam.Assignments do
         unless state == "standing" and assignment_state == "open" and session_state == "active" and
                  is_binary(recipient) and is_binary(owner) and
                  target in [nil, recipient] and
-                 (disposer == "session:" <> recipient or
+                 (is_nil(disposer) or disposer == "session:" <> recipient or
                     (disposer == "user:" <> owner and recipient == Org.personal_session_key(owner))),
                do:
                  raise(DB.Error,
@@ -900,7 +900,7 @@ defmodule Tightbeam.Assignments do
 
     Txn.q(
       txn,
-      "UPDATE assignment_cannot_proceed SET disposerRef=?2 WHERE assignmentId=?1 AND state='standing' AND disposerRef != ?2",
+      "UPDATE assignment_cannot_proceed SET disposerRef=?2 WHERE assignmentId=?1 AND state='standing' AND disposerRef IS NOT ?2",
       [assignment_id, disposer_ref]
     )
 
@@ -940,7 +940,7 @@ defmodule Tightbeam.Assignments do
 
     Txn.q(
       txn,
-      "UPDATE assignment_cannot_proceed SET disposerRef=?2 WHERE assignmentId=?1 AND decisionWakeId=?3 AND state='standing' AND disposerRef LIKE 'session:%' AND disposerRef != ?2",
+      "UPDATE assignment_cannot_proceed SET disposerRef=?2 WHERE assignmentId=?1 AND decisionWakeId=?3 AND state='standing' AND disposerRef LIKE 'session:%' AND disposerRef IS NOT ?2",
       [assignment_id, disposer_ref, decision_wake_id]
     )
 
@@ -1818,6 +1818,7 @@ defmodule Tightbeam.Assignments do
        ) do
     with :ok <- principal_allowed(call.principal, verb),
          :ok <- valid_subject(call.params[:subject]),
+         :ok <- process_assignment_owner(db, call),
          :ok <- valid_supervision_interval(call[:supervision_interval_ms]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
          :ok <- valid_effect_kind(call.params[:effect_kind]),
@@ -1905,8 +1906,59 @@ defmodule Tightbeam.Assignments do
       else: assignment
   end
 
+  defp process_assignment_owner(db, %{principal: {:process, _}, params: params}) do
+    if params[:work_item_id] do
+      :ok
+    else
+      case params[:owner_user_id] do
+        nil ->
+          error("owner_required", "ownerUserId is required")
+
+        owner ->
+          case Tightbeam.Devices.user(db, owner) do
+            nil -> error("unknown_user", "unknown ownerUserId: #{owner}")
+            _ -> :ok
+          end
+      end
+    end
+  end
+
+  defp process_assignment_owner(_db, _call), do: :ok
+
+  @doc false
+  def process_event_in_txn(txn, assignment_id, verb \\ "assign") do
+    verbs = if verb == "assign", do: ["assign", "dispatch"], else: [verb, verb]
+    order = if verb == "assign", do: "ASC", else: "DESC"
+
+    case Txn.q(
+           txn,
+           """
+           SELECT principal,payload FROM events
+           WHERE kind='verb' AND verb IN ('assign','dispatch','revoke-assignment')
+             AND substr(principal,1,8)='process:' AND principal!='process:tightbeam'
+             AND json_extract(payload,'$.id')=?1 AND verb IN (?2,?3)
+           ORDER BY id #{order} LIMIT 1
+           """,
+           [assignment_id | verbs]
+         ) do
+      [[principal, payload]] -> Map.put(JSON.decode!(payload), "principal", principal)
+      [] -> nil
+    end
+  end
+
   defp accept_assignment_in_txn({:created, assignment, _delivery, _effects} = result, txn, call) do
-    if call[:accepted_event_in_txn] do
+    if call[:accepted_event_in_txn] || match?({:process, _}, call.principal) do
+      payload =
+        case call.principal do
+          {:process, _} ->
+            assignment
+            |> Map.put(:ownerUserId, call.params[:owner_user_id])
+            |> JSON.encode!()
+
+          _ ->
+            assignment
+        end
+
       event_id =
         EventLog.append_event_in_txn(
           txn,
@@ -1914,12 +1966,12 @@ defmodule Tightbeam.Assignments do
           call.verb,
           call.origin,
           call.session_key,
-          assignment,
+          payload,
           call.principal,
           now()
         )
 
-      {:accepted_in_txn, event_id, result}
+      if call[:accepted_event_in_txn], do: {:accepted_in_txn, event_id, result}, else: result
     else
       result
     end
@@ -3068,8 +3120,8 @@ defmodule Tightbeam.Assignments do
         # The typed terminal notice already reports this attest when it reaches
         # the card opener. Preserve the separate source only when the canonical
         # terminal route selects another currently accountable recipient.
-        if wake.session_key != assignment_opener_session(assignment) do
-          notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
+        if wake.session_key != assignment_opener_session(txn, assignment) do
+          notify_assignment_opener_of_attest_in_txn(txn, assignment, attest, call)
         end
 
         :ok
@@ -3120,15 +3172,23 @@ defmodule Tightbeam.Assignments do
       nil ->
         condition_id = id("cp_")
         opener_ref = assignment_opener_ref(assignment)
-        target = assignment_opener_session(assignment)
+        target = assignment_opener_session(txn, assignment)
 
         [[asker_owner]] =
           Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [
             assignment.holderKey
           ])
 
-        [[target_owner]] =
-          Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [target])
+        target_owner =
+          if is_nil(assignment.openedByUser) and is_nil(assignment.openedBySession) do
+            {_recipient, owner} = process_notification_recipient_in_txn(txn, assignment.id)
+            owner
+          else
+            [[owner]] =
+              Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [target])
+
+            owner
+          end
 
         %{request: request, wake: wake} =
           Escalation.file_agent_request_in_txn(txn, %{
@@ -3305,10 +3365,43 @@ defmodule Tightbeam.Assignments do
 
   defp assignment_opener_ref(%{openedByUser: user}) when is_binary(user), do: "user:" <> user
 
-  defp assignment_opener_session(%{openedBySession: session}) when is_binary(session), do: session
+  defp assignment_opener_ref(_assignment), do: nil
 
-  defp assignment_opener_session(%{openedByUser: user}) when is_binary(user),
+  defp assignment_opener_session(_txn, %{openedBySession: session}) when is_binary(session),
+    do: session
+
+  defp assignment_opener_session(_txn, %{openedByUser: user}) when is_binary(user),
     do: Org.personal_session_key(user)
+
+  defp assignment_opener_session(txn, assignment) do
+    case process_notification_recipient_in_txn(txn, assignment.id) do
+      {recipient, _owner} -> recipient
+      nil -> nil
+    end
+  end
+
+  @doc false
+  def process_notification_recipient_in_txn(txn, assignment_id) do
+    case Tightbeam.SessionReparent.current_coordination_parent(txn, assignment_id) do
+      nil ->
+        case Txn.q(
+               txn,
+               "SELECT w.ownerUserId FROM assignments a JOIN work_items w ON w.id=a.workItemId WHERE a.id=?1",
+               [assignment_id]
+             ) do
+          [[owner]] ->
+            {Org.personal_session_key(owner), owner}
+
+          [] ->
+            owner = process_event_in_txn(txn, assignment_id)["ownerUserId"]
+            {Org.personal_session_key(owner), owner}
+        end
+
+      parent ->
+        [[owner]] = Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [parent])
+        {parent, owner}
+    end
+  end
 
   defp verdict_in_txn(txn, call) do
     assignment_id = call.params[:assignment_id]
@@ -3356,7 +3449,7 @@ defmodule Tightbeam.Assignments do
 
                   attest = insert_attest(txn, admitted, assignment_id)
                   Mementos.append_inline!(txn, "attest", attest.id, admitted)
-                  notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
+                  notify_assignment_opener_of_attest_in_txn(txn, assignment, attest, call)
 
                   :ok =
                     Wakes.verification_verdict_in_txn(txn, %{
@@ -3617,7 +3710,7 @@ defmodule Tightbeam.Assignments do
         [] ->
           resolved_call = put_in(call, [:params, :verdict_kind], verdict_kind)
           attest = insert_attest(txn, resolved_call, assignment.id, true)
-          notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
+          notify_assignment_opener_of_attest_in_txn(txn, assignment, attest, call)
 
           append_attest_marker(txn, attest)
           %{assignment: assignment, attest: attest}
@@ -3717,7 +3810,7 @@ defmodule Tightbeam.Assignments do
             with :ok <- valid_revocation_reason(call.params[:reason]) do
               if assignment.outcome == "revoked" and
                    assignment.revocationReason == call.params[:reason] and
-                   revoked_by?(assignment, call.principal) do
+                   revoked_by?(txn, assignment, call.principal) do
                 Map.put(assignment, :revocation_replayed, true)
               else
                 assignment_closed()
@@ -4113,8 +4206,8 @@ defmodule Tightbeam.Assignments do
 
   defp append_attest_marker_summary(text, _note), do: text
 
-  defp notify_assignment_opener_of_attest_in_txn(txn, assignment, attest) do
-    recipient = assignment_opener_session(assignment)
+  defp notify_assignment_opener_of_attest_in_txn(txn, assignment, attest, call) do
+    recipient = assignment_opener_session(txn, assignment)
 
     recipient_exists? =
       case assignment do
@@ -4132,7 +4225,7 @@ defmodule Tightbeam.Assignments do
     if recipient_exists? and not same_attest_principal_as_opener?(assignment, attest) do
       Wakes.schedule_in_txn(txn, %{
         session_key: recipient,
-        origin: attest_notice_origin(attest),
+        origin: attest_notice_origin(attest, call),
         creator_session_key: attest.bySession,
         prompt: "Attest #{attest.id} (#{attest.kind}) was filed on assignment #{assignment.id}.",
         due_at: attest.ts,
@@ -4208,10 +4301,12 @@ defmodule Tightbeam.Assignments do
 
   defp same_attest_principal_as_opener?(_assignment, _attest), do: false
 
-  defp attest_notice_origin(%{bySession: session}) when is_binary(session),
+  defp attest_notice_origin(%{bySession: session}, _call) when is_binary(session),
     do: "agent:" <> session
 
-  defp attest_notice_origin(%{byUser: user}) when is_binary(user), do: "user:" <> user
+  defp attest_notice_origin(%{byUser: user}, _call) when is_binary(user), do: "user:" <> user
+
+  defp attest_notice_origin(_attest, %{principal: {:process, name}}), do: "process:" <> name
 
   defp append_assignment_marker(txn, assignment, :opened) do
     append_substrate(txn, assignment.holderKey, "[assignment opened: #{assignment.id}]")
@@ -4384,19 +4479,18 @@ defmodule Tightbeam.Assignments do
 
   defp fetch_assignment!(txn, id), do: fetch_assignment(txn, id) || raise("missing assignment")
 
-  defp principal_allowed({:process, _}, _verb),
-    do: error("process_denied", "process principals cannot use assignment verbs")
+  defp principal_allowed({:process, _}, _verb), do: :ok
 
   defp principal_allowed({:remedy, %{action: "assign"}}, "assign"), do: :ok
 
-  defp principal_allowed({:remedy, _}, verb),
-    do: principal_allowed({:process, "tightbeam"}, verb)
+  defp principal_allowed({:remedy, _}, _verb),
+    do: error("process_denied", "remedy principal cannot use this assignment verb")
 
   defp principal_allowed(nil, _verb),
     do:
       error(
         "principal_required",
-        "assignment verbs require a user credential or a session token"
+        "assignment verbs require an authenticated principal"
       )
 
   defp principal_allowed({kind, _}, _verb) when kind in [:session, :user], do: :ok
@@ -4963,6 +5057,7 @@ defmodule Tightbeam.Assignments do
     }
   end
 
+  defp principal_id({:process, name}), do: "process:" <> name
   defp principal_id({:user, user}), do: "user:" <> user
   defp principal_id({:session, session}), do: "session:" <> session
   defp principal_id({:remedy, %{owner: owner}}), do: "user:" <> owner
@@ -5008,6 +5103,7 @@ defmodule Tightbeam.Assignments do
     }
   end
 
+  defp opener({:process, _}), do: {nil, nil}
   defp opener({:user, user}), do: {user, nil}
   defp opener({:session, session}), do: {nil, session}
   defp opener({:remedy, %{owner: owner}}), do: {owner, nil}
@@ -5170,6 +5266,9 @@ defmodule Tightbeam.Assignments do
   defp retirement_provenance_actor(_txn, "process:tightbeam", _owner_user_id),
     do: {nil, nil, "process:tightbeam"}
 
+  defp retirement_provenance_actor(_txn, "process:" <> _name, _owner_user_id),
+    do: {nil, nil, nil}
+
   defp retirement_provenance_actor(txn, "session:" <> session_key, owner_user_id),
     do: retirement_session_or_owner(txn, session_key, owner_user_id)
 
@@ -5229,8 +5328,15 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  defp revoked_by?(assignment, {:user, user}), do: assignment.closedByUser == user
-  defp revoked_by?(assignment, {:session, session}), do: assignment.closedBySession == session
+  defp revoked_by?(txn, assignment, {:process, name}) do
+    process_event_in_txn(txn, assignment.id, "revoke-assignment")["principal"] ==
+      "process:" <> name
+  end
+
+  defp revoked_by?(_txn, assignment, {:user, user}), do: assignment.closedByUser == user
+
+  defp revoked_by?(_txn, assignment, {:session, session}),
+    do: assignment.closedBySession == session
 
   defp columns do
     "id, subject, holderKey, holderRole, holderFallback, openedByUser, openedBySession, " <>

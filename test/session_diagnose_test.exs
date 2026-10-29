@@ -47,8 +47,9 @@ defmodule Tightbeam.SessionDiagnoseTest do
     pid
   end
 
-  test "real router authenticates and serves any target without DB", %{deps: deps} do
-    assert request(deps, body(), "wrong").status == 401
+  test "organization credential serves any target without DB; unknown credentials need authentication state",
+       %{deps: deps} do
+    assert request(deps, body(), "wrong").status == 503
     assert request(deps, %{body() | "asUser" => "other"}).status == 200
     assert request(deps, %{body() | "sessionKey" => "another-seat"}).status == 200
     assert request(deps, Map.delete(body(), "asUser")).status == 200
@@ -246,7 +247,7 @@ defmodule Tightbeam.SessionDiagnoseTest do
     assert response.status == 503
     assert JSON.decode!(response.resp_body) == %{"error" => %{"code" => "diagnostic_unavailable"}}
     refute response.resp_body =~ @secret
-    assert request(deps, body(), String.duplicate("x", byte_size(@secret))).status == 401
+    assert request(deps, body(), String.duplicate("x", byte_size(@secret))).status == 503
   end
 
   test "many unrelated registry entries do not broaden exact-target output", %{deps: deps} do

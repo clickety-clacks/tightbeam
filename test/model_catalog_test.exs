@@ -452,7 +452,7 @@ defmodule Tightbeam.ModelCatalogTest do
              Tightbeam.TerminalCredentialFailure.get_open(ctx.db, @host, "pi")
 
     assert Tightbeam.TerminalCredentialFailure.statement(ctx.db, incident_id) =~
-             "tightbeam onboard opencode-go --api-key --as-user <adminUserId>"
+             "tightbeam onboard opencode-go --api-key"
   end
 
   test "Pi terminal 401 records the failed named local provider key", ctx do
@@ -511,7 +511,7 @@ defmodule Tightbeam.ModelCatalogTest do
              Tightbeam.TerminalCredentialFailure.get_open(ctx.db, @host, "pi")
 
     assert Tightbeam.TerminalCredentialFailure.statement(ctx.db, incident_id) =~
-             "tightbeam onboard local-openai --endpoint <endpoint-url> --name spark --as-user <adminUserId>"
+             "tightbeam onboard local-openai --endpoint <endpoint-url> --name spark"
 
     assert :counters.get(attempts, 1) == 1
 
@@ -1726,7 +1726,7 @@ defmodule Tightbeam.ModelCatalogTest do
 
       message = Unroutable.message(unroutable)
       assert message =~ "anthropic has no usable credential on testhost"
-      assert message =~ "run tightbeam onboard anthropic --as-user <userId> on testhost"
+      assert message =~ "run tightbeam onboard anthropic on testhost"
       assert Unroutable.code(unroutable) == "catalog_unavailable"
 
       # It is not a verdict on the model: nothing here can see whether the host

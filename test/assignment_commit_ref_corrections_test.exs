@@ -307,8 +307,10 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     )
   end
 
-  test "process principals and malformed requests cannot enter the correction ledger", ctx do
-    assert %{code: "process_denied"} = correct(ctx, {:process, "tightbeam"})
+  test "process corrections retain their actor and malformed requests cannot enter the ledger",
+       ctx do
+    assert %{correction: %{actorKind: "process", actorRef: "automation"}} =
+             correct(ctx, {:process, "automation"})
 
     for {field, value, code} <- [
           {:idempotency_key, "", "invalid_idempotency_key"},

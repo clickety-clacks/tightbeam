@@ -453,7 +453,7 @@ defmodule Tightbeam.Wakes do
         (is_nil(event.work_item_id) or
            (is_binary(event.work_item_id) and String.valid?(event.work_item_id) and
               String.trim(event.work_item_id) != "")) and
-        event[:opened_by_kind] in ["user", "session"] and
+        event[:opened_by_kind] in ["user", "session", "process"] and
         is_integer(event[:terminal_at]) and event.terminal_at >= 0 and
         ((event[:source_kind] == "attest" and event[:outcome] in ["completed", "surrendered"]) or
            (event[:source_kind] == "assignment_revocation" and event[:outcome] == "revoked" and
@@ -1310,12 +1310,11 @@ defmodule Tightbeam.Wakes do
       JOIN assignment_revocations r ON r.id=g.revocationId AND r.assignmentId=a.id
       LEFT JOIN work_items w ON w.id=a.workItemId
       LEFT JOIN sessions parent ON parent.sessionKey=a.openedBySession
-      JOIN users owner ON owner.userId=CASE
-        WHEN a.openedBySession IS NULL THEN a.openedByUser ELSE parent.ownerUserId END
+      LEFT JOIN users owner ON owner.userId=CASE
+        WHEN a.openedBySession IS NOT NULL THEN parent.ownerUserId
+        ELSE COALESCE(a.openedByUser, w.ownerUserId) END
       WHERE a.id=?1
         AND (a.workItemId IS NULL OR w.ownerUserId=owner.userId)
-        AND ((a.openedBySession IS NULL AND a.openedByUser IS NOT NULL)
-          OR (a.openedByUser IS NULL AND a.openedBySession IS NOT NULL))
         AND (
           (a.state='closed' AND a.outcome='revoked' AND a.closingAttestId IS NULL
            AND a.closedAt=r.revokedAt AND a.closedByUser IS r.revokedByUser
@@ -1335,15 +1334,17 @@ defmodule Tightbeam.Wakes do
       [assignment_id]
     )
     |> Enum.map(fn [id, item, child, owner, opened_user, opened_session, token, ts] ->
+      {opener_kind, opener_id} = terminal_opener_in_txn(txn, id, opened_user, opened_session)
+
       %{
         source_kind: "assignment_revocation",
         source_token: token,
         assignment_id: id,
         work_item_id: item,
         child_session_key: child,
-        owner_user_id: owner,
-        opened_by_kind: if(opened_session, do: "session", else: "user"),
-        opened_by_id: opened_session || opened_user,
+        owner_user_id: terminal_owner_in_txn(txn, id, owner),
+        opened_by_kind: opener_kind,
+        opened_by_id: opener_id,
         outcome: "revoked",
         terminal_at: ts
       }
@@ -1365,22 +1366,23 @@ defmodule Tightbeam.Wakes do
         JOIN attests t ON t.id=a.closingAttestId AND t.assignmentId=a.id
         LEFT JOIN work_items w ON w.id=a.workItemId
         LEFT JOIN sessions parent ON parent.sessionKey=a.openedBySession
-        JOIN users owner ON owner.userId=CASE
-          WHEN a.openedBySession IS NULL THEN a.openedByUser ELSE parent.ownerUserId END
+        LEFT JOIN users owner ON owner.userId=CASE
+          WHEN a.openedBySession IS NOT NULL THEN parent.ownerUserId
+        ELSE COALESCE(a.openedByUser, w.ownerUserId) END
         WHERE a.id=?1 AND a.state='closed' AND a.closedBySession=a.holderKey
           AND a.closedByUser IS NULL AND t.bySession=a.holderKey AND t.byUser IS NULL
           AND t.ts=a.closedAt
           AND ((a.outcome='completed' AND t.kind='completion')
             OR (a.outcome='surrendered' AND t.kind='surrender'))
           AND (a.workItemId IS NULL OR w.ownerUserId=owner.userId)
-          AND ((a.openedBySession IS NULL AND a.openedByUser IS NOT NULL)
-            OR (a.openedByUser IS NULL AND a.openedBySession IS NOT NULL))
         """,
         [assignment_id]
       )
 
     case rows do
       [[id, work_item, child, owner, opened_user, opened_session, outcome, closed_at, token]] ->
+        {opener_kind, opener_id} = terminal_opener_in_txn(txn, id, opened_user, opened_session)
+
         {:ok,
          %{
            source_kind: "attest",
@@ -1388,9 +1390,9 @@ defmodule Tightbeam.Wakes do
            assignment_id: id,
            work_item_id: work_item,
            child_session_key: child,
-           owner_user_id: owner,
-           opened_by_kind: if(opened_session, do: "session", else: "user"),
-           opened_by_id: opened_session || opened_user,
+           owner_user_id: terminal_owner_in_txn(txn, id, owner),
+           opened_by_kind: opener_kind,
+           opened_by_id: opener_id,
            outcome: outcome,
            terminal_at: closed_at
          }}
@@ -1401,6 +1403,25 @@ defmodule Tightbeam.Wakes do
           "assignment lacks an exact completion/surrender attest and authorized owner relation"
         )
     end
+  end
+
+  defp terminal_owner_in_txn(txn, id, nil) do
+    {_recipient, owner} = Tightbeam.Assignments.process_notification_recipient_in_txn(txn, id)
+    owner
+  end
+
+  defp terminal_owner_in_txn(_txn, _id, owner), do: owner
+
+  defp terminal_opener_in_txn(_txn, _id, _user, session) when is_binary(session),
+    do: {"session", session}
+
+  defp terminal_opener_in_txn(_txn, _id, user, _session) when is_binary(user),
+    do: {"user", user}
+
+  defp terminal_opener_in_txn(txn, id, nil, nil) do
+    "process:" <> name = Tightbeam.Assignments.process_event_in_txn(txn, id)["principal"]
+
+    {"process", name}
   end
 
   defp terminal_notice_recipient_in_txn(txn, event) do
@@ -1431,9 +1452,20 @@ defmodule Tightbeam.Wakes do
          else: nil
 
     candidates =
-      if event.opened_by_kind == "session",
-        do: [delegated_opener, current, event.opened_by_id, personal],
-        else: [current, personal]
+      case event.opened_by_kind do
+        "session" ->
+          [delegated_opener, current, event.opened_by_id, personal]
+
+        "process" ->
+          [
+            Tightbeam.SessionReparent.current_coordination_parent(txn, event.assignment_id),
+            current,
+            personal
+          ]
+
+        "user" ->
+          [current, personal]
+      end
 
     recipient =
       candidates

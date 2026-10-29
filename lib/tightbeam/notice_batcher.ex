@@ -1460,8 +1460,8 @@ defmodule Tightbeam.NoticeBatcher do
        when is_binary(process_id) and process_id != "" do
     row_exists?(
       db,
-      "SELECT 1 FROM wakes WHERE wakeId=?1 AND origin=?2",
-      [source_wake_id, "process:" <> process_id]
+      "SELECT 1 FROM wakes WHERE wakeId=?1",
+      [source_wake_id]
     )
   end
 

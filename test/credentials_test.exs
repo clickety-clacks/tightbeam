@@ -56,7 +56,7 @@ defmodule Tightbeam.CredentialsTest do
 
   test "Cursor onboarding commands require the API-key ceremony" do
     assert Credentials.onboard_command(:cursor) ==
-             "tightbeam onboard cursor --api-key --as-user <userId>"
+             "tightbeam onboard cursor --api-key"
   end
 
   test "credential fixture isolates exact local and remote warm commands", ctx do
@@ -94,19 +94,19 @@ defmodule Tightbeam.CredentialsTest do
     # `tightbeam onboard` (cli/src/args.rs); the remedy must be hyphenated and carry the flags
     # each provider requires.
     assert Credentials.onboard_command(:local_openai) ==
-             "tightbeam onboard local-openai --endpoint <endpoint-url> --name <provider-name> --as-user <userId>"
+             "tightbeam onboard local-openai --endpoint <endpoint-url> --name <provider-name>"
 
     assert Credentials.onboard_command(:opencode_go) ==
-             "tightbeam onboard opencode-go --api-key --as-user <userId>"
+             "tightbeam onboard opencode-go --api-key"
 
     refute Credentials.onboard_command(:local_openai) =~ "local_openai"
     refute Credentials.onboard_command(:opencode_go) =~ "opencode_go"
 
     # Providers whose atom already equals the CLI name and need no extra flags are unchanged.
     assert Credentials.onboard_command(:anthropic) ==
-             "tightbeam onboard anthropic --as-user <userId>"
+             "tightbeam onboard anthropic"
 
-    assert Credentials.onboard_command(:openai) == "tightbeam onboard openai --as-user <userId>"
+    assert Credentials.onboard_command(:openai) == "tightbeam onboard openai"
   end
 
   test "onboarding commits before the credential-present callback and success publication", ctx do

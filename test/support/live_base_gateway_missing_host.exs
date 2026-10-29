@@ -51,7 +51,7 @@ defmodule GuardMissingHost do
 
         expected =
           "host eurisko is not configured for claude; run tightbeam assimilate <ssh-dest> " <>
-            "--name eurisko --as-user <adminUserId>"
+            "--name eurisko"
 
         assert :appended =
                  Gateway.deliver_prompt("k1", "user:flynn", "try vanished host",

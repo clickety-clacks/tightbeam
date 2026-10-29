@@ -217,6 +217,7 @@ pub enum Command {
     GithubAuthCheck,
     Spawn {
         identity: Identity,
+        owner_user_id: Option<String>,
         display_name: String,
         idempotency_key: String,
         archetype: Option<String>,
@@ -270,6 +271,7 @@ pub enum Command {
         target: Target,
         idempotency_key: Option<String>,
         work_item_id: Option<String>,
+        owner_user_id: Option<String>,
         reviews: Option<String>,
         effect_kind: Option<String>,
         files: Option<Vec<String>>,
@@ -281,6 +283,7 @@ pub enum Command {
         subject: String,
         holder: String,
         work_item_id: Option<String>,
+        owner_user_id: Option<String>,
         effect_kind: Option<String>,
         workdir_root: Option<String>,
         brief: String,
@@ -377,6 +380,7 @@ pub enum Command {
     },
     WorkItemCreate {
         identity: Identity,
+        owner_user_id: Option<String>,
         mementos: Vec<(String, String)>,
         title: String,
         spec_ref_name: Option<String>,
@@ -386,6 +390,7 @@ pub enum Command {
     },
     WorkItemHandoff {
         identity: Identity,
+        owner_user_id: Option<String>,
         work_item_id: Option<String>,
         title: Option<String>,
         delivery_owner: String,
@@ -597,6 +602,7 @@ pub enum Command {
     },
     Onboard {
         identity: Identity,
+        owner_user_id: Option<String>,
         provider: String,
         api_key: bool,
         daemon_credential: bool,
@@ -673,7 +679,7 @@ pub enum Command {
         identity: Identity,
     },
     UpdateClients {
-        as_user: String,
+        identity: Identity,
     },
     Assimilate(AssimilateArgs),
 }
@@ -711,7 +717,7 @@ pub struct ToplineFilters {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssimilateArgs {
     pub ssh_dest: String,
-    pub as_user: String,
+    pub identity: Identity,
     pub name: Option<String>,
     pub base_dir: String,
     pub harnesses: Vec<String>,
@@ -726,18 +732,17 @@ human operator does. Output is JSON on stdout; a nonzero exit means failure
 (the message is on stderr).
 
 IDENTITY (optional inside a session workdir; otherwise required):
-  --as <role>          act as a role you currently hold. Use this when YOU (an
-                       agent) run the command. The role must be bound to your
-                       active session.
-                       To reply to [from user:mike], use wake --user mike; to
-                       reply to [from agent:notetaker], use wake --role
-                       notetaker. [from process:x] cannot be woken.
-  --as-user <userId>   act as a human user (e.g. "flynn"). Use this for
-                       operator/admin actions or when no agent identity applies.
-  --as-process <name>  act as automation (cron, CI, a webhook — e.g.
-                       "cron"). Processes may wake, cancel-wake, file
-                       condition facts, and use fact producer commands — they cannot spawn, retire, or
-                       administer.
+  --as <role>          attribute the call to a bound role.
+  --as-user <userId>   select the user on an organization credential. A session
+                       credential always retains its authenticated agent actor.
+  --as-process <name>  attribute the call to automation (cron, CI, a webhook).
+                       Available with or without a session credential, for all
+                       commands. The name "tightbeam" is reserved.
+  A process without a session supplies --owner <userId> when creating owned
+  work items, Toplines, or sessions. Ownership does not change its actor.
+  No identity flag is needed with a session credential: calls and rows identify
+  that agent, whether it holds zero, one, or several roles. Sessions can perform
+  operator/admin actions without --as-user.
   Pass at most ONE explicit identity. It is who the call is attributed to, NOT
   the target of the call. With no flag, the CLI walks up from the current
   directory for .tightbeam-session and the gateway derives the identity from
@@ -880,7 +885,7 @@ COMMANDS:
         tightbeam list --as orchestrator:news
 
   session-reparent --session <key> --parent <key> --assignment <id> --key <key>
-      Owner-as-user correction of one custom session and its sole open assignment.
+      Correct one custom session and its sole open assignment.
 
   session-po-set --session <key> --po-role <role> --key <key>
       Explicitly associate an exact session with its addressed product-owner role.
@@ -983,7 +988,7 @@ COMMANDS:
       Conclude an item (→ closed). Requires zero open assignments.
   work-item-fail <workItemId> [--reason <text>]
       Rule an item failed (→ failed); --reason is recorded on the item.
-  assign --subject "<work>" (--session <key> | --role <name>)
+  assign --subject "<work>" (--session <key> | --role <name>) [--owner <user>]
          [--key <key>] [--work-item <workItemId>]
          [--reviews <assignmentId>] [--effect-kind <kind>]
          [--files '["lib/a.ex","test/a_test.exs"]'] [--succeeds <assignmentId>]
@@ -993,8 +998,10 @@ COMMANDS:
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
            --brief "<one sentence>" [--work-item <workItemId>]
            [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
-           [--succeeds <assignmentId>]
+           [--succeeds <assignmentId>] [--owner <user>]
       Atomically open an assignment and wake its holder with the card id.
+      For assign/dispatch without a work item, an external process supplies
+      --owner <user> for notices. Session callers retain their own attribution.
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in whose complete id you hold. The
       current expecter is the preferred responder, not an authorization gate.
@@ -1017,7 +1024,7 @@ COMMANDS:
       existing visibility rules.
   assignment-stop-turn <assignmentId> --reason "<why>"
       Stop the current turn only when you opened that assignment.
-  cancel-turn --session <key> --as-user <ownerUserId>
+  cancel-turn --session <key>
       Stop a running turn in a session owned by that user.
   revoke-assignment <assignmentId> --reason "..."
       Revoke when the assignment handler already authorizes your principal.
@@ -1057,8 +1064,8 @@ COMMANDS:
       output).
 
   settle-turn --session <key> --seq <turnSeq> --outcome cancel|fail
-              --reason <text> --key <idempotencyKey> --as-user <adminUserId>
-      Settle one proven-stale running turn. This operator-only command never
+              --reason <text> --key <idempotencyKey>
+      Settle one proven-stale running turn. This command never
       interrupts a live task; use cancel-turn for a live task.
 
   kungfu list
@@ -1092,7 +1099,7 @@ COMMANDS:
       currently applies to it, exactly as served. Defaults to the calling
       session.
 
-  ADMIN (require --as-user of an admin, or an admin-owned agent handle):
+  ADMIN (available to admin-owned sessions without an identity flag):
   identity edit <archetype> [--manifest | --skill <name> [--rm]] [--key <idempotencyKey>]
                 [--file <path>]
       Edit the served identity. Without --file, content is read from stdin.
@@ -1121,7 +1128,7 @@ COMMANDS:
       to the current live identity revision, followed by an ordinary prompt
       asking each started session to re-read them. It cannot confirm that a
       session did, and it does not reload any running model context.
-  onboard openai|anthropic [--api-key]
+  onboard openai|anthropic [--api-key] [--owner <user>]
       Run this machine's model-provider credential onboarding flow. Without
       --api-key this is the interactive subscription ceremony. With it the flow is
       non-interactive and the KEY is read from stdin -- never as an argument,
@@ -1129,6 +1136,8 @@ COMMANDS:
         printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
       The key is validated against the provider before it is banked, and it
       never leaves this machine.
+      A process without a session uses --owner <user> for sign-in and recovery
+      notifications. Session callers retain their session owner.
   onboard cursor --api-key
       Cursor is API-key only; --api-key is required (no subscription login).
       The KEY is read from stdin -- never as an argument:
@@ -1180,10 +1189,10 @@ COMMANDS:
   harness-process settle <launch-id> --adapter-key <key>
       List the durable harness launch ledger, newest launch first.
 
-  session-diagnose --session EXACT [--as-user USER] [--json]
+  session-diagnose --session EXACT [--as <role> | --as-user USER | --as-process <name>] [--json]
       Read a session's process metadata without querying or changing the database.
 
-  doctor [--json] [--base-dir p] [--as <role> | --as-user <userId>]
+  doctor [--json] [--base-dir p] [--as <role> | --as-user <userId> | --as-process <name>]
       Check the local Tightbeam installation and report its health, with each
       learned sentinel's state and what remains to set it up. Sentinel status
       comes from the gateway under the given identity (this session's by
@@ -1205,7 +1214,7 @@ COMMANDS:
       transit between machines; run `tightbeam onboard` independently on
       the assimilated host.
       After: add the host to an archetype's `where`.
-        tightbeam assimilate work-1.local --as-user flynn
+        tightbeam assimilate work-1.local
 
   skill list | skill install [--skill <name>] [--dir <skillsDir>]
       Runs locally; needs no gateway. list shows the agent skills shipped with
@@ -1662,7 +1671,7 @@ fn topline_mutation(
     flags: &HashMap<String, String>,
 ) -> Result<Command, String> {
     let allowed = match verb {
-        "topline-create" => &["title", "key"][..],
+        "topline-create" => &["title", "key", "owner"][..],
         "topline-update" => &["title", "reason", "key"][..],
         "topline-close" | "topline-reopen" => &["reason", "key"][..],
         "topline-link-work" => &["reason", "key"][..],
@@ -1690,7 +1699,11 @@ fn topline_mutation(
     let params = match verb {
         "topline-create" => {
             exact(1)?;
-            vec![title()?, key()?]
+            let mut values = vec![title()?, key()?];
+            if let Some(owner) = nonempty(flags, "owner") {
+                values.push(("ownerUserId".to_owned(), owner));
+            }
+            values
         }
         "topline-update" => {
             exact(2)?;
@@ -1931,13 +1944,16 @@ fn parse_with_optional_catalog(
         "doctor" => {
             let base_dir = nonempty(flags, "base-dir");
             if parsed.positional.len() != 1
-                || flags
-                    .keys()
-                    .any(|flag| !matches!(flag.as_str(), "json" | "base-dir" | "as" | "as-user"))
+                || flags.keys().any(|flag| {
+                    !matches!(
+                        flag.as_str(),
+                        "json" | "base-dir" | "as" | "as-user" | "as-process"
+                    )
+                })
                 || (flags.contains_key("base-dir") && base_dir.is_none())
             {
                 return Err(
-                    "usage: tightbeam doctor [--json] [--base-dir DIR] [--as <role> | --as-user <userId>]"
+                    "usage: tightbeam doctor [--json] [--base-dir DIR] [--as <role> | --as-user <userId> | --as-process <name>]"
                         .to_owned(),
                 );
             }
@@ -1949,12 +1965,15 @@ fn parse_with_optional_catalog(
         }
         "session-diagnose" => {
             if parsed.positional.len() != 1
-                || flags
-                    .keys()
-                    .any(|flag| !matches!(flag.as_str(), "session" | "as-user" | "json"))
+                || flags.keys().any(|flag| {
+                    !matches!(
+                        flag.as_str(),
+                        "session" | "as" | "as-user" | "as-process" | "json"
+                    )
+                })
             {
                 return Err(
-                    "usage: tightbeam session-diagnose --session EXACT [--as-user USER] [--json]"
+                    "usage: tightbeam session-diagnose --session EXACT [--as <role> | --as-user USER | --as-process <name>] [--json]"
                         .to_owned(),
                 );
             }
@@ -2617,6 +2636,7 @@ fn parse_with_optional_catalog(
             }
             Ok(Command::Spawn {
                 identity: identity(flags)?,
+                owner_user_id: nonempty(flags, "owner"),
                 display_name,
                 idempotency_key: nonempty(flags, "key").unwrap_or_else(generated_key),
                 archetype: nonempty(flags, "archetype"),
@@ -2705,6 +2725,7 @@ fn parse_with_optional_catalog(
                     "role",
                     "key",
                     "work-item",
+                    "owner",
                     "reviews",
                     "effect-kind",
                     "files",
@@ -2738,6 +2759,7 @@ fn parse_with_optional_catalog(
                 target: targets.into_iter().next().expect("exactly one target"),
                 idempotency_key: nonempty(flags, "key"),
                 work_item_id: nonempty(flags, "work-item"),
+                owner_user_id: nonempty(flags, "owner"),
                 reviews: nonempty(flags, "reviews"),
                 effect_kind: nonempty(flags, "effect-kind"),
                 files,
@@ -2754,6 +2776,7 @@ fn parse_with_optional_catalog(
                     "subject",
                     "brief",
                     "work-item",
+                    "owner",
                     "effect-kind",
                     "workdir-root",
                     "memento",
@@ -2777,6 +2800,7 @@ fn parse_with_optional_catalog(
                 subject,
                 holder: holders.into_iter().next().expect("exactly one holder"),
                 work_item_id: nonempty(flags, "work-item"),
+                owner_user_id: nonempty(flags, "owner"),
                 effect_kind: nonempty(flags, "effect-kind"),
                 workdir_root: nonempty(flags, "workdir-root"),
                 brief,
@@ -2949,8 +2973,8 @@ fn parse_with_optional_catalog(
             })
         }
         "cancel-turn" => {
-            let usage = "usage: tightbeam cancel-turn --session <key> --as-user <ownerUserId>";
-            const ALLOWED: &[&str] = &["session", "as-user"];
+            let usage = "usage: tightbeam cancel-turn --session <key>";
+            const ALLOWED: &[&str] = &["session", "as", "as-user", "as-process"];
             if parsed.positional.len() != 1
                 || parsed.duplicates.contains("session")
                 || parsed.duplicates.contains("as-user")
@@ -2959,9 +2983,7 @@ fn parse_with_optional_catalog(
                 return Err(usage.to_owned());
             }
             Ok(Command::CancelTurn {
-                identity: Identity::User(
-                    nonempty(flags, "as-user").ok_or_else(|| usage.to_owned())?,
-                ),
+                identity: identity(flags)?,
                 session_key: nonempty(flags, "session").ok_or_else(|| usage.to_owned())?,
             })
         }
@@ -3057,6 +3079,7 @@ fn parse_with_optional_catalog(
             }
             Ok(Command::WorkItemCreate {
                 identity: identity(flags)?,
+                owner_user_id: nonempty(flags, "owner"),
                 mementos: inline_mementos(&parsed)?,
                 title: nonempty(flags, "title").ok_or_else(|| "--title is required".to_owned())?,
                 spec_ref_name,
@@ -3071,6 +3094,7 @@ fn parse_with_optional_catalog(
                 "work-item",
                 "title",
                 "delivery-owner",
+                "owner",
                 "brief",
                 "as",
                 "as-user",
@@ -3101,6 +3125,7 @@ fn parse_with_optional_catalog(
 
             Ok(Command::WorkItemHandoff {
                 identity: identity(flags)?,
+                owner_user_id: nonempty(flags, "owner"),
                 work_item_id,
                 title,
                 delivery_owner,
@@ -3652,7 +3677,7 @@ fn parse_with_optional_catalog(
             })
         }
         "settle-turn" => {
-            let usage = "usage: tightbeam settle-turn --session <key> --seq <turnSeq> --outcome cancel|fail --reason <text> --key <idempotencyKey> --as-user <adminUserId>";
+            let usage = "usage: tightbeam settle-turn --session <key> --seq <turnSeq> --outcome cancel|fail --reason <text> --key <idempotencyKey>";
             if parsed.positional.len() != 1 {
                 return Err(usage.to_owned());
             }
@@ -3738,24 +3763,19 @@ fn parse_with_optional_catalog(
         "host-toolchain-set" => parse_host_toolchain_set(&parsed, flags),
         "update-clients" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam update-clients --as-user <adminUserId>".to_owned());
+                return Err("usage: tightbeam update-clients".to_owned());
             }
-            let Some(as_user) = nonempty(flags, "as-user") else {
-                return Err("--as-user is required for update-clients (admin required)".to_owned());
-            };
-            let selected_identity = identity(flags)?;
-            debug_assert_eq!(selected_identity, Identity::User(as_user.clone()));
-            Ok(Command::UpdateClients { as_user })
+            Ok(Command::UpdateClients {
+                identity: identity(flags)?,
+            })
         }
         "assimilate" => {
-            let ssh_dest = parsed.positional.get(1).cloned().ok_or_else(|| {
-                "usage: tightbeam assimilate <ssh-dest> --as-user <adminUserId>".to_owned()
-            })?;
-            let Some(as_user) = nonempty(flags, "as-user") else {
-                return Err("--as-user is required for assimilate (admin required)".to_owned());
-            };
+            let ssh_dest = parsed
+                .positional
+                .get(1)
+                .cloned()
+                .ok_or_else(|| "usage: tightbeam assimilate <ssh-dest>".to_owned())?;
             let selected_identity = identity(flags)?;
-            debug_assert_eq!(selected_identity, Identity::User(as_user.clone()));
             let catalog = match supplied_catalog {
                 Some(catalog) => catalog.clone(),
                 None => crate::harnesses::catalog_for(Some(
@@ -3772,7 +3792,7 @@ fn parse_with_optional_catalog(
             }
             Ok(Command::Assimilate(AssimilateArgs {
                 ssh_dest,
-                as_user,
+                identity: selected_identity,
                 name: nonempty(flags, "name"),
                 base_dir: nonempty(flags, "base-dir").unwrap_or_else(|| "~/.tightbeam".to_owned()),
                 harnesses,
@@ -4249,6 +4269,7 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     }
     let allowed = [
         "api-key",
+        "owner",
         "daemon-credential",
         "endpoint",
         "name",
@@ -4336,6 +4357,7 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     }
     Ok(Command::Onboard {
         identity: identity(flags)?,
+        owner_user_id: nonempty(flags, "owner"),
         provider,
         api_key: flags.contains_key("api-key"),
         daemon_credential,
@@ -4416,12 +4438,10 @@ mod tests {
     }
 
     #[test]
-    fn cancel_turn_requires_an_explicit_user_and_session() {
+    fn cancel_turn_requires_a_target_and_accepts_ordinary_identities() {
         for args in [
             strings(&["cancel-turn"]),
-            strings(&["cancel-turn", "--session", "s1"]),
             strings(&["cancel-turn", "--as-user", "owner"]),
-            strings(&["cancel-turn", "--session", "s1", "--as", "owner"]),
             strings(&[
                 "cancel-turn",
                 "--session",
@@ -4433,6 +4453,19 @@ mod tests {
             ]),
         ] {
             assert!(parse(args).is_err());
+        }
+
+        assert_eq!(
+            parse(strings(&["cancel-turn", "--session", "s1"])),
+            Ok(Command::CancelTurn {
+                identity: Identity::Session,
+                session_key: "s1".to_owned()
+            })
+        );
+        for suffix in [vec!["--as", "worker"], vec!["--as-process", "automation"]] {
+            let mut argv = vec!["cancel-turn", "--session", "s1"];
+            argv.extend(suffix);
+            assert!(parse(strings(&argv)).is_ok());
         }
 
         assert_eq!(
@@ -5205,7 +5238,7 @@ mod tests {
         let manual = render_help(None);
         let normalized = manual.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            normalized.contains("Processes may wake, cancel-wake, file condition facts, and use fact producer commands — they cannot spawn, retire, or administer."),
+            normalized.contains("Available with or without a session credential, for all"),
             "{manual}"
         );
         for command in ["fact-demand", "fact-producer-claim", "fact-producers"] {
@@ -5424,6 +5457,7 @@ mod tests {
             ])),
             Ok(Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
+                owner_user_id: None,
                 provider: "fixture-provider".to_owned(),
                 api_key: false,
                 daemon_credential: false,
@@ -5446,6 +5480,7 @@ mod tests {
             ])),
             Ok(Command::Onboard {
                 identity: Identity::Session,
+                owner_user_id: None,
                 provider: "github".to_owned(),
                 api_key: false,
                 daemon_credential: false,
@@ -5464,6 +5499,7 @@ mod tests {
             ])),
             Ok(Command::Onboard {
                 identity: Identity::Session,
+                owner_user_id: None,
                 provider: "github".to_owned(),
                 api_key: false,
                 daemon_credential: false,
@@ -5501,6 +5537,7 @@ mod tests {
             parse(strings(&["onboard", "cursor", "--api-key"])),
             Ok(Command::Onboard {
                 identity: Identity::Session,
+                owner_user_id: None,
                 provider: "cursor".to_owned(),
                 api_key: true,
                 daemon_credential: false,
@@ -5533,6 +5570,7 @@ mod tests {
             ])),
             Ok(Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
+                owner_user_id: None,
                 provider: "opencode-go".to_owned(),
                 api_key: true,
                 daemon_credential: false,
@@ -5560,6 +5598,7 @@ mod tests {
             ])),
             Ok(Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
+                owner_user_id: None,
                 provider: "opencode-go".to_owned(),
                 api_key: false,
                 daemon_credential: true,
@@ -5596,6 +5635,7 @@ mod tests {
             ])),
             Ok(Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
+                owner_user_id: None,
                 provider: "local-openai".to_owned(),
                 api_key: false,
                 daemon_credential: false,
@@ -5636,12 +5676,14 @@ mod tests {
         assert_eq!(
             parse(strings(&["update-clients", "--as-user", "flynn"])),
             Ok(Command::UpdateClients {
-                as_user: "flynn".to_owned()
+                identity: Identity::User("flynn".to_owned())
             })
         );
         assert_eq!(
             parse(strings(&["update-clients"])),
-            Err("--as-user is required for update-clients (admin required)".to_owned())
+            Ok(Command::UpdateClients {
+                identity: Identity::Session
+            })
         );
     }
 
@@ -7042,7 +7084,7 @@ mod tests {
             assert_eq!(
                 parse(args),
                 Err(
-                    "usage: tightbeam doctor [--json] [--base-dir DIR] [--as <role> | --as-user <userId>]"
+                    "usage: tightbeam doctor [--json] [--base-dir DIR] [--as <role> | --as-user <userId> | --as-process <name>]"
                         .to_owned()
                 )
             );
@@ -7477,6 +7519,7 @@ mod tests {
                 ]),
                 Command::Spawn {
                     identity: Identity::User("flynn".to_owned()),
+                    owner_user_id: None,
                     display_name: "Worker".to_owned(),
                     idempotency_key: "k".to_owned(),
                     archetype: Some("worker".to_owned()),
@@ -7651,6 +7694,7 @@ mod tests {
                 strings(&["onboard", "openai", "--as-user", "flynn"]),
                 Command::Onboard {
                     identity: Identity::User("flynn".to_owned()),
+                    owner_user_id: None,
                     provider: "openai".to_owned(),
                     api_key: false,
                     daemon_credential: false,
@@ -7676,7 +7720,7 @@ mod tests {
                 ]),
                 Command::Assimilate(AssimilateArgs {
                     ssh_dest: "flynn@host".to_owned(),
-                    as_user: "flynn".to_owned(),
+                    identity: Identity::User("flynn".to_owned()),
                     name: Some("host".to_owned()),
                     base_dir: "/srv/tightbeam".to_owned(),
                     harnesses: vec!["codex".to_owned()],

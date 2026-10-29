@@ -227,8 +227,8 @@ defmodule Tightbeam.BreathingTest do
     call = %{principal: {:user, "owner"}, params: %{target_kind: "session", target_id: "active"}}
     assert %{schema: "breathing-v1"} = Breathing.handle(db, call)
 
-    assert %{code: "process_denied"} =
-             Breathing.handle(db, %{call | principal: {:process, "tightbeam"}})
+    assert Breathing.handle(db, %{call | principal: {:process, "automation"}}).target ==
+             Breathing.handle(db, call).target
   end
 
   test "assignment queue summaries are scoped, private, and read-only", %{db: db} do
@@ -333,8 +333,8 @@ defmodule Tightbeam.BreathingTest do
         params: %{target_kind: "assignment", target_id: "asg_session_opened"}
       })
 
-    assert unrelated_session == Breathing.query(db, "assignment", "asg_session_opened")
-    refute Map.has_key?(unrelated_session, :queue)
+    assert unrelated_session.queue.count == owner.queue.count
+    assert unrelated_session.queue.senders == owner.queue.senders
 
     user_of_opener_without_work_item =
       Breathing.handle(db, %{

@@ -324,9 +324,7 @@ defmodule Tightbeam.Wire.Router do
             verb: verb,
             origin: origin,
             principal: principal,
-            # Identity resolution can turn a session-authenticated call into a user
-            # principal. Keep the authenticated transport beside that principal so a
-            # handler can stamp the hop without trusting a caller param.
+            # Retain the authenticated transport separately from the selected origin.
             transport_session_key: authenticated_session_key(auth),
             session_key: artifact_caller_session(verb, session_key, principal),
             target_role: target_meta.role,
@@ -348,6 +346,9 @@ defmodule Tightbeam.Wire.Router do
                   id: session_key,
                   is_admin: false
                 })
+
+              {"artifact-content-fetch", {:process, name}} ->
+                Map.put(call, :rest_principal, %{kind: "process", id: name, is_admin: true})
 
               {"artifact-content-fetch", {:user, user_id}} ->
                 Map.put(call, :rest_principal, state_principal_view({:user, user_id}, conn))
@@ -2175,12 +2176,8 @@ defmodule Tightbeam.Wire.Router do
   defp resolve_cli_as_user(:org, user_id) when is_binary(user_id) and user_id != "",
     do: {:ok, {:user, user_id}}
 
-  defp resolve_cli_as_user({:session, %{owner_user_id: owner}}, owner)
-       when is_binary(owner) and owner != "",
-       do: {:ok, {:user, owner}}
-
-  defp resolve_cli_as_user({:session, %{owner_user_id: owner}}, _other),
-    do: {:error, 403, "identity_not_yours", "this session belongs to #{owner}"}
+  defp resolve_cli_as_user({:session, %{session_key: key}}, _selector),
+    do: {:ok, {:session, key}}
 
   defp resolve_cli_as_user(_auth, _empty), do: {:error, 400, "invalid_message", nil}
 
@@ -2976,11 +2973,8 @@ defmodule Tightbeam.Wire.Router do
       [] ->
         {:ok, session_read_principal(session.owner_user_id, conn)}
 
-      [user_id] when user_id == session.owner_user_id and user_id != "" ->
-        {:ok, d1_user_principal(user_id, conn)}
-
       [_user_id] ->
-        {:error, 403, "identity_not_yours", "this session belongs to #{session.owner_user_id}"}
+        {:ok, session_read_principal(session.owner_user_id, conn)}
 
       _repeated ->
         {:error, 400, "invalid_as_user", nil}
@@ -3480,7 +3474,7 @@ defmodule Tightbeam.Wire.Router do
       else: {:error, 400, "invalid_message", "verb not allowed: #{verb}"}
   end
 
-  defp agent_identity(%{"asProcess" => "tightbeam"}, :org, _conn) do
+  defp agent_identity(%{"asProcess" => "tightbeam"}, _auth, _conn) do
     {:error, 403, "reserved_origin", "process:tightbeam is reserved to the substrate"}
   end
 
@@ -3506,7 +3500,6 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp agent_identity(body, {:session, session}, conn) do
-    roles = Roles.for_session(db(conn), session.session_key)
     session_principal = {:session, session.session_key}
 
     cond do
@@ -3522,24 +3515,13 @@ defmodule Tightbeam.Wire.Router do
         end
 
       is_binary(body["asUser"]) ->
-        if body["asUser"] == session.owner_user_id do
-          {:ok, "user:#{session.owner_user_id}", {:user, session.owner_user_id}}
-        else
-          {:error, 403, "identity_not_yours", "this session belongs to #{session.owner_user_id}"}
-        end
+        {:ok, "agent:#{session.session_key}", session_principal}
 
       is_binary(body["asProcess"]) and body["asProcess"] != "" ->
-        {:error, 403, "identity_not_yours", "a session token cannot act as a process"}
-
-      length(roles) == 1 ->
-        {:ok, "agent:#{hd(roles)}", session_principal}
-
-      roles == [] ->
-        {:ok, "user:#{session.owner_user_id}", session_principal}
+        {:ok, "process:#{body["asProcess"]}", session_principal}
 
       true ->
-        {:error, 400, "ambiguous_identity",
-         "this session holds several roles (#{Enum.join(roles, ", ")}); pass --as <role>"}
+        {:ok, "agent:#{session.session_key}", session_principal}
     end
   end
 
@@ -3567,11 +3549,11 @@ defmodule Tightbeam.Wire.Router do
         # Third origin class (closed set: user | agent | process): automation
         # that is neither a person nor a session — cron, CI, webhooks.
         # Local-trust like --as (named, not authenticated — v1 decision);
-        # powers are narrow: wake + cancel-wake + condition, nothing else.
         {:ok, "process:#{body["asProcess"]}"}
 
       true ->
-        {:error, 400, "invalid_message", "as (role) or asUser required"}
+        {:error, 400, "invalid_message",
+         "as, asUser, or asProcess required on an organization credential"}
     end
   end
 
@@ -4165,7 +4147,7 @@ defmodule Tightbeam.Wire.Router do
     "topline-reopen" => ~w(idempotency_key reason topline_id)a,
     "topline-close" => ~w(idempotency_key reason topline_id)a,
     "topline-update" => ~w(idempotency_key reason title topline_id)a,
-    "topline-create" => ~w(idempotency_key title)a,
+    "topline-create" => ~w(idempotency_key title owner_user_id)a,
     "withdraw" => ~w(request request_id reason)a,
     "revoke-waiver" => ~w(waiver waiver_id reason)a,
     "waive" =>
@@ -4188,7 +4170,7 @@ defmodule Tightbeam.Wire.Router do
     "ask" =>
       ~w(assignment_id context idempotency_key params question reason role session_key target user_id verb)a,
     "assign" =>
-      ~w(effect_kind files holder_key idempotency_key mementos prompt reviews reviews_assignment_id role session_key subject succeeds_assignment_id work_item_id)a,
+      ~w(effect_kind files holder_key idempotency_key mementos prompt reviews reviews_assignment_id role session_key subject succeeds_assignment_id work_item_id owner_user_id)a,
     "assignment-commitref-correct" =>
       ~w(assignment_id commit_refs evidence_artifact_id idempotency_key reason)a,
     "assignments" => ~w(role session_key state)a,
@@ -4204,7 +4186,7 @@ defmodule Tightbeam.Wire.Router do
     "decision-request" => ~w(request request_id)a,
     "decision-requests" => ~w(status)a,
     "dispatch" =>
-      ~w(brief effect_kind holder_key idempotency_key mementos prompt session_key subject succeeds_assignment_id work_item_id workdir_root)a,
+      ~w(brief effect_kind holder_key idempotency_key mementos prompt session_key subject succeeds_assignment_id work_item_id workdir_root owner_user_id)a,
     "effort-rule" => ~w(action request request_id)a,
     "execution-map" => ~w(tree origin owner state spec spec_sha session quiet_over)a,
     "execution-map-select" =>
@@ -4237,7 +4219,8 @@ defmodule Tightbeam.Wire.Router do
     "kungfu-list" => ~w()a,
     "kungfu-setup" => ~w(name)a,
     "learn" => ~w(idempotency_key name)a,
-    "onboard" => ~w(provider phase kind machine lease_id reason source code callback_url)a,
+    "onboard" =>
+      ~w(provider phase kind machine lease_id reason source code callback_url owner_user_id)a,
     "operator-ask" =>
       ~w(assignment assignment_id choices context deadline idempotency_key note options owner_user_id question supersedes work_item_id)a,
     "operator-rule" => ~w(decision idempotency_key rationale reason request request_id response)a,
@@ -4250,7 +4233,7 @@ defmodule Tightbeam.Wire.Router do
     "return" => ~w(idempotency_key reason request request_id)a,
     "revoke-assignment" => ~w(assignment_id reason)a,
     "role-bind" => ~w(name session_key)a,
-    "role-create" => ~w(name bind description session_key)a,
+    "role-create" => ~w(name bind description session_key owner_user_id)a,
     "role-list" => ~w()a,
     "role-rm" => ~w(name)a,
     "rule" => ~w(request request_id decision rationale reason scope expires_at idempotency_key)a,
@@ -4261,7 +4244,7 @@ defmodule Tightbeam.Wire.Router do
     "session-reparent" => ~w(assignment_id idempotency_key parent_session_key session_key)a,
     "settle-turn" => ~w(idempotency_key outcome reason session_key turn_seq)a,
     "spawn" =>
-      ~w(archetype context display_name effort handle harness host idempotency_key model overrides work_item_id)a,
+      ~w(archetype context display_name effort handle harness host idempotency_key model overrides work_item_id owner_user_id)a,
     "subtree-guidance-set" => ~w(name archetypes text)a,
     "subtree-guidance-show" => ~w(session_key)a,
     "subtree-guidance-withdraw" => ~w(name)a,
@@ -4275,10 +4258,10 @@ defmodule Tightbeam.Wire.Router do
       ~w(prompt after_ms after_turn assignment_id at cancel_wake_id class cron condition_kind condition_scope idempotency_key predicate replace_queued reresolve reresolve_rung reresolve_seed nudge)a,
     "work-item-close" => ~w(work_item_id)a,
     "work-item-create" =>
-      ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body mementos)a,
+      ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body mementos owner_user_id)a,
     "work-item-fail" => ~w(reason work_item_id)a,
     "work-item-get" => ~w(work_item_id)a,
-    "work-item-handoff" => ~w(work_item_id title delivery_owner_session_key brief)a,
+    "work-item-handoff" => ~w(work_item_id title delivery_owner_session_key brief owner_user_id)a,
     "work-item-icebox" => ~w(work_item_id)a,
     "work-item-reopen" => ~w(work_item_id)a,
     "work-item-trace" => ~w(work_item_id)a,

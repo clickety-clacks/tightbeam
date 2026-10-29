@@ -1777,7 +1777,7 @@ fn sentinel_lines(status: &SentinelStatus) -> Vec<String> {
     let value = match status {
         SentinelStatus::Unavailable(reason) => {
             return vec![format!(
-                "sentinels: status unavailable ({reason}); run doctor from a session or pass --as-user <userId>"
+                "sentinels: status unavailable ({reason}); run doctor from a session or select an identity on an organization credential"
             )];
         }
         SentinelStatus::Listed(value) => value,
@@ -1860,7 +1860,7 @@ fn require_credential_integrity(
         return Ok(());
     };
     Err(format!(
-        "doctor: banked OAuth credential for {provider} is CORRUPT ({}); run tightbeam onboard {provider} --as-user <userId>",
+        "doctor: banked OAuth credential for {provider} is CORRUPT ({}); run tightbeam onboard {provider}",
         health.corrupt_fields.join(", ")
     ))
 }
@@ -2083,7 +2083,7 @@ mod tests {
         assert_eq!(
             sentinel_lines(&offline),
             vec![
-                "sentinels: status unavailable (connection refused); run doctor from a session or pass --as-user <userId>"
+                "sentinels: status unavailable (connection refused); run doctor from a session or select an identity on an organization credential"
             ]
         );
         assert_eq!(

@@ -596,8 +596,8 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             session_key,
         } => {
             let mut fields = Vec::new();
-            if let Identity::User(user) = identity {
-                fields.push(string_field("asUser", user));
+            if let Some(field) = identity_field(identity) {
+                fields.push(field);
             }
             fields.push(string_field("sessionKey", session_key));
             Ok(RequestSpec {
@@ -609,6 +609,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         }
         Command::Spawn {
             identity,
+            owner_user_id,
             display_name,
             idempotency_key,
             archetype,
@@ -629,6 +630,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             // on the far side depends on telling those apart. The other fields
             // have no meaningful empty value, so they lift into the same shape.
             for (name, value) in [
+                ("ownerUserId", owner_user_id.clone().map(Some)),
                 ("archetype", archetype.clone().map(Some)),
                 ("harness", harness.clone().map(Some)),
                 ("model", model.clone()),
@@ -745,6 +747,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             target,
             idempotency_key,
             work_item_id,
+            owner_user_id,
             reviews,
             effect_kind,
             files,
@@ -758,6 +761,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             let mut params = vec![string_field("subject", subject)];
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
+            }
+            if let Some(value) = owner_user_id {
+                params.push(string_field("ownerUserId", value));
             }
             if let Some(value) = work_item_id {
                 params.push(string_field("workItemId", value));
@@ -786,6 +792,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             subject,
             holder,
             work_item_id,
+            owner_user_id,
             effect_kind,
             workdir_root,
             brief,
@@ -796,6 +803,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("subject", subject),
                 string_field("brief", brief),
             ];
+            if let Some(value) = owner_user_id {
+                params.push(string_field("ownerUserId", value));
+            }
             if let Some(value) = work_item_id {
                 params.push(string_field("workItemId", value));
             }
@@ -1060,6 +1070,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         )),
         Command::WorkItemCreate {
             identity,
+            owner_user_id,
             mementos,
             title,
             spec_ref_name,
@@ -1068,6 +1079,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             idempotency_key,
         } => {
             let mut params = vec![string_field("title", title)];
+            if let Some(owner) = owner_user_id {
+                params.push(string_field("ownerUserId", owner));
+            }
             if let Some(value) = spec_ref_name {
                 params.push(string_field("specRefName", value));
             }
@@ -1085,12 +1099,16 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         }
         Command::WorkItemHandoff {
             identity,
+            owner_user_id,
             work_item_id,
             title,
             delivery_owner,
             brief,
         } => {
             let mut params = Vec::new();
+            if let Some(owner) = owner_user_id {
+                params.push(string_field("ownerUserId", owner));
+            }
             if let Some(value) = work_item_id {
                 params.push(string_field("workItemId", value));
             }
@@ -1685,13 +1703,17 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             Ok(request(identity, "identity-apply", vec![], params))
         }
         Command::Onboard {
-            identity, provider, ..
-        } => Ok(request(
             identity,
-            "onboard",
-            vec![],
-            vec![string_field("provider", provider)],
-        )),
+            provider,
+            owner_user_id,
+            ..
+        } => {
+            let mut params = vec![string_field("provider", provider)];
+            if let Some(owner) = owner_user_id {
+                params.push(string_field("ownerUserId", owner));
+            }
+            Ok(request(identity, "onboard", vec![], params))
+        }
         Command::AddUser {
             identity,
             user_id,
@@ -1870,7 +1892,7 @@ pub fn build_operator_wake_request(
 }
 
 pub fn build_register_host_request(
-    as_user: &str,
+    identity: &Identity,
     name: &str,
     ssh: &str,
     base_dir: &str,
@@ -1878,7 +1900,7 @@ pub fn build_register_host_request(
     adapter_bin_dir: &str,
 ) -> RequestSpec {
     request(
-        &Identity::User(as_user.to_owned()),
+        identity,
         "register-host",
         vec![],
         vec![
@@ -1892,14 +1914,9 @@ pub fn build_register_host_request(
     .with_attempt_context(Some(CommandContext::assimilate_registration()))
 }
 
-pub fn build_update_clients_request(as_user: &str) -> RequestSpec {
-    request(
-        &Identity::User(as_user.to_owned()),
-        "update-clients",
-        vec![],
-        vec![],
-    )
-    .with_attempt_context(Some(CommandContext::update_clients()))
+pub fn build_update_clients_request(identity: &Identity) -> RequestSpec {
+    request(identity, "update-clients", vec![], vec![])
+        .with_attempt_context(Some(CommandContext::update_clients()))
 }
 
 pub fn discover() -> Result<Endpoint, String> {
@@ -3627,7 +3644,7 @@ where
                 }
             }
         }
-        Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
+        Command::UpdateClients { identity } => crate::ceremonies::update_clients(&identity),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
         Command::SessionConnect { .. } => {
             unreachable!("session-connect is routed before the shared dispatcher")
@@ -3635,6 +3652,7 @@ where
         Command::GithubAuthCheck => crate::github_auth::check_tool_call_stdin(),
         Command::Onboard {
             identity,
+            owner_user_id,
             provider,
             api_key,
             daemon_credential,
@@ -3659,7 +3677,18 @@ where
                 local_endpoint.as_deref(),
                 local_provider_name.as_deref(),
                 &endpoint,
-                send_request,
+                |endpoint, request, deadline| {
+                    let mut request = request.clone();
+                    if let Some(owner) = &owner_user_id {
+                        let mut body: serde_json::Value = serde_json::from_str(&request.body_json)
+                            .expect("onboarding requests contain JSON");
+                        if body["verb"] == "onboard" {
+                            body["params"]["ownerUserId"] = owner.clone().into();
+                            request.body_json = body.to_string();
+                        }
+                    }
+                    send_request(endpoint, &request, deadline)
+                },
                 load_harnesses,
             )
         }
@@ -3768,7 +3797,7 @@ fn require_session_endpoint(identity: &Identity, endpoint: &Endpoint) -> Result<
 
 fn identity_required(cwd: &Path) -> String {
     format!(
-        "identity required: no explicit --as, --as-user, or --as-process flag was passed, and no .tightbeam-session was found walking up from '{}' to the filesystem root. Pass --as <your-agent-handle> (agent action) or --as-user <userId> (operator action). This is WHO the call is from, not the target. Run 'tightbeam help'.",
+        "identity required: no explicit --as, --as-user, or --as-process flag was passed, and no .tightbeam-session was found walking up from '{}' to the filesystem root. Run from a Tightbeam session, or select --as <role>, --as-user <userId>, or --as-process <name> with an organization credential. This is WHO the call is from, not the target. Run 'tightbeam help'.",
         cwd.display()
     )
 }
@@ -4175,6 +4204,48 @@ mod tests {
                 "params": {"workItemId": "wi_1", "body": "editable body"}
             })
         );
+    }
+
+    #[test]
+    fn process_owned_creates_send_owner_as_data() {
+        for argv in [
+            vec!["work-item-create", "--title", "Task"],
+            vec![
+                "work-item-handoff",
+                "--title",
+                "Task",
+                "--delivery-owner",
+                "agent:holder",
+                "--brief",
+                "Deliver the task",
+            ],
+            vec![
+                "topline-create",
+                "--title",
+                "Objective",
+                "--key",
+                "objective-create",
+            ],
+            vec!["spawn", "--display", "Worker", "--key", "worker-create"],
+            vec!["onboard", "openai"],
+            vec!["assign", "--session", "child", "--subject", "Task"],
+            vec![
+                "dispatch",
+                "--to",
+                "child",
+                "--subject",
+                "Task",
+                "--brief",
+                "Do work",
+            ],
+        ] {
+            let mut argv = argv;
+            argv.extend(["--owner", "flynn", "--as-process", "automation"]);
+            let request: serde_json::Value = serde_json::from_str(&body(&argv)).unwrap();
+            assert_eq!(request["asProcess"], "automation");
+            assert_eq!(request["params"]["ownerUserId"], "flynn");
+            assert!(request.get("asUser").is_none());
+        }
     }
 
     #[test]
@@ -5086,6 +5157,20 @@ mod tests {
                 "parent",
             ]),
             r#"{"as":"parent","verb":"cancel","params":{"assignmentId":"asg_1","reason":"replace the stale turn"}}"#
+        );
+        assert_eq!(
+            body(&["cancel-turn", "--session", "worker s_1"]),
+            r#"{"verb":"cancel","sessionKey":"worker s_1","params":{}}"#
+        );
+        assert_eq!(
+            body(&[
+                "cancel-turn",
+                "--session",
+                "worker s_1",
+                "--as-process",
+                "automation"
+            ]),
+            r#"{"asProcess":"automation","verb":"cancel","sessionKey":"worker s_1","params":{}}"#
         );
         assert_eq!(
             body(&[
@@ -6346,6 +6431,7 @@ mod tests {
         let result = run_with(
             Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
+                owner_user_id: Some("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
                 daemon_credential: false,
@@ -6363,6 +6449,8 @@ mod tests {
                 })
             },
             |endpoint, request, deadline| {
+                let body: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+                assert_eq!(body["params"]["ownerUserId"], "flynn");
                 let phase = if request.body_json.contains(r#""phase":"begin""#) {
                     "begin"
                 } else if request.body_json.contains(r#""phase":"finish""#) {
@@ -6458,6 +6546,7 @@ mod tests {
         let result = run_with(
             Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
+                owner_user_id: None,
                 provider: "openai".to_owned(),
                 api_key: false,
                 daemon_credential: false,
@@ -7771,6 +7860,14 @@ mod session_diagnose_tests {
             serde_json::from_str::<Value>(&request.body_json).unwrap(),
             serde_json::json!({"asUser":"mike", "sessionKey":"seat"})
         );
+        for (flag, field) in [("--as", "as"), ("--as-process", "asProcess")] {
+            let parsed =
+                command(&["session-diagnose", "--session", "seat", flag, "automation"]).unwrap();
+            let request = build_request(&parsed).unwrap();
+            let body: Value = serde_json::from_str(&request.body_json).unwrap();
+            assert_eq!(body[field], "automation");
+            assert_eq!(body["sessionKey"], "seat");
+        }
         let bare = command(&["session-diagnose", "--session", "seat"]).unwrap();
         let bare_request = build_request(&bare).unwrap();
         assert_eq!(bare_request.path, "/agent/session-diagnose");
@@ -7779,7 +7876,6 @@ mod session_diagnose_tests {
             serde_json::json!({"sessionKey":"seat"})
         );
         for args in [
-            vec!["session-diagnose", "--session", "seat", "--as", "po"],
             vec!["session-diagnose", "--as-user", "mike"],
             vec![
                 "session-diagnose",

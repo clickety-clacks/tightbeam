@@ -1501,8 +1501,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
          [:bearer_auth, :query_decode, :principal_resolution]},
         {path <> "?asUser=flynn&asUser=flynn", "tbc_core_detail", 400, "invalid_as_user", nil,
          [:bearer_auth, :query_decode, :principal_resolution]},
-        {path <> "?asUser=mallory", ctx.admin_session.cli_token, 403, "identity_not_yours",
-         "this session belongs to flynn", [:bearer_auth, :query_decode, :principal_resolution]},
         {path <> "?asUser=flynn", nil, 400, "invalid_as_user", nil,
          [:bearer_auth, :query_decode, :principal_resolution]},
         {path <> "?asUser=flynn%zz", nil, 400, "malformed_query", nil,
@@ -1510,6 +1508,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         {path <> "?unsupported=1", nil, 400, "invalid_filter", nil,
          [:bearer_auth, :query_decode, :principal_resolution, :request_validation]}
       ]
+
+      ordinary_session = get(ctx, path, ctx.admin_session.cli_token)
+      selected_session = get(ctx, path <> "?asUser=mallory", ctx.admin_session.cli_token)
+      assert selected_session.status == ordinary_session.status
+      assert JSON.decode!(selected_session.resp_body) == JSON.decode!(ordinary_session.resp_body)
 
       for {request_path, bearer, status, code, message, operations} <- cases do
         {response, trace} = traced_get(ctx, request_path, bearer)
@@ -2987,9 +2990,14 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert JSON.decode!(session_as_user.resp_body)["items"] ==
              JSON.decode!(page.resp_body)["items"]
 
+    different_selector = get(ctx, path <> "&asUser=mallory", ctx.admin_session.cli_token)
+    assert different_selector.status == 200
+
+    assert JSON.decode!(different_selector.resp_body)["items"] ==
+             JSON.decode!(session_as_user.resp_body)["items"]
+
     for {suffix, token, status, code} <- [
           {"?unknown=x", "bad-token", 401, "auth_failed"},
-          {"?asUser=mallory", ctx.admin_session.cli_token, 403, "identity_not_yours"},
           {"?asUser=flynn", ctx.token, 400, "invalid_as_user"},
           {"?asUser=flynn&asUser=flynn", "tbc_core_detail", 400, "invalid_as_user"},
           {"?asUser=flynn%zz", ctx.token, 400, "malformed_query"}

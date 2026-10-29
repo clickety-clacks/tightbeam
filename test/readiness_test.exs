@@ -144,7 +144,7 @@ defmodule Tightbeam.ReadinessTest do
 
     statement =
       "testhost lost codex: its openai credential was rejected. Redirect destination: alternate. testhost needs a human sign-in for codex; run " <>
-        "on testhost: tightbeam onboard openai --as-user <adminUserId> " <>
+        "on testhost: tightbeam onboard openai " <>
         "(replace <adminUserId> with your own administrator id)."
 
     config =
@@ -271,7 +271,7 @@ defmodule Tightbeam.ReadinessTest do
     # one surface the operator is told to act on. Assert the provider, and assert
     # the harness name is NOT what gets handed to the verb.
     assert line =~ "tightbeam onboard #{module.credential_provider()}"
-    assert line =~ "--as-user <userId>"
+    refute line =~ "--as-user"
     refute line =~ "tightbeam onboard #{module.wire_name()}"
     assert line =~ "normal #{module.wire_name()} CLI login"
     assert line =~ Path.join(ctx.base, "auth")
@@ -298,7 +298,7 @@ defmodule Tightbeam.ReadinessTest do
       |> Readiness.render(ctx.config)
       |> Enum.find(&(&1 =~ "Tightbeam has no credential for cursor"))
 
-    assert line =~ "tightbeam onboard cursor --api-key --as-user <userId>"
+    assert line =~ "tightbeam onboard cursor --api-key"
   end
 
   test "a default model outside the live catalog is named by its fields", ctx do

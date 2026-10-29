@@ -376,46 +376,11 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
   defp authorized?(_txn, %{kind: "user", ref: user}, %{owner_user_id: owner}),
     do: user == owner
 
-  defp authorized?(txn, %{kind: "session", ref: caller}, %{
-         holder: holder,
-         opened_by_session: opened_by_session
-       }) do
-    if caller == opened_by_session do
-      true
-    else
-      case {product_owner_lane(txn, caller), product_owner_lane(txn, holder)} do
-        {lane, lane} when is_binary(lane) ->
-          true
-
-        _ ->
-          false
-      end
-    end
+  defp authorized?(txn, %{kind: "session", ref: caller}, %{owner_user_id: owner}) do
+    Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [caller]) == [[owner]]
   end
 
-  defp product_owner_lane(txn, session_key) do
-    case Txn.q(
-           txn,
-           """
-           WITH RECURSIVE lineage(sessionKey, spawnedBy, archetype, depth) AS (
-             SELECT sessionKey, spawnedBy, archetype, 0
-             FROM sessions WHERE sessionKey = ?1
-             UNION ALL
-             SELECT parent.sessionKey, parent.spawnedBy, parent.archetype, lineage.depth + 1
-             FROM sessions AS parent
-             JOIN lineage ON parent.sessionKey = lineage.spawnedBy
-             WHERE lineage.spawnedBy != lineage.sessionKey AND lineage.depth < 100
-           )
-           SELECT sessionKey FROM lineage
-           WHERE archetype = 'product-owner'
-           ORDER BY depth ASC LIMIT 1
-           """,
-           [session_key]
-         ) do
-      [[lane]] -> lane
-      _ -> nil
-    end
-  end
+  defp authorized?(_txn, %{kind: "process"}, _context), do: true
 
   # Historical backfill evidence can describe assignments across several work
   # items. The correction keeps the exact artifact id and its immutable hash as
@@ -678,15 +643,14 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
   defp actor({:user, ref}) when is_binary(ref), do: {:ok, %{kind: "user", ref: ref}}
   defp actor({:session, ref}) when is_binary(ref), do: {:ok, %{kind: "session", ref: ref}}
 
-  defp actor({:process, _}),
-    do: {:error, error("process_denied", "process principals cannot correct commitRefs")}
+  defp actor({:process, ref}), do: {:ok, %{kind: "process", ref: ref}}
 
   defp actor(_),
     do:
       {:error,
        error(
          "principal_required",
-         "commitRef correction requires a user credential or session token"
+         "commitRef correction requires an authenticated principal"
        )}
 
   defp valid_key(key) when is_binary(key) do

@@ -3053,8 +3053,10 @@ defmodule Tightbeam.HarnessHealthTest do
     refute Map.has_key?(ordinary, :reviewNotice)
     assert {:ok, _} = HarnessHealth.read_other_evidence(ctx.db, opened.id, {:user, "flynn"})
 
-    assert {:error, %{code: "not_authorized"}} =
+    assert {:ok, same_owner_evidence} =
              HarnessHealth.read_other_evidence(ctx.db, opened.id, {:session, ctx.outside_session})
+
+    assert same_owner_evidence == exact
 
     assert {:error, %{code: "not_authorized"}} =
              HarnessHealth.read_other_evidence(ctx.db, opened.id, "process:tightbeam")

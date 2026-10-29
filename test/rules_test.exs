@@ -727,7 +727,7 @@ defmodule Tightbeam.RulesTest do
     assert [%{kind: "denied", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
   end
 
-  test "matching a constitutional denial is monotonic and leaves domain state unchanged", ctx do
+  test "a declared denial precedes required owner data without changing domain state", ctx do
     config = %{
       db: ctx.db,
       base_dir: ctx.base_dir,
@@ -737,11 +737,13 @@ defmodule Tightbeam.RulesTest do
     }
 
     handler = Gateway.handlers(config)["spawn"]
-    process_call = %{call("process:cron") | verb: "spawn"}
+
+    process_call =
+      Map.merge(call("process:cron"), %{verb: "spawn", principal: {:process, "cron"}})
 
     Rules.load!(ctx.base_dir, ["spawn"])
 
-    assert {:error, %{code: "forbidden"}} =
+    assert {:error, %{code: "owner_required"}} =
              Dispatch.dispatch(ctx.db, %{"spawn" => handler}, process_call)
 
     put_rule(ctx, rule("statute", "spawn", "caller.origin_class", "eq", "process"))

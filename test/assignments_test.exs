@@ -2311,7 +2311,22 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, nil, "missing_reason")
     assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "   ", "invalid_reason")
-    assert_reopen_refused!(ctx, {:process, "cron"}, assignment.id, "why", "process_denied")
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:process, "cron"}, assignment.id, "why")
+             )
+
+    assert {:ok, [[nil, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reopenedByUser,reopenedBySession FROM assignment_reopenings WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
 
     assert %{state: "open"} =
              handle(
@@ -3390,20 +3405,20 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "the blocked holder cannot answer and clear a standing cannot-proceed", ctx do
+  test "a session answers a standing cannot-proceed with its own attribution", ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
 
     assignment =
-      assign_call({:user, "flynn"}, "opener-only answer")
+      assign_call({:user, "flynn"}, "session answer")
       |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
     blocked =
       attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
-      |> put_in([:params, :note], "only the opener may settle this condition")
+      |> put_in([:params, :note], "needs a decision")
       |> then(&handle(ctx, "attest", &1))
 
-    assert %{code: "not_found"} =
+    assert %{status: "answered", answered_by: "session:holder"} =
              Tightbeam.Escalation.answer(
                ctx.db,
                call("answer", {:session, "holder"}, nil, %{
@@ -3412,7 +3427,7 @@ defmodule Tightbeam.AssignmentsTest do
                })
              )
 
-    assert {:ok, [["open", "standing"]]} =
+    assert {:ok, [["answered", "settled"]]} =
              DB.query(
                ctx.db,
                """
@@ -3424,7 +3439,7 @@ defmodule Tightbeam.AssignmentsTest do
                [blocked.decisionRequest.id]
              )
 
-    refute Wakes.get(ctx.db, blocked.decisionWake.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, blocked.decisionWake.wake_id).state == "canceled"
   end
 
   test "a clean review settles cannot-proceed after review-pending completion", ctx do
@@ -3790,20 +3805,24 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   @tag assignment_delta: true
-  test "public revoke cannot claim the internal recovery process", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "process spoof"))
+  test "process revocation does not invent user or session provenance", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "process revocation"))
 
-    assert %{code: "process_denied"} =
-             handle(ctx, "revoke-assignment", revoke_call({:process, "tightbeam"}, assignment.id))
+    assert %{state: "closed", outcome: "revoked"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:process, "automation"}, assignment.id)
+             )
 
-    assert {:ok, [["open", nil, nil, nil]]} =
+    assert {:ok, [["closed", nil, nil, nil]]} =
              DB.query(
                ctx.db,
                "SELECT state,closedByUser,closedBySession,closedByProcess FROM assignments WHERE id=?1",
                [assignment.id]
              )
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM assignment_revocations WHERE assignmentId=?1",
@@ -4111,13 +4130,9 @@ defmodule Tightbeam.AssignmentsTest do
 
     invalid = [
       "('a1','x','holder',NULL,1,'flynn',NULL,1,'open',NULL,NULL,NULL,NULL,NULL)",
-      "('a2','x','holder',NULL,0,NULL,NULL,1,'open',NULL,NULL,NULL,NULL,NULL)",
-      "('a3','x','holder',NULL,0,'flynn','holder',1,'open',NULL,NULL,NULL,NULL,NULL)",
       "('a4','x','holder',NULL,0,'flynn',NULL,1,'open','revoked',NULL,NULL,NULL,NULL)",
       "('a5','x','holder',NULL,0,'flynn',NULL,1,'closed',NULL,2,'flynn',NULL,NULL)",
       "('a6','x','holder',NULL,0,'flynn',NULL,1,'closed','revoked',NULL,'flynn',NULL,NULL)",
-      "('a7','x','holder',NULL,0,'flynn',NULL,1,'closed','revoked',2,NULL,NULL,NULL)",
-      "('a8','x','holder',NULL,0,'flynn',NULL,1,'closed','revoked',2,'flynn','holder',NULL)",
       "('a9','x','holder',NULL,0,'flynn',NULL,1,'closed','completed',2,'flynn',NULL,NULL)"
     ]
 
@@ -4155,6 +4170,21 @@ defmodule Tightbeam.AssignmentsTest do
       assert {:error, %DB.Error{message: check_message}} = DB.query(db, check_base <> values)
       assert check_message =~ "CHECK constraint"
     end)
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               base <>
+                 "('a_process','x','holder',NULL,0,NULL,NULL,1,'open',NULL,NULL,NULL,NULL,NULL)"
+             )
+
+    process_revoked =
+      "('a_process_revoked','x','holder',NULL,0,NULL,NULL,1,'closed','revoked',2,NULL,NULL,NULL)"
+
+    assert {:ok, []} = DB.query(db, check_base <> process_revoked)
+
+    assert {:error, %DB.Error{message: "revoked assignment requires revocation provenance"}} =
+             DB.query(db, base <> process_revoked)
 
     assert {:error, %DB.Error{}} =
              DB.query(
@@ -4218,7 +4248,13 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "assign validates principals, input, liveness, opener typing, and idempotent races", ctx do
-    assert %{code: "process_denied"} = handle(ctx, "assign", assign_call({:process, "cron"}))
+    assert %{openedByUser: nil, openedBySession: nil} =
+             handle(
+               ctx,
+               "assign",
+               put_in(assign_call({:process, "cron"}), [:params, :owner_user_id], "flynn")
+             )
+
     assert %{code: "principal_required"} = handle(ctx, "assign", assign_call(nil))
     assert %{code: "invalid_subject"} = handle(ctx, "assign", assign_call({:user, "flynn"}, " "))
 
@@ -4664,14 +4700,14 @@ defmodule Tightbeam.AssignmentsTest do
 
     assignment_count_before_unrelated = assignment_count(ctx.db)
 
-    assert %{code: "delivery_owner_required"} =
+    assert %{openedBySession: "other-session"} =
              handle(
                ctx,
                "assign",
                assign_call({:session, "other-session"}, "unrelated owner", nil, work_item.id)
              )
 
-    assert assignment_count(ctx.db) == assignment_count_before_unrelated
+    assert assignment_count(ctx.db) == assignment_count_before_unrelated + 1
   end
 
   test "assign and dispatch refuse a foreign caller even after exact fired rumination", ctx do
@@ -4941,12 +4977,44 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(ctx.db, "SELECT count(*) FROM messages WHERE content LIKE '%Wake now.%'")
   end
 
-  test "dispatch rejects disallowed principals exactly as assign does", ctx do
-    for principal <- [{:process, "cron"}, nil] do
-      assign_error = handle(ctx, "assign", assign_call(principal, "work"))
-      dispatch_error = handle(ctx, "dispatch", dispatch_call(principal, "work", "Do work."))
-      assert dispatch_error == assign_error
+  test "dispatch and assign accept processes and retain missing-principal errors", ctx do
+    assign_error = handle(ctx, "assign", assign_call(nil, "work"))
+    dispatch_error = handle(ctx, "dispatch", dispatch_call(nil, "work", "Do work."))
+    assert assign_error.code == "principal_required"
+    assert dispatch_error == assign_error
+
+    assigned =
+      handle(
+        ctx,
+        "assign",
+        put_in(
+          assign_call({:process, "cron"}, "assigned work"),
+          [:params, :owner_user_id],
+          "flynn"
+        )
+      )
+
+    dispatched =
+      handle(
+        ctx,
+        "dispatch",
+        put_in(
+          dispatch_call({:process, "cron"}, "dispatched work", "Do work."),
+          [:params, :owner_user_id],
+          "flynn"
+        )
+      )
+
+    for row <- [assigned, dispatched] do
+      assert row.state == "open"
+      assert row.openedByUser == nil
+      assert row.openedBySession == nil
     end
+
+    assert {:ok, [[prompt]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE assignmentId=?1", [dispatched.id])
+
+    assert prompt == "[from process:cron]\n\n[assignment: #{dispatched.id}]\n\nDo work."
   end
 
   @tag assignment_delta: true
@@ -5783,7 +5851,7 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
-    assert %{code: "process_denied"} =
+    assert %{code: "not_holder"} =
              handle(ctx, "attest", attest_call({:process, "cron"}, assignment.id, "progress"))
 
     assert %{code: "principal_required"} =
@@ -5984,7 +6052,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "deny"))
 
-    assert %{code: "process_denied"} =
+    assert %{outcome: "revoked", closedByUser: nil, closedBySession: nil} =
              handle(ctx, "revoke-assignment", revoke_call({:process, "x"}, assignment.id))
 
     assert %{code: "principal_required"} =
@@ -6017,7 +6085,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{code: "invalid_state_filter"} =
              handle(ctx, "assignments", query_call({:user, "flynn"}, "bad", nil))
 
-    assert %{code: "process_denied"} =
+    assert %{code: "invalid_state_filter"} =
              handle(ctx, "assignments", query_call({:process, "x"}, "bad", nil))
 
     assert %{code: "principal_required"} =
@@ -6917,7 +6985,7 @@ defmodule Tightbeam.AssignmentsTest do
                assignment_get_call({:session, "holder"}, "unknown-assignment")
              )
 
-    assert %{code: "process_denied"} =
+    assert %{cannotProceed: %{state: "standing"}} =
              handle(
                ctx,
                "assignment-get",

@@ -64,7 +64,12 @@ defmodule Tightbeam.ArtifactContentFetchTest do
                rest_principal: %{kind: "session", id: "unrelated", is_admin: false}
            }).code == "content_not_captured"
 
-    assert handler.(%{call | principal: {:process, "fixture"}}) == %{code: "forbidden"}
+    assert handler.(%{
+             call
+             | principal: {:process, "fixture"},
+               rest_principal: %{kind: "process", id: "fixture", is_admin: true}
+           }).code == "content_not_captured"
+
     assert handler.(%{params: call.params}) == %{code: "forbidden"}
   end
 
