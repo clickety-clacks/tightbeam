@@ -66,7 +66,7 @@ defmodule Tightbeam.ArtifactsTest do
   end
 
   @tag artifact_delta: true
-  test "filtered artifact notices preserve visibility and canonical ordered payloads", ctx do
+  test "matching artifact subscriptions deliver canonical ordered payloads", ctx do
     alias Tightbeam.Firehose.Hub
     start_supervised!({Hub, name: Hub})
 
@@ -92,9 +92,22 @@ defmodule Tightbeam.ArtifactsTest do
         origin_path: "lab1:/tmp/filtered"
       })
 
-    refute_receive {:firehose_notice, _}
-    assert Hub.sequence(Hub, self()) == 0
-    :ok = Hub.register(Hub, self(), %{user_id: "flynn"})
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "artifact.recorded",
+                      "subscriptionId" => "artifact",
+                      "payload" => recorded,
+                      "refs" => recorded_refs
+                    }}
+
+    assert recorded_refs["artifactId"] == row.artifact_id
+    assert recorded_refs["sessionKey"] == ctx.child.session_key
+
+    recorded_canonical =
+      StateResources.query_artifact(ctx.db, row.artifact_id)
+      |> StateResources.artifact()
+
+    assert recorded == recorded_canonical
 
     :ok =
       Hub.subscribe(Hub, self(), "wrong-work", %{
@@ -130,9 +143,8 @@ defmodule Tightbeam.ArtifactsTest do
              StateResources.encode_item("artifacts", canonical)
 
     assert payload["rowVersion"] == 2
-    :ok = Hub.delivered(Hub, self())
     refute_receive {:firehose_notice, _}
-    assert Hub.sequence(Hub, self()) == 1
+    assert Hub.sequence(Hub, self()) == 2
   end
 
   @tag artifact_delta: true

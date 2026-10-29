@@ -3069,8 +3069,10 @@ defmodule Tightbeam.Wire.RouterTest do
     end
   end
 
-  test "org CLI reserves process:tightbeam while other process origins still attribute", ctx do
+  test "session and org credentials reserve process:tightbeam while other process origins attribute",
+       ctx do
     target = create_session(ctx.db, "reserved-origin-target", "flynn")
+    session_credential = create_session(ctx.db, "process-wake-session", "flynn")
 
     wake_handler = fn call ->
       wake =
@@ -3109,6 +3111,25 @@ defmodule Tightbeam.Wire.RouterTest do
     refute_received {:persisted_wake, _}
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wakes")
 
+    session_rejected =
+      dispatch_cli(ctx, session_credential.cli_token, %{
+        verb: "wake",
+        asProcess: "tightbeam",
+        sessionKey: target.session_key,
+        params: %{prompt: "forged"}
+      })
+
+    assert session_rejected.status == 403
+
+    assert JSON.decode!(session_rejected.resp_body) == %{
+             "error" => %{
+               "code" => "reserved_origin",
+               "message" => "process:tightbeam is reserved to the substrate"
+             }
+           }
+
+    refute_received {:persisted_wake, _}
+
     accepted =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "wake",
@@ -3122,6 +3143,20 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert {:ok, [["process:ci", "pending"]]} =
              DB.query(ctx.db, "SELECT origin, state FROM wakes")
+
+    session_accepted =
+      dispatch_cli(ctx, session_credential.cli_token, %{
+        verb: "wake",
+        asProcess: "satellite-e2e",
+        sessionKey: target.session_key,
+        params: %{prompt: "build finished"}
+      })
+
+    assert session_accepted.status == 200
+    assert_receive {:persisted_wake, %{origin: "process:satellite-e2e", state: "pending"}}
+
+    assert {:ok, [["process:ci", "pending"], ["process:satellite-e2e", "pending"]]} =
+             DB.query(ctx.db, "SELECT origin, state FROM wakes ORDER BY origin")
   end
 
   test "assign resolves a live-bound role and refuses unusable references", ctx do

@@ -8,7 +8,6 @@ fresh = phase == "first"
 {:ok, _} = Application.ensure_all_started(:exqlite)
 {:ok, _} = Application.ensure_all_started(:crypto)
 Application.put_env(:tightbeam, :autostart, false)
-Application.put_env(:tightbeam, :effort_checkins_enabled, true)
 Application.put_env(:tightbeam, :base_dir, base)
 Application.put_env(:tightbeam, :fixture_harness, true)
 Application.put_env(:tightbeam, :local_host_name, "testhost")
@@ -94,6 +93,7 @@ port =
 Application.put_env(:tightbeam, :port, port)
 Application.put_env(:tightbeam, :default_harness, :fixture)
 Application.put_env(:tightbeam, :default_model, Model.new("fixture-model"))
+Application.put_env(:tightbeam, :supervision_interval_ms, 1_000)
 Application.put_env(:tightbeam, :autostart, true)
 Application.put_env(:tightbeam, :drain_timeout_ms, 1_000)
 

@@ -1,7 +1,7 @@
 defmodule Tightbeam.SupervisionTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Gateway, Org, Supervision, Wakes}
+  alias Tightbeam.{DB, Gateway, HarnessHealth, Ledger, Org, Supervision, Wakes}
   alias Tightbeam.Model
   alias Tightbeam.DB.Txn
 
@@ -28,7 +28,7 @@ defmodule Tightbeam.SupervisionTest do
     %{db: db, main: main, parent: parent, holder: holder}
   end
 
-  test "a due deadline stores one ordinary notice and an unanswered rung readdresses it", ctx do
+  test "a due deadline sends one ordinary notice and keeps reminders with the holder", ctx do
     opened_at = System.system_time(:millisecond) - 5_000
     interval_ms = 1_000
 
@@ -72,60 +72,628 @@ defmodule Tightbeam.SupervisionTest do
 
     notice = Wakes.get(ctx.db, notice_id)
     assert notice.state == "pending"
-    assert notice.session_key == ctx.parent.session_key
+    assert notice.session_key == ctx.holder.session_key
     assert notice.prompt == prompt
+
+    next_climb = pending_climb!(ctx.db, "asg_inactive")
+    assert next_climb.wake_id != climb.wake_id
 
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
-                 "AND consumer='prompt' AND obligationRef=?1 AND state='pending'",
-               [episode_ref]
+                 "AND consumer='prompt' AND obligationRef=?1 AND state='pending' " <>
+                 "AND sessionKey=?2",
+               [episode_ref, ctx.holder.session_key]
              )
 
-    assert {:ok, {:canceled, {^notice_id, nil}}} =
-             DB.transaction(ctx.db, fn txn ->
-               Wakes.undeliverable_delivery_in_txn(
-                 txn,
-                 notice_id,
-                 "recipient is not currently resolvable",
-                 System.system_time(:millisecond)
-               )
-             end)
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND consumer='prompt' AND obligationRef=?1 AND state='pending' " <>
+                 "AND sessionKey<>?2",
+               [episode_ref, ctx.holder.session_key]
+             )
+  end
 
-    assert Wakes.get(ctx.db, notice_id).state == "canceled"
+  test "two holder notices climb through the parent to the owner and then stop", ctx do
+    opened_at = System.system_time(:millisecond) - 10_000
+    interval_ms = 1_000
 
-    assert {:ok, [[nil]]} =
-             DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [notice_id])
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [
+               opened_at
+             ])
 
-    next_climb = pending_climb!(ctx.db, "asg_inactive")
+    open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
 
-    assert is_map(next_climb)
+    first = episode_notices(ctx.db) |> List.first()
+    assert first.session_key == ctx.holder.session_key
+    assert first.prompt =~ "blocker or decision request"
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1", [
+               first.wake_id,
+               System.system_time(:millisecond)
+             ])
+
+    fire_due_climb!(ctx.db, first.wake_id, interval_ms)
+    [first_after, second] = episode_notices(ctx.db)
+    assert first_after.wake_id == first.wake_id
+    assert second.session_key == ctx.holder.session_key
+    assert second.prompt == first.prompt
+
+    fire_due_climb!(ctx.db, second.wake_id, interval_ms)
+    assert length(episode_notices(ctx.db)) == 2
+    assert Wakes.get(ctx.db, second.wake_id).session_key == ctx.parent.session_key
+    assert Wakes.get(ctx.db, second.wake_id).prompt == first.prompt
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db, interval_ms)
+    assert Wakes.get(ctx.db, second.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, second.wake_id).session_key == ctx.parent.session_key
+
+    fire_due_climb!(ctx.db, second.wake_id, interval_ms)
+    assert Wakes.get(ctx.db, second.wake_id).session_key == ctx.main.session_key
+
+    fire_due_climb!(ctx.db, second.wake_id, interval_ms)
+    assert length(episode_notices(ctx.db)) == 2
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='assignment_inactivity_climb' AND state='pending'"
+             )
+  end
+
+  test "a pending holder notice gets a second interval before climbing without a duplicate",
+       ctx do
+    opened_at = System.system_time(:millisecond) - 10_000
+    interval_ms = 1_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [
+               opened_at
+             ])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
+    first = episode_notices(ctx.db) |> List.first()
+
+    fire_due_climb!(ctx.db, first.wake_id, interval_ms)
+    assert length(episode_notices(ctx.db)) == 1
+    assert Wakes.get(ctx.db, first.wake_id).session_key == ctx.holder.session_key
+
+    fire_due_climb!(ctx.db, first.wake_id, interval_ms)
+    assert length(episode_notices(ctx.db)) == 1
+    assert Wakes.get(ctx.db, first.wake_id).session_key == ctx.parent.session_key
+  end
+
+  test "boot reconciliation replaces stored intervals with the configured default", ctx do
+    now = System.system_time(:millisecond)
+    opened_at = now - 29 * 60 * 1_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
+               "asg_inactive",
+               opened_at
+             ])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+    stale = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db)
+
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+    assert deadline.wake_id != stale.wake_id
+    assert deadline.due_at == opened_at + 1_800_000
+    assert Wakes.get(ctx.db, stale.wake_id).state == "canceled"
+    assert {:ok, %{"intervalMs" => 1_800_000}} = JSON.decode(deadline.prompt)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+
+    opened_at = System.system_time(:millisecond) - 1_800_001
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
+               "asg_inactive",
+               opened_at
+             ])
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+    assert deadline.due_at <= System.system_time(:millisecond)
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, deadline)
+
+    assert {:ok, [[holder]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%' " <>
+                 "AND state='pending'",
+               []
+             )
+
+    assert holder == ctx.holder.session_key
+  end
+
+  test "boot reconciliation ignores a stored one-second entitlement", ctx do
+    opened_at = System.system_time(:millisecond) - 29 * 60_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
+               "asg_inactive",
+               opened_at
+             ])
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO supervision_entitlements
+                 (assignmentId,generation,dueAt,state,basisKind,basisId,cause,principal,supervisionIntervalMs)
+               VALUES ('asg_inactive',1,?1,'armed','assignment_open','asg_inactive',
+                 'assignment_open','process:tightbeam',1000)
+               """,
+               [opened_at + 1_000]
+             )
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+    assert deadline.due_at == opened_at + 1_800_000
+    assert {:ok, %{"intervalMs" => 1_800_000}} = JSON.decode(deadline.prompt)
+    assert deadline.due_at > System.system_time(:millisecond)
+  end
+
+  test "off reminders retract prompts and leave one silent deadline", ctx do
+    prior_interval = Application.get_env(:tightbeam, :supervision_interval_ms)
+
+    on_exit(fn ->
+      if is_nil(prior_interval),
+        do: Application.delete_env(:tightbeam, :supervision_interval_ms),
+        else: Application.put_env(:tightbeam, :supervision_interval_ms, prior_interval)
+    end)
+
+    opened_at = System.system_time(:millisecond) - 5_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
+               "asg_inactive",
+               opened_at
+             ])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
+
+    reminder =
+      Enum.find(Wakes.list_pending(ctx.db), fn wake ->
+        wake.consumer == "prompt" and wake.assignment_id == "asg_inactive" and
+          String.starts_with?(wake.obligation_ref || "", "assignment-inactivity-episode-v1:")
+      end)
+
+    assert is_map(reminder)
+    old_climb = pending_climb!(ctx.db, "asg_inactive")
+    Application.put_env(:tightbeam, :supervision_interval_ms, :off)
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db, :off)
+    assert Wakes.get(ctx.db, reminder.wake_id).state == "canceled"
+    new_deadline = pending_deadline!(ctx.db, "asg_inactive")
+    assert Wakes.get(ctx.db, old_climb.wake_id).state == "canceled"
+    refute old_climb.wake_id == new_deadline.wake_id
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND state='pending' AND consumer='assignment_inactivity_climb'"
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND state='pending' AND consumer='prompt' " <>
+                 "AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
 
     assert {:ok, _} =
              DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1 AND state='pending'", [
-               next_climb.wake_id
+               new_deadline.wake_id
              ])
 
-    assert {:ok, :ok} =
-             Supervision.climb(ctx.db, Wakes.get(ctx.db, next_climb.wake_id))
+    assert {:ok, true} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, new_deadline.wake_id))
 
-    assert {:ok, [[successor_id, successor_prompt, main]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId,prompt,sessionKey FROM wakes " <>
-                 "WHERE assignmentId='asg_inactive' AND consumer='prompt' " <>
-                 "AND state='pending' AND obligationRef=?1",
-               [episode_ref]
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND state='pending' AND consumer='prompt' " <>
+                 "AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
              )
-
-    assert successor_id != notice_id
-    assert successor_prompt == prompt
-    assert main == ctx.main.session_key
-    assert Wakes.get(ctx.db, notice_id).state == "canceled"
   end
 
-  test "legacy controller cleanup survives a real migration transaction and stamps once", ctx do
+  test "startup restores the climb and cancels notices outside its visited route", ctx do
+    opened_at = System.system_time(:millisecond) - 5_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
+               "asg_inactive",
+               opened_at
+             ])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
+
+    holder_notice =
+      Enum.find(Wakes.list_pending(ctx.db), fn wake ->
+        wake.consumer == "prompt" and wake.assignment_id == "asg_inactive" and
+          String.starts_with?(wake.obligation_ref || "", "assignment-inactivity-episode-v1:")
+      end)
+
+    assert is_map(holder_notice)
+    old_climb = pending_climb!(ctx.db, "asg_inactive")
+
+    wrong_holder_notice =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.parent.session_key,
+        assignment_id: "asg_inactive",
+        origin: "process:supervision-test",
+        prompt: "stale reminder for an ancestor",
+        due_at: System.system_time(:millisecond) + 60_000,
+        obligation_ref: holder_notice.obligation_ref
+      })
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db, 1_000)
+
+    assert Wakes.get(ctx.db, old_climb.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, wrong_holder_notice.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, holder_notice.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, holder_notice.wake_id).session_key == ctx.holder.session_key
+
+    replacement = pending_climb!(ctx.db, "asg_inactive")
+    refute replacement.wake_id == old_climb.wake_id
+    assert {:ok, %{"intervalMs" => 1_000, "rung" => 1}} = JSON.decode(replacement.prompt)
+  end
+
+  test "startup upgrades an active one-second climb to the configured quiet interval", ctx do
+    opened_at = System.system_time(:millisecond) - 10_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [
+               opened_at
+             ])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
+    first = episode_notices(ctx.db) |> List.first()
+    old_climb = pending_climb!(ctx.db, "asg_inactive")
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db)
+
+    upgraded = pending_climb!(ctx.db, "asg_inactive")
+    assert upgraded.wake_id != old_climb.wake_id
+    assert Wakes.get(ctx.db, old_climb.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, first.wake_id).state == "pending"
+    assert upgraded.due_at == first.created_at + 1_800_000
+    assert {:ok, %{"intervalMs" => 1_800_000, "rung" => 1}} = JSON.decode(upgraded.prompt)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='assignment_inactivity_deadline' AND state='pending'"
+             )
+  end
+
+  test "a pending assignment-linked wake from another session suppresses reminders", ctx do
+    opened_at = System.system_time(:millisecond) - 5_000
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+
+    follow_up =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        creator_session_key: ctx.parent.session_key,
+        assignment_id: "asg_inactive",
+        origin: "session:#{ctx.parent.session_key}",
+        prompt: "finish the scheduled follow-up",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+
+    assert Wakes.get(ctx.db, follow_up.wake_id).state == "pending"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+  end
+
+  test "a model-unavailable incident suppresses holder reminders", ctx do
+    opened_at = System.system_time(:millisecond) - 5_000
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+
+    assert {:opened, _incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "supervision-holder-unavailable",
+               harness: ctx.holder.harness,
+               host: ctx.holder.host,
+               failure_class: "model_unavailable",
+               evidence_kind: "authoritative-provider",
+               session_key: ctx.holder.session_key,
+               assignment_id: nil,
+               observed_at: System.system_time(:millisecond),
+               cause: "model unavailable",
+               principal: "process:tightbeam"
+             })
+
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+  end
+
+  test "an open holder harness incident pauses an active reminder climb", ctx do
+    opened_at = System.system_time(:millisecond) - 5_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [
+               opened_at
+             ])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
+    first = episode_notices(ctx.db) |> List.first()
+
+    assert {:opened, _incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "supervision-climb-holder-unavailable",
+               harness: ctx.holder.harness,
+               host: ctx.holder.host,
+               failure_class: "model_unavailable",
+               evidence_kind: "authoritative-provider",
+               session_key: ctx.holder.session_key,
+               assignment_id: nil,
+               observed_at: System.system_time(:millisecond),
+               cause: "model unavailable",
+               principal: "process:tightbeam"
+             })
+
+    fire_due_climb!(ctx.db, first.wake_id, 1_000)
+    assert length(episode_notices(ctx.db)) == 1
+    assert Wakes.get(ctx.db, first.wake_id).session_key == ctx.holder.session_key
+    assert pending_climb!(ctx.db, "asg_inactive").due_at > System.system_time(:millisecond)
+  end
+
+  test "an inactive holder suppresses inactivity reminders", ctx do
+    opened_at = System.system_time(:millisecond) - 5_000
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+               ctx.holder.session_key
+             ])
+
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at > System.system_time(:millisecond)
+  end
+
+  test "a queued turn for another assignment suppresses inactivity reminders", ctx do
+    opened_at = System.system_time(:millisecond) - 5_000
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state) " <>
+                 "VALUES ('asg_queued_turn','other work',?1,'flynn',?2,'open')",
+               [ctx.holder.session_key, opened_at]
+             )
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: ctx.holder.session_key,
+               message_id: "queued-session-turn",
+               origin: "process:supervision-test",
+               prompt: "work on a different assignment",
+               assignment_id: "asg_queued_turn"
+             })
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+
+    assert {:ok, [["queued"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM turns WHERE sessionKey=?1 AND assignmentId='asg_queued_turn'",
+               [ctx.holder.session_key]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+  end
+
+  test "a resolved model-unavailable incident starts a full quiet interval", ctx do
+    opened_at = System.system_time(:millisecond) - 5_000
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "supervision-holder-unavailable-resolved",
+               harness: ctx.holder.harness,
+               host: ctx.holder.host,
+               failure_class: "model_unavailable",
+               evidence_kind: "authoritative-provider",
+               session_key: ctx.holder.session_key,
+               assignment_id: nil,
+               observed_at: System.system_time(:millisecond),
+               cause: "model unavailable",
+               principal: "process:tightbeam"
+             })
+
+    due = pending_deadline!(ctx.db, "asg_inactive")
+    assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [due.wake_id])
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, due.wake_id))
+
+    resolution_at = System.system_time(:millisecond)
+
+    assert {:resolved, %{id: incident_id, resolvedAt: ^resolution_at}} =
+             HarnessHealth.resolve(ctx.db, %{
+               correlation_id: "supervision-holder-model-restored",
+               harness: ctx.holder.harness,
+               host: ctx.holder.host,
+               failure_class: "model_unavailable",
+               session_key: ctx.holder.session_key,
+               assignment_id: nil,
+               observed_at: resolution_at,
+               cause: "model restored",
+               principal: "process:tightbeam"
+             })
+
+    assert incident_id == incident.id
+
+    due = pending_deadline!(ctx.db, "asg_inactive")
+    assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [due.wake_id])
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, due.wake_id))
+
+    rescheduled = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert {:ok, %{"activityAt" => ^resolution_at, "intervalMs" => 1_000}} =
+             JSON.decode(rescheduled.prompt)
+
+    assert rescheduled.due_at >= resolution_at + 1_000
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+  end
+
+  test "a running turn for a different assignment suppresses inactivity reminders", ctx do
+    opened_at = System.system_time(:millisecond) - 5_000
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state) " <>
+                 "VALUES ('asg_busy_turn','other work',?1,'flynn',?2,'open')",
+               [ctx.holder.session_key, opened_at]
+             )
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: ctx.holder.session_key,
+               message_id: "busy-session-turn",
+               origin: "process:supervision-test",
+               prompt: "work on a different assignment",
+               assignment_id: "asg_busy_turn"
+             })
+
+    assert {:ok, %{seq: _seq}} =
+             Ledger.claim_next(ctx.db, ctx.holder.session_key, "supervision-running-turn")
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+
+    assert {:ok, [["running"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM turns WHERE sessionKey=?1 AND assignmentId='asg_busy_turn'",
+               [ctx.holder.session_key]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+  end
+
+  test "startup resumes historical holder reminders by climbing without a fourth", ctx do
+    opened_at = System.system_time(:millisecond) - 1_800_001
+
+    for index <- 1..3 do
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        assignment_id: "asg_inactive",
+        origin: "process:supervision-test",
+        consumer: "prompt",
+        prompt: "prior inactivity reminder #{index}",
+        due_at: System.system_time(:millisecond),
+        obligation_ref: "assignment-inactivity-episode-v1:prior-#{index}"
+      })
+    end
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
+               "asg_inactive",
+               opened_at
+             ])
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db)
+    climb = pending_climb!(ctx.db, "asg_inactive")
+    assert {:ok, %{"intervalMs" => 1_800_000, "rung" => 2}} = JSON.decode(climb.prompt)
+
+    assert {:ok, [[3]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND consumer='prompt' " <>
+                 "AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+  end
+
+  test "legacy controller cleanup reconciles stored intervals on each startup", ctx do
     legacy =
       Wakes.schedule(ctx.db, %{
         session_key: ctx.holder.session_key,
@@ -161,7 +729,9 @@ defmodule Tightbeam.SupervisionTest do
              )
 
     assert :ok = Supervision.migrate_open_assignments(ctx.db, 1)
-    assert pending_deadline!(ctx.db, "asg_inactive").wake_id == migrated.wake_id
+    updated = pending_deadline!(ctx.db, "asg_inactive")
+    assert updated.wake_id != migrated.wake_id
+    assert Wakes.get(ctx.db, migrated.wake_id).state == "canceled"
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -170,10 +740,11 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
-  test "a pending dated continuation defers only its assignment's inactivity notice until due",
+  test "a pending dated continuation defers its assignment's inactivity notice",
        ctx do
     open_deadline!(ctx.db, "asg_inactive", System.system_time(:millisecond), 1_000)
-    due_at = System.system_time(:millisecond) + 60_000
+    assert :ok = Supervision.migrate_open_assignments(ctx.db)
+    due_at = System.system_time(:millisecond) + 3_600_000
 
     wake =
       Wakes.schedule(ctx.db, %{
@@ -203,7 +774,8 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
 
-    assert pending_deadline!(ctx.db, "asg_inactive").due_at == due_at
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at >=
+             System.system_time(:millisecond) + 29 * 60_000
 
     assert {:ok, [[0]]} =
              DB.query(
@@ -220,11 +792,14 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, next_deadline.wake_id))
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
              )
+
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at >=
+             System.system_time(:millisecond) + 29 * 60_000
   end
 
   test "cancellation and assignment disposition end dated continuation coverage", ctx do
@@ -303,6 +878,7 @@ defmodule Tightbeam.SupervisionTest do
     holder = ctx.holder.session_key
     origin = "agent:#{holder}"
     open_deadline!(ctx.db, "asg_inactive", System.system_time(:millisecond), 1_000)
+    assert :ok = Supervision.migrate_open_assignments(ctx.db)
 
     schedule = fn prompt, offset ->
       Wakes.schedule(ctx.db, %{
@@ -337,29 +913,35 @@ defmodule Tightbeam.SupervisionTest do
                end)
     end
 
-    earlier = schedule.("resume earlier", 60_000)
-    later = schedule.("resume later", 120_000)
+    earlier = schedule.("resume earlier", 3_600_000)
+    later = schedule.("resume later", 7_200_000)
     deadline = pending_deadline!(ctx.db, "asg_inactive")
 
     assert {:ok, _} =
              DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
 
     assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
-    assert pending_deadline!(ctx.db, "asg_inactive").due_at == later.due_at
+
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at >=
+             System.system_time(:millisecond) + 29 * 60_000
 
     cancel.(later)
-    assert pending_deadline!(ctx.db, "asg_inactive").due_at == earlier.due_at
+    assert Wakes.get(ctx.db, later.wake_id).state == "canceled"
+
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at >=
+             System.system_time(:millisecond) + 29 * 60_000
 
     cancel.(earlier)
     restored = pending_deadline!(ctx.db, "asg_inactive")
     assert restored.due_at < earlier.due_at
+    assert restored.due_at >= System.system_time(:millisecond) + 29 * 60_000
 
     assert {:ok, _} =
              DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [restored.wake_id])
 
     assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, restored.wake_id))
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
@@ -678,7 +1260,7 @@ defmodule Tightbeam.SupervisionTest do
            end)
   end
 
-  test "an unanswered climb preserves a delivered rung and creates a fresh parent notice", ctx do
+  test "a running holder turn suppresses climb retries without notifying an ancestor", ctx do
     opened_at = System.system_time(:millisecond) - 5_000
     interval_ms = 1_000
 
@@ -718,6 +1300,9 @@ defmodule Tightbeam.SupervisionTest do
 
     assert is_integer(delivered_turn_seq)
 
+    assert {:ok, %{seq: ^delivered_turn_seq}} =
+             Ledger.claim_next(ctx.db, ctx.holder.session_key, "supervision-notice-turn")
+
     climb = pending_climb!(ctx.db, "asg_inactive")
 
     assert is_map(climb)
@@ -729,29 +1314,34 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok, :ok} = Supervision.climb(ctx.db, Wakes.get(ctx.db, climb.wake_id))
 
-    assert {:ok, [["fired", ^delivered_turn_seq, holder, prompt, episode_ref]]} =
+    assert {:ok, [["fired", ^delivered_turn_seq, holder, episode_ref]]} =
              DB.query(
                ctx.db,
-               "SELECT state,deliveredTurnSeq,sessionKey,prompt,obligationRef FROM wakes WHERE wakeId=?1",
+               "SELECT state,deliveredTurnSeq,sessionKey,obligationRef FROM wakes WHERE wakeId=?1",
                [notice.wake_id]
              )
 
     assert holder == ctx.holder.session_key
 
-    assert {:ok, [[successor_id, successor_holder, ^prompt, ^episode_ref]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId,sessionKey,prompt,obligationRef FROM wakes " <>
-                 "WHERE assignmentId='asg_inactive' AND consumer='prompt' " <>
-                 "AND state='pending' AND obligationRef=?1",
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND consumer='prompt' AND obligationRef=?1",
                [episode_ref]
              )
 
-    assert successor_id != notice.wake_id
-    assert successor_holder == ctx.parent.session_key
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND consumer='prompt' AND obligationRef=?1 " <>
+                 "AND sessionKey<>?2",
+               [episode_ref, ctx.holder.session_key]
+             )
   end
 
-  test "retiring a pending notice recipient readdresses the same episode wake", ctx do
+  test "retiring an ancestor does not readdress the holder's pending reminder", ctx do
     opened_at = System.system_time(:millisecond) - 5_000
     interval_ms = 1_000
 
@@ -778,17 +1368,13 @@ defmodule Tightbeam.SupervisionTest do
                climb.wake_id
              ])
 
-    assert {:ok, :ok} = Supervision.climb(ctx.db, Wakes.get(ctx.db, climb.wake_id))
-    assert Wakes.get(ctx.db, notice.wake_id).session_key == ctx.parent.session_key
-
     assert %{state: "retired"} = Org.retire(ctx.db, ctx.parent.session_key, "user:flynn", 1_000)
 
-    readdressed = Wakes.get(ctx.db, notice.wake_id)
-    assert readdressed.state == "pending"
-    assert readdressed.session_key == ctx.main.session_key
-    assert readdressed.target_gate == 1
-    assert readdressed.prompt == notice.prompt
-    assert readdressed.obligation_ref == notice.obligation_ref
+    retained = Wakes.get(ctx.db, notice.wake_id)
+    assert retained.state == "pending"
+    assert retained.session_key == ctx.holder.session_key
+    assert retained.prompt == notice.prompt
+    assert retained.obligation_ref == notice.obligation_ref
 
     next_climb = pending_climb!(ctx.db, "asg_inactive")
 
@@ -798,13 +1384,22 @@ defmodule Tightbeam.SupervisionTest do
              ])
 
     assert {:ok, :ok} = Supervision.climb(ctx.db, Wakes.get(ctx.db, next_climb.wake_id))
-    assert Wakes.get(ctx.db, notice.wake_id).session_key == ctx.main.session_key
+    assert Wakes.get(ctx.db, notice.wake_id).session_key == ctx.holder.session_key
 
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='prompt' AND obligationRef=?1 AND state='pending'",
                [notice.obligation_ref]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
+                 "AND consumer='prompt' AND obligationRef=?1 AND state='pending' " <>
+                 "AND sessionKey<>?2",
+               [notice.obligation_ref, ctx.holder.session_key]
              )
   end
 
@@ -925,6 +1520,31 @@ defmodule Tightbeam.SupervisionTest do
 
   defp pending_climb!(db, assignment_id) do
     pending_internal_wake!(db, "assignment_inactivity_climb", assignment_id)
+  end
+
+  defp episode_notices(db) do
+    assert {:ok, ids} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE assignmentId='asg_inactive' AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%' ORDER BY rowid"
+             )
+
+    Enum.map(ids, fn [id] -> Wakes.get(db, id) end)
+  end
+
+  defp fire_due_climb!(db, previous_wake_id, interval_ms) do
+    assert {:ok, _} =
+             DB.query(db, "UPDATE wakes SET createdAt=?2 WHERE wakeId=?1", [
+               previous_wake_id,
+               System.system_time(:millisecond) - interval_ms - 1
+             ])
+
+    climb = pending_climb!(db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [climb.wake_id])
+
+    assert {:ok, :ok} = Supervision.climb(db, Wakes.get(db, climb.wake_id))
   end
 
   defp pending_internal_wake!(db, consumer, assignment_id) do

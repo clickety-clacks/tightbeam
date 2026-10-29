@@ -894,13 +894,13 @@ COMMANDS:
   session-po-set --session <key> --po-role <role> --key <key>
       Explicitly associate an exact session with its addressed product-owner role.
 
-  session-connect --session <sessionKey>
+  session-connect --session <sessionKey> [--as-user <userId> | --as-process <name>]
       Run the persistent NDJSON stdin/stdout connection for one selected session.
       Its initial snapshot includes existing wake prompts and delivery status.
-      Optional --as, --as-user, or --as-process flags affect ordinary wake
-      attribution. With an organization bearer, --as-user also selects read
-      visibility for snapshots and the change socket; no user is selected by
-      default. Other bearer types keep their existing read principal.
+      Organization credentials require exactly one of --as-user or --as-process.
+      --as-user selects read visibility; --as-process uses the credential's
+      default read principal and records sends as process:<name>. Session
+      credentials need no identity flag and record sends as their own agent.
 
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
@@ -2692,17 +2692,31 @@ fn parse_with_optional_catalog(
             })
         }
         "session-connect" => {
+            let usage = "usage: tightbeam session-connect --session <sessionKey> [--as-user <userId> | --as-process <name>]";
             if parsed.positional.len() != 1
-                || flags.keys().any(|flag| {
-                    !matches!(flag.as_str(), "session" | "as" | "as-user" | "as-process")
-                })
+                || flags
+                    .keys()
+                    .any(|flag| !matches!(flag.as_str(), "session" | "as-user" | "as-process"))
             {
-                return Err("usage: tightbeam session-connect --session <sessionKey> [--as <role> | --as-user <userId> | --as-process <name>]".to_owned());
+                return Err(usage.to_owned());
             }
             let session_key = nonempty(flags, "session")
                 .ok_or_else(|| "--session requires a non-empty full session key".to_owned())?;
+            let identity = match (
+                flags.contains_key("as-user"),
+                flags.contains_key("as-process"),
+            ) {
+                (true, false) => {
+                    Identity::User(nonempty(flags, "as-user").ok_or_else(|| usage.to_owned())?)
+                }
+                (false, true) => Identity::Process(
+                    nonempty(flags, "as-process").ok_or_else(|| usage.to_owned())?,
+                ),
+                (false, false) => Identity::Session,
+                _ => return Err(usage.to_owned()),
+            };
             Ok(Command::SessionConnect {
-                identity: identity(flags)?,
+                identity,
                 session_key,
             })
         }
@@ -5751,12 +5765,80 @@ mod tests {
         let session_key = "agent:main:clawline:mike:main s_c55fd592";
 
         assert_eq!(
+            parse(strings(&[
+                "session-connect",
+                "--session",
+                session_key,
+                "--as-process",
+                "external-chatgpt",
+            ])),
+            Ok(Command::SessionConnect {
+                identity: Identity::Process("external-chatgpt".to_owned()),
+                session_key: session_key.to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn session_connect_accepts_session_identity_or_one_explicit_identity() {
+        let session_key = "agent:main/example";
+        let usage = "usage: tightbeam session-connect --session <sessionKey> [--as-user <userId> | --as-process <name>]";
+
+        assert_eq!(
+            parse(strings(&[
+                "session-connect",
+                "--session",
+                session_key,
+                "--as-user",
+                "alice",
+            ])),
+            Ok(Command::SessionConnect {
+                identity: Identity::User("alice".to_owned()),
+                session_key: session_key.to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "session-connect",
+                "--session",
+                session_key,
+                "--as-process",
+                "agent",
+            ])),
+            Ok(Command::SessionConnect {
+                identity: Identity::Process("agent".to_owned()),
+                session_key: session_key.to_owned(),
+            })
+        );
+
+        assert_eq!(
             parse(strings(&["session-connect", "--session", session_key])),
             Ok(Command::SessionConnect {
                 identity: Identity::Session,
                 session_key: session_key.to_owned(),
             })
         );
+
+        for argv in [
+            vec![
+                "session-connect",
+                "--session",
+                session_key,
+                "--as-user",
+                "alice",
+                "--as-process",
+                "agent",
+            ],
+            vec![
+                "session-connect",
+                "--session",
+                session_key,
+                "--as",
+                "reader",
+            ],
+        ] {
+            assert_eq!(parse(strings(&argv)), Err(usage.to_owned()));
+        }
     }
 
     #[test]

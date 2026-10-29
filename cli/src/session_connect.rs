@@ -226,6 +226,9 @@ pub fn run(session_key: String, identity: Identity) -> Result<(), String> {
             return Err(error);
         }
     };
+    if is_org_credential(&endpoint) && matches!(identity, Identity::Session) {
+        return Err("session-connect with an organization credential requires exactly one of --as-user or --as-process".to_owned());
+    }
     let read_selection = ReadSelection::for_invocation(&endpoint, &identity);
     let signal_guard = SessionSignalGuard::install()?;
 
@@ -2358,11 +2361,19 @@ mod tests {
     }
 
     fn send_frame(endpoint: Endpoint, idempotency_key: Option<&str>) -> (String, SendFailure) {
+        send_frame_with_identity(endpoint, idempotency_key, Identity::Session)
+    }
+
+    fn send_frame_with_identity(
+        endpoint: Endpoint,
+        idempotency_key: Option<&str>,
+        identity: Identity,
+    ) -> (String, SendFailure) {
         let (tx, rx) = mpsc::channel();
         spawn_send(
             endpoint,
             "agent:main/example".to_owned(),
-            Identity::Session,
+            identity,
             SendFrame {
                 request_id: "request-1".to_owned(),
                 content: "synthetic message".to_owned(),
@@ -2588,6 +2599,36 @@ mod tests {
         assert_gateway_headers(&request);
         assert_eq!(error.code, "wake_redirect");
         assert_eq!(error.message, "wake was redirected");
+    }
+
+    #[test]
+    fn session_wake_preserves_process_identity_without_user_selection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = endpoint(&listener);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            write_json_response(
+                &mut stream,
+                "400 Bad Request",
+                "",
+                r#"{"error":{"code":"invalid_message"}}"#,
+            );
+            request
+        });
+
+        let (request_id, error) = send_frame_with_identity(
+            endpoint,
+            Some("retry-key"),
+            Identity::Process("external-chatgpt".to_owned()),
+        );
+        let request = server.join().unwrap();
+
+        assert_eq!(request_id, "request-1");
+        assert!(request.contains(r#""asProcess":"external-chatgpt""#));
+        assert!(!request.contains("asUser"));
+        assert!(!request.contains(r#""as":"#));
+        assert_eq!(error.code, "invalid_message");
     }
 
     #[test]

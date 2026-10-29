@@ -194,11 +194,13 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     owner_id = ctx.state.user_id
     assert Org.get(ctx.db, dispatch_holder).owner_user_id == owner_id
 
-    assert {:ok, [[revocation_id, terminal_at, dispatch_work_item, ^owner_id]]} =
+    assert {:ok,
+            [[revocation_id, terminal_at, dispatch_work_item, ^owner_id, ^owner_id, nil, nil]]} =
              DB.query(
                ctx.db,
                """
-               SELECT revocation.id,revocation.revokedAt,assignment.workItemId,assignment.openedByUser
+               SELECT revocation.id,revocation.revokedAt,assignment.workItemId,assignment.openedByUser,
+                 revocation.revokedByUser,revocation.revokedBySession,revocation.revokedByProcess
                FROM assignments assignment
                JOIN assignment_revocation_generations generation ON generation.assignmentId=assignment.id
                  AND generation.reopeningId IS (
@@ -210,7 +212,8 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                  AND revocation.revokedByProcess IS assignment.closedByProcess
                WHERE assignment.id=?1 AND assignment.holderKey=?2
                  AND assignment.state='closed' AND assignment.outcome='revoked'
-                 AND assignment.openedBySession IS NULL AND revocation.reason='holder session retired'
+                 AND assignment.openedBySession IS NULL
+                 AND revocation.reason='Feature smoke completed the dispatch checks'
                """,
                [dispatch_id, dispatch_holder]
              )
@@ -412,103 +415,6 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
 
     assert_raise RuntimeError, ~r/execution disagrees/, fn ->
       Tightbeam.FeatureSmokeTopology.review_check!(%{check | output: "invented output"})
-    end
-  end
-
-  test "effort fixture reaches queued dispatch but cannot claim provider-free execution", ctx do
-    previous = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
-    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 2_500)
-
-    on_exit(fn ->
-      if previous,
-        do: Application.put_env(:tightbeam, :effort_checkin_horizon_ms, previous),
-        else: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms)
-    end)
-
-    # Drain only the preparatory rumination through the real claim/terminal
-    # seams, explicitly canceled as fixture setup. No provider reply or model
-    # execution is fabricated. The subsequent holder dispatch stays queued.
-    rumination =
-      Task.async(fn ->
-        drain_effort_rumination!(ctx.db, System.monotonic_time(:millisecond) + 10_000)
-      end)
-
-    ExUnit.CaptureIO.capture_io(fn ->
-      assert_raise Tightbeam.FeatureSmokeDriverFixture.Failure, ~r/effort smoke timed out/, fn ->
-        Driver.check_effort_without_effect(ctx.state)
-      end
-    end)
-
-    {source, carrier, seq} = Task.await(rumination, 1_000)
-    refute source == carrier
-    assert Tightbeam.Wakes.get(ctx.db, source).state == "fired"
-
-    assert {:ok, [["canceled"]]} =
-             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
-
-    assert {:ok, [[1]]} =
-             DB.query(
-               ctx.db,
-               """
-               SELECT count(*) FROM turn_lifecycle_events
-               WHERE turnSeq=?1 AND kind='terminal_committed' AND outcome='canceled'
-               """,
-               [seq]
-             )
-
-    assert {:ok, [["open", nil, "queued"]]} =
-             DB.query(ctx.db, """
-             SELECT a.state,a.outcome,t.status FROM assignments a JOIN turns t ON t.assignmentId=a.id
-             WHERE a.subject LIKE 'effort smoke%'
-             """)
-
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT count(*) FROM decision_requests WHERE kind='effort'"
-             )
-  end
-
-  defp drain_effort_rumination!(db, deadline) do
-    assert {:ok, rows} =
-             DB.query(db, """
-             SELECT source.wakeId,source.sessionKey,t.seq,t.wakeId
-             FROM wakes source JOIN sessions s ON s.sessionKey=source.sessionKey
-             JOIN (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL) d ON d.sourceWakeId=source.wakeId
-             JOIN turns t ON t.seq=d.turnSeq
-             WHERE source.rumination=1 AND source.state='fired' AND (SELECT wakeId FROM turns WHERE seq=d.turnSeq)<>d.sourceWakeId
-               AND s.displayName LIKE 'smoke-effort-parent-%' AND t.status='queued'
-             """)
-
-    case rows do
-      [[source, recipient, seq, carrier]] ->
-        assert {:ok, turn} = Ledger.claim_next(db, recipient, "fixture-rumination-drain")
-        assert turn.seq == seq
-        assert turn.wake_id == carrier
-        refute carrier == source
-
-        assert :ok =
-                 Ledger.finish(db, seq, "canceled", "provider-free fixture preparation only",
-                   owner_lease: turn.owner_lease
-                 )
-
-        {source, carrier, seq}
-
-      [] ->
-        assert System.monotonic_time(:millisecond) < deadline,
-               "actual effort rumination carrier was not admitted"
-
-        # This fixture has no lanes to announce recipient readiness.
-        assert {:ok, ready} =
-                 DB.query(
-                   db,
-                   "SELECT DISTINCT sessionKey FROM wakes WHERE state='pending' AND rumination=1 AND dueAt<=?1",
-                   [System.system_time(:millisecond)]
-                 )
-
-        Enum.each(ready, fn [recipient] -> Tightbeam.Wakes.recipient_ready(recipient) end)
-        Process.sleep(10)
-        drain_effort_rumination!(db, deadline)
     end
   end
 

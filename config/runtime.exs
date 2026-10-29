@@ -46,7 +46,8 @@ if config_env() != :test do
   end
 
   if value = System.get_env("TIGHTBEAM_SUPERVISION_INTERVAL_MS") do
-    config :tightbeam, :supervision_interval_ms, String.to_integer(value)
+    interval = if value == "off", do: :off, else: String.to_integer(value)
+    config :tightbeam, :supervision_interval_ms, interval
   end
 
   if value = System.get_env("TIGHTBEAM_PROD_LIMIT") do
@@ -55,10 +56,6 @@ if config_env() != :test do
 
   if value = System.get_env("TIGHTBEAM_ESCALATION_DECISION_DEADLINE_MS") do
     config :tightbeam, :escalation_decision_deadline_ms, String.to_integer(value)
-  end
-
-  if value = System.get_env("TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS") do
-    config :tightbeam, :effort_checkin_horizon_ms, String.to_integer(value)
   end
 
   if value = System.get_env("TIGHTBEAM_WORK_ITEM_TRIAGE_DEADLINE_MS") do

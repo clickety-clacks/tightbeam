@@ -1,7 +1,7 @@
 defmodule Tightbeam.Wire.OperatorSession do
   @moduledoc false
 
-  alias Tightbeam.{Devices, Org}
+  alias Tightbeam.{DB, Devices, Org}
 
   # The provisioned operator bearer carries no user identity itself. As with
   # CLI dispatch, the caller names the ordinary user operation identity.
@@ -17,6 +17,20 @@ defmodule Tightbeam.Wire.OperatorSession do
   end
 
   def resolve_user(_db, _user_id), do: {:error, "invalid_message"}
+
+  def resolve_default_read_principal(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT userId FROM users WHERE isAdmin = 1 ORDER BY createdAt, userId LIMIT 1",
+        []
+      )
+
+    case rows do
+      [[user_id]] -> resolve_user(db, user_id)
+      [] -> {:ok, %{user_id: "org", is_admin: true}}
+    end
+  end
 
   def resolve(db, %{"asUser" => user_id, "sessionKey" => session_key})
       when is_binary(user_id) and user_id != "" and is_binary(session_key) and

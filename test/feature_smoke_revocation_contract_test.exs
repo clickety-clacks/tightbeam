@@ -1,7 +1,7 @@
 defmodule Tightbeam.FeatureSmokeRevocationContractTest do
   use ExUnit.Case, async: true
 
-  test "fixture revocations are reasoned and no cross-run sweep is invoked" do
+  test "dispatch smoke revocation is reasoned and no cross-run sweep is invoked" do
     source = File.read!(Path.expand("../scripts/feature_smoke.exs", __DIR__))
     ast = Code.string_to_quoted!(source)
 
@@ -14,8 +14,7 @@ defmodule Tightbeam.FeatureSmokeRevocationContractTest do
           {node, calls}
       end)
 
-    # The cannot-proceed duplicate moved to its decisions-runbook owner.
-    assert length(calls) == 2
+    assert length(calls) == 1
 
     reasons =
       Enum.map(calls, fn fields ->
@@ -27,12 +26,7 @@ defmodule Tightbeam.FeatureSmokeRevocationContractTest do
         reason
       end)
 
-    expected_reasons = [
-      "Effort smoke replaces the first assignment to verify request supersession",
-      "Effort smoke completed the replacement assignment checks"
-    ]
-
-    assert Enum.sort(reasons) == Enum.sort(expected_reasons)
+    assert reasons == ["Feature smoke completed the dispatch checks"]
 
     {_, revocation_scopes} =
       Macro.prewalk(ast, [], fn
@@ -53,7 +47,7 @@ defmodule Tightbeam.FeatureSmokeRevocationContractTest do
           {node, scopes}
       end)
 
-    assert Enum.sort(revocation_scopes) == [:check_effort_without_effect]
+    assert revocation_scopes == [:check_dispatch_opens_assignment]
 
     refute String.contains?(source, "sweep_open_work_items")
     refute String.contains?(source, "clear_previous_leg_work_items")

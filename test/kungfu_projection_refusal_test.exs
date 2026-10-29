@@ -345,18 +345,15 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     refute_received {:firehose_notice, _}
   end
 
-  test "queued bytes retain exact content across re-registration", %{hub: hub} do
+  test "matching frames arrive without a per-frame delivery acknowledgement", %{hub: hub} do
     :ok = register(hub)
     Hub.publish(hub, notice())
     Hub.publish(hub, notice())
-    assert %{queued: 1, in_flight: true} = Hub.connection_stats(hub, self())
     assert_receive {:firehose_notice, first}
     assert first == notice()
-    :ok = register(hub, %{is_admin: false})
-    Hub.delivered(hub, self())
-    assert %{queued: 0, in_flight: true} = Hub.connection_stats(hub, self())
     assert_receive {:firehose_notice, second}
     assert second == notice()
+    assert %{queued: 0, in_flight: false} = Hub.connection_stats(hub, self())
   end
 
   test "changes route upgrades on loopback and delivers raw and general subscribed notices", %{
@@ -623,15 +620,15 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
            }
   end
 
-  test "queue overflow and owned process cleanup remain bounded", %{hub: hub} do
-    small = start_supervised!({Hub, name: nil, queue_limit: 1}, id: :small)
-    :ok = register(small)
-    Hub.publish(small, notice())
-    Hub.publish(small, notice())
-    assert %{queued: 0, overflowed: true} = Hub.connection_stats(small, self())
+  test "direct fanout and owned process cleanup do not need a queue limit", %{hub: hub} do
+    direct = start_supervised!({Hub, name: nil}, id: :direct)
+    :ok = register(direct)
+    Hub.publish(direct, notice())
+    Hub.publish(direct, notice())
     assert_receive {:firehose_notice, frame}
     assert frame == notice()
-    assert_receive :firehose_overflow
+    assert_receive {:firehose_notice, frame}
+    assert frame == notice()
 
     pid =
       spawn(fn ->
