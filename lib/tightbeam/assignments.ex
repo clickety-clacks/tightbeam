@@ -2945,10 +2945,16 @@ defmodule Tightbeam.Assignments do
         :ok
 
       true ->
+        producer_session =
+          case call.principal do
+            {:session, session} -> session
+            _ -> nil
+          end
+
         case Txn.q(
                txn,
                """
-               SELECT 1
+               SELECT art.contentSha256
                FROM assignments review
                JOIN artifacts art ON art.artifactId=?2
                JOIN assignments producer ON producer.id=art.producedByAssignmentId
@@ -2956,20 +2962,36 @@ defmodule Tightbeam.Assignments do
                JOIN sessions rs ON rs.sessionKey=review.holderKey
                JOIN sessions ps ON ps.sessionKey=producer.holderKey
                WHERE review.id=?1
-                 AND review.reviewsAssignmentId=art.producedByAssignmentId
-                 AND art.contentSha256=?3
+                 AND (review.reviewsAssignmentId=art.producedByAssignmentId
+                      OR (review.reviewsAssignmentId IS NULL
+                          AND review.id=art.producedByAssignmentId
+                          AND review.workItemId=art.workItemId
+                          AND review.holderKey=?4
+                          AND ?3='verified'))
                  AND rs.ownerUserId=wi.ownerUserId
                  AND ps.ownerUserId=wi.ownerUserId
                """,
-               [call.params[:assignment_id], artifact_id, hash]
+               [
+                 call.params[:assignment_id],
+                 artifact_id,
+                 call.params[:verdict_kind],
+                 producer_session
+               ]
              ) do
-          [[1]] ->
+          [[^hash]] ->
             :ok
+
+          [[expected_hash]] ->
+            error(
+              "invalid_revision_binding",
+              "artifact #{artifact_id} revision mismatch: expected sha256 #{expected_hash}"
+            )
 
           [] ->
             error(
               "invalid_revision_binding",
-              "artifact revision must match the assignment reviewed by this review card"
+              "expected an artifact produced by this assignment for holder verification, " <>
+                "or by the assignment reviewed by this review card"
             )
         end
     end

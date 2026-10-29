@@ -437,10 +437,14 @@ defmodule Tightbeam.FileEffectValidationPortTest do
       }
     }
 
-    assert {:error, %Mementos.Refusal{code: "non_file_operational_evidence_policy_inactive"}} =
+    assert {:ok, prepared} =
              DB.transaction(ctx.db, fn txn ->
                Rules.with_snapshot(snapshot, fn -> AttestEvidence.prepare_in_txn!(txn, call) end)
              end)
+
+    refute Map.has_key?(prepared, :validated_operational_evidence)
+    assert prepared.params.artifact_id == captured.id
+    assert prepared.params.content_sha256 == captured.hash
   end
 
   test "a lifecycle attest writes declared metadata with its attest row", ctx do

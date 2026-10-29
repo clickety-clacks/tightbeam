@@ -119,6 +119,9 @@ defmodule Tightbeam.AttestEvidence do
       end
 
     cond do
+      phase == "legacy" and assignment.effect_kind == "code" and not file_manifest_supplied? ->
+        call
+
       assignment.files_present and artifact_supplied? and
         match?({:ok, _}, operational_policy) and not file_manifest_supplied? ->
         refuse!(
