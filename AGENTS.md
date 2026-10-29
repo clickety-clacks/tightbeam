@@ -6,10 +6,10 @@ The branch and release ruling for both product lines is in
 [CONTRIBUTING.md on main](https://github.com/clickety-clacks/tightbeam/blob/main/CONTRIBUTING.md).
 Integrate maintenance work into the highest `0.1.*` branch (currently `0.1.9`),
 not main. main is now the 0.2 fabric program line — never target it from this
-line; fixes cross to it only by Mike-authorized cherry-pick election. Where
-older guidance, specs, or cards name another default integration branch, read
-"highest `0.1.*` branch" on this line. If a card names a branch explicitly, the
-card wins.
+line; fixes cross to it only by maintainer-authorized cherry-pick. Where
+older guidance, specs, or task instructions name another default integration
+branch, read "highest `0.1.*` branch" on this line. If task instructions name
+a branch explicitly, that branch takes precedence.
 
 ## Keep the substrate neutral
 
