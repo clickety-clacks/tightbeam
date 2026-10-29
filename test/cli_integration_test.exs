@@ -3248,14 +3248,15 @@ defmodule Tightbeam.CliIntegrationTest do
       assert {:ok, [[payload]]} =
                DB.query(
                  ctx.db,
-               "SELECT payload FROM events WHERE kind='denied' AND verb='#{verb}' ORDER BY id DESC LIMIT 1"
+                 "SELECT payload FROM events WHERE kind='denied' AND verb='#{verb}' ORDER BY id DESC LIMIT 1"
                )
 
       assert payload =~ "harklight_origin_unavailable"
     end
   end
 
-  test "real CLI keeps explicit Harklight user and process identities local with session credentials", ctx do
+  test "real CLI keeps explicit Harklight user and process identities local with session credentials",
+       ctx do
     commands = [
       {"harklight-send",
        ["harklight-send", "--session", "new", "--sender-id", "owner", "--title", "Example"],
