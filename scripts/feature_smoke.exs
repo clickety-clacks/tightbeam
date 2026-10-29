@@ -2042,11 +2042,10 @@ defmodule FeatureSmoke do
       "dispatch must persist workItemId (work-item-brackets-v1 F7): #{inspect(got)}"
     )
 
-    reason = "Feature smoke completed the dispatch checks"
     revoked =
       ok!(state, "revoke-assignment", %{
         "assignmentId" => asg_id,
-        "reason" => reason
+        "reason" => "Feature smoke completed the dispatch checks"
       })
 
     assert(

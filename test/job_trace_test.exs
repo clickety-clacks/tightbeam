@@ -351,7 +351,6 @@ defmodule Tightbeam.JobTraceTest do
              "wake_scheduled",
              "wake_fired",
              "decision_request",
-             "effort_generation",
              "attest",
              "attest",
              "attest",

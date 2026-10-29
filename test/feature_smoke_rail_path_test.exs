@@ -210,7 +210,8 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                  AND revocation.revokedByProcess IS assignment.closedByProcess
                WHERE assignment.id=?1 AND assignment.holderKey=?2
                  AND assignment.state='closed' AND assignment.outcome='revoked'
-                 AND assignment.openedBySession IS NULL AND revocation.reason='holder session retired'
+                 AND assignment.openedBySession IS NULL
+                 AND revocation.reason='Feature smoke completed the dispatch checks'
                """,
                [dispatch_id, dispatch_holder]
              )
