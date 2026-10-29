@@ -117,6 +117,8 @@ defmodule Tightbeam.CliIntegrationTest do
       db: db,
       base_dir: base_dir,
       cwd: base_dir,
+      default_harness: :claude,
+      default_model: Model.new("fable"),
       wake_tick_ms: 1_000
     }
 
