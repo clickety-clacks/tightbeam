@@ -2,20 +2,19 @@
 
 ## THIS LINE: main = the 0.2 fabric program (flipped 2026-08-12)
 
-The pre-flip tip lives on branch 0.1.x — the maintenance line the live org
-patches. THE GIT PROCESS ON THIS LINE: NO DOOR means NO PR CEREMONY — nothing else. It
-assumes your branch is READY TO MERGE and the tests PASS. Work on your
-own branch in your own workspace; when the full verification gate is
-GREEN on your branch, merge to main — no PR, no review theater, just a
-clean merge of finished work. Main is never worked in directly, and a
-red suite is never merged; "pre-existing failure" is not a pass, it is a
-stop — fix it or surface it to the owner before anything merges. And the mirror rule at the START of work: branch
-only FROM a green main — never start work on a red base, where your own
+The pre-flip tip lives on branch 0.1.x — the maintenance line. On main, a
+ready-to-merge branch with passing tests needs no pull request or extra
+review step. Work on your own branch in your own workspace; when the full verification gate is
+GREEN on your branch, merge to main without a pull request or additional
+review step. Main is never worked in directly, and a red suite is never merged; "pre-existing failure" is not a pass, it is a
+stop — fix it or surface it to the owner before anything merges. At the
+start of work, branch only from a green main — never start work on a red base, where your own
 breakage and inherited breakage are indistinguishable; if main is red,
-fixing it comes first. Review
-evidence lands in the specs repo first. If your assignment card names a different integration branch,
-the card wins. If your work targets 0.1.x, this is the wrong checkout — do not push here. Fixes cross
-0.1.x -> main by cherry-pick election only, Mike-authorized.
+fixing it comes first. Record review evidence in the specs repository before
+merging. If task instructions name a different integration branch, that branch
+takes precedence. If your work targets 0.1.x, this is the wrong checkout — do
+not push here. Fixes cross 0.1.x -> main only by maintainer-authorized
+cherry-pick.
 
 ## THE PHILOSOPHY GATE — run it before you design, again before you ship
 
