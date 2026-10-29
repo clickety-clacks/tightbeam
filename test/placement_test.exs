@@ -289,7 +289,7 @@ defmodule Tightbeam.PlacementTest do
 
     expected =
       "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> " <>
-        "--name eurisko --as-user <adminUserId>"
+        "--name eurisko"
 
     error =
       assert_raise Placement.Refusal, fn ->

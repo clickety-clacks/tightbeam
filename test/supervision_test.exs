@@ -1082,11 +1082,19 @@ defmodule Tightbeam.SupervisionTest do
     assert Wakes.get(ctx.db, deadline.wake_id).state == "fired"
     assert Wakes.get(ctx.db, pointer.wake_id).state == "pending"
 
+    # A pending follow-up suppresses a reminder, but it is not work activity.
+    # The replacement retains the original activity timestamp rather than
+    # treating the conversational assignment pointer as a new receipt.
+    replacement = pending_deadline!(ctx.db, "asg_inactive")
+    assert replacement.wake_id != deadline.wake_id
+    assert replacement.due_at > pointer.created_at
+    assert %{"activityAt" => ^opened_at} = JSON.decode!(replacement.prompt)
+
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 " <>
-                 "AND consumer='assignment_inactivity_deadline' AND state='pending'",
+                 "AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'",
                ["asg_inactive"]
              )
   end
