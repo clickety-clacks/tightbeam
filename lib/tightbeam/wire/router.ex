@@ -3529,7 +3529,9 @@ defmodule Tightbeam.Wire.Router do
         end
 
       is_binary(body["asProcess"]) and body["asProcess"] != "" ->
-        {:error, 403, "identity_not_yours", "a session token cannot act as a process"}
+        with {:ok, origin} <- agent_origin(body, conn) do
+          {:ok, origin, {:process, body["asProcess"]}}
+        end
 
       length(roles) == 1 ->
         {:ok, "agent:#{hd(roles)}", session_principal}
