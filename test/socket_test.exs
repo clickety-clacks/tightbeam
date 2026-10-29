@@ -362,7 +362,7 @@ defmodule Tightbeam.Wire.SocketTest do
     refute_receive {:db_failure_reporting_callback_called, _db_pid}, 0
   end
 
-  test "pair and auth failures use the contract reasons", ctx do
+  test "pairing and auth failures use the contract close codes and reasons", ctx do
     {:ok, state} = Socket.init(ctx.deps)
 
     pair = %{
@@ -381,7 +381,7 @@ defmodule Tightbeam.Wire.SocketTest do
     {:ok, state} = Socket.init(ctx.deps)
     auth = %{"type" => "auth", "token" => token, "deviceId" => "d1"}
 
-    {:stop, :normal, 1000, {:text, frame}, _} =
+    {:stop, :normal, 1008, {:text, frame}, _} =
       Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
 
     assert %{"success" => false, "reason" => "token_revoked"} = JSON.decode!(frame)
@@ -389,7 +389,7 @@ defmodule Tightbeam.Wire.SocketTest do
     {:ok, state} = Socket.init(ctx.deps)
     auth = %{"type" => "auth", "token" => "nope", "deviceId" => "unknown"}
 
-    {:stop, :normal, 1000, {:text, frame}, _} =
+    {:stop, :normal, 1008, {:text, frame}, _} =
       Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
 
     assert %{"success" => false, "reason" => "auth_failed"} = JSON.decode!(frame)
@@ -405,10 +405,34 @@ defmodule Tightbeam.Wire.SocketTest do
     {:ok, state} = Socket.init(ctx.deps)
     auth = %{"type" => "auth", "token" => "nope", "deviceId" => "d2"}
 
-    {:stop, :normal, 1000, {:text, frame}, _} =
+    {:stop, :normal, 1008, {:text, frame}, _} =
       Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
 
     assert %{"success" => false, "reason" => "device_not_approved"} = JSON.decode!(frame)
+
+    {:pending, _} =
+      Devices.pair(ctx.db, %{
+        device_id: "d3",
+        claimed_name: "Denied",
+        platform: nil,
+        model: nil
+      })
+
+    assert :ok = Devices.deny(ctx.db, "d3")
+    {:ok, state} = Socket.init(ctx.deps)
+
+    denied_pair = %{
+      "type" => "pair_request",
+      "protocolVersion" => 1,
+      "deviceId" => "d3",
+      "claimedName" => "Denied"
+    }
+
+    {:stop, :normal, 1008, {:text, frame}, _} =
+      Socket.handle_in({JSON.encode!(denied_pair), opcode: :text}, state)
+
+    assert %{"type" => "pair_result", "success" => false, "reason" => "pair_denied"} =
+             JSON.decode!(frame)
   end
 
   test "auth registers, replays at most 500, then sends sync_complete", ctx do
@@ -831,7 +855,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
     differing = Map.put(reauth, "subscriptions", ["chat"])
 
-    assert {:stop, :normal, 1000, {:text, error}, _} =
+    assert {:stop, :normal, 1002, {:text, error}, _} =
              Socket.handle_in({JSON.encode!(differing), opcode: :text}, live_again)
 
     assert JSON.decode!(error)["code"] == "invalid_message"
@@ -897,7 +921,7 @@ defmodule Tightbeam.Wire.SocketTest do
         "subscriptions" => subscriptions
       }
 
-      assert {:stop, :normal, 1000, {:text, error}, _} =
+      assert {:stop, :normal, 1002, {:text, error}, _} =
                Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
 
       assert JSON.decode!(error)["code"] == "invalid_message"
