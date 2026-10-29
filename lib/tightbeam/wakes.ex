@@ -197,6 +197,11 @@ defmodule Tightbeam.Wakes do
   CREATE INDEX IF NOT EXISTS wakes_condition ON wakes (state, conditionKind, conditionScope);
   CREATE INDEX IF NOT EXISTS wakes_wait_recognition
     ON wakes (state, waitMode, ownerUserId, recognitionAt, dueAt);
+  -- Reference-only assignment wakes are not holder activity. Retain that
+  -- distinction for the deadline's later activity-history lookup.
+  CREATE TABLE IF NOT EXISTS wake_activity_exclusions (
+    wakeId TEXT PRIMARY KEY
+  );
   CREATE TABLE IF NOT EXISTS wake_retry_attempts (
     wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId),
     rootWakeId TEXT NOT NULL REFERENCES wakes(wakeId),
@@ -1740,6 +1745,10 @@ defmodule Tightbeam.Wakes do
     end
 
     activity_assignment_id = Map.get(input, :activity_assignment_id, wake.assignment_id)
+
+    if is_binary(wake.assignment_id) and is_nil(activity_assignment_id) do
+      Txn.q(txn, "INSERT INTO wake_activity_exclusions (wakeId) VALUES (?1)", [wake.wake_id])
+    end
 
     if is_binary(activity_assignment_id) and is_binary(wake.creator_session_key) do
       Tightbeam.Supervision.activity_in_txn(

@@ -453,6 +453,62 @@ defmodule Tightbeam.SupervisionTest do
     assert pending_deadline!(ctx.db, "asg_inactive").wake_id == deadline.wake_id
   end
 
+  test "assignment-pointer wake is excluded when its inactivity deadline is consumed", ctx do
+    opened_at = System.system_time(:millisecond) - 5_000
+    interval_ms = 1_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
+               "asg_inactive",
+               opened_at
+             ])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    pointer =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        creator_session_key: ctx.holder.session_key,
+        assignment_id: "asg_inactive",
+        activity_assignment_id: nil,
+        origin: "session:#{ctx.holder.session_key}",
+        prompt: "The assignment is ready for review",
+        due_at: System.system_time(:millisecond)
+      })
+
+    deadline_id = deadline.wake_id
+    deadline_due_at = deadline.due_at
+
+    assert {:ok, [[^deadline_id, ^deadline_due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,dueAt FROM wakes WHERE assignmentId=?1 " <>
+                 "AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               ["asg_inactive"]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wake_activity_exclusions WHERE wakeId=?1", [
+               pointer.wake_id
+             ])
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+    assert Wakes.get(ctx.db, deadline.wake_id).state == "fired"
+    assert Wakes.get(ctx.db, pointer.wake_id).state == "pending"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 " <>
+                 "AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               ["asg_inactive"]
+             )
+  end
+
   test "deadline and reopen lookups keep indexed plans with long assignment history", ctx do
     history_size = 20_000
 

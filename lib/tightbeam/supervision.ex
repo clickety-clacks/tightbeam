@@ -1041,7 +1041,9 @@ defmodule Tightbeam.Supervision do
       ),
       max_row(
         txn,
-        "SELECT MAX(createdAt) FROM wakes WHERE assignmentId=?1 AND creatorSessionKey=?2 AND createdAt>=?3",
+        "SELECT MAX(w.createdAt) FROM wakes w " <>
+          "WHERE w.assignmentId=?1 AND w.creatorSessionKey=?2 AND w.createdAt>=?3 " <>
+          "AND NOT EXISTS (SELECT 1 FROM wake_activity_exclusions e WHERE e.wakeId=w.wakeId)",
         [assignment_id, holder, opened_at]
       ),
       max_row(
