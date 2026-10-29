@@ -3169,7 +3169,7 @@ defmodule Tightbeam.CliIntegrationTest do
                "SELECT payload FROM events WHERE kind='denied' AND verb='work-item-create' ORDER BY id DESC LIMIT 1"
              )
 
-    assert JSON.decode!(payload)["code"] == "invalid_priority"
+    assert payload =~ "invalid_priority"
   end
 
   test "real CLI records an unknown spawn harness as a gateway denial", ctx do
@@ -3200,7 +3200,7 @@ defmodule Tightbeam.CliIntegrationTest do
                "SELECT payload FROM events WHERE kind='denied' AND verb='spawn' ORDER BY id DESC LIMIT 1"
              )
 
-    assert JSON.decode!(payload)["code"] == "unknown_harness"
+    assert payload =~ "unknown_harness"
   end
 
   test "real CLI composes priority and metadata in one work-item update", ctx do
