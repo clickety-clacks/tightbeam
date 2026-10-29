@@ -64,61 +64,31 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, %{"post" => fn _ -> %{ok: true} end}, call())
   end
 
-  test "shipped wait effort-relief policy follows TOML reload with a fresh query snapshot", ctx do
+  test "retired wait effort-relief policy is skipped without disabling sibling rules", ctx do
     shipped =
       File.read!(
         Path.expand("../priv/kungfu/agentic-engineering/rules/verification.toml", __DIR__)
       )
 
     put_raw(ctx, shipped)
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
-    facts = %{
-      "wait.obligation_matches" => true,
-      "wait.admitted" => true,
-      "wait.continuation_state" => "pending",
-      "wait.recognized" => false,
-      "resolver.open" => true,
-      "resolver.owed_by_other" => true,
-      "wait.declaration_complete" => true,
-      "wait.verification_accountable" => true,
-      "wait.verification_state" => "provisional"
-    }
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        loaded = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+        assert Enum.any?(loaded, &(&1.name == "completion-requires-verification"))
+        refute Enum.any?(loaded, &(&1.name == "justified-unresolved-dependency"))
 
-    query = fn snapshot ->
-      DB.transaction(
-        ctx.db,
-        &Rules.select_policy_in_txn(&1, "wait-effort-relief", %{wait_facts: snapshot})
-      )
-    end
+        assert {:ok, :none} =
+                 DB.transaction(
+                   ctx.db,
+                   &Rules.select_policy_in_txn(&1, "wait-effort-relief", %{wait_facts: %{}})
+                 )
+      end)
 
-    assert {:ok, {:ok, %{name: "justified-unresolved-dependency"}}} = query.(facts)
+    assert log =~
+             "policy \"justified-unresolved-dependency\" skipped: purpose wait-effort-relief is retired"
 
-    for field <-
-          ~w(wait.obligation_matches wait.admitted resolver.open resolver.owed_by_other wait.declaration_complete wait.verification_accountable) do
-      assert {:ok, :none} = query.(Map.put(facts, field, false))
-    end
-
-    for state <- ~w(queued running) do
-      assert {:ok, :none} = query.(Map.put(facts, "wait.continuation_state", state))
-    end
-
-    assert {:ok, :none} = query.(Map.put(facts, "wait.recognized", true))
-    assert {:ok, :none} = query.(Map.put(facts, "wait.verification_state", "challenged"))
-    assert {:ok, {:ok, _}} = query.(Map.put(facts, "wait.verification_state", "confirmed"))
-
-    put_raw(
-      ctx,
-      String.replace(
-        shipped,
-        ~s(fact = "resolver.owed_by_other", op = "eq", value = true),
-        ~s(fact = "resolver.owed_by_other", op = "eq", value = false)
-      )
-    )
-
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    assert {:ok, :none} = query.(facts)
-    assert {:ok, {:ok, _}} = query.(Map.put(facts, "resolver.owed_by_other", false))
+    assert Rules.evaluate(ctx.db, call()) == :ok
   end
 
   test "predicate policy loading refuses incomplete verification and invalid conditions", ctx do

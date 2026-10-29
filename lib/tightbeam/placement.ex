@@ -95,10 +95,6 @@ defmodule Tightbeam.Placement do
   # timeouts or an invisible password prompt.
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
 
-  # Effort stamps sit in the session's own workdir, so they are reaped with the
-  # workspace and never outlive it.
-  @effort_stamp_dir ".tightbeam-effort"
-
   @typedoc "A configured host. ssh: nil marks the reserved local host."
   @type host_config :: %{
           required(:ssh) => String.t() | nil,
@@ -733,58 +729,8 @@ defmodule Tightbeam.Placement do
   end
 
   @doc """
-  Observe writes under an assignment root without creating it: what was written
-  since the prior stamp, plus the current listing.
-
-  No git anywhere. Arming lays an empty stamp file; a later observation asks
-  `find -newer` what has been written since and diffs the listing for created
-  and deleted paths, then lays the NEXT stamp — so a stamp lives as long as the
-  generation that owns it and dies with the workspace it sits in. The stamp
-  directory is pruned from the walk, so a stamp can never perturb its own probe.
-
-  ONE mechanism. Local and satellite holders run the same bounded shell probe,
-  and nothing may substitute a different observation for it: a caller that could
-  replace this wholesale is a pluggable probe framework, which the spec's
-  Non-goals refuse. Tests inject at the SHELL (`:sh`), so the command is always
-  the one production builds, runs and parses.
-  """
-  @spec effort_observation(map(), map(), String.t(), term()) ::
-          {:ok, map()} | {:error, String.t()}
-  def effort_observation(config, session, root, baseline \\ nil) do
-    host = fetch_session_host!(config, session)
-    stamp_dir = Path.join(workdir_path(config, session), @effort_stamp_dir)
-    stamp = Path.join(stamp_dir, "#{Tightbeam.Id.uuid4()}.stamp")
-    command = effort_observation_command(root, stamp_dir, stamp, prior_stamp(baseline))
-    runner = Map.get(config, :sh, &system_cmd/1)
-
-    invocation =
-      if host.ssh == nil do
-        ["sh", "-lc", command]
-      else
-        ["ssh" | @ssh_opts] ++ [host.ssh, "sh", "-lc", shell_quote(command)]
-      end
-
-    result =
-      if host.ssh == nil do
-        run_probe(runner, invocation)
-      else
-        run_bounded(runner, invocation, Map.get(config, :effort_probe_timeout_ms, 8_000))
-      end
-
-    case result do
-      {:ok, output} -> parse_effort_observation(output, stamp)
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp prior_stamp({:ok, observation}), do: prior_stamp(observation)
-  defp prior_stamp(%{stamp: stamp}) when is_binary(stamp), do: stamp
-  defp prior_stamp(_baseline), do: nil
-
-  @doc """
   Stat paths on the host that holds them — the write-detection half of referent
-  verification, and the same shape as the effort probe: one bounded invocation
-  per host, local or over ssh.
+  verification. Local and remote hosts use a bounded shell invocation.
 
   A present path returns its mtime, so the answer is evidence of a write and not
   merely of existence. `stat` spells its format differently on BSD and GNU, so
@@ -819,7 +765,7 @@ defmodule Tightbeam.Placement do
           if host.ssh == nil do
             run_probe(runner, invocation)
           else
-            run_bounded(runner, invocation, Map.get(config, :effort_probe_timeout_ms, 8_000))
+            run_bounded(runner, invocation, 8_000)
           end
 
         case result do
@@ -1010,71 +956,6 @@ defmodule Tightbeam.Placement do
     end
 
     :ok
-  end
-
-  # Portable shell: no git, no mktemp, no GNU-only find predicates. A vanished
-  # file mid-walk is not a probe failure, so the walk's own stderr is dropped and
-  # only the explicit preconditions (a readable root, a writable stamp) fail.
-  #
-  # ORDER IS LOAD-BEARING. The next stamp is laid BEFORE the walk, so a write
-  # that lands between the two is newer than the new stamp and is caught by the
-  # next probe — at worst counted twice, never missed. And the prior stamp is
-  # never removed: two observers can read the same armed generation (observation
-  # runs before the CAS that picks a winner), and a loser deleting the stamp the
-  # winner's row points at would silently blind the next bracket. A stamp per
-  # generation accumulates in the workdir and dies with the workspace.
-  defp effort_observation_command(root, stamp_dir, stamp, prior) do
-    """
-    set -u
-    root=#{shell_quote(root)}
-    stampdir=#{shell_quote(stamp_dir)}
-    stamp=#{shell_quote(stamp)}
-    prior=#{shell_quote(prior || "")}
-    test -d "$root" || { echo "workdir root is unavailable" >&2; exit 1; }
-    mkdir -p "$stampdir" || exit 1
-    priorState=none
-    writes=0
-    : > "$stamp" || exit 1
-    if test -n "$prior"; then
-      if test -e "$prior"; then
-        priorState=observed
-        writes=$(find "$root" -path "$stampdir" -prune -o -newer "$prior" -print 2>/dev/null | wc -l)
-      else
-        priorState=missing
-      fi
-    fi
-    printf 'B\\t%s\\t%s\\n' "$priorState" "$writes"
-    find "$root" -path "$stampdir" -prune -o -print 2>/dev/null
-    """
-  end
-
-  defp parse_effort_observation(output, stamp) do
-    {header, paths} =
-      output
-      |> String.split("\n", trim: true)
-      |> Enum.reduce({nil, []}, fn line, {header, paths} ->
-        case String.split(line, "\t") do
-          ["B", prior_state, writes] -> {{prior_state, writes}, paths}
-          _ -> {header, [line | paths]}
-        end
-      end)
-
-    case header do
-      nil ->
-        {:error, "effort observation was unreadable"}
-
-      {prior_state, writes} ->
-        sorted = paths |> Enum.uniq() |> Enum.sort()
-
-        {:ok,
-         %{
-           stamp: stamp,
-           prior: prior_state,
-           writes: writes |> String.trim() |> String.to_integer(),
-           entries: length(sorted),
-           digest: :crypto.hash(:sha256, Enum.join(sorted, "\n")) |> Base.encode16(case: :lower)
-         }}
-    end
   end
 
   defp run_bounded(runner, invocation, timeout_ms) do

@@ -13,7 +13,6 @@ defmodule Tightbeam.JobForensicsTest do
     CausalEvents,
     ConditionFacts,
     DB,
-    EffortCheckin,
     Gateway,
     Ledger,
     Org,
@@ -1014,51 +1013,6 @@ defmodule Tightbeam.JobForensicsTest do
       ),
       scheduling_origin: "process:legacy"
     )
-  end
-
-  test "proof 2: unanswered effort deadline expires without rewriting its route", ctx do
-    db = ctx.db
-    work_item(db, "wi_effort")
-    session(db, "parent")
-    session(db, "holder", "parent")
-    assignment(db, "asg_effort", "wi_effort", "holder")
-
-    wake =
-      Wakes.schedule(db, %{
-        session_key: "holder",
-        origin: "process:tightbeam",
-        consumer: "effort_deadline",
-        due_at: 1,
-        assignment_id: "asg_effort"
-      })
-
-    :ok =
-      DB.execute(db, """
-      INSERT INTO decision_requests
-        (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
-         lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
-         question, options, context, status)
-      VALUES ('dr_effort', 'effort', 'process:tightbeam', 'flynn', 'asg_effort',
-              'holder', 1, 1, '#{wake.wake_id}', 1, 1, 'q', '[]', '{}', 'open')
-      """)
-
-    assert :ok = EffortCheckin.deadline(db, %{}, wake)
-
-    assert {:ok, [["withdrawn", "holder", 1, wake_id, "expired-no-decision"]]} =
-             DB.query(
-               db,
-               "SELECT status,expecterSessionKey,lineageRung,deadlineWakeId,withdrawnReason FROM decision_requests WHERE id = 'dr_effort'"
-             )
-
-    assert wake_id == wake.wake_id
-    assert Wakes.get(db, wake_id).state == "fired"
-    assert CausalEvents.for_job(db, "wi_effort", []) == []
-
-    assert {:ok, [["by=process:tightbeam reason=expired-no-decision notified=holder"]]} =
-             DB.query(
-               db,
-               "SELECT detail FROM lifecycle_events WHERE kind='decision_request_withdrawn' AND subject='dr_effort'"
-             )
   end
 
   ## Proof 8 — the trace's additive types leave v1 consumers alone

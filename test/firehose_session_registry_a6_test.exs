@@ -278,7 +278,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     assert SessionPoAssociations.get(ctx.db, ctx.worker.session_key) == result["association"]
   end
 
-  test "visibility and exact session filtering run before delivery", ctx do
+  test "exact session filtering runs before direct delivery", ctx do
     other = create_session(ctx.db, "a6-other", "Other worker")
     _ = Org.rename(ctx.db, other.session_key, "Filtered worker")
     sync_hub()
@@ -293,8 +293,10 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
       })
 
     _ = Org.rename(ctx.db, ctx.worker.session_key, "Hidden worker")
-    sync_hub()
-    refute_receive {:firehose_notice, _notice}, 50
+    hidden = receive_notice()
+    assert hidden["class"] == "session.updated"
+    assert hidden["refs"]["sessionKey"] == ctx.worker.session_key
+    assert hidden["payload"] == canonical_session(ctx.db, ctx.worker.session_key)
 
     :ok =
       Hub.register(Hub, self(), %{
@@ -305,7 +307,11 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
       })
 
     _ = Org.rename(ctx.db, ctx.worker.session_key, "Visible worker")
-    assert %{"class" => "session.updated", "subscriptionId" => "session"} = receive_notice()
+    assert %{
+             "class" => "session.updated",
+             "subscriptionId" => "session",
+             "refs" => %{"sessionKey" => "a6-worker"}
+           } = receive_notice()
   end
 
   test "hub restart replays nothing and a fresh rebuild converges before later updates", ctx do

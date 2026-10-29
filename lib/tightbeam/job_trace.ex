@@ -22,7 +22,6 @@ defmodule Tightbeam.JobTrace do
     "wake_canceled" => 3,
     "decision_request" => 4,
     "causal_event" => 5,
-    "effort_generation" => 6,
     "attest" => 7,
     "commit_ref_correction" => 8,
     "turn_end" => 9,
@@ -51,7 +50,6 @@ defmodule Tightbeam.JobTrace do
            correction_entries(db, assignment_ids) ++
            wake_entries(db, item.id, assignment_ids) ++
            decision_entries(db, assignment_ids) ++
-           effort_entries(db, assignment_ids) ++
            causal_entries(db, item.id, assignment_ids) ++
            Tightbeam.SessionReparent.timeline(db, item.id))
         |> Enum.sort_by(fn entry ->
@@ -287,9 +285,6 @@ defmodule Tightbeam.JobTrace do
             db,
             """
             WITH links(wakeId, assignmentId) AS (
-              SELECT wakeId, assignmentId FROM effort_checkin_generations
-              WHERE assignmentId IN (#{clause})
-              UNION
               SELECT deadlineWakeId, assignmentId FROM decision_requests
               WHERE assignmentId IN (#{clause})
               UNION
@@ -562,34 +557,6 @@ defmodule Tightbeam.JobTrace do
         assignmentId: assignment_id,
         state: state,
         ruling: ruling
-      }
-    end)
-  end
-
-  defp effort_entries(_db, []), do: []
-
-  defp effort_entries(db, assignment_ids) do
-    {clause, params} = in_clause(assignment_ids)
-
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT assignmentId, generation, state, evidence, armedAt
-        FROM effort_checkin_generations
-        WHERE assignmentId IN (#{clause})
-        """,
-        params
-      )
-
-    Enum.map(rows, fn [assignment_id, generation, state, evidence, at] ->
-      %{
-        at: at,
-        type: "effort_generation",
-        id: "gen:#{assignment_id}:#{generation}",
-        assignmentId: assignment_id,
-        state: state,
-        evidence: decode(evidence)
       }
     end)
   end
