@@ -348,7 +348,7 @@ mod tests {
         let requirements = requirements(&catalog(), &["codex".to_owned()]);
         let observation =
             parse("Linux x86_64\nnode /n\nnpm MISSING\nrsync /r\ncodex-cli MISSING\n");
-        let reason = verdict(&requirements, &observation, "eliza").unwrap_err();
+        let reason = verdict(&requirements, &observation, "example-host").unwrap_err();
         assert!(reason.contains("missing 2 prerequisites"), "{reason}");
         assert!(reason.contains("\n  npm "), "{reason}");
         assert!(reason.contains("\n  codex-cli "), "{reason}");

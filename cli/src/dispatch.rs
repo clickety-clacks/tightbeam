@@ -3594,16 +3594,16 @@ mod tests {
         assert_eq!(
             body(&[
                 "work-item-update",
-                "wi_6d418db1-26b4-4ad0-9886-86e757e93342",
+                "wi_00000000-0000-4000-8000-000000000099",
                 "--spec-ref",
-                "patrol-failure-classification-and-escalation-v1.md",
+                "governing.md",
                 "--spec-sha256",
                 class_a_sha,
                 "--as-user",
                 "sample-user",
             ]),
             format!(
-                r#"{{"asUser":"sample-user","verb":"work-item-update","params":{{"workItemId":"wi_6d418db1-26b4-4ad0-9886-86e757e93342","specRefName":"patrol-failure-classification-and-escalation-v1.md","specRefSha256":"{class_a_sha}"}}}}"#
+                r#"{{"asUser":"sample-user","verb":"work-item-update","params":{{"workItemId":"wi_00000000-0000-4000-8000-000000000099","specRefName":"governing.md","specRefSha256":"{class_a_sha}"}}}}"#
             )
         );
         assert_eq!(

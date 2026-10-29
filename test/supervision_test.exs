@@ -1090,14 +1090,14 @@ defmodule Tightbeam.SupervisionTest do
         """
         INSERT INTO attests (id, assignmentId, kind, bySession, ts)
         VALUES
-          ('att_44706a9f','asg_1','progress','holder',2),
-          ('att_38a1a229','asg_1','progress','holder',3),
-          ('att_f0f735ae','asg_1','progress','holder',4),
-          ('att_7b4d29c1','asg_1','progress','holder',5),
-          ('att_a6051dd2','asg_1','progress','holder',6),
-          ('att_c532a60d','asg_1','progress','holder',7),
-          ('att_de16e957','asg_1','progress','holder',8),
-          ('att_99c4c115','asg_1','progress','holder',9)
+          ('att_00000000-0000-4000-8000-000000000114','asg_1','progress','holder',2),
+          ('att_00000000-0000-4000-8000-000000000115','asg_1','progress','holder',3),
+          ('att_00000000-0000-4000-8000-000000000116','asg_1','progress','holder',4),
+          ('att_00000000-0000-4000-8000-000000000117','asg_1','progress','holder',5),
+          ('att_00000000-0000-4000-8000-000000000118','asg_1','progress','holder',6),
+          ('att_00000000-0000-4000-8000-000000000119','asg_1','progress','holder',7),
+          ('att_00000000-0000-4000-8000-000000000120','asg_1','progress','holder',8),
+          ('att_00000000-0000-4000-8000-000000000113','asg_1','progress','holder',9)
         """
       )
 
@@ -1107,10 +1107,10 @@ defmodule Tightbeam.SupervisionTest do
         """
         INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts)
         VALUES
-          ('att_cc66ba00','asg_1','verdict','cannot-proceed-external-main-red','sample-user',10),
-          ('att_c4f2d593','asg_1','verdict','liveness-crediting-false-stall','sample-user',11),
-          ('att_46f3b9a5','asg_1','verdict','liveness-crediting-false-stall','sample-user',12),
-          ('att_8ca4dfcd','asg_1','verdict','liveness-crediting-false-stall','sample-user',13)
+          ('att_00000000-0000-4000-8000-000000000121','asg_1','verdict','cannot-proceed-external-main-red','sample-user',10),
+          ('att_00000000-0000-4000-8000-000000000122','asg_1','verdict','liveness-crediting-false-stall','sample-user',11),
+          ('att_00000000-0000-4000-8000-000000000123','asg_1','verdict','liveness-crediting-false-stall','sample-user',12),
+          ('att_00000000-0000-4000-8000-000000000124','asg_1','verdict','liveness-crediting-false-stall','sample-user',13)
         """
       )
 
@@ -1129,14 +1129,14 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok,
             [
-              ["progress", "att_44706a9f"],
-              ["progress", "att_38a1a229"],
-              ["progress", "att_f0f735ae"],
-              ["progress", "att_7b4d29c1"],
-              ["progress", "att_a6051dd2"],
-              ["progress", "att_c532a60d"],
-              ["progress", "att_de16e957"],
-              ["progress", "att_99c4c115"]
+              ["progress", "att_00000000-0000-4000-8000-000000000114"],
+              ["progress", "att_00000000-0000-4000-8000-000000000115"],
+              ["progress", "att_00000000-0000-4000-8000-000000000116"],
+              ["progress", "att_00000000-0000-4000-8000-000000000117"],
+              ["progress", "att_00000000-0000-4000-8000-000000000118"],
+              ["progress", "att_00000000-0000-4000-8000-000000000119"],
+              ["progress", "att_00000000-0000-4000-8000-000000000120"],
+              ["progress", "att_00000000-0000-4000-8000-000000000113"]
             ]} =
              DB.query(
                ctx.db,
@@ -1145,10 +1145,10 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok,
             [
-              ["verdict", "att_cc66ba00"],
-              ["verdict", "att_c4f2d593"],
-              ["verdict", "att_46f3b9a5"],
-              ["verdict", "att_8ca4dfcd"]
+              ["verdict", "att_00000000-0000-4000-8000-000000000121"],
+              ["verdict", "att_00000000-0000-4000-8000-000000000122"],
+              ["verdict", "att_00000000-0000-4000-8000-000000000123"],
+              ["verdict", "att_00000000-0000-4000-8000-000000000124"]
             ]} =
              DB.query(
                ctx.db,
