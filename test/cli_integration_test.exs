@@ -621,6 +621,41 @@ defmodule Tightbeam.CliIntegrationTest do
                [assignment]
              )
 
+    assert_activity_refresh = fn timing_args, prompt ->
+      assert {:ok, [[prior_wake_id]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+                 [assignment]
+               )
+
+      {output, 0} =
+        System.cmd(
+          ctx.binary,
+          ["wake", "--session", "cli-holder", "--assignment", assignment] ++
+            timing_args ++ ["--prompt", prompt],
+          cd: ctx.workdir
+        )
+
+      assert_receive {:cli_call, %{verb: "wake", params: %{assignment_id: ^assignment}}}
+
+      wake = Wakes.get(ctx.db, JSON.decode!(output)["wakeId"])
+      assert wake.assignment_id == assignment
+
+      assert {:ok, [["canceled"]]} =
+               DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId=?1", [prior_wake_id])
+
+      assert {:ok, [[replacement_wake_id]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+                 [assignment]
+               )
+
+      refute replacement_wake_id == prior_wake_id
+      wake
+    end
+
     immediate_prompt = "The assignment is ready for review"
 
     {immediate_output, 0} =
@@ -727,6 +762,22 @@ defmodule Tightbeam.CliIntegrationTest do
     refute new_inactivity_wake_id == inactivity_wake_id
     assert new_inactivity_due_at > inactivity_due_at
 
+    fact_wake =
+      assert_activity_refresh.(
+        [
+          "--when-fact",
+          "build-finished",
+          "--when-scope",
+          "build-1",
+          "--fallback-after",
+          "1h"
+        ],
+        "fact-conditioned assignment reminder"
+      )
+
+    assert fact_wake.condition_kind == "build-finished"
+    assert fact_wake.condition_scope == "build-1"
+
     {:ok, _} =
       Ledger.enqueue(ctx.db, %{
         session_key: "cli-holder",
@@ -739,28 +790,8 @@ defmodule Tightbeam.CliIntegrationTest do
 
     after_prompt = "D3 manual: continue the named assignment"
 
-    after_result =
-      System.cmd(
-        ctx.binary,
-        [
-          "wake",
-          "--session",
-          "cli-holder",
-          "--assignment",
-          assignment,
-          "--after-turn",
-          "--prompt",
-          after_prompt
-        ],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
-    assert_receive {:cli_call, %{verb: "wake", params: wire_params}}
-    assert wire_params.assignment_id == assignment
-    {after_output, 0} = after_result
-    after_id = JSON.decode!(after_output)["wakeId"]
-    after_wake = Wakes.get(ctx.db, after_id)
+    after_wake = assert_activity_refresh.(["--after-turn"], after_prompt)
+    after_id = after_wake.wake_id
     assert after_wake.assignment_id == assignment
     assert after_wake.obligation_ref == assignment
     assert after_wake.creator_session_key == "cli-holder"
@@ -781,28 +812,13 @@ defmodule Tightbeam.CliIntegrationTest do
 
     dependency_prompt = "D3 manual: read the resolver disposition before acting"
 
-    {dependency_output, 0} =
-      System.cmd(
-        ctx.binary,
-        [
-          "wake",
-          "--session",
-          "cli-holder",
-          "--assignment",
-          assignment,
-          "--predicate",
-          JSON.encode!(predicate),
-          "--fallback-after",
-          "1h",
-          "--prompt",
-          dependency_prompt
-        ],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
+    dependency =
+      assert_activity_refresh.(
+        ["--predicate", JSON.encode!(predicate), "--fallback-after", "1h"],
+        dependency_prompt
       )
 
-    dependency_id = JSON.decode!(dependency_output)["wakeId"]
-    dependency = Wakes.get(ctx.db, dependency_id)
+    dependency_id = dependency.wake_id
     assert dependency.assignment_id == assignment
     assert dependency.obligation_ref == assignment
     assert dependency.creator_session_key == "cli-holder"
