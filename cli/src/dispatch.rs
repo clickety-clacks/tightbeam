@@ -4680,6 +4680,20 @@ mod tests {
         assert_eq!(
             body(&[
                 "wake",
+                "--session",
+                "agent:r",
+                "--assignment",
+                "asg_a",
+                "--prompt",
+                "review is ready",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"wake","sessionKey":"agent:r","params":{"prompt":"review is ready","assignmentId":"asg_a"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "wake",
                 "--user",
                 "mike",
                 "--prompt",

@@ -6951,14 +6951,64 @@ defmodule Tightbeam.Gateway do
   defp maybe_add_producer_warning(response, _wake), do: response
 
   defp schedule_wake_in_txn(txn, call, session_key, due_at) do
-    case replacement_assignment_id_in_txn(txn, call, session_key) do
-      {:ok, replacement_assignment_id} ->
-        schedule_wake_in_txn(txn, call, session_key, due_at, replacement_assignment_id)
+    case validate_immediate_assignment_reference_in_txn(txn, call) do
+      :ok ->
+        case replacement_assignment_id_in_txn(txn, call, session_key) do
+          {:ok, replacement_assignment_id} ->
+            schedule_wake_in_txn(txn, call, session_key, due_at, replacement_assignment_id)
+
+          {:error, error} ->
+            error
+        end
 
       {:error, error} ->
         error
     end
   end
+
+  defp validate_immediate_assignment_reference_in_txn(txn, %{params: params} = call) do
+    if immediate_assignment_pointer_request?(params) and not is_nil(params[:assignment_id]) do
+      case params[:assignment_id] do
+        assignment_id when is_binary(assignment_id) and assignment_id != "" ->
+          if visible_wake_assignment_in_txn(txn, assignment_id, call) do
+            :ok
+          else
+            {:error,
+             %{
+               code: "unknown_assignment",
+               message: "unknown assignment: #{assignment_id}"
+             }}
+          end
+
+        _ ->
+          {:error, %{code: "invalid", message: "assignmentId must be a non-empty string"}}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp immediate_assignment_pointer_request?(params) do
+    is_nil(params[:after_ms]) and is_nil(params[:at]) and is_nil(params[:condition_kind]) and
+      is_nil(params[:predicate]) and params[:after_turn] != true and
+      params[:replace_queued] != true and is_nil(params[:cron])
+  end
+
+  defp visible_wake_assignment_in_txn(txn, assignment_id, %{principal: nil} = call) do
+    case principal_caller(txn, call) do
+      %{caller_session: %{session_key: session_key}} ->
+        StateResources.query_assignment(txn, assignment_id, %{principal: {:session, session_key}})
+
+      %{owner_user_id: user_id} when is_binary(user_id) ->
+        StateResources.query_assignment(txn, assignment_id, %{principal: {:user, user_id}})
+
+      _ ->
+        nil
+    end
+  end
+
+  defp visible_wake_assignment_in_txn(txn, assignment_id, call),
+    do: StateResources.query_assignment(txn, assignment_id, call)
 
   defp schedule_wake_in_txn(txn, call, session_key, due_at, replacement_assignment_id) do
     p = call.params
@@ -7157,6 +7207,12 @@ defmodule Tightbeam.Gateway do
          replacement_assignment_id
        ) do
     p = call.params
+    assignment_id = wake_assignment_id_in_txn(txn, call)
+
+    # A no-trigger assignment on a conversational wake is a reference only.
+    # Keep it on the wake, but do not count the notification as holder activity.
+    activity_assignment_id =
+      if immediate_assignment_pointer_request?(p), do: nil, else: assignment_id
 
     wake =
       Wakes.schedule_in_txn(txn, %{
@@ -7182,11 +7238,10 @@ defmodule Tightbeam.Gateway do
         reresolve_rung: p[:reresolve_rung],
         dated_continuation_assignment_id:
           dated_continuation_assignment_id_in_txn(txn, call, session_key),
-        # Immediate conversational wakes have their assignment link stripped by the
-        # router. Timed and fact-triggered registrations retain the explicit link;
-        # typed waits validate it through register_wait_in_txn/2. Internal process
-        # and bound remedy wakes continue to use their trusted carriers.
-        assignment_id: wake_assignment_id_in_txn(txn, call)
+        # Typed waits validate the assignment through register_wait_in_txn/2.
+        # Internal process and bound remedy wakes continue to use their carriers.
+        assignment_id: assignment_id,
+        activity_assignment_id: activity_assignment_id
       })
 
     wake
@@ -7244,11 +7299,11 @@ defmodule Tightbeam.Gateway do
        do: assignment_id
 
   defp wake_assignment_id_in_txn(_txn, %{principal: {:session, _}, params: params}),
-    do: scheduled_wake_assignment_id(params)
+    do: scheduled_wake_assignment_id(params) || immediate_wake_assignment_id(params)
 
   defp wake_assignment_id_in_txn(_txn, %{principal: {kind, _}, params: params})
        when kind in [:user, :process],
-       do: scheduled_wake_assignment_id(params)
+       do: scheduled_wake_assignment_id(params) || immediate_wake_assignment_id(params)
 
   defp wake_assignment_id_in_txn(_txn, _call), do: nil
 
@@ -7257,6 +7312,10 @@ defmodule Tightbeam.Gateway do
          is_binary(params[:condition_kind]),
        do: params[:assignment_id],
        else: nil
+  end
+
+  defp immediate_wake_assignment_id(params) do
+    if immediate_assignment_pointer_request?(params), do: params[:assignment_id], else: nil
   end
 
   defp dated_continuation_assignment_id_in_txn(txn, call, session_key) do

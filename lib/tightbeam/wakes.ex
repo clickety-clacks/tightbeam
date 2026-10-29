@@ -1739,10 +1739,12 @@ defmodule Tightbeam.Wakes do
       NoticeBatcher.record_policy_in_txn(txn, wake, policy_opts)
     end
 
-    if is_binary(wake.assignment_id) and is_binary(wake.creator_session_key) do
+    activity_assignment_id = Map.get(input, :activity_assignment_id, wake.assignment_id)
+
+    if is_binary(activity_assignment_id) and is_binary(wake.creator_session_key) do
       Tightbeam.Supervision.activity_in_txn(
         txn,
-        wake.assignment_id,
+        activity_assignment_id,
         wake.creator_session_key,
         wake.created_at
       )
