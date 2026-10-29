@@ -3694,7 +3694,7 @@ where
         }
         command => {
             let endpoint = discover_endpoint()?;
-            if let Some(reason) = session_harklight_identity_refusal(&command, &endpoint) {
+            if let Some(reason) = local_harklight_identity_refusal(&command, &endpoint) {
                 return Err(reason.to_owned());
             }
             if let Some(identity) = command_identity(&command) {
@@ -3805,15 +3805,16 @@ fn identity_required(cwd: &Path) -> String {
     )
 }
 
-fn session_harklight_identity_refusal(
+fn local_harklight_identity_refusal(
     command: &Command,
     endpoint: &Endpoint,
 ) -> Option<&'static str> {
-    // A session credential remains the authenticated session in the Gateway, so these
-    // explicit user/process selectors cannot reach the existing origin denial there.
-    // Keep the former local refusal for session credentials; organization credentials
-    // reach the Gateway's durable denial through the ordinary dispatch path.
-    if !matches!(&endpoint.origin, Origin::Session(_)) {
+    // Session files carry session credentials, and explicitly named endpoints may carry
+    // either a session or organization credential. Discovery cannot tell which kind of
+    // token a Named endpoint holds, so preserve the local refusal there. Provisioned
+    // gateway.json files are written with the organization credential and can use the
+    // Gateway's existing durable denial.
+    if !matches!(&endpoint.origin, Origin::Session(_) | Origin::Named) {
         return None;
     }
 

@@ -3204,7 +3204,10 @@ defmodule Tightbeam.CliIntegrationTest do
   end
 
   test "real CLI records Harklight user and process callers as gateway denials", ctx do
-    endpoint = "http://127.0.0.1:#{ctx.port}"
+    File.write!(
+      Path.join(ctx.base_dir, "gateway.json"),
+      JSON.encode!(%{port: ctx.port, cliToken: "tbc_cli_integration"})
+    )
 
     commands = [
       {"harklight-send",
@@ -3234,8 +3237,9 @@ defmodule Tightbeam.CliIntegrationTest do
           args ++ [flag, identity],
           cd: ctx.outside,
           env: [
-            {"TIGHTBEAM_URL", endpoint},
-            {"TIGHTBEAM_TOKEN", "tbc_cli_integration"}
+            {"TIGHTBEAM_BASE_DIR", ctx.base_dir},
+            {"TIGHTBEAM_URL", nil},
+            {"TIGHTBEAM_TOKEN", nil}
           ],
           stderr_to_stdout: true
         )
@@ -3255,7 +3259,7 @@ defmodule Tightbeam.CliIntegrationTest do
     end
   end
 
-  test "real CLI keeps explicit Harklight user and process identities local with session credentials",
+  test "real CLI keeps explicit Harklight identities local with session credentials",
        ctx do
     commands = [
       {"harklight-send",
@@ -3277,11 +3281,24 @@ defmodule Tightbeam.CliIntegrationTest do
        "invalid Harklight command flags"}
     ]
 
-    for {flag, identity} <- [{"--as-user", "owner"}, {"--as-process", "worker"}],
+    endpoint = "http://127.0.0.1:#{ctx.port}"
+
+    for credential_source <- [
+          {ctx.workdir, []},
+          {ctx.outside,
+           [
+             {"TIGHTBEAM_URL", endpoint},
+             {"TIGHTBEAM_TOKEN", ctx.session.cli_token}
+           ]}
+        ],
+        {flag, identity} <- [{"--as-user", "owner"}, {"--as-process", "worker"}],
         {verb, args, local_refusal} <- commands do
+      {cwd, env} = credential_source
+
       {refusal, status} =
         System.cmd(ctx.binary, args ++ [flag, identity],
-          cd: ctx.workdir,
+          cd: cwd,
+          env: env,
           stderr_to_stdout: true
         )
 
