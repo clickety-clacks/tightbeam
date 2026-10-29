@@ -559,6 +559,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   test "fresh transcript history includes rail denials with full identity and order", ctx do
     session = ctx.admin_session
     origin = "session:#{session.session_key}"
+
     call = %{
       verb: "assign",
       origin: origin,
@@ -640,11 +641,13 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     all_event_ids = event_ids ++ [legacy_event_id]
 
     assert Enum.map(denials, & &1.id) == all_event_ids
+
     assert Enum.map(denials, & &1.ts) == [
              event_timestamp,
              event_timestamp,
              event_timestamp + 500
            ]
+
     assert Enum.map(denials, & &1.verb) == ["assign", "assign", "assign"]
 
     assert Enum.map(denials, & &1.origin) == [origin, origin, origin]
@@ -711,6 +714,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
              event_timestamp,
              event_timestamp + 500
            ]
+
     assert Enum.map(rail_denials, & &1["payload"]) == expected_payloads ++ [legacy_payload]
 
     assert Enum.map(rail_denials, & &1["afterMessageSeq"]) == [
@@ -730,6 +734,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
              event_timestamp,
              event_timestamp + 500
            ]
+
     assert Enum.map(rail_denials, & &1["order"]["eventId"]) == all_event_ids
 
     for {{_source_payload, live_frame}, history_denial} <-
