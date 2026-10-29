@@ -56,6 +56,7 @@ defmodule Tightbeam.Wire.Router do
     D1Read,
     Devices,
     Dispatch,
+    EventLog,
     ErrorDiagnostic,
     Org,
     Roles,
@@ -1654,6 +1655,13 @@ defmodule Tightbeam.Wire.Router do
         "page" => page
       }
 
+      body =
+        if resource == "transcript messages" do
+          Map.put(body, "railDenials", session_rail_denials(db(conn), session_key))
+        else
+          body
+        end
+
       state_send(conn, 200, JSON.encode!(body))
     else
       nil -> state_error(conn, resource, 404, "not_found", nil)
@@ -1662,6 +1670,22 @@ defmodule Tightbeam.Wire.Router do
   rescue
     _error in [ArgumentError, KeyError, MatchError] ->
       state_error(conn, resource, 500, "projection_invalid", nil)
+  end
+
+  defp session_rail_denials(db, session_key) do
+    db
+    |> EventLog.rail_denials_for_session(session_key)
+    |> Enum.map(fn denial ->
+      %{
+        "id" => "rail:#{denial.id}",
+        "sessionKey" => session_key,
+        "principal" => denial.principal,
+        "verb" => denial.verb,
+        "rule" => denial.rule,
+        "occurredAt" => denial.ts,
+        "order" => %{"occurredAt" => denial.ts, "eventId" => denial.id}
+      }
+    end)
   end
 
   defp session_collection_session(db, session_key, %{kind: "observer"}),

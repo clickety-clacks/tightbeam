@@ -280,6 +280,27 @@ defmodule Tightbeam.EventLog do
     end)
   end
 
+  @doc "Rail denials visible to a session's live transcript, in stable event-time order."
+  @spec rail_denials_for_session(db(), String.t()) :: [map()]
+  def rail_denials_for_session(db \\ Tightbeam.DB, session_key) when is_binary(session_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT id, ts, verb, principal, json_extract(payload, '$.rule')
+        FROM events
+        WHERE sessionKey = ?1 AND principal = ?2 AND kind = 'denied'
+          AND json_valid(payload) AND json_type(payload, '$.rule') = 'text'
+        ORDER BY ts, id
+        """,
+        [session_key, "session:" <> session_key]
+      )
+
+    Enum.map(rows, fn [id, ts, verb, principal, rule] ->
+      %{id: id, ts: ts, verb: verb, principal: principal, rule: rule}
+    end)
+  end
+
   defp serialize_principal(nil), do: nil
 
   defp serialize_principal({:remedy, %{statute: statute, action: action}}),

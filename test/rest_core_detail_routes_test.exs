@@ -11,6 +11,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     DB,
     Devices,
     Escalation,
+    EventLog,
     Gateway,
     Identity,
     Ledger,
@@ -553,6 +554,86 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert detail["item"]["sender"] == "user:outsider"
     assert detail["item"]["turnIncludesHuman"]
     assert live_message["sender"] == detail["item"]["sender"]
+  end
+
+  test "fresh transcript history includes rail denials with stable identity and order", ctx do
+    session = ctx.admin_session
+
+    {:appended, before_message} =
+      Projection.append(ctx.db, %{
+        session_key: session.session_key,
+        role: "user",
+        content: "before refusal",
+        timestamp: 100,
+        attachments: []
+      })
+
+    {:ok, event_id} =
+      DB.transaction(ctx.db, fn txn ->
+        EventLog.append_event_in_txn(
+          txn,
+          "denied",
+          "assign",
+          "test",
+          session.session_key,
+          JSON.encode!(%{"rule" => "sample-rule"}),
+          {:session, session.session_key},
+          200
+        )
+      end)
+
+    expected_principal = "session:#{session.session_key}"
+
+    assert [
+             %{
+               id: ^event_id,
+               ts: 200,
+               verb: "assign",
+               principal: ^expected_principal,
+               rule: "sample-rule"
+             }
+           ] = EventLog.rail_denials_for_session(ctx.db, session.session_key)
+
+    {:appended, after_message} =
+      Projection.append(ctx.db, %{
+        session_key: session.session_key,
+        role: "assistant",
+        content: "after refusal",
+        timestamp: 300,
+        attachments: []
+      })
+
+    history =
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/messages?limit=20&tail=true",
+        ctx.admin_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert [
+             %{
+               "id" => "rail:" <> event_id_text,
+               "sessionKey" => session_key,
+               "principal" => principal,
+               "verb" => verb,
+               "rule" => rule,
+               "occurredAt" => occurred_at,
+               "order" => %{"occurredAt" => order_at, "eventId" => order_id}
+             }
+           ] = history["railDenials"]
+
+    assert event_id_text == Integer.to_string(event_id)
+    assert session_key == session.session_key
+    assert principal == "session:#{session.session_key}"
+    assert verb == "assign"
+    assert rule == "sample-rule"
+    assert occurred_at == order_at
+    assert order_id == event_id
+
+    items = Map.new(history["items"], &{&1["id"], &1})
+    assert items[before_message.id]["at"] < occurred_at
+    assert occurred_at < items[after_message.id]["at"]
   end
 
   test "session and retained transcript collections use bounded exclusive keysets", ctx do
