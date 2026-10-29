@@ -7482,35 +7482,48 @@ defmodule Tightbeam.Gateway do
   defp create_available_spawn(config, db, call, caller, archetype) do
     p = call.params
     defaults = defaults(config, db)
+    harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
 
-    override_result =
-      if Map.has_key?(p, :overrides) do
-        Archetypes.normalize_overrides(config.base_dir, archetype, p.overrides)
-      else
-        {:ok, nil}
-      end
+    case spawn_harness_module(harness) do
+      {:error, denial} ->
+        denial
 
-    case override_result do
-      {:ok, overrides} ->
-        harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
+      {:ok, module} ->
+        override_result =
+          if Map.has_key?(p, :overrides) do
+            Archetypes.normalize_overrides(config.base_dir, archetype, p.overrides)
+          else
+            {:ok, nil}
+          end
 
-        module =
-          if is_atom(harness), do: Harness.module!(harness), else: Harness.parse!(harness)
+        case override_result do
+          {:ok, overrides} ->
+            default_model = archetype.defaults[:model] || defaults.model
 
-        default_model = archetype.defaults[:model] || defaults.model
+            with {:ok, placement} <-
+                   resolve_spawn_host(config, db, archetype, p, module, default_model) do
+              create_spawn(config, db, call, caller, archetype, placement, overrides)
+            else
+              {:error, denial} ->
+                classified_spawn_denial(denial, "config_denied", "placement_denied")
+            end
 
-        with {:ok, placement} <-
-               resolve_spawn_host(config, db, archetype, p, module, default_model) do
-          create_spawn(config, db, call, caller, archetype, placement, overrides)
-        else
           {:error, denial} ->
             classified_spawn_denial(denial, "config_denied", "placement_denied")
         end
-
-      {:error, denial} ->
-        classified_spawn_denial(denial, "config_denied", "placement_denied")
     end
   end
+
+  defp spawn_harness_module(harness) when is_atom(harness), do: {:ok, Harness.module!(harness)}
+
+  defp spawn_harness_module(harness) when is_binary(harness) do
+    case Enum.find(Harness.all(), &(&1.wire_name() == harness)) do
+      nil -> {:error, %{code: "unknown_harness", message: "unknown harness: #{harness}"}}
+      module -> {:ok, module}
+    end
+  end
+
+  defp spawn_harness_module(harness), do: {:ok, Harness.parse!(harness)}
 
   defp resolve_spawn_host(config, db, archetype, %{host: host} = p, module, default_model)
        when is_binary(host) do
