@@ -97,6 +97,79 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
+  test "two holder notices climb through the parent to the owner and then stop", ctx do
+    opened_at = System.system_time(:millisecond) - 10_000
+    interval_ms = 1_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [
+               opened_at
+             ])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
+
+    first = episode_notices(ctx.db) |> List.first()
+    assert first.session_key == ctx.holder.session_key
+    assert first.prompt =~ "blocker or decision request"
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1", [
+               first.wake_id,
+               System.system_time(:millisecond)
+             ])
+
+    fire_due_climb!(ctx.db, first.wake_id, interval_ms)
+    [first_after, second] = episode_notices(ctx.db)
+    assert first_after.wake_id == first.wake_id
+    assert second.session_key == ctx.holder.session_key
+    assert second.prompt == first.prompt
+
+    fire_due_climb!(ctx.db, second.wake_id, interval_ms)
+    assert length(episode_notices(ctx.db)) == 2
+    assert Wakes.get(ctx.db, second.wake_id).session_key == ctx.parent.session_key
+    assert Wakes.get(ctx.db, second.wake_id).prompt == first.prompt
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db, interval_ms)
+    assert Wakes.get(ctx.db, second.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, second.wake_id).session_key == ctx.parent.session_key
+
+    fire_due_climb!(ctx.db, second.wake_id, interval_ms)
+    assert Wakes.get(ctx.db, second.wake_id).session_key == ctx.main.session_key
+
+    fire_due_climb!(ctx.db, second.wake_id, interval_ms)
+    assert length(episode_notices(ctx.db)) == 2
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='assignment_inactivity_climb' AND state='pending'"
+             )
+  end
+
+  test "a pending holder notice gets a second interval before climbing without a duplicate",
+       ctx do
+    opened_at = System.system_time(:millisecond) - 10_000
+    interval_ms = 1_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [
+               opened_at
+             ])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
+    first = episode_notices(ctx.db) |> List.first()
+
+    fire_due_climb!(ctx.db, first.wake_id, interval_ms)
+    assert length(episode_notices(ctx.db)) == 1
+    assert Wakes.get(ctx.db, first.wake_id).session_key == ctx.holder.session_key
+
+    fire_due_climb!(ctx.db, first.wake_id, interval_ms)
+    assert length(episode_notices(ctx.db)) == 1
+    assert Wakes.get(ctx.db, first.wake_id).session_key == ctx.parent.session_key
+  end
+
   test "boot reconciliation replaces stored intervals with the configured default", ctx do
     now = System.system_time(:millisecond)
     opened_at = now - 29 * 60 * 1_000
@@ -245,7 +318,7 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
-  test "startup cancels all climbs and wrong-holder reminders but keeps the holder notice", ctx do
+  test "startup restores the climb and cancels notices outside its visited route", ctx do
     opened_at = System.system_time(:millisecond) - 5_000
 
     assert {:ok, _} =
@@ -283,8 +356,38 @@ defmodule Tightbeam.SupervisionTest do
     assert Wakes.get(ctx.db, holder_notice.wake_id).state == "pending"
     assert Wakes.get(ctx.db, holder_notice.wake_id).session_key == ctx.holder.session_key
 
-    replacement = pending_deadline!(ctx.db, "asg_inactive")
+    replacement = pending_climb!(ctx.db, "asg_inactive")
     refute replacement.wake_id == old_climb.wake_id
+    assert {:ok, %{"intervalMs" => 1_000, "rung" => 1}} = JSON.decode(replacement.prompt)
+  end
+
+  test "startup upgrades an active one-second climb to the configured quiet interval", ctx do
+    opened_at = System.system_time(:millisecond) - 10_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [
+               opened_at
+             ])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
+    first = episode_notices(ctx.db) |> List.first()
+    old_climb = pending_climb!(ctx.db, "asg_inactive")
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db)
+
+    upgraded = pending_climb!(ctx.db, "asg_inactive")
+    assert upgraded.wake_id != old_climb.wake_id
+    assert Wakes.get(ctx.db, old_climb.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, first.wake_id).state == "pending"
+    assert upgraded.due_at == first.created_at + 1_800_000
+    assert {:ok, %{"intervalMs" => 1_800_000, "rung" => 1}} = JSON.decode(upgraded.prompt)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='assignment_inactivity_deadline' AND state='pending'"
+             )
   end
 
   test "a pending assignment-linked wake from another session suppresses reminders", ctx do
@@ -349,6 +452,38 @@ defmodule Tightbeam.SupervisionTest do
                "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' " <>
                  "AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
              )
+  end
+
+  test "an open holder harness incident pauses an active reminder climb", ctx do
+    opened_at = System.system_time(:millisecond) - 5_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [
+               opened_at
+             ])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
+    first = episode_notices(ctx.db) |> List.first()
+
+    assert {:opened, _incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "supervision-climb-holder-unavailable",
+               harness: ctx.holder.harness,
+               host: ctx.holder.host,
+               failure_class: "model_unavailable",
+               evidence_kind: "authoritative-provider",
+               session_key: ctx.holder.session_key,
+               assignment_id: nil,
+               observed_at: System.system_time(:millisecond),
+               cause: "model unavailable",
+               principal: "process:tightbeam"
+             })
+
+    fire_due_climb!(ctx.db, first.wake_id, 1_000)
+    assert length(episode_notices(ctx.db)) == 1
+    assert Wakes.get(ctx.db, first.wake_id).session_key == ctx.holder.session_key
+    assert pending_climb!(ctx.db, "asg_inactive").due_at > System.system_time(:millisecond)
   end
 
   test "an inactive holder suppresses inactivity reminders", ctx do
@@ -524,7 +659,7 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
-  test "three inactivity reminders stop further notices during the same stall", ctx do
+  test "startup resumes historical holder reminders by climbing without a fourth", ctx do
     opened_at = System.system_time(:millisecond) - 1_800_001
 
     for index <- 1..3 do
@@ -546,8 +681,8 @@ defmodule Tightbeam.SupervisionTest do
              ])
 
     assert :ok = Supervision.migrate_open_assignments(ctx.db)
-    deadline = pending_deadline!(ctx.db, "asg_inactive")
-    assert {:ok, true} = Supervision.deadline(ctx.db, deadline)
+    climb = pending_climb!(ctx.db, "asg_inactive")
+    assert {:ok, %{"intervalMs" => 1_800_000, "rung" => 2}} = JSON.decode(climb.prompt)
 
     assert {:ok, [[3]]} =
              DB.query(
@@ -1329,6 +1464,31 @@ defmodule Tightbeam.SupervisionTest do
 
   defp pending_climb!(db, assignment_id) do
     pending_internal_wake!(db, "assignment_inactivity_climb", assignment_id)
+  end
+
+  defp episode_notices(db) do
+    assert {:ok, ids} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE assignmentId='asg_inactive' AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%' ORDER BY rowid"
+             )
+
+    Enum.map(ids, fn [id] -> Wakes.get(db, id) end)
+  end
+
+  defp fire_due_climb!(db, previous_wake_id, interval_ms) do
+    assert {:ok, _} =
+             DB.query(db, "UPDATE wakes SET createdAt=?2 WHERE wakeId=?1", [
+               previous_wake_id,
+               System.system_time(:millisecond) - interval_ms - 1
+             ])
+
+    climb = pending_climb!(db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [climb.wake_id])
+
+    assert {:ok, :ok} = Supervision.climb(db, Wakes.get(db, climb.wake_id))
   end
 
   defp pending_internal_wake!(db, consumer, assignment_id) do
