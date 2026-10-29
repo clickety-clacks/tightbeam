@@ -2531,7 +2531,7 @@ fn parse_with_optional_catalog(
             let revise = command == "harklight-revise";
             if parsed.positional.len() != 1
                 || flags.keys().any(|flag| {
-                    !matches!(flag.as_str(), "as" | "message")
+                    !matches!(flag.as_str(), "as" | "as-user" | "as-process" | "message")
                         && !(revise
                             && matches!(
                                 flag.as_str(),
@@ -4533,6 +4533,46 @@ mod tests {
                 matches!(command, Command::HarklightRevise { base_revision, .. }
                 if base_revision == revision.parse::<i64>().unwrap())
             );
+        }
+    }
+
+    #[test]
+    fn harklight_change_commands_send_user_and_process_identity_to_gateway() {
+        let calls: &[&[&str]] = &[
+            &[
+                "harklight-revise",
+                "--message",
+                "message-example",
+                "--base-revision",
+                "1",
+                "--title",
+                "Updated title",
+            ],
+            &["harklight-retract", "--message", "message-example"],
+            &["harklight-settle", "--message", "message-example"],
+        ];
+
+        for (identity_flag, identity_value, expected_identity) in [
+            ("--as-user", "owner", Identity::User("owner".to_owned())),
+            (
+                "--as-process",
+                "worker",
+                Identity::Process("worker".to_owned()),
+            ),
+        ] {
+            for call in calls {
+                let mut args = call.to_vec();
+                args.extend([identity_flag, identity_value]);
+
+                let identity = match parse(strings(&args)).unwrap() {
+                    Command::HarklightRevise { identity, .. }
+                    | Command::HarklightRetract { identity, .. }
+                    | Command::HarklightSettle { identity, .. } => identity,
+                    other => panic!("unexpected command: {other:?}"),
+                };
+
+                assert_eq!(identity, expected_identity);
+            }
         }
     }
 

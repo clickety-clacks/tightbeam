@@ -3203,6 +3203,50 @@ defmodule Tightbeam.CliIntegrationTest do
     assert payload =~ "unknown_harness"
   end
 
+  test "real CLI records Harklight user and process callers as gateway denials", ctx do
+    endpoint = "http://127.0.0.1:#{ctx.port}"
+
+    for {flag, identity, principal} <- [
+          {"--as-user", "owner", {:user, "owner"}},
+          {"--as-process", "worker", {:process, "worker"}}
+        ] do
+      {refusal, status} =
+        System.cmd(
+          ctx.binary,
+          [
+            "harklight-revise",
+            "--message",
+            "message-example",
+            "--base-revision",
+            "1",
+            "--title",
+            "Updated title",
+            flag,
+            identity
+          ],
+          cd: ctx.outside,
+          env: [
+            {"TIGHTBEAM_URL", endpoint},
+            {"TIGHTBEAM_TOKEN", "tbc_cli_integration"}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status != 0, refusal
+      assert refusal =~ "harklight_origin_unavailable"
+
+      assert_receive {:cli_call, %{verb: "harklight-revise", principal: ^principal}}
+
+      assert {:ok, [[payload]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT payload FROM events WHERE kind='denied' AND verb='harklight-revise' ORDER BY id DESC LIMIT 1"
+               )
+
+      assert payload =~ "harklight_origin_unavailable"
+    end
+  end
+
   test "real CLI composes priority and metadata in one work-item update", ctx do
     sha = String.duplicate("a", 64)
     sha2 = String.duplicate("b", 64)
