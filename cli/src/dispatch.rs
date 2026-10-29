@@ -3694,6 +3694,9 @@ where
         }
         command => {
             let endpoint = discover_endpoint()?;
+            if let Some(reason) = session_harklight_identity_refusal(&command, &endpoint) {
+                return Err(reason.to_owned());
+            }
             if let Some(identity) = command_identity(&command) {
                 require_session_endpoint(identity, &endpoint)?;
             }
@@ -3800,6 +3803,35 @@ fn identity_required(cwd: &Path) -> String {
         "identity required: no explicit --as, --as-user, or --as-process flag was passed, and no .tightbeam-session was found walking up from '{}' to the filesystem root. Run from a Tightbeam session, or select --as <role>, --as-user <userId>, or --as-process <name> with an organization credential. This is WHO the call is from, not the target. Run 'tightbeam help'.",
         cwd.display()
     )
+}
+
+fn session_harklight_identity_refusal(
+    command: &Command,
+    endpoint: &Endpoint,
+) -> Option<&'static str> {
+    // A session credential remains the authenticated session in the Gateway, so these
+    // explicit user/process selectors cannot reach the existing origin denial there.
+    // Keep the former local refusal for session credentials; organization credentials
+    // reach the Gateway's durable denial through the ordinary dispatch path.
+    if !matches!(&endpoint.origin, Origin::Session(_)) {
+        return None;
+    }
+
+    match command {
+        Command::HarklightSend { identity, .. }
+            if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
+        {
+            Some("harklight-send requires the authenticated session or one of its roles")
+        }
+        Command::HarklightRevise { identity, .. }
+        | Command::HarklightRetract { identity, .. }
+        | Command::HarklightSettle { identity, .. }
+            if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
+        {
+            Some("invalid Harklight command flags")
+        }
+        _ => None,
+    }
 }
 
 fn command_identity(command: &Command) -> Option<&Identity> {
