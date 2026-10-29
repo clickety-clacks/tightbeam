@@ -11,6 +11,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     DB,
     Devices,
     Escalation,
+    EventLog,
     Gateway,
     Identity,
     Ledger,
@@ -553,6 +554,224 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert detail["item"]["sender"] == "user:outsider"
     assert detail["item"]["turnIncludesHuman"]
     assert live_message["sender"] == detail["item"]["sender"]
+  end
+
+  test "fresh transcript history includes rail denials with full identity and order", ctx do
+    session = ctx.admin_session
+    origin = "session:#{session.session_key}"
+
+    call = %{
+      verb: "assign",
+      origin: origin,
+      principal: {:session, session.session_key},
+      session_key: session.session_key,
+      params: %{}
+    }
+
+    rule_error = fn rule ->
+      %{
+        code: "rule_denied",
+        rule: rule,
+        edge: "verb",
+        reason: "blocked",
+        script_exit_class: "denied",
+        ref: "sample-ref",
+        producer: nil,
+        identity_manifest_sha: String.duplicate("a", 64),
+        message: "sample rule denial"
+      }
+    end
+
+    live_samples =
+      for index <- 1..2 do
+        payload = rule_error.("sample-rule-#{index}")
+
+        [_, live_frame] = Publisher.denied_notices(call, payload)
+        {payload, live_frame}
+      end
+
+    first_live_timestamp = live_samples |> hd() |> elem(1) |> Map.fetch!("occurredAt")
+    event_timestamp = first_live_timestamp - 1_000
+
+    {:appended, before_message} =
+      Projection.append(ctx.db, %{
+        session_key: session.session_key,
+        role: "user",
+        content: "before refusal",
+        timestamp: event_timestamp - 1_000,
+        attachments: []
+      })
+
+    source_payloads =
+      for {payload, _live_frame} <- live_samples do
+        {:ok, event_id} =
+          DB.transaction(ctx.db, fn txn ->
+            EventLog.append_event_in_txn(
+              txn,
+              "denied",
+              "assign",
+              origin,
+              session.session_key,
+              JSON.encode!(payload),
+              {:session, session.session_key},
+              event_timestamp
+            )
+          end)
+
+        {event_id, payload}
+      end
+
+    event_ids = Enum.map(source_payloads, &elem(&1, 0))
+
+    expected_payloads =
+      Enum.map(live_samples, fn {_payload, live_frame} -> live_frame["payload"] end)
+
+    expected_principal = "session:#{session.session_key}"
+    legacy_payload = rule_error.("legacy-rule")
+    [_, legacy_live_frame] = Publisher.denied_notices(call, legacy_payload)
+
+    {:ok, legacy_event_id} =
+      DB.transaction(ctx.db, fn txn ->
+        EventLog.append_event_in_txn(
+          txn,
+          "denied",
+          "assign",
+          origin,
+          session.session_key,
+          JSON.encode!(legacy_payload),
+          {:session, session.session_key},
+          event_timestamp + 500
+        )
+      end)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE events SET payload=?1 WHERE id=?2", [
+               JSON.encode!(legacy_payload),
+               legacy_event_id
+             ])
+
+    denials = EventLog.rail_denials_for_session(ctx.db, session.session_key)
+
+    all_event_ids = event_ids ++ [legacy_event_id]
+
+    assert Enum.map(denials, & &1.id) == all_event_ids
+
+    assert Enum.map(denials, & &1.ts) == [
+             event_timestamp,
+             event_timestamp,
+             event_timestamp + 500
+           ]
+
+    assert Enum.map(denials, & &1.verb) == ["assign", "assign", "assign"]
+
+    assert Enum.map(denials, & &1.origin) == [origin, origin, origin]
+
+    assert Enum.map(denials, & &1.principal) == [
+             expected_principal,
+             expected_principal,
+             expected_principal
+           ]
+
+    assert Enum.map(denials, & &1.rule) == ["sample-rule-1", "sample-rule-2", "legacy-rule"]
+    assert Enum.map(denials, & &1.payload) == expected_payloads ++ [legacy_live_frame["payload"]]
+
+    assert Enum.map(denials, & &1.after_message_seq) == [
+             before_message.seq,
+             before_message.seq,
+             nil
+           ]
+
+    {:appended, after_message} =
+      Projection.append(ctx.db, %{
+        session_key: session.session_key,
+        role: "assistant",
+        content: "after refusal",
+        timestamp: event_timestamp + 3_000,
+        attachments: []
+      })
+
+    history =
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/messages?limit=20&tail=true",
+        ctx.admin_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    rail_denials = history["railDenials"]
+
+    assert Enum.map(rail_denials, & &1["id"]) == Enum.map(all_event_ids, &"rail:#{&1}")
+
+    assert Enum.map(rail_denials, & &1["sessionKey"]) == [
+             session.session_key,
+             session.session_key,
+             session.session_key
+           ]
+
+    assert Enum.map(rail_denials, & &1["principal"]) == [
+             "session:#{session.session_key}",
+             "session:#{session.session_key}",
+             "session:#{session.session_key}"
+           ]
+
+    assert Enum.map(rail_denials, & &1["origin"]) == [origin, origin, origin]
+    assert Enum.map(rail_denials, & &1["verb"]) == ["assign", "assign", "assign"]
+
+    assert Enum.map(rail_denials, & &1["rule"]) == [
+             "sample-rule-1",
+             "sample-rule-2",
+             "legacy-rule"
+           ]
+
+    assert Enum.map(rail_denials, & &1["occurredAt"]) == [
+             event_timestamp,
+             event_timestamp,
+             event_timestamp + 500
+           ]
+
+    assert Enum.map(rail_denials, & &1["payload"]) ==
+             expected_payloads ++ [legacy_live_frame["payload"]]
+
+    assert Enum.map(rail_denials, & &1["afterMessageSeq"]) == [
+             before_message.seq,
+             before_message.seq,
+             nil
+           ]
+
+    assert Enum.map(rail_denials, & &1["order"]["afterMessageSeq"]) == [
+             before_message.seq,
+             before_message.seq,
+             nil
+           ]
+
+    assert Enum.map(rail_denials, & &1["order"]["occurredAt"]) == [
+             event_timestamp,
+             event_timestamp,
+             event_timestamp + 500
+           ]
+
+    assert Enum.map(rail_denials, & &1["order"]["eventId"]) == all_event_ids
+
+    for {{_source_payload, live_frame}, history_denial} <-
+          Enum.zip(live_samples, Enum.take(rail_denials, 2)) do
+      assert live_frame["payload"]["verb"] == "assign"
+      assert live_frame["payload"]["scriptExitClass"] == "denied"
+      assert live_frame["payload"]["identityManifestSha"] == String.duplicate("a", 64)
+      assert history_denial["sessionKey"] == live_frame["refs"]["sessionKey"]
+      assert history_denial["origin"] == live_frame["refs"]["origin"]
+      assert history_denial["principal"] == live_frame["refs"]["principal"]
+      assert history_denial["verb"] == live_frame["payload"]["verb"]
+      assert history_denial["rule"] == live_frame["payload"]["rule"]
+      assert history_denial["payload"] == live_frame["payload"]
+      assert abs(history_denial["occurredAt"] - live_frame["occurredAt"]) <= 2_000
+    end
+
+    assert List.last(rail_denials)["payload"] == legacy_live_frame["payload"]
+
+    items = Map.new(history["items"], &{&1["id"], &1})
+    first_denial_at = hd(rail_denials)["occurredAt"]
+    assert items[before_message.id]["at"] < first_denial_at
+    assert first_denial_at < items[after_message.id]["at"]
   end
 
   test "session and retained transcript collections use bounded exclusive keysets", ctx do
