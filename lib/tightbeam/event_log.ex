@@ -1,9 +1,9 @@
 defmodule Tightbeam.EventLog do
   @moduledoc """
   Append-only observability (T5): verb events, lifecycle events, and boot
-  epochs. Nothing consumes these to make decisions in the core — they exist so
-  every failure has a row and a reason, and so future rule reactions have a
-  feed. Additive tables only; the shared `events` table (verb|denied) keeps
+  epochs. Process assignment events retain their actor and explicit notice
+  owner; failures retain their reason and rule reactions consume the feed.
+  Additive tables only; the shared `events` table (verb|denied) keeps
   its original CHECK — lifecycle records go to their own table.
 
   Crash recording is BY INFERENCE (spec: lifecycle acceptance): a boot epoch

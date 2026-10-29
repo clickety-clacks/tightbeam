@@ -571,6 +571,7 @@ mod tests {
     #[test]
     fn work_item_handoff_is_an_unkeyed_dispatch_write() {
         let command = Command::WorkItemHandoff {
+            owner_user_id: None,
             identity: Identity::User("PRIVATE_USER".into()),
             work_item_id: Some("PRIVATE_ITEM".into()),
             title: None,

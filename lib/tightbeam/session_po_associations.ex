@@ -152,6 +152,8 @@ defmodule Tightbeam.SessionPoAssociations do
 
   defp authorize(_txn, {:session, caller}, _target, _owner), do: {:ok, "session:" <> caller}
 
+  defp authorize(_txn, {:process, name}, _target, _owner), do: {:ok, "process:" <> name}
+
   defp authorize(_txn, _principal, _target, _owner),
     do: {:error, "not_authorized", "an authenticated user or session is required"}
 

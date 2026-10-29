@@ -789,7 +789,7 @@ defmodule Tightbeam.ConditionFactsTest do
 
     base_call = %{
       origin: "process:owner",
-      principal: {:session, "agent:creator:app"},
+      principal: {:session, ctx.session.session_key},
       session_key: ctx.session.session_key,
       params: %{
         prompt: "re-adjudicate",
@@ -804,7 +804,7 @@ defmodule Tightbeam.ConditionFactsTest do
     assert [%{code: "no-live-producer", kind: "deploy-succeeded"}] = first.warnings
     assert %{wake_id: wake_id} = wake_handler.(base_call)
     assert wake_id == first.wake_id
-    assert Wakes.get(ctx.db, first.wake_id).creator_session_key == "agent:creator:app"
+    assert Wakes.get(ctx.db, first.wake_id).creator_session_key == ctx.session.session_key
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE wakeId = ?1", [first.wake_id])

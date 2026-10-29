@@ -215,8 +215,8 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert auth.detail =~ "Tightbeam has no credential for anthropic on local-test"
     assert auth.detail =~ "normal claude CLI login"
     assert auth.detail =~ Path.join(ctx.base_dir, "auth")
-    assert auth.detail =~ "tightbeam onboard anthropic --as-user <userId>"
-    assert auth.fix == "tightbeam onboard anthropic --as-user <userId>"
+    assert auth.detail =~ "tightbeam onboard anthropic"
+    assert auth.fix == "tightbeam onboard anthropic"
     assert Doctor.format(report, :human) =~ "Tightbeam has no credential"
   end
 
@@ -464,7 +464,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     statement =
       "local-test lost codex: its openai credential was rejected. Redirect destination: not yet observed; lawful alternate routing remains " <>
         "enabled. local-test needs a human sign-in for codex; run on local-test: tightbeam " <>
-        "onboard openai --as-user <adminUserId> (replace <adminUserId> with your own " <>
+        "onboard openai (replace <adminUserId> with your own " <>
         "administrator id)."
 
     incident = %{

@@ -173,6 +173,20 @@ defmodule Tightbeam.StaleTurnSettlementTest do
     end
   end
 
+  test "an admin-owned session settles under its own principal", ctx do
+    target = stale_turn!(ctx.db, "k1", "session settlement", 93)
+    call = settle_call("k1", target, "cancel", "request absent", "session-key", {:session, "k1"})
+    assert {:ok, %{status: "canceled", won: true}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert %{principal: "session:k1"} = request_for_session(call)
+    assert Tightbeam.Idempotency.settlement(ctx.db, "session:k1", "session-key")
+    refute Tightbeam.Idempotency.settlement(ctx.db, "user:mike", "session-key")
+  end
+
+  defp request_for_session(call) do
+    {:ok, request} = StaleTurnSettlement.request(call.params, call.principal)
+    request
+  end
+
   test "authorized fail stores only the bounded reason and authorization refusals do not mutate",
        ctx do
     target = stale_turn!(ctx.db, "k1", "failed phantom", 43)
@@ -185,7 +199,7 @@ defmodule Tightbeam.StaleTurnSettlementTest do
                settle_call("k1", target, "fail", reason, "reader-key", {:user, "reader"})
              )
 
-    for principal <- [{:session, "k1"}, {:process, "tightbeam"}, nil] do
+    for principal <- [nil] do
       assert {:error, %{code: "not_authorized"}} =
                Dispatch.dispatch(
                  ctx.db,
@@ -205,6 +219,27 @@ defmodule Tightbeam.StaleTurnSettlementTest do
 
     assert terminal_truth(ctx.db, target) == {"failed", reason, 1, 1}
     refute turn_status(ctx.db, target) == "failed_unknown"
+  end
+
+  test "process settlement keeps the process principal", ctx do
+    target = stale_turn!(ctx.db, "k1", "process settlement", 44)
+
+    call =
+      settle_call(
+        "k1",
+        target,
+        "fail",
+        "provider request absent",
+        "process-key",
+        {:process, "automation"}
+      )
+
+    assert {:ok, %{status: "failed", won: true, replayed: false}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+    assert terminal_truth(ctx.db, target) == {"failed", "provider request absent", 1, 1}
+    assert Tightbeam.Idempotency.settlement(ctx.db, "process:automation", "process-key")
+    refute Tightbeam.Idempotency.settlement(ctx.db, "user:mike", "process-key")
   end
 
   test "lane-live, provider-live, and uncorrelatable targets are zero-mutation refusals", ctx do

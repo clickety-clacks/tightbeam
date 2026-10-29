@@ -2152,6 +2152,8 @@ defmodule Tightbeam.ExecutionMap do
     end
   end
 
+  defp caller(_db, {:process, _name}), do: %{owner: nil, admin: true}
+
   defp caller(_db, _principal), do: nil
 
   ## Small shared helpers

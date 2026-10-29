@@ -26,13 +26,12 @@ defmodule OnboardWireRuntime do
         # The payload's real Router/Dispatch/Gateway sees JSON strings; the command
         # renderer keeps its existing atom API and required CLI flags.
         for {wire, atom, command} <- [
-              {"anthropic", :anthropic, "tightbeam onboard anthropic --as-user <userId>"},
-              {"openai", :openai, "tightbeam onboard openai --as-user <userId>"},
-              {"cursor", :cursor, "tightbeam onboard cursor --api-key --as-user <userId>"},
-              {"opencode-go", :opencode_go,
-               "tightbeam onboard opencode-go --api-key --as-user <userId>"},
+              {"anthropic", :anthropic, "tightbeam onboard anthropic"},
+              {"openai", :openai, "tightbeam onboard openai"},
+              {"cursor", :cursor, "tightbeam onboard cursor --api-key"},
+              {"opencode-go", :opencode_go, "tightbeam onboard opencode-go --api-key"},
               {"local-openai", :local_openai,
-               "tightbeam onboard local-openai --endpoint <endpoint-url> --name <provider-name> --as-user <userId>"}
+               "tightbeam onboard local-openai --endpoint <endpoint-url> --name <provider-name>"}
             ] do
           assert Credentials.onboard_command(atom) == command
 

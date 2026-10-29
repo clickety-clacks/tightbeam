@@ -114,7 +114,7 @@ defmodule Tightbeam.Dispatch do
         :ok
     end
 
-    helper? = Tightbeam.Ephemeral.read_only?(db, call)
+    helper? = not match?({:session, _}, principal) and Tightbeam.Ephemeral.read_only?(db, call)
 
     case ephemeral_precheck(db, call, verb, helper?) do
       :proceed ->
@@ -639,6 +639,10 @@ defmodule Tightbeam.Dispatch do
       {:raised, _exception} -> Map.merge(base, %{code: "server_error", crash: true})
     end
   end
+
+  defp outcome_payload(verb, %{principal: {:process, _}}, {:returned, result})
+       when verb in ~w(assign dispatch revoke-assignment),
+       do: JSON.encode!(result)
 
   defp outcome_payload("onboard", _call, {:returned, result}) when is_map(result),
     do: Map.delete(result, :lease_id)

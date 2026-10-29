@@ -62,6 +62,9 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "effort and health parameters preserve accepted aliases" do
+    assert Router.atomize_params_for_test("onboard", %{"ownerUserId" => "flynn"}) ==
+             %{owner_user_id: "flynn"}
+
     assert Router.atomize_params_for_test("effort-rule", %{"requestId" => "request"}) ==
              %{request_id: "request"}
 
@@ -440,8 +443,8 @@ defmodule Tightbeam.Wire.RouterTest do
       Enum.reduce(
         [
           {"tbc_test", %{asUser: "flynn"}, "user:flynn", {:user, "flynn"}, "org-user-body"},
-          {session.cli_token, %{asUser: "flynn"}, "user:flynn", {:user, "flynn"},
-           "session-user-body"},
+          {session.cli_token, %{asUser: "flynn"}, "agent:#{session.session_key}",
+           {:session, session.session_key}, "session-user-body"},
           {session.cli_token, %{as: "body-auth-role"}, "agent:body-auth-role",
            {:session, session.session_key}, "session-role-body"}
         ],
@@ -482,29 +485,28 @@ defmodule Tightbeam.Wire.RouterTest do
         end
       )
 
-    stored_body = "session-role-body"
+    stored_body = "session-process-body"
 
     for {bearer, selector, verb, body} <- [
           {"tbc_test", %{asProcess: "cron"}, "work-item-get", nil},
-          {"tbc_test", %{asProcess: "cron"}, "work-item-update", "denied-org-process"}
+          {"tbc_test", %{asProcess: "cron"}, "work-item-update", "org-process-body"}
         ] do
       params = if body, do: %{workItemId: id, body: body}, else: %{workItemId: id}
       response = dispatch_cli(ctx, bearer, Map.merge(%{verb: verb, params: params}, selector))
-      assert response.status == 403
-      assert JSON.decode!(response.resp_body)["error"]["code"] == "process_denied"
+      assert response.status == 200, response.resp_body
       assert_receive {:body_auth_handler, ^verb, "process:cron", {:process, "cron"}}
     end
 
     for verb <- ["work-item-get", "work-item-update"] do
-      body = if verb == "work-item-update", do: "denied-session-process", else: nil
+      body = if verb == "work-item-update", do: "session-process-body", else: nil
       params = if body, do: %{workItemId: id, body: body}, else: %{workItemId: id}
 
       response =
         dispatch_cli(ctx, session.cli_token, %{verb: verb, asProcess: "cron", params: params})
 
-      assert response.status == 403
-      assert JSON.decode!(response.resp_body)["error"]["code"] == "identity_not_yours"
-      refute_receive {:body_auth_handler, _, _, _}
+      assert response.status == 200, response.resp_body
+      session_key = session.session_key
+      assert_receive {:body_auth_handler, ^verb, "process:cron", {:session, ^session_key}}
     end
 
     for {verb, body} <- [{"work-item-get", nil}, {"work-item-update", "denied-held-role"}] do
@@ -944,11 +946,10 @@ defmodule Tightbeam.Wire.RouterTest do
     }
 
     for body <- [evidence, review] do
-      refused =
+      accepted =
         dispatch_cli(ctx, stranger.cli_token, %{body | as: "coder:health-wire-stranger"})
 
-      assert refused.status == 403
-      assert JSON.decode!(refused.resp_body)["error"]["code"] == "not_authorized"
+      assert accepted.status == 200, accepted.resp_body
     end
 
     read = dispatch_cli(ctx, source.cli_token, evidence)
@@ -961,7 +962,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert missing.status == 400
     assert JSON.decode!(missing.resp_body)["error"]["code"] == "evidence_not_found"
 
-    reviewed = dispatch_cli(ctx, source.cli_token, review)
+    reviewed = dispatch_cli(ctx, stranger.cli_token, %{review | as: "coder:health-wire-stranger"})
     assert reviewed.status == 200
     assert JSON.decode!(reviewed.resp_body)["result"]["review"]["outcome"] == "confirmed_other"
   end
@@ -1033,6 +1034,28 @@ defmodule Tightbeam.Wire.RouterTest do
                "SELECT COUNT(*) FROM assignment_repair_attempts WHERE assignmentId=?1",
                [assignment.id]
              )
+
+    for {token, selector, principal} <- [
+          {holder.cli_token, %{}, "session:" <> holder.session_key},
+          {"tbc_test", %{asProcess: "automation"}, "process:automation"}
+        ] do
+      own_request =
+        request
+        |> Map.delete(:asUser)
+        |> Map.merge(selector)
+        |> put_in([:params, :idempotencyKey], "repair-" <> principal)
+
+      own_response = dispatch_cli(ctx, token, own_request)
+      assert own_response.status == 400
+      assert JSON.decode!(own_response.resp_body)["error"]["code"] == "no_open_incident"
+
+      assert {:ok, [[^principal]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT principal FROM assignment_repair_attempts WHERE assignmentId=?1 AND principal=?2",
+                 [assignment.id, principal]
+               )
+    end
 
     assert {:ok, [["open", nil]]} =
              DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id=?1", [assignment.id])
@@ -1325,6 +1348,59 @@ defmodule Tightbeam.Wire.RouterTest do
     session_ruled = JSON.decode!(ruled_by_session.resp_body)["result"]
     assert session_ruled["status"] == "ruled"
     assert session_ruled["ruledViaSessionKey"] == raiser.session_key
+    assert session_ruled["ruledBy"] == "session:" <> raiser.session_key
+    assert session_ruled["ownerUserId"] == owner
+
+    assert {:ok, [[actor, ^owner]]} =
+             DB.query(ctx.db, "SELECT ruledBy,ownerUserId FROM decision_requests WHERE id=?1", [
+               dr3
+             ])
+
+    for {token, selector, expected_actor, expected_session} <- [
+          {raiser.cli_token, %{asUser: owner}, "session:" <> raiser.session_key,
+           raiser.session_key},
+          {raiser.cli_token, %{asProcess: "automation"}, "session:" <> raiser.session_key,
+           raiser.session_key},
+          {"tbc_test", %{asProcess: "automation"}, "process:automation", nil}
+        ] do
+      asked =
+        dispatch_cli(ctx, raiser.cli_token, %{
+          verb: "operator-ask",
+          params: %{
+            question: "Actor #{expected_actor} #{inspect(selector)}",
+            options: [%{label: "a"}]
+          }
+        })
+
+      request_id = JSON.decode!(asked.resp_body)["result"]["id"]
+
+      response =
+        dispatch_cli(
+          ctx,
+          token,
+          Map.merge(
+            %{verb: "operator-rule", params: %{request: request_id, decision: "a"}},
+            selector
+          )
+        )
+
+      assert response.status == 200, response.resp_body
+
+      assert {:ok, [[^expected_actor, ^expected_actor, ^expected_session, ^owner]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT ruledBy,ruledViaPrincipal,ruledViaSessionKey,ownerUserId FROM decision_requests WHERE id=?1",
+                 [request_id]
+               )
+    end
+
+    assert actor == "session:" <> raiser.session_key
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+
+    assert {:ok, [[^actor, ^owner]]} =
+             DB.query(ctx.db, "SELECT ruledBy,ownerUserId FROM decision_requests WHERE id=?1", [
+               dr3
+             ])
   end
 
   # The --status filter had the same shape of defect the operator verbs did: a working
@@ -3423,14 +3499,457 @@ defmodule Tightbeam.Wire.RouterTest do
              400
 
     assert dispatch_cli(ctx, "invalid-bearer", body).status == 401
-    assert dispatch_cli(ctx, "tbc_test", Map.put(body, :asProcess, "fixture")).status == 403
+    assert dispatch_cli(ctx, "tbc_test", Map.put(body, :asProcess, "fixture")).status == 200
     assert dispatch_cli(ctx, writer.cli_token, Map.put(body, :sessionKey, nil)).status == 400
 
     assert dispatch_cli(ctx, writer.cli_token, put_in(body, [:params, :originPath], "/not/read")).status ==
              400
   end
 
-  test "session bearer enforces the identity ladder and threads the normative principal seam",
+  test "direct process ownership is data and actor provenance stays in events", ctx do
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, observed_real_handlers(ctx))}
+    holder = create_session(ctx.db, "process-task-holder", "flynn")
+    create_session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    invoke = fn verb, params, target ->
+      body = %{verb: verb, asProcess: "automation", params: params}
+      body = if target, do: Map.put(body, :sessionKey, target), else: body
+      response = dispatch_cli(ctx, "tbc_test", body)
+      assert response.status == 200, response.resp_body
+      JSON.decode!(response.resp_body)["result"]
+    end
+
+    missing =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "work-item-create",
+        asProcess: "automation",
+        params: %{title: "Process work"}
+      })
+
+    assert JSON.decode!(missing.resp_body)["error"]["code"] == "owner_required"
+
+    unknown =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "work-item-create",
+        asProcess: "automation",
+        params: %{title: "Process work", ownerUserId: "missing"}
+      })
+
+    assert JSON.decode!(unknown.resp_body)["error"]["code"] == "unknown_user"
+
+    item = invoke.("work-item-create", %{title: "Process work", ownerUserId: "flynn"}, nil)
+    assert item["ownerUserId"] == "flynn"
+    assert item["createdByUser"] == nil
+    assert item["createdBySession"] == nil
+
+    invoke.(
+      "work-item-update",
+      %{workItemId: item["id"], deliveryOwnerSessionKey: holder.session_key},
+      nil
+    )
+
+    handoff =
+      invoke.(
+        "work-item-handoff",
+        %{
+          title: "Process handoff",
+          ownerUserId: "flynn",
+          deliveryOwnerSessionKey: holder.session_key,
+          brief: "Deliver this outcome"
+        },
+        nil
+      )
+
+    assert handoff["workItem"]["ownerUserId"] == "flynn"
+    assert handoff["workItem"]["createdByUser"] == nil
+    assert handoff["workItem"]["createdBySession"] == nil
+
+    role =
+      invoke.(
+        "role-create",
+        %{name: "process-office", ownerUserId: "flynn", bind: holder.session_key},
+        nil
+      )
+
+    assert role["role"]["ownerUserId"] == "flynn"
+    invoke.("role-rm", %{name: "process-office"}, nil)
+
+    assignment =
+      invoke.(
+        "assign",
+        %{subject: "Process task", workItemId: item["id"], effectKind: "evidence"},
+        holder.session_key
+      )
+
+    assert assignment["openedByUser"] == nil
+    assert assignment["openedBySession"] == nil
+
+    verdict =
+      invoke.(
+        "attest",
+        %{
+          assignmentId: assignment["id"],
+          kind: "verdict",
+          verdictKind: "waiting",
+          note: "Process observed state"
+        },
+        nil
+      )
+
+    assert verdict["attest"]["byUser"] == nil
+    assert verdict["attest"]["bySession"] == nil
+
+    session_opened =
+      dispatch_cli(ctx, holder.cli_token, %{
+        verb: "assign",
+        sessionKey: holder.session_key,
+        params: %{subject: "Session-opened task", workItemId: item["id"], effectKind: "evidence"}
+      })
+
+    assert session_opened.status == 200, session_opened.resp_body
+    session_assignment = JSON.decode!(session_opened.resp_body)["result"]
+
+    process_notice =
+      invoke.(
+        "attest",
+        %{
+          assignmentId: session_assignment["id"],
+          kind: "verdict",
+          verdictKind: "waiting",
+          note: "Process notification"
+        },
+        nil
+      )
+
+    assert process_notice["attest"]["byUser"] == nil
+    assert process_notice["attest"]["bySession"] == nil
+
+    assert {:ok, [["process:automation", nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT origin, creatorSessionKey FROM wakes WHERE assignmentId=?1 AND origin='process:automation'",
+               [session_assignment["id"]]
+             )
+
+    updated = invoke.("work-item-update", %{workItemId: item["id"], body: "Process edit"}, nil)
+    assert updated["bodyUpdate"]["updatedByUser"] == nil
+    assert updated["bodyUpdate"]["updatedBySession"] == nil
+
+    topline =
+      invoke.(
+        "topline-create",
+        %{title: "Process objective", idempotencyKey: "process-topline", ownerUserId: "flynn"},
+        nil
+      )
+
+    assert topline["topline"]["ownerUserId"] == "flynn"
+    assert topline["topline"]["createdActor"] == %{"kind" => "process", "ref" => "automation"}
+
+    renamed =
+      invoke.(
+        "topline-update",
+        %{
+          toplineId: topline["topline"]["id"],
+          title: "Updated process objective",
+          reason: "new objective",
+          idempotencyKey: "process-topline-update"
+        },
+        nil
+      )
+
+    assert renamed["topline"]["title"] == "Updated process objective"
+
+    assert {:ok, rows} =
+             DB.query(
+               ctx.db,
+               "SELECT verb,origin,principal,payload FROM events WHERE kind='verb' AND principal='process:automation'"
+             )
+
+    for {verb, id} <- [
+          {"work-item-create", item["id"]},
+          {"work-item-handoff", handoff["workItem"]["id"]},
+          {"role-create", "process-office"},
+          {"role-rm", "process-office"},
+          {"assign", assignment["id"]},
+          {"attest", verdict["attest"]["id"]},
+          {"work-item-update", item["id"]}
+        ] do
+      assert Enum.any?(rows, fn [v, origin, principal, payload] ->
+               v == verb and origin == "process:automation" and principal == "process:automation" and
+                 String.contains?(payload, id)
+             end)
+    end
+
+    lifecycle =
+      invoke.(
+        "assign",
+        %{subject: "Process lifecycle", workItemId: item["id"], effectKind: "evidence"},
+        holder.session_key
+      )
+
+    blocked_response =
+      dispatch_cli(ctx, holder.cli_token, %{
+        verb: "attest",
+        params: %{
+          assignmentId: lifecycle["id"],
+          kind: "cannot-proceed",
+          note: "Needs a response"
+        }
+      })
+
+    assert blocked_response.status == 200, blocked_response.resp_body
+    blocked = JSON.decode!(blocked_response.resp_body)["result"]
+    assert blocked["cannotProceed"]["openerRef"] == nil
+    assert blocked["cannotProceed"]["disposerRef"] == nil
+    assert blocked["decisionWake"]["sessionKey"] == Org.personal_session_key("flynn")
+    assert blocked["attest"]["bySession"] == holder.session_key
+
+    answered =
+      invoke.("answer", %{request: blocked["decisionRequest"]["id"], answer: "Resume"}, nil)
+
+    assert answered["answeredBy"] == "process:automation"
+
+    completed_response =
+      dispatch_cli(ctx, holder.cli_token, %{
+        verb: "attest",
+        params: %{
+          assignmentId: lifecycle["id"],
+          kind: "completion",
+          note: "Finished"
+        }
+      })
+
+    assert completed_response.status == 200, completed_response.resp_body
+    completed = JSON.decode!(completed_response.resp_body)["result"]
+    assert completed["assignment"]["outcome"] == "completed"
+
+    assert {:ok, [[nil, nil, holder_key]]} =
+             DB.query(
+               ctx.db,
+               "SELECT openedByUser,openedBySession,closedBySession FROM assignments WHERE id=?1",
+               [lifecycle["id"]]
+             )
+
+    assert holder_key == holder.session_key
+
+    assert {:ok, {:ok, terminal}} =
+             DB.transaction(
+               ctx.db,
+               &Wakes.admit_terminal_notification_in_txn(&1, lifecycle["id"])
+             )
+
+    assert terminal.assignment_id == lifecycle["id"]
+    assert terminal.owner_user_id == "flynn"
+
+    revoked =
+      invoke.(
+        "revoke-assignment",
+        %{assignmentId: assignment["id"], reason: "Process work finished"},
+        nil
+      )
+
+    assert revoked["outcome"] == "revoked"
+    assert revoked["closedByUser"] == nil
+    assert revoked["closedBySession"] == nil
+
+    assert invoke.(
+             "revoke-assignment",
+             %{assignmentId: assignment["id"], reason: "Process work finished"},
+             nil
+           ) == revoked
+
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+  end
+
+  for personal_session? <- [true, false] do
+    @personal_session personal_session?
+    test "itemless process assignment uses explicit notice owner, personal session=#{@personal_session}",
+         ctx do
+      ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, observed_real_handlers(ctx))}
+      holder = create_session(ctx.db, "itemless-process-holder", "mike")
+      personal = Org.personal_session_key("flynn")
+      if @personal_session, do: create_session(ctx.db, personal, "flynn")
+
+      body = %{
+        verb: "assign",
+        asProcess: "automation",
+        sessionKey: holder.session_key,
+        params: %{
+          subject: "Itemless task",
+          ownerUserId: "flynn",
+          effectKind: "coordination",
+          idempotencyKey: "itemless-process"
+        }
+      }
+
+      response = dispatch_cli(ctx, "tbc_test", body)
+      assert response.status == 200, response.resp_body
+      assignment = JSON.decode!(response.resp_body)["result"]
+      assert assignment["openedByUser"] == nil
+      assert assignment["openedBySession"] == nil
+      assert assignment["workItemId"] == nil
+
+      replay = dispatch_cli(ctx, "tbc_test", put_in(body, [:params, :ownerUserId], "mike"))
+      assert replay.status == 200, replay.resp_body
+      assert JSON.decode!(replay.resp_body)["result"]["id"] == assignment["id"]
+
+      assert {:ok, event} =
+               DB.transaction(ctx.db, fn txn ->
+                 Tightbeam.Assignments.process_event_in_txn(txn, assignment["id"])
+               end)
+
+      assert event["principal"] == "process:automation"
+      assert event["ownerUserId"] == "flynn"
+
+      blocked =
+        dispatch_cli(ctx, holder.cli_token, %{
+          verb: "attest",
+          params: %{
+            assignmentId: assignment["id"],
+            kind: "cannot-proceed",
+            note: "Need owner input"
+          }
+        })
+
+      assert blocked.status == 200, blocked.resp_body
+      blocked = JSON.decode!(blocked.resp_body)["result"]
+      assert blocked["cannotProceed"]["openerRef"] == nil
+      assert blocked["decisionRequest"]["expecterUserId"] == "flynn"
+      assert blocked["decisionWake"]["sessionKey"] == personal
+
+      answered =
+        dispatch_cli(ctx, "tbc_test", %{
+          verb: "answer",
+          asProcess: "automation",
+          params: %{request: blocked["decisionRequest"]["id"], answer: "Continue"}
+        })
+
+      assert answered.status == 200, answered.resp_body
+      assert JSON.decode!(answered.resp_body)["result"]["answeredBy"] == "process:automation"
+
+      completed =
+        dispatch_cli(ctx, holder.cli_token, %{
+          verb: "attest",
+          params: %{assignmentId: assignment["id"], kind: "completion", note: "Done"}
+        })
+
+      assert completed.status == 200, completed.resp_body
+
+      assert {:ok, {:ok, terminal}} =
+               DB.transaction(ctx.db, fn txn ->
+                 Tightbeam.Wakes.admit_terminal_notification_in_txn(txn, assignment["id"])
+               end)
+
+      assert terminal.session_key == personal
+      assert terminal.owner_user_id == "flynn"
+      assert terminal.prompt =~ ~s(opened_by_kind="process")
+      assert terminal.prompt =~ ~s(opened_by_id="automation")
+      assert terminal.assignment_id == assignment["id"]
+    end
+  end
+
+  test "roleless and multi-role credentials write ordinary and admin rows as the agent", ctx do
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, observed_real_handlers(ctx))}
+
+    for role_count <- [0, 2], process <- [nil, "automation", "as-user"] do
+      key = "agent:fixture:#{role_count}:#{process || "default"}"
+      session = create_session(ctx.db, key, "flynn")
+
+      if role_count == 2 do
+        Roles.create!(ctx.db, "first-#{process}", "flynn", key)
+        Roles.create!(ctx.db, "second-#{process}", "flynn", key)
+      end
+
+      dispatch = fn body ->
+        body =
+          case process do
+            "as-user" -> Map.put(body, :asUser, "another-owner")
+            nil -> body
+            name -> Map.put(body, :asProcess, name)
+          end
+
+        response = dispatch_cli(ctx, session.cli_token, body)
+        assert response.status == 200, response.resp_body
+        JSON.decode!(response.resp_body)["result"]
+      end
+
+      item =
+        dispatch.(%{
+          verb: "work-item-create",
+          params: %{title: "Agent work", body: "Before", ownerUserId: "another-owner"}
+        })
+
+      assert item["createdBySession"] == key
+      assert item["createdByUser"] == nil
+      assert item["ownerUserId"] == "flynn"
+
+      diagnostic_body = %{sessionKey: key}
+
+      diagnostic_body =
+        case process do
+          "as-user" -> Map.put(diagnostic_body, :asUser, "another-owner")
+          nil -> diagnostic_body
+          name -> Map.put(diagnostic_body, :asProcess, name)
+        end
+
+      diagnostic =
+        conn(:post, "/agent/session-diagnose", JSON.encode!(diagnostic_body))
+        |> put_req_header("authorization", "Bearer #{session.cli_token}")
+        |> put_req_header(
+          "x-tightbeam-cli-version",
+          Tightbeam.CliCompatibility.required_version()
+        )
+        |> Router.call(Router.init(ctx.opts))
+
+      assert diagnostic.status == 200, diagnostic.resp_body
+      assert JSON.decode!(diagnostic.resp_body)["result"]["sessionKey"] == key
+
+      assignment =
+        dispatch.(%{
+          verb: "assign",
+          sessionKey: key,
+          params: %{subject: "Agent task", workItemId: item["id"], effectKind: "evidence"}
+        })
+
+      assert assignment["openedBySession"] == key
+      assert assignment["openedByUser"] == nil
+
+      result =
+        dispatch.(%{
+          verb: "attest",
+          params: %{assignmentId: assignment["id"], kind: "progress", note: "Acted as myself"}
+        })
+
+      assert result["attest"]["bySession"] == key
+      assert result["attest"]["byUser"] == nil
+
+      updated =
+        dispatch.(%{
+          verb: "work-item-update",
+          params: %{workItemId: item["id"], body: "After"}
+        })
+
+      assert updated["bodyUpdate"]["updatedBySession"] == key
+      assert updated["bodyUpdate"]["updatedByUser"] == nil
+
+      dispatch.(%{verb: "add-user", params: %{userId: "guest-#{role_count}-#{process}"}})
+
+      expected_origin =
+        if process && process != "as-user", do: "process:#{process}", else: "agent:#{key}"
+
+      assert {:ok, rows} =
+               DB.query(
+                 ctx.db,
+                 "SELECT origin,principal FROM events WHERE principal=?1 AND kind='verb'",
+                 ["session:#{key}"]
+               )
+
+      assert length(rows) >= 5
+      assert Enum.all?(rows, &(&1 == [expected_origin, "session:#{key}"]))
+    end
+  end
+
+  test "session bearer supplies an exact agent identity independent of role count",
        ctx do
     holder = create_session(ctx.db, "holder-token", "flynn")
     sibling = create_session(ctx.db, "sibling-token", "mike")
@@ -3461,25 +3980,21 @@ defmodule Tightbeam.Wire.RouterTest do
                     }}
 
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect"}).status == 200
-    assert_receive {:call, %{origin: "agent:held", principal: {:session, "holder-token"}}}
+    assert_receive {:call, %{origin: "agent:holder-token", principal: {:session, "holder-token"}}}
 
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "flynn"}).status == 200
 
     assert_receive {:call,
                     %{
-                      origin: "user:flynn",
-                      principal: {:user, "flynn"},
+                      origin: "agent:holder-token",
+                      principal: {:session, "holder-token"},
                       transport_session_key: "holder-token"
                     }}
 
     empty_user = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: ""})
 
-    assert empty_user.status == 403
-
-    assert JSON.decode!(empty_user.resp_body)["error"] == %{
-             "code" => "identity_not_yours",
-             "message" => "this session belongs to flynn"
-           }
+    assert empty_user.status == 200
+    assert_receive {:call, %{origin: "agent:holder-token", principal: {:session, "holder-token"}}}
 
     # Registering a satellite also provisions its operator endpoint over ssh; this
     # test is about the identity ladder, so the reach is stubbed and the gateway
@@ -3556,11 +4071,11 @@ defmodule Tightbeam.Wire.RouterTest do
            end)
 
     assert dispatch_cli(ctx, main.cli_token, %{verb: "inspect"}).status == 200
-    assert_receive {:call, %{origin: "user:flynn", principal: {:session, ^main_key}}}
+    assert_receive {:call, %{origin: "agent:" <> ^main_key, principal: {:session, ^main_key}}}
 
     Roles.create!(ctx.db, "main-role", "flynn", main.session_key)
     assert dispatch_cli(ctx, main.cli_token, %{verb: "inspect"}).status == 200
-    assert_receive {:call, %{origin: "agent:main-role", principal: {:session, ^main_key}}}
+    assert_receive {:call, %{origin: "agent:" <> ^main_key, principal: {:session, ^main_key}}}
 
     assert dispatch_cli(ctx, "tbc_test", %{verb: "inspect", asUser: "flynn"}).status == 200
 
@@ -3596,34 +4111,32 @@ defmodule Tightbeam.Wire.RouterTest do
 
     wrong_user = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "mike"})
 
-    assert wrong_user.status == 403
-
-    assert JSON.decode!(wrong_user.resp_body)["error"] == %{
-             "code" => "identity_not_yours",
-             "message" => "this session belongs to flynn"
-           }
+    assert wrong_user.status == 200
+    assert_receive {:call, %{origin: "agent:holder-token", principal: {:session, "holder-token"}}}
 
     process = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asProcess: "cron"})
-    assert process.status == 403
-    assert JSON.decode!(process.resp_body)["error"]["code"] == "identity_not_yours"
+    assert process.status == 200
+    assert_receive {:call, %{origin: "process:cron", principal: {:session, "holder-token"}}}
 
     reserved = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asProcess: "tightbeam"})
     assert reserved.status == 403
 
     assert JSON.decode!(reserved.resp_body)["error"] == %{
-             "code" => "identity_not_yours",
-             "message" => "a session token cannot act as a process"
+             "code" => "reserved_origin",
+             "message" => "process:tightbeam is reserved to the substrate"
            }
 
     roleless_key = roleless.session_key
     assert dispatch_cli(ctx, roleless.cli_token, %{verb: "inspect"}).status == 200
-    assert_receive {:call, %{origin: "user:flynn", principal: {:session, ^roleless_key}}}
 
-    ambiguous = dispatch_cli(ctx, several.cli_token, %{verb: "inspect"})
-    assert ambiguous.status == 400
-    assert JSON.decode!(ambiguous.resp_body)["error"]["code"] == "ambiguous_identity"
-    assert ambiguous.resp_body =~ "alpha"
-    assert ambiguous.resp_body =~ "beta"
+    assert_receive {:call,
+                    %{origin: "agent:" <> ^roleless_key, principal: {:session, ^roleless_key}}}
+
+    several_key = several.session_key
+    assert dispatch_cli(ctx, several.cli_token, %{verb: "inspect"}).status == 200
+
+    assert_receive {:call,
+                    %{origin: "agent:" <> ^several_key, principal: {:session, ^several_key}}}
 
     assert dispatch_cli(ctx, "tbs_unknown", %{verb: "inspect"}).status == 401
     Org.retire(ctx.db, holder.session_key, "user:flynn", 1_000)
@@ -4029,7 +4542,7 @@ defmodule Tightbeam.Wire.RouterTest do
              "error" => %{
                "code" => "unknown_host",
                "message" =>
-                 "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> --name eurisko --as-user <adminUserId>",
+                 "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> --name eurisko",
                "diagnostic" => %{
                  "kind" => "denial",
                  "operation" => "spawn",

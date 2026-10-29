@@ -1250,7 +1250,7 @@ defmodule Tightbeam.Rules do
   defp caller_session_key(_db, _call), do: nil
 
   defp caller_session_from_origin(db, "agent:" <> role) do
-    case Roles.resolve(db, role) do
+    case Tightbeam.Origin.resolve_agent(db, role) do
       {:ok, session_key, false} -> active_notice_session(db, session_key)
       _ -> nil
     end
@@ -1265,7 +1265,7 @@ defmodule Tightbeam.Rules do
   defp caller_session_from_origin(_db, _origin), do: nil
 
   defp row_commit_caller_principal(db, "agent:" <> role, owner_user_id) do
-    with {:ok, session_key, false} <- Roles.resolve(db, role),
+    with {:ok, session_key, false} <- Tightbeam.Origin.resolve_agent(db, role),
          session_key when is_binary(session_key) <- active_notice_session(db, session_key) do
       {:session, session_key}
     else
@@ -1282,6 +1282,8 @@ defmodule Tightbeam.Rules do
 
   defp row_commit_caller_principal(_db, "user:" <> user_id, _owner_user_id),
     do: {:user, user_id}
+
+  defp row_commit_caller_principal(_db, "process:" <> name, _owner), do: {:process, name}
 
   defp row_commit_caller_principal(_db, _origin, owner_user_id), do: {:user, owner_user_id}
 
@@ -2454,6 +2456,9 @@ defmodule Tightbeam.Rules do
     end)
   end
 
+  defp compute_fact("caller.roles", db, %{principal: {:session, key}}, cache),
+    do: {Roles.for_session(db, key), cache}
+
   defp compute_fact("caller.roles", db, call, cache) do
     case parse_origin(call.origin) do
       :malformed ->
@@ -3534,7 +3539,7 @@ defmodule Tightbeam.Rules do
   defp agent_started_turn?(db, origin, target_session_key) when is_binary(origin) do
     case Tightbeam.Origin.parse(origin) do
       {:agent, role} ->
-        case Roles.resolve(db, role) do
+        case Tightbeam.Origin.resolve_agent(db, role) do
           {:ok, ^target_session_key, false} -> true
           _ -> false
         end
@@ -3886,8 +3891,8 @@ defmodule Tightbeam.Rules do
   end
 
   defp caller_user(db, call, cache) do
-    case {Map.get(call, :edge), Map.get(call, :principal)} do
-      {:row_commit, {:session, session_key}} ->
+    case Map.get(call, :principal) do
+      {:session, session_key} ->
         value =
           case Org.get(db, session_key) do
             nil -> nil
@@ -3918,18 +3923,20 @@ defmodule Tightbeam.Rules do
           _ -> {nil, cache}
         end
 
-      {:agent, role_name} ->
-        value =
-          case Roles.get(db, role_name) do
-            %{bound_session_key: key} when is_binary(key) ->
-              case Org.get(db, key) do
-                nil -> nil
-                session -> session.owner_user_id
+      {:agent, identifier} ->
+        session =
+          case Org.get(db, identifier) do
+            nil ->
+              case Roles.get(db, identifier) do
+                %{bound_session_key: key} when is_binary(key) -> Org.get(db, key)
+                _ -> nil
               end
 
-            _ ->
-              nil
+            session ->
+              session
           end
+
+        value = if session, do: session.owner_user_id, else: nil
 
         {value, cache}
     end

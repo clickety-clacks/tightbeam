@@ -151,8 +151,8 @@ defmodule Tightbeam.ToplinesTest do
     assert Toplines.get(ctx.db, read_call({:user, "kay"}, %{topline_id: id})) ==
              Toplines.get(ctx.db, read_call({:user, "kay"}, %{topline_id: "tl_missing"}))
 
-    assert %{code: "process_denied"} =
-             Toplines.list(ctx.db, read_call({:process, "tightbeam"}))
+    assert %{toplines: [%{id: ^id}]} =
+             Toplines.list(ctx.db, read_call({:process, "automation"}))
 
     session_created =
       Toplines.create(
@@ -953,10 +953,10 @@ defmodule Tightbeam.ToplinesTest do
     assert %{placements: []} =
              Toplines.list_placements(ctx.db, read_call({:user, "kay"}, %{state: "all"}))
 
-    assert %{code: "process_denied"} =
+    assert %{code: "invalid_message"} =
              Toplines.leave_unlinked(
                ctx.db,
-               call({:process, "tightbeam"}, %{work_item_id: "wi_leave"}, 44)
+               call({:process, "automation"}, %{work_item_id: "wi_leave"}, 44)
              )
   end
 
@@ -1013,7 +1013,7 @@ defmodule Tightbeam.ToplinesTest do
     end
   end
 
-  test "invalid, invisible, cross-owner, duplicate, and process operations refuse without writes",
+  test "invalid, invisible, cross-owner, duplicate, and ownerless creates refuse without writes",
        ctx do
     work_item!(ctx.db, "wi_mine", "flynn")
     work_item!(ctx.db, "wi_theirs", "kay")
@@ -1027,13 +1027,13 @@ defmodule Tightbeam.ToplinesTest do
                call({:user, "flynn"}, %{title: "Valid", idempotency_key: " ", extra: true})
              )
 
-    assert %{code: "process_denied"} =
+    assert %{code: "owner_required"} =
              Toplines.create(
                ctx.db,
-               call({:process, "tightbeam"}, %{title: "Valid", idempotency_key: "k"})
+               call({:process, "automation"}, %{title: "Valid", idempotency_key: "k"})
              )
 
-    assert %{code: "process_denied"} =
+    assert %{code: "owner_required"} =
              Toplines.create(ctx.db, call({:process, "tightbeam"}, %{unexpected: true}))
 
     topline =

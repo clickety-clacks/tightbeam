@@ -428,7 +428,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
          principal: {kind, _principal},
          params: params
        })
-       when kind in [:user, :session] and is_map(params),
+       when kind in [:user, :session, :process] and is_map(params),
        do: is_nil(Map.get(params, :work_item_id))
 
   defp itemless_human_assignment_control?(_call), do: false
@@ -438,7 +438,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
          principal: {kind, _principal},
          params: params
        })
-       when kind in [:user, :session] and is_map(params),
+       when kind in [:user, :session, :process] and is_map(params),
        do: is_nil(Map.get(params, :work_item_id))
 
   defp itemless_public_dispatch_control?(_call), do: false
@@ -447,7 +447,8 @@ defmodule Tightbeam.DeliveryResponsibilities do
        when is_binary(origin) and is_map(params),
        do:
          is_nil(Map.get(params, :work_item_id)) and
-           (String.starts_with?(origin, "user:") or String.starts_with?(origin, "agent:"))
+           (String.starts_with?(origin, "user:") or String.starts_with?(origin, "agent:") or
+              String.starts_with?(origin, "process:"))
 
   defp itemless_public_spawn_control?(_call), do: false
 
@@ -477,9 +478,9 @@ defmodule Tightbeam.DeliveryResponsibilities do
     ) == [[1]]
   end
 
-  defp caller_is_responsible?(owner, work_item_id, call, opts) do
+  defp caller_is_responsible?(_owner, work_item_id, call, opts) do
     case Map.get(call, :principal) do
-      {:user, _user_id} ->
+      {kind, _} when kind in [:user, :session, :process] ->
         true
 
       {:remedy, %{action: "assign", owner: user_id}} when call.verb == "assign" ->
@@ -489,14 +490,6 @@ defmodule Tightbeam.DeliveryResponsibilities do
           work_item_id,
           user_id
         ]) == [[1]]
-
-      {:session, ^owner} ->
-        true
-
-      {:session, session_key} when is_binary(session_key) ->
-        txn = Keyword.fetch!(opts, :txn)
-
-        active_assignment_holder?(txn, session_key, work_item_id)
 
       _ ->
         false

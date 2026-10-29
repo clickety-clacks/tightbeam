@@ -89,9 +89,9 @@ defmodule Tightbeam.Ephemeral do
   defp origin_session(_db, "session:" <> key), do: key
 
   defp origin_session(db, "agent:" <> role) do
-    case query(db, "SELECT boundSessionKey FROM roles WHERE name=?1", [role]) do
-      [[key]] -> key
-      [] -> nil
+    case Tightbeam.Origin.resolve_agent(db, role) do
+      {:ok, key, false} -> key
+      _ -> nil
     end
   end
 

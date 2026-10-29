@@ -6,16 +6,17 @@ defmodule Tightbeam.SessionDiagnose do
   @max_response 4096
   @lane_timeout 200
 
-  # No DB, lane creation, adapter call or domain mutation belongs on this path.
+  # The snapshot does not query the DB, create lanes, or call adapters.
   def handle(conn, deps) do
-    with :ok <- authenticate(conn, deps[:cli_token]),
+    with :ok <- authenticate(conn, deps),
          :ok <- compatible(conn),
          {:ok, bytes, conn} <-
            read_body(conn, length: @max_body, read_length: @max_body, read_timeout: 500),
          {:ok, body} <- JSON.decode(bytes),
          %{"sessionKey" => key} <- body,
-         true <- map_size(Map.delete(body, "asUser")) == 1 and is_binary(key),
-         true <- byte_size(key) in 1..512 do
+         true <- map_size(Map.drop(body, ["as", "asUser", "asProcess"])) == 1 and is_binary(key),
+         true <- byte_size(key) in 1..512,
+         false <- body["asProcess"] == "tightbeam" do
       metadata_deps = Map.take(deps, [:db, :lane_registry])
 
       case bounded_snapshot(fn -> snapshot(key, metadata_deps) end) do
@@ -104,17 +105,28 @@ defmodule Tightbeam.SessionDiagnose do
     end
   end
 
-  defp authenticate(conn, expected) when is_binary(expected) and byte_size(expected) > 0 do
+  defp authenticate(conn, deps) do
+    expected = deps[:cli_token]
+
     case get_req_header(conn, "authorization") do
-      ["Bearer " <> token] when byte_size(token) == byte_size(expected) ->
-        if Plug.Crypto.secure_compare(token, expected), do: :ok, else: {:error, :unauthorized}
+      ["Bearer " <> token] ->
+        cond do
+          is_binary(expected) and byte_size(expected) > 0 and
+            byte_size(token) == byte_size(expected) and
+              Plug.Crypto.secure_compare(token, expected) ->
+            :ok
+
+          Tightbeam.Org.active_session_key_by_cli_token(deps[:db] || Tightbeam.DB, token) ->
+            :ok
+
+          true ->
+            {:error, :unauthorized}
+        end
 
       _ ->
         {:error, :unauthorized}
     end
   end
-
-  defp authenticate(_, _), do: {:error, :unauthorized}
 
   defp reply(conn, status, value) do
     bytes = JSON.encode!(value)

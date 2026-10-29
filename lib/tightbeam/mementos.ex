@@ -550,14 +550,14 @@ defmodule Tightbeam.Mementos do
     end
   end
 
-  def authenticated!({kind, ref}) when kind in [:session, :user] and is_binary(ref),
+  def authenticated!({kind, ref}) when kind in [:session, :user, :process] and is_binary(ref),
     do: {Atom.to_string(kind), ref}
 
   def authenticated!(_),
     do:
       refuse!(
         "memento_unauthenticated",
-        "memento writes require an authenticated user or session"
+        "memento writes require an authenticated caller"
       )
 
   @doc "Read a bounded keyset page in committed append order."

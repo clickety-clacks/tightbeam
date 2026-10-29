@@ -406,6 +406,7 @@ defmodule Tightbeam.Schema do
   @decision_request_row_schema_shape "decision-request-row-schema-v2-019"
   @launch_preparation_boot_shape "launch-preparation-boot-v1-0110"
   @evidence_release_shape "launch-preparation-evidence-v1-0112"
+  @session_identity_shape "session-identity-v1-0114"
   @identity_publication_denial_diagnostic_previous_shape @artifact_origin_shape
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
   @supervision_receipt_cancellation_shape "supervision-receipt-cancellation-v1-019"
@@ -433,6 +434,7 @@ defmodule Tightbeam.Schema do
     @identity_publication_denial_diagnostic_shape,
     @notice_source_payload_shape,
     @launch_preparation_boot_shape,
+    @session_identity_shape,
     @evidence_release_shape,
     @decision_request_row_schema_shape,
     @assignment_source_replacement_shape,
@@ -1734,6 +1736,7 @@ defmodule Tightbeam.Schema do
   @doc false
   def guard_compatible_stamps do
     [
+      @session_identity_shape,
       @evidence_release_shape,
       @launch_preparation_boot_shape,
       @decision_request_row_schema_shape,
@@ -1878,6 +1881,7 @@ defmodule Tightbeam.Schema do
             @identity_publication_denial_diagnostic_shape,
             @notice_source_payload_shape,
             @launch_preparation_boot_shape,
+            @session_identity_shape,
             @evidence_release_shape,
             @decision_request_row_schema_shape,
             @assignment_source_replacement_shape,
@@ -2015,6 +2019,7 @@ defmodule Tightbeam.Schema do
     end
 
     :ok = Tightbeam.ToolCalls.ensure_schema(db)
+    :ok = upgrade_session_identity(db)
 
     case DB.finish_schema(db) do
       :ok -> Tightbeam.Recognition.activate(db)
@@ -2332,6 +2337,7 @@ defmodule Tightbeam.Schema do
                when shape in [
                       @decision_request_row_schema_shape,
                       @launch_preparation_boot_shape,
+                      @session_identity_shape,
                       @evidence_release_shape
                     ] ->
                  validate_notice_source_payload_in_txn!(txn)
@@ -3261,7 +3267,12 @@ defmodule Tightbeam.Schema do
       0 ->
         Enum.with_index(@work_item_body_objects, 1)
         |> Enum.each(fn {object, index} ->
-          :ok = Txn.exec(txn, object.sql)
+          sql =
+            if Txn.q(txn, "SELECT shape FROM schema_stamp") == [[@session_identity_shape]],
+              do: process_actor_table_sql(object.name, object.sql),
+              else: object.sql
+
+          :ok = Txn.exec(txn, sql)
           validate_work_item_body_object!(txn, object)
           maybe_interrupt_activation!(opts, index)
         end)
@@ -3294,6 +3305,11 @@ defmodule Tightbeam.Schema do
   end
 
   defp validate_work_item_body_object!(txn, %{type: type, name: name, sql: expected}) do
+    expected =
+      if Txn.q(txn, "SELECT shape FROM schema_stamp") == [[@session_identity_shape]],
+        do: process_actor_table_sql(name, expected),
+        else: expected
+
     case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2", [type, name]) do
       [[actual]] when is_binary(actual) ->
         if normalize_schema_sql(actual) != normalize_schema_sql(expected),
@@ -3336,6 +3352,7 @@ defmodule Tightbeam.Schema do
                  @assignment_source_replacement_shape,
                  @notice_source_payload_shape,
                  @launch_preparation_boot_shape,
+                 @session_identity_shape,
                  @evidence_release_shape,
                  @decision_request_row_schema_shape
                ],
@@ -3348,6 +3365,7 @@ defmodule Tightbeam.Schema do
           @assignment_source_replacement_shape,
           @notice_source_payload_shape,
           @launch_preparation_boot_shape,
+          @session_identity_shape,
           @evidence_release_shape,
           @decision_request_row_schema_shape
         ] ->
@@ -3430,6 +3448,7 @@ defmodule Tightbeam.Schema do
            @identity_publication_denial_diagnostic_shape,
            @notice_source_payload_shape,
            @launch_preparation_boot_shape,
+           @session_identity_shape,
            @evidence_release_shape,
            @decision_request_row_schema_shape,
            @assignment_source_replacement_shape,
@@ -3449,6 +3468,7 @@ defmodule Tightbeam.Schema do
              @assignment_source_replacement_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] and
@@ -4217,7 +4237,12 @@ defmodule Tightbeam.Schema do
                1 = Txn.changes(txn)
                :ok
 
-             [[shape]] when shape in [@launch_preparation_boot_shape, @evidence_release_shape] ->
+             [[shape]]
+             when shape in [
+                    @launch_preparation_boot_shape,
+                    @evidence_release_shape,
+                    @session_identity_shape
+                  ] ->
                # A stamped successor missing its required columns is corruption, not a
                # second opportunity to migrate an inferred shape.
                Txn.q(txn, "SELECT preparationBootIdentity FROM harness_processes LIMIT 0")
@@ -4240,6 +4265,190 @@ defmodule Tightbeam.Schema do
   # This release line already owns producer attribution, captured content, and
   # attest binding columns. The successor adds only the evidence constraints,
   # history, and judgment index; it never impersonates another branch's stamp.
+  defp upgrade_session_identity(db) do
+    case DB.migration_transaction(
+           db,
+           :session_identity,
+           [],
+           ["PRAGMA writable_schema = OFF"],
+           fn txn ->
+             case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+               [[@evidence_release_shape]] ->
+                 # The predecessor is declared by the carrier migration and its two
+                 # subsequent column additions. Only the attribution restriction changes.
+                 previous =
+                   @decision_carrier_requests_ddl
+                   |> String.replace("decision_requests_agent_v1", ~s("decision_requests"))
+                   |> String.replace(
+                     "returnedAt        INTEGER,",
+                     "returnedAt        INTEGER, rowVersion INTEGER NOT NULL DEFAULT 1, " <>
+                       "rowSchemaRevision INTEGER NOT NULL DEFAULT 1,"
+                   )
+
+                 validate_owned_object!(txn, %{
+                   type: "table",
+                   name: "decision_requests",
+                   sql: previous
+                 })
+
+                 current = String.replace(previous, "AND ruledBy = 'user:' || ownerUserId", "")
+                 [[version]] = Txn.q(txn, "PRAGMA schema_version")
+                 :ok = Txn.exec(txn, "PRAGMA writable_schema = ON")
+
+                 Txn.q(
+                   txn,
+                   "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='decision_requests'",
+                   [current |> String.trim() |> String.trim_trailing(";")]
+                 )
+
+                 tables =
+                   ~w(work_items work_item_bodies assignments attests assignment_reopenings assignment_revocations assignment_cannot_proceed assignment_commit_ref_corrections memento_history session_reparent_events) ++
+                     for object <- Tightbeam.Toplines.Schema.manifest(),
+                         object.type == "table",
+                         do: object.name
+
+                 for table <- tables do
+                   [[sql]] =
+                     Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1", [
+                       table
+                     ])
+
+                   Txn.q(txn, "UPDATE sqlite_master SET sql=?2 WHERE type='table' AND name=?1", [
+                     table,
+                     process_actor_table_sql(table, sql)
+                   ])
+                 end
+
+                 Txn.q(
+                   txn,
+                   "UPDATE topline_schema_stamp SET shape='standalone-toplines-v7',stampedAt=?1 WHERE singleton=1",
+                   [System.system_time(:millisecond)]
+                 )
+
+                 :ok = Txn.exec(txn, "PRAGMA schema_version = #{version + 1}")
+                 :ok = Txn.exec(txn, "PRAGMA writable_schema = RESET")
+
+                 # Process assignment provenance remains in the event payload. Index
+                 # only those events so later notices do not scan unrelated history.
+                 :ok =
+                   Txn.exec(txn, """
+                   CREATE INDEX events_process_assignment
+                   ON events (json_extract(payload,'$.id'), verb, id)
+                   WHERE kind='verb' AND verb IN ('assign','dispatch','revoke-assignment')
+                     AND substr(principal,1,8)='process:' AND principal!='process:tightbeam'
+                   """)
+
+                 Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                   @session_identity_shape,
+                   System.system_time(:millisecond),
+                   @evidence_release_shape
+                 ])
+
+                 :ok
+
+               [[@session_identity_shape]] ->
+                 :ok
+
+               rows ->
+                 raise ShapeError,
+                   message: "incompatible session identity predecessor: #{inspect(rows)}"
+             end
+           end
+         ) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError, message: "session identity migration rolled back: #{inspect(error)}"
+    end
+  end
+
+  # These are the existing attribution clauses in the stamped predecessor.
+  # Process actors are preserved by the existing event stream; typed user and
+  # session fields remain empty. No record data is rewritten.
+  def process_actor_table_sql("work_items", sql),
+    do:
+      String.replace(
+        sql,
+        ~r/,\s*CHECK\(\(createdByUser IS NOT NULL\) != \(createdBySession IS NOT NULL\)\)/,
+        ""
+      )
+
+  def process_actor_table_sql("work_item_bodies", sql),
+    do:
+      String.replace(
+        sql,
+        ~r/,\s*CHECK\(\(updatedByUser IS NOT NULL\) != \(updatedBySession IS NOT NULL\)\)/,
+        ""
+      )
+
+  def process_actor_table_sql("assignments", sql) do
+    sql
+    |> String.replace(
+      ~r/CHECK\(\(openedByUser IS NOT NULL\) != \(openedBySession IS NOT NULL\)\),\s*/,
+      ""
+    )
+    |> String.replace(
+      ~r/ AND\s+\(\(closedByUser IS NOT NULL\) \+ \(closedBySession IS NOT NULL\) \+ \(closedByProcess IS NOT NULL\) = 1\)/,
+      ""
+    )
+  end
+
+  def process_actor_table_sql("attests", sql),
+    do:
+      String.replace(sql, ~r/ AND\s+\(\(bySession IS NOT NULL\) != \(byUser IS NOT NULL\)\)/, "")
+
+  def process_actor_table_sql("assignment_reopenings", sql),
+    do:
+      String.replace(
+        sql,
+        ~r/,\s*CHECK\(\(reopenedByUser IS NOT NULL\) != \(reopenedBySession IS NOT NULL\)\)/,
+        ""
+      )
+
+  def process_actor_table_sql("assignment_revocations", sql),
+    do:
+      String.replace(
+        sql,
+        ~r/CHECK\(\(revokedByUser IS NOT NULL\) \+ \(revokedBySession IS NOT NULL\) \+ \(revokedByProcess IS NOT NULL\) = 1\),\s*/,
+        ""
+      )
+
+  def process_actor_table_sql("assignment_cannot_proceed", sql) do
+    sql
+    |> String.replace("openerRef TEXT NOT NULL", "openerRef TEXT")
+    |> String.replace("disposerRef TEXT NOT NULL", "disposerRef TEXT")
+  end
+
+  def process_actor_table_sql("assignment_commit_ref_corrections", sql),
+    do: String.replace(sql, "CHECK (actorKind IN ('user','session'))", "")
+
+  def process_actor_table_sql("memento_history", sql),
+    do: String.replace(sql, "CHECK(byKind IN ('session','user'))", "")
+
+  def process_actor_table_sql("session_reparent_events", sql) do
+    sql
+    |> String.replace("CHECK (principalKind IN ('user','session'))", "")
+    |> String.replace("CHECK (originAssignmentOpenerKind IN ('user','session'))", "")
+    |> String.replace(
+      ~r/,\s*CHECK \(\s*\(principalKind='user'.*?length\(principalRef\)>8\)\s*\)/s,
+      ""
+    )
+  end
+
+  def process_actor_table_sql("topline" <> _rest, sql) do
+    sql
+    |> String.replace(
+      ~r/,\s*CHECK \(\s*\(cause IN \('created','last_membership_unlinked'\).*?openedActorRef = 'tightbeam'\)\)\)\s*\)/s,
+      ""
+    )
+    |> String.replace(~r/CHECK \(\w*[Aa]ctorKind IN \('user','session'\)\)/, "")
+    |> String.replace(~r/\w*[Aa]ctorKind IN \('user','session'\) AND /, "")
+    |> String.replace(~r/AND\s+\w*[Aa]ctorKind IN \('user','session'\)/, "")
+  end
+
+  def process_actor_table_sql(_name, sql), do: sql
+
   defp upgrade_evidence_release(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
@@ -4260,7 +4469,7 @@ defmodule Tightbeam.Schema do
 
                :ok
 
-             [[@evidence_release_shape]] ->
+             [[shape]] when shape in [@evidence_release_shape, @session_identity_shape] ->
                Tightbeam.EvidenceSchemaRelease.validate_in_txn!(txn)
 
              rows ->
@@ -4304,6 +4513,7 @@ defmodule Tightbeam.Schema do
              when shape in [
                     @decision_request_row_schema_shape,
                     @launch_preparation_boot_shape,
+                    @session_identity_shape,
                     @evidence_release_shape
                   ] ->
                :ok =
@@ -4417,6 +4627,7 @@ defmodule Tightbeam.Schema do
              @assignment_source_replacement_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] do
@@ -4594,6 +4805,7 @@ defmodule Tightbeam.Schema do
              @assignment_source_replacement_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] ->
@@ -4753,6 +4965,7 @@ defmodule Tightbeam.Schema do
              @notice_source_payload_shape,
              @decision_request_row_schema_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
              @evidence_release_shape
            ] ->
         if effort_holder_activity_cancellation_active?(txn) do
@@ -5008,6 +5221,7 @@ defmodule Tightbeam.Schema do
       when shape in [
              @decision_request_row_schema_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
              @evidence_release_shape
            ] ->
         :ok = check_work_item_owner_link_shape(db)
@@ -5119,7 +5333,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@evidence_release_shape}
+          this build: #{@session_identity_shape}
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
@@ -5147,7 +5361,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@evidence_release_shape}
+          this build: #{@session_identity_shape}
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
@@ -5235,6 +5449,7 @@ defmodule Tightbeam.Schema do
                     @identity_publication_denial_diagnostic_shape,
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
+                    @session_identity_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -5341,6 +5556,7 @@ defmodule Tightbeam.Schema do
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -5371,6 +5587,7 @@ defmodule Tightbeam.Schema do
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -5482,6 +5699,7 @@ defmodule Tightbeam.Schema do
                     @identity_publication_denial_diagnostic_shape,
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
+                    @session_identity_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -5665,6 +5883,7 @@ defmodule Tightbeam.Schema do
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -6789,6 +7008,7 @@ defmodule Tightbeam.Schema do
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -6828,6 +7048,7 @@ defmodule Tightbeam.Schema do
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -6945,6 +7166,7 @@ defmodule Tightbeam.Schema do
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -7208,6 +7430,7 @@ defmodule Tightbeam.Schema do
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -7235,6 +7458,7 @@ defmodule Tightbeam.Schema do
                     @identity_publication_denial_diagnostic_shape,
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
+                    @session_identity_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -7275,6 +7499,7 @@ defmodule Tightbeam.Schema do
                     @work_item_owner_link_shape,
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
+                    @session_identity_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -7342,6 +7567,7 @@ defmodule Tightbeam.Schema do
                       @work_item_owner_link_shape,
                       @notice_source_payload_shape,
                       @launch_preparation_boot_shape,
+                      @session_identity_shape,
                       @evidence_release_shape,
                       @decision_request_row_schema_shape,
                       @assignment_source_replacement_shape,
@@ -7399,6 +7625,7 @@ defmodule Tightbeam.Schema do
                     @work_item_owner_link_shape,
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
+                    @session_identity_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -7464,6 +7691,7 @@ defmodule Tightbeam.Schema do
                     @identity_publication_denial_diagnostic_shape,
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
+                    @session_identity_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -7513,6 +7741,7 @@ defmodule Tightbeam.Schema do
                     @assignment_source_replacement_shape,
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
+                    @session_identity_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape
                   ] ->

@@ -224,7 +224,7 @@ defmodule Tightbeam.SpinupTest do
     assert message =~ "Tightbeam has no credential for anthropic on testhost"
     assert message =~ "normal claude CLI login"
     assert message =~ "The credential belongs only in #{home}"
-    assert message =~ "Run on testhost: tightbeam onboard anthropic --as-user <userId>"
+    assert message =~ "Run on testhost: tightbeam onboard anthropic"
     assert [%{kind: "spinup", detail: detail}] = EventLog.lifecycle_events(ctx.db)
     assert detail =~ "DENIED"
   end

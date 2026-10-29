@@ -344,11 +344,12 @@ defmodule Tightbeam.QueuedMessageSuppression do
     do: origin_session == sender
 
   defp replacement_origin_matches_sender?(txn, "agent:" <> role, sender) do
-    Txn.q(
-      txn,
-      "SELECT 1 FROM roles WHERE name=?1 AND boundSessionKey=?2",
-      [role, sender]
-    ) == [[1]]
+    role == sender or
+      Txn.q(
+        txn,
+        "SELECT 1 FROM roles WHERE name=?1 AND boundSessionKey=?2",
+        [role, sender]
+      ) == [[1]]
   end
 
   defp replacement_origin_matches_sender?(_txn, _origin, _sender), do: false

@@ -136,7 +136,7 @@ defmodule Tightbeam.EphemeralTest do
              )
   end
 
-  test "R2.3 inspection-only helpers cannot write records or spawn helpers", %{db: db} do
+  test "helpers without a session credential retain inspection-only behavior", %{db: db} do
     parent = self()
 
     handler = fn _ ->
@@ -148,7 +148,7 @@ defmodule Tightbeam.EphemeralTest do
       call = %{
         verb: verb,
         origin: "session:helper",
-        principal: {:session, "helper"},
+        principal: nil,
         session_key: nil,
         params: %{}
       }
@@ -162,13 +162,36 @@ defmodule Tightbeam.EphemeralTest do
     call = %{
       verb: "inspect",
       origin: "session:helper",
-      principal: {:session, "helper"},
+      principal: nil,
       session_key: nil,
       params: %{}
     }
 
     assert {:ok, %{ok: true}} = Dispatch.dispatch(db, %{"inspect" => handler}, call)
     assert_received :handler_ran
+  end
+
+  test "helpers with session credentials can write as themselves", %{db: db} do
+    call = %{
+      verb: "work-item-create",
+      origin: "agent:helper",
+      principal: {:session, "helper"},
+      session_key: nil,
+      params: %{title: "Helper finding"}
+    }
+
+    assert {:ok, item} =
+             Dispatch.dispatch(
+               db,
+               %{
+                 "work-item-create" => fn c -> WorkItems.__handle__(db, "work-item-create", c) end
+               },
+               call
+             )
+
+    assert item.createdBySession == "helper"
+    assert item.createdByUser == nil
+    assert item.ownerUserId == "owner"
   end
 
   test "R2.3 read rules still deny without escalating the helper", %{db: db} do
@@ -193,7 +216,7 @@ defmodule Tightbeam.EphemeralTest do
     call = %{
       verb: "inspect",
       origin: "session:helper",
-      principal: {:session, "helper"},
+      principal: nil,
       session_key: nil,
       params: %{}
     }

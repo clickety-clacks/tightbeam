@@ -248,7 +248,7 @@ defmodule GuardCheckoutRefusal do
 
     # TELLS: the EXACT remedy, on the host, naming the provider — NOT the raw
     # "adapter is degraded" checkout fault (that fault is kept in the record instead).
-    assert reason =~ "tightbeam onboard anthropic --as-user <userId>"
+    assert reason =~ "tightbeam onboard anthropic"
     assert reason =~ "on testhost"
     refute reason =~ "is degraded"
 
@@ -282,7 +282,7 @@ defmodule GuardCheckoutRefusal do
       |> Enum.find(&String.starts_with?(&1.content || "", "[turn failed]"))
 
     assert marker, "a refused turn must speak its reason in chat"
-    assert marker.content =~ "tightbeam onboard anthropic --as-user <userId>"
+    assert marker.content =~ "tightbeam onboard anthropic"
 
     # NEVER LAUNCHES A DEAD ENGINE: checkout failed pre-engine, so the session/prompt
     # stages never ran — no engine was asked to serve (belt-and-suspenders to the

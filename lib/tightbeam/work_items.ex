@@ -115,7 +115,7 @@ defmodule Tightbeam.WorkItems do
          :ok <- valid_is_bug(is_bug),
          :ok <- valid_priority(call.params[:priority]),
          :ok <- valid_idempotency_key(key),
-         {:ok, owner} <- resolve_owner(db, call.principal) do
+         {:ok, owner} <- resolve_owner(db, call.principal, call.params) do
       {created_by_user, created_by_session} = creator(call.principal)
       snapshot = Rules.effective_snapshot()
 
@@ -287,7 +287,7 @@ defmodule Tightbeam.WorkItems do
     with :ok <- ensure_body_schema_for_use(db),
          :ok <- handoff_principal_allowed(call.principal),
          {:ok, mode} <- valid_handoff_input(params),
-         {:ok, item_owner} <- handoff_item_owner(db, call.principal, mode) do
+         {:ok, item_owner} <- handoff_item_owner(db, call, mode) do
       {created_by_user, created_by_session} = creator(call.principal)
 
       result =
@@ -362,7 +362,7 @@ defmodule Tightbeam.WorkItems do
     do: Map.put(error, :message, message <> "; choose a persistent delivery-owner session")
 
   defp handoff_item_owner(_db, _principal, :existing), do: {:ok, nil}
-  defp handoff_item_owner(db, principal, :new), do: resolve_owner(db, principal)
+  defp handoff_item_owner(db, call, :new), do: resolve_owner(db, call.principal, call.params)
 
   defp handoff_item_in_txn(
          txn,
@@ -646,6 +646,7 @@ defmodule Tightbeam.WorkItems do
 
   defp body_attribution({:user, user}), do: {user, nil}
   defp body_attribution({:session, session}), do: {nil, session}
+  defp body_attribution({:process, _}), do: {nil, nil}
   defp body_attribution(_), do: {nil, "unknown"}
 
   defp patch_updates(params, title, spec_ref_name, spec_ref_sha256, is_bug) do
@@ -935,6 +936,7 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
+  defp disposition_allowed?(_txn, {:process, _}, _item), do: true
   defp disposition_allowed?(_txn, _principal, _item), do: false
 
   defp admin_user?(txn, user),
@@ -1270,6 +1272,7 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
+  defp trace_allowed?(_db, {:process, _}, _item), do: true
   defp trace_allowed?(_db, _principal, _item), do: false
   defp trace_not_found, do: error("not_found", "work item not found")
 
@@ -1645,43 +1648,47 @@ defmodule Tightbeam.WorkItems do
   defp valid_idempotency_key(_),
     do: error("invalid_idempotency_key", "idempotencyKey must be text")
 
-  defp handoff_principal_allowed({:process, _}),
-    do:
-      error(
-        "process_denied",
-        "automated callers cannot hand off work items; use a user credential or session token"
-      )
-
   defp handoff_principal_allowed(nil),
     do:
       error(
         "principal_required",
-        "work-item-handoff requires a user credential or session token"
+        "work-item-handoff requires an authenticated principal"
       )
 
-  defp handoff_principal_allowed({kind, _}) when kind in [:session, :user], do: :ok
-
-  defp principal_allowed({:process, _}),
-    do: error("process_denied", "process principals cannot use work-item verbs")
+  defp handoff_principal_allowed({kind, _}) when kind in [:session, :user, :process], do: :ok
 
   defp principal_allowed(nil),
     do:
       error(
         "principal_required",
-        "work-item verbs require a user credential or a session token"
+        "work-item verbs require an authenticated principal"
       )
 
-  defp principal_allowed({kind, _}) when kind in [:session, :user], do: :ok
+  defp principal_allowed({kind, _}) when kind in [:session, :user, :process], do: :ok
 
-  defp resolve_owner(_db, {:user, user}), do: {:ok, user}
+  defp resolve_owner(_db, {:user, user}, _params), do: {:ok, user}
 
-  defp resolve_owner(db, {:session, session}) do
+  defp resolve_owner(db, {:session, session}, _params) do
     case Org.get(db, session) do
       %{owner_user_id: owner} when is_binary(owner) -> {:ok, owner}
       _ -> error("unknown_session", "creator session #{session} not found")
     end
   end
 
+  defp resolve_owner(db, {:process, _}, params) do
+    case params[:owner_user_id] do
+      nil ->
+        error("owner_required", "ownerUserId is required")
+
+      owner ->
+        case Tightbeam.Devices.user(db, owner) do
+          nil -> error("unknown_user", "unknown ownerUserId: #{owner}")
+          _ -> {:ok, owner}
+        end
+    end
+  end
+
+  defp creator({:process, _}), do: {nil, nil}
   defp creator({:user, user}), do: {user, nil}
   defp creator({:session, session}), do: {nil, session}
   defp unknown(id), do: error("unknown_work_item", "unknown work item: #{id}")

@@ -26,8 +26,20 @@ defmodule Tightbeam.AssignmentQueue do
         :not_found
 
       [[holder_key, opened_by_user, opened_by_session, owner_user_id, opener_owner_user_id]] ->
+        owner_principal =
+          case principal do
+            {:session, key} ->
+              case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [key]) do
+                [[owner]] -> {:user, owner}
+                _ -> principal
+              end
+
+            _ ->
+              principal
+          end
+
         if authorized?(
-             principal,
+             owner_principal,
              opened_by_user,
              opened_by_session,
              owner_user_id,
@@ -97,6 +109,8 @@ defmodule Tightbeam.AssignmentQueue do
        do:
          user_id == opened_by_user or user_id == owner_user_id or
            user_id == opener_owner_user_id
+
+  defp authorized?({:process, _}, _, _, _, _), do: true
 
   defp authorized?(
          _principal,
