@@ -2487,7 +2487,7 @@ fn parse_with_optional_catalog(
                 || flags.keys().any(|flag| {
                     !matches!(
                         flag.as_str(),
-                        "as" | "session"
+                        "as" | "as-user" | "as-process" | "session"
                             | "sender-id"
                             | "title"
                             | "body"
@@ -4734,6 +4734,8 @@ mod tests {
             "exact_error",
             "--exact-error",
             "provider refused the request",
+            "--observed-state",
+            "provider request failed",
             "--world-status",
             "UNKNOWN",
             "--exact-probe",
@@ -6138,7 +6140,8 @@ mod tests {
                 "work-item-create",
                 "--title",
                 "Priority",
-                "--priority=-0",
+            "--priority",
+            "-0",
             ]))
             .is_err()
         );
