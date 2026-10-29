@@ -1,7 +1,7 @@
 defmodule Tightbeam.Wire.ChangeSocketTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Devices, Gateway, Model, Org, StateResources}
+  alias Tightbeam.{DB, Devices, Gateway, Ledger, Model, Org, Projection, StateResources}
   alias Tightbeam.Firehose.{Hub, Registry}
   alias Tightbeam.Wire.ChangeSocket
 
@@ -307,6 +307,300 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     assert Enum.map(decoded, & &1["subscriptionId"]) |> Enum.sort() == ["all-work", "work"]
     assert Enum.map(decoded, & &1["seq"]) |> Enum.sort() == [1, 2]
+  end
+
+  test "archetype filters follow late-spawned subject sessions and compose with refs", ctx do
+    {:push, {:text, ready}, state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "product-owners",
+          "filters" => %{
+            "classes" => ["message.created", "topline.created"],
+            "archetype" => "product-owner"
+          }
+        },
+        ctx.state
+      )
+
+    assert JSON.decode!(ready)["type"] == "subscription_ready"
+
+    {:push, {:text, scoped_ready}, state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "wrong-session",
+          "filters" => %{
+            "classes" => ["message.created"],
+            "archetype" => "product-owner",
+            "sessionKey" => "agent:late-coder"
+          }
+        },
+        state
+      )
+
+    assert JSON.decode!(scoped_ready)["type"] == "subscription_ready"
+
+    {:push, {:text, unknown_ready}, _state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "unknown-archetype",
+          "filters" => %{
+            "classes" => ["message.created"],
+            "archetype" => "no-such-archetype"
+          }
+        },
+        state
+      )
+
+    assert JSON.decode!(unknown_ready)["type"] == "subscription_ready"
+
+    product_owner =
+      Org.create(ctx.db, %{
+        session_key: "agent:late-product-owner",
+        display_name: "Late product owner",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "product-owner",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    coder =
+      Org.create(ctx.db, %{
+        session_key: "agent:late-coder",
+        display_name: "Late coder",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    for session <- [product_owner, coder] do
+      Hub.publish(ctx.hub, %{
+        "class" => "message.created",
+        "refs" => %{"sessionKey" => session.session_key},
+        "payload" => %{"sessionKey" => session.session_key}
+      })
+    end
+
+    Hub.publish(ctx.hub, %{"class" => "topline.created", "refs" => %{}, "payload" => %{}})
+    _barrier = Hub.sequence(ctx.hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "message.created",
+                      "subscriptionId" => "product-owners",
+                      "refs" => %{"sessionKey" => "agent:late-product-owner"}
+                    }}
+
+    :ok = Hub.delivered(ctx.hub, self())
+    refute_receive {:firehose_notice, _}
+  end
+
+  test "archetype filters accept null and reject non-string values", ctx do
+    {:push, {:text, error}, _state} =
+      inbound(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "invalid-archetype",
+          "filters" => %{"archetype" => 7}
+        },
+        ctx.state
+      )
+
+    assert JSON.decode!(error) == %{
+             "type" => "error",
+             "code" => "invalid_request",
+             "message" => "invalid filters"
+           }
+
+    {:push, {:text, ready}, state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "no-archetype",
+          "filters" => %{"archetype" => nil}
+        },
+        ctx.state
+      )
+
+    assert JSON.decode!(ready) == %{
+             "type" => "subscription_ready",
+             "subscriptionId" => "no-archetype"
+           }
+
+    assert state.subscriptions["no-archetype"] == %{"archetype" => nil}
+
+    Hub.publish(ctx.hub, %{"class" => "topline.created", "refs" => %{}, "payload" => %{}})
+    _barrier = Hub.sequence(ctx.hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "topline.created",
+                      "subscriptionId" => "no-archetype"
+                    }}
+
+    :ok = Hub.delivered(ctx.hub, self())
+  end
+
+  test "retired and repointed sessions match their committed archetype", ctx do
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:archetype-repoint",
+        display_name: "Archetype repoint",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "product-owner",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    {:push, {:text, po_ready}, state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "product-owner",
+          "filters" => %{"classes" => ["session."], "archetype" => "product-owner"}
+        },
+        ctx.state
+      )
+
+    assert JSON.decode!(po_ready)["type"] == "subscription_ready"
+
+    {:push, {:text, reviewer_ready}, state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "reviewer-code",
+          "filters" => %{"classes" => ["session."], "archetype" => "reviewer-code"}
+        },
+        state
+      )
+
+    assert JSON.decode!(reviewer_ready)["type"] == "subscription_ready"
+
+    assert %{state: "retired"} =
+             retired = Org.retire(ctx.db, session.session_key, "user:flynn", 1_000)
+
+    :ok =
+      Hub.committed(ctx.hub, "session.retired", retired, %{"sessionKey" => session.session_key})
+
+    _barrier = Hub.sequence(ctx.hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "session.retired",
+                      "subscriptionId" => "product-owner",
+                      "refs" => %{"sessionKey" => "agent:archetype-repoint"}
+                    }}
+
+    :ok = Hub.delivered(ctx.hub, self())
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, repointed} =
+             Org.repoint_retired_archetype(ctx.db, session.session_key, "reviewer-code")
+
+    :ok =
+      Hub.committed(ctx.hub, "session.updated", repointed, %{"sessionKey" => session.session_key})
+
+    _barrier = Hub.sequence(ctx.hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "session.updated",
+                      "subscriptionId" => "reviewer-code",
+                      "refs" => %{"sessionKey" => "agent:archetype-repoint"}
+                    }}
+
+    :ok = Hub.delivered(ctx.hub, self())
+    refute_receive {:firehose_notice, _}
+  end
+
+  test "invisible notices do not trigger an archetype lookup", ctx do
+    hub_pid = Process.whereis(ctx.hub)
+
+    :ok =
+      Hub.register(ctx.hub, self(), %{
+        mode: :filtered,
+        db: nil,
+        user_id: "flynn",
+        principal_kind: :user,
+        principal_id: "flynn",
+        is_admin: false
+      })
+
+    :ok =
+      Hub.subscribe(ctx.hub, self(), "invisible", %{
+        "classes" => ["critical_lease.updated"],
+        "archetype" => "product-owner"
+      })
+
+    Hub.publish(ctx.hub, %{
+      "class" => "critical_lease.updated",
+      "refs" => %{"sessionKey" => "must-not-be-looked-up"},
+      "payload" => %{"sessionKey" => "must-not-be-looked-up"}
+    })
+
+    _barrier = Hub.sequence(ctx.hub, self())
+
+    assert Process.alive?(hub_pid)
+    assert Process.whereis(ctx.hub) == hub_pid
+    refute_receive {:firehose_notice, _}
+  end
+
+  test "archetype-only subscriptions do not add active-turn snapshots", ctx do
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:active-product-owner",
+        display_name: "Active product owner",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "product-owner",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    {:appended, message} =
+      Projection.append(ctx.db, %{
+        session_key: session.session_key,
+        role: "user",
+        content: "queued before subscribe"
+      })
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: session.session_key,
+               message_id: message.id,
+               origin: "user:flynn",
+               prompt: message.content
+             })
+
+    {:push, {:text, ready}, _state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "archetype-only",
+          "filters" => %{
+            "classes" => ["turn."],
+            "archetype" => "product-owner"
+          }
+        },
+        ctx.state
+      )
+
+    assert JSON.decode!(ready)["type"] == "subscription_ready"
+    refute_receive {:firehose_notice, _}
   end
 
   test "the 101st subscription is a typed invalid_request", ctx do

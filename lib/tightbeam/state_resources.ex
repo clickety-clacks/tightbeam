@@ -766,16 +766,18 @@ defmodule Tightbeam.StateResources do
   end
 
   @doc "Return a bounded page of sessions visible to one REST principal."
-  def query_sessions_page(db, principal, boundary, limit) do
+  def query_sessions_page(db, principal, boundary, limit, archetypes \\ nil) do
     trace_core_detail(principal, {:au4_visibility, "sessions"})
 
-    {where, params} =
+    {visibility_where, visibility_params} =
       cond do
         principal.kind == "observer" -> {nil, []}
         principal.is_admin -> {nil, []}
         principal.kind == "session" -> {nil, []}
         true -> {"sessions.ownerUserId = ?", [principal.id]}
       end
+
+    {where, params} = sessions_page_filter(visibility_where, visibility_params, archetypes)
 
     case DB.transaction(db, fn txn ->
            query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
@@ -796,6 +798,23 @@ defmodule Tightbeam.StateResources do
       {:error, error} -> raise error
     end
   end
+
+  defp sessions_page_filter(where, params, archetypes)
+       when is_list(archetypes) and archetypes != [] do
+    archetype_where =
+      archetypes
+      |> Enum.map_join(" OR ", fn _ -> "sessions.archetype = ?" end)
+      |> then(&("(" <> &1 <> ")"))
+
+    where =
+      if is_binary(where),
+        do: "(" <> where <> ") AND " <> archetype_where,
+        else: archetype_where
+
+    {where, params ++ archetypes}
+  end
+
+  defp sessions_page_filter(where, params, _archetypes), do: {where, params}
 
   def query_session(db, id) when is_binary(id) do
     case query(db, @session_select <> " WHERE sessions.sessionKey = ?1", [id]) do

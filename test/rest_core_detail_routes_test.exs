@@ -452,6 +452,103 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert Enum.any?(admin_items, &(&1["sessionKey"] == outsider_session.session_key))
   end
 
+  test "session collection filters exact archetype sets and binds them to cursors", ctx do
+    product_owner =
+      Org.create(ctx.db, %{
+        session_key: "agent:rest-product-owner",
+        display_name: "REST product owner",
+        owner_user_id: ctx.admin_device.user_id,
+        origin: "user:#{ctx.admin_device.user_id}",
+        archetype: "product-owner",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    coder =
+      Org.create(ctx.db, %{
+        session_key: "agent:rest-coder",
+        display_name: "REST coder",
+        owner_user_id: ctx.admin_device.user_id,
+        origin: "user:#{ctx.admin_device.user_id}",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    product_owner_page =
+      get(
+        ctx,
+        "/api/sessions?archetype=product-owner&limit=1",
+        ctx.admin_device.token
+      )
+
+    assert product_owner_page.status == 200
+    product_owner_body = JSON.decode!(product_owner_page.resp_body)
+
+    assert Enum.map(product_owner_body["items"], & &1["sessionKey"]) == [
+             product_owner.session_key
+           ]
+
+    assert Enum.all?(product_owner_body["items"], &(&1["archetype"] == "product-owner"))
+
+    both_page =
+      get(
+        ctx,
+        "/api/sessions?archetype=product-owner&archetype=coder&limit=1",
+        ctx.admin_device.token
+      )
+
+    assert both_page.status == 200
+    both_body = JSON.decode!(both_page.resp_body)
+
+    assert Enum.all?(both_body["items"], &(&1["archetype"] in ["product-owner", "coder"]))
+
+    both_sessions =
+      get(
+        ctx,
+        "/api/sessions?archetype=product-owner&archetype=coder",
+        ctx.admin_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body)["items"])
+
+    both_session_keys = Enum.map(both_sessions, & &1["sessionKey"])
+    assert product_owner.session_key in both_session_keys
+    assert coder.session_key in both_session_keys
+
+    reversed_filter_cursor =
+      get(
+        ctx,
+        "/api/sessions?archetype=coder&archetype=product-owner&limit=1&after=" <>
+          URI.encode_www_form(both_body["page"]["newestCursor"]),
+        ctx.admin_device.token
+      )
+
+    assert reversed_filter_cursor.status == 200
+
+    unmatched =
+      get(ctx, "/api/sessions?archetype=no-such-archetype", ctx.admin_device.token)
+
+    assert unmatched.status == 200
+    assert JSON.decode!(unmatched.resp_body)["items"] == []
+
+    mismatched_cursor =
+      get(
+        ctx,
+        "/api/sessions?archetype=coder&limit=1&after=" <>
+          URI.encode_www_form(product_owner_body["page"]["newestCursor"]),
+        ctx.admin_device.token
+      )
+
+    assert mismatched_cursor.status == 400
+    assert JSON.decode!(mismatched_cursor.resp_body)["error"]["code"] == "invalid_cursor"
+
+    assert get(ctx, "/api/sessions?state=active", ctx.admin_device.token).status == 400
+  end
+
   test "REST and Firehose fill sender for direct and historical human messages", ctx do
     device = outsider_device(ctx)
     session = ensure_main_session(ctx.db, "outsider")

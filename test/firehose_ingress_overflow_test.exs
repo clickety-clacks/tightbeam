@@ -174,6 +174,78 @@ defmodule Tightbeam.FirehoseIngressOverflowTest do
     refute_received :firehose_overflow
   end
 
+  test "shared ingress overflow conservatively closes archetype subscribers" do
+    db = :"firehose_archetype_overflow_db_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    hub = start_supervised!({Hub, name: nil})
+    parent = self()
+
+    subscriber =
+      spawn(fn ->
+        :ok =
+          Hub.register(hub, self(), %{
+            mode: :filtered,
+            db: db,
+            user_id: nil,
+            device_id: nil,
+            principal_kind: :observer,
+            principal_id: "observer",
+            is_admin: false
+          })
+
+        :ok =
+          Hub.subscribe(hub, self(), "product-owners", %{
+            "classes" => ["message.created"],
+            "archetype" => "product-owner"
+          })
+
+        send(parent, {:archetype_subscriber_ready, self()})
+
+        receive do
+          :firehose_overflow ->
+            send(parent, {:archetype_subscriber_overflowed, self()})
+
+            receive do
+              :stop -> :ok
+            end
+
+          :stop ->
+            :ok
+        end
+      end)
+
+    assert_receive {:archetype_subscriber_ready, ^subscriber}, 5_000
+
+    on_exit(fn ->
+      if Process.alive?(subscriber), do: send(subscriber, :stop)
+    end)
+
+    :ok = :sys.suspend(hub)
+
+    try do
+      Enum.each(1..1_000, fn index ->
+        Hub.publish(hub, %{
+          "class" => "unrelated.event",
+          "refs" => %{"sessionKey" => "noise-#{index}"},
+          "payload" => %{}
+        })
+      end)
+
+      Hub.publish(hub, %{
+        "class" => "message.created",
+        "refs" => %{"sessionKey" => "late-product-owner"},
+        "payload" => %{}
+      })
+    after
+      :ok = :sys.resume(hub)
+    end
+
+    _barrier = Hub.sequence(hub, self())
+    assert_receive {:archetype_subscriber_overflowed, ^subscriber}, 5_000
+  end
+
   test "a dropped device revocation overflows its device socket" do
     db = :"firehose_device_revocation_overflow_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})

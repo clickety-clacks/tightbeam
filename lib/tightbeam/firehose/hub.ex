@@ -3,7 +3,7 @@ defmodule Tightbeam.Firehose.Hub do
   use GenServer
   require Logger
   alias Tightbeam.Firehose.Publisher
-  alias Tightbeam.StateVisibility
+  alias Tightbeam.{StateResources, StateVisibility}
 
   defmodule Socket do
     @moduledoc false
@@ -200,14 +200,17 @@ defmodule Tightbeam.Firehose.Hub do
               |> :queue.to_list()
               |> Enum.split_with(fn {subscription_id, _notice} -> subscription_id == id end)
 
-            {snapshot_frames, seq} = matching_notice_frames(notices, id, filters, socket.seq)
+            {snapshot_frames, seq} =
+              matching_notice_frames(notices, id, filters, socket.seq, socket.db, false)
 
             {pending_frames, seq} =
               matching_notice_frames(
                 Enum.map(pending_notices, fn {_subscription_id, notice} -> notice end),
                 id,
                 filters,
-                seq
+                seq,
+                socket.db,
+                true
               )
 
             ready = %{"type" => "subscription_ready", "subscriptionId" => id}
@@ -408,17 +411,40 @@ defmodule Tightbeam.Firehose.Hub do
       end)
 
   defp deliver_visible_notice(socket, pid, notice, limit, authorized? \\ false) do
-    pending_subscriptions =
+    matching_subscriptions =
+      Enum.filter(socket.subscriptions, fn {_id, filters} -> matches?(notice, filters) end)
+
+    pending_candidates =
       socket.pending_subscriptions
       |> Enum.filter(fn {_id, filters} -> matches?(notice, filters) end)
 
-    frames =
-      if socket.mode == :all,
-        do: [notice],
-        else: matching_frames(notice, socket.subscriptions, socket.seq)
+    matching_subscription? =
+      socket.mode == :all or matching_subscriptions != []
 
-    if (frames != [] or pending_subscriptions != []) and not secret_payload?(notice["payload"]) and
+    if (matching_subscription? or pending_candidates != []) and
+         not secret_payload?(notice["payload"]) and
          (authorized? or visible?(socket, notice)) do
+      # Existing class/ref filters remain the pre-visibility candidate check.
+      # Only the new subject-session lookup is deferred until visibility allows
+      # the notice.
+      pending_subscriptions =
+        Enum.filter(pending_candidates, fn {_id, filters} ->
+          archetype_matches?(socket.db, notice, filters)
+        end)
+
+      frames =
+        if socket.mode == :all,
+          do: [notice],
+          else:
+            matching_frames(
+              notice,
+              matching_subscriptions,
+              socket.seq,
+              socket.db,
+              false,
+              true
+            )
+
       seq =
         if frames == [] or socket.mode == :all,
           do: socket.seq,
@@ -503,10 +529,17 @@ defmodule Tightbeam.Firehose.Hub do
   defp send_frame(pid, frame),
     do: send(pid, {:firehose_notice, Publisher.wire_notice(frame)})
 
-  defp matching_notice_frames(notices, id, filters, seq) do
+  defp matching_notice_frames(notices, id, filters, seq, db, archetype_matched?) do
     {frames, seq} =
       Enum.reduce(notices, {[], seq}, fn notice, {frames, seq} ->
-        case matching_frames(notice, %{id => filters}, seq) do
+        case matching_frames(
+               notice,
+               %{id => filters},
+               seq,
+               db,
+               true,
+               not archetype_matched?
+             ) do
           [] ->
             {frames, seq}
 
@@ -518,11 +551,23 @@ defmodule Tightbeam.Firehose.Hub do
     {Enum.reverse(frames), seq}
   end
 
-  defp matching_frames(notice, subscriptions, seq) do
+  defp matching_frames(
+         notice,
+         subscriptions,
+         seq,
+         db,
+         check_base_filters?,
+         check_archetype_filter?
+       ) do
     {frames, _seq} =
       Enum.sort(subscriptions)
       |> Enum.reduce({[], seq}, fn {id, filters}, {frames, n} ->
-        if matches?(notice, filters),
+        base_match? = not check_base_filters? or matches?(notice, filters)
+
+        archetype_match? =
+          not check_archetype_filter? or archetype_matches?(db, notice, filters)
+
+        if base_match? and archetype_match?,
           do:
             {[
                Map.merge(notice, %{
@@ -554,6 +599,21 @@ defmodule Tightbeam.Firehose.Hub do
         &(is_nil(filters[&1]) or filters[&1] == refs[&1])
       )
   end
+
+  defp archetype_matches?(db, notice, %{"archetype" => archetype}) when is_binary(archetype) do
+    case get_in(notice, ["refs", "sessionKey"]) do
+      session_key when is_binary(session_key) ->
+        case StateResources.query_session(db, session_key) do
+          %{archetype: subject_archetype} -> subject_archetype == archetype
+          _ -> false
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  defp archetype_matches?(_db, _notice, _filters), do: true
 
   defp revoked?(_notice, %{principal_kind: :observer}), do: false
 
