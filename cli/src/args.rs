@@ -4471,8 +4471,7 @@ mod tests {
             })
         );
 
-        assert!(
-            matches!(parse(strings(&[
+        assert!(matches!(parse(strings(&[
                 "harklight-send",
                 "--session",
                 "new",
@@ -4482,8 +4481,7 @@ mod tests {
                 "Question",
                 "--as-user",
                 "owner",
-            ])), Ok(Command::HarklightSend { identity: Identity::User(user), .. }) if user == "owner")
-        );
+            ])), Ok(Command::HarklightSend { identity: Identity::User(user), .. }) if user == "owner"));
         assert!(matches!(
             parse(strings(&[
                 "harklight-send",
@@ -4529,8 +4527,10 @@ mod tests {
             ]))
             .unwrap();
 
-            assert!(matches!(command, Command::HarklightRevise { base_revision, .. }
-                if base_revision == revision.parse::<i64>().unwrap()));
+            assert!(
+                matches!(command, Command::HarklightRevise { base_revision, .. }
+                if base_revision == revision.parse::<i64>().unwrap())
+            );
         }
     }
 
@@ -4707,8 +4707,10 @@ mod tests {
         ]))
         .unwrap();
 
-        assert!(matches!(command, Command::HarnessHealthObserveOther { evidence_mode, world_status, .. }
-            if evidence_mode == "probe_digest" && world_status == "UNKNOWN"));
+        assert!(
+            matches!(command, Command::HarnessHealthObserveOther { evidence_mode, world_status, .. }
+            if evidence_mode == "probe_digest" && world_status == "UNKNOWN")
+        );
     }
 
     #[test]
@@ -4750,8 +4752,10 @@ mod tests {
         ]))
         .unwrap();
 
-        assert!(matches!(command, Command::HarnessHealthObserveOther { observed_at: Some(value), .. }
-            if value == observed_at.to_string()));
+        assert!(
+            matches!(command, Command::HarnessHealthObserveOther { observed_at: Some(value), .. }
+            if value == observed_at.to_string())
+        );
     }
 
     #[test]
@@ -6099,13 +6103,7 @@ mod tests {
             serde_json::from_str(&negative_priority_body).unwrap();
         assert_eq!(negative_priority_request["params"]["priority"], -1);
 
-        let default_priority = parse(strings(&[
-            "config",
-            "set",
-            "default-priority",
-            "9",
-        ]))
-        .unwrap();
+        let default_priority = parse(strings(&["config", "set", "default-priority", "9"])).unwrap();
         let config_body = crate::dispatch::build_request(&default_priority)
             .unwrap()
             .body_json;
@@ -6125,21 +6123,25 @@ mod tests {
         let mementos_request: serde_json::Value = serde_json::from_str(&mementos_body).unwrap();
         assert_eq!(mementos_request["params"]["limit"], 0);
 
-        assert!(parse(strings(&[
-            "work-item-create",
-            "--title",
-            "Priority",
-            "--priority",
-            "not-a-number",
-        ]))
-        .is_err());
-        assert!(parse(strings(&[
-            "work-item-create",
-            "--title",
-            "Priority",
-            "--priority=-0",
-        ]))
-        .is_err());
+        assert!(
+            parse(strings(&[
+                "work-item-create",
+                "--title",
+                "Priority",
+                "--priority",
+                "not-a-number",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(strings(&[
+                "work-item-create",
+                "--title",
+                "Priority",
+                "--priority=-0",
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
