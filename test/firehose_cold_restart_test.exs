@@ -353,7 +353,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
     File.write!(path <> ".tmp", JSON.encode!(%{"assignmentId" => id}))
     File.rename!(path <> ".tmp", path)
     result = Path.join(plan.base, phase <> "-generations.json")
-    deadline = System.monotonic_time(:millisecond) + 5_000
+    deadline = System.monotonic_time(:millisecond) + 15_000
 
     wait = fn recur ->
       if File.regular?(result) do

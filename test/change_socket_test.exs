@@ -238,6 +238,110 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     ChangeSocket.terminate(:normal, heartbeat_state)
   end
 
+  test "credentialless observer remains connected on session retirement without owner", ctx do
+    {:push, {:text, ready}, observer_state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "protocolVersion" => 2,
+          "subscriptionId" => "observer-retirement",
+          "filters" => %{"classes" => ["session.retired"]}
+        },
+        ctx.state
+      )
+
+    assert JSON.decode!(ready)["subscriptionId"] == "observer-retirement"
+
+    Hub.publish(ctx.hub, %{
+      "class" => "session.retired",
+      "refs" => %{"sessionKey" => "agent:retired"},
+      "payload" => %{"sessionKey" => "agent:retired"}
+    })
+
+    assert_receive {:firehose_notice, notice}
+    assert notice["class"] == "session.retired"
+
+    assert {:push, {:text, retired}, live_state} =
+             ChangeSocket.handle_info({:firehose_notice, notice}, observer_state)
+
+    assert JSON.decode!(retired)["class"] == "session.retired"
+    assert live_state.phase == :live
+    assert live_state.principal_kind == :observer
+    refute_receive :firehose_revoked
+    ChangeSocket.terminate(:normal, live_state)
+  end
+
+  test "a non-admin session receives another session's active-turn snapshot", ctx do
+    Devices.add_user(ctx.db, "other", false)
+
+    subscriber =
+      Org.create(ctx.db, %{
+        session_key: "agent:other-subscriber",
+        display_name: "Other subscriber",
+        owner_user_id: "other",
+        origin: "user:other",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    target =
+      Org.create(ctx.db, %{
+        session_key: "agent:flynn-target",
+        display_name: "Flynn target",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO turns " <>
+                 "(sessionKey, messageId, origin, prompt, status, createdAt, startedAt) " <>
+                 "VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6)",
+               [target.session_key, "target-message", "user:flynn", "active prompt", 1, 1]
+             )
+
+    {:push, {:text, auth}, state} =
+      inbound(%{"type" => "auth", "token" => subscriber.cli_token}, ctx.state)
+
+    assert JSON.decode!(auth)["success"]
+    assert state.principal_kind == :session
+    assert state.is_admin == false
+
+    {:push, {:text, ready}, state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "protocolVersion" => 2,
+          "subscriptionId" => "other-session-turn",
+          "filters" => %{
+            "sessionKey" => target.session_key,
+            "classes" => ["turn."]
+          }
+        },
+        state
+      )
+
+    assert JSON.decode!(ready)["subscriptionId"] == "other-session-turn"
+    assert_receive {:firehose_notice, notice}
+    assert notice["class"] == "turn.started"
+    assert notice["refs"]["sessionKey"] == target.session_key
+
+    assert {:push, {:text, turn_event}, state} =
+             ChangeSocket.handle_info({:firehose_notice, notice}, state)
+
+    assert JSON.decode!(turn_event)["class"] == "turn.started"
+    ChangeSocket.terminate(:normal, state)
+  end
+
   test "an unusable first auth frame continues as an observer", ctx do
     for auth_frame <- [
           %{"type" => "auth"},

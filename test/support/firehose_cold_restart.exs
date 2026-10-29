@@ -93,6 +93,7 @@ port =
 Application.put_env(:tightbeam, :port, port)
 Application.put_env(:tightbeam, :default_harness, :fixture)
 Application.put_env(:tightbeam, :default_model, Model.new("fixture-model"))
+Application.put_env(:tightbeam, :supervision_interval_ms, 1_000)
 Application.put_env(:tightbeam, :autostart, true)
 Application.put_env(:tightbeam, :drain_timeout_ms, 1_000)
 

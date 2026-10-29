@@ -207,11 +207,23 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
           type: "subscribe",
           protocolVersion: 2,
           subscriptionId: "observer",
-          filters: %{}
+          filters: %{classes: ["session."]}
         })
 
-        {reply, socket} = recv_frame(socket)
-        assert reply == %{"type" => "subscription_ready", "subscriptionId" => "observer"}
+        {ready, socket} = recv_frame(socket)
+        assert ready == %{"type" => "subscription_ready", "subscriptionId" => "observer"}
+
+        Hub.publish(ctx.hub, %{
+          "class" => "session.updated",
+          "refs" => %{"sessionKey" => "foreign"},
+          "payload" => %{"sessionKey" => "foreign", "rowVersion" => 1}
+        })
+
+        {change, socket} = recv_frame(socket)
+        assert change["type"] == "change"
+        assert change["subscriptionId"] == "observer"
+        assert change["class"] == "session.updated"
+        assert change["refs"]["sessionKey"] == "foreign"
       else
         {reply, socket} = recv_frame(socket)
         org_wide_identity? = Map.has_key?(overrides, :sessionKey) and is_nil(overrides.sessionKey)
@@ -236,6 +248,53 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
 
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM devices")
+  end
+
+  test "organization bearer without asUser uses the default org read principal", ctx do
+    changes = connect(ctx, "/ws/changes?protocolVersion=2")
+    send_frame(changes, %{type: "auth", token: "operator-fixture"})
+    {auth_result, changes} = recv_frame(changes)
+
+    assert %{
+             "type" => "auth_result",
+             "success" => true,
+             "userId" => "org",
+             "isAdmin" => true
+           } = auth_result
+
+    send_frame(changes, %{
+      type: "subscribe",
+      protocolVersion: 2,
+      subscriptionId: "all",
+      filters: %{classes: ["session."]}
+    })
+
+    {ready, changes} = recv_frame(changes)
+    assert ready == %{"type" => "subscription_ready", "subscriptionId" => "all"}
+
+    Hub.publish(ctx.hub, %{
+      "class" => "session.updated",
+      "refs" => %{"sessionKey" => "foreign"},
+      "payload" => %{"sessionKey" => "foreign", "rowVersion" => 1}
+    })
+
+    {change, _changes} = recv_frame(changes)
+    assert change["type"] == "change"
+    assert change["refs"]["sessionKey"] == "foreign"
+  end
+
+  test "organization bearer without asUser selects the default admin user", ctx do
+    Devices.set_user_admin(ctx.db, "reader", true)
+    changes = connect(ctx, "/ws/changes?protocolVersion=2")
+    send_frame(changes, %{type: "auth", token: "operator-fixture"})
+    {auth_result, _changes} = recv_frame(changes)
+
+    assert %{
+             "type" => "auth_result",
+             "success" => true,
+             "userId" => "reader",
+             "isAdmin" => true
+           } = auth_result
   end
 
   test "organization bearer receives matching events for each subscribed filter", ctx do

@@ -1019,7 +1019,7 @@ defmodule Tightbeam.Acp.Adapter do
           {:ok, verified_result} ->
             case confirmed_public_model(verified_result, state.preset, model) do
               %Model{} = public ->
-                {:ok, %{model | context: public.context || model.context}}
+                {:ok, %{model | context: public.context}}
 
               nil ->
                 verified_model_mismatch(
@@ -1142,7 +1142,6 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp verify_candidate_model(true, %Model{} = requested, %Model{} = actual)
        when requested.family != actual.family or
-              requested.context != actual.context or
               (not is_nil(requested.effort) and requested.effort != actual.effort),
        do: {:error, {:runtime_config_mismatch, actual}}
 
@@ -1267,8 +1266,8 @@ defmodule Tightbeam.Acp.Adapter do
          {:ok, verified_result} <-
            apply_verified_effort(state, sid, model.effort, model_result, request_timeout) do
       case confirmed_public_model(verified_result, state.preset, model) do
-        %Model{} ->
-          {:ok, model}
+        %Model{} = public ->
+          {:ok, %{model | context: public.context}}
 
         nil ->
           verified_model_mismatch(verified_result, state.preset, "model", Model.to_ref(model))
@@ -2179,13 +2178,13 @@ defmodule Tightbeam.Acp.Adapter do
         {:ok, applied_model} ->
           # Some clients return an opaque wire alias after accepting a public
           # model ref. Trust the selected offered option only when it names the
-          # requested model and context; never infer identity from the alias.
+          # requested model family; never infer identity from the alias.
           case confirmed_public_model(effort_result, state.preset, model_ref) do
             %Model{} = public_model ->
               {:ok,
                %{
                  model_ref
-                 | context: public_model.context || model_ref.context,
+                 | context: public_model.context,
                    effort: applied_model.effort
                }}
 
@@ -2721,8 +2720,7 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp public_option_confirms_model?(_option, %Model{} = public, %Model{} = requested) do
-    public.family == requested.family and
-      public.context == requested.context
+    public.family == requested.family
   end
 
   defp remember_reported_config_model(state, sid, options) do

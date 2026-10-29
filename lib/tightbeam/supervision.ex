@@ -16,7 +16,8 @@ defmodule Tightbeam.Supervision do
   @climb_consumer "assignment_inactivity_climb"
   @deadline_ref "assignment-inactivity-deadline-v1:"
   @episode_ref "assignment-inactivity-episode-v1:"
-  @default_interval_ms 1_000
+  @default_interval_ms 1_800_000
+  @max_holder_reminders 2
 
   # Retained only for the exact predecessor-shape migration in Schema. The
   # current runtime keeps no supervision production tables.
@@ -71,6 +72,8 @@ defmodule Tightbeam.Supervision do
     end
   end
 
+  def assignment_opened_in_txn(%Txn{}, _assignment_id, _opened_at, :off), do: :ok
+
   def assignment_opened_in_txn(_txn, assignment_id, _opened_at, _interval_ms) do
     Logger.warning("invalid assignment inactivity deadline input for #{inspect(assignment_id)}")
     :ok
@@ -87,8 +90,18 @@ defmodule Tightbeam.Supervision do
   def assignment_closed_in_txn(_txn, _assignment_id), do: :ok
 
   @doc false
-  def activity_in_txn(%Txn{} = txn, assignment_id, actor_session_key, at)
+  def activity_in_txn(%Txn{} = txn, assignment_id, actor_session_key, at, interval_ms \\ nil)
       when is_binary(assignment_id) and is_binary(actor_session_key) and is_integer(at) do
+    if reminders_disabled?(interval_ms) do
+      :disabled
+    else
+      activity_start_result(txn, assignment_id, actor_session_key, at, interval_ms)
+    end
+  end
+
+  def activity_in_txn(_txn, _assignment_id, _actor_session_key, _at, _interval_ms), do: :ignored
+
+  defp activity_start_result(txn, assignment_id, actor_session_key, at, configured_interval) do
     case Txn.q(
            txn,
            "SELECT holderKey,workItemId,openedAt,state FROM assignments WHERE id=?1",
@@ -98,8 +111,14 @@ defmodule Tightbeam.Supervision do
       when is_integer(opened_at) ->
         activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
 
-        {interval_ms, last_activity} =
+        {stored_interval_ms, last_activity} =
           latest_deadline_state_in_txn(txn, assignment_id, activity_start)
+
+        interval_ms =
+          case configured_interval do
+            value when is_integer(value) and value > 0 -> value
+            _ -> stored_interval_ms
+          end
 
         effective_at = max(activity_start, max(last_activity, at))
 
@@ -129,11 +148,17 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  def activity_in_txn(_txn, _assignment_id, _actor_session_key, _at), do: :ignored
-
   @doc false
   def dated_continuation_canceled_in_txn(%Txn{} = txn, assignment_id, at)
       when is_binary(assignment_id) and is_integer(at) do
+    if reminders_disabled?(nil) do
+      :ok
+    else
+      dated_continuation_canceled_result(txn, assignment_id, at)
+    end
+  end
+
+  defp dated_continuation_canceled_result(txn, assignment_id, at) do
     case Txn.q(
            txn,
            "SELECT holderKey,workItemId FROM assignments WHERE id=?1 AND state='open'",
@@ -224,7 +249,8 @@ defmodule Tightbeam.Supervision do
 
   @doc false
   def migrate_open_assignments(db, default_interval_ms \\ @default_interval_ms)
-      when is_integer(default_interval_ms) and default_interval_ms > 0 do
+      when default_interval_ms == :off or
+             (is_integer(default_interval_ms) and default_interval_ms > 0) do
     case DB.migration_transaction(db, :assignment_inactivity_deadlines_v1, [], [], fn txn ->
            rows =
              Txn.q(
@@ -237,30 +263,106 @@ defmodule Tightbeam.Supervision do
                [assignment_id, holder, work_item_id, opened_at]
                when is_binary(assignment_id) and is_binary(holder) and is_integer(opened_at) ->
                  isolated_side_task(txn, assignment_id, "migration", fn ->
-                   unless pending_deadline_in_txn?(txn, assignment_id) do
-                     interval_ms =
-                       interval_from_entitlement_in_txn(txn, assignment_id, default_interval_ms)
+                   configured_off? = default_interval_ms == :off
+
+                   if configured_off? do
+                     interval_ms = @default_interval_ms
 
                      activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
 
                      last_activity =
                        current_activity_time_in_txn(txn, assignment_id, holder, activity_start)
 
-                     deadline =
+                     disabled_deadline =
                        schedule_deadline_in_txn(
                          txn,
                          assignment_id,
                          holder,
                          work_item_id,
-                         max(opened_at, last_activity),
-                         interval_ms
+                         last_activity,
+                         interval_ms,
+                         now() + interval_ms
                        )
 
-                     cancel_assignment_sources_in_txn(
+                     cancel_boot_sources_in_txn(
                        txn,
                        assignment_id,
-                       {:replacement, deadline.wake_id}
+                       holder,
+                       disabled_deadline.wake_id,
+                       true
                      )
+                   else
+                     interval_ms = default_interval_ms
+                     activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
+
+                     last_activity =
+                       current_activity_time_in_txn(txn, assignment_id, holder, activity_start)
+
+                     quiet_start =
+                       quiet_start_in_txn(
+                         txn,
+                         assignment_id,
+                         holder,
+                         max(opened_at, last_activity)
+                       )
+
+                     reminder_count =
+                       reminder_count_since_activity_in_txn(
+                         txn,
+                         assignment_id,
+                         holder,
+                         last_activity
+                       )
+
+                     case restore_boot_climb_in_txn(
+                            txn,
+                            assignment_id,
+                            holder,
+                            work_item_id,
+                            last_activity,
+                            reminder_count,
+                            interval_ms
+                          ) do
+                       {:active, climb, visited} ->
+                         cancel_boot_sources_in_txn(
+                           txn,
+                           assignment_id,
+                           holder,
+                           climb.wake_id,
+                           false,
+                           {climb.obligation_ref, visited}
+                         )
+
+                       :none ->
+                         suppression? =
+                           reminder_suppressed_in_txn?(txn, assignment_id, holder, now())
+
+                         due_at =
+                           cond do
+                             reminder_count >= @max_holder_reminders -> now()
+                             suppression? -> now() + interval_ms
+                             true -> quiet_start + interval_ms
+                           end
+
+                         deadline =
+                           schedule_deadline_in_txn(
+                             txn,
+                             assignment_id,
+                             holder,
+                             work_item_id,
+                             quiet_start,
+                             interval_ms,
+                             due_at
+                           )
+
+                         cancel_boot_sources_in_txn(
+                           txn,
+                           assignment_id,
+                           holder,
+                           deadline.wake_id,
+                           false
+                         )
+                     end
                    end
 
                    :ok
@@ -458,46 +560,85 @@ defmodule Tightbeam.Supervision do
               latest_activity =
                 current_activity_time_in_txn(txn, assignment_id, holder, activity_start)
 
+              quiet_start = quiet_start_in_txn(txn, assignment_id, holder, latest_activity)
               covered_until = Wakes.dated_continuation_due_in_txn(txn, assignment_id, now)
 
-              cond do
-                latest_activity > activity_at ->
-                  replacement =
-                    schedule_deadline_in_txn(
-                      txn,
-                      assignment_id,
-                      holder,
-                      work_item_id,
-                      latest_activity,
-                      interval_ms
-                    )
+              reminder_count =
+                reminder_count_since_activity_in_txn(
+                  txn,
+                  assignment_id,
+                  holder,
+                  latest_activity
+                )
 
+              cond do
+                reminders_disabled?(nil) ->
                   fire_internal_in_txn(txn, wake.wake_id, @deadline_consumer, now)
 
-                  cancel_assignment_sources_in_txn(
+                reminder_suppressed_in_txn?(txn, assignment_id, holder, now) ->
+                  reschedule_deadline_after_interval_in_txn(
                     txn,
+                    wake,
                     assignment_id,
-                    {:replacement, replacement.wake_id}
+                    holder,
+                    work_item_id,
+                    latest_activity,
+                    interval_ms,
+                    now
+                  )
+
+                latest_activity > activity_at ->
+                  reschedule_deadline_in_txn(
+                    txn,
+                    wake,
+                    assignment_id,
+                    holder,
+                    work_item_id,
+                    quiet_start,
+                    interval_ms,
+                    quiet_start + interval_ms,
+                    now
                   )
 
                 is_integer(covered_until) ->
-                  replacement =
-                    schedule_deadline_in_txn(
-                      txn,
-                      assignment_id,
-                      holder,
-                      work_item_id,
-                      latest_activity,
-                      interval_ms,
-                      covered_until
-                    )
+                  reschedule_deadline_in_txn(
+                    txn,
+                    wake,
+                    assignment_id,
+                    holder,
+                    work_item_id,
+                    quiet_start,
+                    interval_ms,
+                    max(quiet_start + interval_ms, covered_until),
+                    now
+                  )
 
+                reminder_count >= @max_holder_reminders ->
                   fire_internal_in_txn(txn, wake.wake_id, @deadline_consumer, now)
 
-                  cancel_assignment_sources_in_txn(
+                quiet_start + interval_ms > now ->
+                  reschedule_deadline_in_txn(
                     txn,
+                    wake,
                     assignment_id,
-                    {:replacement, replacement.wake_id}
+                    holder,
+                    work_item_id,
+                    quiet_start,
+                    interval_ms,
+                    quiet_start + interval_ms,
+                    now
+                  )
+
+                pending_inactivity_reminder_in_txn?(txn, assignment_id, holder) ->
+                  reschedule_deadline_after_interval_in_txn(
+                    txn,
+                    wake,
+                    assignment_id,
+                    holder,
+                    work_item_id,
+                    quiet_start,
+                    interval_ms,
+                    now
                   )
 
                 fire_internal_in_txn(txn, wake.wake_id, @deadline_consumer, now) ->
@@ -508,7 +649,7 @@ defmodule Tightbeam.Supervision do
                     holder,
                     work_item_id,
                     interval_ms,
-                    latest_activity,
+                    quiet_start,
                     now
                   )
 
@@ -529,6 +670,56 @@ defmodule Tightbeam.Supervision do
       _ ->
         :ok
     end
+  end
+
+  defp reschedule_deadline_after_interval_in_txn(
+         txn,
+         wake,
+         assignment_id,
+         holder,
+         work_item_id,
+         activity_at,
+         interval_ms,
+         now
+       ) do
+    reschedule_deadline_in_txn(
+      txn,
+      wake,
+      assignment_id,
+      holder,
+      work_item_id,
+      activity_at,
+      interval_ms,
+      now + interval_ms,
+      now
+    )
+  end
+
+  defp reschedule_deadline_in_txn(
+         txn,
+         wake,
+         assignment_id,
+         holder,
+         work_item_id,
+         activity_at,
+         interval_ms,
+         due_at,
+         now
+       ) do
+    replacement =
+      schedule_deadline_in_txn(
+        txn,
+        assignment_id,
+        holder,
+        work_item_id,
+        activity_at,
+        interval_ms,
+        due_at
+      )
+
+    fire_internal_in_txn(txn, wake.wake_id, @deadline_consumer, now)
+    cancel_controllers_in_txn(txn, assignment_id, replacement.wake_id)
+    :ok
   end
 
   defp begin_episode_in_txn(
@@ -556,18 +747,35 @@ defmodule Tightbeam.Supervision do
         now
       )
 
-    schedule_climb_in_txn(
-      txn,
-      assignment_id,
-      holder,
-      work_item_id,
-      episode_ref,
-      1,
-      interval_ms,
-      notice.wake_id,
-      [holder],
-      now + interval_ms
-    )
+    activity_start =
+      case Txn.q(txn, "SELECT openedAt FROM assignments WHERE id=?1", [assignment_id]) do
+        [[opened_at]] when is_integer(opened_at) ->
+          activity_start_in_txn(txn, assignment_id, opened_at)
+
+        _ ->
+          activity_at
+      end
+
+    last_activity =
+      current_activity_time_in_txn(txn, assignment_id, holder, activity_start)
+
+    reminder_count =
+      reminder_count_since_activity_in_txn(txn, assignment_id, holder, last_activity)
+
+    if reminder_count < @max_holder_reminders do
+      schedule_climb_in_txn(
+        txn,
+        assignment_id,
+        holder,
+        work_item_id,
+        episode_ref,
+        1,
+        interval_ms,
+        notice.wake_id,
+        [holder],
+        now + interval_ms
+      )
+    end
 
     :ok
   end
@@ -595,53 +803,19 @@ defmodule Tightbeam.Supervision do
                assignment_id
              ]) do
           [[^origin_holder, "open", work_item_id]] ->
-            case ladder_target(txn, origin_holder, rung) do
-              target when is_binary(target) ->
-                if target in visited do
-                  fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
-                  :ok
-                else
-                  case next_notice_in_txn(
-                         txn,
-                         previous_wake_id,
-                         target,
-                         assignment_id,
-                         work_item_id,
-                         episode_ref,
-                         now
-                       ) do
-                    {:ok, notice_id} ->
-                      fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
-
-                      schedule_climb_in_txn(
-                        txn,
-                        assignment_id,
-                        origin_holder,
-                        work_item_id,
-                        episode_ref,
-                        rung + 1,
-                        interval_ms,
-                        notice_id,
-                        [target | visited],
-                        now + interval_ms
-                      )
-
-                      :ok
-
-                    {:error, reason} ->
-                      Logger.warning(
-                        "assignment notice climb deferred for #{assignment_id}: #{inspect(reason)}"
-                      )
-
-                      fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
-                      :ok
-                  end
-                end
-
-              _ ->
-                fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
-                :ok
-            end
+            quiet_climb_result(
+              txn,
+              wake,
+              assignment_id,
+              episode_ref,
+              origin_holder,
+              rung,
+              interval_ms,
+              previous_wake_id,
+              visited,
+              work_item_id,
+              now
+            )
 
           _ ->
             fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
@@ -656,76 +830,290 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp next_notice_in_txn(
+  defp quiet_climb_result(
          txn,
-         previous_wake_id,
-         target,
+         wake,
          assignment_id,
-         work_item_id,
          episode_ref,
+         holder,
+         reminder_number,
+         interval_ms,
+         previous_wake_id,
+         visited,
+         work_item_id,
          now
        ) do
-    case Txn.q(
-           txn,
-           "SELECT state,deliveredTurnSeq,prompt FROM wakes WHERE wakeId=?1 AND consumer='prompt' AND assignmentId=?2 AND obligationRef=?3",
-           [previous_wake_id, assignment_id, episode_ref]
-         ) do
-      [["pending", nil, _prompt]] ->
-        case Wakes.readdress_pending_in_txn(txn, previous_wake_id, target) do
-          {:ok, %{wake_id: ^previous_wake_id}} -> {:ok, previous_wake_id}
-          {:error, reason} -> {:error, reason}
-          other -> {:error, {:invalid_readdress_result, other}}
-        end
+    activity_start =
+      case Txn.q(txn, "SELECT openedAt FROM assignments WHERE id=?1", [assignment_id]) do
+        [[opened_at]] when is_integer(opened_at) ->
+          activity_start_in_txn(txn, assignment_id, opened_at)
 
-      [["fired", delivered_turn_seq, prompt]]
-      when is_integer(delivered_turn_seq) and is_binary(prompt) ->
-        notice =
-          schedule_notice_with_prompt_in_txn(
-            txn,
-            assignment_id,
-            target,
-            work_item_id,
-            episode_ref,
-            now,
-            prompt
-          )
+        _ ->
+          now
+      end
 
-        {:ok, notice.wake_id}
+    latest_activity =
+      current_activity_time_in_txn(txn, assignment_id, holder, activity_start)
 
-      [[state, nil, prompt]] when state in ["fired", "canceled"] and is_binary(prompt) ->
-        case Txn.q(
-               txn,
-               "SELECT reasonKind FROM wake_cancellations WHERE wakeId=?1 ORDER BY canceledAt DESC LIMIT 1",
-               [previous_wake_id]
-             ) do
-          [[reason]] when reason in ["target_unresolvable", "consumer_unavailable"] ->
-            notice =
-              schedule_notice_with_prompt_in_txn(
-                txn,
-                assignment_id,
-                target,
-                work_item_id,
-                episode_ref,
-                now,
-                prompt
-              )
+    quiet_start = quiet_start_in_txn(txn, assignment_id, holder, latest_activity)
+    count = reminder_count_since_activity_in_txn(txn, assignment_id, holder, latest_activity)
 
-            {:ok, notice.wake_id}
+    cond do
+      reminders_disabled?(nil) ->
+        fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
+        :ok
 
-          _ ->
-            {:error, :previous_notice_fired_without_delivery_or_undeliverable_record}
-        end
-
-      [] ->
-        Logger.warning(
-          "assignment notice history missing for #{previous_wake_id}; stopping this climb"
+      reminder_suppressed_in_txn?(txn, assignment_id, holder, now) ->
+        reschedule_climb_in_txn(
+          txn,
+          wake,
+          assignment_id,
+          episode_ref,
+          holder,
+          reminder_number,
+          interval_ms,
+          previous_wake_id,
+          visited,
+          work_item_id,
+          now + interval_ms,
+          now
         )
 
-        {:error, :previous_notice_missing}
+      quiet_start + interval_ms > now ->
+        reschedule_climb_in_txn(
+          txn,
+          wake,
+          assignment_id,
+          episode_ref,
+          holder,
+          reminder_number,
+          interval_ms,
+          previous_wake_id,
+          visited,
+          work_item_id,
+          quiet_start + interval_ms,
+          now
+        )
 
-      _ ->
-        {:error, :previous_notice_not_pending_or_terminal}
+      reminder_number == 1 and count < @max_holder_reminders ->
+        repeat_holder_or_advance_in_txn(
+          txn,
+          wake,
+          assignment_id,
+          episode_ref,
+          holder,
+          previous_wake_id,
+          work_item_id,
+          interval_ms,
+          now
+        )
+
+      true ->
+        advance_climb_in_txn(
+          txn,
+          wake,
+          assignment_id,
+          episode_ref,
+          holder,
+          max(1, reminder_number - 1),
+          previous_wake_id,
+          visited,
+          work_item_id,
+          interval_ms,
+          now
+        )
     end
+  end
+
+  defp repeat_holder_or_advance_in_txn(
+         txn,
+         wake,
+         assignment_id,
+         episode_ref,
+         holder,
+         previous_wake_id,
+         work_item_id,
+         interval_ms,
+         now
+       ) do
+    # A still-pending first notice is already an attempt to reach the holder.
+    # Wait one more interval, then climb without queuing a duplicate notice.
+    previous = Wakes.get_in_txn(txn, previous_wake_id)
+
+    if is_map(previous) and previous.assignment_id == assignment_id and
+         previous.obligation_ref == episode_ref and is_binary(previous.prompt) do
+      next_wake_id =
+        if pending_inactivity_reminder_in_txn?(txn, assignment_id, holder) do
+          previous_wake_id
+        else
+          notice =
+            schedule_notice_with_prompt_in_txn(
+              txn,
+              assignment_id,
+              holder,
+              work_item_id,
+              episode_ref,
+              now,
+              previous.prompt
+            )
+
+          notice.wake_id
+        end
+
+      fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
+
+      schedule_climb_in_txn(
+        txn,
+        assignment_id,
+        holder,
+        work_item_id,
+        episode_ref,
+        2,
+        interval_ms,
+        next_wake_id,
+        [holder],
+        now + interval_ms
+      )
+    else
+      Logger.warning("assignment inactivity climb lost its prior notice for #{assignment_id}")
+      fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
+    end
+
+    :ok
+  end
+
+  defp advance_climb_in_txn(
+         txn,
+         wake,
+         assignment_id,
+         episode_ref,
+         holder,
+         rung,
+         previous_wake_id,
+         visited,
+         work_item_id,
+         interval_ms,
+         now
+       ) do
+    target = ladder_target(txn, holder, rung)
+    previous = Wakes.get_in_txn(txn, previous_wake_id)
+
+    cond do
+      target == nil or target in visited ->
+        fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
+        :ok
+
+      not is_map(previous) or previous.assignment_id != assignment_id or
+        previous.obligation_ref != episode_ref or not is_binary(previous.prompt) ->
+        Logger.warning("assignment inactivity climb lost its prior notice for #{assignment_id}")
+        fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
+        :ok
+
+      true ->
+        case next_notice_in_txn(
+               txn,
+               previous,
+               assignment_id,
+               work_item_id,
+               episode_ref,
+               target,
+               now
+             ) do
+          {:ok, notice} ->
+            fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
+
+            schedule_climb_in_txn(
+              txn,
+              assignment_id,
+              holder,
+              work_item_id,
+              episode_ref,
+              rung + 2,
+              interval_ms,
+              notice.wake_id,
+              visited ++ [target],
+              now + interval_ms
+            )
+
+            :ok
+
+          {:error, reason} ->
+            Logger.warning(
+              "assignment inactivity climb could not address #{target}: #{inspect(reason)}"
+            )
+
+            reschedule_climb_in_txn(
+              txn,
+              wake,
+              assignment_id,
+              episode_ref,
+              holder,
+              rung + 1,
+              interval_ms,
+              previous_wake_id,
+              visited,
+              work_item_id,
+              now + interval_ms,
+              now
+            )
+        end
+    end
+  end
+
+  defp next_notice_in_txn(
+         txn,
+         %{state: "pending"} = previous,
+         _assignment_id,
+         _work_item_id,
+         _episode_ref,
+         target,
+         _now
+       ) do
+    Wakes.readdress_pending_in_txn(txn, previous.wake_id, target)
+  end
+
+  defp next_notice_in_txn(txn, previous, assignment_id, work_item_id, episode_ref, target, now) do
+    {:ok,
+     schedule_notice_with_prompt_in_txn(
+       txn,
+       assignment_id,
+       target,
+       work_item_id,
+       episode_ref,
+       now,
+       previous.prompt
+     )}
+  end
+
+  defp reschedule_climb_in_txn(
+         txn,
+         wake,
+         assignment_id,
+         episode_ref,
+         holder,
+         reminder_number,
+         interval_ms,
+         previous_wake_id,
+         visited,
+         work_item_id,
+         due_at,
+         now
+       ) do
+    schedule_climb_in_txn(
+      txn,
+      assignment_id,
+      holder,
+      work_item_id,
+      episode_ref,
+      reminder_number,
+      interval_ms,
+      previous_wake_id,
+      visited,
+      due_at
+    )
+
+    fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
+    :ok
   end
 
   defp schedule_deadline_in_txn(
@@ -852,7 +1240,7 @@ defmodule Tightbeam.Supervision do
     holder = if is_binary(holder) and holder != "", do: holder, else: "(holder unavailable)"
 
     "Assignment #{assignment_id} (#{subject}), held by #{holder}, has had no recorded activity since #{activity_at} ms. " <>
-      "Record progress, ask for a decision, or complete it."
+      "Holder: record progress, ask for a decision, or complete it. If this remains unresolved after escalation, the supervisor should record a blocker or decision request."
   end
 
   defp schedule_climb_in_txn(
@@ -888,6 +1276,356 @@ defmodule Tightbeam.Supervision do
       obligation_ref: episode_ref
     })
   end
+
+  defp restore_boot_climb_in_txn(
+         txn,
+         assignment_id,
+         holder,
+         work_item_id,
+         last_activity,
+         reminder_count,
+         interval_ms
+       ) do
+    pending_climb =
+      Txn.q(
+        txn,
+        "SELECT wakeId FROM wakes INDEXED BY wakes_assignment WHERE assignmentId=?1 AND consumer=?2 AND state='pending' ORDER BY rowid DESC LIMIT 1",
+        [assignment_id, @climb_consumer]
+      )
+
+    case pending_climb do
+      [[wake_id]] ->
+        old = Wakes.get_in_txn(txn, wake_id)
+
+        with {:ok, payload} <- decode_payload(old, @climb_consumer),
+             {:ok, ^assignment_id, episode_ref, ^holder, _old_rung, _old_interval,
+              previous_wake_id, visited} <- climb_payload(payload, old),
+             previous when is_map(previous) <- Wakes.get_in_txn(txn, previous_wake_id),
+             true <-
+               previous.obligation_ref == episode_ref and
+                 previous.created_at >= last_activity do
+          rung =
+            if length(visited) > 1,
+              do: length(visited) + 1,
+              else: if(reminder_count < @max_holder_reminders, do: 1, else: 2)
+
+          due_at = max(now(), previous.created_at + interval_ms)
+
+          climb =
+            schedule_climb_in_txn(
+              txn,
+              assignment_id,
+              holder,
+              work_item_id,
+              episode_ref,
+              rung,
+              interval_ms,
+              previous_wake_id,
+              visited,
+              due_at
+            )
+
+          {:active, climb, visited}
+        else
+          _ -> :none
+        end
+
+      _ ->
+        restore_older_holder_episode_in_txn(
+          txn,
+          assignment_id,
+          holder,
+          work_item_id,
+          last_activity,
+          reminder_count,
+          interval_ms
+        )
+    end
+  end
+
+  defp restore_older_holder_episode_in_txn(
+         txn,
+         assignment_id,
+         holder,
+         work_item_id,
+         last_activity,
+         reminder_count,
+         interval_ms
+       ) do
+    pending_deadline? =
+      Txn.q(
+        txn,
+        "SELECT 1 FROM wakes INDEXED BY wakes_assignment WHERE assignmentId=?1 AND consumer=?2 AND state='pending' LIMIT 1",
+        [assignment_id, @deadline_consumer]
+      ) != []
+
+    if pending_deadline? or reminder_count == 0 do
+      :none
+    else
+      case Txn.q(
+             txn,
+             "SELECT wakeId FROM wakes INDEXED BY wakes_assignment WHERE assignmentId=?1 AND consumer='prompt' AND sessionKey=?2 AND createdAt>=?3 AND substr(obligationRef,1,length(?4))=?4 AND state IN ('pending','fired') ORDER BY rowid DESC LIMIT 1",
+             [assignment_id, holder, last_activity, @episode_ref]
+           ) do
+        [[wake_id]] ->
+          previous = Wakes.get_in_txn(txn, wake_id)
+
+          already_climbed? =
+            Txn.q(
+              txn,
+              "SELECT 1 FROM wakes INDEXED BY wakes_assignment WHERE assignmentId=?1 AND consumer='prompt' AND obligationRef=?2 AND sessionKey<>?3 LIMIT 1",
+              [assignment_id, previous.obligation_ref, holder]
+            ) != []
+
+          if already_climbed? do
+            :none
+          else
+            rung = if reminder_count < @max_holder_reminders, do: 1, else: 2
+
+            climb =
+              schedule_climb_in_txn(
+                txn,
+                assignment_id,
+                holder,
+                work_item_id,
+                previous.obligation_ref,
+                rung,
+                interval_ms,
+                wake_id,
+                [holder],
+                max(now(), previous.created_at + interval_ms)
+              )
+
+            {:active, climb, [holder]}
+          end
+
+        _ ->
+          :none
+      end
+    end
+  end
+
+  defp cancel_boot_sources_in_txn(
+         txn,
+         assignment_id,
+         holder,
+         replacement_id,
+         cancel_all_prompts?,
+         retained_episode \\ nil
+       ) do
+    Txn.q(
+      txn,
+      """
+      SELECT wakeId,consumer,sessionKey,obligationRef
+      FROM wakes INDEXED BY wakes_assignment
+      WHERE assignmentId=?1 AND state='pending'
+        AND (consumer IN (?2,?3) OR
+             (consumer='prompt' AND substr(obligationRef,1,length(?4))=?4))
+      ORDER BY createdAt,wakeId
+      """,
+      [assignment_id, @deadline_consumer, @climb_consumer, @episode_ref]
+    )
+    |> Enum.each(fn
+      [wake_id, consumer, recipient, obligation_ref]
+      when is_binary(wake_id) and is_binary(consumer) ->
+        if wake_id != replacement_id and
+             (consumer in [@deadline_consumer, @climb_consumer] or cancel_all_prompts? or
+                (recipient != holder and
+                   not retained_episode_recipient?(retained_episode, obligation_ref, recipient))) do
+          cancel_superseded_source_in_txn(txn, wake_id, replacement_id)
+        end
+
+      _ ->
+        Logger.warning("skipping malformed inactivity source during startup reconciliation")
+    end)
+
+    :ok
+  end
+
+  defp retained_episode_recipient?({episode_ref, visited}, episode_ref, recipient),
+    do: recipient in visited
+
+  defp retained_episode_recipient?(_, _, _), do: false
+
+  defp cancel_controllers_in_txn(txn, assignment_id, replacement_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT wakeId FROM wakes INDEXED BY wakes_assignment
+      WHERE assignmentId=?1 AND state='pending' AND consumer IN (?2,?3)
+        AND wakeId<>?4
+      ORDER BY createdAt,wakeId
+      """,
+      [assignment_id, @deadline_consumer, @climb_consumer, replacement_id]
+    )
+    |> Enum.each(fn
+      [wake_id] when is_binary(wake_id) ->
+        cancel_superseded_source_in_txn(txn, wake_id, replacement_id)
+
+      _ ->
+        Logger.warning("skipping malformed inactivity controller reference")
+    end)
+
+    :ok
+  end
+
+  defp cancel_superseded_source_in_txn(txn, wake_id, replacement_id) do
+    unless Wakes.cancel_in_txn(txn, %{
+             wake_id: wake_id,
+             requester: %{kind: "process", id: "tightbeam:assignments"},
+             reason_kind: "superseded",
+             causal_source: %{kind: "wake", id: replacement_id},
+             outcome: %{kind: "replacement", replacement_wake_id: replacement_id}
+           }) do
+      Logger.warning("assignment inactivity wake #{wake_id} could not be retracted")
+    end
+  end
+
+  defp reminder_count_since_activity_in_txn(txn, assignment_id, holder, activity_at) do
+    case Txn.q(
+           txn,
+           """
+           SELECT COUNT(*) FROM wakes INDEXED BY wakes_assignment
+           WHERE assignmentId=?1 AND consumer='prompt' AND sessionKey=?2 AND createdAt>=?3
+             AND substr(obligationRef,1,length(?4))=?4
+           """,
+           [assignment_id, holder, activity_at, @episode_ref]
+         ) do
+      [[count]] when is_integer(count) ->
+        count
+
+      other ->
+        Logger.warning("assignment inactivity reminder history unavailable: #{inspect(other)}")
+        3
+    end
+  end
+
+  defp quiet_start_in_txn(txn, assignment_id, holder, activity_at) do
+    holder_route =
+      case Txn.q(txn, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [holder]) do
+        [[harness, host]] when is_binary(harness) and is_binary(host) -> {harness, host}
+        _ -> nil
+      end
+
+    covering_followup_terminal =
+      max_row(
+        txn,
+        """
+        SELECT MAX(COALESCE(t.createdAt,c.canceledAt,w.firedAt))
+        FROM wakes w INDEXED BY wakes_assignment
+        LEFT JOIN turns t ON t.seq=w.deliveredTurnSeq
+        LEFT JOIN wake_cancellations c ON c.wakeId=w.wakeId
+        WHERE w.assignmentId=?1 AND w.sessionKey=?2
+          AND w.state IN ('fired','canceled')
+          AND w.consumer NOT IN (?3,?4,'effort_probe','effort_deadline')
+          AND (w.obligationRef IS NULL OR substr(w.obligationRef,1,length(?5))<>?5)
+        """,
+        [assignment_id, holder, @deadline_consumer, @climb_consumer, @episode_ref]
+      )
+
+    last_reminder =
+      max_row(
+        txn,
+        """
+        SELECT MAX(createdAt) FROM wakes INDEXED BY wakes_assignment
+        WHERE assignmentId=?1 AND consumer='prompt' AND sessionKey=?2
+          AND substr(obligationRef,1,length(?3))=?3
+        """,
+        [assignment_id, holder, @episode_ref]
+      )
+
+    quiet_events = [
+      max_row(
+        txn,
+        "SELECT MAX(endedAt) FROM turns WHERE sessionKey=?1 AND endedAt IS NOT NULL",
+        [holder]
+      ),
+      max_row(
+        txn,
+        "SELECT MAX(settledAt) FROM assignment_cannot_proceed WHERE assignmentId=?1",
+        [assignment_id]
+      ),
+      covering_followup_terminal,
+      last_reminder,
+      health_restored_at_in_txn(txn, holder_route)
+    ]
+
+    [activity_at | Enum.filter(quiet_events, &is_integer/1)] |> Enum.max()
+  end
+
+  defp health_restored_at_in_txn(_txn, nil), do: nil
+
+  defp health_restored_at_in_txn(txn, {harness, host}) do
+    max_row(
+      txn,
+      """
+      SELECT MAX(COALESCE(resolvedAt,expiredAt)) FROM harness_health_incidents
+      WHERE harness=?1 AND host=?2 AND state IN ('resolved','expired')
+      """,
+      [harness, host]
+    )
+  end
+
+  defp reminder_suppressed_in_txn?(txn, assignment_id, holder, _at) do
+    pending_turn =
+      Txn.q(
+        txn,
+        "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('queued','running') LIMIT 1",
+        [holder]
+      ) != []
+
+    pending_followup =
+      Txn.q(
+        txn,
+        """
+        SELECT 1 FROM wakes w INDEXED BY wakes_assignment
+        WHERE w.assignmentId=?1 AND w.sessionKey=?2
+          AND w.state='pending'
+          AND w.consumer NOT IN (?3,?4,'effort_probe','effort_deadline')
+          AND (w.obligationRef IS NULL OR substr(w.obligationRef,1,length(?5))<>?5)
+        LIMIT 1
+        """,
+        [assignment_id, holder, @deadline_consumer, @climb_consumer, @episode_ref]
+      ) != []
+
+    holder_unavailable =
+      case Txn.q(txn, "SELECT harness,host,state FROM sessions WHERE sessionKey=?1", [holder]) do
+        [[harness, host, "active"]] ->
+          Txn.q(
+            txn,
+            "SELECT 1 FROM harness_health_incidents WHERE harness=?1 AND host=?2 AND state='open' LIMIT 1",
+            [harness, host]
+          ) != []
+
+        _ ->
+          true
+      end
+
+    Tightbeam.Assignments.cannot_proceed_standing_in_txn?(txn, assignment_id) or
+      pending_turn or pending_followup or holder_unavailable
+  end
+
+  defp pending_inactivity_reminder_in_txn?(txn, assignment_id, holder) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM wakes INDEXED BY wakes_assignment
+      WHERE assignmentId=?1 AND sessionKey=?2 AND consumer='prompt' AND state='pending'
+        AND substr(obligationRef,1,length(?3))=?3
+      LIMIT 1
+      """,
+      [assignment_id, holder, @episode_ref]
+    ) != []
+  end
+
+  defp reminders_disabled?(:off), do: true
+
+  defp reminders_disabled?(configured_interval)
+       when is_integer(configured_interval) and configured_interval > 0,
+       do: false
+
+  defp reminders_disabled?(_configured_interval),
+    do: Application.get_env(:tightbeam, :supervision_interval_ms, @default_interval_ms) == :off
 
   defp cancel_assignment_sources_in_txn(txn, assignment_id, disposition, clock \\ &now/0) do
     replacement_id =
@@ -1084,31 +1822,6 @@ defmodule Tightbeam.Supervision do
       other ->
         Logger.warning("assignment activity time unavailable: #{inspect(other)}")
         nil
-    end
-  end
-
-  defp interval_from_entitlement_in_txn(txn, assignment_id, default_interval_ms) do
-    case Txn.q(
-           txn,
-           "SELECT state,supervisionIntervalMs FROM supervision_entitlements WHERE assignmentId=?1",
-           [assignment_id]
-         ) do
-      [[state, interval]]
-      when state in ["armed", "claimed"] and is_integer(interval) and interval > 0 ->
-        interval
-
-      [["terminus", nil]] ->
-        default_interval_ms
-
-      [] ->
-        default_interval_ms
-
-      other ->
-        Logger.warning(
-          "assignment legacy interval unavailable for #{assignment_id}: #{inspect(other)}; using default"
-        )
-
-        default_interval_ms
     end
   end
 
