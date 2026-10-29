@@ -13,9 +13,10 @@ defmodule Tightbeam.Harness.Claude do
   def local_client_model_authority?(%Model{family: "claude-" <> _rest}), do: true
   def local_client_model_authority?(%Model{}), do: false
 
-  # ACP 0.81.0 pins Claude Agent SDK 0.3.280, the first pinned CLI version that
-  # meets Anthropic's 2.1.280 minimum for Opus 5.5.
-  @adapter_version "0.81.0"
+  # ACP 0.98.0 registers and hydrates a fork before returning its child id.
+  # Tightbeam configures that id immediately, so this ordering is part of the
+  # adapter version contract rather than a race the client can repair later.
+  @adapter_version "0.98.0"
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
   @warm_timeout_ms 30_000

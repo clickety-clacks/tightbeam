@@ -154,8 +154,8 @@ defmodule Tightbeam.HarnessSeamTest do
     refute source =~ "keep_selectable"
   end
 
-  test "Claude ACP pin supports Opus 5.5's minimum CLI version" do
-    assert Tightbeam.Harness.Claude.adapter_version() == "0.81.0"
+  test "Claude ACP pin registers and hydrates forks before returning them" do
+    assert Tightbeam.Harness.Claude.adapter_version() == "0.98.0"
   end
 
   test "claude carries no model alias table" do
