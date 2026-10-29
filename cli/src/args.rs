@@ -4777,7 +4777,7 @@ mod tests {
             "--host",
             "host-a",
             "--source-session",
-            "agent:worker:session",
+            "session-example",
             "--description",
             "observation",
             "--evidence-mode",
