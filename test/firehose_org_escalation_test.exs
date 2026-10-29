@@ -1006,8 +1006,11 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     assert %{code: "read_marker_conflict"} = handlers["read-marker-set"].(stale)
     assert Tightbeam.ReadMarkers.get(db, "synthetic-owner", "scope") == before
 
-    assert %{code: "unknown_caller"} =
+    assert %{changed: false, user_id: "synthetic-owner"} =
              handlers["read-marker-set"].(%{call | origin: "agent:missing"})
+
+    assert %{code: "unknown_caller"} =
+             handlers["read-marker-set"].(%{call | principal: {:session, "missing"}})
 
     assert %{code: "invalid"} =
              handlers["read-marker-set"].(put_in(call.params.marker, -1))

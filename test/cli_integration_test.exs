@@ -302,10 +302,10 @@ defmodule Tightbeam.CliIntegrationTest do
     assert {:ok, [[nil]]} =
              DB.query(ctx.db, "SELECT spawnedBy FROM sessions WHERE sessionKey='cli-holder'")
 
-    assert {:ok, [["flynn", "cli-holder", "open"]]} =
+    assert {:ok, [[nil, "cli-holder", "cli-holder", "open"]]} =
              DB.query(
                ctx.db,
-               "SELECT openedByUser,holderKey,state FROM assignments WHERE id=?1",
+               "SELECT openedByUser,openedBySession,holderKey,state FROM assignments WHERE id=?1",
                [assignment]
              )
 
@@ -1233,7 +1233,11 @@ defmodule Tightbeam.CliIntegrationTest do
 
     {foreign_output, foreign_status} =
       System.cmd(ctx.binary, cancel_args.(foreign.session_key),
-        cd: owner_workdir,
+        cd: ctx.outside,
+        env: [
+          {"TIGHTBEAM_URL", "http://127.0.0.1:#{ctx.port}"},
+          {"TIGHTBEAM_TOKEN", "tbc_cli_integration"}
+        ],
         stderr_to_stdout: true
       )
 
@@ -1287,8 +1291,8 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call,
                     %{
                       verb: "cancel",
-                      origin: "user:owner",
-                      principal: {:user, "owner"},
+                      origin: "agent:cancel-owner-main",
+                      principal: {:session, "cancel-owner-main"},
                       session_key: "cancel-owner-worker",
                       params: %{}
                     }}
@@ -1805,14 +1809,14 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    assert_receive {:cli_call, %{origin: "user:flynn", principal: {:user, "flynn"}}}
+    assert_receive {:cli_call, %{origin: "agent:cli-holder", principal: {:session, "cli-holder"}}}
 
     Org.retire(ctx.db, ctx.session.session_key, "user:flynn", 1_000)
     {refused, 1} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
     assert refused =~ "auth_failed"
   end
 
-  test "session-auth --as-user attributes verdicts to the user and grants admin revocation",
+  test "session-auth --as-user retains agent attribution for verdicts and revocation",
        ctx do
     {:ok, _} =
       DB.query(
@@ -1875,11 +1879,11 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call,
                     %{
                       verb: "attest",
-                      origin: "user:flynn",
-                      principal: {:user, "flynn"}
+                      origin: "agent:cli-holder",
+                      principal: {:session, "cli-holder"}
                     }}
 
-    assert {:ok, [["flynn", nil]]} =
+    assert {:ok, [[nil, "cli-holder"]]} =
              DB.query(
                ctx.db,
                "SELECT byUser, bySession FROM attests WHERE assignmentId = ?1 AND verdictKind = 'tests-passed'",
@@ -1896,10 +1900,10 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert revoked =~ "revoked"
 
-    assert {:ok, [["cli-other", "cli-worker", "flynn", "flynn"]]} =
+    assert {:ok, [["cli-other", "cli-worker", nil, "cli-holder", nil, "cli-holder"]]} =
              DB.query(
                ctx.db,
-               "SELECT a.openedBySession,a.holderKey,a.closedByUser,r.revokedByUser FROM assignments a JOIN assignment_revocations r ON r.assignmentId=a.id WHERE a.id=?1",
+               "SELECT a.openedBySession,a.holderKey,a.closedByUser,a.closedBySession,r.revokedByUser,r.revokedBySession FROM assignments a JOIN assignment_revocations r ON r.assignmentId=a.id WHERE a.id=?1",
                [assignment_id]
              )
 
@@ -1913,8 +1917,8 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call,
                     %{
                       verb: "revoke-assignment",
-                      origin: "user:flynn",
-                      principal: {:user, "flynn"}
+                      origin: "agent:cli-holder",
+                      principal: {:session, "cli-holder"}
                     }}
 
     assert {:ok, [["closed", "revoked"]]} =
@@ -2273,7 +2277,11 @@ defmodule Tightbeam.CliIntegrationTest do
           "--as-user",
           "flynn"
         ],
-        cd: ctx.workdir,
+        cd: ctx.outside,
+        env: [
+          {"TIGHTBEAM_URL", "http://127.0.0.1:#{ctx.port}"},
+          {"TIGHTBEAM_TOKEN", "tbc_cli_integration"}
+        ],
         stderr_to_stdout: true
       )
 

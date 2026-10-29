@@ -75,13 +75,12 @@ defmodule Tightbeam.RetireOwnershipTest do
     assert Org.get(ctx.db, "kays-other").state == "active"
   end
 
-  test "a process origin still gets not_found", ctx do
+  test "a process principal can retire a session", ctx do
     session!(ctx.db, "process-target", "flynn")
 
-    # `resolve_caller/2` gives a process a nil owner, and ownerUserId is NOT NULL,
-    # so the fall-through to not_found is by construction rather than by guard.
-    assert %{code: "not_found"} = retire(ctx, "process:cron", nil, "process-target")
-    assert Org.get(ctx.db, "process-target").state == "active"
+    assert %{deleted_session_key: "process-target"} =
+             retire(ctx, "process:cron", {:process, "cron"}, "process-target")
+    assert Org.get(ctx.db, "process-target").state == "retired"
   end
 
   test "an unknown origin still gets not_found", ctx do
@@ -191,11 +190,11 @@ defmodule Tightbeam.RetireOwnershipTest do
     call = %{
       verb: "retire",
       origin: origin,
+      principal: principal,
       session_key: session_key,
       params: params
     }
 
-    call = if principal, do: Map.put(call, :principal, principal), else: call
     ctx.handlers["retire"].(call)
   end
 
