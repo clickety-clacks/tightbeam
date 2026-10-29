@@ -622,6 +622,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       end
 
     event_ids = Enum.map(source_payloads, &elem(&1, 0))
+
     expected_payloads =
       Enum.map(live_samples, fn {_payload, live_frame} -> live_frame["payload"] end)
 
