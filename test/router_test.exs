@@ -3409,6 +3409,86 @@ defmodule Tightbeam.Wire.RouterTest do
            |> Map.has_key?("created_at")
   end
 
+  test "read-marker verbs use the user credential owner through agent dispatch", ctx do
+    owner = ctx.device.user_id
+    scope_key = "session:read-marker-route-#{System.unique_integer([:positive])}"
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    opts = Keyword.put(ctx.opts, :handlers, handlers)
+
+    dispatch = fn verb, params ->
+      conn(:post, "/agent/dispatch", JSON.encode!(%{"verb" => verb, "params" => params}))
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+    end
+
+    get_marker = fn ->
+      conn(:get, "/api/read-markers/#{scope_key}")
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+    end
+
+    missing = get_marker.()
+    assert missing.status == 404
+    assert JSON.decode!(missing.resp_body)["error"]["code"] == "not_found"
+
+    first =
+      dispatch.("read-marker-set", %{
+        "scopeKey" => scope_key,
+        "marker" => "100",
+        "expectedCurrent" => nil
+      })
+
+    assert first.status == 200, first.resp_body
+    first_result = JSON.decode!(first.resp_body)["result"]
+    assert first_result["userId"] == owner
+    assert first_result["readMarker"]["userId"] == owner
+    assert first_result["readMarker"]["scopeKey"] == scope_key
+    assert first_result["readMarker"]["marker"] == "100"
+
+    null_conflict =
+      dispatch.("read-marker-set", %{
+        "scopeKey" => scope_key,
+        "marker" => "200",
+        "expectedCurrent" => nil
+      })
+
+    assert JSON.decode!(null_conflict.resp_body)["error"]["code"] == "read_marker_conflict"
+
+    stale_conflict =
+      dispatch.("read-marker-set", %{
+        "scopeKey" => scope_key,
+        "marker" => "200",
+        "expectedCurrent" => "99"
+      })
+
+    assert JSON.decode!(stale_conflict.resp_body)["error"]["code"] == "read_marker_conflict"
+
+    unconditional = dispatch.("read-marker-set", %{"scopeKey" => scope_key, "marker" => "200"})
+    assert unconditional.status == 200, unconditional.resp_body
+
+    current = get_marker.()
+    assert current.status == 200, current.resp_body
+
+    assert %{
+             "item" => %{
+               "userId" => ^owner,
+               "scopeKey" => ^scope_key,
+               "marker" => "200"
+             }
+           } = JSON.decode!(current.resp_body)
+
+    cleared = dispatch.("read-marker-clear", %{"scopeKey" => scope_key})
+    assert cleared.status == 200, cleared.resp_body
+    assert JSON.decode!(cleared.resp_body)["result"]["readMarker"]["marker"] == nil
+
+    after_clear = get_marker.()
+    assert after_clear.status == 404
+    assert JSON.decode!(after_clear.resp_body)["error"]["code"] == "not_found"
+
+    assert JSON.decode!(dispatch.("inspect", %{}).resp_body)["error"]["code"] ==
+             "auth_failed"
+  end
+
   test "artifact verbs are agent verbs and recording binds the authenticated session caller",
        ctx do
     session = create_session(ctx.db, "artifact-writer", "flynn")
