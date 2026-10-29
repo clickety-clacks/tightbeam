@@ -1683,7 +1683,12 @@ defmodule Tightbeam.Wire.Router do
         "verb" => denial.verb,
         "rule" => denial.rule,
         "occurredAt" => denial.ts,
-        "order" => %{"occurredAt" => denial.ts, "eventId" => denial.id}
+        "afterMessageSeq" => denial.after_message_seq,
+        "order" => %{
+          "afterMessageSeq" => denial.after_message_seq,
+          "occurredAt" => denial.ts,
+          "eventId" => denial.id
+        }
       }
     end)
   end

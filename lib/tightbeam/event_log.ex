@@ -192,6 +192,9 @@ defmodule Tightbeam.EventLog do
         ts
       )
       when kind in ~w(verb denied) and is_integer(ts) and ts >= 0 do
+    payload =
+      denial_payload_with_message_position(txn, kind, session_key, principal, payload)
+
     [[event_id]] =
       Txn.q(
         txn,
@@ -280,26 +283,68 @@ defmodule Tightbeam.EventLog do
     end)
   end
 
-  @doc "Rail denials visible to a session's live transcript, in stable event-time order."
+  @doc "Rail denials visible to a session's live transcript, in message order."
   @spec rail_denials_for_session(db(), String.t()) :: [map()]
   def rail_denials_for_session(db \\ Tightbeam.DB, session_key) when is_binary(session_key) do
     {:ok, rows} =
       DB.query(
         db,
         """
-        SELECT id, ts, verb, principal, json_extract(payload, '$.rule')
+        SELECT id, ts, verb, principal, json_extract(payload, '$.rule'),
+          json_extract(payload, '$.afterMessageSeq')
         FROM events
         WHERE sessionKey = ?1 AND principal = ?2 AND kind = 'denied'
           AND json_valid(payload) AND json_type(payload, '$.rule') = 'text'
-        ORDER BY ts, id
+        ORDER BY CASE
+          WHEN json_type(payload, '$.afterMessageSeq') = 'integer' THEN 0
+          ELSE 1
+        END, json_extract(payload, '$.afterMessageSeq'), ts, id
         """,
         [session_key, "session:" <> session_key]
       )
 
-    Enum.map(rows, fn [id, ts, verb, principal, rule] ->
-      %{id: id, ts: ts, verb: verb, principal: principal, rule: rule}
+    Enum.map(rows, fn [id, ts, verb, principal, rule, after_message_seq] ->
+      %{
+        id: id,
+        ts: ts,
+        verb: verb,
+        principal: principal,
+        rule: rule,
+        after_message_seq: after_message_seq
+      }
     end)
   end
+
+  defp denial_payload_with_message_position(
+         %Txn{} = txn,
+         "denied",
+         session_key,
+         principal,
+         payload
+       )
+       when is_binary(session_key) and is_binary(payload) do
+    if principal == {:session, session_key} do
+      case JSON.decode(payload) do
+        {:ok, %{"rule" => rule} = decoded} when is_binary(rule) ->
+          [[after_message_seq]] =
+            Txn.q(
+              txn,
+              "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
+              [session_key]
+            )
+
+          JSON.encode!(Map.put(decoded, "afterMessageSeq", after_message_seq))
+
+        _ ->
+          payload
+      end
+    else
+      payload
+    end
+  end
+
+  defp denial_payload_with_message_position(_txn, _kind, _session_key, _principal, payload),
+    do: payload
 
   defp serialize_principal(nil), do: nil
 

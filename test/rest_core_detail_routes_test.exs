@@ -568,31 +568,35 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         attachments: []
       })
 
-    {:ok, event_id} =
-      DB.transaction(ctx.db, fn txn ->
-        EventLog.append_event_in_txn(
-          txn,
-          "denied",
-          "assign",
-          "test",
-          session.session_key,
-          JSON.encode!(%{"rule" => "sample-rule"}),
-          {:session, session.session_key},
-          200
-        )
-      end)
+    event_ids =
+      for index <- 1..2 do
+        {:ok, event_id} =
+          DB.transaction(ctx.db, fn txn ->
+            EventLog.append_event_in_txn(
+              txn,
+              "denied",
+              "assign",
+              "test",
+              session.session_key,
+              JSON.encode!(%{"rule" => "sample-rule-#{index}"}),
+              {:session, session.session_key},
+              200
+            )
+          end)
+
+        event_id
+      end
 
     expected_principal = "session:#{session.session_key}"
 
-    assert [
-             %{
-               id: ^event_id,
-               ts: 200,
-               verb: "assign",
-               principal: ^expected_principal,
-               rule: "sample-rule"
-             }
-           ] = EventLog.rail_denials_for_session(ctx.db, session.session_key)
+    denials = EventLog.rail_denials_for_session(ctx.db, session.session_key)
+
+    assert Enum.map(denials, & &1.id) == event_ids
+    assert Enum.map(denials, & &1.ts) == [200, 200]
+    assert Enum.map(denials, & &1.verb) == ["assign", "assign"]
+    assert Enum.map(denials, & &1.principal) == [expected_principal, expected_principal]
+    assert Enum.map(denials, & &1.rule) == ["sample-rule-1", "sample-rule-2"]
+    assert Enum.map(denials, & &1.after_message_seq) == [before_message.seq, before_message.seq]
 
     {:appended, after_message} =
       Projection.append(ctx.db, %{
@@ -611,29 +615,41 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       )
       |> then(&JSON.decode!(&1.resp_body))
 
-    assert [
-             %{
-               "id" => "rail:" <> event_id_text,
-               "sessionKey" => session_key,
-               "principal" => principal,
-               "verb" => verb,
-               "rule" => rule,
-               "occurredAt" => occurred_at,
-               "order" => %{"occurredAt" => order_at, "eventId" => order_id}
-             }
-           ] = history["railDenials"]
+    rail_denials = history["railDenials"]
 
-    assert event_id_text == Integer.to_string(event_id)
-    assert session_key == session.session_key
-    assert principal == "session:#{session.session_key}"
-    assert verb == "assign"
-    assert rule == "sample-rule"
-    assert occurred_at == order_at
-    assert order_id == event_id
+    assert Enum.map(rail_denials, & &1["id"]) == Enum.map(event_ids, &"rail:#{&1}")
+
+    assert Enum.map(rail_denials, & &1["sessionKey"]) == [
+             session.session_key,
+             session.session_key
+           ]
+
+    assert Enum.map(rail_denials, & &1["principal"]) == [
+             "session:#{session.session_key}",
+             "session:#{session.session_key}"
+           ]
+
+    assert Enum.map(rail_denials, & &1["verb"]) == ["assign", "assign"]
+    assert Enum.map(rail_denials, & &1["rule"]) == ["sample-rule-1", "sample-rule-2"]
+    assert Enum.map(rail_denials, & &1["occurredAt"]) == [200, 200]
+
+    assert Enum.map(rail_denials, & &1["afterMessageSeq"]) == [
+             before_message.seq,
+             before_message.seq
+           ]
+
+    assert Enum.map(rail_denials, & &1["order"]["afterMessageSeq"]) == [
+             before_message.seq,
+             before_message.seq
+           ]
+
+    assert Enum.map(rail_denials, & &1["order"]["occurredAt"]) == [200, 200]
+    assert Enum.map(rail_denials, & &1["order"]["eventId"]) == event_ids
 
     items = Map.new(history["items"], &{&1["id"], &1})
-    assert items[before_message.id]["at"] < occurred_at
-    assert occurred_at < items[after_message.id]["at"]
+    first_denial_at = hd(rail_denials)["occurredAt"]
+    assert items[before_message.id]["at"] < first_denial_at
+    assert first_denial_at < items[after_message.id]["at"]
   end
 
   test "session and retained transcript collections use bounded exclusive keysets", ctx do
