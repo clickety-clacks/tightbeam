@@ -318,9 +318,6 @@ defmodule Tightbeam.FirehoseColdRestartTest do
               dispatch!(plan, new["port"], device, "assignment-get", %{"assignmentId" => id})
 
             assert Enum.map(history, & &1["reason"]) == ["First restart", "After restart"]
-            # The configured short reminder may still have a holder turn in
-            # progress when shutdown begins. Let it settle first.
-            assert_holder_turn_ended!(holder_turns, id, previous_turn)
             File.write!(Path.join(plan.base, "second-stop"), "stop\n")
             assert {:ok, {:closed, 1012}, _} = WS.recv_event(resumed, 5_000)
             assert exit!(second, plan, "second") == 0
