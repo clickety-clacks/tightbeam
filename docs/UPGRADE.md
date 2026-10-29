@@ -638,6 +638,13 @@ starts the currently selected complete build.
 250ms, for turns in `status = 'running'` to clear. Budget is
 `:drain_timeout_ms`, **default 90s**.
 
+Keep the service manager's stop limit longer than the effective drain budget.
+The README examples use 120 seconds (`TimeoutStopSec=120s` for systemd and
+`ExitTimeOut=120` for launchd). If `TIGHTBEAM_DRAIN_TIMEOUT_MS` overrides the
+default, convert its millisecond value to seconds and set the service manager's
+limit higher; a shorter limit can force-kill the gateway before its drain
+finishes.
+
 While draining, `SessionLane` claims nothing new (`session_lane.ex:161`), so the
 drain is not chasing a moving target — the set of running turns only shrinks.
 

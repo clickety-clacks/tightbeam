@@ -557,6 +557,11 @@ installed it.
 Keep `base_dir` somewhere durable; it holds the org's credentials, identity,
 sessions, and work.
 
+The gateway's drain budget defaults to 90 seconds. Both service examples allow
+120 seconds before the service manager sends a forced kill. If you set
+`TIGHTBEAM_DRAIN_TIMEOUT_MS`, convert its millisecond value to seconds and set
+the manager's stop limit higher.
+
 ### macOS — launchd
 
 `/Library/LaunchDaemons/com.tightbeam.gateway.plist`, owned `root:wheel` mode
@@ -591,6 +596,7 @@ meet the requirements above. `UserName` keeps the process off root.
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key>
   <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ExitTimeOut</key><integer>120</integer>
   <key>StandardOutPath</key><string>/Users/you/.tightbeam/gateway.log</string>
   <key>StandardErrorPath</key><string>/Users/you/.tightbeam/gateway.err.log</string>
 </dict>
@@ -634,7 +640,7 @@ Environment=PATH=/opt/tightbeam/current/tightbeam/bin:/usr/local/bin:/usr/bin:/b
 # LoadCredential=opencode-go-api-key:/home/you/secrets/opencode-go-api-key
 Restart=on-failure
 RestartSec=5s
-TimeoutStopSec=30s
+TimeoutStopSec=120s
 
 [Install]
 WantedBy=multi-user.target
