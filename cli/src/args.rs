@@ -2487,7 +2487,9 @@ fn parse_with_optional_catalog(
                 || flags.keys().any(|flag| {
                     !matches!(
                         flag.as_str(),
-                        "as" | "as-user" | "as-process" | "session"
+                        "as" | "as-user"
+                            | "as-process"
+                            | "session"
                             | "sender-id"
                             | "title"
                             | "body"
@@ -6140,8 +6142,8 @@ mod tests {
                 "work-item-create",
                 "--title",
                 "Priority",
-            "--priority",
-            "-0",
+                "--priority",
+                "-0",
             ]))
             .is_err()
         );
