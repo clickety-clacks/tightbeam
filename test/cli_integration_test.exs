@@ -117,6 +117,8 @@ defmodule Tightbeam.CliIntegrationTest do
       db: db,
       base_dir: base_dir,
       cwd: base_dir,
+      default_harness: :claude,
+      default_model: Model.new("fable"),
       wake_tick_ms: 1_000
     }
 
@@ -3145,6 +3147,165 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     assert pairing =~ "supplied together"
+  end
+
+  test "real CLI records an out-of-range priority as a gateway denial", ctx do
+    {refusal, status} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-create", "--title", "Priority refusal", "--priority", "9"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0, refusal
+    assert refusal =~ "invalid_priority"
+
+    assert_receive {:cli_call, %{verb: "work-item-create", params: %{priority: 9}}}
+
+    assert {:ok, [[payload]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload FROM events WHERE kind='denied' AND verb='work-item-create' ORDER BY id DESC LIMIT 1"
+             )
+
+    assert payload =~ "invalid_priority"
+  end
+
+  test "real CLI records an unknown spawn harness as a gateway denial", ctx do
+    {refusal, status} =
+      System.cmd(
+        ctx.binary,
+        [
+          "spawn",
+          "--display",
+          "Unknown harness",
+          "--harness",
+          "not-supported",
+          "--key",
+          "unknown-harness"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0, refusal
+    assert refusal =~ "unknown_harness"
+
+    assert_receive {:cli_call, %{verb: "spawn", params: %{harness: "not-supported"}}}
+
+    assert {:ok, [[payload]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload FROM events WHERE kind='denied' AND verb='spawn' ORDER BY id DESC LIMIT 1"
+             )
+
+    assert payload =~ "unknown_harness"
+  end
+
+  test "real CLI records Harklight user and process callers as gateway denials", ctx do
+    File.write!(
+      Path.join(ctx.base_dir, "gateway.json"),
+      JSON.encode!(%{port: ctx.port, cliToken: "tbc_cli_integration"})
+    )
+
+    commands = [
+      {"harklight-send",
+       ["harklight-send", "--session", "new", "--sender-id", "owner", "--title", "Example"]},
+      {"harklight-revise",
+       [
+         "harklight-revise",
+         "--message",
+         "message-example",
+         "--base-revision",
+         "1",
+         "--title",
+         "Updated title"
+       ]},
+      {"harklight-retract", ["harklight-retract", "--message", "message-example"]},
+      {"harklight-settle", ["harklight-settle", "--message", "message-example"]}
+    ]
+
+    for {flag, identity, principal} <- [
+          {"--as-user", "owner", {:user, "owner"}},
+          {"--as-process", "worker", {:process, "worker"}}
+        ],
+        {verb, args} <- commands do
+      {refusal, status} =
+        System.cmd(
+          ctx.binary,
+          args ++ [flag, identity],
+          cd: ctx.outside,
+          env: [
+            {"TIGHTBEAM_BASE_DIR", ctx.base_dir},
+            {"TIGHTBEAM_URL", nil},
+            {"TIGHTBEAM_TOKEN", nil}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status != 0, refusal
+      assert refusal =~ "harklight_origin_unavailable"
+
+      assert_receive {:cli_call, %{verb: ^verb, principal: ^principal}}
+
+      assert {:ok, [[payload]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT payload FROM events WHERE kind='denied' AND verb='#{verb}' ORDER BY id DESC LIMIT 1"
+               )
+
+      assert payload =~ "harklight_origin_unavailable"
+    end
+  end
+
+  test "real CLI keeps explicit Harklight identities local with session credentials",
+       ctx do
+    commands = [
+      {"harklight-send",
+       ["harklight-send", "--session", "new", "--sender-id", "owner", "--title", "Example"],
+       "harklight-send requires the authenticated session or one of its roles"},
+      {"harklight-revise",
+       [
+         "harklight-revise",
+         "--message",
+         "message-example",
+         "--base-revision",
+         "1",
+         "--title",
+         "Updated title"
+       ], "invalid Harklight command flags"},
+      {"harklight-retract", ["harklight-retract", "--message", "message-example"],
+       "invalid Harklight command flags"},
+      {"harklight-settle", ["harklight-settle", "--message", "message-example"],
+       "invalid Harklight command flags"}
+    ]
+
+    endpoint = "http://127.0.0.1:#{ctx.port}"
+
+    for credential_source <- [
+          {ctx.workdir, []},
+          {ctx.outside,
+           [
+             {"TIGHTBEAM_URL", endpoint},
+             {"TIGHTBEAM_TOKEN", ctx.session.cli_token}
+           ]}
+        ],
+        {flag, identity} <- [{"--as-user", "owner"}, {"--as-process", "worker"}],
+        {verb, args, local_refusal} <- commands do
+      {cwd, env} = credential_source
+
+      {refusal, status} =
+        System.cmd(ctx.binary, args ++ [flag, identity],
+          cd: cwd,
+          env: env,
+          stderr_to_stdout: true
+        )
+
+      assert status != 0, refusal
+      assert refusal =~ local_refusal
+      refute_receive {:cli_call, %{verb: ^verb}}, 0
+    end
   end
 
   test "real CLI composes priority and metadata in one work-item update", ctx do
