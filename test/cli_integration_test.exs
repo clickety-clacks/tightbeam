@@ -3206,24 +3206,32 @@ defmodule Tightbeam.CliIntegrationTest do
   test "real CLI records Harklight user and process callers as gateway denials", ctx do
     endpoint = "http://127.0.0.1:#{ctx.port}"
 
+    commands = [
+      {"harklight-send",
+       ["harklight-send", "--session", "new", "--sender-id", "owner", "--title", "Example"]},
+      {"harklight-revise",
+       [
+         "harklight-revise",
+         "--message",
+         "message-example",
+         "--base-revision",
+         "1",
+         "--title",
+         "Updated title"
+       ]},
+      {"harklight-retract", ["harklight-retract", "--message", "message-example"]},
+      {"harklight-settle", ["harklight-settle", "--message", "message-example"]}
+    ]
+
     for {flag, identity, principal} <- [
           {"--as-user", "owner", {:user, "owner"}},
           {"--as-process", "worker", {:process, "worker"}}
-        ] do
+        ],
+        {verb, args} <- commands do
       {refusal, status} =
         System.cmd(
           ctx.binary,
-          [
-            "harklight-revise",
-            "--message",
-            "message-example",
-            "--base-revision",
-            "1",
-            "--title",
-            "Updated title",
-            flag,
-            identity
-          ],
+          args ++ [flag, identity],
           cd: ctx.outside,
           env: [
             {"TIGHTBEAM_URL", endpoint},
@@ -3235,15 +3243,50 @@ defmodule Tightbeam.CliIntegrationTest do
       assert status != 0, refusal
       assert refusal =~ "harklight_origin_unavailable"
 
-      assert_receive {:cli_call, %{verb: "harklight-revise", principal: ^principal}}
+      assert_receive {:cli_call, %{verb: ^verb, principal: ^principal}}
 
       assert {:ok, [[payload]]} =
                DB.query(
                  ctx.db,
-                 "SELECT payload FROM events WHERE kind='denied' AND verb='harklight-revise' ORDER BY id DESC LIMIT 1"
+               "SELECT payload FROM events WHERE kind='denied' AND verb='#{verb}' ORDER BY id DESC LIMIT 1"
                )
 
       assert payload =~ "harklight_origin_unavailable"
+    end
+  end
+
+  test "real CLI keeps explicit Harklight user and process identities local with session credentials", ctx do
+    commands = [
+      {"harklight-send",
+       ["harklight-send", "--session", "new", "--sender-id", "owner", "--title", "Example"],
+       "harklight-send requires the authenticated session or one of its roles"},
+      {"harklight-revise",
+       [
+         "harklight-revise",
+         "--message",
+         "message-example",
+         "--base-revision",
+         "1",
+         "--title",
+         "Updated title"
+       ], "invalid Harklight command flags"},
+      {"harklight-retract", ["harklight-retract", "--message", "message-example"],
+       "invalid Harklight command flags"},
+      {"harklight-settle", ["harklight-settle", "--message", "message-example"],
+       "invalid Harklight command flags"}
+    ]
+
+    for {flag, identity} <- [{"--as-user", "owner"}, {"--as-process", "worker"}],
+        {verb, args, local_refusal} <- commands do
+      {refusal, status} =
+        System.cmd(ctx.binary, args ++ [flag, identity],
+          cd: ctx.workdir,
+          stderr_to_stdout: true
+        )
+
+      assert status != 0, refusal
+      assert refusal =~ local_refusal
+      refute_receive {:cli_call, %{verb: ^verb}}, 0
     end
   end
 
