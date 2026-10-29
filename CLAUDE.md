@@ -3,27 +3,24 @@
 ## THIS LINE: main = the 0.2 fabric program (flipped 2026-08-12)
 
 The pre-flip tip lives on branch 0.1.x — the maintenance line the live org
-patches. THE GIT PROCESS ON THIS LINE (intent restated by Mike, 2026-08-22 —
-decisions ledger): NO DOOR means NO PR CEREMONY — nothing else. It
+patches. THE GIT PROCESS ON THIS LINE: NO DOOR means NO PR CEREMONY — nothing else. It
 assumes your branch is READY TO MERGE and the tests PASS. Work on your
 own branch in your own workspace; when the full verification gate is
 GREEN on your branch, merge to main — no PR, no review theater, just a
 clean merge of finished work. Main is never worked in directly, and a
 red suite is never merged; "pre-existing failure" is not a pass, it is a
-stop — fix it or surface it to the owner before anything merges. And the mirror rule at the START of work (Mike, 2026-08-22): branch
+stop — fix it or surface it to the owner before anything merges. And the mirror rule at the START of work: branch
 only FROM a green main — never start work on a red base, where your own
 breakage and inherited breakage are indistinguishable; if main is red,
 fixing it comes first. Review
 evidence lands in the specs repo first. If your assignment card names a different integration branch,
-the card wins. If you are a 0.1.x-org agent reading this: your line is
-0.1.x and this checkout is the wrong one — do not push here. Fixes cross
+the card wins. If your work targets 0.1.x, this is the wrong checkout — do not push here. Fixes cross
 0.1.x -> main by cherry-pick election only, Mike-authorized.
 
 ## THE PHILOSOPHY GATE — run it before you design, again before you ship
 
 Tightbeam is agent-first: agents run the org; the substrate records truth,
-prods, and executes named org-authored law — it NEVER judges and NEVER seizes
-(adjudication deletion ruling, 2026-08-05, shared specs tightbeam-decisions.md).
+prods, and executes named org-authored law — it NEVER judges and NEVER seizes.
 Every spec and every change answers these ten. A "no" is a FINDING to report,
 not a style nit — the "hey, that's not what we're about" moment is this list
 doing its job. Layer vocabulary: PHYSICS = substrate mechanism (invariant,
