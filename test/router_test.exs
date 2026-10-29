@@ -2705,12 +2705,11 @@ defmodule Tightbeam.Wire.RouterTest do
     assert after_turns == before_turns
   end
 
-  test "the dispatch boundary strips an immediate wake's assignment link and request provenance",
+  test "the dispatch boundary carries an immediate wake's assignment reference but strips request provenance",
        ctx do
-    # An immediate conversational wake is not an assignment-linked continuation,
-    # so its assignmentId is dropped. The requestRef remains substrate-only. Drive
-    # a REAL authenticated /agent/dispatch request rather than calling the handler
-    # or the strip helper directly.
+    # An immediate assignment reference is a message pointer, not a continuation.
+    # The requestRef remains substrate-only. Drive a REAL authenticated
+    # /agent/dispatch request rather than calling the handler or strip helper.
     #
     # The other half of the rule — that the strip is SCOPED to that carrier and
     # leaves `assignmentId` alone on attest/assign/dispatch — is proven at the
@@ -2723,8 +2722,8 @@ defmodule Tightbeam.Wire.RouterTest do
         asUser: "flynn",
         params: %{
           prompt: "an ordinary conversational wake",
-          assignmentId: "asg_victim",
-          requestRef: "dr_forged"
+          assignmentId: "assignment-reference",
+          requestRef: "request-reference"
         }
       })
 
@@ -2744,8 +2743,7 @@ defmodule Tightbeam.Wire.RouterTest do
     # to whatever rule set another file last loaded.)
     assert_receive {:call, %{verb: "wake", params: wake_params}}
 
-    refute Map.has_key?(wake_params, :assignment_id),
-           "an immediate conversational wake must not carry assignment attribution"
+    assert wake_params[:assignment_id] == "assignment-reference"
 
     refute Map.has_key?(wake_params, :request_ref),
            "a client-supplied wake requestRef must never reach the handler"
@@ -2787,10 +2785,23 @@ defmodule Tightbeam.Wire.RouterTest do
 
     for malformed <- [%{"afterTurn" => false}, %{"afterTurn" => "true"}, %{"predicate" => nil}] do
       params =
-        Router.atomize_params_for_test("wake", Map.put(malformed, "assignmentId", "asg_named"))
+        Router.atomize_params_for_test(
+          "wake",
+          Map.put(malformed, "assignmentId", "assignment-reference")
+        )
 
       refute Map.has_key?(params, :assignment_id)
     end
+
+    immediate =
+      Router.atomize_params_for_test("wake", %{
+        "prompt" => "message reference",
+        "assignmentId" => "assignment-reference",
+        "requestRef" => "request-reference"
+      })
+
+    assert immediate.assignment_id == "assignment-reference"
+    refute Map.has_key?(immediate, :request_ref)
 
     for timing <- [
           %{"afterMs" => 3_600_000},

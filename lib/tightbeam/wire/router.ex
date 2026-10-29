@@ -4079,9 +4079,10 @@ defmodule Tightbeam.Wire.Router do
   end
 
   # SUBSTRATE-INTERNAL params, PER VERB: fields a client may not set on that verb
-  # because the substrate is their only legitimate author. Immediate conversational
-  # wakes do not carry assignment attribution; scheduled wakes and typed obligation
-  # waits may carry an explicit assignment link. That reference is not authority.
+  # because the substrate is their only legitimate author. An assignment on an
+  # immediate conversational wake is a validated message reference; scheduled wakes
+  # and typed obligation waits may carry an explicit assignment link. That reference
+  # is not authority.
   # `replacement_assignment_id` is derived from `assignmentId` only for the
   # `replaceQueued` operation below.
   #
@@ -4312,7 +4313,23 @@ defmodule Tightbeam.Wire.Router do
         params
 
       true ->
-        Map.delete(params, :assignment_id)
+        if Enum.any?(
+             [
+               :after_ms,
+               :after_turn,
+               :at,
+               :condition_kind,
+               :condition_scope,
+               :cron,
+               :predicate,
+               :replace_queued
+             ],
+             &Map.has_key?(params, &1)
+           ) do
+          Map.delete(params, :assignment_id)
+        else
+          params
+        end
     end
   end
 
