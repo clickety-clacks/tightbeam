@@ -568,13 +568,23 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       params: %{}
     }
 
+    rule_error = fn rule ->
+      %{
+        code: "rule_denied",
+        rule: rule,
+        edge: "verb",
+        reason: "blocked",
+        script_exit_class: "denied",
+        ref: "sample-ref",
+        producer: nil,
+        identity_manifest_sha: String.duplicate("a", 64),
+        message: "sample rule denial"
+      }
+    end
+
     live_samples =
       for index <- 1..2 do
-        payload = %{
-          "code" => "rule_denied",
-          "detail" => "sample-detail-#{index}",
-          "rule" => "sample-rule-#{index}"
-        }
+        payload = rule_error.("sample-rule-#{index}")
 
         [_, live_frame] = Publisher.denied_notices(call, payload)
         {payload, live_frame}
@@ -612,9 +622,12 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       end
 
     event_ids = Enum.map(source_payloads, &elem(&1, 0))
-    expected_payloads = Enum.map(source_payloads, &elem(&1, 1))
+    expected_payloads =
+      Enum.map(live_samples, fn {_payload, live_frame} -> live_frame["payload"] end)
+
     expected_principal = "session:#{session.session_key}"
-    legacy_payload = %{"code" => "rule_denied", "rule" => "legacy-rule"}
+    legacy_payload = rule_error.("legacy-rule")
+    [_, legacy_live_frame] = Publisher.denied_notices(call, legacy_payload)
 
     {:ok, legacy_event_id} =
       DB.transaction(ctx.db, fn txn ->
@@ -659,7 +672,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
            ]
 
     assert Enum.map(denials, & &1.rule) == ["sample-rule-1", "sample-rule-2", "legacy-rule"]
-    assert Enum.map(denials, & &1.payload) == expected_payloads ++ [legacy_payload]
+    assert Enum.map(denials, & &1.payload) == expected_payloads ++ [legacy_live_frame["payload"]]
 
     assert Enum.map(denials, & &1.after_message_seq) == [
              before_message.seq,
@@ -715,7 +728,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
              event_timestamp + 500
            ]
 
-    assert Enum.map(rail_denials, & &1["payload"]) == expected_payloads ++ [legacy_payload]
+    assert Enum.map(rail_denials, & &1["payload"]) ==
+             expected_payloads ++ [legacy_live_frame["payload"]]
 
     assert Enum.map(rail_denials, & &1["afterMessageSeq"]) == [
              before_message.seq,
@@ -739,14 +753,19 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     for {{_source_payload, live_frame}, history_denial} <-
           Enum.zip(live_samples, Enum.take(rail_denials, 2)) do
+      assert live_frame["payload"]["verb"] == "assign"
+      assert live_frame["payload"]["scriptExitClass"] == "denied"
+      assert live_frame["payload"]["identityManifestSha"] == String.duplicate("a", 64)
       assert history_denial["sessionKey"] == live_frame["refs"]["sessionKey"]
       assert history_denial["origin"] == live_frame["refs"]["origin"]
       assert history_denial["principal"] == live_frame["refs"]["principal"]
       assert history_denial["verb"] == live_frame["payload"]["verb"]
       assert history_denial["rule"] == live_frame["payload"]["rule"]
-      assert history_denial["payload"] == Map.delete(live_frame["payload"], "verb")
+      assert history_denial["payload"] == live_frame["payload"]
       assert abs(history_denial["occurredAt"] - live_frame["occurredAt"]) <= 2_000
     end
+
+    assert List.last(rail_denials)["payload"] == legacy_live_frame["payload"]
 
     items = Map.new(history["items"], &{&1["id"], &1})
     first_denial_at = hd(rail_denials)["occurredAt"]

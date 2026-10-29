@@ -23,6 +23,7 @@ defmodule Tightbeam.EventLog do
   alias Tightbeam.DB.Txn
   alias Tightbeam.Org
   alias Tightbeam.Projection
+  alias Tightbeam.StateResources
   alias Tightbeam.Wire.Payloads
 
   @type db :: GenServer.server()
@@ -312,11 +313,43 @@ defmodule Tightbeam.EventLog do
         principal: principal,
         rule: rule,
         # Keep ordering metadata separate from the source payload identity.
-        payload: JSON.decode!(payload) |> Map.delete("afterMessageSeq"),
+        payload: denial_payload_for_history(payload, verb),
         after_message_seq: after_message_seq
       }
     end)
   end
+
+  defp denial_payload_for_history(payload, verb) do
+    # Event JSON stores atom keys as snake_case strings; live denial notices pass
+    # those atom-keyed errors through the shared public wire projection.
+    payload
+    |> JSON.decode!()
+    |> Map.delete("afterMessageSeq")
+    |> restore_denial_payload_atom_keys()
+    |> StateResources.observation()
+    |> Map.put("verb", verb)
+  end
+
+  defp restore_denial_payload_atom_keys(value) when is_map(value) do
+    Map.new(value, fn {key, nested} ->
+      {existing_denial_payload_atom(key), restore_denial_payload_atom_keys(nested)}
+    end)
+  end
+
+  defp restore_denial_payload_atom_keys(values) when is_list(values),
+    do: Enum.map(values, &restore_denial_payload_atom_keys/1)
+
+  defp restore_denial_payload_atom_keys(value), do: value
+
+  defp existing_denial_payload_atom(key) when is_binary(key) do
+    try do
+      String.to_existing_atom(key)
+    rescue
+      ArgumentError -> key
+    end
+  end
+
+  defp existing_denial_payload_atom(key), do: key
 
   defp denial_payload_with_message_position(
          %Txn{} = txn,
