@@ -192,7 +192,7 @@ pub enum Command {
     HarklightRevise {
         identity: Identity,
         message: String,
-        base_revision: u64,
+        base_revision: i64,
         title: String,
         body: Option<String>,
         choices: Vec<String>,
@@ -501,7 +501,7 @@ pub enum Command {
         record: String,
         history: bool,
         name: Option<String>,
-        limit: Option<u32>,
+        limit: Option<i64>,
         cursor: Option<String>,
     },
     Attests {
@@ -1827,17 +1827,6 @@ fn number_coercion(text: &str) -> f64 {
     }
 }
 
-fn exceeds_other_validity_window(observed_at: &str, valid_until: &str) -> bool {
-    const MAX_VALIDITY_MS: f64 = 900_000.0;
-    let observed_at = number_coercion(observed_at);
-    let valid_until = number_coercion(valid_until);
-    observed_at.is_finite()
-        && valid_until.is_finite()
-        && observed_at.fract() == 0.0
-        && valid_until.fract() == 0.0
-        && valid_until > observed_at + MAX_VALIDITY_MS
-}
-
 fn js_number_json(value: f64) -> String {
     if !value.is_finite() {
         return "null".to_owned();
@@ -2254,25 +2243,9 @@ fn parse_with_optional_catalog(
             if evidence_mode == "probe_digest" && output_digest.is_none() {
                 return Err("--output-digest is required for probe_digest evidence".to_owned());
             }
-            if world_status == "UNKNOWN" && evidence_mode != "exact_error" {
-                return Err(
-                    "--world-status UNKNOWN requires --evidence-mode exact_error".to_owned(),
-                );
-            }
             let observed_at = nonempty(flags, "observed-at");
             let valid_until = nonempty(flags, "valid-until")
                 .ok_or_else(|| "--valid-until is required".to_owned())?;
-            if observed_at
-                .as_deref()
-                .is_some_and(|observed_at| exceeds_other_validity_window(observed_at, &valid_until))
-            {
-                return Err(
-                    "--valid-until must be no more than 15 minutes after --observed-at".to_owned(),
-                );
-            }
-            if !flags.contains_key("redaction-confirmed") {
-                return Err("--redaction-confirmed is required".to_owned());
-            }
             Ok(Command::HarnessHealthObserveOther {
                 identity: identity(flags)?,
                 harness: nonempty(flags, "harness")
@@ -2296,7 +2269,7 @@ fn parse_with_optional_catalog(
                 observed_at: observed_at.map(|value| js_number_json(number_coercion(&value))),
                 valid_until: js_number_json(number_coercion(&valid_until)),
                 world_status,
-                redaction_confirmed: true,
+                redaction_confirmed: flags.contains_key("redaction-confirmed"),
                 idempotency_key: nonempty(flags, "key")
                     .ok_or_else(|| "--key is required".to_owned())?,
                 correlation_id: nonempty(flags, "correlation-id"),
@@ -2514,7 +2487,9 @@ fn parse_with_optional_catalog(
                 || flags.keys().any(|flag| {
                     !matches!(
                         flag.as_str(),
-                        "as" | "session"
+                        "as" | "as-user"
+                            | "as-process"
+                            | "session"
                             | "sender-id"
                             | "title"
                             | "body"
@@ -2535,12 +2510,6 @@ fn parse_with_optional_catalog(
                 }
             };
             let sender_identity = identity(flags)?;
-            if !matches!(sender_identity, Identity::Session | Identity::Role(_)) {
-                return Err(
-                    "harklight-send requires the authenticated session or one of its roles"
-                        .to_owned(),
-                );
-            }
             Ok(Command::HarklightSend {
                 identity: sender_identity,
                 session: nonempty(flags, "session").ok_or("--session is required")?,
@@ -2562,7 +2531,7 @@ fn parse_with_optional_catalog(
             let revise = command == "harklight-revise";
             if parsed.positional.len() != 1
                 || flags.keys().any(|flag| {
-                    !matches!(flag.as_str(), "as" | "message")
+                    !matches!(flag.as_str(), "as" | "as-user" | "as-process" | "message")
                         && !(revise
                             && matches!(
                                 flag.as_str(),
@@ -2584,11 +2553,8 @@ fn parse_with_optional_catalog(
                 _ => {
                     let base_revision = nonempty(flags, "base-revision")
                         .ok_or("--base-revision is required")?
-                        .parse::<u64>()
+                        .parse::<i64>()
                         .map_err(|_| "--base-revision must be a positive integer")?;
-                    if base_revision == 0 {
-                        return Err("--base-revision must be a positive integer".to_owned());
-                    }
                     let choices = flags
                         .get("choices-json")
                         .map(|v| serde_json::from_str::<Vec<String>>(v))
@@ -2615,17 +2581,6 @@ fn parse_with_optional_catalog(
             let display_name =
                 nonempty(flags, "display").ok_or_else(|| "--display is required".to_owned())?;
             let harness = nonempty(flags, "harness");
-            if let Some(name) = harness.as_deref() {
-                let catalog = match supplied_catalog {
-                    Some(catalog) => catalog.clone(),
-                    None => crate::harnesses::catalog_for(Some(
-                        crate::attempt_diagnostic::command_context::CommandContext::spawn_catalog(),
-                    ))?,
-                };
-                if !catalog.contains(name) {
-                    return Err(format!("unsupported harness: {name}"));
-                }
-            }
             Ok(Command::Spawn {
                 identity: identity(flags)?,
                 owner_user_id: nonempty(flags, "owner"),
@@ -3605,13 +3560,10 @@ fn parse_with_optional_catalog(
                 .get("limit")
                 .map(|value| {
                     value
-                        .parse::<u32>()
+                        .parse::<i64>()
                         .map_err(|_| "--limit requires a positive integer".to_owned())
                 })
                 .transpose()?;
-            if limit == Some(0) {
-                return Err("--limit requires a positive integer".to_owned());
-            }
             Ok(Command::Mementos {
                 identity: identity(flags)?,
                 record: nonempty(flags, "record").ok_or("--record is required")?,
@@ -3642,9 +3594,6 @@ fn parse_with_optional_catalog(
                     let id = value
                         .parse::<i64>()
                         .map_err(|_| "--fact-id must be a positive integer".to_owned())?;
-                    if id <= 0 {
-                        return Err("--fact-id must be a positive integer".to_owned());
-                    }
                     Some(id)
                 }
             };
@@ -3695,11 +3644,9 @@ fn parse_with_optional_catalog(
 
             let turn_seq = nonempty(flags, "seq").ok_or_else(|| usage.to_owned())?;
             let normalized_turn_seq = turn_seq
-                .parse::<u64>()
-                .ok()
-                .filter(|value| *value > 0 && *value <= i64::MAX as u64)
+                .parse::<i64>()
                 .map(|value| value.to_string())
-                .ok_or_else(|| "--seq must be a positive integer".to_owned())?;
+                .map_err(|_| "--seq must be a positive integer".to_owned())?;
 
             Ok(Command::SettleTurn {
                 identity: identity(flags)?,
@@ -4063,8 +4010,7 @@ fn parse_harness_process(
 fn priority_flag(flags: &HashMap<String, String>) -> Result<Option<String>, String> {
     nonempty(flags, "priority")
         .map(|value| {
-            let priority = value.parse::<u8>().ok();
-            if priority.is_some_and(|priority| priority <= 8) {
+            if value != "-0" && serde_json::from_str::<serde_json::Number>(&value).is_ok() {
                 Ok(value)
             } else {
                 Err("priority must be an integer from 0 through 8".to_owned())
@@ -4090,8 +4036,7 @@ fn parse_config(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comma
             value: value.clone(),
         }),
         (Some("set"), Some("default-priority"), Some(value), None) => {
-            let priority = value.parse::<u8>().ok();
-            if priority.is_none_or(|priority| priority > 8) {
+            if value == "-0" || serde_json::from_str::<serde_json::Number>(value).is_err() {
                 return Err("default-priority must be an integer from 0 through 8".to_owned());
             }
             Ok(Command::ConfigSet {
@@ -4542,8 +4487,7 @@ mod tests {
             })
         );
 
-        assert!(
-            parse(strings(&[
+        assert!(matches!(parse(strings(&[
                 "harklight-send",
                 "--session",
                 "new",
@@ -4553,9 +4497,22 @@ mod tests {
                 "Question",
                 "--as-user",
                 "owner",
-            ]))
-            .is_err()
-        );
+            ])), Ok(Command::HarklightSend { identity: Identity::User(user), .. }) if user == "owner"));
+        assert!(matches!(
+            parse(strings(&[
+                "harklight-send",
+                "--session",
+                "new",
+                "--sender-id",
+                "sender",
+                "--title",
+                "Question",
+                "--as-process",
+                "worker",
+            ])),
+            Ok(Command::HarklightSend { identity: Identity::Process(process), .. })
+                if process == "worker"
+        ));
         assert!(
             parse(strings(&[
                 "harklight-send",
@@ -4570,6 +4527,67 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn harklight_revise_sends_base_revision_validity_to_gateway() {
+        for revision in ["0", "-1"] {
+            let command = parse(strings(&[
+                "harklight-revise",
+                "--message",
+                "message-example",
+                "--base-revision",
+                revision,
+                "--title",
+                "Updated title",
+            ]))
+            .unwrap();
+
+            assert!(
+                matches!(command, Command::HarklightRevise { base_revision, .. }
+                if base_revision == revision.parse::<i64>().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn harklight_change_commands_send_user_and_process_identity_to_gateway() {
+        let calls: &[&[&str]] = &[
+            &[
+                "harklight-revise",
+                "--message",
+                "message-example",
+                "--base-revision",
+                "1",
+                "--title",
+                "Updated title",
+            ],
+            &["harklight-retract", "--message", "message-example"],
+            &["harklight-settle", "--message", "message-example"],
+        ];
+
+        for (identity_flag, identity_value, expected_identity) in [
+            ("--as-user", "owner", Identity::User("owner".to_owned())),
+            (
+                "--as-process",
+                "worker",
+                Identity::Process("worker".to_owned()),
+            ),
+        ] {
+            for call in calls {
+                let mut args = call.to_vec();
+                args.extend([identity_flag, identity_value]);
+
+                let identity = match parse(strings(&args)).unwrap() {
+                    Command::HarklightRevise { identity, .. }
+                    | Command::HarklightRetract { identity, .. }
+                    | Command::HarklightSettle { identity, .. } => identity,
+                    other => panic!("unexpected command: {other:?}"),
+                };
+
+                assert_eq!(identity, expected_identity);
+            }
+        }
     }
 
     #[test]
@@ -4640,7 +4658,7 @@ mod tests {
             "--host",
             "host-a",
             "--source-session",
-            "agent:worker:session",
+            "session-example",
             "--description",
             "provider connection reset",
             "--evidence-mode",
@@ -4705,51 +4723,141 @@ mod tests {
     }
 
     #[test]
-    fn harness_health_observe_other_rejects_unknown_probe_digest_evidence() {
+    fn harness_health_observe_other_sends_unknown_probe_digest_evidence_to_gateway() {
         let digest = "a".repeat(64);
-        let error = parse(strings(&[
+        let valid_until = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            + 60_000)
+            .to_string();
+        let command = parse(strings(&[
             "harness-health-observe-other",
+            "--harness",
+            "claude",
+            "--host",
+            "host-a",
+            "--source-session",
+            "session-example",
+            "--description",
+            "observation",
             "--evidence-mode",
             "probe_digest",
             "--output-digest",
             &digest,
+            "--observed-state",
+            "provider request failed",
+            "--exact-probe",
+            "provider health probe",
+            "--recovery-condition",
+            "a normal provider turn completes",
+            "--not-known-class",
+            "not one of the named failure classes",
+            "--valid-until",
+            &valid_until,
             "--world-status",
             "UNKNOWN",
+            "--redaction-confirmed",
+            "--key",
+            "observation-2",
         ]))
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(
-            error,
-            "--world-status UNKNOWN requires --evidence-mode exact_error"
+        assert!(
+            matches!(command, Command::HarnessHealthObserveOther { evidence_mode, world_status, .. }
+            if evidence_mode == "probe_digest" && world_status == "UNKNOWN")
         );
     }
 
     #[test]
-    fn harness_health_observe_other_rejects_valid_until_beyond_observed_window() {
+    fn harness_health_observe_other_sends_validity_window_to_gateway() {
         let observed_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis();
         let valid_until = observed_at + 900_001;
-        let error = parse(strings(&[
+        let command = parse(strings(&[
             "harness-health-observe-other",
+            "--harness",
+            "claude",
+            "--host",
+            "host-a",
+            "--source-session",
+            "session-example",
+            "--description",
+            "observation",
             "--evidence-mode",
             "exact_error",
             "--exact-error",
             "provider refused the request",
+            "--observed-state",
+            "provider request failed",
             "--world-status",
             "UNKNOWN",
+            "--exact-probe",
+            "provider health probe",
+            "--recovery-condition",
+            "a normal provider turn completes",
+            "--not-known-class",
+            "not one of the named failure classes",
             "--observed-at",
             &observed_at.to_string(),
             "--valid-until",
             &valid_until.to_string(),
+            "--redaction-confirmed",
+            "--key",
+            "observation-3",
         ]))
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(
-            error,
-            "--valid-until must be no more than 15 minutes after --observed-at"
+        assert!(
+            matches!(command, Command::HarnessHealthObserveOther { observed_at: Some(value), .. }
+            if value == observed_at.to_string())
         );
+    }
+
+    #[test]
+    fn harness_health_observe_other_sends_redaction_confirmation_state_to_gateway() {
+        let valid_until = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            + 60_000)
+            .to_string();
+        let command = parse(strings(&[
+            "harness-health-observe-other",
+            "--harness",
+            "claude",
+            "--host",
+            "host-a",
+            "--source-session",
+            "session-example",
+            "--description",
+            "observation",
+            "--evidence-mode",
+            "exact_error",
+            "--exact-error",
+            "provider refused the request",
+            "--observed-state",
+            "provider request failed",
+            "--exact-probe",
+            "provider health probe",
+            "--recovery-condition",
+            "a normal provider turn completes",
+            "--not-known-class",
+            "not one of the named failure classes",
+            "--valid-until",
+            &valid_until,
+            "--world-status",
+            "UNKNOWN",
+            "--key",
+            "observation-4",
+        ]))
+        .unwrap();
+
+        let body = crate::dispatch::build_request(&command).unwrap().body_json;
+        let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(request["params"]["redactionConfirmed"], false);
     }
 
     #[test]
@@ -5720,7 +5828,7 @@ mod tests {
     }
 
     #[test]
-    fn settlement_requires_a_positive_sqlite_sequence_and_closed_outcome() {
+    fn settlement_sends_sequence_validity_to_gateway_and_keeps_malformed_values_local() {
         let argv = [
             "settle-turn",
             "--session",
@@ -5747,7 +5855,15 @@ mod tests {
                 idempotency_key: "one".to_owned(),
             })
         );
-        for seq in ["0", "-1", "9223372036854775808", "abc"] {
+        for seq in ["0", "-1"] {
+            let mut invalid = argv;
+            invalid[4] = seq;
+            assert!(matches!(
+                parse(strings(&invalid)),
+                Ok(Command::SettleTurn { turn_seq, .. }) if turn_seq == seq
+            ));
+        }
+        for seq in ["9223372036854775808", "abc"] {
             let mut invalid = argv;
             invalid[4] = seq;
             assert!(parse(strings(&invalid)).is_err(), "accepted {seq}");
@@ -6085,6 +6201,77 @@ mod tests {
     }
 
     #[test]
+    fn numeric_domain_limits_are_sent_to_gateway() {
+        let priority = parse(strings(&[
+            "work-item-create",
+            "--title",
+            "Priority",
+            "--priority",
+            "9",
+        ]))
+        .unwrap();
+        let priority_body = crate::dispatch::build_request(&priority).unwrap().body_json;
+        let priority_request: serde_json::Value = serde_json::from_str(&priority_body).unwrap();
+        assert_eq!(priority_request["params"]["priority"], 9);
+
+        let negative_priority = parse(strings(&[
+            "work-item-create",
+            "--title",
+            "Priority",
+            "--priority",
+            "-1",
+        ]))
+        .unwrap();
+        let negative_priority_body = crate::dispatch::build_request(&negative_priority)
+            .unwrap()
+            .body_json;
+        let negative_priority_request: serde_json::Value =
+            serde_json::from_str(&negative_priority_body).unwrap();
+        assert_eq!(negative_priority_request["params"]["priority"], -1);
+
+        let default_priority = parse(strings(&["config", "set", "default-priority", "9"])).unwrap();
+        let config_body = crate::dispatch::build_request(&default_priority)
+            .unwrap()
+            .body_json;
+        let config_request: serde_json::Value = serde_json::from_str(&config_body).unwrap();
+        assert_eq!(config_request["params"]["value"], 9);
+
+        let mementos = parse(strings(&[
+            "mementos",
+            "--record",
+            "assignment:example",
+            "--history",
+            "--limit",
+            "0",
+        ]))
+        .unwrap();
+        let mementos_body = crate::dispatch::build_request(&mementos).unwrap().body_json;
+        let mementos_request: serde_json::Value = serde_json::from_str(&mementos_body).unwrap();
+        assert_eq!(mementos_request["params"]["limit"], 0);
+
+        assert!(
+            parse(strings(&[
+                "work-item-create",
+                "--title",
+                "Priority",
+                "--priority",
+                "not-a-number",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(strings(&[
+                "work-item-create",
+                "--title",
+                "Priority",
+                "--priority",
+                "-0",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn fixture_projection_drives_spawn_validation_and_assimilation_defaults() {
         let catalog = HarnessCatalog {
             harnesses: vec![crate::harnesses::HarnessProjection {
@@ -6114,7 +6301,7 @@ mod tests {
             }) if harness == "fixture"
         ));
 
-        assert_eq!(
+        assert!(matches!(
             parse_with_catalog(
                 strings(&[
                     "spawn",
@@ -6129,8 +6316,8 @@ mod tests {
                 ]),
                 &catalog
             ),
-            Err("unsupported harness: codex".to_owned())
-        );
+            Ok(Command::Spawn { harness: Some(ref harness), .. }) if harness == "codex"
+        ));
 
         assert!(matches!(
             parse_with_catalog(strings(&[
@@ -7114,17 +7301,27 @@ mod tests {
             })
         );
 
-        for value in ["0", "-1", "unknown"] {
-            assert_eq!(
+        for value in ["0", "-1"] {
+            assert!(matches!(
                 parse(strings(&[
                     "assignment-get",
                     "assignment-example",
                     "--fact-id",
                     value,
                 ])),
-                Err("--fact-id must be a positive integer".to_owned())
-            );
+                Ok(Command::AssignmentGet { fact_id: Some(id), .. })
+                    if id == value.parse::<i64>().unwrap()
+            ));
         }
+        assert_eq!(
+            parse(strings(&[
+                "assignment-get",
+                "assignment-example",
+                "--fact-id",
+                "unknown",
+            ])),
+            Err("--fact-id must be a positive integer".to_owned())
+        );
 
         let entry = render_command_help(None, "assignment-get").unwrap();
         assert!(entry.starts_with("  assignment-get <assignmentId>"));
