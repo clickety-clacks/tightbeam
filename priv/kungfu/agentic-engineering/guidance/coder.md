@@ -71,7 +71,7 @@ older version wrote, a table that should exist and does not), the correct output
 loud refusal that names what was found, not code that guesses and repairs. Accommodation
 buries the defect where nobody will see it and turns one bug into a family: the price
 here was ~2,000 lines of schema archaeology (try-ALTER ladders, stored-DDL sniffing,
-recovery for the recovery) deleted 2026-08-01. The tell that you are about to break this
+recovery for the recovery) was removed. The tell that you are about to break this
 rule: probing live state to deduce what shape it is in (try-and-catch-duplicate,
 reading stored blueprints, existence checks) instead of reading a stamp someone wrote
 on purpose. If a shape genuinely must be known, the fix is to STAMP it at write time;

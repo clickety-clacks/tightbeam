@@ -1236,7 +1236,7 @@ defmodule Tightbeam.ModelCatalogTest do
       {local, :fresh} = ModelCatalog.get(@host, "claude", catalog)
       refute Enum.any?(local, &(&1.family == "satellite-only"))
 
-      # The eurisko method: the credential is read by the shell ON the owning
+      # The test-host method: the credential is read by the shell ON the owning
       # host, so no byte of it is in the argv, and each script says so literally.
       # The shell variable is `credential`, not `token`: this file holds whichever
       # KIND the host was onboarded on.
@@ -1503,7 +1503,7 @@ defmodule Tightbeam.ModelCatalogTest do
     end
   end
 
-  # Task #41. The catalog must not advertise a model the adapter will refuse, and no
+  # . The catalog must not advertise a model the adapter will refuse, and no
   # substitution may be smuggled in at the only place a mapping could live.
   describe "claude selectable-model pin" do
     test "keeps Fable 5.1 default and 1m vendor identities", ctx do

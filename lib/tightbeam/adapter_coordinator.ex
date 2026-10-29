@@ -37,7 +37,7 @@ defmodule Tightbeam.AdapterCoordinator do
   - FAILURE MEMORY is ATTEMPT-SCOPED: `last_failure` records {generation, reason}
     and is only served to a caller asking about that same generation. A
     replacement adapter's death must never be labelled with its predecessor's
-    reason (cross-review F4).
+    reason.
   """
 
   use GenServer
@@ -308,20 +308,14 @@ defmodule Tightbeam.AdapterCoordinator do
       Tightbeam.HarnessProcess.fenced?(state.db, key) ->
         {:reply, {:error, {:park_fenced, key_name(key)}}, state}
 
-      # THE CIRCUIT DOES NOT GATE CREDENTIAL INSTALLATION (the credential-swap
-      # incident, 2026-08-14). It protects agent connections from a dead
+      # THE CIRCUIT DOES NOT GATE CREDENTIAL INSTALLATION. It protects agent
+      # connections from a dead
       # harness; it has no authority over an operator installing a credential.
       # `authoritative?` is set only by the credential lifecycle, whose one
       # caller is `start_provider_runtime`.
       #
-      # Conflating them deadlocked recovery by construction. The circuit is
-      # guaranteed open exactly when a credential has stopped working — which is
-      # the only reason anyone replaces one — so the latch vetoed the single
-      # call that could unlatch it. Onboarding reported "Successfully logged in"
-      # and then :degraded, the ceremony read that as a bad credential, and the
-      # replacement was rolled back. Measured live: three onboardings left the
-      # store still holding the original credential, and recovery needed an
-      # operator restarting the gateway.
+      # Credential replacement is the operation that can restore a failed
+      # connection, so an open circuit must not veto that authoritative update.
       entry.circuit == :open and not authoritative? ->
         {:reply, {:error, :degraded}, state}
 
@@ -691,7 +685,7 @@ defmodule Tightbeam.AdapterCoordinator do
         end
 
       # The message NAMES THE INSTANCE that booted. `on_ready` runs in the
-      # adapter's own process, so self() here is that adapter. Without it the
+      # adapter's own process, so self here is that adapter. Without it the
       # coordinator can only credit whichever pid the entry holds when the
       # message is finally processed — and an adapter that dies between
       # announcing readiness and being heard would hand its credit to the

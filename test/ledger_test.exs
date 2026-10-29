@@ -19,13 +19,13 @@ defmodule Tightbeam.LedgerTest do
          archetype, identityName,
          harness, provider, model, thinkingLevel, modelContext, createdAt, updatedAt)
       VALUES
-        ('ledger-main', 'Ledger Main', 'main', 1, 'flynn', 'user:flynn',
+        ('ledger-main', 'Ledger Main', 'main', 1, 'sample-user', 'user:sample-user',
          'ledger-main', 'default', 'default',
          'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1),
-        ('k1', 'K1', 'custom', 0, 'flynn', 'user:flynn',
+        ('k1', 'K1', 'custom', 0, 'sample-user', 'user:sample-user',
          'ledger-main', 'default', 'default',
          'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1),
-        ('k2', 'K2', 'custom', 0, 'flynn', 'user:flynn',
+        ('k2', 'K2', 'custom', 0, 'sample-user', 'user:sample-user',
          'ledger-main', 'default', 'default',
          'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1);
       """)
@@ -317,7 +317,7 @@ defmodule Tightbeam.LedgerTest do
   test "enqueue refuses a turn addressed to a session that has no row", %{db: db} do
     assert {:error, :no_session} =
              Ledger.enqueue(db, %{
-               session_key: "agent:main:clawline:flynn:main",
+               session_key: "agent:main:clawline:sample-user:main",
                message_id: "m-phantom",
                origin: "process:tightbeam",
                prompt: "a prompt nobody can claim"
@@ -350,17 +350,17 @@ defmodule Tightbeam.LedgerTest do
   test "claim_next separates an empty queue from work nobody can claim", %{db: db} do
     assert :none = Ledger.claim_next(db, "k1", "lane")
 
-    insert_orphan_turn(db, "agent:main:clawline:flynn:main")
+    insert_orphan_turn(db, "agent:main:clawline:sample-user:main")
 
     assert {:unclaimable, :no_session} =
-             Ledger.claim_next(db, "agent:main:clawline:flynn:main", "lane")
+             Ledger.claim_next(db, "agent:main:clawline:sample-user:main", "lane")
   end
 
   test "unclaimable turns age into failed carrying the reason", %{db: db} do
-    seq = insert_orphan_turn(db, "agent:main:clawline:flynn:main")
+    seq = insert_orphan_turn(db, "agent:main:clawline:sample-user:main")
 
     assert [^seq] =
-             Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session)
+             Ledger.fail_unclaimable(db, "agent:main:clawline:sample-user:main", :no_session)
 
     assert {:ok, [["failed", error]]} =
              DB.query(db, "SELECT status, error FROM turns WHERE seq = ?1", [seq])
@@ -369,18 +369,18 @@ defmodule Tightbeam.LedgerTest do
 
     # The named terminal rides the existing at-least-once publication feed.
     assert [%{seq: ^seq, status: "failed"}] = Ledger.unpublished_terminals(db)
-    assert Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session) == []
+    assert Ledger.fail_unclaimable(db, "agent:main:clawline:sample-user:main", :no_session) == []
   end
 
-  # Review finding 3. The diagnosis and the failure are separate transactions,
+  # The diagnosis and the failure are separate transactions,
   # so the cause has to be re-asserted by the UPDATE itself. A session created
   # in that window makes the turn claimable again, and aging it anyway destroys
   # live work on the strength of a reading that had already expired.
   test "a session appearing after the diagnosis spares its turn", %{db: db} do
-    seq = insert_orphan_turn(db, "agent:main:clawline:flynn:main")
+    seq = insert_orphan_turn(db, "agent:main:clawline:sample-user:main")
 
     assert {:unclaimable, :no_session} =
-             Ledger.claim_next(db, "agent:main:clawline:flynn:main", "lane")
+             Ledger.claim_next(db, "agent:main:clawline:sample-user:main", "lane")
 
     :ok =
       DB.execute(db, """
@@ -389,26 +389,32 @@ defmodule Tightbeam.LedgerTest do
          archetype, identityName,
          harness, provider, model, thinkingLevel, modelContext, createdAt, updatedAt)
       VALUES
-        ('agent:main:clawline:flynn:main', 'Flynn', 'main', 1, 'flynn', 'user:flynn',
-         'agent:main:clawline:flynn:main', 'default',
+        ('agent:main:clawline:sample-user:main', 'user', 'main', 1, 'sample-user', 'user:sample-user',
+         'agent:main:clawline:sample-user:main', 'default',
          'default', 'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1);
       """)
 
-    assert Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session) == []
+    assert Ledger.fail_unclaimable(db, "agent:main:clawline:sample-user:main", :no_session) == []
     assert {:ok, [["queued"]]} = DB.query(db, "SELECT status FROM turns WHERE seq = ?1", [seq])
-    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, "agent:main:clawline:flynn:main", "lane")
+
+    assert {:ok, %{seq: ^seq}} =
+             Ledger.claim_next(db, "agent:main:clawline:sample-user:main", "lane")
   end
 
-  # Re-review finding. Identifying the aged rows by the error string this
+  # Identifying the aged rows by the error string this
   # function itself wrote makes a second aging re-report the first batch, so the
   # lane announces rows it did not touch. Only the statement that did the work
   # knows what it did.
   test "aging reports the rows it transitioned, never a previous batch", %{db: db} do
-    first = insert_orphan_turn(db, "agent:main:clawline:flynn:main")
-    assert [^first] = Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session)
+    first = insert_orphan_turn(db, "agent:main:clawline:sample-user:main")
 
-    second = insert_orphan_turn(db, "agent:main:clawline:flynn:main")
-    assert [^second] = Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session)
+    assert [^first] =
+             Ledger.fail_unclaimable(db, "agent:main:clawline:sample-user:main", :no_session)
+
+    second = insert_orphan_turn(db, "agent:main:clawline:sample-user:main")
+
+    assert [^second] =
+             Ledger.fail_unclaimable(db, "agent:main:clawline:sample-user:main", :no_session)
   end
 
   # A turn the ledger would refuse today, written the way the pre-guard gateway

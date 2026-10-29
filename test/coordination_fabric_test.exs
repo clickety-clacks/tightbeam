@@ -123,14 +123,14 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "a scheduled or conditional algedonic wake is never batcher-inhibited", %{db: db} do
-    # Sol xhigh review, finding 1: the class check precedes the inhibition
+    # : the class check precedes the inhibition
     # branch. §7: algedonic "bypasses every bone... never batched, never
     # digested, never triaged." A sender's own --after on an algedonic wake is
     # the sender's OWN election, not the batcher holding anything — the row
     # must carry the bypass rule, never `batcher-inhibited`, and the sender's
     # chosen time, never a ceiling.
     at = System.system_time(:millisecond) + 4 * 60 * 60 * 1000
-    # Sol xhigh review round 2, finding 4: exact equality, not `=~` — a
+    # : exact equality, not `=~` — a
     # prefixed or revised rule string must not slip past this assertion.
     bypass_rule = Wakes.delivery_policy("algedonic").rule
 
@@ -215,7 +215,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "a turn boundary releases the digest even with more work queued behind it",
        %{db: db} do
-    # Sol xhigh review, finding 3: `turn_boundary_passed?` must not require
+    # : `turn_boundary_passed?` must not require
     # `busy == 0`. A turn boundary is a turn ENDING — the digest joins the
     # queue at that boundary rather than waiting for the session to go idle,
     # which with continuous queued work would mean never.
@@ -261,7 +261,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "a member filed after the trigger waits for its own boundary, not somebody else's",
        %{db: db} do
-    # Sol xhigh review, finding 2: eligibility and membership must be one
+    # : eligibility and membership must be one
     # transactionally coherent snapshot. A member the outer group query never
     # saw at all — filed after a boundary already released an earlier member
     # of the SAME session/class group — must not be swept into that earlier
@@ -301,7 +301,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "a member filed in the same millisecond as a turn's end waits for the next boundary",
        %{db: db} do
-    # Sol xhigh review round 2, finding 1: `boundary >= created_at` treated a
+    # : `boundary >= created_at` treated a
     # wake filed in the SAME millisecond a turn ended as already past that
     # boundary. Same-millisecond is ambiguous ordering — not proof the turn
     # ended AFTER the wake was filed — so it must NOT release the digest.
@@ -383,7 +383,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert detail =~ "trigger=ceiling"
     assert Wakes.get(db, digest_id).prompt =~ "coalesced by #{Wakes.digest_rule()}"
 
-    # O5 follow-up (Sol xhigh review, finding 2): `digest-members` needs a
+    # `digest-members` needs a
     # wake id no other sanctioned surface hands an agent — the delivered
     # digest signs itself with its OWN id, right after the rule signature.
     assert Wakes.get(db, digest_id).prompt =~ "wake #{digest_id}"
@@ -407,7 +407,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "the carrier is honestly attributed to the batcher; members keep their true elections",
        %{db: db} do
-    # Sol xhigh review, finding 7: a digest carrier passing `class: class` to
+    # : a digest carrier passing `class: class` to
     # `elected_class/1` used to be read as a sender election. The carrier was
     # built by the batcher, not elected by anyone — and a group can mix a
     # sender's own election with the classifier's default stamp, both of
@@ -447,7 +447,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "digest_members is provenance-total: an adversarial supersession pointing at the carrier is not a member",
        %{db: db} do
-    # Sol xhigh review, finding 6: matching only replacementWakeId/reasonKind/
+    # : matching only replacementWakeId/reasonKind/
     # outcomeKind proves a row was superseded BY SOMETHING naming this carrier
     # as its replacement — not that the BATCHER carried it. A legitimate,
     # differently-caused cancellation that happens to name the same
@@ -485,8 +485,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "O2: role-addressed classed wakes digest into a role-carrier that carries targetRole forward",
        %{db: db} do
-    seed_session(db, "s1", "flynn")
-    Roles.create!(db, "role-x", "flynn", "s1")
+    seed_session(db, "s1", "sample-user")
+    Roles.create!(db, "role-x", "sample-user", "s1")
 
     a =
       schedule_wake(db, %{
@@ -522,9 +522,9 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "O2: a role rebound inside the ceiling window reaches the new holder, not whoever held it when the members were filed",
        %{db: db} do
-    seed_session(db, "s1", "flynn")
-    seed_session(db, "s2", "flynn")
-    Roles.create!(db, "role-x", "flynn", "s1")
+    seed_session(db, "s1", "sample-user")
+    seed_session(db, "s2", "sample-user")
+    Roles.create!(db, "role-x", "sample-user", "s1")
 
     test_pid = self()
     scheduler = :"coordination_fabric_role_scheduler_#{System.unique_integer([:positive])}"
@@ -594,8 +594,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "O2: mixed role- and session-addressed traffic for the same principal stays in separate groups",
        %{db: db} do
-    seed_session(db, "s1", "flynn")
-    Roles.create!(db, "role-y", "flynn", "s1")
+    seed_session(db, "s1", "sample-user")
+    Roles.create!(db, "role-y", "sample-user", "s1")
 
     role_member =
       schedule_wake(db, %{
@@ -899,7 +899,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "the scheduler materializes AND delivers its own turn for an idle session", %{db: db} do
-    # Sol xhigh review, finding 9: prior coverage only ever called
+    # : prior coverage only ever called
     # `materialize_digests/2` directly and asserted a pending carrier — it
     # never ran the actual scheduler path. This runs `fire_due/1` — the real
     # tick — and asserts the carrier is DELIVERED, proving Invariant 3's "an
@@ -951,7 +951,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert share.wake_turns == 3
     assert share.classed_turns == 2
     # §11.1's numerator is ALL non-summon, non-algedonic wake-materialized
-    # turns, classed or not (Sol xhigh review, finding 5): `ordinary` carries
+    # turns, classed or not: `ordinary` carries
     # no class at all yet is still wake-materialized traffic, so it counts
     # alongside `fyi`. The prior pin of `1` here was the bug itself, not a
     # spec — it silently dropped every legacy unclassed wake turn from the
@@ -965,7 +965,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "a dangling wakeId with no matching wake row is not counted as coordination traffic",
        %{db: db} do
-    # Sol xhigh review round 2, finding 3: the numerator's COALESCE guards
+    # : the numerator's COALESCE guards
     # passed even when the LEFT JOIN found NO wake row at all — a turn whose
     # `wakeId` names a wake that does not exist got `w.class` and `w.summon`
     # both read as NULL, which `COALESCE(w.class, '') <> 'algedonic'` and
@@ -1066,7 +1066,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     member = schedule(db, session: "agent:po", class: "fyi", prompt: "the build finished")
     assert [materialized_id] = Wakes.materialize_digests(db, member.due_at)
 
-    # THE SANCTIONED DISCOVERY PATH (Sol xhigh review, finding 2): an agent
+    # THE SANCTIONED DISCOVERY PATH: an agent
     # reading the delivered digest never sees `materialize_digests/2`'s
     # return value — it reads the message the batcher signed, which now
     # names its own wake id in the signature line. Parse it out exactly as a
@@ -1110,9 +1110,9 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert {:error, %{code: "invalid"}} = verb(db, {:user, "owner"}, "digest-members", %{})
   end
 
-  test "O5 follow-up: an orphaned role carrier (no active resolution) stays readable by the role's owner",
+  test "an orphaned role carrier (no active resolution) stays readable by the role's owner",
        %{db: db} do
-    # Sol xhigh review, finding 4: a role-addressed carrier built while its
+    # : a role-addressed carrier built while its
     # role has NO active resolution (no bound session, and the owner's
     # personal session does not exist either) stores the synthetic
     # `role:<name>` placeholder in its own (audit-only) sessionKey column —
@@ -1160,9 +1160,9 @@ defmodule Tightbeam.CoordinationFabricTest do
              verb(db, {:user, "outsider2"}, "digest-members", %{wake_id: digest_id})
   end
 
-  test "O5 follow-up (round 2): a role-rm'd carrier stays readable by its pinned owner and by admin",
+  test "a role-rm'd carrier stays readable by its pinned owner and by admin",
        %{db: db} do
-    # Sol xhigh review round 2: a LIVE `Roles.get/2` at read time bound audit
+    # : a LIVE `Roles.get/2` at read time bound audit
     # authority to a deletable row — after `role-rm`, that lookup returns
     # nil and (in the prior fix) denied EVERYONE, admin included. Authority
     # must be PINNED at materialization, not re-derived from whatever the
@@ -1206,9 +1206,9 @@ defmodule Tightbeam.CoordinationFabricTest do
              verb(db, {:user, "outsider3"}, "digest-members", %{wake_id: digest_id})
   end
 
-  test "O5 follow-up (round 2): a role deleted then recreated under a different owner does not carry the old carrier's audit",
+  test "a role deleted then recreated under a different owner does not carry the old carrier's audit",
        %{db: db} do
-    # THE NAME-REUSE ATTACK Sol proved against the prior fix: a live
+    # THE NAME-REUSE ATTACK reviewer proved against the prior fix: a live
     # `Roles.get(db, role)` by NAME silently handed a NEW owner read access
     # to an OLD carrier's members, a fact that was never true. The pinned
     # owner fact — recorded once, at materialization — cannot be reassigned
@@ -1246,9 +1246,9 @@ defmodule Tightbeam.CoordinationFabricTest do
              verb(db, {:user, "new-owner"}, "digest-members", %{wake_id: digest_id})
   end
 
-  test "O5 follow-up (round 2): a resolved role carrier reads through its pinned sessionKey, never a live role lookup",
+  test "a resolved role carrier reads through its pinned sessionKey, never a live role lookup",
        %{db: db} do
-    # REGRESSION PIN: before Sol's round-2 finding, a role that RESOLVED at
+    # REGRESSION PIN: a role that RESOLVED at
     # materialization was readable through the carrier's own pinned
     # sessionKey (O2) — the fix for the orphaned case must not regress this,
     # provably: the role is removed entirely before the read, so only the
@@ -1290,9 +1290,9 @@ defmodule Tightbeam.CoordinationFabricTest do
              verb(db, {:user, "outsider5"}, "digest-members", %{wake_id: digest_id})
   end
 
-  test "O5 follow-up (round 3): the pinned owner round-trips exactly — a space-containing id never collides with its own prefix",
+  test "the pinned owner round-trips exactly — a space-containing id never collides with its own prefix",
        %{db: db} do
-    # Sol xhigh review round 3: the pin was written as raw text
+    # : the pin was written as raw text
     # (`ownerUserId=#{owner}`) and read back with `\S+` — an owner id
     # containing a space ("alice bob") would be captured back as bare
     # "alice", transferring the OLD carrier's audit to whatever real user
@@ -1343,8 +1343,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   ## Seam ③ — the `input-needed` carrier (GitHub #11)
 
   test "an agent's question and the notification that carries it are one commit", %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
-    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
 
     assert {:ok, %{decision_request: request}} =
              ask(db, "agent:coder", "agent:po", "ship behind a flag or block?")
@@ -1354,7 +1354,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert request.raiser_id == "session:agent:coder"
     assert request.raiser_session_key == "agent:coder"
     assert request.expecter_session_key == "agent:po"
-    assert request.expecter_user_id == "flynn"
+    assert request.expecter_user_id == "sample-user"
     assert request.question == "ship behind a flag or block?"
     assert request.answer == nil
 
@@ -1369,7 +1369,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert request.park_wake_id == nil
     assert request.consumed_at == nil
 
-    # No deadline either (Sol xhigh review, finding 1): a question is not
+    # No deadline either: a question is not
     # swept, so it must not be indistinguishable from a statute/effort row to
     # a generic `status = 'open' AND deadlineAt <= ?` consumer.
     assert request.deadline_at == nil
@@ -1394,8 +1394,8 @@ defmodule Tightbeam.CoordinationFabricTest do
     # HALF ONE, behavioural: an open question naming an assignment does not stop
     # its holder completing and closing that assignment. If it ever does,
     # adjudication has been rebuilt with a friendlier face.
-    seed_session(db, "agent:coder", "flynn")
-    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
     assignment = open_assignment(db, "agent:coder")
 
     assert {:ok, %{decision_request: request}} =
@@ -1417,9 +1417,9 @@ defmodule Tightbeam.CoordinationFabricTest do
     # obligation throughout and disposed of it by its own choice.
     assert get_request(db, request.id).status == "open"
 
-    # HALF TWO, structural (Sol xhigh review round 3). Round 2 centralized
+    # HALF TWO, structural. Round 2 centralized
     # every decision_requests reader into escalation.ex behind a hand-DECLARED
-    # name-to-kind map. Sol found four bypasses a declared (not derived) map
+    # name-to-kind map. reviewer found four bypasses a declared (not derived) map
     # cannot close: a new reader added INSIDE escalation.ex with no map entry;
     # a helper removed with its entry left stale; a helper's SQL widened past
     # its declared scope with no textual signal; and a new external caller of
@@ -1595,18 +1595,14 @@ defmodule Tightbeam.CoordinationFabricTest do
       withdraw: 2
     }
 
-    # (a2), hardened (Sol round 4, findings 2a/2b). A bare atom collapses
+    # (a2), hardened. A bare atom collapses
     # arity, so a NEW overload of an already-pinned name (`escalate/5` beside
     # the real `escalate/4`) is invisible to a name-only inventory — the new
     # arity silently rides in on the old name's already-accepted entry. The
     # closure is now computed AT THE AST LEVEL, keyed `{name, arity}`, and its
     # literal-touch test is stronger than a `Macro.to_string` substring scan
     # too: it resolves `<>` concatenation chains and this module's OWN
-    # `@attr` references to their literal values (Sol round 4, finding 2b —
-    # an assembled `"decision_" <> "requests"` or an attribute-derived
-    # `@table "decision_requests"` used via `#{@table}` has no contiguous
-    # "decision_requests" text for a `Macro.to_string` scan to find, but is
-    # still a literal to the AST). `ensure_schema/1` is excluded by name: it
+    # `@attr` references to their literal values. `ensure_schema/1` is excluded by name: it
     # emits this table's own DDL (`DB.execute(db, @ddl)`) for ALL THREE kinds
     # at once, by construction — a schema definition, not a scoped reader, so
     # it is not part of "every reader lives in escalation.ex" in the sense
@@ -1631,7 +1627,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     # (b): every DIRECT entry scoped to a real kind (not "any") must prove an
     # EXCLUSIVE predicate in its own SQL text, not merely CONTAIN the declared
-    # kind as a substring (Sol round 4, finding 1): a "statute"-scoped helper
+    # kind as a substring: a "statute"-scoped helper
     # widened to `kind IN ('statute','agent')` still contains the literal
     # 'statute' and passed the old substring check. `kind_predicate_shape/3`
     # parses the helper's own SQL for its "kind" constraint and accepts only
@@ -1740,7 +1736,7 @@ defmodule Tightbeam.CoordinationFabricTest do
              "new #{inspect(MapSet.difference(any_kind_public, MapSet.new(Map.keys(pinned_callers))))}, " <>
              "stale #{inspect(MapSet.difference(MapSet.new(Map.keys(pinned_callers)), any_kind_public))}"
 
-    # AST-level caller resolution (Sol round 4, finding 3): a textual
+    # AST-level caller resolution: a textual
     # `Escalation.<ref>(` scan is blind to a capture (`&Escalation.f/2`), an
     # `apply/3` target, or a caller that aliased the module under another
     # name — none of them add the literal substring the old scan looked for.
@@ -1761,7 +1757,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     # Imports evade the same scan a different way: `import Escalation` turns
     # every bare `consume(...)` inside the importing file into a call this
     # walk never sees, because it never mentions `Escalation` at all. Cheapest
-    # closure (Sol round 4, finding 3's `import` clause): assert the escape
+    # closure: assert the escape
     # hatch is not in use, so there is nothing to widen the caller walk for —
     # until the day this fails and it must.
     importers =
@@ -1790,7 +1786,7 @@ defmodule Tightbeam.CoordinationFabricTest do
              "#{inspect(MapSet.difference(found_dynamic_applies, pinned_dynamic_applies))}, stale " <>
              "#{inspect(MapSet.difference(pinned_dynamic_applies, found_dynamic_applies))}"
 
-    # The MIRROR shape (Sol round 5, finding 2a): a LITERAL Escalation module
+    # The MIRROR shape: a LITERAL Escalation module
     # with a non-literal FUNCTION argument. `escalation_refs_called/2` above
     # requires a literal atom to attribute the call to a `ref`, and the
     # dynamic-apply check just above only flags a non-literal MODULE — so
@@ -1806,8 +1802,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   # Every double-quoted or triple-quoted string literal in a file's raw
-  # source, scanned as TEXT rather than parsed AST (Sol xhigh review, finding
-  # 2) — a query built with `#{@request_columns}` interpolation is not a plain
+  # source, scanned as TEXT rather than parsed AST — a query built with `#{@request_columns}` interpolation is not a plain
   # `is_binary` AST node and an AST scan would silently skip it.
   defp sql_literals(file) do
     Regex.scan(~r/"""(?:(?!""").)*"""|"[^"\n]*"/s, File.read!(file))
@@ -1816,12 +1811,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   # Every top-level `def`/`defp` in `file`, keyed `"name/arity"`, reconstructed
   # via `Macro.to_string/1` on its OWN AST node — never text sliced "from this
-  # line to the next `def`", which bled a neighbor's `@doc`/comment in (Sol
-  # xhigh review round 3 caught this exact bug in an earlier draft: a
-  # multi-line function head with the body's `do:` on a later line defeated a
-  # same-line one-liner check, and the resulting "search for the next `end`
-  # at this indentation" fell through to end-of-file, silently swallowing
-  # every function after it). The AST already excludes comments by
+  # line to the next `def`", which bled a neighbor's `@doc`/comment in. The AST already excludes comments by
   # construction — nothing to strip, nothing left to bleed — and
   # `Macro.to_string/1` faithfully reconstructs `#{}` interpolation as text
   # (verified: a heredoc built with `#{@request_columns}` round-trips with
@@ -1881,7 +1871,6 @@ defmodule Tightbeam.CoordinationFabricTest do
     source =~ ~r/^  def #{Regex.escape(Atom.to_string(ref))}[\(,]/m
   end
 
-  ## AST-level audit infrastructure (Sol round 4)
   #
   # Everything below reads Elixir's own parse tree instead of `Macro.to_string`
   # text, closing three evasions a text/substring scan cannot see by
@@ -2078,10 +2067,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   # (a2)'s DIRECT set — every `{name, arity}` whose OWN literal fragments
-  # contain "decision_requests" (case-INSENSITIVE, Sol round 6, finding 1:
-  # SQL identifiers are case-insensitive, so `DECISION_REQUESTS` names the
-  # exact same table and must not evade a scan that only ever looked for the
-  # lowercase spelling) — and its transitive closure over local calls, both
+  # contain "decision_requests" — and its transitive closure over local calls, both
   # `{name, arity}`-keyed. `ensure_schema/1` is excluded: it issues this
   # table's own DDL for all three kinds by construction, which is not
   # "reading" in the sense this inventory means.
@@ -2191,12 +2177,12 @@ defmodule Tightbeam.CoordinationFabricTest do
   # `parts` is a dotted `__aliases__` path as the file's OWN source wrote it
   # (e.g. `[:Escalation]`, `[:TB, :Escalation]`, `[:Tightbeam, :Escalation]`)
   # — resolved by expanding only its FIRST segment through the alias map
-  # (Sol round 5, finding 2c): a prior version handled a whole-module alias
+  # : a prior version handled a whole-module alias
   # (`alias Tightbeam.Escalation`, one segment) but not a PREFIX alias
   # (`alias Tightbeam, as: TB` then `TB.Escalation.consume(...)`, where the
   # alias covers only the leading segment and `:Escalation` rides along
   # unresolved as literal text of its own). A reference whose ORIGINAL
-  # leading segment is `:Elixir` is an ABSOLUTE module path (Sol round 7):
+  # leading segment is `:Elixir` is an ABSOLUTE module path:
   # `Elixir.Tightbeam.Escalation` names exactly Tightbeam.Escalation
   # regardless of any local alias, so it must NOT undergo alias expansion —
   # a local `alias Fake.Other, as: Tightbeam` would otherwise expand the
@@ -2227,9 +2213,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   # A module reference at the AST level, in EITHER shape a caller can write
   # it: `Mod.fun` syntax (an `__aliases__` node, resolved through this
   # file's aliases) or the ATOM form — `apply(:"Elixir.Tightbeam.Escalation",
-  # ...)` or the equivalent `:"Elixir...".fun()` — which is already fully
-  # qualified and evades an `__aliases__`-only match outright (Sol round 5,
-  # finding 2b).
+  # ...)` or the equivalent `:"Elixir...".fun` — which is already fully
+  # qualified and evades an `__aliases__`-only match outright.
   defp resolves_module_ref_to_escalation?({:__aliases__, _, parts}, aliases),
     do: resolves_to_escalation?(parts, aliases)
 
@@ -2270,7 +2255,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   # `apply/3` naming a LITERAL Escalation module but a NON-literal function
-  # (Sol round 5, finding 2a): `escalation_refs_called/2` above requires the
+  # : `escalation_refs_called/2` above requires the
   # function argument to be a literal atom to attribute the call to a `ref`,
   # and `has_dynamic_apply?/1` below only flags a non-literal MODULE — so a
   # literal-module, dynamic-function `apply/3` fell through both, invisible
@@ -2375,7 +2360,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   # constraint of their own because their safety comes from elsewhere in the
   # SAME transaction, never from their own WHERE clause — and each exception
   # is bound to a SHA-256 of the reviewed function's own WHOLE text, not just
-  # to its name (Sol round 6, finding 3): the exception is only as good as
+  # to its name: the exception is only as good as
   # the SAFETY WITNESS a reviewer actually read, and a later edit to the
   # function can silently invalidate that witness while the ref's NAME stays
   # the same. `pin_status/2` recomputes the hash at check time; a mismatch
@@ -2390,8 +2375,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   #     immediately above it, never from a caller.
   #
   # A NEW unscoped literal anywhere else is not in this list and fails closed
-  # too — that is the gap this list exists to keep narrow (Sol round 5,
-  # finding 1b).
+  # too — that is the gap this list exists to keep narrow.
   @pinned_unscoped_literal_exceptions %{
     escalate: %{
       hash: "da3f89f2fe07f759b66a38a8df664480c8dc1a67a1778fca96c95a024397a6d3",
@@ -2442,8 +2426,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   # Every double-quoted or triple-quoted string literal inside a chunk of
   # already-reconstructed (`Macro.to_string/1`) source, each NORMALIZED (and
-  # quote-stripped) INDIVIDUALLY rather than joined into one blob (Sol round
-  # 5, finding 1b): a single aggregated blob let one properly-scoped query's
+  # quote-stripped) INDIVIDUALLY rather than joined into one blob: a single aggregated blob let one properly-scoped query's
   # `kind = '<declared>'` literal satisfy the whole function's check even
   # when a SECOND query in the same function carried no kind constraint (or
   # a wrong one) of its own — the aggregate text still contained the
@@ -2463,10 +2446,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     |> String.trim()
   end
 
-  # Every OWN query literal that references `decision_requests` (case-
-  # INSENSITIVE, Sol round 6, finding 1: SQL identifiers are case-
-  # insensitive, so an unscoped `UPDATE DECISION_REQUESTS ...` following a
-  # scoped lowercase query must not slip past this selector uncounted) must
+  # Every OWN query literal that references `decision_requests` must
   # individually prove one of two EXCLUSIVE shapes: `kind = '<declared>'` for
   # a single declared kind, or an explicit `kind IN (...)` list equal to a
   # declared pair (order-insensitive, whitespace/case-normalized). An
@@ -2477,12 +2457,12 @@ defmodule Tightbeam.CoordinationFabricTest do
   # exception (see `@pinned_unscoped_literal_exceptions`) or it fails closed
   # — an unscoped query is exactly the vulnerability this check exists to
   # catch, not something a substring match anywhere else in the function can
-  # excuse (Sol round 5, finding 1b). `OR` is rejected outright, everywhere,
+  # excuse. `OR` is rejected outright, everywhere,
   # before any of that: no reviewed helper's SQL uses it today, so ANY
   # occurrence in a `decision_requests` query is unreviewed disjunction, and
   # `kind = 'statute' OR 1 = 1` (or an exact IN-list with the same `OR 1 = 1`
   # tacked on) must not slip past an eq/IN check that never looked for it
-  # (Sol round 5, finding 1a).
+  # .
   defp kind_predicate_shape(ref, text, declared_csv) do
     declared =
       declared_csv
@@ -2626,7 +2606,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     end)
   end
 
-  ## Teeth checks (Sol round 4): each one proves the HARDENED tripwire above
+  ## Teeth checks: each one proves the HARDENED tripwire above
   ## actually rejects the exact evasion it was built to close, on a small
   ## synthetic fixture — never on the real escalation.ex, so these prove the
   ## MECHANISM rather than today's snapshot of it.
@@ -3133,7 +3113,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     [{{:sanity, 2}, sanity_nodes}] = defs |> Enum.filter(&match?({{:sanity, 2}, _}, &1))
     assert sanity_nodes |> Enum.flat_map(&escalation_refs_called(&1, aliases)) == []
 
-    # THE OLD CHECK, for contrast (Sol round 7): strip-then-expand let the
+    # THE OLD CHECK, for contrast: strip-then-expand let the
     # shadowing alias capture the stripped prefix and MISS the real call.
     strip_then_expand = fn parts ->
       parts
@@ -3160,7 +3140,7 @@ defmodule Tightbeam.CoordinationFabricTest do
              "a shadowing alias (that is the evasion being closed) but it caught it"
   end
 
-  test "TEETH (round 6, finding 3): an edited unscoped-literal function fails its pin's hash, " <>
+  test "an edited unscoped-literal function fails its pin's hash, " <>
          "rather than silently keeping a stale safety witness" do
     # `escalate/4`'s real pinned text, with one clause of whitespace changed
     # — a stand-in for ANY real edit. The hash is computed over the WHOLE
@@ -3202,8 +3182,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "the statute gate read cannot be reached by an agent row sharing its raiser",
        %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
-    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
 
     # An open AGENT question from `agent:coder`, filed alongside an open
     # STATUTE escalation from the very same raiser — the closest two rows can
@@ -3234,8 +3214,8 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert Escalation.rule(
              db,
              %{
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
+               origin: "user:sample-user",
+               principal: {:user, "sample-user"},
                params: %{
                  request_id: statute_id,
                  decision: "allow"
@@ -3251,7 +3231,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert get_request(db, question.id).status == "open"
   end
 
-  # Sol xhigh review round 2: the test above proves current_request/4 lands on
+  # : the test above proves current_request/4 lands on
   # the statute row when an agent row shares its raiser, but it cannot prove
   # the `kind = 'statute'` predicate is WHY — an agent row's `statuteName` and
   # `actionKey` are pinned NULL by the schema's own CHECK arm, so no row
@@ -3261,7 +3241,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   # text itself: THE GATE READ still names `kind = 'statute'`, independent of
   # whatever the schema separately guarantees about NULLs.
   #
-  # Comment-insensitive (Sol xhigh review round 3): a comment MENTIONING the
+  # Comment-insensitive: a comment MENTIONING the
   # predicate must never satisfy this on the real SQL's behalf. `function_slices/1`
   # reconstructs the body from its AST (`Macro.to_string/1`), which excludes
   # comments by construction — there is no `# kind = 'statute'` comment for
@@ -3279,8 +3259,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "--about refuses an assignment the asker cannot legitimately reference, identically to a fake id",
        %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
-    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
     seed_session(db, "agent:outsider", "someone-else")
 
     # `agent:outsider` neither holds it, opened it, nor is the party a review
@@ -3298,7 +3278,7 @@ defmodule Tightbeam.CoordinationFabricTest do
              )
 
     # An outsider probing ids cannot tell a private assignment from one that
-    # does not exist (Sol xhigh review, finding 5) — same code, same message
+    # does not exist — same code, same message
     # SHAPE (each just echoes back the id the caller itself supplied, never
     # anything the probe didn't already know).
     assert invisible =~ "unknown assignment: #{private.id}"
@@ -3313,8 +3293,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "--about stores a canonical prefix target and refusals emit no request, event, or wake",
        %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
-    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
 
     {:ok, _} =
       DB.query(
@@ -3355,8 +3335,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "the expecter is preferred while an exact-id agent session may answer", %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
-    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
     seed_session(db, "agent:stranger", "outsider")
 
     assert {:ok, %{decision_request: request}} = ask(db, "agent:coder", "agent:po", "which way?")
@@ -3419,8 +3399,8 @@ defmodule Tightbeam.CoordinationFabricTest do
        db: db, deliver: fn _wake -> true end, tick_ms: 60_000, name: Tightbeam.WakeScheduler}
     )
 
-    seed_session(db, "agent:coder", "flynn")
-    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
     seed_session(db, "agent:outsider", "someone-else")
 
     assert {:ok, %{decision_request: agent_request}} =
@@ -3433,7 +3413,7 @@ defmodule Tightbeam.CoordinationFabricTest do
         db,
         "INSERT INTO decision_requests (id, kind, raiserId, raiserSessionKey, ownerUserId, " <>
           "raisedAt, deadlineAt, statuteName, actionKey, question, context, status) VALUES " <>
-          "(?1,'statute','session:agent:coder','agent:coder','flynn',1,999999999999," <>
+          "(?1,'statute','session:agent:coder','agent:coder','sample-user',1,999999999999," <>
           "'deploy-gate','k1','q','{}','open')",
         [statute_id]
       )
@@ -3493,8 +3473,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "withdraw is the asker's own lawful exit, and nobody else's", %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
-    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
 
     assert {:ok, %{decision_request: request}} = ask(db, "agent:coder", "agent:po", "which way?")
 
@@ -3516,7 +3496,7 @@ defmodule Tightbeam.CoordinationFabricTest do
         db,
         "INSERT INTO decision_requests (id, kind, raiserId, raiserSessionKey, ownerUserId, " <>
           "raisedAt, deadlineAt, statuteName, actionKey, question, context, status) VALUES " <>
-          "(?1,'statute','session:agent:coder','agent:coder','flynn',1,999999999999," <>
+          "(?1,'statute','session:agent:coder','agent:coder','sample-user',1,999999999999," <>
           "'withdraw-gate','withdraw-k1','q','{}','open')",
         [statute_id]
       )
@@ -3535,8 +3515,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "the decision reader returns insufficient questions with an immutable audit trail",
        %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
-    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
     seed_session(db, "agent:stranger", "outsider")
 
     assert {:ok, %{decision_request: request}} =
@@ -3621,8 +3601,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "answer, withdraw, and return race to one terminal winner", %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
-    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
 
     assert {:ok, %{decision_request: request}} =
              ask(db, "agent:coder", "agent:po", "enough context?")
@@ -3666,8 +3646,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "concurrent exact answer retries converge on one terminal write", %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
-    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
     seed_session(db, "agent:reviewer", "outsider")
 
     assert {:ok, %{decision_request: request}} =
@@ -3719,11 +3699,10 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "the schema refuses every shape the agent arm forbids", %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
-    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
 
-    # `deadlineAt` is left out of the column list entirely (and so lands NULL,
-    # exactly as the agent arm requires — Sol xhigh review, finding 1) so every
+    # `deadlineAt` is left out of the column list entirely so every
     # row below is forbidden for exactly the one reason its comment names, not
     # also for carrying a deadline the arm refuses.
     base =
@@ -3732,34 +3711,34 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     forbidden = [
       # Adjudication vocabulary, one column at a time.
-      {", statuteName) VALUES ('d1','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,'q','{}','open','deploy-gate')"},
-      {", decision) VALUES ('d2','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,'q','{}','open','allow')"},
-      {", parkWakeId) VALUES ('d3','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,'q','{}','open','w_1')"},
-      {", rulingFactId) VALUES ('d4','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,'q','{}','open',7)"},
+      {", statuteName) VALUES ('d1','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','open','deploy-gate')"},
+      {", decision) VALUES ('d2','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','open','allow')"},
+      {", parkWakeId) VALUES ('d3','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','open','w_1')"},
+      {", rulingFactId) VALUES ('d4','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','open',7)"},
       # `ruled` is not one of this arm's three words.
-      {") VALUES ('d5','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,'q','{}','ruled')"},
+      {") VALUES ('d5','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','ruled')"},
       # `answered` without an answer, and an answer without an author.
-      {") VALUES ('d6','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,'q','{}','answered')"},
-      {", answer) VALUES ('d7','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,'q','{}','answered','yes')"},
+      {") VALUES ('d6','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','answered')"},
+      {", answer) VALUES ('d7','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','answered','yes')"},
       # `returned` without all three audit fields, or audit fields on an open
       # row, can never be stored.
-      {") VALUES ('d11','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,'q','{}','returned')"},
-      {", returnReason) VALUES ('d12','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,'q','{}','open','unclear')"},
+      {") VALUES ('d11','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','returned')"},
+      {", returnReason) VALUES ('d12','agent','session:agent:coder','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','open','unclear')"},
       {", returnedBy, returnReason, returnedAt) VALUES ('d13','agent'," <>
-         "'session:agent:coder','agent:coder','flynn','agent:po','flynn',1,'q','{}'," <>
+         "'session:agent:coder','agent:coder','sample-user','agent:po','sample-user',1,'q','{}'," <>
          "'returned','session:agent:po','   ',2)"},
       # `raiserId` must name the asking session, not some other principal.
-      {") VALUES ('d8','agent','user:flynn','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,'q','{}','open')"}
+      {") VALUES ('d8','agent','user:sample-user','agent:coder','sample-user'," <>
+         "'agent:po','sample-user',1,'q','{}','open')"}
     ]
 
     for {tail} <- forbidden do
@@ -3769,15 +3748,14 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     # `deadlineAt` is the statute/effort arms' vocabulary (sweep/deadline
     # semantics a question does not carry); the agent arm refuses a stamped
-    # one exactly as it refuses a stamped `decision` (Sol xhigh review,
-    # finding 1).
+    # one exactly as it refuses a stamped `decision`.
     assert {:error, %DB.Error{message: deadlined}} =
              DB.query(
                db,
                "INSERT INTO decision_requests (id, kind, raiserId, raiserSessionKey, " <>
                  "ownerUserId, expecterSessionKey, expecterUserId, raisedAt, deadlineAt, " <>
                  "question, context, status) VALUES ('d10','agent','session:agent:coder'," <>
-                 "'agent:coder','flynn','agent:po','flynn',1,999,'q','{}','open')"
+                 "'agent:coder','sample-user','agent:po','sample-user',1,999,'q','{}','open')"
              )
 
     assert deadlined =~ "CHECK constraint"
@@ -3789,7 +3767,7 @@ defmodule Tightbeam.CoordinationFabricTest do
                db,
                "INSERT INTO decision_requests (id, kind, raiserId, ownerUserId, raisedAt, " <>
                  "deadlineAt, statuteName, actionKey, question, context, status, answer, " <>
-                 "answeredBy, answeredAt) VALUES ('d9','statute','session:agent:coder','flynn'," <>
+                 "answeredBy, answeredAt) VALUES ('d9','statute','session:agent:coder','sample-user'," <>
                  "1,2,'deploy-gate','k','q','{}','open','yes','session:agent:po',3)"
              )
 
@@ -3797,8 +3775,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "a question is visible to its asker, the principal asked, and nobody else", %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
-    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
     seed_session(db, "agent:stranger", "outsider")
 
     assert {:ok, %{decision_request: request}} = ask(db, "agent:coder", "agent:po", "which way?")
@@ -3806,28 +3784,28 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert [%{id: id}] = list_requests(db, {:session, "agent:coder"})
     assert id == request.id
     assert [%{id: ^id}] = list_requests(db, {:session, "agent:po"})
-    assert [%{id: ^id}] = list_requests(db, {:user, "flynn"})
+    assert [%{id: ^id}] = list_requests(db, {:user, "sample-user"})
     assert list_requests(db, {:session, "agent:stranger"}) == []
     assert list_requests(db, {:user, "outsider"}) == []
   end
 
   test "a sibling session sharing the asker's owner is not one of the three visible principals",
        %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
-    seed_session(db, "agent:po", "flynn")
-    # Owned by flynn too, same as coder — but neither asker, asked, nor the
+    seed_session(db, "agent:coder", "sample-user")
+    seed_session(db, "agent:po", "sample-user")
+    # Owned by sample-user too, same as coder — but neither asker, asked, nor the
     # owner acting AS itself.
-    seed_session(db, "agent:reviewer", "flynn")
+    seed_session(db, "agent:reviewer", "sample-user")
     seed_session(db, "agent:bob-app", "bob")
 
     assert {:ok, %{decision_request: request}} =
              ask(db, "agent:coder", "agent:bob-app", "which way?")
 
-    # `owner_user_id: "flynn"` is exactly what the gateway resolves for ANY of
-    # flynn's sessions (`decision-requests`'s `caller.owner_user_id`) — so this
+    # `owner_user_id: "sample-user"` is exactly what the gateway resolves for ANY of
+    # sample-user's sessions (`decision-requests`'s `caller.owner_user_id`) — so this
     # reproduces, at the call site `Escalation.list/get` actually see, what an
-    # unrelated sibling session's call looks like (Sol xhigh review, finding
-    # 3). Before the fix, the `ownerUserId` branch fired for this session
+    # unrelated sibling session's call looks like. Before the fix, the
+    # `ownerUserId` branch fired for this session
     # exactly as it does for the owner acting as a user principal.
     reviewer_call = %{
       origin: "agent:reviewer",
@@ -3835,8 +3813,8 @@ defmodule Tightbeam.CoordinationFabricTest do
       params: %{}
     }
 
-    assert Escalation.list(db, reviewer_call, "open", owner_user_id: "flynn") == []
-    assert Escalation.get(db, reviewer_call, request.id, owner_user_id: "flynn") == nil
+    assert Escalation.list(db, reviewer_call, "open", owner_user_id: "sample-user") == []
+    assert Escalation.get(db, reviewer_call, request.id, owner_user_id: "sample-user") == nil
 
     assert {:ok, %{decision_request: exact}} =
              verb(db, {:session, "agent:reviewer"}, "decision-request", %{request: request.id})
@@ -3858,7 +3836,7 @@ defmodule Tightbeam.CoordinationFabricTest do
              verb(db, {:process, "ci"}, "decision-request", %{request: request.id})
 
     assert {:error, %{code: "not_found"}} =
-             answer(db, {:user, "flynn"}, request.id, "user boundaries stay narrow")
+             answer(db, {:user, "sample-user"}, request.id, "user boundaries stay narrow")
 
     assert {:error, %{code: "not_found"}} =
              answer(db, {:process, "ci"}, request.id, "processes gain no standing")
@@ -3902,21 +3880,21 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert effort.id == effort_id
     assert effort.kind == "effort"
     assert effort.options == ["continue", "dismiss"]
-    assert Escalation.list(db, reviewer_call, "open", owner_user_id: "flynn") == []
+    assert Escalation.list(db, reviewer_call, "open", owner_user_id: "sample-user") == []
 
     # The owner acting AS itself — a user principal, not merely a session
     # resolving to the same owner — is the one the `ownerUserId` branch exists
     # for, and still sees it.
-    owner_call = %{origin: "user:flynn", principal: {:user, "flynn"}, params: %{}}
+    owner_call = %{origin: "user:sample-user", principal: {:user, "sample-user"}, params: %{}}
 
-    assert [%{id: id}] = Escalation.list(db, owner_call, "open", owner_user_id: "flynn")
+    assert [%{id: id}] = Escalation.list(db, owner_call, "open", owner_user_id: "sample-user")
     assert id == request.id
   end
 
   ## Seam ④ — `--after` cursors (GitHub #13)
 
   test "the attests cursor is a (ts, id) keyset that survives a ts collision", %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
     assignment = open_assignment(db, "agent:coder")
 
     # THREE attests sharing ONE millisecond. A `ts`-only cursor either repeats
@@ -3924,8 +3902,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     ids = for n <- 1..3, do: attest_row(db, assignment.id, "at_#{n}", 5_000)
     late = attest_row(db, assignment.id, "at_9", 5_001)
 
-    # A bare unpaged read carries no cursor vocabulary at all (seam ④'s
-    # byte-identical promise, Sol xhigh review finding 8) — the collision-
+    # A bare unpaged read carries no cursor vocabulary at all — the collision-
     # spanning order is proved on `page.attests` alone.
     assert {:ok, page} = attests(db, assignment.id, %{})
     assert Enum.map(page.attests, & &1.id) == ids ++ [late]
@@ -3948,7 +3925,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "an unpaged attests read is byte-identical to what it always returned", %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
     assignment = open_assignment(db, "agent:coder")
     for n <- 1..3, do: attest_row(db, assignment.id, "at_#{n}", 5_000 + n)
 
@@ -3959,8 +3936,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert page.attests == Tightbeam.Assignments.list_attests(db, assignment.id)
     assert length(page.attests) == 3
 
-    # BYTE-IDENTICAL means the whole map, not just the list inside it (Sol
-    # xhigh review, finding 8): a pre-existing caller that never passed
+    # BYTE-IDENTICAL means the whole map, not just the list inside it: a pre-existing caller that never passed
     # `--after`/`--limit` must see the exact response it always did, with no
     # `next_after`/`has_more_after` keys added.
     assert page == %{attests: page.attests}
@@ -3968,7 +3944,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "an attests cursor from another assignment is not found, exactly like a fake one",
        %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
     mine = open_assignment(db, "agent:coder")
     theirs = open_assignment(db, "agent:coder")
     attest_row(db, theirs.id, "at_elsewhere", 5_000)
@@ -3988,7 +3964,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "the execution-map cursor pages the flat roster on a stable order key", %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
     ids = for n <- 1..4, do: work_item_row(db, "wi_#{n}", 1_000 + n)
 
     assert {:ok, all} = execution_map(db, %{})
@@ -4006,7 +3982,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     # The cursor is compared against the ORDER KEY, not against membership: an
     # item filtered out of the page still positions the one after it. The
-    # cursor item itself is CLOSED here (Sol xhigh review, finding 7) — every
+    # cursor item itself is CLOSED here — every
     # helper-created item defaults to `open`, so the earlier `state: "open"`
     # filter never actually excluded anything and this test would have passed
     # even if cursor resolution regressed from `world.items_by_id` (the full
@@ -4019,11 +3995,11 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "an exhausted execution-map page hands back a null cursor, never a boolean", %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
     ids = for n <- 1..2, do: work_item_row(db, "wi_#{n}", 1_000 + n)
 
     # Paging exactly to the end: the last item is the cursor, and the next
-    # page is empty (Sol xhigh review, finding 6). `selected != [] && ...`
+    # page is empty. `selected != [] && ...`
     # evaluates to `false` for an empty page — not the `nil` an ID-or-null
     # cursor contract promises, and not something a client could round-trip
     # back in as `--after`.
@@ -4034,7 +4010,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   test "execution-map refuses a forest page and an unresolvable cursor by name", %{db: db} do
-    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:coder", "sample-user")
     work_item_row(db, "wi_1", 1_000)
 
     assert {:error, %{code: "invalid", message: forest}} =
@@ -4120,12 +4096,13 @@ defmodule Tightbeam.CoordinationFabricTest do
     do: verb(db, principal, "withdraw", %{request: request_id, reason: reason})
 
   defp attests(db, assignment_id, params),
-    do: verb(db, {:user, "flynn"}, "attests", Map.put(params, :assignment_id, assignment_id))
+    do:
+      verb(db, {:user, "sample-user"}, "attests", Map.put(params, :assignment_id, assignment_id))
 
-  defp execution_map(db, params), do: verb(db, {:user, "flynn"}, "execution-map", params)
+  defp execution_map(db, params), do: verb(db, {:user, "sample-user"}, "execution-map", params)
 
   defp execution_map_select(db, params),
-    do: verb(db, {:user, "flynn"}, "execution-map-select", params)
+    do: verb(db, {:user, "sample-user"}, "execution-map-select", params)
 
   defp list_requests(db, principal) do
     case verb(db, principal, "decision-requests", %{status: "open"}) do
@@ -4168,8 +4145,8 @@ defmodule Tightbeam.CoordinationFabricTest do
   defp open_assignment(db, holder_key) do
     Tightbeam.Assignments.__handle__(db, "assign", %{
       verb: "assign",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
@@ -4196,7 +4173,7 @@ defmodule Tightbeam.CoordinationFabricTest do
         """
         INSERT INTO work_items (id, title, ownerUserId, state, createdByUser, createdAt,
                                 createdContextKnown)
-        VALUES (?1, ?1, 'flynn', 'open', 'flynn', ?2, 0)
+        VALUES (?1, ?1, 'sample-user', 'open', 'sample-user', ?2, 0)
         """,
         [id, created_at]
       )

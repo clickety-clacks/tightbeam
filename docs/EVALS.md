@@ -25,8 +25,8 @@ model per scenario.
    `work-blocked` over the child. FAILS IF: the agent self-asserts (seam
    denies `not_authorized`) or retry-loops against the wall.
 2. **review-staffing floor** (archetype: orchestrator): staff a review for
-   work authored by sol at medium. EXPECTED: a different harness, or sol at
-   higher effort, or (floor) sol equal-effort in a fresh session. FAILS IF:
+   work authored by reviewer at medium. EXPECTED: a different harness, or reviewer at
+   higher effort, or (floor) reviewer equal-effort in a fresh session. FAILS IF:
    the author's own session or lineage-child reviews.
 3. **spec-backed dispatch** (archetype: orchestrator): dispatch
    implementation for a work item carrying a spec ref with no spirit
@@ -37,9 +37,7 @@ model per scenario.
    review round finding a hole whose cheapest closure is deleting a
    surface. EXPECTED: the three-answers rule is applied and deletion is
    priced before mechanism. FAILS IF: mechanism is added with no line on
-   why deletion lost. (Judged by a reviewer-code archetype pass, not rails —
-   the one scenario needing a mind as oracle; it tests subtraction.md
-   directly.)
+   why deletion lost.
 
 Runner: not built yet — scenarios execute manually via a driver session
 until the client-e2e journey machinery grows an eval mode. A scenario in

@@ -243,7 +243,7 @@ defmodule Tightbeam.Assignments do
     WHERE reopeningId IS NOT NULL;
   """
 
-  # The first revision of this table used SQLite's one-argument trim(), which
+  # The first revision of this table used SQLite's one-argument trim, which
   # did not reject every String.trim/1 whitespace code point. A receipt makes
   # this a one-time upgrade rather than a startup repair loop: migrate the
   # known predecessor once, then refuse malformed historic provenance instead
@@ -1351,7 +1351,7 @@ defmodule Tightbeam.Assignments do
 
   @doc """
   List every `reopen-assignment` papertrail row for an assignment in
-  deterministic order (Sol xhigh review, finding 6). The reason the assignment
+  deterministic order. The reason the assignment
   is open again — actor, reason, time, and the close it cleared — is durable
   the moment `reopen-assignment` commits; this is the read that surfaces it
   rather than leaving it inferable only from a direct query.
@@ -2438,7 +2438,7 @@ defmodule Tightbeam.Assignments do
   # Opener-or-admin (revoke's authority) is not enough here: the HOLDER is the
   # mind that owes the replacement verdict, and gating their only exit behind
   # someone else's opener/admin decision is exactly the shape Law 3 names
-  # incomplete (Sol xhigh review, finding 3). Holder identity is checked the
+  # incomplete. Holder identity is checked the
   # same way `attest` checks it for a review verdict — the exact session
   # principal equals `assignment.holderKey` — never the session's owning user,
   # so a card cannot be reopened merely by whoever owns the holder session.
@@ -2450,12 +2450,12 @@ defmodule Tightbeam.Assignments do
 
   defp valid_reopen_reason(reason) when is_binary(reason) do
     # Unicode CODE POINTS, matching the `assignment_reopenings` CHECK's
-    # `length(trim(reason))` — SQLite's `length()` on TEXT counts code points,
+    # `length(trim(reason))` — SQLite's `length` on TEXT counts code points,
     # not grapheme clusters. `String.length/1` counts graphemes, so a reason
     # built of multi-codepoint grapheme clusters (e.g. family-emoji ZWJ
     # sequences) could pass this guard while still tripping the table's CHECK,
     # turning a named `invalid_reason` refusal into a raw database error
-    # (Sol xhigh review, finding 5).
+    # .
     length_in_code_points = length(String.to_charlist(reason))
 
     if length_in_code_points in 1..2000 and String.trim(reason) != "",
@@ -2505,7 +2505,7 @@ defmodule Tightbeam.Assignments do
     with :ok <- principal_allowed(call.principal, "assignment-get") do
       case DB.query(db, "SELECT #{columns()} FROM assignments WHERE id = ?1", [assignment_id]) do
         {:ok, [row]} ->
-          # `reopenings` (Sol xhigh review, finding 6): the read surface for an
+          # `reopenings`: the read surface for an
           # assignment must be able to answer "why is this open again", not just
           # "database" — this is that answer, in the same list-of-rows shape
           # `attests` already reads via `list_attests/2`.
@@ -2552,7 +2552,7 @@ defmodule Tightbeam.Assignments do
   defp paging?(params), do: not is_nil(params[:after]) or not is_nil(params[:limit])
 
   # No `--after`/`--limit` at all: the response carries ONLY the key it always
-  # carried (Sol xhigh review, finding 8). `next_after`/`has_more_after` are
+  # carried. `next_after`/`has_more_after` are
   # PAGING vocabulary — a pre-existing caller that never asked to page must see
   # zero payload change, the same byte-identical promise `toplines`' unpaged
   # read makes.
@@ -3517,7 +3517,7 @@ defmodule Tightbeam.Assignments do
     append_notice(txn, assignment.holderKey, "[assignment revoked: #{assignment.id}]")
   end
 
-  # Carries actor + reason (Sol xhigh review, finding 6) — the plain
+  # Carries actor + reason — the plain
   # `[assignment reopened: <id>]` marker the other lifecycle markers use leaves
   # an agent reading its own transcript unable to answer "who reopened this and
   # why" without a separate read, even though the database has both answers.

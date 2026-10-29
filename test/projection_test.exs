@@ -112,7 +112,7 @@ defmodule Tightbeam.ProjectionTest do
       {"agent", "user", "agent:sender", "agent"},
       {"process", "assistant", "process:scheduler", "substrate"},
       {"remedy", "assistant", "remedy:retry-statute", "substrate"},
-      {"human", "user", "user:flynn", nil},
+      {"human", "user", "user:sample-user", nil},
       {"historical", "assistant", nil, nil}
     ]
 
@@ -221,11 +221,11 @@ defmodule Tightbeam.ProjectionTest do
   end
 
   test "read state upserts per user and session", %{db: db} do
-    :ok = Projection.set_read_state(db, "flynn", "k1", "s_a")
-    :ok = Projection.set_read_state(db, "flynn", "k1", "s_b")
-    :ok = Projection.set_read_state(db, "flynn", "k2", "s_c")
+    :ok = Projection.set_read_state(db, "sample-user", "k1", "s_a")
+    :ok = Projection.set_read_state(db, "sample-user", "k1", "s_b")
+    :ok = Projection.set_read_state(db, "sample-user", "k2", "s_c")
 
-    assert Projection.read_states(db, "flynn") == %{"k1" => "s_b", "k2" => "s_c"}
+    assert Projection.read_states(db, "sample-user") == %{"k1" => "s_b", "k2" => "s_c"}
     assert Projection.read_states(db, "sam") == %{}
 
     {:ok, rows} =
@@ -234,7 +234,7 @@ defmodule Tightbeam.ProjectionTest do
         "SELECT userId, sessionKey, lastReadMessageId FROM read_states ORDER BY sessionKey"
       )
 
-    assert rows == [["flynn", "k1", "s_b"], ["flynn", "k2", "s_c"]]
+    assert rows == [["sample-user", "k1", "s_b"], ["sample-user", "k2", "s_c"]]
   end
 
   test "role and client dedupe invariants live in SQL", %{db: db} do

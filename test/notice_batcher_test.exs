@@ -40,7 +40,7 @@ defmodule Tightbeam.NoticeBatcherTest do
     user =
       Wakes.schedule(db, %{
         session_key: "agent:recipient",
-        origin: "user:mike",
+        origin: "user:sample-user",
         prompt: "human message",
         due_at: 0,
         class: "fyi"

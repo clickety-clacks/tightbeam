@@ -52,13 +52,13 @@ defmodule Tightbeam.TranscriptTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1),('kay', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 0, 'admin_add', 1),('other', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
       )
 
-    Enum.each(~w(flynn kay root), &ensure_main_session(db, &1))
+    Enum.each(~w(sample-user other root), &ensure_main_session(db, &1))
 
-    owned = session!(db, "owned", "flynn", "Coder Session")
-    foreign = session!(db, "foreign", "kay", "Kay Session")
+    owned = session!(db, "owned", "sample-user", "Coder Session")
+    foreign = session!(db, "foreign", "other", "other Session")
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-transcript-#{System.unique_integer([:positive])}")
@@ -222,9 +222,9 @@ defmodule Tightbeam.TranscriptTest do
   ## Proof 6 — name lookup
 
   test "proof 6: a name resolves to a candidate CHOICE, never to content", ctx do
-    session!(ctx.db, "coder-two", "flynn", "Coder Session Two")
-    session!(ctx.db, "retired-one", "flynn", "Retired Coder", state: "retired")
-    session!(ctx.db, "literal", "flynn", "100% Coverage")
+    session!(ctx.db, "coder-two", "sample-user", "Coder Session Two")
+    session!(ctx.db, "retired-one", "sample-user", "Retired Coder", state: "retired")
+    session!(ctx.db, "literal", "sample-user", "100% Coverage")
 
     # Exact single match is STILL a one-row candidate list, never content.
     exact = read(ctx, %{name: "100% Coverage"})
@@ -271,7 +271,7 @@ defmodule Tightbeam.TranscriptTest do
 
   test "proof 7: owner and admin read; everyone else gets one not_found", ctx do
     seed(ctx.db, "owned", 2)
-    session!(ctx.db, "gone", "flynn", "Gone Session", state: "retired")
+    session!(ctx.db, "gone", "sample-user", "Gone Session", state: "retired")
     retired_ids = seed(ctx.db, "gone", 1)
 
     assert length(read(ctx, %{session_key: "owned"}).messages) == 2
@@ -284,14 +284,14 @@ defmodule Tightbeam.TranscriptTest do
     assert length(read(ctx, %{session_key: "owned"}, {:session, "owned"}).messages) == 2
 
     # Non-owner and unknown key are byte-identical.
-    forbidden = read(ctx, %{session_key: "owned"}, {:user, "kay"})
-    unknown = read(ctx, %{session_key: "no-such-session"}, {:user, "kay"})
+    forbidden = read(ctx, %{session_key: "owned"}, {:user, "other"})
+    unknown = read(ctx, %{session_key: "no-such-session"}, {:user, "other"})
     assert forbidden == unknown
     assert forbidden.code == "not_found"
     assert read(ctx, %{session_key: "owned"}, {:session, "foreign"}) == forbidden
 
     # `--name` cannot enumerate what the caller may not read.
-    assert Enum.map(read(ctx, %{name: "Session"}, {:user, "kay"}).candidates, & &1.session_key) ==
+    assert Enum.map(read(ctx, %{name: "Session"}, {:user, "other"}).candidates, & &1.session_key) ==
              ["foreign"]
   end
 
@@ -303,7 +303,7 @@ defmodule Tightbeam.TranscriptTest do
     ok =
       dispatch(opts, %{
         verb: "transcript",
-        asUser: "flynn",
+        asUser: "sample-user",
         params: %{sessionKey: "owned"}
       })
 
@@ -324,24 +324,39 @@ defmodule Tightbeam.TranscriptTest do
     # values below all reached a 200 with a verb event while the check filtered on
     # `is_binary/1` — a null-valued key is still a volunteered typed target.
     bodies = [
-      %{verb: "transcript", asUser: "flynn", sessionKey: "no-such-session"},
-      %{verb: "transcript", asUser: "flynn", sessionKey: "owned"},
-      %{verb: "transcript", asUser: "flynn", sessionKey: "foreign"},
-      %{verb: "transcript", asUser: "flynn", target: "owned"},
-      %{verb: "transcript", asUser: "flynn", sessionKey: "owned", role: "whatever"},
-      %{verb: "transcript", asUser: "flynn", userId: "flynn"},
-      %{verb: "transcript", asUser: "flynn", role: "whatever"},
+      %{verb: "transcript", asUser: "sample-user", sessionKey: "no-such-session"},
+      %{verb: "transcript", asUser: "sample-user", sessionKey: "owned"},
+      %{verb: "transcript", asUser: "sample-user", sessionKey: "foreign"},
+      %{verb: "transcript", asUser: "sample-user", target: "owned"},
+      %{verb: "transcript", asUser: "sample-user", sessionKey: "owned", role: "whatever"},
+      %{verb: "transcript", asUser: "sample-user", userId: "sample-user"},
+      %{verb: "transcript", asUser: "sample-user", role: "whatever"},
       # Null, and carrying otherwise-valid params so nothing else could refuse it.
-      %{verb: "transcript", asUser: "flynn", sessionKey: nil, params: %{sessionKey: "owned"}},
-      %{verb: "transcript", asUser: "flynn", target: nil, params: %{sessionKey: "owned"}},
-      %{verb: "transcript", asUser: "flynn", role: nil, params: %{sessionKey: "owned"}},
-      %{verb: "transcript", asUser: "flynn", userId: nil, params: %{sessionKey: "owned"}},
-      # A number, a boolean and an object — the same gap as null.
-      %{verb: "transcript", asUser: "flynn", sessionKey: 42, params: %{sessionKey: "owned"}},
-      %{verb: "transcript", asUser: "flynn", sessionKey: true, params: %{sessionKey: "owned"}},
       %{
         verb: "transcript",
-        asUser: "flynn",
+        asUser: "sample-user",
+        sessionKey: nil,
+        params: %{sessionKey: "owned"}
+      },
+      %{verb: "transcript", asUser: "sample-user", target: nil, params: %{sessionKey: "owned"}},
+      %{verb: "transcript", asUser: "sample-user", role: nil, params: %{sessionKey: "owned"}},
+      %{verb: "transcript", asUser: "sample-user", userId: nil, params: %{sessionKey: "owned"}},
+      # A number, a boolean and an object — the same gap as null.
+      %{
+        verb: "transcript",
+        asUser: "sample-user",
+        sessionKey: 42,
+        params: %{sessionKey: "owned"}
+      },
+      %{
+        verb: "transcript",
+        asUser: "sample-user",
+        sessionKey: true,
+        params: %{sessionKey: "owned"}
+      },
+      %{
+        verb: "transcript",
+        asUser: "sample-user",
         sessionKey: %{key: "owned"},
         params: %{sessionKey: "owned"}
       }
@@ -375,7 +390,7 @@ defmodule Tightbeam.TranscriptTest do
 
     # A REAL production write: one transaction commits the echo and its turn.
     assert :appended =
-             Gateway.deliver_prompt("owned", "user:flynn", "the real prompt",
+             Gateway.deliver_prompt("owned", "user:sample-user", "the real prompt",
                db: ctx.db,
                client_message_id: "c_real"
              )
@@ -583,8 +598,8 @@ defmodule Tightbeam.TranscriptTest do
 
     call = %{
       verb: "transcript",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: nil,
       params: %{session_key: "owned"}
     }
@@ -615,7 +630,7 @@ defmodule Tightbeam.TranscriptTest do
 
   ## Helpers — reads
 
-  defp read(ctx, params, principal \\ {:user, "flynn"}) do
+  defp read(ctx, params, principal \\ {:user, "sample-user"}) do
     Transcript.read(ctx.db, %{params: params, principal: principal})
   end
 
@@ -697,7 +712,7 @@ defmodule Tightbeam.TranscriptTest do
         """
         INSERT INTO turns (sessionKey, messageId, origin, prompt, model, thinkingLevel,
           modelContext, harness, createdAt)
-        VALUES (?1, ?2, 'user:flynn', 'legacy', ?3, ?5, ?6, ?4, 1)
+        VALUES (?1, ?2, 'user:sample-user', 'legacy', ?3, ?5, ?6, ?4, 1)
         """,
         [session_key, message_id, opts[:model], opts[:harness], opts[:effort], opts[:context]]
       )
@@ -725,8 +740,8 @@ defmodule Tightbeam.TranscriptTest do
 
     Dispatch.dispatch(ctx.db, handlers, %{
       verb: "transcript",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: nil,
       params: params
     })

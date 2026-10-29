@@ -1,6 +1,6 @@
 defmodule Tightbeam.RecordNoticeTest do
   @moduledoc """
-  Proofs for `EventLog.notice/5` (Flynn rulings 2026-08-03).
+  Proofs for `EventLog.notice/5`.
 
   The bias being corrected: `[adapter recovered]` reached the chat while
   `adapter_down` reached a table no client reads. A notice is ONE call that
@@ -27,21 +27,21 @@ defmodule Tightbeam.RecordNoticeTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 0, 'admin_add', 1)"
       )
 
-    create_session(db, Org.personal_session_key("flynn"), "Main")
+    create_session(db, Org.personal_session_key("sample-user"), "Main")
     create_session(db, "work", "Work")
 
-    %{db: db, registry: registry, main: Org.personal_session_key("flynn")}
+    %{db: db, registry: registry, main: Org.personal_session_key("sample-user")}
   end
 
   defp create_session(db, session_key, display_name) do
     Org.create(db, %{
       session_key: session_key,
       display_name: display_name,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -54,7 +54,7 @@ defmodule Tightbeam.RecordNoticeTest do
     {:ok, ref, _replaced} =
       ConnRegistry.register(registry, %{
         pid: self(),
-        user_id: "flynn",
+        user_id: "sample-user",
         device_id: device_id,
         is_admin: false,
         subscriptions: MapSet.new(["chat"])
@@ -110,7 +110,7 @@ defmodule Tightbeam.RecordNoticeTest do
       )
 
     # Nobody was connected, so nothing was pushed. Replay is the other half of
-    # the ruling: the same rows a reconnecting socket drains (Wire.Socket reads
+    # the behavior: the same rows a reconnecting socket drains (Wire.Socket reads
     # list_after and frames each row with server_message/1).
     refute_received {:push_message, _, _, _}
 
@@ -121,7 +121,7 @@ defmodule Tightbeam.RecordNoticeTest do
     assert frame["attentionTier"] == 0
   end
 
-  ## Flynn ruling 2: no session is a log line, never a mailbox
+  ## An audience without a session is logged, never delivered to a mailbox
 
   test "an audience with no session is logged and nothing is conjured for it", ctx do
     log =
@@ -148,7 +148,7 @@ defmodule Tightbeam.RecordNoticeTest do
   end
 
   test "a retired session is not an audience", ctx do
-    Org.retire(ctx.db, "work", "user:flynn", 1_000)
+    Org.retire(ctx.db, "work", "user:sample-user", 1_000)
 
     capture_log(fn ->
       :ok =
@@ -168,15 +168,15 @@ defmodule Tightbeam.RecordNoticeTest do
 
   test "an ambient audience lands in the named owner's main session", ctx do
     :ok =
-      EventLog.notice(ctx.db, "endpoint_not_provisioned", "eurisko", "ssh refused",
-        audience: {:ambient, "flynn"},
+      EventLog.notice(ctx.db, "endpoint_not_provisioned", "remote-host", "ssh refused",
+        audience: {:ambient, "sample-user"},
         attention: :low,
-        message: "[host unreachable]\n\neurisko did not answer.",
+        message: "[host unreachable]\n\nremote-host did not answer.",
         conn_registry: ctx.registry
       )
 
     assert [marker] = Projection.list_after(ctx.db, ctx.main, nil, 10)
-    assert marker.content =~ "eurisko did not answer"
+    assert marker.content =~ "remote-host did not answer"
     assert Projection.list_after(ctx.db, "work", nil, 10) == []
   end
 

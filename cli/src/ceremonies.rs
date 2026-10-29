@@ -286,7 +286,7 @@ where
 ///
 /// This is the artifact check one layer out, and the same mistake it was: an exit code was
 /// read as "codex produced a credential", and here a transport success was read as "the
-/// gateway installed one". Every 2xx reached `Ok(())`, including a body with no `result`
+/// gateway installed one". Every 2xx reached `Ok()`, including a body with no `result`
 /// at all -- `dispatch::parse_response` answers `Ok(None)` for that -- so a gateway that
 /// returned `{}` would have the CLI report a completed onboarding it had never been told
 /// about.
@@ -351,7 +351,7 @@ where
 /// Which machine this ceremony acts on.
 ///
 /// The gateway defaults an unnamed onboarding machine to its OWN hostname
-/// (`gateway.ex`, `params[:machine] || Placement.local_host_name()`). On the gateway host
+/// (`gateway.ex`, `params[:machine] || Placement.local_host_name`). On the gateway host
 /// that is right. On a satellite it is a trap: the gateway stages the credential into its
 /// own directories while the provider CLI writes into the satellite's, and `finish` then
 /// reads an absent file and reports a TOKEN failure -- blaming the credential for what is
@@ -2342,7 +2342,7 @@ mod tests {
     fn a_ceremony_outliving_its_lease_is_killed_with_its_whole_group() {
         // The stub forks a GRANDCHILD and records its pid, so this asserts the whole group
         // died rather than just the process we spawned. A wrapper that killed only its
-        // direct child would leave the grandchild behind -- which is the eurisko orphan's
+        // direct child would leave the grandchild behind -- which is the test-host orphan's
         // exact shape: `script` gone, `claude setup-token` still running.
         let marker = std::env::temp_dir().join(format!(
             "tightbeam-ceremony-watchdog-{}-{:?}",
@@ -3001,7 +3001,7 @@ mod tests {
         let sent = std::cell::RefCell::new(Vec::new());
 
         let reason = cancel_after_begin(
-            &Identity::User("flynn".to_owned()),
+            &Identity::User("sample-user".to_owned()),
             "anthropic",
             "subscription",
             Some("worker"),
@@ -3328,11 +3328,11 @@ mod tests {
             ..FakeIo::default()
         };
 
-        let error = update_clients_with(&mut io, "flynn").unwrap_err();
+        let error = update_clients_with(&mut io, "sample-user").unwrap_err();
 
         assert_eq!(
             io.dispatched,
-            vec![r#"{"asUser":"flynn","verb":"update-clients","params":{}}"#]
+            vec![r#"{"asUser":"sample-user","verb":"update-clients","params":{}}"#]
         );
         assert_eq!(io.commands[0].0, "ssh");
         assert_eq!(
@@ -3402,7 +3402,7 @@ mod tests {
             ..FakeIo::default()
         };
 
-        update_clients_with(&mut io, "flynn").unwrap();
+        update_clients_with(&mut io, "sample-user").unwrap();
 
         assert_eq!(
             io.commands[0].1,
@@ -3443,7 +3443,7 @@ mod tests {
             "Welcome to satellite.local\nmaintenance tonight\n{current}\n"
         ))]);
 
-        let error = update_clients_with(&mut io, "flynn").unwrap_err();
+        let error = update_clients_with(&mut io, "sample-user").unwrap_err();
 
         assert_eq!(
             io.commands
@@ -3465,7 +3465,7 @@ mod tests {
         ] {
             let mut io = one_update_host(vec![Ok(answer.to_owned())]);
 
-            let error = update_clients_with(&mut io, "flynn").unwrap_err();
+            let error = update_clients_with(&mut io, "sample-user").unwrap_err();
 
             assert_eq!(io.commands.len(), 1, "answer {answer:?} must not ship");
             assert!(io.logs[0].contains("question failed"));
@@ -3477,7 +3477,7 @@ mod tests {
     fn failed_version_question_does_not_ship() {
         let mut io = one_update_host(vec![Err(exec_failure("tightbeam: version refused"))]);
 
-        let error = update_clients_with(&mut io, "flynn").unwrap_err();
+        let error = update_clients_with(&mut io, "sample-user").unwrap_err();
 
         assert_eq!(
             io.commands
@@ -3499,7 +3499,7 @@ mod tests {
         };
         let mut io = one_update_host(vec![Ok("0.0.9\n".to_owned()), Ok(format!("{remote}\n"))]);
 
-        let error = update_clients_with(&mut io, "flynn").unwrap_err();
+        let error = update_clients_with(&mut io, "sample-user").unwrap_err();
 
         assert_eq!(
             io.commands
@@ -3525,7 +3525,7 @@ mod tests {
             Ok(String::new()),
         ]);
 
-        let error = update_clients_with(&mut io, "flynn").unwrap_err();
+        let error = update_clients_with(&mut io, "sample-user").unwrap_err();
         let remote_scripts = io
             .commands
             .iter()
@@ -3689,8 +3689,8 @@ mod tests {
 
     fn args() -> AssimilateArgs {
         AssimilateArgs {
-            ssh_dest: "flynn@work-1.local".to_owned(),
-            as_user: "flynn".to_owned(),
+            ssh_dest: "sample-user@work-1.local".to_owned(),
+            as_user: "sample-user".to_owned(),
             name: None,
             base_dir: "~/.tightbeam".to_owned(),
             harnesses: vec!["claude".to_owned(), "codex".to_owned()],
@@ -3786,7 +3786,7 @@ mod tests {
         let probe = io.commands[0].1.last().unwrap();
         assert_eq!(
             io.commands[0].1[..4],
-            ["-o", "BatchMode=yes", "--", "flynn@work-1.local"]
+            ["-o", "BatchMode=yes", "--", "sample-user@work-1.local"]
         );
         for expected in [
             "uname -sm",
@@ -3821,7 +3821,7 @@ mod tests {
         assert_eq!(
             io.dispatched,
             vec![
-                r#"{"asUser":"flynn","verb":"register-host","params":{"name":"work-1.local","ssh":"flynn@work-1.local","baseDir":"/Users/remote/.tightbeam","cliBin":"/Users/remote/.tightbeam/bin","adapterBinDir":"/Users/remote/.tightbeam/adapters/node_modules/.bin"}}"#
+                r#"{"asUser":"sample-user","verb":"register-host","params":{"name":"work-1.local","ssh":"sample-user@work-1.local","baseDir":"/Users/remote/.tightbeam","cliBin":"/Users/remote/.tightbeam/bin","adapterBinDir":"/Users/remote/.tightbeam/adapters/node_modules/.bin"}}"#
             ]
         );
         assert!(io.logs.contains(&"[assimilate] PROBE... ok".to_owned()));
@@ -3906,7 +3906,7 @@ mod tests {
         let reason = assimilate_with(&mut io, dry_args).unwrap_err();
 
         assert!(reason.contains("claude"), "{reason}");
-        assert!(reason.contains("flynn@work-1.local"), "{reason}");
+        assert!(reason.contains("sample-user@work-1.local"), "{reason}");
         assert!(reason.contains("never the vendors' software"), "{reason}");
         assert!(
             io.logs
@@ -4079,7 +4079,7 @@ mod tests {
     fn default_name_strips_user_prefix() {
         assert_eq!(default_assimilate_name("worker.local"), "worker.local");
         assert_eq!(
-            default_assimilate_name("flynn@worker.local"),
+            default_assimilate_name("sample-user@worker.local"),
             "worker.local"
         );
     }
@@ -4144,17 +4144,17 @@ mod tests {
             let reason = require_on_path(
                 binary,
                 &empty,
-                &preflight::missing_harness_cli(binary, harness, "eurisko", &empty),
+                &preflight::missing_harness_cli(binary, harness, "test-host", &empty),
             )
             .unwrap_err();
             assert!(reason.contains(binary), "{reason}");
-            assert!(reason.contains("eurisko"), "{reason}");
+            assert!(reason.contains("test-host"), "{reason}");
             assert!(
                 reason.contains(&empty),
                 "the PATH searched must be shown: {reason}"
             );
             assert!(
-                reason.contains(&format!("Install {binary} on eurisko and re-run")),
+                reason.contains(&format!("Install {binary} on test-host and re-run")),
                 "{reason}"
             );
             assert!(

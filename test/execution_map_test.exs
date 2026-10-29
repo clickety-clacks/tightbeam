@@ -74,10 +74,10 @@ defmodule Tightbeam.ExecutionMapTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1),('kay', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 0, 'admin_add', 1),('other', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
       )
 
-    Enum.each(~w(flynn kay root), &ensure_main_session(db, &1))
+    Enum.each(~w(sample-user other root), &ensure_main_session(db, &1))
 
     # The epoch is stamped once at table creation, so a test that needs a known
     # cutoff moves the single row rather than pretending to control the clock.
@@ -87,14 +87,14 @@ defmodule Tightbeam.ExecutionMapTest do
   ## Proof 1 — origin is reported and annotated, never classified
 
   test "proof 1: origin annotation is filter-independent and --origin selects on it", ctx do
-    session!(ctx.db, "s_creator", "flynn")
-    item!(ctx.db, "wi_user", created_at: at(1), created_by_user: "flynn")
+    session!(ctx.db, "s_creator", "sample-user")
+    item!(ctx.db, "wi_user", created_at: at(1), created_by_user: "sample-user")
     item!(ctx.db, "wi_session", created_at: at(2), created_by_session: "s_creator")
 
     all = roster(ctx)
     assert ids(all) == ["wi_user", "wi_session"]
 
-    assert node(all, "wi_user").origin == %{principal: "user", created_by: "flynn"}
+    assert node(all, "wi_user").origin == %{principal: "user", created_by: "sample-user"}
     assert node(all, "wi_session").origin == %{principal: "session", created_by: "s_creator"}
 
     assert ids(roster(ctx, %{origin: "user"})) == ["wi_user"]
@@ -107,7 +107,7 @@ defmodule Tightbeam.ExecutionMapTest do
     for params <- [%{}, %{origin: "all"}, %{origin: "user"}, %{state: "open"}] do
       case Enum.find(roster(ctx, params).items, &(&1.id == "wi_user")) do
         nil -> flunk("wi_user must appear under #{inspect(params)}")
-        found -> assert found.origin == %{principal: "user", created_by: "flynn"}
+        found -> assert found.origin == %{principal: "user", created_by: "sample-user"}
       end
     end
   end
@@ -116,7 +116,7 @@ defmodule Tightbeam.ExecutionMapTest do
 
   test "proof 2: linked, from_turn, no_turn_observed and unrecorded are distinct and exhaustive",
        ctx do
-    session!(ctx.db, "s_lane", "flynn")
+    session!(ctx.db, "s_lane", "sample-user")
 
     # The parent target itself: the substrate LOOKED and nothing was running.
     item!(ctx.db, "wi_root", created_at: at(1), context_known: 1, created_in_turn_seq: nil)
@@ -185,8 +185,8 @@ defmodule Tightbeam.ExecutionMapTest do
   ## Proof 3 — edge derivation succeeds through BOTH carriers
 
   test "proof 3: a jobRef with no assignment and a transitive review chain both derive", ctx do
-    session!(ctx.db, "s_lane", "flynn")
-    session!(ctx.db, "s_holder", "flynn")
+    session!(ctx.db, "s_lane", "sample-user")
+    session!(ctx.db, "s_holder", "sample-user")
     item!(ctx.db, "wi_bracket_parent", created_at: at(1))
     item!(ctx.db, "wi_review_parent", created_at: at(2))
 
@@ -266,7 +266,7 @@ defmodule Tightbeam.ExecutionMapTest do
 
   test "proof 5: --under returns visible linked descendants and terminates on inserted cycles",
        ctx do
-    session!(ctx.db, "s_lane", "flynn")
+    session!(ctx.db, "s_lane", "sample-user")
     item!(ctx.db, "wi_a", created_at: at(1))
     turn!(ctx.db, 30, "s_lane", job_ref: "wi_a")
     item!(ctx.db, "wi_b", created_at: at(2), context_known: 1, created_in_turn_seq: 30)
@@ -282,8 +282,8 @@ defmodule Tightbeam.ExecutionMapTest do
 
     # Unknown and invisible anchors are ONE answer, byte-identical.
     unknown = read(ctx, :topline, %{under: "wi_does_not_exist"})
-    item!(ctx.db, "wi_kay", owner: "kay")
-    invisible = read(ctx, :topline, %{under: "wi_kay"})
+    item!(ctx.db, "wi_other", owner: "other")
+    invisible = read(ctx, :topline, %{under: "wi_other"})
 
     assert unknown == %{code: "not_found", message: "work item not found"}
     assert JSON.encode!(unknown) == JSON.encode!(invisible)
@@ -333,8 +333,8 @@ defmodule Tightbeam.ExecutionMapTest do
   ## Proof 6 — singular resolved membership under a legacy conflict
 
   test "proof 6: a legacy conflicted review contributes to exactly ONE item's telemetry", ctx do
-    session!(ctx.db, "s_holder_a", "flynn")
-    session!(ctx.db, "s_holder_r", "flynn")
+    session!(ctx.db, "s_holder_a", "sample-user")
+    session!(ctx.db, "s_holder_r", "sample-user")
     item!(ctx.db, "wi_A", created_at: at(1))
     item!(ctx.db, "wi_B", created_at: at(2))
 
@@ -423,7 +423,7 @@ defmodule Tightbeam.ExecutionMapTest do
 
   test "proof 7: a bracket nag, a review turn and a both-keys turn each count exactly once",
        ctx do
-    session!(ctx.db, "s_holder", "flynn")
+    session!(ctx.db, "s_holder", "sample-user")
     item!(ctx.db, "wi_union")
     assignment!(ctx.db, "asg_union", work_item_id: "wi_union", holder: "s_holder")
 
@@ -448,7 +448,7 @@ defmodule Tightbeam.ExecutionMapTest do
 
   test "proof 8: finished_at tracks the CURRENT terminal state and closing_attests exclude revoked",
        ctx do
-    session!(ctx.db, "s_holder", "flynn")
+    session!(ctx.db, "s_holder", "sample-user")
 
     # Driven through the real disposition writer, so the causal event under test
     # is the one production appends.
@@ -473,8 +473,8 @@ defmodule Tightbeam.ExecutionMapTest do
     assignment =
       Assignments.__handle__(ctx.db, "assign", %{
         verb: "assign",
-        principal: {:user, "flynn"},
-        origin: "user:flynn",
+        principal: {:user, "sample-user"},
+        origin: "user:sample-user",
         session_key: "s_holder",
         target_role: nil,
         role_fallback: false,
@@ -558,8 +558,8 @@ defmodule Tightbeam.ExecutionMapTest do
   ## Proof 9 — the progress clock and quietness
 
   test "proof 9: the clock floors at the cutoff, attests reset it, and wakes never do", ctx do
-    session!(ctx.db, "s_stale", "flynn")
-    session!(ctx.db, "s_current", "flynn")
+    session!(ctx.db, "s_stale", "sample-user")
+    session!(ctx.db, "s_current", "sample-user")
 
     # An item created before attribution was knowable: its clock can never claim
     # quiet time from before the cutoff.
@@ -601,7 +601,7 @@ defmodule Tightbeam.ExecutionMapTest do
     # A pending PROMPT wake on a current open holder also defeats it — the gate
     # is session-keyed across all pending prompt wakes, not item-attributed.
     item!(ctx.db, "wi_pending", created_at: 2_000_000)
-    session!(ctx.db, "s_nudged", "flynn")
+    session!(ctx.db, "s_nudged", "sample-user")
     assignment!(ctx.db, "asg_pending", work_item_id: "wi_pending", holder: "s_nudged")
     wake!(ctx.db, "wk_prompt", "s_nudged", state: "pending")
 
@@ -629,8 +629,8 @@ defmodule Tightbeam.ExecutionMapTest do
   test "a work item's pending_wake_classes sums classed pending wakes across its current holders",
        ctx do
     item!(ctx.db, "wi_classed", created_at: 2_000_000)
-    session!(ctx.db, "s_classed_a", "flynn")
-    session!(ctx.db, "s_classed_b", "flynn")
+    session!(ctx.db, "s_classed_a", "sample-user")
+    session!(ctx.db, "s_classed_b", "sample-user")
     assignment!(ctx.db, "asg_classed_a", work_item_id: "wi_classed", holder: "s_classed_a")
     assignment!(ctx.db, "asg_classed_b", work_item_id: "wi_classed", holder: "s_classed_b")
 
@@ -669,7 +669,7 @@ defmodule Tightbeam.ExecutionMapTest do
 
   test "proof 10: a pre-cutoff item nulls attribution-dependent counts and keeps durable facts",
        ctx do
-    session!(ctx.db, "s_holder", "flynn")
+    session!(ctx.db, "s_holder", "sample-user")
     item!(ctx.db, "wi_old", created_at: @cutoff - 1)
     item!(ctx.db, "wi_new", created_at: @cutoff)
 
@@ -721,7 +721,7 @@ defmodule Tightbeam.ExecutionMapTest do
 
   test "proof 11: a filter-excluded visible parent leaves its child top-level and still named",
        ctx do
-    session!(ctx.db, "s_lane", "flynn")
+    session!(ctx.db, "s_lane", "sample-user")
     item!(ctx.db, "wi_parent", created_at: at(1), state: "open")
     turn!(ctx.db, 100, "s_lane", job_ref: "wi_parent")
 
@@ -763,10 +763,10 @@ defmodule Tightbeam.ExecutionMapTest do
   ## Proof 12 — --assignments exercises all three classes at once
 
   test "proof 12: with-item, NONE and unknown-versus-invisible ids in one proof", ctx do
-    session!(ctx.db, "s_mine", "flynn")
-    session!(ctx.db, "s_theirs", "kay")
+    session!(ctx.db, "s_mine", "sample-user")
+    session!(ctx.db, "s_theirs", "other")
     item!(ctx.db, "wi_selected")
-    item!(ctx.db, "wi_theirs", owner: "kay")
+    item!(ctx.db, "wi_theirs", owner: "other")
 
     assignment!(ctx.db, "asg_with_item", work_item_id: "wi_selected", holder: "s_mine")
     assignment!(ctx.db, "asg_none", work_item_id: nil, reviews: nil, holder: "s_mine")
@@ -816,10 +816,10 @@ defmodule Tightbeam.ExecutionMapTest do
   end
 
   test "typed prefixes cover topline assignments, under anchors, and roster cursors", ctx do
-    session!(ctx.db, "s_prefix_mine", "flynn")
-    session!(ctx.db, "s_prefix_theirs", "kay")
+    session!(ctx.db, "s_prefix_mine", "sample-user")
+    session!(ctx.db, "s_prefix_theirs", "other")
     item!(ctx.db, "wi_prefix_alpha", created_at: at(1))
-    item!(ctx.db, "wi_prefix_hidden", owner: "kay", created_at: at(2))
+    item!(ctx.db, "wi_prefix_hidden", owner: "other", created_at: at(2))
     item!(ctx.db, "wi_prefix_zulu", created_at: at(3))
 
     assignment!(ctx.db, "asg_prefix_alpha",
@@ -861,7 +861,7 @@ defmodule Tightbeam.ExecutionMapTest do
 
   test "proof 13: roster order is createdAt ASC then id ASC under every filter combination",
        ctx do
-    session!(ctx.db, "s_creator", "flynn")
+    session!(ctx.db, "s_creator", "sample-user")
 
     # Equal createdAt across three ids forces the id tiebreak to do the work.
     for {id, created} <- [
@@ -881,7 +881,7 @@ defmodule Tightbeam.ExecutionMapTest do
 
     combinations =
       for origin <- [nil, "all", "session"],
-          owner <- [nil, "flynn"],
+          owner <- [nil, "sample-user"],
           state <- [nil, "open"],
           spec <- [nil, "topline-map-v1"],
           session <- [nil, "s_creator"] do
@@ -907,7 +907,7 @@ defmodule Tightbeam.ExecutionMapTest do
   ## Proof 14 — every surface is read-only in its own effects
 
   test "proof 14: a dispatched read writes only the ordinary audit row", ctx do
-    session!(ctx.db, "s_holder", "flynn")
+    session!(ctx.db, "s_holder", "sample-user")
     item!(ctx.db, "wi_readonly")
     assignment!(ctx.db, "asg_readonly", work_item_id: "wi_readonly", holder: "s_holder")
 
@@ -927,8 +927,8 @@ defmodule Tightbeam.ExecutionMapTest do
       assert {:ok, _result} =
                Dispatch.dispatch(ctx.db, handlers, %{
                  verb: verb,
-                 origin: "user:flynn",
-                 principal: {:user, "flynn"},
+                 origin: "user:sample-user",
+                 principal: {:user, "sample-user"},
                  session_key: nil,
                  params: params
                })
@@ -942,7 +942,7 @@ defmodule Tightbeam.ExecutionMapTest do
   ## Surface — the wiring these verbs need, at the router
 
   test "the router routes both verbs and refuses a volunteered typed target", ctx do
-    session!(ctx.db, "s_real", "flynn")
+    session!(ctx.db, "s_real", "sample-user")
     item!(ctx.db, "wi_routed")
 
     base_dir =
@@ -964,7 +964,7 @@ defmodule Tightbeam.ExecutionMapTest do
       session_status: fn _ -> nil end
     ]
 
-    ok = post_dispatch(opts, %{verb: "execution-map", asUser: "flynn", params: %{}})
+    ok = post_dispatch(opts, %{verb: "execution-map", asUser: "sample-user", params: %{}})
     assert ok.status == 200
     assert [%{"id" => "wi_routed"}] = JSON.decode!(ok.resp_body)["result"]["items"]
 
@@ -976,7 +976,7 @@ defmodule Tightbeam.ExecutionMapTest do
       for verb <- ["execution-map", "execution-map-select"],
           key <- ["s_real", "s_does_not_exist"] do
         response =
-          post_dispatch(opts, %{verb: verb, asUser: "flynn", sessionKey: key, params: %{}})
+          post_dispatch(opts, %{verb: verb, asUser: "sample-user", sessionKey: key, params: %{}})
 
         assert response.status == 400
         {verb, JSON.decode!(response.resp_body)}
@@ -999,7 +999,12 @@ defmodule Tightbeam.ExecutionMapTest do
     for verb <-
           ~w(toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list) do
       response =
-        post_dispatch(opts, %{verb: verb, asUser: "flynn", sessionKey: "s_real", params: %{}})
+        post_dispatch(opts, %{
+          verb: verb,
+          asUser: "sample-user",
+          sessionKey: "s_real",
+          params: %{}
+        })
 
       assert response.status == 400
 
@@ -1028,8 +1033,8 @@ defmodule Tightbeam.ExecutionMapTest do
   defp read(ctx, kind, params, opts \\ []) do
     call = %{
       verb: if(kind == :roster, do: "toplines", else: "topline"),
-      origin: "user:flynn",
-      principal: Keyword.get(opts, :principal, {:user, "flynn"}),
+      origin: "user:sample-user",
+      principal: Keyword.get(opts, :principal, {:user, "sample-user"}),
       session_key: nil,
       params: params,
       now: Keyword.get(opts, :now, @now)
@@ -1069,9 +1074,9 @@ defmodule Tightbeam.ExecutionMapTest do
   # holds, markers and turn attributions — are never written at all, which is
   # what makes the comparison a twin-WORLD proof rather than an id sweep.
   defp seed_twin_world(db, invisible: invisible?) do
-    session!(db, "s_mine", "flynn")
-    session!(db, "s_lane", "flynn")
-    if invisible?, do: session!(db, "s_theirs", "kay")
+    session!(db, "s_mine", "sample-user")
+    session!(db, "s_lane", "sample-user")
+    if invisible?, do: session!(db, "s_theirs", "other")
 
     item!(db, "wi_anchor", created_at: at(1))
     turn!(db, 200, "s_lane", job_ref: "wi_anchor")
@@ -1091,7 +1096,7 @@ defmodule Tightbeam.ExecutionMapTest do
     )
 
     if invisible? do
-      item!(db, "wi_theirs", owner: "kay", created_at: at(4))
+      item!(db, "wi_theirs", owner: "other", created_at: at(4))
       assignment!(db, "asg_theirs", work_item_id: "wi_theirs", holder: "s_theirs")
       attest!(db, "att_theirs", "asg_theirs", by_session: "s_theirs", ts: 3_500_000)
       wake!(db, "wk_theirs", "s_theirs", state: "pending", work_item_id: "wi_theirs")
@@ -1139,13 +1144,13 @@ defmodule Tightbeam.ExecutionMapTest do
           "Item #{id}",
           Keyword.get(opts, :spec_ref_name),
           Keyword.get(opts, :spec_ref_sha256),
-          Keyword.get(opts, :owner, "flynn"),
+          Keyword.get(opts, :owner, "sample-user"),
           Keyword.get(opts, :state, "open"),
           Keyword.get(opts, :fail_reason),
           Keyword.get(opts, :routing_wake_id),
           if(Keyword.has_key?(opts, :created_by_session),
             do: nil,
-            else: Keyword.get(opts, :created_by_user, "flynn")
+            else: Keyword.get(opts, :created_by_user, "sample-user")
           ),
           Keyword.get(opts, :created_by_session),
           Keyword.get(opts, :created_in_turn_seq),
@@ -1164,7 +1169,7 @@ defmodule Tightbeam.ExecutionMapTest do
         """
         INSERT INTO assignments
           (id, subject, holderKey, openedByUser, openedAt, state, workItemId, reviewsAssignmentId)
-        VALUES (?1, ?2, ?3, 'flynn', ?4, 'open', ?5, ?6)
+        VALUES (?1, ?2, ?3, 'sample-user', ?4, 'open', ?5, ?6)
         """,
         [
           id,
@@ -1189,7 +1194,7 @@ defmodule Tightbeam.ExecutionMapTest do
           """
           INSERT INTO assignment_revocations
             (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
-          VALUES (?1, ?2, ?3, 'flynn', NULL, 'execution-map test revocation')
+          VALUES (?1, ?2, ?3, 'sample-user', NULL, 'execution-map test revocation')
           """,
           [revocation_id, id, @default_created + 1]
         )
@@ -1211,7 +1216,7 @@ defmodule Tightbeam.ExecutionMapTest do
         db,
         """
         UPDATE assignments
-        SET state = 'closed', outcome = ?2, closedAt = ?3, closedByUser = 'flynn',
+        SET state = 'closed', outcome = ?2, closedAt = ?3, closedByUser = 'sample-user',
             closingAttestId = ?4
         WHERE id = ?1
         """,
@@ -1257,7 +1262,7 @@ defmodule Tightbeam.ExecutionMapTest do
         INSERT INTO turns
           (seq, sessionKey, messageId, origin, prompt, assignmentId, jobRef, model,
            thinkingLevel, modelContext, harness, status, createdAt, endedAt)
-        VALUES (?1, ?2, ?3, 'user:flynn', 'p', ?4, ?5, ?6, ?11, ?12, ?7, ?8, ?9, ?10)
+        VALUES (?1, ?2, ?3, 'user:sample-user', 'p', ?4, ?5, ?6, ?11, ?12, ?7, ?8, ?9, ?10)
         """,
         [
           seq,
@@ -1285,7 +1290,7 @@ defmodule Tightbeam.ExecutionMapTest do
         """
         INSERT INTO wakes
           (wakeId, sessionKey, origin, prompt, consumer, dueAt, state, createdAt, work_item_id)
-        VALUES (?1, ?2, 'user:flynn', 'p', ?3, ?4, ?5, ?4, ?6)
+        VALUES (?1, ?2, 'user:sample-user', 'p', ?3, ?4, ?5, ?4, ?6)
         """,
         [
           wake_id,
@@ -1340,8 +1345,8 @@ defmodule Tightbeam.ExecutionMapTest do
   defp dispose(db, verb, id, extra_params \\ %{}) do
     WorkItems.__handle__(db, verb, %{
       verb: verb,
-      principal: {:user, "flynn"},
-      origin: "user:flynn",
+      principal: {:user, "sample-user"},
+      origin: "user:sample-user",
       session_key: nil,
       params: Map.put(extra_params, :work_item_id, id)
     })

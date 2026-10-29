@@ -2306,7 +2306,7 @@ defmodule Tightbeam.Wire.Router do
   # Plug decodes %20 in path segments but leaves '+' literal (that's a query-string
   # convention, not a path one) — session keys carry a space, never a literal '+'.
   #
-  # The clawline iOS client sometimes double-percent-encodes the :key segment (a
+  # An iOS client sometimes double-percent-encodes the :key segment (a
   # space becomes %2520 instead of %20). Plug's router decodes the segment once
   # before we see it, so three additional passes preserve the four-pass wire cap.
   # Stop at the first fixed point. The "+" -> " " replacement runs first so an
@@ -2438,7 +2438,7 @@ defmodule Tightbeam.Wire.Router do
         {:ok, value} when is_nil(value) or value == "" ->
           Map.put(params, String.to_existing_atom(key), nil)
 
-        # F6 (Sol xhigh review): a value this seam does not know how to read
+        # F6: a value this seam does not know how to read
         # (a number, a bool, an object) is NOT a field value it silently
         # discards. Dropping it here used to hand the gateway a params map
         # indistinguishable from "the caller named nothing", which activated
@@ -2644,7 +2644,7 @@ defmodule Tightbeam.Wire.Router do
   # SUBSTRATE-INTERNAL params, PER VERB: fields a client may not set on that verb
   # because the substrate is their only legitimate author. `wake.assignmentId` is
   # the wake's attribution CARRIER — a client-supplied one would forge
-  # wake -> turn -> trace attribution, which Law 0 forbids (cross-review F6), so
+  # wake -> turn -> trace attribution, which Law 0 forbids, so
   # it is stripped before the handler sees it.
   #
   # Scoped per verb deliberately: `assignmentId` is an ORDINARY caller param on

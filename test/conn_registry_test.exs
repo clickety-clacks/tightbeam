@@ -17,8 +17,8 @@ defmodule Tightbeam.ConnRegistryTest do
   } do
     {:ok, _, _} =
       ConnRegistry.register(reg, %{
-        pid: :flynn,
-        user_id: "flynn",
+        pid: :sample_admin,
+        user_id: "sample-admin",
         device_id: "d1",
         is_admin: true,
         subscriptions: MapSet.new(["chat"])
@@ -26,22 +26,22 @@ defmodule Tightbeam.ConnRegistryTest do
 
     {:ok, _, _} =
       ConnRegistry.register(reg, %{
-        pid: :mike,
-        user_id: "mike",
+        pid: :sample_owner,
+        user_id: "sample-owner",
         device_id: "d2",
         is_admin: false,
         subscriptions: MapSet.new(["chat"])
       })
 
-    :ok = ConnRegistry.broadcast(reg, "mike", %{t: "typing"}, d)
-    # mike (owner) gets it; flynn (admin) gets NOTHING — not one byte of
+    :ok = ConnRegistry.broadcast(reg, "sample-owner", %{t: "typing"}, d)
+    # sample-owner gets it; sample-admin gets NOTHING — not one byte of
     # another user's content reaches an admin device.
-    assert_received {:sent, :mike, %{t: "typing"}}
-    refute_received {:sent, :flynn, _}
+    assert_received {:sent, :sample_owner, %{t: "typing"}}
+    refute_received {:sent, :sample_admin, _}
 
-    :ok = ConnRegistry.publish_message(reg, "k1", "mike", 1, %{t: "message"}, d)
-    assert_received {:sent, :mike, %{t: "message"}}
-    refute_received {:sent, :flynn, _}
+    :ok = ConnRegistry.publish_message(reg, "k1", "sample-owner", 1, %{t: "message"}, d)
+    assert_received {:sent, :sample_owner, %{t: "message"}}
+    refute_received {:sent, :sample_admin, _}
   end
 
   test "publish_message delivers unconditionally — no filter, no watermark", %{

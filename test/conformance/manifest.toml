@@ -70,11 +70,9 @@ phase = "pending"
 blocking_phase = "P7"
 runners = ["rules_decide", "acting_layer"]
 
-# Coordination fabric (coordination-fabric-v1 §13 Phase 1). GREEN on this line:
-# the mechanism ships here, so its fixtures execute rather than being annotated
-# as pending. The live feature-smoke on both harnesses is deferred by recorded
-# ruling (program §8d — the 0.1.x gateway is deliberately paused); these are the
-# substrate proofs that stand in the meantime.
+# The coordination fabric ships as product behavior, so its fixtures execute
+# rather than being annotated as pending. Live feature-smoke exercises integration
+# behavior separately from these substrate-level conformance checks.
 [[class]]
 id = "C8"
 dir = "c8_coordination_fabric"
@@ -88,7 +86,7 @@ blocking_phase = ""
 # and the manifest is where that would be visible.
 runners = ["delivery_policy", "question_carrier", "read_cursor"]
 
-# The live engine switch (v0.2 program §4). GREEN: the mechanism ships on this
+# The live engine switch. GREEN: the mechanism ships on this
 # line, so its fixtures execute. ONE kind, ONE runner, its own named clause —
 # no catch-all, so a fixture whose kind names no runner runs nothing and the
 # manifest is where that absence is visible.

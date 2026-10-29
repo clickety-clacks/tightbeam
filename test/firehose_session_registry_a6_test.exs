@@ -20,21 +20,21 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('sample-user',1,'admin_add',1)"
       )
 
     register_hosts(db, %{
       "testhost" => %{ssh: nil, base_dir: System.tmp_dir!(), cli_bin: nil}
     })
 
-    main = create_session(db, Org.personal_session_key("flynn"), "Main", kind: "main")
+    main = create_session(db, Org.personal_session_key("sample-user"), "Main", kind: "main")
     worker = create_session(db, "a6-worker", "A6 worker", operational_parent: main.session_key)
 
     :ok =
       Hub.register(Hub, self(), %{
         mode: :subscribed,
         db: db,
-        user_id: "flynn",
+        user_id: "sample-user",
         is_admin: false
       })
 
@@ -122,7 +122,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
       assert StateResources.encode_item("sessions", randomized, @catalog) == expected_bytes
     end
 
-    owner = %{kind: "user", id: "flynn", is_admin: false}
+    owner = %{kind: "user", id: "sample-user", is_admin: false}
     target = %{kind: "session", id: ctx.worker.session_key, is_admin: false}
     denied_user = %{kind: "user", id: "mallory", is_admin: false}
     denied_session = %{kind: "session", id: "other-session", is_admin: false}
@@ -190,8 +190,8 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
         ctx.db,
         %{
           verb: "spawn",
-          origin: "user:flynn",
-          principal: {:user, "flynn"},
+          origin: "user:sample-user",
+          principal: {:user, "sample-user"},
           session_key: session.session_key,
           params: %{}
         },
@@ -204,7 +204,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     updated = receive_notice()
     updated_item = canonical_session(ctx.db, session.session_key)
 
-    retired_row = Org.retire(ctx.db, session.session_key, "user:flynn", 1_000)
+    retired_row = Org.retire(ctx.db, session.session_key, "user:sample-user", 1_000)
 
     retired =
       Publisher.committed_notice("session.retired", retired_row, %{
@@ -255,7 +255,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
       Hub.register(Hub, self(), %{
         mode: :subscribed,
         db: ctx.db,
-        user_id: "flynn",
+        user_id: "sample-user",
         is_admin: false
       })
 
@@ -274,7 +274,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
       Hub.register(Hub, self(), %{
         mode: :subscribed,
         db: ctx.db,
-        user_id: "flynn",
+        user_id: "sample-user",
         is_admin: false
       })
 
@@ -329,7 +329,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
         Projection.append(ctx.db, %{
           session_key: ctx.worker.session_key,
           role: "user",
-          sender: "user:flynn",
+          sender: "user:sample-user",
           content: content
         })
     end
@@ -414,8 +414,8 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
       kind: Keyword.get(opts, :kind, "custom"),
       is_built_in: Keyword.get(opts, :kind) == "main",
       adopted: true,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       operational_parent: Keyword.get(opts, :operational_parent),
       archetype: "default",
       overrides: Keyword.get(opts, :overrides),

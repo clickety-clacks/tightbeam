@@ -75,12 +75,12 @@ end
   )
 
 # Enqueue a turn (as a client post would) and let the reconciler/lane run it.
-session_key = "agent:main:clawline:flynn:main"
+session_key = "agent:main:clawline:operator:main"
 {:ok, seq} =
   Ledger.enqueue(%{
     session_key: session_key,
     message_id: "s_e1_1",
-    origin: "user:flynn",
+    origin: "user:operator",
     prompt: "Reply with exactly: ELIXIR FIRST LIGHT"
   })
 

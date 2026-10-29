@@ -32,7 +32,7 @@ defmodule Tightbeam.PrivSkillsTest do
       Application.app_dir(:tightbeam, "priv/skills/tightbeam-archetype-cultivation/SKILL.md")
       |> File.read!()
 
-    refute authoring =~ ~r/\b(spec|spec-writer|coder|reviewer)\b/i
+    refute authoring =~ ~r/\b(spec|product[- ]owner|builder|judge)\b/i
     refute cultivation =~ ~r/\b(spec|product[- ]owner)\b/i
   end
 end

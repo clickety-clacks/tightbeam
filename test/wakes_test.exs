@@ -364,8 +364,8 @@ defmodule Tightbeam.WakesTest do
     # Backdate the original's filing time deep into its own ceiling window —
     # 3h59m into a 4h `fyi` ceiling — so a restarted ceiling (retarget-moment
     # + ceiling_ms) is provably DIFFERENT from the preserved one, not a
-    # coincidental match (Sol xhigh review round 2, finding 1: Invariant 3 —
-    # the ceiling anchors on the wake's own creation, never on when it
+    # coincidental match — the ceiling anchors on the wake's own creation,
+    # never on when it
     # happened to get retargeted; recomputing it here would let this `fyi`
     # land at 7h59m, a straight §7 violation).
     ceiling = Wakes.delivery_policy("fyi").ceiling_ms

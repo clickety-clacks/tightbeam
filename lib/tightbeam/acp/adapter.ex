@@ -90,7 +90,7 @@ defmodule Tightbeam.Acp.Adapter do
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: opts[:name])
 
   @doc """
-  Create a fresh harness session, model applied (fable-trap rule), rooted at
+  Create a fresh harness session, model applied (model-pin rule), rooted at
   `cwd` — the SESSION's isolated workdir, never a shared/operator directory
   (harnesses load project-level instruction files walking up from cwd; an
   un-isolated cwd leaks the operator's own guidance and files into the
@@ -244,7 +244,7 @@ defmodule Tightbeam.Acp.Adapter do
   call must be caught like every other adapter-boundary call: otherwise the turn
   task exits and the lane records a bare `:task_crash`, skipping the
   adjudication closure entirely — no hold, no cause, nothing to heal
-  (cross-review F1; the spec names runtime failures an adapter-fault form).
+  (the spec names runtime failures an adapter-fault form).
   """
   @spec prompt(adapter(), String.t(), String.t(), keyword()) ::
           {:ok,
@@ -293,7 +293,7 @@ defmodule Tightbeam.Acp.Adapter do
   @spec knows_session?(adapter(), String.t()) ::
           boolean() | {:error, {:adapter_unavailable, term()}}
   def knows_session?(adapter, session_id) do
-    # The BOOT-BOUNDARY budget (task #20): a residency call legally queues
+    # The BOOT-BOUNDARY budget: a residency call legally queues
     # behind a slow codex boot, and the old 5s caller budget undercut that queue.
     # A DEAD adapter still fails promptly via :noproc — only a BOOTING one waits.
     GenServer.call(adapter, {:knows_session?, session_id}, @boot_boundary_timeout)
@@ -1177,7 +1177,7 @@ defmodule Tightbeam.Acp.Adapter do
   defp normalize_trace_result({:error, reason}), do: {:error, reason}
   defp normalize_trace_result(other), do: {:error, {:invalid_trace_callback_result, other}}
 
-  ## Model application (the fable-trap rule)
+  ## Model application (the model-pin rule)
 
   defp establish_new_session_model(state, sid, %Model{} = model, _result, request_timeout),
     do: apply_model_to_session(state, sid, model, request_timeout)
@@ -1235,7 +1235,7 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   # The adapter's own refusal of a model value — JSON-RPC -32602 Invalid params,
-  # recorded live 2026-07-28: the harness ACP adapter refused the platform id
+  # The harness ACP adapter refused the platform id
   # `gpt-5.1-codex` at `session/set_config_option {configId: "model"}` — is a
   # model decision, not an adapter fault, and it must say so in the house
   # vocabulary (`:model_unavailable`, the word `strict_apply/4` already uses)

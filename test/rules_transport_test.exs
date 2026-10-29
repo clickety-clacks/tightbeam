@@ -59,7 +59,7 @@ defmodule Tightbeam.RulesTransportTest do
       end)
 
     {:paired, device} =
-      claim_org(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+      claim_org(db, %{device_id: "d1", claimed_name: "Sample User", platform: nil, model: nil})
 
     main = Org.get(db, Org.personal_session_key(device.user_id))
 

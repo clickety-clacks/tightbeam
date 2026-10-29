@@ -33,7 +33,7 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('sample-user',1,'admin_add',1)"
       )
 
     register_testhost(db)
@@ -61,8 +61,8 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
 
     call = %{
       verb: "retire",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: root.session_key,
       params: %{}
     }
@@ -94,7 +94,7 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('sample-user',1,'admin_add',1)"
       )
 
     register_testhost(db)
@@ -105,8 +105,8 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
 
     call = %{
       verb: "retire",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: root.session_key,
       params: %{}
     }
@@ -144,24 +144,24 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('sample-user',1,'admin_add',1)"
       )
 
     register_testhost(db)
-    main_key = Org.personal_session_key("flynn")
+    main_key = Org.personal_session_key("sample-user")
     _supervisor = create_session(db, "transfer-supervisor", main_key)
     _holder = create_session(db, "transfer-holder", "transfer-supervisor")
 
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO work_items (id,title,ownerUserId,state,createdByUser,createdAt) VALUES ('wi_transfer','work','flynn','open','flynn',1)"
+        "INSERT INTO work_items (id,title,ownerUserId,state,createdByUser,createdAt) VALUES ('wi_transfer','work','sample-user','open','sample-user',1)"
       )
 
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,workItemId) VALUES ('asg_transfer','ship','transfer-holder','flynn',1,'wi_transfer')"
+        "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,workItemId) VALUES ('asg_transfer','ship','transfer-holder','sample-user',1,'wi_transfer')"
       )
 
     terminal_seq = terminal_turn(db, "transfer-holder", "asg_transfer")
@@ -195,11 +195,11 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
                Assignments.interrupt_for_retire_in_txn(
                  txn,
                  "transfer-supervisor",
-                 "flynn",
-                 "user:flynn"
+                 "sample-user",
+                 "user:sample-user"
                )
 
-               Org.retire_in_txn(txn, "transfer-supervisor", "user:flynn", 1_000)
+               Org.retire_in_txn(txn, "transfer-supervisor", "user:sample-user", 1_000)
              end)
 
     notices =
@@ -216,8 +216,8 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
     Org.create(db, %{
       session_key: session_key,
       display_name: session_key,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       spawned_by: spawned_by,
       operational_parent: spawned_by,
       archetype: "default",
@@ -234,13 +234,13 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
     })
 
     Org.create(db, %{
-      session_key: Org.personal_session_key("flynn"),
+      session_key: Org.personal_session_key("sample-user"),
       display_name: "Main",
       kind: "main",
       is_built_in: true,
       adopted: true,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -254,7 +254,7 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
       Ledger.enqueue(db, %{
         session_key: session_key,
         message_id: "terminal-#{assignment_id}",
-        origin: "user:flynn",
+        origin: "user:sample-user",
         prompt: "external",
         assignment_id: assignment_id
       })

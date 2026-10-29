@@ -220,7 +220,7 @@ defmodule Tightbeam.ReadinessTest do
       |> Enum.find(&(&1 =~ "Tightbeam has no credential"))
 
     # The CLI's `onboard` takes the credential PROVIDER (anthropic|openai), not the
-    # harness (claude|codex). This assertion used to pin wire_name(), so it stayed
+    # harness (claude|codex). This assertion used to pin wire_name, so it stayed
     # green while the summary printed a command the CLI rejects outright — on the
     # one surface the operator is told to act on. Assert the provider, and assert
     # the harness name is NOT what gets handed to the verb.
@@ -250,7 +250,7 @@ defmodule Tightbeam.ReadinessTest do
     assert line =~ "TIGHTBEAM_DEFAULT_MODEL"
   end
 
-  # THE WRONG CAUSE (task #12). A tiered model named with no effort IS in the
+  # THE WRONG CAUSE . A tiered model named with no effort IS in the
   # live catalog; what is missing is the tier. Blaming the catalog sends the
   # operator to `catalog.diff` to hunt for a model that is already there — the
   # same defect class adjudication was fixed for, surviving in a second copy

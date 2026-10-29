@@ -690,11 +690,11 @@ defmodule Tightbeam.Archetypes do
   # table with `model`, and optionally `effort` and `context`.
   #
   #     [[model_preferences]]
-  #     model = "claude-fable-5"
+  #     model = "claude-example-5"
   #     effort = "high"
   #
   # A list of packed strings — the shape this used to take — is REFUSED by
-  # name rather than parsed. Splitting `claude-fable-5[1m]` here is exactly the
+  # name rather than parsed. Splitting `claude-example-5[1m]` here is exactly the
   # guess that lost the 1M model, and a file an older version wrote deserves a
   # bug report, not an inference.
   defp validate_model_preferences!(raw, path) do

@@ -20,12 +20,12 @@ defmodule Tightbeam.CheckTierTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1), ('other', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 1, 'admin_add', 1), ('other', 0, 'admin_add', 1)"
       )
 
-    Enum.each(~w(flynn other), &ensure_main_session(db, &1))
+    Enum.each(~w(sample-user other), &ensure_main_session(db, &1))
 
-    holder = session(db, "holder", "flynn", "coder")
+    holder = session(db, "holder", "sample-user", "coder")
     reviewer = session(db, "reviewer", "other", "reviewer")
     base_dir = Path.join(System.tmp_dir!(), "check-tier-#{System.unique_integer([:positive])}")
     File.mkdir_p!(Path.join(base_dir, "identity/rules"))
@@ -44,7 +44,7 @@ defmodule Tightbeam.CheckTierTest do
       ["bad2", assignment.id, "verdict", "tests-passed", nil, nil, nil, 1],
       ["bad3", assignment.id, "verdict", "tests-passed", nil, "reviewer", "other", 1],
       ["bad4", assignment.id, "progress", "tests-passed", nil, "holder", nil, 1],
-      ["bad5", assignment.id, "progress", nil, nil, nil, "flynn", 1]
+      ["bad5", assignment.id, "progress", nil, nil, nil, "sample-user", 1]
     ]
 
     Enum.each(invalid, fn params ->
@@ -68,7 +68,7 @@ defmodule Tightbeam.CheckTierTest do
        ctx do
     assignment = assign(ctx)
 
-    for principal <- [{:session, "reviewer"}, {:session, "holder"}, {:user, "flynn"}] do
+    for principal <- [{:session, "reviewer"}, {:session, "holder"}, {:user, "sample-user"}] do
       result = verdict(ctx, principal, assignment.id, "tests-passed")
       assert result.assignment.state == "open"
       assert result.attest.verdictKind == "tests-passed"
@@ -153,7 +153,7 @@ defmodule Tightbeam.CheckTierTest do
   test "attests query authorizes principals and orders every kind by ts then id", ctx do
     assignment = assign(ctx)
     first = attest(ctx, {:session, "holder"}, assignment.id, "progress")
-    second = verdict(ctx, {:user, "flynn"}, assignment.id, "reviewed")
+    second = verdict(ctx, {:user, "sample-user"}, assignment.id, "reviewed")
 
     {:ok, _} =
       DB.query(ctx.db, "UPDATE attests SET ts = 7 WHERE assignmentId = ?1", [assignment.id])
@@ -162,10 +162,10 @@ defmodule Tightbeam.CheckTierTest do
     assert %{attests: rows} = query_attests(ctx, {:session, "reviewer"}, assignment.id)
     assert Enum.map(rows, & &1.id) == expected
     assert Enum.all?(rows, &Map.has_key?(&1, :verdictKind))
-    assert %{attests: [_ | _]} = query_attests(ctx, {:user, "flynn"}, assignment.id)
+    assert %{attests: [_ | _]} = query_attests(ctx, {:user, "sample-user"}, assignment.id)
     assert %{code: "process_denied"} = query_attests(ctx, {:process, "cron"}, assignment.id)
     assert %{code: "principal_required"} = query_attests(ctx, nil, assignment.id)
-    assert %{code: "unknown_assignment"} = query_attests(ctx, {:user, "flynn"}, "missing")
+    assert %{code: "unknown_assignment"} = query_attests(ctx, {:user, "sample-user"}, "missing")
   end
 
   test "assignment facts distinguish unknown from empty and gate completion end to end", ctx do
@@ -214,7 +214,7 @@ defmodule Tightbeam.CheckTierTest do
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               call("attest", {:user, "flynn"}, %{
+               call("attest", {:user, "sample-user"}, %{
                  assignment_id: assignment.id,
                  kind: "verdict",
                  verdict_kind: "tests-passed"
@@ -251,7 +251,7 @@ defmodule Tightbeam.CheckTierTest do
       {"assignment.caller_is_holder", "eq", false,
        call("attest", {:session, "reviewer"}, %{assignment_id: assignment.id}), true},
       {"assignment.caller_is_holder", "eq", false,
-       call("attest", {:user, "flynn"}, %{assignment_id: assignment.id}), true},
+       call("attest", {:user, "sample-user"}, %{assignment_id: assignment.id}), true},
       {"assignment.caller_is_holder", "eq", false,
        call("attest", {:process, "cron"}, %{assignment_id: assignment.id}), true},
       {"assignment.caller_is_holder", "eq", false,
@@ -272,7 +272,7 @@ defmodule Tightbeam.CheckTierTest do
     assert :ok = Rules.evaluate(ctx.db, without_principal)
 
     verdict(ctx, {:session, "reviewer"}, assignment.id, "reviewed")
-    verdict(ctx, {:user, "flynn"}, assignment.id, "reviewed")
+    verdict(ctx, {:user, "sample-user"}, assignment.id, "reviewed")
     assert Assignments.verdict_kinds(ctx.db, assignment.id) == ["reviewed"]
   end
 
@@ -346,11 +346,11 @@ defmodule Tightbeam.CheckTierTest do
                })
              )
 
-    assert {:ok, %{attest: %{byUser: "flynn"}}} =
+    assert {:ok, %{attest: %{byUser: "sample-user"}}} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               call("attest", {:user, "flynn"}, %{
+               call("attest", {:user, "sample-user"}, %{
                  assignment_id: assignment.id,
                  kind: "verdict",
                  verdict_kind: "reviewed"
@@ -359,13 +359,13 @@ defmodule Tightbeam.CheckTierTest do
   end
 
   test "archetype-scoped completion gate is inert for other archetypes", ctx do
-    session(ctx.db, "writer", "flynn", "writer")
+    session(ctx.db, "writer", "sample-user", "writer")
 
     assignment =
       Assignments.__handle__(
         ctx.db,
         "assign",
-        call("assign", {:user, "flynn"}, %{subject: "writing", idempotency_key: nil})
+        call("assign", {:user, "sample-user"}, %{subject: "writing", idempotency_key: nil})
         |> Map.merge(%{session_key: "writer", target_role: nil, role_fallback: false})
       )
 
@@ -411,7 +411,7 @@ defmodule Tightbeam.CheckTierTest do
     Assignments.__handle__(
       ctx.db,
       "assign",
-      call("assign", {:user, "flynn"}, %{subject: subject, idempotency_key: nil})
+      call("assign", {:user, "sample-user"}, %{subject: subject, idempotency_key: nil})
       |> Map.merge(%{session_key: "holder", target_role: nil, role_fallback: false})
     )
   end
@@ -432,7 +432,7 @@ defmodule Tightbeam.CheckTierTest do
     Assignments.__handle__(
       ctx.db,
       "revoke-assignment",
-      call("revoke-assignment", {:user, "flynn"}, %{
+      call("revoke-assignment", {:user, "sample-user"}, %{
         assignment_id: assignment_id,
         reason: "test revocation"
       })

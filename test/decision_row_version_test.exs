@@ -163,7 +163,7 @@ defmodule Tightbeam.DecisionRowVersionTest do
         Map.merge(row, %{
           status: "ruled",
           decision: "accept",
-          ruled_by: "user:flynn",
+          ruled_by: "user:sample-user",
           ruled_at: 10
         })
 
@@ -188,7 +188,7 @@ defmodule Tightbeam.DecisionRowVersionTest do
       Map.merge(row, %{
         status: "ruled",
         decision: "accept",
-        ruled_by: "user:flynn",
+        ruled_by: "user:sample-user",
         ruled_at: 10
       })
 

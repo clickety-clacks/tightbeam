@@ -450,7 +450,7 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   # The comparison value comes from the SAME code that recorded it: the Rust
-  # launcher's boot_identity(), via the helper's `boot-identity` subcommand on
+  # launcher's boot_identity, via the helper's `boot-identity` subcommand on
   # the row's own helper_path. Deliberately NOT reimplemented in Elixir —
   # darwin's value includes st_birthtime, which the BEAM cannot read, and any
   # format drift would read live processes as reboot orphans and resolve

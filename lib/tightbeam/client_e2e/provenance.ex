@@ -5,7 +5,7 @@ defmodule Tightbeam.ClientE2E.Provenance do
   A run document says "this is what the code did". That claim is only checkable
   if the sha in its header identifies the tree that produced it — a scorecard
   from an uncommitted tree cannot be reproduced from its own header, and a
-  cross-review caught exactly that: a PASS credited to a sha whose tree did not
+  verification must prevent a PASS from being credited to a sha whose tree did not
   yet contain the logic it credited.
 
   So `stamp/1` returns:

@@ -22,13 +22,13 @@ defmodule Tightbeam.WorkStateTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1)"
       )
 
-    Enum.each(~w(flynn other), &ensure_main_session(db, &1))
+    Enum.each(~w(sample-user other), &ensure_main_session(db, &1))
 
-    session(db, "holder", "flynn")
-    session(db, "retiring", "flynn")
+    session(db, "holder", "sample-user")
+    session(db, "retiring", "sample-user")
     session(db, "other-holder", "other")
 
     assignment_change = fn id, from -> WorkState.emit(db, id, from) end
@@ -55,7 +55,7 @@ defmodule Tightbeam.WorkStateTest do
     revoke(ctx, abandoned.id)
 
     stranded = assign(ctx, "retiring", "stranded")
-    Org.retire(ctx.db, "retiring", "user:flynn", 1_000)
+    Org.retire(ctx.db, "retiring", "user:sample-user", 1_000)
 
     assert WorkState.status(ctx.db, open.id) == "open"
     assert WorkState.status(ctx.db, active.id) == "active"
@@ -196,7 +196,7 @@ defmodule Tightbeam.WorkStateTest do
     {:ok, _, _} =
       ConnRegistry.register(ConnRegistry, %{
         pid: self(),
-        user_id: "flynn",
+        user_id: "sample-user",
         device_id: "observer",
         is_admin: false,
         subscriptions: MapSet.new(["work_state"])
@@ -224,7 +224,7 @@ defmodule Tightbeam.WorkStateTest do
     refute_receive {:push, _}
 
     update = %{
-      principal: {:user, "flynn"},
+      principal: {:user, "sample-user"},
       params: %{work_item_id: item.id, title: "Changed"}
     }
 
@@ -241,7 +241,7 @@ defmodule Tightbeam.WorkStateTest do
     {:ok, _, _} =
       ConnRegistry.register(ConnRegistry, %{
         pid: self(),
-        user_id: "flynn",
+        user_id: "sample-user",
         device_id: "denied-observer",
         is_admin: false,
         subscriptions: MapSet.new(["work_state"])
@@ -277,7 +277,7 @@ defmodule Tightbeam.WorkStateTest do
     assert WorkState.status(ctx.db, assignment.id) == "active"
 
     update = %{
-      principal: {:user, "flynn"},
+      principal: {:user, "sample-user"},
       params: %{work_item_id: item.id, title: "After"}
     }
 
@@ -293,7 +293,7 @@ defmodule Tightbeam.WorkStateTest do
     {:ok, _, _} =
       ConnRegistry.register(ConnRegistry, %{
         pid: self(),
-        user_id: "flynn",
+        user_id: "sample-user",
         device_id: "client-observer",
         is_admin: false,
         subscriptions: MapSet.new(["work_state"])
@@ -308,7 +308,7 @@ defmodule Tightbeam.WorkStateTest do
     handlers["attest"].(attest_call(assignment.id, "progress", "holder"))
 
     handlers["work-item-update"].(%{
-      principal: {:user, "flynn"},
+      principal: {:user, "sample-user"},
       params: %{work_item_id: item.id, title: "Current"}
     })
 
@@ -349,8 +349,7 @@ defmodule Tightbeam.WorkStateTest do
     dropped_assignment = handlers["assign"].(assign_call("holder", "dropped", dropped_item.id))
 
     # Exact shapes, not blind binds: a `_frame` match cannot fail for its
-    # stated reason — it would swallow any frame at all. (Salvaged from the
-    # observability worktree's uncommitted delta, 2026-08-04.)
+    # stated reason — it would swallow any frame at all.
     [
       %{"type" => "work_state_event", "from" => nil, "to" => "open"},
       %{"type" => "work_item_event", "kind" => "composition"}
@@ -379,7 +378,7 @@ defmodule Tightbeam.WorkStateTest do
     {:ok, _, _} =
       ConnRegistry.register(ConnRegistry, %{
         pid: self(),
-        user_id: "flynn",
+        user_id: "sample-user",
         device_id: "retire-observer",
         is_admin: false,
         subscriptions: MapSet.new(["work_state"])
@@ -403,8 +402,8 @@ defmodule Tightbeam.WorkStateTest do
 
     result =
       handlers["retire"].(%{
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:sample-user",
+        principal: {:user, "sample-user"},
         session_key: "retiring",
         params: %{}
       })
@@ -434,8 +433,8 @@ defmodule Tightbeam.WorkStateTest do
   defp create_item(ctx, title) do
     WorkItems.__handle__(ctx.db, "work-item-create", %{
       verb: "work-item-create",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: nil,
       params: %{title: title}
     })
@@ -444,8 +443,8 @@ defmodule Tightbeam.WorkStateTest do
   defp assign(ctx, holder, subject, work_item_id \\ nil) do
     Assignments.__handle__(ctx.db, "assign", %{
       verb: "assign",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: holder,
       target_role: nil,
       role_fallback: false,
@@ -458,8 +457,8 @@ defmodule Tightbeam.WorkStateTest do
 
   defp assign_call(holder, subject, work_item_id \\ nil) do
     %{
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: holder,
       target_role: nil,
       role_fallback: false,
@@ -494,8 +493,8 @@ defmodule Tightbeam.WorkStateTest do
   defp revoke(ctx, assignment_id) do
     Assignments.__handle__(ctx.db, "revoke-assignment", %{
       verb: "revoke-assignment",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: nil,
       params: %{assignment_id: assignment_id, reason: "test revocation"},
       on_assignment_change: ctx.assignment_change

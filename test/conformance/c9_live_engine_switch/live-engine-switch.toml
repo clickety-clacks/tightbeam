@@ -4,7 +4,7 @@ name = "live-engine-switch"
 phase = "green"
 blocking_phase = ""
 kind = "live-switch"
-source = "v0.2 program §4 adjudication boundary; 0.1.x supported live session tuning (835ebb3)"
+source = "Product contract for authorized live engine switching"
 legibility = "eventlog:denied verb=tune"
 
 # THE INVARIANT THIS FIXTURE EXISTS TO HOLD DOWN: a live engine switch is an

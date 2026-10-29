@@ -93,18 +93,18 @@ defmodule Tightbeam.ArtifactCarrierTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 1, 'admin_add', 1)"
       )
 
-    main_key = Org.personal_session_key("flynn")
+    main_key = Org.personal_session_key("sample-user")
 
     Org.create(db, %{
       session_key: main_key,
       display_name: "Main",
       kind: "main",
       is_built_in: true,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -116,8 +116,8 @@ defmodule Tightbeam.ArtifactCarrierTest do
       Org.create(db, %{
         session_key: "carrier-coder",
         display_name: "Carrier Coder",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "sample-user",
+        origin: "user:sample-user",
         archetype: "coder",
         host: "testhost",
         harness: "claude",
@@ -125,7 +125,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
         model: Model.new("fable")
       })
 
-    Roles.create!(db, "carrier-coder", "flynn", coder.session_key)
+    Roles.create!(db, "carrier-coder", "sample-user", coder.session_key)
 
     handlers = Gateway.handlers(%{db: db, base_dir: base_dir})
     Rules.load!(base_dir, Map.keys(handlers))
@@ -141,7 +141,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
 
     work_item =
       handlers["work-item-create"].(%{
-        principal: {:user, "flynn"},
+        principal: {:user, "sample-user"},
         params: %{title: "Carrier work"}
       })
 
@@ -196,7 +196,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
     {:ok, turn} = Ledger.claim_next(ctx.db, ctx.coder.session_key, "owner")
     :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: turn.owner_lease)
 
-    result = record_over_wire(ctx, %{"kind" => "doc", "title" => "Operator shell"})
+    result = record_over_wire(ctx, %{"kind" => "doc", "title" => "user shell"})
 
     assert result["recordedMessageId"] == nil
     assert result["recordedTurnEvidence"] == "none"
@@ -273,8 +273,8 @@ defmodule Tightbeam.ArtifactCarrierTest do
       Org.create(ctx.db, %{
         session_key: "carrier-other",
         display_name: "Other",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "sample-user",
+        origin: "user:sample-user",
         archetype: "coder",
         host: "testhost",
         harness: "claude",
@@ -282,7 +282,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
         model: Model.new("fable")
       })
 
-    Roles.create!(ctx.db, "carrier-other", "flynn", other.session_key)
+    Roles.create!(ctx.db, "carrier-other", "sample-user", other.session_key)
 
     other_ctx = %{ctx | coder: other}
     result = record_over_wire(other_ctx, %{"kind" => "report", "title" => "Bare report"})
@@ -567,7 +567,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
       Ledger.enqueue(ctx.db, %{
         session_key: ctx.coder.session_key,
         message_id: message.id,
-        origin: "user:flynn",
+        origin: "user:sample-user",
         prompt: "do the work"
       })
 

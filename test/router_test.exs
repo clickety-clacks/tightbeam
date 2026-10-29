@@ -32,7 +32,7 @@ defmodule Tightbeam.Wire.RouterTest do
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     {:paired, device} =
-      claim_org(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+      claim_org(db, %{device_id: "d1", claimed_name: "Sample User", platform: nil, model: nil})
 
     ensure_main_session(db, device.user_id)
 
@@ -183,7 +183,7 @@ defmodule Tightbeam.Wire.RouterTest do
     response =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "identity-status",
-        asUser: "flynn",
+        asUser: "sample-user",
         params: %{}
       })
 
@@ -195,7 +195,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call,
                     %{
                       verb: "identity-status",
-                      origin: "user:flynn",
+                      origin: "user:sample-user",
                       params: %{}
                     }}
   end
@@ -350,21 +350,21 @@ defmodule Tightbeam.Wire.RouterTest do
     response =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "activation-status",
-        asUser: "flynn",
+        asUser: "sample-user",
         params: %{activationId: "act_example"}
       })
 
     assert response.status == 200
     assert_receive {:call, call}
     assert call.verb == "activation-status"
-    assert call.principal == {:user, "flynn"}
+    assert call.principal == {:user, "sample-user"}
     assert call.params == %{activation_id: "act_example"}
 
     refused =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "activation-status",
-        asUser: "flynn",
-        sessionKey: Org.personal_session_key("flynn"),
+        asUser: "sample-user",
+        sessionKey: Org.personal_session_key("sample-user"),
         params: %{activationId: "act_example"}
       })
 
@@ -402,7 +402,7 @@ defmodule Tightbeam.Wire.RouterTest do
       response =
         dispatch_cli(actual_ctx, "tbc_test", %{
           verb: "activation-status",
-          asUser: "flynn",
+          asUser: "sample-user",
           params: Map.merge(%{activationId: "act_example"}, supplied)
         })
 
@@ -413,7 +413,7 @@ defmodule Tightbeam.Wire.RouterTest do
     renotify =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "activation-renotify",
-        asUser: "flynn",
+        asUser: "sample-user",
         params: %{
           activationId: "act_example",
           predecessorEventId: "aev_head",
@@ -440,7 +440,7 @@ defmodule Tightbeam.Wire.RouterTest do
     acknowledged =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "activation-ack",
-        asUser: "flynn",
+        asUser: "sample-user",
         params: %{
           activationId: "act_example",
           predecessorEventId: "aev_requeued",
@@ -479,7 +479,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "CLI exact-version refusal is loud and precedes bearer authentication", ctx do
-    body = JSON.encode!(%{verb: "inspect", asUser: "flynn", params: %{}})
+    body = JSON.encode!(%{verb: "inspect", asUser: "sample-user", params: %{}})
     required_version = Tightbeam.CliCompatibility.required_version()
     %Version{major: required_major} = Version.parse!(required_version)
     offered_version = "#{required_major + 1}.0.0"
@@ -524,7 +524,7 @@ defmodule Tightbeam.Wire.RouterTest do
     response =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "kungfu-scaffold",
-        asUser: "flynn",
+        asUser: "sample-user",
         params: %{name: "demo", purpose: "Help a team do demo work."}
       })
 
@@ -534,7 +534,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call,
                     %{
                       verb: "kungfu-scaffold",
-                      origin: "user:flynn",
+                      origin: "user:sample-user",
                       params: %{name: "demo", purpose: "Help a team do demo work."}
                     }}
   end
@@ -543,7 +543,7 @@ defmodule Tightbeam.Wire.RouterTest do
     response =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "kungfu-list",
-        asUser: "flynn",
+        asUser: "sample-user",
         params: %{}
       })
 
@@ -565,7 +565,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call,
                     %{
                       verb: "kungfu-list",
-                      origin: "user:flynn",
+                      origin: "user:sample-user",
                       params: %{}
                     }}
   end
@@ -655,7 +655,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "all work-item verbs route, preserve generic target behavior, and map unknown ids", ctx do
-    target = create_session(ctx.db, "work-item-target", "flynn")
+    target = create_session(ctx.db, "work-item-target", "sample-user")
 
     for {verb, params} <- [
           {"work-item-create", %{title: "Create"}},
@@ -667,7 +667,7 @@ defmodule Tightbeam.Wire.RouterTest do
       response =
         dispatch_cli(ctx, "tbc_test", %{
           verb: verb,
-          asUser: "flynn",
+          asUser: "sample-user",
           sessionKey: target.session_key,
           params: params
         })
@@ -679,7 +679,7 @@ defmodule Tightbeam.Wire.RouterTest do
     missing =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "work-item-get",
-        asUser: "flynn",
+        asUser: "sample-user",
         params: %{workItemId: "missing", returnCode: "unknown_work_item"}
       })
 
@@ -748,7 +748,7 @@ defmodule Tightbeam.Wire.RouterTest do
         conn(
           :post,
           "/agent/dispatch",
-          JSON.encode!(%{verb: "tune", asUser: "flynn", sessionKey: key, params: params})
+          JSON.encode!(%{verb: "tune", asUser: "sample-user", sessionKey: key, params: params})
         )
         |> put_req_header("authorization", "Bearer tbc_test")
         |> put_req_header(
@@ -763,8 +763,8 @@ defmodule Tightbeam.Wire.RouterTest do
     end
   end
 
-  test "PATCH /api/streams/:key decodes a clawline '+' path key as a space", ctx do
-    key = "agent:main:clawline:mike:main s_test1234"
+  test "PATCH /api/streams/:key decodes a client '+' path key as a space", ctx do
+    key = "agent:main:clawline:operator:main s_test1234"
     create_session(ctx.db, key, ctx.device.user_id)
     opts = with_handler(ctx.opts, "tune", &send_call/1)
 
@@ -780,7 +780,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "PATCH /api/streams/:key still accepts an already-decoded space in the key", ctx do
-    key = "agent:main:clawline:mike:main s_test5678"
+    key = "agent:main:clawline:operator:main s_test5678"
     create_session(ctx.db, key, ctx.device.user_id)
     opts = with_handler(ctx.opts, "tune", &send_call/1)
 
@@ -793,8 +793,8 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call, %{verb: "tune", session_key: ^key}}
   end
 
-  test "DELETE /api/streams/:key decodes a clawline '+' path key as a space", ctx do
-    key = "agent:main:clawline:mike:main s_test9012"
+  test "DELETE /api/streams/:key decodes a client '+' path key as a space", ctx do
+    key = "agent:main:clawline:operator:main s_test9012"
     create_session(ctx.db, key, ctx.device.user_id)
 
     opts =
@@ -816,7 +816,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "PATCH /api/streams/:key still accepts a single-encoded %20 space in the key", ctx do
-    key = "agent:main:clawline:mike:main s_test0020"
+    key = "agent:main:clawline:operator:main s_test0020"
     create_session(ctx.db, key, ctx.device.user_id)
     opts = with_handler(ctx.opts, "tune", &send_call/1)
 
@@ -836,14 +836,14 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "PATCH /api/streams/:key decodes the captured double-encoded Clawline path", ctx do
-    key = "agent:main:clawline:flynn:main s_request_path"
+    key = "agent:main:clawline:sample-user:main s_request_path"
     create_session(ctx.db, key, ctx.device.user_id)
     opts = with_handler(ctx.opts, "tune", &send_call/1)
 
     response =
       conn(
         :patch,
-        "/api/streams/agent%253Amain%253Aclawline%253Aflynn%253Amain%2520s_request_path",
+        "/api/streams/agent%253Amain%253Aclawline%253Asample-user%253Amain%2520s_request_path",
         JSON.encode!(%{"displayName" => "Renamed"})
       )
       |> put_req_header("authorization", "Bearer #{ctx.device.token}")
@@ -854,7 +854,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "DELETE /api/streams/:key decodes the captured double-encoded Clawline path", ctx do
-    key = "agent:main:clawline:flynn:main s_request_path"
+    key = "agent:main:clawline:sample-user:main s_request_path"
     create_session(ctx.db, key, ctx.device.user_id)
 
     opts =
@@ -866,7 +866,7 @@ defmodule Tightbeam.Wire.RouterTest do
     response =
       conn(
         :delete,
-        "/api/streams/agent%253Amain%253Aclawline%253Aflynn%253Amain%2520s_request_path",
+        "/api/streams/agent%253Amain%253Aclawline%253Asample-user%253Amain%2520s_request_path",
         JSON.encode!(%{})
       )
       |> put_req_header("authorization", "Bearer #{ctx.device.token}")
@@ -878,7 +878,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "PATCH /api/streams/:key accepts at most four total percent-decode layers", ctx do
-    key = "agent:main:clawline:mike:main s_test_decode_cap"
+    key = "agent:main:clawline:operator:main s_test_decode_cap"
     create_session(ctx.db, key, ctx.device.user_id)
     opts = with_handler(ctx.opts, "tune", &send_call/1)
 
@@ -912,7 +912,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "stream mutations reject a repeatedly encoded path separator before lookup", ctx do
-    key = "agent:main:clawline:mike:main/child"
+    key = "agent:main:clawline:operator:main/child"
     create_session(ctx.db, key, ctx.device.user_id)
 
     opts =
@@ -938,7 +938,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "stream mutations reject malformed percent encoding before lookup", ctx do
-    key = "agent:main:clawline:mike:main%zz"
+    key = "agent:main:clawline:operator:main%zz"
     create_session(ctx.db, key, ctx.device.user_id)
 
     opts =
@@ -992,7 +992,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
   test "PATCH /api/streams/:key resolves a double-encoded '%252B' path key as a literal plus",
        ctx do
-    key = "agent:main:clawline:mike:main+plus_test2b"
+    key = "agent:main:clawline:operator:main+plus_test2b"
     create_session(ctx.db, key, ctx.device.user_id)
     opts = with_handler(ctx.opts, "tune", &send_call/1)
 
@@ -1017,7 +1017,7 @@ defmodule Tightbeam.Wire.RouterTest do
     response =
       conn(
         :patch,
-        "/api/streams/agent:main:clawline:mike:main%zzmalformed",
+        "/api/streams/agent:main:clawline:operator:main%zzmalformed",
         JSON.encode!(%{"displayName" => "Renamed"})
       )
       |> put_req_header("authorization", "Bearer #{ctx.device.token}")
@@ -1032,8 +1032,8 @@ defmodule Tightbeam.Wire.RouterTest do
       Org.create(ctx.db, %{
         session_key: "orch",
         display_name: "Orchestrator",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "sample-user",
+        origin: "user:sample-user",
         handle: "orchestrator:demo",
         archetype: "default",
         host: "testhost",
@@ -1042,7 +1042,7 @@ defmodule Tightbeam.Wire.RouterTest do
         model: Model.new("fable")
       })
 
-    Roles.create!(ctx.db, "orchestrator:demo", "flynn", actor.session_key)
+    Roles.create!(ctx.db, "orchestrator:demo", "sample-user", actor.session_key)
 
     body =
       JSON.encode!(%{
@@ -1077,7 +1077,7 @@ defmodule Tightbeam.Wire.RouterTest do
                     %{verb: "wake", origin: "agent:orchestrator:demo", session_key: "orch"}}
 
     disallowed =
-      conn(:post, "/agent/dispatch", JSON.encode!(%{verb: "post", as_user: "flynn"}))
+      conn(:post, "/agent/dispatch", JSON.encode!(%{verb: "post", as_user: "sample-user"}))
       |> put_req_header("authorization", "Bearer tbc_test")
       |> put_req_header(
         "x-tightbeam-cli-version",
@@ -1102,7 +1102,7 @@ defmodule Tightbeam.Wire.RouterTest do
     forge =
       JSON.encode!(%{
         verb: "wake",
-        asUser: "flynn",
+        asUser: "sample-user",
         params: %{prompt: "an ordinary conversational wake", assignmentId: "asg_victim"}
       })
 
@@ -1134,7 +1134,7 @@ defmodule Tightbeam.Wire.RouterTest do
     forged =
       JSON.encode!(%{
         verb: "work-item-create",
-        asUser: "flynn",
+        asUser: "sample-user",
         params: %{
           title: "substrate-stamped",
           createdInTurnSeq: 999_999,
@@ -1161,19 +1161,19 @@ defmodule Tightbeam.Wire.RouterTest do
   test "typed target grammar distinguishes keys, users, and roles without unions", ctx do
     {:pending, _device} =
       Devices.pair(ctx.db, %{
-        device_id: "mike-device",
-        claimed_name: "Mike",
+        device_id: "target-user-device",
+        claimed_name: "Target User",
         platform: nil,
         model: nil
       })
 
-    main_key = Org.personal_session_key("mike")
+    main_key = Org.personal_session_key("target-user")
 
     Org.create(ctx.db, %{
       session_key: main_key,
       display_name: "Main",
-      owner_user_id: "mike",
-      origin: "user:mike",
+      owner_user_id: "target-user",
+      origin: "user:target-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -1181,13 +1181,13 @@ defmodule Tightbeam.Wire.RouterTest do
       model: Model.new("fable")
     })
 
-    assert dispatch_wake(ctx, %{"userId" => "mike"}).status == 200
+    assert dispatch_wake(ctx, %{"userId" => "target-user"}).status == 200
     assert_receive {:call, %{verb: "wake", session_key: ^main_key, target_role: nil}}
 
-    # The type is the FIELD: "mike" as a role is a role lookup, never a user.
-    bare_user = dispatch_wake(ctx, %{"role" => "mike"})
+    # The type is the FIELD: "target-user" as a role is a role lookup, never a user.
+    bare_user = dispatch_wake(ctx, %{"role" => "target-user"})
     assert bare_user.status == 404
-    assert JSON.decode!(bare_user.resp_body)["error"]["message"] == "unknown role: mike"
+    assert JSON.decode!(bare_user.resp_body)["error"]["message"] == "unknown role: target-user"
 
     unknown_user = dispatch_wake(ctx, %{"userId" => "missing"})
     assert unknown_user.status == 404
@@ -1197,7 +1197,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert retired.status == 400
     assert JSON.decode!(retired.resp_body)["error"]["message"] =~ ~s("target" is retired)
 
-    union = dispatch_wake(ctx, %{"role" => "x", "userId" => "mike"})
+    union = dispatch_wake(ctx, %{"role" => "x", "userId" => "target-user"})
     assert union.status == 400
 
     assert JSON.decode!(union.resp_body)["error"]["message"] ==
@@ -1207,8 +1207,8 @@ defmodule Tightbeam.Wire.RouterTest do
       Org.create(ctx.db, %{
         session_key: "agent:direct",
         display_name: "Direct",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "target-user",
+        origin: "user:target-user",
         archetype: "default",
         host: "testhost",
         harness: "claude",
@@ -1226,8 +1226,8 @@ defmodule Tightbeam.Wire.RouterTest do
     Org.create(ctx.db, %{
       session_key: "role-session",
       display_name: "Role holder",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "target-user",
+      origin: "user:target-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -1235,16 +1235,16 @@ defmodule Tightbeam.Wire.RouterTest do
       model: Model.new("fable")
     })
 
-    Roles.create!(ctx.db, "mike", "flynn", "role-session")
-    Roles.create!(ctx.db, "fallback", "mike", nil)
+    Roles.create!(ctx.db, "target-user", "target-user", "role-session")
+    Roles.create!(ctx.db, "fallback", "target-user", nil)
 
-    assert dispatch_wake(ctx, %{"role" => "mike"}).status == 200
+    assert dispatch_wake(ctx, %{"role" => "target-user"}).status == 200
 
     assert_receive {:call,
                     %{
                       verb: "wake",
                       session_key: "role-session",
-                      target_role: "mike",
+                      target_role: "target-user",
                       role_fallback: false
                     }}
 
@@ -1267,7 +1267,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
   test "assignment typed-target teaching errors precede Dispatch and status classes are pinned",
        ctx do
-    create_session(ctx.db, "holder-target", "flynn")
+    create_session(ctx.db, "holder-target", "sample-user")
 
     missing =
       dispatch_cli(ctx, "tbc_test", %{verb: "assign", asProcess: "cron", params: %{subject: "x"}})
@@ -1279,7 +1279,7 @@ defmodule Tightbeam.Wire.RouterTest do
       dispatch_cli(ctx, "tbc_test", %{
         verb: "assign",
         asProcess: "cron",
-        userId: "flynn",
+        userId: "sample-user",
         params: %{subject: "x"}
       })
 
@@ -1301,7 +1301,7 @@ defmodule Tightbeam.Wire.RouterTest do
     forbidden =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "attest",
-        asUser: "flynn",
+        asUser: "sample-user",
         params: %{returnCode: "not_holder"}
       })
 
@@ -1310,7 +1310,7 @@ defmodule Tightbeam.Wire.RouterTest do
     missing_assignment =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "attest",
-        asUser: "flynn",
+        asUser: "sample-user",
         params: %{returnCode: "unknown_assignment"}
       })
 
@@ -1318,7 +1318,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "org CLI reserves process:tightbeam while other process origins still attribute", ctx do
-    target = create_session(ctx.db, "reserved-origin-target", "flynn")
+    target = create_session(ctx.db, "reserved-origin-target", "sample-user")
 
     wake_handler = fn call ->
       wake =
@@ -1373,16 +1373,16 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "assign resolves bound and fallback roles and refuses unusable references", ctx do
-    main = create_session(ctx.db, Org.personal_session_key("flynn"), "flynn")
-    holder = create_session(ctx.db, "assign-holder", "flynn")
-    retired = create_session(ctx.db, "assign-retired", "flynn")
-    Roles.create!(ctx.db, "bound-assignment", "flynn", holder.session_key)
-    Roles.create!(ctx.db, "fallback-assignment", "flynn", nil)
-    Org.retire(ctx.db, retired.session_key, "user:flynn", 1_000)
+    main = create_session(ctx.db, Org.personal_session_key("sample-user"), "sample-user")
+    holder = create_session(ctx.db, "assign-holder", "sample-user")
+    retired = create_session(ctx.db, "assign-retired", "sample-user")
+    Roles.create!(ctx.db, "bound-assignment", "sample-user", holder.session_key)
+    Roles.create!(ctx.db, "fallback-assignment", "sample-user", nil)
+    Org.retire(ctx.db, retired.session_key, "user:sample-user", 1_000)
 
     assert dispatch_cli(ctx, "tbc_test", %{
              verb: "assign",
-             asUser: "flynn",
+             asUser: "sample-user",
              role: "bound-assignment",
              params: %{subject: "x"}
            }).status == 200
@@ -1397,7 +1397,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert dispatch_cli(ctx, "tbc_test", %{
              verb: "assign",
-             asUser: "flynn",
+             asUser: "sample-user",
              role: "fallback-assignment",
              params: %{subject: "x"}
            }).status == 200
@@ -1413,8 +1413,13 @@ defmodule Tightbeam.Wire.RouterTest do
     assert key == main.session_key
 
     for body <- [
-          %{verb: "assign", asUser: "flynn", role: "missing-assignment", params: %{subject: "x"}},
-          %{verb: "assign", asUser: "flynn", sessionKey: "missing", params: %{subject: "x"}}
+          %{
+            verb: "assign",
+            asUser: "sample-user",
+            role: "missing-assignment",
+            params: %{subject: "x"}
+          },
+          %{verb: "assign", asUser: "sample-user", sessionKey: "missing", params: %{subject: "x"}}
         ] do
       response = dispatch_cli(ctx, "tbc_test", body)
       assert response.status == 404
@@ -1424,7 +1429,7 @@ defmodule Tightbeam.Wire.RouterTest do
     response =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "assign",
-        asUser: "flynn",
+        asUser: "sample-user",
         sessionKey: retired.session_key,
         params: %{subject: "x"}
       })
@@ -1438,8 +1443,8 @@ defmodule Tightbeam.Wire.RouterTest do
       Org.create(ctx.db, %{
         session_key: "holder",
         display_name: "Holder",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "sample-user",
+        origin: "user:sample-user",
         archetype: "default",
         host: "testhost",
         harness: "claude",
@@ -1447,8 +1452,8 @@ defmodule Tightbeam.Wire.RouterTest do
         model: Model.new("fable")
       })
 
-    Roles.create!(ctx.db, "held", "flynn", holder.session_key)
-    Roles.create!(ctx.db, "vacant", "flynn", nil)
+    Roles.create!(ctx.db, "held", "sample-user", holder.session_key)
+    Roles.create!(ctx.db, "vacant", "sample-user", nil)
 
     held = dispatch_as_role(ctx, "held")
     assert held.status == 200
@@ -1509,7 +1514,7 @@ defmodule Tightbeam.Wire.RouterTest do
     facts =
       dispatch_cli(%{ctx | opts: facts_opts}, "tbc_test", %{
         verb: "facts-read",
-        asUser: "flynn",
+        asUser: "sample-user",
         params: %{kind: "tour-given", scope: "agent:tour:app"}
       })
 
@@ -1531,7 +1536,7 @@ defmodule Tightbeam.Wire.RouterTest do
     list =
       dispatch_cli(%{ctx | opts: list_opts}, "tbc_test", %{
         verb: "inspect",
-        asUser: "flynn"
+        asUser: "sample-user"
       })
 
     assert %{"createdAt" => 123} =
@@ -1544,8 +1549,8 @@ defmodule Tightbeam.Wire.RouterTest do
 
   test "artifact verbs are agent verbs and recording binds the authenticated session caller",
        ctx do
-    session = create_session(ctx.db, "artifact-writer", "flynn")
-    Roles.create!(ctx.db, "artifact-writer", "flynn", session.session_key)
+    session = create_session(ctx.db, "artifact-writer", "sample-user")
+    Roles.create!(ctx.db, "artifact-writer", "sample-user", session.session_key)
 
     recorded =
       dispatch_cli(ctx, session.cli_token, %{
@@ -1570,7 +1575,7 @@ defmodule Tightbeam.Wire.RouterTest do
           {"artifacts", %{workItemId: "wi_1", sessionKey: "artifact-writer", kind: "spec"}}
         ] do
       response =
-        dispatch_cli(ctx, "tbc_test", %{verb: verb, asUser: "flynn", params: params})
+        dispatch_cli(ctx, "tbc_test", %{verb: verb, asUser: "sample-user", params: params})
 
       assert response.status == 200
       assert_receive {:call, %{verb: ^verb}}
@@ -1579,7 +1584,7 @@ defmodule Tightbeam.Wire.RouterTest do
     missing =
       dispatch_cli(ctx, "tbc_test", %{
         verb: "artifact-get",
-        asUser: "flynn",
+        asUser: "sample-user",
         params: %{artifactId: "missing", returnCode: "not_found"}
       })
 
@@ -1589,17 +1594,17 @@ defmodule Tightbeam.Wire.RouterTest do
 
   test "session bearer enforces the identity ladder and threads the normative principal seam",
        ctx do
-    holder = create_session(ctx.db, "holder-token", "flynn")
-    sibling = create_session(ctx.db, "sibling-token", "mike")
-    main = create_session(ctx.db, "main-token", "flynn", is_built_in: true, kind: "main")
-    roleless = create_session(ctx.db, "roleless-token", "flynn")
-    several = create_session(ctx.db, "several-token", "flynn")
+    holder = create_session(ctx.db, "holder-token", "sample-user")
+    sibling = create_session(ctx.db, "sibling-token", "sample-user")
+    main = create_session(ctx.db, "main-token", "sample-user", is_built_in: true, kind: "main")
+    roleless = create_session(ctx.db, "roleless-token", "sample-user")
+    several = create_session(ctx.db, "several-token", "sample-user")
 
-    Roles.create!(ctx.db, "held", "flynn", holder.session_key)
-    Roles.create!(ctx.db, "sibling", "mike", sibling.session_key)
-    Roles.create!(ctx.db, "fallback", "mike", nil)
-    Roles.create!(ctx.db, "alpha", "flynn", several.session_key)
-    Roles.create!(ctx.db, "beta", "flynn", several.session_key)
+    Roles.create!(ctx.db, "held", "sample-user", holder.session_key)
+    Roles.create!(ctx.db, "sibling", "sample-user", sibling.session_key)
+    Roles.create!(ctx.db, "fallback", "sample-user", nil)
+    Roles.create!(ctx.db, "alpha", "sample-user", several.session_key)
+    Roles.create!(ctx.db, "beta", "sample-user", several.session_key)
 
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", as: "held"}).status == 200
     assert_receive {:call, %{origin: "agent:held", principal: {:session, "holder-token"}}}
@@ -1607,8 +1612,10 @@ defmodule Tightbeam.Wire.RouterTest do
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect"}).status == 200
     assert_receive {:call, %{origin: "agent:held", principal: {:session, "holder-token"}}}
 
-    assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "flynn"}).status == 200
-    assert_receive {:call, %{origin: "user:flynn", principal: {:user, "flynn"}}}
+    assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "sample-user"}).status ==
+             200
+
+    assert_receive {:call, %{origin: "user:sample-user", principal: {:user, "sample-user"}}}
 
     # Registering a satellite also provisions its operator endpoint over ssh; this
     # test is about the identity ladder, so the reach is stubbed and the gateway
@@ -1655,7 +1662,7 @@ defmodule Tightbeam.Wire.RouterTest do
     admin =
       dispatch_cli(admin_ctx, holder.cli_token, %{
         verb: "register-host",
-        asUser: "flynn",
+        asUser: "sample-user",
         params: %{
           name: "worker",
           ssh: "worker",
@@ -1678,14 +1685,14 @@ defmodule Tightbeam.Wire.RouterTest do
            end)
 
     assert dispatch_cli(ctx, main.cli_token, %{verb: "inspect"}).status == 200
-    assert_receive {:call, %{origin: "user:flynn", principal: {:session, "main-token"}}}
+    assert_receive {:call, %{origin: "user:sample-user", principal: {:session, "main-token"}}}
 
-    Roles.create!(ctx.db, "main-role", "flynn", main.session_key)
+    Roles.create!(ctx.db, "main-role", "sample-user", main.session_key)
     assert dispatch_cli(ctx, main.cli_token, %{verb: "inspect"}).status == 200
     assert_receive {:call, %{origin: "agent:main-role", principal: {:session, "main-token"}}}
 
-    assert dispatch_cli(ctx, "tbc_test", %{verb: "inspect", asUser: "flynn"}).status == 200
-    assert_receive {:call, %{origin: "user:flynn", principal: {:user, "flynn"}}}
+    assert dispatch_cli(ctx, "tbc_test", %{verb: "inspect", asUser: "sample-user"}).status == 200
+    assert_receive {:call, %{origin: "user:sample-user", principal: {:user, "sample-user"}}}
 
     assert dispatch_cli(ctx, "tbc_test", %{verb: "inspect", asProcess: "cron"}).status == 200
     assert_receive {:call, %{origin: "process:cron", principal: {:process, "cron"}}}
@@ -1703,13 +1710,13 @@ defmodule Tightbeam.Wire.RouterTest do
     end
 
     wrong_user =
-      dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "mike"})
+      dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "other-user"})
 
     assert wrong_user.status == 403
 
     assert JSON.decode!(wrong_user.resp_body)["error"] == %{
              "code" => "identity_not_yours",
-             "message" => "this session belongs to flynn"
+             "message" => "this session belongs to sample-user"
            }
 
     process = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asProcess: "cron"})
@@ -1730,7 +1737,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert ambiguous.resp_body =~ "beta"
 
     assert dispatch_cli(ctx, "tbs_unknown", %{verb: "inspect"}).status == 401
-    Org.retire(ctx.db, holder.session_key, "user:flynn", 1_000)
+    Org.retire(ctx.db, holder.session_key, "user:sample-user", 1_000)
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect"}).status == 401
 
     {:ok, principals} =
@@ -1738,7 +1745,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert ["session:holder-token"] in principals
     assert ["session:main-token"] in principals
-    assert ["user:flynn"] in principals
+    assert ["user:sample-user"] in principals
     assert ["process:cron"] in principals
     assert [nil] in principals
 
@@ -1850,7 +1857,7 @@ defmodule Tightbeam.Wire.RouterTest do
     body =
       JSON.encode!(
         Map.merge(
-          %{"verb" => "wake", "asUser" => "flynn", "params" => %{"prompt" => "hi"}},
+          %{"verb" => "wake", "asUser" => "sample-user", "params" => %{"prompt" => "hi"}},
           fields
         )
       )
@@ -1917,7 +1924,11 @@ defmodule Tightbeam.Wire.RouterTest do
         conn(
           :post,
           "/api/session-control",
-          JSON.encode!(%{"sessionKey" => key, "action" => "set_model", "model" => "fable"})
+          JSON.encode!(%{
+            "sessionKey" => key,
+            "action" => "set_model",
+            "model" => "fable"
+          })
         )
         |> put_req_header("authorization", "Bearer #{ctx.device.token}")
         |> Router.call(Router.init(opts))
@@ -2047,7 +2058,7 @@ defmodule Tightbeam.Wire.RouterTest do
       with_handler(ctx.opts, "spawn", fn _call ->
         Placement.workdir_path(
           %{base_dir: ctx.base_dir, db: ctx.db},
-          %{session_key: "vanished-session", host: "eurisko", harness: "codex"}
+          %{session_key: "vanished-session", host: "remote-host", harness: "codex"}
         )
       end)
 
@@ -2069,7 +2080,7 @@ defmodule Tightbeam.Wire.RouterTest do
              "error" => %{
                "code" => "unknown_host",
                "message" =>
-                 "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> --name eurisko --as-user <adminUserId>"
+                 "host remote-host is not configured for codex; run tightbeam assimilate <ssh-dest> --name remote-host --as-user <adminUserId>"
              }
            }
   end
@@ -2154,7 +2165,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
   test "F6: a malformed model field on the DEVICE path reaches the gateway named, not silently dropped",
        ctx do
-    # Sol xhigh review, live-switch finding 6. `model_params/1` used to drop
+    # . `model_params/1` used to drop
     # a non-string field entirely, so the gateway saw a params map
     # indistinguishable from "no model named" — which, before F2 closed it,
     # activated the destination's default and reported `ok: true` on a
@@ -2190,7 +2201,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
   test "F6: an unknown tune param key on RAW DISPATCH is refused by name, never silently forwarded",
        ctx do
-    # Sol xhigh review, live-switch finding 6. Raw `/agent/dispatch` has no
+    # . Raw `/agent/dispatch` has no
     # closed flag set the way the CLI does — `atomize_params/2` forwards
     # whatever the caller sent. A mistyped `modle` used to be inert: no
     # branch read it, `model` stayed absent, and (before F2 closed it) the

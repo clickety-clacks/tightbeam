@@ -26,8 +26,7 @@ defmodule Tightbeam.Application do
       config = production_config()
 
       # ONE refusal is quiet here, and it is the one that was asked for: a first run
-      # with no registered harness CLI on PATH (task #23 — measured on a test host from the
-      # npm tarball, the most ordinary first-run state there is).
+      # with no registered harness CLI on PATH.
       #
       # This used to also wrap `start_tree/1` in a try/rescue naming two more refusals,
       # a stale database (Schema.ShapeError) and an identity tree missing its refs.
@@ -124,10 +123,8 @@ defmodule Tightbeam.Application do
       # org is a moment that never arrives: you cannot spawn until you have
       # onboarded, onboarding VERIFIES by starting a runtime, and that runtime
       # needs the adapter only a spawn would have installed. Circular, and every
-      # fresh install hit it — a production host twice, on both providers, surfacing as
-      # `harness command could not be executed: No such file or directory`
-      # (Flynn, 2026-08-04). Boot printed the npm command as a "manual
-      # fallback"; the only change is that we run it instead of describing it.
+      # fresh installs hit it: the onboarding runtime needs an adapter that was
+      # previously installed only by a later session spawn. Boot now installs it.
       #
       # In the readiness task, not inline: a cold npm install is minutes and boot
       # must not block on the network. Failures log and never stop the gateway —
@@ -182,12 +179,11 @@ defmodule Tightbeam.Application do
   # THE DEFAULTS COME FROM WHAT THE BOX CAN ACTUALLY RUN — a harness whose CLI
   # is installed AND whose credential is onboarded — not merely what is on PATH.
   #
-  # `default_harness` was `hd(Harness.all())` — registry order — and
+  # `default_harness` was `hd(Harness.all)` — registry order — and
   # `default_model` was the literal claude-sonnet-5, whatever harness that
   # implied. A codex-only machine therefore placed its first turn on a harness
   # it had never installed, with a model it cannot run, and refused naming a
-  # vendor the operator never chose (Flynn, 2026-08-04: "what if i'm a codex
-  # only user"). The first repair special-cased exactly one INSTALLED binary,
+  # vendor the operator never chose. The first repair special-cased exactly one INSTALLED binary,
   # but a tester with BOTH CLIs on PATH and ONLY codex onboarded still fell to
   # registry-order claude + claude-sonnet-5 — a dead default whose first turn
   # cannot run (observed in production). Installed is not runnable;
@@ -241,11 +237,7 @@ defmodule Tightbeam.Application do
     %{
       base_dir: Application.get_env(:tightbeam, :base_dir, default_base_dir()),
       cwd: Application.get_env(:tightbeam, :cwd, File.cwd!()),
-      # 11373: the Expanse's 1373 colonized worlds, plus one for Earth (Flynn's
-      # port, agreed at project start). The code defaulted to 4321 long after the
-      # convention settled, so a bare `tightbeam-gateway` boot landed on a port no
-      # client dials — Flynn's first clawline connect to a fresh production install
-      # failed exactly there (2026-08-04). The default IS the convention now.
+      # 11373 is the established default port used by the clients.
       port: Application.get_env(:tightbeam, :port, 11_373),
       default_harness: Tightbeam.Harness.default().id(),
       default_model:

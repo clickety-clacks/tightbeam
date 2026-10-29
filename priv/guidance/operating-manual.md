@@ -14,7 +14,7 @@ to do. It holds your identity, mailbox, and history across restarts and machine 
 tightbeam refuses a command, it names the rule that refused it. Read the reason.
 
 ## See what is around you
-Run `tightbeam list`. It returns the sessions you can address, the archetypes in this org,
+Run `tightbeam list`. It returns the sessions you can address, the archetypes in the organization,
 the hosts (machines agents run on), and the model catalog (the model names you may use). Use
 a model name from that catalog exactly. Each session row names the host it runs on — yours
 included. Run `tightbeam identity current` to print your own session key. Never open
@@ -76,7 +76,7 @@ escalating the silence. The substrate routes lifecycle exceptions through the re
 graph. Main is for root-terminal cases, not a routine fallback.
 
 ## Say how urgent a wake is: --class
-Attention is the scarcest thing this org has. Tell tightbeam how urgent a message is and it
+Attention is the scarcest thing the organization has. Tell tightbeam how urgent a message is and it
 shapes WHEN the receiver spends a turn on it — never whether it is recorded:
 
     tightbeam wake --role owner --prompt "the requested report is ready" --class fyi

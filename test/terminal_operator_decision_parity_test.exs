@@ -33,8 +33,8 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
     scheduler = :"terminal_operator_scheduler_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = ensure_all_schemas(db)
-    ensure_main_session(db, "flynn")
-    raiser = session(db, "raiser", "flynn")
+    ensure_main_session(db, "sample-user")
+    raiser = session(db, "raiser", "sample-user")
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})
 
@@ -87,8 +87,8 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
     refute Map.has_key?(firehose_item, "ruledViaPrincipal")
     refute Map.has_key?(firehose_item, "ruledViaSessionState")
 
-    [listed] = Escalation.list(ctx.db, rule, "ruled", owner_user_id: "flynn")
-    detailed = Escalation.get(ctx.db, rule, request.id, owner_user_id: "flynn")
+    [listed] = Escalation.list(ctx.db, rule, "ruled", owner_user_id: "sample-user")
+    detailed = Escalation.get(ctx.db, rule, request.id, owner_user_id: "sample-user")
 
     assert listed == detailed
     refute Map.has_key?(listed, :row_version)
@@ -102,17 +102,17 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
              options: [%{"label" => "alpha"}, %{"label" => "beta"}],
              raiser_id: "agent:raiser",
              raiser_session_key: raiser_key,
-             owner_user_id: "flynn",
+             owner_user_id: "sample-user",
              assignment_id: nil,
              decision: "alpha",
              rationale: nil,
-             ruled_by: "user:flynn",
+             ruled_by: "user:sample-user",
              ruled_via_session_key: nil,
              consumed_at: nil,
              ruling_attribution: %{
-               on_behalf_of: "user:flynn",
+               on_behalf_of: "user:sample-user",
                performer: %{
-                 principal: %{state: "known", value: "user:flynn"},
+                 principal: %{state: "known", value: "user:sample-user"},
                  session: %{state: "none"}
                }
              }
@@ -217,11 +217,11 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
     assert %{
              ruling_attribution: %{
                performer: %{
-                 principal: %{state: "known", value: "user:flynn"},
+                 principal: %{state: "known", value: "user:sample-user"},
                  session: %{state: "known", key: ^session_key}
                }
              }
-           } = Escalation.get(ctx.db, call, request.id, owner_user_id: "flynn")
+           } = Escalation.get(ctx.db, call, request.id, owner_user_id: "sample-user")
   end
 
   test "visible impossible terminal shape refuses and records privacy-safe evidence", ctx do
@@ -274,7 +274,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
     assert surface == "list"
     assert observer == "session:#{ctx.raiser.session_key}"
     assert shape_digest == "efa9964d4e3857fc094f9b699b19ac1feb91a30b439236e05572b483cb886403"
-    refute failing_fields =~ "flynn"
+    refute failing_fields =~ "sample-user"
     refute failing_fields =~ "tamper"
     assert ruled.ruling_fact_id > 0
   end
@@ -286,7 +286,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
         call = rule_call(request.id, %{decision: "accept"})
 
         assert %{code: "decision_request_integrity_invalid"} =
-                 Escalation.get(ctx.db, call, request.id, owner_user_id: "flynn")
+                 Escalation.get(ctx.db, call, request.id, owner_user_id: "sample-user")
 
         request
       end
@@ -296,7 +296,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                ctx.db,
                rule_call(hd(requests).id, %{decision: "accept"}),
                "ruled",
-               owner_user_id: "flynn"
+               owner_user_id: "sample-user"
              )
 
     assert {:ok, evidence_rows} =
@@ -346,7 +346,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                  ctx.db,
                  rule_call(request.id, %{decision: "accept"}),
                  request.id,
-                 owner_user_id: "flynn"
+                 owner_user_id: "sample-user"
                )
     end
 
@@ -401,7 +401,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                  ctx.db,
                  rule_call(request.id, %{decision: "accept"}),
                  request.id,
-                 owner_user_id: "flynn"
+                 owner_user_id: "sample-user"
                )
     end
 
@@ -454,7 +454,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                  ctx.db,
                  rule_call(request.id, %{decision: "accept"}),
                  request.id,
-                 owner_user_id: "flynn"
+                 owner_user_id: "sample-user"
                )
     end
 
@@ -493,7 +493,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                ctx.db,
                rule_call(request.id, %{decision: "accept"}),
                request.id,
-               owner_user_id: "flynn"
+               owner_user_id: "sample-user"
              )
 
     assert {:ok, [[fields]]} =
@@ -515,15 +515,15 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
 
     for attribution <- [
           "",
-          ",ruledViaPrincipal='user:flynn'",
-          ",ruledViaPrincipal='user:flynn',ruledViaSessionState='known'",
-          ",ruledViaPrincipal='user:flynn',ruledViaSessionState='none',ruledViaSessionKey='agent:presenter'",
+          ",ruledViaPrincipal='user:sample-user'",
+          ",ruledViaPrincipal='user:sample-user',ruledViaSessionState='known'",
+          ",ruledViaPrincipal='user:sample-user',ruledViaSessionState='none',ruledViaSessionKey='agent:presenter'",
           ",ruledViaSessionState='none'"
         ] do
       assert {:error, %DB.Error{message: message}} =
                DB.query(
                  ctx.db,
-                 "UPDATE decision_requests SET status='ruled',decision='accept',ruledBy='user:flynn',ruledAt=1,rulingFactId=1#{attribution} WHERE id=?1",
+                 "UPDATE decision_requests SET status='ruled',decision='accept',ruledBy='user:sample-user',ruledAt=1,rulingFactId=1#{attribution} WHERE id=?1",
                  [request.id]
                )
 
@@ -536,7 +536,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
     assert {:error, %DB.Error{message: insert_message}} =
              DB.query(
                ctx.db,
-               "INSERT INTO decision_requests (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,actionKey,question,options,context,status,decision,ruledBy,ruledAt,rulingFactId) VALUES ('dr_incomplete_insert','operator','agent:raiser','agent:raiser:app','flynn',1,2,'insert','insert?','[{\"label\":\"accept\"}]','{}','ruled','accept','user:flynn',1,1)"
+               "INSERT INTO decision_requests (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,actionKey,question,options,context,status,decision,ruledBy,ruledAt,rulingFactId) VALUES ('dr_incomplete_insert','operator','agent:raiser','agent:raiser:app','sample-user',1,2,'insert','insert?','[{\"label\":\"accept\"}]','{}','ruled','accept','user:sample-user',1,1)"
              )
 
     assert insert_message =~ "decision_request_integrity_invalid"
@@ -601,7 +601,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                ctx.db,
                rule_call(expected, %{decision: "accept"}),
                "ruled",
-               owner_user_id: "flynn"
+               owner_user_id: "sample-user"
              )
 
     assert {:ok, evidence_rows} =
@@ -626,11 +626,11 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
         "DELETE FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject='#{request.id}'"
       )
 
-    flynn_call = rule_call(request.id, %{decision: "accept"})
-    assert Escalation.get(ctx.db, flynn_call, request.id, owner_user_id: "flynn") == nil
+    example_call = rule_call(request.id, %{decision: "accept"})
+    assert Escalation.get(ctx.db, example_call, request.id, owner_user_id: "sample-user") == nil
 
     refute Enum.any?(
-             Escalation.list(ctx.db, flynn_call, "ruled", owner_user_id: "flynn"),
+             Escalation.list(ctx.db, example_call, "ruled", owner_user_id: "sample-user"),
              &(&1.id == request.id)
            )
 
@@ -643,11 +643,11 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
   end
 
   test "an unrelated sibling session cannot borrow owner visibility", ctx do
-    reviewer = session(ctx.db, "reviewer", "flynn")
+    reviewer = session(ctx.db, "reviewer", "sample-user")
     request = invalid_without_event(ctx, "sibling private?")
     reviewer_call = ask_call(reviewer, %{})
 
-    assert Escalation.get(ctx.db, reviewer_call, request.id, owner_user_id: "flynn") == nil
+    assert Escalation.get(ctx.db, reviewer_call, request.id, owner_user_id: "sample-user") == nil
 
     assert {:ok, [[0]]} =
              DB.query(
@@ -661,7 +661,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                ctx.db,
                ask_call(ctx.raiser, %{}),
                request.id,
-               owner_user_id: "flynn"
+               owner_user_id: "sample-user"
              )
 
     assert request_id == request.id
@@ -703,7 +703,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                  session: %{state: "legacy-unknown"}
                }
              }
-           } = Escalation.get(ctx.db, direct_call, direct.id, owner_user_id: "flynn")
+           } = Escalation.get(ctx.db, direct_call, direct.id, owner_user_id: "sample-user")
 
     assert %{
              ruled_via_session_key: session_key,
@@ -713,7 +713,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                  session: %{state: "known", key: session_key}
                }
              }
-           } = Escalation.get(ctx.db, via_call, via.id, owner_user_id: "flynn")
+           } = Escalation.get(ctx.db, via_call, via.id, owner_user_id: "sample-user")
 
     assert session_key == ctx.raiser.session_key
   end
@@ -751,7 +751,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
     call = rule_call(conflict_request.id, %{decision: "accept"})
 
     assert %{code: "decision_request_integrity_invalid"} =
-             Escalation.get(ctx.db, call, conflict_request.id, owner_user_id: "flynn")
+             Escalation.get(ctx.db, call, conflict_request.id, owner_user_id: "sample-user")
 
     :ok =
       DB.execute(
@@ -760,7 +760,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
       )
 
     assert %{code: "decision_request_integrity_evidence_conflict"} =
-             Escalation.get(ctx.db, call, conflict_request.id, owner_user_id: "flynn")
+             Escalation.get(ctx.db, call, conflict_request.id, owner_user_id: "sample-user")
 
     unavailable_request = invalid_without_event(ctx, "evidence unavailable?")
 
@@ -775,7 +775,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                ctx.db,
                call,
                unavailable_request.id,
-               owner_user_id: "flynn"
+               owner_user_id: "sample-user"
              )
 
     assert {:ok, [[0]]} =
@@ -1081,7 +1081,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                  ctx.db,
                  rule_call(request.id, %{decision: "accept"}),
                  request.id,
-                 owner_user_id: "flynn"
+                 owner_user_id: "sample-user"
                )
 
       assert request_id == request.id
@@ -1132,7 +1132,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                ctx.db,
                rule_call(request.id, %{decision: "accept"}),
                request.id,
-               owner_user_id: "flynn"
+               owner_user_id: "sample-user"
              )
 
     assert {:ok, [[~s(["raiserNotificationWake"])]]} =
@@ -1255,7 +1255,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                ctx.db,
                rule_call(invalid.id, %{decision: "accept"}),
                invalid.id,
-               owner_user_id: "flynn"
+               owner_user_id: "sample-user"
              )
 
     known_fact_id = known_ruled.ruling_fact_id
@@ -1283,13 +1283,16 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
 
     assert %{
              ruling_attribution: %{
-               on_behalf_of: "user:flynn",
+               on_behalf_of: "user:sample-user",
                performer: %{
-                 principal: %{state: "known", value: "user:flynn"},
+                 principal: %{state: "known", value: "user:sample-user"},
                  session: %{state: "none"}
                }
              }
-           } = Escalation.get(ctx.db, rule_call(known.id, %{}), known.id, owner_user_id: "flynn")
+           } =
+             Escalation.get(ctx.db, rule_call(known.id, %{}), known.id,
+               owner_user_id: "sample-user"
+             )
 
     assert %{
              ruling_attribution: %{
@@ -1299,7 +1302,9 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                }
              }
            } =
-             Escalation.get(ctx.db, rule_call(legacy.id, %{}), legacy.id, owner_user_id: "flynn")
+             Escalation.get(ctx.db, rule_call(legacy.id, %{}), legacy.id,
+               owner_user_id: "sample-user"
+             )
 
     assert {:ok, [[1, ~s(["rulingLifecycleEvent"])]]} =
              DB.query(
@@ -1333,7 +1338,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
     }
   end
 
-  defp rule_call(id, params, owner \\ "flynn") do
+  defp rule_call(id, params, owner \\ "sample-user") do
     %{
       verb: "operator-rule",
       origin: "user:#{owner}",

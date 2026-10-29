@@ -26,14 +26,14 @@ defmodule Tightbeam.HarnessHealthTest do
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
 
-    main_session = Org.personal_session_key("flynn")
+    main_session = Org.personal_session_key("sample-user")
 
     Org.create(db, %{
       session_key: main_session,
       display_name: "Main",
       kind: "main",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: "default",
       host: "host-a",
       harness: "codex",
@@ -48,8 +48,8 @@ defmodule Tightbeam.HarnessHealthTest do
         Org.create(db, %{
           session_key: session_key,
           display_name: "Harness health #{index}",
-          owner_user_id: "flynn",
-          origin: "user:flynn",
+          owner_user_id: "sample-user",
+          origin: "user:sample-user",
           archetype: "coder",
           host: "host-a",
           harness: "claude",
@@ -79,8 +79,8 @@ defmodule Tightbeam.HarnessHealthTest do
     Org.create(db, %{
       session_key: outside_session,
       display_name: "Healthy harness member",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: "coder",
       host: "host-b",
       harness: "claude",

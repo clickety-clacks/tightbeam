@@ -2634,9 +2634,9 @@ mod tests {
                 "--effort",
                 "high",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"tune","sessionKey":"agent:coder:x s_1","params":{"setting":"set_harness","harness":"codex","model":"gpt-5.6-sol","effort":"high"}}"#
+            r#"{"asUser":"sample-user","verb":"tune","sessionKey":"agent:coder:x s_1","params":{"setting":"set_harness","harness":"codex","model":"gpt-5.6-sol","effort":"high"}}"#
         );
 
         // No model named: REFUSED at parse time (v0.2 program §4 — the
@@ -2653,7 +2653,7 @@ mod tests {
                     "--harness",
                     "codex",
                     "--as-user",
-                    "flynn"
+                    "sample-user"
                 ]
                 .iter()
                 .map(|value| (*value).to_owned())
@@ -2676,9 +2676,9 @@ mod tests {
                 "--context",
                 "1m",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"tune","sessionKey":"s_1","params":{"setting":"set_model","model":"claude-fable-5","context":"1m"}}"#
+            r#"{"asUser":"sample-user","verb":"tune","sessionKey":"s_1","params":{"setting":"set_model","model":"claude-fable-5","context":"1m"}}"#
         );
 
         // NAMED EMPTY crosses as JSON null, exactly as it does on spawn: the
@@ -2693,9 +2693,9 @@ mod tests {
                 "--context",
                 "",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"tune","sessionKey":"s_1","params":{"setting":"set_model","model":"claude-fable-5","context":null}}"#
+            r#"{"asUser":"sample-user","verb":"tune","sessionKey":"s_1","params":{"setting":"set_model","model":"claude-fable-5","context":null}}"#
         );
 
         // The effort form spells the gateway's column word. Without the
@@ -2711,9 +2711,9 @@ mod tests {
                 "--effort",
                 "xhigh",
                 "--as-user",
-                "flynn"
+                "sample-user"
             ]),
-            r#"{"asUser":"flynn","verb":"tune","sessionKey":"s_1","params":{"setting":"set_reasoning","reasoningLevel":"xhigh"}}"#
+            r#"{"asUser":"sample-user","verb":"tune","sessionKey":"s_1","params":{"setting":"set_reasoning","reasoningLevel":"xhigh"}}"#
         );
     }
 
@@ -2727,25 +2727,25 @@ mod tests {
                 "--seq",
                 "17",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"turn-trace","params":{"sessionKey":"agent:coder:x s_1","turnSeq":17}}"#
+            r#"{"asUser":"sample-user","verb":"turn-trace","params":{"sessionKey":"agent:coder:x s_1","turnSeq":17}}"#
         );
     }
 
     #[test]
     fn builds_harness_process_list_request() {
         assert_eq!(
-            body(&["harness-process", "list", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"harness-processes","params":{}}"#
+            body(&["harness-process", "list", "--as-user", "sample-user"]),
+            r#"{"asUser":"sample-user","verb":"harness-processes","params":{}}"#
         );
     }
 
     #[test]
     fn add_user_builds_the_ordinary_authenticated_gateway_request() {
         assert_eq!(
-            body(&["add-user", "guest", "--admin", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"add-user","params":{"userId":"guest","isAdmin":true}}"#
+            body(&["add-user", "guest", "--admin", "--as-user", "sample-user"]),
+            r#"{"asUser":"sample-user","verb":"add-user","params":{"userId":"guest","isAdmin":true}}"#
         );
     }
 
@@ -2862,9 +2862,9 @@ mod tests {
                 "--prompt",
                 "go",
                 "--as-user",
-                "flynn"
+                "sample-user"
             ]),
-            r#"{"asUser":"flynn","verb":"wake","role":"reviewer","params":{"prompt":"go"}}"#
+            r#"{"asUser":"sample-user","verb":"wake","role":"reviewer","params":{"prompt":"go"}}"#
         );
         assert_eq!(
             body(&[
@@ -2890,9 +2890,9 @@ mod tests {
                 "--at",
                 "+1",
                 "--as-user",
-                "flynn"
+                "sample-user"
             ]),
-            r#"{"asUser":"flynn","verb":"wake","userId":"sampleuser","params":{"prompt":"go","at":1}}"#
+            r#"{"asUser":"sample-user","verb":"wake","userId":"sampleuser","params":{"prompt":"go","at":1}}"#
         );
         assert_eq!(
             body(&[
@@ -2904,9 +2904,9 @@ mod tests {
                 "--at",
                 "0x10",
                 "--as-user",
-                "flynn"
+                "sample-user"
             ]),
-            r#"{"asUser":"flynn","verb":"wake","userId":"sampleuser","params":{"prompt":"go","at":16}}"#
+            r#"{"asUser":"sample-user","verb":"wake","userId":"sampleuser","params":{"prompt":"go","at":16}}"#
         );
     }
 
@@ -2967,9 +2967,9 @@ mod tests {
                 "--to",
                 "200",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"coordination-share","params":{"session":"agent:po","from":100,"to":200}}"#
+            r#"{"asUser":"sample-user","verb":"coordination-share","params":{"session":"agent:po","from":100,"to":200}}"#
         );
         for missing in [
             &["coordination-share", "--from", "1", "--to", "2"][..],
@@ -2977,7 +2977,7 @@ mod tests {
             &["coordination-share", "--session", "agent:po", "--from", "1"][..],
         ] {
             let mut argv = missing.to_vec();
-            argv.extend_from_slice(&["--as-user", "flynn"]);
+            argv.extend_from_slice(&["--as-user", "sample-user"]);
             assert!(args::parse(argv.iter().map(|v| (*v).to_owned()).collect()).is_err());
         }
     }
@@ -2987,12 +2987,12 @@ mod tests {
         // O5: the same positional-id shape `work-item-get` uses — the wake id
         // travels as an ordinary `wakeId` param, never a typed target.
         assert_eq!(
-            body(&["digest-members", "w_abc123", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"digest-members","params":{"wakeId":"w_abc123"}}"#
+            body(&["digest-members", "w_abc123", "--as-user", "sample-user"]),
+            r#"{"asUser":"sample-user","verb":"digest-members","params":{"wakeId":"w_abc123"}}"#
         );
         assert!(
             args::parse(
-                ["digest-members", "--as-user", "flynn"]
+                ["digest-members", "--as-user", "sample-user"]
                     .iter()
                     .map(|v| (*v).to_owned())
                     .collect()
@@ -3039,9 +3039,9 @@ mod tests {
                 "--answer",
                 "behind a flag",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"answer","params":{"request":"dr_1","answer":"behind a flag"}}"#
+            r#"{"asUser":"sample-user","verb":"answer","params":{"request":"dr_1","answer":"behind a flag"}}"#
         );
         assert_eq!(
             body(&[
@@ -3051,9 +3051,9 @@ mod tests {
                 "--reason",
                 "name the migration",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"return","params":{"request":"dr_1","reason":"name the migration"}}"#
+            r#"{"asUser":"sample-user","verb":"return","params":{"request":"dr_1","reason":"name the migration"}}"#
         );
         for missing in [
             &["ask", "--question", "q"][..],
@@ -3080,8 +3080,8 @@ mod tests {
         // Seam ④. `--limit` is a JSON NUMBER, and neither flag carries a default:
         // an unpaged call must build exactly the body it built before.
         assert_eq!(
-            body(&["attests", "as_1", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"attests","params":{"assignmentId":"as_1"}}"#
+            body(&["attests", "as_1", "--as-user", "sample-user"]),
+            r#"{"asUser":"sample-user","verb":"attests","params":{"assignmentId":"as_1"}}"#
         );
         assert_eq!(
             body(&[
@@ -3092,9 +3092,9 @@ mod tests {
                 "--limit",
                 "50",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"attests","params":{"assignmentId":"as_1","after":"at_9","limit":50}}"#
+            r#"{"asUser":"sample-user","verb":"attests","params":{"assignmentId":"as_1","after":"at_9","limit":50}}"#
         );
         assert_eq!(
             body(&[
@@ -3104,9 +3104,9 @@ mod tests {
                 "--limit",
                 "25",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"execution-map","params":{"after":"wi_1","limit":25}}"#
+            r#"{"asUser":"sample-user","verb":"execution-map","params":{"after":"wi_1","limit":25}}"#
         );
         // A forest has no lawful page boundary, and the CLI says so before the
         // round trip rather than after it.
@@ -3118,7 +3118,7 @@ mod tests {
                     "--limit",
                     "5",
                     "--as-user",
-                    "flynn"
+                    "sample-user"
                 ]
                 .iter()
                 .map(|v| (*v).to_owned())
@@ -3135,7 +3135,7 @@ mod tests {
             &["execution-map", "--after", ""][..],
         ] {
             let mut argv = bad.to_vec();
-            argv.extend_from_slice(&["--as-user", "flynn"]);
+            argv.extend_from_slice(&["--as-user", "sample-user"]);
             assert!(args::parse(argv.iter().map(|v| (*v).to_owned()).collect()).is_err());
         }
     }
@@ -3222,9 +3222,9 @@ mod tests {
                 "--key",
                 "k1",
                 "--as-user",
-                "flynn"
+                "sample-user"
             ]),
-            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","effort":"high","context":"1m","handle":"reviewer","host":"lab1"}}"#
+            r#"{"asUser":"sample-user","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","effort":"high","context":"1m","handle":"reviewer","host":"lab1"}}"#
         );
 
         // A flag NAMED but left empty is a real selection — "the vendor's
@@ -3248,9 +3248,9 @@ mod tests {
                 "--key",
                 "k1",
                 "--as-user",
-                "flynn"
+                "sample-user"
             ]),
-            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","context":null}}"#
+            r#"{"asUser":"sample-user","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","context":null}}"#
         );
 
         // …and an OMITTED flag still omits the key, or inheritance downstream
@@ -3269,12 +3269,12 @@ mod tests {
                 "--key",
                 "k1",
                 "--as-user",
-                "flynn"
+                "sample-user"
             ]),
-            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt"}}"#
+            r#"{"asUser":"sample-user","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt"}}"#
         );
         let command = Command::IdentityEdit {
-            identity: Identity::User("flynn".to_owned()),
+            identity: Identity::User("sample-user".to_owned()),
             archetype: "coder".to_owned(),
             manifest: false,
             skill: Some("swift".to_owned()),
@@ -3283,7 +3283,7 @@ mod tests {
         };
         assert_eq!(
             build_request(&command).unwrap().body_json,
-            r#"{"asUser":"flynn","verb":"identity-edit","params":{"archetype":"coder","manifest":false,"remove":false,"skill":"swift","content":"line one\nline two"}}"#
+            r#"{"asUser":"sample-user","verb":"identity-edit","params":{"archetype":"coder","manifest":false,"remove":false,"skill":"swift","content":"line one\nline two"}}"#
         );
     }
 
@@ -3317,9 +3317,9 @@ mod tests {
                 "--session",
                 "agent:writer:app",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"artifacts","params":{"workItemId":"wi_1","sessionKey":"agent:writer:app"}}"#
+            r#"{"asUser":"sample-user","verb":"artifacts","params":{"workItemId":"wi_1","sessionKey":"agent:writer:app"}}"#
         );
     }
 
@@ -3346,9 +3346,9 @@ mod tests {
                 "agent:report s_1",
                 "--delivers-work-item",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem","workItemId":"wi_1","reviews":"asg_parent","effectKind":"policy","files":["lib/a.ex","test/a_test.exs"],"reportToSessionKey":"agent:report s_1","deliversWorkItem":true}}"#
+            r#"{"asUser":"sample-user","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem","workItemId":"wi_1","reviews":"asg_parent","effectKind":"policy","files":["lib/a.ex","test/a_test.exs"],"reportToSessionKey":"agent:report s_1","deliversWorkItem":true}}"#
         );
         assert_eq!(
             body(&[
@@ -3371,9 +3371,9 @@ mod tests {
                 "agent:report s_1",
                 "--delivers-work-item",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","effectKind":"release","workdirRoot":"checkout","idempotencyKey":"idem","reportToSessionKey":"agent:report s_1","deliversWorkItem":true}}"#
+            r#"{"asUser":"sample-user","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","effectKind":"release","workdirRoot":"checkout","idempotencyKey":"idem","reportToSessionKey":"agent:report s_1","deliversWorkItem":true}}"#
         );
         assert_eq!(
             body(&[
@@ -3431,9 +3431,9 @@ mod tests {
                 "--state",
                 "all",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"assignments","sessionKey":"s1","params":{"state":"all"}}"#
+            r#"{"asUser":"sample-user","verb":"assignments","sessionKey":"s1","params":{"state":"all"}}"#
         );
         assert_eq!(
             body(&[
@@ -3454,9 +3454,9 @@ mod tests {
                 "--decision",
                 "retain",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"completion-disposition","params":{"completionId":"cn_1","decision":"retain"}}"#
+            r#"{"asUser":"sample-user","verb":"completion-disposition","params":{"completionId":"cn_1","decision":"retain"}}"#
         );
     }
 
@@ -3506,9 +3506,9 @@ mod tests {
                 "--verdict",
                 "verified",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"attest","params":{"assignmentId":"asg_1","kind":"verdict","verdictKind":"verified"}}"#
+            r#"{"asUser":"sample-user","verb":"attest","params":{"assignmentId":"asg_1","kind":"verdict","verdictKind":"verified"}}"#
         );
         assert_eq!(
             body(&["attests", "asg_1", "--as", "reviewer"]),
@@ -3543,19 +3543,19 @@ mod tests {
                 "--spec-sha256",
                 &sha,
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
             format!(
-                r#"{{"asUser":"flynn","verb":"work-item-create","params":{{"title":"Ship","specRefName":"spec.md","specRefSha256":"{sha}"}}}}"#
+                r#"{{"asUser":"sample-user","verb":"work-item-create","params":{{"title":"Ship","specRefName":"spec.md","specRefSha256":"{sha}"}}}}"#
             )
         );
         assert_eq!(
-            body(&["work-item-get", "wi_1", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"work-item-get","params":{"workItemId":"wi_1"}}"#
+            body(&["work-item-get", "wi_1", "--as-user", "sample-user"]),
+            r#"{"asUser":"sample-user","verb":"work-item-get","params":{"workItemId":"wi_1"}}"#
         );
         assert_eq!(
-            body(&["work-item-update", "wi_1", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1"}}"#
+            body(&["work-item-update", "wi_1", "--as-user", "sample-user"]),
+            r#"{"asUser":"sample-user","verb":"work-item-update","params":{"workItemId":"wi_1"}}"#
         );
         assert_eq!(
             body(&[
@@ -3566,10 +3566,10 @@ mod tests {
                 "--spec-sha256",
                 &sha,
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
             format!(
-                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_1","title":"Retitled","specRefSha256":"{sha}"}}}}"#
+                r#"{{"asUser":"sample-user","verb":"work-item-update","params":{{"workItemId":"wi_1","title":"Retitled","specRefSha256":"{sha}"}}}}"#
             )
         );
         assert_eq!(
@@ -3585,25 +3585,25 @@ mod tests {
                 "--priority",
                 "7",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
             format!(
-                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_1","title":"Together","specRefName":"governing.md","specRefSha256":"{sha}","priority":7}}}}"#
+                r#"{{"asUser":"sample-user","verb":"work-item-update","params":{{"workItemId":"wi_1","title":"Together","specRefName":"governing.md","specRefSha256":"{sha}","priority":7}}}}"#
             )
         );
         assert_eq!(
             body(&[
                 "work-item-update",
-                "wi_6d418db1-26b4-4ad0-9886-86e757e93342",
+                "wi_00000000-0000-4000-8000-000000000099",
                 "--spec-ref",
-                "patrol-failure-classification-and-escalation-v1.md",
+                "governing.md",
                 "--spec-sha256",
                 class_a_sha,
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
             format!(
-                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_6d418db1-26b4-4ad0-9886-86e757e93342","specRefName":"patrol-failure-classification-and-escalation-v1.md","specRefSha256":"{class_a_sha}"}}}}"#
+                r#"{{"asUser":"sample-user","verb":"work-item-update","params":{{"workItemId":"wi_00000000-0000-4000-8000-000000000099","specRefName":"governing.md","specRefSha256":"{class_a_sha}"}}}}"#
             )
         );
         assert_eq!(
@@ -3612,17 +3612,23 @@ mod tests {
                 "wi_1",
                 "--clear-spec-ref",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null}}"#
+            r#"{"asUser":"sample-user","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null}}"#
         );
         assert_eq!(
-            body(&["breathing", "assignment", "asg_1", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"breathing","params":{"targetKind":"assignment","targetId":"asg_1"}}"#
+            body(&[
+                "breathing",
+                "assignment",
+                "asg_1",
+                "--as-user",
+                "sample-user"
+            ]),
+            r#"{"asUser":"sample-user","verb":"breathing","params":{"targetKind":"assignment","targetId":"asg_1"}}"#
         );
         assert_eq!(
-            body(&["work-item-trace", "wi_1", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"work-item-trace","params":{"workItemId":"wi_1"}}"#
+            body(&["work-item-trace", "wi_1", "--as-user", "sample-user"]),
+            r#"{"asUser":"sample-user","verb":"work-item-trace","params":{"workItemId":"wi_1"}}"#
         );
         assert_eq!(
             body(&[
@@ -3632,9 +3638,9 @@ mod tests {
                 "--key",
                 "k1",
                 "--as-user",
-                "flynn"
+                "sample-user"
             ]),
-            r#"{"asUser":"flynn","verb":"work-item-create","params":{"title":"Ship","idempotencyKey":"k1"}}"#
+            r#"{"asUser":"sample-user","verb":"work-item-create","params":{"title":"Ship","idempotencyKey":"k1"}}"#
         );
         assert_eq!(
             body(&[
@@ -3644,9 +3650,9 @@ mod tests {
                 "--priority",
                 "7",
                 "--as-user",
-                "flynn"
+                "sample-user"
             ]),
-            r#"{"asUser":"flynn","verb":"work-item-create","params":{"title":"Urgent","priority":7}}"#
+            r#"{"asUser":"sample-user","verb":"work-item-create","params":{"title":"Urgent","priority":7}}"#
         );
         assert_eq!(
             body(&[
@@ -3655,9 +3661,9 @@ mod tests {
                 "--priority",
                 "2",
                 "--as-user",
-                "flynn"
+                "sample-user"
             ]),
-            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","priority":2}}"#
+            r#"{"asUser":"sample-user","verb":"work-item-update","params":{"workItemId":"wi_1","priority":2}}"#
         );
         assert_eq!(
             body(&[
@@ -3667,17 +3673,17 @@ mod tests {
                 "--priority",
                 "1",
                 "--as-user",
-                "flynn"
+                "sample-user"
             ]),
-            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null,"priority":1}}"#
+            r#"{"asUser":"sample-user","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null,"priority":1}}"#
         );
         assert_eq!(
-            body(&["work-item-icebox", "wi_1", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"work-item-icebox","params":{"workItemId":"wi_1"}}"#
+            body(&["work-item-icebox", "wi_1", "--as-user", "sample-user"]),
+            r#"{"asUser":"sample-user","verb":"work-item-icebox","params":{"workItemId":"wi_1"}}"#
         );
         assert_eq!(
-            body(&["work-item-reopen", "wi_1", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"work-item-reopen","params":{"workItemId":"wi_1"}}"#
+            body(&["work-item-reopen", "wi_1", "--as-user", "sample-user"]),
+            r#"{"asUser":"sample-user","verb":"work-item-reopen","params":{"workItemId":"wi_1"}}"#
         );
         assert_eq!(
             body(&[
@@ -3690,9 +3696,9 @@ mod tests {
                 "--key",
                 "close-key",
                 "--as-user",
-                "flynn"
+                "sample-user"
             ]),
-            r#"{"asUser":"flynn","verb":"work-item-close","params":{"workItemId":"wi_1","completionAttestId":"att_1","ownerRulingReason":"accept the narrower claim","idempotencyKey":"close-key"}}"#
+            r#"{"asUser":"sample-user","verb":"work-item-close","params":{"workItemId":"wi_1","completionAttestId":"att_1","ownerRulingReason":"accept the narrower claim","idempotencyKey":"close-key"}}"#
         );
         assert_eq!(
             body(&[
@@ -3701,9 +3707,9 @@ mod tests {
                 "--reason",
                 "cannot repro",
                 "--as-user",
-                "flynn"
+                "sample-user"
             ]),
-            r#"{"asUser":"flynn","verb":"work-item-fail","params":{"workItemId":"wi_1","reason":"cannot repro"}}"#
+            r#"{"asUser":"sample-user","verb":"work-item-fail","params":{"workItemId":"wi_1","reason":"cannot repro"}}"#
         );
     }
 
@@ -3711,12 +3717,12 @@ mod tests {
     fn builds_byte_exact_durable_topline_bodies() {
         for (argv, expected) in [
             (
-                &["toplines", "--state", "open", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"toplines","params":{"state":"open"}}"#,
+                &["toplines", "--state", "open", "--as-user", "sample-user"][..],
+                r#"{"asUser":"sample-user","verb":"toplines","params":{"state":"open"}}"#,
             ),
             (
-                &["topline", "tl_1", "--history", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"topline","params":{"toplineId":"tl_1","history":true}}"#,
+                &["topline", "tl_1", "--history", "--as-user", "sample-user"][..],
+                r#"{"asUser":"sample-user","verb":"topline","params":{"toplineId":"tl_1","history":true}}"#,
             ),
             (
                 &[
@@ -3727,9 +3733,9 @@ mod tests {
                     "--key",
                     "k",
                     "--as-user",
-                    "flynn",
+                    "sample-user",
                 ][..],
-                r#"{"asUser":"flynn","verb":"topline-work-leave-unlinked","params":{"workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+                r#"{"asUser":"sample-user","verb":"topline-work-leave-unlinked","params":{"workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
             ),
             (
                 &[
@@ -3737,9 +3743,9 @@ mod tests {
                     "--state",
                     "resolved",
                     "--as-user",
-                    "flynn",
+                    "sample-user",
                 ][..],
-                r#"{"asUser":"flynn","verb":"topline-placement-list","params":{"state":"resolved"}}"#,
+                r#"{"asUser":"sample-user","verb":"topline-placement-list","params":{"state":"resolved"}}"#,
             ),
             (
                 &[
@@ -3749,9 +3755,9 @@ mod tests {
                     "--key",
                     "k",
                     "--as-user",
-                    "flynn",
+                    "sample-user",
                 ][..],
-                r#"{"asUser":"flynn","verb":"topline-create","params":{"title":"Ship","idempotencyKey":"k"}}"#,
+                r#"{"asUser":"sample-user","verb":"topline-create","params":{"title":"Ship","idempotencyKey":"k"}}"#,
             ),
             (
                 &[
@@ -3764,9 +3770,9 @@ mod tests {
                     "--key",
                     "k",
                     "--as-user",
-                    "flynn",
+                    "sample-user",
                 ][..],
-                r#"{"asUser":"flynn","verb":"topline-update","params":{"toplineId":"tl_1","title":"Ship","reason":"why","idempotencyKey":"k"}}"#,
+                r#"{"asUser":"sample-user","verb":"topline-update","params":{"toplineId":"tl_1","title":"Ship","reason":"why","idempotencyKey":"k"}}"#,
             ),
             (
                 &[
@@ -3777,9 +3783,9 @@ mod tests {
                     "--key",
                     "k",
                     "--as-user",
-                    "flynn",
+                    "sample-user",
                 ][..],
-                r#"{"asUser":"flynn","verb":"topline-close","params":{"toplineId":"tl_1","reason":"why","idempotencyKey":"k"}}"#,
+                r#"{"asUser":"sample-user","verb":"topline-close","params":{"toplineId":"tl_1","reason":"why","idempotencyKey":"k"}}"#,
             ),
             (
                 &[
@@ -3790,9 +3796,9 @@ mod tests {
                     "--key",
                     "k",
                     "--as-user",
-                    "flynn",
+                    "sample-user",
                 ][..],
-                r#"{"asUser":"flynn","verb":"topline-reopen","params":{"toplineId":"tl_1","reason":"why","idempotencyKey":"k"}}"#,
+                r#"{"asUser":"sample-user","verb":"topline-reopen","params":{"toplineId":"tl_1","reason":"why","idempotencyKey":"k"}}"#,
             ),
             (
                 &[
@@ -3804,9 +3810,9 @@ mod tests {
                     "--key",
                     "k",
                     "--as-user",
-                    "flynn",
+                    "sample-user",
                 ][..],
-                r#"{"asUser":"flynn","verb":"topline-link-work","params":{"toplineId":"tl_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+                r#"{"asUser":"sample-user","verb":"topline-link-work","params":{"toplineId":"tl_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
             ),
             (
                 &[
@@ -3817,9 +3823,9 @@ mod tests {
                     "--key",
                     "k",
                     "--as-user",
-                    "flynn",
+                    "sample-user",
                 ][..],
-                r#"{"asUser":"flynn","verb":"topline-unlink-work","params":{"membershipId":"tlm_1","reason":"why","idempotencyKey":"k"}}"#,
+                r#"{"asUser":"sample-user","verb":"topline-unlink-work","params":{"membershipId":"tlm_1","reason":"why","idempotencyKey":"k"}}"#,
             ),
             (
                 &[
@@ -3830,9 +3836,9 @@ mod tests {
                     "--key",
                     "k",
                     "--as-user",
-                    "flynn",
+                    "sample-user",
                 ][..],
-                r#"{"asUser":"flynn","verb":"topline-concern-create","params":{"toplineId":"tl_1","title":"Risk","idempotencyKey":"k"}}"#,
+                r#"{"asUser":"sample-user","verb":"topline-concern-create","params":{"toplineId":"tl_1","title":"Risk","idempotencyKey":"k"}}"#,
             ),
             (
                 &[
@@ -3844,9 +3850,9 @@ mod tests {
                     "--key",
                     "k",
                     "--as-user",
-                    "flynn",
+                    "sample-user",
                 ][..],
-                r#"{"asUser":"flynn","verb":"topline-concern-link-work","params":{"concernId":"tlc_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+                r#"{"asUser":"sample-user","verb":"topline-concern-link-work","params":{"concernId":"tlc_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
             ),
             (
                 &[
@@ -3858,9 +3864,9 @@ mod tests {
                     "--key",
                     "k",
                     "--as-user",
-                    "flynn",
+                    "sample-user",
                 ][..],
-                r#"{"asUser":"flynn","verb":"topline-concern-unlink-work","params":{"concernId":"tlc_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+                r#"{"asUser":"sample-user","verb":"topline-concern-unlink-work","params":{"concernId":"tlc_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
             ),
         ] {
             assert_eq!(body(argv), expected);
@@ -3870,8 +3876,14 @@ mod tests {
     #[test]
     fn builds_byte_exact_config_bodies() {
         assert_eq!(
-            body(&["config", "get", "default-archetype", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"config","params":{"action":"get","setting":"default-archetype"}}"#
+            body(&[
+                "config",
+                "get",
+                "default-archetype",
+                "--as-user",
+                "sample-user"
+            ]),
+            r#"{"asUser":"sample-user","verb":"config","params":{"action":"get","setting":"default-archetype"}}"#
         );
         assert_eq!(
             body(&[
@@ -3880,13 +3892,19 @@ mod tests {
                 "default-archetype",
                 "coder",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-archetype","value":"coder"}}"#
+            r#"{"asUser":"sample-user","verb":"config","params":{"action":"set","setting":"default-archetype","value":"coder"}}"#
         );
         assert_eq!(
-            body(&["config", "get", "default-priority", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"config","params":{"action":"get","setting":"default-priority"}}"#
+            body(&[
+                "config",
+                "get",
+                "default-priority",
+                "--as-user",
+                "sample-user"
+            ]),
+            r#"{"asUser":"sample-user","verb":"config","params":{"action":"get","setting":"default-priority"}}"#
         );
         assert_eq!(
             body(&[
@@ -3895,9 +3913,9 @@ mod tests {
                 "default-priority",
                 "6",
                 "--as-user",
-                "flynn"
+                "sample-user"
             ]),
-            r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-priority","value":6}}"#
+            r#"{"asUser":"sample-user","verb":"config","params":{"action":"set","setting":"default-priority","value":6}}"#
         );
     }
 
@@ -3924,9 +3942,9 @@ mod tests {
                 "--harness",
                 "claude",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"host-env-list","params":{"host":"node-a","harness":"claude"}}"#
+            r#"{"asUser":"sample-user","verb":"host-env-list","params":{"host":"node-a","harness":"claude"}}"#
         );
         assert_eq!(
             body(&[
@@ -3937,16 +3955,16 @@ mod tests {
                 "claude",
                 "EXAMPLE_OVERLAY_VAR",
                 "--as-user",
-                "flynn",
+                "sample-user",
             ]),
-            r#"{"asUser":"flynn","verb":"host-env-unset","params":{"host":"node-a","harness":"claude","name":"EXAMPLE_OVERLAY_VAR"}}"#
+            r#"{"asUser":"sample-user","verb":"host-env-unset","params":{"host":"node-a","harness":"claude","name":"EXAMPLE_OVERLAY_VAR"}}"#
         );
     }
 
     #[test]
     fn onboarding_phase_names_the_machine_without_transporting_credentials() {
         let request = build_onboard_phase_request(
-            &Identity::User("flynn".to_owned()),
+            &Identity::User("sample-user".to_owned()),
             "openai",
             "begin",
             "subscription",
@@ -3957,7 +3975,7 @@ mod tests {
 
         assert_eq!(
             request.body_json,
-            r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"openai","phase":"begin","kind":"subscription","machine":"work-1"}}"#
+            r#"{"asUser":"sample-user","verb":"onboard","params":{"provider":"openai","phase":"begin","kind":"subscription","machine":"work-1"}}"#
         );
         assert!(!request.body_json.contains("auth.json"));
         assert!(!request.body_json.contains("token"));
@@ -3966,7 +3984,7 @@ mod tests {
         // new. The key itself is staged on the host being onboarded and never
         // crosses the wire, exactly as the subscription credential never does.
         let keyed = build_onboard_phase_request(
-            &Identity::User("flynn".to_owned()),
+            &Identity::User("sample-user".to_owned()),
             "anthropic",
             "finish",
             "apiKey",
@@ -3977,7 +3995,7 @@ mod tests {
 
         assert_eq!(
             keyed.body_json,
-            r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"anthropic","phase":"finish","kind":"apiKey","machine":"work-1","leaseId":"lease-7"}}"#
+            r#"{"asUser":"sample-user","verb":"onboard","params":{"provider":"anthropic","phase":"finish","kind":"apiKey","machine":"work-1","leaseId":"lease-7"}}"#
         );
         assert!(!keyed.body_json.contains("sk-"));
     }
@@ -3997,21 +4015,27 @@ mod tests {
                     "--key",
                     "retire-k",
                     "--as-user",
-                    "flynn",
+                    "sample-user",
                 ][..],
-                r#"{"asUser":"flynn","verb":"retire","sessionKey":"agent:r","params":{"idempotencyKey":"retire-k"}}"#,
+                r#"{"asUser":"sample-user","verb":"retire","sessionKey":"agent:r","params":{"idempotencyKey":"retire-k"}}"#,
             ),
             (
                 &["cancel-wake", "wake-1", "--as-process", "cron"][..],
                 r#"{"asProcess":"cron","verb":"wake","params":{"cancelWakeId":"wake-1"}}"#,
             ),
             (
-                &["identity", "status", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"identity-status","params":{}}"#,
+                &["identity", "status", "--as-user", "sample-user"][..],
+                r#"{"asUser":"sample-user","verb":"identity-status","params":{}}"#,
             ),
             (
-                &["identity", "apply", "agent:coder:app", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"identity-apply","params":{"all":false,"sessionKey":"agent:coder:app"}}"#,
+                &[
+                    "identity",
+                    "apply",
+                    "agent:coder:app",
+                    "--as-user",
+                    "sample-user",
+                ][..],
+                r#"{"asUser":"sample-user","verb":"identity-apply","params":{"all":false,"sessionKey":"agent:coder:app"}}"#,
             ),
             (
                 &[
@@ -4020,21 +4044,21 @@ mod tests {
                     "agent:retired",
                     "default",
                     "--as-user",
-                    "flynn",
+                    "sample-user",
                 ][..],
-                r#"{"asUser":"flynn","verb":"identity-repoint","sessionKey":"agent:retired","params":{"archetype":"default"}}"#,
+                r#"{"asUser":"sample-user","verb":"identity-repoint","sessionKey":"agent:retired","params":{"archetype":"default"}}"#,
             ),
             (
-                &["kungfu", "list", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"kungfu-list","params":{}}"#,
+                &["kungfu", "list", "--as-user", "sample-user"][..],
+                r#"{"asUser":"sample-user","verb":"kungfu-list","params":{}}"#,
             ),
             (
-                &["learn", "agentic-engineering", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"learn","params":{"name":"agentic-engineering"}}"#,
+                &["learn", "agentic-engineering", "--as-user", "sample-user"][..],
+                r#"{"asUser":"sample-user","verb":"learn","params":{"name":"agentic-engineering"}}"#,
             ),
             (
-                &["unlearn", "agentic-engineering", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"unlearn","params":{"name":"agentic-engineering"}}"#,
+                &["unlearn", "agentic-engineering", "--as-user", "sample-user"][..],
+                r#"{"asUser":"sample-user","verb":"unlearn","params":{"name":"agentic-engineering"}}"#,
             ),
         ] {
             assert_eq!(body(args), expected);
@@ -4538,7 +4562,7 @@ mod tests {
         let catalog_calls = RefCell::new(Vec::new());
         let result = run_with(
             Command::Onboard {
-                identity: Identity::User("flynn".to_owned()),
+                identity: Identity::User("sample-user".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
             },
@@ -4615,7 +4639,7 @@ mod tests {
     ///
     /// The same mistake as reading a codex exit code as "a credential was produced", one
     /// layer out. `parse_response` answers `Ok(None)` for a success with no `result`, so
-    /// before this every 2xx reached `Ok(())` and the CLI reported a completed onboarding
+    /// before this every 2xx reached `Ok()` and the CLI reported a completed onboarding
     /// the gateway had never confirmed. The stub here returns exactly that: a finish that
     /// succeeds at the transport and says nothing.
     ///
@@ -4645,7 +4669,7 @@ mod tests {
         let phases = RefCell::new(Vec::new());
         let result = run_with(
             Command::Onboard {
-                identity: Identity::User("flynn".to_owned()),
+                identity: Identity::User("sample-user".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
             },
@@ -4736,7 +4760,7 @@ mod tests {
             origin: Origin::Provisioned,
         };
         let request = build_onboard_phase_request(
-            &Identity::User("flynn".to_owned()),
+            &Identity::User("sample-user".to_owned()),
             "openai",
             "finish",
             "subscription",

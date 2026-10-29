@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn parse_reads_labelled_lines_and_paths_containing_spaces() {
         let observation = parse(
-            "Linux x86_64\nnode /usr/bin/node\nnpm MISSING\nrsync /opt/my tools/rsync\nbase-dir /home/flynn/.tightbeam\n",
+            "Linux x86_64\nnode /usr/bin/node\nnpm MISSING\nrsync /opt/my tools/rsync\nbase-dir /home/sample-user/.tightbeam\n",
         );
         assert_eq!(observation.platform, "Linux x86_64");
         assert_eq!(observation.path_of("node"), Some("/usr/bin/node"));
@@ -322,7 +322,7 @@ mod tests {
         assert_eq!(observation.path_of("rsync"), Some("/opt/my tools/rsync"));
         assert_eq!(
             observation.base_dir.as_deref(),
-            Some("/home/flynn/.tightbeam")
+            Some("/home/sample-user/.tightbeam")
         );
     }
 
@@ -335,9 +335,9 @@ mod tests {
     fn a_missing_harness_cli_names_the_binary_the_host_and_whose_job_it_is() {
         let requirements = requirements(&catalog(), &["claude".to_owned()]);
         let observation = parse("Linux x86_64\nnode /n\nnpm /np\nrsync /r\nclaude-cli MISSING\n");
-        let reason = verdict(&requirements, &observation, "flynn@eurisko").unwrap_err();
+        let reason = verdict(&requirements, &observation, "sample-user@test-host").unwrap_err();
         assert!(reason.contains("claude-cli"));
-        assert!(reason.contains("flynn@eurisko"));
+        assert!(reason.contains("sample-user@test-host"));
         assert!(reason.contains("harness claude"));
         assert!(reason.contains("never the vendors' software"));
         assert!(reason.contains("non-interactive ssh"));
@@ -348,7 +348,7 @@ mod tests {
         let requirements = requirements(&catalog(), &["codex".to_owned()]);
         let observation =
             parse("Linux x86_64\nnode /n\nnpm MISSING\nrsync /r\ncodex-cli MISSING\n");
-        let reason = verdict(&requirements, &observation, "eliza").unwrap_err();
+        let reason = verdict(&requirements, &observation, "example-host").unwrap_err();
         assert!(reason.contains("missing 2 prerequisites"), "{reason}");
         assert!(reason.contains("\n  npm "), "{reason}");
         assert!(reason.contains("\n  codex-cli "), "{reason}");
@@ -383,9 +383,9 @@ mod tests {
     /// the vendor's software is -- the point of sharing the prose with `verdict`.
     #[test]
     fn a_local_refusal_names_the_binary_the_host_the_path_and_the_repair() {
-        let reason = missing_harness_cli("claude", "claude", "eurisko", "/usr/bin:/bin");
+        let reason = missing_harness_cli("claude", "claude", "test-host", "/usr/bin:/bin");
         assert!(
-            reason.starts_with("claude is missing on eurisko"),
+            reason.starts_with("claude is missing on test-host"),
             "{reason}"
         );
         assert!(
@@ -394,7 +394,7 @@ mod tests {
         );
         assert!(reason.contains("never the vendors' software"), "{reason}");
         assert!(
-            reason.contains("Install claude on eurisko and re-run"),
+            reason.contains("Install claude on test-host and re-run"),
             "{reason}"
         );
         assert!(reason.contains("PATH searched: /usr/bin:/bin"), "{reason}");

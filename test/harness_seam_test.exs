@@ -146,7 +146,7 @@ defmodule Tightbeam.HarnessSeamTest do
              )
   end
 
-  # Task #41 (Flynn: "hard code it and leave a note"). The claude adapter accepts a
+  #  (sample-user: "hard code it and leave a note"). The claude adapter accepts a
   # NARROWER model vocabulary than the derived catalog, and every substitution for a
   # refused model is a silent downgrade — `claude-opus-5` -> `opus` delivers Opus 4.8,
   # and `claude-fable-5` has no equivalent at all. This pins the recorded table AND the

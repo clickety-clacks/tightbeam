@@ -1818,7 +1818,7 @@ defmodule Tightbeam.EffortCheckin do
 
   # Thin wrappers, kept under their existing local names so the (many) call
   # sites below are untouched — the SQL itself now lives nowhere in this file
-  # (Sol xhigh review round 2, finding 1). `Escalation.request_from_row/1`'s
+  # . `Escalation.request_from_row/1`'s
   # map already carries every field this module ever read from its own
   # narrower 18-column parser (`owner_user_id`, `assignment_id`,
   # `expecter_session_key`, `expecter_user_id`, `lineage_rung`,

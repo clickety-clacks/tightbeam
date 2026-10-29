@@ -244,7 +244,7 @@ defmodule Tightbeam.ConformanceSupport do
   defp applicable_runners("harness-gate", runners),
     do: Enum.filter(runners, &(&1 == "compiled_hook_grep"))
 
-  # F10 (Sol xhigh review): NO CATCH-ALL. Every fixture `kind` this manifest
+  # : NO CATCH-ALL. Every fixture `kind` this manifest
   # actually uses has its own clause above; a kind that matches none of them
   # — a typo, or a future kind nobody wired a runner for — must run NOTHING
   # and fail loudly (`runners != []` at the call site), not fall back to
@@ -821,7 +821,7 @@ defmodule Tightbeam.ConformanceSupport do
   # The rule NAME cannot tell a genuine denial from a load-induced one: a rail script that
   # blows its budget denies under the SAME rule with reason `script_timeout`, so a case
   # asserting only the name went green while proving nothing about the mechanism it names
-  # (task #38's residual class). The `script_return` a fixture already declares determines
+  # ('s residual class). The `script_return` a fixture already declares determines
   # the reason its mechanism must produce, so both are pinned and a timeout reads RED.
   defp expected_denial(kase), do: {kase["reason"], deny_reason(kase["script_return"])}
 
@@ -1407,8 +1407,8 @@ defmodule Tightbeam.ConformanceSupport do
 
     # NO DEFAULT LIMIT. Every row the assignment carries. And, since neither
     # `--after` nor `--limit` was named, the response carries ONLY `attests`
-    # — no `next_after`/`has_more_after` paging vocabulary added (Sol xhigh
-    # review, finding 8: those keys are PAGING vocabulary, and a caller that
+    # — no `next_after`/`has_more_after` paging vocabulary added: those keys
+    # are PAGING vocabulary, and a caller that
     # never asked to page must see zero payload change).
     assert length(page.attests) == length(Map.get(kase["world"], "attests"))
     assert page == %{attests: page.attests}
@@ -1633,8 +1633,8 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp assert_overlap_observation(_fixture, _db, _call, _overlap?), do: :ok
 
-  # `reopen-assignment`'s own conformance exercise (Sol xhigh review, finding
-  # 4). `holder-verdict-wins` calls only `attest`; this fixture routes
+  # `reopen-assignment`'s own conformance exercise. `holder-verdict-wins`
+  # calls only `attest`; this fixture routes
   # `reopen-assignment` itself through `Dispatch.dispatch/3` — the same
   # chokepoint the wire router uses, which is also what puts the verb through
   # `Rules.decide`. The case named `earlier-verdict-round-displaces-…`
@@ -4301,7 +4301,7 @@ defmodule Tightbeam.ConformanceTest do
     # pending C4 dispatch-rule fixture with its own cases, so it lands in the
     # active and activated counts, not in the exact-mechanism skips.
     #
-    # Sol xhigh review, finding 4 (2026-08-13) adds a second: C4's
+    #  (2026-08-13) adds a second: C4's
     # reopen-assignment-repair, which routes `reopen-assignment` itself
     # through the dispatch chokepoint (holder-verdict-wins only ever calls
     # `attest`) and exercises the defining displacement shape. It is also a
@@ -4374,7 +4374,7 @@ defmodule Tightbeam.ConformanceTest do
     end)
 
     # 52 since C4/holder-verdict-wins joined the corpus (fabric §13 Phase 0); 53
-    # since C4/reopen-assignment-repair joined it (Sol xhigh review, finding 4).
+    # since C4/reopen-assignment-repair joined it .
     assert Enum.count(entries, &(&1.scope == "fixture")) == 53
 
     assert %{

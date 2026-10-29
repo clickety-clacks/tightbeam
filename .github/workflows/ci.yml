@@ -171,8 +171,7 @@ jobs:
   # THE DEPLOY ARTIFACT IS BUILT HERE, from the pushed SHA, by a machine nobody
   # develops or smoke-tests on. Building it from a dev tree conflates "what I
   # have" with "what was reviewed"; building it on the smoke host conflates the
-  # gate with the artifact (caught by Flynn, 2026-08-04: "you're bundling up a
-  # deploy from a smoke test?!"). The runners are exactly the two supported
+  # gate with the artifact. The runners are exactly the two supported
   # platforms — ubuntu x86_64 and macOS arm64 — so `assemble.sh`'s refusal of
   # anything else composes with this matrix rather than fighting it.
   #

@@ -4,7 +4,7 @@ name = "reopen-assignment-repair"
 phase = "pending"
 blocking_phase = "P3"
 kind = "handler-refusal"
-source = "fabric §13 Phase 0; wi_1b0237fe wedge class; Sol xhigh review (2026-08-13), finding 4"
+source = "Product contract for repairing a reopened assignment"
 legibility = "handler:not_authorized"
 
 # holder-verdict-wins.cases.jsonl exercises the SELECTION fix by calling only

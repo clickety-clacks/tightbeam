@@ -51,14 +51,14 @@ defmodule Tightbeam.ConditionFactsTest do
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "sample-user")
 
     session =
       Org.create(db, %{
         session_key: "agent:condition:app",
         display_name: "Condition target",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "sample-user",
+        origin: "user:sample-user",
         archetype: "default",
         host: "testhost",
         harness: "claude",
@@ -282,7 +282,7 @@ defmodule Tightbeam.ConditionFactsTest do
     assert filed == condition_handler.(call)
 
     assert condition_handler.(%{
-             origin: "user:flynn",
+             origin: "user:sample-user",
              params: %{kind: "escalation-ruled"}
            }).code == "reserved_kind"
   end
@@ -320,7 +320,7 @@ defmodule Tightbeam.ConditionFactsTest do
       ConditionFacts.file(ctx.db, ctx.scheduler, %{
         kind: "tour-given",
         scope: "agent:first:app",
-        origin: "user:flynn"
+        origin: "user:sample-user"
       })
 
     second =
@@ -339,7 +339,7 @@ defmodule Tightbeam.ConditionFactsTest do
                ts: first.ts,
                kind: "tour-given",
                scope: "agent:first:app",
-               origin: "user:flynn"
+               origin: "user:sample-user"
              }
            }
 
@@ -360,7 +360,7 @@ defmodule Tightbeam.ConditionFactsTest do
     ConditionFacts.file(ctx.db, ctx.scheduler, %{
       kind: "build-green",
       scope: "staging",
-      origin: "user:flynn"
+      origin: "user:sample-user"
     })
 
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, wake.wake_id)
@@ -376,7 +376,7 @@ defmodule Tightbeam.ConditionFactsTest do
     ConditionFacts.file(ctx.db, ctx.scheduler, %{
       kind: "release-ready",
       scope: "prod",
-      origin: "user:flynn"
+      origin: "user:sample-user"
     })
 
     assert Wakes.get(ctx.db, first.wake_id).state == "fired"
@@ -542,8 +542,8 @@ defmodule Tightbeam.ConditionFactsTest do
         Org.create(ctx.db, %{
           session_key: "agent:race:#{index}",
           display_name: "Race target #{index}",
-          owner_user_id: "flynn",
-          origin: "user:flynn",
+          owner_user_id: "sample-user",
+          origin: "user:sample-user",
           archetype: "default",
           host: "testhost",
           harness: "claude",
@@ -561,7 +561,10 @@ defmodule Tightbeam.ConditionFactsTest do
         )
 
       fire = Task.async(fn -> Wakes.fire_due(ctx.scheduler) end)
-      retire = Task.async(fn -> Org.retire(ctx.db, target.session_key, "user:flynn", 1_000) end)
+
+      retire =
+        Task.async(fn -> Org.retire(ctx.db, target.session_key, "user:sample-user", 1_000) end)
+
       assert :ok = Task.await(fire)
       assert %{state: "retired"} = Task.await(retire)
 
@@ -779,15 +782,15 @@ defmodule Tightbeam.ConditionFactsTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
+        "INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 0, 'admin_add', 1)"
       )
 
     caller =
       Org.create(ctx.db, %{
         session_key: "agent:creator:app",
         display_name: "Wake creator",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "sample-user",
+        origin: "user:sample-user",
         archetype: "default",
         host: "testhost",
         harness: "claude",
@@ -795,13 +798,13 @@ defmodule Tightbeam.ConditionFactsTest do
         model: Model.new("fable")
       })
 
-    Roles.create!(ctx.db, "creator", "flynn", caller.session_key)
+    Roles.create!(ctx.db, "creator", "sample-user", caller.session_key)
 
     work_item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
         verb: "work-item-create",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:sample-user",
+        principal: {:user, "sample-user"},
         session_key: nil,
         params: %{title: "Wake carrier proof"}
       })
@@ -809,8 +812,8 @@ defmodule Tightbeam.ConditionFactsTest do
     assignment =
       Assignments.__handle__(ctx.db, "assign", %{
         verb: "assign",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:sample-user",
+        principal: {:user, "sample-user"},
         session_key: caller.session_key,
         target_role: nil,
         role_fallback: false,
@@ -827,14 +830,14 @@ defmodule Tightbeam.ConditionFactsTest do
         session_key: caller.session_key,
         role: "user",
         content: "schedule the follow-up",
-        sender: "user:flynn"
+        sender: "user:sample-user"
       })
 
     {:ok, turn_seq} =
       Ledger.enqueue(ctx.db, %{
         session_key: caller.session_key,
         message_id: message.id,
-        origin: "user:flynn",
+        origin: "user:sample-user",
         prompt: "schedule the follow-up",
         assignment_id: assignment.id,
         job_ref: work_item.id

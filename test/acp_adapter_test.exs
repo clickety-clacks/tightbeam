@@ -58,9 +58,9 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "a vendor context variant crosses the adapter seam without loss" do
     {adapter, capture_path} = start_adapter()
 
-    fable_1m = Model.new("claude-fable-5", context: "1m", effort: "high")
+    example_1m = Model.new("claude-fable-5", context: "1m", effort: "high")
 
-    assert :ok = Adapter.apply_model(adapter, "sess-1", fable_1m)
+    assert :ok = Adapter.apply_model(adapter, "sess-1", example_1m)
 
     config = fn id ->
       capture_path
@@ -105,7 +105,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         end
       end)
 
-    # The boot-boundary proof (task #20): a residency call legally queues behind a
+    # The boot-boundary proof: a residency call legally queues behind a
     # slow codex boot, and the 5s DEFAULT GenServer.call budget it replaced would
     # have given up. There is no way to observe "did not give up at 5s" in under
     # 5s, so the wait below is the price of the assertion, not slack.
@@ -162,7 +162,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "haiku":
         return { value, name: "Haiku", description: "Haiku 4.5" };
       case "claude-fable-5[1m]":
-        return { value, name: "Fable", description: "Fable 5 with 1M context" };
+        return { value, name: "Example Model", description: "Example Model 5 with 1M context" };
       default:
         return { value, name: value };
     }
@@ -250,7 +250,7 @@ defmodule Tightbeam.Acp.AdapterTest do
           return send({ id: m.id, error: { code: -32000, message: "Invalid value for config option model" } });
         }
         if (failMode === "model-invalid-params" && m.params.configId === "model") {
-          // Recorded live 2026-07-28: codex-acp's refusal of a model value the
+          // codex-acp refuses a model value the
           // catalog advertised (`gpt-5.1-codex`) — JSON-RPC -32602 Invalid params.
           return send({ id: m.id, error: { code: -32602, message: "Invalid params" } });
         }
@@ -1264,7 +1264,14 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:error,
             {:model_apply_failed, %{"message" => "Invalid value for config option model"}}} =
-             Adapter.load_session(adapter, "sess-1", Model.new("fable"), "/tmp", [], "guidance")
+             Adapter.load_session(
+               adapter,
+               "sess-1",
+               Model.new("fable"),
+               "/tmp",
+               [],
+               "guidance"
+             )
 
     refute Adapter.knows_session?(adapter, "sess-1")
 
@@ -1649,7 +1656,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     db = :"auth_callback_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "sample-user")
     Tightbeam.Archetypes.load!(base)
     Tightbeam.Rails.load!(base)
 
@@ -1755,7 +1762,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     db = :"subagent_callback_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "sample-user")
 
     Tightbeam.Archetypes.load!(base)
     Tightbeam.Rails.load!(base)
@@ -1765,8 +1772,8 @@ defmodule Tightbeam.Acp.AdapterTest do
       Tightbeam.Org.create(db, %{
         session_key: "parent",
         display_name: "parent",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "sample-user",
+        origin: "user:sample-user",
         archetype: "default",
         host: "testhost",
         harness: "codex",
@@ -1780,7 +1787,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       Tightbeam.Ledger.enqueue(db, %{
         session_key: session.session_key,
         message_id: "message-running",
-        origin: "user:flynn",
+        origin: "user:sample-user",
         prompt: "run",
         assignment_id: "assignment-running"
       })
@@ -1864,7 +1871,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     db = :"subagent_failure_db_#{System.unique_integer([:positive])}"
     db_pid = start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "sample-user")
 
     Tightbeam.Archetypes.load!(base)
     Tightbeam.Rails.load!(base)
@@ -1874,8 +1881,8 @@ defmodule Tightbeam.Acp.AdapterTest do
       Tightbeam.Org.create(db, %{
         session_key: "parent",
         display_name: "parent",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "sample-user",
+        origin: "user:sample-user",
         archetype: "default",
         host: "testhost",
         harness: "codex",

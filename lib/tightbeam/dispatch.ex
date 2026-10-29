@@ -36,7 +36,7 @@ defmodule Tightbeam.Dispatch do
   }
 
   @typedoc """
-  A verb call. `origin` is WHO (\"user:flynn\" | \"agent:<handle>\") — never
+  A verb call. `origin` is WHO (\"user:operator\" | \"agent:<handle>\") — never
   trusted from params, always set by the transport from its authenticated
   identity. `session_key` is the TARGET (nil for verbs without one).
   """

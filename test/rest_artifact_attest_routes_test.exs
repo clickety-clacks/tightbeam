@@ -38,12 +38,12 @@ defmodule Tightbeam.RestArtifactAttestRoutesTest do
     {:paired, admin_device} =
       claim_org(db, %{
         device_id: "artifact-attest-admin-device",
-        claimed_name: "Flynn",
+        claimed_name: "sample-user",
         platform: nil,
         model: nil
       })
 
-    creator_session = ensure_main_session(db, "flynn")
+    creator_session = ensure_main_session(db, "sample-user")
     alice = create_user(db, "alice")
     bob = create_user(db, "bob")
     outsider = create_user(db, "outsider")

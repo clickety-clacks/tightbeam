@@ -30,7 +30,7 @@ end)
 
 {:ok, _ref, nil} =
   ConnRegistry.register(Tightbeam.ConnRegistry, %{
-    pid: self(), user_id: "flynn", device_id: "d1", is_admin: true, subscriptions: MapSet.new(["chat"])
+    pid: self(), user_id: "operator", device_id: "d1", is_admin: true, subscriptions: MapSet.new(["chat"])
   })
 
 config = %{
@@ -43,10 +43,10 @@ spawn_fn = Gateway.handlers(config)["spawn"]
 {:ok, [[sessions_before]]} = DB.query(db, "SELECT COUNT(*) FROM sessions")
 
 dead = spawn_fn.(%{
-  origin: "user:flynn", session_key: nil,
+  origin: "user:operator", session_key: nil,
   params: %{display_name: "SmokeDead", handle: "smoke-dead-#{System.unique_integer([:positive])}",
             idempotency_key: "smoke-dead-#{System.unique_integer([:positive])}",
-            model: "claude-fable-5"}   # no effort for a with-efforts model: dead
+            model: "claude-example-5"}   # no effort for a with-efforts model: dead
 })
 
 {:ok, [[sessions_after]]} = DB.query(db, "SELECT COUNT(*) FROM sessions")

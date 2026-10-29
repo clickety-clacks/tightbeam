@@ -349,8 +349,7 @@ defmodule Tightbeam.Gateway do
 
   Returns WHICH harnesses are installed, not merely that one is: the defaults a
   fresh org runs on are derived from what the box actually has, and throwing
-  that away is why a codex-only machine defaulted to claude and claude-sonnet-5
-  (Flynn, 2026-08-04).
+  that away is why a codex-only machine defaulted to claude and claude-sonnet-5.
   """
   @spec preflight(config()) :: {:ok, [atom()]} | {:error, {:no_harness_cli, String.t()}}
   def preflight(config) do
@@ -2669,7 +2668,7 @@ defmodule Tightbeam.Gateway do
   # how to build it.
   defp refusing_wrapper(candidates) do
     # Paths ride inside SINGLE quotes with the only metacharacter a single-quoted
-    # sh string has — the quote itself — escaped. Double quotes left `$()`,
+    # sh string has — the quote itself — escaped. Double quotes left `$`,
     # backticks and `"` live: a hostile-or-merely-odd base_dir path would EXECUTE
     # on invocation instead of reliably reporting and exiting 127.
     quoted = fn path -> "'" <> String.replace(path, "'", "'\\''") <> "'" end
@@ -2759,12 +2758,8 @@ defmodule Tightbeam.Gateway do
 
           {:error, {failed_stage, reason}} ->
             # A FAILED TURN FAILS. It does not freeze the session behind a
-            # ruling. Adjudication — episodes, holds, an escalation ladder, a
-            # `tightbeam adjudicate` verb — was deleted 2026-08-05 (Flynn: "why
-            # is the substrate making a model selection?"), because model choice
-            # is judgment and judgment belongs to inference, not to a substrate
-            # mechanism. The pattern spec said exactly that in its first
-            # paragraph and the implementation contradicted it anyway.
+            # ruling. Model choice is judgment and belongs to inference, not to
+            # a substrate mechanism.
             #
             # The substrate owes three things here and owes nothing else: the
             # truth (a `failed` turn row), the named reason (`turns.error` and
@@ -2813,7 +2808,7 @@ defmodule Tightbeam.Gateway do
             failure_publish = fn _terminal ->
               # THE ERROR MUST REACH THE CHAT. Every failed turn gets the marker
               # now; the adjudication path used to skip it because the brief was
-              # its message, and a failure that lost its brief showed Flynn
+              # its message, and a failure that lost its brief showed the operator
               # "agent progress interrupted" with no reason attached.
               append_turn_failed_marker(db, turn.session_key, error_sentence(public_reason))
 
@@ -3603,7 +3598,7 @@ defmodule Tightbeam.Gateway do
     # out. If the coordinator has not yet processed that :DOWN — or the record
     # belongs to a PREVIOUS attempt — we get nil and report the generic reason.
     # Mislabelling a new death with its predecessor's reason would be worse than
-    # saying less (cross-review F4).
+    # saying less.
     reason =
       case AdapterCoordinator.last_failure(coordinator, key, generation) do
         nil -> "adapter is not running"
@@ -5077,7 +5072,7 @@ defmodule Tightbeam.Gateway do
           |> Enum.filter(&MapSet.member?(keys, &1.session_key))
           |> Enum.map(&inspect_wake(db, &1, principal))
 
-        # F9 (Sol xhigh review): the sanctioned discovery path for a digest
+        # : the sanctioned discovery path for a digest
         # carrier's OWN wake id, surviving a cross-harness barrier that hides
         # the delivered digest message which would ordinarily carry it.
         # `wakes` above is scoped to PENDING work and a delivered carrier is
@@ -6003,7 +5998,7 @@ defmodule Tightbeam.Gateway do
     %{stream: db |> Org.get(session_key) |> Payloads.stream_session(), session_key: session_key}
   end
 
-  # THE CLOSED PARAMETER SURFACE FOR TUNE (F6, Sol xhigh review). The CLI's own
+  # THE CLOSED PARAMETER SURFACE FOR TUNE . The CLI's own
   # `tune` flag set is closed (cli/src/args.rs `ALLOWED`) so a caller who
   # mistypes `--modle` learns immediately rather than switching a session to a
   # destination default it never asked for. Raw `/agent/dispatch` has no such
@@ -6058,7 +6053,7 @@ defmodule Tightbeam.Gateway do
   defp tune_dispatch(config, db, call, p) do
     cond do
       p[:setting] == "rename" and is_binary(p[:display_name]) ->
-        # F3 (Sol xhigh review): every tune mutation passes the same
+        # : every tune mutation passes the same
         # owner-or-admin gate `set_harness`/`set_model` already do. This was
         # the pre-existing hole a role-token caller could drive with its own
         # `sessionKey` swapped for a victim's — legacy since before this
@@ -6165,7 +6160,7 @@ defmodule Tightbeam.Gateway do
           {:ok, session} ->
             # A RELATIVE election: new_ref is DERIVED from the snapshot's
             # model, so the snapshot model is part of the election and must
-            # still hold at commit (Sol round 4, blocking). set_model is
+            # still hold at commit . set_model is
             # absolute -- the caller named their target -- so it passes no
             # basis and tolerates concurrent effort tweaks.
             new_ref = %{session.model | effort: p.reasoningLevel}
@@ -6287,7 +6282,7 @@ defmodule Tightbeam.Gateway do
   defp repair_tune_authorized?(_db, _call, _session), do: false
 
   # THE CALLER'S IDENTITY IS WHAT THE ROUTER ALREADY PROVED, not a fresh
-  # re-resolution of `call.origin`'s role name (F8, Sol xhigh review). A role
+  # re-resolution of `call.origin`'s role name . A role
   # can be REBOUND to a different session between the router's authentication
   # and this check; `resolve_caller/2` re-reading `"agent:<role>"` at THIS
   # moment would authorize whoever holds the role NOW for a request the
@@ -6436,7 +6431,7 @@ defmodule Tightbeam.Gateway do
   # this request's validation and its commit (a concurrent tune or set_host won
   # the race). Nothing was applied and nothing was re-derived on the caller's
   # behalf: re-run the command so the election happens against the session as
-  # it now is (Sol round 2, blocking 1/3).
+  # it now is .
   defp stale_election_error do
     %{
       ok: false,
@@ -6454,7 +6449,7 @@ defmodule Tightbeam.Gateway do
   # to the newly selected model. A brand-new session carries no risk of
   # silently discarding a caller's OWN prior election, which is the harm
   # `compose_tune_model_selection/3` below exists to prevent — that function,
-  # not this one, is TUNE's (Sol xhigh review, live-switch finding 2; scoped
+  # not this one, is TUNE's (; scoped
   # here to the verb the finding's scenarios and diff actually cover).
   defp compose_model_selection(host, harness, current, %Model{effort: nil} = selected) do
     case efforts_for(host, harness, selected) do
@@ -6499,7 +6494,7 @@ defmodule Tightbeam.Gateway do
   # `--context` qualifies a model, so a context with no model to qualify gets
   # the more specific refusal instead of the generic "you must name a model".
   # FIELDS ARE NEVER PACKED ACROSS THE ENGINE BOUNDARY, and the server owns
-  # that contract — not the CLI (Sol round 2, important 5). Raw-dispatch and
+  # that contract — not the CLI . Raw-dispatch and
   # device callers reach the gateway directly, and a packed ref like
   # "model[effort]" or the vendor "[1m]" would smuggle an effort or context
   # election past the typed fields on a cross-harness switch. Scoped to
@@ -6559,7 +6554,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # F6 (Sol xhigh review): a malformed field is a DIFFERENT fact than an
+  # : a malformed field is a DIFFERENT fact than an
   # absent one, and must be named as what it is rather than falling through
   # to `model_required`/`context_requires_model` and reading as a caller who
   # simply named nothing.
@@ -6637,7 +6632,7 @@ defmodule Tightbeam.Gateway do
        ) do
     deliver_opts = if config[:sh], do: [sh: config.sh], else: []
 
-    # THE SERIALIZATION DOMAIN (Sol xhigh review, live-switch findings 1/4/5).
+    # THE SERIALIZATION DOMAIN (/5).
     # The fresh same-harness check, the pending-turn count, the engine swap,
     # the history barrier, and its tombstone are ONE transaction — not five
     # separate calls to the single-writer `DB` owner. `DB` processes one
@@ -6650,7 +6645,7 @@ defmodule Tightbeam.Gateway do
     # `tunable_session` returned before the lane was ever taken — is what
     # lets a second, concurrent, identical swap see the FIRST swap's result
     # and refuse `same_harness` instead of performing a same-harness no-op
-    # that still moves the barrier and appends a false tombstone (finding 5).
+    # that still moves the barrier and appends a false tombstone .
     #
     # History barrier (product ruling): a new engine gets a fresh visible
     # slate. Rows are RETAINED (never deleted) but replay stops at the
@@ -6675,7 +6670,7 @@ defmodule Tightbeam.Gateway do
           fresh.harness == harness ->
             {:refused, :same_harness}
 
-          # THE ELECTION'S SNAPSHOT MUST STILL HOLD (Sol round 2, blocking 3).
+          # THE ELECTION'S SNAPSHOT MUST STILL HOLD .
           # Everything decided before this transaction — credential preflight,
           # catalog resolution, Spinup.ensure_ready, the home pin — was decided
           # against `session.host`. The transaction serializes WRITES, but it
@@ -6774,7 +6769,7 @@ defmodule Tightbeam.Gateway do
         # pre-lane snapshot) sees that and refuses by the same name a
         # sequential same-harness request gets, rather than performing a
         # same-harness no-op that still moves the barrier and appends a
-        # false tombstone (finding 5).
+        # false tombstone .
         distinct_harness_error(harness)
 
       {:ok, {:refused, :not_found}} ->
@@ -6902,7 +6897,7 @@ defmodule Tightbeam.Gateway do
       # the record to correct. It still earns its marker, on the same rule as
       # the resident path: the session's model changed, and the transcript is
       # where an agent reads that it did. ONE transaction for both, same as
-      # the resident branch (Sol round 2, important 6): a set_model that
+      # the resident branch : a set_model that
       # commits without its marker is the silent substitution the marker
       # exists to prevent, and a crash between two separate writes produced
       # exactly that. The same transaction also holds the stale-election
@@ -7062,7 +7057,7 @@ defmodule Tightbeam.Gateway do
   # A RELATIVE election (set_reasoning derives its target from the snapshot's
   # model) carries that model as its BASIS: if the recorded family or context
   # no longer matches it at commit, the derivation is stale and committing it
-  # would silently revert a concurrent set_model (Sol round 4, blocking).
+  # would silently revert a concurrent set_model .
   # Effort is excluded on purpose -- concurrent effort-only changes are
   # last-writer-wins, and comparing it would refuse legitimate races.
   defp stale_basis?(nil, _record_model), do: false
@@ -7100,7 +7095,7 @@ defmodule Tightbeam.Gateway do
         {record_model, record_harness, record_host} =
           read_recorded_model(txn, session.session_key)
 
-        # THE ELECTION'S SNAPSHOT MUST STILL HOLD (Sol rounds 2-3). BOTH axes:
+        # THE ELECTION'S SNAPSHOT MUST STILL HOLD . BOTH axes:
         # this model was validated against `session.harness`'s catalog ON
         # `session.host`, and the fork was built with that host's placement,
         # guidance and cwd. A harness switch OR a set_host committing in
@@ -7796,7 +7791,7 @@ defmodule Tightbeam.Gateway do
   end
 
   # PIN THE PAST, NEVER READ THE PRESENT (specs roles-registry-v1.md:31 —
-  # Sol xhigh review round 2, finding: a LIVE `Roles.get/2` at read time
+  # : a LIVE `Roles.get/2` at read time
   # bound audit authority to a deletable, name-reusable row. After
   # `role-rm`, `Roles.get/2` returns nil and denied EVERYONE, admin
   # included; after delete-then-recreate under a different owner, the same
@@ -7829,7 +7824,7 @@ defmodule Tightbeam.Gateway do
   # reached): the deny-on-nil case never precedes the admin check.
   #
   # `URI.decode_www_form/1` reverses `Wakes`'s `pinned_owner_field/1`
-  # (Sol xhigh review round 3): the raw text was LOSSY for a user id
+  # : the raw text was LOSSY for a user id
   # containing a space — "alice bob" pinned and captured back by `\S+` as
   # bare "alice" would transfer the OLD carrier's audit to a real user named
   # "alice." Decoding here is what makes the round trip exact regardless of
@@ -8755,8 +8750,8 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # THE INDICATOR IS DERIVED, NEVER NARRATED (Flynn's rule, 2026-08-04: "once a
-  # message of any type is delivered and there are no more pending messages, that
+  # THE INDICATOR IS DERIVED, NEVER NARRATED: once a message of any type is
+  # delivered and there are no more pending messages, that
   # typing indicator should be cleared"). One deterministic fact decides it — does
   # this session have a turn in 'queued' or 'running'? — read from the ledger, the
   # single-writer table every transition already funnels through. Every emission

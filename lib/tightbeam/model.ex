@@ -6,8 +6,8 @@ defmodule Tightbeam.Model do
 
   The fields answer different questions and are never packed into one slot:
 
-    * `family` — which model, the vendor's undecorated name (`claude-fable-5`,
-      `gpt-5.6-sol`).
+    * `family` — which model, the vendor's undecorated name (`claude-example-5`,
+      `gpt-5.6-example`).
     * `context` — the vendor's context-window variant when it offers more than
       one (`1m`). `nil` is the model's default window.
     * `effort` — reasoning level, TIGHTBEAM's vocabulary (`low`…`max`). `nil`
@@ -38,8 +38,8 @@ defmodule Tightbeam.Model do
   @doc """
   Build an identity from a family and optional `:effort` / `:context`.
 
-      iex> Tightbeam.Model.new("gpt-5.6-sol", effort: "medium")
-      %Tightbeam.Model{family: "gpt-5.6-sol", effort: "medium", context: nil}
+      iex> Tightbeam.Model.new("gpt-5.6-example", effort: "medium")
+      %Tightbeam.Model{family: "gpt-5.6-example", effort: "medium", context: nil}
   """
   @spec new(String.t(), keyword()) :: t()
   def new(family, opts \\ []) when is_binary(family) do
@@ -54,11 +54,11 @@ defmodule Tightbeam.Model do
   Parse a vendor identifier into family and context. Effort is never read from
   a vendor identifier — the bracket is the vendor's context variant.
 
-      iex> Tightbeam.Model.parse_ref("claude-fable-5[1m]")
-      %Tightbeam.Model{family: "claude-fable-5", effort: nil, context: "1m"}
+      iex> Tightbeam.Model.parse_ref("claude-example-5[1m]")
+      %Tightbeam.Model{family: "claude-example-5", effort: nil, context: "1m"}
 
-      iex> Tightbeam.Model.parse_ref("gpt-5.6-sol")
-      %Tightbeam.Model{family: "gpt-5.6-sol", effort: nil, context: nil}
+      iex> Tightbeam.Model.parse_ref("gpt-5.6-example")
+      %Tightbeam.Model{family: "gpt-5.6-example", effort: nil, context: nil}
   """
   @spec parse_ref(String.t()) :: t()
   def parse_ref(ref) when is_binary(ref) do
@@ -72,8 +72,8 @@ defmodule Tightbeam.Model do
   Render the vendor identifier: family, plus the context variant when there is
   one. Effort is NOT rendered here — it crosses as its own field.
 
-      iex> Tightbeam.Model.to_ref(Tightbeam.Model.new("claude-fable-5", context: "1m", effort: "high"))
-      "claude-fable-5[1m]"
+      iex> Tightbeam.Model.to_ref(Tightbeam.Model.new("claude-example-5", context: "1m", effort: "high"))
+      "claude-example-5[1m]"
   """
   @spec to_ref(t()) :: String.t()
   def to_ref(%__MODULE__{family: family, context: nil}), do: family
@@ -84,8 +84,8 @@ defmodule Tightbeam.Model do
   agent (failure records, tombstones). Unambiguous on purpose: nothing here
   is parsed back.
 
-      iex> Tightbeam.Model.describe(Tightbeam.Model.new("claude-fable-5", context: "1m", effort: "high"))
-      "claude-fable-5 (context 1m, effort high)"
+      iex> Tightbeam.Model.describe(Tightbeam.Model.new("claude-example-5", context: "1m", effort: "high"))
+      "claude-example-5 (context 1m, effort high)"
   """
   @spec describe(t() | nil) :: String.t()
   def describe(nil), do: "unknown"

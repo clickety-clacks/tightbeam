@@ -1,6 +1,6 @@
 defmodule Tightbeam.AttentionTierTest do
   @moduledoc """
-  Proofs for the assistant attention tier (Flynn, 2026-07-26).
+  Proofs for the assistant attention tier.
 
   TWO tiers, agent-elected: normal (0, what electing nothing gives) and high (1).
   The substrate derives nothing and decides no presentation — it stamps the
@@ -118,7 +118,7 @@ defmodule Tightbeam.AttentionTierTest do
     {:paired, _device} =
       claim_org(db, %{
         device_id: "attention-device",
-        claimed_name: "flynn",
+        claimed_name: "sample-user",
         platform: nil,
         model: nil
       })
@@ -126,8 +126,8 @@ defmodule Tightbeam.AttentionTierTest do
     Org.create(db, %{
       session_key: "k1",
       display_name: "Main",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -207,8 +207,8 @@ defmodule Tightbeam.AttentionTierTest do
     Org.create(ctx.db, %{
       session_key: "k2",
       display_name: "Other",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -221,7 +221,7 @@ defmodule Tightbeam.AttentionTierTest do
     # newest turn" instead of THIS turn would stamp k1's reply from k2's election.
     interfere = fn ->
       assert :appended =
-               Gateway.deliver_prompt("k2", "user:flynn", "other session work",
+               Gateway.deliver_prompt("k2", "user:sample-user", "other session work",
                  db: ctx.db,
                  client_message_id: "c_other_#{System.unique_integer([:positive])}"
                )
@@ -258,7 +258,7 @@ defmodule Tightbeam.AttentionTierTest do
     # `post` is the only client path that creates a message from client input, and
     # it forwards a fixed set of params; the tier is not among them.
     assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "hello",
+             Gateway.deliver_prompt("k1", "user:sample-user", "hello",
                db: ctx.db,
                client_message_id: "c_forge",
                attention_tier: 1
@@ -288,7 +288,7 @@ defmodule Tightbeam.AttentionTierTest do
     assert %{code: "no_running_turn"} =
              handlers["attend"].(%{
                verb: "attend",
-               origin: "user:flynn",
+               origin: "user:sample-user",
                principal: {:session, "k1"},
                session_key: nil,
                params: %{high: true}
@@ -297,7 +297,7 @@ defmodule Tightbeam.AttentionTierTest do
     # A QUEUED turn is not yet yours to elect on: the predicate is `running`, not
     # "any turn of mine".
     assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "not started yet",
+             Gateway.deliver_prompt("k1", "user:sample-user", "not started yet",
                db: ctx.db,
                client_message_id: "c_queued"
              )
@@ -315,15 +315,15 @@ defmodule Tightbeam.AttentionTierTest do
     assert %{code: "invalid"} =
              handlers["attend"].(%{
                verb: "attend",
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
+               origin: "user:sample-user",
+               principal: {:user, "sample-user"},
                session_key: nil,
                params: %{high: true}
              })
 
     # With a running turn, the election lands on THAT turn.
     assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "queued work",
+             Gateway.deliver_prompt("k1", "user:sample-user", "queued work",
                db: ctx.db,
                client_message_id: "c_running"
              )
@@ -390,7 +390,7 @@ defmodule Tightbeam.AttentionTierTest do
     client_message_id = "c_#{System.unique_integer([:positive])}"
 
     assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", prompt,
+             Gateway.deliver_prompt("k1", "user:sample-user", prompt,
                db: ctx.db,
                client_message_id: client_message_id
              )

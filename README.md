@@ -304,18 +304,6 @@ runtime. Cleanup is conditional: keep intentional pins that the target supports.
    its conversation continues. Record the results before calling the upgrade
    successful. This checklist is not proof that an untested release works.
 
-**Recorded upgrade example (2026-09-05):** A host's Codex overlay was saved
-with reported runtime version `0.153.2` and SHA-256
-`f8786262ebc0fa1337448a2977332beadec66c8d0cda0ce973c7849766d7943c`.
-The prior overlay was absent. The saved override was not activated, and no
-production restart occurred. Its path points into the package-managed
-`@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex`
-tree. For a 0.1.9 upgrade, review this override using the steps above: remove
-it only if obsolete, retain it if intentional and compatible, and verify
-the effective version and hash after activation. This record does not prove
-0.1.9 compatibility. A separate disposable gateway's partial test results
-do not establish production activation or complete gateway verification.
-
 If verification fails, stop the rollout. Restore each changed overlay to its
 recorded value with `tightbeam host-env-set --host <host> --harness <harness>
 'NAME=previous-value' --as-user <adminUserId>`. Restore the prior service
@@ -519,8 +507,7 @@ reboot. An install that leaves you with a foreground process is not finished.
 hand the remaining commands to a person; it cannot complete the install alone.
 Say so plainly rather than substituting a foreground workaround.
 
-**What skipping it actually costs**, measured on a production host that ran
-foreground in tmux for a day (2026-08-05):
+**What skipping it actually costs:**
 
 - the machine rebooted and the gateway did not come back — every client sat
   timing out until someone noticed and started it by hand;

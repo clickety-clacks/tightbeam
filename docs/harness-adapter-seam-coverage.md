@@ -1,11 +1,10 @@
 # Harness adapter seam coverage
 
-Source of truth: `harness-adapter-seam-v1.md`, READY r10. Baseline:
-`5ae730c8a32ca423b6107525a25fc438c605aa5d`.
+Source of truth: `harness-adapter-seam-v1.md`.
 
-This is the implementation checklist re-derived from this worktree before any
-production edit. Line numbers describe the baseline and intentionally drift as
-the sites move. A grouped row covers every named line in that group.
+This is the implementation checklist re-derived from its source snapshot. Line
+numbers refer to that snapshot and intentionally drift as the sites move. A
+grouped row covers every named line in that group.
 
 ## Scan
 
@@ -99,8 +98,8 @@ closed world. The specifically closed-world subjects are:
 | Site | Classification | Required reconciliation |
 |---|---|---|
 | `test/archetypes_test.exs:180-184` (spec's former `:562` anchor) | test oracle with exact two-name message | expected valid-name text derives from registry while still rejecting the bad value |
-| `test/gateway_test.exs` model-inference probe (spec's former `:638` anchor) | test oracle with two-clause probe | registry-driven zero/one/multiple probe including fixture |
-| doctor test in `test/mix_tasks_test.exs` (spec's former `tightbeam_doctor_test.exs:29` anchor) | test oracle with two-inventory catalog | registry-driven inventory including fixture |
+| `test/gateway_test.exs` model-inference probe | test oracle with two-clause probe | registry-driven zero/one/multiple probe including fixture |
+| doctor test in `test/mix_tasks_test.exs` | test oracle with two-inventory catalog | registry-driven inventory including fixture |
 | `test/model_catalog_test.exs`, `test/spinup_test.exs`, `test/placement_test.exs`, `test/homes_test.exs`, `test/acp_adapter_test.exs`, `test/subagent_markers_test.exs` | parity oracles | retain subjects and add the spec's seam/parity cases |
 | `docs/**`, `priv/**`, `scripts/**`, test fixtures | docs/fixture carve-out | no production dispatch; names may remain as examples/oracles |
 

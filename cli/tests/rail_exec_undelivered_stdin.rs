@@ -5,7 +5,7 @@
 //! When the script never received its input, the wrapper used to print that exact line
 //! with a made-up `1` in it, so a check that judged nothing was recorded as a script
 //! that failed. This asserts the real binary's real bytes: the parsed line appears only
-//! when a child exit was actually observed (task #43).
+//! when a child exit was actually observed.
 
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;

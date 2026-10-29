@@ -853,7 +853,7 @@ defmodule Tightbeam.Ledger do
   read inside the SAME transaction that goes on to perform the swap+barrier
   closes that gap: no other write (`deliver_prompt`'s echo+enqueue included)
   can land between this read and the writes that follow it, because none can
-  run until this transaction commits (Sol xhigh review, live-switch finding 1).
+  run until this transaction commits.
   """
   @spec pending_count_in_txn(Txn.t(), String.t()) :: non_neg_integer()
   def pending_count_in_txn(%Txn{} = txn, session_key) do

@@ -246,7 +246,7 @@ defmodule Tightbeam.ClientE2ETest do
     test "REGRESSION: a stale clear cannot vouch for an indicator left ON" do
       # false → true → reply. The old oracle matched the leading `false` as
       # "cleared" and started its lingering check after the final `true`, so it
-      # passed with the indicator active. This is the bug the cross-review found.
+      # passed with the indicator active. This is the regression this test guards.
       frames = [echo("c_1"), typing(false), typing(true), reply("c_1")]
 
       assert oracle(frames) =~ "left ON"
@@ -406,7 +406,7 @@ defmodule Tightbeam.ClientE2ETest do
       sequential = [%{"a" => 1}, %{}, %{"b" => 1}]
       together = [%{"a" => 1}, %{"a" => 1, "b" => 1}, %{"b" => 1}]
 
-      # This is the laundering the cross-review found: per-session maxima are
+      # This is the attribution error this test guards: per-session maxima are
       # 1 and 1 in BOTH lists, so a maxima-based witness calls sequential
       # execution concurrent.
       refute Substrate.simultaneous?(sequential, ["a", "b"])
@@ -1561,7 +1561,7 @@ defmodule Tightbeam.ClientE2ETest do
   describe "the client's session-status decode contract" do
     test "a full payload has no gaps" do
       assert Journeys.decode_contract_gaps(%{
-               "sessionKey" => "agent:main:user:flynn",
+               "sessionKey" => "agent:main:user:sample-user",
                "display" => %{"model" => "fable"},
                "run" => %{"state" => "idle"},
                "capabilities" => %{}
@@ -1570,7 +1570,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "each field the Swift decoder requires is reported by name when missing" do
       full = %{
-        "sessionKey" => "agent:main:user:flynn",
+        "sessionKey" => "agent:main:user:sample-user",
         "display" => %{"model" => "fable"},
         "run" => %{"state" => "idle"},
         "capabilities" => %{}
@@ -1784,7 +1784,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "J0 passes: the wire pairs, authenticates, seeds Main and syncs", ctx do
       {:ok, %{token: token}} =
-        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "Flynn")
+        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "sample-user")
 
       {:ok, client} = SimClient.connect("127.0.0.1", ctx.port, token, device_id: "sim-j0")
 
@@ -1804,7 +1804,10 @@ defmodule Tightbeam.ClientE2ETest do
 
     test "posting with a malformed id is refused on the wire, not silently dropped", ctx do
       {:ok, %{token: token}} =
-        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-bad-id", claimed_name: "Flynn")
+        SimClient.pair("127.0.0.1", ctx.port,
+          device_id: "sim-bad-id",
+          claimed_name: "sample-user"
+        )
 
       {:ok, client} = SimClient.connect("127.0.0.1", ctx.port, token, device_id: "sim-bad-id")
       watermark = SimClient.mark(client)

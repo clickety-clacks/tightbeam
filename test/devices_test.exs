@@ -25,14 +25,14 @@ defmodule Tightbeam.DevicesTest do
   end
 
   test "first user bootstraps as admin and re-pair rotates the token", %{db: db} do
-    assert {:paired, first} = pair(db, "dev-1", "Flynn iPhone")
-    assert first.user_id == "flynn-iphone"
+    assert {:paired, first} = pair(db, "dev-1", "Sample User iPhone")
+    assert first.user_id == "sample-user-iphone"
     assert first.is_admin
     assert first.status == "allowlisted"
     assert first.token =~ ~r/^tbt_[A-Za-z0-9_-]{32}$/
-    assert Devices.user(db, "flynn-iphone").is_admin
+    assert Devices.user(db, "sample-user-iphone").is_admin
 
-    assert {:paired, second} = pair(db, "dev-1", "Flynn iPhone")
+    assert {:paired, second} = pair(db, "dev-1", "Sample User iPhone")
     refute second.token == first.token
     assert Devices.by_token(db, first.token) == nil
     assert Devices.by_token(db, second.token).device_id == "dev-1"
@@ -77,11 +77,11 @@ defmodule Tightbeam.DevicesTest do
   end
 
   test "admin follows the user and unknown mutations raise", %{db: db} do
-    assert {:paired, _} = pair(db, "phone-1", "Flynn")
-    assert {:pending, _} = pair(db, "phone-2", "Flynn")
+    assert {:paired, _} = pair(db, "phone-1", "Sample User")
+    assert {:pending, _} = pair(db, "phone-2", "Sample User")
     assert Devices.approve(db, "phone-2").is_admin
 
-    refute Devices.set_user_admin(db, "flynn", false).is_admin
+    refute Devices.set_user_admin(db, "sample-user", false).is_admin
     refute Devices.by_id(db, "phone-1").is_admin
 
     assert_raise ArgumentError, "unknown device: missing", fn -> Devices.revoke(db, "missing") end

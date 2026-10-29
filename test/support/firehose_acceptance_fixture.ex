@@ -60,7 +60,7 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
       {:paired, device} =
         Tightbeam.TestCase.claim_org(db, %{
           device_id: "firehose-acceptance-#{id}",
-          claimed_name: "Flynn",
+          claimed_name: "Sample User",
           platform: nil,
           model: nil
         })

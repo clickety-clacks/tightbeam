@@ -5,11 +5,8 @@ defmodule Tightbeam.AdapterPatchModeTest do
 
   alias Tightbeam.Harness.AdapterPatch
 
-  # Regression: ensure! once hardcoded chmod 0o644 on the patched bundle. npm marks
-  # bin-target bundles executable and node_modules/.bin symlinks exec them directly,
-  # so the stripped x-bit broke every codex adapter spawn with Permission denied
-  # (found live on the codex smoke leg, 2026-07-25). The write must preserve the
-  # bundle's own mode.
+  # Regression: ensure! must preserve an executable bit on bin-target bundles,
+  # because npm symlinks execute those bundles directly.
   test "ensure! preserves the executable bit on a patched bin-target bundle" do
     root = Path.join(System.tmp_dir!(), "tb-patch-mode-#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf!(root) end)

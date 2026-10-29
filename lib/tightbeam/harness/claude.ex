@@ -84,18 +84,9 @@ defmodule Tightbeam.Harness.Claude do
   # set_config_option (-32602 for `gpt-5.1-codex`) while accepting codex-native
   # slugs (`gpt-5.6-sol` ran a real turn). Codex's api-key catalog now carries
   # its own `@adapter_selectable_models` guard on this precedent.
-  # RE-MEASURED 2026-08-05 on a production host (claude CLI 2.1.221, the production grant):
-  # `claude -p --model claude-fable-5` answered a real prompt — the 2026-07-26
-  # REJECTED row for fable was one environment's snapshot, not a property of the
-  # account or the CLI (Flynn was literally talking to Fable while this table
-  # said his account could not). The offered list is environment-dependent
-  # across homes; the projected-home model pin is what
-  # makes it deterministic. Keep re-probing per the note above before trusting
-  # any row here, in either direction.
-  # RE-MEASURED 2026-08-06 on a production host (adapter 0.59.0, the production grant):
-  # a pin-probe home (settings.json model=claude-opus-5) OFFERED and ACCEPTED
-  # claude-opus-5, and a live prompt through the production adapter+credential
-  # answered as Opus 5 — the 2026-07-26 REJECTED row for opus-5 was, like
+  # The offered list is environment-dependent across homes; the projected-home
+  # model pin is what makes it deterministic. Keep re-probing per the note above
+  # before trusting any row here, in either direction.
   # fable's, one environment's snapshot ("refused on this grant" measured a
   # default-pin vocabulary, not the grant; the operator's own picker offered
   # Opus 5 all along). Same lesson, second occurrence: re-probe from a second

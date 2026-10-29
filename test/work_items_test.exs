@@ -25,12 +25,12 @@ defmodule Tightbeam.WorkItemsTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1)"
       )
 
-    Enum.each(~w(flynn other), &ensure_main_session(db, &1))
+    Enum.each(~w(sample-user other), &ensure_main_session(db, &1))
 
-    holder = session(db, "holder", "flynn")
+    holder = session(db, "holder", "sample-user")
     other = session(db, "other-holder", "other")
     handlers = Gateway.handlers(%{db: db})
     Rules.load!(System.tmp_dir!(), Map.keys(handlers))
@@ -45,13 +45,13 @@ defmodule Tightbeam.WorkItemsTest do
       "INSERT INTO work_items (id, title, specRefName, specRefSha256, ownerUserId, state, createdByUser, createdBySession, createdAt) VALUES "
 
     for values <- [
-          "('wi_none','x',NULL,NULL,'flynn','open',NULL,NULL,1)",
-          "('wi_both','x',NULL,NULL,'flynn','open','flynn','holder',1)",
-          "('wi_name','x','spec',NULL,'flynn','open','flynn',NULL,1)",
-          "('wi_sha','x',NULL,'#{@sha}','flynn','open','flynn',NULL,1)",
-          "('wi_blank','   ',NULL,NULL,'flynn','open','flynn',NULL,1)",
-          "('wi_upper','x','spec','#{String.upcase(@sha)}','flynn','open','flynn',NULL,1)",
-          "('wi_state','x',NULL,NULL,'flynn','bogus','flynn',NULL,1)"
+          "('wi_none','x',NULL,NULL,'sample-user','open',NULL,NULL,1)",
+          "('wi_both','x',NULL,NULL,'sample-user','open','sample-user','holder',1)",
+          "('wi_name','x','spec',NULL,'sample-user','open','sample-user',NULL,1)",
+          "('wi_sha','x',NULL,'#{@sha}','sample-user','open','sample-user',NULL,1)",
+          "('wi_blank','   ',NULL,NULL,'sample-user','open','sample-user',NULL,1)",
+          "('wi_upper','x','spec','#{String.upcase(@sha)}','sample-user','open','sample-user',NULL,1)",
+          "('wi_state','x',NULL,NULL,'sample-user','bogus','sample-user',NULL,1)"
         ] do
       assert {:error, %DB.Error{message: message}} = DB.query(db, base <> values)
       assert message =~ "CHECK constraint"
@@ -61,7 +61,7 @@ defmodule Tightbeam.WorkItemsTest do
     assert {:error, %DB.Error{message: null_message}} =
              DB.query(
                db,
-               "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_noowner','x',NULL,'flynn',1)"
+               "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_noowner','x',NULL,'sample-user',1)"
              )
 
     assert null_message =~ "NOT NULL constraint failed: work_items.ownerUserId"
@@ -123,7 +123,7 @@ defmodule Tightbeam.WorkItemsTest do
     assert %{code: "principal_required"} = create(ctx, nil, %{title: "x"})
 
     for title <- [nil, " ", String.duplicate("x", 2001)] do
-      assert %{code: "invalid_title"} = create(ctx, {:user, "flynn"}, %{title: title})
+      assert %{code: "invalid_title"} = create(ctx, {:user, "sample-user"}, %{title: title})
     end
 
     for params <- [
@@ -135,19 +135,19 @@ defmodule Tightbeam.WorkItemsTest do
           %{title: "x", spec_ref_name: "spec", spec_ref_sha256: "abc"},
           %{title: "x", spec_ref_name: "spec", spec_ref_sha256: String.duplicate("g", 64)}
         ] do
-      assert %{code: "invalid_spec_ref"} = create(ctx, {:user, "flynn"}, params)
+      assert %{code: "invalid_spec_ref"} = create(ctx, {:user, "sample-user"}, params)
     end
 
-    user = create(ctx, {:user, "flynn"}, %{title: "User item"})
+    user = create(ctx, {:user, "sample-user"}, %{title: "User item"})
     assert String.starts_with?(user.id, "wi_")
-    assert user.createdByUser == "flynn"
+    assert user.createdByUser == "sample-user"
     assert user.createdBySession == nil
     assert user.specRefName == nil
     assert user.specRefSha256 == nil
     refute user.isBug
 
     assert %{code: "invalid_is_bug"} =
-             create(ctx, {:user, "flynn"}, %{title: "Invalid bug", is_bug: "yes"})
+             create(ctx, {:user, "sample-user"}, %{title: "Invalid bug", is_bug: "yes"})
 
     session =
       create(ctx, {:session, "holder"}, %{
@@ -165,12 +165,12 @@ defmodule Tightbeam.WorkItemsTest do
 
     assert user.priority == 4
 
-    explicit = create(ctx, {:user, "flynn"}, %{title: "Urgent", priority: 7})
+    explicit = create(ctx, {:user, "sample-user"}, %{title: "Urgent", priority: 7})
     assert explicit.priority == 7
 
     for invalid <- [-1, 9, "4"] do
       assert %{code: "invalid_priority"} =
-               create(ctx, {:user, "flynn"}, %{title: "Invalid priority", priority: invalid})
+               create(ctx, {:user, "sample-user"}, %{title: "Invalid priority", priority: invalid})
     end
   end
 
@@ -217,30 +217,32 @@ defmodule Tightbeam.WorkItemsTest do
   test "update implements the complete PATCH matrix", ctx do
     assert %{code: "process_denied"} = update(ctx, {:process, "cron"}, "missing", %{})
     assert %{code: "principal_required"} = update(ctx, nil, "missing", %{})
-    assert %{code: "unknown_work_item"} = update(ctx, {:user, "flynn"}, "missing", %{})
+    assert %{code: "unknown_work_item"} = update(ctx, {:user, "sample-user"}, "missing", %{})
 
-    unpinned = create(ctx, {:user, "flynn"}, %{title: "Original"})
-    assert %{code: "invalid_title"} = update(ctx, {:user, "flynn"}, unpinned.id, %{title: " "})
+    unpinned = create(ctx, {:user, "sample-user"}, %{title: "Original"})
+
+    assert %{code: "invalid_title"} =
+             update(ctx, {:user, "sample-user"}, unpinned.id, %{title: " "})
 
     assert %{code: "invalid_spec_ref"} =
-             update(ctx, {:user, "flynn"}, unpinned.id, %{spec_ref_name: "spec.md"})
+             update(ctx, {:user, "sample-user"}, unpinned.id, %{spec_ref_name: "spec.md"})
 
     assert %{code: "invalid_spec_ref"} =
-             update(ctx, {:user, "flynn"}, unpinned.id, %{spec_ref_sha256: @sha})
+             update(ctx, {:user, "sample-user"}, unpinned.id, %{spec_ref_sha256: @sha})
 
-    noop = update(ctx, {:user, "flynn"}, unpinned.id, %{})
+    noop = update(ctx, {:user, "sample-user"}, unpinned.id, %{})
     assert noop == unpinned
-    assert update(ctx, {:user, "flynn"}, unpinned.id, %{}) == noop
+    assert update(ctx, {:user, "sample-user"}, unpinned.id, %{}) == noop
 
     assert %{code: "invalid_is_bug"} =
-             update(ctx, {:user, "flynn"}, unpinned.id, %{is_bug: nil})
+             update(ctx, {:user, "sample-user"}, unpinned.id, %{is_bug: nil})
 
-    bug = update(ctx, {:user, "flynn"}, unpinned.id, %{is_bug: true})
+    bug = update(ctx, {:user, "sample-user"}, unpinned.id, %{is_bug: true})
     assert bug.isBug
-    refute update(ctx, {:user, "flynn"}, unpinned.id, %{is_bug: false}).isBug
+    refute update(ctx, {:user, "sample-user"}, unpinned.id, %{is_bug: false}).isBug
 
     pinned =
-      update(ctx, {:user, "flynn"}, unpinned.id, %{
+      update(ctx, {:user, "sample-user"}, unpinned.id, %{
         spec_ref_name: "spec.md",
         spec_ref_sha256: @sha
       })
@@ -249,27 +251,27 @@ defmodule Tightbeam.WorkItemsTest do
     assert pinned.specRefName == "spec.md"
     assert pinned.specRefSha256 == @sha
 
-    repinned = update(ctx, {:user, "flynn"}, pinned.id, %{spec_ref_sha256: @sha2})
+    repinned = update(ctx, {:user, "sample-user"}, pinned.id, %{spec_ref_sha256: @sha2})
     assert repinned.specRefName == "spec.md"
     assert repinned.specRefSha256 == @sha2
 
-    titled = update(ctx, {:user, "flynn"}, pinned.id, %{title: "Retitled"})
+    titled = update(ctx, {:user, "sample-user"}, pinned.id, %{title: "Retitled"})
     assert titled.title == "Retitled"
     assert titled.specRefName == "spec.md"
     assert titled.specRefSha256 == @sha2
-    assert update(ctx, {:user, "flynn"}, pinned.id, %{title: "Retitled"}) == titled
+    assert update(ctx, {:user, "sample-user"}, pinned.id, %{title: "Retitled"}) == titled
 
-    reprioritized = update(ctx, {:user, "flynn"}, pinned.id, %{priority: 6})
+    reprioritized = update(ctx, {:user, "sample-user"}, pinned.id, %{priority: 6})
     assert reprioritized.priority == 6
 
     inherited = assign(ctx, "holder", "priority inheritance", pinned.id)
     assert inherited.priority == 6
 
     assert %{code: "invalid_priority"} =
-             update(ctx, {:user, "flynn"}, pinned.id, %{priority: 10})
+             update(ctx, {:user, "sample-user"}, pinned.id, %{priority: 10})
 
     combined =
-      update(ctx, {:user, "flynn"}, pinned.id, %{
+      update(ctx, {:user, "sample-user"}, pinned.id, %{
         title: "Combined",
         spec_ref_name: "combined.md",
         spec_ref_sha256: @sha,
@@ -282,12 +284,12 @@ defmodule Tightbeam.WorkItemsTest do
     assert combined.priority == 3
 
     assert %{code: "invalid_spec_ref"} =
-             update(ctx, {:user, "flynn"}, pinned.id, %{
+             update(ctx, {:user, "sample-user"}, pinned.id, %{
                spec_ref_name: nil,
                spec_ref_sha256: @sha
              })
 
-    cleared = update(ctx, {:user, "flynn"}, pinned.id, %{spec_ref_name: nil})
+    cleared = update(ctx, {:user, "sample-user"}, pinned.id, %{spec_ref_name: nil})
     assert cleared.specRefName == nil
     assert cleared.specRefSha256 == nil
 
@@ -295,7 +297,7 @@ defmodule Tightbeam.WorkItemsTest do
     # fires on a real metadata change and is silent on a no-op. observability-v1
     # OWNS this doorbell; work-item-v1 §Mutability flags the card-refresh need.
     change_call =
-      update_call({:user, "flynn"}, pinned.id, %{title: "Retitled again"})
+      update_call({:user, "sample-user"}, pinned.id, %{title: "Retitled again"})
       |> Map.put(:on_work_item_change, fn _, _ -> send(self(), :work_item_change) end)
 
     assert WorkItems.__handle__(ctx.db, "work-item-update", change_call).title ==
@@ -304,7 +306,7 @@ defmodule Tightbeam.WorkItemsTest do
     assert_received :work_item_change
 
     noop_call =
-      update_call({:user, "flynn"}, pinned.id, %{title: "Retitled again"})
+      update_call({:user, "sample-user"}, pinned.id, %{title: "Retitled again"})
       |> Map.put(:on_work_item_change, fn _, _ -> send(self(), :work_item_change) end)
 
     assert WorkItems.__handle__(ctx.db, "work-item-update", noop_call).title ==
@@ -315,7 +317,7 @@ defmodule Tightbeam.WorkItemsTest do
 
   test "gateway serializes concurrent full re-pins without a torn governing-spec pair", ctx do
     item =
-      create(ctx, {:user, "flynn"}, %{
+      create(ctx, {:user, "sample-user"}, %{
         title: "Concurrent current-spec pin",
         spec_ref_name: "initial.md",
         spec_ref_sha256: @sha
@@ -331,7 +333,7 @@ defmodule Tightbeam.WorkItemsTest do
           receive do
             :apply_update ->
               ctx.handlers["work-item-update"].(
-                update_call({:user, "flynn"}, item.id, %{
+                update_call({:user, "sample-user"}, item.id, %{
                   spec_ref_name: name,
                   spec_ref_sha256: sha
                 })
@@ -353,20 +355,20 @@ defmodule Tightbeam.WorkItemsTest do
     returned = MapSet.new(results, &{&1.specRefName, &1.specRefSha256})
     assert returned == expected
 
-    current = get(ctx, {:user, "flynn"}, item.id).workItem
+    current = get(ctx, {:user, "sample-user"}, item.id).workItem
     assert MapSet.member?(expected, {current.specRefName, current.specRefSha256})
   end
 
   test "get and list return deterministic eras, aspects, and ordering", ctx do
-    assert %{workItems: []} = list(ctx, {:user, "flynn"})
-    assert %{code: "unknown_work_item"} = get(ctx, {:user, "flynn"}, "missing")
+    assert %{workItems: []} = list(ctx, {:user, "sample-user"})
+    assert %{code: "unknown_work_item"} = get(ctx, {:user, "sample-user"}, "missing")
 
-    first = create(ctx, {:user, "flynn"}, %{title: "First"})
+    first = create(ctx, {:user, "sample-user"}, %{title: "First"})
     assert %{workItem: ^first, assignments: []} = get(ctx, {:session, "holder"}, first.id)
-    second = create(ctx, {:user, "flynn"}, %{title: "Second"})
+    second = create(ctx, {:user, "sample-user"}, %{title: "Second"})
     {:ok, _} = DB.query(ctx.db, "UPDATE work_items SET createdAt = 99")
 
-    assert %{workItems: work_items} = list(ctx, {:user, "flynn"})
+    assert %{workItems: work_items} = list(ctx, {:user, "sample-user"})
     assert Enum.map(work_items, & &1.id) == Enum.sort([first.id, second.id], :desc)
 
     era = assign(ctx, "holder", "era", first.id)
@@ -378,7 +380,7 @@ defmodule Tightbeam.WorkItemsTest do
     {:ok, _} =
       DB.query(ctx.db, "UPDATE assignments SET openedAt = 123 WHERE workItemId = ?1", [first.id])
 
-    detail = get(ctx, {:user, "flynn"}, first.id)
+    detail = get(ctx, {:user, "sample-user"}, first.id)
 
     assert Enum.map(detail.assignments, & &1.id) ==
              Enum.sort([era.id, restaffed.id, aspect.id], :desc)
@@ -388,27 +390,27 @@ defmodule Tightbeam.WorkItemsTest do
   end
 
   test "work-item and assignment lifecycles are independent", ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Independent"})
+    item = create(ctx, {:user, "sample-user"}, %{title: "Independent"})
     assignment = assign(ctx, "holder", "work", item.id)
 
     # The OBSERVABLE item (title/spec/owner/state — never the internal bracket
     # wake-id columns, which a last-close does write) is untouched by closure.
-    before_item = get(ctx, {:user, "flynn"}, item.id).workItem
+    before_item = get(ctx, {:user, "sample-user"}, item.id).workItem
     _ = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call(assignment.id))
-    assert get(ctx, {:user, "flynn"}, item.id).workItem == before_item
+    assert get(ctx, {:user, "sample-user"}, item.id).workItem == before_item
 
     before_assignment = row(ctx.db, "SELECT * FROM assignments WHERE id = ?1", assignment.id)
-    _ = update(ctx, {:user, "flynn"}, item.id, %{title: "Changed"})
+    _ = update(ctx, {:user, "sample-user"}, item.id, %{title: "Changed"})
 
     assert row(ctx.db, "SELECT * FROM assignments WHERE id = ?1", assignment.id) ==
              before_assignment
   end
 
   test "all four verbs emit one event and statutes can deny create", ctx do
-    item = dispatch!(ctx, create_call({:user, "flynn"}, %{title: "Events"}))
-    dispatch!(ctx, update_call({:user, "flynn"}, item.id, %{title: "Updated"}))
-    dispatch!(ctx, get_call({:user, "flynn"}, item.id))
-    dispatch!(ctx, list_call({:user, "flynn"}))
+    item = dispatch!(ctx, create_call({:user, "sample-user"}, %{title: "Events"}))
+    dispatch!(ctx, update_call({:user, "sample-user"}, item.id, %{title: "Updated"}))
+    dispatch!(ctx, get_call({:user, "sample-user"}, item.id))
+    dispatch!(ctx, list_call({:user, "sample-user"}))
 
     assert {:ok, [[4]]} =
              DB.query(
@@ -509,7 +511,7 @@ defmodule Tightbeam.WorkItemsTest do
 
   defp assign(ctx, holder, subject, work_item_id) do
     assignment_call =
-      call("assign", {:user, "flynn"}, %{subject: subject, work_item_id: work_item_id})
+      call("assign", {:user, "sample-user"}, %{subject: subject, work_item_id: work_item_id})
       |> Map.merge(%{session_key: holder, target_role: nil, role_fallback: false})
 
     Assignments.__handle__(ctx.db, "assign", assignment_call)
@@ -517,7 +519,10 @@ defmodule Tightbeam.WorkItemsTest do
 
   defp revoke_call(id),
     do:
-      call("revoke-assignment", {:user, "flynn"}, %{assignment_id: id, reason: "test revocation"})
+      call("revoke-assignment", {:user, "sample-user"}, %{
+        assignment_id: id,
+        reason: "test revocation"
+      })
 
   defp dispatch!(ctx, call) do
     assert {:ok, result} = Dispatch.dispatch(ctx.db, ctx.handlers, call)

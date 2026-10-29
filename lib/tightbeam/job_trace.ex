@@ -396,8 +396,7 @@ defmodule Tightbeam.JobTrace do
           {clause, params} = in_clause(ids)
 
           # The `decision_requests` clause of this UNION is text supplied by
-          # `Escalation.wake_link_fragment/1` (Sol xhigh
-          # review round 2, finding 1) — no SQL naming that table is written
+          # `Escalation.wake_link_fragment/1` — no SQL naming that table is written
           # here. It shares this SAME numbered `clause`/`params` pair with the
           # other two tables' clauses, so all three placeholder sets line up.
           wake_rows(
@@ -705,7 +704,7 @@ defmodule Tightbeam.JobTrace do
   defp decision_entries(_db, []), do: []
 
   # `Escalation.decision_trace_rows/2` is now the sole owner of this query
-  # (Sol xhigh review round 2, finding 1) — ANY kind, deliberately: a job
+  # — ANY kind, deliberately: a job
   # trace answers "what happened here", not "what could have gated it".
   defp decision_entries(db, assignment_ids) do
     Escalation.decision_trace_rows(db, assignment_ids)

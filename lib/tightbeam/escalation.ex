@@ -49,10 +49,7 @@ defmodule Tightbeam.Escalation do
     -- Nullable at the column: only the statute/effort arms carry sweep/deadline
     -- semantics and require it below. The agent arm pins it NULL, right beside
     -- every other adjudication column it refuses to borrow — a question has no
-    -- deadline for the same reason it has no `decision` (Sol xhigh review,
-    -- finding 1: a non-null `deadlineAt` on every row made an agent question
-    -- indistinguishable from a statute/effort row to any generic
-    -- `status = 'open' AND deadlineAt <= ?` sweep).
+    -- deadline for the same reason it has no `decision`.
     deadlineAt        INTEGER,
     statuteName       TEXT,
     actionKey         TEXT,
@@ -116,7 +113,7 @@ defmodule Tightbeam.Escalation do
       -- asker reads it and decides for itself (adjudication-deletion amendment:
       -- the row is data its asker chooses to honor).
       --
-      -- `deadlineAt` NULL too (Sol xhigh review, finding 1): a deadline is
+      -- `deadlineAt` NULL too: a deadline is
       -- sweep/statute-arm vocabulary — something the substrate wakes up to act
       -- on unilaterally. A question has no such semantics; the asker holds its
       -- own obligation for as long as it likes (gate Q3's three exits are all
@@ -892,7 +889,7 @@ defmodule Tightbeam.Escalation do
   #
   # THE MAXIM: an agent files a question, and keeps its obligation while it
   # waits — the row is data its asker chooses to honor, never a condition the
-  # substrate enforces (adjudication-deletion amendment, 2026-08-12).
+  # substrate enforces.
   #
   # WHAT THIS IS NOT, stated where the code is so a future reader trips over it:
   # nothing in the tree may READ an open `kind = 'agent'` row and act on its
@@ -1337,8 +1334,7 @@ defmodule Tightbeam.Escalation do
   # A bare existence check let an outsider name ANY assignment id, filing a
   # question that associates it with private work it has no standing to
   # reference — and an existing-but-invisible id filed successfully while a
-  # nonexistent one refused, which is an existence oracle on top (Sol xhigh
-  # review, finding 5). There is no general assignment-visibility predicate in
+  # nonexistent one refused, which is an existence oracle on top. There is no general assignment-visibility predicate in
   # this codebase to reuse (`assignment-get` itself is unscoped), so this is
   # the minimal one: the asker must hold the assignment, have opened it, or be
   # the one it reviews. Both an invisible id and a nonexistent one refuse
@@ -1477,7 +1473,7 @@ defmodule Tightbeam.Escalation do
       # has no allow/deny/waived to hand out, and letting `rule` reach one would
       # turn a question into an authorization the substrate then owns.
       #
-      # Gated on `:authorized` too (Sol xhigh review, finding 4): without it, an
+      # Gated on `:authorized` too: without it, an
       # unauthorized caller learned a request exists AND is an agent's question
       # before ever being told it lacks standing to rule anything. Falling
       # through to `rule_statute/4` for an unauthorized+agent-kind call gives it
@@ -1661,7 +1657,7 @@ defmodule Tightbeam.Escalation do
 
   @doc "Withdraw open requests and revoke live waivers for one retired session raiser."
   # KIND-AGNOSTIC BY DESIGN, not an oversight the tripwire's enumeration should
-  # flag (Sol xhigh review, finding 2): withdrawal is the one verb every arm
+  # flag: withdrawal is the one verb every arm
   # answers to as its own lawful, judgment-free exit (gate Q3 for the agent
   # arm's own doc above). Retirement withdraws ALL of a session's open rows —
   # statute, effort, agent alike — on that session's behalf, exactly as if the
@@ -1761,7 +1757,7 @@ defmodule Tightbeam.Escalation do
 
   THE MIRROR CASE IS RULED ACCEPTED — do not "fix" it. A summons evaluated before a
   healthy close but landing after it opens an episode for a sensor that has already
-  recovered. That is ACCEPTED BOUNDED STALENESS, not a defect (§A3/§B, ruled 2026-07-29):
+  recovered. That is ACCEPTED BOUNDED STALENESS, not a defect:
   the malfunction genuinely occurred and genuinely denied a call, so the summons is
   truthful, and the next healthy evaluation closes it.
   """
@@ -1951,7 +1947,7 @@ defmodule Tightbeam.Escalation do
     :crypto.hash(:sha256, canonical_json(canonical)) |> Base.encode16(case: :lower)
   end
 
-  ## EXTERNAL READERS (Sol xhigh review round 2, finding 1).
+  ## EXTERNAL READERS.
   #
   # Every production module outside this file that touches `decision_requests`
   # calls ONE of the functions below — never SQL of its own. That is now the
@@ -1964,7 +1960,7 @@ defmodule Tightbeam.Escalation do
   # updated by hand.
   #
   # A prior version of this tripwire DECLARED this inventory by hand and
-  # scanned production source for the raw SQL outside it. Sol xhigh review
+  # scanned production source for the raw SQL outside it.
   # round 3 named four bypasses that survives: a new reader added INSIDE this
   # file with no map entry; a helper removed with its entry left stale; a
   # helper's SQL widened past its declared scope with no textual signal; and
@@ -2273,8 +2269,7 @@ defmodule Tightbeam.Escalation do
   # shared shape `owner_notification/1` (statute) and `ask_notification/2`
   # (agent) each feed their own `Wakes.schedule_in_txn/2` call with, kept here
   # rather than in `EffortCheckin` so the row write and its notification are
-  # provably one commit in the same file (Sol xhigh review round 2: proof 10's
-  # same-file call-graph traversal cannot see across a module boundary).
+  # provably one commit in the same file.
   defp effort_notification_in_txn(txn, request) do
     prompt =
       "Effort check-in #{request.id} for assignment #{request.assignment_id}.\n" <>
@@ -2489,8 +2484,8 @@ defmodule Tightbeam.Escalation do
         else
           current = request_in_txn(txn, request.id)
 
-          # A concurrent-ruler loser filed nothing: it must not nudge (F13 —
-          # one post-commit nudge per filed fact, owned by the filer).
+          # A concurrent-ruler loser filed nothing: it must not nudge; send one
+          # post-commit nudge per filed fact, owned by the filer.
           if current.status == "ruled" and current.decision == decision do
             Publisher.maybe_accepted_in_txn(txn, opts[:firehose_call], current)
             {current, nil}
@@ -3502,7 +3497,7 @@ defmodule Tightbeam.Escalation do
   defp nonblank?(_value), do: false
 
   # Every read that treats `ruled` as a fact uses this same base invariant.
-  # Operator rulings additionally pass through their attribution/fact audit.
+  # user rulings additionally pass through their attribution/fact audit.
   defp ruled_decision_complete?(request),
     do:
       normalized_text?(request.decision) and normalized_text?(request.ruled_by) and
@@ -3750,9 +3745,7 @@ defmodule Tightbeam.Escalation do
   # caller's session) happens to equal the row's owner. Every session an owner
   # runs shares that same resolved owner id, so gating on the value alone let
   # one of the owner's UNRELATED sessions see a question it was never asker,
-  # asked, nor acting-as-owner for (Sol xhigh review, finding 3: Alice's
-  # `reviewer` session could see `coder`'s question to Bob through Alice's
-  # owner id, despite being a fourth, uninvolved principal).
+  # asked, nor acting-as-owner for.
   defp agent_visibility(call, raiser, owner_user_id) do
     {asked_sql, asked_params} =
       case call.principal do

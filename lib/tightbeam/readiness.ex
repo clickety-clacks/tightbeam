@@ -9,7 +9,7 @@ defmodule Tightbeam.Readiness do
   past ABOVE that line, so the closing statement was the only one that read like
   a verdict and it was the wrong one.
 
-  Serving with nothing configured stays correct (Flynn: "if it can run at all").
+  Serving with nothing configured stays correct.
   This does not refuse a boot, gate anything, or return a status. It only makes
   the closing statement true.
 

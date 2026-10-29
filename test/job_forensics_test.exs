@@ -58,10 +58,10 @@ defmodule Tightbeam.JobForensicsTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user',1,'admin_add',1)"
       )
 
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "sample-user")
 
     %{db: db, registry: registry, lane: lane}
   end
@@ -256,8 +256,10 @@ defmodule Tightbeam.JobForensicsTest do
     session(db, "k1")
 
     # Path 1: an origin-guarded authenticated requester.
-    a = Wakes.schedule(db, %{session_key: "k1", origin: "user:flynn", prompt: "a", due_at: 1})
-    assert public_cancel(db, a.wake_id, "user:flynn", %{kind: "user", id: "flynn"})
+    a =
+      Wakes.schedule(db, %{session_key: "k1", origin: "user:sample-user", prompt: "a", due_at: 1})
+
+    assert public_cancel(db, a.wake_id, "user:sample-user", %{kind: "user", id: "sample-user"})
     assert is_integer(Wakes.get(db, a.wake_id).canceled_at)
 
     # Path 2: a closed-set substrate process cancellation.
@@ -283,8 +285,10 @@ defmodule Tightbeam.JobForensicsTest do
     assert is_integer(Wakes.get(db, b.wake_id).canceled_at)
 
     # A refused cancel stamps nothing.
-    c = Wakes.schedule(db, %{session_key: "k1", origin: "user:flynn", prompt: "c", due_at: 1})
-    refute public_cancel(db, c.wake_id, "user:someone-else", %{kind: "user", id: "flynn"})
+    c =
+      Wakes.schedule(db, %{session_key: "k1", origin: "user:sample-user", prompt: "c", due_at: 1})
+
+    refute public_cancel(db, c.wake_id, "user:someone-else", %{kind: "user", id: "sample-user"})
     assert is_nil(Wakes.get(db, c.wake_id).canceled_at)
     assert Wakes.get(db, c.wake_id).state == "pending"
 
@@ -499,14 +503,19 @@ defmodule Tightbeam.JobForensicsTest do
     cancel_first =
       Wakes.schedule(db, %{
         session_key: "target",
-        origin: "user:flynn",
+        origin: "user:sample-user",
         prompt: "cancel first",
         due_at: 0,
         work_item_id: "wi_cancel_first"
       })
 
     assert %{canceled: true} =
-             cancel_via_gateway(db, cancel_first.wake_id, "user:flynn", {:user, "flynn"})
+             cancel_via_gateway(
+               db,
+               cancel_first.wake_id,
+               "user:sample-user",
+               {:user, "sample-user"}
+             )
 
     assert :ok = Wakes.fire_due(scheduler)
     cancel_first_id = cancel_first.wake_id
@@ -519,7 +528,7 @@ defmodule Tightbeam.JobForensicsTest do
     fire_first =
       Wakes.schedule(db, %{
         session_key: "target",
-        origin: "user:flynn",
+        origin: "user:sample-user",
         prompt: "fire first",
         due_at: 0,
         work_item_id: "wi_fire_first"
@@ -530,7 +539,12 @@ defmodule Tightbeam.JobForensicsTest do
     assert fire_id == fire_first.wake_id
 
     assert %{canceled: false} =
-             cancel_via_gateway(db, fire_first.wake_id, "user:flynn", {:user, "flynn"})
+             cancel_via_gateway(
+               db,
+               fire_first.wake_id,
+               "user:sample-user",
+               {:user, "sample-user"}
+             )
 
     fire_timeline = trace(db, "wi_fire_first").timeline
     assert Enum.count(fire_timeline, &(&1.type == "wake_fired")) == 1
@@ -749,7 +763,7 @@ defmodule Tightbeam.JobForensicsTest do
     work_item(db, "wi_retire_wakes")
     :ok = DB.execute(db, "UPDATE work_items SET state='closed' WHERE id='wi_retire_wakes'")
     retiring = session(db, "retiring-target")
-    Roles.create!(db, "retiring-role", "flynn", retiring.session_key)
+    Roles.create!(db, "retiring-role", "sample-user", retiring.session_key)
 
     direct =
       Wakes.schedule(db, %{
@@ -770,7 +784,7 @@ defmodule Tightbeam.JobForensicsTest do
         work_item_id: "wi_retire_wakes"
       })
 
-    Org.retire(db, retiring.session_key, "user:flynn", 1_000)
+    Org.retire(db, retiring.session_key, "user:sample-user", 1_000)
 
     for wake <- [direct, role] do
       assert Wakes.get(db, wake.wake_id).state == "canceled"
@@ -800,14 +814,14 @@ defmodule Tightbeam.JobForensicsTest do
     proven =
       Wakes.schedule(db, %{
         session_key: "target",
-        origin: "user:flynn",
+        origin: "user:sample-user",
         prompt: "proven",
         due_at: 10,
         work_item_id: "wi_restart_cancel"
       })
 
     assert %{canceled: true} =
-             cancel_via_gateway(db, proven.wake_id, "user:flynn", {:user, "flynn"})
+             cancel_via_gateway(db, proven.wake_id, "user:sample-user", {:user, "sample-user"})
 
     before_restart = canceled_entry(db, "wi_restart_cancel", proven.wake_id)
 
@@ -849,7 +863,7 @@ defmodule Tightbeam.JobForensicsTest do
           (wakeId, sessionKey, origin, prompt, consumer, dueAt, state, createdAt,
            canceledAt, work_item_id, targetGate)
         VALUES
-          ('w_eca7e8a2-646b-4ada-8760-685db9df622c', 'legacy-target',
+          ('w_00000000-0000-4000-8000-000000000201', 'legacy-target',
            'process:legacy', 'preserved production specimen', 'prompt',
            1786352503252, 'canceled', 1786266103252, 1786266112203,
            'wi_legacy_cancel', 1)
@@ -861,7 +875,7 @@ defmodule Tightbeam.JobForensicsTest do
     :ok =
       DB.execute(
         legacy_db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('sample-user',1,'admin_add',1)"
       )
 
     work_item(legacy_db, "wi_legacy_cancel")
@@ -872,7 +886,7 @@ defmodule Tightbeam.JobForensicsTest do
     assert {:ok, [[0]]} =
              DB.query(
                legacy_db,
-               "SELECT count(*) FROM wake_cancellations WHERE wakeId='w_eca7e8a2-646b-4ada-8760-685db9df622c'"
+               "SELECT count(*) FROM wake_cancellations WHERE wakeId='w_00000000-0000-4000-8000-000000000201'"
              )
 
     assert {:ok, [[activated_at]]} =
@@ -887,7 +901,7 @@ defmodule Tightbeam.JobForensicsTest do
       canceled_entry(
         legacy_db,
         "wi_legacy_cancel",
-        "w_eca7e8a2-646b-4ada-8760-685db9df622c"
+        "w_00000000-0000-4000-8000-000000000201"
       ),
       scheduling_origin: "process:legacy"
     )
@@ -1004,7 +1018,7 @@ defmodule Tightbeam.JobForensicsTest do
         (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
          lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
          question, options, context, status)
-      VALUES ('dr_effort', 'effort', 'process:tightbeam', 'flynn', 'asg_effort',
+      VALUES ('dr_effort', 'effort', 'process:tightbeam', 'sample-user', 'asg_effort',
               'holder', 1, 1, '#{wake.wake_id}', 1, 1, 'q', '[]', '{}', 'open')
       """)
 
@@ -1076,7 +1090,7 @@ defmodule Tightbeam.JobForensicsTest do
     assert List.last(timeline).type == "turn_end"
   end
 
-  ## Cross-review regressions (Sol CHANGES-REQUIRED, 2026-07-26)
+  ## Regression coverage
 
   test "F5: the retired prod_answered writer does not reinterpret attest history", ctx do
     db = ctx.db
@@ -1150,7 +1164,7 @@ defmodule Tightbeam.JobForensicsTest do
     forge = fn principal ->
       handlers["wake"].(%{
         verb: "wake",
-        origin: "user:flynn",
+        origin: "user:sample-user",
         principal: principal,
         session_key: "agent-session",
         params: %{
@@ -1247,8 +1261,8 @@ defmodule Tightbeam.JobForensicsTest do
   defp trace(db, work_item_id) do
     WorkItems.__handle__(db, "work-item-trace", %{
       verb: "work-item-trace",
-      principal: {:user, "flynn"},
-      origin: "user:flynn",
+      principal: {:user, "sample-user"},
+      origin: "user:sample-user",
       session_key: nil,
       params: %{work_item_id: work_item_id}
     })
@@ -1264,8 +1278,8 @@ defmodule Tightbeam.JobForensicsTest do
 
     WorkItems.__handle__(db, verb, %{
       verb: verb,
-      principal: {:user, "flynn"},
-      origin: "user:flynn",
+      principal: {:user, "sample-user"},
+      origin: "user:sample-user",
       session_key: nil,
       params: Map.merge(%{work_item_id: id}, params)
     })
@@ -1275,7 +1289,7 @@ defmodule Tightbeam.JobForensicsTest do
     :ok =
       DB.execute(db, """
       INSERT INTO work_items (id, title, ownerUserId, state, createdByUser, createdAt)
-      VALUES ('#{id}', 'Item #{id}', 'flynn', 'open', 'flynn', 1)
+      VALUES ('#{id}', 'Item #{id}', 'sample-user', 'open', 'sample-user', 1)
       """)
 
     {:ok, _} =
@@ -1295,7 +1309,7 @@ defmodule Tightbeam.JobForensicsTest do
     :ok =
       DB.execute(db, """
       INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt, state, workItemId)
-      VALUES ('#{id}', 'subject #{id}', '#{holder}', 'flynn', 1, 'open', '#{work_item_id}')
+      VALUES ('#{id}', 'subject #{id}', '#{holder}', 'sample-user', 1, 'open', '#{work_item_id}')
       """)
 
     {:ok, :ok} =
@@ -1334,7 +1348,7 @@ defmodule Tightbeam.JobForensicsTest do
     suffix = Tightbeam.Id.uuid4()
     assignment_id = "asg_" <> suffix
     attest_id = "att_" <> suffix
-    holder = Org.personal_session_key("flynn")
+    holder = Org.personal_session_key("sample-user")
     assignment(db, assignment_id, work_item_id, holder)
 
     {:ok, :ok} =
@@ -1391,8 +1405,8 @@ defmodule Tightbeam.JobForensicsTest do
     Org.create(db, %{
       session_key: key,
       display_name: key,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       spawned_by: spawned_by,
       archetype: "default",
       host: "testhost",
@@ -1408,7 +1422,7 @@ defmodule Tightbeam.JobForensicsTest do
         Ledger.enqueue_in_txn(txn, %{
           session_key: session_key,
           message_id: "m_#{System.unique_integer([:positive])}",
-          origin: "user:flynn",
+          origin: "user:sample-user",
           prompt: "p",
           assignment_id: Keyword.get(opts, :assignment_id),
           job_ref: Keyword.get(opts, :job_ref)
@@ -1431,8 +1445,8 @@ defmodule Tightbeam.JobForensicsTest do
   defp fetch_item(db, id) do
     WorkItems.__handle__(db, "work-item-get", %{
       verb: "work-item-get",
-      principal: {:user, "flynn"},
-      origin: "user:flynn",
+      principal: {:user, "sample-user"},
+      origin: "user:sample-user",
       session_key: nil,
       params: %{work_item_id: id}
     })

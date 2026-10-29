@@ -115,10 +115,8 @@ succeeds. The tag must be `v<version>+<build>`, where `<build>` is
 5. Push the tag once.
 6. Read the remote tag target and verify the exact SHA.
 
-Never update or delete a release tag. Never publish an immutable GitHub Release before
-quits: deleting it does not make its tag name reusable. The premature immutable `v0.1.8`
-release burned that bare name permanently. The release-candidate workflow has no tag
-trigger.
+Never update or delete a release tag; deleting a release does not make its tag name reusable.
+The release-candidate workflow has no tag trigger.
 
 ## Prevent duplicate work
 

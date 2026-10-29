@@ -1,6 +1,6 @@
 defmodule Tightbeam.Rules do
   @moduledoc """
-  Operator-authored, deny-only verb statutes loaded from
+  user-authored, deny-only verb statutes loaded from
   `identity/rules/*.toml` and evaluated at the dispatch chokepoint.
 
   Facts are demand-driven, cached once per dispatch call, and are
@@ -918,7 +918,7 @@ defmodule Tightbeam.Rules do
                   exit_class
                 )
 
-              # Everything else is a MALFUNCTION, not a verdict (§A3, Flynn 2026-07-29,
+              # Everything else is a MALFUNCTION, not a verdict,
               # generalized under dark-factory doctrine): a clock, a crash, a containment
               # refusal, a token outside the declared set, or one of the four paths that
               # reached a deny with nothing observed at all. A clock or a crash decided,

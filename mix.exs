@@ -16,8 +16,8 @@ defmodule Tightbeam.MixProject do
     ]
   end
 
-  # The npm-installable gateway (Flynn rulings 2026-08-03: one package carrying CLI and
-  # gateway so the version handshake holds by construction; mix release bundled
+  # The npm-installable gateway uses one package carrying CLI and gateway so the
+  # version handshake holds by construction; mix release bundled
   # per-platform; no registry until a real release).
   #
   # INSTALLS ARE FROM A BUILT TARBALL, NOT FROM THE GIT URL. `packaging/package.json` is
@@ -57,7 +57,7 @@ defmodule Tightbeam.MixProject do
   defp deps do
     [
       {:exqlite, "~> 0.27"},
-      # Wire front: Bandit serves Plug (HTTP control plane) + WebSock (Clawline WS).
+      # Wire front: Bandit serves Plug (HTTP control plane) and WebSocket connections.
       # The floor is the advisory boundary, stated as the advisory states it:
       # EEF-CVE-2026-65623 / GHSA-vg8x-66vg-5pxh affects >= 1.11.0 and < 1.12.1.
       {:bandit, ">= 1.12.1 and < 2.0.0"},

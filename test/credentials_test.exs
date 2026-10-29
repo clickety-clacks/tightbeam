@@ -1078,7 +1078,7 @@ defmodule Tightbeam.CredentialsTest do
       # Nothing was installed, so the prior state stays coherent: the prior
       # credential and its prior metadata still describe each other. The stale
       # `onboarded: true` can never come to describe a candidate that was never
-      # activated (Sol xhigh blocking 1).
+      # activated candidate.
       assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) == prior_credential
 
       # And a restarted gateway reads the same thing from disk, not from memory.

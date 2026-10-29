@@ -868,8 +868,8 @@ defmodule Tightbeam.FirehoseSmokeTest do
   defp firehose_call(verb, params) do
     %{
       verb: verb,
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: nil,
       params: params,
       firehose_in_txn: true

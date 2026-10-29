@@ -33,7 +33,7 @@ defmodule Tightbeam.SubagentMarkersTest do
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "sample-user")
 
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})
@@ -206,7 +206,7 @@ defmodule Tightbeam.SubagentMarkersTest do
 
     assert %{code: "reserved_kind"} =
              condition.(%{
-               origin: "user:flynn",
+               origin: "user:sample-user",
                params: %{kind: "subagent_stop", scope: "forged"}
              })
 
@@ -271,8 +271,8 @@ defmodule Tightbeam.SubagentMarkersTest do
       Org.create(db, %{
         session_key: key,
         display_name: key,
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: "sample-user",
+        origin: "user:sample-user",
         archetype: "default",
         host: "host-b",
         harness: harness,

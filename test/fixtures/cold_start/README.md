@@ -1,7 +1,7 @@
 # Captured v5 cold-start fixtures
 
-These database sets came from the production release at source commit
-`d00e06aea578d711e608637d38a97872487df15e`. They are not idealized schemas.
+These database sets came from a production release captured by
+`scripts/capture_v5_cold_start.sh`. They are not idealized schemas.
 The release performed every boot, pair, auth, and local-user write named in
 `manifest.json`. Each gateway stopped cleanly before the set was copied.
 

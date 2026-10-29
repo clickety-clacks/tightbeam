@@ -22,7 +22,12 @@ defmodule Tightbeam.RulesTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     {:paired, _device} =
-      claim_org(db, %{device_id: "rules-device", claimed_name: "flynn", platform: nil, model: nil})
+      claim_org(db, %{
+        device_id: "rules-device",
+        claimed_name: "sample-user",
+        platform: nil,
+        model: nil
+      })
 
     Enum.each(~w(mike other reviewer), &ensure_main_session(db, &1))
 
@@ -228,7 +233,7 @@ defmodule Tightbeam.RulesTest do
       assert match_result(Rules.evaluate(ctx.db, call())) == fires?
     end
 
-    :ok = EventLog.append_event(ctx.db, "verb", "post", "user:flynn")
+    :ok = EventLog.append_event(ctx.db, "verb", "post", "user:sample-user")
 
     for {op, value, fires?} <- [
           {"gt", 0, true},
@@ -342,11 +347,11 @@ defmodule Tightbeam.RulesTest do
     {:pending, _} =
       Devices.pair(ctx.db, %{device_id: "d2", claimed_name: "Mike", platform: nil, model: nil})
 
-    active = session(ctx.db, "active", "flynn")
+    active = session(ctx.db, "active", "sample-user")
     retired = session(ctx.db, "retired", "mike")
     Org.retire(ctx.db, retired.session_key, "user:mike", 1_000)
-    Roles.create!(ctx.db, "alpha", "flynn", active.session_key)
-    Roles.create!(ctx.db, "beta", "flynn", active.session_key)
+    Roles.create!(ctx.db, "alpha", "sample-user", active.session_key)
+    Roles.create!(ctx.db, "beta", "sample-user", active.session_key)
     Roles.create!(ctx.db, "vacant", "mike", nil)
     Roles.create!(ctx.db, "old", "mike", nil)
 
@@ -357,14 +362,14 @@ defmodule Tightbeam.RulesTest do
       ])
 
     assertions = [
-      {call("user:flynn"), "caller.origin_class", "eq", "user", true},
+      {call("user:sample-user"), "caller.origin_class", "eq", "user", true},
       {call("agent:alpha"), "caller.origin_class", "eq", "agent", true},
       {call("process:cron"), "caller.origin_class", "eq", "process", true},
-      {call("agent:alpha"), "caller.user", "eq", "flynn", true},
+      {call("agent:alpha"), "caller.user", "eq", "sample-user", true},
       {call("agent:vacant"), "caller.user", "eq", "mike", false},
       {call("agent:old"), "caller.user", "eq", "mike", true},
-      {call("process:cron"), "caller.user", "eq", "flynn", false},
-      {call("user:flynn"), "caller.is_admin", "eq", true, true},
+      {call("process:cron"), "caller.user", "eq", "sample-user", false},
+      {call("user:sample-user"), "caller.is_admin", "eq", true, true},
       {call("user:mike"), "caller.is_admin", "eq", false, true},
       {call("user:unknown"), "caller.is_admin", "eq", false, false},
       {call("agent:alpha"), "caller.roles", "in", ["alpha", "beta"], true},
@@ -385,7 +390,7 @@ defmodule Tightbeam.RulesTest do
     )
 
     Rules.load!(ctx.base_dir, ["post"])
-    assert {:deny, %{rule: "live-count"}} = Rules.evaluate(ctx.db, call("user:flynn"))
+    assert {:deny, %{rule: "live-count"}} = Rules.evaluate(ctx.db, call("user:sample-user"))
     assert :ok = Rules.evaluate(ctx.db, call("process:cron"))
     assert :ok = Rules.evaluate(ctx.db, call("broken"))
   end
@@ -397,12 +402,12 @@ defmodule Tightbeam.RulesTest do
     :ok =
       DB.execute(
         ctx.db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('fact_flynn', 0, 'admin_add', 1),('fact_kay', 0, 'admin_add', 1),('fact_root', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('fact_sample-user', 0, 'admin_add', 1),('fact_kay', 0, 'admin_add', 1),('fact_root', 1, 'admin_add', 1)"
       )
 
     for {id, owner} <- [
-          {"wi_fact_none", "fact_flynn"},
-          {"wi_fact_linked", "fact_flynn"},
+          {"wi_fact_none", "fact_sample-user"},
+          {"wi_fact_linked", "fact_sample-user"},
           {"wi_fact_foreign", "fact_kay"}
         ] do
       {:ok, _} =
@@ -425,26 +430,26 @@ defmodule Tightbeam.RulesTest do
     Rules.load!(ctx.base_dir, ["post"])
 
     assert {:deny, %{rule: "known-none"}} =
-             Rules.evaluate(ctx.db, fact_call.("user:fact_flynn", "wi_fact_none"))
+             Rules.evaluate(ctx.db, fact_call.("user:fact_sample-user", "wi_fact_none"))
 
     assert {:deny, %{rule: "known-none"}} =
              Rules.evaluate(ctx.db, fact_call.("user:fact_root", "wi_fact_foreign"))
 
-    assert :ok = Rules.evaluate(ctx.db, fact_call.("user:fact_flynn", "wi_missing"))
-    assert :ok = Rules.evaluate(ctx.db, fact_call.("user:fact_flynn", "wi_fact_foreign"))
+    assert :ok = Rules.evaluate(ctx.db, fact_call.("user:fact_sample-user", "wi_missing"))
+    assert :ok = Rules.evaluate(ctx.db, fact_call.("user:fact_sample-user", "wi_fact_foreign"))
     assert :ok = Rules.evaluate(ctx.db, call("process:tightbeam"))
     assert :ok = Rules.evaluate(ctx.db, fact_call.("process:tightbeam", "wi_fact_none"))
 
     topline =
       Toplines.create(ctx.db, %{
-        principal: {:user, "fact_flynn"},
+        principal: {:user, "fact_sample-user"},
         params: %{title: "Fact proof", idempotency_key: "fact-create"},
         now: 10
       }).topline
 
     linked =
       Toplines.link_work(ctx.db, %{
-        principal: {:user, "fact_flynn"},
+        principal: {:user, "fact_sample-user"},
         params: %{
           topline_id: topline.id,
           work_item_id: "wi_fact_linked",
@@ -458,13 +463,13 @@ defmodule Tightbeam.RulesTest do
     Rules.load!(ctx.base_dir, ["post"])
 
     assert {:deny, %{rule: "known-active"}} =
-             Rules.evaluate(ctx.db, fact_call.("user:fact_flynn", "wi_fact_linked"))
+             Rules.evaluate(ctx.db, fact_call.("user:fact_sample-user", "wi_fact_linked"))
 
     assert {:deny, %{rule: "known-active"}} =
              Rules.evaluate(ctx.db, fact_call.("user:fact_root", "wi_fact_linked"))
 
     Toplines.unlink_work(ctx.db, %{
-      principal: {:user, "fact_flynn"},
+      principal: {:user, "fact_sample-user"},
       params: %{
         membership_id: linked.id,
         reason: "episode ended",
@@ -473,24 +478,24 @@ defmodule Tightbeam.RulesTest do
       now: 12
     })
 
-    assert :ok = Rules.evaluate(ctx.db, fact_call.("user:fact_flynn", "wi_fact_linked"))
+    assert :ok = Rules.evaluate(ctx.db, fact_call.("user:fact_sample-user", "wi_fact_linked"))
 
     put_rule(ctx, rule("known-ended", "post", "work_item.has_topline", "eq", false))
     Rules.load!(ctx.base_dir, ["post"])
 
     assert {:deny, %{rule: "known-ended"}} =
-             Rules.evaluate(ctx.db, fact_call.("user:fact_flynn", "wi_fact_linked"))
+             Rules.evaluate(ctx.db, fact_call.("user:fact_sample-user", "wi_fact_linked"))
   end
 
   test "target facts cover active retired missing ghost dm and main sessions", ctx do
-    active = session(ctx.db, "active", "flynn", kind: "main")
+    active = session(ctx.db, "active", "sample-user", kind: "main")
     dm = session(ctx.db, "dm", "mike", kind: "dm")
     custom = session(ctx.db, "custom", "mike")
-    retired = session(ctx.db, "retired", "flynn")
-    Org.retire(ctx.db, retired.session_key, "user:flynn", 1_000)
+    retired = session(ctx.db, "retired", "sample-user")
+    Org.retire(ctx.db, retired.session_key, "user:sample-user", 1_000)
 
     assertions = [
-      {active.session_key, "target.owner", "flynn", true},
+      {active.session_key, "target.owner", "sample-user", true},
       {active.session_key, "target.archetype", "default", true},
       {active.session_key, "target.host", "testhost", true},
       {active.session_key, "target.kind", "main", true},
@@ -514,10 +519,10 @@ defmodule Tightbeam.RulesTest do
     now = System.system_time(:millisecond)
 
     for {ts, kind, verb, origin} <- [
-          {now - 1, "verb", "post", "user:flynn"},
-          {now - 86_400_000, "verb", "post", "user:flynn"},
-          {now - 2, "denied", "post", "user:flynn"},
-          {now - 2, "verb", "wake", "user:flynn"},
+          {now - 1, "verb", "post", "user:sample-user"},
+          {now - 86_400_000, "verb", "post", "user:sample-user"},
+          {now - 2, "denied", "post", "user:sample-user"},
+          {now - 2, "verb", "wake", "user:sample-user"},
           {now - 2, "verb", "post", "user:mike"}
         ] do
       {:ok, _} =
@@ -529,7 +534,7 @@ defmodule Tightbeam.RulesTest do
         ])
     end
 
-    assert EventLog.verb_count(ctx.db, "user:flynn", "post", now - 86_400_000) == 1
+    assert EventLog.verb_count(ctx.db, "user:sample-user", "post", now - 86_400_000) == 1
 
     put_rule(ctx, rule("quota", "post", "caller.verb_count_24h", "gte", 1))
     Rules.load!(ctx.base_dir, ["post"])
@@ -570,9 +575,9 @@ defmodule Tightbeam.RulesTest do
 
   test "zero rules lets completion close with null verdict filer fields and one verb event",
        ctx do
-    ensure_users(ctx.db, ["flynn"])
-    holder = session(ctx.db, "zero-rule-holder", "flynn", archetype: "coder")
-    assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+    ensure_users(ctx.db, ["sample-user"])
+    holder = session(ctx.db, "zero-rule-holder", "sample-user", archetype: "coder")
+    assignment = assignment(ctx, holder.session_key, {:user, "sample-user"})
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     completion =
@@ -730,9 +735,9 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "P3 fact nil, empty-list, and overlap presence matrix", ctx do
-    holder = session(ctx.db, "p3-holder", "flynn", archetype: "coder")
-    assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
-    review = assignment(ctx, holder.session_key, {:user, "flynn"}, reviews: assignment.id)
+    holder = session(ctx.db, "p3-holder", "sample-user", archetype: "coder")
+    assignment = assignment(ctx, holder.session_key, {:user, "sample-user"})
+    review = assignment(ctx, holder.session_key, {:user, "sample-user"}, reviews: assignment.id)
 
     list_facts = [
       "assignment.qualifying_review_verdict_kinds",
@@ -803,7 +808,7 @@ defmodule Tightbeam.RulesTest do
                p3_call("attest", nil, %{assignment_id: assignment.id, kind: "completion"})
              )
 
-    _existing = assignment(ctx, holder.session_key, {:user, "flynn"}, files: ["lib/a.ex"])
+    _existing = assignment(ctx, holder.session_key, {:user, "sample-user"}, files: ["lib/a.ex"])
 
     overlap_cases = [
       {%{}, true, false},
@@ -824,7 +829,7 @@ defmodule Tightbeam.RulesTest do
       )
 
       Rules.load!(ctx.base_dir, ["assign"])
-      result = Rules.evaluate(ctx.db, p3_call("assign", {:user, "flynn"}, params))
+      result = Rules.evaluate(ctx.db, p3_call("assign", {:user, "sample-user"}, params))
       assert match_result(result) == fires?
     end
 
@@ -846,13 +851,13 @@ defmodule Tightbeam.RulesTest do
     assert {:deny, %{code: "rule_error", fact: "assign.declared_files_overlap_open"}} =
              Rules.evaluate(
                :missing_db,
-               p3_call("assign", {:user, "flynn"}, %{files: ["lib/a.ex"]})
+               p3_call("assign", {:user, "sample-user"}, %{files: ["lib/a.ex"]})
              )
   end
 
   test "check-tier assignment facts are nil for every unresolved assignment shape", ctx do
-    holder = session(ctx.db, "check-tier-holder", "flynn", archetype: "coder")
-    assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+    holder = session(ctx.db, "check-tier-holder", "sample-user", archetype: "coder")
+    assignment = assignment(ctx, holder.session_key, {:user, "sample-user"})
 
     unresolved_params = [
       %{kind: "completion"},
@@ -896,8 +901,8 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "two required verdict statutes deny under each missing kind's own name", ctx do
-    holder = session(ctx.db, "two-kind-holder", "flynn", archetype: "coder")
-    assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+    holder = session(ctx.db, "two-kind-holder", "sample-user", archetype: "coder")
+    assignment = assignment(ctx, holder.session_key, {:user, "sample-user"})
 
     put_raw(ctx, """
     [[rule]]
@@ -935,10 +940,10 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "restored independent verdict fact accepts the prior linked-review shape", ctx do
-    holder = session(ctx.db, "producer", "flynn", archetype: "coder")
+    holder = session(ctx.db, "producer", "sample-user", archetype: "coder")
     reviewer = session(ctx.db, "reviewer", "other", harness: "claude", provider: "anthropic")
-    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
-    review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
+    producer = assignment(ctx, holder.session_key, {:user, "sample-user"})
+    review = assignment(ctx, reviewer.session_key, {:user, "sample-user"}, reviews: producer.id)
 
     verdict(ctx, reviewer.session_key, review.id, "reviewed-clean")
 
@@ -963,18 +968,18 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "qualifying review ignores harness/provider", ctx do
-    holder = session(ctx.db, "producer", "flynn", archetype: "coder")
+    holder = session(ctx.db, "producer", "sample-user", archetype: "coder")
     reviewer = session(ctx.db, "reviewer", "other", harness: "claude", provider: "anthropic")
     third = session(ctx.db, "third", "other", harness: "codex", provider: "openai")
-    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+    producer = assignment(ctx, holder.session_key, {:user, "sample-user"})
 
     verdict(ctx, reviewer.session_key, producer.id, "direct")
 
     valid_review =
-      assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
+      assignment(ctx, reviewer.session_key, {:user, "sample-user"}, reviews: producer.id)
 
     verdict(ctx, third.session_key, valid_review.id, "third-session")
-    user_verdict(ctx, "flynn", valid_review.id, "user-on-review")
+    user_verdict(ctx, "sample-user", valid_review.id, "user-on-review")
 
     put_rule(
       ctx,
@@ -1013,9 +1018,9 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "artifact kinds fact resolves holder-recorded kinds only (A6)", ctx do
-    holder = session(ctx.db, "artifact-holder", "flynn", archetype: "coder")
+    holder = session(ctx.db, "artifact-holder", "sample-user", archetype: "coder")
     other = session(ctx.db, "artifact-other", "other")
-    assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+    assignment = assignment(ctx, holder.session_key, {:user, "sample-user"})
     attach_work_item(ctx, assignment.id, "wi_artifact_fact")
 
     # Empty list for a holder who recorded nothing: `not_in` fires.
@@ -1035,7 +1040,7 @@ defmodule Tightbeam.RulesTest do
     # Another session's report and the holder's kinds on OTHER items do not count.
     record_artifact(ctx, "wi_artifact_fact", other.session_key, "report", "in-workspace")
 
-    other_assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+    other_assignment = assignment(ctx, holder.session_key, {:user, "sample-user"})
     attach_work_item(ctx, other_assignment.id, "wi_artifact_elsewhere")
     record_artifact(ctx, "wi_artifact_elsewhere", holder.session_key, "report", "in-workspace")
 
@@ -1064,10 +1069,10 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "P3 review and artifact statutes deny before attest and allow after proof", ctx do
-    ensure_users(ctx.db, ["flynn", "other"])
-    holder = session(ctx.db, "gate-holder", "flynn", archetype: "coder")
+    ensure_users(ctx.db, ["sample-user", "other"])
+    holder = session(ctx.db, "gate-holder", "sample-user", archetype: "coder")
     reviewer = session(ctx.db, "gate-reviewer", "other", archetype: "reviewer")
-    assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+    assignment = assignment(ctx, holder.session_key, {:user, "sample-user"})
     parent = self()
     actual_attest = ctx.handlers["attest"]
 
@@ -1094,7 +1099,7 @@ defmodule Tightbeam.RulesTest do
     assert Assignments.open_count(ctx.db, holder.session_key) == 1
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM events WHERE kind = 'denied'")
 
-    review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: assignment.id)
+    review = assignment(ctx, reviewer.session_key, {:user, "sample-user"}, reviews: assignment.id)
     verdict(ctx, reviewer.session_key, review.id, "reviewed-clean")
 
     assert {:ok, %{assignment: %{state: "closed"}}} =
@@ -1112,7 +1117,7 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, handlers, review_completion)
 
     evidence_assignment =
-      assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "evidence")
+      assignment(ctx, holder.session_key, {:user, "sample-user"}, effect_kind: "evidence")
 
     evidence_completion =
       p3_call("attest", {:session, holder.session_key}, %{
@@ -1123,7 +1128,7 @@ defmodule Tightbeam.RulesTest do
     assert {:ok, %{assignment: %{state: "closed", effectKind: "evidence"}}} =
              Dispatch.dispatch(ctx.db, handlers, evidence_completion)
 
-    artifact_assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+    artifact_assignment = assignment(ctx, holder.session_key, {:user, "sample-user"})
     attach_work_item(ctx, artifact_assignment.id, "wi_artifact_gate")
     put_raw(ctx, artifact_gate_rule())
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -1150,15 +1155,15 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "shipped code-review rail requires the open code producer's nonblank test receipt", ctx do
-    holder = session(ctx.db, "receipt-holder", "flynn", archetype: "coder")
+    holder = session(ctx.db, "receipt-holder", "sample-user", archetype: "coder")
     other = session(ctx.db, "receipt-other", "other", archetype: "coder")
     reviewer = session(ctx.db, "receipt-reviewer", "reviewer", archetype: "reviewer")
-    producer = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "code")
+    producer = assignment(ctx, holder.session_key, {:user, "sample-user"}, effect_kind: "code")
 
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
+        "INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 0, 'admin_add', 1)"
       )
 
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
@@ -1183,7 +1188,7 @@ defmodule Tightbeam.RulesTest do
     assert producer_id == producer.id
     assert review_count(ctx.db, producer.id) == 0
 
-    user_verdict(ctx, "flynn", producer.id, "tests-passed", "user claim")
+    user_verdict(ctx, "sample-user", producer.id, "tests-passed", "user claim")
     verdict(ctx, other.session_key, producer.id, "tests-passed", "other session claim")
     verdict(ctx, holder.session_key, producer.id, "tests-passed")
 
@@ -1207,21 +1212,21 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "review receipt gate follows producer effect kind, including documentation policy", ctx do
-    coder = session(ctx.db, "effect-kind-coder", "flynn", archetype: "coder")
+    coder = session(ctx.db, "effect-kind-coder", "sample-user", archetype: "coder")
 
     orchestrator =
-      session(ctx.db, "effect-kind-orchestrator", "flynn", archetype: "orchestrator")
+      session(ctx.db, "effect-kind-orchestrator", "sample-user", archetype: "orchestrator")
 
     reviewer =
       session(ctx.db, "effect-kind-reviewer", "reviewer", archetype: "reviewer")
 
     code =
-      assignment(ctx, orchestrator.session_key, {:user, "flynn"}, effect_kind: "code")
+      assignment(ctx, orchestrator.session_key, {:user, "sample-user"}, effect_kind: "code")
 
-    policy = assignment(ctx, coder.session_key, {:user, "flynn"}, effect_kind: "policy")
+    policy = assignment(ctx, coder.session_key, {:user, "sample-user"}, effect_kind: "policy")
 
     documentation_policy =
-      assignment(ctx, coder.session_key, {:user, "flynn"},
+      assignment(ctx, coder.session_key, {:user, "sample-user"},
         subject: "document the reviewed policy",
         effect_kind: "policy"
       )
@@ -1276,16 +1281,16 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do
-    ensure_users(ctx.db, ["flynn"])
-    coder = session(ctx.db, "receipt-closed", "flynn", archetype: "coder")
-    noncoder = session(ctx.db, "receipt-orchestrator", "flynn", archetype: "orchestrator")
+    ensure_users(ctx.db, ["sample-user"])
+    coder = session(ctx.db, "receipt-closed", "sample-user", archetype: "coder")
+    noncoder = session(ctx.db, "receipt-orchestrator", "sample-user", archetype: "orchestrator")
     reviewer = session(ctx.db, "receipt-exempt-reviewer", "reviewer", archetype: "reviewer")
-    closed = assignment(ctx, coder.session_key, {:user, "flynn"})
-    open_coder = assignment(ctx, coder.session_key, {:user, "flynn"})
-    policy = assignment(ctx, noncoder.session_key, {:user, "flynn"}, effect_kind: "policy")
+    closed = assignment(ctx, coder.session_key, {:user, "sample-user"})
+    open_coder = assignment(ctx, coder.session_key, {:user, "sample-user"})
+    policy = assignment(ctx, noncoder.session_key, {:user, "sample-user"}, effect_kind: "policy")
 
     orchestration =
-      assignment(ctx, noncoder.session_key, {:user, "flynn"}, effect_kind: "evidence")
+      assignment(ctx, noncoder.session_key, {:user, "sample-user"}, effect_kind: "evidence")
 
     assert %{assignment: %{state: "closed"}} =
              Assignments.__handle__(
@@ -1351,7 +1356,7 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
-  defp call(origin \\ "user:flynn") do
+  defp call(origin \\ "user:sample-user") do
     %{verb: "post", origin: origin, session_key: nil, params: %{}}
   end
 
@@ -1427,7 +1432,7 @@ defmodule Tightbeam.RulesTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO work_items (id, title, ownerUserId, state, createdByUser, createdAt) VALUES (?1, 'artifact gate item', 'flynn', 'open', 'flynn', 1)",
+        "INSERT INTO work_items (id, title, ownerUserId, state, createdByUser, createdAt) VALUES (?1, 'artifact gate item', 'sample-user', 'open', 'sample-user', 1)",
         [work_item_id]
       )
 

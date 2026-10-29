@@ -36,14 +36,14 @@ defmodule Tightbeam.VerificationPapertrailTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 1, 'admin_add', 1)"
       )
 
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "sample-user")
 
     holder = session(db, "vp-coder", "coder", "claude", "anthropic")
     reviewer = session(db, "vp-reviewer", "reviewer-code", "codex", "openai")
-    Roles.create!(db, "reviewer-code", "flynn", reviewer.session_key)
+    Roles.create!(db, "reviewer-code", "sample-user", reviewer.session_key)
 
     test_pid = self()
 
@@ -84,7 +84,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
   # `rules/`.
   defp learn_engineering_rules!(ctx) do
     assert {:ok, _revision} =
-             Identity.learn!(ctx.base_dir, "agentic-engineering", "flynn")
+             Identity.learn!(ctx.base_dir, "agentic-engineering", "sample-user")
 
     for file <- ["engineering.toml", "verification.toml"] do
       assert File.exists?(Path.join([ctx.base_dir, "identity", "rules", file])),
@@ -97,7 +97,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
   defp reviewed_clean_assignment(ctx) do
     item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
-        principal: {:user, "flynn"},
+        principal: {:user, "sample-user"},
         params: %{title: "papertrail #{System.unique_integer([:positive])}", is_bug: false}
       })
 
@@ -267,7 +267,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
     item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
-        principal: {:user, "flynn"},
+        principal: {:user, "sample-user"},
         params: %{title: "escalation gate", is_bug: false}
       })
 
@@ -280,7 +280,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
                attest_call(ctx.holder.session_key, work.id, "completion")
              )
 
-    assert {:ok, [["open", "flynn"]]} =
+    assert {:ok, [["open", "sample-user"]]} =
              DB.query(
                ctx.db,
                "SELECT status, ownerUserId FROM decision_requests WHERE id = ?1",
@@ -303,7 +303,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
     item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
-        principal: {:user, "flynn"},
+        principal: {:user, "sample-user"},
         params: %{title: "neutral work", is_bug: false}
       })
 
@@ -371,8 +371,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
   defp assign(ctx, holder_key, work_item_id, subject, opts \\ []) do
     Assignments.__handle__(ctx.db, "assign", %{
       verb: "assign",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
@@ -430,8 +430,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
       session_key: key,
       display_name: key,
       kind: "custom",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: archetype,
       host: "host-b",
       harness: harness,

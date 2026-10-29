@@ -14,7 +14,7 @@ defmodule Tightbeam.ArtifactsTest do
     :ok = Placement.ensure_schema(db)
     :ok = Artifacts.ensure_schema(db)
 
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "sample-user")
     parent = session(db, "parent", nil)
     child = session(db, "child", parent.session_key)
     seed_work_items(db)
@@ -304,7 +304,7 @@ defmodule Tightbeam.ArtifactsTest do
            }
 
     assert handlers["artifact-record"].(%{
-             principal: {:user, "flynn"},
+             principal: {:user, "sample-user"},
              session_key: nil,
              params: call.params
            }) == %{
@@ -332,7 +332,7 @@ defmodule Tightbeam.ArtifactsTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_prefix_alpha', 'alpha', 'flynn', 'flynn', 2)"
+        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_prefix_alpha', 'alpha', 'sample-user', 'sample-user', 2)"
       )
 
     call = %{
@@ -356,7 +356,7 @@ defmodule Tightbeam.ArtifactsTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_prefix_beta', 'beta', 'flynn', 'flynn', 3)"
+        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_prefix_beta', 'beta', 'sample-user', 'sample-user', 3)"
       )
 
     {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM artifacts")
@@ -807,7 +807,7 @@ defmodule Tightbeam.ArtifactsTest do
       record(ctx.db, ctx.child.session_key, %{
         kind: "report",
         title: "Remote only",
-        origin_path: "eurisko:/srv/app/report.md"
+        origin_path: "test-host:/srv/app/report.md"
       })
 
     # Reap passes nil for a workspace it cannot see (gateway archive_retired_workspace).
@@ -851,7 +851,7 @@ defmodule Tightbeam.ArtifactsTest do
           """
           INSERT INTO work_items
             (id, title, ownerUserId, createdByUser, createdBySession, createdAt)
-          VALUES (?1, ?1, 'flynn', 'flynn', NULL, 1)
+          VALUES (?1, ?1, 'sample-user', 'sample-user', NULL, 1)
           """,
           [id]
         )
@@ -881,7 +881,7 @@ defmodule Tightbeam.ArtifactsTest do
       Ledger.enqueue(db, %{
         session_key: session_key,
         message_id: "msg_#{session_key}",
-        origin: "user:flynn",
+        origin: "user:sample-user",
         prompt: "record the artifact"
       })
 
@@ -893,8 +893,8 @@ defmodule Tightbeam.ArtifactsTest do
     Org.create(db, %{
       session_key: key,
       display_name: key,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       spawned_by: spawned_by,
       operational_parent: spawned_by,
       archetype: "default",

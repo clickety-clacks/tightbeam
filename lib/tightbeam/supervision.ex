@@ -2216,7 +2216,7 @@ defmodule Tightbeam.Supervision do
   # `decision_request_id` here only ever names a statute row: it is the `dr_id`
   # `Escalation.resolve/3` handed back, which comes from `current_request/4`'s
   # own `kind = 'statute'`-scoped read. `Escalation.statute_park_candidate_in_txn/2`
-  # (Sol xhigh review, finding 2 / round 2 finding 1) restates that scope at
+  # restates that scope at
   # its own read rather than leaning on the upstream invariant alone — a park
   # sweep is exactly the kind of reader that must not be able to reach an
   # agent row even by construction accident — and is now the ONLY place this
@@ -2462,13 +2462,9 @@ defmodule Tightbeam.Supervision do
         do: current.attemptCount,
         else: current.attemptCount + 1
 
-    # THE LADDER ADVANCES ON HEARD PRODS, NOT SENT ONES (Mike's design,
-    # 2026-08-15, after the correlated-outage postmortem). `current.prodCount`
-    # counts every prod CLAIMED — including prods whose wake-turn failed
-    # because the harness was down. During the 2026-08-10 outage that meant
-    # ladders exhausted into a dead tree: every rung's wake became a failed
-    # turn, the count climbed anyway, 127 strands stalled in one day, and
-    # nothing re-armed them when the harness recovered.
+    # THE LADDER ADVANCES ON HEARD PRODS, NOT SENT ONES. `current.prodCount`
+    # counts every prod claimed, including prods whose wake-turn failed because
+    # the harness was down.
     #
     # A failed prod turn is evidence about the TRANSPORT, not the holder. The
     # ladder measures unaccountability, so only prods that were actually
@@ -2602,14 +2598,10 @@ defmodule Tightbeam.Supervision do
   #
   # EPOCH: a typed liveness receipt is the holder's NAMED REPAIR VERB — it
   # resets the ladder, and evidence from before it must never resurrect a
-  # rung (Sol review, blocking: a lifetime count re-escalated an accountable
-  # holder immediately after their receipt, overriding the repair seam the
-  # philosophy gates require). The receipt records the generation it re-armed;
+  # rung. The receipt records the generation it re-armed;
   # prods charged at or after it are this epoch's, everything earlier is
   # history. Before any receipt exists, ALL evidence counts — including legacy
-  # retirement rows whose chargedGeneration is NULL (a NULL would silently
-  # fail a >= comparison, un-hearing a durable parent transfer; Sol
-  # confirmation round). Once a receipt boundary exists, NULL-generation rows
+  # retirement rows whose chargedGeneration is NULL. Once a receipt boundary exists, NULL-generation rows
   # fall out of the epoch — conservative, and honest: a repaired ladder
   # restarts at prod 1.
   defp heard_prod_count(txn, assignment_id) do

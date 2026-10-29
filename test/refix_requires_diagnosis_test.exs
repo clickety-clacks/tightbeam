@@ -33,15 +33,15 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('sample-user', 1, 'admin_add', 1)"
       )
 
-    ensure_main_session(db, "flynn")
+    ensure_main_session(db, "sample-user")
 
     holder = session(db, "fix-holder", "coder", "claude", "anthropic")
     recon = session(db, "recon-holder", "recon", "codex", "openai")
     orchestrator = session(db, "slice-orchestrator", "orchestrator", "codex", "openai")
-    Roles.create!(db, "recon", "flynn", recon.session_key)
+    Roles.create!(db, "recon", "sample-user", recon.session_key)
 
     base_dir =
       Path.join(
@@ -50,7 +50,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       )
 
     assert :initialized = Archetypes.init_identity!(base_dir)
-    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "flynn")
+    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "sample-user")
     archetypes = Archetypes.load!(base_dir)
 
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
@@ -223,8 +223,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       assert %{ok: true} =
                ctx.handlers[verb].(%{
                  verb: verb,
-                 origin: "user:flynn",
-                 principal: {:user, "flynn"},
+                 origin: "user:sample-user",
+                 principal: {:user, "sample-user"},
                  session_key: nil,
                  params: params
                })
@@ -246,7 +246,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
   defp work_item(ctx, is_bug) do
     item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
-        principal: {:user, "flynn"},
+        principal: {:user, "sample-user"},
         params: %{title: "Bug #{System.unique_integer([:positive])}", is_bug: is_bug}
       })
 
@@ -280,8 +280,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
     revoked =
       Assignments.__handle__(ctx.db, "revoke-assignment", %{
         verb: "revoke-assignment",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:sample-user",
+        principal: {:user, "sample-user"},
         session_key: nil,
         params: %{assignment_id: slice.id, reason: "posture ruled; slice card not needed"}
       })
@@ -301,8 +301,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
   defp assign(ctx, holder_key, work_item_id, subject, opts \\ []) do
     Assignments.__handle__(ctx.db, "assign", %{
       verb: "assign",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
@@ -329,8 +329,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
   defp dispatch_call(holder_key, work_item_id, subject) do
     %{
       verb: "dispatch",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:sample-user",
+      principal: {:user, "sample-user"},
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
@@ -354,7 +354,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
 
   defp assignment(db, assignment_id) do
     Assignments.__handle__(db, "assignment-get", %{
-      principal: {:user, "flynn"},
+      principal: {:user, "sample-user"},
       params: %{assignment_id: assignment_id}
     })
   end
@@ -375,8 +375,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       session_key: key,
       display_name: key,
       kind: "custom",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "sample-user",
+      origin: "user:sample-user",
       archetype: archetype,
       host: "host-b",
       harness: harness,
