@@ -775,6 +775,7 @@ COMMANDS:
       --at = a scheduled wake that fires later. A wake ALWAYS carries a prompt —
       there is no content-free ping. This is how you DM or nudge another
       session (or yourself).
+      An assignment on an immediate wake is a message reference, not a wait.
       A matching fact or fallback delivers a new notification turn.
       It never resumes or replays prior work. The fact stamp reports why the prompt arrived.
       --replace-queued requires --assignment and asks delivery to cancel only your own
@@ -790,6 +791,9 @@ COMMANDS:
       the sender's chosen delivery time.
       Immediate:
         tightbeam wake --role owner --prompt "check the next step" --as coder
+      Immediate with an assignment reference:
+        tightbeam wake --session agent:recipient:example --assignment <assignmentId> \
+          --prompt "review is ready"
       Timed:
         tightbeam wake --session agent:coder:app --prompt "recheck the card" --after 5m --as coder
       Condition:
@@ -2094,18 +2098,6 @@ fn parse_with_optional_catalog(
             if replace_queued && wait {
                 return Err(
                     "--replace-queued cannot be combined with --predicate or --after-turn"
-                        .to_owned(),
-                );
-            }
-            if !wait
-                && assignment_id.is_some()
-                && !replace_queued
-                && after_ms.is_none()
-                && at.is_none()
-                && condition_kind.is_none()
-            {
-                return Err(
-                    "--assignment requires --predicate, --after-turn, --after, --at, or --when-fact"
                         .to_owned(),
                 );
             }
@@ -5958,8 +5950,9 @@ mod tests {
             .unwrap()
             .0;
 
-        assert_eq!(examples.matches("tightbeam wake --").count(), 3);
+        assert_eq!(examples.matches("tightbeam wake --").count(), 4);
         assert!(examples.contains("tightbeam wake --role owner --prompt"));
+        assert!(examples.contains("--session agent:recipient:example --assignment <assignmentId>"));
         assert!(examples.contains("--after 5m"));
         assert!(examples.contains("--when-fact assignment-landed"));
         assert!(examples.contains("--fallback-after 2h"));
@@ -5989,7 +5982,7 @@ mod tests {
             }) if assignment_id == "asg_123" && after_ms == "300000"
         ));
 
-        assert_eq!(
+        assert!(matches!(
             parse(strings(&[
                 "wake",
                 "--session",
@@ -5999,11 +5992,14 @@ mod tests {
                 "--prompt",
                 "no trigger",
             ])),
-            Err(
-                "--assignment requires --predicate, --after-turn, --after, --at, or --when-fact"
-                    .to_owned()
-            )
-        );
+            Ok(Command::Wake {
+                assignment_id: Some(ref assignment_id),
+                after_ms: None,
+                at: None,
+                condition_kind: None,
+                ..
+            }) if assignment_id == "asg_123"
+        ));
     }
 
     #[test]

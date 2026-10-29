@@ -426,6 +426,40 @@ defmodule Tightbeam.CliIntegrationTest do
     end
   end
 
+  test "real CLI sends an invalid immediate assignment reference to the gateway", ctx do
+    {output, status} =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-worker",
+          "--assignment",
+          "missing-immediate-reference",
+          "--prompt",
+          "check the named work"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0
+    assert output =~ "unknown_assignment"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "wake",
+                      principal: {:session, "cli-holder"},
+                      params: %{assignment_id: "missing-immediate-reference"}
+                    }}
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='missing-immediate-reference'"
+             )
+  end
+
   test "holder's dated CLI wake admits one exact assignment continuation", ctx do
     {assignment_output, 0} =
       System.cmd(
@@ -570,6 +604,180 @@ defmodule Tightbeam.CliIntegrationTest do
 
     [assignment, resolver, verifier] = ids
 
+    assert {:ok, :reset} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.Supervision.activity_in_txn(
+                 txn,
+                 assignment,
+                 "cli-holder",
+                 System.system_time(:millisecond)
+               )
+             end)
+
+    assert {:ok, [[inactivity_wake_id, inactivity_due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,dueAt FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               [assignment]
+             )
+
+    assert_activity_refresh = fn timing_args, prompt ->
+      assert {:ok, [[prior_wake_id]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+                 [assignment]
+               )
+
+      {output, 0} =
+        System.cmd(
+          ctx.binary,
+          ["wake", "--session", "cli-holder", "--assignment", assignment] ++
+            timing_args ++ ["--prompt", prompt],
+          cd: ctx.workdir
+        )
+
+      assert_receive {:cli_call, %{verb: "wake", params: %{assignment_id: ^assignment}}}
+
+      wake = Wakes.get(ctx.db, JSON.decode!(output)["wakeId"])
+      assert wake.assignment_id == assignment
+
+      assert {:ok, [["canceled"]]} =
+               DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId=?1", [prior_wake_id])
+
+      assert {:ok, [[replacement_wake_id]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+                 [assignment]
+               )
+
+      refute replacement_wake_id == prior_wake_id
+      wake
+    end
+
+    immediate_prompt = "The assignment is ready for review"
+
+    {immediate_output, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-worker",
+          "--assignment",
+          assignment,
+          "--prompt",
+          immediate_prompt
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "wake",
+                      principal: {:session, "cli-holder"},
+                      params: %{assignment_id: ^assignment}
+                    }}
+
+    immediate_id = JSON.decode!(immediate_output)["wakeId"]
+    immediate_wake = Wakes.get(ctx.db, immediate_id)
+    assert immediate_wake.assignment_id == assignment
+    assert immediate_wake.session_key == "cli-worker"
+    assert immediate_wake.prompt == immediate_prompt
+    assert is_nil(immediate_wake.wait_mode)
+    assert is_nil(immediate_wake.obligation_ref)
+    assert is_nil(immediate_wake.resolver_id)
+    assert is_nil(immediate_wake.verification_assignment_id)
+
+    assert {:ok, [[^inactivity_wake_id, ^inactivity_due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,dueAt FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               [assignment]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [immediate_id]
+             )
+
+    Wakes.fire_due(Tightbeam.WakeScheduler)
+
+    assert [
+             %{delivery_wake_id: immediate_delivery_id, batch_state: "delivered"}
+           ] = NoticeBatcher.source_refs(ctx.db, immediate_id)
+
+    assert {:ok, [["cli-worker", ^assignment, delivered_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,assignmentId,prompt FROM turns WHERE wakeId=?1",
+               [immediate_delivery_id]
+             )
+
+    assert delivered_prompt =~ immediate_prompt
+    assert Wakes.get(ctx.db, immediate_id).state == "fired"
+
+    {timed_output, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-worker",
+          "--assignment",
+          assignment,
+          "--after",
+          "1h",
+          "--prompt",
+          "timed assignment reminder"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "wake",
+                      principal: {:session, "cli-holder"},
+                      params: %{assignment_id: ^assignment, after_ms: 3_600_000}
+                    }}
+
+    timed_id = JSON.decode!(timed_output)["wakeId"]
+    assert Wakes.get(ctx.db, timed_id).assignment_id == assignment
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId=?1", [inactivity_wake_id])
+
+    assert {:ok, [[new_inactivity_wake_id, new_inactivity_due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,dueAt FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               [assignment]
+             )
+
+    refute new_inactivity_wake_id == inactivity_wake_id
+    assert new_inactivity_due_at > inactivity_due_at
+
+    fact_wake =
+      assert_activity_refresh.(
+        [
+          "--when-fact",
+          "build-finished",
+          "--when-scope",
+          "build-1",
+          "--fallback-after",
+          "1h"
+        ],
+        "fact-conditioned assignment reminder"
+      )
+
+    assert fact_wake.condition_kind == "build-finished"
+    assert fact_wake.condition_scope == "build-1"
+
     {:ok, _} =
       Ledger.enqueue(ctx.db, %{
         session_key: "cli-holder",
@@ -582,28 +790,8 @@ defmodule Tightbeam.CliIntegrationTest do
 
     after_prompt = "D3 manual: continue the named assignment"
 
-    after_result =
-      System.cmd(
-        ctx.binary,
-        [
-          "wake",
-          "--session",
-          "cli-holder",
-          "--assignment",
-          assignment,
-          "--after-turn",
-          "--prompt",
-          after_prompt
-        ],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
-    assert_receive {:cli_call, %{verb: "wake", params: wire_params}}
-    assert wire_params.assignment_id == assignment
-    {after_output, 0} = after_result
-    after_id = JSON.decode!(after_output)["wakeId"]
-    after_wake = Wakes.get(ctx.db, after_id)
+    after_wake = assert_activity_refresh.(["--after-turn"], after_prompt)
+    after_id = after_wake.wake_id
     assert after_wake.assignment_id == assignment
     assert after_wake.obligation_ref == assignment
     assert after_wake.creator_session_key == "cli-holder"
@@ -624,28 +812,13 @@ defmodule Tightbeam.CliIntegrationTest do
 
     dependency_prompt = "D3 manual: read the resolver disposition before acting"
 
-    {dependency_output, 0} =
-      System.cmd(
-        ctx.binary,
-        [
-          "wake",
-          "--session",
-          "cli-holder",
-          "--assignment",
-          assignment,
-          "--predicate",
-          JSON.encode!(predicate),
-          "--fallback-after",
-          "1h",
-          "--prompt",
-          dependency_prompt
-        ],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
+    dependency =
+      assert_activity_refresh.(
+        ["--predicate", JSON.encode!(predicate), "--fallback-after", "1h"],
+        dependency_prompt
       )
 
-    dependency_id = JSON.decode!(dependency_output)["wakeId"]
-    dependency = Wakes.get(ctx.db, dependency_id)
+    dependency_id = dependency.wake_id
     assert dependency.assignment_id == assignment
     assert dependency.obligation_ref == assignment
     assert dependency.creator_session_key == "cli-holder"
