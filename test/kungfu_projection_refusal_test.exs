@@ -345,18 +345,15 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     refute_received {:firehose_notice, _}
   end
 
-  test "queued bytes retain exact content across re-registration", %{hub: hub} do
+  test "matching frames arrive without a per-frame delivery acknowledgement", %{hub: hub} do
     :ok = register(hub)
     Hub.publish(hub, notice())
     Hub.publish(hub, notice())
-    assert %{queued: 1, in_flight: true} = Hub.connection_stats(hub, self())
     assert_receive {:firehose_notice, first}
     assert first == notice()
-    :ok = register(hub, %{is_admin: false})
-    Hub.delivered(hub, self())
-    assert %{queued: 0, in_flight: true} = Hub.connection_stats(hub, self())
     assert_receive {:firehose_notice, second}
     assert second == notice()
+    assert %{queued: 0, in_flight: false} = Hub.connection_stats(hub, self())
   end
 
   test "changes route upgrades on loopback and delivers raw and general subscribed notices", %{

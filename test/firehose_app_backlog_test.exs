@@ -2,7 +2,7 @@ defmodule Tightbeam.FirehoseAppBacklogTest do
   use Tightbeam.TestCase, async: false
   import ExUnit.CaptureLog
 
-  alias Tightbeam.Firehose.Hub
+  alias Tightbeam.Firehose.{Hub, Publisher}
 
   test "credentialless observers receive subscribed notices without revocation" do
     hub = start_supervised!({Hub, name: nil})
@@ -96,7 +96,7 @@ defmodule Tightbeam.FirehoseAppBacklogTest do
         backlog_counter: counter
       })
 
-    :ok = Hub.subscribe(hub, self(), "large", %{"classes" => ["large.created"]})
+    :ok = Hub.subscribe(hub, self(), "large", %{"classes" => ["kungfu.updated"]})
 
     parent = self()
 
@@ -113,7 +113,7 @@ defmodule Tightbeam.FirehoseAppBacklogTest do
             backlog_counter: counter
           })
 
-        :ok = Hub.subscribe(hub, self(), "small", %{"classes" => ["small.created"]})
+        :ok = Hub.subscribe(hub, self(), "small", %{"classes" => ["session.updated"]})
         send(parent, {:healthy_ready, self()})
 
         receive do
@@ -132,23 +132,40 @@ defmodule Tightbeam.FirehoseAppBacklogTest do
     assert_receive {:healthy_ready, ^healthy_app}, 5_000
     on_exit(fn -> if Process.alive?(healthy_app), do: send(healthy_app, :stop) end)
 
-    payload = String.duplicate("x", 33 * 1_024 * 1_024)
+    item = fn purpose ->
+      %{
+        "name" => "synthetic",
+        "purpose" => purpose,
+        "phrases" => ["fixture"],
+        "rootArchetype" => "coder",
+        "installedRevision" => nil,
+        "status" => "available",
+        "documents" => [],
+        "rowVersion" => 1
+      }
+    end
 
-    Hub.publish(hub, %{
-      "class" => "large.created",
-      "refs" => %{},
-      "payload" => %{"body" => payload}
-    })
+    under_limit =
+      Publisher.committed_notice(
+        "kungfu.updated",
+        item.(String.duplicate("x", 63 * 1_024 * 1_024)),
+        %{}
+      )
+
+    over_limit =
+      Publisher.committed_notice(
+        "kungfu.updated",
+        item.(String.duplicate("y", 2 * 1_024 * 1_024)),
+        %{}
+      )
+
+    Hub.publish(hub, under_limit)
 
     assert Hub.sequence(hub, self()) == 1
 
     log =
       capture_log(fn ->
-        Hub.publish(hub, %{
-          "class" => "large.created",
-          "refs" => %{},
-          "payload" => %{"body" => payload}
-        })
+        Hub.publish(hub, over_limit)
 
         assert Hub.sequence(hub, self()) == 2
       end)
@@ -157,12 +174,12 @@ defmodule Tightbeam.FirehoseAppBacklogTest do
     assert log =~ "slow-app"
     assert log =~ "reason=outbound_queue_overflow"
     assert_receive :firehose_overflow, 5_000
-    assert_receive {:firehose_notice, %{"class" => "large.created", "seq" => 1}}, 5_000
+    assert_receive {:firehose_notice, %{"class" => "kungfu.updated", "seq" => 1}}, 5_000
     assert %{overflowed: true, seq: 2} = Hub.connection_stats(hub, self())
 
-    Hub.publish(hub, %{"class" => "small.created", "refs" => %{}, "payload" => %{}})
+    Hub.publish(hub, %{"class" => "session.updated", "refs" => %{}, "payload" => %{}})
     assert Hub.sequence(hub, healthy_app) == 1
-    assert_receive {:healthy_notice, %{"class" => "small.created", "seq" => 1}}, 5_000
+    assert_receive {:healthy_notice, %{"class" => "session.updated", "seq" => 1}}, 5_000
     refute_received :firehose_overflow
     assert %{overflowed: false, seq: 1} = Hub.connection_stats(hub, healthy_app)
   end

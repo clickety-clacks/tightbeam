@@ -243,8 +243,7 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
     for name <- [
           :open_grounded_assignment!,
           :check_work_item_and_assignment_get,
-          :check_dispatch_opens_assignment,
-          :check_effort_without_effect
+          :check_dispatch_opens_assignment
         ] do
       {_, calls} =
         Macro.prewalk(Map.fetch!(functions, name), [], fn
@@ -266,7 +265,7 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
 
       assert [{:prepare, prepared_at}] = Enum.filter(calls, &(elem(&1, 0) == :prepare))
       staffing = Enum.filter(calls, &(elem(&1, 0) == :staff))
-      assert length(staffing) == if(name == :check_effort_without_effect, do: 2, else: 1)
+      assert length(staffing) == 1
       assert Enum.all?(staffing, fn {:staff, line} -> prepared_at < line end)
     end
   end

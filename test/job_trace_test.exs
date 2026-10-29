@@ -63,10 +63,10 @@ defmodule Tightbeam.JobTraceTest do
 
       INSERT INTO wakes
         (wakeId, sessionKey, origin, prompt, dueAt, state, createdAt, firedAt,
-         conditionKind, conditionScope, conditionAfterId, firedBy)
+         conditionKind, conditionScope, conditionAfterId, firedBy, assignmentId)
       VALUES
         ('w_condition', 'holder', 'user:owner', 'condition', 500, 'fired', 100, 100,
-         'quota-recovered', 'asg_direct', 0, 'condition');
+         'quota-recovered', 'asg_direct', 0, 'condition', 'asg_direct');
 
       INSERT INTO wakes
         (wakeId, sessionKey, origin, prompt, dueAt, state, createdAt, firedAt,
@@ -82,21 +82,6 @@ defmodule Tightbeam.JobTraceTest do
         ('dr_trace', 'statute', 'user:owner', 'owner', 'asg_direct', 100, 500,
          'trace-rule', 'trace-action', 'Choose', '{}', 'ruled', 'allow');
       """)
-
-    {:ok, _rows} =
-      DB.query(
-        db,
-        """
-        INSERT INTO effort_checkin_generations
-          (assignmentId, generation, state, baseHorizonMs, multiplier, armedAt,
-           terminalSeqWatermark, holderKey, host, root, baseline, wakeId, evidence)
-        VALUES
-          ('asg_direct', 1, 'probed', 10, 1, 100, 0, 'holder', ?1, '/tmp',
-           '{"status":"available","observation":{"stamp":"/tmp/effort.stamp","prior":"observed","writes":0,"entries":1,"digest":"same"}}',
-           'w_condition', '{"outcome":"zero_effect"}')
-        """,
-        [Tightbeam.Placement.local_host_name()]
-      )
 
     Enum.each([{"asg_direct", 2}, {"asg_bad", 3}, {"asg_review", 4}], fn
       {assignment_id, opened_at} ->

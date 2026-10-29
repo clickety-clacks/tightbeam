@@ -214,7 +214,7 @@ defmodule FeatureSmoke do
       Enum.flat_map(areas, fn
         "provider" -> ["provider/onboard surface"]
         "work" -> ["work records and dispatch"]
-        "decisions" -> ["effort check-in"]
+        "decisions" -> []
         "telemetry" -> ["telemetry queries and execution-map assertions"]
         "artifacts" -> []
       end)
@@ -2042,9 +2042,25 @@ defmodule FeatureSmoke do
       "dispatch must persist workItemId (work-item-brackets-v1 F7): #{inspect(got)}"
     )
 
+    reason = "Feature smoke completed the dispatch checks"
+    revoked =
+      ok!(state, "revoke-assignment", %{
+        "assignmentId" => asg_id,
+        "reason" => reason
+      })
+
+    assert(
+      state,
+      revoked["state"] == "closed" and revoked["outcome"] == "revoked",
+      "dispatch smoke revocation should close #{asg_id} as revoked, got #{inspect(revoked)}"
+    )
+
     retire(state, holder)
     retire(state, topology)
-    pass(state, "dispatch opens an assignment linked to its work item (brackets F7)")
+    pass(
+      state,
+      "dispatch opens a linked assignment and reasoned revocation closes it (brackets F7)"
+    )
   end
 
   # --- 0.1.9 physical breathing query -----------------------------------------
