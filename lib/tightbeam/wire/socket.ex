@@ -164,7 +164,7 @@ defmodule Tightbeam.Wire.Socket do
         )
 
       {:takeover_close} ->
-        stop_with(Payloads.wire_error("session_replaced"), 1000, state)
+        stop_with(Payloads.wire_error("session_replaced"), state)
 
       {:ping, token} ->
         if token == state.deps[:ping_token] do
@@ -264,14 +264,10 @@ defmodule Tightbeam.Wire.Socket do
         pair_limit(state),
         60_000
       ) ->
-        stop_with(Payloads.wire_error("rate_limited"), 1008, state)
+        stop_with(Payloads.wire_error("rate_limited"), state)
 
       msg["protocolVersion"] != 1 ->
-        stop_with(
-          Payloads.wire_error("invalid_message", "protocolVersion must be 1"),
-          1002,
-          state
-        )
+        stop_with(Payloads.wire_error("invalid_message", "protocolVersion must be 1"), state)
 
       true ->
         info = if is_map(msg["deviceInfo"]), do: msg["deviceInfo"], else: %{}
@@ -284,19 +280,14 @@ defmodule Tightbeam.Wire.Socket do
             model: info["model"]
           })
 
-        {payload, close_code} =
+        payload =
           case result do
-            {:paired, device} ->
-              {Payloads.pair_result({:ok, device.token, device.user_id}), 1000}
-
-            {:pending, _device} ->
-              {Payloads.pair_result({:error, "pair_pending"}), 1000}
-
-            :denied ->
-              {Payloads.pair_result({:error, "pair_denied"}), 1008}
+            {:paired, device} -> Payloads.pair_result({:ok, device.token, device.user_id})
+            {:pending, _device} -> Payloads.pair_result({:error, "pair_pending"})
+            :denied -> Payloads.pair_result({:error, "pair_denied"})
           end
 
-        stop_with(payload, close_code, state)
+        stop_with(payload, state)
     end
   end
 
@@ -345,12 +336,12 @@ defmodule Tightbeam.Wire.Socket do
       state = state |> schedule_ping() |> arm_pong_deadline()
       push_many([payload, Payloads.sync_complete()], state)
     else
-      _ -> stop_with(Payloads.auth_result_failure("auth_failed"), 1008, state)
+      _ -> stop_with(Payloads.auth_result_failure("auth_failed"), state)
     end
   end
 
   defp auth_operator(_msg, state),
-    do: stop_with(Payloads.auth_result_failure("auth_failed"), 1008, state)
+    do: stop_with(Payloads.auth_result_failure("auth_failed"), state)
 
   defp auth_device(msg, token, state) do
     case Devices.by_token(db(state), token) do
@@ -364,7 +355,7 @@ defmodule Tightbeam.Wire.Socket do
             _ -> "auth_failed"
           end
 
-        stop_with(Payloads.auth_result_failure(reason), 1008, state)
+        stop_with(Payloads.auth_result_failure(reason), state)
 
       device ->
         auth_success(msg, device, state)
@@ -391,7 +382,7 @@ defmodule Tightbeam.Wire.Socket do
         auth_replay(msg, device, conn_ref, subscriptions, %{state | registry_monitor: monitor})
 
       :error ->
-        stop_with(Payloads.wire_error("invalid_message"), 1002, state)
+        stop_with(Payloads.wire_error("invalid_message"), state)
     end
   end
 
@@ -402,7 +393,7 @@ defmodule Tightbeam.Wire.Socket do
         auth_replay(msg, device, state.conn_ref, subscriptions, state)
 
       _ ->
-        stop_with(Payloads.wire_error("invalid_message"), 1002, state)
+        stop_with(Payloads.wire_error("invalid_message"), state)
     end
   end
 
@@ -699,8 +690,8 @@ defmodule Tightbeam.Wire.Socket do
   defp push_many(payloads, state),
     do: {:push, Enum.map(payloads, &{:text, JSON.encode!(&1)}), state}
 
-  defp stop_with(payload, code, state),
-    do: {:stop, :normal, code, {:text, JSON.encode!(payload)}, state}
+  defp stop_with(payload, state),
+    do: {:stop, :normal, 1000, {:text, JSON.encode!(payload)}, state}
 
   defp string(nil), do: ""
   defp string(value) when is_binary(value), do: value
