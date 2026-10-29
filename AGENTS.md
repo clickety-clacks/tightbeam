@@ -6,17 +6,16 @@ The branch and release ruling for both product lines is in
 [CONTRIBUTING.md on main](https://github.com/clickety-clacks/tightbeam/blob/main/CONTRIBUTING.md).
 Integrate maintenance work into the highest `0.1.*` branch (currently `0.1.9`),
 not main. main is now the 0.2 fabric program line — never target it from this
-line; fixes cross to it only by Mike-authorized cherry-pick election. Where
-older guidance, specs, or cards name another default integration branch, read
-"highest `0.1.*` branch" on this line. If a card names a branch explicitly, the
-card wins.
+line; fixes cross to it only by maintainer-authorized cherry-pick. Where
+older guidance, specs, or task instructions name another default integration
+branch, read "highest `0.1.*` branch" on this line. If task instructions name
+a branch explicitly, that branch takes precedence.
 
 ## Keep the substrate neutral
 
 The substrate (`priv/seed`, `priv/guidance`, `priv/skills`, and Main's default
-archetype) stays neutral. Put ways of working — such as PO/PDO roles, delivery
-and review process, and how to build a product org — in the applicable kungfu
-bundle, never in substrate guidance.
+archetype) stays neutral. Put ways of working in the applicable kungfu bundle,
+never in substrate guidance.
 
 ## ACP / harness facts (for anyone touching the adapter layer)
 
@@ -74,9 +73,8 @@ data shows whether the event path ever drops anything.
 - The Evidence section of
   `priv/kungfu/agentic-engineering/guidance/engineering-core.md` decides which
   tests to add or require. Established tests and gates, including CI
-  configuration, stay; take one you believe is wrong to its owner through the
-  authorized source path. Adding a gate, check or process step needs the user's
-  approval through a decision request.
+  configuration, stay; take one you believe is wrong to its owner. Adding a
+  gate, check or process step needs the user's approval.
 - Repository commands. Run those whose checks that rule keeps:
   - Elixir: `mix format --check-formatted` and `scripts/verify_mix.sh`.
   - Rust, from `cli/`: `cargo fmt --check` and `cargo test`.
@@ -111,8 +109,7 @@ everyone downstream.
 - **Make sure the test is real.** It must be able to fail: it exercises the actual subject, it
   asserts a specific observable outcome, and breaking the code it covers turns it red. If you
   cannot state what regression it would catch, it is not a test yet.
-- **A mock that diverges from the real harness tests fake shit.** (Flynn, 2026-07-26, after
-  merge ff4b64b passed 730 mocked tests and then killed every LIVE claude turn — reverted.)
+- **A mock that diverges from the real harness tests fake shit.**
   Mocks are valid ONLY for properties that live entirely on OUR side of the ACP seam
   (durability, ordering, races, SQL — stage pathologies freely). Any test whose property
   depends on what the OTHER side actually does is circular through a mock: it verifies our
