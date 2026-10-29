@@ -1679,9 +1679,11 @@ defmodule Tightbeam.Wire.Router do
       %{
         "id" => "rail:#{denial.id}",
         "sessionKey" => session_key,
+        "origin" => denial.origin,
         "principal" => denial.principal,
         "verb" => denial.verb,
         "rule" => denial.rule,
+        "payload" => denial.payload,
         "occurredAt" => denial.ts,
         "afterMessageSeq" => denial.after_message_seq,
         "order" => %{

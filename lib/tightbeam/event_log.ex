@@ -290,8 +290,8 @@ defmodule Tightbeam.EventLog do
       DB.query(
         db,
         """
-        SELECT id, ts, verb, principal, json_extract(payload, '$.rule'),
-          json_extract(payload, '$.afterMessageSeq')
+        SELECT id, ts, verb, origin, principal, payload,
+          json_extract(payload, '$.rule'), json_extract(payload, '$.afterMessageSeq')
         FROM events
         WHERE sessionKey = ?1 AND principal = ?2 AND kind = 'denied'
           AND json_valid(payload) AND json_type(payload, '$.rule') = 'text'
@@ -303,13 +303,16 @@ defmodule Tightbeam.EventLog do
         [session_key, "session:" <> session_key]
       )
 
-    Enum.map(rows, fn [id, ts, verb, principal, rule, after_message_seq] ->
+    Enum.map(rows, fn [id, ts, verb, origin, principal, payload, rule, after_message_seq] ->
       %{
         id: id,
         ts: ts,
         verb: verb,
+        origin: origin,
         principal: principal,
         rule: rule,
+        # Keep ordering metadata separate from the source payload identity.
+        payload: JSON.decode!(payload) |> Map.delete("afterMessageSeq"),
         after_message_seq: after_message_seq
       }
     end)

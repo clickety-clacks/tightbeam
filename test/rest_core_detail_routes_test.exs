@@ -568,35 +568,82 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         attachments: []
       })
 
-    event_ids =
+    origin = "session:#{session.session_key}"
+
+    source_payloads =
       for index <- 1..2 do
+        payload = %{
+          "code" => "rule_denied",
+          "detail" => "sample-detail-#{index}",
+          "rule" => "sample-rule-#{index}"
+        }
+
         {:ok, event_id} =
           DB.transaction(ctx.db, fn txn ->
             EventLog.append_event_in_txn(
               txn,
               "denied",
               "assign",
-              "test",
+              origin,
               session.session_key,
-              JSON.encode!(%{"rule" => "sample-rule-#{index}"}),
+              JSON.encode!(payload),
               {:session, session.session_key},
               200
             )
           end)
 
-        event_id
+        {event_id, payload}
       end
 
+    event_ids = Enum.map(source_payloads, &elem(&1, 0))
+    expected_payloads = Enum.map(source_payloads, &elem(&1, 1))
     expected_principal = "session:#{session.session_key}"
+    legacy_payload = %{"code" => "rule_denied", "rule" => "legacy-rule"}
+
+    {:ok, legacy_event_id} =
+      DB.transaction(ctx.db, fn txn ->
+        EventLog.append_event_in_txn(
+          txn,
+          "denied",
+          "assign",
+          origin,
+          session.session_key,
+          JSON.encode!(legacy_payload),
+          {:session, session.session_key},
+          250
+        )
+      end)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE events SET payload=?1 WHERE id=?2", [
+               JSON.encode!(legacy_payload),
+               legacy_event_id
+             ])
 
     denials = EventLog.rail_denials_for_session(ctx.db, session.session_key)
 
-    assert Enum.map(denials, & &1.id) == event_ids
-    assert Enum.map(denials, & &1.ts) == [200, 200]
-    assert Enum.map(denials, & &1.verb) == ["assign", "assign"]
-    assert Enum.map(denials, & &1.principal) == [expected_principal, expected_principal]
-    assert Enum.map(denials, & &1.rule) == ["sample-rule-1", "sample-rule-2"]
-    assert Enum.map(denials, & &1.after_message_seq) == [before_message.seq, before_message.seq]
+    all_event_ids = event_ids ++ [legacy_event_id]
+
+    assert Enum.map(denials, & &1.id) == all_event_ids
+    assert Enum.map(denials, & &1.ts) == [200, 200, 250]
+    assert Enum.map(denials, & &1.verb) == ["assign", "assign", "assign"]
+
+    assert Enum.map(denials, & &1.origin) == [origin, origin, origin]
+
+    assert Enum.map(denials, & &1.principal) == [
+             expected_principal,
+             expected_principal,
+             expected_principal
+           ]
+
+    assert Enum.map(denials, & &1.rule) == ["sample-rule-1", "sample-rule-2", "legacy-rule"]
+    assert Enum.map(denials, & &1.payload) == expected_payloads ++ [legacy_payload]
+
+    assert Enum.map(denials, & &1.after_message_seq) == [
+             before_message.seq,
+             before_message.seq,
+             nil
+           ]
 
     {:appended, after_message} =
       Projection.append(ctx.db, %{
@@ -617,34 +664,46 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     rail_denials = history["railDenials"]
 
-    assert Enum.map(rail_denials, & &1["id"]) == Enum.map(event_ids, &"rail:#{&1}")
+    assert Enum.map(rail_denials, & &1["id"]) == Enum.map(all_event_ids, &"rail:#{&1}")
 
     assert Enum.map(rail_denials, & &1["sessionKey"]) == [
+             session.session_key,
              session.session_key,
              session.session_key
            ]
 
     assert Enum.map(rail_denials, & &1["principal"]) == [
              "session:#{session.session_key}",
+             "session:#{session.session_key}",
              "session:#{session.session_key}"
            ]
 
-    assert Enum.map(rail_denials, & &1["verb"]) == ["assign", "assign"]
-    assert Enum.map(rail_denials, & &1["rule"]) == ["sample-rule-1", "sample-rule-2"]
-    assert Enum.map(rail_denials, & &1["occurredAt"]) == [200, 200]
+    assert Enum.map(rail_denials, & &1["origin"]) == [origin, origin, origin]
+    assert Enum.map(rail_denials, & &1["verb"]) == ["assign", "assign", "assign"]
+
+    assert Enum.map(rail_denials, & &1["rule"]) == [
+             "sample-rule-1",
+             "sample-rule-2",
+             "legacy-rule"
+           ]
+
+    assert Enum.map(rail_denials, & &1["occurredAt"]) == [200, 200, 250]
+    assert Enum.map(rail_denials, & &1["payload"]) == expected_payloads ++ [legacy_payload]
 
     assert Enum.map(rail_denials, & &1["afterMessageSeq"]) == [
              before_message.seq,
-             before_message.seq
+             before_message.seq,
+             nil
            ]
 
     assert Enum.map(rail_denials, & &1["order"]["afterMessageSeq"]) == [
              before_message.seq,
-             before_message.seq
+             before_message.seq,
+             nil
            ]
 
-    assert Enum.map(rail_denials, & &1["order"]["occurredAt"]) == [200, 200]
-    assert Enum.map(rail_denials, & &1["order"]["eventId"]) == event_ids
+    assert Enum.map(rail_denials, & &1["order"]["occurredAt"]) == [200, 200, 250]
+    assert Enum.map(rail_denials, & &1["order"]["eventId"]) == all_event_ids
 
     items = Map.new(history["items"], &{&1["id"], &1})
     first_denial_at = hd(rail_denials)["occurredAt"]
