@@ -946,6 +946,11 @@ defmodule Tightbeam.Gateway do
       {"harklight-settle", []} => fn call ->
         HarklightSend.settle(db, call, runner: Map.get(config, :harklight_send_runner))
       end,
+      {"harklight-follow", []} => fn call ->
+        Tightbeam.HarklightFollows.follow(db, call,
+          runner: Map.get(config, :harklight_send_runner)
+        )
+      end,
       {"artifacts", []} => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
       {"rule", ["decision_request.ruled"]} => fn call ->
         Escalation.rule(db, call,

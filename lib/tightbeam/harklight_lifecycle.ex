@@ -25,6 +25,16 @@ defmodule Tightbeam.HarklightLifecycle do
       reason TEXT,
       PRIMARY KEY(senderId,messageId)
     );
+    CREATE TABLE IF NOT EXISTS harklight_follow_message_ends (
+      senderId TEXT NOT NULL,
+      messageId TEXT NOT NULL,
+      handle TEXT NOT NULL,
+      opId TEXT NOT NULL,
+      replacementId TEXT,
+      endedBySessionKey TEXT,
+      endKind TEXT NOT NULL CHECK(endKind IN ('retracted','superseded','terminal')),
+      PRIMARY KEY(senderId,messageId)
+    );
     CREATE TABLE IF NOT EXISTS harklight_held_terminals (
       handle TEXT NOT NULL,
       eventId TEXT NOT NULL,
@@ -91,7 +101,7 @@ defmodule Tightbeam.HarklightLifecycle do
 
   defp decode_effects(value) when is_map(value) do
     keys =
-      ~w(wake_effect supersedes pending_delivery message_id effect reason acknowledgment subscription_state handle event_id)a
+      ~w(wake_effect supersedes pending_delivery message_id effect reason acknowledgment subscription_state handle event_id session_key follower kind state replacement_id follows)a
 
     Map.new(value, fn {k, v} ->
       {Enum.find(keys, k, &(Atom.to_string(&1) == k)), decode_effects(v)}
@@ -142,7 +152,17 @@ defmodule Tightbeam.HarklightLifecycle do
             {%{message_id: id, effect: "no_subscription"}, pending}
 
           old.session_key != session ->
-            {%{message_id: id, effect: "other_session"}, pending}
+            entries =
+              end_follows_in_txn(
+                txn,
+                old,
+                op_id,
+                message["message_id"],
+                session,
+                "superseded"
+              )
+
+            {%{message_id: id, effect: "other_session"}, pending ++ entries}
 
           true ->
             entries = end_in_txn(txn, old, op_id, message["message_id"], "pending")
@@ -202,6 +222,87 @@ defmodule Tightbeam.HarklightLifecycle do
       )
     end
 
+    end_follows_in_txn(
+      txn,
+      record,
+      op_id,
+      replacement,
+      record.session_key,
+      if(replacement, do: "superseded", else: "retracted")
+    )
+  end
+
+  defp end_follows_in_txn(txn, record, op_id, replacement, ended_by, end_kind) do
+    now = System.system_time(:millisecond)
+
+    Txn.q(
+      txn,
+      """
+      UPDATE harklight_wake_follows SET state='ended',endedAt=?3
+      WHERE senderId=?1 AND messageId=?2 AND kind='message' AND state='open'
+        AND (?4<>'superseded' OR sessionKey=?5)
+      """,
+      [record.sender_id, record.message_id, now, end_kind, ended_by]
+    )
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO harklight_follow_message_ends(senderId,messageId,handle,opId,replacementId,endedBySessionKey,endKind)
+      VALUES(?1,?2,?3,?4,?5,?6,?7)
+      ON CONFLICT(senderId,messageId) DO UPDATE SET
+        handle=excluded.handle,opId=excluded.opId,replacementId=excluded.replacementId,
+        endedBySessionKey=excluded.endedBySessionKey,endKind=excluded.endKind
+      """,
+      [record.sender_id, record.message_id, record.handle, op_id, replacement, ended_by, end_kind]
+    )
+
+    pending_deliveries_in_txn(txn, record, replacement)
+  end
+
+  def end_message_follows_in_txn(txn, sender_id, message_id, handle, event_id) do
+    Txn.q(
+      txn,
+      "UPDATE harklight_wake_follows SET state='ended',endedAt=?3 WHERE senderId=?1 AND messageId=?2 AND kind='message' AND state='open'",
+      [sender_id, message_id, System.system_time(:millisecond)]
+    )
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO harklight_follow_message_ends(senderId,messageId,handle,opId,replacementId,endedBySessionKey,endKind)
+      VALUES(?1,?2,?3,?4,NULL,NULL,'terminal')
+      ON CONFLICT(senderId,messageId) DO NOTHING
+      """,
+      [sender_id, message_id, handle, "terminal:" <> event_id]
+    )
+
+    :ok
+  end
+
+  def supersede_caller_in_txn(txn, sender_id, message_id) do
+    case Txn.q(
+           txn,
+           "SELECT endedBySessionKey FROM harklight_follow_message_ends WHERE senderId=?1 AND messageId=?2 AND endKind='superseded'",
+           [sender_id, message_id]
+         ) do
+      [[session_key]] -> session_key
+      _ -> nil
+    end
+  end
+
+  def message_follow_end_kind_in_txn(txn, sender_id, message_id) do
+    case Txn.q(
+           txn,
+           "SELECT endKind FROM harklight_follow_message_ends WHERE senderId=?1 AND messageId=?2",
+           [sender_id, message_id]
+         ) do
+      [[end_kind]] -> end_kind
+      _ -> nil
+    end
+  end
+
+  defp pending_deliveries_in_txn(txn, record, replacement) do
     statement =
       if replacement,
         do:
@@ -210,10 +311,17 @@ defmodule Tightbeam.HarklightLifecycle do
 
     Txn.q(
       txn,
-      "SELECT wakeId,handle,eventId FROM harklight_wake_entries WHERE senderId=?1 AND messageId=?2 ORDER BY feedCursor",
+      """
+      SELECT COALESCE(d.wakeId,e.wakeId),e.handle,e.eventId,COALESCE(d.sessionKey,h.sessionKey)
+      FROM harklight_wake_entries e
+      JOIN harklight_wake_handles h ON h.handle=e.handle
+      LEFT JOIN harklight_wake_deliveries d ON d.handle=e.handle AND d.eventId=e.eventId
+      WHERE e.senderId=?1 AND e.messageId=?2
+      ORDER BY e.feedCursor,COALESCE(d.sessionKey,h.sessionKey)
+      """,
       [record.sender_id, record.message_id]
     )
-    |> Enum.flat_map(fn [wake, handle, event] ->
+    |> Enum.flat_map(fn [wake, handle, event, session_key] ->
       delivered =
         NoticeBatcher.source_delivery_turns_in_txn(txn, wake)
         |> Enum.any?(fn [_, status, _] -> status != "queued" end)
@@ -227,9 +335,17 @@ defmodule Tightbeam.HarklightLifecycle do
           [wake, statement]
         )
 
-        [%{message_id: record.message_id, handle: handle, event_id: event}]
+        [
+          %{
+            message_id: record.message_id,
+            handle: handle,
+            event_id: event,
+            session_key: session_key
+          }
+        ]
       end
     end)
+    |> Enum.uniq_by(&{&1.event_id, &1.session_key})
   end
 
   # The claim transaction is the final presentation boundary, shared with
@@ -258,13 +374,6 @@ defmodule Tightbeam.HarklightLifecycle do
     if statements == [], do: prompt, else: prompt <> "\n\n" <> Enum.join(statements, "\n")
   end
 
-  def ended_in_txn?(txn, sender, message) do
-    Txn.q(txn, "SELECT 1 FROM harklight_subscription_ends WHERE senderId=?1 AND messageId=?2", [
-      sender,
-      message
-    ]) != []
-  end
-
   # A terminal can precede its send response. Hold only a possible own closing
   # terminal until the stored outcome distinguishes it from another sender's
   # operation. A refused/closed target releases the real terminal unchanged.
@@ -285,10 +394,9 @@ defmodule Tightbeam.HarklightLifecycle do
           """
           SELECT s.payload FROM harklight_send_operations s
           LEFT JOIN harklight_command_results r ON r.opId=s.opId
-          WHERE s.state='pending' AND r.opId IS NULL AND s.sessionKey=(
-            SELECT sessionKey FROM harklight_send_operations WHERE senderId=?1 AND messageId=?2 AND state='bound')
+          WHERE s.state='pending' AND r.opId IS NULL
           """,
-          [sender, message]
+          []
         )
         |> Enum.any?(fn [payload] ->
           prepared = JSON.decode!(payload)
@@ -296,23 +404,29 @@ defmodule Tightbeam.HarklightLifecycle do
           m["sender_id"] == sender and message in (m["supersedes"] || [])
         end)
 
-      if ended != [] or pending do
+      if pending do
         Txn.q(
           txn,
           "INSERT INTO harklight_held_terminals(handle,eventId,senderId,messageId,rawLine) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(handle,eventId) DO NOTHING",
           [handle, event_id, sender, message, line]
         )
 
+        true
+      else
         if ended == [["pending"]] do
           Txn.q(
             txn,
             "UPDATE harklight_subscription_ends SET ackEventId=?3 WHERE senderId=?1 AND messageId=?2 AND ackEventId IS NULL",
             [sender, message, event_id]
           )
+
+          Txn.q(
+            txn,
+            "INSERT INTO harklight_held_terminals(handle,eventId,senderId,messageId,rawLine) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(handle,eventId) DO NOTHING",
+            [handle, event_id, sender, message, line]
+          )
         end
 
-        true
-      else
         false
       end
     else
@@ -329,7 +443,13 @@ defmodule Tightbeam.HarklightLifecycle do
         if String.starts_with?(id, "w_harklight_") do
           case Txn.q(
                  txn,
-                 "SELECT handle,feedCursor FROM harklight_wake_entries WHERE wakeId=?1",
+                 """
+                 SELECT e.handle,e.feedCursor
+                 FROM harklight_wake_entries e
+                 LEFT JOIN harklight_wake_deliveries d ON d.handle=e.handle AND d.eventId=e.eventId
+                 WHERE e.wakeId=?1 OR d.wakeId=?1
+                 LIMIT 1
+                 """,
                  [id]
                ) do
             [[handle, cursor]] -> {id, handle, cursor}
@@ -350,6 +470,7 @@ defmodule Tightbeam.HarklightLifecycle do
             WHERE t.handle=?1 AND CAST(t.eventId AS INTEGER)<?2
               AND NOT EXISTS (SELECT 1 FROM harklight_subscription_ends e WHERE e.senderId=t.senderId AND e.messageId=t.messageId)
               AND NOT EXISTS (SELECT 1 FROM harklight_wake_entries e WHERE e.handle=t.handle AND e.eventId=t.eventId)
+              AND NOT EXISTS (SELECT 1 FROM harklight_wake_suppressed_entries e WHERE e.handle=t.handle AND e.eventId=t.eventId)
             LIMIT 1
             """,
             [handle, cursor]
@@ -391,6 +512,7 @@ defmodule Tightbeam.HarklightLifecycle do
         LEFT JOIN harklight_subscription_ends e ON e.senderId=t.senderId AND e.messageId=t.messageId
         WHERE (e.messageId IS NULL OR (e.acknowledgment='pending' AND e.ackEventId IS NULL))
           AND NOT EXISTS (SELECT 1 FROM harklight_wake_entries w WHERE w.handle=t.handle AND w.eventId=t.eventId)
+          AND NOT EXISTS (SELECT 1 FROM harklight_wake_suppressed_entries w WHERE w.handle=t.handle AND w.eventId=t.eventId)
         ORDER BY CAST(t.eventId AS INTEGER)
         """
       )
@@ -452,7 +574,12 @@ defmodule Tightbeam.HarklightLifecycle do
                  [target.message_id]
                ) do
             {:ok, [[ack, state, reason]]} ->
-              Map.merge(target, %{acknowledgment: ack, subscription_state: state, reason: reason})
+              Map.merge(target, %{
+                acknowledgment: ack,
+                subscription_state: state,
+                reason: reason,
+                follows: follows_for_message(db, target.message_id)
+              })
 
             _ ->
               target
@@ -464,11 +591,48 @@ defmodule Tightbeam.HarklightLifecycle do
     end)
   end
 
+  defp follows_for_message(db, message_id) do
+    case DB.query(
+           db,
+           "SELECT handle FROM harklight_wake_requests WHERE messageId=?1 LIMIT 1",
+           [message_id]
+         ) do
+      {:ok, [[handle]]} ->
+        case DB.query(
+               db,
+               "SELECT sessionKey,kind,messageId,state FROM harklight_wake_follows WHERE handle=?1 AND (kind='conversation' OR messageId=?2) ORDER BY createdAt,followId",
+               [handle, message_id]
+             ) do
+          {:ok, rows} ->
+            Enum.map(rows, fn [follower, kind, followed_message, state] ->
+              %{
+                follower: follower,
+                kind: kind,
+                message_id: if(followed_message == "", do: nil, else: followed_message),
+                state: state
+              }
+            end)
+
+          _ ->
+            []
+        end
+
+      _ ->
+        []
+    end
+  end
+
   def complete_in_txn(txn, handle) do
     Txn.q(
       txn,
       "UPDATE harklight_subscription_ends SET state='ended',acknowledgment=CASE WHEN acknowledgment='pending' AND ackEventId IS NULL THEN 'not_needed' ELSE acknowledgment END WHERE handle=?1",
       [handle]
+    )
+
+    Txn.q(
+      txn,
+      "UPDATE harklight_wake_follows SET state='ended',endedAt=?2 WHERE handle=?1 AND state='open'",
+      [handle, System.system_time(:millisecond)]
     )
   end
 end

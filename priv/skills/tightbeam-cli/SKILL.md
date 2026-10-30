@@ -21,6 +21,15 @@ Wakes deliver addressed prompts and decisions ask a named principal for judgment
 Use returned typed identifiers exactly; do not invent them. These records preserve
 custody across lost context; recover from them before acting.
 
+## Harklight follows
+
+When the installed Tightbeam release includes `harklight-follow`, use `tightbeam
+harklight-follow --message <id>` or `tightbeam harklight-follow --handle <handle>` to
+receive wakes about another session's Tightbeam-sent message or conversation. Only
+messages and conversations sent through `tightbeam harklight-send` can be followed.
+A follow ends when the conversation is finished, or when its message is retracted or
+superseded. Replies stay on raw `harklight-agent` commands.
+
 ## Start from the assignment
 
 Run the CLI from the assignment worktree. Let it discover the nearest

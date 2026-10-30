@@ -23,10 +23,16 @@ defmodule Tightbeam.GatewayTest do
       expected ++
         ~w(harness-health-observe-other harness-health-resolve-other harness-health-review-other harness-health-close-promotion harness-health-evidence-other)
 
-    expected = expected ++ ~w(harklight-send harklight-revise harklight-retract harklight-settle)
+    expected =
+      expected ++
+        ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-follow)
 
     expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle)
-    expected = expected ++ ~w(kungfu-setup sentinel-enable sentinel-disable sentinel-list)
+
+    expected =
+      expected ++
+        ~w(kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe)
+
     expected = expected ++ ~w(memento-set mementos)
 
     expected =
