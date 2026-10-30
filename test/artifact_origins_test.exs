@@ -1,4 +1,5 @@
 defmodule Tightbeam.ArtifactOriginsTest do
+  @current_shape hd(Tightbeam.Schema.guard_compatible_stamps())
   use Tightbeam.TestCase, async: false
   alias Tightbeam.{ArtifactOrigins, Artifacts, DB, Org, Placement, Schema}
 
@@ -173,7 +174,7 @@ defmodule Tightbeam.ArtifactOriginsTest do
     assert :ok = Schema.ensure_all(db)
     assert Artifacts.get(db, row.artifact_id) == migrated
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [[@current_shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 

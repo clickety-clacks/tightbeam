@@ -339,7 +339,7 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
     assert read(ctx, ctx.selected, "", ctx.selected.cli_token).status == 200
     assert read(ctx, ctx.selected, "", ctx.owner.token).status == 200
 
-    for token <- [ctx.selected.cli_token, ctx.owner.token] do
+    for {token, kind} <- [{ctx.selected.cli_token, "user-admin"}, {ctx.owner.token, "user"}] do
       response = read(ctx, ctx.selected, "asUser=owner", token)
       assert response.status == 200, response.resp_body
       assert Enum.any?(body(response)["items"], &(&1["content"] == "ordinary reads"))
@@ -349,7 +349,7 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
         |> Base.url_decode64!(padding: false)
         |> JSON.decode!()
 
-      assert identity["principalKind"] == "user"
+      assert identity["principalKind"] == kind
       assert identity["principalId"] == "owner"
     end
 

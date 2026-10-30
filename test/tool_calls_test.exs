@@ -1,4 +1,5 @@
 defmodule Tightbeam.ToolCallsTest do
+  @current_shape hd(Tightbeam.Schema.guard_compatible_stamps())
   use Tightbeam.TestCase, async: false
 
   import Plug.Conn
@@ -403,7 +404,7 @@ defmodule Tightbeam.ToolCallsTest do
 
   test "fresh setup applies the feature-local migration without changing the root stamp", ctx do
     {:ok, [[root_shape]]} = DB.query(ctx.db, "SELECT shape FROM schema_stamp", [])
-    assert root_shape == "launch-preparation-evidence-v1-0112"
+    assert root_shape == @current_shape
 
     {:ok, [[0, "tool-call-transition-v1-011"]]} =
       DB.query(ctx.db, "SELECT id, shape FROM tool_call_transition_migration", [])
@@ -434,6 +435,11 @@ defmodule Tightbeam.ToolCallsTest do
 
   test "upgrades the named migration while preserving message rows and sequence high water",
        ctx do
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_session_identity!(ctx.db)
+
+    :ok =
+      DB.execute(ctx.db, "UPDATE schema_stamp SET shape='launch-preparation-evidence-v1-0112'")
+
     {:ok, :ok} =
       DB.transaction(ctx.db, fn txn ->
         Tightbeam.DB.Txn.q(
@@ -512,7 +518,7 @@ defmodule Tightbeam.ToolCallsTest do
 
     rewind_messages_to_predecessor(ctx.db)
 
-    :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    :ok = Tightbeam.SchemaShapeRuntimeFixture.upgrade_to_identity_predecessor!(ctx.db)
     assert :ok = ToolCalls.ensure_schema(ctx.db)
 
     {:ok, [[message_high_water_after]]} =
@@ -596,6 +602,9 @@ defmodule Tightbeam.ToolCallsTest do
              "kind"
            ] ==
              "context-compacted"
+
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    assert {:ok, [[@current_shape]]} = DB.query(ctx.db, "SELECT shape FROM schema_stamp")
 
     :ok = DB.execute(ctx.db, "DROP INDEX tool_calls_session_anchor")
 

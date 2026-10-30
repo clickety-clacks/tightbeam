@@ -141,17 +141,6 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     body = %{verb: "assignment-commitref-correct", as: caller_role, params: params}
     before = correction_count(ctx.db)
 
-    unauthorized =
-      dispatch_cli(ctx, stranger.cli_token, %{
-        body
-        | as: stranger_role,
-          params: %{params | idempotencyKey: "wire-commit-stranger"}
-      })
-
-    assert unauthorized.status == 404
-    assert JSON.decode!(unauthorized.resp_body)["error"]["code"] == "unknown_assignment"
-    assert correction_count(ctx.db) == before
-
     wrong_target =
       dispatch_cli(ctx, caller.cli_token, %{
         body
@@ -166,11 +155,14 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert JSON.decode!(wrong_target.resp_body)["error"]["code"] == "unknown_assignment"
     assert correction_count(ctx.db) == before
 
-    accepted = dispatch_cli(ctx, caller.cli_token, body)
+    accepted_body = %{body | as: stranger_role}
+    accepted = dispatch_cli(ctx, stranger.cli_token, accepted_body)
     assert accepted.status == 200, accepted.resp_body
     accepted_json = JSON.decode!(accepted.resp_body)
     assert accepted_json["result"]["correction"]["assignmentId"] == "asg_wire_commit"
     assert correction_count(ctx.db) == before + 1
+    assert accepted_json["result"]["correction"]["actorKind"] == "session"
+    assert accepted_json["result"]["correction"]["actorRef"] == stranger.session_key
 
     correction_exists =
       dispatch_cli(ctx, caller.cli_token, %{
@@ -182,7 +174,7 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert JSON.decode!(correction_exists.resp_body)["error"]["code"] == "correction_exists"
     assert correction_count(ctx.db) == before + 1
 
-    replay = dispatch_cli(ctx, caller.cli_token, body)
+    replay = dispatch_cli(ctx, stranger.cli_token, accepted_body)
     assert replay.status == 200, replay.resp_body
     assert JSON.decode!(replay.resp_body)["result"] == accepted_json["result"]
     assert correction_count(ctx.db) == before + 1
@@ -237,7 +229,7 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert JSON.decode!(repeated.resp_body)["result"]["status"] == "duplicate"
     assert other_incident_count(ctx.db) == 1
 
-    unauthorized =
+    same_owner =
       dispatch_cli(ctx, stranger.cli_token, %{
         observe_body
         | as: stranger_role,
@@ -248,11 +240,19 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
           }
       })
 
-    assert unauthorized.status == 403
-    assert JSON.decode!(unauthorized.resp_body)["error"]["code"] == "not_authorized"
+    assert same_owner.status == 200, same_owner.resp_body
+    assert JSON.decode!(same_owner.resp_body)["result"]["incident"]["id"] == incident_id
+
+    assert {:ok, [[principal]]} =
+             DB.query(
+               ctx.db,
+               "SELECT principal FROM harness_health_observations ORDER BY rowid DESC LIMIT 1"
+             )
+
+    assert principal == "session:" <> stranger.session_key
     assert other_incident_count(ctx.db) == 1
 
-    wrong_target =
+    other_source =
       dispatch_cli(ctx, source.cli_token, %{
         observe_body
         | params: %{
@@ -262,8 +262,16 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
           }
       })
 
-    assert wrong_target.status == 403
-    assert JSON.decode!(wrong_target.resp_body)["error"]["code"] == "not_authorized"
+    assert other_source.status == 200, other_source.resp_body
+    assert JSON.decode!(other_source.resp_body)["result"]["incident"]["id"] == incident_id
+
+    assert {:ok, [[principal, session]]} =
+             DB.query(
+               ctx.db,
+               "SELECT principal,sessionKey FROM harness_health_observations ORDER BY rowid DESC LIMIT 1"
+             )
+
+    assert {principal, session} == {"session:" <> source.session_key, stranger.session_key}
     assert other_incident_count(ctx.db) == 1
 
     recovery_condition = "a normal provider turn completes"
@@ -302,23 +310,22 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert missing.status == 403
     assert JSON.decode!(missing.resp_body)["error"]["code"] == "not_authorized"
 
-    refused =
-      dispatch_cli(ctx, stranger.cli_token, %{
-        resolve_body
-        | as: stranger_role,
-          params: %{resolve_params | idempotencyKey: "wire-health-refused"}
-      })
-
-    assert refused.status == 403
-    assert JSON.decode!(refused.resp_body)["error"]["code"] == "not_authorized"
-    assert incident_state(ctx.db, incident_id) == "open"
-
-    resolved = dispatch_cli(ctx, source.cli_token, resolve_body)
+    resolve_body = %{resolve_body | as: stranger_role}
+    resolved = dispatch_cli(ctx, stranger.cli_token, resolve_body)
     assert resolved.status == 200, resolved.resp_body
     assert JSON.decode!(resolved.resp_body)["result"]["status"] == "resolved"
     assert incident_state(ctx.db, incident_id) == "resolved"
 
-    resolve_replay = dispatch_cli(ctx, source.cli_token, resolve_body)
+    assert {:ok, [[principal]]} =
+             DB.query(
+               ctx.db,
+               "SELECT principal FROM harness_health_observations WHERE evidenceKind='normal-turn-success' AND incidentId=?1",
+               [incident_id]
+             )
+
+    assert principal == "session:" <> stranger.session_key
+
+    resolve_replay = dispatch_cli(ctx, stranger.cli_token, resolve_body)
     assert resolve_replay.status == 403
     assert JSON.decode!(resolve_replay.resp_body)["error"]["code"] == "not_authorized"
     assert incident_state(ctx.db, incident_id) == "resolved"
@@ -469,17 +476,6 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
 
     body = %{verb: "harness-health-close-promotion", as: source_role, params: params}
 
-    unauthorized =
-      dispatch_cli(ctx, stranger.cli_token, %{
-        body
-        | as: stranger_role,
-          params: %{params | idempotencyKey: "wire-promotion-stranger"}
-      })
-
-    assert unauthorized.status == 403
-    assert JSON.decode!(unauthorized.resp_body)["error"]["code"] == "not_authorized"
-    assert promotion_state(ctx.db, promotion_id) == "open"
-
     missing =
       dispatch_cli(ctx, source.cli_token, %{
         body
@@ -494,11 +490,21 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert JSON.decode!(missing.resp_body)["error"]["code"] == "promotion_not_found"
     assert promotion_state(ctx.db, promotion_id) == "open"
 
-    closed = dispatch_cli(ctx, source.cli_token, body)
+    body = %{body | as: stranger_role}
+    closed = dispatch_cli(ctx, stranger.cli_token, body)
     assert closed.status == 200, closed.resp_body
     assert JSON.decode!(closed.resp_body)["result"]["promotion"]["state"] == "closed"
 
-    replay = dispatch_cli(ctx, source.cli_token, body)
+    assert {:ok, [[principal]]} =
+             DB.query(
+               ctx.db,
+               "SELECT closedBy FROM harness_health_class_promotions WHERE id=?1",
+               [promotion_id]
+             )
+
+    assert principal == "session:" <> stranger.session_key
+
+    replay = dispatch_cli(ctx, stranger.cli_token, body)
     assert replay.status == 200, replay.resp_body
     assert JSON.decode!(replay.resp_body)["result"]["promotion"]["state"] == "closed"
     assert promotion_state(ctx.db, promotion_id) == "closed"

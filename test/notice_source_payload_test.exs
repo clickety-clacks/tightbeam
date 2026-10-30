@@ -1,4 +1,5 @@
 defmodule Tightbeam.NoticeSourcePayloadTest do
+  @current_shape hd(Tightbeam.Schema.guard_compatible_stamps())
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
@@ -186,7 +187,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
                "SELECT name FROM sqlite_master WHERE name IN ('notice_batch_source_attachments','staged_message_dedupes','notice_delivery_policies','notice_batching_lane_policies')"
              )
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [[@current_shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
@@ -295,7 +296,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
 
       assert Wakes.get(db, ordinary.wake_id).state == "pending"
 
-      assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+      assert {:ok, [[@current_shape]]} =
                DB.query(db, "SELECT shape FROM schema_stamp")
 
       assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM turns")
@@ -358,7 +359,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
                  [condition.wake_id]
                )
 
-      assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+      assert {:ok, [[@current_shape]]} =
                DB.query(db, "SELECT shape FROM schema_stamp")
 
       before = current_storage_snapshot(db)
@@ -546,7 +547,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
     assert {:ok, [[nil]]} =
              DB.query(db, "SELECT sourceAttachments FROM wakes WHERE wakeId=?1", [source.wake_id])
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [[@current_shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert :ok = Schema.ensure_all(db)
@@ -590,6 +591,8 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
   end
 
   defp predecessor!(db, db_opts) do
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_session_identity!(db)
+
     :ok =
       DB.execute(
         db,

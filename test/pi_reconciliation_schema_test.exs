@@ -1,4 +1,5 @@
 defmodule Tightbeam.PiReconciliationSchemaTest do
+  @current_shape hd(Tightbeam.Schema.guard_compatible_stamps())
   use Tightbeam.TestCase, async: false
   alias Tightbeam.{DB, Schema}
 
@@ -12,7 +13,7 @@ defmodule Tightbeam.PiReconciliationSchemaTest do
     assert :ok = Schema.ensure_all(db)
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [[@current_shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert :ok =
@@ -55,7 +56,7 @@ defmodule Tightbeam.PiReconciliationSchemaTest do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [[@current_shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, columns} = DB.query(db, "PRAGMA table_info(sessions)")

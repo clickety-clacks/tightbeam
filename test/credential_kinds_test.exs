@@ -1087,7 +1087,11 @@ defmodule Tightbeam.CredentialKindsTest do
           onboarding_lease_ms: 1_800_000
         })["onboard"]
 
-      call = %{origin: "user:owner-admin", params: %{provider: "anthropic"}}
+      call = %{
+        principal: {:user, "owner-admin"},
+        origin: "user:owner-admin",
+        params: %{provider: "anthropic"}
+      }
 
       assert %{status: "ready", owner_user_id: "owner-admin"} =
                onboard.(put_in(call.params[:phase], "begin"))

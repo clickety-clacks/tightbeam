@@ -2,7 +2,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   @moduledoc false
   import ExUnit.Assertions
   alias Tightbeam.{DB, NoticeBatcher, Schema}
-  @shape "session-identity-v1-0114"
+  @shape hd(Schema.guard_compatible_stamps())
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -163,6 +163,120 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
 
     refute "noticeState" in table_columns(db, "rail_remedy_episodes")
     :ok
+  end
+
+  # Reconstruct all identity predecessor tables through the retained migration chain.
+  # The interposer stops before the identity migration; no current DDL is relabeled.
+  def downgrade_session_identity!(db) do
+    {:ok, predecessor} = DB.start_link(path: ":memory:", name: nil)
+
+    try do
+      :ok = load_admission_fixture(predecessor)
+
+      upgrade_to_identity_predecessor!(predecessor)
+
+      assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+               DB.query(predecessor, "SELECT shape FROM schema_stamp")
+
+      # Some historical callers remove this older column before undoing identity.
+      unless "deliveryOwnerSessionKey" in table_columns(db, "work_items") do
+        assert :ok =
+                 DB.execute(
+                   predecessor,
+                   "ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey"
+                 )
+      end
+
+      tables =
+        ~w(decision_requests work_items work_item_bodies assignments attests assignment_reopenings assignment_revocations assignment_cannot_proceed assignment_commit_ref_corrections memento_history session_reparent_events) ++
+          for object <- Tightbeam.Toplines.Schema.manifest(),
+              object.type == "table",
+              do: object.name
+
+      objects =
+        for table <- tables do
+          assert {:ok, [[sql]]} =
+                   DB.query(
+                     predecessor,
+                     "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                     [table]
+                   )
+
+          {table, sql}
+        end
+
+      assert {:ok, [[topline_shape]]} =
+               DB.query(predecessor, "SELECT shape FROM topline_schema_stamp")
+
+      assert {:ok, :ok} =
+               DB.migration_transaction(
+                 db,
+                 :identity_predecessor_fixture,
+                 [],
+                 ["PRAGMA writable_schema = OFF"],
+                 fn txn ->
+                   [[version]] = DB.Txn.q(txn, "PRAGMA schema_version")
+                   :ok = DB.Txn.exec(txn, "PRAGMA writable_schema = ON")
+
+                   for {table, sql} <- objects do
+                     DB.Txn.q(
+                       txn,
+                       "UPDATE sqlite_master SET sql=?2 WHERE type='table' AND name=?1",
+                       [table, sql]
+                     )
+                   end
+
+                   DB.Txn.q(txn, "UPDATE topline_schema_stamp SET shape=?1", [topline_shape])
+                   :ok = DB.Txn.exec(txn, "DROP INDEX IF EXISTS events_process_assignment")
+                   :ok = DB.Txn.exec(txn, "PRAGMA schema_version = #{version + 1}")
+                   :ok = DB.Txn.exec(txn, "PRAGMA writable_schema = RESET")
+                 end
+               )
+
+      for {table, sql} <- objects do
+        assert {:ok, [[^sql]]} =
+                 DB.query(db, "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1", [
+                   table
+                 ])
+      end
+
+      assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+    after
+      GenServer.stop(predecessor)
+    end
+  end
+
+  def upgrade_to_identity_predecessor!(db) do
+    {:ok, boundary} = __MODULE__.PreIdentityBoundary.start_link(db)
+
+    try do
+      assert_raise Schema.ShapeError, ~r/session identity migration rolled back/, fn ->
+        Schema.ensure_all(boundary)
+      end
+    after
+      GenServer.stop(boundary)
+    end
+
+    :ok
+  end
+
+  defmodule PreIdentityBoundary do
+    use GenServer
+    def start_link(db), do: GenServer.start_link(__MODULE__, db)
+    @impl true
+    def init(db) do
+      :persistent_term.put({DB, self()}, :persistent_term.get({DB, GenServer.whereis(db)}))
+      {:ok, db}
+    end
+
+    @impl true
+    def terminate(_reason, _db), do: :persistent_term.erase({DB, self()})
+    @impl true
+    def handle_call({:migration_transaction, :session_identity, _, _, _}, _from, db),
+      do: {:reply, {:error, "fixture predecessor boundary"}, db}
+
+    def handle_call(message, _from, db),
+      do: {:reply, GenServer.call(db, message, :infinity), db}
   end
 
   def run!(proof, opts) do
@@ -731,6 +845,8 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
 
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@shape]]} ->
+        downgrade_session_identity!(db)
+
         # Reconstruct the known predecessor representation, including source
         # notices emitted while seeding association history; never erase them.
         assert {:ok, [[0]]} =

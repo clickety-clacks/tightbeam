@@ -1,4 +1,5 @@
 defmodule Tightbeam.SettlementMigrationTest do
+  @current_shape hd(Tightbeam.Schema.guard_compatible_stamps())
   use Tightbeam.TestCase, async: false
   alias Tightbeam.{DB, Schema}
 
@@ -49,8 +50,9 @@ defmodule Tightbeam.SettlementMigrationTest do
 
     assert {:ok, before_ddl} = DB.query(db, preserved_sql)
     assert length(before_ddl) == 3
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = Tightbeam.SchemaShapeRuntimeFixture.upgrade_to_identity_predecessor!(db)
     assert {:ok, ^before_ddl} = DB.query(db, preserved_sql)
+    assert :ok = Schema.ensure_all(db)
 
     assert {:ok, [[wake_cancellations_ddl]]} =
              DB.query(
@@ -61,7 +63,7 @@ defmodule Tightbeam.SettlementMigrationTest do
     assert Regex.match?(@assignment_replacement_route, wake_cancellations_ddl)
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [[@current_shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [["prior-fingerprint", ~s({"prior":true}), nil]]} =
