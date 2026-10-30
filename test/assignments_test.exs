@@ -2,6 +2,9 @@ defmodule Tightbeam.AssignmentsTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
+  @session_identity_shape "session-identity-v1-0114"
+  @closed_assignment_reconciliation_shape "closed-assignment-cannot-proceed-reconciliation-v1-015"
+
   alias Tightbeam.{
     Assignments,
     ConditionFacts,
@@ -3615,6 +3618,266 @@ defmodule Tightbeam.AssignmentsTest do
                """,
                [blocked.cannotProceed.id]
              )
+
+    {:ok, [[revocation_id]]} =
+      DB.query(
+        ctx.db,
+        "SELECT id FROM assignment_revocations WHERE assignmentId=?1",
+        [assignment.id]
+      )
+
+    {:ok, [[withdrawn_reason]]} =
+      DB.query(
+        ctx.db,
+        "SELECT withdrawnReason FROM decision_requests WHERE id=?1",
+        [blocked.cannotProceed.decisionRequestId]
+      )
+
+    assert withdrawn_reason =~ "moot"
+    assert withdrawn_reason =~ "revocation record #{revocation_id}"
+
+    assert {:ok, cancellations} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,
+                      outcomeKind,dispositionKind,dispositionId
+               FROM wake_cancellations WHERE wakeId=?1
+               """,
+               [blocked.decisionWake.wake_id]
+             )
+
+    assert cancellations == [
+             [
+               "tightbeam:escalation",
+               "obligation_disposed",
+               "decision_request",
+               blocked.cannotProceed.decisionRequestId,
+               "disposition",
+               "decision_request_transition",
+               blocked.cannotProceed.decisionRequestId
+             ]
+           ]
+  end
+
+  test "install reconciliation disposes a closed completed hold by its completion attest", ctx do
+    {assignment, blocked, closing_attest_id, closed_at} =
+      stranded_completed_assignment(ctx, "stranded completed assignment")
+
+    attests_before =
+      reconciliation_rows(
+        ctx.db,
+        "SELECT id,kind,verdictKind,note,bySession,byUser,ts FROM attests WHERE assignmentId=?1 ORDER BY ts,id",
+        [assignment.id]
+      )
+
+    assert :ok = force_closed_assignment_reconciliation(ctx)
+
+    assert {:ok, [["closed", "completed", ^closed_at, ^closing_attest_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,outcome,closedAt,closingAttestId FROM assignments WHERE id=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [["settled", "disposed", ^closed_at, "session:holder"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,settlementKind,settledAt,settledBy FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert {:ok, [["withdrawn", reason]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,withdrawnReason FROM decision_requests WHERE id=?1",
+               [blocked.cannotProceed.decisionRequestId]
+             )
+
+    assert reason =~ "moot"
+    assert reason =~ "completion attest #{closing_attest_id}"
+    assert Wakes.get(ctx.db, blocked.decisionWake.wake_id).state == "canceled"
+
+    assert {:ok, cancellations} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,
+                      outcomeKind,dispositionKind,dispositionId
+               FROM wake_cancellations WHERE wakeId=?1
+               """,
+               [blocked.decisionWake.wake_id]
+             )
+
+    assert cancellations == [
+             [
+               "tightbeam:escalation",
+               "obligation_disposed",
+               "decision_request",
+               blocked.cannotProceed.decisionRequestId,
+               "disposition",
+               "decision_request_transition",
+               blocked.cannotProceed.decisionRequestId
+             ]
+           ]
+
+    assert {:ok, [[closing_attest_id, "completion", "holder", ^closed_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,kind,bySession,ts FROM attests WHERE id=?1",
+               [closing_attest_id]
+             )
+
+    assert reconciliation_rows(
+             ctx.db,
+             "SELECT id,kind,verdictKind,note,bySession,byUser,ts FROM attests WHERE assignmentId=?1 ORDER BY ts,id",
+             [assignment.id]
+           ) == attests_before
+
+    assert {:ok, [[event_detail]]} =
+             DB.query(
+               ctx.db,
+               "SELECT detail FROM lifecycle_events WHERE kind='decision_request_withdrawn' AND subject=?1",
+               [blocked.cannotProceed.decisionRequestId]
+             )
+
+    assert event_detail =~ closing_attest_id
+
+    assert {:ok, [[@closed_assignment_reconciliation_shape]]} =
+             DB.query(ctx.db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "install reconciliation of a closed revoked hold names its actual revocation", ctx do
+    {assignment, blocked, revocation_id, closed_at} =
+      stranded_revoked_assignment(ctx, "stranded revoked assignment")
+
+    attests_before =
+      reconciliation_rows(
+        ctx.db,
+        "SELECT id,kind,verdictKind,note,bySession,byUser,ts FROM attests WHERE assignmentId=?1 ORDER BY ts,id",
+        [assignment.id]
+      )
+
+    assert :ok = force_closed_assignment_reconciliation(ctx)
+
+    assert {:ok, [["closed", "revoked", ^closed_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,outcome,closedAt FROM assignments WHERE id=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [["settled", "disposed"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,settlementKind FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert {:ok, [["withdrawn", reason]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,withdrawnReason FROM decision_requests WHERE id=?1",
+               [blocked.cannotProceed.decisionRequestId]
+             )
+
+    assert reason =~ "moot"
+    assert reason =~ "revocation record #{revocation_id}"
+    assert Wakes.get(ctx.db, blocked.decisionWake.wake_id).state == "canceled"
+
+    assert {:ok, cancellations} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,
+                      outcomeKind,dispositionKind,dispositionId
+               FROM wake_cancellations WHERE wakeId=?1
+               """,
+               [blocked.decisionWake.wake_id]
+             )
+
+    assert cancellations == [
+             [
+               "tightbeam:escalation",
+               "obligation_disposed",
+               "decision_request",
+               blocked.cannotProceed.decisionRequestId,
+               "disposition",
+               "decision_request_transition",
+               blocked.cannotProceed.decisionRequestId
+             ]
+           ]
+
+    assert reconciliation_rows(
+             ctx.db,
+             "SELECT id,kind,verdictKind,note,bySession,byUser,ts FROM attests WHERE assignmentId=?1 ORDER BY ts,id",
+             [assignment.id]
+           ) == attests_before
+  end
+
+  test "a rerun preserves the completed settlement and its history", ctx do
+    {assignment, blocked, _closing_attest_id, _closed_at} =
+      stranded_completed_assignment(ctx, "idempotent completed assignment")
+
+    assert :ok = force_closed_assignment_reconciliation(ctx)
+
+    before =
+      closed_assignment_reconciliation_snapshot(ctx.db, assignment.id, blocked.cannotProceed.id)
+
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+
+    assert closed_assignment_reconciliation_snapshot(
+             ctx.db,
+             assignment.id,
+             blocked.cannotProceed.id
+           ) ==
+             before
+  end
+
+  test "closed assignment without matching completion provenance stays as-is and is listed",
+       ctx do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    assignment =
+      assign_call({:user, "flynn"}, "missing close provenance")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    progress =
+      attest_call({:session, "holder"}, assignment.id, "progress")
+      |> put_in([:params, :note], "historical progress")
+      |> then(&handle(ctx, "attest", &1))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "awaiting opener")
+      |> then(&handle(ctx, "attest", &1))
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE assignments SET state='closed',outcome='completed',closedAt=?2,closedBySession='holder',closingAttestId=?3 WHERE id=?1",
+        [assignment.id, progress.attest.ts, progress.attest.id]
+      )
+
+    before =
+      closed_assignment_reconciliation_snapshot(ctx.db, assignment.id, blocked.cannotProceed.id)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = force_closed_assignment_reconciliation(ctx)
+      end)
+
+    assert log =~ assignment.id
+    assert log =~ blocked.cannotProceed.id
+    assert log =~ "missing_closing_completion_attest"
+
+    assert closed_assignment_reconciliation_snapshot(
+             ctx.db,
+             assignment.id,
+             blocked.cannotProceed.id
+           ) ==
+             before
   end
 
   test "a pending holder reminder does not block opener revocation after reparenting", ctx do
@@ -7239,6 +7502,165 @@ defmodule Tightbeam.AssignmentsTest do
   defp assignment_count(db) do
     {:ok, [[count]]} = DB.query(db, "SELECT count(*) FROM assignments")
     count
+  end
+
+  defp stranded_completed_assignment(ctx, subject) do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    assignment =
+      assign_call({:user, "flynn"}, subject)
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "historical unresolved hold")
+      |> then(&handle(ctx, "attest", &1))
+
+    closing_attest_id = "att_reconcile_#{System.unique_integer([:positive])}"
+    closed_at = System.system_time(:millisecond)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO attests (id,assignmentId,kind,note,bySession,ts)
+               VALUES (?1,?2,'completion','historical completion','holder',?3)
+               """,
+               [closing_attest_id, assignment.id, closed_at]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignments
+               SET state='closed',outcome='completed',closedAt=?2,closedBySession='holder',
+                   closingAttestId=?3
+               WHERE id=?1 AND state='open'
+               """,
+               [assignment.id, closed_at, closing_attest_id]
+             )
+
+    {assignment, blocked, closing_attest_id, closed_at}
+  end
+
+  defp stranded_revoked_assignment(ctx, subject) do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    assignment =
+      assign_call({:user, "flynn"}, subject)
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "historical unresolved hold")
+      |> then(&handle(ctx, "attest", &1))
+
+    revocation_id = "rev_reconcile_#{System.unique_integer([:positive])}"
+    closed_at = System.system_time(:millisecond)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignment_revocations
+                   (id,assignmentId,revokedAt,revokedByUser,reason)
+                 VALUES (?1,?2,?3,'flynn','historical revocation')
+                 """,
+                 [revocation_id, assignment.id, closed_at]
+               )
+
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignment_revocation_generations (revocationId,assignmentId,reopeningId)
+                 VALUES (?1,?2,NULL)
+                 """,
+                 [revocation_id, assignment.id]
+               )
+
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 """
+                 UPDATE assignments
+                 SET state='closed',outcome='revoked',closedAt=?2,closedByUser='flynn'
+                 WHERE id=?1 AND state='open'
+                 """,
+                 [assignment.id, closed_at]
+               )
+
+               :ok
+             end)
+
+    {assignment, blocked, revocation_id, closed_at}
+  end
+
+  defp force_closed_assignment_reconciliation(ctx) do
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE schema_stamp SET shape=?1,stampedAt=1",
+               [@session_identity_shape]
+             )
+
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+  end
+
+  defp closed_assignment_reconciliation_snapshot(db, assignment_id, condition_id) do
+    {:ok, [[request_id, wake_id]]} =
+      DB.query(
+        db,
+        "SELECT decisionRequestId,decisionWakeId FROM assignment_cannot_proceed WHERE id=?1",
+        [condition_id]
+      )
+
+    %{
+      assignment:
+        reconciliation_rows(
+          db,
+          "SELECT state,outcome,closedAt,closedByUser,closedBySession,closedByProcess,closingAttestId FROM assignments WHERE id=?1",
+          [assignment_id]
+        ),
+      condition:
+        reconciliation_rows(
+          db,
+          "SELECT * FROM assignment_cannot_proceed WHERE id=?1",
+          [condition_id]
+        ),
+      request:
+        reconciliation_rows(
+          db,
+          "SELECT status,withdrawnBy,withdrawnReason,withdrawnAt FROM decision_requests WHERE id=?1",
+          [request_id]
+        ),
+      wake: reconciliation_rows(db, "SELECT state FROM wakes WHERE wakeId=?1", [wake_id]),
+      cancellations:
+        reconciliation_rows(
+          db,
+          "SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind,dispositionKind,dispositionId FROM wake_cancellations WHERE wakeId=?1 ORDER BY canceledAt",
+          [wake_id]
+        ),
+      attests:
+        reconciliation_rows(
+          db,
+          "SELECT id,kind,verdictKind,note,bySession,byUser,ts FROM attests WHERE assignmentId=?1 ORDER BY ts,id",
+          [assignment_id]
+        ),
+      withdrawal_events:
+        reconciliation_rows(
+          db,
+          "SELECT kind,subject,detail FROM lifecycle_events WHERE kind='decision_request_withdrawn' AND subject=?1 ORDER BY id",
+          [request_id]
+        )
+    }
+  end
+
+  defp reconciliation_rows(db, sql, args) do
+    {:ok, rows} = DB.query(db, sql, args)
+    rows
   end
 
   defp assign_call(principal, subject \\ "work", key \\ nil, work_item_id \\ nil) do
