@@ -358,10 +358,10 @@ defmodule Tightbeam.StateResources do
       nullable: ~w(description parentSession contentSha256 recordedMessageId home)
     },
     "read markers" => %{
-      strings: ~w(userId scopeKey marker),
+      strings: ~w(userId scopeKey),
       integers: ~w(updatedAt rowVersion),
       booleans: [],
-      nullable: []
+      nullable: ~w(marker)
     },
     "transcript messages" => %{
       strings:
@@ -428,6 +428,7 @@ defmodule Tightbeam.StateResources do
     {"decision requests", "context"} => :json,
     {"sessions", "overrides"} => :session_overrides,
     {"sessions", "capabilities"} => :session_capabilities,
+    {"read markers", "marker"} => :read_marker,
     {"transcript messages", "attachments"} => {:array, :attachment, :preserve},
     {"transcript messages", "marker"} => :transition_marker,
     {"transcript messages", "context"} => :json,
@@ -2468,6 +2469,16 @@ defmodule Tightbeam.StateResources do
   defp validate_wire_value!(value, :positive_integer, _label)
        when is_integer(value) and value > 0,
        do: :ok
+
+  defp validate_wire_value!(value, :read_marker, _label)
+       when is_integer(value) and value >= 0,
+       do: :ok
+
+  defp validate_wire_value!(value, :read_marker, _label) when is_binary(value) and value != "",
+    do: :ok
+
+  defp validate_wire_value!(_value, :read_marker, label),
+    do: raise(ArgumentError, "#{label} must be a nonempty string or a nonnegative integer")
 
   defp validate_wire_value!(value, :boolean, _label) when is_boolean(value), do: :ok
   defp validate_wire_value!(value, {:catalog, _field}, _label) when is_binary(value), do: :ok

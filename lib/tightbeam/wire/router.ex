@@ -71,6 +71,7 @@ defmodule Tightbeam.Wire.Router do
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
+  @read_marker_verbs ~w(read-marker-set read-marker-clear)
   @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle spawn session-reparent session-po-set retire critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
   @agent_verbs @agent_verbs ++
                  [
@@ -88,6 +89,7 @@ defmodule Tightbeam.Wire.Router do
                    "subtree-guidance-withdraw",
                    "subtree-guidance-show"
                  ]
+
   @max_upload_bytes 32 * 1024 * 1024
   @state_malformed_percent_escape ~r/%(?![0-9A-Fa-f]{2})/
   @core_detail_fact_id ~r/\A[1-9][0-9]*\z/
@@ -324,10 +326,10 @@ defmodule Tightbeam.Wire.Router do
   end
 
   post "/agent/dispatch" do
-    with {:ok, auth} <- cli_auth(conn) do
+    with {:ok, auth} <- agent_dispatch_auth(conn) do
       with_json(conn, fn body, conn ->
         with {:ok, verb} <- required_string(body["verb"]),
-             :ok <- allowed_agent_verb(verb),
+             :ok <- allowed_agent_verb(verb, auth),
              {:ok, origin, principal} <- agent_identity(body, auth, conn),
              {:ok, session_key, target_meta} <- typed_target(verb, body, conn),
              :ok <- visible_cancel_target(verb, session_key, principal, conn) do
@@ -3400,6 +3402,16 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  defp agent_dispatch_auth(conn) do
+    case cli_auth(conn) do
+      {:error, 401, "auth_failed", nil} ->
+        with {:ok, device} <- device_auth(conn), do: {:ok, {:device, device}}
+
+      result ->
+        result
+    end
+  end
+
   defp cli_version_compatible(conn, auth) do
     version =
       case Plug.Conn.get_req_header(conn, "x-tightbeam-cli-version") do
@@ -3515,8 +3527,19 @@ defmodule Tightbeam.Wire.Router do
       else: {:error, 400, "invalid_message", "verb not allowed: #{verb}"}
   end
 
+  defp allowed_agent_verb(verb, {:device, _device}) when verb in @read_marker_verbs, do: :ok
+
+  defp allowed_agent_verb(_verb, {:device, _device}),
+    do: {:error, 401, "auth_failed", nil}
+
+  defp allowed_agent_verb(verb, _auth), do: allowed_agent_verb(verb)
+
   defp agent_identity(%{"asProcess" => "tightbeam"}, _auth, _conn) do
     {:error, 403, "reserved_origin", "process:tightbeam is reserved to the substrate"}
+  end
+
+  defp agent_identity(_body, {:device, device}, _conn) do
+    {:ok, "user:#{device.user_id}", {:user, device.user_id}}
   end
 
   defp agent_identity(body, :org, conn) do
@@ -3599,6 +3622,7 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp authenticated_session_key({:session, session}), do: session.session_key
+  defp authenticated_session_key({:device, _device}), do: nil
   defp authenticated_session_key(:org), do: nil
 
   # Strictly typed target seam (spec Addendum A): the reference TYPE is
@@ -4274,6 +4298,8 @@ defmodule Tightbeam.Wire.Router do
     "retire" => ~w(idempotency_key session_key)a,
     "return" => ~w(idempotency_key reason request request_id)a,
     "revoke-assignment" => ~w(assignment_id reason)a,
+    "read-marker-clear" => ~w(expected_current scope_key)a,
+    "read-marker-set" => ~w(expected_current marker scope_key)a,
     "role-bind" => ~w(name session_key)a,
     "role-create" => ~w(name bind description session_key owner_user_id)a,
     "role-list" => ~w()a,
