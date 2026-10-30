@@ -1021,6 +1021,9 @@ defmodule Tightbeam.Org do
         AND NOT EXISTS (
           SELECT 1 FROM sentinel_subscription_wake_matches m WHERE m.wakeId=w.wakeId
         )
+        AND NOT EXISTS (
+          SELECT 1 FROM harklight_wake_deliveries d WHERE d.wakeId=w.wakeId
+        )
       ORDER BY w.createdAt,w.wakeId
       """,
       [session_key]

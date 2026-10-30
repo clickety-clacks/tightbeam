@@ -2,8 +2,8 @@ defmodule Tightbeam.HarklightWakes do
   @moduledoc """
   Durable, origin-bound handoff from a Harklight controller stream to ordinary
   prompt wakes. The external CLI owns the feed journal and cursor; this table
-  owns the correlation between one handle and one local session and remembers
-  every line captured into the wake queue.
+  owns each handle's sender and follower subscriptions and remembers every line
+  captured for one or more sessions.
   """
 
   use GenServer
@@ -29,6 +29,14 @@ defmodule Tightbeam.HarklightWakes do
   );
   CREATE UNIQUE INDEX IF NOT EXISTS harklight_send_bound_request
     ON harklight_send_operations(senderId,messageId);
+  CREATE TABLE IF NOT EXISTS harklight_pending_supersedes (
+    opId TEXT NOT NULL REFERENCES harklight_send_operations(opId),
+    senderId TEXT NOT NULL,
+    messageId TEXT NOT NULL,
+    PRIMARY KEY(opId,senderId,messageId)
+  );
+  CREATE INDEX IF NOT EXISTS harklight_pending_supersedes_target
+    ON harklight_pending_supersedes(senderId,messageId,opId);
   CREATE TABLE IF NOT EXISTS harklight_wake_handles (
     handle TEXT PRIMARY KEY,
     sessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
@@ -46,6 +54,21 @@ defmodule Tightbeam.HarklightWakes do
     handle TEXT NOT NULL REFERENCES harklight_wake_handles(handle),
     PRIMARY KEY(senderId,messageId)
   );
+  CREATE TABLE IF NOT EXISTS harklight_wake_follows (
+    followId TEXT PRIMARY KEY,
+    sessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+    kind TEXT NOT NULL CHECK(kind IN ('message','conversation')),
+    handle TEXT NOT NULL REFERENCES harklight_wake_handles(handle),
+    senderId TEXT,
+    messageId TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('open','ended')),
+    createdAt INTEGER NOT NULL,
+    endedAt INTEGER,
+    CHECK ((kind='conversation' AND senderId IS NULL AND messageId='') OR
+           (kind='message' AND senderId IS NOT NULL AND messageId<>''))
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS harklight_wake_follows_open
+    ON harklight_wake_follows(sessionKey,kind,handle,messageId) WHERE state='open';
   CREATE TABLE IF NOT EXISTS harklight_wake_entries (
     handle TEXT NOT NULL REFERENCES harklight_wake_handles(handle),
     eventId TEXT NOT NULL,
@@ -61,14 +84,43 @@ defmodule Tightbeam.HarklightWakes do
     PRIMARY KEY(handle,eventId),
     UNIQUE(handle,feedCursor)
   );
+  CREATE TABLE IF NOT EXISTS harklight_wake_deliveries (
+    handle TEXT NOT NULL,
+    eventId TEXT NOT NULL,
+    sessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+    wakeId TEXT NOT NULL UNIQUE REFERENCES wakes(wakeId),
+    PRIMARY KEY(handle,eventId,sessionKey),
+    FOREIGN KEY(handle,eventId) REFERENCES harklight_wake_entries(handle,eventId)
+  );
+  CREATE TABLE IF NOT EXISTS harklight_wake_suppressed_entries (
+    handle TEXT NOT NULL REFERENCES harklight_wake_handles(handle),
+    eventId TEXT NOT NULL,
+    feedCursor INTEGER NOT NULL,
+    senderId TEXT NOT NULL,
+    messageId TEXT NOT NULL,
+    requestRevision INTEGER,
+    entryKind TEXT NOT NULL,
+    entryAuthor TEXT NOT NULL,
+    rawLine TEXT NOT NULL,
+    capturedAt INTEGER NOT NULL,
+    PRIMARY KEY(handle,eventId),
+    UNIQUE(handle,feedCursor)
+  );
   CREATE INDEX IF NOT EXISTS harklight_wake_requests_handle
     ON harklight_wake_requests(handle);
+  CREATE INDEX IF NOT EXISTS harklight_wake_follows_handle
+    ON harklight_wake_follows(handle,state,kind,messageId);
+  CREATE INDEX IF NOT EXISTS harklight_wake_deliveries_session
+    ON harklight_wake_deliveries(sessionKey,handle,eventId);
   """
 
   @uuid4 ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
 
   def ensure_schema(db \\ DB) do
-    with :ok <- DB.execute(db, @ddl), do: HarklightLifecycle.ensure_schema(db)
+    with :ok <- DB.execute(db, @ddl),
+         :ok <- HarklightLifecycle.ensure_schema(db) do
+      backfill_pending_supersedes(db)
+    end
   end
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -86,6 +138,7 @@ defmodule Tightbeam.HarklightWakes do
          %{state: "active", host: host} <- Org.get(db, session_key),
          true <- host == Placement.local_host_name() do
       now = System.system_time(:millisecond)
+      supersedes = pending_supersede_targets(payload)
 
       case DB.transaction(db, fn txn ->
              case Txn.q(
@@ -100,9 +153,20 @@ defmodule Tightbeam.HarklightWakes do
                    [op_id, session_key, host, payload, now]
                  )
 
+                 insert_pending_supersedes(txn, op_id, supersedes)
+
                  {:ok, "pending"}
 
                [[^session_key, ^host, ^payload, state]] ->
+                 if state == "pending" and
+                      Txn.q(
+                        txn,
+                        "SELECT 1 FROM harklight_command_results WHERE opId=?1",
+                        [op_id]
+                      ) == [] do
+                   insert_pending_supersedes(txn, op_id, supersedes)
+                 end
+
                  {:ok, state}
 
                _ ->
@@ -483,7 +547,7 @@ defmodule Tightbeam.HarklightWakes do
 
     state =
       Enum.reduce(rows, state, fn [handle, host, handle_state], acc ->
-        if origin_eligible?(acc.db, session_key, host) do
+        if listener_eligible?(acc.db, handle, session_key, host) do
           if handle_state == "complete", do: acc, else: start_worker(acc, handle)
         else
           # Persist invalidation before the worker's DOWN can reach observers.
@@ -548,9 +612,27 @@ defmodule Tightbeam.HarklightWakes do
       not MapSet.member?(state.restart, handle)
   end
 
-  defp origin_eligible?(db, session_key, host) do
+  defp listener_eligible?(db, handle, session_key, host) do
     host == Placement.local_host_name() and
-      match?(%{state: "active", host: ^host}, Org.get(db, session_key))
+      (match?(%{state: "active", host: ^host}, Org.get(db, session_key)) or
+         match?(
+           {:ok, [[1]]},
+           DB.query(
+             db,
+             "SELECT 1 FROM harklight_wake_follows WHERE handle=?1 AND state='open' LIMIT 1",
+             [handle]
+           )
+         ))
+  end
+
+  defp listener_eligible_in_txn?(txn, handle, session_key, host) do
+    host == Placement.local_host_name() and
+      (match?(%{state: "active", host: ^host}, Org.get_in_txn(txn, session_key)) or
+         Txn.q(
+           txn,
+           "SELECT 1 FROM harklight_wake_follows WHERE handle=?1 AND state='open' LIMIT 1",
+           [handle]
+         ) != [])
   end
 
   @impl true
@@ -695,35 +777,38 @@ defmodule Tightbeam.HarklightWakes do
            ) do
         {:ok, [[session_key, host, saved_vendor_id, state_value]]}
         when state_value in ["active", "unavailable"] ->
-          case Org.get(state.db, session_key) do
-            %{state: "active", host: ^host} ->
-              if host == Placement.local_host_name() do
-                pointer = Org.current_pointer(state.db, session_key)
-                vendor_id = if pointer, do: pointer.harness_session_id, else: saved_vendor_id
+          if listener_eligible?(state.db, handle, session_key, host) do
+            vendor_id =
+              case Org.get(state.db, session_key) do
+                %{state: "active", host: ^host} ->
+                  case Org.current_pointer(state.db, session_key) do
+                    nil -> saved_vendor_id
+                    pointer -> pointer.harness_session_id
+                  end
 
-                if vendor_id != saved_vendor_id do
-                  DB.query(
-                    state.db,
-                    "UPDATE harklight_wake_handles SET vendorSessionId=?2,updatedAt=?3 WHERE handle=?1",
-                    [handle, vendor_id, System.system_time(:millisecond)]
-                  )
-                end
-
-                manager = self()
-                {:ok, pid} = Task.start(fn -> state.listener.(manager, handle, vendor_id) end)
-                ref = Process.monitor(pid)
-
-                %{
-                  state
-                  | workers: Map.put(state.workers, handle, pid),
-                    refs: Map.put(state.refs, ref, handle)
-                }
-              else
-                state
+                _ ->
+                  saved_vendor_id
               end
 
-            _ ->
+            if vendor_id != saved_vendor_id do
+              DB.query(
+                state.db,
+                "UPDATE harklight_wake_handles SET vendorSessionId=?2,updatedAt=?3 WHERE handle=?1",
+                [handle, vendor_id, System.system_time(:millisecond)]
+              )
+            end
+
+            manager = self()
+            {:ok, pid} = Task.start(fn -> state.listener.(manager, handle, vendor_id) end)
+            ref = Process.monitor(pid)
+
+            %{
               state
+              | workers: Map.put(state.workers, handle, pid),
+                refs: Map.put(state.refs, ref, handle)
+            }
+          else
+            state
           end
 
         _ ->
@@ -934,8 +1019,7 @@ defmodule Tightbeam.HarklightWakes do
 
     case handle_state do
       [[session_key, host, prior_cursor, "active"]] ->
-        if host == Placement.local_host_name() and
-             match?(%{state: "active", host: ^host}, Org.get_in_txn(txn, session_key)) do
+        if listener_eligible_in_txn?(txn, handle, session_key, host) do
           capture_for_active_origin(
             txn,
             handle,
@@ -983,22 +1067,25 @@ defmodule Tightbeam.HarklightWakes do
         ]
       )
 
+    suppressed =
+      Txn.q(
+        txn,
+        "SELECT feedCursor,senderId,messageId,requestRevision,entryKind,entryAuthor FROM harklight_wake_suppressed_entries WHERE handle=?1 AND eventId=?2",
+        [handle, event_id]
+      )
+
     cond do
       existing != [] ->
         if existing == [[cursor, sender_id, message_id, revision, kind, author]],
           do: :ok,
           else: {:error, "event_identity_mismatch"}
 
+      suppressed != [] ->
+        if suppressed == [[cursor, sender_id, message_id, revision, kind, author]],
+          do: :ok,
+          else: {:error, "event_identity_mismatch"}
+
       HarklightLifecycle.hold_terminal_in_txn?(txn, handle, sender_id, message_id, event_id, line) ->
-        Txn.q(
-          txn,
-          "UPDATE harklight_wake_handles SET lastCursor=MAX(lastCursor,?2) WHERE handle=?1",
-          [handle, cursor]
-        )
-
-        :ok
-
-      HarklightLifecycle.ended_in_txn?(txn, sender_id, message_id) ->
         Txn.q(
           txn,
           "UPDATE harklight_wake_handles SET lastCursor=MAX(lastCursor,?2) WHERE handle=?1",
@@ -1058,47 +1145,168 @@ defmodule Tightbeam.HarklightWakes do
     else
       wake_id = "w_harklight_" <> handle <> "_" <> String.pad_leading(event_id, 20, "0")
       prompt = line <> "\n\n" <> handling_instruction(handle, event_id, message_id, kind, author)
-
-      wake =
-        Wakes.schedule_in_txn(txn, %{
-          wake_id: wake_id,
-          session_key: session_key,
-          origin: "process:tightbeam",
-          prompt: prompt,
-          due_at: System.system_time(:millisecond),
-          creator_session_key: session_key,
-          class: "blocker"
-        })
-
       now = System.system_time(:millisecond)
 
-      Txn.q(
-        txn,
-        "INSERT INTO harklight_wake_entries(handle,eventId,feedCursor,senderId,messageId,requestRevision,entryKind,entryAuthor,rawLine,wakeId,capturedAt) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-        [
-          handle,
-          event_id,
-          cursor,
-          sender_id,
-          message_id,
-          revision,
-          kind,
-          author,
-          line,
-          wake.wake_id,
-          now
-        ]
-      )
+      recipients =
+        delivery_recipients_in_txn(txn, handle, session_key, sender_id, message_id, kind, line)
 
-      Txn.q(
-        txn,
-        "UPDATE harklight_wake_handles SET lastCursor=MAX(lastCursor,?2),updatedAt=?3 WHERE handle=?1",
-        [handle, cursor, now]
-      )
+      if recipients == [] do
+        Txn.q(
+          txn,
+          "INSERT INTO harklight_wake_suppressed_entries(handle,eventId,feedCursor,senderId,messageId,requestRevision,entryKind,entryAuthor,rawLine,capturedAt) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+          [handle, event_id, cursor, sender_id, message_id, revision, kind, author, line, now]
+        )
 
-      Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
-      :ok
+        if superseded_terminal?(kind, line),
+          do:
+            HarklightLifecycle.end_message_follows_in_txn(
+              txn,
+              sender_id,
+              message_id,
+              handle,
+              event_id
+            )
+
+        Txn.q(
+          txn,
+          "UPDATE harklight_wake_handles SET lastCursor=MAX(lastCursor,?2),updatedAt=?3 WHERE handle=?1",
+          [handle, cursor, now]
+        )
+
+        :ok
+      else
+        primary = if session_key in recipients, do: session_key, else: hd(recipients)
+
+        wakes =
+          Enum.map(recipients, fn recipient ->
+            recipient_wake_id =
+              if recipient == primary do
+                wake_id
+              else
+                wake_id <> "_" <> recipient_suffix(recipient)
+              end
+
+            wake =
+              Wakes.schedule_in_txn(txn, %{
+                wake_id: recipient_wake_id,
+                session_key: recipient,
+                origin: "process:tightbeam",
+                prompt: prompt,
+                due_at: now,
+                creator_session_key: session_key,
+                class: "blocker"
+              })
+
+            {recipient, wake.wake_id}
+          end)
+
+        {^primary, primary_wake_id} =
+          Enum.find(wakes, fn {recipient, _} -> recipient == primary end)
+
+        Txn.q(
+          txn,
+          "INSERT INTO harklight_wake_entries(handle,eventId,feedCursor,senderId,messageId,requestRevision,entryKind,entryAuthor,rawLine,wakeId,capturedAt) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+          [
+            handle,
+            event_id,
+            cursor,
+            sender_id,
+            message_id,
+            revision,
+            kind,
+            author,
+            line,
+            primary_wake_id,
+            now
+          ]
+        )
+
+        Enum.each(wakes, fn {recipient, recipient_wake_id} ->
+          Txn.q(
+            txn,
+            "INSERT INTO harklight_wake_deliveries(handle,eventId,sessionKey,wakeId) VALUES(?1,?2,?3,?4)",
+            [handle, event_id, recipient, recipient_wake_id]
+          )
+
+          Wakes.publish_change_in_txn(txn, "wake.scheduled", recipient_wake_id)
+        end)
+
+        if superseded_terminal?(kind, line),
+          do:
+            HarklightLifecycle.end_message_follows_in_txn(
+              txn,
+              sender_id,
+              message_id,
+              handle,
+              event_id
+            )
+
+        Txn.q(
+          txn,
+          "UPDATE harklight_wake_handles SET lastCursor=MAX(lastCursor,?2),updatedAt=?3 WHERE handle=?1",
+          [handle, cursor, now]
+        )
+
+        :ok
+      end
     end
+  end
+
+  defp delivery_recipients_in_txn(txn, handle, owner_session, sender_id, message_id, kind, line) do
+    terminal = superseded_terminal?(kind, line)
+
+    superseding_session =
+      if terminal,
+        do: HarklightLifecycle.supersede_caller_in_txn(txn, sender_id, message_id),
+        else: nil
+
+    follow_end = HarklightLifecycle.message_follow_end_kind_in_txn(txn, sender_id, message_id)
+
+    owner_open =
+      Txn.q(
+        txn,
+        "SELECT 1 FROM harklight_subscription_ends WHERE senderId=?1 AND messageId=?2",
+        [sender_id, message_id]
+      ) == []
+
+    own_recipients = if owner_open, do: [owner_session], else: []
+
+    conversation_recipients =
+      Txn.q(
+        txn,
+        "SELECT sessionKey FROM harklight_wake_follows WHERE handle=?1 AND kind='conversation' AND state='open'",
+        [handle]
+      )
+      |> List.flatten()
+
+    message_recipients =
+      if follow_end == "superseded" and not terminal do
+        []
+      else
+        Txn.q(
+          txn,
+          "SELECT sessionKey FROM harklight_wake_follows WHERE senderId=?1 AND messageId=?2 AND kind='message' AND state='open'",
+          [sender_id, message_id]
+        )
+        |> List.flatten()
+      end
+
+    (own_recipients ++ conversation_recipients ++ message_recipients)
+    |> Enum.reject(&(terminal and &1 == superseding_session))
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp superseded_terminal?("terminal", line) do
+    entry = JSON.decode!(line)["entry"]
+    entry["terminal_state"] == "superseded"
+  end
+
+  defp superseded_terminal?(_, _), do: false
+
+  defp recipient_suffix(session_key) do
+    :crypto.hash(:sha256, session_key)
+    |> Base.encode16(case: :lower)
   end
 
   defp handling_instruction(handle, event_id, message_id, _kind, _author) do
@@ -1107,5 +1315,81 @@ defmodule Tightbeam.HarklightWakes do
       "For an answered terminal by a person, reconcile any earlier effect before applying once, then report with `harklight-agent result --session #{handle} --request #{message_id} --in-reply-to #{event_id} --status applied|refused`. An agent-authored terminal is not the person's choice. " <>
       "For cleared, expired or superseded, stop work on that request; do not treat it as approval. " <>
       "If delivered is true, check prior effects before acting again. Do not run listen; the controller listens."
+  end
+
+  defp pending_supersede_targets(payload) do
+    prepared = JSON.decode!(payload)
+    request = prepared["request"] || %{}
+    message = request["message"] || %{}
+    sender = message["sender_id"]
+    targets = message["supersedes"] || []
+
+    if is_binary(sender) and is_list(targets) do
+      targets
+      |> Enum.filter(&(is_binary(&1) and &1 != ""))
+      |> Enum.uniq()
+      |> Enum.map(&{sender, &1})
+    else
+      []
+    end
+  end
+
+  defp insert_pending_supersedes(txn, op_id, targets) do
+    Enum.each(targets, fn {sender, message} ->
+      Txn.q(
+        txn,
+        "INSERT OR IGNORE INTO harklight_pending_supersedes(opId,senderId,messageId) VALUES(?1,?2,?3)",
+        [op_id, sender, message]
+      )
+    end)
+  end
+
+  # Keep this one-time pending-payload walk in schema migration, never in
+  # terminal capture. The marker commits with the backfill so interruption retries it.
+  defp backfill_pending_supersedes(db) do
+    case DB.migration_transaction(db, :harklight_pending_supersedes_backfill, [], [], fn txn ->
+           :ok =
+             Txn.exec(txn, """
+             CREATE TABLE IF NOT EXISTS harklight_pending_supersedes_migration (
+               id INTEGER PRIMARY KEY CHECK(id=0),
+               appliedAt INTEGER NOT NULL CHECK(appliedAt >= 0)
+             )
+             """)
+
+           case Txn.q(txn, "SELECT id,appliedAt FROM harklight_pending_supersedes_migration") do
+             [] ->
+               Txn.q(
+                 txn,
+                 """
+                 INSERT OR IGNORE INTO harklight_pending_supersedes(opId,senderId,messageId)
+                 SELECT s.opId,json_extract(s.payload,'$.request.message.sender_id'),target.value
+                 FROM harklight_send_operations s
+                 JOIN json_each(s.payload,'$.request.message.supersedes') target
+                 LEFT JOIN harklight_command_results r ON r.opId=s.opId
+                 WHERE s.state='pending' AND r.opId IS NULL
+                   AND json_type(s.payload,'$.request.message.sender_id')='text'
+                   AND target.type='text' AND target.value<>''
+                 """
+               )
+
+               Txn.q(
+                 txn,
+                 "INSERT INTO harklight_pending_supersedes_migration(id,appliedAt) VALUES(0,?1)",
+                 [System.system_time(:millisecond)]
+               )
+
+               :ok
+
+             [[0, applied_at]] when is_integer(applied_at) and applied_at >= 0 ->
+               :ok
+
+             rows ->
+               raise Tightbeam.Schema.ShapeError,
+                 message: "incompatible_harklight_pending_supersedes_migration: #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
   end
 end
