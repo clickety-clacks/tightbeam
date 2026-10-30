@@ -1459,6 +1459,103 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       assert inspect(plan) =~ index, inspect(plan)
       refute inspect(plan) =~ "USE TEMP B-TREE", inspect(plan)
     end
+
+    {:ok, [[activation_at]]} =
+      DB.query(
+        db,
+        "SELECT MAX(CAST(value AS INTEGER)) FROM org_settings " <>
+          "WHERE key IN ('record-event-feed-activation:work_item.filed', " <>
+          "'record-event-feed-activation:assignment.opened')"
+      )
+
+    seed_record_event_plan_scale(db, activation_at + 1)
+    :ok = DB.execute(db, "ANALYZE")
+
+    assert {:ok, [[60, 15_000, 1_200, 68_138, 88_479]]} =
+             DB.query(db, """
+             SELECT
+               (SELECT COUNT(*) FROM sessions WHERE sessionKey GLOB 'record-event-plan-session-*'),
+               (SELECT COUNT(*) FROM assignments WHERE id GLOB 'record-event-plan-assignment-*'),
+               (SELECT COUNT(*) FROM work_items WHERE id GLOB 'record-event-plan-work-item-*'),
+               (SELECT COUNT(*) FROM messages WHERE id GLOB 'record-event-plan-message-*'),
+               (SELECT COUNT(*) FROM wake_cancellations WHERE wakeId GLOB 'record-event-plan-wake-*')
+             """)
+
+    scale_session = "record-event-plan-session-00"
+    event_id = "assignment.opened:record-event-plan-assignment-00008"
+
+    notice_ids =
+      Enum.map(1..4, &("record-event-plan-message-" <> String.pad_leading("#{&1}", 5, "0")))
+
+    page =
+      Tightbeam.RecordEvents.query_for_session_page(
+        db,
+        scale_session,
+        {:after, [activation_at + 8, "assignment.opened:record-event-plan-assignment-00007"]},
+        1
+      )
+
+    assert [page_item] = page.rows
+    assert page_item["eventId"] == event_id
+    assert page_item["noticeMessageIds"] == notice_ids
+
+    {:ok, tied_events} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.RecordEvents.assignment_opened_in_txn(
+          txn,
+          "record-event-plan-assignment-00008"
+        )
+      end)
+
+    holder_event = Enum.find(tied_events, &(elem(&1, 0) == scale_session))
+    opener_event = Enum.find(tied_events, &(elem(&1, 0) == "record-event-plan-session-01"))
+    assert elem(holder_event, 1)["noticeMessageIds"] == notice_ids
+    assert elem(opener_event, 1)["noticeMessageIds"] == []
+
+    collection_plans =
+      Tightbeam.RecordEvents.keyset_plan_queries(scale_session)
+
+    IO.puts("Exqlite record-event collection plans on production-size data:")
+
+    for {sql, params, index} <- collection_plans do
+      {:ok, plan} = DB.query(db, "EXPLAIN QUERY PLAN " <> sql, params)
+      plan_text = inspect(plan)
+      IO.puts("#{index}: #{plan_text}")
+      assert plan_text =~ index, plan_text
+      refute plan_text =~ "USE TEMP B-TREE", plan_text
+    end
+
+    for {sql, params, index} <-
+          Tightbeam.RecordEvents.single_event_plan_queries(
+            scale_session,
+            "record-event-plan-work-item-00060",
+            "record-event-plan-assignment-00008"
+          ) do
+      {:ok, plan} = DB.query(db, "EXPLAIN QUERY PLAN " <> sql, params)
+      plan_text = inspect(plan)
+      IO.puts("single-event #{index}: #{plan_text}")
+      assert plan_text =~ index, plan_text
+    end
+
+    {notice_sql, notice_params} =
+      Tightbeam.RecordEvents.notice_message_ids_plan_query(
+        event_id,
+        scale_session
+      )
+
+    {:ok, notice_plan} = DB.query(db, "EXPLAIN QUERY PLAN " <> notice_sql, notice_params)
+    notice_plan_text = inspect(notice_plan)
+    IO.puts("event notice lookup: #{notice_plan_text}")
+
+    assert notice_plan_text =~ "messages_record_event_ids", notice_plan_text
+    assert notice_plan_text =~ "wakes_record_event_ids", notice_plan_text
+    assert notice_plan_text =~ "messages_record_event_reply", notice_plan_text
+    assert notice_plan_text =~ "messages_client_dedupe", notice_plan_text
+    assert notice_plan_text =~ "wakes_delivered_turn", notice_plan_text
+    assert notice_plan_text =~ "SEARCH cancellation", notice_plan_text
+    assert notice_plan_text =~ "wakeId=?", notice_plan_text
+    refute notice_plan_text =~ "SCAN cancellation", notice_plan_text
+    refute notice_plan_text =~ "AUTOMATIC COVERING INDEX (replacementWakeId=?", notice_plan_text
   end
 
   test "CLI inspect capabilities match the REST session detail", ctx do
@@ -4652,5 +4749,176 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     critical_unknown = get(ctx, "/api/critical-state/no-such-session", ctx.token)
     assert_error(critical_unknown, 404, "critical state", "not_found")
     assert_application_headers(critical_unknown)
+  end
+
+  defp seed_record_event_plan_scale(db, seeded_at) do
+    :ok =
+      DB.execute(db, """
+      WITH RECURSIVE numbers(n) AS (
+        SELECT 0
+        UNION ALL SELECT n + 1 FROM numbers WHERE n < 59
+      )
+      INSERT INTO sessions(
+        sessionKey, displayName, ownerUserId, origin, archetype, harness, provider, model,
+        createdAt, updatedAt
+      )
+      SELECT
+        'record-event-plan-session-' || printf('%02d', n),
+        'record event plan session ' || n,
+        'flynn', 'test', 'main', 'codex', 'openai', 'test-model', n + 1, n + 1
+      FROM numbers
+      """)
+
+    :ok =
+      DB.execute(db, """
+      WITH RECURSIVE numbers(n) AS (
+        SELECT 1
+        UNION ALL SELECT n + 1 FROM numbers WHERE n < 15000
+      )
+      INSERT INTO assignments(id, subject, holderKey, openedBySession, openedAt)
+      SELECT
+        'record-event-plan-assignment-' || printf('%05d', n),
+        'production-scale assignment ' || n,
+        CASE WHEN n % 8 = 0
+          THEN 'record-event-plan-session-00'
+          ELSE 'record-event-plan-session-02'
+        END,
+        CASE WHEN n % 7 = 0
+          THEN 'record-event-plan-session-00'
+          ELSE 'record-event-plan-session-01'
+        END,
+        #{seeded_at} + n
+      FROM numbers
+      """)
+
+    :ok =
+      DB.execute(db, """
+      WITH RECURSIVE numbers(n) AS (
+        SELECT 1
+        UNION ALL SELECT n + 1 FROM numbers WHERE n < 1200
+      )
+      INSERT INTO work_items(id, title, ownerUserId, createdBySession, createdAt)
+      SELECT
+        'record-event-plan-work-item-' || printf('%05d', n),
+        'production-scale work item ' || n,
+        'flynn',
+        CASE WHEN n % 60 = 0
+          THEN 'record-event-plan-session-00'
+          ELSE 'record-event-plan-session-01'
+        END,
+        #{seeded_at} + n
+      FROM numbers
+      """)
+
+    :ok =
+      DB.execute(db, """
+      WITH RECURSIVE numbers(n) AS (
+        SELECT 1
+        UNION ALL SELECT n + 1 FROM numbers WHERE n < 68138
+      )
+      INSERT INTO messages(
+        id, sessionKey, role, content, timestamp, deviceId, clientMessageId, replyToMessageId,
+        llmVisibleMessageId, attachments, recordEventIds
+      )
+      SELECT
+        'record-event-plan-message-' || printf('%05d', n),
+        'record-event-plan-session-00',
+        CASE WHEN n % 2 = 1 THEN 'user' ELSE 'assistant' END,
+        'production-scale message ' || n,
+        n,
+        CASE n
+          WHEN 1 THEN 'record-event-plan-device-01'
+          WHEN 2 THEN 'record-event-plan-device-02'
+        END,
+        CASE n
+          WHEN 1 THEN 'record-event-plan-client-01'
+          WHEN 2 THEN 'record-event-plan-client-02'
+        END,
+        CASE WHEN n % 2 = 0
+          THEN 'record-event-plan-message-' || printf('%05d', n - 1)
+        END,
+        'record-event-plan-message-' || printf('%05d', n),
+        '[]',
+        CASE WHEN n = 1
+          THEN '["assignment.opened:record-event-plan-assignment-00008"]'
+        END
+      FROM numbers
+      """)
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        :ok =
+          Tightbeam.DB.Txn.exec(txn, """
+          WITH RECURSIVE numbers(n) AS (
+            SELECT 1
+            UNION ALL SELECT n + 1 FROM numbers WHERE n < 88481
+          )
+          INSERT INTO wakes(
+            wakeId, sessionKey, origin, prompt, dueAt, createdAt, recordEventIds,
+            sourceClientIdentity
+          )
+          SELECT
+            'record-event-plan-wake-' || printf('%05d', n),
+            'record-event-plan-session-00', 'test', 'production-scale wake', 1, 1,
+            CASE WHEN n = 1
+              THEN '["assignment.opened:record-event-plan-assignment-00008"]'
+            END,
+            CASE WHEN n IN (1, 2) THEN json_object(
+              'targetSessionKey', 'record-event-plan-session-00',
+              'deviceId', 'record-event-plan-device-0' || n,
+              'clientMessageId', 'record-event-plan-client-0' || n,
+              'sourceWakeId', 'record-event-plan-wake-' || printf('%05d', n),
+              'payloadSha256', printf('%064d', 0),
+              'createdAt', #{seeded_at}
+            ) END
+          FROM numbers
+          """)
+
+        :ok =
+          Tightbeam.DB.Txn.exec(txn, """
+          INSERT INTO wake_cancellations(
+            wakeId, wakeState, canceledAt, requesterKind, requesterId, reasonKind,
+            causalSourceKind, causalSourceId, outcomeKind, workImpactKind, actionNeeded,
+            rootWakeId, attempt, outcome, observedAt
+          )
+          SELECT
+            wakeId, 'canceled', 1, 'session', 'record-event-plan-session-00',
+            'requester_withdrew', 'verb_call', 'record-event-plan', 'no_replacement',
+            'no_linked_work', 0, wakeId, 0, 'canceled', 1
+          FROM wakes
+          WHERE wakeId BETWEEN 'record-event-plan-wake-00003' AND 'record-event-plan-wake-88481'
+          """)
+
+        :ok =
+          Tightbeam.DB.Txn.exec(txn, """
+          UPDATE wakes SET state = 'canceled', canceledAt = 1
+          WHERE wakeId BETWEEN 'record-event-plan-wake-00003' AND 'record-event-plan-wake-88481'
+          """)
+
+        :ok =
+          Tightbeam.DB.Txn.exec(txn, """
+          INSERT INTO turns(sessionKey, messageId, wakeId, origin, prompt, status, createdAt)
+          VALUES (
+            'record-event-plan-session-00',
+            'record-event-plan-message-00003',
+            'record-event-plan-wake-00001',
+            'test', 'production-scale turn', 'delivered', #{seeded_at}
+          )
+          """)
+
+        :ok =
+          Tightbeam.DB.Txn.exec(txn, """
+          UPDATE wakes
+          SET state = 'fired', firedAt = #{seeded_at},
+              deliveredTurnSeq = (
+                SELECT seq FROM turns WHERE wakeId = 'record-event-plan-wake-00001'
+              )
+          WHERE wakeId BETWEEN 'record-event-plan-wake-00001' AND 'record-event-plan-wake-00002'
+          """)
+
+        :ok
+      end)
+
+    :ok
   end
 end
