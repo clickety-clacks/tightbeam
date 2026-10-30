@@ -4,11 +4,11 @@ skills = ["repository-retirement"]
 [defaults]
 harness = "codex"
 model = "gpt-6-astra"
-effort = "high"
+effort = "xhigh"
 
 [[model_preferences]]
 model = "gpt-6-astra"
-effort = "high"
+effort = "xhigh"
 
 [guidance]
 text = """

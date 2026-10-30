@@ -10,6 +10,10 @@ effort = "high"
 model = "claude-opus-5-5"
 effort = "high"
 
+[[model_preferences]]
+model = "gpt-6-sol"
+effort = "high"
+
 [guidance]
 text = """
 #include "operating-manual.md"
