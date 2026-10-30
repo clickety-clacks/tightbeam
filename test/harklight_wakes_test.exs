@@ -1,7 +1,16 @@
 defmodule Tightbeam.HarklightWakesTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, HarklightSend, HarklightWakes, Model, Org, Placement}
+  alias Tightbeam.{
+    DB,
+    HarklightFollows,
+    HarklightLifecycle,
+    HarklightSend,
+    HarklightWakes,
+    Model,
+    Org,
+    Placement
+  }
 
   @handle "7d737f62-bbd7-4c51-978d-f6ff5b4d8146"
   @send_op "0bdb87a0-3a09-4f61-bff4-9a4a704324c8"
@@ -1203,6 +1212,115 @@ defmodule Tightbeam.HarklightWakesTest do
     assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_entries")
   end
 
+  test "superseded-terminal lookup uses the sender and target index", %{db: db} do
+    assert {:ok, rows} =
+             DB.query(
+               db,
+               "EXPLAIN QUERY PLAN SELECT 1 FROM harklight_pending_supersedes WHERE senderId=?1 AND messageId=?2 LIMIT 1",
+               ["sender", "request"]
+             )
+
+    assert Enum.any?(rows, fn row ->
+             List.last(row) =~
+               "SEARCH harklight_pending_supersedes USING COVERING INDEX harklight_pending_supersedes_target"
+           end)
+  end
+
+  test "schema backfills preexisting pending supersede targets and deduplicates them", %{
+    db: db,
+    call: call
+  } do
+    op = Tightbeam.Id.uuid4()
+
+    payload =
+      JSON.encode!(%{
+        request: %{
+          message: %{
+            sender_id: "sender",
+            message_id: "replacement",
+            supersedes: ["request", "request"]
+          }
+        }
+      })
+
+    assert %{state: "pending"} = HarklightWakes.prepare_send(db, call, op, payload)
+
+    assert :ok = DB.execute(db, "DROP INDEX harklight_pending_supersedes_target")
+
+    assert :ok = DB.execute(db, "DROP TABLE harklight_pending_supersedes")
+    assert :ok = DB.execute(db, "DROP TABLE harklight_pending_supersedes_migration")
+    assert :ok = HarklightWakes.ensure_schema(db)
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_pending_supersedes WHERE opId=?1", [op])
+
+    assert {:ok, _} = DB.query(db, "DELETE FROM harklight_pending_supersedes WHERE opId=?1", [op])
+
+    assert {:ok, _} = DB.query(db, "DELETE FROM harklight_pending_supersedes_migration")
+
+    assert :ok =
+             DB.execute(db, """
+             CREATE TRIGGER fail_harklight_pending_supersedes_marker
+             BEFORE INSERT ON harklight_pending_supersedes_migration
+             BEGIN
+               SELECT RAISE(ABORT, 'simulated interrupted migration');
+             END;
+             """)
+
+    assert {:error, _} = HarklightWakes.ensure_schema(db)
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_pending_supersedes WHERE opId=?1", [op])
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_pending_supersedes_migration")
+
+    assert :ok = DB.execute(db, "DROP TRIGGER fail_harklight_pending_supersedes_marker")
+
+    assert :ok = HarklightWakes.ensure_schema(db)
+    assert :ok = HarklightWakes.ensure_schema(db)
+
+    assert {:ok, [[^op, "sender", "request"]]} =
+             DB.query(
+               db,
+               "SELECT opId,senderId,messageId FROM harklight_pending_supersedes WHERE opId=?1",
+               [op]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_pending_supersedes WHERE opId=?1", [op])
+
+    assert :ok = HarklightWakes.capture_line(db, @handle, terminal(1, "request"))
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_held_terminals WHERE eventId='1'")
+  end
+
+  test "preparing a settled pending send does not restore supersede targets", %{
+    db: db,
+    call: call
+  } do
+    op = Tightbeam.Id.uuid4()
+
+    payload =
+      JSON.encode!(%{
+        request: %{
+          message: %{sender_id: "sender", message_id: "replacement", supersedes: ["request"]}
+        }
+      })
+
+    assert %{state: "pending"} = HarklightWakes.prepare_send(db, call, op, payload)
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_pending_supersedes WHERE opId=?1", [op])
+
+    assert {:ok, %{wake_effect: "none"}} = HarklightLifecycle.record_refused(db, op)
+    assert %{state: "pending"} = HarklightWakes.prepare_send(db, call, op, payload)
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_pending_supersedes WHERE opId=?1", [op])
+  end
+
   test "superseding another session leaves its terminal wake and never acknowledges it", %{
     db: db,
     call: call,
@@ -1440,6 +1558,591 @@ defmodule Tightbeam.HarklightWakesTest do
     refute_receive {:acked, _}
   end
 
+  test "message and conversation follows overlap once per session and entry", %{
+    db: db,
+    call: call,
+    main: main
+  } do
+    follower = follower_session(db, main, "agent:follower:one")
+    second_follower = follower_session(db, main, "agent:follower:two")
+    message_call = follow_call(call, follower, %{message_id: "request"})
+    conversation_call = follow_call(call, follower, %{handle: @handle})
+    runner = lifecycle_runner(db)
+
+    assert %{
+             command: "follow",
+             following: "message",
+             outcome: "committed",
+             wake_effect: "subscribed",
+             message_id: "request",
+             handle: @handle,
+             sender_id: "sender"
+           } = follow_for_test(db, message_call, runner: runner)
+
+    assert %{outcome: "committed", following: "conversation", wake_effect: "subscribed"} =
+             follow_for_test(db, conversation_call, runner: runner)
+
+    assert %{outcome: "committed", wake_effect: "kept"} =
+             follow_for_test(db, message_call, runner: runner)
+
+    assert %{outcome: "committed", wake_effect: "subscribed"} =
+             follow_for_test(
+               db,
+               follow_call(call, second_follower, %{message_id: "request"}),
+               runner: runner
+             )
+
+    assert %{outcome: "committed", wake_effect: "kept"} =
+             follow_for_test(db, follow_call(call, call, %{message_id: "request"}),
+               runner: runner
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM harklight_wake_follows WHERE sessionKey=?1 AND kind='message'",
+               [call.session_key]
+             )
+
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "Reply"))
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM harklight_wake_deliveries WHERE handle=?1 AND eventId='1' AND sessionKey=?2",
+               [@handle, follower.session_key]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM harklight_wake_deliveries WHERE handle=?1 AND eventId='1' AND sessionKey=?2",
+               [@handle, second_follower.session_key]
+             )
+
+    assert {:ok, [[owner_prompt]]} =
+             DB.query(db, "SELECT prompt FROM wakes WHERE sessionKey=?1", [call.session_key])
+
+    assert {:ok, [[follower_prompt]]} =
+             DB.query(db, "SELECT prompt FROM wakes WHERE sessionKey=?1", [follower.session_key])
+
+    assert follower_prompt == owner_prompt
+
+    assert Enum.count(
+             follow_for_test(db, conversation_call, runner: runner).subscriptions,
+             &(&1.follower == follower.session_key and &1.kind == "conversation" and
+                 &1.state == "open")
+           ) == 1
+  end
+
+  test "a follow starts at its transaction and does not gain earlier captured entries", %{
+    db: db,
+    call: call,
+    main: main
+  } do
+    follower = follower_session(db, main, "agent:follower:coverage")
+    runner = lifecycle_runner(db)
+    entry = event(1, "discussion", "Already captured")
+
+    assert :ok = HarklightWakes.capture_line(db, @handle, entry)
+
+    assert %{outcome: "committed"} =
+             follow_for_test(db, follow_call(call, follower, %{message_id: "request"}),
+               runner: runner
+             )
+
+    assert :ok = HarklightWakes.capture_line(db, @handle, entry)
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [follower.session_key])
+
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(2, "discussion", "New reply"))
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [follower.session_key])
+  end
+
+  test "unknown and unresolved messages refuse without recording a follow", %{
+    db: db,
+    call: call,
+    main: main
+  } do
+    follower = follower_session(db, main, "agent:follower:unknown")
+    runner = lifecycle_runner(db)
+
+    assert %{outcome: "refused", wake_effect: "none", reason: message_reason} =
+             follow_for_test(db, follow_call(call, follower, %{message_id: "raw-message"}),
+               runner: runner
+             )
+
+    assert message_reason =~
+             "only messages and conversations sent through tightbeam harklight-send"
+
+    assert %{outcome: "refused", wake_effect: "none", reason: handle_reason} =
+             follow_for_test(db, follow_call(call, follower, %{handle: "raw-handle"}),
+               runner: runner
+             )
+
+    assert handle_reason =~
+             "only messages and conversations sent through tightbeam harklight-send"
+
+    pending_op = Tightbeam.Id.uuid4()
+
+    pending_payload =
+      JSON.encode!(%{
+        request: %{
+          session_handle: @handle,
+          message: %{sender_id: "sender", message_id: "pending-message"}
+        }
+      })
+
+    assert %{state: "pending"} =
+             HarklightWakes.prepare_send(db, call, pending_op, pending_payload)
+
+    assert %{
+             outcome: "refused",
+             wake_effect: "none",
+             message_id: "pending-message",
+             reason: unresolved_reason
+           } =
+             follow_for_test(
+               db,
+               follow_call(call, follower, %{message_id: "pending-message"}),
+               runner: runner
+             )
+
+    assert unresolved_reason =~ "is unresolved"
+    assert unresolved_reason =~ "tightbeam harklight-settle --message pending-message"
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_follows WHERE sessionKey=?1", [
+               follower.session_key
+             ])
+  end
+
+  test "status decides whether a follow can be recorded", %{db: db, call: call, main: main} do
+    follower = follower_session(db, main, "agent:follower:status")
+    follow_call = follow_call(call, follower, %{handle: @handle})
+
+    assert %{outcome: "refused", wake_effect: "none", reason: finished_reason} =
+             follow_for_test(db, follow_call,
+               runner:
+                 lifecycle_runner(db,
+                   status: %{
+                     open_requests: 0,
+                     open_chats: 0,
+                     pending_undelivered: 0,
+                     pending_delivered_unacted: 0
+                   }
+                 )
+             )
+
+    assert finished_reason =~ "already finished"
+
+    assert %{outcome: "failed", wake_effect: "none", reason: status_reason} =
+             follow_for_test(db, follow_call, runner: lifecycle_runner(db, status_failure: true))
+
+    assert status_reason =~ "status could not be read"
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_follows WHERE sessionKey=?1", [
+               follower.session_key
+             ])
+  end
+
+  test "following requires the existing conversation origin host rule", %{
+    db: db,
+    call: call,
+    main: main
+  } do
+    follower = follower_session(db, main, "agent:follower:remote-origin")
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET host='other-host' WHERE handle=?1",
+               [@handle]
+             )
+
+    result =
+      follow_for_test(
+        db,
+        follow_call(call, follower, %{message_id: "request"}),
+        runner: fn _ -> flunk("status must not run outside the conversation origin host") end
+      )
+
+    assert %{
+             command: "follow",
+             following: "message",
+             outcome: "failed",
+             wake_effect: "none",
+             message_id: "request",
+             handle: @handle,
+             sender_id: "sender",
+             code: "harklight_origin_unavailable"
+           } = result
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_follows WHERE sessionKey=?1", [
+               follower.session_key
+             ])
+  end
+
+  test "self supersede files follower terminals before acknowledgment and keeps conversation follows open",
+       %{db: db, call: call, main: main} do
+    message_follower = follower_session(db, main, "agent:follower:message")
+    conversation_follower = follower_session(db, main, "agent:follower:conversation")
+    runner = lifecycle_runner(db)
+
+    assert %{outcome: "committed"} =
+             follow_for_test(
+               db,
+               follow_call(call, message_follower, %{message_id: "request"}),
+               runner: runner
+             )
+
+    assert %{outcome: "committed"} =
+             follow_for_test(
+               db,
+               follow_call(call, conversation_follower, %{handle: @handle}),
+               runner: runner
+             )
+
+    supersede_call = %{
+      call
+      | params: %{
+          harklight_session: @handle,
+          sender_id: "sender",
+          title: "Replacement",
+          supersedes: ["request"]
+        }
+    }
+
+    assert %{outcome: "committed", supersedes: [%{effect: "ended"}]} =
+             HarklightSend.send_request(db, supersede_call, runner: runner)
+
+    assert :ok = HarklightWakes.capture_line(db, @handle, terminal(1, "request"))
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [
+               message_follower.session_key
+             ])
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [
+               conversation_follower.session_key
+             ])
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [call.session_key])
+
+    assert {:ok, [["ended"]]} =
+             DB.query(
+               db,
+               "SELECT state FROM harklight_wake_follows WHERE sessionKey=?1 AND kind='message'",
+               [message_follower.session_key]
+             )
+
+    assert {:ok, [["open"]]} =
+             DB.query(
+               db,
+               "SELECT state FROM harklight_wake_follows WHERE sessionKey=?1 AND kind='conversation'",
+               [conversation_follower.session_key]
+             )
+
+    HarklightLifecycle.process_terminals(db, runner: runner)
+    assert_receive {:acked, "1"}
+
+    assert :ok =
+             HarklightSend.ack(@handle, "1",
+               runner: lifecycle_runner(db, ack_status: "already_delivered")
+             )
+
+    assert :ok =
+             HarklightWakes.capture_line(
+               db,
+               @handle,
+               event(2, "discussion", "Old conversation entry")
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [call.session_key])
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [
+               message_follower.session_key
+             ])
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM wakes WHERE sessionKey=?1",
+               [conversation_follower.session_key]
+             )
+
+    assert :ok =
+             HarklightWakes.capture_line(
+               db,
+               @handle,
+               event(3, "discussion", "Replacement reply", "replacement")
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [
+               message_follower.session_key
+             ])
+
+    assert {:ok, [[3]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [
+               conversation_follower.session_key
+             ])
+  end
+
+  test "a failed supersede acknowledgment follows terminal delivery and does not retry",
+       %{db: db, call: call, main: main} do
+    follower = follower_session(db, main, "agent:follower:ack-failure")
+
+    assert %{outcome: "committed"} =
+             follow_for_test(
+               db,
+               follow_call(call, follower, %{message_id: "request"}),
+               runner: lifecycle_runner(db)
+             )
+
+    runner =
+      lifecycle_runner(db,
+        ack_failure: true,
+        before_commit: fn -> HarklightWakes.capture_line(db, @handle, terminal(1, "request")) end
+      )
+
+    assert %{
+             outcome: "committed",
+             supersedes: [
+               %{effect: "ended", acknowledgment: "failed", subscription_state: "open"}
+             ]
+           } =
+             HarklightSend.send_request(
+               db,
+               %{
+                 call
+                 | params: %{
+                     harklight_session: @handle,
+                     sender_id: "sender",
+                     title: "Replacement",
+                     supersedes: ["request"]
+                   }
+               },
+               runner: runner
+             )
+
+    assert_receive {:acked, "1"}
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [follower.session_key])
+
+    assert :ok = HarklightSend.ack(@handle, "1", runner: lifecycle_runner(db))
+    assert_receive {:acked, "1"}
+    HarklightLifecycle.process_terminals(db, runner: lifecycle_runner(db))
+    refute_receive {:acked, _}
+  end
+
+  test "another-session supersede wakes the sender and message followers but excludes the caller",
+       %{db: db, call: call, main: main} do
+    message_follower = follower_session(db, main, "agent:follower:other-message")
+    caller = follower_session(db, main, "agent:follower:other-caller")
+    runner = lifecycle_runner(db)
+
+    assert %{outcome: "committed"} =
+             follow_for_test(
+               db,
+               follow_call(call, message_follower, %{message_id: "request"}),
+               runner: runner
+             )
+
+    assert %{outcome: "committed"} =
+             follow_for_test(
+               db,
+               follow_call(call, caller, %{handle: @handle}),
+               runner: runner
+             )
+
+    payload =
+      JSON.encode!(%{
+        request: %{
+          message: %{
+            sender_id: "sender",
+            message_id: "replacement-other",
+            supersedes: ["request"]
+          }
+        }
+      })
+
+    assert {:ok, effects} =
+             DB.transaction(db, fn txn ->
+               HarklightLifecycle.send_committed_in_txn(
+                 txn,
+                 caller.session_key,
+                 "cross-session-operation",
+                 payload,
+                 JSON.encode!(%{supersedes_warnings: []})
+               )
+             end)
+
+    assert [%{effect: "other_session"}] = effects.supersedes
+    assert :ok = HarklightWakes.capture_line(db, @handle, terminal(1, "request"))
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [call.session_key])
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [
+               message_follower.session_key
+             ])
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [caller.session_key])
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM harklight_subscription_ends WHERE senderId='sender' AND messageId='request'"
+             )
+
+    assert :ok =
+             HarklightWakes.capture_line(
+               db,
+               @handle,
+               event(2, "discussion", "Still open to sender")
+             )
+
+    assert {:ok, [[2]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [call.session_key])
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [
+               message_follower.session_key
+             ])
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [caller.session_key])
+  end
+
+  test "retract ends message follows and preserves pending deliveries for each recipient", %{
+    db: db,
+    call: call,
+    main: main
+  } do
+    follower = follower_session(db, main, "agent:follower:retract")
+    conversation_follower = follower_session(db, main, "agent:follower:retract-conversation")
+
+    assert %{outcome: "committed"} =
+             follow_for_test(db, follow_call(call, follower, %{message_id: "request"}),
+               runner: lifecycle_runner(db)
+             )
+
+    assert %{outcome: "committed"} =
+             follow_for_test(
+               db,
+               follow_call(call, conversation_follower, %{handle: @handle}),
+               runner: lifecycle_runner(db)
+             )
+
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "Pending reply"))
+    record = HarklightLifecycle.lookup(db, "request")
+    effects = HarklightLifecycle.retract_committed(db, record, "retract-operation")
+
+    assert effects.wake_effect == "ended"
+
+    assert Enum.map(effects.pending_delivery, & &1.session_key) |> Enum.sort() ==
+             Enum.sort([
+               call.session_key,
+               follower.session_key,
+               conversation_follower.session_key
+             ])
+
+    assert {:ok, [["ended"]]} =
+             DB.query(
+               db,
+               "SELECT state FROM harklight_wake_follows WHERE sessionKey=?1 AND kind='message'",
+               [follower.session_key]
+             )
+
+    assert {:ok, [["open"]]} =
+             DB.query(
+               db,
+               "SELECT state FROM harklight_wake_follows WHERE sessionKey=?1 AND kind='conversation'",
+               [conversation_follower.session_key]
+             )
+
+    assert %{state: "registered"} = bind_extra(db, call, "next-request")
+
+    assert :ok =
+             HarklightWakes.capture_line(
+               db,
+               @handle,
+               event(2, "discussion", "After retract", "next-request")
+             )
+
+    assert {:ok, [[2]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_entries")
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [follower.session_key])
+
+    assert {:ok, [[2]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [
+               conversation_follower.session_key
+             ])
+  end
+
+  test "an open follow restores listening after restart when its sender session is retired", %{
+    db: db,
+    call: call,
+    main: main
+  } do
+    follower = follower_session(db, main, "agent:follower:restart")
+
+    assert %{outcome: "committed"} =
+             follow_for_test(
+               db,
+               follow_call(call, follower, %{message_id: "request"}),
+               runner: lifecycle_runner(db)
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET vendorSessionId='saved-vendor' WHERE handle=?1",
+               [@handle]
+             )
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+               call.session_key
+             ])
+
+    test_pid = self()
+
+    listener = fn manager, handle, vendor_id ->
+      send(test_pid, {:listener_started, handle, vendor_id})
+      :ok = GenServer.call(manager, {:attached, handle})
+
+      receive do
+        :stop -> :ok
+      end
+    end
+
+    start_supervised!({HarklightWakes, db: db, listener: listener})
+
+    assert_receive {:listener_started, @handle, "saved-vendor"}
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "After restart"))
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [follower.session_key])
+  end
+
+  defp follow_for_test(db, call, opts),
+    do: HarklightFollows.follow(db, call, Keyword.put(opts, :activate, false))
+
   defp frame(value), do: {JSON.encode!(value) <> "\n", 0}
 
   defp bind_extra(db, call, message) do
@@ -1470,6 +2173,25 @@ defmodule Tightbeam.HarklightWakesTest do
   defp lifecycle_runner(db, opts \\ []) do
     fn args ->
       cond do
+        hd(args) == "status" ->
+          if opts[:status_failure] do
+            {"status unavailable", 2}
+          else
+            status =
+              Map.merge(
+                %{
+                  session_handle: List.last(args),
+                  open_requests: 1,
+                  open_chats: 1,
+                  pending_undelivered: 0,
+                  pending_delivered_unacted: 0
+                },
+                opts[:status] || %{}
+              )
+
+            frame(status)
+          end
+
         Enum.take(args, 2) == ["send", "--prepare"] ->
           value = fn flag -> Enum.at(args, Enum.find_index(args, &(&1 == flag)) + 1) end
 
@@ -1505,7 +2227,12 @@ defmodule Tightbeam.HarklightWakesTest do
 
           if opts[:ack_failure],
             do: {"ack refused", 2},
-            else: frame(%{kind: "acknowledged", event_id: event, status: "delivered"})
+            else:
+              frame(%{
+                kind: "acknowledged",
+                event_id: event,
+                status: opts[:ack_status] || "delivered"
+              })
 
         true ->
           op = List.last(args)
@@ -1548,5 +2275,30 @@ defmodule Tightbeam.HarklightWakesTest do
       "acted" => false,
       "entry" => %{"kind" => kind, "author" => "person", "content" => content}
     })
+  end
+
+  defp follower_session(db, main, key) do
+    Org.create(db, %{
+      session_key: key,
+      display_name: "Follower",
+      owner_user_id: "owner",
+      origin: "user:owner",
+      spawned_by: main.session_key,
+      archetype: "default",
+      host: Placement.local_host_name(),
+      harness: "codex",
+      provider: "openai",
+      model: Model.new("fable")
+    })
+  end
+
+  defp follow_call(call, session, params) do
+    %{
+      call
+      | session_key: session.session_key,
+        principal: {:session, session.session_key},
+        transport_session_key: session.session_key,
+        params: params
+    }
   end
 end

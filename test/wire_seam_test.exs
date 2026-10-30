@@ -457,6 +457,39 @@ defmodule Tightbeam.Wire.SeamTest do
     assert error["reason"] =~ "harklight-settle --message minted-id"
   end
 
+  test "follow crosses the CLI, router, and gateway and refuses an unknown message", ctx do
+    session = create_session(ctx.db, "wire-harklight-follow", "test-agent")
+    Org.set_host(ctx.db, session.session_key, Tightbeam.Placement.local_host_name())
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: ctx.opts[:base_dir]
+      })
+
+    response =
+      dispatch_cli(
+        %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)},
+        session.cli_token,
+        %{
+          verb: "harklight-follow",
+          params: %{messageId: "raw-message"}
+        }
+      )
+
+    assert response.status != 200
+
+    assert %{
+             "command" => "follow",
+             "outcome" => "refused",
+             "wakeEffect" => "none",
+             "reason" => reason
+           } = JSON.decode!(response.resp_body)["error"]
+
+    assert reason =~ "only messages and conversations sent through tightbeam harklight-send"
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM harklight_wake_follows")
+  end
+
   test "assignment-stop-turn crosses dispatch and refuses a non-opener", ctx do
     holder = create_session(ctx.db, "stop-holder", "flynn")
 

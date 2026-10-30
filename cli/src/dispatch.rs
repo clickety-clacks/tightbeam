@@ -587,6 +587,23 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("messageId", message)],
         )),
+        Command::HarklightFollow {
+            identity,
+            message,
+            handle,
+        } => {
+            let selector = match (message, handle) {
+                (Some(message), None) => string_field("messageId", message),
+                (None, Some(handle)) => string_field("handle", handle),
+                _ => unreachable!("the parser requires exactly one Harklight follow selector"),
+            };
+            Ok(request(
+                identity,
+                "harklight-follow",
+                vec![],
+                vec![selector],
+            ))
+        }
         // Not a verb and not on /agent/dispatch: it changes no domain state, it
         // tells the gateway to look at this session's running turn NOW, while the
         // command it observed has not run yet.
@@ -3892,6 +3909,7 @@ fn local_harklight_identity_refusal(
         Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
+        | Command::HarklightFollow { identity, .. }
             if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
         {
             Some("invalid Harklight command flags")
@@ -3919,6 +3937,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
+        | Command::HarklightFollow { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::Retire { identity, .. }
@@ -4158,6 +4177,14 @@ mod tests {
                 vec!["harklight-settle", "--message", "m"],
                 "harklight-settle",
             ),
+            (
+                vec!["harklight-follow", "--message", "m"],
+                "harklight-follow",
+            ),
+            (
+                vec!["harklight-follow", "--handle", "h"],
+                "harklight-follow",
+            ),
         ];
         for (args, verb) in commands {
             let command =
@@ -4170,6 +4197,8 @@ mod tests {
                     body["params"]["supersedes"],
                     serde_json::json!(["one", "two", "one"])
                 );
+            } else if verb == "harklight-follow" && body["params"].get("handle").is_some() {
+                assert_eq!(body["params"]["handle"], "h");
             } else {
                 assert_eq!(body["params"]["messageId"], "m");
             }

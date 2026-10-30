@@ -6346,7 +6346,7 @@ defmodule Tightbeam.Wakes do
           ", (SELECT routingWakeId FROM work_items WHERE id=wakes.work_item_id), (SELECT slateWakeId FROM work_items WHERE id=wakes.work_item_id)"
         ) <>
           " INDEXED BY wakes_due WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL AND waitMode IS NULL AND consumer<>'cron'" <>
-          " AND NOT EXISTS (SELECT 1 FROM harklight_wake_entries e JOIN harklight_wake_handles h ON h.handle=e.handle JOIN sessions s ON s.sessionKey=h.sessionKey WHERE e.wakeId=wakes.wakeId AND (s.state<>'active' OR s.host<>h.host))" <>
+          " AND NOT EXISTS (SELECT 1 FROM harklight_wake_entries e JOIN harklight_wake_handles h ON h.handle=e.handle LEFT JOIN harklight_wake_deliveries d ON d.handle=e.handle AND d.eventId=e.eventId AND d.wakeId=wakes.wakeId LEFT JOIN sessions owner ON owner.sessionKey=h.sessionKey LEFT JOIN sessions recipient ON recipient.sessionKey=wakes.sessionKey WHERE (e.wakeId=wakes.wakeId OR d.wakeId=wakes.wakeId) AND ((d.wakeId IS NULL AND (owner.state<>'active' OR owner.host<>h.host)) OR (d.sessionKey=h.sessionKey AND (recipient.state<>'active' OR recipient.host<>h.host)) OR (d.sessionKey<>h.sessionKey AND recipient.state<>'active')))" <>
           " AND NOT (consumer='prompt' AND digest=0 AND COALESCE(deliveryRule,'')<>'turn-boundary-digest r1')" <>
           " ORDER BY dueAt ASC",
         [now()]
