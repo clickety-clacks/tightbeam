@@ -4536,7 +4536,26 @@ defmodule Tightbeam.Assignments do
   defp attest_notice_origin(_attest, %{principal: {:process, name}}), do: "process:" <> name
 
   defp append_assignment_marker(txn, assignment, :opened) do
-    append_substrate(txn, assignment.holderKey, "[assignment opened: #{assignment.id}]")
+    event_id = "assignment.opened:" <> assignment.id
+
+    {:appended, _message} =
+      Projection.append_substrate_in_txn(
+        txn,
+        assignment.holderKey,
+        "[assignment opened: #{assignment.id}]",
+        :normal,
+        [event_id]
+      )
+
+    Tightbeam.RecordEvents.assignment_opened_in_txn(txn, assignment.id)
+    |> Enum.each(fn {session_key, item} ->
+      Tightbeam.Firehose.Publisher.committed_in_txn(
+        txn,
+        "session_record_event.created",
+        item,
+        %{"sessionKey" => session_key}
+      )
+    end)
   end
 
   defp append_assignment_marker(txn, assignment, :closed) do
