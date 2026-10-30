@@ -81,7 +81,7 @@ defmodule Tightbeam.SentinelMatrixWatcherTest do
              "--key",
              "$event-one:example.org",
              "--detail",
-             "room=!room:example.org",
+             "room=!sentinels-output:example.org",
              "--detail",
              "sender=@author:example.org",
              "--detail",
