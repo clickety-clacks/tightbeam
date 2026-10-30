@@ -371,6 +371,36 @@ defmodule Tightbeam.AdminProjectionTest do
     assert StateResources.query_config(ctx.db, "default-archetype").row_version ==
              first_config["rowVersion"]
 
+    activation_key = "record-event-feed-activation:work_item.filed"
+    assert StateResources.query_config(ctx.db, activation_key) == nil
+    assert AdminProjection.version(ctx.db, "config", activation_key) == nil
+
+    case_variant_key = "Record-event-feed-activation:ordinary-setting"
+    :ok = Org.put_setting(ctx.db, case_variant_key, "ordinary")
+    assert %{key: ^case_variant_key} = StateResources.query_config(ctx.db, case_variant_key)
+    case_variant_version = AdminProjection.version(ctx.db, "config", case_variant_key)
+    assert is_integer(case_variant_version)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "INSERT INTO admin_projection_versions " <>
+                   "(resource, primaryKey, rowVersion, updatedAt) VALUES ('config', ?1, 42, 1)",
+                 [activation_key]
+               )
+
+               :ok
+             end)
+
+    assert AdminProjection.version(ctx.db, "config", activation_key) == 42
+    assert StateResources.query_config(ctx.db, activation_key) == nil
+
+    assert :ok = AdminProjection.ensure_schema(ctx.db)
+    assert AdminProjection.version(ctx.db, "config", activation_key) == nil
+    assert AdminProjection.version(ctx.db, "config", case_variant_key) == case_variant_version
+    assert %{key: ^case_variant_key} = StateResources.query_config(ctx.db, case_variant_key)
+
     :ok = Org.put_setting(ctx.db, "private-token", "tbc_config_secret_12345678")
     private_config = StateResources.query_config(ctx.db, "private-token")
     private_config_version = private_config.row_version

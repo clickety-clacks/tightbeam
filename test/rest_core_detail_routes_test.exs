@@ -1459,6 +1459,147 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       assert inspect(plan) =~ index, inspect(plan)
       refute inspect(plan) =~ "USE TEMP B-TREE", inspect(plan)
     end
+
+    {:ok, [[activation_at]]} =
+      DB.query(
+        db,
+        "SELECT MAX(CAST(value AS INTEGER)) FROM org_settings " <>
+          "WHERE key IN ('record-event-feed-activation:work_item.filed', " <>
+          "'record-event-feed-activation:assignment.opened')"
+      )
+
+    seed_record_event_plan_scale(db, activation_at + 1)
+    :ok = DB.execute(db, "ANALYZE")
+
+    assert {:ok, [[60, 15_000, 1_200, 68_138, 88_479]]} =
+             DB.query(db, """
+             SELECT
+               (SELECT COUNT(*) FROM sessions WHERE sessionKey GLOB 'record-event-plan-session-*'),
+               (SELECT COUNT(*) FROM assignments WHERE id GLOB 'record-event-plan-assignment-*'),
+               (SELECT COUNT(*) FROM work_items WHERE id GLOB 'record-event-plan-work-item-*'),
+               (SELECT COUNT(*) FROM messages WHERE id GLOB 'record-event-plan-message-*'),
+               (SELECT COUNT(*) FROM wake_cancellations WHERE wakeId GLOB 'record-event-plan-wake-*')
+             """)
+
+    scale_session = "record-event-plan-session-00"
+    event_id = "assignment.opened:record-event-plan-assignment-00008"
+
+    notice_ids =
+      Enum.map(1..4, &("record-event-plan-message-" <> String.pad_leading("#{&1}", 5, "0")))
+
+    page =
+      Tightbeam.RecordEvents.query_for_session_page(
+        db,
+        scale_session,
+        {:after, [activation_at + 8, "assignment.opened:record-event-plan-assignment-00007"]},
+        1
+      )
+
+    assert [page_item] = page.rows
+    assert page_item["eventId"] == event_id
+    assert page_item["noticeMessageIds"] == notice_ids
+
+    {:ok, tied_events} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.RecordEvents.assignment_opened_in_txn(
+          txn,
+          "record-event-plan-assignment-00008"
+        )
+      end)
+
+    holder_event = Enum.find(tied_events, &(elem(&1, 0) == scale_session))
+    opener_event = Enum.find(tied_events, &(elem(&1, 0) == "record-event-plan-session-01"))
+    assert elem(holder_event, 1)["noticeMessageIds"] == notice_ids
+    assert elem(opener_event, 1)["noticeMessageIds"] == []
+
+    collection_plans =
+      Tightbeam.RecordEvents.keyset_plan_queries(scale_session)
+
+    IO.puts("Exqlite record-event collection plans on production-size data:")
+
+    for {sql, params, index} <- collection_plans do
+      {:ok, plan} = DB.query(db, "EXPLAIN QUERY PLAN " <> sql, params)
+      plan_text = inspect(plan)
+      IO.puts("#{index}: #{plan_text}")
+      assert plan_text =~ index, plan_text
+      refute plan_text =~ "USE TEMP B-TREE", plan_text
+      refute plan_text =~ "SCAN org_settings", plan_text
+    end
+
+    for {sql, params, index} <-
+          Tightbeam.RecordEvents.single_event_plan_queries(
+            scale_session,
+            "record-event-plan-work-item-00060",
+            "record-event-plan-assignment-00008"
+          ) do
+      {:ok, plan} = DB.query(db, "EXPLAIN QUERY PLAN " <> sql, params)
+      plan_text = inspect(plan)
+      IO.puts("single-event #{index}: #{plan_text}")
+      assert plan_text =~ index, plan_text
+      refute plan_text =~ "SCAN org_settings", plan_text
+    end
+
+    {notice_sql, notice_params} =
+      Tightbeam.RecordEvents.notice_message_ids_plan_query(
+        event_id,
+        scale_session
+      )
+
+    {:ok, notice_plan} = DB.query(db, "EXPLAIN QUERY PLAN " <> notice_sql, notice_params)
+    notice_plan_text = inspect(notice_plan, limit: :infinity)
+    IO.puts("event notice lookup: #{notice_plan_text}")
+
+    assert notice_plan_text =~ "messages_record_event_ids", notice_plan_text
+    assert notice_plan_text =~ "wakes_record_event_ids", notice_plan_text
+    assert notice_plan_text =~ "messages_record_event_reply", notice_plan_text
+    assert notice_plan_text =~ "messages_client_dedupe", notice_plan_text
+    assert notice_plan_text =~ "wakes_delivered_turn", notice_plan_text
+
+    assert notice_plan_text =~ "SEARCH direct_wake USING INDEX wakes_record_event_ids",
+           notice_plan_text
+
+    assert notice_plan_text =~
+             "SEARCH direct_turn USING COVERING INDEX turns_session (sessionKey=? AND seq=?",
+           notice_plan_text
+
+    assert notice_plan_text =~ "SEARCH member_wake USING COVERING INDEX wakes_record_event_ids",
+           notice_plan_text
+
+    assert notice_plan_text =~ "SEARCH cancellation", notice_plan_text
+    assert notice_plan_text =~ "wakeId=?", notice_plan_text
+
+    assert notice_plan_text =~
+             "SEARCH replacement_turn USING INDEX sqlite_autoindex_turns_1 (wakeId=?)",
+           notice_plan_text
+
+    assert notice_plan_text =~ "SEARCH notice USING INDEX sqlite_autoindex_messages_1 (id=?)",
+           notice_plan_text
+
+    assert notice_plan_text =~ "SEARCH notice USING INDEX messages_record_event_reply",
+           notice_plan_text
+
+    assert notice_plan_text =~ "SEARCH source USING INDEX wakes_delivered_turn",
+           notice_plan_text
+
+    assert notice_plan_text =~
+             "SEARCH source_message USING INDEX messages_client_dedupe (sessionKey=? AND deviceId=? AND clientMessageId=?)",
+           notice_plan_text
+
+    refute notice_plan_text =~ "SCAN cancellation", notice_plan_text
+
+    refute notice_plan_text =~
+             "SEARCH direct_turn USING COVERING INDEX turns_session (sessionKey=?)",
+           notice_plan_text
+
+    refute notice_plan_text =~ "SEARCH replacement_turn USING INDEX turns_session",
+           notice_plan_text
+
+    refute notice_plan_text =~ "SCAN notice USING INDEX turns_message_id",
+           notice_plan_text
+
+    refute notice_plan_text =~ "SCAN source USING INDEX wakes_delivered_turn", notice_plan_text
+    refute notice_plan_text =~ "AUTOMATIC", notice_plan_text
+    refute notice_plan_text =~ "USE TEMP B-TREE", notice_plan_text
   end
 
   test "CLI inspect capabilities match the REST session detail", ctx do
@@ -3320,6 +3461,330 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     end
   end
 
+  test "stage-one record events share tied history, exact notice ids, and commit frames", ctx do
+    holder = ctx.admin_session
+
+    opener =
+      Org.create(ctx.db, %{
+        session_key: "flynn-record-event-opener",
+        display_name: "Record event opener",
+        kind: "custom",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable"),
+        host: "testhost"
+      })
+
+    {:ok, [[activation_value]]} =
+      DB.query(
+        ctx.db,
+        "SELECT value FROM org_settings WHERE key='record-event-feed-activation:work_item.filed'"
+      )
+
+    activation_at = String.to_integer(activation_value)
+    before_cutoff_id = "wi_before_record_event_activation"
+
+    {:ok, []} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO work_items (id, title, ownerUserId, state, createdBySession, createdAt)
+        VALUES (?1, 'Before record-event activation', 'flynn', 'open', ?2, ?3)
+        """,
+        [before_cutoff_id, holder.session_key, activation_at - 1]
+      )
+
+    :ok =
+      Hub.register(Hub, self(), %{
+        mode: :all,
+        db: ctx.db,
+        user_id: "flynn",
+        is_admin: true
+      })
+
+    work_item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "agent:#{holder.session_key}",
+        principal: {:session, holder.session_key},
+        session_key: holder.session_key,
+        params: %{title: "Record event work item"}
+      })
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "session_record_event.created",
+                      "resource" => "record events",
+                      "op" => "append",
+                      "occurredAt" => work_item_at,
+                      "refs" => %{"sessionKey" => holder_key},
+                      "payload" => live_work_item_event
+                    }}
+
+    assert holder_key == holder.session_key
+    assert live_work_item_event["eventId"] == "work_item.filed:" <> work_item.id
+    assert live_work_item_event["at"] == work_item_at
+    assert live_work_item_event["tiedAs"] == ["creator"]
+    assert live_work_item_event["actorSessionKey"] == holder.session_key
+    assert live_work_item_event["cause"] == nil
+    assert live_work_item_event["noticeMessageIds"] == []
+
+    assert live_work_item_event["record"] == %{
+             "type" => "work-item",
+             "id" => work_item.id,
+             "workItemId" => work_item.id,
+             "detail" => "/api/work-items/#{work_item.id}"
+           }
+
+    assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "agent:#{opener.session_key}",
+        principal: {:session, opener.session_key},
+        session_key: holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 60_000,
+        params: %{
+          subject: "Record event assignment",
+          idempotency_key: nil,
+          reviews_assignment_id: nil,
+          work_item_id: work_item.id,
+          files: []
+        }
+      })
+
+    assignment_live_frames =
+      for _ <- 1..2 do
+        assert_receive {:firehose_notice, %{"class" => "session_record_event.created"} = notice},
+                       1_000
+
+        notice
+      end
+
+    assert Enum.map(assignment_live_frames, &get_in(&1, ["refs", "sessionKey"])) |> Enum.sort() ==
+             Enum.sort([holder.session_key, opener.session_key])
+
+    event_id = "assignment.opened:" <> assignment.id
+
+    holder_history_response =
+      get(ctx, "/api/sessions/#{holder.session_key}/record-events")
+
+    assert holder_history_response.status == 200
+    holder_history = JSON.decode!(holder_history_response.resp_body)
+    assert holder_history["schemaVersion"] == 1
+    assert holder_history["resource"] == "record events"
+
+    holder_work_item_event =
+      Enum.find(holder_history["items"], &(&1["eventId"] == "work_item.filed:" <> work_item.id))
+
+    holder_assignment_event = Enum.find(holder_history["items"], &(&1["eventId"] == event_id))
+
+    assert holder_work_item_event == live_work_item_event
+    assert holder_assignment_event["actorSessionKey"] == opener.session_key
+    assert holder_assignment_event["tiedAs"] == ["holder"]
+    assert holder_assignment_event["cause"] == nil
+
+    assert holder_assignment_event["record"] == %{
+             "type" => "assignment",
+             "id" => assignment.id,
+             "workItemId" => work_item.id,
+             "detail" => "/api/assignments/#{assignment.id}"
+           }
+
+    opener_history =
+      get(ctx, "/api/sessions/#{opener.session_key}/record-events")
+      |> then(&JSON.decode!(&1.resp_body))
+
+    refute Enum.any?(
+             opener_history["items"],
+             &(&1["eventId"] == "work_item.filed:" <> work_item.id)
+           )
+
+    opener_assignment_event = Enum.find(opener_history["items"], &(&1["eventId"] == event_id))
+    assert opener_assignment_event["tiedAs"] == ["opener"]
+    assert opener_assignment_event["noticeMessageIds"] == []
+
+    holder_assignment_frame =
+      Enum.find(
+        assignment_live_frames,
+        &(get_in(&1, ["refs", "sessionKey"]) == holder.session_key)
+      )
+
+    opener_assignment_frame =
+      Enum.find(
+        assignment_live_frames,
+        &(get_in(&1, ["refs", "sessionKey"]) == opener.session_key)
+      )
+
+    assert holder_assignment_frame["payload"] == holder_assignment_event
+    assert opener_assignment_frame["payload"] == opener_assignment_event
+
+    {:ok, [[marker_id]]} =
+      DB.query(
+        ctx.db,
+        """
+        SELECT m.id
+        FROM messages AS m
+        WHERE m.sessionKey = ?1
+          AND EXISTS (
+            SELECT 1 FROM json_each(COALESCE(m.recordEventIds, '[]'))
+            WHERE value = ?2
+          )
+        """,
+        [holder.session_key, event_id]
+      )
+
+    assert holder_assignment_event["noticeMessageIds"] == [marker_id]
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "message.created",
+                      "payload" => %{"id" => ^marker_id, "recordEventIds" => [^event_id]}
+                    }}
+
+    marker_history =
+      get(ctx, "/api/sessions/#{holder.session_key}/messages?limit=500&tail=true")
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.find(marker_history["items"], &(&1["id"] == marker_id))["recordEventIds"] ==
+             [event_id]
+
+    {:appended, ordinary_notice} =
+      Projection.append_substrate(
+        ctx.db,
+        holder.session_key,
+        "This ordinary notice mentions #{event_id}."
+      )
+
+    ordinary_history =
+      get(ctx, "/api/sessions/#{holder.session_key}/messages?limit=500&tail=true")
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.find(ordinary_history["items"], &(&1["id"] == ordinary_notice.id))[
+             "recordEventIds"
+           ] ==
+             []
+
+    refreshed_holder_events =
+      get(ctx, "/api/sessions/#{holder.session_key}/record-events")
+      |> then(&JSON.decode!(&1.resp_body))
+      |> Map.fetch!("items")
+
+    assert Enum.find(refreshed_holder_events, &(&1["eventId"] == event_id))["noticeMessageIds"] ==
+             [marker_id]
+
+    assert holder_history["items"] ==
+             Enum.sort_by(holder_history["items"], &{&1["at"], &1["eventId"]})
+
+    latest_page =
+      get(ctx, "/api/sessions/#{holder.session_key}/record-events?limit=1")
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert latest_page["items"] == [List.last(holder_history["items"])]
+    assert latest_page["page"]["hasMoreBefore"]
+
+    older_page =
+      get(
+        ctx,
+        "/api/sessions/#{holder.session_key}/record-events?limit=1&before=" <>
+          latest_page["page"]["oldestCursor"]
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert older_page["items"] == [Enum.at(holder_history["items"], -2)]
+
+    refute Enum.any?(
+             holder_history["items"],
+             &(&1["eventId"] == "work_item.filed:" <> before_cutoff_id)
+           )
+
+    same_party_assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "agent:#{holder.session_key}",
+        principal: {:session, holder.session_key},
+        session_key: holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 60_000,
+        params: %{
+          subject: "Record event same-party assignment",
+          idempotency_key: nil,
+          reviews_assignment_id: nil,
+          work_item_id: work_item.id,
+          files: []
+        }
+      })
+
+    same_party_event_id = "assignment.opened:" <> same_party_assignment.id
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "session_record_event.created",
+                      "refs" => %{"sessionKey" => holder_key},
+                      "payload" =>
+                        %{"eventId" => ^same_party_event_id, "tiedAs" => ["holder", "opener"]} =
+                          same_party_event
+                    }}
+
+    assert holder_key == holder.session_key
+
+    refute_receive {:firehose_notice,
+                    %{
+                      "class" => "session_record_event.created",
+                      "payload" => %{"eventId" => ^same_party_event_id}
+                    }},
+                   50
+
+    updated_holder_history =
+      get(ctx, "/api/sessions/#{holder.session_key}/record-events")
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.find(updated_holder_history["items"], &(&1["eventId"] == same_party_event_id)) ==
+             same_party_event
+  end
+
+  test "record-event activation migration is idempotent and uses only existing tables", ctx do
+    {:ok, [[table_count_before]]} =
+      DB.query(
+        ctx.db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+      )
+
+    {:ok, activation_before} =
+      DB.query(
+        ctx.db,
+        "SELECT key, value, updatedAt FROM org_settings WHERE key LIKE 'record-event-feed-activation:%' ORDER BY key"
+      )
+
+    assert length(activation_before) == 2
+    assert :ok = Tightbeam.RecordEvents.ensure_schema(ctx.db)
+
+    {:ok, [[table_count_after]]} =
+      DB.query(
+        ctx.db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+      )
+
+    {:ok, activation_after} =
+      DB.query(
+        ctx.db,
+        "SELECT key, value, updatedAt FROM org_settings WHERE key LIKE 'record-event-feed-activation:%' ORDER BY key"
+      )
+
+    assert table_count_after == table_count_before
+    assert activation_after == activation_before
+
+    for table <- ["messages", "wakes"] do
+      {:ok, columns} = DB.query(ctx.db, "PRAGMA table_info(#{table})")
+      assert Enum.any?(columns, fn [_cid, name | _rest] -> name == "recordEventIds" end)
+    end
+  end
+
   defp get(ctx, path, bearer \\ nil, headers \\ []) do
     Enum.reduce(headers, conn(:get, path), fn {name, value}, conn ->
       put_req_header(conn, name, value)
@@ -4328,5 +4793,175 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     critical_unknown = get(ctx, "/api/critical-state/no-such-session", ctx.token)
     assert_error(critical_unknown, 404, "critical state", "not_found")
     assert_application_headers(critical_unknown)
+  end
+
+  defp seed_record_event_plan_scale(db, seeded_at) do
+    :ok =
+      DB.execute(db, """
+      WITH RECURSIVE numbers(n) AS (
+        SELECT 0
+        UNION ALL SELECT n + 1 FROM numbers WHERE n < 59
+      )
+      INSERT INTO sessions(
+        sessionKey, displayName, ownerUserId, origin, archetype, harness, provider, model,
+        createdAt, updatedAt
+      )
+      SELECT
+        'record-event-plan-session-' || printf('%02d', n),
+        'record event plan session ' || n,
+        'flynn', 'test', 'main', 'codex', 'openai', 'test-model', n + 1, n + 1
+      FROM numbers
+      """)
+
+    :ok =
+      DB.execute(db, """
+      WITH RECURSIVE numbers(n) AS (
+        SELECT 1
+        UNION ALL SELECT n + 1 FROM numbers WHERE n < 15000
+      )
+      INSERT INTO assignments(id, subject, holderKey, openedBySession, openedAt)
+      SELECT
+        'record-event-plan-assignment-' || printf('%05d', n),
+        'production-scale assignment ' || n,
+        CASE WHEN n % 8 = 0
+          THEN 'record-event-plan-session-00'
+          ELSE 'record-event-plan-session-02'
+        END,
+        CASE WHEN n % 7 = 0
+          THEN 'record-event-plan-session-00'
+          ELSE 'record-event-plan-session-01'
+        END,
+        #{seeded_at} + n
+      FROM numbers
+      """)
+
+    :ok =
+      DB.execute(db, """
+      WITH RECURSIVE numbers(n) AS (
+        SELECT 1
+        UNION ALL SELECT n + 1 FROM numbers WHERE n < 1200
+      )
+      INSERT INTO work_items(id, title, ownerUserId, createdBySession, createdAt)
+      SELECT
+        'record-event-plan-work-item-' || printf('%05d', n),
+        'production-scale work item ' || n,
+        'flynn',
+        CASE WHEN n % 60 = 0
+          THEN 'record-event-plan-session-00'
+          ELSE 'record-event-plan-session-01'
+        END,
+        #{seeded_at} + n
+      FROM numbers
+      """)
+
+    :ok =
+      DB.execute(db, """
+      WITH RECURSIVE numbers(n) AS (
+        SELECT 1
+        UNION ALL SELECT n + 1 FROM numbers WHERE n < 68138
+      )
+      INSERT INTO messages(
+        id, sessionKey, role, content, timestamp, deviceId, clientMessageId, replyToMessageId,
+        llmVisibleMessageId, attachments, recordEventIds
+      )
+      SELECT
+        'record-event-plan-message-' || printf('%05d', n),
+        'record-event-plan-session-00',
+        CASE WHEN n IN (1, 2) OR n % 2 = 1 THEN 'user' ELSE 'assistant' END,
+        'production-scale message ' || n,
+        n,
+        CASE n
+          WHEN 1 THEN 'record-event-plan-device-01'
+          WHEN 2 THEN 'record-event-plan-device-02'
+        END,
+        CASE n
+          WHEN 1 THEN 'record-event-plan-client-01'
+          WHEN 2 THEN 'record-event-plan-client-02'
+        END,
+        CASE WHEN n > 2 AND n % 2 = 0
+          THEN 'record-event-plan-message-' || printf('%05d', n - 1)
+        END,
+        'record-event-plan-message-' || printf('%05d', n),
+        '[]',
+        CASE WHEN n = 1
+          THEN '["assignment.opened:record-event-plan-assignment-00008"]'
+        END
+      FROM numbers
+      """)
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        :ok =
+          Tightbeam.DB.Txn.exec(txn, """
+          WITH RECURSIVE numbers(n) AS (
+            SELECT 1
+            UNION ALL SELECT n + 1 FROM numbers WHERE n < 88481
+          )
+          INSERT INTO wakes(
+            wakeId, sessionKey, origin, prompt, dueAt, createdAt, recordEventIds,
+            sourceClientIdentity
+          )
+          SELECT
+            'record-event-plan-wake-' || printf('%05d', n),
+            'record-event-plan-session-00', 'test', 'production-scale wake', 1, 1,
+            CASE WHEN n = 1
+              THEN '["assignment.opened:record-event-plan-assignment-00008"]'
+            END,
+            CASE WHEN n IN (1, 2) THEN json_object(
+              'targetSessionKey', 'record-event-plan-session-00',
+              'deviceId', 'record-event-plan-device-0' || n,
+              'clientMessageId', 'record-event-plan-client-0' || n,
+              'sourceWakeId', 'record-event-plan-wake-' || printf('%05d', n),
+              'payloadSha256', printf('%064d', 0),
+              'createdAt', #{seeded_at}
+            ) END
+          FROM numbers
+          """)
+
+        :ok =
+          Tightbeam.DB.Txn.exec(txn, """
+          INSERT INTO wake_cancellations(
+            wakeId, wakeState, canceledAt, requesterKind, requesterId, reasonKind,
+            causalSourceKind, causalSourceId, outcomeKind, workImpactKind, actionNeeded
+          )
+          SELECT
+            wakeId, 'canceled', 1, 'session', 'record-event-plan-session-00',
+            'requester_withdrew', 'verb_call', 'record-event-plan', 'no_replacement',
+            'no_linked_work', 0
+          FROM wakes
+          WHERE wakeId BETWEEN 'record-event-plan-wake-00003' AND 'record-event-plan-wake-88481'
+          """)
+
+        :ok =
+          Tightbeam.DB.Txn.exec(txn, """
+          UPDATE wakes SET state = 'canceled', canceledAt = 1
+          WHERE wakeId BETWEEN 'record-event-plan-wake-00003' AND 'record-event-plan-wake-88481'
+          """)
+
+        :ok =
+          Tightbeam.DB.Txn.exec(txn, """
+          INSERT INTO turns(sessionKey, messageId, wakeId, origin, prompt, status, createdAt)
+          VALUES (
+            'record-event-plan-session-00',
+            'record-event-plan-message-00003',
+            'record-event-plan-wake-00001',
+            'test', 'production-scale turn', 'delivered', #{seeded_at}
+          )
+          """)
+
+        :ok =
+          Tightbeam.DB.Txn.exec(txn, """
+          UPDATE wakes
+          SET state = 'fired', firedAt = #{seeded_at},
+              deliveredTurnSeq = (
+                SELECT seq FROM turns WHERE wakeId = 'record-event-plan-wake-00001'
+              )
+          WHERE wakeId BETWEEN 'record-event-plan-wake-00001' AND 'record-event-plan-wake-00002'
+          """)
+
+        :ok
+      end)
+
+    :ok
   end
 end

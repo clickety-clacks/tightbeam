@@ -477,7 +477,7 @@ defmodule Tightbeam.ToolCallsTest do
     message_columns = ~w(
       seq id sessionKey role content timestamp sender deviceId clientMessageId
       replyToMessageId replyToClientMessageId llmVisibleMessageId attachments
-      attentionTier messageType markerKind markerFrom markerTo
+      attentionTier messageType markerKind markerFrom markerTo recordEventIds
     )
 
     message_rows_sql =
@@ -643,6 +643,13 @@ defmodule Tightbeam.ToolCallsTest do
 
     {:ok, :ok} =
       DB.transaction(db, fn txn ->
+        Tightbeam.DB.Txn.q(
+          txn,
+          "DELETE FROM org_settings WHERE key IN ('record-event-feed-activation:work_item.filed', 'record-event-feed-activation:assignment.opened')"
+        )
+
+        Tightbeam.DB.Txn.exec(txn, "ALTER TABLE wakes DROP COLUMN recordEventIds")
+
         Tightbeam.DB.Txn.exec(txn, """
         DROP INDEX messages_session;
         DROP INDEX messages_client_dedupe;

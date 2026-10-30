@@ -456,6 +456,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
              "wake.scheduled",
              "wake.canceled",
              "message.created",
+             "session_record_event.created",
+             "session_record_event.created",
              "session.updated",
              "message.created",
              "verb.accepted",
