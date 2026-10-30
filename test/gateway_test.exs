@@ -6782,7 +6782,7 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert message =~ "no credential for anthropic on testhost"
-    assert message =~ "tightbeam onboard anthropic --as-user <userId>"
+    assert message =~ "Run on testhost: tightbeam onboard anthropic"
     refute message =~ "GATEWAY host"
     refute message =~ "onboard anthropic on worker"
   end
