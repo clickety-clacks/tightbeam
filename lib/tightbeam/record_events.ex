@@ -267,7 +267,8 @@ defmodule Tightbeam.RecordEvents do
   @doc false
   def single_event_plan_queries(session_key, work_item_id, assignment_id) do
     [
-      {@work_item_event_by_id_query, [session_key, work_item_id], "work_items_id_owner"},
+      {@work_item_event_by_id_query, [session_key, work_item_id],
+       "sqlite_autoindex_work_items_1"},
       {@assignment_event_by_id_query, [session_key, assignment_id],
        "sqlite_autoindex_assignments_1"}
     ]
