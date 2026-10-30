@@ -18,17 +18,28 @@ def required_path(name):
     return value
 
 
-def post_event(event):
+def post_event(output):
+    if not isinstance(output, dict):
+        raise WatcherError("matrix-commander output must be an object")
+
+    event = output.get("source")
+    if not isinstance(event, dict):
+        raise WatcherError("matrix-commander output has no source event")
+
     event_type = event.get("type")
     if event_type != "m.room.message":
         return
+
+    room = output.get("room")
+    if not isinstance(room, dict):
+        raise WatcherError("message event has no room object")
 
     content = event.get("content")
     if not isinstance(content, dict):
         raise WatcherError("message event has no content object")
 
     values = {
-        "room": event.get("room_id"),
+        "room": room.get("room_id"),
         "sender": event.get("sender"),
         "text": content.get("body"),
         "event_id": event.get("event_id"),
@@ -84,7 +95,7 @@ def main():
         "forever",
         "--listen-self",
         "--output",
-        "json-spec",
+        "json",
     ]
 
     try:

@@ -1,7 +1,7 @@
 defmodule Tightbeam.SentinelMatrixWatcherTest do
   use Tightbeam.TestCase, async: false
 
-  test "posts a json-spec message with its original ID and complete body" do
+  test "posts a message from recorded matrix-commander JSON output" do
     root = Path.join(System.tmp_dir!(), "sentinel-watcher-#{System.unique_integer([:positive])}")
     bin = Path.join(root, "bin")
     File.mkdir_p!(bin)
@@ -65,7 +65,7 @@ defmodule Tightbeam.SentinelMatrixWatcherTest do
              "forever",
              "--listen-self",
              "--output",
-             "json-spec"
+             "json"
            ]
 
     assert [posted_args] =
