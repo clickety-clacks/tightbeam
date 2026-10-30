@@ -89,11 +89,11 @@ defmodule Tightbeam.ToolCalls do
 
   @messages_with_record_event_ids_ddl (case String.split(
                                               String.trim(@messages_new_ddl),
-                                              "markerTo               TEXT,\n    CHECK ("
+                                              "markerTo               TEXT,\n  CHECK ("
                                             ) do
                                          [prefix, suffix] ->
                                            prefix <>
-                                             "markerTo               TEXT, recordEventIds TEXT,\n    CHECK (" <>
+                                             "markerTo               TEXT, recordEventIds TEXT,\n  CHECK (" <>
                                              suffix
 
                                          _ ->
