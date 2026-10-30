@@ -277,6 +277,81 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     end)
   end
 
+  test "turn tries an unlisted preference after a raw harness model refusal" do
+    with_gateway(fn %{db: db, config: config, lane: lane} ->
+      first = Model.new("synthetic-first", effort: "low")
+      second = Model.new("synthetic-second", effort: "high")
+
+      {:ok, catalog} =
+        CatalogStub.start_link(%{
+          {"testhost", "fixture"} => [
+            %{family: first.family, context: nil, efforts: ["low"], provider: :fixture_provider}
+          ]
+        })
+
+      refusal = %{"code" => -32603, "message" => "Requested model was refused"}
+
+      first_reason =
+        ErrorDiagnostic.diagnosed(
+          refusal,
+          ErrorDiagnostic.new("jsonrpc_error",
+            phase: "model",
+            config_id: "model",
+            reason: refusal
+          )
+        )
+
+      {:ok, adapter} =
+        RingDownAdapter.start_link(
+          parent: self(),
+          outcomes: %{
+            first.family => {:error, first_reason},
+            second.family => {:ok, "unlisted-session"}
+          },
+          readback: %{"unlisted-session" => second}
+        )
+
+      {:ok, _coordinator} = CoordinatorStub.start_link({adapter, self()})
+      config = Map.put(config, :model_catalog, catalog)
+
+      Org.create(db, %{
+        session_key: "ring-unlisted",
+        display_name: "Unlisted ring entry",
+        owner_user_id: "synthetic-owner",
+        origin: "user:synthetic-owner",
+        archetype: "synthetic-ring",
+        host: "testhost",
+        harness: "fixture",
+        provider: "fixture_provider",
+        model: first
+      })
+
+      assert :appended =
+               Gateway.deliver_prompt("ring-unlisted", "user:synthetic-owner", "select",
+                 db: db,
+                 lane_manager: lane,
+                 conn_registry: ConnRegistry,
+                 client_message_id: "ring-unlisted-client"
+               )
+
+      assert {:ok, turn} = Ledger.claim_next(db, "ring-unlisted", "ring-test")
+      assert {:ok, _} = runner(config).(Map.put(turn, :session_key, "ring-unlisted"))
+
+      assert_receive {:model_attempt, ^first}
+      assert_receive {:model_attempt, ^second}
+      assert Org.get(db, "ring-unlisted").model == second
+
+      details =
+        EventLog.lifecycle_events(db)
+        |> Enum.filter(&(&1.kind == "model_selection_attempt"))
+        |> Enum.map(& &1.detail)
+        |> Enum.join("\n")
+
+      assert details =~ "Requested model was refused"
+      assert details =~ "synthetic-second"
+    end)
+  end
+
   test "turn exhaustion stops at the configured entries and keeps the typed refusal" do
     with_gateway(fn %{db: db, config: config, lane: lane} ->
       first = Model.new("synthetic-first", effort: "low")
@@ -348,6 +423,12 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
         session_key = "ring-cross-harness"
 
         [cross_harness_reason] = production_model_use_failures([cross_harness], :codex)
+
+        assert %{"code" => -32602, "message" => "Invalid params"} =
+                 ErrorDiagnostic.classified(cross_harness_reason)
+
+        assert %{"phase" => "model", "configId" => "model"} =
+                 ErrorDiagnostic.of(cross_harness_reason)
 
         {:ok, catalog} =
           CatalogStub.start_link(%{
@@ -469,7 +550,7 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
           RingDownAdapter.start_link(
             parent: self(),
             outcomes: %{cross_harness.family => {:ok, "cross-harness-session"}},
-            readback: %{}
+            readback: %{"cross-harness-session" => cross_harness}
           )
 
         coordinator = fn
@@ -582,7 +663,7 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
             parent: self(),
             outcomes: %{cross_harness.family => {:ok, "cross-harness-health-session"}},
             prompt_outcome: {:error, rate_limit},
-            readback: %{}
+            readback: %{"cross-harness-health-session" => cross_harness}
           )
 
         coordinator = fn
@@ -675,7 +756,9 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
         [not_selectable_reason, effort_reason] =
           production_model_use_failures([not_selectable, unsupported_effort])
 
-        assert :model_unavailable == ErrorDiagnostic.classified(not_selectable_reason)
+        assert %{"code" => -32602, "message" => "Invalid params"} =
+                 ErrorDiagnostic.classified(not_selectable_reason)
+
         assert %{"phase" => "model"} = ErrorDiagnostic.of(not_selectable_reason)
 
         assert %{"code" => -32602, "message" => "Invalid params"} =
@@ -1075,7 +1158,7 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     )
   end
 
-  test "spawn skips an unavailable named preference and uses the next routed entry" do
+  test "spawn keeps the first named preference when the catalog omits it" do
     preferences = [
       {"synthetic-missing", "low", nil},
       {"synthetic-available", "high", nil}
@@ -1103,42 +1186,40 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
                    session_key: nil,
                    params: %{
                      archetype: "synthetic-ring",
-                     display_name: "Skip unavailable preference",
-                     idempotency_key: "skip-unavailable-preference"
+                     display_name: "Unlisted preference",
+                     idempotency_key: "unlisted-preference"
                    }
                  })
 
-        assert %Model{family: "synthetic-available"} = Org.get(db, session_key).model
+        assert %Model{family: "synthetic-missing"} = Org.get(db, session_key).model
       end,
       preferences
     )
   end
 
-  test "spawn exhaustion names every configured unavailable preference" do
+  test "spawn preserves the first preference when the catalog has no entries" do
     preferences = [
       {"synthetic-missing-one", "low", nil},
       {"synthetic-missing-two", "high", nil}
     ]
 
     with_gateway(
-      fn %{config: config} ->
+      fn %{db: db, config: config} ->
         {:ok, catalog} = CatalogStub.start_link(%{})
         spawn = Gateway.handlers(Map.put(config, :model_catalog, catalog))["spawn"]
 
-        assert %{code: "config_denied", message: message} =
+        assert %{session_key: session_key} =
                  spawn.(%{
                    origin: "user:synthetic-owner",
                    session_key: nil,
                    params: %{
                      archetype: "synthetic-ring",
-                     display_name: "Exhausted preferences",
-                     idempotency_key: "exhausted-preferences"
+                     display_name: "Unlisted preferences",
+                     idempotency_key: "unlisted-preferences"
                    }
                  })
 
-        assert message =~ "synthetic-missing-one"
-        assert message =~ "synthetic-missing-two"
-        assert message =~ "no configured model preference can run"
+        assert %Model{family: "synthetic-missing-one"} = Org.get(db, session_key).model
       end,
       preferences
     )

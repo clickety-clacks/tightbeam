@@ -157,7 +157,14 @@ defmodule GuardHarnessSwitch do
   defp prove(base, db, lane, exact_registry, runner, config, adapter) do
     local_host = Tightbeam.Placement.local_host_name()
 
-    assert %{ok: true, harness: "codex", model: "gpt-5.6-sol", effort: "medium"} =
+    assert %{
+             ok: true,
+             harness: "codex",
+             model: nil,
+             effort: nil,
+             requested: %{model: "gpt-5.6-sol", effort: "medium"},
+             running_status: "not reported by codex"
+           } =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",

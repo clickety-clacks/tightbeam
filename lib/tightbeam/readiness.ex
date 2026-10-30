@@ -150,7 +150,7 @@ defmodule Tightbeam.Readiness do
     adapter = adapter_state(module, local?, config)
     binary = binary_state(module, local?, config)
     credential = credential_state(entries, health)
-    model = model_state(host, wire, credential, config, catalog)
+    model = model_state(credential, config)
 
     %{
       host: host,
@@ -247,32 +247,16 @@ defmodule Tightbeam.Readiness do
   defp classify(:not_derived), do: {:unknown, :catalog_not_derived_yet}
   defp classify(reason), do: {:degraded, reason}
 
-  # THE MODEL ROW DEFERS ONLY WHERE ANOTHER ROW ALREADY SPEAKS. An ABSENT or
-  # UNKNOWN credential is the credential column's story — it names the grant, the
-  # host and the onboard command — and repeating it here would be noise, so the
-  # model is reported unknown (this is also where the not-yet-derived policy
-  # lives: nothing is established, so nothing is asserted).
-  #
-  # A DEGRADED catalog is a different fact. The credential is not implicated: the
-  # inventory came back empty for the catalog's own reason — a client_version
-  # filter, a malformed body — and NO other row says so. Deferring there is how
-  # the centralized "upgrade the binary" diagnosis failed to reach boot at all.
-  defp model_state(_host, _harness, {:absent, _reason}, _config, _catalog), do: :unknown
-  defp model_state(_host, _harness, {:unknown, _reason}, _config, _catalog), do: :unknown
+  # An absent or unknown credential already has its own readiness explanation.
+  # Once the credential is known, the named default can be sent to the harness
+  # regardless of whether the provider catalog lists it.
+  defp model_state({:absent, _reason}, _config), do: :unknown
+  defp model_state({:unknown, _reason}, _config), do: :unknown
 
-  # Asked of the one routability owner rather than derived here. Boot used to
-  # decide this itself, with a narrower rule that could not tell "no such model"
-  # from "model present, no tier named" — and reported the second as the first.
-  defp model_state(host, harness, _credential, config, catalog) do
+  defp model_state(_credential, config) do
     case Map.get(config, :default_model) do
-      %Model{} = model ->
-        case ModelCatalog.route(host, harness, model, catalog) do
-          {:ok, _routed} -> :selectable
-          {:error, unroutable} -> {:unroutable, unroutable}
-        end
-
-      _ ->
-        :unset
+      %Model{} -> :selectable
+      _ -> :unset
     end
   end
 
