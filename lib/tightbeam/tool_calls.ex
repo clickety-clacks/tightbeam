@@ -87,6 +87,12 @@ defmodule Tightbeam.ToolCalls do
   )
   """
 
+  @messages_with_record_event_ids_ddl String.replace!(
+                                        String.trim(@messages_new_ddl),
+                                        "markerTo               TEXT,\n    CHECK (",
+                                        "markerTo               TEXT, recordEventIds TEXT,\n    CHECK ("
+                                      )
+
   @doc "Apply the one-time tool-call and transition schema migration."
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ DB) do
@@ -163,7 +169,15 @@ defmodule Tightbeam.ToolCalls do
       {"index", "tool_calls_session_anchor",
        "CREATE INDEX tool_calls_session_anchor ON tool_calls (sessionKey, afterMessageSeq)"},
       {"table", "messages",
-       String.replace(@messages_new_ddl, "messages_new", "messages", global: false)},
+       [
+         String.replace(@messages_new_ddl, "messages_new", "messages", global: false),
+         String.replace(
+           @messages_with_record_event_ids_ddl,
+           "messages_new",
+           "messages",
+           global: false
+         )
+       ]},
       {"index", "messages_session",
        "CREATE INDEX messages_session ON messages (sessionKey, seq)"},
       {"index", "messages_client_dedupe",
@@ -177,7 +191,11 @@ defmodule Tightbeam.ToolCalls do
              [type, name]
            ) do
         [[sql]] ->
-          unless normalize_schema_sql(sql) == normalize_schema_sql(expected_sql) do
+          expected_sqls = List.wrap(expected_sql)
+
+          unless Enum.any?(expected_sqls, fn candidate ->
+                   normalize_schema_sql(sql) == normalize_schema_sql(candidate)
+                 end) do
             raise Tightbeam.Schema.ShapeError,
               message:
                 "incompatible_tool_call_transition_schema_object: #{inspect({type, name, sql})}"

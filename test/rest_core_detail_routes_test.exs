@@ -3320,6 +3320,330 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     end
   end
 
+  test "stage-one record events share tied history, exact notice ids, and commit frames", ctx do
+    holder = ctx.admin_session
+
+    opener =
+      Org.create(ctx.db, %{
+        session_key: "flynn-record-event-opener",
+        display_name: "Record event opener",
+        kind: "custom",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable"),
+        host: "testhost"
+      })
+
+    {:ok, [[activation_value]]} =
+      DB.query(
+        ctx.db,
+        "SELECT value FROM org_settings WHERE key='record-event-feed-activation:work_item.filed'"
+      )
+
+    activation_at = String.to_integer(activation_value)
+    before_cutoff_id = "wi_before_record_event_activation"
+
+    {:ok, []} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO work_items (id, title, ownerUserId, state, createdBySession, createdAt)
+        VALUES (?1, 'Before record-event activation', 'flynn', 'open', ?2, ?3)
+        """,
+        [before_cutoff_id, holder.session_key, activation_at - 1]
+      )
+
+    :ok =
+      Hub.register(Hub, self(), %{
+        mode: :all,
+        db: ctx.db,
+        user_id: "flynn",
+        is_admin: true
+      })
+
+    work_item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "agent:#{holder.session_key}",
+        principal: {:session, holder.session_key},
+        session_key: holder.session_key,
+        params: %{title: "Record event work item"}
+      })
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "session_record_event.created",
+                      "resource" => "record events",
+                      "op" => "append",
+                      "occurredAt" => work_item_at,
+                      "refs" => %{"sessionKey" => holder_key},
+                      "payload" => live_work_item_event
+                    }}
+
+    assert holder_key == holder.session_key
+    assert live_work_item_event["eventId"] == "work_item.filed:" <> work_item.id
+    assert live_work_item_event["at"] == work_item_at
+    assert live_work_item_event["tiedAs"] == ["creator"]
+    assert live_work_item_event["actorSessionKey"] == holder.session_key
+    assert live_work_item_event["cause"] == nil
+    assert live_work_item_event["noticeMessageIds"] == []
+
+    assert live_work_item_event["record"] == %{
+             "type" => "work-item",
+             "id" => work_item.id,
+             "workItemId" => work_item.id,
+             "detail" => "/api/work-items/#{work_item.id}"
+           }
+
+    assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "agent:#{opener.session_key}",
+        principal: {:session, opener.session_key},
+        session_key: holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 60_000,
+        params: %{
+          subject: "Record event assignment",
+          idempotency_key: nil,
+          reviews_assignment_id: nil,
+          work_item_id: work_item.id,
+          files: []
+        }
+      })
+
+    assignment_live_frames =
+      for _ <- 1..2 do
+        assert_receive {:firehose_notice, %{"class" => "session_record_event.created"} = notice},
+                       1_000
+
+        notice
+      end
+
+    assert Enum.map(assignment_live_frames, &get_in(&1, ["refs", "sessionKey"])) |> Enum.sort() ==
+             Enum.sort([holder.session_key, opener.session_key])
+
+    event_id = "assignment.opened:" <> assignment.id
+
+    holder_history_response =
+      get(ctx, "/api/sessions/#{holder.session_key}/record-events")
+
+    assert holder_history_response.status == 200
+    holder_history = JSON.decode!(holder_history_response.resp_body)
+    assert holder_history["schemaVersion"] == 1
+    assert holder_history["resource"] == "record events"
+
+    holder_work_item_event =
+      Enum.find(holder_history["items"], &(&1["eventId"] == "work_item.filed:" <> work_item.id))
+
+    holder_assignment_event = Enum.find(holder_history["items"], &(&1["eventId"] == event_id))
+
+    assert holder_work_item_event == live_work_item_event
+    assert holder_assignment_event["actorSessionKey"] == opener.session_key
+    assert holder_assignment_event["tiedAs"] == ["holder"]
+    assert holder_assignment_event["cause"] == nil
+
+    assert holder_assignment_event["record"] == %{
+             "type" => "assignment",
+             "id" => assignment.id,
+             "workItemId" => work_item.id,
+             "detail" => "/api/assignments/#{assignment.id}"
+           }
+
+    opener_history =
+      get(ctx, "/api/sessions/#{opener.session_key}/record-events")
+      |> then(&JSON.decode!(&1.resp_body))
+
+    refute Enum.any?(
+             opener_history["items"],
+             &(&1["eventId"] == "work_item.filed:" <> work_item.id)
+           )
+
+    opener_assignment_event = Enum.find(opener_history["items"], &(&1["eventId"] == event_id))
+    assert opener_assignment_event["tiedAs"] == ["opener"]
+    assert opener_assignment_event["noticeMessageIds"] == []
+
+    holder_assignment_frame =
+      Enum.find(
+        assignment_live_frames,
+        &(get_in(&1, ["refs", "sessionKey"]) == holder.session_key)
+      )
+
+    opener_assignment_frame =
+      Enum.find(
+        assignment_live_frames,
+        &(get_in(&1, ["refs", "sessionKey"]) == opener.session_key)
+      )
+
+    assert holder_assignment_frame["payload"] == holder_assignment_event
+    assert opener_assignment_frame["payload"] == opener_assignment_event
+
+    {:ok, [[marker_id]]} =
+      DB.query(
+        ctx.db,
+        """
+        SELECT m.id
+        FROM messages AS m
+        WHERE m.sessionKey = ?1
+          AND EXISTS (
+            SELECT 1 FROM json_each(COALESCE(m.recordEventIds, '[]'))
+            WHERE value = ?2
+          )
+        """,
+        [holder.session_key, event_id]
+      )
+
+    assert holder_assignment_event["noticeMessageIds"] == [marker_id]
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "message.created",
+                      "payload" => %{"id" => ^marker_id, "recordEventIds" => [^event_id]}
+                    }}
+
+    marker_history =
+      get(ctx, "/api/sessions/#{holder.session_key}/messages?limit=500&tail=true")
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.find(marker_history["items"], &(&1["id"] == marker_id))["recordEventIds"] ==
+             [event_id]
+
+    {:appended, ordinary_notice} =
+      Projection.append_substrate(
+        ctx.db,
+        holder.session_key,
+        "This ordinary notice mentions #{event_id}."
+      )
+
+    ordinary_history =
+      get(ctx, "/api/sessions/#{holder.session_key}/messages?limit=500&tail=true")
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.find(ordinary_history["items"], &(&1["id"] == ordinary_notice.id))[
+             "recordEventIds"
+           ] ==
+             []
+
+    refreshed_holder_events =
+      get(ctx, "/api/sessions/#{holder.session_key}/record-events")
+      |> then(&JSON.decode!(&1.resp_body))
+      |> Map.fetch!("items")
+
+    assert Enum.find(refreshed_holder_events, &(&1["eventId"] == event_id))["noticeMessageIds"] ==
+             [marker_id]
+
+    assert holder_history["items"] ==
+             Enum.sort_by(holder_history["items"], &{&1["at"], &1["eventId"]})
+
+    latest_page =
+      get(ctx, "/api/sessions/#{holder.session_key}/record-events?limit=1")
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert latest_page["items"] == [List.last(holder_history["items"])]
+    assert latest_page["page"]["hasMoreBefore"]
+
+    older_page =
+      get(
+        ctx,
+        "/api/sessions/#{holder.session_key}/record-events?limit=1&before=" <>
+          latest_page["page"]["oldestCursor"]
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert older_page["items"] == [Enum.at(holder_history["items"], -2)]
+
+    refute Enum.any?(
+             holder_history["items"],
+             &(&1["eventId"] == "work_item.filed:" <> before_cutoff_id)
+           )
+
+    same_party_assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "agent:#{holder.session_key}",
+        principal: {:session, holder.session_key},
+        session_key: holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 60_000,
+        params: %{
+          subject: "Record event same-party assignment",
+          idempotency_key: nil,
+          reviews_assignment_id: nil,
+          work_item_id: work_item.id,
+          files: []
+        }
+      })
+
+    same_party_event_id = "assignment.opened:" <> same_party_assignment.id
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "session_record_event.created",
+                      "refs" => %{"sessionKey" => holder_key},
+                      "payload" =>
+                        %{"eventId" => ^same_party_event_id, "tiedAs" => ["holder", "opener"]} =
+                          same_party_event
+                    }}
+
+    assert holder_key == holder.session_key
+
+    refute_receive {:firehose_notice,
+                    %{
+                      "class" => "session_record_event.created",
+                      "payload" => %{"eventId" => ^same_party_event_id}
+                    }},
+                   50
+
+    updated_holder_history =
+      get(ctx, "/api/sessions/#{holder.session_key}/record-events")
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.find(updated_holder_history["items"], &(&1["eventId"] == same_party_event_id)) ==
+             same_party_event
+  end
+
+  test "record-event activation migration is idempotent and uses only existing tables", ctx do
+    {:ok, [[table_count_before]]} =
+      DB.query(
+        ctx.db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+      )
+
+    {:ok, activation_before} =
+      DB.query(
+        ctx.db,
+        "SELECT key, value, updatedAt FROM org_settings WHERE key LIKE 'record-event-feed-activation:%' ORDER BY key"
+      )
+
+    assert length(activation_before) == 2
+    assert :ok = Tightbeam.RecordEvents.ensure_schema(ctx.db)
+
+    {:ok, [[table_count_after]]} =
+      DB.query(
+        ctx.db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+      )
+
+    {:ok, activation_after} =
+      DB.query(
+        ctx.db,
+        "SELECT key, value, updatedAt FROM org_settings WHERE key LIKE 'record-event-feed-activation:%' ORDER BY key"
+      )
+
+    assert table_count_after == table_count_before
+    assert activation_after == activation_before
+
+    for table <- ["messages", "wakes"] do
+      {:ok, columns} = DB.query(ctx.db, "PRAGMA table_info(#{table})")
+      assert Enum.any?(columns, fn [_cid, name | _rest] -> name == "recordEventIds" end)
+    end
+  end
+
   defp get(ctx, path, bearer \\ nil, headers \\ []) do
     Enum.reduce(headers, conn(:get, path), fn {name, value}, conn ->
       put_req_header(conn, name, value)
