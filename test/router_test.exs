@@ -3410,20 +3410,36 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "read-marker verbs use the user credential owner through agent dispatch", ctx do
-    owner = ctx.device.user_id
-    scope_key = "session:read-marker-route-#{System.unique_integer([:positive])}"
+    owner = "mike"
+    Devices.add_user(ctx.db, owner, false)
+
+    unique = System.unique_integer([:positive])
+    device_id = "read-marker-device-#{unique}"
+
+    {:pending, _device} =
+      Devices.pair(ctx.db, %{
+        device_id: device_id,
+        claimed_name: "Mike",
+        platform: nil,
+        model: nil
+      })
+
+    device = Devices.approve(ctx.db, device_id, owner)
+    session = create_session(ctx.db, "chat:thread #{unique}", owner)
+    scope_key = "#{session.session_key}:session-read-position"
+    encoded_scope_key = URI.encode(scope_key, &URI.char_unreserved?/1)
     handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
     opts = Keyword.put(ctx.opts, :handlers, handlers)
 
     dispatch = fn verb, params ->
       conn(:post, "/agent/dispatch", JSON.encode!(%{"verb" => verb, "params" => params}))
-      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> put_req_header("authorization", "Bearer #{device.token}")
       |> Router.call(Router.init(opts))
     end
 
     get_marker = fn ->
-      conn(:get, "/api/read-markers/#{scope_key}")
-      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      conn(:get, "/api/read-markers/#{encoded_scope_key}")
+      |> put_req_header("authorization", "Bearer #{device.token}")
       |> Router.call(Router.init(opts))
     end
 
@@ -3434,7 +3450,7 @@ defmodule Tightbeam.Wire.RouterTest do
     first =
       dispatch.("read-marker-set", %{
         "scopeKey" => scope_key,
-        "marker" => "100",
+        "marker" => 0,
         "expectedCurrent" => nil
       })
 
@@ -3443,12 +3459,12 @@ defmodule Tightbeam.Wire.RouterTest do
     assert first_result["userId"] == owner
     assert first_result["readMarker"]["userId"] == owner
     assert first_result["readMarker"]["scopeKey"] == scope_key
-    assert first_result["readMarker"]["marker"] == "100"
+    assert first_result["readMarker"]["marker"] == 0
 
     null_conflict =
       dispatch.("read-marker-set", %{
         "scopeKey" => scope_key,
-        "marker" => "200",
+        "marker" => 8,
         "expectedCurrent" => nil
       })
 
@@ -3457,13 +3473,13 @@ defmodule Tightbeam.Wire.RouterTest do
     stale_conflict =
       dispatch.("read-marker-set", %{
         "scopeKey" => scope_key,
-        "marker" => "200",
-        "expectedCurrent" => "99"
+        "marker" => 8,
+        "expectedCurrent" => 7
       })
 
     assert JSON.decode!(stale_conflict.resp_body)["error"]["code"] == "read_marker_conflict"
 
-    unconditional = dispatch.("read-marker-set", %{"scopeKey" => scope_key, "marker" => "200"})
+    unconditional = dispatch.("read-marker-set", %{"scopeKey" => scope_key, "marker" => 12})
     assert unconditional.status == 200, unconditional.resp_body
 
     current = get_marker.()
@@ -3473,7 +3489,7 @@ defmodule Tightbeam.Wire.RouterTest do
              "item" => %{
                "userId" => ^owner,
                "scopeKey" => ^scope_key,
-               "marker" => "200"
+               "marker" => 12
              }
            } = JSON.decode!(current.resp_body)
 
@@ -3482,11 +3498,33 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(cleared.resp_body)["result"]["readMarker"]["marker"] == nil
 
     after_clear = get_marker.()
-    assert after_clear.status == 404
-    assert JSON.decode!(after_clear.resp_body)["error"]["code"] == "not_found"
+    assert after_clear.status == 200, after_clear.resp_body
+
+    assert %{
+             "item" => %{
+               "userId" => ^owner,
+               "scopeKey" => ^scope_key,
+               "marker" => nil
+             }
+           } = JSON.decode!(after_clear.resp_body)
 
     assert JSON.decode!(dispatch.("inspect", %{}).resp_body)["error"]["code"] ==
              "auth_failed"
+
+    cli_ctx = %{ctx | opts: opts}
+
+    for token <- [ctx.opts[:cli_token], session.cli_token],
+        verb <- ["read-marker-set", "read-marker-clear"] do
+      denied =
+        dispatch_cli(cli_ctx, token, %{
+          verb: verb,
+          asUser: owner,
+          params: %{scopeKey: scope_key, marker: 8}
+        })
+
+      assert denied.status == 400
+      assert JSON.decode!(denied.resp_body)["error"]["code"] == "invalid_message"
+    end
   end
 
   test "artifact verbs are agent verbs and recording binds the authenticated session caller",

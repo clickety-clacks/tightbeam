@@ -65,7 +65,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       ~w(ownerUserId spawnedBy topologyParent handle identityName identityRevision provider model thinkingLevel modelContext host clearedThroughSeq overrides),
     "devices" => ~w(claimedName platform model),
     "artifacts" => ~w(description parentSession contentSha256 recordedMessageId home),
-    "read markers" => []
+    "read markers" => ~w(marker)
   }
 
   @integer_fields %{
@@ -2854,6 +2854,10 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         domain = Map.get(@enum_domains, {resource, field}) ->
           assert value in domain,
                  "#{resource}.#{field}=#{inspect(value)} is outside #{inspect(domain)}"
+
+        {resource, field} == {"read markers", "marker"} ->
+          assert (is_integer(value) and value >= 0) or (is_binary(value) and value != ""),
+                 "read markers.marker is neither a nonnegative integer nor a nonempty string"
 
         field in Map.fetch!(@integer_fields, resource) ->
           assert is_integer(value), "#{resource}.#{field} is not an integer"

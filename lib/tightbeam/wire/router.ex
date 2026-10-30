@@ -2031,12 +2031,7 @@ defmodule Tightbeam.Wire.Router do
 
   defp core_detail_row(conn, %{query: query, resource: "read markers"}, scope_key, principal) do
     core_detail_trace(conn, {:shared_lookup, "read markers", query})
-
-    case apply(StateResources, query, [db(conn), %{key: scope_key, principal: principal}, %{}]) do
-      # A clear retains its update row, but no current marker.
-      %{marker: nil} -> nil
-      row -> row
-    end
+    apply(StateResources, query, [db(conn), %{key: scope_key, principal: principal}, %{}])
   end
 
   defp core_detail_row(conn, %{resource: "sessions"}, session_key, %{kind: "observer"}) do
