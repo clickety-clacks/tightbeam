@@ -1,6 +1,6 @@
 defmodule Tightbeam.RowReactions do
   @moduledoc false
-  alias Tightbeam.{DB, Wakes}
+  alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.RowReactions.{Cutover, Notice, Snapshot, Store}
 

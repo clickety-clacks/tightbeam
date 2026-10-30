@@ -626,6 +626,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
                  DROP TRIGGER wake_cancellations_pending_insert;
                  DROP TRIGGER wakes_typed_cancellation_required;
                  DROP TABLE effort_holder_activity_cancellation_epoch;
+                 DELETE FROM supervision_liveness_migrations WHERE migrationId='row-reaction-cancellation/v1';
                  ALTER TABLE wake_cancellations RENAME TO wake_cancellations_effort_activity_current;
                  #{predecessor_ddl};
                  INSERT INTO wake_cancellations (#{column_names})
@@ -1135,6 +1136,9 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
       DROP TABLE IF EXISTS supervision_liveness_checkpoint_bindings;
       DROP TABLE IF EXISTS supervision_entitlements;
       DROP TABLE IF EXISTS supervision_liveness_epoch;
+      DROP TABLE IF EXISTS row_reaction_actions;
+      DROP TABLE IF EXISTS row_reaction_events;
+      DROP TABLE IF EXISTS row_reaction_cutovers;
       DROP TABLE IF EXISTS supervision_liveness_migrations;
       DROP INDEX IF EXISTS wakes_cancellation_state;
       """)
