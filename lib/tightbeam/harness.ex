@@ -125,14 +125,11 @@ defmodule Tightbeam.Harness do
               {:subagent_start | :subagent_stop, map()} | :skip
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
 
-  @doc "Whether this harness's installed local client owns acceptance of an uncataloged model id."
-  @callback local_client_model_authority?(Tightbeam.Model.t()) :: boolean()
   @callback records_tool_calls?() :: boolean()
 
   @optional_callbacks preflight_launch: 3,
                       warm_home: 2,
                       materialize_legacy_credential_link: 2,
-                      local_client_model_authority?: 1,
                       records_tool_calls?: 0,
                       submission_text_limit: 0,
                       project_session_identity: 3,
@@ -192,15 +189,6 @@ defmodule Tightbeam.Harness do
     if function_exported?(module, :submission_text_limit, 0),
       do: module.submission_text_limit(),
       else: nil
-  end
-
-  @doc "Ask a harness whether its installed local client, rather than its catalog, accepts this id."
-  @spec local_client_model_authority?(binary(), Tightbeam.Model.t()) :: boolean()
-  def local_client_model_authority?(harness, model) when is_binary(harness) do
-    module = parse!(harness)
-
-    function_exported?(module, :local_client_model_authority?, 1) and
-      module.local_client_model_authority?(model)
   end
 
   def records_tool_calls?(harness) do

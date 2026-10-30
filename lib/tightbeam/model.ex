@@ -10,15 +10,15 @@ defmodule Tightbeam.Model do
       `gpt-5.6-sol`).
     * `context` — the vendor's context-window variant when it offers more than
       one (`1m`). `nil` is the model's default window.
-    * `effort` — reasoning level, TIGHTBEAM's vocabulary (`low`…`max`). `nil`
-      when the model has no effort tiers.
+    * `effort` — the named or reported harness reasoning setting. `nil` when
+      omitted or not reported.
 
   Why this module exists: Anthropic spells a context variant `name[1m]` and
   Tightbeam used to spell a reasoning level `name[high]`. The syntaxes matched,
   so the catalog read the vendor's suffix as ours — it dropped `[1m]`, and the
   1M-context model silently ceased to exist. Family and context are the
-  VENDOR's business; effort is OURS; nothing may put them in the same slot
-  again.
+  vendor's business; effort travels separately and its acceptance belongs to
+  the harness. Nothing may put them in the same slot again.
 
   `to_ref/1` and `parse_ref/1` are the vendor line format both current harnesses
   use: the identity WITHOUT effort, because effort travels as its own config
@@ -34,13 +34,6 @@ defmodule Tightbeam.Model do
           effort: String.t() | nil,
           context: String.t() | nil
         }
-
-  @efforts ~w(low medium high xhigh max ultra)
-
-  @doc "Whether an effort is in Tightbeam reasoning vocabulary."
-  @spec valid_effort?(String.t() | nil) :: boolean()
-  def valid_effort?(nil), do: true
-  def valid_effort?(effort), do: effort in @efforts
 
   @doc """
   Build an identity from a family and optional `:effort` / `:context`.

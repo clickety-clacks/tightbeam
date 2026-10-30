@@ -32,13 +32,14 @@ defmodule GuardErrorMarkers do
       {:ok, lane} = GenServer.start_link(GuardErrorDoorbell, self())
       setup_diagnosed? = input["mode"] == "setup_diagnosed"
 
-      # What the real adapter returns when the harness refuses the model while
-      # creating the session: the legacy classification carrying the refusal.
+      # A model refusal and option list reported by the adapter during setup.
       setup_refusal = %{
-        "code" => -32602,
-        "message" => "Invalid params",
-        "data" => %{"model" => "fable", "detail" => "not offered"}
+        "code" => -32603,
+        "message" => "Internal error",
+        "data" => %{"details" => "Invalid value for config option model: fable"}
       }
+
+      offered_options = [%{"value" => "opus[1m]", "name" => "Opus 5.5"}]
 
       stub_arg =
         if setup_diagnosed?,
@@ -46,11 +47,12 @@ defmodule GuardErrorMarkers do
             {:new_session_reply,
              {:error,
               ErrorDiagnostic.diagnosed(
-                :model_unavailable,
-                ErrorDiagnostic.with_facts(setup_refusal,
+                setup_refusal,
+                ErrorDiagnostic.from_reason(setup_refusal,
                   operation: "session/set_config_option",
                   phase: "model",
-                  origin: "acp_adapter"
+                  origin: "acp_adapter",
+                  offered_options: offered_options
                 )
               )}, self()},
           else: self()
@@ -105,10 +107,10 @@ defmodule GuardErrorMarkers do
           assert runner_reason == {:acp_request_not_dispatched, :closed}
         end
 
-        # A configured model ring may report explicit exhaustion, but the
-        # original classification remains the carrier inside that result.
+        # The turn carries the adapter's own refusal text through to the
+        # failure marker when model selection fails during setup.
         if setup_diagnosed? do
-          assert %{code: "model_selection_exhausted", message: _} = runner_reason
+          assert runner_reason == setup_refusal["data"]["details"]
         end
 
         assert {:ok, true} =
@@ -132,7 +134,7 @@ defmodule GuardErrorMarkers do
         expected =
           cond do
             pre_dispatch? -> "{:acp_request_not_dispatched, :closed}"
-            setup_diagnosed? -> runner_reason.message
+            setup_diagnosed? -> runner_reason
             true -> input["expected"]
           end
 
@@ -160,13 +162,14 @@ defmodule GuardErrorMarkers do
         if setup_diagnosed? do
           assert %{
                    "stage" => "session",
-                   "reason" => "model_unavailable",
+                   "reason" => ^setup_refusal,
                    "diagnostic" => %{
                      "kind" => "jsonrpc_error",
                      "operation" => "session/set_config_option",
                      "phase" => "model",
                      "origin" => "acp_adapter",
-                     "reason" => ^setup_refusal
+                     "reason" => ^setup_refusal,
+                     "offeredOptions" => ^offered_options
                    }
                  } = JSON.decode!(lifecycle.detail)
 
@@ -180,7 +183,8 @@ defmodule GuardErrorMarkers do
                          "diagnostic" => %{
                            "kind" => "jsonrpc_error",
                            "operation" => "session/set_config_option",
-                           "reason" => ^setup_refusal
+                           "reason" => ^setup_refusal,
+                           "offeredOptions" => ^offered_options
                          }
                        }
                      },
