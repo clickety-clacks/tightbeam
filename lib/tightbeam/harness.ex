@@ -230,6 +230,26 @@ defmodule Tightbeam.Harness do
       if(@fixture_harness?, do: [Fixture], else: [])
   end
 
+  @doc "Whether a harness may be absent from a host without indicating a setup problem."
+  @spec optional?(module()) :: boolean()
+  def optional?(Tightbeam.Harness.Pi), do: true
+  def optional?(_module), do: false
+
+  @doc false
+  @spec optional_unconfigured?(module(), (atom() -> term())) :: boolean()
+  def optional_unconfigured?(module, credential_status) when is_function(credential_status, 1) do
+    if optional?(module) do
+      Enum.all?(configuration_providers(module), fn provider ->
+        credential_status.(provider) == {:needs_onboarding, :missing}
+      end)
+    else
+      false
+    end
+  end
+
+  defp configuration_providers(Tightbeam.Harness.Pi), do: [:opencode_go, :local_openai]
+  defp configuration_providers(module), do: [module.credential_provider()]
+
   @doc "All known harness modules, including dormant entries used by onboarding."
   @spec known() :: [module()]
   def known do

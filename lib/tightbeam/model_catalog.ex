@@ -602,7 +602,11 @@ defmodule Tightbeam.ModelCatalog do
         end
 
       _ ->
-        Logger.warning("model catalog #{harness} on #{host} refresh degraded: #{inspect(reason)}")
+        unless optional_harness_absence?(harness, reason) do
+          Logger.warning(
+            "model catalog #{harness} on #{host} refresh degraded: #{inspect(reason)}"
+          )
+        end
 
         case state.entries[key] do
           nil ->
@@ -622,6 +626,11 @@ defmodule Tightbeam.ModelCatalog do
         end
     end
   end
+
+  defp optional_harness_absence?(harness, {:needs_onboarding, :missing}),
+    do: Harness.optional?(Harness.parse!(harness))
+
+  defp optional_harness_absence?(_harness, _reason), do: false
 
   defp background_info({:catalog_recovery, key, incident_id, fact_id, result}, state) do
     {outcome, entries} = recovery_outcome(result)
