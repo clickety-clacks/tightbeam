@@ -1,0 +1,2 @@
+{"event_id":"$event-one:example.org","room_id":"!room:example.org","sender":"@author:example.org","type":"m.room.message","content":{"msgtype":"m.text","body":"first line\na=b\nsecond line"}}
+{"event_id":"$event-two:example.org","room_id":"!room:example.org","sender":"@author:example.org","type":"m.room.member","content":{"membership":"join"}}

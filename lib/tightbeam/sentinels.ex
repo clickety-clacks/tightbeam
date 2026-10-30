@@ -92,6 +92,37 @@ defmodule Tightbeam.Sentinels do
      }}
   end
 
+  @doc "Resolve a qualified event name against the currently learned bundles."
+  def resolve_event(base_dir, reference) when is_binary(reference) do
+    events = learned_events(base_dir)
+
+    case Enum.find(events, &(&1.qualified == reference)) do
+      nil ->
+        {:error,
+         %{
+           code: "unknown_sentinel_event",
+           message: "unknown_sentinel_event rule: no learned bundle declares event #{reference}"
+         }}
+
+      event ->
+        {:ok, event}
+    end
+  end
+
+  def resolve_event(_base_dir, reference) do
+    {:error,
+     %{
+       code: "unknown_sentinel_event",
+       message: "unknown_sentinel_event rule: #{inspect(reference)} is not an event name"
+     }}
+  end
+
+  @doc "List the event declarations published by all learned bundles."
+  def learned_events(base_dir) do
+    %{sentinels: sentinels} = Identity.learned_sentinels(base_dir)
+    Enum.flat_map(sentinels, & &1.events)
+  end
+
   @doc "Every durable state row on `host`, keyed by qualified name."
   @spec states(DB.server(), String.t()) :: %{optional(String.t()) => map()}
   def states(db, host) do

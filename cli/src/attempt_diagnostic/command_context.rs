@@ -143,6 +143,11 @@ impl CommandContext {
             SentinelEnable { .. } => ("cli.sentinel_enable", DispatchPath),
             SentinelDisable { .. } => ("cli.sentinel_disable", DispatchPath),
             SentinelList { .. } => ("cli.sentinel_list", DispatchPath),
+            SentinelEvents { .. } => ("cli.sentinel_events", DispatchPath),
+            SentinelPost { .. } => ("cli.sentinel_post", DispatchPath),
+            SentinelSubscribe { .. } => ("cli.sentinel_subscribe", DispatchPath),
+            SentinelSubscriptions { .. } => ("cli.sentinel_subscriptions", DispatchPath),
+            SentinelUnsubscribe { .. } => ("cli.sentinel_unsubscribe", DispatchPath),
             SentinelEnvSet { .. } => ("cli.sentinel_env_set", DispatchPath),
             SentinelEnvList { .. } => ("cli.sentinel_env_list", DispatchPath),
             SentinelEnvUnset { .. } => ("cli.sentinel_env_unset", DispatchPath),
@@ -336,6 +341,8 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | KungfuList { .. }
         | KungfuSetup { .. }
         | SentinelList { .. }
+        | SentinelEvents { .. }
+        | SentinelSubscriptions { .. }
         | SentinelEnvList { .. }
         | ConfigGet { .. }
         | HostEnvList { .. }
@@ -346,6 +353,8 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         // records a lifecycle event. It carries no idempotency key; the
         // guarded operation itself reports already-settled on a repeat.
         HarnessProcessSettle { .. } => WriteWithoutIdempotency,
+
+        SentinelPost { key, .. } => keyed_write(Some(key)),
 
         // A handoff commits the owner change and notification together, but
         // the command does not accept an idempotency key.
@@ -469,6 +478,8 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | HostEnvUnset { .. }
         | SentinelEnable { .. }
         | SentinelDisable { .. }
+        | SentinelSubscribe { .. }
+        | SentinelUnsubscribe { .. }
         | SentinelEnvSet { .. }
         | SentinelEnvUnset { .. }
         | HostToolchainSet { .. }
@@ -812,6 +823,52 @@ mod tests {
                 "cli.sentinel_list",
                 "sentinel-list",
                 EffectContract::Read,
+            ),
+            (
+                Command::SentinelEvents {
+                    identity: identity.clone(),
+                },
+                "cli.sentinel_events",
+                "sentinel-events",
+                EffectContract::Read,
+            ),
+            (
+                Command::SentinelPost {
+                    identity: identity.clone(),
+                    event: "sample/demo/ping".into(),
+                    key: "PRIVATE_EVENT_KEY".into(),
+                    details: vec!["channel=!a:x".into(), "who=@mike:x".into()],
+                },
+                "cli.sentinel_post",
+                "sentinel-post",
+                EffectContract::WriteWithExistingIdempotency,
+            ),
+            (
+                Command::SentinelSubscribe {
+                    identity: identity.clone(),
+                    event: "sample/demo/ping".into(),
+                    where_values: vec!["channel=!a:x".into()],
+                },
+                "cli.sentinel_subscribe",
+                "sentinel-subscribe",
+                EffectContract::WriteWithoutIdempotency,
+            ),
+            (
+                Command::SentinelSubscriptions {
+                    identity: identity.clone(),
+                },
+                "cli.sentinel_subscriptions",
+                "sentinel-subscriptions",
+                EffectContract::Read,
+            ),
+            (
+                Command::SentinelUnsubscribe {
+                    identity: identity.clone(),
+                    subscription_id: "sub_1".into(),
+                },
+                "cli.sentinel_unsubscribe",
+                "sentinel-unsubscribe",
+                EffectContract::WriteWithoutIdempotency,
             ),
             (
                 Command::SentinelEnvSet {

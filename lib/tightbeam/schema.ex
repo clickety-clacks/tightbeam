@@ -1953,6 +1953,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_terminal_credential_failure(db)
     :ok = Tightbeam.ReadMarkers.ensure_schema(db)
     :ok = Tightbeam.Sentinels.ensure_schema(db)
+    :ok = Tightbeam.SentinelSubscriptions.ensure_schema(db)
     :ok = Tightbeam.SubtreeGuidance.ensure_schema(db)
     :ok = upgrade_agent_reparent(db)
     :ok = upgrade_artifact_origins(db)

@@ -95,6 +95,7 @@ defmodule Tightbeam.Gateway do
     Roles,
     Schema,
     SentinelSupervisor,
+    SentinelSubscriptions,
     Sentinels,
     SessionPoAssociations,
     DeliveryResponsibilities,
@@ -1123,6 +1124,98 @@ defmodule Tightbeam.Gateway do
             ),
           setup: Sentinels.setup_all(config.base_dir, db, host)
         }
+      end,
+      {"sentinel-events", []} => fn _call ->
+        %{events: Sentinels.learned_events(config.base_dir)}
+      end,
+      {"sentinel-post", []} => fn call ->
+        p = call.params
+
+        with {:ok, event} <- Sentinels.resolve_event(config.base_dir, p[:event]),
+             {:ok, details} <- sentinel_post_details(event, p[:detail]),
+             :ok <- sentinel_post_key(p[:key]),
+             :ok <- sentinel_post_caller(call[:principal]) do
+          scheduler = Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
+
+          {result, _filed?} =
+            ConditionFacts.file_idempotent_with_effect(
+              db,
+              scheduler,
+              %{
+                kind: SentinelSubscriptions.event_kind(event.qualified),
+                scope: nil,
+                origin: call.origin,
+                principal: call[:principal],
+                payload: details,
+                sentinel_event: %{
+                  qualified: event.qualified,
+                  declaration: event,
+                  details: details,
+                  principal: call[:principal]
+                },
+                idempotency_key: p[:key]
+              },
+              call
+            )
+
+          case result do
+            {:error, error} -> error
+            fact -> %{event: fact, qualified_event: event.qualified}
+          end
+        else
+          {:error, denial} -> denial
+          _ -> %{code: "invalid", message: "sentinel post requires an event, key and details"}
+        end
+      end,
+      {"sentinel-subscribe", []} => fn call ->
+        p = call.params
+
+        with {:session, session_key} <- call[:principal],
+             {:ok, event} <- Sentinels.resolve_event(config.base_dir, p[:event]),
+             {:ok, where_pairs} <- sentinel_filter_pairs(p[:where]) do
+          case DB.transaction(db, fn txn ->
+                 SentinelSubscriptions.subscribe_in_txn(txn, session_key, event, where_pairs)
+               end) do
+            {:ok, result} -> result
+            {:error, error} -> raise error
+          end
+        else
+          {:error, denial} -> denial
+          _ -> %{code: "not_authorized", message: "an active session is required to subscribe"}
+        end
+      end,
+      {"sentinel-subscriptions", []} => fn call ->
+        case call[:principal] do
+          {:session, session_key} ->
+            case DB.transaction(db, &SentinelSubscriptions.list_in_txn(&1, session_key)) do
+              {:ok, subscriptions} -> %{subscriptions: subscriptions}
+              {:error, error} -> raise error
+            end
+
+          _ ->
+            %{
+              code: "not_authorized",
+              message: "an active session is required to list subscriptions"
+            }
+        end
+      end,
+      {"sentinel-unsubscribe", []} => fn call ->
+        case call[:principal] do
+          {:session, _session_key} ->
+            case DB.transaction(db, fn txn ->
+                   SentinelSubscriptions.unsubscribe_in_txn(
+                     txn,
+                     call,
+                     call.params[:subscription_id]
+                   )
+                 end) do
+              {:ok, result} -> result
+              {:error, error} -> raise error
+            end
+
+          _ ->
+            %{code: "not_authorized", message: "an active session is required to unsubscribe"}
+        end
       end,
       {"kungfu-setup", []} => fn call -> kungfu_setup_result(config, db, call.params[:name]) end,
       {"host-toolchain-set", []} =>
@@ -6852,6 +6945,97 @@ defmodule Tightbeam.Gateway do
   defp supervision_interval_ms(config) do
     Map.get(config, :supervision_interval_ms, 1_800_000)
   end
+
+  defp sentinel_post_details(event, values) when is_list(values) do
+    declared = MapSet.new(Enum.map(event.details, & &1.name))
+
+    parsed =
+      Enum.reduce_while(values, {:ok, %{}}, fn
+        value, {:ok, acc} when is_binary(value) ->
+          case String.split(value, "=", parts: 2) do
+            [name, detail_value] ->
+              cond do
+                not MapSet.member?(declared, name) ->
+                  {:halt,
+                   {:error,
+                    %{code: "invalid", message: "event #{event.qualified} has no detail #{name}"}}}
+
+                Map.has_key?(acc, name) ->
+                  {:halt,
+                   {:error,
+                    %{
+                      code: "invalid",
+                      message: "event detail #{name} was supplied more than once"
+                    }}}
+
+                true ->
+                  {:cont, {:ok, Map.put(acc, name, detail_value)}}
+              end
+
+            _ ->
+              {:halt,
+               {:error, %{code: "invalid", message: "event detail must use name=value syntax"}}}
+          end
+
+        _, _ ->
+          {:halt,
+           {:error, %{code: "invalid", message: "event detail must use name=value syntax"}}}
+      end)
+
+    with {:ok, details} <- parsed do
+      missing =
+        MapSet.difference(declared, MapSet.new(Map.keys(details)))
+        |> MapSet.to_list()
+        |> Enum.sort()
+
+      if missing == [],
+        do: {:ok, details},
+        else:
+          {:error,
+           %{
+             code: "invalid",
+             message: "event #{event.qualified} is missing details: #{Enum.join(missing, ", ")}"
+           }}
+    end
+  end
+
+  defp sentinel_post_details(event, _values),
+    do: {:error, %{code: "invalid", message: "event #{event.qualified} requires --detail values"}}
+
+  defp sentinel_post_key(key) when is_binary(key) and key != "", do: :ok
+
+  defp sentinel_post_key(_key),
+    do: {:error, %{code: "invalid", message: "sentinel post requires a non-empty event key"}}
+
+  defp sentinel_post_caller({:process, _id}), do: :ok
+
+  defp sentinel_post_caller(_principal),
+    do: {:error, %{code: "not_authorized", message: "sentinel post requires a process caller"}}
+
+  defp sentinel_filter_pairs(values) when is_list(values) do
+    Enum.reduce_while(values, {:ok, []}, fn
+      value, {:ok, pairs} when is_binary(value) ->
+        case String.split(value, "=", parts: 2) do
+          [name, detail_value] ->
+            {:cont, {:ok, [{name, detail_value} | pairs]}}
+
+          _ ->
+            {:halt, {:error, %{code: "invalid", message: "--where must use detail=value syntax"}}}
+        end
+
+      _, _ ->
+        {:halt, {:error, %{code: "invalid", message: "--where must use detail=value syntax"}}}
+    end)
+    |> case do
+      {:ok, pairs} -> {:ok, Enum.reverse(pairs)}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp sentinel_filter_pairs(nil), do: {:ok, []}
+
+  defp sentinel_filter_pairs(_values),
+    do: {:error, %{code: "invalid", message: "--where values must use detail=value syntax"}}
 
   defp cancel_wake_result(db, call, wake_id) do
     with {:ok, requester} <- cancellation_requester(call[:principal]) do

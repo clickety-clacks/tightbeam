@@ -597,6 +597,27 @@ pub enum Command {
     SentinelList {
         identity: Identity,
     },
+    SentinelEvents {
+        identity: Identity,
+    },
+    SentinelPost {
+        identity: Identity,
+        event: String,
+        key: String,
+        details: Vec<String>,
+    },
+    SentinelSubscribe {
+        identity: Identity,
+        event: String,
+        where_values: Vec<String>,
+    },
+    SentinelSubscriptions {
+        identity: Identity,
+    },
+    SentinelUnsubscribe {
+        identity: Identity,
+        subscription_id: String,
+    },
     IdentityApply {
         identity: Identity,
         session_key: Option<String>,
@@ -1097,6 +1118,18 @@ COMMANDS:
   sentinel list
       List learned sentinels on this gateway's host: state, required setting
       names, missing names and the running command's SHA-256.
+  sentinel events
+      List the event names, descriptions and declared detail descriptions as JSON.
+  sentinel post --event <event> --key <key> --detail <name=value>...
+      Record one declared event. Repeat --detail once for each declared detail.
+  sentinel subscribe --event <event> [--where <name=value>...]
+      Subscribe this session to an event. Repeated values for one detail are
+      alternatives; different details must all match. With no --where, every
+      event of that name matches.
+  sentinel subscriptions
+      List this session's active event subscriptions.
+  sentinel unsubscribe <id>
+      End a subscription and withdraw its retractable pending wakes.
 
   identity current
       Print this session's key without printing its bearer credential.
@@ -1370,7 +1403,13 @@ fn split_args(args: Vec<String>) -> Flags {
                 let value = next.cloned().unwrap_or_default();
                 if matches!(
                     name,
-                    "memento" | "value" | "kind-prefix" | "kind" | "supersedes"
+                    "memento"
+                        | "value"
+                        | "kind-prefix"
+                        | "kind"
+                        | "supersedes"
+                        | "detail"
+                        | "where"
                 ) {
                     repeated
                         .entry(name.to_owned())
@@ -3876,11 +3915,49 @@ fn sentinel_scope(flags: &HashMap<String, String>) -> Result<Option<String>, Str
 }
 
 fn parse_sentinel(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
-    let usage = "usage: tightbeam sentinel enable <sentinel> | tightbeam sentinel disable <sentinel> | tightbeam sentinel list";
+    let usage = "usage: tightbeam sentinel enable <sentinel> | disable <sentinel> | list | events | post --event <event> --key <key> --detail <name=value>... | subscribe --event <event> [--where <name=value>...] | subscriptions | unsubscribe <id>";
     match parsed.positional.as_slice() {
         [_, list] if list == "list" => Ok(Command::SentinelList {
             identity: identity(flags)?,
         }),
+        [_, events] if events == "events" => Ok(Command::SentinelEvents {
+            identity: identity(flags)?,
+        }),
+        [_, post] if post == "post" => {
+            let event = nonempty(flags, "event").ok_or_else(|| usage.to_owned())?;
+            let key = nonempty(flags, "key").ok_or_else(|| usage.to_owned())?;
+            if parsed.duplicates.contains("event") || parsed.duplicates.contains("key") {
+                return Err(usage.to_owned());
+            }
+            Ok(Command::SentinelPost {
+                identity: identity(flags)?,
+                event,
+                key,
+                details: parsed.repeated.get("detail").cloned().unwrap_or_default(),
+            })
+        }
+        [_, subscribe] if subscribe == "subscribe" => {
+            let event = nonempty(flags, "event").ok_or_else(|| usage.to_owned())?;
+            if parsed.duplicates.contains("event") {
+                return Err(usage.to_owned());
+            }
+            Ok(Command::SentinelSubscribe {
+                identity: identity(flags)?,
+                event,
+                where_values: parsed.repeated.get("where").cloned().unwrap_or_default(),
+            })
+        }
+        [_, subscriptions] if subscriptions == "subscriptions" => {
+            Ok(Command::SentinelSubscriptions {
+                identity: identity(flags)?,
+            })
+        }
+        [_, unsubscribe, subscription_id] if unsubscribe == "unsubscribe" => {
+            Ok(Command::SentinelUnsubscribe {
+                identity: identity(flags)?,
+                subscription_id: subscription_id.clone(),
+            })
+        }
         [_, action, name] if action == "enable" => Ok(Command::SentinelEnable {
             identity: identity(flags)?,
             name: name.clone(),
@@ -5155,6 +5232,87 @@ mod tests {
             })
         );
         assert_eq!(
+            parse(strings(&["sentinel", "events"])),
+            Ok(Command::SentinelEvents {
+                identity: Identity::Session,
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "sentinel",
+                "post",
+                "--event",
+                "sample/demo/ping",
+                "--key",
+                "event-id",
+                "--detail",
+                "channel=!a:x",
+                "--detail",
+                "who=@mike:x",
+                "--detail",
+                "text=a=b",
+            ])),
+            Ok(Command::SentinelPost {
+                identity: Identity::Session,
+                event: "sample/demo/ping".to_owned(),
+                key: "event-id".to_owned(),
+                details: vec![
+                    "channel=!a:x".to_owned(),
+                    "who=@mike:x".to_owned(),
+                    "text=a=b".to_owned(),
+                ],
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "sentinel",
+                "subscribe",
+                "--event",
+                "sample/demo/ping",
+                "--where",
+                "channel=!a:x",
+                "--where",
+                "channel=!b:x",
+                "--where",
+                "who=@mike:x",
+            ])),
+            Ok(Command::SentinelSubscribe {
+                identity: Identity::Session,
+                event: "sample/demo/ping".to_owned(),
+                where_values: vec![
+                    "channel=!a:x".to_owned(),
+                    "channel=!b:x".to_owned(),
+                    "who=@mike:x".to_owned(),
+                ],
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "sentinel",
+                "subscribe",
+                "--event",
+                "sample/demo/ping"
+            ])),
+            Ok(Command::SentinelSubscribe {
+                identity: Identity::Session,
+                event: "sample/demo/ping".to_owned(),
+                where_values: vec![],
+            })
+        );
+        assert_eq!(
+            parse(strings(&["sentinel", "subscriptions"])),
+            Ok(Command::SentinelSubscriptions {
+                identity: Identity::Session,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["sentinel", "unsubscribe", "sub_1"])),
+            Ok(Command::SentinelUnsubscribe {
+                identity: Identity::Session,
+                subscription_id: "sub_1".to_owned(),
+            })
+        );
+        assert_eq!(
             parse(strings(&["kungfu", "setup", "example-bundle"])),
             Ok(Command::KungfuSetup {
                 identity: Identity::Session,
@@ -5169,7 +5327,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse(args),
-                Err("usage: tightbeam sentinel enable <sentinel> | tightbeam sentinel disable <sentinel> | tightbeam sentinel list".to_owned())
+                Err("usage: tightbeam sentinel enable <sentinel> | disable <sentinel> | list | events | post --event <event> --key <key> --detail <name=value>... | subscribe --event <event> [--where <name=value>...] | subscriptions | unsubscribe <id>".to_owned())
             );
         }
         assert_eq!(
@@ -6129,6 +6287,11 @@ mod tests {
             "kungfu list",
             "kungfu setup <bundle>",
             "sentinel list",
+            "sentinel events",
+            "sentinel post --event <event> --key <key> --detail <name=value>...",
+            "sentinel subscribe --event <event> [--where <name=value>...]",
+            "sentinel subscriptions",
+            "sentinel unsubscribe <id>",
             "sentinel enable <sentinel>",
             "sentinel disable <sentinel>",
             "host-env-set [--host <host>] --sentinel <sentinel> NAME=VALUE",

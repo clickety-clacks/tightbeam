@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Post declared events for messages reported by matrix-commander."""
+
+import json
+import os
+import subprocess
+import sys
+
+
+class WatcherError(Exception):
+    pass
+
+
+def required_path(name):
+    value = os.environ.get(name)
+    if not value:
+        raise WatcherError(f"required setting {name} is missing")
+    return value
+
+
+def post_event(event):
+    event_type = event.get("type")
+    if event_type != "m.room.message":
+        return
+
+    content = event.get("content")
+    if not isinstance(content, dict):
+        raise WatcherError("message event has no content object")
+
+    values = {
+        "room": event.get("room_id"),
+        "sender": event.get("sender"),
+        "text": content.get("body"),
+        "event_id": event.get("event_id"),
+    }
+    if not all(isinstance(value, str) for value in values.values()):
+        raise WatcherError("message event is missing a required string field")
+
+    command = [
+        "tightbeam",
+        "sentinel",
+        "post",
+        "--event",
+        "sentinels/matrix/message",
+        "--key",
+        values["event_id"],
+        "--detail",
+        "room=" + values["room"],
+        "--detail",
+        "sender=" + values["sender"],
+        "--detail",
+        "text=" + values["text"],
+    ]
+    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if result.returncode != 0:
+        raise WatcherError("event post failed")
+
+
+def stop(process):
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def main():
+    try:
+        credentials = required_path("MATRIX_COMMANDER_CREDENTIALS")
+        store = required_path("MATRIX_COMMANDER_STORE")
+    except WatcherError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+    command = [
+        "matrix-commander",
+        "--credentials",
+        credentials,
+        "--store",
+        store,
+        "--listen",
+        "forever",
+        "--listen-self",
+        "--output",
+        "json-spec",
+    ]
+
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+        )
+    except OSError:
+        print("matrix-commander could not be started", file=sys.stderr)
+        return 1
+
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            if not line.strip():
+                raise WatcherError("matrix-commander produced an empty output line")
+            try:
+                event = json.loads(line)
+            except (json.JSONDecodeError, UnicodeError) as error:
+                raise WatcherError("matrix-commander produced malformed JSON") from error
+            if not isinstance(event, dict):
+                raise WatcherError("matrix-commander output must be an event object")
+            post_event(event)
+
+        return_code = process.wait()
+        if return_code == 0:
+            print("matrix-commander exited while the watcher was listening", file=sys.stderr)
+            return 1
+        return return_code
+    except (OSError, UnicodeError, WatcherError) as error:
+        print(str(error), file=sys.stderr)
+        stop(process)
+        return 1
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

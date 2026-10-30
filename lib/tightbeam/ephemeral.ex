@@ -128,6 +128,8 @@ defmodule Tightbeam.Ephemeral do
         [key, System.system_time(:millisecond)]
       )
 
+      Tightbeam.SentinelSubscriptions.end_session_in_txn(txn, key)
+
       session = Org.get_in_txn(txn, key)
 
       Tightbeam.Firehose.Publisher.committed_in_txn(txn, "session.retired", session, %{
