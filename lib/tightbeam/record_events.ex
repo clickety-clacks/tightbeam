@@ -158,10 +158,10 @@ defmodule Tightbeam.RecordEvents do
   """
 
   @notice_message_ids_query """
-  WITH event_turns(seq) AS (
+  WITH event_turns(seq, message_id) AS (
     -- Start from the event stamp, then follow its delivered turn. Digest
     -- members follow the cancellation's primary-key wake link to the carrier.
-    SELECT direct_turn.seq
+    SELECT direct_turn.seq, direct_turn.messageId
     FROM wakes AS direct_wake INDEXED BY wakes_record_event_ids
     CROSS JOIN turns AS direct_turn ON direct_turn.seq = direct_wake.deliveredTurnSeq
     WHERE direct_wake.recordEventIds = json_array(?1)
@@ -171,12 +171,13 @@ defmodule Tightbeam.RecordEvents do
         WHERE repair.attemptSeq = direct_turn.seq
       )
 
-    UNION
+    UNION ALL
 
-    SELECT replacement_turn.seq
+    SELECT replacement_turn.seq, replacement_turn.messageId
     FROM wakes AS member_wake INDEXED BY wakes_record_event_ids
     CROSS JOIN wake_cancellations AS cancellation ON cancellation.wakeId = member_wake.wakeId
-    CROSS JOIN turns AS replacement_turn ON replacement_turn.wakeId = cancellation.replacementWakeId
+    CROSS JOIN turns AS replacement_turn INDEXED BY sqlite_autoindex_turns_1
+      ON replacement_turn.wakeId = cancellation.replacementWakeId
     WHERE member_wake.recordEventIds = json_array(?1)
       AND cancellation.replacementWakeId IS NOT NULL
       AND replacement_turn.sessionKey = ?2
@@ -193,26 +194,25 @@ defmodule Tightbeam.RecordEvents do
     WHERE direct.recordEventIds = json_array(?1)
       AND direct.sessionKey = ?2
 
-    UNION
+    UNION ALL
 
     SELECT notice.id, notice.seq
     FROM event_turns
-    CROSS JOIN turns AS notice_turn ON notice_turn.seq = event_turns.seq
-    CROSS JOIN messages AS notice ON notice.id = notice_turn.messageId
+    CROSS JOIN messages AS notice INDEXED BY sqlite_autoindex_messages_1
+      ON notice.id = event_turns.message_id
     WHERE notice.sessionKey = ?2
       AND notice.role = 'user'
 
-    UNION
+    UNION ALL
 
     SELECT notice.id, notice.seq
     FROM event_turns
-    CROSS JOIN turns AS notice_turn ON notice_turn.seq = event_turns.seq
     CROSS JOIN messages AS notice INDEXED BY messages_record_event_reply
-      ON notice.replyToMessageId = notice_turn.messageId
+      ON notice.replyToMessageId = event_turns.message_id
      AND notice.sessionKey = ?2
      AND notice.role = 'assistant'
 
-    UNION
+    UNION ALL
 
     SELECT source_message.id, source_message.seq
     FROM event_turns
@@ -228,12 +228,8 @@ defmodule Tightbeam.RecordEvents do
       AND source_message.deviceId IS NOT NULL
       AND source_message.clientMessageId IS NOT NULL
   )
-  SELECT COALESCE(json_group_array(message_id), '[]')
-  FROM (
-    SELECT message_id
-    FROM notice_messages
-    ORDER BY message_seq
-  )
+  SELECT message_id, message_seq
+  FROM notice_messages
   """
 
   @doc "Add the stage-one notice columns and per-kind activation rows."
@@ -533,8 +529,11 @@ defmodule Tightbeam.RecordEvents do
 
   defp notice_message_ids_in_txn(txn, event_id, session_key) do
     case Txn.q(txn, @notice_message_ids_query, [event_id, session_key]) do
-      [[encoded_ids]] when is_binary(encoded_ids) ->
-        encoded_ids |> JSON.decode!() |> Enum.uniq()
+      rows when is_list(rows) ->
+        rows
+        |> Enum.sort_by(fn [_message_id, message_seq] -> message_seq end)
+        |> Enum.uniq_by(fn [message_id, _message_seq] -> message_id end)
+        |> Enum.map(fn [message_id, _message_seq] -> message_id end)
 
       _ ->
         []
