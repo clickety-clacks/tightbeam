@@ -90,7 +90,6 @@ defmodule Tightbeam.Wire.Router do
                    "subtree-guidance-show"
                  ]
 
-  @agent_verbs @agent_verbs ++ @read_marker_verbs
   @max_upload_bytes 32 * 1024 * 1024
   @state_malformed_percent_escape ~r/%(?![0-9A-Fa-f]{2})/
   @core_detail_fact_id ~r/\A[1-9][0-9]*\z/
