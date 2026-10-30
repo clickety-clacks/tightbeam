@@ -30,10 +30,12 @@ defmodule Tightbeam.RecordEvents do
     CASE WHEN wi.createdContextKnown = 1 THEN wi.createdInTurnSeq END AS cause_turn_seq,
     'creator' AS tied_as
   FROM work_items AS wi
-  JOIN org_settings AS activation
-    ON activation.key = 'record-event-feed-activation:work_item.filed'
   WHERE wi.createdBySession = ?1
-    AND wi.createdAt >= CAST(activation.value AS INTEGER)
+    AND wi.createdAt >= (
+      SELECT CAST(value AS INTEGER)
+      FROM org_settings
+      WHERE key = 'record-event-feed-activation:work_item.filed'
+    )
   ORDER BY wi.createdAt, wi.id
   """
 
@@ -50,10 +52,12 @@ defmodule Tightbeam.RecordEvents do
     NULL AS cause_turn_seq,
     CASE WHEN a.openedBySession = ?1 THEN 'holder,opener' ELSE 'holder' END AS tied_as
   FROM assignments AS a
-  JOIN org_settings AS activation
-    ON activation.key = 'record-event-feed-activation:assignment.opened'
   WHERE a.holderKey = ?1
-    AND a.openedAt >= CAST(activation.value AS INTEGER)
+    AND a.openedAt >= (
+      SELECT CAST(value AS INTEGER)
+      FROM org_settings
+      WHERE key = 'record-event-feed-activation:assignment.opened'
+    )
   ORDER BY a.openedAt, a.id
   """
 
@@ -70,11 +74,13 @@ defmodule Tightbeam.RecordEvents do
     NULL AS cause_turn_seq,
     'opener' AS tied_as
   FROM assignments AS a
-  JOIN org_settings AS activation
-    ON activation.key = 'record-event-feed-activation:assignment.opened'
   WHERE a.openedBySession = ?1
     AND a.holderKey <> ?1
-    AND a.openedAt >= CAST(activation.value AS INTEGER)
+    AND a.openedAt >= (
+      SELECT CAST(value AS INTEGER)
+      FROM org_settings
+      WHERE key = 'record-event-feed-activation:assignment.opened'
+    )
 
   ORDER BY a.openedAt, a.id
   """
