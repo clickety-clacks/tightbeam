@@ -122,11 +122,13 @@ defmodule Tightbeam.RecordEvents do
     CASE WHEN wi.createdContextKnown = 1 THEN wi.createdInTurnSeq END AS cause_turn_seq,
     'creator' AS tied_as
   FROM work_items AS wi
-  JOIN org_settings AS activation
-    ON activation.key = 'record-event-feed-activation:work_item.filed'
   WHERE wi.id = ?2
     AND wi.createdBySession = ?1
-    AND wi.createdAt >= CAST(activation.value AS INTEGER)
+    AND wi.createdAt >= (
+      SELECT CAST(value AS INTEGER)
+      FROM org_settings
+      WHERE key = 'record-event-feed-activation:work_item.filed'
+    )
   """
 
   @assignment_event_by_id_query """
@@ -146,11 +148,13 @@ defmodule Tightbeam.RecordEvents do
       ELSE 'opener'
     END AS tied_as
   FROM assignments AS a
-  JOIN org_settings AS activation
-    ON activation.key = 'record-event-feed-activation:assignment.opened'
   WHERE a.id = ?2
     AND (a.holderKey = ?1 OR a.openedBySession = ?1)
-    AND a.openedAt >= CAST(activation.value AS INTEGER)
+    AND a.openedAt >= (
+      SELECT CAST(value AS INTEGER)
+      FROM org_settings
+      WHERE key = 'record-event-feed-activation:assignment.opened'
+    )
   """
 
   @notice_message_ids_query """
@@ -264,7 +268,7 @@ defmodule Tightbeam.RecordEvents do
   def single_event_plan_queries(session_key, work_item_id, assignment_id) do
     [
       {@work_item_event_by_id_query, [session_key, work_item_id],
-       "sqlite_autoindex_work_items_1"},
+       "work_items_id_owner"},
       {@assignment_event_by_id_query, [session_key, assignment_id],
        "sqlite_autoindex_assignments_1"}
     ]
