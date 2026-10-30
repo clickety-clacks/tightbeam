@@ -303,6 +303,59 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   @tag firehose_final_stamp: true
+  test "elected notice cancellation upgrades its exact predecessor and stays valid on repeated boot",
+       %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    :ok = Tightbeam.SchemaShapeRuntimeFixture.downgrade_effort_holder_activity_cancellation!(db)
+    assert :ok = Schema.upgrade_effort_holder_activity_cancellation_v1(db)
+
+    {:ok, [[before_sql]]} =
+      DB.query(db, "SELECT sql FROM sqlite_master WHERE name='wake_cancellations'")
+
+    refute before_sql =~ "tightbeam:row-reactions"
+    assert :ok = Schema.upgrade_row_reaction_cancellation_v1(db)
+    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM supervision_liveness_migrations WHERE migrationId='row-reaction-cancellation/v1'"
+             )
+
+    assert {:ok, [[after_sql]]} =
+             DB.query(db, "SELECT sql FROM sqlite_master WHERE name='wake_cancellations'")
+
+    assert after_sql =~ "tightbeam:row-reactions"
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+  end
+
+  test "an unstamped cancellation successor refuses without guessing or changing its schema", %{
+    db: db
+  } do
+    assert :ok = Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "DELETE FROM supervision_liveness_migrations WHERE migrationId='row-reaction-cancellation/v1'"
+      )
+
+    {:ok, before_schema} =
+      DB.query(db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
+
+    assert_raise Schema.ShapeError, fn -> Schema.upgrade_row_reaction_cancellation_v1(db) end
+
+    assert {:ok, ^before_schema} =
+             DB.query(db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM supervision_liveness_migrations WHERE migrationId='row-reaction-cancellation/v1'"
+             )
+  end
+
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
     assert "executionId" in table_columns(db, "command_executions")
@@ -2704,6 +2757,10 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TABLE IF EXISTS supervision_liveness_checkpoint_bindings;
       DROP TABLE IF EXISTS supervision_entitlements;
       DROP TABLE IF EXISTS supervision_liveness_epoch;
+      DROP INDEX IF EXISTS row_reaction_receipt_candidates;
+      DROP TABLE IF EXISTS row_reaction_actions;
+      DROP TABLE IF EXISTS row_reaction_events;
+      DROP TABLE IF EXISTS row_reaction_cutovers;
       DROP TABLE IF EXISTS supervision_liveness_migrations;
       DROP INDEX IF EXISTS wakes_cancellation_state;
       DROP TABLE IF EXISTS effort_holder_activity_cancellation_epoch;

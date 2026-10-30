@@ -1560,14 +1560,21 @@ defmodule Tightbeam.WakesTest do
   defp requester_principal(%{kind: "process", id: id}), do: {:process, id}
 
   describe "accountable parent terminal relation" do
+    setup %{db: db} do
+      root =
+        Path.join(System.tmp_dir!(), "terminal-relation-#{System.unique_integer([:positive])}")
+
+      on_exit(fn -> File.rm_rf!(root) end)
+      verbs = Tightbeam.Gateway.handlers(%{db: db}) |> Map.keys()
+      Tightbeam.TerminalReactionFixture.load!(root, verbs)
+      :ok
+    end
+
     test "user opener owns notice despite a distinct child owner", %{db: db} do
       personal = parent_relation_fixture(db)
 
       assert {:ok, {:ok, wake}} =
-               DB.transaction(
-                 db,
-                 &Wakes.admit_terminal_notification_in_txn(&1, "asg_parent_relation")
-               )
+               admit_parent_transition(db)
 
       assert wake.owner_user_id == "parent-owner"
       assert wake.session_key == personal
@@ -1606,10 +1613,7 @@ defmodule Tightbeam.WakesTest do
         )
 
       assert {:ok, {:ok, wake}} =
-               DB.transaction(
-                 db,
-                 &Wakes.admit_terminal_notification_in_txn(&1, "asg_parent_relation")
-               )
+               admit_parent_transition(db)
 
       assert wake.session_key == "accountable-parent"
       assert wake.owner_user_id == "parent-owner"
@@ -1727,6 +1731,25 @@ defmodule Tightbeam.WakesTest do
     else
       refs
     end
+  end
+
+  defp admit_parent_transition(db) do
+    DB.transaction(db, fn txn ->
+      # The relation fixture supplies a closed source row. Capture its open
+      # before image so this call exercises insertion, not historical replay.
+      after_row = Tightbeam.RowReactions.Snapshot.assignment(txn, "asg_parent_relation")
+
+      before =
+        Map.merge(after_row, %{
+          "state" => "open",
+          "outcome" => nil,
+          "closedAt" => nil,
+          "closingAttestId" => nil,
+          "closedBySession" => nil
+        })
+
+      Wakes.admit_terminal_notification_in_txn(txn, "asg_parent_relation", before)
+    end)
   end
 
   defp parent_relation_fixture(db, close \\ true) do
