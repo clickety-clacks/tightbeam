@@ -23,7 +23,9 @@ defmodule Tightbeam.Identity do
   @seed_owned_paths ["archetypes/default.toml", "guidance/operating-model.md"]
   @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
   @bundle_setup_path "setup.md"
-  @sentinel_keys ~w(name command requires)
+  @sentinel_keys ~w(name command requires events)
+  @sentinel_event_keys ~w(name description details)
+  @sentinel_event_detail_keys ~w(name description)
   @env_name ~r/^[A-Z_][A-Z0-9_]*$/
   @render_contract "universal-root-render-v1"
   @universal_roots ["operating-model.md", "operating-manual.md"]
@@ -852,6 +854,7 @@ defmodule Tightbeam.Identity do
     name = Map.get(entry, "name")
     command = Map.get(entry, "command")
     requires = Map.get(entry, "requires")
+    bundle = Path.basename(Path.dirname(path))
 
     unless is_binary(name) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/, name) do
       raise ArgumentError,
@@ -870,11 +873,119 @@ defmodule Tightbeam.Identity do
             "kungfu manifest sentinel #{name} requires must be a list of names matching [A-Z_][A-Z0-9_]*: #{path}"
     end
 
-    %{name: name, command: command, requires: Enum.uniq(requires)}
+    %{
+      name: name,
+      command: command,
+      requires: Enum.uniq(requires),
+      events: sentinel_events!(Map.get(entry, "events", []), path, bundle, name)
+    }
   end
 
   defp sentinel_declaration!(_entry, path),
     do: raise(ArgumentError, "kungfu manifest sentinels must be an array of tables: #{path}")
+
+  defp sentinel_events!(events, path, bundle, sentinel) when is_list(events) do
+    prefix = "#{bundle}/#{sentinel}"
+    declarations = Enum.map(events, &sentinel_event!(&1, path, prefix))
+    names = Enum.map(declarations, & &1.name)
+
+    case names -- Enum.uniq(names) do
+      [] ->
+        declarations
+
+      duplicates ->
+        name = hd(duplicates)
+        raise ArgumentError, "duplicate event #{prefix}/#{name} in sentinel #{prefix}: #{path}"
+    end
+  end
+
+  defp sentinel_events!(_events, path, bundle, sentinel),
+    do:
+      raise(
+        ArgumentError,
+        "events for sentinel #{bundle}/#{sentinel} must be an array of tables: #{path}"
+      )
+
+  defp sentinel_event!(entry, path, prefix) when is_map(entry) do
+    name = Map.get(entry, "name")
+    event_ref = if is_binary(name), do: "#{prefix}/#{name}", else: "#{prefix}/<unnamed>"
+
+    case Map.keys(entry) -- @sentinel_event_keys do
+      [] ->
+        :ok
+
+      keys ->
+        raise ArgumentError,
+              "event #{event_ref} has unknown keys #{Enum.join(Enum.sort(keys), ", ")}: #{path}"
+    end
+
+    unless is_binary(name) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/, name) do
+      raise ArgumentError,
+            "event #{event_ref} name must match [A-Za-z0-9][A-Za-z0-9_-]*: #{path}"
+    end
+
+    description = Map.get(entry, "description")
+
+    unless is_binary(description) and String.trim(description) != "" do
+      raise ArgumentError, "event #{event_ref} description must be non-empty: #{path}"
+    end
+
+    details = sentinel_event_details!(Map.get(entry, "details"), path, event_ref)
+    detail_names = Enum.map(details, & &1.name)
+
+    case detail_names -- Enum.uniq(detail_names) do
+      [] ->
+        :ok
+
+      duplicates ->
+        duplicate = hd(duplicates)
+        raise ArgumentError, "event #{event_ref} has duplicate detail #{duplicate}: #{path}"
+    end
+
+    %{name: name, description: description, details: details}
+  end
+
+  defp sentinel_event!(entry, path, prefix),
+    do: raise(ArgumentError, "event entry for sentinel #{prefix} must be a table: #{path}")
+
+  defp sentinel_event_details!(details, path, event_ref)
+       when is_list(details) and details != [] do
+    Enum.map(details, fn detail -> sentinel_event_detail!(detail, path, event_ref) end)
+  end
+
+  defp sentinel_event_details!(_details, path, event_ref),
+    do: raise(ArgumentError, "event #{event_ref} must declare one or more details: #{path}")
+
+  defp sentinel_event_detail!(detail, path, event_ref) when is_map(detail) do
+    name = Map.get(detail, "name")
+    detail_ref = if is_binary(name), do: name, else: "<unnamed>"
+
+    case Map.keys(detail) -- @sentinel_event_detail_keys do
+      [] ->
+        :ok
+
+      keys ->
+        raise ArgumentError,
+              "event #{event_ref} detail #{detail_ref} has unknown keys #{Enum.join(Enum.sort(keys), ", ")}: #{path}"
+    end
+
+    unless is_binary(name) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/, name) do
+      raise ArgumentError,
+            "event #{event_ref} detail name #{detail_ref} must match [A-Za-z0-9][A-Za-z0-9_-]*: #{path}"
+    end
+
+    description = Map.get(detail, "description")
+
+    unless is_binary(description) and String.trim(description) != "" do
+      raise ArgumentError,
+            "event #{event_ref} detail #{name} description must be non-empty: #{path}"
+    end
+
+    %{name: name, description: description}
+  end
+
+  defp sentinel_event_detail!(_detail, path, event_ref),
+    do: raise(ArgumentError, "event #{event_ref} detail must be a table: #{path}")
 
   defp bundle_relative_file?(relative) when is_binary(relative) do
     segments = String.split(relative, "/")
@@ -902,7 +1013,8 @@ defmodule Tightbeam.Identity do
               name: String.t(),
               qualified: String.t(),
               command_path: String.t(),
-              requires: [String.t()]
+              requires: [String.t()],
+              events: [map()]
             }
           ]
         }
@@ -919,7 +1031,11 @@ defmodule Tightbeam.Identity do
               name: sentinel.name,
               qualified: "#{bundle}/#{sentinel.name}",
               command_path: Path.join(["kungfu", bundle, sentinel.command]),
-              requires: sentinel.requires
+              requires: sentinel.requires,
+              events:
+                Enum.map(sentinel.events, fn event ->
+                  Map.merge(event, %{qualified: "#{bundle}/#{sentinel.name}/#{event.name}"})
+                end)
             }
           end
         rescue

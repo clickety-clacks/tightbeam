@@ -13,7 +13,7 @@ defmodule Tightbeam.ConditionFacts do
   substrate is forbidden to assert an agent's judgment.
   """
 
-  alias Tightbeam.{DB, EventLog, Gateway, Idempotency, Wakes}
+  alias Tightbeam.{DB, EventLog, Gateway, Idempotency, SentinelSubscriptions, Wakes}
   alias Tightbeam.DB.Txn
 
   @reserved_kinds ~w(
@@ -135,10 +135,16 @@ defmodule Tightbeam.ConditionFacts do
 
     case kind_authority(kind, origin) do
       :ok ->
-        with :ok <- consequence_admission(txn, input) do
+        with :ok <- sentinel_event_admission(input),
+             :ok <- consequence_admission(txn, input) do
           case consequence_replay(txn, input) do
-            :new -> file_admitted_in_txn(txn, kind, origin, input)
-            result -> result
+            :new ->
+              with :ok <- prepare_sentinel_event_in_txn(txn, input) do
+                file_admitted_in_txn(txn, kind, origin, input)
+              end
+
+            result ->
+              result
           end
         end
 
@@ -146,6 +152,51 @@ defmodule Tightbeam.ConditionFacts do
         error
     end
   end
+
+  defp sentinel_event_admission(%{kind: kind} = input) do
+    event = input[:sentinel_event]
+
+    cond do
+      SentinelSubscriptions.event_kind?(kind) and is_map(event) ->
+        details = event[:details]
+        declaration = event[:declaration]
+
+        declared_names =
+          if is_map(declaration), do: Enum.map(declaration.details, & &1.name), else: []
+
+        valid =
+          is_map(declaration) and is_binary(event[:qualified]) and
+            kind == SentinelSubscriptions.event_kind(event.qualified) and
+            event.qualified == declaration.qualified and is_map(details) and
+            input[:payload] == details and
+            Enum.sort(Map.keys(details)) == Enum.sort(declared_names) and
+            Enum.all?(details, fn {name, value} -> is_binary(name) and is_binary(value) end) and
+            match?({:process, _}, event[:principal])
+
+        if valid,
+          do: :ok,
+          else: {:error, %{code: "invalid", message: "invalid declared sentinel event"}}
+
+      SentinelSubscriptions.event_kind?(kind) ->
+        {:error, %{code: "invalid", message: "sentinel event requires declared event metadata"}}
+
+      is_nil(event) ->
+        :ok
+
+      true ->
+        {:error, %{code: "invalid", message: "sentinel event metadata requires an event kind"}}
+    end
+  end
+
+  defp sentinel_event_admission(_input),
+    do: {:error, %{code: "invalid", message: "condition fact requires a kind"}}
+
+  defp prepare_sentinel_event_in_txn(txn, %{sentinel_event: event, origin: origin})
+       when is_map(event) do
+    SentinelSubscriptions.prepare_event_in_txn(txn, event.declaration, event.details, origin)
+  end
+
+  defp prepare_sentinel_event_in_txn(_txn, _input), do: :ok
 
   defp consequence_admission(txn, %{kind: "obligation-consequence-changed"} = input) do
     payload = input[:payload]
@@ -207,7 +258,17 @@ defmodule Tightbeam.ConditionFacts do
     end
   end
 
-  defp consequence_admission(_txn, input) do
+  defp consequence_admission(_txn, %{kind: kind} = input) do
+    if SentinelSubscriptions.event_kind?(kind) do
+      if is_map(input[:payload]),
+        do: :ok,
+        else: {:error, %{code: "invalid", message: "sentinel event requires detail values"}}
+    else
+      consequence_payload_admission(input)
+    end
+  end
+
+  defp consequence_payload_admission(input) do
     if is_nil(input[:payload]),
       do: :ok,
       else: {:error, %{code: "invalid", message: "payload requires consequence kind"}}
@@ -285,7 +346,8 @@ defmodule Tightbeam.ConditionFacts do
 
     [[fact_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
 
-    if payload = input[:payload] do
+    if kind == "obligation-consequence-changed" and not is_nil(input[:payload]) do
+      payload = input[:payload]
       [[encoded]] = Txn.q(txn, "SELECT reminderState FROM assignments WHERE id=?1", [scope])
 
       state =
@@ -340,7 +402,8 @@ defmodule Tightbeam.ConditionFacts do
              outcome =
                if prior do
                  result =
-                   with :ok <- consequence_admission(txn, input) do
+                   with :ok <- sentinel_event_admission(input),
+                        :ok <- consequence_admission(txn, input) do
                      fact = fact_in_txn(txn, prior.session_key)
 
                      if input[:payload] &&

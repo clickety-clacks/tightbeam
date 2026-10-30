@@ -94,6 +94,11 @@ fn string_field(name: &str, value: &str) -> String {
     format!("\"{name}\":{}", quoted(value))
 }
 
+fn string_list_field(name: &str, values: &[String]) -> String {
+    let encoded = serde_json::to_string(values).expect("string lists are JSON serializable");
+    format!("\"{name}\":{encoded}")
+}
+
 fn append_mementos(fields: &mut Vec<String>, entries: &[(String, String)]) {
     if !entries.is_empty() {
         let values: Vec<_> = entries
@@ -1656,6 +1661,49 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         Command::SentinelList { identity } => {
             Ok(request(identity, "sentinel-list", vec![], vec![]))
         }
+        Command::SentinelEvents { identity } => {
+            Ok(request(identity, "sentinel-events", vec![], vec![]))
+        }
+        Command::SentinelPost {
+            identity,
+            event,
+            key,
+            details,
+        } => Ok(request(
+            identity,
+            "sentinel-post",
+            vec![],
+            vec![
+                string_field("event", event),
+                string_field("key", key),
+                string_list_field("detail", details),
+            ],
+        )),
+        Command::SentinelSubscribe {
+            identity,
+            event,
+            where_values,
+        } => Ok(request(
+            identity,
+            "sentinel-subscribe",
+            vec![],
+            vec![
+                string_field("event", event),
+                string_list_field("where", where_values),
+            ],
+        )),
+        Command::SentinelSubscriptions { identity } => {
+            Ok(request(identity, "sentinel-subscriptions", vec![], vec![]))
+        }
+        Command::SentinelUnsubscribe {
+            identity,
+            subscription_id,
+        } => Ok(request(
+            identity,
+            "sentinel-unsubscribe",
+            vec![],
+            vec![string_field("subscriptionId", subscription_id)],
+        )),
         Command::SentinelEnvSet {
             identity,
             host,
@@ -3942,6 +3990,11 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::SentinelEnable { identity, .. }
         | Command::SentinelDisable { identity, .. }
         | Command::SentinelList { identity }
+        | Command::SentinelEvents { identity }
+        | Command::SentinelPost { identity, .. }
+        | Command::SentinelSubscribe { identity, .. }
+        | Command::SentinelSubscriptions { identity }
+        | Command::SentinelUnsubscribe { identity, .. }
         | Command::SentinelEnvSet { identity, .. }
         | Command::SentinelEnvList { identity, .. }
         | Command::SentinelEnvUnset { identity, .. }
@@ -5933,6 +5986,50 @@ mod tests {
         assert_eq!(
             body(&["sentinel", "list", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"sentinel-list","params":{}}"#
+        );
+        assert_eq!(
+            body(&["sentinel", "events", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"sentinel-events","params":{}}"#
+        );
+        assert_eq!(
+            body(&[
+                "sentinel",
+                "post",
+                "--event",
+                "sample/demo/ping",
+                "--key",
+                "event-id",
+                "--detail",
+                "channel=!a:x",
+                "--detail",
+                "text=a=b\nsecond",
+                "--as-process",
+                "watcher",
+            ]),
+            r#"{"asProcess":"watcher","verb":"sentinel-post","params":{"event":"sample/demo/ping","key":"event-id","detail":["channel=!a:x","text=a=b\nsecond"]}}"#
+        );
+        assert_eq!(
+            body(&[
+                "sentinel",
+                "subscribe",
+                "--event",
+                "sample/demo/ping",
+                "--where",
+                "channel=!a:x",
+                "--where",
+                "who=@mike:x",
+                "--as",
+                "reader",
+            ]),
+            r#"{"as":"reader","verb":"sentinel-subscribe","params":{"event":"sample/demo/ping","where":["channel=!a:x","who=@mike:x"]}}"#
+        );
+        assert_eq!(
+            body(&["sentinel", "subscriptions", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"sentinel-subscriptions","params":{}}"#
+        );
+        assert_eq!(
+            body(&["sentinel", "unsubscribe", "sub_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"sentinel-unsubscribe","params":{"subscriptionId":"sub_1"}}"#
         );
         assert_eq!(
             body(&["kungfu", "setup", "example-bundle", "--as-user", "flynn"]),

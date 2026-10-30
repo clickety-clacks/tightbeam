@@ -991,6 +991,8 @@ defmodule Tightbeam.Org do
 
     Txn.handoff(txn, Tightbeam.HarklightWakes, {:origin_changed, session_key})
 
+    Tightbeam.SentinelSubscriptions.end_session_in_txn(txn, session_key)
+
     readdress_retirement_notices_in_txn!(txn, session_key)
 
     session = stamp_session_change_in_txn(txn, session_key, retirement_epoch)
@@ -1015,6 +1017,9 @@ defmodule Tightbeam.Org do
         AND ((w.targetRole IS NULL AND w.sessionKey=?1) OR r.boundSessionKey=?1)
         AND NOT EXISTS (
           SELECT 1 FROM harklight_wake_entries e WHERE e.wakeId=w.wakeId
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM sentinel_subscription_wake_matches m WHERE m.wakeId=w.wakeId
         )
       ORDER BY w.createdAt,w.wakeId
       """,

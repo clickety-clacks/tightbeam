@@ -72,7 +72,7 @@ defmodule Tightbeam.Wire.Router do
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
   @read_marker_verbs ~w(read-marker-set read-marker-clear)
-  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle spawn session-reparent session-po-set retire critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
+  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle spawn session-reparent session-po-set retire critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
   @agent_verbs @agent_verbs ++
                  [
                    "fact-demand",
@@ -4308,6 +4308,11 @@ defmodule Tightbeam.Wire.Router do
     "sentinel-disable" => ~w(name)a,
     "sentinel-enable" => ~w(name)a,
     "sentinel-list" => ~w()a,
+    "sentinel-events" => ~w()a,
+    "sentinel-post" => ~w(detail event key)a,
+    "sentinel-subscribe" => ~w(event where)a,
+    "sentinel-subscriptions" => ~w()a,
+    "sentinel-unsubscribe" => ~w(subscription_id)a,
     "session-po-set" => ~w(idempotency_key po_role po_session_key session_key)a,
     "session-reparent" => ~w(assignment_id idempotency_key parent_session_key session_key)a,
     "settle-turn" => ~w(idempotency_key outcome reason session_key turn_seq)a,

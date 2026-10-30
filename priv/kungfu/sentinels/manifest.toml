@@ -1,0 +1,16 @@
+purpose = "Share generic event subscription tools and a read-only Matrix event watcher."
+root_archetype = "default"
+
+[[sentinels]]
+name = "matrix"
+command = "sentinels/matrix"
+requires = ["MATRIX_COMMANDER_CREDENTIALS", "MATRIX_COMMANDER_STORE"]
+
+[[sentinels.events]]
+name = "message"
+description = "A message someone posted in a room the watcher's login has joined."
+details = [
+  { name = "room", description = "Room ID reported by the Matrix event." },
+  { name = "sender", description = "User ID of the message author." },
+  { name = "text", description = "Full message body reported by Matrix." },
+]

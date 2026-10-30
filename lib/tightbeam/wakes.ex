@@ -4435,6 +4435,17 @@ defmodule Tightbeam.Wakes do
   defp pending_wake(_txn, _command), do: :error
 
   defp authorize_cancel(
+         %{
+           requester: %{kind: "session", id: id},
+           reason_kind: "requester_withdrew",
+           subscription_withdrawal: true
+         },
+         %{creator_session_key: creator_session_key}
+       )
+       when is_binary(id) and id != "" and is_binary(creator_session_key),
+       do: :ok
+
+  defp authorize_cancel(
          %{requester: %{kind: kind, id: id}, reason_kind: "requester_withdrew"},
          %{origin: origin, creator_session_key: creator_session_key}
        )
