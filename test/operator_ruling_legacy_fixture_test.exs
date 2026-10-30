@@ -3,8 +3,9 @@ defmodule Tightbeam.OperatorRulingLegacyFixtureTest do
 
   alias Tightbeam.{ConnRegistry, DB, Escalation, Model, Org, Wakes}
 
-  @fixture_path "test/fixtures/operator_ruling_legacy_f4e5e6a1.json"
-  @settlement_fixture_path "test/fixtures/operator_ruling_settlement_8dcb742c.json"
+  # Historical schema rows use synthetic identifiers and a synthetic test principal.
+  @fixture_path "test/fixtures/operator_ruling_legacy_synthetic.json"
+  @settlement_fixture_path "test/fixtures/operator_ruling_settlement_synthetic.json"
   @source_commit "f4e5e6a197abd0e75da70d2b7a0a2e316cbc3252"
   @source_tree "9efdfea554bbd8010f76d4d261a0fcaf2c48d4b2"
   @source_lock "38984dd5bf62caf36299f920a7347ba2bcb3f11de8f574ebf35d25967abf0e13"
@@ -32,8 +33,8 @@ defmodule Tightbeam.OperatorRulingLegacyFixtureTest do
     Org.create(db, %{
       session_key: "agent:raiser:app",
       display_name: "raiser",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "tester",
+      origin: "user:tester",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -60,7 +61,7 @@ defmodule Tightbeam.OperatorRulingLegacyFixtureTest do
     call = owner_operator_rule(pending["requestId"], %{decision: "accept"})
 
     assert MapSet.new(
-             Enum.map(Escalation.list(ctx.db, call, "ruled", owner_user_id: "flynn"), & &1.id)
+             Enum.map(Escalation.list(ctx.db, call, "ruled", owner_user_id: "tester"), & &1.id)
            ) ==
              MapSet.new([pending["requestId"], fired["requestId"]])
 
@@ -68,7 +69,7 @@ defmodule Tightbeam.OperatorRulingLegacyFixtureTest do
       replay_call = owner_operator_rule(legacy["requestId"], %{decision: "accept"})
 
       assert %{id: request_id, status: "ruled", decision: "accept"} =
-               Escalation.get(ctx.db, replay_call, legacy["requestId"], owner_user_id: "flynn")
+               Escalation.get(ctx.db, replay_call, legacy["requestId"], owner_user_id: "tester")
 
       assert request_id == legacy["requestId"]
 
@@ -93,7 +94,7 @@ defmodule Tightbeam.OperatorRulingLegacyFixtureTest do
              ])
 
     assert %{code: "decision_request_integrity_invalid", request_id: request_id} =
-             Escalation.get(ctx.db, call, pending["requestId"], owner_user_id: "flynn")
+             Escalation.get(ctx.db, call, pending["requestId"], owner_user_id: "tester")
 
     assert request_id == pending["requestId"]
 
@@ -121,8 +122,8 @@ defmodule Tightbeam.OperatorRulingLegacyFixtureTest do
     Org.create(db, %{
       session_key: "agent:raiser:app",
       display_name: "raiser",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: "tester",
+      origin: "user:tester",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -178,8 +179,8 @@ defmodule Tightbeam.OperatorRulingLegacyFixtureTest do
   defp owner_operator_rule(id, params) do
     %{
       verb: "operator-rule",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:tester",
+      principal: {:user, "tester"},
       transport_session_key: nil,
       params: Map.put(params, :request, id)
     }

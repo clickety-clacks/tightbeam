@@ -6,7 +6,7 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
   @fixture Path.expand("fixtures/artifact_durability_reparent_9082cb14.sql", __DIR__)
   @fixture_sha "d8039e7a3584ab26a77aae6214c8927dfc077ab1234ba452ae61ba5731597508"
   @predecessor "session-reparent-v1-019"
-  @successor "launch-preparation-boot-v1-0110"
+  @successor "launch-preparation-evidence-v1-0112"
 
   @content_objects [
     "artifact_contents",
@@ -191,8 +191,7 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
     seed_artifact(db, "art_external_1", "in-workspace")
     seed_artifact(db, "art_unread_1", "in-workspace")
 
-    # Two shapes of uncaptured row. Retirement must be able to release both
-    # (att_7669b55f §6, B1 and B3).
+    # Two shapes of uncaptured row. Retirement must be able to release both.
     #
     # The external shape: `Artifacts.archive_session/4` releases an artifact whose
     # bytes lie outside the workspace straight from `in-workspace`, home NULL,

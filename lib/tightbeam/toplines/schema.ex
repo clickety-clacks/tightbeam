@@ -462,8 +462,16 @@ defmodule Tightbeam.Toplines.Schema do
       [[1, "integer", shape, "text", stamped_at, "integer"]]
       when is_binary(shape) and shape != "" and is_integer(stamped_at) and stamped_at >= 0 ->
         case shape do
+          "standalone-toplines-v7" ->
+            objects =
+              Enum.map(@objects, fn object ->
+                %{object | sql: Tightbeam.Schema.process_actor_table_sql(object.name, object.sql)}
+              end)
+
+            if exact_manifest?(stored, objects), do: :ok, else: refusal("schema_shape_mismatch")
+
           @shape ->
-            if exact_manifest?(stored), do: :ok, else: refusal("schema_shape_mismatch")
+            if exact_manifest?(stored, @objects), do: :ok, else: refusal("schema_shape_mismatch")
 
           @previous_shape ->
             if exact_manifest?(stored, @v5_objects) and portable_rebuild_allowed?(txn) do

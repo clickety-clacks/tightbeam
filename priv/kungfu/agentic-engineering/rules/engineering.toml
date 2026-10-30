@@ -2,6 +2,14 @@
 # Resolve a defective rule with its responsible owner; preserve the governing
 # restriction and continue separable authorized work while it is corrected.
 
+[[policy]]
+name = "operational-evidence-for-unfiled-live-effects"
+purpose = "attest-operational-evidence"
+when = [
+  { fact = "assignment.effect_kind", op = "eq", value = "live_mutation" },
+  { fact = "assignment.declared_files_present", op = "eq", value = false },
+]
+
 # Qualifying completion requires an applicable independent reviewed-clean conclusion.
 # When review is needed, O2 sends an accountable notification; the owner directs staffing.
 # The notification does not force a reviewer-code assignment or satisfy completion checks.
@@ -9,7 +17,7 @@
 [[rule]]
 name = "completion-requires-review"
 verb = "attest"
-text = "code, policy, release, and live-mutation completion needs the most recent holder-filed review-conclusion verdict (reviewed-clean or changes-requested), pooled across all --reviews-linked cards, to be reviewed-clean on a card held by a different session; code completion also requires that review to cover every commit in the holder's latest verified result, and a missing-coverage refusal names the uncovered commits; verdicts of other kinds are ignored; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide review-session selection only"
+text = "code, policy, release, and live-mutation completion needs the most recent holder-filed review-conclusion verdict (reviewed-clean or changes-requested), pooled across all --reviews-linked cards and substantive unlinked review-effect cards on the same work item, to be reviewed-clean on a card held by a different session; code completion also requires that review to cover every commit in the holder's latest verified result, and a missing-coverage refusal names the uncovered commits; verdicts of other kinds are ignored; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide review-session selection only"
 external_producer = true
 edges = ["verb"]
 effect = "remedy"

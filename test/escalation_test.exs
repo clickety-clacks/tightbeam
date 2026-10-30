@@ -96,6 +96,26 @@ defmodule Tightbeam.EscalationTest do
     assert {:deny, %{code: "escalation_denied"}} = Escalation.resolve(ctx.db, call, statute)
   end
 
+  test "a process-only request is owned by the organization admin", ctx do
+    process_call = %{
+      verb: "attest",
+      origin: "process:maintenance",
+      principal: {:process, "maintenance"},
+      session_key: nil,
+      params: %{assignment_id: "process-only", kind: "completion"}
+    }
+
+    {:decision_pending, id} = open(ctx, process_call, statute())
+
+    assert %{owner_user_id: "flynn", raiser_id: "process:maintenance", raiser_session_key: nil} =
+             request(ctx, id)
+
+    assert Enum.any?(notification_wakes(ctx), fn wake ->
+             wake.owner_user_id == "flynn" and
+               wake.session_key == Org.personal_session_key("flynn")
+           end)
+  end
+
   test "statute open, ruling, and consume publish their committed decision snapshots", ctx do
     alias Tightbeam.Firehose.Hub
 
@@ -434,12 +454,11 @@ defmodule Tightbeam.EscalationTest do
     scheduler = start_gateway_scheduler(ctx)
     handlers = Gateway.handlers(%{db: ctx.db, wake_scheduler: scheduler})
 
-    assert %{code: "not_owner"} =
-             handlers["rule"].(%{
-               origin: "process:cron",
-               principal: {:process, "cron"},
-               params: %{request_id: id, decision: "allow"}
-             })
+    process_rule = %{
+      origin: "process:cron",
+      principal: {:process, "cron"},
+      params: %{request_id: id, decision: "allow"}
+    }
 
     assert %{code: "invalid_decision"} =
              handlers["rule"].(%{
@@ -448,7 +467,8 @@ defmodule Tightbeam.EscalationTest do
                params: %{request_id: id, decision: "later"}
              })
 
-    ruled = handlers["rule"].(rule_call(id, "allow"))
+    ruled = handlers["rule"].(process_rule)
+    assert ruled.ruled_by == "process:cron"
     # Wait for the delivery pass the condition nudge queued.
     :sys.get_state(scheduler)
     assert ruled.status == "ruled"
@@ -459,8 +479,10 @@ defmodule Tightbeam.EscalationTest do
 
     assert_receive {:lane_nudged, _}
 
-    assert handlers["rule"].(rule_call(id, "allow")).ruling_fact_id == ruled.ruling_fact_id
-    assert %{code: "not_open"} = handlers["rule"].(rule_call(id, "deny"))
+    assert handlers["rule"].(process_rule).ruling_fact_id == ruled.ruling_fact_id
+
+    assert %{code: "not_open"} =
+             handlers["rule"].(put_in(process_rule, [:params, :decision], "deny"))
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -1232,7 +1254,7 @@ defmodule Tightbeam.EscalationTest do
     assert observer == "session:#{ctx.raiser.session_key}"
     refute fields =~ "integrity?"
 
-    assert shape_digest == "efa9964d4e3857fc094f9b699b19ac1feb91a30b439236e05572b483cb886403"
+    assert shape_digest == "a5122ab91fc09a0122206f0efb1804d1e57d24c8622aa0b547c4c23ff2ee1afe"
     assert ruled.ruling_fact_id > 0
   end
 
@@ -1510,7 +1532,7 @@ defmodule Tightbeam.EscalationTest do
            ]
   end
 
-  test "an unrelated sibling session cannot borrow owner visibility", ctx do
+  test "sessions have their owner's operator request visibility", ctx do
     request =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "private?"}))
 
@@ -1523,8 +1545,9 @@ defmodule Tightbeam.EscalationTest do
       params: %{}
     }
 
-    assert [] = Escalation.list(ctx.db, sibling_call, "open")
-    assert nil == Escalation.get(ctx.db, sibling_call, request.id)
+    assert [%{id: sibling_id}] = Escalation.list(ctx.db, sibling_call, "open")
+    assert sibling_id == request.id
+    assert %{id: ^sibling_id} = Escalation.get(ctx.db, sibling_call, request.id)
     assert [%{id: request_id}] = Escalation.list(ctx.db, owner_call, "open")
     assert request_id == request.id
     assert %{id: ^request_id} = Escalation.get(ctx.db, owner_call, request.id)
@@ -1543,10 +1566,13 @@ defmodule Tightbeam.EscalationTest do
                [System.system_time(:millisecond), request.id]
              )
 
-    assert [] = Escalation.list(ctx.db, sibling_call, "ruled")
-    assert nil == Escalation.get(ctx.db, sibling_call, request.id)
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.list(ctx.db, sibling_call, "ruled")
 
-    assert {:ok, [[0]]} =
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.get(ctx.db, sibling_call, request.id)
+
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM decision_request_integrity_evidence WHERE requestId=?1",
@@ -2843,13 +2869,35 @@ defmodule Tightbeam.EscalationTest do
                })
              )
 
-    assert ^not_found =
-             Escalation.answer(ctx.db, %{
-               verb: "answer",
-               origin: "process:ci",
-               principal: {:process, "ci"},
-               params: %{request: request.id, answer: "process answer"}
-             })
+    process_request =
+      Escalation.ask(
+        ctx.db,
+        agent_call(ctx.raiser, %{question: "Process answer?"}, %{
+          verb: "ask",
+          session_key: asked.session_key
+        })
+      )
+
+    process_call = %{
+      verb: "answer",
+      origin: "process:ci",
+      principal: {:process, "ci"},
+      params: %{request: process_request.id, answer: "process answer"}
+    }
+
+    assert %{status: "answered", answered_by: "process:ci", answer: "process answer"} =
+             process_answer = Escalation.answer(ctx.db, process_call)
+
+    assert ^process_answer = Escalation.answer(ctx.db, process_call)
+
+    assert [process_wake] =
+             Enum.filter(
+               notification_wakes(ctx),
+               &(&1.session_key == ctx.raiser.session_key and
+                   String.contains?(&1.prompt, process_request.id))
+             )
+
+    assert process_wake.prompt =~ "answered by process:ci"
 
     assert ^not_found =
              Escalation.answer(ctx.db, %{
@@ -2942,7 +2990,9 @@ defmodule Tightbeam.EscalationTest do
 
     response_wakes =
       notification_wakes(ctx)
-      |> Enum.filter(&(&1.session_key == ctx.raiser.session_key))
+      |> Enum.filter(
+        &(&1.session_key == ctx.raiser.session_key and String.contains?(&1.prompt, request.id))
+      )
 
     assert [wake] = response_wakes
     assert wake.target_gate == 0

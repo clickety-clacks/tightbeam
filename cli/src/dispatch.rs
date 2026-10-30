@@ -94,6 +94,19 @@ fn string_field(name: &str, value: &str) -> String {
     format!("\"{name}\":{}", quoted(value))
 }
 
+fn append_mementos(fields: &mut Vec<String>, entries: &[(String, String)]) {
+    if !entries.is_empty() {
+        let values: Vec<_> = entries
+            .iter()
+            .map(|(name, value)| serde_json::json!({"name": name, "value": value}))
+            .collect();
+        fields.push(format!(
+            "\"mementos\":{}",
+            serde_json::to_string(&values).expect("mementos are JSON serializable")
+        ));
+    }
+}
+
 /// Roster filters, shared verbatim by `toplines` and `topline --under` — the
 /// spec says "the same roster filters", so there is one builder, not two lists.
 fn filter_params(filters: &crate::args::ToplineFilters) -> Vec<String> {
@@ -234,6 +247,33 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 }
             }
             Ok(request(identity, "condition", vec![], params))
+        }
+        Command::FactDemand { identity, prefixes } => Ok(request(
+            identity,
+            "fact-demand",
+            vec![],
+            vec![format!(
+                "\"kindPrefixes\":{}",
+                serde_json::to_string(prefixes).unwrap()
+            )],
+        )),
+        Command::FactProducerClaim {
+            identity,
+            producer,
+            kinds,
+            live_for_ms,
+        } => Ok(request(
+            identity,
+            "fact-producer-claim",
+            vec![],
+            vec![
+                string_field("producer", producer),
+                format!("\"kinds\":{}", serde_json::to_string(kinds).unwrap()),
+                format!("\"liveForMs\":{live_for_ms}"),
+            ],
+        )),
+        Command::FactProducers { identity } => {
+            Ok(request(identity, "fact-producers", vec![], vec![]))
         }
         Command::HarnessHealthObserveOther {
             identity,
@@ -427,6 +467,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             description,
             work_item_id,
             content_sha256,
+            content_base64,
             produced_by_assignment_id,
         } => {
             let mut params = vec![
@@ -438,6 +479,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 ("description", description),
                 ("workItemId", work_item_id),
                 ("contentSha256", content_sha256),
+                ("contentBase64", content_base64),
                 ("producedByAssignmentId", produced_by_assignment_id),
             ] {
                 if let Some(value) = value {
@@ -446,6 +488,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "artifact-record", vec![], params))
         }
+        Command::ArtifactContentFetch {
+            identity,
+            artifact_id,
+        } => Ok(request(
+            identity,
+            "artifact-content-fetch",
+            vec![],
+            vec![string_field("artifactId", artifact_id)],
+        )),
         Command::Artifacts {
             identity,
             work_item_id,
@@ -468,8 +519,13 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             choices,
             files,
             vendor_session_id,
+            supersedes,
         } => {
             let mut params = vec![
+                format!(
+                    "\"supersedes\":{}",
+                    serde_json::to_string(supersedes).expect("message IDs are JSON serializable")
+                ),
                 string_field("harklightSession", session),
                 string_field("senderId", sender_id),
                 string_field("title", title),
@@ -490,6 +546,42 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "harklight-send", vec![], params))
         }
+        Command::HarklightRevise {
+            identity,
+            message,
+            base_revision,
+            title,
+            body,
+            choices,
+            clear_choices,
+        } => {
+            let mut params = vec![
+                string_field("messageId", message),
+                string_field("title", title),
+                format!("\"baseRevision\":{base_revision}"),
+                format!("\"clearChoices\":{clear_choices}"),
+                format!(
+                    "\"choices\":{}",
+                    serde_json::to_string(choices).expect("choices are JSON serializable")
+                ),
+            ];
+            if let Some(body) = body {
+                params.push(string_field("body", body));
+            }
+            Ok(request(identity, "harklight-revise", vec![], params))
+        }
+        Command::HarklightRetract { identity, message } => Ok(request(
+            identity,
+            "harklight-retract",
+            vec![],
+            vec![string_field("messageId", message)],
+        )),
+        Command::HarklightSettle { identity, message } => Ok(request(
+            identity,
+            "harklight-settle",
+            vec![],
+            vec![string_field("messageId", message)],
+        )),
         // Not a verb and not on /agent/dispatch: it changes no domain state, it
         // tells the gateway to look at this session's running turn NOW, while the
         // command it observed has not run yet.
@@ -504,8 +596,8 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             session_key,
         } => {
             let mut fields = Vec::new();
-            if let Identity::User(user) = identity {
-                fields.push(string_field("asUser", user));
+            if let Some(field) = identity_field(identity) {
+                fields.push(field);
             }
             fields.push(string_field("sessionKey", session_key));
             Ok(RequestSpec {
@@ -517,6 +609,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         }
         Command::Spawn {
             identity,
+            owner_user_id,
             display_name,
             idempotency_key,
             archetype,
@@ -537,6 +630,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             // on the far side depends on telling those apart. The other fields
             // have no meaningful empty value, so they lift into the same shape.
             for (name, value) in [
+                ("ownerUserId", owner_user_id.clone().map(Some)),
                 ("archetype", archetype.clone().map(Some)),
                 ("harness", harness.clone().map(Some)),
                 ("model", model.clone()),
@@ -648,14 +742,17 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         }
         Command::Assign {
             identity,
+            mementos,
             subject,
             target,
             idempotency_key,
             work_item_id,
+            owner_user_id,
             reviews,
             effect_kind,
             files,
             succeeds,
+            parent_assignment,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -665,6 +762,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             let mut params = vec![string_field("subject", subject)];
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
+            }
+            if let Some(value) = owner_user_id {
+                params.push(string_field("ownerUserId", value));
             }
             if let Some(value) = work_item_id {
                 params.push(string_field("workItemId", value));
@@ -684,23 +784,33 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = succeeds {
                 params.push(string_field("succeedsAssignmentId", value));
             }
+            if let Some(value) = parent_assignment {
+                params.push(string_field("parentAssignmentId", value));
+            }
+            append_mementos(&mut params, mementos);
             Ok(request(identity, "assign", vec![target], params))
         }
         Command::Dispatch {
             identity,
+            mementos,
             subject,
             holder,
             work_item_id,
+            owner_user_id,
             effect_kind,
             workdir_root,
             brief,
             idempotency_key,
             succeeds,
+            parent_assignment,
         } => {
             let mut params = vec![
                 string_field("subject", subject),
                 string_field("brief", brief),
             ];
+            if let Some(value) = owner_user_id {
+                params.push(string_field("ownerUserId", value));
+            }
             if let Some(value) = work_item_id {
                 params.push(string_field("workItemId", value));
             }
@@ -716,6 +826,10 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = succeeds {
                 params.push(string_field("succeedsAssignmentId", value));
             }
+            if let Some(value) = parent_assignment {
+                params.push(string_field("parentAssignmentId", value));
+            }
+            append_mementos(&mut params, mementos);
             Ok(request(
                 identity,
                 "dispatch",
@@ -964,6 +1078,8 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         )),
         Command::WorkItemCreate {
             identity,
+            owner_user_id,
+            mementos,
             title,
             spec_ref_name,
             spec_ref_sha256,
@@ -971,6 +1087,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             idempotency_key,
         } => {
             let mut params = vec![string_field("title", title)];
+            if let Some(owner) = owner_user_id {
+                params.push(string_field("ownerUserId", owner));
+            }
             if let Some(value) = spec_ref_name {
                 params.push(string_field("specRefName", value));
             }
@@ -983,16 +1102,21 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
             }
+            append_mementos(&mut params, mementos);
             Ok(request(identity, "work-item-create", vec![], params))
         }
         Command::WorkItemHandoff {
             identity,
+            owner_user_id,
             work_item_id,
             title,
             delivery_owner,
             brief,
         } => {
             let mut params = Vec::new();
+            if let Some(owner) = owner_user_id {
+                params.push(string_field("ownerUserId", owner));
+            }
             if let Some(value) = work_item_id {
                 params.push(string_field("workItemId", value));
             }
@@ -1238,6 +1362,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         }
         Command::Attest {
             identity,
+            mementos,
             assignment_id,
             kind,
             verdict,
@@ -1272,6 +1397,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = content_sha256 {
                 params.push(string_field("contentSha256", value));
             }
+            append_mementos(&mut params, mementos);
             if let Some(value) = wait_id {
                 params.push(string_field("waitId", value));
             }
@@ -1285,6 +1411,47 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 params.push(string_field("releaseFactPrincipalRef", value));
             }
             Ok(request(identity, "attest", vec![], params))
+        }
+        Command::MementoSet {
+            identity,
+            record,
+            name,
+            values,
+            clear,
+        } => {
+            let mut params = vec![string_field("record", record), string_field("name", name)];
+            if *clear {
+                params.push("\"clear\":true".to_owned());
+            } else {
+                params.push(format!(
+                    "\"values\":{}",
+                    serde_json::to_string(values).expect("strings are JSON serializable")
+                ));
+            }
+            Ok(request(identity, "memento-set", vec![], params))
+        }
+        Command::Mementos {
+            identity,
+            record,
+            history,
+            name,
+            limit,
+            cursor,
+        } => {
+            let mut params = vec![string_field("record", record)];
+            if *history {
+                params.push("\"history\":true".to_owned());
+            }
+            if let Some(value) = name {
+                params.push(string_field("name", value));
+            }
+            if let Some(value) = limit {
+                params.push(format!("\"limit\":{value}"));
+            }
+            if let Some(value) = cursor {
+                params.push(string_field("cursor", value));
+            }
+            Ok(request(identity, "mementos", vec![], params))
         }
         Command::Attests {
             identity,
@@ -1544,13 +1711,17 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             Ok(request(identity, "identity-apply", vec![], params))
         }
         Command::Onboard {
-            identity, provider, ..
-        } => Ok(request(
             identity,
-            "onboard",
-            vec![],
-            vec![string_field("provider", provider)],
-        )),
+            provider,
+            owner_user_id,
+            ..
+        } => {
+            let mut params = vec![string_field("provider", provider)];
+            if let Some(owner) = owner_user_id {
+                params.push(string_field("ownerUserId", owner));
+            }
+            Ok(request(identity, "onboard", vec![], params))
+        }
         Command::AddUser {
             identity,
             user_id,
@@ -1710,7 +1881,7 @@ pub fn build_onboard_phase_request(
 
 /// Build a `wake --user <owner>` request carrying the onboarding sign-in prompt, so the
 /// operator who cannot see the ceremony's terminal still receives the URL+code. The wake
-/// row IS the durable record of the delivery (wi_0535922b) -- it persists in the substrate
+/// row IS the durable record of the delivery -- it persists in the substrate
 /// with the code text, the target, and timestamps.
 ///
 /// `userId` is a target field and `prompt` a param, exactly as `Command::Wake` builds them.
@@ -1729,7 +1900,7 @@ pub fn build_operator_wake_request(
 }
 
 pub fn build_register_host_request(
-    as_user: &str,
+    identity: &Identity,
     name: &str,
     ssh: &str,
     base_dir: &str,
@@ -1737,7 +1908,7 @@ pub fn build_register_host_request(
     adapter_bin_dir: &str,
 ) -> RequestSpec {
     request(
-        &Identity::User(as_user.to_owned()),
+        identity,
         "register-host",
         vec![],
         vec![
@@ -1751,14 +1922,9 @@ pub fn build_register_host_request(
     .with_attempt_context(Some(CommandContext::assimilate_registration()))
 }
 
-pub fn build_update_clients_request(as_user: &str) -> RequestSpec {
-    request(
-        &Identity::User(as_user.to_owned()),
-        "update-clients",
-        vec![],
-        vec![],
-    )
-    .with_attempt_context(Some(CommandContext::update_clients()))
+pub fn build_update_clients_request(identity: &Identity) -> RequestSpec {
+    request(identity, "update-clients", vec![], vec![])
+        .with_attempt_context(Some(CommandContext::update_clients()))
 }
 
 pub fn discover() -> Result<Endpoint, String> {
@@ -3495,7 +3661,7 @@ where
                 }
             }
         }
-        Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
+        Command::UpdateClients { identity } => crate::ceremonies::update_clients(&identity),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
         Command::SessionConnect { .. } => {
             unreachable!("session-connect is routed before the shared dispatcher")
@@ -3503,6 +3669,7 @@ where
         Command::GithubAuthCheck => crate::github_auth::check_tool_call_stdin(),
         Command::Onboard {
             identity,
+            owner_user_id,
             provider,
             api_key,
             daemon_credential,
@@ -3527,12 +3694,26 @@ where
                 local_endpoint.as_deref(),
                 local_provider_name.as_deref(),
                 &endpoint,
-                send_request,
+                |endpoint, request, deadline| {
+                    let mut request = request.clone();
+                    if let Some(owner) = &owner_user_id {
+                        let mut body: serde_json::Value = serde_json::from_str(&request.body_json)
+                            .expect("onboarding requests contain JSON");
+                        if body["verb"] == "onboard" {
+                            body["params"]["ownerUserId"] = owner.clone().into();
+                            request.body_json = body.to_string();
+                        }
+                    }
+                    send_request(endpoint, &request, deadline)
+                },
                 load_harnesses,
             )
         }
         command => {
             let endpoint = discover_endpoint()?;
+            if let Some(reason) = local_harklight_identity_refusal(&command, &endpoint) {
+                return Err(reason.to_owned());
+            }
             if let Some(identity) = command_identity(&command) {
                 require_session_endpoint(identity, &endpoint)?;
             }
@@ -3559,6 +3740,15 @@ where
             }
             let request = build_request(&command)?;
             if let Some(result) = send_request(&endpoint, &request, None)? {
+                if matches!(command, Command::Wake { .. }) {
+                    if let Some(warnings) = result.get("warnings").and_then(Value::as_array) {
+                        for warning in warnings {
+                            if let Some(message) = warning.get("message").and_then(Value::as_str) {
+                                eprintln!("{message}");
+                            }
+                        }
+                    }
+                }
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&result).expect("JSON value serializes")
@@ -3627,15 +3817,48 @@ fn require_session_endpoint(identity: &Identity, endpoint: &Endpoint) -> Result<
 
 fn identity_required(cwd: &Path) -> String {
     format!(
-        "identity required: no explicit --as, --as-user, or --as-process flag was passed, and no .tightbeam-session was found walking up from '{}' to the filesystem root. Pass --as <your-agent-handle> (agent action) or --as-user <userId> (operator action). This is WHO the call is from, not the target. Run 'tightbeam help'.",
+        "identity required: no explicit --as, --as-user, or --as-process flag was passed, and no .tightbeam-session was found walking up from '{}' to the filesystem root. Run from a Tightbeam session, or select --as <role>, --as-user <userId>, or --as-process <name> with an organization credential. This is WHO the call is from, not the target. Run 'tightbeam help'.",
         cwd.display()
     )
+}
+
+fn local_harklight_identity_refusal(
+    command: &Command,
+    endpoint: &Endpoint,
+) -> Option<&'static str> {
+    // Session files carry session credentials, and explicitly named endpoints may carry
+    // either a session or organization credential. Discovery cannot tell which kind of
+    // token a Named endpoint holds, so preserve the local refusal there. Provisioned
+    // gateway.json files are written with the organization credential and can use the
+    // Gateway's existing durable denial.
+    if !matches!(&endpoint.origin, Origin::Session(_) | Origin::Named) {
+        return None;
+    }
+
+    match command {
+        Command::HarklightSend { identity, .. }
+            if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
+        {
+            Some("harklight-send requires the authenticated session or one of its roles")
+        }
+        Command::HarklightRevise { identity, .. }
+        | Command::HarklightRetract { identity, .. }
+        | Command::HarklightSettle { identity, .. }
+            if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
+        {
+            Some("invalid Harklight command flags")
+        }
+        _ => None,
+    }
 }
 
 fn command_identity(command: &Command) -> Option<&Identity> {
     match command {
         Command::Wake { identity, .. }
         | Command::Condition { identity, .. }
+        | Command::FactDemand { identity, .. }
+        | Command::FactProducerClaim { identity, .. }
+        | Command::FactProducers { identity }
         | Command::HarnessHealthObserveOther { identity, .. }
         | Command::HarnessHealthResolveOther { identity, .. }
         | Command::HarnessHealthReviewOther { identity, .. }
@@ -3645,6 +3868,9 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::ArtifactContentFetch { identity, .. }
         | Command::Artifacts { identity, .. }
         | Command::HarklightSend { identity, .. }
+        | Command::HarklightRevise { identity, .. }
+        | Command::HarklightRetract { identity, .. }
+        | Command::HarklightSettle { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::Retire { identity, .. }
@@ -3687,6 +3913,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemClose { identity, .. }
         | Command::WorkItemFail { identity, .. }
         | Command::Attest { identity, .. }
+        | Command::MementoSet { identity, .. }
+        | Command::Mementos { identity, .. }
         | Command::Attests { identity, .. }
         | Command::AssignmentGet { identity, .. }
         | Command::Assignments { identity, .. }
@@ -3806,6 +4034,99 @@ fn current_session_key_from(cwd: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parent_assignment_is_forwarded_for_both_opening_routes() {
+        for args in [
+            vec![
+                "assign",
+                "--subject",
+                "child",
+                "--session",
+                "worker",
+                "--parent-assignment",
+                "parent-task",
+            ],
+            vec![
+                "dispatch",
+                "--subject",
+                "child",
+                "--to",
+                "worker",
+                "--brief",
+                "do work",
+                "--parent-assignment",
+                "parent-task",
+            ],
+        ] {
+            let encoded: serde_json::Value = serde_json::from_str(&body(&args)).unwrap();
+            assert_eq!(encoded["params"]["parentAssignmentId"], "parent-task");
+        }
+    }
+
+    #[test]
+    fn harklight_lifecycle_wire_fields_and_order() {
+        let commands = [
+            (
+                vec![
+                    "harklight-send",
+                    "--session",
+                    "new",
+                    "--sender-id",
+                    "s",
+                    "--title",
+                    "t",
+                    "--supersedes",
+                    "one",
+                    "--supersedes",
+                    "two",
+                    "--supersedes",
+                    "one",
+                ],
+                "harklight-send",
+            ),
+            (
+                vec![
+                    "harklight-revise",
+                    "--message",
+                    "m",
+                    "--base-revision",
+                    "2",
+                    "--title",
+                    "new",
+                    "--clear-choices",
+                ],
+                "harklight-revise",
+            ),
+            (
+                vec!["harklight-retract", "--message", "m"],
+                "harklight-retract",
+            ),
+            (
+                vec!["harklight-settle", "--message", "m"],
+                "harklight-settle",
+            ),
+        ];
+        for (args, verb) in commands {
+            let command =
+                crate::args::parse(args.into_iter().map(str::to_owned).collect()).unwrap();
+            let request = build_request(&command).unwrap();
+            let body: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+            assert_eq!(body["verb"], verb);
+            if verb == "harklight-send" {
+                assert_eq!(
+                    body["params"]["supersedes"],
+                    serde_json::json!(["one", "two", "one"])
+                );
+            } else {
+                assert_eq!(body["params"]["messageId"], "m");
+            }
+            if verb == "harklight-revise" {
+                assert_eq!(body["params"]["baseRevision"], 2);
+                assert_eq!(body["params"]["clearChoices"], true);
+            }
+        }
+    }
+
     #[test]
     fn builds_agent_decision_bodies() {
         assert_eq!(
@@ -3978,6 +4299,48 @@ mod tests {
                 "params": {"workItemId": "wi_1", "body": "editable body"}
             })
         );
+    }
+
+    #[test]
+    fn process_owned_creates_send_owner_as_data() {
+        for argv in [
+            vec!["work-item-create", "--title", "Task"],
+            vec![
+                "work-item-handoff",
+                "--title",
+                "Task",
+                "--delivery-owner",
+                "agent:holder",
+                "--brief",
+                "Deliver the task",
+            ],
+            vec![
+                "topline-create",
+                "--title",
+                "Objective",
+                "--key",
+                "objective-create",
+            ],
+            vec!["spawn", "--display", "Worker", "--key", "worker-create"],
+            vec!["onboard", "openai"],
+            vec!["assign", "--session", "child", "--subject", "Task"],
+            vec![
+                "dispatch",
+                "--to",
+                "child",
+                "--subject",
+                "Task",
+                "--brief",
+                "Do work",
+            ],
+        ] {
+            let mut argv = argv;
+            argv.extend(["--owner", "flynn", "--as-process", "automation"]);
+            let request: serde_json::Value = serde_json::from_str(&body(&argv)).unwrap();
+            assert_eq!(request["asProcess"], "automation");
+            assert_eq!(request["params"]["ownerUserId"], "flynn");
+            assert!(request.get("asUser").is_none());
+        }
     }
 
     #[test]
@@ -4412,6 +4775,20 @@ mod tests {
         assert_eq!(
             body(&[
                 "wake",
+                "--session",
+                "agent:r",
+                "--assignment",
+                "asg_a",
+                "--prompt",
+                "review is ready",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"wake","sessionKey":"agent:r","params":{"prompt":"review is ready","assignmentId":"asg_a"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "wake",
                 "--user",
                 "mike",
                 "--prompt",
@@ -4604,13 +4981,13 @@ mod tests {
                 "--context",
                 "1m",
                 "--host",
-                "eezo",
+                "lab1",
                 "--key",
                 "k1",
                 "--as-user",
                 "flynn"
             ]),
-            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","effort":"high","context":"1m","handle":"reviewer","host":"eezo"}}"#
+            r#"{"asUser":"flynn","verb":"spawn","params":{"displayName":"Reviewer","idempotencyKey":"k1","archetype":"worker","harness":"codex","model":"gpt","effort":"high","context":"1m","handle":"reviewer","host":"lab1"}}"#
         );
 
         // A flag NAMED but left empty is a real selection — "the vendor's
@@ -4891,6 +5268,20 @@ mod tests {
             r#"{"as":"parent","verb":"cancel","params":{"assignmentId":"asg_1","reason":"replace the stale turn"}}"#
         );
         assert_eq!(
+            body(&["cancel-turn", "--session", "worker s_1"]),
+            r#"{"verb":"cancel","sessionKey":"worker s_1","params":{}}"#
+        );
+        assert_eq!(
+            body(&[
+                "cancel-turn",
+                "--session",
+                "worker s_1",
+                "--as-process",
+                "automation"
+            ]),
+            r#"{"asProcess":"automation","verb":"cancel","sessionKey":"worker s_1","params":{}}"#
+        );
+        assert_eq!(
             body(&[
                 "cancel-turn",
                 "--session",
@@ -4916,7 +5307,7 @@ mod tests {
                 "assignment-commitref-correct",
                 "asg_1",
                 "--commit-refs",
-                r#"[{"repo":"gibson:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                r#"[{"repo":"node-a:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
                 "--evidence",
                 "art_1",
                 "--reason",
@@ -4926,7 +5317,7 @@ mod tests {
                 "--as",
                 "parent",
             ]),
-            r#"{"as":"parent","verb":"assignment-commitref-correct","params":{"assignmentId":"asg_1","commitRefs":[{"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"refs/heads/main","remote":"git@example/repo","repo":"gibson:/repo"}],"reason":"canonical historical backfill","evidenceArtifactId":"art_1","idempotencyKey":"backfill-1"}}"#
+            r#"{"as":"parent","verb":"assignment-commitref-correct","params":{"assignmentId":"asg_1","commitRefs":[{"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"refs/heads/main","remote":"git@example/repo","repo":"node-a:/repo"}],"reason":"canonical historical backfill","evidenceArtifactId":"art_1","idempotencyKey":"backfill-1"}}"#
         );
         assert_eq!(
             body(&[
@@ -5019,11 +5410,11 @@ mod tests {
                 "--kind",
                 "completion",
                 "--commit-refs",
-                r#"[{"repo":"eezo:/src/repo","commit":"abc123"}]"#,
+                r#"[{"repo":"lab1:/src/repo","commit":"abc123"}]"#,
                 "--as",
                 "builder",
             ]),
-            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","commitRefs":[{"commit":"abc123","repo":"eezo:/src/repo"}]}}"#
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","commitRefs":[{"commit":"abc123","repo":"lab1:/src/repo"}]}}"#
         );
     }
 
@@ -5453,39 +5844,39 @@ mod tests {
             body(&[
                 "host-env-set",
                 "--host",
-                "gibson",
+                "node-a",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR=example",
                 "--as",
                 "operator",
             ]),
-            r#"{"as":"operator","verb":"host-env-set","params":{"host":"gibson","harness":"claude","name":"EXAMPLE_OVERLAY_VAR","value":"example"}}"#
+            r#"{"as":"operator","verb":"host-env-set","params":{"host":"node-a","harness":"claude","name":"EXAMPLE_OVERLAY_VAR","value":"example"}}"#
         );
         assert_eq!(
             body(&[
                 "host-env-list",
                 "--host",
-                "gibson",
+                "node-a",
                 "--harness",
                 "claude",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"host-env-list","params":{"host":"gibson","harness":"claude"}}"#
+            r#"{"asUser":"flynn","verb":"host-env-list","params":{"host":"node-a","harness":"claude"}}"#
         );
         assert_eq!(
             body(&[
                 "host-env-unset",
                 "--host",
-                "gibson",
+                "node-a",
                 "--harness",
                 "claude",
                 "EXAMPLE_OVERLAY_VAR",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"host-env-unset","params":{"host":"gibson","harness":"claude","name":"EXAMPLE_OVERLAY_VAR"}}"#
+            r#"{"asUser":"flynn","verb":"host-env-unset","params":{"host":"node-a","harness":"claude","name":"EXAMPLE_OVERLAY_VAR"}}"#
         );
     }
 
@@ -5555,13 +5946,13 @@ mod tests {
             body(&[
                 "host-toolchain-set",
                 "--host",
-                "gibson",
+                "node-a",
                 "--dirs",
                 r#"["/tools/one","/tools/two"]"#,
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"host-toolchain-set","params":{"host":"gibson","dirs":["/tools/one","/tools/two"]}}"#
+            r#"{"asUser":"flynn","verb":"host-toolchain-set","params":{"host":"node-a","dirs":["/tools/one","/tools/two"]}}"#
         );
     }
 
@@ -5803,7 +6194,7 @@ mod tests {
             })
         );
 
-        // The shrdlu failure, as a test: with TIGHTBEAM_BASE_DIR naming the org --
+        // The production failure, as a test: with TIGHTBEAM_BASE_DIR naming the org --
         // the variable the README documents and both service units set -- discovery
         // must read THAT gateway.json. It read ~/.tightbeam's instead, so `tightbeam
         // onboard` dialled a pre-existing org's port while its own gateway served
@@ -5890,7 +6281,7 @@ mod tests {
 
     // RECORDED REALITY, not a chosen fixture: `Placement.provision_endpoint` writes
     // TIGHTBEAM_ADVERTISED_URL verbatim, and that value is the WEBSOCKET url -- in
-    // production, `ws://shrdlu:11373`. This base is the root of an HTTP path
+    // production, `ws://gateway.example:11373`. This base is the root of an HTTP path
     // (`/agent/dispatch`), and the http client rejects the scheme outright with
     // "Unknown Scheme: unknown scheme 'ws'", so every satellite ceremony died on the
     // one url a real gateway ever writes. The sibling fixtures above hardcode
@@ -6033,11 +6424,11 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("tightbeam_cli_session_ws_{unique}"));
         let cases = [
-            ("ws", "ws://gibson:11373", "http://gibson:11373"),
-            ("wss", "wss://gibson:11373", "https://gibson:11373"),
+            ("ws", "ws://node-a:11373", "http://node-a:11373"),
+            ("wss", "wss://node-a:11373", "https://node-a:11373"),
             // http and https are already the dispatch scheme and pass through whole.
-            ("http", "http://gibson:11373", "http://gibson:11373"),
-            ("https", "https://gibson:11373", "https://gibson:11373"),
+            ("http", "http://node-a:11373", "http://node-a:11373"),
+            ("https", "https://node-a:11373", "https://node-a:11373"),
         ];
         for (name, written, expected) in cases {
             let dir = root.join(name);
@@ -6149,6 +6540,7 @@ mod tests {
         let result = run_with(
             Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
+                owner_user_id: Some("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
                 daemon_credential: false,
@@ -6166,6 +6558,8 @@ mod tests {
                 })
             },
             |endpoint, request, deadline| {
+                let body: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+                assert_eq!(body["params"]["ownerUserId"], "flynn");
                 let phase = if request.body_json.contains(r#""phase":"begin""#) {
                     "begin"
                 } else if request.body_json.contains(r#""phase":"finish""#) {
@@ -6261,6 +6655,7 @@ mod tests {
         let result = run_with(
             Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
+                owner_user_id: None,
                 provider: "openai".to_owned(),
                 api_key: false,
                 daemon_credential: false,
@@ -6605,7 +7000,7 @@ mod tests {
         let body = serde_json::json!({
             "error": {
                 "code": "adapter_unavailable",
-                "message": "adapter for codex/luna on host racter is degraded",
+                "message": "adapter for codex/luna on host node-b is degraded",
                 "requestId": "req_9",
                 "diagnostic": {
                     "kind": "circuit_open",
@@ -6622,7 +7017,7 @@ mod tests {
 
         assert_eq!(
             human,
-            "adapter_unavailable: adapter for codex/luna on host racter is degraded (req_9)"
+            "adapter_unavailable: adapter for codex/luna on host node-b is degraded (req_9)"
         );
         assert_eq!(machine["httpStatus"], 503);
         assert_eq!(machine["ok"], false);
@@ -7574,6 +7969,14 @@ mod session_diagnose_tests {
             serde_json::from_str::<Value>(&request.body_json).unwrap(),
             serde_json::json!({"asUser":"mike", "sessionKey":"seat"})
         );
+        for (flag, field) in [("--as", "as"), ("--as-process", "asProcess")] {
+            let parsed =
+                command(&["session-diagnose", "--session", "seat", flag, "automation"]).unwrap();
+            let request = build_request(&parsed).unwrap();
+            let body: Value = serde_json::from_str(&request.body_json).unwrap();
+            assert_eq!(body[field], "automation");
+            assert_eq!(body["sessionKey"], "seat");
+        }
         let bare = command(&["session-diagnose", "--session", "seat"]).unwrap();
         let bare_request = build_request(&bare).unwrap();
         assert_eq!(bare_request.path, "/agent/session-diagnose");
@@ -7582,7 +7985,6 @@ mod session_diagnose_tests {
             serde_json::json!({"sessionKey":"seat"})
         );
         for args in [
-            vec!["session-diagnose", "--session", "seat", "--as", "po"],
             vec!["session-diagnose", "--as-user", "mike"],
             vec![
                 "session-diagnose",

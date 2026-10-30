@@ -365,7 +365,7 @@ defmodule Tightbeam.Credentials do
         _ -> ""
       end
 
-    "tightbeam onboard #{provider_cli_name(provider)}#{required} --as-user <userId>"
+    "tightbeam onboard #{provider_cli_name(provider)}#{required}"
   end
 
   # Each answer names the FIELD, not just "invalid": the operator reading this has a file in

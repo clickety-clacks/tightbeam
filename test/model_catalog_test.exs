@@ -452,7 +452,7 @@ defmodule Tightbeam.ModelCatalogTest do
              Tightbeam.TerminalCredentialFailure.get_open(ctx.db, @host, "pi")
 
     assert Tightbeam.TerminalCredentialFailure.statement(ctx.db, incident_id) =~
-             "tightbeam onboard opencode-go --api-key --as-user <adminUserId>"
+             "tightbeam onboard opencode-go --api-key"
   end
 
   test "Pi terminal 401 records the failed named local provider key", ctx do
@@ -511,7 +511,7 @@ defmodule Tightbeam.ModelCatalogTest do
              Tightbeam.TerminalCredentialFailure.get_open(ctx.db, @host, "pi")
 
     assert Tightbeam.TerminalCredentialFailure.statement(ctx.db, incident_id) =~
-             "tightbeam onboard local-openai --endpoint <endpoint-url> --name spark --as-user <adminUserId>"
+             "tightbeam onboard local-openai --endpoint <endpoint-url> --name spark"
 
     assert :counters.get(attempts, 1) == 1
 
@@ -1293,6 +1293,68 @@ defmodule Tightbeam.ModelCatalogTest do
     assert log =~ "refresh degraded: #{inspect(reason)}"
   end
 
+  test "an unconfigured optional catalog stays quiet while a configured failure still warns",
+       ctx do
+    missing = {:needs_onboarding, :missing}
+    quiet_catalog = unique_name(:optional_harness_missing)
+    {:ok, credential_checks} = Agent.start_link(fn -> 0 end)
+
+    quiet_log =
+      capture_log(fn ->
+        start_catalog(ctx,
+          name: quiet_catalog,
+          credential_status: fn
+            provider, _host when provider in [:opencode_go, :local_openai] ->
+              Agent.update(credential_checks, &(&1 + 1))
+              missing
+
+            _provider, _host ->
+              :onboarded
+          end
+        )
+
+        expected = {[], {:unavailable, missing}}
+        await(fn -> ModelCatalog.get(@host, "pi", quiet_catalog) == expected end)
+        assert ModelCatalog.get(@host, "pi", quiet_catalog) == expected
+
+        first_check_count = Agent.get(credential_checks, & &1)
+        assert first_check_count >= 2
+        assert ModelCatalog.get(@host, "pi", quiet_catalog) == expected
+
+        await(fn -> Agent.get(credential_checks, & &1) >= first_check_count + 2 end)
+
+        await(fn ->
+          state = :sys.get_state(quiet_catalog)
+          cache = state.entries[{@host, "pi"}]
+          not cache.refreshing and state.background == nil and :queue.is_empty(state.pending)
+        end)
+      end)
+
+    refute quiet_log =~ "model catalog pi on #{@host} refresh degraded"
+
+    failure_catalog = unique_name(:configured_harness_failure)
+
+    failure_log =
+      capture_log(fn ->
+        start_catalog(ctx,
+          name: failure_catalog,
+          credential_status: fn
+            provider when provider in [:opencode_go, :local_openai] -> missing
+            _provider -> :onboarded
+          end,
+          claude_fetch: fn _path, _headers -> {:error, :network_down} end
+        )
+
+        await(fn ->
+          ModelCatalog.get(@host, "claude", failure_catalog) ==
+            {[], {:unavailable, :network_down}}
+        end)
+      end)
+
+    assert failure_log =~
+             "model catalog claude on #{@host} refresh degraded: :network_down"
+  end
+
   test "failed fetch, malformed JSON, and a refused grant degrade without crashing readers",
        ctx do
     for {label, opts, harness, reason} <- [
@@ -1726,7 +1788,7 @@ defmodule Tightbeam.ModelCatalogTest do
 
       message = Unroutable.message(unroutable)
       assert message =~ "anthropic has no usable credential on testhost"
-      assert message =~ "run tightbeam onboard anthropic --as-user <userId> on testhost"
+      assert message =~ "run tightbeam onboard anthropic on testhost"
       assert Unroutable.code(unroutable) == "catalog_unavailable"
 
       # It is not a verdict on the model: nothing here can see whether the host
@@ -2792,7 +2854,7 @@ defmodule Tightbeam.ModelCatalogTest do
       assert_receive {:fetch_started, 2}, 60_000
     end
 
-    # The eezo production repro (orchestrator, 2026-08-06): a CLEAN one-shot
+    # A production reproduction showed a clean one-shot
     # ceremony, yet placement refused with `:in_progress` MINUTES after `status`
     # read onboarded. `credential_status/2` returns `:in_progress` only while the
     # onboarding lease stands (credentials.ex), and `finish_onboard` clears the

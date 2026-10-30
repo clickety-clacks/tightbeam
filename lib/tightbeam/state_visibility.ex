@@ -61,6 +61,15 @@ defmodule Tightbeam.StateVisibility do
     topline_visible?(db, notice, user_id, is_admin)
   end
 
+  def visible?(db, %{"class" => class, "refs" => refs, "payload" => payload}, user_id, is_admin)
+      when class in ["transition.recorded", "tool_call.started", "tool_call.ended"] do
+    session_key = refs["sessionKey"] || payload["sessionKey"]
+
+    is_admin or
+      (is_binary(session_key) and
+         session_owner?(db, session_key, %{kind: "user", id: user_id}))
+  end
+
   def visible?(db, %{"class" => "subagent_marker.appended"} = notice, user_id, is_admin) do
     subagent_marker_visible?(db, notice, user_id, is_admin)
   end
@@ -236,8 +245,6 @@ defmodule Tightbeam.StateVisibility do
     do: value(row, :user_id) == user_id
 
   defp do_core_detail_visible?(_db, "read markers", _row, _principal), do: false
-
-  defp do_core_detail_visible?(_db, "sessions", _row, %{kind: "observer"}), do: true
 
   defp do_core_detail_visible?(_db, "sessions", row, principal) do
     owner_user_id = value(row, :owner_user_id)

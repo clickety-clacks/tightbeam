@@ -74,6 +74,29 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     assert entry.verifiedAt == correction.verifiedAt
   end
 
+  test "schema upgrade makes verification time nullable without changing prior corrections",
+       ctx do
+    assert %{correction: correction} = correct(ctx, {:session, "po-owner"})
+    assert is_integer(correction.verifiedAt)
+
+    recreate_legacy_correction_table!(ctx.db)
+
+    assert {:ok, columns} =
+             DB.query(ctx.db, "PRAGMA table_info(assignment_commit_ref_corrections)")
+
+    assert [_cid, "verifiedAt", "INTEGER", 1, nil, 0] =
+             Enum.find(columns, &(&1 |> Enum.at(1) == "verifiedAt"))
+
+    assert :ok = AssignmentCommitRefCorrections.ensure_schema(ctx.db)
+    assert [^correction] = AssignmentCommitRefCorrections.list(ctx.db, "asg_closed")
+
+    assert {:ok, columns} =
+             DB.query(ctx.db, "PRAGMA table_info(assignment_commit_ref_corrections)")
+
+    assert [_cid, "verifiedAt", "INTEGER", 0, nil, 0] =
+             Enum.find(columns, &(&1 |> Enum.at(1) == "verifiedAt"))
+  end
+
   test "only the accountability owner or matching product owner is authorized", ctx do
     assert %{correction: %{actorKind: "user", actorRef: "owner"}} =
              correct(ctx, {:user, "owner"})
@@ -192,18 +215,38 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     refute_received {:git_ran, _, _, _}
   end
 
-  test "canonical remote, ref, and commit proof is mandatory", ctx do
-    bad_remote = with_param(ctx, :commit_refs, [Map.put(ref(ctx), "remote", "missing")])
-    assert %{code: "unverifiable_commit_ref"} = correct(bad_remote, {:session, "po-owner"})
+  test "unreadable canonical refs are recorded with a warning and no verification time", ctx do
+    bad_refs = [
+      {"asg_bad_remote", Map.put(ref(ctx), "remote", "missing")},
+      {"asg_bad_ref", Map.put(ref(ctx), "ref", "refs/heads/missing")},
+      {"asg_bad_commit", Map.put(ref(ctx), "commit", String.duplicate("f", 40))}
+    ]
 
-    bad_ref = with_param(ctx, :commit_refs, [Map.put(ref(ctx), "ref", "refs/heads/missing")])
-    assert %{code: "unverifiable_commit_ref"} = correct(bad_ref, {:session, "po-owner"})
+    for {assignment_id, requested_ref} <- bad_refs do
+      insert_closed_assignment!(ctx.db, assignment_id)
 
-    bad_commit =
-      with_param(ctx, :commit_refs, [Map.put(ref(ctx), "commit", String.duplicate("f", 40))])
+      correction_call =
+        ctx
+        |> with_param(:assignment_id, assignment_id)
+        |> with_param(:commit_refs, [requested_ref])
+        |> with_param(:idempotency_key, "history-#{assignment_id}")
 
-    assert %{code: "unverifiable_commit_ref"} = correct(bad_commit, {:session, "po-owner"})
-    assert AssignmentCommitRefCorrections.list(ctx.db, "asg_closed") == []
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert %{warning: warning, correction: correction} =
+                   correct(correction_call, {:session, "po-owner"})
+
+          assert warning =~ "without successful canonical Git verification"
+          assert correction.assignmentId == assignment_id
+          assert is_nil(correction.verifiedAt)
+          assert correction.commitRefs == [requested_ref]
+        end)
+
+      assert log =~ "commit_ref_correction_unverified assignmentId=#{assignment_id}"
+
+      assert [%{verifiedAt: nil, commitRefs: [^requested_ref]}] =
+               AssignmentCommitRefCorrections.list(ctx.db, assignment_id)
+    end
   end
 
   test "same request replays, changed replay conflicts, and a second correction is denied", ctx do
@@ -264,8 +307,10 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     )
   end
 
-  test "process principals and malformed requests cannot enter the correction ledger", ctx do
-    assert %{code: "process_denied"} = correct(ctx, {:process, "tightbeam"})
+  test "process corrections retain their actor and malformed requests cannot enter the ledger",
+       ctx do
+    assert %{correction: %{actorKind: "process", actorRef: "automation"}} =
+             correct(ctx, {:process, "automation"})
 
     for {field, value, code} <- [
           {:idempotency_key, "", "invalid_idempotency_key"},
@@ -297,6 +342,94 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
       reason: "canonical historical backfill",
       idempotency_key: "history-1"
     })
+  end
+
+  defp insert_closed_assignment!(db, assignment_id) do
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        revocation_id = "history-revocation-#{assignment_id}"
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          """
+          INSERT INTO assignments
+            (id, subject, holderKey, openedBySession, openedAt, state, outcome,
+             closedAt, closedBySession, workItemId)
+          VALUES (?1, 'unverified correction', 'holder-owner', 'po-owner', 2,
+                  'open', NULL, NULL, NULL, 'wi_history')
+          """,
+          [assignment_id]
+        )
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          """
+          INSERT INTO assignment_revocations
+            (id, assignmentId, revokedAt, revokedBySession, reason)
+          VALUES (?1, ?2, 3, 'po-owner', 'historical correction fixture')
+          """,
+          [revocation_id, assignment_id]
+        )
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          """
+          INSERT INTO assignment_revocation_generations
+            (revocationId, assignmentId, reopeningId)
+          VALUES (?1, ?2, NULL)
+          """,
+          [revocation_id, assignment_id]
+        )
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          """
+          UPDATE assignments
+          SET state='closed', outcome='revoked', closedAt=3, closedBySession='po-owner'
+          WHERE id=?1
+          """,
+          [assignment_id]
+        )
+
+        if Tightbeam.DB.Txn.changes(txn) != 1, do: raise("fixture assignment missing")
+        :ok
+      end)
+  end
+
+  defp recreate_legacy_correction_table!(db) do
+    :ok = DB.execute(db, "DROP INDEX IF EXISTS assignment_commit_ref_corrections_assignment")
+
+    :ok =
+      DB.execute(
+        db,
+        "ALTER TABLE assignment_commit_ref_corrections RENAME TO correction_before_nullable_test"
+      )
+
+    :ok =
+      DB.execute(db, """
+      CREATE TABLE assignment_commit_ref_corrections (
+        id                 TEXT PRIMARY KEY,
+        assignmentId       TEXT NOT NULL UNIQUE REFERENCES assignments(id),
+        commitRefs         TEXT NOT NULL CHECK (json_valid(commitRefs) AND json_type(commitRefs) = 'array'),
+        reason             TEXT NOT NULL CHECK (length(trim(reason)) BETWEEN 1 AND 4000),
+        evidenceArtifactId TEXT NOT NULL REFERENCES artifacts(artifactId),
+        actorKind          TEXT NOT NULL CHECK (actorKind IN ('user','session')),
+        actorRef           TEXT NOT NULL,
+        cause              TEXT NOT NULL CHECK (cause = 'historical_canonical_commitref_correction'),
+        idempotencyKey     TEXT NOT NULL CHECK (length(trim(idempotencyKey)) BETWEEN 1 AND 200),
+        requestFingerprint TEXT NOT NULL CHECK (length(requestFingerprint) = 64),
+        verifiedAt         INTEGER NOT NULL,
+        createdAt          INTEGER NOT NULL,
+        UNIQUE (actorKind, actorRef, idempotencyKey)
+      );
+
+      INSERT INTO assignment_commit_ref_corrections
+      SELECT * FROM correction_before_nullable_test;
+
+      DROP TABLE correction_before_nullable_test;
+      CREATE INDEX assignment_commit_ref_corrections_assignment
+        ON assignment_commit_ref_corrections (assignmentId, createdAt, id);
+      """)
   end
 
   defp ref(ctx) do

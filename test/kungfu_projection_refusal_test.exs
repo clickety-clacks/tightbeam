@@ -345,7 +345,7 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     refute_received {:firehose_notice, _}
   end
 
-  test "matched frames arrive without a per-frame delivery acknowledgement", %{hub: hub} do
+  test "matching frames arrive without a per-frame delivery acknowledgement", %{hub: hub} do
     :ok = register(hub)
     Hub.publish(hub, notice())
     Hub.publish(hub, notice())
@@ -467,11 +467,6 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     assert :ok = ChangeSocket.terminate(:normal, live)
   end
 
-  @tag skip:
-         if(:os.type() in [{:unix, :linux}, {:unix, :darwin}],
-           do: "known 0.1.12 baseline failure",
-           else: false
-         )
   test "ChangeSocket authenticates synthetic devices and validates subscription state", %{
     db: db,
     hub: hub
@@ -491,22 +486,31 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
       ChangeSocket.handle_in({JSON.encode!(message), opcode: :text}, state)
     end
 
-    for {id, token, reason} <- [
-          {"missing", "invalid", "auth_failed"},
-          {"synthetic-pending", "invalid", "device_not_approved"}
-        ] do
+    request = %{
+      "type" => "subscribe",
+      "subscriptionId" => "one",
+      "filters" => %{"classes" => ["kungfu."]}
+    }
+
+    for id <- ["missing", "synthetic-pending"] do
       assert {:ok, pending} = ChangeSocket.init(deps)
 
-      assert {:stop, :normal, 1008, {:text, bytes}, ^pending} =
-               send_frame.(pending, %{"type" => "auth", "deviceId" => id, "token" => token})
+      assert {:ok, observer} =
+               send_frame.(pending, %{"type" => "auth", "deviceId" => id, "token" => "invalid"})
 
-      assert JSON.decode!(bytes) == %{
-               "type" => "auth_result",
-               "success" => false,
-               "reason" => reason
-             }
+      assert observer.phase == :live
+      assert observer.principal_kind == :observer
 
-      assert :ok = ChangeSocket.terminate(:normal, pending)
+      assert {:ok, subscribed} = send_frame.(observer, request)
+      assert_receive {:firehose_control, ready_frame}
+
+      assert {:push, {:text, ready}, ^subscribed} =
+               ChangeSocket.handle_info({:firehose_control, ready_frame}, subscribed)
+
+      :ok = Hub.delivered(hub, self())
+      assert JSON.decode!(ready) == %{"type" => "subscription_ready", "subscriptionId" => "one"}
+
+      assert :ok = ChangeSocket.terminate(:normal, subscribed)
     end
 
     assert {:ok, pending} = ChangeSocket.init(deps)
@@ -522,12 +526,6 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
            }
 
     assert live.phase == :live
-
-    request = %{
-      "type" => "subscribe",
-      "subscriptionId" => "one",
-      "filters" => %{"classes" => ["kungfu."]}
-    }
 
     assert {:ok, subscribed} = send_frame.(live, request)
     assert_receive {:firehose_control, ready_frame}
@@ -559,15 +557,25 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     assert :ok = Devices.revoke(db, admin.device_id)
     assert {:ok, pending} = ChangeSocket.init(deps)
 
-    assert {:stop, :normal, 1008, {:text, revoked}, ^pending} =
+    assert {:ok, observer} =
              send_frame.(pending, %{
                "type" => "auth",
                "deviceId" => admin.device_id,
                "token" => admin.token
              })
 
-    assert JSON.decode!(revoked)["reason"] == "token_revoked"
-    assert :ok = ChangeSocket.terminate(:normal, pending)
+    assert observer.phase == :live
+    assert observer.principal_kind == :observer
+
+    assert {:ok, subscribed} = send_frame.(observer, request)
+    assert_receive {:firehose_control, ready_frame}
+
+    assert {:push, {:text, ready}, ^subscribed} =
+             ChangeSocket.handle_info({:firehose_control, ready_frame}, subscribed)
+
+    :ok = Hub.delivered(hub, self())
+    assert JSON.decode!(ready) == %{"type" => "subscription_ready", "subscriptionId" => "one"}
+    assert :ok = ChangeSocket.terminate(:normal, subscribed)
   end
 
   test "final ChangeSocket preserves valid bytes and rejects malformed or unauthenticated frames",
@@ -612,31 +620,15 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
            }
   end
 
-  test "queue overflow and owned process cleanup remain bounded", %{hub: hub} do
-    small = start_supervised!({Hub, name: nil}, id: :small)
-    backlog_counter = :atomics.new(1, signed: false)
-    :ok = register(small, %{backlog_counter: backlog_counter})
-
-    under_limit =
-      Publisher.committed_notice(
-        "kungfu.updated",
-        Map.put(item(), "purpose", String.duplicate("x", 63 * 1_024 * 1_024)),
-        %{}
-      )
-
-    over_limit =
-      Publisher.committed_notice(
-        "kungfu.updated",
-        Map.put(item(), "purpose", String.duplicate("y", 2 * 1_024 * 1_024)),
-        %{}
-      )
-
-    Hub.publish(small, under_limit)
-    Hub.publish(small, over_limit)
-    assert %{queued: 2, overflowed: true} = Hub.connection_stats(small, self())
+  test "direct fanout and owned process cleanup do not need a queue limit", %{hub: hub} do
+    direct = start_supervised!({Hub, name: nil}, id: :direct)
+    :ok = register(direct)
+    Hub.publish(direct, notice())
+    Hub.publish(direct, notice())
     assert_receive {:firehose_notice, frame}
-    assert frame == under_limit
-    assert_receive :firehose_overflow
+    assert frame == notice()
+    assert_receive {:firehose_notice, frame}
+    assert frame == notice()
 
     pid =
       spawn(fn ->

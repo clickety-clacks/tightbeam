@@ -178,24 +178,21 @@ new yes before acting; read-only inventory can proceed while waiting.
 
 ## 0.1.8 to 0.1.9 database rehearsal
 
-The canonical standalone E2E migration procedure is
-[docs/e2e/0.1.9/migration.md](e2e/0.1.9/migration.md). It starts from a
-verified copy of a real 0.1.8 database, lets the verified 0.1.9 gateway migrate
-that copy once, and preserves the migrated result for separately runnable
-feature checks. The aggregate order and feature-area runbooks are in
-[docs/e2e/0.1.9/README.md](e2e/0.1.9/README.md). Do not use this rehearsal as
-permission to point a command at a live base.
+To rehearse this upgrade, start from a verified backup of the 0.1.8 database.
+Place a copy in a scratch base separate from every live base. Start the verified
+0.1.9 gateway once against that copy so it performs the migration, then run
+`PRAGMA quick_check` on the migrated copy. Never point a rehearsal command at a
+live base.
 
 For source-lineage context, canonical tag `v0.1.8+1343` (build 1343,
-`b2add64414b41606a713ed284abf01a0b4d125e6`, the release Gibson runs) writes
+`b2add64414b41606a713ed284abf01a0b4d125e6`, the reference production release) writes
 `operator-decision-requests-v1`, which current 0.1.9 names as a predecessor.
 This is a verified reference lineage, not presumed provenance for a later real
 0.1.8 database. The actual snapshot's manifest must establish its source tag,
 build, package provenance, commit, and stored stamp. If the actual build or
-stamp differs from this reference, stop for delivery's source-backed lineage
-adjudication; a different stamp does not automatically reject every 0.1.8
-release. See the [0.1.9 migration runbook](e2e/0.1.9/migration.md) for source
-qualification. The `pi-harness-v1` stamp below is the historical terminal
+stamp differs from this reference, stop and confirm which release produced the
+database before upgrading; a different stamp does not automatically reject
+every 0.1.8 release. The `pi-harness-v1` stamp below is the historical terminal
 stamp of the 0.1.8 package's own migration chain. It is not an accepted 0.1.9
 source stamp, and this document does not claim that current 0.1.9 migrates it.
 
@@ -622,7 +619,7 @@ isolated test gateway.
    `PRAGMA quick_check = ok`; no foreign key failures; all new columns and
    indexes; and no migration temporary table.
 
-Do not run the TARS or Shrdlu cold-install custody matrix again. This is the
+Do not repeat the earlier cold-install custody matrix. This is the
 upgrade-preservation check that matrix did not cover.
 
 ## Release upgrade sequence
@@ -640,6 +637,13 @@ starts the currently selected complete build.
 `Application.prep_stop/1` sets a `draining` flag and then waits, polling every
 250ms, for turns in `status = 'running'` to clear. Budget is
 `:drain_timeout_ms`, **default 90s**.
+
+Keep the service manager's stop limit longer than the effective drain budget.
+The README examples use 120 seconds (`TimeoutStopSec=120s` for systemd and
+`ExitTimeOut=120` for launchd). If `TIGHTBEAM_DRAIN_TIMEOUT_MS` overrides the
+default, convert its millisecond value to seconds and set the service manager's
+limit higher; a shorter limit can force-kill the gateway before its drain
+finishes.
 
 While draining, `SessionLane` claims nothing new (`session_lane.ex:161`), so the
 drain is not chasing a moving target — the set of running turns only shrinks.

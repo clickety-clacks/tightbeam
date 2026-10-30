@@ -15,7 +15,7 @@ defmodule Tightbeam.BaseDir do
   booted against the requested directory with no identity repo in it — and if
   `~/.tightbeam` already held an unrelated org, init no-op'd against it and
   printed "already initialized", which reads as confirmation that the new
-  install is ready when nothing was done. Found on shrdlu, 2026-07-27, by the
+  install is ready when nothing was done. Found on 2026-07-27 during the
   production-install smoke, where it silently targeted a live unrelated org.
 
   Precedence, matching what the README documents and what `catalog_diff`

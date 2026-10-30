@@ -519,7 +519,7 @@ defmodule Tightbeam.DispatchTest do
       identity_manifest_sha: "identity-sha"
     }
 
-    :persistent_term.put(Rules, [rule, rule])
+    snapshot = %{Rules.effective_snapshot() | rules: [rule, rule], revision: "identity-sha"}
     action_key = Escalation.digest(call)
 
     {:ok, _} =
@@ -545,7 +545,10 @@ defmodule Tightbeam.DispatchTest do
               ref: "a-cas",
               producer: nil,
               identity_manifest_sha: "identity-sha"
-            }} = Dispatch.dispatch(db, %{"post" => fn _ -> flunk("CAS loss must deny") end}, call)
+            }} =
+             Rules.with_snapshot(snapshot, fn ->
+               Dispatch.dispatch(db, %{"post" => fn _ -> flunk("CAS loss must deny") end}, call)
+             end)
 
     assert [
              %{

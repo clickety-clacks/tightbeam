@@ -25,6 +25,9 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
      ["artifactId"], :artifact},
     {~w(read_marker.updated), "read-markers", "upsert", ["userId", "scopeKey"], :read_marker},
     {~w(message.created), "messages", "upsert", ["messageId", "sessionKey"], :message},
+    {~w(transition.recorded), "messages", "upsert", ["messageId", "sessionKey"], :message},
+    {~w(tool_call.started tool_call.ended), "tool calls", "upsert", ["toolCallId", "sessionKey"],
+     :tool_call},
     {~w(condition_fact.filed), "condition-facts", "upsert", ["factId"], :condition_fact},
     {~w(critical_lease.updated), "critical-state", "upsert", ["sessionKey"], :critical_state},
     {~w(config.updated), "config", "upsert", ["key"], :config},
@@ -467,9 +470,9 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     end)
   end
 
-  # StateVisibility remains a REST rebuild concern; Firehose delivery is
-  # narrowed by the subscriber's class and reference filters.
-  test "A3 every matching row emits for each subscribed credential", ctx do
+  # The filter is the Firehose visibility boundary; StateVisibility remains
+  # available to read APIs but does not gate each delivered frame.
+  test "A3 matching subscriptions receive events regardless of read visibility", ctx do
     %{valid: notices, unresolved_marker: unresolved_marker} = visibility_notices(ctx)
 
     Enum.each(notices, fn notice ->
@@ -534,6 +537,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
                        {Hub, :matches?, [^notice, %{"classes" => ^classes}]}}
 
       assert_received {:firehose_notice, %{"class" => ^class, "type" => "change"}}
+      Hub.delivered(ctx.hub, self())
       _sequence = Hub.sequence(ctx.hub, self())
       :ok = Hub.unsubscribe(ctx.hub, self(), class)
     end)

@@ -49,8 +49,8 @@ defmodule Tightbeam.Wire.ChangeSocket do
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{hub_monitor: ref} = state),
     do: {:stop, :normal, 1012, state}
 
-  def handle_info({:firehose_notice, notice}, %{phase: :live} = state) do
-    state = release_backlog_bytes(state, {:firehose_notice, notice})
+  def handle_info({:firehose_notice, notice} = message, %{phase: :live} = state) do
+    state = release_backlog_bytes(state, message)
     await_delivery_release(state, notice)
 
     try do
@@ -139,8 +139,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
             mode: :filtered,
             user_id: session.owner_user_id,
             principal_kind: :session,
-            principal_id: session.session_key,
-            is_admin: false
+            principal_id: session.session_key
           })
 
         state = %{
@@ -171,8 +170,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
             user_id: device.user_id,
             device_id: device.device_id,
             principal_kind: :user,
-            principal_id: device.user_id,
-            is_admin: device.is_admin
+            principal_id: device.user_id
           })
 
         state = %{
@@ -216,8 +214,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
           mode: :filtered,
           user_id: user.user_id,
           principal_kind: :user,
-          principal_id: user.user_id,
-          is_admin: user.is_admin
+          principal_id: user.user_id
         })
 
       state = %{
@@ -367,10 +364,8 @@ defmodule Tightbeam.Wire.ChangeSocket do
     :ok =
       Hub.register(hub(state), self(), %{
         mode: :filtered,
-        db: db(state),
         principal_kind: :observer,
-        principal_id: "observer",
-        is_admin: false
+        principal_id: "observer"
       })
 
     %{state | phase: :live, principal_kind: :observer, principal_id: "observer", is_admin: false}

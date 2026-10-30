@@ -55,6 +55,9 @@ defmodule Tightbeam.Harness.Codex do
   def id, do: :codex
 
   @impl true
+  def records_tool_calls?, do: true
+
+  @impl true
   def wire_name, do: "codex"
 
   @impl true

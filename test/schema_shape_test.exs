@@ -23,7 +23,7 @@ defmodule Tightbeam.SchemaShapeTest do
     Wakes
   }
 
-  @shape "launch-preparation-boot-v1-0110"
+  @shape "closed-assignment-cannot-proceed-reconciliation-v1-015"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
   @owner_link_history_ddl """
   CREATE TABLE work_item_delivery_scope_events (
@@ -1329,6 +1329,41 @@ defmodule Tightbeam.SchemaShapeTest do
     Tightbeam.SchemaShapeRuntimeFixture.run!("operator", %{})
   end
 
+  test "process event index and identity stamp commit together and preserve legacy events", %{
+    db: db
+  } do
+    :ok = Schema.ensure_all(db)
+    rewind_to_agent_reparent!(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO events(ts,kind,verb,origin,principal,payload)
+      VALUES(1,'verb','wake','process:external','process:external','legacy payload');
+      CREATE TRIGGER reject_identity_stamp BEFORE UPDATE ON schema_stamp
+      WHEN NEW.shape='session-identity-v1-0114'
+      BEGIN SELECT RAISE(ABORT,'test stamp interruption'); END;
+      """)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "session identity migration rolled back"
+
+    assert {:ok, []} =
+             DB.query(db, "SELECT name FROM sqlite_master WHERE name='events_process_assignment'")
+
+    assert {:ok, [["legacy payload"]]} =
+             DB.query(db, "SELECT payload FROM events WHERE origin='process:external'")
+
+    :ok = DB.execute(db, "DROP TRIGGER reject_identity_stamp")
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["events_process_assignment"]]} =
+             DB.query(db, "SELECT name FROM sqlite_master WHERE name='events_process_assignment'")
+
+    assert {:ok, [["legacy payload"]]} =
+             DB.query(db, "SELECT payload FROM events WHERE origin='process:external'")
+  end
+
   test "a failed exact migration rolls back the rename and stamp", %{db: db} do
     :ok = Schema.ensure_all(db)
     downgrade_decision_requests_to_model_identity(db)
@@ -1554,6 +1589,71 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert :ok = Schema.ensure_all(db)
     assert "supervision_lineage_fire_requires_sidecar" in owned_activation_objects(db)
+  end
+
+  test "the preceding continuation guard upgrades without promoting an old reminder", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO users(userId,isAdmin,createdAt) VALUES('dated-owner',1,1);
+             INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,createdAt,updatedAt)
+               VALUES('dated-holder','holder','dated-owner','user:dated-owner','default','claude','anthropic','fable',1,1);
+             INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state)
+               VALUES('dated-assignment','dated work','dated-holder','dated-owner',1,'open');
+             """)
+
+    assert {:ok, [[current_guard]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='supervision_liveness_sidecar_insert_coherent'"
+             )
+
+    preceding_guard =
+      Regex.replace(
+        ~r/AND w\.prompt IS NOT NULL AND \(\s*w\.waitMode IN \('dependency','after-turn'\) OR\s*\(w\.waitMode IS NULL AND w\.conditionKind IS NULL AND w\.targetRole IS NULL\s*AND w\.creatorSessionKey=a\.holderKey AND w\.dueAt>w\.createdAt\)\s*\)/,
+        current_guard,
+        "AND w.waitMode IN ('dependency','after-turn') AND w.prompt IS NOT NULL"
+      )
+
+    refute preceding_guard == current_guard
+
+    assert :ok =
+             DB.execute(
+               db,
+               "DROP TRIGGER supervision_liveness_sidecar_insert_coherent; #{preceding_guard};"
+             )
+
+    input = %{
+      session_key: "dated-holder",
+      creator_session_key: "dated-holder",
+      assignment_id: "dated-assignment",
+      origin: "session:dated-holder",
+      prompt: "resume later",
+      due_at: System.system_time(:millisecond) + 60_000,
+      sender_scheduled: true
+    }
+
+    historical = Wakes.schedule(db, input)
+    assert historical.obligation_ref == nil
+    assert :ok = Schema.ensure_all(db)
+    assert Wakes.get(db, historical.wake_id).obligation_ref == nil
+
+    dated =
+      Wakes.schedule(db, Map.put(input, :dated_continuation_assignment_id, "dated-assignment"))
+
+    assert dated.obligation_ref == "dated-assignment"
+
+    assert {:ok, [["pending"]]} =
+             DB.query(
+               db,
+               "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1 AND controllerOrigin='holder_continuation'",
+               [dated.wake_id]
+             )
+
+    assert :ok = Schema.ensure_all(db)
+    assert Wakes.get(db, historical.wake_id).obligation_ref == nil
+    assert Wakes.get(db, dated.wake_id).obligation_ref == "dated-assignment"
   end
 
   test "only Tightbeam supervision lineage firing requires a sidecar", %{db: db} do
@@ -2113,6 +2213,101 @@ defmodule Tightbeam.SchemaShapeTest do
              )
   end
 
+  # Restore the declared attribution clauses before labeling this fixture as
+  # the earlier reparent predecessor. No row values change.
+  defp restore_predecessor_attribution!(db) do
+    :ok = DB.execute(db, "DROP INDEX IF EXISTS events_process_assignment")
+
+    objects = [
+      {"work_item_bodies",
+       """
+       CREATE TABLE work_item_bodies (
+         workItemId TEXT PRIMARY KEY REFERENCES work_items(id),
+         body TEXT,
+         updatedByUser TEXT REFERENCES users(userId),
+         updatedBySession TEXT REFERENCES sessions(sessionKey),
+         updatedAt INTEGER NOT NULL CHECK(updatedAt >= 0),
+         CHECK(body IS NULL OR (typeof(body) = 'text' AND length(CAST(body AS BLOB)) <= 65536)),
+         CHECK((updatedByUser IS NOT NULL) != (updatedBySession IS NOT NULL))
+       )
+       """},
+      {"session_reparent_events",
+       """
+       CREATE TABLE session_reparent_events (
+       eventSeq INTEGER PRIMARY KEY AUTOINCREMENT,
+       eventId TEXT NOT NULL UNIQUE,
+       ownerUserId TEXT NOT NULL,
+       childSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+       assignmentId TEXT NOT NULL REFERENCES assignments(id),
+       workItemId TEXT NOT NULL REFERENCES work_items(id),
+       originParentSessionKey TEXT,
+       previousCurrentParentSessionKey TEXT,
+       newCurrentParentSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+       originAssignmentOpenerKind TEXT NOT NULL CHECK (originAssignmentOpenerKind IN ('user','session')),
+       originAssignmentOpenerRef TEXT NOT NULL,
+       previousCurrentCoordinationParentSessionKey TEXT,
+       newCurrentCoordinationParentSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+       cause TEXT NOT NULL CHECK (cause IN ('owner_topology_correction','delivery_owner_reparent')),
+       principalKind TEXT NOT NULL CHECK (principalKind IN ('user','session')),
+       principalRef TEXT NOT NULL,
+       idempotencyKey TEXT NOT NULL,
+       requestFingerprint TEXT NOT NULL,
+       createdAt INTEGER NOT NULL,
+       UNIQUE(ownerUserId,idempotencyKey),
+       CHECK (newCurrentParentSessionKey=newCurrentCoordinationParentSessionKey),
+       CHECK (
+       (principalKind='user' AND cause='owner_topology_correction' AND
+        principalRef='user:' || ownerUserId) OR
+       (principalKind='session' AND cause='delivery_owner_reparent' AND
+        substr(principalRef,1,8)='session:' AND length(principalRef)>8)
+       )
+       )
+       """}
+    ]
+
+    assert {:ok, :ok} =
+             DB.migration_transaction(
+               db,
+               :fixture_predecessor_attribution,
+               [],
+               ["PRAGMA writable_schema=OFF"],
+               fn txn ->
+                 [[version]] = Tightbeam.DB.Txn.q(txn, "PRAGMA schema_version")
+                 :ok = Tightbeam.DB.Txn.exec(txn, "PRAGMA writable_schema=ON")
+
+                 [[decision_sql]] =
+                   Tightbeam.DB.Txn.q(
+                     txn,
+                     "SELECT sql FROM sqlite_master WHERE type='table' AND name='decision_requests'"
+                   )
+
+                 decision_sql =
+                   Regex.replace(
+                     ~r/(AND decision IS NOT NULL)\s+(AND ruledAt IS NOT NULL AND rulingFactId IS NOT NULL)/,
+                     decision_sql,
+                     "\\1 AND ruledBy = 'user:' || ownerUserId \\2"
+                   )
+
+                 Tightbeam.DB.Txn.q(
+                   txn,
+                   "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='decision_requests'",
+                   [decision_sql]
+                 )
+
+                 for {name, sql} <- objects do
+                   Tightbeam.DB.Txn.q(
+                     txn,
+                     "UPDATE sqlite_master SET sql=?2 WHERE type='table' AND name=?1",
+                     [name, String.trim(sql)]
+                   )
+                 end
+
+                 :ok = Tightbeam.DB.Txn.exec(txn, "PRAGMA schema_version=#{version + 1}")
+                 :ok = Tightbeam.DB.Txn.exec(txn, "PRAGMA writable_schema=RESET")
+               end
+             )
+  end
+
   defp rewind_to_agent_reparent!(db) do
     downgrade_assignment_source_replacement_cancellation!(db)
 
@@ -2280,6 +2475,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_assignment_source_replacement_cancellation!(db) do
+    restore_predecessor_attribution!(db)
     Tightbeam.SchemaShapeRuntimeFixture.downgrade_effort_holder_activity_cancellation!(db)
     downgrade_notice_source_storage!(db)
 

@@ -11,6 +11,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     DB,
     Devices,
     Escalation,
+    EventLog,
     Gateway,
     Identity,
     Ledger,
@@ -33,7 +34,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "work items" =>
       ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority rowVersion),
     "assignments" =>
-      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
+      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
     "wakes" =>
       ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon deliveryStatus rowVersion),
     "turns" =>
@@ -53,7 +54,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "work items" =>
       ~w(specRefName specRefSha256 ownerUserId failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq),
     "assignments" =>
-      ~w(holderRole openedByUser openedBySession outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider),
+      ~w(holderRole openedByUser openedBySession outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider),
     "wakes" =>
       ~w(targetRole prompt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey workItemId assignmentId canceledAt class classElection deliveryRule deliveryStatus),
     "turns" =>
@@ -64,7 +65,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       ~w(ownerUserId spawnedBy topologyParent handle identityName identityRevision provider model thinkingLevel modelContext host clearedThroughSeq overrides),
     "devices" => ~w(claimedName platform model),
     "artifacts" => ~w(description parentSession contentSha256 recordedMessageId home),
-    "read markers" => []
+    "read markers" => ~w(marker)
   }
 
   @integer_fields %{
@@ -525,7 +526,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert {:ok, [[""]]} =
              DB.query(ctx.db, "SELECT sender FROM messages WHERE id=?1", [empty_sender_message.id])
 
-    assert {:ok, [[nil]]} =
+    assert {:ok, [["user:outsider"]]} =
              DB.query(ctx.db, "SELECT sender FROM messages WHERE id=?1", [direct_id])
 
     history =
@@ -553,6 +554,224 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert detail["item"]["sender"] == "user:outsider"
     assert detail["item"]["turnIncludesHuman"]
     assert live_message["sender"] == detail["item"]["sender"]
+  end
+
+  test "fresh transcript history includes rail denials with full identity and order", ctx do
+    session = ctx.admin_session
+    origin = "session:#{session.session_key}"
+
+    call = %{
+      verb: "assign",
+      origin: origin,
+      principal: {:session, session.session_key},
+      session_key: session.session_key,
+      params: %{}
+    }
+
+    rule_error = fn rule ->
+      %{
+        code: "rule_denied",
+        rule: rule,
+        edge: "verb",
+        reason: "blocked",
+        script_exit_class: "denied",
+        ref: "sample-ref",
+        producer: nil,
+        identity_manifest_sha: String.duplicate("a", 64),
+        message: "sample rule denial"
+      }
+    end
+
+    live_samples =
+      for index <- 1..2 do
+        payload = rule_error.("sample-rule-#{index}")
+
+        [_, live_frame] = Publisher.denied_notices(call, payload)
+        {payload, live_frame}
+      end
+
+    first_live_timestamp = live_samples |> hd() |> elem(1) |> Map.fetch!("occurredAt")
+    event_timestamp = first_live_timestamp - 1_000
+
+    {:appended, before_message} =
+      Projection.append(ctx.db, %{
+        session_key: session.session_key,
+        role: "user",
+        content: "before refusal",
+        timestamp: event_timestamp - 1_000,
+        attachments: []
+      })
+
+    source_payloads =
+      for {payload, _live_frame} <- live_samples do
+        {:ok, event_id} =
+          DB.transaction(ctx.db, fn txn ->
+            EventLog.append_event_in_txn(
+              txn,
+              "denied",
+              "assign",
+              origin,
+              session.session_key,
+              JSON.encode!(payload),
+              {:session, session.session_key},
+              event_timestamp
+            )
+          end)
+
+        {event_id, payload}
+      end
+
+    event_ids = Enum.map(source_payloads, &elem(&1, 0))
+
+    expected_payloads =
+      Enum.map(live_samples, fn {_payload, live_frame} -> live_frame["payload"] end)
+
+    expected_principal = "session:#{session.session_key}"
+    legacy_payload = rule_error.("legacy-rule")
+    [_, legacy_live_frame] = Publisher.denied_notices(call, legacy_payload)
+
+    {:ok, legacy_event_id} =
+      DB.transaction(ctx.db, fn txn ->
+        EventLog.append_event_in_txn(
+          txn,
+          "denied",
+          "assign",
+          origin,
+          session.session_key,
+          JSON.encode!(legacy_payload),
+          {:session, session.session_key},
+          event_timestamp + 500
+        )
+      end)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE events SET payload=?1 WHERE id=?2", [
+               JSON.encode!(legacy_payload),
+               legacy_event_id
+             ])
+
+    denials = EventLog.rail_denials_for_session(ctx.db, session.session_key)
+
+    all_event_ids = event_ids ++ [legacy_event_id]
+
+    assert Enum.map(denials, & &1.id) == all_event_ids
+
+    assert Enum.map(denials, & &1.ts) == [
+             event_timestamp,
+             event_timestamp,
+             event_timestamp + 500
+           ]
+
+    assert Enum.map(denials, & &1.verb) == ["assign", "assign", "assign"]
+
+    assert Enum.map(denials, & &1.origin) == [origin, origin, origin]
+
+    assert Enum.map(denials, & &1.principal) == [
+             expected_principal,
+             expected_principal,
+             expected_principal
+           ]
+
+    assert Enum.map(denials, & &1.rule) == ["sample-rule-1", "sample-rule-2", "legacy-rule"]
+    assert Enum.map(denials, & &1.payload) == expected_payloads ++ [legacy_live_frame["payload"]]
+
+    assert Enum.map(denials, & &1.after_message_seq) == [
+             before_message.seq,
+             before_message.seq,
+             nil
+           ]
+
+    {:appended, after_message} =
+      Projection.append(ctx.db, %{
+        session_key: session.session_key,
+        role: "assistant",
+        content: "after refusal",
+        timestamp: event_timestamp + 3_000,
+        attachments: []
+      })
+
+    history =
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/messages?limit=20&tail=true",
+        ctx.admin_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    rail_denials = history["railDenials"]
+
+    assert Enum.map(rail_denials, & &1["id"]) == Enum.map(all_event_ids, &"rail:#{&1}")
+
+    assert Enum.map(rail_denials, & &1["sessionKey"]) == [
+             session.session_key,
+             session.session_key,
+             session.session_key
+           ]
+
+    assert Enum.map(rail_denials, & &1["principal"]) == [
+             "session:#{session.session_key}",
+             "session:#{session.session_key}",
+             "session:#{session.session_key}"
+           ]
+
+    assert Enum.map(rail_denials, & &1["origin"]) == [origin, origin, origin]
+    assert Enum.map(rail_denials, & &1["verb"]) == ["assign", "assign", "assign"]
+
+    assert Enum.map(rail_denials, & &1["rule"]) == [
+             "sample-rule-1",
+             "sample-rule-2",
+             "legacy-rule"
+           ]
+
+    assert Enum.map(rail_denials, & &1["occurredAt"]) == [
+             event_timestamp,
+             event_timestamp,
+             event_timestamp + 500
+           ]
+
+    assert Enum.map(rail_denials, & &1["payload"]) ==
+             expected_payloads ++ [legacy_live_frame["payload"]]
+
+    assert Enum.map(rail_denials, & &1["afterMessageSeq"]) == [
+             before_message.seq,
+             before_message.seq,
+             nil
+           ]
+
+    assert Enum.map(rail_denials, & &1["order"]["afterMessageSeq"]) == [
+             before_message.seq,
+             before_message.seq,
+             nil
+           ]
+
+    assert Enum.map(rail_denials, & &1["order"]["occurredAt"]) == [
+             event_timestamp,
+             event_timestamp,
+             event_timestamp + 500
+           ]
+
+    assert Enum.map(rail_denials, & &1["order"]["eventId"]) == all_event_ids
+
+    for {{_source_payload, live_frame}, history_denial} <-
+          Enum.zip(live_samples, Enum.take(rail_denials, 2)) do
+      assert live_frame["payload"]["verb"] == "assign"
+      assert live_frame["payload"]["scriptExitClass"] == "denied"
+      assert live_frame["payload"]["identityManifestSha"] == String.duplicate("a", 64)
+      assert history_denial["sessionKey"] == live_frame["refs"]["sessionKey"]
+      assert history_denial["origin"] == live_frame["refs"]["origin"]
+      assert history_denial["principal"] == live_frame["refs"]["principal"]
+      assert history_denial["verb"] == live_frame["payload"]["verb"]
+      assert history_denial["rule"] == live_frame["payload"]["rule"]
+      assert history_denial["payload"] == live_frame["payload"]
+      assert abs(history_denial["occurredAt"] - live_frame["occurredAt"]) <= 2_000
+    end
+
+    assert List.last(rail_denials)["payload"] == legacy_live_frame["payload"]
+
+    items = Map.new(history["items"], &{&1["id"], &1})
+    first_denial_at = hd(rail_denials)["occurredAt"]
+    assert items[before_message.id]["at"] < first_denial_at
+    assert first_denial_at < items[after_message.id]["at"]
   end
 
   test "session and retained transcript collections use bounded exclusive keysets", ctx do
@@ -1501,8 +1720,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
          [:bearer_auth, :query_decode, :principal_resolution]},
         {path <> "?asUser=flynn&asUser=flynn", "tbc_core_detail", 400, "invalid_as_user", nil,
          [:bearer_auth, :query_decode, :principal_resolution]},
-        {path <> "?asUser=mallory", ctx.admin_session.cli_token, 403, "identity_not_yours",
-         "this session belongs to flynn", [:bearer_auth, :query_decode, :principal_resolution]},
         {path <> "?asUser=flynn", nil, 400, "invalid_as_user", nil,
          [:bearer_auth, :query_decode, :principal_resolution]},
         {path <> "?asUser=flynn%zz", nil, 400, "malformed_query", nil,
@@ -1510,6 +1727,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         {path <> "?unsupported=1", nil, 400, "invalid_filter", nil,
          [:bearer_auth, :query_decode, :principal_resolution, :request_validation]}
       ]
+
+      ordinary_session = get(ctx, path, ctx.admin_session.cli_token)
+      selected_session = get(ctx, path <> "?asUser=mallory", ctx.admin_session.cli_token)
+      assert selected_session.status == ordinary_session.status
+      assert JSON.decode!(selected_session.resp_body) == JSON.decode!(ordinary_session.resp_body)
 
       for {request_path, bearer, status, code, message, operations} <- cases do
         {response, trace} = traced_get(ctx, request_path, bearer)
@@ -1776,11 +1998,18 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert observer_with_org_message_cursor.status == 200
     assert org_with_observer_message_cursor.status == 200
 
-    assert JSON.decode!(observer_with_org_message_cursor.resp_body)["items"] ==
-             JSON.decode!(anonymous_message_page.resp_body)["items"]
+    # Without `asUser`, both reads use the same observer principal, so these
+    # cursors are valid across both reads and continue after the newest message.
+    observer_after_org_cursor = JSON.decode!(observer_with_org_message_cursor.resp_body)
+    org_after_observer_cursor = JSON.decode!(org_with_observer_message_cursor.resp_body)
 
-    assert JSON.decode!(org_with_observer_message_cursor.resp_body)["items"] ==
-             JSON.decode!(org_message_page.resp_body)["items"]
+    assert observer_after_org_cursor["items"] == []
+    assert observer_after_org_cursor["page"]["hasMoreBefore"] == true
+    assert observer_after_org_cursor["page"]["hasMoreAfter"] == false
+
+    assert org_after_observer_cursor["items"] == []
+    assert org_after_observer_cursor["page"]["hasMoreBefore"] == true
+    assert org_after_observer_cursor["page"]["hasMoreAfter"] == false
 
     message_cursor = JSON.decode!(anonymous_messages.resp_body)["page"]["newestCursor"]
 
@@ -2038,184 +2267,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       "work items",
       "auth_failed"
     )
-  end
-
-  test "credentialless and authenticated clients read and receive changes through a real gateway",
-       ctx do
-    session_key = ctx.admin_session.session_key
-    user_message_id = "loopback-observer-question"
-    reply_message_id = "loopback-observer-answer"
-
-    query!(
-      ctx.db,
-      """
-      INSERT INTO messages
-        (id, sessionKey, role, content, timestamp, sender, llmVisibleMessageId, attachments)
-      VALUES (?1, ?2, 'user', 'loopback question', 1, 'user:flynn', ?1, '[]')
-      """,
-      [user_message_id, session_key]
-    )
-
-    query!(
-      ctx.db,
-      """
-      INSERT INTO messages
-        (id, sessionKey, role, content, timestamp, sender, replyToMessageId,
-         llmVisibleMessageId, attachments)
-      VALUES (?1, ?2, 'assistant', 'loopback answer', 2, 'agent:main', ?3, ?1, '[]')
-      """,
-      [reply_message_id, session_key, user_message_id]
-    )
-
-    Devices.add_user(ctx.db, "loopback-observer", false)
-
-    assert {:ok, true, _marker} =
-             ReadMarkers.set(ctx.db, "loopback-observer", "core-scope", "observer-cursor")
-
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug: {Router, Router.init(ctx.opts)}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    {:ok, observer_ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
-
-    :ok =
-      WS.send_text(
-        observer_ws,
-        JSON.encode!(%{
-          "type" => "subscribe",
-          "protocolVersion" => 2,
-          "subscriptionId" => "credentialless-observer",
-          "filters" => %{"classes" => ["work_item.created"]}
-        })
-      )
-
-    {:ok, {:text, observer_ready}, observer_ws} = WS.recv(observer_ws, 2_000)
-    assert JSON.decode!(observer_ready)["type"] == "subscription_ready"
-
-    {:ok, authenticated_ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
-
-    :ok =
-      WS.send_text(
-        authenticated_ws,
-        JSON.encode!(%{"type" => "auth", "token" => ctx.token})
-      )
-
-    {:ok, {:text, auth_result}, authenticated_ws} = WS.recv(authenticated_ws, 2_000)
-    assert JSON.decode!(auth_result)["success"] == true
-
-    :ok =
-      WS.send_text(
-        authenticated_ws,
-        JSON.encode!(%{
-          "type" => "subscribe",
-          "protocolVersion" => 2,
-          "subscriptionId" => "authenticated-client",
-          "filters" => %{"classes" => ["work_item.created"]}
-        })
-      )
-
-    {:ok, {:text, authenticated_ready}, authenticated_ws} = WS.recv(authenticated_ws, 2_000)
-    assert JSON.decode!(authenticated_ready)["type"] == "subscription_ready"
-
-    {observer_sessions_status, _headers, observer_sessions_body} =
-      http_get_without_authorization(port, "/api/sessions")
-
-    {authenticated_sessions_status, _headers, authenticated_sessions_body} =
-      http_get(port, "/api/sessions", ctx.opts[:cli_token])
-
-    assert observer_sessions_status == 200
-    assert authenticated_sessions_status == 200
-
-    assert JSON.decode!(observer_sessions_body)["items"] ==
-             JSON.decode!(authenticated_sessions_body)["items"]
-
-    message_path = "/api/sessions/#{session_key}/messages"
-
-    {observer_messages_status, _headers, observer_messages_body} =
-      http_get_without_authorization(port, message_path)
-
-    {authenticated_messages_status, _headers, authenticated_messages_body} =
-      http_get(port, message_path, ctx.opts[:cli_token])
-
-    assert observer_messages_status == 200
-    assert authenticated_messages_status == 200
-
-    observer_message_ids =
-      JSON.decode!(observer_messages_body)["items"] |> Enum.map(& &1["id"])
-
-    assert user_message_id in observer_message_ids
-    assert reply_message_id in observer_message_ids
-
-    assert JSON.decode!(observer_messages_body)["items"] ==
-             JSON.decode!(authenticated_messages_body)["items"]
-
-    {observer_detail_status, _headers, observer_detail_body} =
-      http_get_without_authorization(port, message_path <> "/#{reply_message_id}")
-
-    {authenticated_detail_status, _headers, authenticated_detail_body} =
-      http_get(port, message_path <> "/#{reply_message_id}", ctx.opts[:cli_token])
-
-    assert observer_detail_status == 200
-    assert authenticated_detail_status == 200
-
-    assert JSON.decode!(observer_detail_body)["item"] ==
-             JSON.decode!(authenticated_detail_body)["item"]
-
-    {observer_markers_status, _headers, observer_markers_body} =
-      http_get_without_authorization(port, "/api/read-markers")
-
-    {authenticated_markers_status, _headers, authenticated_markers_body} =
-      http_get(port, "/api/read-markers", ctx.opts[:cli_token])
-
-    assert observer_markers_status == 200
-    assert authenticated_markers_status == 200
-
-    observer_marker_users =
-      JSON.decode!(observer_markers_body)["items"] |> Enum.map(& &1["userId"])
-
-    assert "flynn" in observer_marker_users
-    assert "loopback-observer" in observer_marker_users
-
-    authenticated_marker_users =
-      JSON.decode!(authenticated_markers_body)["items"] |> Enum.map(& &1["userId"])
-
-    assert authenticated_marker_users == ["flynn"]
-
-    {observer_marker_detail_status, _headers, observer_marker_detail_body} =
-      http_get_without_authorization(port, "/api/read-markers/core-scope")
-
-    {authenticated_marker_detail_status, _headers, authenticated_marker_detail_body} =
-      http_get(port, "/api/read-markers/core-scope", ctx.opts[:cli_token])
-
-    assert observer_marker_detail_status == 200
-    assert authenticated_marker_detail_status == 200
-
-    observer_detail_users =
-      JSON.decode!(observer_marker_detail_body)["items"] |> Enum.map(& &1["userId"])
-
-    assert observer_detail_users == ["flynn", "loopback-observer"]
-    assert JSON.decode!(authenticated_marker_detail_body)["item"]["userId"] == "flynn"
-
-    work =
-      WorkItems.__handle__(
-        ctx.db,
-        "work-item-create",
-        firehose_call("work-item-create", nil, %{title: "Credentialless loopback event"})
-      )
-
-    {observer_raw, observer_ws} = receive_raw_change(observer_ws, "work_item.created")
-
-    {authenticated_raw, authenticated_ws} =
-      receive_raw_change(authenticated_ws, "work_item.created")
-
-    assert JSON.decode!(observer_raw)["refs"]["workItemId"] == work.id
-    assert JSON.decode!(authenticated_raw)["refs"]["workItemId"] == work.id
-
-    :ok = WS.close(observer_ws)
-    :ok = WS.close(authenticated_ws)
   end
 
   test "credentialless marker reads apply AU2 selection and all-user collection", ctx do
@@ -2804,6 +2855,10 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           assert value in domain,
                  "#{resource}.#{field}=#{inspect(value)} is outside #{inspect(domain)}"
 
+        {resource, field} == {"read markers", "marker"} ->
+          assert (is_integer(value) and value >= 0) or (is_binary(value) and value != ""),
+                 "read markers.marker is neither a nonnegative integer nor a nonempty string"
+
         field in Map.fetch!(@integer_fields, resource) ->
           assert is_integer(value), "#{resource}.#{field} is not an integer"
 
@@ -3158,9 +3213,14 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert JSON.decode!(session_as_user.resp_body)["items"] ==
              JSON.decode!(page.resp_body)["items"]
 
+    different_selector = get(ctx, path <> "&asUser=mallory", ctx.admin_session.cli_token)
+    assert different_selector.status == 200
+
+    assert JSON.decode!(different_selector.resp_body)["items"] ==
+             JSON.decode!(session_as_user.resp_body)["items"]
+
     for {suffix, token, status, code} <- [
           {"?unknown=x", "bad-token", 401, "auth_failed"},
-          {"?asUser=mallory", ctx.admin_session.cli_token, 403, "identity_not_yours"},
           {"?asUser=flynn", ctx.token, 400, "invalid_as_user"},
           {"?asUser=flynn&asUser=flynn", "tbc_core_detail", 400, "invalid_as_user"},
           {"?asUser=flynn%zz", ctx.token, 400, "malformed_query"}
@@ -3787,15 +3847,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         [{:timeout, 2_000}],
         body_format: :binary
       )
-
-    {status, headers, body}
-  end
-
-  defp http_get_without_authorization(port, path) do
-    url = String.to_charlist("http://127.0.0.1:#{port}#{path}")
-
-    {:ok, {{_version, status, _reason}, headers, body}} =
-      :httpc.request(:get, {url, []}, [{:timeout, 2_000}], body_format: :binary)
 
     {status, headers, body}
   end

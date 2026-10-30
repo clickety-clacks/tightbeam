@@ -22,7 +22,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "eezo" => %{
+      "lab1" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -365,7 +365,8 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
   end
 
   defp dispatch_after_rumination(ctx, call) do
-    assert {:ok, %{rumination_required: true}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert {:ok, %{id: assignment_id, rumination_required: true}} =
+             result = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
     assert {:ok, []} =
              DB.query(
@@ -377,7 +378,10 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
                [call.params.work_item_id, elem(call.principal, 1)]
              )
 
-    Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE id=?1", [assignment_id])
+
+    result
   end
 
   defp verdict_call(session_key, assignment_id, kind) do
@@ -399,7 +403,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
       archetype: archetype,
       harness: "codex",
       provider: "openai",
-      host: "eezo",
+      host: "lab1",
       model: Model.new("sonnet", effort: "medium"),
       spawned_by: nil,
       is_built_in: false

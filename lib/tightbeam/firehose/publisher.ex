@@ -59,30 +59,11 @@ defmodule Tightbeam.Firehose.Publisher do
   @doc "Queue accepted notices on the transaction that committed their state."
   @spec accepted_in_txn(Txn.t(), map(), term()) :: :ok
   def accepted_in_txn(%Txn{} = txn, call, result) do
-    result = canonical_in_txn(txn, call, result)
-
-    notices =
-      case call do
-        %{verb: "wake", params: %{cancel_wake_id: wake_id}} when is_binary(wake_id) ->
-          [
-            observation_notice("verb.accepted", call),
-            build(
-              "wake.canceled",
-              call,
-              Tightbeam.Wakes.get(txn, wake_id) || %{wake_id: wake_id},
-              &StateResources.wake/1
-            )
-          ]
-
-        _ ->
-          accepted_notices(nil, call, result)
-      end
-
-    Enum.each(notices, fn notice ->
-      Txn.handoff(txn, Hub.destination(hub(call)), {:publish, notice})
-    end)
-
-    :ok
+    Txn.handoff(
+      txn,
+      Hub.destination(hub(call)),
+      {:accepted, nil, call, canonical_in_txn(txn, call, result)}
+    )
   end
 
   defp canonical_in_txn(txn, %{verb: verb} = call, result)
@@ -149,11 +130,7 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @spec denied_in_txn(Txn.t(), map(), map()) :: :ok
   def denied_in_txn(%Txn{} = txn, call, error) do
-    Enum.each(denied_notices(call, error), fn notice ->
-      Txn.handoff(txn, Hub.destination(hub(call)), {:publish, notice})
-    end)
-
-    :ok
+    Txn.handoff(txn, Hub.destination(hub(call)), {:denied, call, error})
   end
 
   @spec observed_accepted(map()) :: :ok
@@ -200,8 +177,11 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @doc false
   def committed_in_txn(%Txn{} = txn, class, payload, refs, hub) do
-    notice = committed_notice(class, payload, refs)
-    Txn.handoff(txn, Hub.destination(hub), {:publish, notice})
+    if class == "kungfu.updated" do
+      Txn.handoff(txn, Hub.destination(hub), {:publish, committed_notice(class, payload, refs)})
+    else
+      Txn.handoff(txn, Hub.destination(hub), {:committed, class, payload, refs})
+    end
   end
 
   @doc "Capture one artifact lifecycle snapshot independently of dispatch flags."
@@ -212,11 +192,7 @@ defmodule Tightbeam.Firehose.Publisher do
       "workItemId" => snapshot.work_item_id
     }
 
-    Txn.handoff(
-      txn,
-      Hub.destination(hub(call)),
-      {:publish, committed_notice(class, snapshot, refs)}
-    )
+    Txn.handoff(txn, Hub.destination(hub(call)), {:committed, class, snapshot, refs})
   end
 
   @doc "Queue one exact source-invalidation notice on its committing transaction."
@@ -279,7 +255,7 @@ defmodule Tightbeam.Firehose.Publisher do
             "refs=#{inspect(refs)}"
   end
 
-  @doc "Queue the existing message-created notice on the transaction that appended it."
+  @doc "Queue the canonical transcript-message or transition notice on its append transaction."
   @spec message_in_txn(Txn.t(), String.t(), map(), String.t() | nil) :: :ok
   def message_in_txn(%Txn{} = txn, session_key, message, owner_user_id \\ nil) do
     owner_user_id =
@@ -296,7 +272,12 @@ defmodule Tightbeam.Firehose.Publisher do
         StateResources.query_message(txn, message_id) ||
           raise ArgumentError, "committed transcript message is missing from its transaction"
 
-      committed_in_txn(txn, "message.created", canonical, %{
+      class =
+        if canonical[:message_type] == "marker",
+          do: "transition.recorded",
+          else: "message.created"
+
+      committed_in_txn(txn, class, canonical, %{
         "messageId" => message_id,
         "sessionKey" => session_key,
         "ownerUserId" => owner_user_id
@@ -712,8 +693,8 @@ defmodule Tightbeam.Firehose.Publisher do
   defp primary_param(_key), do: :id
 
   defp occurred_at(payload) do
-    payload["updatedAt"] || payload["createdAt"] || payload["openedAt"] || payload["ts"] ||
-      System.system_time(:millisecond)
+    payload["updatedAt"] || payload["createdAt"] || payload["openedAt"] || payload["endedAt"] ||
+      payload["startedAt"] || payload["ts"] || System.system_time(:millisecond)
   end
 
   defp principal(nil), do: nil

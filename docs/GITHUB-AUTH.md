@@ -210,11 +210,11 @@ When creating or opening a project whose remote URL is on a GitHub hostname:
 Example refusal:
 
 ```text
-Tightbeam cannot use GitHub from host eezo for github.com: gh is not
+Tightbeam cannot use GitHub from host example-macos-host for github.com: gh is not
 authenticated in the non-interactive project environment. Run:
   tightbeam onboard github --hostname github.com
   tightbeam onboard github --hostname github.com --remote <remote-url>
-on eezo, then retry. Do not paste a PAT into an agent.
+on that host, then retry. Do not paste a PAT into an agent.
 ```
 
 Projects without a GitHub remote do not fail this gate unless their requested
@@ -369,11 +369,11 @@ Session/project status should expose only non-secret fields. Suggested display:
 ```json
 {
   "github": {
-    "host": "eezo",
+    "host": "example-macos-host",
     "hostname": "github.com",
     "gh_path": "/opt/homebrew/bin/gh",
     "state": "live",
-    "account": "gdiab",
+    "account": "example-user",
     "git_protocol": "https",
     "storage": "file",
     "repair": null
@@ -465,8 +465,8 @@ The 0.1.8 GitHub E2E inventory is:
 | Probe states | Fixture probes prove `live`, `needs_onboarding`, `insufficient_scope`, `git_unready`, and timeout or provider failure as `unknown`. Unknown never authorizes work. |
 | Redaction and agreement | Rust and Elixir classify the same API failures. All outputs omit fixture secrets. Capability metadata and onboarding success JSON contain only the PATH-only `config_dir` or `configDir`; refusals and doctor output do not disclose bank paths. |
 
-The later installed-build live E2E should use **tars**, the sanctioned
-non-production macOS gateway test host. It must run only after separate authority
+The later installed-build live E2E should use a designated non-production macOS
+gateway test host. It must run only after separate authority
 permits packaging, installation, and a human device login. This fixture gate does
 not perform that row, and this producer does not install a build or touch a live
 credential.

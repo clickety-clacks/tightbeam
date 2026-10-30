@@ -1777,7 +1777,7 @@ fn sentinel_lines(status: &SentinelStatus) -> Vec<String> {
     let value = match status {
         SentinelStatus::Unavailable(reason) => {
             return vec![format!(
-                "sentinels: status unavailable ({reason}); run doctor from a session or pass --as-user <userId>"
+                "sentinels: status unavailable ({reason}); run doctor from a session or select an identity on an organization credential"
             )];
         }
         SentinelStatus::Listed(value) => value,
@@ -1860,7 +1860,7 @@ fn require_credential_integrity(
         return Ok(());
     };
     Err(format!(
-        "doctor: banked OAuth credential for {provider} is CORRUPT ({}); run tightbeam onboard {provider} --as-user <userId>",
+        "doctor: banked OAuth credential for {provider} is CORRUPT ({}); run tightbeam onboard {provider}",
         health.corrupt_fields.join(", ")
     ))
 }
@@ -2083,7 +2083,7 @@ mod tests {
         assert_eq!(
             sentinel_lines(&offline),
             vec![
-                "sentinels: status unavailable (connection refused); run doctor from a session or pass --as-user <userId>"
+                "sentinels: status unavailable (connection refused); run doctor from a session or select an identity on an organization credential"
             ]
         );
         assert_eq!(
@@ -2287,11 +2287,11 @@ mod tests {
 
     #[test]
     fn marker_codec_and_raw_policy() {
-        let value = token_fields(Some(b"tb1-cmVzaWRlbnRAZWV6bw"));
-        assert_eq!(value.lineage.as_deref(), Some("resident@eezo"));
+        let value = token_fields(Some(b"tb1-cmVzaWRlbnRAbGFiMQ"));
+        assert_eq!(value.lineage.as_deref(), Some("resident@lab1"));
         assert_eq!(
             value.raw_b64.as_deref(),
-            Some("dGIxLWNtVnphV1JsYm5SQVpXVjZidw==")
+            Some("dGIxLWNtVnphV1JsYm5SQWJHRmlNUQ==")
         );
         assert_eq!(token_fields(Some(b"tb2-any")).lineage, None);
         assert_eq!(token_fields(Some(b"tb1-!!!")).lineage, None);
@@ -2822,9 +2822,9 @@ mod tests {
             pid: 7,
             ppid: Some(1),
             pgid: Some(7),
-            lineage: Some("resident@eezo".to_owned()),
-            lineage_raw: Some("tb1-cmVzaWRlbnRAZWV6bw".to_owned()),
-            lineage_raw_b64: Some("dGIxLWNtVnphV1JsYm5SQVpXVjZidw==".to_owned()),
+            lineage: Some("resident@lab1".to_owned()),
+            lineage_raw: Some("tb1-cmVzaWRlbnRAbGFiMQ".to_owned()),
+            lineage_raw_b64: Some("dGIxLWNtVnphV1JsYm5SQWJHRmlNUQ==".to_owned()),
             evidence: "environ_exact",
             executable: Some("/usr/local/bin/codex".to_owned()),
             elapsed_s: Some(9),
@@ -2956,7 +2956,7 @@ mod tests {
             raw,
             10_000,
             7,
-            "eezo".into(),
+            "lab1".into(),
             BaseDir {
                 path: "/srv/tightbeam".into(),
                 status: "present",
@@ -2973,7 +2973,7 @@ mod tests {
   "probed_at_ms": 10000,
   "collection_ms": 7,
   "host": {
-    "hostname": "eezo",
+    "hostname": "lab1",
     "platform": "linux",
     "probe_version": "PROBE_VERSION"
   },

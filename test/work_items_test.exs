@@ -434,7 +434,7 @@ defmodule Tightbeam.WorkItemsTest do
     refute_receive {:firehose_notice, _}
   end
 
-  test "schema pins typed creator, paired spec ref, owner, and the four disposition states",
+  test "schema permits event-attributed creators and pins paired spec ref, owner and states",
        %{db: db} do
     assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
 
@@ -442,8 +442,6 @@ defmodule Tightbeam.WorkItemsTest do
       "INSERT INTO work_items (id, title, specRefName, specRefSha256, ownerUserId, state, createdByUser, createdBySession, createdAt) VALUES "
 
     for values <- [
-          "('wi_none','x',NULL,NULL,'flynn','open',NULL,NULL,1)",
-          "('wi_both','x',NULL,NULL,'flynn','open','flynn','holder',1)",
           "('wi_name','x','spec',NULL,'flynn','open','flynn',NULL,1)",
           "('wi_sha','x',NULL,'#{@sha}','flynn','open','flynn',NULL,1)",
           "('wi_blank','   ',NULL,NULL,'flynn','open','flynn',NULL,1)",
@@ -453,6 +451,15 @@ defmodule Tightbeam.WorkItemsTest do
       assert {:error, %DB.Error{message: message}} = DB.query(db, base <> values)
       assert message =~ "CHECK constraint"
     end
+
+    assert {:ok, []} =
+             DB.query(db, base <> "('wi_none','x',NULL,NULL,'flynn','open',NULL,NULL,1)")
+
+    assert {:ok, [[nil, nil]]} =
+             DB.query(
+               db,
+               "SELECT createdByUser, createdBySession FROM work_items WHERE id='wi_none'"
+             )
 
     # ownerUserId is NOT NULL — the owner is always a user (constitution §3).
     assert {:error, %DB.Error{message: null_message}} =
@@ -517,7 +524,7 @@ defmodule Tightbeam.WorkItemsTest do
   end
 
   test "create validates every field and records session or user creator", ctx do
-    assert %{code: "process_denied"} = create(ctx, {:process, "cron"}, %{title: "x"})
+    assert %{code: "owner_required"} = create(ctx, {:process, "cron"}, %{title: "x"})
     assert %{code: "principal_required"} = create(ctx, nil, %{title: "x"})
 
     for title <- [nil, " ", String.duplicate("x", 2001)] do
@@ -696,16 +703,15 @@ defmodule Tightbeam.WorkItemsTest do
 
     process_call =
       handoff_call({:process, "scheduler"}, %{
-        title: "Unauthorized handoff",
+        title: "Handoff without an owner",
         delivery_owner_session_key: "holder",
         brief: "A complete brief."
       })
 
-    assert %{code: "process_denied", message: authority_error} =
+    assert %{code: "owner_required", message: authority_error} =
              WorkItems.__handle__(ctx.db, "work-item-handoff", process_call)
 
-    assert authority_error =~ "automated callers cannot hand off work items"
-    assert authority_error =~ "user credential or session token"
+    assert authority_error =~ "ownerUserId is required"
     refute authority_error =~ "--work-item"
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM work_items")
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
@@ -815,7 +821,7 @@ defmodule Tightbeam.WorkItemsTest do
   end
 
   test "update implements the complete PATCH matrix", ctx do
-    assert %{code: "process_denied"} = update(ctx, {:process, "cron"}, "missing", %{})
+    assert %{code: "unknown_work_item"} = update(ctx, {:process, "cron"}, "missing", %{})
     assert %{code: "principal_required"} = update(ctx, nil, "missing", %{})
     assert %{code: "unknown_work_item"} = update(ctx, {:user, "flynn"}, "missing", %{})
 
@@ -1444,7 +1450,7 @@ defmodule Tightbeam.WorkItemsTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "eezo"
+      host: "lab1"
     })
   end
 end

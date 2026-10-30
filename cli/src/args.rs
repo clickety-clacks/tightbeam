@@ -84,6 +84,19 @@ pub enum Command {
         idempotency_key: Option<String>,
         payload: Option<String>,
     },
+    FactDemand {
+        identity: Identity,
+        prefixes: Vec<String>,
+    },
+    FactProducerClaim {
+        identity: Identity,
+        producer: String,
+        kinds: Vec<String>,
+        live_for_ms: String,
+    },
+    FactProducers {
+        identity: Identity,
+    },
     HarnessHealthObserveOther {
         identity: Identity,
         harness: String,
@@ -153,6 +166,7 @@ pub enum Command {
         description: Option<String>,
         work_item_id: Option<String>,
         content_sha256: Option<String>,
+        content_base64: Option<String>,
         produced_by_assignment_id: Option<String>,
     },
     ArtifactContentFetch {
@@ -173,6 +187,24 @@ pub enum Command {
         choices: Vec<String>,
         files: Vec<String>,
         vendor_session_id: Option<String>,
+        supersedes: Vec<String>,
+    },
+    HarklightRevise {
+        identity: Identity,
+        message: String,
+        base_revision: i64,
+        title: String,
+        body: Option<String>,
+        choices: Vec<String>,
+        clear_choices: bool,
+    },
+    HarklightRetract {
+        identity: Identity,
+        message: String,
+    },
+    HarklightSettle {
+        identity: Identity,
+        message: String,
     },
     /// Substrate-reserved: the PreToolUse hook reporting that this session is
     /// about to run `artifact-record`. Carries no identity flag because the
@@ -185,6 +217,7 @@ pub enum Command {
     GithubAuthCheck,
     Spawn {
         identity: Identity,
+        owner_user_id: Option<String>,
         display_name: String,
         idempotency_key: String,
         archetype: Option<String>,
@@ -233,25 +266,31 @@ pub enum Command {
     },
     Assign {
         identity: Identity,
+        mementos: Vec<(String, String)>,
         subject: String,
         target: Target,
         idempotency_key: Option<String>,
         work_item_id: Option<String>,
+        owner_user_id: Option<String>,
         reviews: Option<String>,
         effect_kind: Option<String>,
         files: Option<Vec<String>>,
         succeeds: Option<String>,
+        parent_assignment: Option<String>,
     },
     Dispatch {
         identity: Identity,
+        mementos: Vec<(String, String)>,
         subject: String,
         holder: String,
         work_item_id: Option<String>,
+        owner_user_id: Option<String>,
         effect_kind: Option<String>,
         workdir_root: Option<String>,
         brief: String,
         idempotency_key: Option<String>,
         succeeds: Option<String>,
+        parent_assignment: Option<String>,
     },
     EffortRule {
         identity: Identity,
@@ -343,6 +382,8 @@ pub enum Command {
     },
     WorkItemCreate {
         identity: Identity,
+        owner_user_id: Option<String>,
+        mementos: Vec<(String, String)>,
         title: String,
         spec_ref_name: Option<String>,
         spec_ref_sha256: Option<String>,
@@ -351,6 +392,7 @@ pub enum Command {
     },
     WorkItemHandoff {
         identity: Identity,
+        owner_user_id: Option<String>,
         work_item_id: Option<String>,
         title: Option<String>,
         delivery_owner: String,
@@ -436,6 +478,7 @@ pub enum Command {
     },
     Attest {
         identity: Identity,
+        mementos: Vec<(String, String)>,
         assignment_id: String,
         kind: String,
         verdict: Option<String>,
@@ -447,6 +490,21 @@ pub enum Command {
         release_fact_kind: Option<String>,
         release_fact_scope: Option<String>,
         release_fact_principal_ref: Option<String>,
+    },
+    MementoSet {
+        identity: Identity,
+        record: String,
+        name: String,
+        values: Vec<String>,
+        clear: bool,
+    },
+    Mementos {
+        identity: Identity,
+        record: String,
+        history: bool,
+        name: Option<String>,
+        limit: Option<i64>,
+        cursor: Option<String>,
     },
     Attests {
         identity: Identity,
@@ -546,6 +604,7 @@ pub enum Command {
     },
     Onboard {
         identity: Identity,
+        owner_user_id: Option<String>,
         provider: String,
         api_key: bool,
         daemon_credential: bool,
@@ -622,7 +681,7 @@ pub enum Command {
         identity: Identity,
     },
     UpdateClients {
-        as_user: String,
+        identity: Identity,
     },
     Assimilate(AssimilateArgs),
 }
@@ -660,7 +719,7 @@ pub struct ToplineFilters {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssimilateArgs {
     pub ssh_dest: String,
-    pub as_user: String,
+    pub identity: Identity,
     pub name: Option<String>,
     pub base_dir: String,
     pub harnesses: Vec<String>,
@@ -675,18 +734,17 @@ human operator does. Output is JSON on stdout; a nonzero exit means failure
 (the message is on stderr).
 
 IDENTITY (optional inside a session workdir; otherwise required):
-  --as <role>          act as a role you currently hold. Use this when YOU (an
-                       agent) run the command. The role must be bound to your
-                       active session.
-                       To reply to [from user:mike], use wake --user mike; to
-                       reply to [from agent:notetaker], use wake --role
-                       notetaker. [from process:x] cannot be woken.
-  --as-user <userId>   act as a human user (e.g. "flynn"). Use this for
-                       operator/admin actions or when no agent identity applies.
-  --as-process <name>  act as automation (cron, CI, a webhook — e.g.
-                       "cron"). Processes may wake, cancel-wake, and file
-                       condition facts ONLY — they cannot spawn, retire, or
-                       administer.
+  --as <role>          attribute the call to a bound role.
+  --as-user <userId>   select the user on an organization credential. A session
+                       credential always retains its authenticated agent actor.
+  --as-process <name>  attribute the call to automation (cron, CI, a webhook).
+                       Available with or without a session credential, for all
+                       commands. The name "tightbeam" is reserved.
+  A process without a session supplies --owner <userId> when creating owned
+  work items, Toplines, or sessions. Ownership does not change its actor.
+  No identity flag is needed with a session credential: calls and rows identify
+  that agent, whether it holds zero, one, or several roles. Sessions can perform
+  operator/admin actions without --as-user.
   Pass at most ONE explicit identity. It is who the call is attributed to, NOT
   the target of the call. With no flag, the CLI walks up from the current
   directory for .tightbeam-session and the gateway derives the identity from
@@ -719,14 +777,15 @@ COMMANDS:
       --at = a scheduled wake that fires later. A wake ALWAYS carries a prompt —
       there is no content-free ping. This is how you DM or nudge another
       session (or yourself).
+      An assignment on an immediate wake is a message reference, not a wait.
       A matching fact or fallback delivers a new notification turn.
       It never resumes or replays prior work. The fact stamp reports why the prompt arrived.
       --replace-queued requires --assignment and asks delivery to cancel only your own
       eligible queued messages to that assignment's holder.
       The accountable agent re-reads durable state and decides the next action.
       The fallback timer detects silence only; it does not select an action.
-      A dependency predicate names conditions, bindings, resolverRef, necessity,
-      and verificationRef. --after-turn captures the caller's running turn.
+      A dependency predicate names conditions, optional bindings, and resolverRef.
+      No necessity or verifier assignment is required. --after-turn captures the caller's running turn.
       --prompt is the caller's explicit instruction override.
       Tightbeam carries it without rewriting it.
       --class elects the receiver's delivery policy. Without --class the wake
@@ -734,15 +793,35 @@ COMMANDS:
       the sender's chosen delivery time.
       Immediate:
         tightbeam wake --role owner --prompt "check the next step" --as coder
+      Immediate with an assignment reference:
+        tightbeam wake --session agent:recipient:example --assignment <assignmentId> \
+          --prompt "review is ready"
       Timed:
         tightbeam wake --session agent:coder:app --prompt "recheck the card" --after 5m --as coder
+      Use this plain condition when you only need to be notified of completion;
+      for other terminal outcomes, use a dependency wait on assignment.state.
       Condition:
-        tightbeam wake --session agent:owner:app --when-fact assignment-landed \
-          --when-scope asg_123 --fallback-after 2h --prompt "re-read the card" --as coder
+        tightbeam wake --session <targetSession> --when-fact assignment-landed \
+          --when-scope <assignmentId> --fallback-after 2h --prompt "read the completed assignment"
+      Dependency predicate example (resolverRef is a nested reference object):
+        tightbeam wake --session <holderSession> --assignment <assignmentId> \
+          --predicate '{"conditions":[{"fact":"assignment.state","op":"eq","value":"closed"}],
+            "bindings":{"assignmentId":"<resolverId>"},
+            "resolverRef":{"kind":"assignment","id":"<resolverId>"}}' \
+          --fallback-after 2h --prompt "read the resolver result"
 
   condition --kind <kind> [--scope <scope>] [--key <idempotencyKey>]
       File an observable fact. Matching condition wakes receive the fact as a new
       notification turn; they never resume or replay prior work.
+
+  fact-demand [--kind-prefix <prefix>]...
+      List distinct fact kinds and scopes demanded by pending condition waits.
+  fact-producer-claim --producer <name> --kind <kind> [--kind <kind>]...
+      --live-for 1s|5m|1h
+      Advertise the exact fact kinds this producer serves for a bounded time.
+      Repeating the claim replaces its kinds and renews its live period.
+  fact-producers
+      List producer claims and whether each is live now.
 
   harness-health-observe-other --harness <harness> --host <host>
       --source-session <session> --description <text> --evidence-mode exact_error|probe_digest
@@ -771,17 +850,28 @@ COMMANDS:
 
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
-                  [--produced-by-assignment <assignmentId>]
+                  [--produced-by-assignment <assignmentId>] [--content-base64 <bytes>]
       Record a deliberate artifact pointer for the calling session.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
+  harklight-revise --message <id> --base-revision <n> --title <text>
+      [--body <text>] [--choices-json <array>] [--clear-choices]
+  harklight-retract --message <id>
+  harklight-settle --message <id>
+      Settle one unresolved send using its original operation and inputs.
   harklight-send --session new|<handle> --sender-id <id> --title <text>
+      [--supersedes <id>]...
       [--body <text>] [--choices-json <array>] [--files-json <array>]
       [--vendor-session-id <id>]
       Send from the authenticated local session and register its reply wake.
   artifact-content-fetch <artifactId>
       Fetch captured bytes as contentBase64 with contentSha256 and contentSize.
       Reads stored custody only, never the origin path; uncaptured content is reported unavailable.
+  memento-set --record <kind>:<id> --name <name> (--value <value>... | --clear)
+      Set a declared record value and retain its history.
+  mementos --record <kind>:<id> [--history] [--name <name>]
+      [--limit <count>] [--cursor <cursor>]
+      Read current declared values or their ordered history.
 
   spawn --display "<name>" [--name <role>] [--archetype <a>]
         [--harness {{HARNESSES_PIPE}}] [--model <model>] [--effort <level>]
@@ -809,18 +899,18 @@ COMMANDS:
         tightbeam list --as orchestrator:news
 
   session-reparent --session <key> --parent <key> --assignment <id> --key <key>
-      Owner-as-user correction of one custom session and its sole open assignment.
+      Correct one custom session and its sole open assignment.
 
   session-po-set --session <key> --po-role <role> --key <key>
       Explicitly associate an exact session with its addressed product-owner role.
 
-  session-connect --session <sessionKey> (--as-user <userId> | --as-process <name>)
+  session-connect --session <sessionKey> [--as-user <userId> | --as-process <name>]
       Run the persistent NDJSON stdin/stdout connection for one selected session.
       Its initial snapshot includes existing wake prompts and delivery status.
-      Exactly one identity flag is required. --as-user selects read visibility
-      for organization credentials. --as-process uses the credential's default
-      read principal and records sends as process:<name>. Other bearer types
-      keep their existing read principal.
+      Organization credentials require exactly one of --as-user or --as-process.
+      --as-user selects read visibility; --as-process uses the credential's
+      default read principal and records sends as process:<name>. Session
+      credentials need no identity flag and record sends as their own agent.
 
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
@@ -912,18 +1002,24 @@ COMMANDS:
       Conclude an item (→ closed). Requires zero open assignments.
   work-item-fail <workItemId> [--reason <text>]
       Rule an item failed (→ failed); --reason is recorded on the item.
-  assign --subject "<work>" (--session <key> | --role <name>)
+  --parent-assignment explicitly links an open assignment held by the opener.
+      It takes precedence over the current turn or delivered batch evidence.
+      An invalid explicit parent leaves the new assignment unlinked, without refusal.
+
+  assign --subject "<work>" (--session <key> | --role <name>) [--owner <user>]
          [--key <key>] [--work-item <workItemId>]
          [--reviews <assignmentId>] [--effect-kind <kind>]
-         [--files '["lib/a.ex","test/a_test.exs"]'] [--succeeds <assignmentId>]
+         [--files '["lib/a.ex","test/a_test.exs"]'] [--succeeds <assignmentId>] [--parent-assignment <assignmentId>]
       Open an obligation held by a session; a work item is the durable thread
       across assignments. --files is an advisory suggestion that others can see;
       it reserves no path and does not limit the assignment's work.
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
            --brief "<one sentence>" [--work-item <workItemId>]
            [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
-           [--succeeds <assignmentId>]
+           [--succeeds <assignmentId>] [--parent-assignment <assignmentId>] [--owner <user>]
       Atomically open an assignment and wake its holder with the card id.
+      For assign/dispatch without a work item, an external process supplies
+      --owner <user> for notices. Session callers retain their own attribution.
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in whose complete id you hold. The
       current expecter is the preferred responder, not an authorization gate.
@@ -946,7 +1042,7 @@ COMMANDS:
       existing visibility rules.
   assignment-stop-turn <assignmentId> --reason "<why>"
       Stop the current turn only when you opened that assignment.
-  cancel-turn --session <key> --as-user <ownerUserId>
+  cancel-turn --session <key>
       Stop a running turn in a session owned by that user.
   revoke-assignment <assignmentId> --reason "..."
       Revoke when the assignment handler already authorizes your principal.
@@ -986,8 +1082,8 @@ COMMANDS:
       output).
 
   settle-turn --session <key> --seq <turnSeq> --outcome cancel|fail
-              --reason <text> --key <idempotencyKey> --as-user <adminUserId>
-      Settle one proven-stale running turn. This operator-only command never
+              --reason <text> --key <idempotencyKey>
+      Settle one proven-stale running turn. This command never
       interrupts a live task; use cancel-turn for a live task.
 
   kungfu list
@@ -1021,7 +1117,7 @@ COMMANDS:
       currently applies to it, exactly as served. Defaults to the calling
       session.
 
-  ADMIN (require --as-user of an admin, or an admin-owned agent handle):
+  ADMIN (available to admin-owned sessions without an identity flag):
   identity edit <archetype> [--manifest | --skill <name> [--rm]] [--key <idempotencyKey>]
                 [--file <path>]
       Edit the served identity. Without --file, content is read from stdin.
@@ -1050,7 +1146,7 @@ COMMANDS:
       to the current live identity revision, followed by an ordinary prompt
       asking each started session to re-read them. It cannot confirm that a
       session did, and it does not reload any running model context.
-  onboard openai|anthropic [--api-key]
+  onboard openai|anthropic [--api-key] [--owner <user>]
       Run this machine's model-provider credential onboarding flow. Without
       --api-key this is the interactive subscription ceremony. With it the flow is
       non-interactive and the KEY is read from stdin -- never as an argument,
@@ -1058,6 +1154,8 @@ COMMANDS:
         printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
       The key is validated against the provider before it is banked, and it
       never leaves this machine.
+      A process without a session uses --owner <user> for sign-in and recovery
+      notifications. Session callers retain their session owner.
   onboard cursor --api-key
       Cursor is API-key only; --api-key is required (no subscription login).
       The KEY is read from stdin -- never as an argument:
@@ -1109,10 +1207,10 @@ COMMANDS:
   harness-process settle <launch-id> --adapter-key <key>
       List the durable harness launch ledger, newest launch first.
 
-  session-diagnose --session EXACT [--as-user USER] [--json]
+  session-diagnose --session EXACT [--as <role> | --as-user USER | --as-process <name>] [--json]
       Read a session's process metadata without querying or changing the database.
 
-  doctor [--json] [--base-dir p] [--as <role> | --as-user <userId>]
+  doctor [--json] [--base-dir p] [--as <role> | --as-user <userId> | --as-process <name>]
       Check the local Tightbeam installation and report its health, with each
       learned sentinel's state and what remains to set it up. Sentinel status
       comes from the gateway under the given identity (this session's by
@@ -1134,7 +1232,17 @@ COMMANDS:
       transit between machines; run `tightbeam onboard` independently on
       the assimilated host.
       After: add the host to an archetype's `where`.
-        tightbeam assimilate work-1.local --as-user flynn
+        tightbeam assimilate work-1.local
+
+  skill list | skill install [--skill <name>] [--dir <skillsDir>]
+      Runs locally; needs no gateway. list shows the agent skills shipped with
+      this CLI and the Tightbeam version each one was written for.
+      install copies this release's agent skills into the user skills
+      directory of each supported agent harness configured in your home
+      directory, or into --dir only. Harnesses that are not set up are
+      skipped, never created. It replaces earlier copies of the same skills
+      and reports the version each replaced copy was written for. Start a
+      fresh agent session afterwards.
 
 DISCOVERY: the CLI walks up from cwd for .tightbeam-session first, then uses
   TIGHTBEAM_URL + TIGHTBEAM_TOKEN, then
@@ -1203,7 +1311,9 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "replace-queued",
     "api-key",
     "clear-spec-ref",
+    "clear-choices",
     "clear-delivery-owner",
+    "clear",
     "daemon-credential",
     "dry-run",
     "help",
@@ -1221,6 +1331,7 @@ struct Flags {
     positional: Vec<String>,
     flags: HashMap<String, String>,
     duplicates: HashSet<String>,
+    repeated: HashMap<String, Vec<String>>,
     missing_values: HashSet<String>,
     body_operations: Vec<BodyUpdateOperation>,
 }
@@ -1240,6 +1351,7 @@ fn split_args(args: Vec<String>) -> Flags {
     let mut positional = Vec::new();
     let mut flags = HashMap::new();
     let mut duplicates = HashSet::new();
+    let mut repeated: HashMap<String, Vec<String>> = HashMap::new();
     let mut missing_values = HashSet::new();
     let mut index = 0;
     while index < args.len() {
@@ -1256,6 +1368,15 @@ fn split_args(args: Vec<String>) -> Flags {
                     missing_values.insert(name.to_owned());
                 }
                 let value = next.cloned().unwrap_or_default();
+                if matches!(
+                    name,
+                    "memento" | "value" | "kind-prefix" | "kind" | "supersedes"
+                ) {
+                    repeated
+                        .entry(name.to_owned())
+                        .or_default()
+                        .push(value.clone());
+                }
                 if flags.insert(name.to_owned(), value).is_some() {
                     duplicates.insert(name.to_owned());
                 }
@@ -1272,6 +1393,7 @@ fn split_args(args: Vec<String>) -> Flags {
         positional,
         flags,
         duplicates,
+        repeated,
         missing_values,
         body_operations: Vec::new(),
     }
@@ -1370,9 +1492,28 @@ fn split_work_item_update_args(args: Vec<String>) -> Flags {
         positional,
         flags,
         duplicates,
+        repeated: HashMap::new(),
         missing_values,
         body_operations,
     }
+}
+
+fn inline_mementos(parsed: &Flags) -> Result<Vec<(String, String)>, String> {
+    parsed
+        .repeated
+        .get("memento")
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            let (name, value) = entry
+                .split_once('=')
+                .ok_or("--memento requires <name>=<value>")?;
+            if name.is_empty() || value.is_empty() {
+                return Err("--memento requires non-empty name and value".to_owned());
+            }
+            Ok((name.to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
@@ -1548,7 +1689,7 @@ fn topline_mutation(
     flags: &HashMap<String, String>,
 ) -> Result<Command, String> {
     let allowed = match verb {
-        "topline-create" => &["title", "key"][..],
+        "topline-create" => &["title", "key", "owner"][..],
         "topline-update" => &["title", "reason", "key"][..],
         "topline-close" | "topline-reopen" => &["reason", "key"][..],
         "topline-link-work" => &["reason", "key"][..],
@@ -1576,7 +1717,11 @@ fn topline_mutation(
     let params = match verb {
         "topline-create" => {
             exact(1)?;
-            vec![title()?, key()?]
+            let mut values = vec![title()?, key()?];
+            if let Some(owner) = nonempty(flags, "owner") {
+                values.push(("ownerUserId".to_owned(), owner));
+            }
+            values
         }
         "topline-update" => {
             exact(2)?;
@@ -1696,17 +1841,6 @@ fn number_coercion(text: &str) -> f64 {
     }
 }
 
-fn exceeds_other_validity_window(observed_at: &str, valid_until: &str) -> bool {
-    const MAX_VALIDITY_MS: f64 = 900_000.0;
-    let observed_at = number_coercion(observed_at);
-    let valid_until = number_coercion(valid_until);
-    observed_at.is_finite()
-        && valid_until.is_finite()
-        && observed_at.fract() == 0.0
-        && valid_until.fract() == 0.0
-        && valid_until > observed_at + MAX_VALIDITY_MS
-}
-
 fn js_number_json(value: f64) -> String {
     if !value.is_finite() {
         return "null".to_owned();
@@ -1817,13 +1951,16 @@ fn parse_with_optional_catalog(
         "doctor" => {
             let base_dir = nonempty(flags, "base-dir");
             if parsed.positional.len() != 1
-                || flags
-                    .keys()
-                    .any(|flag| !matches!(flag.as_str(), "json" | "base-dir" | "as" | "as-user"))
+                || flags.keys().any(|flag| {
+                    !matches!(
+                        flag.as_str(),
+                        "json" | "base-dir" | "as" | "as-user" | "as-process"
+                    )
+                })
                 || (flags.contains_key("base-dir") && base_dir.is_none())
             {
                 return Err(
-                    "usage: tightbeam doctor [--json] [--base-dir DIR] [--as <role> | --as-user <userId>]"
+                    "usage: tightbeam doctor [--json] [--base-dir DIR] [--as <role> | --as-user <userId> | --as-process <name>]"
                         .to_owned(),
                 );
             }
@@ -1835,12 +1972,15 @@ fn parse_with_optional_catalog(
         }
         "session-diagnose" => {
             if parsed.positional.len() != 1
-                || flags
-                    .keys()
-                    .any(|flag| !matches!(flag.as_str(), "session" | "as-user" | "json"))
+                || flags.keys().any(|flag| {
+                    !matches!(
+                        flag.as_str(),
+                        "session" | "as" | "as-user" | "as-process" | "json"
+                    )
+                })
             {
                 return Err(
-                    "usage: tightbeam session-diagnose --session EXACT [--as-user USER] [--json]"
+                    "usage: tightbeam session-diagnose --session EXACT [--as <role> | --as-user USER | --as-process <name>] [--json]"
                         .to_owned(),
                 );
             }
@@ -1964,18 +2104,6 @@ fn parse_with_optional_catalog(
                         .to_owned(),
                 );
             }
-            if !wait
-                && assignment_id.is_some()
-                && !replace_queued
-                && after_ms.is_none()
-                && at.is_none()
-                && condition_kind.is_none()
-            {
-                return Err(
-                    "--assignment requires --predicate, --after-turn, --after, --at, or --when-fact"
-                        .to_owned(),
-                );
-            }
             if predicate.is_some() && fallback_after_ms.is_none() && at.is_none() {
                 return Err(
                     "a predicate wake requires a fallback (--fallback-after / --at)".to_owned(),
@@ -2031,6 +2159,58 @@ fn parse_with_optional_catalog(
                 payload: nonempty(flags, "payload"),
             })
         }
+        "fact-demand" => {
+            closed_command_flags("fact-demand", flags, &["kind-prefix"])?;
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam fact-demand [--kind-prefix <prefix>]...".to_owned());
+            }
+            let prefixes = parsed
+                .repeated
+                .get("kind-prefix")
+                .cloned()
+                .unwrap_or_default();
+            if prefixes.iter().any(String::is_empty) {
+                return Err("--kind-prefix requires a nonempty prefix".to_owned());
+            }
+            Ok(Command::FactDemand {
+                identity: identity(flags)?,
+                prefixes,
+            })
+        }
+        "fact-producer-claim" => {
+            closed_command_flags(
+                "fact-producer-claim",
+                flags,
+                &["producer", "kind", "live-for"],
+            )?;
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam fact-producer-claim --producer <name> --kind <kind> [--kind <kind>]... --live-for <duration>".to_owned());
+            }
+            let producer = nonempty(flags, "producer").ok_or("--producer is required")?;
+            let kinds = parsed.repeated.get("kind").cloned().unwrap_or_default();
+            if kinds.is_empty() || kinds.iter().any(|kind| kind.trim().is_empty()) {
+                return Err("--kind requires one or more nonblank kinds".to_owned());
+            }
+            let live_for_ms = parse_duration(
+                "live-for",
+                &nonempty(flags, "live-for").ok_or("--live-for is required")?,
+            )?;
+            Ok(Command::FactProducerClaim {
+                identity: identity(flags)?,
+                producer,
+                kinds,
+                live_for_ms,
+            })
+        }
+        "fact-producers" => {
+            closed_command_flags("fact-producers", flags, &[])?;
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam fact-producers".to_owned());
+            }
+            Ok(Command::FactProducers {
+                identity: identity(flags)?,
+            })
+        }
         "harness-health-observe-other" => {
             let allowed = [
                 "as",
@@ -2077,25 +2257,9 @@ fn parse_with_optional_catalog(
             if evidence_mode == "probe_digest" && output_digest.is_none() {
                 return Err("--output-digest is required for probe_digest evidence".to_owned());
             }
-            if world_status == "UNKNOWN" && evidence_mode != "exact_error" {
-                return Err(
-                    "--world-status UNKNOWN requires --evidence-mode exact_error".to_owned(),
-                );
-            }
             let observed_at = nonempty(flags, "observed-at");
             let valid_until = nonempty(flags, "valid-until")
                 .ok_or_else(|| "--valid-until is required".to_owned())?;
-            if observed_at
-                .as_deref()
-                .is_some_and(|observed_at| exceeds_other_validity_window(observed_at, &valid_until))
-            {
-                return Err(
-                    "--valid-until must be no more than 15 minutes after --observed-at".to_owned(),
-                );
-            }
-            if !flags.contains_key("redaction-confirmed") {
-                return Err("--redaction-confirmed is required".to_owned());
-            }
             Ok(Command::HarnessHealthObserveOther {
                 identity: identity(flags)?,
                 harness: nonempty(flags, "harness")
@@ -2119,7 +2283,7 @@ fn parse_with_optional_catalog(
                 observed_at: observed_at.map(|value| js_number_json(number_coercion(&value))),
                 valid_until: js_number_json(number_coercion(&valid_until)),
                 world_status,
-                redaction_confirmed: true,
+                redaction_confirmed: flags.contains_key("redaction-confirmed"),
                 idempotency_key: nonempty(flags, "key")
                     .ok_or_else(|| "--key is required".to_owned())?,
                 correlation_id: nonempty(flags, "correlation-id"),
@@ -2285,7 +2449,7 @@ fn parse_with_optional_catalog(
         }
         "artifact-record" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>] [--produced-by-assignment <assignmentId>]".to_owned());
+                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>] [--content-base64 <bytes>] [--produced-by-assignment <assignmentId>]".to_owned());
             }
             Ok(Command::ArtifactRecord {
                 identity: identity(flags)?,
@@ -2296,6 +2460,7 @@ fn parse_with_optional_catalog(
                 description: nonempty(flags, "description"),
                 work_item_id: nonempty(flags, "work-item"),
                 content_sha256: nonempty(flags, "sha256"),
+                content_base64: nonempty(flags, "content-base64"),
                 produced_by_assignment_id: nonempty(flags, "produced-by-assignment"),
             })
         }
@@ -2336,13 +2501,16 @@ fn parse_with_optional_catalog(
                 || flags.keys().any(|flag| {
                     !matches!(
                         flag.as_str(),
-                        "as" | "session"
+                        "as" | "as-user"
+                            | "as-process"
+                            | "session"
                             | "sender-id"
                             | "title"
                             | "body"
                             | "choices-json"
                             | "files-json"
                             | "vendor-session-id"
+                            | "supersedes"
                     )
                 })
             {
@@ -2356,12 +2524,6 @@ fn parse_with_optional_catalog(
                 }
             };
             let sender_identity = identity(flags)?;
-            if !matches!(sender_identity, Identity::Session | Identity::Role(_)) {
-                return Err(
-                    "harklight-send requires the authenticated session or one of its roles"
-                        .to_owned(),
-                );
-            }
             Ok(Command::HarklightSend {
                 identity: sender_identity,
                 session: nonempty(flags, "session").ok_or("--session is required")?,
@@ -2371,25 +2533,71 @@ fn parse_with_optional_catalog(
                 choices: list("choices-json")?,
                 files: list("files-json")?,
                 vendor_session_id: nonempty(flags, "vendor-session-id"),
+                supersedes: parsed
+                    .repeated
+                    .get("supersedes")
+                    .cloned()
+                    .unwrap_or_default(),
             })
+        }
+        "harklight-revise" | "harklight-retract" | "harklight-settle" => {
+            let command = command.expect("checked above");
+            let revise = command == "harklight-revise";
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| {
+                    !matches!(flag.as_str(), "as" | "as-user" | "as-process" | "message")
+                        && !(revise
+                            && matches!(
+                                flag.as_str(),
+                                "base-revision"
+                                    | "title"
+                                    | "body"
+                                    | "choices-json"
+                                    | "clear-choices"
+                            ))
+                })
+            {
+                return Err("invalid Harklight command flags".to_owned());
+            }
+            let identity = identity(flags)?;
+            let message = nonempty(flags, "message").ok_or("--message is required")?;
+            match command {
+                "harklight-retract" => Ok(Command::HarklightRetract { identity, message }),
+                "harklight-settle" => Ok(Command::HarklightSettle { identity, message }),
+                _ => {
+                    let base_revision = nonempty(flags, "base-revision")
+                        .ok_or("--base-revision is required")?
+                        .parse::<i64>()
+                        .map_err(|_| "--base-revision must be a positive integer")?;
+                    let choices = flags
+                        .get("choices-json")
+                        .map(|v| serde_json::from_str::<Vec<String>>(v))
+                        .transpose()
+                        .map_err(|_| "--choices-json must be a JSON array of strings")?
+                        .unwrap_or_default();
+                    let clear_choices = flags.contains_key("clear-choices");
+                    if clear_choices && !choices.is_empty() {
+                        return Err("use choices or --clear-choices, not both".to_owned());
+                    }
+                    Ok(Command::HarklightRevise {
+                        identity,
+                        message,
+                        base_revision,
+                        title: nonempty(flags, "title").ok_or("--title is required")?,
+                        body: flags.get("body").cloned(),
+                        choices,
+                        clear_choices,
+                    })
+                }
+            }
         }
         "spawn" => {
             let display_name =
                 nonempty(flags, "display").ok_or_else(|| "--display is required".to_owned())?;
             let harness = nonempty(flags, "harness");
-            if let Some(name) = harness.as_deref() {
-                let catalog = match supplied_catalog {
-                    Some(catalog) => catalog.clone(),
-                    None => crate::harnesses::catalog_for(Some(
-                        crate::attempt_diagnostic::command_context::CommandContext::spawn_catalog(),
-                    ))?,
-                };
-                if !catalog.contains(name) {
-                    return Err(format!("unsupported harness: {name}"));
-                }
-            }
             Ok(Command::Spawn {
                 identity: identity(flags)?,
+                owner_user_id: nonempty(flags, "owner"),
                 display_name,
                 idempotency_key: nonempty(flags, "key").unwrap_or_else(generated_key),
                 archetype: nonempty(flags, "archetype"),
@@ -2453,7 +2661,7 @@ fn parse_with_optional_catalog(
             })
         }
         "session-connect" => {
-            let usage = "usage: tightbeam session-connect --session <sessionKey> (--as-user <userId> | --as-process <name>)";
+            let usage = "usage: tightbeam session-connect --session <sessionKey> [--as-user <userId> | --as-process <name>]";
             if parsed.positional.len() != 1
                 || flags
                     .keys()
@@ -2473,6 +2681,7 @@ fn parse_with_optional_catalog(
                 (false, true) => Identity::Process(
                     nonempty(flags, "as-process").ok_or_else(|| usage.to_owned())?,
                 ),
+                (false, false) => Identity::Session,
                 _ => return Err(usage.to_owned()),
             };
             Ok(Command::SessionConnect {
@@ -2491,10 +2700,13 @@ fn parse_with_optional_catalog(
                     "role",
                     "key",
                     "work-item",
+                    "owner",
                     "reviews",
                     "effect-kind",
                     "files",
+                    "memento",
                     "succeeds",
+                    "parent-assignment",
                 ],
             )?;
             let targets = [
@@ -2518,14 +2730,17 @@ fn parse_with_optional_catalog(
                 .transpose()?;
             Ok(Command::Assign {
                 identity: identity(flags)?,
+                mementos: inline_mementos(&parsed)?,
                 subject,
                 target: targets.into_iter().next().expect("exactly one target"),
                 idempotency_key: nonempty(flags, "key"),
                 work_item_id: nonempty(flags, "work-item"),
+                owner_user_id: nonempty(flags, "owner"),
                 reviews: nonempty(flags, "reviews"),
                 effect_kind: nonempty(flags, "effect-kind"),
                 files,
                 succeeds: nonempty(flags, "succeeds"),
+                parent_assignment: flags.get("parent-assignment").cloned(),
             })
         }
         "dispatch" => {
@@ -2538,10 +2753,13 @@ fn parse_with_optional_catalog(
                     "subject",
                     "brief",
                     "work-item",
+                    "owner",
                     "effect-kind",
                     "workdir-root",
+                    "memento",
                     "key",
                     "succeeds",
+                    "parent-assignment",
                 ],
             )?;
             let holders = [nonempty(flags, "to"), nonempty(flags, "holder")]
@@ -2556,14 +2774,17 @@ fn parse_with_optional_catalog(
             let brief = nonempty(flags, "brief").ok_or_else(|| "--brief is required".to_owned())?;
             Ok(Command::Dispatch {
                 identity: identity(flags)?,
+                mementos: inline_mementos(&parsed)?,
                 subject,
                 holder: holders.into_iter().next().expect("exactly one holder"),
                 work_item_id: nonempty(flags, "work-item"),
+                owner_user_id: nonempty(flags, "owner"),
                 effect_kind: nonempty(flags, "effect-kind"),
                 workdir_root: nonempty(flags, "workdir-root"),
                 brief,
                 idempotency_key: nonempty(flags, "key"),
                 succeeds: nonempty(flags, "succeeds"),
+                parent_assignment: flags.get("parent-assignment").cloned(),
             })
         }
         "effort-rule" => {
@@ -2731,8 +2952,8 @@ fn parse_with_optional_catalog(
             })
         }
         "cancel-turn" => {
-            let usage = "usage: tightbeam cancel-turn --session <key> --as-user <ownerUserId>";
-            const ALLOWED: &[&str] = &["session", "as-user"];
+            let usage = "usage: tightbeam cancel-turn --session <key>";
+            const ALLOWED: &[&str] = &["session", "as", "as-user", "as-process"];
             if parsed.positional.len() != 1
                 || parsed.duplicates.contains("session")
                 || parsed.duplicates.contains("as-user")
@@ -2741,9 +2962,7 @@ fn parse_with_optional_catalog(
                 return Err(usage.to_owned());
             }
             Ok(Command::CancelTurn {
-                identity: Identity::User(
-                    nonempty(flags, "as-user").ok_or_else(|| usage.to_owned())?,
-                ),
+                identity: identity(flags)?,
                 session_key: nonempty(flags, "session").ok_or_else(|| usage.to_owned())?,
             })
         }
@@ -2839,6 +3058,8 @@ fn parse_with_optional_catalog(
             }
             Ok(Command::WorkItemCreate {
                 identity: identity(flags)?,
+                owner_user_id: nonempty(flags, "owner"),
+                mementos: inline_mementos(&parsed)?,
                 title: nonempty(flags, "title").ok_or_else(|| "--title is required".to_owned())?,
                 spec_ref_name,
                 spec_ref_sha256,
@@ -2852,6 +3073,7 @@ fn parse_with_optional_catalog(
                 "work-item",
                 "title",
                 "delivery-owner",
+                "owner",
                 "brief",
                 "as",
                 "as-user",
@@ -2882,6 +3104,7 @@ fn parse_with_optional_catalog(
 
             Ok(Command::WorkItemHandoff {
                 identity: identity(flags)?,
+                owner_user_id: nonempty(flags, "owner"),
                 work_item_id,
                 title,
                 delivery_owner,
@@ -3253,6 +3476,16 @@ fn parse_with_optional_catalog(
                         .map_err(|error| format!("--commit-refs must be a JSON array: {error}"))
                 })
                 .transpose()?;
+            let artifact_id = nonempty(flags, "artifact");
+            let content_sha256 = nonempty(flags, "sha256");
+            if artifact_id.is_some() != content_sha256.is_some() {
+                return Err("--artifact and --sha256 must be supplied together".to_owned());
+            }
+            if kind != "verdict" && artifact_id.is_some() {
+                return Err(
+                    "--artifact and --sha256 are only valid when --kind is verdict".to_owned(),
+                );
+            }
             let release_fact_kind = nonempty(flags, "release-fact-kind");
             let release_fact_scope = nonempty(flags, "release-fact-scope");
             let release_fact_principal_ref = nonempty(flags, "release-fact-principal-ref");
@@ -3292,6 +3525,7 @@ fn parse_with_optional_catalog(
             }
             Ok(Command::Attest {
                 identity: identity(flags)?,
+                mementos: inline_mementos(&parsed)?,
                 assignment_id,
                 kind,
                 verdict,
@@ -3303,6 +3537,58 @@ fn parse_with_optional_catalog(
                 release_fact_kind,
                 release_fact_scope,
                 release_fact_principal_ref,
+            })
+        }
+        "memento-set" => {
+            closed_command_flags("memento-set", flags, &["record", "name", "value", "clear"])?;
+            let values = parsed.repeated.get("value").cloned().unwrap_or_default();
+            let clear = flags.contains_key("clear");
+            if parsed.positional.len() != 1
+                || clear == !values.is_empty()
+                || parsed.duplicates.iter().any(|flag| flag != "value")
+                || values.iter().any(String::is_empty)
+            {
+                return Err("usage: tightbeam memento-set --record <kind>:<id> --name <name> (--value <value>... | --clear)".to_owned());
+            }
+            Ok(Command::MementoSet {
+                identity: identity(flags)?,
+                record: nonempty(flags, "record").ok_or("--record is required")?,
+                name: nonempty(flags, "name").ok_or("--name is required")?,
+                values,
+                clear,
+            })
+        }
+        "mementos" => {
+            closed_command_flags(
+                "mementos",
+                flags,
+                &["record", "history", "name", "limit", "cursor"],
+            )?;
+            let history = flags.contains_key("history");
+            if parsed.positional.len() != 1
+                || !parsed.duplicates.is_empty()
+                || (!history
+                    && ["name", "limit", "cursor"]
+                        .iter()
+                        .any(|flag| flags.contains_key(*flag)))
+            {
+                return Err("history options require mementos --history".to_owned());
+            }
+            let limit = flags
+                .get("limit")
+                .map(|value| {
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| "--limit requires a positive integer".to_owned())
+                })
+                .transpose()?;
+            Ok(Command::Mementos {
+                identity: identity(flags)?,
+                record: nonempty(flags, "record").ok_or("--record is required")?,
+                history,
+                name: nonempty(flags, "name"),
+                limit,
+                cursor: nonempty(flags, "cursor"),
             })
         }
         "attests" => {
@@ -3326,9 +3612,6 @@ fn parse_with_optional_catalog(
                     let id = value
                         .parse::<i64>()
                         .map_err(|_| "--fact-id must be a positive integer".to_owned())?;
-                    if id <= 0 {
-                        return Err("--fact-id must be a positive integer".to_owned());
-                    }
                     Some(id)
                 }
             };
@@ -3367,7 +3650,7 @@ fn parse_with_optional_catalog(
             })
         }
         "settle-turn" => {
-            let usage = "usage: tightbeam settle-turn --session <key> --seq <turnSeq> --outcome cancel|fail --reason <text> --key <idempotencyKey> --as-user <adminUserId>";
+            let usage = "usage: tightbeam settle-turn --session <key> --seq <turnSeq> --outcome cancel|fail --reason <text> --key <idempotencyKey>";
             if parsed.positional.len() != 1 {
                 return Err(usage.to_owned());
             }
@@ -3379,11 +3662,9 @@ fn parse_with_optional_catalog(
 
             let turn_seq = nonempty(flags, "seq").ok_or_else(|| usage.to_owned())?;
             let normalized_turn_seq = turn_seq
-                .parse::<u64>()
-                .ok()
-                .filter(|value| *value > 0 && *value <= i64::MAX as u64)
+                .parse::<i64>()
                 .map(|value| value.to_string())
-                .ok_or_else(|| "--seq must be a positive integer".to_owned())?;
+                .map_err(|_| "--seq must be a positive integer".to_owned())?;
 
             Ok(Command::SettleTurn {
                 identity: identity(flags)?,
@@ -3453,24 +3734,19 @@ fn parse_with_optional_catalog(
         "host-toolchain-set" => parse_host_toolchain_set(&parsed, flags),
         "update-clients" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam update-clients --as-user <adminUserId>".to_owned());
+                return Err("usage: tightbeam update-clients".to_owned());
             }
-            let Some(as_user) = nonempty(flags, "as-user") else {
-                return Err("--as-user is required for update-clients (admin required)".to_owned());
-            };
-            let selected_identity = identity(flags)?;
-            debug_assert_eq!(selected_identity, Identity::User(as_user.clone()));
-            Ok(Command::UpdateClients { as_user })
+            Ok(Command::UpdateClients {
+                identity: identity(flags)?,
+            })
         }
         "assimilate" => {
-            let ssh_dest = parsed.positional.get(1).cloned().ok_or_else(|| {
-                "usage: tightbeam assimilate <ssh-dest> --as-user <adminUserId>".to_owned()
-            })?;
-            let Some(as_user) = nonempty(flags, "as-user") else {
-                return Err("--as-user is required for assimilate (admin required)".to_owned());
-            };
+            let ssh_dest = parsed
+                .positional
+                .get(1)
+                .cloned()
+                .ok_or_else(|| "usage: tightbeam assimilate <ssh-dest>".to_owned())?;
             let selected_identity = identity(flags)?;
-            debug_assert_eq!(selected_identity, Identity::User(as_user.clone()));
             let catalog = match supplied_catalog {
                 Some(catalog) => catalog.clone(),
                 None => crate::harnesses::catalog_for(Some(
@@ -3487,7 +3763,7 @@ fn parse_with_optional_catalog(
             }
             Ok(Command::Assimilate(AssimilateArgs {
                 ssh_dest,
-                as_user,
+                identity: selected_identity,
                 name: nonempty(flags, "name"),
                 base_dir: nonempty(flags, "base-dir").unwrap_or_else(|| "~/.tightbeam".to_owned()),
                 harnesses,
@@ -3496,7 +3772,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -3752,8 +4028,7 @@ fn parse_harness_process(
 fn priority_flag(flags: &HashMap<String, String>) -> Result<Option<String>, String> {
     nonempty(flags, "priority")
         .map(|value| {
-            let priority = value.parse::<u8>().ok();
-            if priority.is_some_and(|priority| priority <= 8) {
+            if value != "-0" && serde_json::from_str::<serde_json::Number>(&value).is_ok() {
                 Ok(value)
             } else {
                 Err("priority must be an integer from 0 through 8".to_owned())
@@ -3779,8 +4054,7 @@ fn parse_config(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comma
             value: value.clone(),
         }),
         (Some("set"), Some("default-priority"), Some(value), None) => {
-            let priority = value.parse::<u8>().ok();
-            if priority.is_none_or(|priority| priority > 8) {
+            if value == "-0" || serde_json::from_str::<serde_json::Number>(value).is_err() {
                 return Err("default-priority must be an integer from 0 through 8".to_owned());
             }
             Ok(Command::ConfigSet {
@@ -3964,6 +4238,7 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     }
     let allowed = [
         "api-key",
+        "owner",
         "daemon-credential",
         "endpoint",
         "name",
@@ -4051,6 +4326,7 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     }
     Ok(Command::Onboard {
         identity: identity(flags)?,
+        owner_user_id: nonempty(flags, "owner"),
         provider,
         api_key: flags.contains_key("api-key"),
         daemon_credential,
@@ -4131,12 +4407,10 @@ mod tests {
     }
 
     #[test]
-    fn cancel_turn_requires_an_explicit_user_and_session() {
+    fn cancel_turn_requires_a_target_and_accepts_ordinary_identities() {
         for args in [
             strings(&["cancel-turn"]),
-            strings(&["cancel-turn", "--session", "s1"]),
             strings(&["cancel-turn", "--as-user", "owner"]),
-            strings(&["cancel-turn", "--session", "s1", "--as", "owner"]),
             strings(&[
                 "cancel-turn",
                 "--session",
@@ -4148,6 +4422,19 @@ mod tests {
             ]),
         ] {
             assert!(parse(args).is_err());
+        }
+
+        assert_eq!(
+            parse(strings(&["cancel-turn", "--session", "s1"])),
+            Ok(Command::CancelTurn {
+                identity: Identity::Session,
+                session_key: "s1".to_owned()
+            })
+        );
+        for suffix in [vec!["--as", "worker"], vec!["--as-process", "automation"]] {
+            let mut argv = vec!["cancel-turn", "--session", "s1"];
+            argv.extend(suffix);
+            assert!(parse(strings(&argv)).is_ok());
         }
 
         assert_eq!(
@@ -4214,11 +4501,11 @@ mod tests {
                 choices: vec!["Yes".to_owned(), "No".to_owned()],
                 files: vec!["/tmp/request.txt".to_owned()],
                 vendor_session_id: None,
+                supersedes: vec![],
             })
         );
 
-        assert!(
-            parse(strings(&[
+        assert!(matches!(parse(strings(&[
                 "harklight-send",
                 "--session",
                 "new",
@@ -4228,9 +4515,22 @@ mod tests {
                 "Question",
                 "--as-user",
                 "owner",
-            ]))
-            .is_err()
-        );
+            ])), Ok(Command::HarklightSend { identity: Identity::User(user), .. }) if user == "owner"));
+        assert!(matches!(
+            parse(strings(&[
+                "harklight-send",
+                "--session",
+                "new",
+                "--sender-id",
+                "sender",
+                "--title",
+                "Question",
+                "--as-process",
+                "worker",
+            ])),
+            Ok(Command::HarklightSend { identity: Identity::Process(process), .. })
+                if process == "worker"
+        ));
         assert!(
             parse(strings(&[
                 "harklight-send",
@@ -4245,6 +4545,67 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn harklight_revise_sends_base_revision_validity_to_gateway() {
+        for revision in ["0", "-1"] {
+            let command = parse(strings(&[
+                "harklight-revise",
+                "--message",
+                "message-example",
+                "--base-revision",
+                revision,
+                "--title",
+                "Updated title",
+            ]))
+            .unwrap();
+
+            assert!(
+                matches!(command, Command::HarklightRevise { base_revision, .. }
+                if base_revision == revision.parse::<i64>().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn harklight_change_commands_send_user_and_process_identity_to_gateway() {
+        let calls: &[&[&str]] = &[
+            &[
+                "harklight-revise",
+                "--message",
+                "message-example",
+                "--base-revision",
+                "1",
+                "--title",
+                "Updated title",
+            ],
+            &["harklight-retract", "--message", "message-example"],
+            &["harklight-settle", "--message", "message-example"],
+        ];
+
+        for (identity_flag, identity_value, expected_identity) in [
+            ("--as-user", "owner", Identity::User("owner".to_owned())),
+            (
+                "--as-process",
+                "worker",
+                Identity::Process("worker".to_owned()),
+            ),
+        ] {
+            for call in calls {
+                let mut args = call.to_vec();
+                args.extend([identity_flag, identity_value]);
+
+                let identity = match parse(strings(&args)).unwrap() {
+                    Command::HarklightRevise { identity, .. }
+                    | Command::HarklightRetract { identity, .. }
+                    | Command::HarklightSettle { identity, .. } => identity,
+                    other => panic!("unexpected command: {other:?}"),
+                };
+
+                assert_eq!(identity, expected_identity);
+            }
+        }
     }
 
     #[test]
@@ -4315,7 +4676,7 @@ mod tests {
             "--host",
             "host-a",
             "--source-session",
-            "agent:worker:session",
+            "session-example",
             "--description",
             "provider connection reset",
             "--evidence-mode",
@@ -4380,51 +4741,141 @@ mod tests {
     }
 
     #[test]
-    fn harness_health_observe_other_rejects_unknown_probe_digest_evidence() {
+    fn harness_health_observe_other_sends_unknown_probe_digest_evidence_to_gateway() {
         let digest = "a".repeat(64);
-        let error = parse(strings(&[
+        let valid_until = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            + 60_000)
+            .to_string();
+        let command = parse(strings(&[
             "harness-health-observe-other",
+            "--harness",
+            "claude",
+            "--host",
+            "host-a",
+            "--source-session",
+            "session-example",
+            "--description",
+            "observation",
             "--evidence-mode",
             "probe_digest",
             "--output-digest",
             &digest,
+            "--observed-state",
+            "provider request failed",
+            "--exact-probe",
+            "provider health probe",
+            "--recovery-condition",
+            "a normal provider turn completes",
+            "--not-known-class",
+            "not one of the named failure classes",
+            "--valid-until",
+            &valid_until,
             "--world-status",
             "UNKNOWN",
+            "--redaction-confirmed",
+            "--key",
+            "observation-2",
         ]))
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(
-            error,
-            "--world-status UNKNOWN requires --evidence-mode exact_error"
+        assert!(
+            matches!(command, Command::HarnessHealthObserveOther { evidence_mode, world_status, .. }
+            if evidence_mode == "probe_digest" && world_status == "UNKNOWN")
         );
     }
 
     #[test]
-    fn harness_health_observe_other_rejects_valid_until_beyond_observed_window() {
+    fn harness_health_observe_other_sends_validity_window_to_gateway() {
         let observed_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis();
         let valid_until = observed_at + 900_001;
-        let error = parse(strings(&[
+        let command = parse(strings(&[
             "harness-health-observe-other",
+            "--harness",
+            "claude",
+            "--host",
+            "host-a",
+            "--source-session",
+            "session-example",
+            "--description",
+            "observation",
             "--evidence-mode",
             "exact_error",
             "--exact-error",
             "provider refused the request",
+            "--observed-state",
+            "provider request failed",
             "--world-status",
             "UNKNOWN",
+            "--exact-probe",
+            "provider health probe",
+            "--recovery-condition",
+            "a normal provider turn completes",
+            "--not-known-class",
+            "not one of the named failure classes",
             "--observed-at",
             &observed_at.to_string(),
             "--valid-until",
             &valid_until.to_string(),
+            "--redaction-confirmed",
+            "--key",
+            "observation-3",
         ]))
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(
-            error,
-            "--valid-until must be no more than 15 minutes after --observed-at"
+        assert!(
+            matches!(command, Command::HarnessHealthObserveOther { observed_at: Some(value), .. }
+            if value == observed_at.to_string())
         );
+    }
+
+    #[test]
+    fn harness_health_observe_other_sends_redaction_confirmation_state_to_gateway() {
+        let valid_until = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            + 60_000)
+            .to_string();
+        let command = parse(strings(&[
+            "harness-health-observe-other",
+            "--harness",
+            "claude",
+            "--host",
+            "host-a",
+            "--source-session",
+            "session-example",
+            "--description",
+            "observation",
+            "--evidence-mode",
+            "exact_error",
+            "--exact-error",
+            "provider refused the request",
+            "--observed-state",
+            "provider request failed",
+            "--exact-probe",
+            "provider health probe",
+            "--recovery-condition",
+            "a normal provider turn completes",
+            "--not-known-class",
+            "not one of the named failure classes",
+            "--valid-until",
+            &valid_until,
+            "--world-status",
+            "UNKNOWN",
+            "--key",
+            "observation-4",
+        ]))
+        .unwrap();
+
+        let body = crate::dispatch::build_request(&command).unwrap().body_json;
+        let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(request["params"]["redactionConfirmed"], false);
     }
 
     #[test]
@@ -4917,10 +5368,18 @@ mod tests {
         }
 
         let manual = render_help(None);
+        let normalized = manual.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            manual.contains("Processes may wake, cancel-wake, and file\n                       condition facts ONLY"),
+            normalized.contains("Available with or without a session credential, for all"),
             "{manual}"
         );
+        for command in ["fact-demand", "fact-producer-claim", "fact-producers"] {
+            assert!(
+                render_command_help(None, command).is_some(),
+                "missing help for {command}"
+            );
+        }
+        assert!(!manual.contains("condition facts ONLY"));
         assert!(!manual.contains("Processes may wake and cancel-wake ONLY"));
     }
 
@@ -5130,6 +5589,7 @@ mod tests {
             ])),
             Ok(Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
+                owner_user_id: None,
                 provider: "fixture-provider".to_owned(),
                 api_key: false,
                 daemon_credential: false,
@@ -5152,6 +5612,7 @@ mod tests {
             ])),
             Ok(Command::Onboard {
                 identity: Identity::Session,
+                owner_user_id: None,
                 provider: "github".to_owned(),
                 api_key: false,
                 daemon_credential: false,
@@ -5170,6 +5631,7 @@ mod tests {
             ])),
             Ok(Command::Onboard {
                 identity: Identity::Session,
+                owner_user_id: None,
                 provider: "github".to_owned(),
                 api_key: false,
                 daemon_credential: false,
@@ -5207,6 +5669,7 @@ mod tests {
             parse(strings(&["onboard", "cursor", "--api-key"])),
             Ok(Command::Onboard {
                 identity: Identity::Session,
+                owner_user_id: None,
                 provider: "cursor".to_owned(),
                 api_key: true,
                 daemon_credential: false,
@@ -5239,6 +5702,7 @@ mod tests {
             ])),
             Ok(Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
+                owner_user_id: None,
                 provider: "opencode-go".to_owned(),
                 api_key: true,
                 daemon_credential: false,
@@ -5266,6 +5730,7 @@ mod tests {
             ])),
             Ok(Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
+                owner_user_id: None,
                 provider: "opencode-go".to_owned(),
                 api_key: false,
                 daemon_credential: true,
@@ -5302,6 +5767,7 @@ mod tests {
             ])),
             Ok(Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
+                owner_user_id: None,
                 provider: "local-openai".to_owned(),
                 api_key: false,
                 daemon_credential: false,
@@ -5342,12 +5808,14 @@ mod tests {
         assert_eq!(
             parse(strings(&["update-clients", "--as-user", "flynn"])),
             Ok(Command::UpdateClients {
-                as_user: "flynn".to_owned()
+                identity: Identity::User("flynn".to_owned())
             })
         );
         assert_eq!(
             parse(strings(&["update-clients"])),
-            Err("--as-user is required for update-clients (admin required)".to_owned())
+            Ok(Command::UpdateClients {
+                identity: Identity::Session
+            })
         );
     }
 
@@ -5378,7 +5846,7 @@ mod tests {
     }
 
     #[test]
-    fn settlement_requires_a_positive_sqlite_sequence_and_closed_outcome() {
+    fn settlement_sends_sequence_validity_to_gateway_and_keeps_malformed_values_local() {
         let argv = [
             "settle-turn",
             "--session",
@@ -5405,7 +5873,15 @@ mod tests {
                 idempotency_key: "one".to_owned(),
             })
         );
-        for seq in ["0", "-1", "9223372036854775808", "abc"] {
+        for seq in ["0", "-1"] {
+            let mut invalid = argv;
+            invalid[4] = seq;
+            assert!(matches!(
+                parse(strings(&invalid)),
+                Ok(Command::SettleTurn { turn_seq, .. }) if turn_seq == seq
+            ));
+        }
+        for seq in ["9223372036854775808", "abc"] {
             let mut invalid = argv;
             invalid[4] = seq;
             assert!(parse(strings(&invalid)).is_err(), "accepted {seq}");
@@ -5438,9 +5914,9 @@ mod tests {
     }
 
     #[test]
-    fn session_connect_requires_exactly_one_user_or_process_identity() {
+    fn session_connect_accepts_session_identity_or_one_explicit_identity() {
         let session_key = "agent:main/example";
-        let usage = "usage: tightbeam session-connect --session <sessionKey> (--as-user <userId> | --as-process <name>)";
+        let usage = "usage: tightbeam session-connect --session <sessionKey> [--as-user <userId> | --as-process <name>]";
 
         assert_eq!(
             parse(strings(&[
@@ -5469,8 +5945,15 @@ mod tests {
             })
         );
 
+        assert_eq!(
+            parse(strings(&["session-connect", "--session", session_key])),
+            Ok(Command::SessionConnect {
+                identity: Identity::Session,
+                session_key: session_key.to_owned(),
+            })
+        );
+
         for argv in [
-            vec!["session-connect", "--session", session_key],
             vec![
                 "session-connect",
                 "--session",
@@ -5541,6 +6024,9 @@ mod tests {
                 "breathing",
                 "cancel-wake",
                 "condition",
+                "fact-demand",
+                "fact-producer-claim",
+                "fact-producers",
                 "config",
                 "decision-request",
                 "decision-requests",
@@ -5550,6 +6036,9 @@ mod tests {
                 "effort-rule",
                 "harness-process",
                 "harklight-send",
+                "harklight-revise",
+                "harklight-retract",
+                "harklight-settle",
                 "harness-health-observe-other",
                 "harness-health-resolve-other",
                 "harness-health-review-other",
@@ -5563,6 +6052,8 @@ mod tests {
                 "kungfu",
                 "learn",
                 "list",
+                "memento-set",
+                "mementos",
                 "onboard",
                 "operator-ask",
                 "operator-rule",
@@ -5571,6 +6062,7 @@ mod tests {
                 "sentinel",
                 "session-connect",
                 "session-reparent",
+                "skill",
                 "session-po-set",
                 "settle-turn",
                 "repair-assignment",
@@ -5674,8 +6166,9 @@ mod tests {
             .unwrap()
             .0;
 
-        assert_eq!(examples.matches("tightbeam wake --").count(), 3);
+        assert_eq!(examples.matches("tightbeam wake --").count(), 5);
         assert!(examples.contains("tightbeam wake --role owner --prompt"));
+        assert!(examples.contains("--session agent:recipient:example --assignment <assignmentId>"));
         assert!(examples.contains("--after 5m"));
         assert!(examples.contains("--when-fact assignment-landed"));
         assert!(examples.contains("--fallback-after 2h"));
@@ -5705,7 +6198,7 @@ mod tests {
             }) if assignment_id == "asg_123" && after_ms == "300000"
         ));
 
-        assert_eq!(
+        assert!(matches!(
             parse(strings(&[
                 "wake",
                 "--session",
@@ -5715,10 +6208,84 @@ mod tests {
                 "--prompt",
                 "no trigger",
             ])),
-            Err(
-                "--assignment requires --predicate, --after-turn, --after, --at, or --when-fact"
-                    .to_owned()
-            )
+            Ok(Command::Wake {
+                assignment_id: Some(ref assignment_id),
+                after_ms: None,
+                at: None,
+                condition_kind: None,
+                ..
+            }) if assignment_id == "asg_123"
+        ));
+    }
+
+    #[test]
+    fn numeric_domain_limits_are_sent_to_gateway() {
+        let priority = parse(strings(&[
+            "work-item-create",
+            "--title",
+            "Priority",
+            "--priority",
+            "9",
+        ]))
+        .unwrap();
+        let priority_body = crate::dispatch::build_request(&priority).unwrap().body_json;
+        let priority_request: serde_json::Value = serde_json::from_str(&priority_body).unwrap();
+        assert_eq!(priority_request["params"]["priority"], 9);
+
+        let negative_priority = parse(strings(&[
+            "work-item-create",
+            "--title",
+            "Priority",
+            "--priority",
+            "-1",
+        ]))
+        .unwrap();
+        let negative_priority_body = crate::dispatch::build_request(&negative_priority)
+            .unwrap()
+            .body_json;
+        let negative_priority_request: serde_json::Value =
+            serde_json::from_str(&negative_priority_body).unwrap();
+        assert_eq!(negative_priority_request["params"]["priority"], -1);
+
+        let default_priority = parse(strings(&["config", "set", "default-priority", "9"])).unwrap();
+        let config_body = crate::dispatch::build_request(&default_priority)
+            .unwrap()
+            .body_json;
+        let config_request: serde_json::Value = serde_json::from_str(&config_body).unwrap();
+        assert_eq!(config_request["params"]["value"], 9);
+
+        let mementos = parse(strings(&[
+            "mementos",
+            "--record",
+            "assignment:example",
+            "--history",
+            "--limit",
+            "0",
+        ]))
+        .unwrap();
+        let mementos_body = crate::dispatch::build_request(&mementos).unwrap().body_json;
+        let mementos_request: serde_json::Value = serde_json::from_str(&mementos_body).unwrap();
+        assert_eq!(mementos_request["params"]["limit"], 0);
+
+        assert!(
+            parse(strings(&[
+                "work-item-create",
+                "--title",
+                "Priority",
+                "--priority",
+                "not-a-number",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(strings(&[
+                "work-item-create",
+                "--title",
+                "Priority",
+                "--priority",
+                "-0",
+            ]))
+            .is_err()
         );
     }
 
@@ -5752,7 +6319,7 @@ mod tests {
             }) if harness == "fixture"
         ));
 
-        assert_eq!(
+        assert!(matches!(
             parse_with_catalog(
                 strings(&[
                     "spawn",
@@ -5767,8 +6334,8 @@ mod tests {
                 ]),
                 &catalog
             ),
-            Err("unsupported harness: codex".to_owned())
-        );
+            Ok(Command::Spawn { harness: Some(ref harness), .. }) if harness == "codex"
+        ));
 
         assert!(matches!(
             parse_with_catalog(strings(&[
@@ -5999,6 +6566,42 @@ mod tests {
                 scope: None,
                 idempotency_key: None,
                 payload: None,
+            })
+        );
+    }
+
+    #[test]
+    fn fact_producer_commands_keep_repeated_prefixes_and_kinds() {
+        assert_eq!(
+            parse(strings(&[
+                "fact-demand",
+                "--kind-prefix",
+                "landing.",
+                "--kind-prefix",
+                "pr."
+            ])),
+            Ok(Command::FactDemand {
+                identity: Identity::Session,
+                prefixes: vec!["landing.".to_owned(), "pr.".to_owned()],
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "fact-producer-claim",
+                "--producer",
+                "feed",
+                "--kind",
+                "a.done",
+                "--kind",
+                "a.failed",
+                "--live-for",
+                "2m"
+            ])),
+            Ok(Command::FactProducerClaim {
+                identity: Identity::Session,
+                producer: "feed".to_owned(),
+                kinds: vec!["a.done".to_owned(), "a.failed".to_owned()],
+                live_for_ms: "120000".to_owned(),
             })
         );
     }
@@ -6522,7 +7125,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
@@ -6716,17 +7319,27 @@ mod tests {
             })
         );
 
-        for value in ["0", "-1", "unknown"] {
-            assert_eq!(
+        for value in ["0", "-1"] {
+            assert!(matches!(
                 parse(strings(&[
                     "assignment-get",
                     "assignment-example",
                     "--fact-id",
                     value,
                 ])),
-                Err("--fact-id must be a positive integer".to_owned())
-            );
+                Ok(Command::AssignmentGet { fact_id: Some(id), .. })
+                    if id == value.parse::<i64>().unwrap()
+            ));
         }
+        assert_eq!(
+            parse(strings(&[
+                "assignment-get",
+                "assignment-example",
+                "--fact-id",
+                "unknown",
+            ])),
+            Err("--fact-id must be a positive integer".to_owned())
+        );
 
         let entry = render_command_help(None, "assignment-get").unwrap();
         assert!(entry.starts_with("  assignment-get <assignmentId>"));
@@ -6764,7 +7377,7 @@ mod tests {
             assert_eq!(
                 parse(args),
                 Err(
-                    "usage: tightbeam doctor [--json] [--base-dir DIR] [--as <role> | --as-user <userId>]"
+                    "usage: tightbeam doctor [--json] [--base-dir DIR] [--as <role> | --as-user <userId> | --as-process <name>]"
                         .to_owned()
                 )
             );
@@ -7076,6 +7689,49 @@ mod tests {
     }
 
     #[test]
+    fn attest_evidence_requires_paired_revision_and_valid_memento_input() {
+        assert_eq!(
+            parse(strings(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "verdict",
+                "--verdict",
+                "verified",
+                "--artifact",
+                "art_1",
+            ])),
+            Err("--artifact and --sha256 must be supplied together".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "progress",
+                "--artifact",
+                "art_1",
+                "--sha256",
+                "abc123",
+            ])),
+            Err("--artifact and --sha256 are only valid when --kind is verdict".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "verdict",
+                "--verdict",
+                "verified",
+                "--memento",
+                "missing-equals",
+            ])),
+            Err("--memento requires <name>=<value>".to_owned())
+        );
+    }
+
+    #[test]
     fn parses_every_command_happy_shape_exactly() {
         let skill_path = std::env::temp_dir().join(format!(
             "tightbeam_skill_{}",
@@ -7156,6 +7812,7 @@ mod tests {
                 ]),
                 Command::Spawn {
                     identity: Identity::User("flynn".to_owned()),
+                    owner_user_id: None,
                     display_name: "Worker".to_owned(),
                     idempotency_key: "k".to_owned(),
                     archetype: Some("worker".to_owned()),
@@ -7330,6 +7987,7 @@ mod tests {
                 strings(&["onboard", "openai", "--as-user", "flynn"]),
                 Command::Onboard {
                     identity: Identity::User("flynn".to_owned()),
+                    owner_user_id: None,
                     provider: "openai".to_owned(),
                     api_key: false,
                     daemon_credential: false,
@@ -7355,7 +8013,7 @@ mod tests {
                 ]),
                 Command::Assimilate(AssimilateArgs {
                     ssh_dest: "flynn@host".to_owned(),
-                    as_user: "flynn".to_owned(),
+                    identity: Identity::User("flynn".to_owned()),
                     name: Some("host".to_owned()),
                     base_dir: "/srv/tightbeam".to_owned(),
                     harnesses: vec!["codex".to_owned()],

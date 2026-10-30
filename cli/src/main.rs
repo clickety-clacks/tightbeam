@@ -20,6 +20,7 @@ mod probe;
 mod process_tree;
 mod rail_action;
 mod session_connect;
+mod skills;
 mod transport_receipt;
 mod users;
 
@@ -162,6 +163,21 @@ fn main() {
             None => eprintln!("usage: tightbeam contain-stage <profile>"),
         }
         std::process::exit(0);
+    }
+
+    // The shipped external-agent skills are local files compiled into this binary;
+    // listing or installing them never reaches a gateway. `skill --help` falls
+    // through to the ordinary per-command help below.
+    if args.first().is_some_and(|arg| arg == "skill")
+        && !args.iter().any(|arg| arg == "--help" || arg == "-h")
+    {
+        match skills::run(&args[1..]) {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
     }
 
     if args

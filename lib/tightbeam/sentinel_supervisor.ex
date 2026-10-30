@@ -22,7 +22,6 @@ defmodule Tightbeam.SentinelSupervisor do
   alias Tightbeam.Identity
   alias Tightbeam.Org
   alias Tightbeam.Placement
-  alias Tightbeam.Roles
   alias Tightbeam.Sentinels
   alias Tightbeam.Wakes
 
@@ -289,7 +288,7 @@ defmodule Tightbeam.SentinelSupervisor do
   defp principal_session(_db, "user:" <> user_id), do: {:ok, Org.personal_session_key(user_id)}
 
   defp principal_session(db, "agent:" <> role) do
-    case Roles.resolve(db, role) do
+    case Tightbeam.Origin.resolve_agent(db, role) do
       {:ok, session_key, _fallback} -> {:ok, session_key}
       {:error, _denial} -> :none
     end

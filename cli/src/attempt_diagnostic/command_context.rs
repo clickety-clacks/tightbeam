@@ -56,6 +56,9 @@ impl CommandContext {
             Doctor { .. } => ("cli.doctor", CatalogAndDispatch),
             Wake { .. } => ("cli.wake", DispatchPath),
             Condition { .. } => ("cli.condition", DispatchPath),
+            FactDemand { .. } => ("cli.fact_demand", DispatchPath),
+            FactProducerClaim { .. } => ("cli.fact_producer_claim", DispatchPath),
+            FactProducers { .. } => ("cli.fact_producers", DispatchPath),
             HarnessHealthObserveOther { .. } => ("cli.harness_health_observe_other", DispatchPath),
             HarnessHealthResolveOther { .. } => ("cli.harness_health_resolve_other", DispatchPath),
             HarnessHealthReviewOther { .. } => ("cli.harness_health_review_other", DispatchPath),
@@ -67,6 +70,9 @@ impl CommandContext {
             }
             ArtifactRecord { .. } => ("cli.artifact_record", DispatchPath),
             HarklightSend { .. } => ("cli.harklight_send", DispatchPath),
+            HarklightRevise { .. } => ("cli.harklight_revise", DispatchPath),
+            HarklightRetract { .. } => ("cli.harklight_retract", DispatchPath),
+            HarklightSettle { .. } => ("cli.harklight_settle", DispatchPath),
             ArtifactContentFetch { .. } => ("cli.artifact_content_fetch", DispatchPath),
             Artifacts { .. } => ("cli.artifacts", DispatchPath),
             ToolCallObserved => ("cli.tool_call_observed", Requests::ToolCallObserved),
@@ -116,6 +122,8 @@ impl CommandContext {
             WorkItemClose { .. } => ("cli.work_item_close", DispatchPath),
             WorkItemFail { .. } => ("cli.work_item_fail", DispatchPath),
             Attest { .. } => ("cli.attest", DispatchPath),
+            MementoSet { .. } => ("cli.memento_set", DispatchPath),
+            Mementos { .. } => ("cli.mementos", DispatchPath),
             Attests { .. } => ("cli.attests", DispatchPath),
             AssignmentGet { .. } => ("cli.assignment_get", DispatchPath),
             Assignments { .. } => ("cli.assignments", DispatchPath),
@@ -306,6 +314,8 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | HarnessHealthEvidenceOther { .. }
         | ArtifactContentFetch { .. }
         | Artifacts { .. }
+        | FactDemand { .. }
+        | FactProducers { .. }
         | List { .. }
         | DecisionRequests { .. }
         | DecisionRequest { .. }
@@ -317,6 +327,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | Topline { .. }
         | DurableToplines { .. }
         | DurableTopline { .. }
+        | Mementos { .. }
         | Attests { .. }
         | AssignmentGet { .. }
         | Assignments { .. }
@@ -420,7 +431,11 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         },
 
         ArtifactRecord { .. }
+        | FactProducerClaim { .. }
         | HarklightSend { .. }
+        | HarklightRevise { .. }
+        | HarklightRetract { .. }
+        | HarklightSettle { .. }
         | ToolCallObserved
         | Tune { .. }
         | EffortRule { .. }
@@ -441,6 +456,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | WorkItemClose { .. }
         | WorkItemFail { .. }
         | Attest { .. }
+        | MementoSet { .. }
         | CancelWake { .. }
         | IdentityRepoint { .. }
         | IdentityApply { .. }
@@ -555,6 +571,7 @@ mod tests {
     #[test]
     fn work_item_handoff_is_an_unkeyed_dispatch_write() {
         let command = Command::WorkItemHandoff {
+            owner_user_id: None,
             identity: Identity::User("PRIVATE_USER".into()),
             work_item_id: Some("PRIVATE_ITEM".into()),
             title: None,

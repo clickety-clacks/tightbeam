@@ -1806,7 +1806,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         # the host's process-enumeration cost — deterministically lost on Linux,
         # where 24 parks answer the cooperative cancel well inside 100ms and
         # retirement runs early (0/24 late over 5 runs), and only incidentally
-        # won on macOS (24/24 late; art_171f5abc).
+        # won on macOS (24/24 late in the measured runs).
         shutdown_cancel_grace_ms: 0,
         shutdown_cleanup_supervisor: cleanup_owner,
         name:
@@ -1878,9 +1878,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # (observed +12..26ms under 4x CPU oversubscription). 100ms is ~3x the worst
     # observed sum of the two. This bound is a sanity check on the deadline
     # contract, not the regression detector: at the pre-fix base its catch rate
-    # is platform-dependent — 0 of 8 loaded runs on eezo (macOS, elapsed
-    # 853-1284ms, review control art_88fb2ef4) versus 3 of 6 on racter (Linux,
-    # 1320-1338ms). What caught the base defect on both hosts is the row-state,
+    # is platform-dependent — 0 of 8 loaded macOS runs (elapsed 853-1284ms)
+    # versus 3 of 6 Linux runs (1320-1338ms). What caught the base defect on
+    # both platforms is the row-state,
     # log-content and census oracles below, which this allowance leaves
     # untouched. With 24
     # retained adapters this also proves the bound does not degrade with
@@ -1952,7 +1952,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       )
 
     # The grace must exceed what consumes it: 24 concurrent process-group
-    # enumerations cost ~31ms on Linux and ~197ms on macOS (art_171f5abc), so
+    # enumerations cost ~31ms on Linux and ~197ms on macOS, so
     # one second holds a >5x margin on the slower platform. The budget grows by
     # the same second so the park phase keeps the cutoff test's shape: parks
     # get ~900ms against a 2s hang and always time out into the cancel path.

@@ -83,21 +83,6 @@ defmodule Tightbeam.JobTraceTest do
          'trace-rule', 'trace-action', 'Choose', '{}', 'ruled', 'allow');
       """)
 
-    {:ok, _rows} =
-      DB.query(
-        db,
-        """
-        INSERT INTO effort_checkin_generations
-          (assignmentId, generation, state, baseHorizonMs, multiplier, armedAt,
-           terminalSeqWatermark, holderKey, host, root, baseline, wakeId, evidence)
-        VALUES
-          ('asg_direct', 1, 'probed', 10, 1, 100, 0, 'holder', ?1, '/tmp',
-           '{"status":"available","observation":{"stamp":"/tmp/effort.stamp","prior":"observed","writes":0,"entries":1,"digest":"same"}}',
-           'w_condition', '{"outcome":"zero_effect"}')
-        """,
-        [Tightbeam.Placement.local_host_name()]
-      )
-
     Enum.each([{"asg_direct", 2}, {"asg_bad", 3}, {"asg_review", 4}], fn
       {assignment_id, opened_at} ->
         assert {:ok, :ok} =
@@ -245,11 +230,11 @@ defmodule Tightbeam.JobTraceTest do
 
     assert %{code: "not_found"} = trace(db, {:user, "other"}, "wi_trace")
     assert %{code: "not_found"} = trace(db, {:session, "other-session"}, "wi_trace")
-    assert %{code: "not_found"} = trace(db, {:process, "cron"}, "wi_trace")
+    assert trace(db, {:process, "cron"}, "wi_trace") == trace
     assert %{code: "not_found"} = trace(db, {:user, "owner"}, "wi_missing")
 
     assert_keys(trace, ~w(assignments timeline workItem)a)
-    assert_keys(trace.workItem, ~w(failReason id ownerUserId state title)a)
+    assert_keys(trace.workItem, ~w(failReason id mementos ownerUserId state title)a)
 
     assert Enum.map(trace.assignments, & &1.id) == ["asg_bad", "asg_direct", "asg_review"]
     assert trace.workItem.state == "open"
@@ -258,7 +243,7 @@ defmodule Tightbeam.JobTraceTest do
     Enum.each(trace.assignments, fn assignment ->
       assert_keys(
         assignment,
-        ~w(commitRefCorrections currentCoordinationParentRef files holderKey id openerRef reviewsAssignmentId state)a
+        ~w(commitRefCorrections currentCoordinationParentRef files holderKey id mementos openerRef reviewsAssignmentId state)a
       )
     end)
 
@@ -444,7 +429,7 @@ defmodule Tightbeam.JobTraceTest do
           ~w(assignmentId at context effort harness id jobRef model status type)a
 
         "attest" ->
-          ~w(assignmentId at commitRefs id kind type verdict)a
+          ~w(assignmentId at commitRefs id kind mementos type verdict)a
 
         "wake_scheduled" ->
           ~w(assignmentId at dueAt id type)a
@@ -454,9 +439,6 @@ defmodule Tightbeam.JobTraceTest do
 
         "decision_request" ->
           ~w(assignmentId at id ruling state type)a
-
-        "effort_generation" ->
-          ~w(assignmentId at evidence id state type)a
 
         "commit_ref_correction" ->
           ~w(assignmentId at actorKind actorRef cause commitRefs evidenceArtifactId id type verifiedAt)a

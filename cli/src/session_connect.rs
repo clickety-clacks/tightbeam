@@ -226,6 +226,9 @@ pub fn run(session_key: String, identity: Identity) -> Result<(), String> {
             return Err(error);
         }
     };
+    if is_org_credential(&endpoint) && matches!(identity, Identity::Session) {
+        return Err("session-connect with an organization credential requires exactly one of --as-user or --as-process".to_owned());
+    }
     let read_selection = ReadSelection::for_invocation(&endpoint, &identity);
     let signal_guard = SessionSignalGuard::install()?;
 
@@ -2252,7 +2255,7 @@ mod tests {
             "{request}"
         );
         assert!(
-            lower.contains("x-tightbeam-cli-version: 0.1.12\r\n"),
+            lower.contains("x-tightbeam-cli-version: 0.1.14\r\n"),
             "{request}"
         );
     }

@@ -381,6 +381,82 @@ defmodule Tightbeam.Wire.SeamTest do
     assert JSON.decode!(local.resp_body)["error"]["code"] == "invalid_harklight_send"
   end
 
+  test "Harklight wire keys reach prepare and uncertain results retain the message ID", ctx do
+    runner = fn args ->
+      if Enum.take(args, 2) == ["send", "--prepare"] do
+        assert Enum.take(args, 2) == ["send", "--prepare"]
+
+        for pair <- [
+              ["--sender-id", "sender"],
+              ["--title", "Question"],
+              ["--body", "Body"],
+              ["--vendor-session-id", "vendor"],
+              ["--choice", "Yes"],
+              ["--file", "/tmp/file"],
+              ["--supersedes", "old"]
+            ] do
+          assert pair in Enum.chunk_every(args, 2, 1, :discard)
+        end
+
+        op = Enum.at(args, 3)
+
+        {JSON.encode!(%{
+           kind: "prepared",
+           op_id: op,
+           files: [],
+           request: %{
+             type: "send",
+             op_id: op,
+             session_handle: "069c53c7-765f-48d1-bda7-98b58ad94194",
+             route: "other",
+             vendor_session_id: "vendor",
+             message: %{
+               sender_id: "sender",
+               message_id: "minted-id",
+               title: "Question",
+               body: "Body",
+               supersedes: ["old"]
+             }
+           }
+         }), 0}
+      else
+        {JSON.encode!(%{kind: "outcome_unknown", op_id: List.last(args)}), 7}
+      end
+    end
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: ctx.opts[:base_dir],
+        harklight_send_runner: runner
+      })
+
+    opts = Keyword.put(ctx.opts, :handlers, handlers)
+    session = create_session(ctx.db, "wire-harklight", "flynn")
+    Org.set_host(ctx.db, session.session_key, Tightbeam.Placement.local_host_name())
+
+    response =
+      dispatch_cli(%{ctx | opts: opts}, session.cli_token, %{
+        verb: "harklight-send",
+        params: %{
+          harklightSession: "new",
+          senderId: "sender",
+          title: "Question",
+          body: "Body",
+          vendorSessionId: "vendor",
+          choices: ["Yes"],
+          files: ["/tmp/file"],
+          supersedes: ["old"]
+        }
+      })
+
+    error = JSON.decode!(response.resp_body)["error"]
+    assert error["messageId"] == "minted-id"
+    assert error["outcome"] == "outcome_unknown"
+    assert error["wakeEffect"] == "none"
+    assert error["reason"] =~ "harklight-settle --message minted-id"
+  end
+
   test "assignment-stop-turn crosses dispatch and refuses a non-opener", ctx do
     holder = create_session(ctx.db, "stop-holder", "flynn")
 
@@ -485,7 +561,7 @@ defmodule Tightbeam.Wire.SeamTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "eezo"
+      host: "lab1"
     })
   end
 

@@ -3,7 +3,7 @@ defmodule Tightbeam.Wire.OperationRegistry do
   Finite HTTP method/template operations for the current 0.1.9 router.
 
   The source check compares declared routes and rows in both directions. The
-  PO's att_32a752d1 retains semantic names while adding agent/terminal and the
+  The accepted route contract retains semantic names while adding agent/terminal and the
   current work-items parameter spelling. Concrete URLs never become labels.
   CLI command identity and allowed paths are implemented separately in Rust.
   """
@@ -58,6 +58,7 @@ defmodule Tightbeam.Wire.OperationRegistry do
     {{"GET", "/api/host-env/:host/:harness/:name"}, "http.api_host_env.get"},
     {{"GET", "/api/devices/:device_id"}, "http.api_devices.get"},
     {{"GET", "/api/artifacts/:artifact_id"}, "http.api_artifacts.get"},
+    {{"GET", "/api/read-markers"}, "http.api_read_markers.list"},
     {{"GET", "/api/read-markers/:scope_key"}, "http.api_read_markers.get"},
     {{"POST", "/api/streams"}, "http.api_streams.create"},
     {{"PATCH", "/api/streams/:key"}, "http.api_streams.update"},

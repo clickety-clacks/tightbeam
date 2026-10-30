@@ -495,6 +495,124 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     refute_received {:lane_nudged, :default_lanes, _}
   end
 
+  ## Proof 10 — the closure law
+
+  defp scenario(10, _ctx) do
+    # Every production `decision_requests` insert/retarget site, and the
+    # in-transaction prompt arm each one owes.
+    request_sites = [
+      {"lib/tightbeam/escalation.ex", "escalate/4"},
+      {"lib/tightbeam/escalation.ex", "file_agent_request_in_txn/2"},
+      {"lib/tightbeam/escalation.ex", "insert_operator_request_in_txn/7"}
+    ]
+
+    assert Enum.sort(request_sites) == Enum.sort(decision_request_sites())
+
+    for {file, ref} <- request_sites do
+      assert arms_prompt_wake_in_txn?(file, ref),
+             "#{file} #{ref} inserts/retargets a decision request without arming a prompt wake in the transaction"
+    end
+
+    # Every turn-bearing delivery sink, keyed by enclosing definition with its
+    # exact call count: a new site changes the map and fails.
+    assert sink_sites() == %{
+             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
+              "children_after_preflight/1"} => 1,
+             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "handler_specs/1"} => 1,
+             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
+              "execute_assignment_repair/6"} => 1,
+             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "notify_session/4"} => 1,
+             # The fault bubble's transactional notice enqueue: a
+             # substrate-authored turn to the failing session's nearest active
+             # ancestor, deduped by deterministic wakeId and committed with
+             # the current cannot-proceed disposer.
+             {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt_in_txn/5",
+              "deliver_bubble_notice_in_txn/4"} => 1,
+             {"lib/tightbeam/gateway.ex", "Gateway.notify_session/4", "remove_override_result/3"} =>
+               1,
+             # A queued human post carries its source wake, client identity and
+             # attachments through the transaction that admits its prompt and turn.
+             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5",
+              "deliver_waiting_human_post_in_txn/6"} => 1,
+             {"lib/tightbeam/assignments.ex", "Gateway.deliver_prompt_in_txn/5",
+              "open_dispatch_result/2"} => 1,
+             {"lib/tightbeam/wakes.ex", "Gateway.deliver_prompt_in_txn/5", "fire_in_txn/3"} => 1,
+             {"lib/tightbeam/wakes.ex", "Gateway.deliver_prompt_in_txn/5",
+              "deliver_wait_in_txn/3"} => 1,
+             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5", "deliver_prompt/4"} =>
+               1,
+             # `deliver_prompt_in_txn/5` declines undeliverable addresses before
+             # appending the echo. Message enqueue then reaches this one turn sink.
+             {"lib/tightbeam/gateway.ex", "Ledger.enqueue_in_txn/2", "enqueue_message_in_txn/9"} =>
+               1,
+             {"lib/tightbeam/harness_health.ex", "Gateway.deliver_prompt_in_txn/5",
+              "incident_notice_in_txn/4"} => 1,
+             # One concrete-session snapshot admits its carrier and actual turn
+             # together; the inventory still rejects any additional turn sink.
+             {"lib/tightbeam/notice_batcher.ex", "Gateway.deliver_prompt_in_txn/5",
+              "admit_session_chunk_in_txn/6"} => 1,
+             {"lib/tightbeam/wakes.ex", "Ledger.enqueue_in_txn/2",
+              "redeliver_health_source_in_txn/3"} => 1,
+             {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "enqueue/2"} => 1,
+             {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "append_repair_attempt/5"} =>
+               1
+           }
+
+    # `Ledger.enqueue/2` has zero production call sites: the wrapper exists for
+    # tests only, so no path bypasses `enqueue_in_txn/2`'s callers.
+    assert Enum.filter(Map.keys(sink_sites()), &(elem(&1, 1) == "Ledger.enqueue/2")) == []
+
+    # A hand-written turn insert would step around every AST allowlist above.
+    # Case-, whitespace- and quoting-insensitive: `insert into turns`, the phrase
+    # broken across lines, and `insert into "turns"` / `[turns]` / backticked are
+    # all the same step-around as the canonical spelling (SQLite accepts every
+    # one of those identifier quotings).
+    #
+    # The quoting class is a RUN that includes a backslash on purpose. Because
+    # this scan reads SOURCE TEXT, a double-quoted identifier inside an ordinary
+    # Elixir string is spelled `\"turns\"` in the file, while the same identifier
+    # in a heredoc is spelled `"turns"`. A class matching only the quote character
+    # catches the heredoc form and misses the escaped one — which is exactly how
+    # the first attempt at this fix still let the reviewer's case through.
+    #
+    # WHAT EACH SCAN READS, AND WHAT NEITHER CATCHES. This one greps the ENTIRE
+    # SOURCE TEXT of each production file, so it sees the phrase wherever it is
+    # written — including in a comment, which would be a false positive it
+    # deliberately accepts rather than parsing to exclude. The decision-request
+    # scan below is different: it walks the AST and inspects individual string
+    # LITERALS.
+    #
+    # Neither catches SQL whose table name is assembled at runtime —
+    # `"INSERT INTO " <> table`, an interpolated name, or a query built from
+    # fragments — because the phrase is then never adjacent in one place to be
+    # found. That limit is deliberate: folding arbitrary concatenation is
+    # unbounded, and someone concatenating SQL to slip past a named guard is
+    # evading review, which no test prevents. The guard is a floor against drift,
+    # not a sandbox against intent.
+    assert Enum.filter(
+             production_files(),
+             &(File.read!(&1) =~ ~r/insert\s+into\s*[\\"\[`\s]*turns\b/i)
+           ) == ["lib/tightbeam/ledger.ex"]
+
+    # The request modules cannot reach a delivery seam through an injected fun.
+    for file <- ["lib/tightbeam/escalation.ex", "lib/tightbeam/effort_checkin.ex"] do
+      assert indirect_invocations(file) == [],
+             "#{file} contains an indirect function invocation"
+    end
+
+    # The deleted callback/config seams stay deleted.
+    for seam <- [
+          "deliver_owner",
+          "effort_notify",
+          "notify_expecter",
+          "deliver_notification",
+          "escalation_context"
+        ] do
+      assert Enum.filter(production_files(), &(File.read!(&1) =~ seam)) == [],
+             "production still mentions the #{seam} seam"
+    end
+  end
+
   ## Proof 11 — retirement readdresses before ordinary delivery
 
   defp scenario(11, ctx) do
@@ -629,7 +747,6 @@ defmodule Tightbeam.EscalationDeliveryFixture do
       wake_tick_ms: 60_000,
       onboarding_lease_ms: 1_800_000,
       db: db,
-      effort_checkin_horizon_ms: 1,
       credential_status: fn _provider -> :onboarded end,
       credential_kind: fn _provider -> :subscription end,
       patch_adapter: fn _harness, _path -> :ok end,
@@ -766,6 +883,173 @@ defmodule Tightbeam.EscalationDeliveryFixture do
   end
 
   ## Helpers — closure law
+
+  @sinks %{
+    {:deliver_prompt, 4} => "Gateway.deliver_prompt/4",
+    {:deliver_prompt_in_txn, 5} => "Gateway.deliver_prompt_in_txn/5",
+    {:notify_session, 4} => "Gateway.notify_session/4",
+    {:enqueue_in_txn, 2} => "Ledger.enqueue_in_txn/2",
+    {:enqueue, 2} => "Ledger.enqueue/2"
+  }
+
+  defp production_files, do: Path.wildcard("lib/**/*.ex") |> Enum.sort()
+
+  defp definitions(file) do
+    file
+    |> File.read!()
+    |> Code.string_to_quoted!()
+    |> then(fn ast ->
+      {_, found} =
+        Macro.prewalk(ast, [], fn
+          {kind, _meta, [head, body]} = node, acc when kind in [:def, :defp] ->
+            {node, [{definition_ref(head), body} | acc]}
+
+          node, acc ->
+            {node, acc}
+        end)
+
+      found
+    end)
+  end
+
+  defp definition_ref({:when, _, [head | _]}), do: definition_ref(head)
+  defp definition_ref({name, _, args}) when is_list(args), do: "#{name}/#{length(args)}"
+  defp definition_ref({name, _, nil}), do: "#{name}/0"
+
+  # {file, sink, enclosing definition} => call count. Keyed on definitions, not
+  # line numbers, so an unrelated edit cannot make the law lie either way.
+  defp sink_sites do
+    for file <- production_files(),
+        {ref, body} <- definitions(file),
+        sink <- collect(body, &sink_label/1),
+        reduce: %{} do
+      acc -> Map.update(acc, {file, sink, ref}, 1, &(&1 + 1))
+    end
+  end
+
+  defp sink_label({{:., _, [_mod, name]}, _meta, args}), do: sink_label(name, args)
+
+  defp sink_label({name, _meta, args}) when is_atom(name) and is_list(args),
+    do: sink_label(name, args)
+
+  defp sink_label(_), do: nil
+
+  defp sink_label(name, args), do: Map.get(@sinks, {name, length(args)})
+
+  # Every definition whose body inserts into or retargets `decision_requests`.
+  defp decision_request_sites do
+    for file <- production_files(),
+        {ref, body} <- definitions(file),
+        touches_decision_requests?(body),
+        do: {file, ref}
+  end
+
+  # Per-LITERAL, unlike the whole-file turn scan above: case, spacing and
+  # identifier quoting cannot hide a writer, but SQL assembled from fragments can
+  # (no single literal then holds the phrase).
+  defp touches_decision_requests?(body) do
+    body
+    |> collect(fn
+      sql when is_binary(sql) ->
+        cond do
+          # `\b` excludes the schema-rebuild copy into `decision_requests_new`.
+          sql_matches?(sql, ~r/insert\s+into\s+["\[`]?decision_requests\b/i) -> :insert
+          retarget_sql?(sql) -> :retarget
+          true -> nil
+        end
+
+      _ ->
+        nil
+    end)
+    |> Kernel.!=([])
+  end
+
+  # A retarget is the expecter/deadline rotation CAS, not a ruling or withdrawal.
+  #
+  # This is INTENTIONALLY not what the pre-r2 check matched, in two cases the
+  # cross-review found, and both changes are the point rather than a side effect:
+  #
+  #   `UPDATE decision_requests SET expecterSessionKey=?1` — no space before `=`.
+  #   Was NOT matched, now IS. SQL does not require that space, so the old check
+  #   had a false negative on a real retarget site.
+  #
+  #   `UPDATE decision_requests_new SET expecterSessionKey = ?1` — the
+  #   schema-rebuild copy table. WAS matched, now is NOT. A rebuild is not a
+  #   retarget site, and `\b` here now agrees with the insert scan, which always
+  #   excluded `decision_requests_new`.
+  #
+  # The production site as written today matches under both, so the allowlist did
+  # not move when this changed.
+  defp retarget_sql?(sql) do
+    sql_matches?(sql, ~r/update\s+["\[`]?decision_requests\b/i) and
+      sql_matches?(sql, ~r/expecterSessionKey\s*=/i)
+  end
+
+  defp sql_matches?(sql, pattern),
+    do: sql |> String.replace(~r/\s+/, " ") |> then(&Regex.match?(pattern, &1))
+
+  # The arm may be inline or one local private helper away, so resolution
+  # follows same-file local calls.
+  defp arms_prompt_wake_in_txn?(file, ref, seen \\ []) do
+    bodies = for {^ref, body} <- definitions(file), do: body
+
+    cond do
+      ref in seen ->
+        false
+
+      Enum.any?(bodies, fn body -> collect(body, &prompt_arm/1) != [] end) ->
+        true
+
+      true ->
+        bodies
+        |> Enum.flat_map(fn body -> collect(body, &local_call/1) end)
+        |> Enum.any?(&arms_prompt_wake_in_txn?(file, &1, [ref | seen]))
+    end
+  end
+
+  defp prompt_arm({{:., _, [{:__aliases__, _, aliases}, :schedule_in_txn]}, _, [_txn, arg]}) do
+    if List.last(aliases) == :Wakes and ungated_prompt_arm?(arg), do: :armed, else: nil
+  end
+
+  defp prompt_arm(_), do: nil
+
+  defp local_call({name, _, args}) when is_atom(name) and is_list(args),
+    do: "#{name}/#{length(args)}"
+
+  defp local_call(_), do: nil
+
+  # A notification arm carries `target_gate: 0` and a prompt (the wakes CHECK
+  # makes a prompt-consumer row without prompt text impossible).
+  defp ungated_prompt_arm?({:%{}, _, pairs}) do
+    Keyword.get(pairs, :target_gate) == 0 and Keyword.has_key?(pairs, :prompt)
+  end
+
+  defp ungated_prompt_arm?(_), do: false
+
+  # `apply/2,3` or a `fun.(...)` call — the shapes a post-commit callback seam
+  # would have to come back through.
+  defp indirect_invocations(file) do
+    for {ref, body} <- definitions(file),
+        _ <-
+          collect(body, fn
+            {{:., _, [{name, _, nil}]}, _, _} when is_atom(name) -> :dot_call
+            {:apply, _, args} when length(args) in [2, 3] -> :apply
+            _ -> nil
+          end),
+        do: ref
+  end
+
+  defp collect(ast, matcher) do
+    {_, found} =
+      Macro.prewalk(ast, [], fn node, acc ->
+        case matcher.(node) do
+          nil -> {node, acc}
+          hit -> {node, [hit | acc]}
+        end
+      end)
+
+    found
+  end
 
   ## Helpers — SQL
 

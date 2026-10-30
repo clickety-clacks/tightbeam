@@ -4,9 +4,12 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
 
   A correction is not an attest and never changes assignment lifecycle state. It
   records who supplied a replacement canonical reference, why, the immutable
-  evidence row supporting it, and the exact branch or tag that contained the
-  commit when Tightbeam verified it.
+  evidence row supporting it, and whether Tightbeam verified the exact branch
+  or tag that contained the commit. An unverified correction keeps the
+  requested refs and has a nil `verifiedAt`.
   """
+
+  require Logger
 
   alias Tightbeam.{DB, Placement}
   alias Tightbeam.DB.Txn
@@ -26,16 +29,59 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
     cause              TEXT NOT NULL CHECK (cause = '#{@cause}'),
     idempotencyKey     TEXT NOT NULL CHECK (length(trim(idempotencyKey)) BETWEEN 1 AND 200),
     requestFingerprint TEXT NOT NULL CHECK (length(requestFingerprint) = 64),
-    verifiedAt         INTEGER NOT NULL,
+    verifiedAt         INTEGER,
     createdAt          INTEGER NOT NULL,
     UNIQUE (actorKind, actorRef, idempotencyKey)
   );
-  CREATE INDEX IF NOT EXISTS assignment_commit_ref_corrections_assignment
-    ON assignment_commit_ref_corrections (assignmentId, createdAt, id);
   """
 
+  @index_ddl "CREATE INDEX IF NOT EXISTS assignment_commit_ref_corrections_assignment " <>
+               "ON assignment_commit_ref_corrections (assignmentId, createdAt, id)"
+
+  @legacy_ddl """
+  CREATE TABLE assignment_commit_ref_corrections_unverified_v1 (
+    id                 TEXT PRIMARY KEY,
+    assignmentId       TEXT NOT NULL UNIQUE REFERENCES assignments(id),
+    commitRefs         TEXT NOT NULL CHECK (json_valid(commitRefs) AND json_type(commitRefs) = 'array'),
+    reason             TEXT NOT NULL CHECK (length(trim(reason)) BETWEEN 1 AND 4000),
+    evidenceArtifactId TEXT NOT NULL REFERENCES artifacts(artifactId),
+    actorKind          TEXT NOT NULL CHECK (actorKind IN ('user','session')),
+    actorRef           TEXT NOT NULL,
+    cause              TEXT NOT NULL CHECK (cause = '#{@cause}'),
+    idempotencyKey     TEXT NOT NULL CHECK (length(trim(idempotencyKey)) BETWEEN 1 AND 200),
+    requestFingerprint TEXT NOT NULL CHECK (length(requestFingerprint) = 64),
+    verifiedAt         INTEGER,
+    createdAt          INTEGER NOT NULL,
+    UNIQUE (actorKind, actorRef, idempotencyKey)
+  )
+  """
+
+  @column_shape [
+    {"id", "TEXT", 0, 1},
+    {"assignmentId", "TEXT", 1, 0},
+    {"commitRefs", "TEXT", 1, 0},
+    {"reason", "TEXT", 1, 0},
+    {"evidenceArtifactId", "TEXT", 1, 0},
+    {"actorKind", "TEXT", 1, 0},
+    {"actorRef", "TEXT", 1, 0},
+    {"cause", "TEXT", 1, 0},
+    {"idempotencyKey", "TEXT", 1, 0},
+    {"requestFingerprint", "TEXT", 1, 0},
+    {"verifiedAt", "INTEGER", 0, 0},
+    {"createdAt", "INTEGER", 1, 0}
+  ]
+
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    case DB.transaction(db, fn txn ->
+           :ok = Txn.exec(txn, @ddl)
+           :ok = ensure_nullable_verified_at(txn)
+           :ok = Txn.exec(txn, @index_ddl)
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> {:error, error}
+    end
+  end
 
   @doc false
   def __handle__(db, "assignment-commitref-correct", call), do: correct(db, call)
@@ -73,13 +119,18 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
            {:ok, prepared} <- prepare(db, call, actor, requested_refs) do
         case prepared do
           {:replay, row} ->
-            %{correction: row}
+            correction_result(row)
 
           {:new, context} ->
-            with {:ok, verified_refs} <- verify_refs(db, requested_refs) do
-              verified_at = System.system_time(:millisecond)
-              maybe_after_verify(call, db)
-              commit(db, call, actor, context, verified_refs, verified_at)
+            case verify_refs(db, requested_refs) do
+              {:ok, verified_refs} ->
+                verified_at = System.system_time(:millisecond)
+                maybe_after_verify(call, db)
+                commit(db, call, actor, context, verified_refs, verified_at)
+
+              {:error, _verification_error} ->
+                commit(db, call, actor, context, requested_refs, nil)
+                |> warn_unverified_correction()
             end
         end
       end
@@ -88,6 +139,79 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
       {:error, error} -> error
       result -> result
     end
+  end
+
+  defp correction_result(%{verifiedAt: nil} = row),
+    do: %{correction: row, warning: unverified_correction_warning()}
+
+  defp correction_result(row), do: %{correction: row}
+
+  defp warn_unverified_correction(
+         %{correction: %{verifiedAt: nil, assignmentId: assignment_id}} = result
+       ) do
+    Logger.warning("commit_ref_correction_unverified assignmentId=#{assignment_id}")
+    Map.put(result, :warning, unverified_correction_warning())
+  end
+
+  defp warn_unverified_correction(result), do: result
+
+  defp unverified_correction_warning,
+    do: "commitRefs were recorded without successful canonical Git verification"
+
+  defp ensure_nullable_verified_at(txn) do
+    columns =
+      Txn.q(txn, "PRAGMA table_info(assignment_commit_ref_corrections)")
+      |> Enum.map(fn [_cid, name, type, not_null, _default, primary_key] ->
+        {name, type, not_null, primary_key}
+      end)
+
+    shape = Enum.map(columns, &elem(&1, 0))
+    expected = Enum.map(@column_shape, &elem(&1, 0))
+
+    cond do
+      shape != expected ->
+        raise ArgumentError, "assignment_commit_ref_corrections_incompatible_shape"
+
+      columns == @column_shape ->
+        :ok
+
+      columns ==
+          List.update_at(@column_shape, 10, fn {name, type, _not_null, primary_key} ->
+            {name, type, 1, primary_key}
+          end) ->
+        rebuild_nullable_verified_at(txn)
+
+      true ->
+        raise ArgumentError, "assignment_commit_ref_corrections_incompatible_shape"
+    end
+  end
+
+  defp rebuild_nullable_verified_at(txn) do
+    :ok = Txn.exec(txn, @legacy_ddl)
+
+    :ok =
+      Txn.exec(txn, """
+      INSERT INTO assignment_commit_ref_corrections_unverified_v1 (
+        id, assignmentId, commitRefs, reason, evidenceArtifactId, actorKind,
+        actorRef, cause, idempotencyKey, requestFingerprint, verifiedAt, createdAt
+      )
+      SELECT id, assignmentId, commitRefs, reason, evidenceArtifactId, actorKind,
+             actorRef, cause, idempotencyKey, requestFingerprint, verifiedAt, createdAt
+      FROM assignment_commit_ref_corrections
+      """)
+
+    :ok = Txn.exec(txn, "DROP INDEX IF EXISTS assignment_commit_ref_corrections_assignment")
+    :ok = Txn.exec(txn, "DROP TABLE assignment_commit_ref_corrections")
+
+    :ok =
+      Txn.exec(
+        txn,
+        "ALTER TABLE assignment_commit_ref_corrections_unverified_v1 " <>
+          "RENAME TO assignment_commit_ref_corrections"
+      )
+
+    :ok = Txn.exec(txn, @index_ddl)
+    :ok
   end
 
   defp prepare(db, call, actor, refs) do
@@ -252,46 +376,11 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
   defp authorized?(_txn, %{kind: "user", ref: user}, %{owner_user_id: owner}),
     do: user == owner
 
-  defp authorized?(txn, %{kind: "session", ref: caller}, %{
-         holder: holder,
-         opened_by_session: opened_by_session
-       }) do
-    if caller == opened_by_session do
-      true
-    else
-      case {product_owner_lane(txn, caller), product_owner_lane(txn, holder)} do
-        {lane, lane} when is_binary(lane) ->
-          true
-
-        _ ->
-          false
-      end
-    end
+  defp authorized?(txn, %{kind: "session", ref: caller}, %{owner_user_id: owner}) do
+    Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [caller]) == [[owner]]
   end
 
-  defp product_owner_lane(txn, session_key) do
-    case Txn.q(
-           txn,
-           """
-           WITH RECURSIVE lineage(sessionKey, spawnedBy, archetype, depth) AS (
-             SELECT sessionKey, spawnedBy, archetype, 0
-             FROM sessions WHERE sessionKey = ?1
-             UNION ALL
-             SELECT parent.sessionKey, parent.spawnedBy, parent.archetype, lineage.depth + 1
-             FROM sessions AS parent
-             JOIN lineage ON parent.sessionKey = lineage.spawnedBy
-             WHERE lineage.spawnedBy != lineage.sessionKey AND lineage.depth < 100
-           )
-           SELECT sessionKey FROM lineage
-           WHERE archetype = 'product-owner'
-           ORDER BY depth ASC LIMIT 1
-           """,
-           [session_key]
-         ) do
-      [[lane]] -> lane
-      _ -> nil
-    end
-  end
+  defp authorized?(_txn, %{kind: "process"}, _context), do: true
 
   # Historical backfill evidence can describe assignments across several work
   # items. The correction keeps the exact artifact id and its immutable hash as
@@ -554,15 +643,14 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
   defp actor({:user, ref}) when is_binary(ref), do: {:ok, %{kind: "user", ref: ref}}
   defp actor({:session, ref}) when is_binary(ref), do: {:ok, %{kind: "session", ref: ref}}
 
-  defp actor({:process, _}),
-    do: {:error, error("process_denied", "process principals cannot correct commitRefs")}
+  defp actor({:process, ref}), do: {:ok, %{kind: "process", ref: ref}}
 
   defp actor(_),
     do:
       {:error,
        error(
          "principal_required",
-         "commitRef correction requires a user credential or session token"
+         "commitRef correction requires an authenticated principal"
        )}
 
   defp valid_key(key) when is_binary(key) do

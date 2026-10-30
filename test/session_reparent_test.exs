@@ -162,14 +162,20 @@ defmodule Tightbeam.SessionReparentTest do
     assert {:error, _} = DB.query(db, "DELETE FROM session_reparent_events")
   end
 
+  test "process corrections preserve process attribution and existing ownership", ctx do
+    process_call = %{call(ctx.params) | principal: {:process, "synthetic"}}
+    result = SessionReparent.handle(ctx.db, process_call)
+    assert is_binary(result["eventId"])
+    assert SessionReparent.handle(ctx.db, process_call) == result
+
+    assert rows(
+             ctx.db,
+             "SELECT ownerUserId,principalKind,principalRef FROM session_reparent_events"
+           ) == [["owner", "process", "process:synthetic"]]
+  end
+
   test "corrections require consistent owner rows and a single open assignment",
        ctx do
-    assert %{code: "user_principal_required"} =
-             SessionReparent.handle(ctx.db, %{
-               call(ctx.params)
-               | principal: {:process, "synthetic"}
-             })
-
     assert %{code: "not_authorized"} =
              SessionReparent.handle(ctx.db, %{call(ctx.params) | principal: {:user, "other"}})
 

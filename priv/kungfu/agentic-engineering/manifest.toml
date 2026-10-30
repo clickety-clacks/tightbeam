@@ -12,4 +12,4 @@ phrases = [
 [[sentinels]]
 name = "landing-watch"
 command = "sentinels/landing-watch"
-requires = ["GH_CONFIG_DIR", "LANDING_REPOS"]
+requires = ["GH_CONFIG_DIR"]

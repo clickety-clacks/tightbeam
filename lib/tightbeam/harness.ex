@@ -125,9 +125,12 @@ defmodule Tightbeam.Harness do
               {:subagent_start | :subagent_stop, map()} | :skip
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
 
+  @callback records_tool_calls?() :: boolean()
+
   @optional_callbacks preflight_launch: 3,
                       warm_home: 2,
                       materialize_legacy_credential_link: 2,
+                      records_tool_calls?: 0,
                       submission_text_limit: 0,
                       project_session_identity: 3,
                       verify_session_identity_hook: 2
@@ -188,6 +191,12 @@ defmodule Tightbeam.Harness do
       else: nil
   end
 
+  def records_tool_calls?(harness) do
+    module = module!(harness)
+    Code.ensure_loaded!(module)
+    function_exported?(module, :records_tool_calls?, 0) and module.records_tool_calls?()
+  end
+
   @callback conformance_vectors() :: %{
               required(String.t()) => [
                 %{
@@ -208,6 +217,26 @@ defmodule Tightbeam.Harness do
       Enum.filter(@dormant_registry, &(&1.id() in enabled_dormant)) ++
       if(@fixture_harness?, do: [Fixture], else: [])
   end
+
+  @doc "Whether a harness may be absent from a host without indicating a setup problem."
+  @spec optional?(module()) :: boolean()
+  def optional?(Tightbeam.Harness.Pi), do: true
+  def optional?(_module), do: false
+
+  @doc false
+  @spec optional_unconfigured?(module(), (atom() -> term())) :: boolean()
+  def optional_unconfigured?(module, credential_status) when is_function(credential_status, 1) do
+    if optional?(module) do
+      Enum.all?(configuration_providers(module), fn provider ->
+        credential_status.(provider) == {:needs_onboarding, :missing}
+      end)
+    else
+      false
+    end
+  end
+
+  defp configuration_providers(Tightbeam.Harness.Pi), do: [:opencode_go, :local_openai]
+  defp configuration_providers(module), do: [module.credential_provider()]
 
   @doc "All known harness modules, including dormant entries used by onboarding."
   @spec known() :: [module()]

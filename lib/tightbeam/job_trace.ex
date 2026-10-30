@@ -34,13 +34,15 @@ defmodule Tightbeam.JobTrace do
     assignment_ids = Enum.map(assignments, & &1.id)
 
     %{
-      workItem: %{
-        id: item.id,
-        ownerUserId: item.ownerUserId,
-        state: item.state,
-        failReason: item.failReason,
-        title: item.title
-      },
+      workItem:
+        %{
+          id: item.id,
+          ownerUserId: item.ownerUserId,
+          state: item.state,
+          failReason: item.failReason,
+          title: item.title
+        }
+        |> then(&Tightbeam.Mementos.attach(db, "work_item", &1)),
       assignments: assignments,
       timeline:
         (turn_entries(db, item.id) ++
@@ -108,6 +110,7 @@ defmodule Tightbeam.JobTrace do
         commitRefCorrections: Tightbeam.AssignmentCommitRefCorrections.list(db, id),
         reviewsAssignmentId: reviews
       }
+      |> then(&Tightbeam.Mementos.attach(db, "assignment", &1))
     end)
   end
 
@@ -236,6 +239,7 @@ defmodule Tightbeam.JobTrace do
         verdict: verdict,
         commitRefs: decode(commit_refs)
       }
+      |> then(&Tightbeam.Mementos.attach(db, "attest", &1))
     end)
   end
 

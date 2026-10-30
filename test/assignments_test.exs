@@ -2,6 +2,9 @@ defmodule Tightbeam.AssignmentsTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
+  @session_identity_shape "session-identity-v1-0114"
+  @closed_assignment_reconciliation_shape "closed-assignment-cannot-proceed-reconciliation-v1-015"
+
   alias Tightbeam.{
     Assignments,
     ConditionFacts,
@@ -29,7 +32,7 @@ defmodule Tightbeam.AssignmentsTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
-      "eezo" => %{
+      "lab1" => %{
         ssh: nil,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         cli_bin: nil
@@ -48,6 +51,134 @@ defmodule Tightbeam.AssignmentsTest do
     handlers = Gateway.handlers(gateway_config)
     Rules.load!(System.tmp_dir!(), Map.keys(handlers))
     %{db: db, holder: holder, other: other, handlers: handlers}
+  end
+
+  test "upgrading assignments adds no parent links to existing rows", ctx do
+    existing = ctx.handlers["assign"].(assign_call({:user, "flynn"}, "existing task"))
+
+    {:ok, :ok} =
+      DB.migration_transaction(ctx.db, :prior_assignment_shape, [], [], fn txn ->
+        Tightbeam.DB.Txn.exec(txn, "DROP INDEX assignments_parent")
+        Tightbeam.DB.Txn.exec(txn, "ALTER TABLE assignments DROP COLUMN parentAssignmentId")
+      end)
+
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    readback = ctx.handlers["assignment-get"].(assignment_get_call({:user, "flynn"}, existing.id))
+    assert readback.parentAssignmentId == nil
+    assert readback.subject == "existing task"
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+  end
+
+  test "child parent comes from the current task or explicit override, never sole ownership",
+       ctx do
+    parent = ctx.handlers["assign"].(assign_call({:user, "flynn"}, "parent"))
+    unrelated = ctx.handlers["assign"].(assign_call({:session, "holder"}, "unrelated"))
+    assert unrelated.parentAssignmentId == nil
+    turn = start_running_turn(ctx.db, "holder", "work on parent")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE turns SET assignmentId=?2 WHERE seq=?1", [turn.seq, parent.id])
+
+    child = ctx.handlers["assign"].(assign_call({:session, "holder"}, "linked"))
+    assert child.parentAssignmentId == parent.id
+    invalid = assign_call({:session, "holder"}, "explicit invalid")
+    invalid = put_in(invalid.params[:parent_assignment_id], "missing")
+    unlinked = ctx.handlers["assign"].(invalid)
+    assert unlinked.parentAssignmentId == nil
+    assert unlinked.parentExplanation =~ "no parent was linked"
+    override = put_in(invalid.params[:parent_assignment_id], unrelated.id)
+    linked = ctx.handlers["assign"].(override)
+    assert linked.parentAssignmentId == unrelated.id
+    user_opened = ctx.handlers["assign"].(assign_call({:user, "flynn"}, "user task"))
+    assert user_opened.parentAssignmentId == nil
+    readback = ctx.handlers["assignment-get"].(assignment_get_call({:user, "flynn"}, child.id))
+    assert readback.parentAssignmentId == parent.id
+
+    assert %{state: "closed"} =
+             ctx.handlers["revoke-assignment"].(revoke_call({:session, "holder"}, child.id))
+
+    assert %{state: "open", parentAssignmentId: recorded_parent} =
+             ctx.handlers["reopen-assignment"].(
+               reopen_call({:session, "holder"}, child.id, "continue scope")
+             )
+
+    assert recorded_parent == parent.id
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE assignments SET holderKey=?2 WHERE id=?1", [
+        child.id,
+        ctx.other.session_key
+      ])
+
+    assert ctx.handlers["assignment-get"].(assignment_get_call({:user, "flynn"}, child.id)).parentAssignmentId ==
+             parent.id
+  end
+
+  for count <- [1, 2] do
+    test "parent inference uses unique frozen batch evidence: #{count} assignments", ctx do
+      start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+      start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+
+      parents =
+        for n <- 1..unquote(count),
+            do: ctx.handlers["assign"].(assign_call({:user, "flynn"}, "parent #{n}"))
+
+      for parent <- parents do
+        {:ok, _wake} =
+          DB.transaction(ctx.db, fn txn ->
+            Wakes.schedule_in_txn(txn, %{
+              session_key: "holder",
+              origin: "process:tightbeam",
+              prompt: "parent work",
+              assignment_id: parent.id,
+              due_at: System.system_time(:millisecond)
+            })
+          end)
+      end
+
+      item =
+        WorkItems.__handle__(
+          ctx.db,
+          "work-item-create",
+          work_item_call("work-item-create", {:user, "flynn"}, %{title: "Unrelated work"})
+        )
+
+      {:ok, _wake} =
+        DB.transaction(ctx.db, fn txn ->
+          Wakes.schedule_in_txn(txn, %{
+            session_key: "holder",
+            origin: "process:tightbeam",
+            prompt: "unrelated general message",
+            work_item_id: item.id,
+            due_at: System.system_time(:millisecond)
+          })
+        end)
+
+      assert [_ | _] = NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 60_000)
+      assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "batch-parent-test")
+
+      assert {:ok, [[nil]]} =
+               DB.query(ctx.db, "SELECT assignmentId FROM turns WHERE seq=?1", [turn.seq])
+
+      child = ctx.handlers["assign"].(assign_call({:session, "holder"}, "child from batch"))
+
+      if unquote(count) == 1 do
+        assert child.parentAssignmentId == hd(parents).id
+      else
+        assert child.parentAssignmentId == nil
+        chosen = List.last(parents)
+        explicit = assign_call({:session, "holder"}, "explicit batch child")
+        explicit = put_in(explicit.params[:parent_assignment_id], chosen.id)
+        assert ctx.handlers["assign"].(explicit).parentAssignmentId == chosen.id
+
+        assert %{state: "closed"} =
+                 ctx.handlers["revoke-assignment"].(revoke_call({:session, "holder"}, chosen.id))
+
+        closed = ctx.handlers["assign"].(explicit)
+        assert closed.parentAssignmentId == nil
+        assert closed.parentExplanation =~ "it is closed"
+      end
+    end
   end
 
   test "gateway opens and retires with supervision reminders off", ctx do
@@ -503,8 +634,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert hint.record_dependency.bindings == %{"assignmentId" => assignment.id}
     assert hint.record_dependency.message =~ "not a complete --predicate"
     assert hint.record_dependency.message =~ "caller-selected resolverRef"
-    assert hint.record_dependency.message =~ "nonblank necessity"
-    assert hint.record_dependency.message =~ "same-owner open assignment"
+    assert hint.record_dependency.message =~ "No necessity or verifier assignment is required"
     assert hint.message =~ "--when-fact assignment-landed"
     assert hint.message =~ "assignmentId=#{assignment.id}"
     assert hint.message =~ "assignment.state"
@@ -2329,7 +2459,22 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, nil, "missing_reason")
     assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "   ", "invalid_reason")
-    assert_reopen_refused!(ctx, {:process, "cron"}, assignment.id, "why", "process_denied")
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:process, "cron"}, assignment.id, "why")
+             )
+
+    assert {:ok, [[nil, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reopenedByUser,reopenedBySession FROM assignment_reopenings WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
 
     assert %{state: "open"} =
              handle(
@@ -3349,20 +3494,20 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "the blocked holder cannot answer and clear a standing cannot-proceed", ctx do
+  test "a session answers a standing cannot-proceed with its own attribution", ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
 
     assignment =
-      assign_call({:user, "flynn"}, "opener-only answer")
+      assign_call({:user, "flynn"}, "session answer")
       |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
     blocked =
       attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
-      |> put_in([:params, :note], "only the opener may settle this condition")
+      |> put_in([:params, :note], "needs a decision")
       |> then(&handle(ctx, "attest", &1))
 
-    assert %{code: "not_found"} =
+    assert %{status: "answered", answered_by: "session:holder"} =
              Tightbeam.Escalation.answer(
                ctx.db,
                call("answer", {:session, "holder"}, nil, %{
@@ -3371,7 +3516,7 @@ defmodule Tightbeam.AssignmentsTest do
                })
              )
 
-    assert {:ok, [["open", "standing"]]} =
+    assert {:ok, [["answered", "settled"]]} =
              DB.query(
                ctx.db,
                """
@@ -3383,7 +3528,7 @@ defmodule Tightbeam.AssignmentsTest do
                [blocked.decisionRequest.id]
              )
 
-    refute Wakes.get(ctx.db, blocked.decisionWake.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, blocked.decisionWake.wake_id).state == "canceled"
   end
 
   test "a clean review settles cannot-proceed after review-pending completion", ctx do
@@ -3473,6 +3618,266 @@ defmodule Tightbeam.AssignmentsTest do
                """,
                [blocked.cannotProceed.id]
              )
+
+    {:ok, [[revocation_id]]} =
+      DB.query(
+        ctx.db,
+        "SELECT id FROM assignment_revocations WHERE assignmentId=?1",
+        [assignment.id]
+      )
+
+    {:ok, [[withdrawn_reason]]} =
+      DB.query(
+        ctx.db,
+        "SELECT withdrawnReason FROM decision_requests WHERE id=?1",
+        [blocked.cannotProceed.decisionRequestId]
+      )
+
+    assert withdrawn_reason =~ "moot"
+    assert withdrawn_reason =~ "revocation record #{revocation_id}"
+
+    assert {:ok, cancellations} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,
+                      outcomeKind,dispositionKind,dispositionId
+               FROM wake_cancellations WHERE wakeId=?1
+               """,
+               [blocked.decisionWake.wake_id]
+             )
+
+    assert cancellations == [
+             [
+               "tightbeam:escalation",
+               "obligation_disposed",
+               "decision_request",
+               blocked.cannotProceed.decisionRequestId,
+               "disposition",
+               "decision_request_transition",
+               blocked.cannotProceed.decisionRequestId
+             ]
+           ]
+  end
+
+  test "install reconciliation disposes a closed completed hold by its completion attest", ctx do
+    {assignment, blocked, closing_attest_id, closed_at} =
+      stranded_completed_assignment(ctx, "stranded completed assignment")
+
+    attests_before =
+      reconciliation_rows(
+        ctx.db,
+        "SELECT id,kind,verdictKind,note,bySession,byUser,ts FROM attests WHERE assignmentId=?1 ORDER BY ts,id",
+        [assignment.id]
+      )
+
+    assert :ok = force_closed_assignment_reconciliation(ctx)
+
+    assert {:ok, [["closed", "completed", ^closed_at, ^closing_attest_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,outcome,closedAt,closingAttestId FROM assignments WHERE id=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [["settled", "disposed", ^closed_at, "session:holder"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,settlementKind,settledAt,settledBy FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert {:ok, [["withdrawn", reason]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,withdrawnReason FROM decision_requests WHERE id=?1",
+               [blocked.cannotProceed.decisionRequestId]
+             )
+
+    assert reason =~ "moot"
+    assert reason =~ "completion attest #{closing_attest_id}"
+    assert Wakes.get(ctx.db, blocked.decisionWake.wake_id).state == "canceled"
+
+    assert {:ok, cancellations} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,
+                      outcomeKind,dispositionKind,dispositionId
+               FROM wake_cancellations WHERE wakeId=?1
+               """,
+               [blocked.decisionWake.wake_id]
+             )
+
+    assert cancellations == [
+             [
+               "tightbeam:escalation",
+               "obligation_disposed",
+               "decision_request",
+               blocked.cannotProceed.decisionRequestId,
+               "disposition",
+               "decision_request_transition",
+               blocked.cannotProceed.decisionRequestId
+             ]
+           ]
+
+    assert {:ok, [[closing_attest_id, "completion", "holder", ^closed_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,kind,bySession,ts FROM attests WHERE id=?1",
+               [closing_attest_id]
+             )
+
+    assert reconciliation_rows(
+             ctx.db,
+             "SELECT id,kind,verdictKind,note,bySession,byUser,ts FROM attests WHERE assignmentId=?1 ORDER BY ts,id",
+             [assignment.id]
+           ) == attests_before
+
+    assert {:ok, [[event_detail]]} =
+             DB.query(
+               ctx.db,
+               "SELECT detail FROM lifecycle_events WHERE kind='decision_request_withdrawn' AND subject=?1",
+               [blocked.cannotProceed.decisionRequestId]
+             )
+
+    assert event_detail =~ closing_attest_id
+
+    assert {:ok, [[@closed_assignment_reconciliation_shape]]} =
+             DB.query(ctx.db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "install reconciliation of a closed revoked hold names its actual revocation", ctx do
+    {assignment, blocked, revocation_id, closed_at} =
+      stranded_revoked_assignment(ctx, "stranded revoked assignment")
+
+    attests_before =
+      reconciliation_rows(
+        ctx.db,
+        "SELECT id,kind,verdictKind,note,bySession,byUser,ts FROM attests WHERE assignmentId=?1 ORDER BY ts,id",
+        [assignment.id]
+      )
+
+    assert :ok = force_closed_assignment_reconciliation(ctx)
+
+    assert {:ok, [["closed", "revoked", ^closed_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,outcome,closedAt FROM assignments WHERE id=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [["settled", "disposed"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,settlementKind FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert {:ok, [["withdrawn", reason]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,withdrawnReason FROM decision_requests WHERE id=?1",
+               [blocked.cannotProceed.decisionRequestId]
+             )
+
+    assert reason =~ "moot"
+    assert reason =~ "revocation record #{revocation_id}"
+    assert Wakes.get(ctx.db, blocked.decisionWake.wake_id).state == "canceled"
+
+    assert {:ok, cancellations} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,
+                      outcomeKind,dispositionKind,dispositionId
+               FROM wake_cancellations WHERE wakeId=?1
+               """,
+               [blocked.decisionWake.wake_id]
+             )
+
+    assert cancellations == [
+             [
+               "tightbeam:escalation",
+               "obligation_disposed",
+               "decision_request",
+               blocked.cannotProceed.decisionRequestId,
+               "disposition",
+               "decision_request_transition",
+               blocked.cannotProceed.decisionRequestId
+             ]
+           ]
+
+    assert reconciliation_rows(
+             ctx.db,
+             "SELECT id,kind,verdictKind,note,bySession,byUser,ts FROM attests WHERE assignmentId=?1 ORDER BY ts,id",
+             [assignment.id]
+           ) == attests_before
+  end
+
+  test "a rerun preserves the completed settlement and its history", ctx do
+    {assignment, blocked, _closing_attest_id, _closed_at} =
+      stranded_completed_assignment(ctx, "idempotent completed assignment")
+
+    assert :ok = force_closed_assignment_reconciliation(ctx)
+
+    before =
+      closed_assignment_reconciliation_snapshot(ctx.db, assignment.id, blocked.cannotProceed.id)
+
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+
+    assert closed_assignment_reconciliation_snapshot(
+             ctx.db,
+             assignment.id,
+             blocked.cannotProceed.id
+           ) ==
+             before
+  end
+
+  test "closed assignment without matching completion provenance stays as-is and is listed",
+       ctx do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    assignment =
+      assign_call({:user, "flynn"}, "missing close provenance")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    progress =
+      attest_call({:session, "holder"}, assignment.id, "progress")
+      |> put_in([:params, :note], "historical progress")
+      |> then(&handle(ctx, "attest", &1))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "awaiting opener")
+      |> then(&handle(ctx, "attest", &1))
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE assignments SET state='closed',outcome='completed',closedAt=?2,closedBySession='holder',closingAttestId=?3 WHERE id=?1",
+        [assignment.id, progress.attest.ts, progress.attest.id]
+      )
+
+    before =
+      closed_assignment_reconciliation_snapshot(ctx.db, assignment.id, blocked.cannotProceed.id)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = force_closed_assignment_reconciliation(ctx)
+      end)
+
+    assert log =~ assignment.id
+    assert log =~ blocked.cannotProceed.id
+    assert log =~ "missing_closing_completion_attest"
+
+    assert closed_assignment_reconciliation_snapshot(
+             ctx.db,
+             assignment.id,
+             blocked.cannotProceed.id
+           ) ==
+             before
   end
 
   test "a pending holder reminder does not block opener revocation after reparenting", ctx do
@@ -3734,20 +4139,24 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   @tag assignment_delta: true
-  test "public revoke cannot claim the internal recovery process", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "process spoof"))
+  test "process revocation does not invent user or session provenance", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "process revocation"))
 
-    assert %{code: "process_denied"} =
-             handle(ctx, "revoke-assignment", revoke_call({:process, "tightbeam"}, assignment.id))
+    assert %{state: "closed", outcome: "revoked"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:process, "automation"}, assignment.id)
+             )
 
-    assert {:ok, [["open", nil, nil, nil]]} =
+    assert {:ok, [["closed", nil, nil, nil]]} =
              DB.query(
                ctx.db,
                "SELECT state,closedByUser,closedBySession,closedByProcess FROM assignments WHERE id=?1",
                [assignment.id]
              )
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM assignment_revocations WHERE assignmentId=?1",
@@ -4055,13 +4464,9 @@ defmodule Tightbeam.AssignmentsTest do
 
     invalid = [
       "('a1','x','holder',NULL,1,'flynn',NULL,1,'open',NULL,NULL,NULL,NULL,NULL)",
-      "('a2','x','holder',NULL,0,NULL,NULL,1,'open',NULL,NULL,NULL,NULL,NULL)",
-      "('a3','x','holder',NULL,0,'flynn','holder',1,'open',NULL,NULL,NULL,NULL,NULL)",
       "('a4','x','holder',NULL,0,'flynn',NULL,1,'open','revoked',NULL,NULL,NULL,NULL)",
       "('a5','x','holder',NULL,0,'flynn',NULL,1,'closed',NULL,2,'flynn',NULL,NULL)",
       "('a6','x','holder',NULL,0,'flynn',NULL,1,'closed','revoked',NULL,'flynn',NULL,NULL)",
-      "('a7','x','holder',NULL,0,'flynn',NULL,1,'closed','revoked',2,NULL,NULL,NULL)",
-      "('a8','x','holder',NULL,0,'flynn',NULL,1,'closed','revoked',2,'flynn','holder',NULL)",
       "('a9','x','holder',NULL,0,'flynn',NULL,1,'closed','completed',2,'flynn',NULL,NULL)"
     ]
 
@@ -4099,6 +4504,21 @@ defmodule Tightbeam.AssignmentsTest do
       assert {:error, %DB.Error{message: check_message}} = DB.query(db, check_base <> values)
       assert check_message =~ "CHECK constraint"
     end)
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               base <>
+                 "('a_process','x','holder',NULL,0,NULL,NULL,1,'open',NULL,NULL,NULL,NULL,NULL)"
+             )
+
+    process_revoked =
+      "('a_process_revoked','x','holder',NULL,0,NULL,NULL,1,'closed','revoked',2,NULL,NULL,NULL)"
+
+    assert {:ok, []} = DB.query(db, check_base <> process_revoked)
+
+    assert {:error, %DB.Error{message: "revoked assignment requires revocation provenance"}} =
+             DB.query(db, base <> process_revoked)
 
     assert {:error, %DB.Error{}} =
              DB.query(
@@ -4162,7 +4582,13 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "assign validates principals, input, liveness, opener typing, and idempotent races", ctx do
-    assert %{code: "process_denied"} = handle(ctx, "assign", assign_call({:process, "cron"}))
+    assert %{openedByUser: nil, openedBySession: nil} =
+             handle(
+               ctx,
+               "assign",
+               put_in(assign_call({:process, "cron"}), [:params, :owner_user_id], "flynn")
+             )
+
     assert %{code: "principal_required"} = handle(ctx, "assign", assign_call(nil))
     assert %{code: "invalid_subject"} = handle(ctx, "assign", assign_call({:user, "flynn"}, " "))
 
@@ -4291,7 +4717,7 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE id = ?1", [assignment.id])
   end
 
-  test "unowned dispatch defers through its exact routing bracket, then admits exact fired rumination",
+  test "unowned dispatch opens with advisory rumination and cancels its routing bracket",
        ctx do
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
@@ -4322,6 +4748,13 @@ defmodule Tightbeam.AssignmentsTest do
         "work-item-create",
         work_item_call("work-item-create", {:user, "flynn"}, %{title: "Rumination rail"})
       )
+
+    assert {:ok, [[routing_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT routingWakeId FROM work_items WHERE id = ?1",
+               [work_item.id]
+             )
 
     call =
       dispatch_call(
@@ -4354,27 +4787,40 @@ defmodule Tightbeam.AssignmentsTest do
             %{
               rumination_required: true,
               work_item_id: work_item_id,
-              message: message
+              message: message,
+              id: assignment_id,
+              workItemId: assignment_work_item_id,
+              state: "open"
             }} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
     assert work_item_id == work_item.id
+    assert assignment_work_item_id == work_item.id
 
     assert message ==
-             "Sent you to ruminate on #{work_item.id} first — re-dispatch when you're done thinking."
+             "Rumination is scheduled for #{work_item.id}; this dispatch opened the assignment anyway."
 
-    assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'ship the rail'")
+    assert {:ok, [[1, ^assignment_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*),MIN(id) FROM assignments WHERE subject = 'ship the rail'"
+             )
 
-    # Two wakes are pending: the bracket-1 routing nag armed at create (on the
-    # owner's personal session) and the rumination wake on the dispatcher.
+    # Dispatch opened the assignment, so its owner-routing bracket is canceled;
+    # the advisory rumination wake remains pending on the dispatcher.
     pending = Wakes.list_pending(ctx.db)
     wake = Enum.find(pending, & &1.rumination)
     assert wake
 
-    assert Enum.any?(pending, fn w ->
+    refute Enum.any?(pending, fn w ->
              not w.rumination and w.work_item_id == work_item.id and
                w.session_key == Org.personal_session_key("flynn")
            end)
+
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id = ?1", [work_item.id])
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId = ?1", [routing_wake_id])
 
     assert wake.session_key == "dispatcher"
     assert wake.creator_session_key == "dispatcher"
@@ -4383,13 +4829,13 @@ defmodule Tightbeam.AssignmentsTest do
     assert wake.work_item_id == work_item.id
 
     assert wake.prompt ==
-             "digest: Ruminate on work-item #{work_item.id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=ship the rail brief=Implement the ratified behavior. When you've thought it through, re-issue the dispatch."
+             "digest: Ruminate on work-item #{work_item.id} against the whole spec and its spirit. The assignment has already been dispatched: subject=ship the rail brief=Implement the ratified behavior. When you've thought it through, review the open assignment and adjust it if needed."
 
     assert wake.delivery_rule == NoticeBatcher.rule()
 
-    # A repeated attempt in this same active turn keeps the gate closed while
-    # reusing the one pending rumination source.
-    assert {:ok, %{rumination_required: true}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    # The same idempotency key replays the already-opened assignment while the
+    # one rumination source remains pending.
+    assert {:ok, %{id: ^assignment_id}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -4514,8 +4960,9 @@ defmodule Tightbeam.AssignmentsTest do
                Wakes.rumination_status_in_txn(txn, work_item.id, "dispatcher")
              end)
 
-    # F7 amendment: the re-dispatch persists workItemId exactly as assign does.
+    # Rumination is advisory: the first dispatch already opened this assignment.
     assert {:ok, assignment} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert assignment.id == assignment_id
     assert assignment.workItemId == work_item.id
     assert assignment.openedBySession == "dispatcher"
 
@@ -4587,14 +5034,14 @@ defmodule Tightbeam.AssignmentsTest do
 
     assignment_count_before_unrelated = assignment_count(ctx.db)
 
-    assert %{code: "delivery_owner_required"} =
+    assert %{openedBySession: "other-session"} =
              handle(
                ctx,
                "assign",
                assign_call({:session, "other-session"}, "unrelated owner", nil, work_item.id)
              )
 
-    assert assignment_count(ctx.db) == assignment_count_before_unrelated
+    assert assignment_count(ctx.db) == assignment_count_before_unrelated + 1
   end
 
   test "assign and dispatch refuse a foreign caller even after exact fired rumination", ctx do
@@ -4675,7 +5122,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     baseline = assignment_count(ctx.db)
 
-    assert {:ok, %{rumination_required: true}} =
+    assert {:ok, %{rumination_required: true, workItemId: work_item_id}} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
@@ -4688,7 +5135,8 @@ defmodule Tightbeam.AssignmentsTest do
                )
              )
 
-    assert assignment_count(ctx.db) == baseline
+    assert work_item_id == work_item.id
+    assert assignment_count(ctx.db) == baseline + 1
   end
 
   test "unowned dispatch rejects canceled and mismatched routing brackets", ctx do
@@ -4863,12 +5311,44 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(ctx.db, "SELECT count(*) FROM messages WHERE content LIKE '%Wake now.%'")
   end
 
-  test "dispatch rejects disallowed principals exactly as assign does", ctx do
-    for principal <- [{:process, "cron"}, nil] do
-      assign_error = handle(ctx, "assign", assign_call(principal, "work"))
-      dispatch_error = handle(ctx, "dispatch", dispatch_call(principal, "work", "Do work."))
-      assert dispatch_error == assign_error
+  test "dispatch and assign accept processes and retain missing-principal errors", ctx do
+    assign_error = handle(ctx, "assign", assign_call(nil, "work"))
+    dispatch_error = handle(ctx, "dispatch", dispatch_call(nil, "work", "Do work."))
+    assert assign_error.code == "principal_required"
+    assert dispatch_error == assign_error
+
+    assigned =
+      handle(
+        ctx,
+        "assign",
+        put_in(
+          assign_call({:process, "cron"}, "assigned work"),
+          [:params, :owner_user_id],
+          "flynn"
+        )
+      )
+
+    dispatched =
+      handle(
+        ctx,
+        "dispatch",
+        put_in(
+          dispatch_call({:process, "cron"}, "dispatched work", "Do work."),
+          [:params, :owner_user_id],
+          "flynn"
+        )
+      )
+
+    for row <- [assigned, dispatched] do
+      assert row.state == "open"
+      assert row.openedByUser == nil
+      assert row.openedBySession == nil
     end
+
+    assert {:ok, [[prompt]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE assignmentId=?1", [dispatched.id])
+
+    assert prompt == "[from process:cron]\n\n[assignment: #{dispatched.id}]\n\nDo work."
   end
 
   @tag assignment_delta: true
@@ -5705,7 +6185,7 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
-    assert %{code: "process_denied"} =
+    assert %{code: "not_holder"} =
              handle(ctx, "attest", attest_call({:process, "cron"}, assignment.id, "progress"))
 
     assert %{code: "principal_required"} =
@@ -5906,7 +6386,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "deny"))
 
-    assert %{code: "process_denied"} =
+    assert %{outcome: "revoked", closedByUser: nil, closedBySession: nil} =
              handle(ctx, "revoke-assignment", revoke_call({:process, "x"}, assignment.id))
 
     assert %{code: "principal_required"} =
@@ -5939,7 +6419,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{code: "invalid_state_filter"} =
              handle(ctx, "assignments", query_call({:user, "flynn"}, "bad", nil))
 
-    assert %{code: "process_denied"} =
+    assert %{code: "invalid_state_filter"} =
              handle(ctx, "assignments", query_call({:process, "x"}, "bad", nil))
 
     assert %{code: "principal_required"} =
@@ -6108,6 +6588,234 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert %{code: "inapplicable_code_evidence"} =
              handle(ctx, "attest", attest_call({:session, "holder"}, unreviewed.id, "completion"))
+  end
+
+  test "same-item independent unlinked review can qualify code completion", ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    rules_base =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-assignment-review-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(rules_base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+
+    completion_rules =
+      File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+      |> String.split("\n# Posture gate", parts: 2)
+      |> hd()
+
+    File.write!(Path.join(rules_dir, "engineering.toml"), completion_rules)
+    Rules.load!(rules_base, Map.keys(ctx.handlers))
+    on_exit(fn -> File.rm_rf!(rules_base) end)
+
+    work_item = create_work_item(ctx, "unlinked review completion")
+    other_work_item = create_work_item(ctx, "unrelated review work")
+    commit = String.duplicate("a", 40)
+    producer_refs = [%{"repo" => "testhost:/tmp/producer", "commit" => commit}]
+    review_refs = [%{"repo" => "testhost:/tmp/reviewer", "commit" => commit}]
+
+    producer =
+      assign_call({:user, "flynn"}, "producer", nil, work_item.id)
+      |> put_in([:params, :effect_kind], "code")
+      |> then(&handle(ctx, "assign", &1))
+
+    unrelated_review =
+      assign_call({:user, "flynn"}, "unrelated review", nil, other_work_item.id)
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :effect_kind], "review")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert unrelated_review.reviewsAssignmentId == nil
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, unrelated_review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], review_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], producer_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(
+             ctx.db,
+             producer.id,
+             "holder",
+             producer_refs
+           ) == []
+
+    assert {:deny, %{rule: "completion-requires-review"}} =
+             Rules.evaluate(ctx.db, attest_call({:session, "holder"}, producer.id, "completion"))
+
+    review =
+      assign_call({:user, "flynn"}, "same-item review", nil, work_item.id)
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :effect_kind], "review")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert review.reviewsAssignmentId == nil
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], review_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(
+             ctx.db,
+             producer.id,
+             "holder",
+             producer_refs
+           ) == [
+             "reviewed-clean"
+           ]
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
+                 Dispatch.dispatch(
+                   ctx.db,
+                   ctx.handlers,
+                   attest_call({:session, "holder"}, producer.id, "completion")
+                 )
+      end)
+
+    assert log =~ "completion_review_missing_link accepted"
+  end
+
+  test "linked review conclusions take precedence over later unlinked same-item reviews", ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    rules_base =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-linked-review-precedence-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(rules_base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+
+    completion_rules =
+      File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+      |> String.split("\n# Posture gate", parts: 2)
+      |> hd()
+
+    File.write!(Path.join(rules_dir, "engineering.toml"), completion_rules)
+    Rules.load!(rules_base, Map.keys(ctx.handlers))
+    on_exit(fn -> File.rm_rf!(rules_base) end)
+
+    work_item = create_work_item(ctx, "linked review remains authoritative")
+    commit_a = String.duplicate("a", 40)
+    commit_b = String.duplicate("b", 40)
+    producer_refs = [%{"repo" => "testhost:/tmp/producer", "commit" => commit_a}]
+    matching_review_refs = [%{"repo" => "testhost:/tmp/linked-review", "commit" => commit_a}]
+    other_review_refs = [%{"repo" => "testhost:/tmp/unlinked-review", "commit" => commit_b}]
+
+    producer =
+      assign_call({:user, "flynn"}, "linked producer", nil, work_item.id)
+      |> put_in([:params, :effect_kind], "code")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], producer_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    linked_clean =
+      assign_call({:user, "flynn"}, "linked clean review", nil, work_item.id)
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :effect_kind], "review")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert linked_clean.reviewsAssignmentId == producer.id
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, linked_clean.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], matching_review_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    unlinked_changes =
+      assign_call({:user, "flynn"}, "later unlinked changes request", nil, work_item.id)
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :effect_kind], "review")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert unlinked_changes.reviewsAssignmentId == nil
+
+    assert %{attest: %{verdictKind: "changes-requested"}} =
+             attest_call({:session, "other-session"}, unlinked_changes.id, "verdict")
+             |> put_in([:params, :verdict_kind], "changes-requested")
+             |> put_in([:params, :commit_refs], matching_review_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert ["reviewed-clean"] ==
+             Assignments.qualifying_review_verdict_kinds(
+               ctx.db,
+               producer.id,
+               "holder",
+               producer_refs
+             )
+
+    completion_call = attest_call({:session, "holder"}, producer.id, "completion")
+    assert :ok = Rules.evaluate(ctx.db, completion_call)
+
+    unlinked_other_clean =
+      assign_call({:user, "flynn"}, "later unlinked clean review", nil, work_item.id)
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :effect_kind], "review")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, unlinked_other_clean.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], other_review_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert ["reviewed-clean"] ==
+             Assignments.qualifying_review_verdict_kinds(
+               ctx.db,
+               producer.id,
+               "holder",
+               producer_refs
+             )
+
+    assert :ok = Rules.evaluate(ctx.db, completion_call)
+
+    completion_log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
+                 Dispatch.dispatch(ctx.db, ctx.handlers, completion_call)
+      end)
+
+    refute completion_log =~ "completion_review_missing_link accepted"
   end
 
   test "code completion refusal names uncovered verified producer commits", ctx do
@@ -6611,7 +7319,7 @@ defmodule Tightbeam.AssignmentsTest do
                assignment_get_call({:session, "holder"}, "unknown-assignment")
              )
 
-    assert %{code: "process_denied"} =
+    assert %{cannotProceed: %{state: "standing"}} =
              handle(
                ctx,
                "assignment-get",
@@ -6796,6 +7504,165 @@ defmodule Tightbeam.AssignmentsTest do
     count
   end
 
+  defp stranded_completed_assignment(ctx, subject) do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    assignment =
+      assign_call({:user, "flynn"}, subject)
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "historical unresolved hold")
+      |> then(&handle(ctx, "attest", &1))
+
+    closing_attest_id = "att_reconcile_#{System.unique_integer([:positive])}"
+    closed_at = System.system_time(:millisecond)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO attests (id,assignmentId,kind,note,bySession,ts)
+               VALUES (?1,?2,'completion','historical completion','holder',?3)
+               """,
+               [closing_attest_id, assignment.id, closed_at]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignments
+               SET state='closed',outcome='completed',closedAt=?2,closedBySession='holder',
+                   closingAttestId=?3
+               WHERE id=?1 AND state='open'
+               """,
+               [assignment.id, closed_at, closing_attest_id]
+             )
+
+    {assignment, blocked, closing_attest_id, closed_at}
+  end
+
+  defp stranded_revoked_assignment(ctx, subject) do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    assignment =
+      assign_call({:user, "flynn"}, subject)
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "historical unresolved hold")
+      |> then(&handle(ctx, "attest", &1))
+
+    revocation_id = "rev_reconcile_#{System.unique_integer([:positive])}"
+    closed_at = System.system_time(:millisecond)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignment_revocations
+                   (id,assignmentId,revokedAt,revokedByUser,reason)
+                 VALUES (?1,?2,?3,'flynn','historical revocation')
+                 """,
+                 [revocation_id, assignment.id, closed_at]
+               )
+
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignment_revocation_generations (revocationId,assignmentId,reopeningId)
+                 VALUES (?1,?2,NULL)
+                 """,
+                 [revocation_id, assignment.id]
+               )
+
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 """
+                 UPDATE assignments
+                 SET state='closed',outcome='revoked',closedAt=?2,closedByUser='flynn'
+                 WHERE id=?1 AND state='open'
+                 """,
+                 [assignment.id, closed_at]
+               )
+
+               :ok
+             end)
+
+    {assignment, blocked, revocation_id, closed_at}
+  end
+
+  defp force_closed_assignment_reconciliation(ctx) do
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE schema_stamp SET shape=?1,stampedAt=1",
+               [@session_identity_shape]
+             )
+
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+  end
+
+  defp closed_assignment_reconciliation_snapshot(db, assignment_id, condition_id) do
+    {:ok, [[request_id, wake_id]]} =
+      DB.query(
+        db,
+        "SELECT decisionRequestId,decisionWakeId FROM assignment_cannot_proceed WHERE id=?1",
+        [condition_id]
+      )
+
+    %{
+      assignment:
+        reconciliation_rows(
+          db,
+          "SELECT state,outcome,closedAt,closedByUser,closedBySession,closedByProcess,closingAttestId FROM assignments WHERE id=?1",
+          [assignment_id]
+        ),
+      condition:
+        reconciliation_rows(
+          db,
+          "SELECT * FROM assignment_cannot_proceed WHERE id=?1",
+          [condition_id]
+        ),
+      request:
+        reconciliation_rows(
+          db,
+          "SELECT status,withdrawnBy,withdrawnReason,withdrawnAt FROM decision_requests WHERE id=?1",
+          [request_id]
+        ),
+      wake: reconciliation_rows(db, "SELECT state FROM wakes WHERE wakeId=?1", [wake_id]),
+      cancellations:
+        reconciliation_rows(
+          db,
+          "SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind,dispositionKind,dispositionId FROM wake_cancellations WHERE wakeId=?1 ORDER BY canceledAt",
+          [wake_id]
+        ),
+      attests:
+        reconciliation_rows(
+          db,
+          "SELECT id,kind,verdictKind,note,bySession,byUser,ts FROM attests WHERE assignmentId=?1 ORDER BY ts,id",
+          [assignment_id]
+        ),
+      withdrawal_events:
+        reconciliation_rows(
+          db,
+          "SELECT kind,subject,detail FROM lifecycle_events WHERE kind='decision_request_withdrawn' AND subject=?1 ORDER BY id",
+          [request_id]
+        )
+    }
+  end
+
+  defp reconciliation_rows(db, sql, args) do
+    {:ok, rows} = DB.query(db, sql, args)
+    rows
+  end
+
   defp assign_call(principal, subject \\ "work", key \\ nil, work_item_id \\ nil) do
     call("assign", principal, "holder", %{
       subject: subject,
@@ -6859,7 +7726,7 @@ defmodule Tightbeam.AssignmentsTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("fable"),
-      host: "eezo"
+      host: "lab1"
     }
 
     Org.create(db, Map.merge(input, overrides))

@@ -15,15 +15,36 @@ before staging or replacing a package.
 
 ## External-agent operation skill
 
-Use the [current-line CLI edition](priv/skills/tightbeam-cli/SKILL.md) when an external
-agent operates an existing Tightbeam organization through the command line.
+Every release ships two skills for agents that work with Tightbeam from outside it:
 
-Copy the whole `tightbeam-cli` directory to `.codex/skills/tightbeam-cli/` or
-`.claude/skills/tightbeam-cli/` in the external agent's project. Keep the directory name
-and `SKILL.md` filename unchanged. Start a fresh agent session after the copy so the agent
-rediscovers the skill metadata.
+- [`tightbeam-cli`](priv/skills/tightbeam-cli/SKILL.md) is for an agent that holds a
+  Tightbeam session credential in its worktree and works one assigned card.
+- [`tightbeam-operator`](priv/skills/tightbeam-operator/SKILL.md) is for an agent that
+  acts for a named user (`--as-user`): it inspects the organization, presents and rules
+  on decision requests, files and routes work to a delivery owner, and wakes sessions.
 
-The skill does not install Tightbeam, create a session, supply a credential, operate a
+Each skill states the Tightbeam version it was written for, and the `tightbeam` CLI
+carries the edition that matches its own version. After installing or upgrading
+Tightbeam, install the matching skills with:
+
+```sh
+tightbeam skill install
+```
+
+This copies both skills into `~/.claude/skills` and `~/.codex/skills` (or
+`$CLAUDE_CONFIG_DIR/skills` and `$CODEX_HOME/skills` when those are set), skipping a
+harness whose configuration directory does not exist. It replaces earlier copies and
+reports the version each replaced copy was written for. Use `--skill <name>` to install
+one skill, or `--dir <skillsDir>` to install into one directory instead, such as a
+project's `.claude/skills`. `tightbeam skill list` shows what this CLI ships.
+
+To copy a skill by hand, copy its whole directory from the release you run; the
+package carries them under `release/lib/tightbeam-<version>/priv/skills/`.
+Keep the directory name and `SKILL.md` filename unchanged.
+Start a fresh agent session after installing so the agent rediscovers the skill
+metadata.
+
+The skills do not install Tightbeam, create a session, supply a credential, operate a
 kungfu bundle, or change a Tightbeam identity. Provision those prerequisites separately.
 
 ## Install only a verified release package
@@ -537,6 +558,11 @@ installed it.
 Keep `base_dir` somewhere durable; it holds the org's credentials, identity,
 sessions, and work.
 
+The gateway's drain budget defaults to 90 seconds. Both service examples allow
+120 seconds before the service manager sends a forced kill. If you set
+`TIGHTBEAM_DRAIN_TIMEOUT_MS`, convert its millisecond value to seconds and set
+the manager's stop limit higher.
+
 ### macOS — launchd
 
 `/Library/LaunchDaemons/com.tightbeam.gateway.plist`, owned `root:wheel` mode
@@ -562,15 +588,16 @@ meet the requirements above. `UserName` keeps the process off root.
   <key>WorkingDirectory</key><string>/Users/you</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>TIGHTBEAM_LOCAL_HOST_NAME</key><string>gibson</string>
+    <key>TIGHTBEAM_LOCAL_HOST_NAME</key><string>gateway-host</string>
     <key>TIGHTBEAM_BASE_DIR</key><string>/Users/you/.tightbeam</string>
     <key>TIGHTBEAM_PORT</key><string>11373</string>
-    <key>TIGHTBEAM_ADVERTISED_URL</key><string>ws://gibson.local:11373</string>
+    <key>TIGHTBEAM_ADVERTISED_URL</key><string>ws://gateway-host.local:11373</string>
     <key>PATH</key><string>/opt/tightbeam/current/tightbeam/bin:/Users/you/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key>
   <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ExitTimeOut</key><integer>120</integer>
   <key>StandardOutPath</key><string>/Users/you/.tightbeam/gateway.log</string>
   <key>StandardErrorPath</key><string>/Users/you/.tightbeam/gateway.err.log</string>
 </dict>
@@ -604,17 +631,17 @@ User=you
 Group=you
 WorkingDirectory=/home/you
 ExecStart=/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway
-Environment=TIGHTBEAM_LOCAL_HOST_NAME=gibson
+Environment=TIGHTBEAM_LOCAL_HOST_NAME=gateway-host
 Environment=TIGHTBEAM_BASE_DIR=/home/you/.tightbeam
 Environment=TIGHTBEAM_PORT=11373
-Environment=TIGHTBEAM_ADVERTISED_URL=ws://gibson.local:11373
+Environment=TIGHTBEAM_ADVERTISED_URL=ws://gateway-host.local:11373
 Environment=PATH=/opt/tightbeam/current/tightbeam/bin:/usr/local/bin:/usr/bin:/bin
 # Daemon-owned OpenCode Go key (optional): systemd copies the source file into
 # $CREDENTIALS_DIRECTORY/opencode-go-api-key, the fixed name the gateway reads.
 # LoadCredential=opencode-go-api-key:/home/you/secrets/opencode-go-api-key
 Restart=on-failure
 RestartSec=5s
-TimeoutStopSec=30s
+TimeoutStopSec=120s
 
 [Install]
 WantedBy=multi-user.target
@@ -744,7 +771,11 @@ mix run --no-halt                  # boots the gateway; creates state.db and bin
 
 Releases are version tags on canonical `main`, not release branches. First set
 the version in `cli/Cargo.toml`, land it on `main`, and wait for the ordinary
-`main` CI run to pass. Then create and push the matching annotated tag:
+`main` CI run to pass. In the same change, re-check each external-agent skill that
+`tightbeam skill install` ships (listed in `cli/src/skills.rs`) against the new
+`tightbeam --help`, and update its `Written for Tightbeam <version>.` line. CI runs
+`scripts/verify_external_skills.py` on every push and refuses a version whose skills
+are stamped for another. Then create and push the matching annotated tag:
 
 ```sh
 git fetch origin

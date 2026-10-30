@@ -130,7 +130,8 @@ defmodule Tightbeam.ArtifactContent do
         params: %{artifact_id: artifact_id} = params
       })
       when ((kind == :user and visibility_kind == "user") or
-              (kind == :session and visibility_kind == "session")) and
+              (kind == :session and visibility_kind == "session") or
+              (kind == :process and visibility_kind == "process")) and
              is_binary(id) and is_boolean(is_admin) and is_binary(artifact_id) and
              artifact_id != "" and map_size(params) == 1 do
     case DB.transaction(db, fn txn ->
@@ -156,7 +157,7 @@ defmodule Tightbeam.ArtifactContent do
     end
   end
 
-  def fetch_call(_db, %{principal: {kind, _}}) when kind in [:user, :session],
+  def fetch_call(_db, %{principal: {kind, _}}) when kind in [:user, :session, :process],
     do: %{code: "invalid", message: "artifact-content-fetch requires only artifactId"}
 
   def fetch_call(_db, _call), do: %{code: "forbidden"}

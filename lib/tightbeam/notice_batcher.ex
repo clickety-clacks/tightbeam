@@ -816,6 +816,7 @@ defmodule Tightbeam.NoticeBatcher do
       [at, recipient]
     )
     |> Enum.map(&hd/1)
+    |> then(&Tightbeam.HarklightLifecycle.ready_sources_in_txn(txn, &1))
   end
 
   defp prepared_source_in_txn(txn, wake_id) do
@@ -1461,8 +1462,8 @@ defmodule Tightbeam.NoticeBatcher do
        when is_binary(process_id) and process_id != "" do
     row_exists?(
       db,
-      "SELECT 1 FROM wakes WHERE wakeId=?1 AND origin=?2",
-      [source_wake_id, "process:" <> process_id]
+      "SELECT 1 FROM wakes WHERE wakeId=?1",
+      [source_wake_id]
     )
   end
 

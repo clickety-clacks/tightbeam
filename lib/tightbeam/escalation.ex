@@ -1663,10 +1663,11 @@ defmodule Tightbeam.Escalation do
     end
   end
 
+  defp decision_reader?(%{principal: {:process, _}}, _request), do: true
+
   defp decision_reader?(%{principal: {:session, _key}}, _request), do: true
 
-  defp answer_reader?(%{principal: {:session, key}}, request),
-    do: not cannot_proceed_request?(request) or key == request.expecter_session_key
+  defp answer_reader?(%{principal: {:session, _key}}, _request), do: true
 
   defp answer_reader?(call, request), do: decision_reader?(call, request)
 
@@ -1746,6 +1747,17 @@ defmodule Tightbeam.Escalation do
       )
 
     consumed?
+  end
+
+  @doc false
+  def consume_in_txn(%Txn{} = txn, ruling_id, _verb, _origin) do
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET status='consumed', consumedAt=?2 WHERE id=?1 AND kind='statute' AND status='ruled'",
+      [ruling_id, now()]
+    )
+
+    Txn.changes(txn) == 1
   end
 
   @doc "Rule one open request. `:authorized` is supplied by Gateway's admin axis."
@@ -2539,7 +2551,7 @@ defmodule Tightbeam.Escalation do
     do: session_key == caller_session_key
 
   defp unowned_agent_stretch_raiser?(txn, session_key, "agent:" <> role) do
-    case Roles.resolve(txn, role) do
+    case Tightbeam.Origin.resolve_agent(txn, role) do
       {:ok, ^session_key, false} -> true
       _ -> false
     end
@@ -2713,7 +2725,7 @@ defmodule Tightbeam.Escalation do
   defp replay_operator_ruling_in_txn(txn, call, request, answer) do
     case validate_terminal_request_in_txn(txn, request) do
       %{failures: []} ->
-        ruled_by = "user:" <> request.owner_user_id
+        ruled_by = principal_id(call.principal)
 
         with {:ok, decision} <- operator_decision(request, answer) do
           if request.decision == decision and request.rationale == answer.rationale and
@@ -2738,7 +2750,7 @@ defmodule Tightbeam.Escalation do
   end
 
   defp rule_operator_request_in_txn(txn, call, request, decision, answer, opts) do
-    ruled_by = "user:" <> request.owner_user_id
+    ruled_by = principal_id(call.principal)
     via = Map.get(call, :transport_session_key)
     via_principal = principal_id(Map.fetch!(call, :principal))
     via_state = if is_binary(via), do: "known", else: "none"
@@ -3226,13 +3238,16 @@ defmodule Tightbeam.Escalation do
 
   defp operator_withdrawer_in_txn(txn, call, request) do
     case Map.get(call, :principal) do
+      {:process, name} ->
+        {:ok, "process:" <> name}
+
       {:user, owner_user_id} when owner_user_id == request.owner_user_id ->
         {:ok, "user:" <> owner_user_id}
 
       {:session, session_key} ->
         case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [session_key]) do
           [[owner_user_id]]
-          when owner_user_id == request.owner_user_id and call.origin == request.raiser_id ->
+          when owner_user_id == request.owner_user_id ->
             {:ok, call.origin}
 
           _ ->
@@ -3794,7 +3809,7 @@ defmodule Tightbeam.Escalation do
       end
 
     %{
-      on_behalf_of: request.ruled_by,
+      on_behalf_of: "user:" <> request.owner_user_id,
       performer: %{principal: %{state: "known", value: principal}, session: session}
     }
   end
@@ -3808,7 +3823,7 @@ defmodule Tightbeam.Escalation do
       end
 
     %{
-      on_behalf_of: request.ruled_by,
+      on_behalf_of: "user:" <> request.owner_user_id,
       performer: %{principal: %{state: "legacy-unknown"}, session: session}
     }
   end
@@ -3863,8 +3878,7 @@ defmodule Tightbeam.Escalation do
         is_map(request.context)
 
     owner_valid =
-      non_blank?(request.owner_user_id) and non_blank?(request.raiser_session_key) and
-        request.ruled_by == "user:" <> request.owner_user_id
+      non_blank?(request.owner_user_id) and non_blank?(request.raiser_session_key)
 
     options_valid = valid_operator_options?(request.options)
     decision_valid = normalized_text?(request.decision)
@@ -3902,7 +3916,7 @@ defmodule Tightbeam.Escalation do
           "ownerUserIdType" => terminal_type_class(request.owner_user_id),
           "raiserSessionKeyType" => terminal_type_class(request.raiser_session_key),
           "ruledByType" => terminal_type_class(request.ruled_by),
-          "ruledByMatchesOwner" => owner_valid
+          "ownerPresent" => owner_valid
         }),
       "options" =>
         terminal_structural_check(options_valid, terminal_operator_options_shape(request.options)),
@@ -4298,6 +4312,7 @@ defmodule Tightbeam.Escalation do
 
   defp canonical_principal?("user:" <> suffix), do: non_blank?(suffix)
   defp canonical_principal?("session:" <> suffix), do: non_blank?(suffix)
+  defp canonical_principal?("process:" <> suffix), do: non_blank?(suffix)
   defp canonical_principal?(_value), do: false
 
   defp valid_operator_options?(options) when is_list(options) and options != [] do
@@ -4338,7 +4353,24 @@ defmodule Tightbeam.Escalation do
     }
   end
 
-  defp visibility(_db, call, owner_user_id) do
+  defp visibility(_db, %{principal: {:process, _}}, _owner), do: {"1", []}
+
+  defp visibility(db, call, owner_user_id) do
+    owner_user_id =
+      case call.principal do
+        {:session, key} ->
+          case Org.get(db, key) do
+            %{owner_user_id: owner} -> owner
+            _ -> owner_user_id
+          end
+
+        {:user, owner} ->
+          owner
+
+        _ ->
+          owner_user_id
+      end
+
     raiser = raiser_id(call)
 
     effort =
@@ -4356,7 +4388,7 @@ defmodule Tightbeam.Escalation do
     operator =
       case call.principal do
         {:user, user_id} -> {"ownerUserId = ?", [user_id]}
-        {:session, session_key} -> {"raiserSessionKey = ?", [session_key]}
+        {:session, _session_key} -> {"ownerUserId = ?", [owner_user_id]}
         _ -> {"0", []}
       end
 
@@ -4390,7 +4422,7 @@ defmodule Tightbeam.Escalation do
       end
 
     case call.principal do
-      {:user, ^owner_user_id} when is_binary(owner_user_id) ->
+      {kind, _} when kind in [:user, :session] and is_binary(owner_user_id) ->
         {"(raiserId = ? OR ownerUserId = ? OR #{asked_sql})",
          [raiser, owner_user_id] ++ asked_params}
 
@@ -4448,10 +4480,13 @@ defmodule Tightbeam.Escalation do
 
   defp owner_user_id!(_db, %{principal: {:user, user_id}}), do: user_id
 
+  defp owner_user_id!(db, %{principal: {:process, _process}} = call),
+    do: org_owner_user_id!(db, call)
+
   defp owner_user_id!(_db, %{origin: "user:" <> user_id}), do: user_id
 
   defp owner_user_id!(db, %{origin: "agent:" <> role}) do
-    with {:ok, session_key, _fallback} <- Roles.resolve(db, role),
+    with {:ok, session_key, _fallback} <- Tightbeam.Origin.resolve_agent(db, role),
          %{owner_user_id: owner} <- Org.get(db, session_key) do
       owner
     else
@@ -4459,8 +4494,31 @@ defmodule Tightbeam.Escalation do
     end
   end
 
+  defp owner_user_id!(db, %{origin: "process:" <> _process} = call),
+    do: org_owner_user_id!(db, call)
+
   defp owner_user_id!(_db, call),
     do: raise(ArgumentError, "raiser has no accountable owner: #{call.origin}")
+
+  # Process-originated requests use the same stable first-admin owner selection
+  # as the gateway's existing organization-owner notifications.
+  defp org_owner_user_id!(db, call) do
+    case DB.query(
+           db,
+           "SELECT userId FROM users WHERE isAdmin = 1 ORDER BY createdAt, userId LIMIT 1",
+           []
+         ) do
+      {:ok, [[owner_user_id]]} ->
+        owner_user_id
+
+      {:ok, []} ->
+        raise ArgumentError, "process request has no organization owner: #{call.origin}"
+
+      {:error, reason} ->
+        raise ArgumentError,
+              "cannot resolve organization owner for process request #{call.origin}: #{inspect(reason)}"
+    end
+  end
 
   defp statute_name(statute), do: Map.get(statute, :name) || Map.fetch!(statute, "name")
 

@@ -65,7 +65,7 @@ fn lease_deadline(ready: &serde_json::Value, now: Instant) -> Instant {
     now + lease_timeout(ready)
 }
 
-/// The owner user id the gateway names on the `begin` reply (wi_0535922b), so the CLI can
+/// The owner user id the gateway names on the `begin` reply, so the CLI can
 /// wake THAT user with the sign-in URL+code. Absent on a gateway too old to send it or a
 /// caller with no owner (a process principal) -- the emission then degrades loudly rather
 /// than waking no one. Pure so the wire shape can be pinned by a test.
@@ -89,7 +89,7 @@ struct Ceremony<'a> {
     endpoint: &'a Endpoint,
     deadline: Instant,
     load_harnesses: &'a HarnessLoader<'a>,
-    // Emission context (wi_0535922b): who to attribute the wake to, how to send it, which
+    // Emission context: who to attribute the wake to, how to send it, which
     // provider/machine the delivery names, and the owner user to wake (absent on an older
     // gateway or a non-owned caller -> the CLI degrades loudly).
     identity: &'a Identity,
@@ -1419,7 +1419,7 @@ fn wake_id_of(reply: &serde_json::Value) -> Option<String> {
 }
 
 /// Surface a sign-in deliverable the operator cannot see on the ceremony's terminal, through
-/// the three channels of Mike's triad (wi_0535922b): the operator WAKE (the durable substrate
+/// three delivery channels: the operator WAKE (the durable substrate
 /// row AND the notification, in one), a 0600 local delivery FILE, and a machine-readable
 /// STRUCTURED line on stdout. Every channel is best-effort and LOUD on failure -- a delivery
 /// that cannot be waked or filed says so rather than vanishing.
@@ -2641,13 +2641,13 @@ struct ClientUpdateHost {
     cli_bin: Option<String>,
 }
 
-pub fn update_clients(as_user: &str) -> Result<(), String> {
+pub fn update_clients(identity: &Identity) -> Result<(), String> {
     let mut io = SystemIo;
-    update_clients_with(&mut io, as_user)
+    update_clients_with(&mut io, identity)
 }
 
-fn update_clients_with(io: &mut dyn CeremonyIo, as_user: &str) -> Result<(), String> {
-    let request = dispatch::build_update_clients_request(as_user);
+fn update_clients_with(io: &mut dyn CeremonyIo, identity: &Identity) -> Result<(), String> {
+    let request = dispatch::build_update_clients_request(identity);
     let response = io.dispatch(&request)?;
     let hosts = client_update_hosts(response)?;
     let current_version = env!("CARGO_PKG_VERSION");
@@ -2993,7 +2993,7 @@ fn assimilate_with_asset_fetcher(
         io.log("[assimilate] REGISTER... skipped (--dry-run)");
     } else {
         let request = dispatch::build_register_host_request(
-            &args.as_user,
+            &args.identity,
             &host_name,
             &args.ssh_dest,
             &resolved_base,
@@ -3925,7 +3925,7 @@ mod tests {
             401,
             "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\
              \"message\":\"Invalid bearer token\"}}",
-            "shrdlu",
+            "node-c",
         );
 
         assert!(message.contains("Invalid bearer token"), "{message}");
@@ -3934,7 +3934,7 @@ mod tests {
         // Must not read as a subscription problem: `onboard` classifies the cancel
         // phase off that exact phrase, and a rejected paste is not that.
         assert!(!message.contains("no subscription"), "{message}");
-        assert!(message.contains("shrdlu"), "{message}");
+        assert!(message.contains("node-c"), "{message}");
         assert!(
             message.contains("Nothing was banked"),
             "the api-key path's promise, verbatim: {message}"
@@ -3954,7 +3954,7 @@ mod tests {
     /// authorization re-authorizing something that was never broken.
     #[test]
     fn an_unreachable_provider_is_not_a_verdict_on_the_token() {
-        let message = unvalidated_setup_token("dns error: failed to lookup address", "shrdlu");
+        let message = unvalidated_setup_token("dns error: failed to lookup address", "node-c");
 
         assert!(message.contains("could not reach anthropic"), "{message}");
         assert!(message.contains("NOT validated"), "{message}");
@@ -3968,7 +3968,7 @@ mod tests {
 
     #[test]
     fn an_api_key_network_timeout_is_not_reported_as_lease_expiry_or_rejection() {
-        let message = unvalidated_api_key("openai", "network operation timed out", "shrdlu");
+        let message = unvalidated_api_key("openai", "network operation timed out", "node-c");
 
         assert!(message.contains("could not reach openai"), "{message}");
         assert!(message.contains("timed out"), "{message}");
@@ -4587,7 +4587,7 @@ mod tests {
             identity: &Identity::User("mike".to_owned()),
             send: &send,
             provider: "openai",
-            machine: Some("shrdlu"),
+            machine: Some("node-c"),
             owner_user_id: Some("mike".to_owned()),
         };
 
@@ -4697,7 +4697,7 @@ mod tests {
             identity: &Identity::User("mike".to_owned()),
             send: &send,
             provider: "openai",
-            machine: Some("shrdlu"),
+            machine: Some("node-c"),
             owner_user_id: Some("mike".to_owned()),
         };
 
@@ -4805,7 +4805,7 @@ mod tests {
             identity: &Identity::User("mike".to_owned()),
             send: &send,
             provider: "openai",
-            machine: Some("shrdlu"),
+            machine: Some("node-c"),
             owner_user_id: Some("mike".to_owned()),
         };
 
@@ -4982,7 +4982,7 @@ mod tests {
             identity: &Identity::User("mike".to_owned()),
             send: &send,
             provider: "openai",
-            machine: Some("shrdlu"),
+            machine: Some("node-c"),
             owner_user_id: Some("mike".to_owned()),
         };
 
@@ -5063,7 +5063,7 @@ mod tests {
             identity: &Identity::User("mike".to_owned()),
             send: &|_, _, _| panic!("a ceremony that emitted nothing must send no wake"),
             provider: "openai",
-            machine: Some("shrdlu"),
+            machine: Some("node-c"),
             owner_user_id: Some("mike".to_owned()),
         };
 
@@ -5215,7 +5215,7 @@ mod tests {
             identity: &Identity::User("mike".to_owned()),
             send: &send,
             provider: "openai",
-            machine: Some("shrdlu"),
+            machine: Some("node-c"),
             owner_user_id: Some("mike".to_owned()),
         };
         let deliverable = Deliverable::DeviceCode {
@@ -5223,7 +5223,7 @@ mod tests {
             code: "VG6S-L35ON".to_owned(),
         };
 
-        let notified = notify_operator(&ceremony, &deliverable, "shrdlu");
+        let notified = notify_operator(&ceremony, &deliverable, "node-c");
 
         assert_eq!(
             notified,
@@ -5259,14 +5259,14 @@ mod tests {
             identity: &Identity::Session,
             send: &send,
             provider: "openai",
-            machine: Some("shrdlu"),
+            machine: Some("node-c"),
             owner_user_id: None,
         };
         let deliverable = Deliverable::SignInUrl {
             url: "https://claude.ai/oauth/authorize".to_owned(),
         };
 
-        let notified = notify_operator(&ceremony, &deliverable, "shrdlu");
+        let notified = notify_operator(&ceremony, &deliverable, "node-c");
 
         match notified {
             Notified::NotNotified { reason } => assert!(reason.contains("ownerUserId"), "{reason}"),
@@ -6433,7 +6433,7 @@ mod tests {
             ..FakeIo::default()
         };
 
-        let error = update_clients_with(&mut io, "flynn").unwrap_err();
+        let error = update_clients_with(&mut io, &Identity::User("flynn".to_owned())).unwrap_err();
 
         assert_eq!(
             io.dispatched,
@@ -6507,7 +6507,7 @@ mod tests {
             ..FakeIo::default()
         };
 
-        update_clients_with(&mut io, "flynn").unwrap();
+        update_clients_with(&mut io, &Identity::User("flynn".to_owned())).unwrap();
 
         assert_eq!(
             io.commands[0].1,
@@ -6548,7 +6548,7 @@ mod tests {
             "Welcome to satellite.local\nmaintenance tonight\n{current}\n"
         ))]);
 
-        let error = update_clients_with(&mut io, "flynn").unwrap_err();
+        let error = update_clients_with(&mut io, &Identity::User("flynn".to_owned())).unwrap_err();
 
         assert_eq!(
             io.commands
@@ -6570,7 +6570,8 @@ mod tests {
         ] {
             let mut io = one_update_host(vec![Ok(answer.to_owned())]);
 
-            let error = update_clients_with(&mut io, "flynn").unwrap_err();
+            let error =
+                update_clients_with(&mut io, &Identity::User("flynn".to_owned())).unwrap_err();
 
             assert_eq!(io.commands.len(), 1, "answer {answer:?} must not ship");
             assert!(io.logs[0].contains("question failed"));
@@ -6582,7 +6583,7 @@ mod tests {
     fn failed_version_question_does_not_ship() {
         let mut io = one_update_host(vec![Err(exec_failure("tightbeam: version refused"))]);
 
-        let error = update_clients_with(&mut io, "flynn").unwrap_err();
+        let error = update_clients_with(&mut io, &Identity::User("flynn".to_owned())).unwrap_err();
 
         assert_eq!(
             io.commands
@@ -6604,7 +6605,7 @@ mod tests {
         };
         let mut io = one_update_host(vec![Ok("0.0.9\n".to_owned()), Ok(format!("{remote}\n"))]);
 
-        let error = update_clients_with(&mut io, "flynn").unwrap_err();
+        let error = update_clients_with(&mut io, &Identity::User("flynn".to_owned())).unwrap_err();
 
         assert_eq!(
             io.commands
@@ -6630,7 +6631,7 @@ mod tests {
             Ok(String::new()),
         ]);
 
-        let error = update_clients_with(&mut io, "flynn").unwrap_err();
+        let error = update_clients_with(&mut io, &Identity::User("flynn".to_owned())).unwrap_err();
         let remote_scripts = io
             .commands
             .iter()
@@ -6795,7 +6796,7 @@ mod tests {
     fn args() -> AssimilateArgs {
         AssimilateArgs {
             ssh_dest: "flynn@work-1.local".to_owned(),
-            as_user: "flynn".to_owned(),
+            identity: Identity::User("flynn".to_owned()),
             name: None,
             base_dir: "~/.tightbeam".to_owned(),
             harnesses: vec!["claude".to_owned(), "codex".to_owned()],
@@ -7165,7 +7166,7 @@ mod tests {
 
     #[test]
     fn staging_path_reads_the_wire_shape_the_gateway_actually_sends() {
-        // Verbatim from a live gateway on shrdlu (2026-07-27), captured off the wire
+        // Verbatim from a live gateway (2026-07-27), captured off the wire
         // during the production-install smoke. Every response key is lower-camelCase
         // because router.ex camelizes atom keys on the way out.
         let ready: serde_json::Value = serde_json::from_str(

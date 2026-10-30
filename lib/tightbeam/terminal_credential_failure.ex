@@ -214,7 +214,10 @@ defmodule Tightbeam.TerminalCredentialFailure do
                  "notice-source-storage-v1-019",
                  "decision-request-row-schema-v2-019",
                  "work-item-delivery-owner-v1-019",
-                 "launch-preparation-boot-v1-0110"
+                 "launch-preparation-boot-v1-0110",
+                 "launch-preparation-evidence-v1-0112",
+                 "session-identity-v1-0114",
+                 "closed-assignment-cannot-proceed-reconciliation-v1-015"
                ] ->
             readonly_views_from_conn(conn)
 
@@ -849,8 +852,7 @@ defmodule Tightbeam.TerminalCredentialFailure do
 
     "#{host} lost #{harness}: its #{provider} credential was rejected. Redirect destination: " <>
       "#{redirect_state}. #{host} needs a human " <>
-      "sign-in for #{harness}; run on #{host}: #{onboard} " <>
-      "(replace <adminUserId> with your own administrator id)."
+      "sign-in for #{harness}; run on #{host}: #{onboard}."
   end
 
   defp credential_fact_provider("pi", "opencode_go"), do: "opencode_go"
@@ -862,7 +864,6 @@ defmodule Tightbeam.TerminalCredentialFailure do
       harness
       |> onboarding_provider(provider)
       |> Credentials.onboard_command()
-      |> String.replace("<userId>", "<adminUserId>")
 
     if harness == "pi" and provider != "opencode_go" do
       String.replace(command, "<provider-name>", provider)

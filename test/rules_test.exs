@@ -91,7 +91,7 @@ defmodule Tightbeam.RulesTest do
     assert Rules.evaluate(ctx.db, call()) == :ok
   end
 
-  test "predicate policy loading refuses incomplete verification and invalid conditions", ctx do
+  test "retired verification policies skip validation without making commands unavailable", ctx do
     valid = """
     [[policy]]
     name = "verifier"
@@ -111,11 +111,12 @@ defmodule Tightbeam.RulesTest do
         ] do
       path = put_raw(ctx, contents)
 
-      error =
-        assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
+      log =
+        ExUnit.CaptureLog.capture_log(fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
-      assert error.message =~ path
-      assert error.message =~ "verifier"
+      assert log =~ path
+      assert log =~ "purpose wait-verification-admission is retired"
+      assert Rules.evaluate(ctx.db, call()) == :ok
     end
   end
 
@@ -697,7 +698,7 @@ defmodule Tightbeam.RulesTest do
     assert [%{kind: "denied", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
   end
 
-  test "matching a constitutional denial is monotonic and leaves domain state unchanged", ctx do
+  test "a declared denial precedes required owner data without changing domain state", ctx do
     config = %{
       db: ctx.db,
       base_dir: ctx.base_dir,
@@ -707,11 +708,13 @@ defmodule Tightbeam.RulesTest do
     }
 
     handler = Gateway.handlers(config)["spawn"]
-    process_call = %{call("process:cron") | verb: "spawn"}
+
+    process_call =
+      Map.merge(call("process:cron"), %{verb: "spawn", principal: {:process, "cron"}})
 
     Rules.load!(ctx.base_dir, ["spawn"])
 
-    assert {:error, %{code: "forbidden"}} =
+    assert {:error, %{code: "owner_required"}} =
              Dispatch.dispatch(ctx.db, %{"spawn" => handler}, process_call)
 
     put_rule(ctx, rule("statute", "spawn", "caller.origin_class", "eq", "process"))
@@ -1425,7 +1428,7 @@ defmodule Tightbeam.RulesTest do
       holder.session_key,
       producer.id,
       "tests-passed",
-      "gibson:/repo abc123; mix test test/rules_test.exs; passed: 1 test"
+      "node-a:/repo abc123; mix test test/rules_test.exs; passed: 1 test"
     )
 
     assert {:ok, %{reviewsAssignmentId: ^producer_id, effectKind: "review"}} =
@@ -1483,7 +1486,7 @@ defmodule Tightbeam.RulesTest do
           holder.session_key,
           producer.id,
           "tests-passed",
-          "gibson:/repo effect123; mix test test/rules_test.exs; passed: #{label}"
+          "node-a:/repo effect123; mix test test/rules_test.exs; passed: #{label}"
         )
       end
 
@@ -4062,6 +4065,77 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
+  test "producer verification binds its own artifact revision and reports the expected hash",
+       ctx do
+    holder = session(ctx.db, "artifact-producer", "flynn", archetype: "coder")
+    other = session(ctx.db, "artifact-other", "flynn", archetype: "coder")
+    hash = String.duplicate("a", 64)
+
+    for files <- [nil, ["lib/example.ex"]] do
+      producer = assignment(ctx, holder.session_key, {:user, "flynn"}, files: files)
+      item = "producer-revision-#{System.unique_integer([:positive])}"
+      attach_work_item(ctx, producer.id, item)
+      artifact = record_revision_artifact(ctx, holder.session_key, producer.id, item, hash)
+
+      call =
+        p3_call("attest", {:session, holder.session_key}, %{
+          assignment_id: producer.id,
+          kind: "verdict",
+          verdict_kind: "verified",
+          artifact_id: artifact.artifact_id,
+          content_sha256: hash,
+          commit_refs: fixture_commit_refs()
+        })
+
+      assert {:error, %{code: "invalid_commit_refs"}} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, put_in(call.params.commit_refs, nil))
+
+      assert {:error, %{code: "invalid_revision_binding", message: message}} =
+               Dispatch.dispatch(
+                 ctx.db,
+                 ctx.handlers,
+                 put_in(call.params.content_sha256, String.duplicate("b", 64))
+               )
+
+      assert message =~ "expected sha256 #{hash}"
+      assert message =~ artifact.artifact_id
+
+      assert {:error, %{code: "invalid_revision_binding"}} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, %{
+                 call
+                 | principal: {:session, other.session_key}
+               })
+
+      assert {:error, %{code: "invalid_revision_binding"}} =
+               Dispatch.dispatch(
+                 ctx.db,
+                 ctx.handlers,
+                 call
+                 |> put_in([:params, :verdict_kind], "reviewed-clean")
+                 |> put_in([:params, :commit_refs], nil)
+               )
+
+      unrelated = assignment(ctx, holder.session_key, {:user, "flynn"}, work_item_id: item)
+
+      assert {:error, %{code: "invalid_revision_binding"}} =
+               Dispatch.dispatch(
+                 ctx.db,
+                 ctx.handlers,
+                 put_in(call.params.assignment_id, unrelated.id)
+               )
+
+      assert {:ok, %{attest: verified}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+      assert verified.artifactId == artifact.artifact_id
+      assert verified.contentSha256 == hash
+      assert verified.commitRefs == fixture_commit_refs()
+
+      assert {:ok, [[1]]} =
+               DB.query(ctx.db, "SELECT count(*) FROM attests WHERE assignmentId=?1", [
+                 producer.id
+               ])
+    end
+  end
+
   test "artifact revisions bind their producer, review verdict, and predicate candidate", ctx do
     producer_holder = session(ctx.db, "revision-producer", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "revision-reviewer", "flynn", archetype: "reviewer")
@@ -4125,13 +4199,27 @@ defmodule Tightbeam.RulesTest do
     assert %{code: "invalid_revision_binding"} =
              revision_verdict(ctx, reviewer.session_key, review.id, artifact.artifact_id, nil)
 
-    assert %{code: "invalid_revision_binding"} =
+    assert %{code: "invalid_revision_binding", message: message} =
              revision_verdict(
                ctx,
                reviewer.session_key,
                review.id,
                artifact.artifact_id,
                String.duplicate("b", 64)
+             )
+
+    assert message =~ "expected sha256 #{hash}"
+
+    unrelated = assignment(ctx, producer_holder.session_key, {:user, "flynn"})
+    wrong_review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: unrelated.id)
+
+    assert %{code: "invalid_revision_binding"} =
+             revision_verdict(
+               ctx,
+               reviewer.session_key,
+               wrong_review.id,
+               artifact.artifact_id,
+               hash
              )
 
     valid =

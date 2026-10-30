@@ -185,7 +185,8 @@ defmodule Tightbeam.Toplines do
     work_item_id = Map.fetch!(attrs, :work_item_id)
     resolution_seq = Map.get(attrs, :resolution_causal_event_seq)
 
-    if Map.fetch!(attrs, :actor_kind) == "process" do
+    if Map.fetch!(attrs, :actor_kind) == "process" and
+         Map.fetch!(attrs, :actor_ref) == "tightbeam" do
       require_terminal_source!(txn, resolution_seq, work_item_id, Map.fetch!(attrs, :reason))
     end
 
@@ -235,8 +236,11 @@ defmodule Tightbeam.Toplines do
   def create(db, call) do
     params = Map.get(call, :params, %{})
 
-    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
-         :ok <- valid_shape(params, [:idempotency_key, :title]),
+    with {:ok, caller} <- create_caller(db, call),
+         :ok <-
+           valid_shape(params, [:idempotency_key, :title, :owner_user_id],
+             optional: [:owner_user_id]
+           ),
          {:ok, title} <- canonical_title(param(params, :title)),
          :ok <- valid_key(param(params, :idempotency_key)) do
       operation = "topline-create"
@@ -310,6 +314,8 @@ defmodule Tightbeam.Toplines do
       transaction!(db, fn txn ->
         with {:ok, caller} <- reauthorize(txn, caller),
              {:ok, topline} <- visible_topline(txn, topline_id, caller) do
+          caller = mutation_caller(caller, topline)
+
           case replay(txn, caller.user, "topline-update", key, fingerprint) do
             {:ok, response} ->
               response
@@ -379,6 +385,8 @@ defmodule Tightbeam.Toplines do
       transaction!(db, fn txn ->
         with {:ok, caller} <- reauthorize(txn, caller),
              {:ok, topline} <- visible_topline(txn, topline_id, caller) do
+          caller = mutation_caller(caller, topline)
+
           case replay(txn, caller.user, operation, key, fingerprint) do
             {:ok, response} ->
               response
@@ -441,7 +449,9 @@ defmodule Tightbeam.Toplines do
       transaction!(db, fn txn ->
         with {:ok, caller} <- reauthorize(txn, caller),
              {:ok, topline} <- visible_topline(txn, topline_id, caller),
-             {:ok, _work_item} <- visible_work_item(txn, work_item_id, caller) do
+             {:ok, work_item} <- visible_work_item(txn, work_item_id, caller) do
+          caller = mutation_caller(caller, topline)
+
           case replay(txn, caller.user, operation, key, fingerprint) do
             {:ok, response} ->
               response
@@ -529,6 +539,8 @@ defmodule Tightbeam.Toplines do
       transaction!(db, fn txn ->
         with {:ok, caller} <- reauthorize(txn, caller),
              {:ok, membership} <- visible_membership(txn, membership_id, caller) do
+          caller = mutation_caller(caller, membership)
+
           case replay(txn, caller.user, operation, key, fingerprint) do
             {:ok, response} ->
               response
@@ -610,6 +622,8 @@ defmodule Tightbeam.Toplines do
       transaction!(db, fn txn ->
         with {:ok, caller} <- reauthorize(txn, caller),
              {:ok, topline} <- visible_topline(txn, topline_id, caller) do
+          caller = mutation_caller(caller, topline)
+
           case replay(txn, caller.user, operation, key, fingerprint) do
             {:ok, response} ->
               response
@@ -682,6 +696,8 @@ defmodule Tightbeam.Toplines do
              {:ok, concern} <- visible_concern(txn, concern_id, caller),
              {:ok, work_item} <- visible_work_item(txn, work_item_id, caller),
              :ok <- concern_contains_work(txn, concern, work_item) do
+          caller = mutation_caller(caller, concern)
+
           case replay(txn, caller.user, operation, key, fingerprint) do
             {:ok, response} ->
               response
@@ -764,7 +780,9 @@ defmodule Tightbeam.Toplines do
       transaction!(db, fn txn ->
         with {:ok, caller} <- reauthorize(txn, caller),
              {:ok, concern} <- visible_concern(txn, concern_id, caller),
-             {:ok, _work_item} <- visible_work_item(txn, work_item_id, caller) do
+             {:ok, work_item} <- visible_work_item(txn, work_item_id, caller) do
+          caller = mutation_caller(caller, concern)
+
           case replay(txn, caller.user, operation, key, fingerprint) do
             {:ok, response} ->
               response
@@ -885,7 +903,9 @@ defmodule Tightbeam.Toplines do
 
       transaction!(db, fn txn ->
         with {:ok, caller} <- reauthorize(txn, caller),
-             {:ok, _work_item} <- visible_work_item(txn, work_item_id, caller) do
+             {:ok, work_item} <- visible_work_item(txn, work_item_id, caller) do
+          caller = mutation_caller(caller, work_item)
+
           case replay(txn, caller.user, operation, key, fingerprint) do
             {:ok, response} ->
               response
@@ -1435,16 +1455,22 @@ defmodule Tightbeam.Toplines do
     case Txn.q(
            txn,
            """
-           SELECT c.id, c.toplineId, c.title, t.state
+           SELECT c.id, c.toplineId, c.title, t.state, t.ownerUserId
            FROM topline_concerns c
            JOIN toplines t ON t.id = c.toplineId
            WHERE c.id = ?1 #{shifted_owner_filter(owner_sql, 1)}
            """,
            [id | owner_params]
          ) do
-      [[concern_id, topline_id, title, topline_state]] ->
+      [[concern_id, topline_id, title, topline_state, owner]] ->
         {:ok,
-         %{id: concern_id, topline_id: topline_id, title: title, topline_state: topline_state}}
+         %{
+           id: concern_id,
+           topline_id: topline_id,
+           title: title,
+           topline_state: topline_state,
+           owner_user_id: owner
+         }}
 
       [] ->
         error("not_found", "record not found")
@@ -1595,8 +1621,32 @@ defmodule Tightbeam.Toplines do
     ArgumentError -> key
   end
 
-  defp caller(_db, {:process, _}),
-    do: error("process_denied", "process principals cannot access Toplines")
+  defp mutation_caller(%{actor_kind: "process"} = caller, target),
+    do: %{caller | user: target.owner_user_id}
+
+  defp mutation_caller(caller, _target), do: caller
+
+  defp caller(_db, {:process, name}),
+    do: {:ok, %{user: nil, admin: true, actor_kind: "process", actor_ref: name}}
+
+  defp create_caller(db, %{principal: {:process, _}, params: params} = call) do
+    case param(params, :owner_user_id) do
+      nil ->
+        error("owner_required", "ownerUserId is required")
+
+      owner ->
+        case Tightbeam.Devices.user(db, owner) do
+          nil ->
+            error("unknown_user", "unknown ownerUserId: #{owner}")
+
+          _ ->
+            {:ok, caller} = caller(db, call.principal)
+            {:ok, %{caller | user: owner}}
+        end
+    end
+  end
+
+  defp create_caller(db, call), do: caller(db, call.principal)
 
   defp caller(db, {:user, user}) when is_binary(user) do
     case DB.query(db, "SELECT isAdmin FROM users WHERE userId = ?1", [user]) do
@@ -1628,6 +1678,8 @@ defmodule Tightbeam.Toplines do
   end
 
   defp caller(_db, _principal), do: error("invalid_message", "invalid message")
+
+  defp reauthorize(_txn, %{actor_kind: "process"} = caller), do: {:ok, caller}
 
   defp reauthorize(txn, %{actor_kind: "user", actor_ref: user}) do
     case Txn.q(txn, "SELECT isAdmin FROM users WHERE userId = ?1", [user]) do

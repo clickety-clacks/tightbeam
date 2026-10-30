@@ -1559,15 +1559,18 @@ defmodule Tightbeam.ConformanceSupport do
                  Escalation.rule(db, escalation_rule_call(request_id, "allow"), authorized: true)
 
         {:ok, _} = DB.query(db, "UPDATE users SET isAdmin=1 WHERE userId='owner'")
-        [escalate_rule | _] = :persistent_term.get(Rules)
-        :persistent_term.put(Rules, [escalate_rule, escalate_rule])
+        loaded_snapshot = Rules.effective_snapshot()
+        [escalate_rule | _] = loaded_snapshot.rules
+        snapshot = %{loaded_snapshot | rules: [escalate_rule, escalate_rule]}
 
         assert {:error, %{code: "rule_denied", rule: rule}} =
-                 Dispatch.dispatch(
-                   db,
-                   %{"attest" => fn _ -> flunk("CAS loss must deny") end},
-                   call
-                 )
+                 Rules.with_snapshot(snapshot, fn ->
+                   Dispatch.dispatch(
+                     db,
+                     %{"attest" => fn _ -> flunk("CAS loss must deny") end},
+                     call
+                   )
+                 end)
 
         assert rule == fixture_rule_name(fixture)
       after

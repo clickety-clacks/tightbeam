@@ -32,6 +32,11 @@ defmodule Tightbeam.ConditionFacts do
   )
   @agent_only_kinds ~w(work-blocked work-unblocked)
 
+  def substrate_defined_kind?(kind) when is_binary(kind),
+    do:
+      kind in @reserved_kinds or kind in @agent_only_kinds or
+        String.starts_with?(kind, "subagent_")
+
   @standing_pairs %{
     "work-blocked" => "work-unblocked",
     "user-alerted" => "user-alert-cleared",
@@ -167,9 +172,20 @@ defmodule Tightbeam.ConditionFacts do
 
       authorized =
         case {rows, input[:principal]} do
-          {[[holder, opener, _]], {:session, actor}} -> actor == holder or actor == opener
-          {[[_, _, owner]], {:user, actor}} -> actor == owner
-          _ -> false
+          {[[holder, opener, owner]], {:session, actor}} ->
+            actor == holder or actor == opener or
+              Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [actor]) == [
+                [owner]
+              ]
+
+          {[[_, _, _]], {:process, _}} ->
+            true
+
+          {[[_, _, owner]], {:user, actor}} ->
+            actor == owner
+
+          _ ->
+            false
         end
 
       evidence =
@@ -437,12 +453,10 @@ defmodule Tightbeam.ConditionFacts do
   end
 
   defp owner_for_origin_in_txn(txn, "agent:" <> role) do
-    case Txn.q(
-           txn,
-           "SELECT s.ownerUserId FROM roles r JOIN sessions s ON s.sessionKey=r.boundSessionKey JOIN users u ON u.userId=s.ownerUserId WHERE r.name=?1",
-           [role]
-         ) do
-      [[owner_user_id]] -> owner_user_id
+    with {:ok, key, false} <- Tightbeam.Origin.resolve_agent(txn, role),
+         %{owner_user_id: owner} <- Tightbeam.Org.get(txn, key) do
+      owner
+    else
       _ -> nil
     end
   end

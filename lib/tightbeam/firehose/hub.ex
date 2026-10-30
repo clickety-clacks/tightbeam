@@ -77,18 +77,13 @@ defmodule Tightbeam.Firehose.Hub do
   def publish(server \\ __MODULE__, notice), do: GenServer.cast(server, {:publish, notice})
 
   def committed(server \\ __MODULE__, class, payload, refs),
-    do: publish(server, Publisher.committed_notice(class, payload, refs))
+    do: GenServer.cast(server, {:committed, class, payload, refs})
 
-  def accepted(server \\ __MODULE__, db, call, result),
-    do: publish_many(server, Publisher.accepted_notices(db, call, result))
+  def accepted(server, db, call, result),
+    do: GenServer.cast(server, {:accepted, db, call, result})
 
-  def denied(server \\ __MODULE__, call, error),
-    do: publish_many(server, Publisher.denied_notices(call, error))
-
-  defp publish_many(server, notices) do
-    Enum.each(notices, &publish(server, &1))
-    :ok
-  end
+  def denied(server, call, error),
+    do: GenServer.cast(server, {:denied, call, error})
 
   @impl true
   def init(_opts), do: {:ok, %__MODULE__{}}
@@ -224,7 +219,72 @@ defmodule Tightbeam.Firehose.Hub do
   def handle_cast({:publish, notice}, state),
     do: {:noreply, fanout(state, notice)}
 
+  def handle_cast({:committed, _, _, _}, %{shutting_down: true} = state),
+    do: {:noreply, state}
+
+  def handle_cast({:committed, class, payload, refs}, state)
+      when class in ~w(session.spawned session.updated session.harness_changed session.retired) do
+    session_key = refs["sessionKey"] || payload[:session_key] || payload["sessionKey"]
+    owner = refs["ownerUserId"] || payload[:owner_user_id] || payload["ownerUserId"]
+
+    probe = %{
+      "class" => class,
+      "refs" => Map.merge(refs, %{"sessionKey" => session_key, "ownerUserId" => owner}),
+      "payload" => %{"sessionKey" => session_key, "ownerUserId" => owner}
+    }
+
+    recipients =
+      Enum.filter(state.sockets, fn {pid, socket} ->
+        cond do
+          socket.mode == :pending or socket.overflowed ->
+            false
+
+          revoked?(probe, socket) ->
+            send(pid, :firehose_revoked)
+            false
+
+          true ->
+            interested?(socket, probe)
+        end
+      end)
+
+    if recipients == [] do
+      {:noreply, state}
+    else
+      notice = Publisher.committed_notice(class, payload, refs)
+      {:noreply, deliver_to_interested(state, recipients, notice)}
+    end
+  end
+
+  def handle_cast({:committed, class, payload, refs}, state),
+    do: {:noreply, fanout(state, Publisher.committed_notice(class, payload, refs))}
+
+  def handle_cast({:accepted, db, call, result}, state),
+    do:
+      {:noreply,
+       Enum.reduce(Publisher.accepted_notices(db, call, result), state, &fanout(&2, &1))}
+
+  def handle_cast({:denied, call, error}, state),
+    do: {:noreply, Enum.reduce(Publisher.denied_notices(call, error), state, &fanout(&2, &1))}
+
   def handle_cast(_, state), do: {:noreply, state}
+
+  defp interested?(%{mode: :all}, _notice), do: true
+
+  defp interested?(socket, notice) do
+    Enum.any?(Map.merge(socket.subscriptions, socket.pending_subscriptions), fn {_id, filters} ->
+      matches?(notice, filters)
+    end)
+  end
+
+  defp deliver_to_interested(state, recipients, notice) do
+    sockets =
+      Enum.reduce(recipients, state.sockets, fn {pid, socket}, sockets ->
+        Map.put(sockets, pid, deliver_matching_notice(socket, pid, notice))
+      end)
+
+    %{state | sockets: sockets}
+  end
 
   defp fanout(%{shutting_down: true} = state, _), do: state
 

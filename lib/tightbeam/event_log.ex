@@ -1,9 +1,9 @@
 defmodule Tightbeam.EventLog do
   @moduledoc """
   Append-only observability (T5): verb events, lifecycle events, and boot
-  epochs. Nothing consumes these to make decisions in the core — they exist so
-  every failure has a row and a reason, and so future rule reactions have a
-  feed. Additive tables only; the shared `events` table (verb|denied) keeps
+  epochs. Process assignment events retain their actor and explicit notice
+  owner; failures retain their reason and rule reactions consume the feed.
+  Additive tables only; the shared `events` table (verb|denied) keeps
   its original CHECK — lifecycle records go to their own table.
 
   Crash recording is BY INFERENCE (spec: lifecycle acceptance): a boot epoch
@@ -23,6 +23,7 @@ defmodule Tightbeam.EventLog do
   alias Tightbeam.DB.Txn
   alias Tightbeam.Org
   alias Tightbeam.Projection
+  alias Tightbeam.StateResources
   alias Tightbeam.Wire.Payloads
 
   @type db :: GenServer.server()
@@ -192,6 +193,9 @@ defmodule Tightbeam.EventLog do
         ts
       )
       when kind in ~w(verb denied) and is_integer(ts) and ts >= 0 do
+    payload =
+      denial_payload_with_message_position(txn, kind, session_key, principal, payload)
+
     [[event_id]] =
       Txn.q(
         txn,
@@ -279,6 +283,104 @@ defmodule Tightbeam.EventLog do
       }
     end)
   end
+
+  @doc "Rail denials visible to a session's live transcript, in message order."
+  @spec rail_denials_for_session(db(), String.t()) :: [map()]
+  def rail_denials_for_session(db \\ Tightbeam.DB, session_key) when is_binary(session_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT id, ts, verb, origin, principal, payload,
+          json_extract(payload, '$.rule'), json_extract(payload, '$.afterMessageSeq')
+        FROM events
+        WHERE sessionKey = ?1 AND principal = ?2 AND kind = 'denied'
+          AND json_valid(payload) AND json_type(payload, '$.rule') = 'text'
+        ORDER BY CASE
+          WHEN json_type(payload, '$.afterMessageSeq') = 'integer' THEN 0
+          ELSE 1
+        END, json_extract(payload, '$.afterMessageSeq'), ts, id
+        """,
+        [session_key, "session:" <> session_key]
+      )
+
+    Enum.map(rows, fn [id, ts, verb, origin, principal, payload, rule, after_message_seq] ->
+      %{
+        id: id,
+        ts: ts,
+        verb: verb,
+        origin: origin,
+        principal: principal,
+        rule: rule,
+        # Keep ordering metadata separate from the source payload identity.
+        payload: denial_payload_for_history(payload, verb),
+        after_message_seq: after_message_seq
+      }
+    end)
+  end
+
+  defp denial_payload_for_history(payload, verb) do
+    # Event JSON stores atom keys as snake_case strings; live denial notices pass
+    # those atom-keyed errors through the shared public wire projection.
+    payload
+    |> JSON.decode!()
+    |> Map.delete("afterMessageSeq")
+    |> restore_denial_payload_atom_keys()
+    |> StateResources.observation()
+    |> Map.put("verb", verb)
+  end
+
+  defp restore_denial_payload_atom_keys(value) when is_map(value) do
+    Map.new(value, fn {key, nested} ->
+      {existing_denial_payload_atom(key), restore_denial_payload_atom_keys(nested)}
+    end)
+  end
+
+  defp restore_denial_payload_atom_keys(values) when is_list(values),
+    do: Enum.map(values, &restore_denial_payload_atom_keys/1)
+
+  defp restore_denial_payload_atom_keys(value), do: value
+
+  defp existing_denial_payload_atom(key) when is_binary(key) do
+    try do
+      String.to_existing_atom(key)
+    rescue
+      ArgumentError -> key
+    end
+  end
+
+  defp existing_denial_payload_atom(key), do: key
+
+  defp denial_payload_with_message_position(
+         %Txn{} = txn,
+         "denied",
+         session_key,
+         principal,
+         payload
+       )
+       when is_binary(session_key) and is_binary(payload) do
+    if principal == {:session, session_key} do
+      case JSON.decode(payload) do
+        {:ok, %{"rule" => rule} = decoded} when is_binary(rule) ->
+          [[after_message_seq]] =
+            Txn.q(
+              txn,
+              "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
+              [session_key]
+            )
+
+          JSON.encode!(Map.put(decoded, "afterMessageSeq", after_message_seq))
+
+        _ ->
+          payload
+      end
+    else
+      payload
+    end
+  end
+
+  defp denial_payload_with_message_position(_txn, _kind, _session_key, _principal, payload),
+    do: payload
 
   defp serialize_principal(nil), do: nil
 

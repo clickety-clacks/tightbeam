@@ -73,7 +73,7 @@ process_field() { # $1: pid, $2: ps field name -> that field's current value, or
   # with trailing blanks).
   #
   # LC_ALL=C is load-bearing, not tidiness: `lstart` is locale-formatted on macOS
-  # (measured on eezo — LC_TIME=de_DE.UTF-8 renders "Fr.  4 Sep. 23:20:39 2026"
+  # (measured on macOS — LC_TIME=de_DE.UTF-8 renders "Fr.  4 Sep. 23:20:39 2026"
   # for the instant the C locale renders "Fri Sep  4 23:20:39 2026"). The writer
   # in gateway.ex forces C too, so both sides compare one spelling; an operator
   # shell in another locale must not be able to refuse a valid stop.

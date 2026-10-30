@@ -36,6 +36,14 @@ defmodule Tightbeam.Origin do
 
   def parse(_), do: :malformed
 
+  @doc "Resolve an agent origin's identifier to its session, including explicit role origins."
+  def resolve_agent(db, identifier) do
+    case Tightbeam.Org.get(db, identifier) do
+      %{session_key: key} -> {:ok, key, false}
+      _ -> Tightbeam.Roles.resolve(db, identifier)
+    end
+  end
+
   @doc "The origin's class as a string, or nil when the origin is malformed."
   @spec class(term()) :: String.t() | nil
   def class(origin) do

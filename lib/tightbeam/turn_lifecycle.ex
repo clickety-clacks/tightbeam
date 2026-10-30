@@ -258,7 +258,7 @@ defmodule Tightbeam.TurnLifecycle do
 
   defp system_terminal_authority?(event) do
     (event.cause in ["operator:stale-running-turn", "operator:clear-stranded"] and
-       String.starts_with?(event.principal, "user:")) or
+       nonempty_string?(event.principal)) or
       (event.cause == "session-retired" and nonempty_string?(event.principal)) or
       (event.principal == "process:tightbeam" and
          (event.cause in ["boot-recovery", "queued-message-suppressed"] or

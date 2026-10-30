@@ -1984,7 +1984,7 @@ defmodule Tightbeam.HarnessHealth do
             )
             |> Enum.any?(fn [source, owner, custodian] ->
               value == source or value == custodian or
-                active_same_owner_ancestor?(txn, value, source, owner)
+                session_owner_authorized?(txn, value, owner)
             end)
 
           _ ->
@@ -1993,7 +1993,11 @@ defmodule Tightbeam.HarnessHealth do
     end
   end
 
+  defp promotion_close_authorized?(_txn, {:process, _name}, _id), do: true
+
   defp promotion_close_authorized?(_txn, _principal, _promotion_id), do: false
+
+  defp review_authorized?(_txn, _id, {:process, _name}), do: true
 
   defp review_authorized?(txn, incident_id, principal) do
     rows =
@@ -2013,7 +2017,7 @@ defmodule Tightbeam.HarnessHealth do
     case {rows, principal} do
       {[[source, custodian, owner]], {:session, session}} ->
         session == custodian or session == source or
-          active_same_owner_ancestor?(txn, session, source, owner)
+          session_owner_authorized?(txn, session, owner)
 
       {[[_, _, owner]], {:user, user}} ->
         user == owner or admin_user?(txn, user)
@@ -2025,6 +2029,8 @@ defmodule Tightbeam.HarnessHealth do
         false
     end
   end
+
+  defp resolve_other_authorized?(_txn, _id, {:process, _name}), do: true
 
   defp resolve_other_authorized?(txn, incident_id, principal) do
     rows =
@@ -2044,7 +2050,7 @@ defmodule Tightbeam.HarnessHealth do
     case {rows, principal} do
       {[[source, owner, custodian]], {:session, session}} ->
         session == source or session == custodian or
-          active_same_owner_ancestor?(txn, session, source, owner)
+          session_owner_authorized?(txn, session, owner)
 
       {[[_, owner, _]], {:user, user}} ->
         user == owner or admin_user?(txn, user)
@@ -2057,37 +2063,10 @@ defmodule Tightbeam.HarnessHealth do
     end
   end
 
-  defp active_same_owner_ancestor?(txn, candidate, source, owner) do
-    ancestor_chain(txn, source, owner, MapSet.new(), 0)
-    |> Enum.any?(&(&1 == candidate))
-  end
-
-  defp ancestor_chain(_txn, _session, _owner, _seen, hop) when hop >= 32, do: []
-
-  defp ancestor_chain(txn, session, owner, seen, hop) do
-    if MapSet.member?(seen, session) do
-      []
-    else
-      case Txn.q(
-             txn,
-             "SELECT spawnedBy,ownerUserId,state FROM sessions WHERE sessionKey=?1",
-             [session]
-           ) do
-        [[nil, _owner, _state]] ->
-          []
-
-        [[parent, ^owner, "active"]] ->
-          [parent | ancestor_chain(txn, parent, owner, MapSet.put(seen, session), hop + 1)]
-
-        [[parent, ^owner, _state]] ->
-          ancestor_chain(txn, parent, owner, MapSet.put(seen, session), hop + 1)
-
-        [[_parent, _foreign_owner, _state]] ->
-          []
-
-        [] ->
-          []
-      end
+  defp session_owner_authorized?(txn, session, owner) do
+    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [session]) do
+      [[user]] -> user == owner or admin_user?(txn, user)
+      _ -> false
     end
   end
 
@@ -2210,7 +2189,7 @@ defmodule Tightbeam.HarnessHealth do
 
   defp evidence_read_authorized?(txn, {:session, session}, source, owner, custodian) do
     session == source or session == custodian or custodian == "session:" <> session or
-      active_same_owner_ancestor?(txn, session, source, owner)
+      session_owner_authorized?(txn, session, owner)
   end
 
   defp evidence_read_authorized?(txn, {:user, user}, _source, owner, _custodian),
@@ -2218,6 +2197,8 @@ defmodule Tightbeam.HarnessHealth do
 
   defp evidence_read_authorized?(_txn, "process:tightbeam", _source, _owner, _custodian),
     do: false
+
+  defp evidence_read_authorized?(_txn, {:process, _name}, _source, _owner, _custodian), do: true
 
   defp evidence_read_authorized?(_txn, _principal, _source, _owner, _custodian), do: false
 
@@ -2959,7 +2940,7 @@ defmodule Tightbeam.HarnessHealth do
   end
 
   defp other_source_authorized?(txn, {:session, session_key}, source, owner),
-    do: session_key == source or active_same_owner_ancestor?(txn, session_key, source, owner)
+    do: session_key == source or session_owner_authorized?(txn, session_key, owner)
 
   defp other_source_authorized?(txn, {:user, user}, _source, owner),
     do: user == owner or admin_user?(txn, user)
@@ -2971,6 +2952,8 @@ defmodule Tightbeam.HarnessHealth do
       _ -> false
     end
   end
+
+  defp other_source_authorized?(_txn, {:process, _name}, _source, _owner), do: true
 
   defp other_source_authorized?(_txn, _principal, _source, _owner), do: false
 
@@ -3912,12 +3895,14 @@ defmodule Tightbeam.HarnessHealth do
   defp principal_text(value) when is_binary(value), do: value
   defp principal_text(value), do: inspect(value)
 
-  defp normalize_principal!({kind, value}) when kind in [:session, :user] and is_binary(value),
-    do: {kind, value}
+  defp normalize_principal!({kind, value})
+       when kind in [:session, :user, :process] and is_binary(value),
+       do: {kind, value}
 
   defp normalize_principal!("session:" <> value) when value != "", do: {:session, value}
   defp normalize_principal!("user:" <> value) when value != "", do: {:user, value}
   defp normalize_principal!("process:tightbeam"), do: "process:tightbeam"
+  defp normalize_principal!("process:" <> value), do: {:process, value}
   defp normalize_principal!(_), do: raise(ArgumentError, "not_authorized")
 
   defp principal_ref(principal), do: principal_text(principal)

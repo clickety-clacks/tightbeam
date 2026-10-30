@@ -1,6 +1,6 @@
 defmodule Tightbeam.StaleTurnSettlement do
   @moduledoc """
-  Operator-only settlement for a proven stale running turn.
+  Settlement for a proven stale running turn.
 
   The session lane owns the live/stale decision. This module owns correlation,
   the guarded terminal transaction, and durable idempotent replay.
@@ -40,7 +40,7 @@ defmodule Tightbeam.StaleTurnSettlement do
 
   @doc "Validate and normalize the public settle-turn request."
   @spec request(map(), term()) :: {:ok, request()} | {:error, map()}
-  def request(params, {:user, user_id}) when is_binary(user_id) do
+  def request(params, {kind, id}) when kind in [:user, :session, :process] and is_binary(id) do
     with {:ok, session_key} <- nonempty(params[:session_key], "sessionKey"),
          {:ok, turn_seq} <- positive_integer(params[:turn_seq], "turnSeq"),
          {:ok, outcome} <- outcome(params[:outcome]),
@@ -53,13 +53,13 @@ defmodule Tightbeam.StaleTurnSettlement do
          outcome: outcome,
          reason: reason,
          idempotency_key: idempotency_key,
-         principal: "user:#{user_id}",
+         principal: "#{kind}:#{id}",
          gateway_pid: self()
        }}
     end
   end
 
-  def request(_params, _principal), do: error("not_authorized", "admin user required")
+  def request(_params, _principal), do: error("not_authorized", "administrator required")
 
   @doc "Canonical request fingerprint required by the settle-turn replay contract."
   @spec fingerprint(request()) :: String.t()

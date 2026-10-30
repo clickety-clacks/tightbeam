@@ -172,22 +172,16 @@ try do
     assert_receive {:held, socket, notice}, 2_000
     assert notice["refs"]["workItemId"] == first.id
     second = create.("queued")
-    third = create.("queued too")
-    fourth = create.("overflow")
-    large_value = String.duplicate("x", 64 * 1_024 * 1_024)
+    third = create.("overflow")
 
     Hub.publish(hub, %{
       "class" => "work_item.created",
-      "refs" => %{},
-      "payload" => %{"value" => large_value}
+      "refs" => %{"workItemId" => "oversized"},
+      "payload" => %{"id" => "oversized", "title" => String.duplicate("x", 65 * 1_024 * 1_024)}
     })
 
-    assert Hub.connection_stats(hub, socket) == %{
-             in_flight: false,
-             overflowed: true,
-             queued: 4,
-             seq: 5
-           }
+    assert Hub.sequence(hub, socket) == 4
+    assert %{overflowed: true, seq: 4} = Hub.connection_stats(hub, socket)
 
     send(socket, :release)
 

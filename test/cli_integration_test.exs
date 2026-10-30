@@ -117,6 +117,8 @@ defmodule Tightbeam.CliIntegrationTest do
       db: db,
       base_dir: base_dir,
       cwd: base_dir,
+      default_harness: :claude,
+      default_model: Model.new("fable"),
       wake_tick_ms: 1_000
     }
 
@@ -180,6 +182,80 @@ defmodule Tightbeam.CliIntegrationTest do
     }
   end
 
+  test "session-connect composes explicit organization identity with automatic session identity",
+       ctx do
+    start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+
+    env = [
+      {"TIGHTBEAM_URL", "http://127.0.0.1:#{ctx.port}"},
+      {"TIGHTBEAM_TOKEN", "tbc_cli_integration"}
+    ]
+
+    args = ["session-connect", "--session", ctx.worker.session_key]
+
+    assert {error, 1} =
+             System.cmd(ctx.binary, args, cd: ctx.outside, env: env, stderr_to_stdout: true)
+
+    assert error =~ "organization credential requires exactly one of --as-user or --as-process"
+    refute_received {:cli_call, _}
+
+    for {cwd, flags, origin, principal} <- [
+          {ctx.workdir, [], "agent:cli-holder", {:session, "cli-holder"}},
+          {ctx.outside, ["--as-user", "flynn"], "user:flynn", {:user, "flynn"}},
+          {ctx.outside, ["--as-process", "external-client"], "process:external-client",
+           {:process, "external-client"}}
+        ] do
+      port =
+        Port.open({:spawn_executable, ctx.binary}, [
+          :binary,
+          :exit_status,
+          :stderr_to_stdout,
+          {:line, 1_048_576},
+          {:cd, cwd},
+          {:args, args ++ flags},
+          {:env,
+           Enum.map(env, fn {key, value} ->
+             {String.to_charlist(key), String.to_charlist(value)}
+           end)}
+        ])
+
+      try do
+        session_connect_frame(port, "ready")
+
+        Port.command(
+          port,
+          JSON.encode!(%{
+            type: "send",
+            protocolVersion: 1,
+            requestId: "identity",
+            content: "identity composition"
+          }) <> "\n"
+        )
+
+        assert %{"wakeId" => wake_id} = session_connect_frame(port, "send.accepted")
+        assert_receive {:cli_call, %{verb: "wake", origin: ^origin, principal: ^principal}}
+        assert %{origin: ^origin} = Wakes.get(ctx.db, wake_id)
+      after
+        if Port.info(port), do: Port.close(port)
+      end
+    end
+  end
+
+  defp session_connect_frame(port, wanted) do
+    receive do
+      {^port, {:data, {:eol, line}}} ->
+        frame = JSON.decode!(line)
+        refute frame["type"] in ["fatal", "send.rejected"], inspect(frame)
+        if frame["type"] == wanted, do: frame, else: session_connect_frame(port, wanted)
+
+      {^port, {:exit_status, status}} ->
+        flunk("session-connect exited with #{status} before #{wanted}")
+    after
+      5_000 -> flunk("session-connect did not emit #{wanted}")
+    end
+  end
+
   test "session reparent crosses the real CLI wire and preserves assignment continuity", ctx do
     run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
 
@@ -228,10 +304,10 @@ defmodule Tightbeam.CliIntegrationTest do
     assert {:ok, [[nil]]} =
              DB.query(ctx.db, "SELECT spawnedBy FROM sessions WHERE sessionKey='cli-holder'")
 
-    assert {:ok, [["flynn", "cli-holder", "open"]]} =
+    assert {:ok, [[nil, "cli-holder", "cli-holder", "open"]]} =
              DB.query(
                ctx.db,
-               "SELECT openedByUser,holderKey,state FROM assignments WHERE id=?1",
+               "SELECT openedByUser,openedBySession,holderKey,state FROM assignments WHERE id=?1",
                [assignment]
              )
 
@@ -401,8 +477,7 @@ defmodule Tightbeam.CliIntegrationTest do
           ctx.binary,
           ["wake", "--session", "cli-holder", "--assignment", assignment] ++
             timing_args ++ ["--prompt", prompt],
-          cd: ctx.workdir,
-          stderr_to_stdout: true
+          cd: ctx.workdir
         )
 
       assert_receive {:cli_call, %{verb: "wake", params: wire_params}}
@@ -425,6 +500,122 @@ defmodule Tightbeam.CliIntegrationTest do
           assert wake.condition_scope == "build-1"
       end
     end
+  end
+
+  test "real CLI sends an invalid immediate assignment reference to the gateway", ctx do
+    {output, status} =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-worker",
+          "--assignment",
+          "missing-immediate-reference",
+          "--prompt",
+          "check the named work"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0
+    assert output =~ "unknown_assignment"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "wake",
+                      principal: {:session, "cli-holder"},
+                      params: %{assignment_id: "missing-immediate-reference"}
+                    }}
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='missing-immediate-reference'"
+             )
+  end
+
+  test "holder's dated CLI wake admits one exact assignment continuation", ctx do
+    {assignment_output, 0} =
+      System.cmd(
+        ctx.binary,
+        ["assign", "--session", "cli-holder", "--subject", "dated continuation"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assignment = JSON.decode!(assignment_output)["id"]
+    future = Integer.to_string(System.system_time(:millisecond) + 3_600_000)
+
+    for timing <- [["--after", "1h"], ["--at", future]] do
+      {output, 0} =
+        System.cmd(
+          ctx.binary,
+          ["wake", "--session", "cli-holder", "--assignment", assignment] ++
+            timing ++ ["--prompt", "continue the same assignment"],
+          cd: ctx.workdir,
+          stderr_to_stdout: true
+        )
+
+      wake = Wakes.get(ctx.db, JSON.decode!(output)["wakeId"])
+      assert wake.assignment_id == assignment
+      assert wake.obligation_ref == assignment
+      assert wake.creator_session_key == "cli-holder"
+      assert wake.wait_mode == nil
+      assert wake.due_at > wake.created_at
+
+      assert {:ok, [["pending"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1 AND controllerOrigin='holder_continuation'",
+                 [wake.wake_id]
+               )
+    end
+
+    {output, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-worker",
+          "--assignment",
+          assignment,
+          "--after",
+          "1h",
+          "--prompt",
+          "ordinary reminder"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    other_target = Wakes.get(ctx.db, JSON.decode!(output)["wakeId"])
+    assert other_target.assignment_id == assignment
+    assert other_target.obligation_ref == nil
+
+    {output, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-holder",
+          "--assignment",
+          assignment,
+          "--at",
+          "1",
+          "--prompt",
+          "past reminder"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    past = Wakes.get(ctx.db, JSON.decode!(output)["wakeId"])
+    assert past.assignment_id == assignment
+    assert past.obligation_ref == nil
   end
 
   test "manual obligation continuation examples register rows and deliver intact prompts", ctx do
@@ -489,6 +680,180 @@ defmodule Tightbeam.CliIntegrationTest do
 
     [assignment, resolver, verifier] = ids
 
+    assert {:ok, :reset} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.Supervision.activity_in_txn(
+                 txn,
+                 assignment,
+                 "cli-holder",
+                 System.system_time(:millisecond)
+               )
+             end)
+
+    assert {:ok, [[inactivity_wake_id, inactivity_due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,dueAt FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               [assignment]
+             )
+
+    assert_activity_refresh = fn timing_args, prompt ->
+      assert {:ok, [[prior_wake_id]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+                 [assignment]
+               )
+
+      {output, 0} =
+        System.cmd(
+          ctx.binary,
+          ["wake", "--session", "cli-holder", "--assignment", assignment] ++
+            timing_args ++ ["--prompt", prompt],
+          cd: ctx.workdir
+        )
+
+      assert_receive {:cli_call, %{verb: "wake", params: %{assignment_id: ^assignment}}}
+
+      wake = Wakes.get(ctx.db, JSON.decode!(output)["wakeId"])
+      assert wake.assignment_id == assignment
+
+      assert {:ok, [["canceled"]]} =
+               DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId=?1", [prior_wake_id])
+
+      assert {:ok, [[replacement_wake_id]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+                 [assignment]
+               )
+
+      refute replacement_wake_id == prior_wake_id
+      wake
+    end
+
+    immediate_prompt = "The assignment is ready for review"
+
+    {immediate_output, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-worker",
+          "--assignment",
+          assignment,
+          "--prompt",
+          immediate_prompt
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "wake",
+                      principal: {:session, "cli-holder"},
+                      params: %{assignment_id: ^assignment}
+                    }}
+
+    immediate_id = JSON.decode!(immediate_output)["wakeId"]
+    immediate_wake = Wakes.get(ctx.db, immediate_id)
+    assert immediate_wake.assignment_id == assignment
+    assert immediate_wake.session_key == "cli-worker"
+    assert immediate_wake.prompt == immediate_prompt
+    assert is_nil(immediate_wake.wait_mode)
+    assert is_nil(immediate_wake.obligation_ref)
+    assert is_nil(immediate_wake.resolver_id)
+    assert is_nil(immediate_wake.verification_assignment_id)
+
+    assert {:ok, [[^inactivity_wake_id, ^inactivity_due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,dueAt FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               [assignment]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [immediate_id]
+             )
+
+    Wakes.fire_due(Tightbeam.WakeScheduler)
+
+    assert [
+             %{delivery_wake_id: immediate_delivery_id, batch_state: "delivered"}
+           ] = NoticeBatcher.source_refs(ctx.db, immediate_id)
+
+    assert {:ok, [["cli-worker", ^assignment, delivered_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,assignmentId,prompt FROM turns WHERE wakeId=?1",
+               [immediate_delivery_id]
+             )
+
+    assert delivered_prompt =~ immediate_prompt
+    assert Wakes.get(ctx.db, immediate_id).state == "fired"
+
+    {timed_output, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-worker",
+          "--assignment",
+          assignment,
+          "--after",
+          "1h",
+          "--prompt",
+          "timed assignment reminder"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "wake",
+                      principal: {:session, "cli-holder"},
+                      params: %{assignment_id: ^assignment, after_ms: 3_600_000}
+                    }}
+
+    timed_id = JSON.decode!(timed_output)["wakeId"]
+    assert Wakes.get(ctx.db, timed_id).assignment_id == assignment
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId=?1", [inactivity_wake_id])
+
+    assert {:ok, [[new_inactivity_wake_id, new_inactivity_due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,dueAt FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               [assignment]
+             )
+
+    refute new_inactivity_wake_id == inactivity_wake_id
+    assert new_inactivity_due_at > inactivity_due_at
+
+    fact_wake =
+      assert_activity_refresh.(
+        [
+          "--when-fact",
+          "build-finished",
+          "--when-scope",
+          "build-1",
+          "--fallback-after",
+          "1h"
+        ],
+        "fact-conditioned assignment reminder"
+      )
+
+    assert fact_wake.condition_kind == "build-finished"
+    assert fact_wake.condition_scope == "build-1"
+
     {:ok, _} =
       Ledger.enqueue(ctx.db, %{
         session_key: "cli-holder",
@@ -501,28 +866,8 @@ defmodule Tightbeam.CliIntegrationTest do
 
     after_prompt = "D3 manual: continue the named assignment"
 
-    after_result =
-      System.cmd(
-        ctx.binary,
-        [
-          "wake",
-          "--session",
-          "cli-holder",
-          "--assignment",
-          assignment,
-          "--after-turn",
-          "--prompt",
-          after_prompt
-        ],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
-    assert_receive {:cli_call, %{verb: "wake", params: wire_params}}
-    assert wire_params.assignment_id == assignment
-    {after_output, 0} = after_result
-    after_id = JSON.decode!(after_output)["wakeId"]
-    after_wake = Wakes.get(ctx.db, after_id)
+    after_wake = assert_activity_refresh.(["--after-turn"], after_prompt)
+    after_id = after_wake.wake_id
     assert after_wake.assignment_id == assignment
     assert after_wake.obligation_ref == assignment
     assert after_wake.creator_session_key == "cli-holder"
@@ -543,35 +888,21 @@ defmodule Tightbeam.CliIntegrationTest do
 
     dependency_prompt = "D3 manual: read the resolver disposition before acting"
 
-    {dependency_output, 0} =
-      System.cmd(
-        ctx.binary,
-        [
-          "wake",
-          "--session",
-          "cli-holder",
-          "--assignment",
-          assignment,
-          "--predicate",
-          JSON.encode!(predicate),
-          "--fallback-after",
-          "1h",
-          "--prompt",
-          dependency_prompt
-        ],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
+    dependency =
+      assert_activity_refresh.(
+        ["--predicate", JSON.encode!(predicate), "--fallback-after", "1h"],
+        dependency_prompt
       )
 
-    dependency_id = JSON.decode!(dependency_output)["wakeId"]
-    dependency = Wakes.get(ctx.db, dependency_id)
+    dependency_id = dependency.wake_id
     assert dependency.assignment_id == assignment
     assert dependency.obligation_ref == assignment
     assert dependency.creator_session_key == "cli-holder"
     assert dependency.originating_turn_seq == turn.seq
-    assert dependency.verification_assignment_id == verifier
-    assert dependency.verification_state == "provisional"
-    assert dependency.selected_policy_name == "accountable-dependency-verifier"
+    assert dependency.verification_assignment_id == nil
+    assert dependency.verification_state == nil
+    assert dependency.selected_policy_name == nil
+    assert dependency.verification_notice_wake_id == nil
     assert dependency.resolver_id == resolver
     assert dependency.due_at > System.system_time(:millisecond)
     assert dependency.prompt == dependency_prompt
@@ -664,6 +995,207 @@ defmodule Tightbeam.CliIntegrationTest do
     assert version == CliCompatibility.required_version()
   end
 
+  test "real CLI captures and fetches assignment-produced bytes", ctx do
+    item =
+      ctx.handlers["work-item-create"].(%{
+        verb: "work-item-create",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        params: %{title: "Captured result"}
+      })
+
+    assignment =
+      ctx.handlers["assign"].(%{
+        verb: "assign",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: ctx.session.session_key,
+        target_role: nil,
+        role_fallback: false,
+        params: %{subject: "Record observed result", work_item_id: item.id}
+      })
+
+    bytes = <<0, 1, 255>>
+    digest = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+
+    {recorded, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Observed result",
+          "--path",
+          "missing-result.bin",
+          "--work-item",
+          item.id,
+          "--produced-by-assignment",
+          assignment.id,
+          "--content-base64",
+          Base.encode64(bytes)
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    recorded = JSON.decode!(recorded)
+    assert recorded["contentSha256"] == digest
+    assert recorded["producedByAssignmentId"] == assignment.id
+
+    {fetched, 0} =
+      System.cmd(ctx.binary, ["artifact-content-fetch", recorded["artifactId"]],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(fetched) == %{
+             "artifactId" => recorded["artifactId"],
+             "contentSha256" => digest,
+             "contentSize" => byte_size(bytes),
+             "contentBase64" => Base.encode64(bytes)
+           }
+
+    assert {:ok, [[payload]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload FROM events WHERE verb='artifact-content-fetch' ORDER BY id DESC LIMIT 1"
+             )
+
+    assert JSON.decode!(payload) == nil
+    refute payload =~ Base.encode64(bytes)
+  end
+
+  test "real CLI writes and reads declared record metadata", ctx do
+    manifest = Path.join([ctx.base_dir, "identity", "kungfu", "example", "manifest.toml"])
+    File.mkdir_p!(Path.dirname(manifest))
+
+    File.write!(
+      manifest,
+      "[[mementos]]\nname = \"receipt\"\nrecords = [\"work_item\"]\nmany = false\n"
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "test-identity-revision")
+
+    item =
+      ctx.handlers["work-item-create"].(%{
+        verb: "work-item-create",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        params: %{title: "Recorded metadata"}
+      })
+
+    record = "work_item:#{item.id}"
+
+    {written, 0} =
+      System.cmd(
+        ctx.binary,
+        ["memento-set", "--record", record, "--name", "example/receipt", "--value", "observed"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(written) == %{
+             "record" => record,
+             "mementos" => %{"example/receipt" => ["observed"]}
+           }
+
+    {read, 0} =
+      System.cmd(ctx.binary, ["mementos", "--record", record],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(read) == JSON.decode!(written)
+  end
+
+  test "real CLI carries repeated inline metadata through lifecycle writes", ctx do
+    manifest = Path.join([ctx.base_dir, "identity", "kungfu", "example", "manifest.toml"])
+    File.mkdir_p!(Path.dirname(manifest))
+
+    File.write!(
+      manifest,
+      "[[mementos]]\nname = \"receipt\"\nrecords = [\"work_item\", \"assignment\", \"attest\"]\nmany = true\n"
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "test-identity-revision")
+    run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+
+    assert {created, 0} =
+             run.([
+               "work-item-create",
+               "--title",
+               "Inline metadata",
+               "--as-user",
+               "flynn",
+               "--memento",
+               "example/receipt=first",
+               "--memento",
+               "example/receipt=second"
+             ])
+
+    item_id = JSON.decode!(created)["id"]
+
+    assert Tightbeam.Mementos.current(ctx.db, "work_item", item_id, "example/receipt") ==
+             ["first", "second"]
+
+    assert {assigned, 0} =
+             run.([
+               "assign",
+               "--subject",
+               "Inline assignment",
+               "--session",
+               ctx.session.session_key,
+               "--work-item",
+               item_id,
+               "--as-user",
+               "flynn",
+               "--memento",
+               "example/receipt=assigned"
+             ])
+
+    assignment_id = JSON.decode!(assigned)["id"]
+
+    assert Tightbeam.Mementos.current(ctx.db, "assignment", assignment_id, "example/receipt") ==
+             ["assigned"]
+
+    assert {dispatched, 0} =
+             run.([
+               "dispatch",
+               "--holder",
+               ctx.worker.session_key,
+               "--subject",
+               "Inline dispatch",
+               "--brief",
+               "Record the synthetic result.",
+               "--memento",
+               "example/receipt=dispatched"
+             ])
+
+    dispatched_id = JSON.decode!(dispatched)["id"]
+
+    assert Tightbeam.Mementos.current(ctx.db, "assignment", dispatched_id, "example/receipt") ==
+             ["dispatched"]
+
+    assert {filed, 0} =
+             run.([
+               "attest",
+               assignment_id,
+               "--kind",
+               "progress",
+               "--note",
+               "Observed progress",
+               "--memento",
+               "example/receipt=filed"
+             ])
+
+    attest_id = JSON.decode!(filed)["attest"]["id"]
+
+    assert Tightbeam.Mementos.current(ctx.db, "attest", attest_id, "example/receipt") ==
+             ["filed"]
+  end
+
   test "cancel-turn cancels an owned unattributed turn and refuses another user's session", ctx do
     :ok = DB.execute(ctx.db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('owner',0,1)")
     :ok = DB.execute(ctx.db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('other',0,1)")
@@ -704,7 +1236,11 @@ defmodule Tightbeam.CliIntegrationTest do
 
     {foreign_output, foreign_status} =
       System.cmd(ctx.binary, cancel_args.(foreign.session_key),
-        cd: owner_workdir,
+        cd: ctx.outside,
+        env: [
+          {"TIGHTBEAM_URL", "http://127.0.0.1:#{ctx.port}"},
+          {"TIGHTBEAM_TOKEN", "tbc_cli_integration"}
+        ],
         stderr_to_stdout: true
       )
 
@@ -758,8 +1294,8 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call,
                     %{
                       verb: "cancel",
-                      origin: "user:owner",
-                      principal: {:user, "owner"},
+                      origin: "agent:cancel-owner-main",
+                      principal: {:session, "cancel-owner-main"},
                       session_key: "cancel-owner-worker",
                       params: %{}
                     }}
@@ -1276,14 +1812,14 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    assert_receive {:cli_call, %{origin: "user:flynn", principal: {:user, "flynn"}}}
+    assert_receive {:cli_call, %{origin: "agent:cli-holder", principal: {:session, "cli-holder"}}}
 
     Org.retire(ctx.db, ctx.session.session_key, "user:flynn", 1_000)
     {refused, 1} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
     assert refused =~ "auth_failed"
   end
 
-  test "session-auth --as-user attributes verdicts to the user and grants admin revocation",
+  test "session-auth --as-user retains agent attribution for verdicts and revocation",
        ctx do
     {:ok, _} =
       DB.query(
@@ -1346,11 +1882,11 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call,
                     %{
                       verb: "attest",
-                      origin: "user:flynn",
-                      principal: {:user, "flynn"}
+                      origin: "agent:cli-holder",
+                      principal: {:session, "cli-holder"}
                     }}
 
-    assert {:ok, [["flynn", nil]]} =
+    assert {:ok, [[nil, "cli-holder"]]} =
              DB.query(
                ctx.db,
                "SELECT byUser, bySession FROM attests WHERE assignmentId = ?1 AND verdictKind = 'tests-passed'",
@@ -1367,10 +1903,10 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert revoked =~ "revoked"
 
-    assert {:ok, [["cli-other", "cli-worker", "flynn", "flynn"]]} =
+    assert {:ok, [["cli-other", "cli-worker", nil, "cli-holder", nil, "cli-holder"]]} =
              DB.query(
                ctx.db,
-               "SELECT a.openedBySession,a.holderKey,a.closedByUser,r.revokedByUser FROM assignments a JOIN assignment_revocations r ON r.assignmentId=a.id WHERE a.id=?1",
+               "SELECT a.openedBySession,a.holderKey,a.closedByUser,a.closedBySession,r.revokedByUser,r.revokedBySession FROM assignments a JOIN assignment_revocations r ON r.assignmentId=a.id WHERE a.id=?1",
                [assignment_id]
              )
 
@@ -1384,8 +1920,8 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call,
                     %{
                       verb: "revoke-assignment",
-                      origin: "user:flynn",
-                      principal: {:user, "flynn"}
+                      origin: "agent:cli-holder",
+                      principal: {:session, "cli-holder"}
                     }}
 
     assert {:ok, [["closed", "revoked"]]} =
@@ -1438,7 +1974,9 @@ defmodule Tightbeam.CliIntegrationTest do
           "--brief",
           "Investigate the restored CLI path.",
           "--key",
-          "dispatch-cli"
+          "dispatch-cli",
+          "--parent-assignment",
+          assignment_id
         ],
         cd: ctx.workdir,
         stderr_to_stdout: true
@@ -1446,6 +1984,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     dispatch_id = JSON.decode!(dispatched)["id"]
     assert "asg_" <> _ = dispatch_id
+    assert JSON.decode!(dispatched)["parentAssignmentId"] == assignment_id
 
     assert_receive {:cli_call,
                     %{
@@ -1455,7 +1994,8 @@ defmodule Tightbeam.CliIntegrationTest do
                       params: %{
                         subject: "investigate",
                         brief: "Investigate the restored CLI path.",
-                        idempotency_key: "dispatch-cli"
+                        idempotency_key: "dispatch-cli",
+                        parent_assignment_id: ^assignment_id
                       }
                     }}
 
@@ -1744,7 +2284,11 @@ defmodule Tightbeam.CliIntegrationTest do
           "--as-user",
           "flynn"
         ],
-        cd: ctx.workdir,
+        cd: ctx.outside,
+        env: [
+          {"TIGHTBEAM_URL", "http://127.0.0.1:#{ctx.port}"},
+          {"TIGHTBEAM_TOKEN", "tbc_cli_integration"}
+        ],
         stderr_to_stdout: true
       )
 
@@ -2690,6 +3234,165 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     assert pairing =~ "supplied together"
+  end
+
+  test "real CLI records an out-of-range priority as a gateway denial", ctx do
+    {refusal, status} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-create", "--title", "Priority refusal", "--priority", "9"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0, refusal
+    assert refusal =~ "invalid_priority"
+
+    assert_receive {:cli_call, %{verb: "work-item-create", params: %{priority: 9}}}
+
+    assert {:ok, [[payload]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload FROM events WHERE kind='denied' AND verb='work-item-create' ORDER BY id DESC LIMIT 1"
+             )
+
+    assert payload =~ "invalid_priority"
+  end
+
+  test "real CLI records an unknown spawn harness as a gateway denial", ctx do
+    {refusal, status} =
+      System.cmd(
+        ctx.binary,
+        [
+          "spawn",
+          "--display",
+          "Unknown harness",
+          "--harness",
+          "not-supported",
+          "--key",
+          "unknown-harness"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0, refusal
+    assert refusal =~ "unknown_harness"
+
+    assert_receive {:cli_call, %{verb: "spawn", params: %{harness: "not-supported"}}}
+
+    assert {:ok, [[payload]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload FROM events WHERE kind='denied' AND verb='spawn' ORDER BY id DESC LIMIT 1"
+             )
+
+    assert payload =~ "unknown_harness"
+  end
+
+  test "real CLI records Harklight user and process callers as gateway denials", ctx do
+    File.write!(
+      Path.join(ctx.base_dir, "gateway.json"),
+      JSON.encode!(%{port: ctx.port, cliToken: "tbc_cli_integration"})
+    )
+
+    commands = [
+      {"harklight-send",
+       ["harklight-send", "--session", "new", "--sender-id", "owner", "--title", "Example"]},
+      {"harklight-revise",
+       [
+         "harklight-revise",
+         "--message",
+         "message-example",
+         "--base-revision",
+         "1",
+         "--title",
+         "Updated title"
+       ]},
+      {"harklight-retract", ["harklight-retract", "--message", "message-example"]},
+      {"harklight-settle", ["harklight-settle", "--message", "message-example"]}
+    ]
+
+    for {flag, identity, principal} <- [
+          {"--as-user", "owner", {:user, "owner"}},
+          {"--as-process", "worker", {:process, "worker"}}
+        ],
+        {verb, args} <- commands do
+      {refusal, status} =
+        System.cmd(
+          ctx.binary,
+          args ++ [flag, identity],
+          cd: ctx.outside,
+          env: [
+            {"TIGHTBEAM_BASE_DIR", ctx.base_dir},
+            {"TIGHTBEAM_URL", nil},
+            {"TIGHTBEAM_TOKEN", nil}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status != 0, refusal
+      assert refusal =~ "harklight_origin_unavailable"
+
+      assert_receive {:cli_call, %{verb: ^verb, principal: ^principal}}
+
+      assert {:ok, [[payload]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT payload FROM events WHERE kind='denied' AND verb='#{verb}' ORDER BY id DESC LIMIT 1"
+               )
+
+      assert payload =~ "harklight_origin_unavailable"
+    end
+  end
+
+  test "real CLI keeps explicit Harklight identities local with session credentials",
+       ctx do
+    commands = [
+      {"harklight-send",
+       ["harklight-send", "--session", "new", "--sender-id", "owner", "--title", "Example"],
+       "harklight-send requires the authenticated session or one of its roles"},
+      {"harklight-revise",
+       [
+         "harklight-revise",
+         "--message",
+         "message-example",
+         "--base-revision",
+         "1",
+         "--title",
+         "Updated title"
+       ], "invalid Harklight command flags"},
+      {"harklight-retract", ["harklight-retract", "--message", "message-example"],
+       "invalid Harklight command flags"},
+      {"harklight-settle", ["harklight-settle", "--message", "message-example"],
+       "invalid Harklight command flags"}
+    ]
+
+    endpoint = "http://127.0.0.1:#{ctx.port}"
+
+    for credential_source <- [
+          {ctx.workdir, []},
+          {ctx.outside,
+           [
+             {"TIGHTBEAM_URL", endpoint},
+             {"TIGHTBEAM_TOKEN", ctx.session.cli_token}
+           ]}
+        ],
+        {flag, identity} <- [{"--as-user", "owner"}, {"--as-process", "worker"}],
+        {verb, args, local_refusal} <- commands do
+      {cwd, env} = credential_source
+
+      {refusal, status} =
+        System.cmd(ctx.binary, args ++ [flag, identity],
+          cd: cwd,
+          env: env,
+          stderr_to_stdout: true
+        )
+
+      assert status != 0, refusal
+      assert refusal =~ local_refusal
+      refute_receive {:cli_call, %{verb: ^verb}}, 0
+    end
   end
 
   test "real CLI composes priority and metadata in one work-item update", ctx do

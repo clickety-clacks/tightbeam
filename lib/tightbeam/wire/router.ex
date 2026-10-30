@@ -49,6 +49,8 @@ defmodule Tightbeam.Wire.Router do
 
   use Plug.Router
 
+  @websocket_read_timeout :infinity
+
   alias Tightbeam.{
     Assets,
     CliCompatibility,
@@ -56,6 +58,7 @@ defmodule Tightbeam.Wire.Router do
     D1Read,
     Devices,
     Dispatch,
+    EventLog,
     ErrorDiagnostic,
     Org,
     Roles,
@@ -68,9 +71,13 @@ defmodule Tightbeam.Wire.Router do
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
-  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts harklight-send spawn session-reparent session-po-set retire critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
+  @read_marker_verbs ~w(read-marker-set read-marker-clear)
+  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle spawn session-reparent session-po-set retire critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
   @agent_verbs @agent_verbs ++
                  [
+                   "fact-demand",
+                   "fact-producer-claim",
+                   "fact-producers",
                    "artifact-content-fetch",
                    "assignment-commitref-correct",
                    "harness-health-observe-other",
@@ -82,6 +89,7 @@ defmodule Tightbeam.Wire.Router do
                    "subtree-guidance-withdraw",
                    "subtree-guidance-show"
                  ]
+
   @max_upload_bytes 32 * 1024 * 1024
   @state_malformed_percent_escape ~r/%(?![0-9A-Fa-f]{2})/
   @core_detail_fact_id ~r/\A[1-9][0-9]*\z/
@@ -101,6 +109,11 @@ defmodule Tightbeam.Wire.Router do
       resource: "transcript messages",
       query: :query_message,
       serializer: :message
+    },
+    tool_calls: %{
+      resource: "tool calls",
+      query: :query_tool_call,
+      serializer: :tool_call
     },
     roles: %{resource: "roles", query: :query_role, serializer: :role},
     facts: %{
@@ -230,7 +243,11 @@ defmodule Tightbeam.Wire.Router do
     if Plug.Conn.get_req_header(conn, "upgrade") == ["websocket"] and
          conn.query_params["protocolVersion"] == "2" do
       conn = Tightbeam.Wire.ResponseObservationAdapter.unwrap(conn)
-      WebSockAdapter.upgrade(conn, ChangeSocket, deps(conn), max_frame_size: 2 * 1024 * 1024)
+
+      WebSockAdapter.upgrade(conn, ChangeSocket, deps(conn),
+        max_frame_size: 2 * 1024 * 1024,
+        timeout: @websocket_read_timeout
+      )
     else
       Plug.Conn.send_resp(conn, 426, "")
     end
@@ -239,7 +256,11 @@ defmodule Tightbeam.Wire.Router do
   defp upgrade_socket(conn) do
     if Plug.Conn.get_req_header(conn, "upgrade") == ["websocket"] do
       conn = Tightbeam.Wire.ResponseObservationAdapter.unwrap(conn)
-      WebSockAdapter.upgrade(conn, Socket, deps(conn), max_frame_size: 2 * 1024 * 1024)
+
+      WebSockAdapter.upgrade(conn, Socket, deps(conn),
+        max_frame_size: 2 * 1024 * 1024,
+        timeout: @websocket_read_timeout
+      )
     else
       error(conn, 404, "not_found")
     end
@@ -305,10 +326,10 @@ defmodule Tightbeam.Wire.Router do
   end
 
   post "/agent/dispatch" do
-    with {:ok, auth} <- cli_auth(conn) do
+    with {:ok, auth} <- agent_dispatch_auth(conn) do
       with_json(conn, fn body, conn ->
         with {:ok, verb} <- required_string(body["verb"]),
-             :ok <- allowed_agent_verb(verb),
+             :ok <- allowed_agent_verb(verb, auth),
              {:ok, origin, principal} <- agent_identity(body, auth, conn),
              {:ok, session_key, target_meta} <- typed_target(verb, body, conn),
              :ok <- visible_cancel_target(verb, session_key, principal, conn) do
@@ -316,9 +337,7 @@ defmodule Tightbeam.Wire.Router do
             verb: verb,
             origin: origin,
             principal: principal,
-            # Identity resolution can turn a session-authenticated call into a user
-            # principal. Keep the authenticated transport beside that principal so a
-            # handler can stamp the hop without trusting a caller param.
+            # Retain the authenticated transport separately from the selected origin.
             transport_session_key: authenticated_session_key(auth),
             session_key: artifact_caller_session(verb, session_key, principal),
             target_role: target_meta.role,
@@ -340,6 +359,9 @@ defmodule Tightbeam.Wire.Router do
                   id: session_key,
                   is_admin: false
                 })
+
+              {"artifact-content-fetch", {:process, name}} ->
+                Map.put(call, :rest_principal, %{kind: "process", id: name, is_admin: true})
 
               {"artifact-content-fetch", {:user, user_id}} ->
                 Map.put(call, :rest_principal, state_principal_view({:user, user_id}, conn))
@@ -571,6 +593,14 @@ defmodule Tightbeam.Wire.Router do
     )
   end
 
+  get "/api/sessions/:session_key/tool-calls/:tool_call_id" do
+    core_detail(
+      conn,
+      Map.fetch!(@core_detail_specs, :tool_calls),
+      {session_key, tool_call_id}
+    )
+  end
+
   get "/api/roles/:name" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :roles), name)
   end
@@ -599,6 +629,10 @@ defmodule Tightbeam.Wire.Router do
       :query_messages_for_session_page,
       :message
     )
+  end
+
+  get "/api/sessions/:session_key/tool-calls" do
+    tool_calls_collection(conn, session_key)
   end
 
   get "/api/sessions/:session_key/wakes" do
@@ -1549,6 +1583,7 @@ defmodule Tightbeam.Wire.Router do
 
   defp session_collection_tuple("transcript messages", %{seq: seq}), do: [seq]
   defp session_collection_tuple("turns", %{seq: seq}), do: [seq]
+  defp session_collection_tuple("tool calls", %{seq: seq, id: id}), do: [seq, id]
 
   defp session_collection_tuple("wakes", %{created_at: created_at, wake_id: wake_id}),
     do: [created_at, wake_id]
@@ -1556,6 +1591,9 @@ defmodule Tightbeam.Wire.Router do
   defp session_collection_tuple?(resource, [seq])
        when resource in ["transcript messages", "turns"] and is_integer(seq) and seq > 0,
        do: true
+
+  defp session_collection_tuple?("tool calls", [seq, id]),
+    do: is_integer(seq) and seq > 0 and is_binary(id) and id != ""
 
   defp session_collection_tuple?(
          "wakes",
@@ -1629,6 +1667,13 @@ defmodule Tightbeam.Wire.Router do
         "page" => page
       }
 
+      body =
+        if resource == "transcript messages" do
+          Map.put(body, "railDenials", session_rail_denials(db(conn), session_key))
+        else
+          body
+        end
+
       state_send(conn, 200, JSON.encode!(body))
     else
       nil -> state_error(conn, resource, 404, "not_found", nil)
@@ -1637,6 +1682,29 @@ defmodule Tightbeam.Wire.Router do
   rescue
     _error in [ArgumentError, KeyError, MatchError] ->
       state_error(conn, resource, 500, "projection_invalid", nil)
+  end
+
+  defp session_rail_denials(db, session_key) do
+    db
+    |> EventLog.rail_denials_for_session(session_key)
+    |> Enum.map(fn denial ->
+      %{
+        "id" => "rail:#{denial.id}",
+        "sessionKey" => session_key,
+        "origin" => denial.origin,
+        "principal" => denial.principal,
+        "verb" => denial.verb,
+        "rule" => denial.rule,
+        "payload" => denial.payload,
+        "occurredAt" => denial.ts,
+        "afterMessageSeq" => denial.after_message_seq,
+        "order" => %{
+          "afterMessageSeq" => denial.after_message_seq,
+          "occurredAt" => denial.ts,
+          "eventId" => denial.id
+        }
+      }
+    end)
   end
 
   defp session_collection_session(db, session_key, %{kind: "observer"}),
@@ -1652,11 +1720,17 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
-  # Organization credentials can select a user for this session's collection.
-  defp session_collection_principal(:org, query, conn, session_key, _resource) do
+  # REST state API v1 AU1a makes an unselected transcript read an observer read.
+  # Organization credentials can still select a user for this session's collection.
+  defp session_collection_principal(:org, query, conn, session_key, resource) do
     case Map.get(query, "asUser", []) do
       [] ->
-        {:ok, org_read_principal(conn), Map.delete(query, "asUser")}
+        principal =
+          if resource == "transcript messages",
+            do: observer_principal(),
+            else: org_read_principal(conn)
+
+        {:ok, principal, Map.delete(query, "asUser")}
 
       [user_id] when user_id != "" ->
         case Tightbeam.Wire.OperatorSession.resolve(db(conn), %{
@@ -1744,13 +1818,119 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp session_collection_request(query, session_key) do
-    valid_keys? =
-      Enum.all?(Map.keys(query), &(&1 in ["sessionKey", "limit", "before", "after", "tail"]))
+    session_collection_request(query, session_key, "transcript messages")
+  end
+
+  defp session_collection_request(query, session_key, resource) do
+    allowed = ["sessionKey", "limit", "before", "after", "tail"]
+
+    allowed =
+      if resource == "tool calls",
+        do: allowed ++ ["afterMessageSeqFromInclusive", "afterMessageSeqToExclusive"],
+        else: allowed
+
+    valid_keys? = Enum.all?(Map.keys(query), &(&1 in allowed))
 
     selected? = Map.get(query, "sessionKey", []) in [[], [session_key]]
 
     if valid_keys? and selected?, do: :ok, else: {:error, 400, "invalid_filter", nil}
   end
+
+  defp tool_calls_collection(conn, session_key) do
+    resource = "tool calls"
+    route = "session.tool_calls.collection:#{session_key}"
+
+    with {:ok, auth} <- selected_session_auth(conn),
+         {:ok, request} <- decode_state_query(conn),
+         {:ok, principal, request} <-
+           session_collection_principal(auth, request, conn, session_key, resource),
+         :ok <- session_collection_request(request, session_key, resource),
+         {:ok, after_from} <-
+           state_nonnegative_integer_filter(request, "afterMessageSeqFromInclusive"),
+         {:ok, after_to} <-
+           state_nonnegative_integer_filter(request, "afterMessageSeqToExclusive"),
+         filters <- %{
+           "afterMessageSeqFromInclusive" => cursor_filter_value(after_from),
+           "afterMessageSeqToExclusive" => cursor_filter_value(after_to)
+         },
+         {:ok, limit, boundary} <-
+           state_page_request(
+             request,
+             route,
+             resource,
+             filters,
+             principal,
+             &session_collection_tuple?(resource, &1),
+             @state_default_limit,
+             :latest,
+             :earliest,
+             :latest
+           ),
+         session when not is_nil(session) <-
+           StateResources.query_session(db(conn), %{key: session_key, principal: principal}),
+         page_result <-
+           StateResources.query_tool_calls_for_session_page(
+             db(conn),
+             session_key,
+             boundary,
+             limit,
+             after_from,
+             after_to
+           ),
+         page <-
+           state_page_metadata(
+             page_result.rows,
+             page_result.flags,
+             &session_collection_tuple(resource, &1),
+             route,
+             resource,
+             filters,
+             principal,
+             :asc
+           ),
+         items <- Enum.map(page_result.rows, &StateResources.tool_call/1),
+         item_bytes <-
+           Enum.map(items, &StateResources.encode_item(resource, &1, state_catalog(conn))) do
+      body =
+        "{" <>
+          ~s("schemaVersion":1,"resource":"tool calls","items":[) <>
+          Enum.join(item_bytes, ",") <>
+          "],\"page\":" <> JSON.encode!(page) <> "}"
+
+      state_send(conn, 200, body)
+    else
+      nil -> state_error(conn, resource, 404, "not_found", nil)
+      {:error, status, code, message} -> state_error(conn, resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, "tool calls", 500, "projection_invalid", nil)
+  end
+
+  defp state_nonnegative_integer_filter(query, key) do
+    with {:ok, value} <- one_query_value(query, key) do
+      case value do
+        nil ->
+          {:ok, nil}
+
+        text when is_binary(text) ->
+          if Regex.match?(~r/\A(?:0|[1-9][0-9]*)\z/, text) do
+            case Integer.parse(text) do
+              {integer, ""} when integer <= 9_223_372_036_854_775_807 -> {:ok, integer}
+              _ -> {:error, 400, "invalid_filter", nil}
+            end
+          else
+            {:error, 400, "invalid_filter", nil}
+          end
+
+        _ ->
+          {:error, 400, "invalid_filter", nil}
+      end
+    end
+  end
+
+  defp cursor_filter_value(nil), do: []
+  defp cursor_filter_value(value), do: [Integer.to_string(value)]
 
   defp selected_session_auth(conn) do
     case bearer_token(conn) do
@@ -1854,6 +2034,25 @@ defmodule Tightbeam.Wire.Router do
     apply(StateResources, query, [db(conn), %{key: scope_key, principal: principal}, %{}])
   end
 
+  defp core_detail_row(conn, %{resource: "sessions"}, session_key, %{kind: "observer"}) do
+    core_detail_trace(conn, {:shared_lookup, "sessions", :query_session})
+    StateResources.query_session(db(conn), session_key)
+  end
+
+  defp core_detail_row(
+         conn,
+         %{resource: "transcript messages"},
+         {session_key, message_id},
+         %{kind: "observer"}
+       ) do
+    core_detail_trace(conn, {:shared_lookup, "transcript messages", :query_message})
+
+    case StateResources.query_message(db(conn), message_id) do
+      %{session_key: ^session_key} = row -> row
+      _ -> nil
+    end
+  end
+
   defp core_detail_row(conn, %{query: query, resource: resource}, key, principal) do
     core_detail_trace(conn, {:shared_lookup, resource, query})
     apply(StateResources, query, [db(conn), %{key: key, principal: principal}])
@@ -1886,6 +2085,10 @@ defmodule Tightbeam.Wire.Router do
   defp core_detail_key("transcript messages", {session_key, message_id})
        when is_binary(session_key) and is_binary(message_id),
        do: {:ok, {session_key, message_id}}
+
+  defp core_detail_key("tool calls", {session_key, tool_call_id})
+       when is_binary(session_key) and is_binary(tool_call_id),
+       do: {:ok, {session_key, tool_call_id}}
 
   defp core_detail_key("host environment", {host, harness, name})
        when is_binary(host) and is_binary(harness) and is_binary(name),
@@ -2016,12 +2219,8 @@ defmodule Tightbeam.Wire.Router do
   defp resolve_cli_as_user(:org, user_id) when is_binary(user_id) and user_id != "",
     do: {:ok, {:user, user_id}}
 
-  defp resolve_cli_as_user({:session, %{owner_user_id: owner}}, owner)
-       when is_binary(owner) and owner != "",
-       do: {:ok, {:user, owner}}
-
-  defp resolve_cli_as_user({:session, %{owner_user_id: owner}}, _other),
-    do: {:error, 403, "identity_not_yours", "this session belongs to #{owner}"}
+  defp resolve_cli_as_user({:session, %{session_key: key}}, _selector),
+    do: {:ok, {:session, key}}
 
   defp resolve_cli_as_user(_auth, _empty), do: {:error, 400, "invalid_message", nil}
 
@@ -2817,11 +3016,8 @@ defmodule Tightbeam.Wire.Router do
       [] ->
         {:ok, session_read_principal(session.owner_user_id, conn)}
 
-      [user_id] when user_id == session.owner_user_id and user_id != "" ->
-        {:ok, d1_user_principal(user_id, conn)}
-
       [_user_id] ->
-        {:error, 403, "identity_not_yours", "this session belongs to #{session.owner_user_id}"}
+        {:ok, session_read_principal(session.owner_user_id, conn)}
 
       _repeated ->
         {:error, 400, "invalid_as_user", nil}
@@ -3206,6 +3402,16 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  defp agent_dispatch_auth(conn) do
+    case cli_auth(conn) do
+      {:error, 401, "auth_failed", nil} ->
+        with {:ok, device} <- device_auth(conn), do: {:ok, {:device, device}}
+
+      result ->
+        result
+    end
+  end
+
   defp cli_version_compatible(conn, auth) do
     version =
       case Plug.Conn.get_req_header(conn, "x-tightbeam-cli-version") do
@@ -3321,8 +3527,19 @@ defmodule Tightbeam.Wire.Router do
       else: {:error, 400, "invalid_message", "verb not allowed: #{verb}"}
   end
 
-  defp agent_identity(%{"asProcess" => "tightbeam"}, :org, _conn) do
+  defp allowed_agent_verb(verb, {:device, _device}) when verb in @read_marker_verbs, do: :ok
+
+  defp allowed_agent_verb(_verb, {:device, _device}),
+    do: {:error, 401, "auth_failed", nil}
+
+  defp allowed_agent_verb(verb, _auth), do: allowed_agent_verb(verb)
+
+  defp agent_identity(%{"asProcess" => "tightbeam"}, _auth, _conn) do
     {:error, 403, "reserved_origin", "process:tightbeam is reserved to the substrate"}
+  end
+
+  defp agent_identity(_body, {:device, device}, _conn) do
+    {:ok, "user:#{device.user_id}", {:user, device.user_id}}
   end
 
   defp agent_identity(body, :org, conn) do
@@ -3347,7 +3564,6 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp agent_identity(body, {:session, session}, conn) do
-    roles = Roles.for_session(db(conn), session.session_key)
     session_principal = {:session, session.session_key}
 
     cond do
@@ -3363,26 +3579,13 @@ defmodule Tightbeam.Wire.Router do
         end
 
       is_binary(body["asUser"]) ->
-        if body["asUser"] == session.owner_user_id do
-          {:ok, "user:#{session.owner_user_id}", {:user, session.owner_user_id}}
-        else
-          {:error, 403, "identity_not_yours", "this session belongs to #{session.owner_user_id}"}
-        end
+        {:ok, "agent:#{session.session_key}", session_principal}
 
       is_binary(body["asProcess"]) and body["asProcess"] != "" ->
-        with {:ok, origin} <- agent_origin(body, conn) do
-          {:ok, origin, {:process, body["asProcess"]}}
-        end
-
-      length(roles) == 1 ->
-        {:ok, "agent:#{hd(roles)}", session_principal}
-
-      roles == [] ->
-        {:ok, "user:#{session.owner_user_id}", session_principal}
+        {:ok, "process:#{body["asProcess"]}", session_principal}
 
       true ->
-        {:error, 400, "ambiguous_identity",
-         "this session holds several roles (#{Enum.join(roles, ", ")}); pass --as <role>"}
+        {:ok, "agent:#{session.session_key}", session_principal}
     end
   end
 
@@ -3410,15 +3613,16 @@ defmodule Tightbeam.Wire.Router do
         # Third origin class (closed set: user | agent | process): automation
         # that is neither a person nor a session — cron, CI, webhooks.
         # Local-trust like --as (named, not authenticated — v1 decision);
-        # powers are narrow: wake + cancel-wake + condition, nothing else.
         {:ok, "process:#{body["asProcess"]}"}
 
       true ->
-        {:error, 400, "invalid_message", "as (role) or asUser required"}
+        {:error, 400, "invalid_message",
+         "as, asUser, or asProcess required on an organization credential"}
     end
   end
 
   defp authenticated_session_key({:session, session}), do: session.session_key
+  defp authenticated_session_key({:device, _device}), do: nil
   defp authenticated_session_key(:org), do: nil
 
   # Strictly typed target seam (spec Addendum A): the reference TYPE is
@@ -3442,7 +3646,7 @@ defmodule Tightbeam.Wire.Router do
   # `--session <key>` is a COHORT FILTER over creator identity, not a target, so
   # resolving it as one would turn a roster filter into a session-existence
   # oracle. Both verbs' selectors travel as ordinary body params.
-  @non_target_verbs ~w(harklight-send settle-turn answer return transcript execution-map execution-map-select breathing toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list)
+  @non_target_verbs ~w(harklight-send harklight-revise harklight-retract harklight-settle settle-turn answer return transcript execution-map execution-map-select breathing toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list)
 
   @non_target_verbs @non_target_verbs ++
                       [
@@ -3524,8 +3728,7 @@ defmodule Tightbeam.Wire.Router do
           # assignment: assign/dispatch BIND an obligation, and the owner's session
           # is not the requested role's holder — commonly not even its provider — so
           # the card lands on a session that cannot do the work while the requester
-          # believes it dispatched (wi_756153b7, specimens asg_6f380b79 and
-          # asg_388a5a54, the latter against a role whose bound session was retired).
+          # believes it dispatched, including when a role's bound session was retired.
           # Refuse HERE, the one place the fallback is still distinguishable: past
           # this seam only a boolean survives, and the handler sees an active session
           # it has no reason to doubt. Every other consumer keeps the fallback.
@@ -3546,8 +3749,9 @@ defmodule Tightbeam.Wire.Router do
   defp artifact_caller_session("artifact-record", nil, {:session, session_key}),
     do: session_key
 
-  defp artifact_caller_session("harklight-send", nil, {:session, session_key}),
-    do: session_key
+  defp artifact_caller_session(verb, nil, {:session, session_key})
+       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle),
+       do: session_key
 
   defp artifact_caller_session(_verb, session_key, _principal), do: session_key
 
@@ -3940,9 +4144,10 @@ defmodule Tightbeam.Wire.Router do
   end
 
   # SUBSTRATE-INTERNAL params, PER VERB: fields a client may not set on that verb
-  # because the substrate is their only legitimate author. Immediate conversational
-  # wakes do not carry assignment attribution; scheduled wakes and typed obligation
-  # waits may carry an explicit assignment link. That reference is not authority.
+  # because the substrate is their only legitimate author. An assignment on an
+  # immediate conversational wake is a validated message reference; scheduled wakes
+  # and typed obligation waits may carry an explicit assignment link. That reference
+  # is not authority.
   # `replacement_assignment_id` is derived from `assignmentId` only for the
   # `replaceQueued` operation below.
   #
@@ -3991,6 +4196,11 @@ defmodule Tightbeam.Wire.Router do
   }
 
   @param_keys %{
+    "harklight-send" =>
+      ~w(harklight_session sender_id title body choices files vendor_session_id supersedes)a,
+    "harklight-revise" => ~w(message_id base_revision title body choices clear_choices)a,
+    "harklight-retract" => ~w(message_id)a,
+    "harklight-settle" => ~w(message_id)a,
     "work-item-list" =>
       ~w(state status owner_user_id created_by_session created_by_user is_bug spec_ref_name holder_key limit after)a,
     "topline-placement-list" => ~w(state)a,
@@ -4003,7 +4213,7 @@ defmodule Tightbeam.Wire.Router do
     "topline-reopen" => ~w(idempotency_key reason topline_id)a,
     "topline-close" => ~w(idempotency_key reason topline_id)a,
     "topline-update" => ~w(idempotency_key reason title topline_id)a,
-    "topline-create" => ~w(idempotency_key title)a,
+    "topline-create" => ~w(idempotency_key title owner_user_id)a,
     "withdraw" => ~w(request request_id reason)a,
     "revoke-waiver" => ~w(waiver waiver_id reason)a,
     "waive" =>
@@ -4019,18 +4229,20 @@ defmodule Tightbeam.Wire.Router do
     "artifact-content-fetch" => ~w(artifact_id)a,
     "artifact-get" => ~w(artifact_id)a,
     "artifact-record" =>
-      ~w(content_sha256 description kind origin_path produced_by_assignment_id title work_item_id)a,
+      ~w(content_base64 content_sha256 description kind origin_path produced_by_assignment_id title work_item_id)a,
     "artifacts" => ~w(session_key work_item_id kind)a,
+    "memento-set" => ~w(record name values clear)a,
+    "mementos" => ~w(record history name limit cursor)a,
     "ask" =>
       ~w(assignment_id context idempotency_key params question reason role session_key target user_id verb)a,
     "assign" =>
-      ~w(effect_kind files holder_key idempotency_key prompt reviews reviews_assignment_id role session_key subject succeeds_assignment_id work_item_id)a,
+      ~w(effect_kind files holder_key idempotency_key mementos prompt reviews reviews_assignment_id role session_key subject succeeds_assignment_id parent_assignment_id work_item_id owner_user_id)a,
     "assignment-commitref-correct" =>
       ~w(assignment_id commit_refs evidence_artifact_id idempotency_key reason)a,
     "assignments" => ~w(role session_key state)a,
     "attend" => ~w(high)a,
     "attest" =>
-      ~w(artifact_id assignment_id commit_refs content_sha256 kind note release_fact_kind release_fact_principal_ref release_fact_scope verdict_kind wait_id)a,
+      ~w(artifact_id assignment_id commit_refs content_sha256 kind mementos note release_fact_kind release_fact_principal_ref release_fact_scope verdict_kind wait_id)a,
     "attests" => ~w(assignment_id)a,
     "breathing" => ~w(target_id target_kind)a,
     "cancel" => ~w(assignment_id reason)a,
@@ -4040,12 +4252,15 @@ defmodule Tightbeam.Wire.Router do
     "decision-request" => ~w(request request_id)a,
     "decision-requests" => ~w(status)a,
     "dispatch" =>
-      ~w(brief effect_kind holder_key idempotency_key prompt session_key subject succeeds_assignment_id work_item_id workdir_root)a,
+      ~w(brief effect_kind holder_key idempotency_key mementos prompt session_key subject succeeds_assignment_id parent_assignment_id work_item_id workdir_root owner_user_id)a,
     "effort-rule" => ~w(action request request_id)a,
     "execution-map" => ~w(tree origin owner state spec spec_sha session quiet_over)a,
     "execution-map-select" =>
       ~w(assignments under origin owner state spec spec_sha session quiet_over)a,
     "facts-read" => ~w(after kind limit scope)a,
+    "fact-demand" => ~w(kind_prefixes)a,
+    "fact-producer-claim" => ~w(producer kinds live_for_ms)a,
+    "fact-producers" => ~w()a,
     "harness-health-close-promotion" =>
       ~w(candidate_commit idempotency_key named_class promotion_id review_artifact_id review_assignment_id review_attest_id spec_artifact_id spec_ref spec_sha256)a,
     "harness-health-evidence-other" => ~w(incident_id)a,
@@ -4070,7 +4285,8 @@ defmodule Tightbeam.Wire.Router do
     "kungfu-list" => ~w()a,
     "kungfu-setup" => ~w(name)a,
     "learn" => ~w(idempotency_key name)a,
-    "onboard" => ~w(provider phase kind machine lease_id reason source code callback_url)a,
+    "onboard" =>
+      ~w(provider phase kind machine lease_id reason source code callback_url owner_user_id)a,
     "operator-ask" =>
       ~w(assignment assignment_id choices context deadline idempotency_key note options owner_user_id question supersedes work_item_id)a,
     "operator-rule" => ~w(decision idempotency_key rationale reason request request_id response)a,
@@ -4082,8 +4298,10 @@ defmodule Tightbeam.Wire.Router do
     "retire" => ~w(idempotency_key session_key)a,
     "return" => ~w(idempotency_key reason request request_id)a,
     "revoke-assignment" => ~w(assignment_id reason)a,
+    "read-marker-clear" => ~w(expected_current scope_key)a,
+    "read-marker-set" => ~w(expected_current marker scope_key)a,
     "role-bind" => ~w(name session_key)a,
-    "role-create" => ~w(name bind description session_key)a,
+    "role-create" => ~w(name bind description session_key owner_user_id)a,
     "role-list" => ~w()a,
     "role-rm" => ~w(name)a,
     "rule" => ~w(request request_id decision rationale reason scope expires_at idempotency_key)a,
@@ -4094,7 +4312,7 @@ defmodule Tightbeam.Wire.Router do
     "session-reparent" => ~w(assignment_id idempotency_key parent_session_key session_key)a,
     "settle-turn" => ~w(idempotency_key outcome reason session_key turn_seq)a,
     "spawn" =>
-      ~w(archetype context display_name effort handle harness host idempotency_key model overrides work_item_id)a,
+      ~w(archetype context display_name effort handle harness host idempotency_key model overrides work_item_id owner_user_id)a,
     "subtree-guidance-set" => ~w(name archetypes text)a,
     "subtree-guidance-show" => ~w(session_key)a,
     "subtree-guidance-withdraw" => ~w(name)a,
@@ -4108,10 +4326,10 @@ defmodule Tightbeam.Wire.Router do
       ~w(prompt after_ms after_turn assignment_id at cancel_wake_id class cron condition_kind condition_scope idempotency_key predicate replace_queued reresolve reresolve_rung reresolve_seed nudge)a,
     "work-item-close" => ~w(work_item_id)a,
     "work-item-create" =>
-      ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body)a,
+      ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body mementos owner_user_id)a,
     "work-item-fail" => ~w(reason work_item_id)a,
     "work-item-get" => ~w(work_item_id)a,
-    "work-item-handoff" => ~w(work_item_id title delivery_owner_session_key brief)a,
+    "work-item-handoff" => ~w(work_item_id title delivery_owner_session_key brief owner_user_id)a,
     "work-item-icebox" => ~w(work_item_id)a,
     "work-item-reopen" => ~w(work_item_id)a,
     "work-item-trace" => ~w(work_item_id)a,
@@ -4162,7 +4380,23 @@ defmodule Tightbeam.Wire.Router do
         params
 
       true ->
-        Map.delete(params, :assignment_id)
+        if Enum.any?(
+             [
+               :after_ms,
+               :after_turn,
+               :at,
+               :condition_kind,
+               :condition_scope,
+               :cron,
+               :predicate,
+               :replace_queued
+             ],
+             &Map.has_key?(params, &1)
+           ) do
+          Map.delete(params, :assignment_id)
+        else
+          params
+        end
     end
   end
 
@@ -4183,6 +4417,11 @@ defmodule Tightbeam.Wire.Router do
       |> put_optional("diagnostic", diagnostic)
 
     json(conn, status, %{"error" => detail})
+  end
+
+  defp dispatch_error(conn, %{verb: verb}, status, result)
+       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle) do
+    json(conn, status, %{"error" => wire_value(result)})
   end
 
   defp dispatch_error(conn, %{verb: "tune"}, status, result) do

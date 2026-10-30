@@ -11,7 +11,7 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
   def cases do
     [
       {"gateway.ex", "SELECT seq, role, sender, content, attachments", ["index-session", 3, 100],
-       [[1, "user", nil, "visible", "[]"]]},
+       [[1, "user", "user:index-owner", "visible", "[]"]]},
       {"workspace_cleanup.ex", "SELECT sessionKey,nextAt FROM retired_workspace_cleanup", [],
        [["index-session", 0]]},
       {"escalation.ex", "SELECT COUNT(*) FROM lifecycle_events WHERE kind", ["index-decision"],
@@ -100,10 +100,10 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
         (0,'decision_request_ruled','index-decision',NULL),
         (0,'decision_request_ruled','another-decision',NULL),
         (0,'queued_message_suppressed','2','{"messageKind":"sender-replacement"}');
-      INSERT INTO messages(seq,id,sessionKey,role,content,timestamp,llmVisibleMessageId)
-      VALUES (1,'index-visible','index-session','user','visible',0,'index-visible'),
-             (2,'index-hidden','index-session','user','hidden',0,'index-hidden'),
-             (3,'index-foreign','other-session','user','foreign',0,'index-foreign');
+      INSERT INTO messages(seq,id,sessionKey,role,sender,content,timestamp,llmVisibleMessageId)
+      VALUES (1,'index-visible','index-session','user','user:index-owner','visible',0,'index-visible'),
+             (2,'index-hidden','index-session','user','process:synthetic','hidden',0,'index-hidden'),
+             (3,'index-foreign','other-session','user','user:index-owner','foreign',0,'index-foreign');
       INSERT INTO turns(seq,sessionKey,messageId,origin,prompt,status,error,createdAt)
       VALUES (2,'index-session','index-hidden','process:synthetic','fixture','canceled',
               'queued-message-suppressed: sender_requested_replacement',0);

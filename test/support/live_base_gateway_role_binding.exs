@@ -42,6 +42,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
     scheduled =
       wake_handler.(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: old.session_key,
         target_role: "reviewer",
         role_fallback: false,
@@ -80,6 +81,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
     deleted =
       wake_handler.(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: new.session_key,
         target_role: "reviewer",
         role_fallback: false,

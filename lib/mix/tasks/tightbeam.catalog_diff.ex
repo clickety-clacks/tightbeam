@@ -175,6 +175,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
   end
 
   defp settled?(:fresh), do: true
+  defp settled?({:unavailable, {:host_not_configured, _host}}), do: false
   defp settled?({:unavailable, reason}), do: reason != :not_derived
   defp settled?(_state), do: false
 

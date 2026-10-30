@@ -20,7 +20,7 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
   def proof!("current-stamped-readonly", db, base) do
     assert {:opened, incident} = open(db, "current-stamped-readonly")
 
-    assert {:ok, [["launch-preparation-boot-v1-0110"]]} =
+    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert [view] = TerminalCredentialFailure.views(db)
@@ -40,13 +40,11 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
     assert TerminalCredentialFailure.statement(db, incident.id) ==
              "testhost lost codex: its openai credential was rejected. Redirect destination: not yet observed; lawful alternate " <>
                "routing remains enabled. testhost needs a human sign-in for codex; run on " <>
-               "testhost: tightbeam onboard openai --as-user <adminUserId> (replace " <>
-               "<adminUserId> with your own administrator id)."
+               "testhost: tightbeam onboard openai."
 
     expected =
       "testhost lost codex: its openai credential was rejected. Redirect destination: alternate. testhost needs a human sign-in for codex; " <>
-        "run on testhost: tightbeam onboard openai --as-user <adminUserId> " <>
-        "(replace <adminUserId> with your own administrator id)."
+        "run on testhost: tightbeam onboard openai."
 
     assert {:ok, :recorded} =
              DB.transaction(db, fn txn ->
@@ -77,7 +75,7 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
     assert view.canonical_statement == expected
     assert view.redirect_destinations == ["alternate"]
 
-    assert {:ok, [["launch-preparation-boot-v1-0110"]]} =
+    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert [readonly] = TerminalCredentialFailure.readonly_views(base)

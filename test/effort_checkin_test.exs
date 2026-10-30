@@ -2,7 +2,7 @@ defmodule Tightbeam.EffortCheckinTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
-  alias Tightbeam.{Assignments, DB, EffortCheckin, Gateway, Org, Placement, Wakes}
+  alias Tightbeam.{Assignments, DB, Gateway, Org, Placement, Wakes}
 
   setup do
     db = :"effort_retirement_#{System.unique_integer([:positive])}"
@@ -24,10 +24,20 @@ defmodule Tightbeam.EffortCheckinTest do
   end
 
   test "new assignments never arm effort generations, even with the retired setting", ctx do
-    refute EffortCheckin.enabled?(%{
-             effort_checkins_enabled: true,
-             effort_checkin_horizon_ms: 1
-           })
+    previous_enabled = Application.get_env(:tightbeam, :effort_checkins_enabled)
+    previous_horizon = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
+    Application.put_env(:tightbeam, :effort_checkins_enabled, true)
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 1)
+
+    on_exit(fn ->
+      if is_nil(previous_enabled),
+        do: Application.delete_env(:tightbeam, :effort_checkins_enabled),
+        else: Application.put_env(:tightbeam, :effort_checkins_enabled, previous_enabled)
+
+      if is_nil(previous_horizon),
+        do: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms),
+        else: Application.put_env(:tightbeam, :effort_checkin_horizon_ms, previous_horizon)
+    end)
 
     assignment = assign(ctx.db)
 

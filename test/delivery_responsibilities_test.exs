@@ -38,6 +38,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
           {"peer", "owner", "coder"},
           {"consult-po", "owner", "product-owner"},
           {"intake-pdo", "owner", "pdo"},
+          {"office-orchestrator", "owner", "orchestrator"},
           {"reviewer", "owner", "reviewer"},
           {"foreign-pdo", "other", "pdo"},
           {"foreign-worker", "other", "coder"}
@@ -101,8 +102,10 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
       params: %{work_item_id: "wi_a1", delivery_owner_session_key: "pdo-a"}
     }
 
-    assert %{code: "process_denied"} = WorkItems.__handle__(db, "work-item-update", call)
-    assert is_nil(DeliveryResponsibilities.current_owner(db, "wi_a1"))
+    assert %{deliveryOwnerSessionKey: "pdo-a"} =
+             WorkItems.__handle__(db, "work-item-update", call)
+
+    assert DeliveryResponsibilities.current_owner(db, "wi_a1")["accountableSessionKey"] == "pdo-a"
   end
 
   test "owner remedy text describes explicit update without an owner-admin permission claim", %{
@@ -144,11 +147,11 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     {:ok, _} = DB.query(db, "UPDATE sessions SET spawnedBy='pdo-a' WHERE sessionKey='peer'")
 
     for caller <- ["peer", "foreign-worker"] do
-      assert %{code: "delivery_owner_required", message: message} =
+      assert %{openedBySession: ^caller, holderKey: "worker-a"} =
                assign(db, {:session, caller}, "worker-a", "wi_a1")
 
-      assert message =~ "session:pdo-a"
-      assert message =~ "active holder of an open assignment on this exact item"
+      assert DeliveryResponsibilities.current_owner(db, "wi_a1")["accountableSessionKey"] ==
+               "pdo-a"
     end
   end
 
@@ -280,16 +283,17 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert unavailable =~ "replace the link with work-item-update --delivery-owner"
   end
 
-  test "an echoed owner reference is not authority and denial creates no assignment", %{db: db} do
+  test "sessions can staff without becoming the delivery owner", %{db: db} do
     set_owner(db, {:user, "owner"}, "wi_a1", "pdo-a")
     before = count(db, "assignments")
 
-    assert %{code: "delivery_owner_required"} =
+    assert %{openedBySession: "peer", holderKey: "worker-a"} =
              assign(db, {:session, "peer"}, "worker-a", "wi_a1",
                delivery_owner_ref: "session:pdo-a"
              )
 
-    assert count(db, "assignments") == before
+    assert count(db, "assignments") == before + 1
+    assert DeliveryResponsibilities.responsibility(db, "peer", "wi_a1") == "none"
 
     assert %{holderKey: "worker-a"} = assign(db, {:session, "pdo-a"}, "worker-a", "wi_a1")
   end
@@ -302,7 +306,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert DeliveryResponsibilities.responsibility(db, "lane-a", "wi_a1") == "delegated"
     assert DeliveryResponsibilities.responsibility(db, "lane-a", "wi_b1") == "none"
 
-    assert %{code: "delivery_owner_required"} =
+    assert %{openedBySession: "lane-a", holderKey: "worker-a"} =
              assign(db, {:session, "lane-a"}, "worker-a", "wi_b1")
 
     child = assign(db, {:session, "lane-a"}, "worker-a", "wi_a1")
@@ -312,7 +316,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     assert DeliveryResponsibilities.responsibility(db, "lane-a", "wi_a1") == "none"
 
-    assert %{code: "delivery_owner_required"} =
+    assert %{openedBySession: "lane-a", holderKey: "lane-b"} =
              assign(db, {:session, "lane-a"}, "lane-b", "wi_a1")
 
     assert %{holderKey: "peer"} = assign(db, {:session, "worker-a"}, "peer", "wi_a1")
@@ -347,7 +351,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert DeliveryResponsibilities.responsibility(db, "lane-b", "wi_a1") == "none"
 
     for holder <- ["lane-a", "lane-b"] do
-      assert %{code: "delivery_owner_required"} =
+      assert %{openedBySession: ^holder, holderKey: "worker-a"} =
                assign(db, {:session, holder}, "worker-a", "wi_a1")
     end
   end
@@ -375,7 +379,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     assert %{holderKey: "worker-a"} = assign(db, {:session, "lane-a"}, "worker-a", "wi_a1")
 
-    assert %{code: "delivery_owner_required"} =
+    assert %{openedBySession: "pdo-a", holderKey: "peer"} =
              assign(db, {:session, "pdo-a"}, "peer", "wi_a1")
 
     assert {:ok, [["pdo-a", "lane-a"]]} =
@@ -479,6 +483,85 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     assert {:ok, [[0]]} =
              DB.query(db, "SELECT COUNT(*) FROM assignments WHERE workItemId=?1", [item_id])
+  end
+
+  test "production and linked reviews refuse office archetypes while coder work and coordination remain available",
+       %{db: db} do
+    tmp =
+      Path.join(System.tmp_dir!(), "office-target-rules-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(tmp) end)
+    load_delivery_rules!(tmp)
+    handlers = assignment_handlers(db)
+    set_owner(db, {:user, "owner"}, "wi_a1", "pdo-a")
+
+    topology =
+      assign(db, {:session, "pdo-a"}, "lane-a", "wi_a1", effect_kind: "coordination")
+
+    assert %{attest: %{verdictKind: "topology-decided"}} =
+             attest_verdict(db, "lane-a", topology.id, "topology-decided")
+
+    assert {:ok, producer} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               production_call("assign", {:user, "owner"}, "worker-a", "wi_a1")
+             )
+
+    before = count(db, "assignments")
+    wakes_before = count(db, "wakes")
+
+    for {target, archetype} <- [
+          {"consult-po", "product-owner"},
+          {"intake-pdo", "pdo"},
+          {"office-orchestrator", "orchestrator"}
+        ],
+        verb <- ["assign", "dispatch"],
+        effect <- ["code", "review"] do
+      rule = "engineering-#{verb}-production-office-target-refused"
+
+      call =
+        production_call(verb, {:user, "owner"}, target, "wi_a1")
+        |> put_in([:params, :effect_kind], effect)
+
+      call =
+        if effect == "review",
+          do: put_in(call, [:params, :reviews_assignment_id], producer.id),
+          else: call
+
+      assert {:error, %{code: "rule_denied", rule: ^rule}} =
+               Dispatch.dispatch(db, handlers, call),
+             "#{archetype} #{verb} #{effect} must be refused"
+    end
+
+    assert count(db, "assignments") == before
+    assert count(db, "wakes") == wakes_before
+
+    assert {:ok, %{holderKey: "peer", effectKind: "code"}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               production_call("assign", {:user, "owner"}, "peer", "wi_a1")
+             )
+
+    assert {:ok, %{holderKey: "reviewer", effectKind: "review"}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               production_call("assign", {:user, "owner"}, "reviewer", "wi_a1")
+               |> put_in([:params, :effect_kind], "review")
+               |> put_in([:params, :reviews_assignment_id], producer.id)
+             )
+
+    for target <- ["consult-po", "intake-pdo", "office-orchestrator"] do
+      assert {:ok, %{holderKey: ^target, effectKind: "coordination"}} =
+               Dispatch.dispatch(
+                 db,
+                 handlers,
+                 production_call("assign", {:user, "owner"}, target, "wi_a1")
+                 |> put_in([:params, :effect_kind], "coordination")
+               )
+    end
   end
 
   test "loaded engineering rules require owner and topology even with an authentic routing bracket",
@@ -680,18 +763,25 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     before = count(db, "assignments")
     wakes_before = count(db, "wakes")
 
+    {:ok, []} =
+      DB.query(
+        db,
+        "INSERT OR IGNORE INTO hosts(name,baseDir) VALUES('synthetic-host','/synthetic-only')"
+      )
+
     for caller <- ["peer", "foreign-worker"] do
-      assert {:error, %{code: "delivery_owner_required", message: message}} =
+      assert {:ok, %{openedBySession: ^caller, holderKey: "worker-a"}} =
                Dispatch.dispatch(
                  db,
                  handlers,
                  production_call("assign", {:session, caller}, "worker-a", "wi_a1")
                )
-
-      assert message =~ "session:pdo-a"
-      assert count(db, "assignments") == before
-      assert count(db, "wakes") == wakes_before
     end
+
+    assert count(db, "assignments") == before + 2
+    assert count(db, "wakes") >= wakes_before
+    before = count(db, "assignments")
+    wakes_before = count(db, "wakes")
 
     set_owner(db, {:user, "owner"}, "wi_a2", "pdo-b")
     {:ok, _} = DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='pdo-b'")
@@ -727,8 +817,19 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     owner_dispatch = production_call("dispatch", {:session, "pdo-a"}, "peer", "wi_a1")
 
-    assert {:ok, %{rumination_required: true}} =
+    assert {:ok, %{rumination_required: true, id: owner_assignment_id, workItemId: "wi_a1"}} =
              Dispatch.dispatch(db, handlers, owner_dispatch)
+
+    pending_dispatch = production_call("dispatch", {:session, "pdo-a"}, "peer", "wi_a1")
+
+    assert {:ok,
+            %{
+              rumination_required: true,
+              rumination_status: :pending,
+              state: "open",
+              workItemId: "wi_a1"
+            }} =
+             Dispatch.dispatch(db, handlers, pending_dispatch)
 
     assert [owner_rumination] =
              Enum.filter(Tightbeam.Wakes.list_pending(db), fn wake ->
@@ -744,18 +845,22 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     assert Tightbeam.Wakes.rumination_exists?(db, "wi_a1", "pdo-a")
 
-    {:ok, []} =
-      DB.query(
-        db,
-        "INSERT OR IGNORE INTO hosts(name,baseDir) VALUES('synthetic-host','/synthetic-only')"
-      )
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM wakes WHERE rumination=1 AND work_item_id='wi_a1' AND creatorSessionKey='pdo-a' AND state='fired'"
+             )
 
-    assert {:ok, %{holderKey: "peer", workItemId: "wi_a1"}} =
-             Dispatch.dispatch(db, handlers, owner_dispatch)
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM assignments WHERE id=?1 AND holderKey='peer' AND workItemId='wi_a1'",
+               [owner_assignment_id]
+             )
 
     delegated_dispatch = production_call("dispatch", {:session, "lane-a"}, "worker-a", "wi_a1")
 
-    assert {:ok, %{rumination_required: true}} =
+    assert {:ok, %{rumination_required: true, holderKey: "worker-a"}} =
              Dispatch.dispatch(db, handlers, delegated_dispatch)
 
     set_owner(db, {:user, "owner"}, "wi_b1", "peer")
@@ -763,12 +868,14 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     intake = production_call("dispatch", {:session, "peer"}, "intake-pdo", "wi_b1")
     intake = put_in(intake, [:params, :effect_kind], "coordination")
 
-    assert {:ok, %{rumination_required: true}} = Dispatch.dispatch(db, handlers, intake)
+    assert {:ok, %{rumination_required: true, workItemId: "wi_b1"}} =
+             Dispatch.dispatch(db, handlers, intake)
 
     consultation = production_call("dispatch", {:session, "peer"}, "consult-po", "wi_b1")
     consultation = put_in(consultation, [:params, :effect_kind], "coordination")
 
-    assert {:ok, %{rumination_required: true}} = Dispatch.dispatch(db, handlers, consultation)
+    assert {:ok, %{rumination_required: true, workItemId: "wi_b1"}} =
+             Dispatch.dispatch(db, handlers, consultation)
 
     producer = assign(db, {:session, "pdo-a"}, "worker-a", "wi_a1")
     producer_id = producer.id

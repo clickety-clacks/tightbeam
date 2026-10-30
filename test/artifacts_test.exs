@@ -30,7 +30,7 @@ defmodule Tightbeam.ArtifactsTest do
       record(ctx.db, ctx.child.session_key, %{
         kind: "report",
         title: "Private",
-        origin_path: "eezo:/tmp/private"
+        origin_path: "lab1:/tmp/private"
       })
 
     owner = %{kind: "user", id: "flynn", is_admin: false}
@@ -66,7 +66,7 @@ defmodule Tightbeam.ArtifactsTest do
   end
 
   @tag artifact_delta: true
-  test "filtered artifact notices use caller filters and canonical ordered payloads", ctx do
+  test "matching artifact subscriptions deliver canonical ordered payloads", ctx do
     alias Tightbeam.Firehose.Hub
     start_supervised!({Hub, name: Hub})
 
@@ -89,25 +89,25 @@ defmodule Tightbeam.ArtifactsTest do
       record(ctx.db, ctx.child.session_key, %{
         kind: "report",
         title: "Filtered",
-        origin_path: "eezo:/tmp/filtered"
+        origin_path: "lab1:/tmp/filtered"
       })
 
     assert_receive {:firehose_notice,
                     %{
                       "class" => "artifact.recorded",
                       "subscriptionId" => "artifact",
-                      "payload" => recorded_payload,
+                      "payload" => recorded,
                       "refs" => recorded_refs
                     }}
 
     assert recorded_refs["artifactId"] == row.artifact_id
     assert recorded_refs["sessionKey"] == ctx.child.session_key
-    recorded = StateResources.query_artifact(ctx.db, row.artifact_id) |> StateResources.artifact()
-    assert recorded_payload == recorded
-    assert recorded_payload["rowVersion"] == 1
-    assert Hub.sequence(Hub, self()) == 1
-    :ok = Hub.delivered(Hub, self())
-    :ok = Hub.register(Hub, self(), %{user_id: "flynn"})
+
+    recorded_canonical =
+      StateResources.query_artifact(ctx.db, row.artifact_id)
+      |> StateResources.artifact()
+
+    assert recorded == recorded_canonical
 
     :ok =
       Hub.subscribe(Hub, self(), "wrong-work", %{
@@ -143,7 +143,6 @@ defmodule Tightbeam.ArtifactsTest do
              StateResources.encode_item("artifacts", canonical)
 
     assert payload["rowVersion"] == 2
-    :ok = Hub.delivered(Hub, self())
     refute_receive {:firehose_notice, _}
     assert Hub.sequence(Hub, self()) == 2
   end
@@ -246,7 +245,7 @@ defmodule Tightbeam.ArtifactsTest do
       record(ctx.db, ctx.child.session_key, %{
         kind: "report",
         title: "Floor",
-        origin_path: "eezo:/tmp/external-artifact"
+        origin_path: "lab1:/tmp/external-artifact"
       })
 
     assert_receive {:firehose_notice, %{"class" => "artifact.recorded", "payload" => creation}}
@@ -294,7 +293,7 @@ defmodule Tightbeam.ArtifactsTest do
       record(ctx.db, ctx.child.session_key, %{
         kind: "report",
         title: "Legacy",
-        origin_path: "eezo:/tmp/legacy"
+        origin_path: "lab1:/tmp/legacy"
       })
 
     {:ok, _} =
@@ -931,12 +930,12 @@ defmodule Tightbeam.ArtifactsTest do
     on_exit(fn -> File.rm_rf(workspace) end)
 
     # The exact form the operating manual teaches for remote work. Resolving it
-    # against the workspace would make "shrdlu:" a missing directory and raise.
+    # against the workspace would treat the remote-host prefix as a missing directory.
     row =
       record(ctx.db, ctx.child.session_key, %{
         kind: "report",
         title: "Remote vhost",
-        origin_path: "shrdlu:/etc/nginx/sites-enabled/app"
+        origin_path: "node-c:/etc/nginx/sites-enabled/app"
       })
 
     assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)

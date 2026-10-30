@@ -15,7 +15,7 @@ defmodule Tightbeam.Breathing do
 
   @spec handle(DB.server(), map()) :: map()
   def handle(db, %{principal: {kind, principal}, params: params})
-      when kind in [:session, :user] do
+      when kind in [:session, :user, :process] do
     with target_kind when target_kind in ~w(session assignment work-item) <-
            params[:target_kind],
          target_id when is_binary(target_id) and target_id != "" <- params[:target_id] do
@@ -33,13 +33,10 @@ defmodule Tightbeam.Breathing do
     end
   end
 
-  def handle(_db, %{principal: {:process, _}}),
-    do: %{code: "process_denied", message: "process principals cannot use breathing queries"}
-
   def handle(_db, _call),
     do: %{
       code: "principal_required",
-      message: "breathing requires a user credential or session token"
+      message: "breathing requires an authenticated principal"
     }
 
   defp assignment_query(db, id, principal) do

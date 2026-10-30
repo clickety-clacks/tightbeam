@@ -22,7 +22,9 @@ user.
 
        tightbeam host-env-set --sentinel agentic-engineering/landing-watch GH_CONFIG_DIR=<dir>
 
-3. Tell the watcher which branches to watch and which role owns each one.
+3. Scheduled demand determines which pull requests and checks the landing
+   watcher follows. `LANDING_REPOS` is optional and configures only standing
+   branch-owner alerts.
    Each entry is `<owner>/<repo>@<branch>=<owner role>`; separate entries
    with spaces:
 

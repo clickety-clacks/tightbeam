@@ -29,6 +29,7 @@ defmodule Tightbeam.Dispatch do
     Escalation,
     EventLog,
     Firehose.Publisher,
+    Mementos,
     Placement,
     RailEpisodes,
     RailRemedy,
@@ -63,7 +64,7 @@ defmodule Tightbeam.Dispatch do
 
   @type handlers :: %{optional(String.t()) => handler()}
 
-  @read_verbs ~w(facts-read artifact-content-fetch artifact-get artifacts decision-requests
+  @read_verbs ~w(facts-read fact-demand fact-producers artifact-content-fetch artifact-get artifacts mementos decision-requests
     decision-request host-env-list sentinel-list identity-status kungfu-list harness-processes
     role-list breathing work-item-get work-item-trace transcript execution-map execution-map-select
     toplines topline topline-placement-list work-item-list attests assignment-get assignments inspect
@@ -87,7 +88,7 @@ defmodule Tightbeam.Dispatch do
     previous_audited = Process.delete(:tightbeam_dispatch_audited)
 
     try do
-      dispatch_call(db, handlers, call)
+      Rules.with_snapshot(fn -> dispatch_call(db, handlers, call) end)
     after
       if previous_audit,
         do: Process.put(:tightbeam_dispatch_audit, previous_audit),
@@ -113,7 +114,7 @@ defmodule Tightbeam.Dispatch do
         :ok
     end
 
-    helper? = Tightbeam.Ephemeral.read_only?(db, call)
+    helper? = not match?({:session, _}, principal) and Tightbeam.Ephemeral.read_only?(db, call)
 
     case ephemeral_precheck(db, call, verb, helper?) do
       :proceed ->
@@ -180,6 +181,35 @@ defmodule Tightbeam.Dispatch do
   defp bracket_precheck(_db, _call, _verb), do: :proceed
 
   defp dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key, helper?) do
+    case Mementos.protect(fn -> Mementos.prepare_call!(call) end) do
+      %{code: _} = error ->
+        best_effort_denial(db, verb, origin, principal, session_key, error)
+        {:error, error}
+
+      prepared ->
+        dispatch_prepared_through_rail(
+          db,
+          handlers,
+          prepared,
+          verb,
+          origin,
+          principal,
+          session_key,
+          helper?
+        )
+    end
+  end
+
+  defp dispatch_prepared_through_rail(
+         db,
+         handlers,
+         call,
+         verb,
+         origin,
+         principal,
+         session_key,
+         helper?
+       ) do
     {decision, to_close, to_consume} = Rules.decide(db, call)
 
     decision =
@@ -285,6 +315,10 @@ defmodule Tightbeam.Dispatch do
 
   defp close(db, {statute, subject, occurrence}),
     do: RailRemedy.close(db, statute, subject, occurrence)
+
+  @doc false
+  def close_rule_effects(db, _handlers, effects),
+    do: Enum.each(effects, &close(db, &1))
 
   defp dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key) do
     call =
@@ -605,6 +639,10 @@ defmodule Tightbeam.Dispatch do
       {:raised, _exception} -> Map.merge(base, %{code: "server_error", crash: true})
     end
   end
+
+  defp outcome_payload(verb, %{principal: {:process, _}}, {:returned, result})
+       when verb in ~w(assign dispatch revoke-assignment),
+       do: JSON.encode!(result)
 
   defp outcome_payload("onboard", _call, {:returned, result}) when is_map(result),
     do: Map.delete(result, :lease_id)

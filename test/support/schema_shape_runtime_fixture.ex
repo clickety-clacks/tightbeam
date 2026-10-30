@@ -2,7 +2,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   @moduledoc false
   import ExUnit.Assertions
   alias Tightbeam.{DB, NoticeBatcher, Schema}
-  @shape "launch-preparation-boot-v1-0110"
+  @shape "closed-assignment-cannot-proceed-reconciliation-v1-015"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -16,6 +16,13 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     "supervision_fired_lineage_sidecar_required_delete",
     "supervision_fired_lineage_sidecar_identity_immutable"
   ]
+  @dated_holder_continuation_clause """
+  AND w.prompt IS NOT NULL AND (
+    w.waitMode IN ('dependency','after-turn') OR
+    (w.waitMode IS NULL AND w.conditionKind IS NULL AND w.targetRole IS NULL
+     AND w.creatorSessionKey=a.holderKey AND w.dueAt>w.createdAt)
+  )
+  """
 
   # Captured from Schema.ensure_all/1 at be61cfc98df6b18c0cc280adeca42cba3fbf14b5.
   # Keep the old table exact: its missing ruledViaSessionKey column is why this
@@ -423,7 +430,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
     trigger = object_sql(second, "trigger", "supervision_liveness_sidecar_insert_coherent")
     refute trigger =~ "creator.owneruserid=w.owneruserid"
-    refute trigger =~ "w.creatorsessionkey=a.holderkey"
+    assert_timed_holder_continuation_guard!(trigger)
     assert trigger =~ "t.sessionkey=w.creatorsessionkey"
     assert :ok = Schema.ensure_all(second)
 
@@ -871,6 +878,11 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     current_continuation_guard!() |> String.trim()
   end
 
+  def assert_timed_holder_continuation_guard!(sql) do
+    assert normalize_guard(sql) =~ normalize_guard(@dated_holder_continuation_clause)
+    :ok
+  end
+
   defp previous_continuation_guard!(),
     do:
       continuation_guard_fixture!(
@@ -886,7 +898,13 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
 
     assert Regex.match?(ancestry, recorded)
 
-    Regex.replace(ancestry, recorded, "")
+    cross_owner = Regex.replace(ancestry, recorded, "")
+    wait_mode = "AND w.waitMode IN ('dependency','after-turn') AND w.prompt IS NOT NULL"
+    assert [before, after_clause] = String.split(cross_owner, wait_mode)
+
+    current = before <> @dated_holder_continuation_clause <> after_clause
+    assert_timed_holder_continuation_guard!(current)
+    current
   end
 
   # The prior released form retained the creator-owner restriction.

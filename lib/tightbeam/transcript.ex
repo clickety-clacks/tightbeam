@@ -363,6 +363,8 @@ defmodule Tightbeam.Transcript do
     end
   end
 
+  defp caller(_db, {:process, _name}), do: %{owner: nil, admin: true}
+
   defp caller(_db, _principal), do: nil
 
   defp readable?(nil, _session), do: false

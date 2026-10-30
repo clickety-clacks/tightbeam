@@ -197,6 +197,11 @@ defmodule Tightbeam.Wakes do
   CREATE INDEX IF NOT EXISTS wakes_condition ON wakes (state, conditionKind, conditionScope);
   CREATE INDEX IF NOT EXISTS wakes_wait_recognition
     ON wakes (state, waitMode, ownerUserId, recognitionAt, dueAt);
+  -- Reference-only assignment wakes are not holder activity. Retain that
+  -- distinction for the deadline's later activity-history lookup.
+  CREATE TABLE IF NOT EXISTS wake_activity_exclusions (
+    wakeId TEXT PRIMARY KEY
+  );
   CREATE TABLE IF NOT EXISTS wake_retry_attempts (
     wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId),
     rootWakeId TEXT NOT NULL REFERENCES wakes(wakeId),
@@ -453,7 +458,7 @@ defmodule Tightbeam.Wakes do
         (is_nil(event.work_item_id) or
            (is_binary(event.work_item_id) and String.valid?(event.work_item_id) and
               String.trim(event.work_item_id) != "")) and
-        event[:opened_by_kind] in ["user", "session"] and
+        event[:opened_by_kind] in ["user", "session", "process"] and
         is_integer(event[:terminal_at]) and event.terminal_at >= 0 and
         ((event[:source_kind] == "attest" and event[:outcome] in ["completed", "surrendered"]) or
            (event[:source_kind] == "assignment_revocation" and event[:outcome] == "revoked" and
@@ -969,7 +974,7 @@ defmodule Tightbeam.Wakes do
          is_nil(terminal_action_attest_for_event_in_txn(txn, event, recipient)) and
          terminal_action_destination_available_in_txn?(txn, recipient) do
       wake_id = terminal_action_wake_id(root.wake_id, predecessor_id)
-      prompt = terminal_action_prompt(event, root.wake_id)
+      prompt = terminal_action_prompt(txn, event, root.wake_id, recipient)
       condition_kind = terminal_action_condition_kind(root.wake_id)
 
       reminder = %{
@@ -1011,22 +1016,29 @@ defmodule Tightbeam.Wakes do
     @terminal_action_condition_kind <> "-" <> digest
   end
 
-  defp terminal_action_prompt(event, root_wake_id) do
-    "A parent action is still due for child assignment #{event.assignment_id} " <>
-      "(finish occurrence #{event.source_kind}/#{event.source_token}). Choose keep, park, or retire " <>
-      "based on current purpose and obligations, act within your existing authority, then record " <>
-      "what you did on an open assignment with a progress attest naming this child and occurrence. " <>
-      "Use note: completion-handoff-action #{event.assignment_id} #{event.source_kind} " <>
-      "#{event.source_token} kept|parked|retired: <what you did>. " <>
-      "A refusal or failed action must be reported truthfully. Notice #{root_wake_id}."
-  end
+  defp terminal_action_prompt(txn, event, root_wake_id, recipient) do
+    [[state]] =
+      Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [event.child_session_key])
 
-  defp terminal_action_prompt_matches?(wake, event, root_wake_id),
-    do: wake.prompt == terminal_action_prompt(event, root_wake_id)
+    Tightbeam.Reminders.render(txn, "terminal-action", %{
+      child_assignment_id: event.assignment_id,
+      source_kind: event.source_kind,
+      source_token: event.source_token,
+      notice_id: root_wake_id,
+      child_session: event.child_session_key,
+      child_session_state: state,
+      your_last_activity:
+        Tightbeam.Reminders.activity(
+          Tightbeam.Supervision.holder_activity_in_txn(txn, recipient),
+          now()
+        ),
+      child_finished: Tightbeam.Reminders.activity(event.terminal_at, now())
+    })
+  end
 
   defp terminal_action_reminder_matches?(wake, expected) do
     fields =
-      ~w(wake_id session_key origin prompt condition_kind condition_scope creator_session_key owner_user_id obligation_ref)a
+      ~w(wake_id session_key origin condition_kind condition_scope creator_session_key owner_user_id obligation_ref)a
 
     Enum.all?(fields, &(Map.get(wake, &1) == Map.get(expected, &1))) and
       is_integer(wake.condition_after_id)
@@ -1051,7 +1063,7 @@ defmodule Tightbeam.Wakes do
     )
     |> Enum.find_value(fn
       [attest_id, note] when is_binary(attest_id) and is_binary(note) ->
-        if terminal_action_note_matches?(note, event), do: attest_id
+        if terminal_action_note_matches?(txn, note, event), do: attest_id
 
       _ ->
         nil
@@ -1082,7 +1094,7 @@ defmodule Tightbeam.Wakes do
              [attest_id]
            ),
          true <- parent == wake.session_key,
-         true <- terminal_action_note_matches?(note, event) do
+         true <- terminal_action_note_matches?(txn, note, event) do
       {:ok, %{root: root, event: event}}
     else
       _ -> :error
@@ -1104,7 +1116,6 @@ defmodule Tightbeam.Wakes do
          true <- root.owner_user_id == wake.owner_user_id,
          true <- wake.condition_scope == root.wake_id,
          true <- wake.condition_kind == terminal_action_condition_kind(root.wake_id),
-         true <- terminal_action_prompt_matches?(wake, event, root.wake_id),
          true <- wake.origin == "process:tightbeam",
          true <- wake.creator_session_key == event.child_session_key,
          true <- is_nil(wake.assignment_id) and is_nil(wake.work_item_id),
@@ -1148,23 +1159,27 @@ defmodule Tightbeam.Wakes do
     ) == [[1]]
   end
 
-  defp terminal_action_note_matches?(note, event) when is_binary(note) do
+  defp terminal_action_note_matches?(txn, note, event) when is_binary(note) do
     case Regex.run(
            ~r/\Acompletion-handoff-action ([^\s]+) ([^\s]+) ([^\s]+) (kept|parked|retired): (.+)\z/us,
            note,
            capture: :all_but_first
          ) do
-      [assignment_id, source_kind, source_token, _action, detail] ->
+      [assignment_id, source_kind, source_token, action, detail] ->
         terminal_action_event?(event) and assignment_id == event.assignment_id and
           source_kind == event.source_kind and source_token == event.source_token and
-          String.trim(detail) != ""
+          String.trim(detail) != "" and
+          (action != "retired" or
+             Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [
+               event.child_session_key
+             ]) == [["retired"]])
 
       _ ->
         false
     end
   end
 
-  defp terminal_action_note_matches?(_, _), do: false
+  defp terminal_action_note_matches?(_, _, _), do: false
 
   # A reminder is a pending prompt wake addressed to its recipient, so the
   # recipient's pending prompt index holds every candidate.
@@ -1310,12 +1325,11 @@ defmodule Tightbeam.Wakes do
       JOIN assignment_revocations r ON r.id=g.revocationId AND r.assignmentId=a.id
       LEFT JOIN work_items w ON w.id=a.workItemId
       LEFT JOIN sessions parent ON parent.sessionKey=a.openedBySession
-      JOIN users owner ON owner.userId=CASE
-        WHEN a.openedBySession IS NULL THEN a.openedByUser ELSE parent.ownerUserId END
+      LEFT JOIN users owner ON owner.userId=CASE
+        WHEN a.openedBySession IS NOT NULL THEN parent.ownerUserId
+        ELSE COALESCE(a.openedByUser, w.ownerUserId) END
       WHERE a.id=?1
         AND (a.workItemId IS NULL OR w.ownerUserId=owner.userId)
-        AND ((a.openedBySession IS NULL AND a.openedByUser IS NOT NULL)
-          OR (a.openedByUser IS NULL AND a.openedBySession IS NOT NULL))
         AND (
           (a.state='closed' AND a.outcome='revoked' AND a.closingAttestId IS NULL
            AND a.closedAt=r.revokedAt AND a.closedByUser IS r.revokedByUser
@@ -1335,15 +1349,17 @@ defmodule Tightbeam.Wakes do
       [assignment_id]
     )
     |> Enum.map(fn [id, item, child, owner, opened_user, opened_session, token, ts] ->
+      {opener_kind, opener_id} = terminal_opener_in_txn(txn, id, opened_user, opened_session)
+
       %{
         source_kind: "assignment_revocation",
         source_token: token,
         assignment_id: id,
         work_item_id: item,
         child_session_key: child,
-        owner_user_id: owner,
-        opened_by_kind: if(opened_session, do: "session", else: "user"),
-        opened_by_id: opened_session || opened_user,
+        owner_user_id: terminal_owner_in_txn(txn, id, owner),
+        opened_by_kind: opener_kind,
+        opened_by_id: opener_id,
         outcome: "revoked",
         terminal_at: ts
       }
@@ -1365,22 +1381,23 @@ defmodule Tightbeam.Wakes do
         JOIN attests t ON t.id=a.closingAttestId AND t.assignmentId=a.id
         LEFT JOIN work_items w ON w.id=a.workItemId
         LEFT JOIN sessions parent ON parent.sessionKey=a.openedBySession
-        JOIN users owner ON owner.userId=CASE
-          WHEN a.openedBySession IS NULL THEN a.openedByUser ELSE parent.ownerUserId END
+        LEFT JOIN users owner ON owner.userId=CASE
+          WHEN a.openedBySession IS NOT NULL THEN parent.ownerUserId
+        ELSE COALESCE(a.openedByUser, w.ownerUserId) END
         WHERE a.id=?1 AND a.state='closed' AND a.closedBySession=a.holderKey
           AND a.closedByUser IS NULL AND t.bySession=a.holderKey AND t.byUser IS NULL
           AND t.ts=a.closedAt
           AND ((a.outcome='completed' AND t.kind='completion')
             OR (a.outcome='surrendered' AND t.kind='surrender'))
           AND (a.workItemId IS NULL OR w.ownerUserId=owner.userId)
-          AND ((a.openedBySession IS NULL AND a.openedByUser IS NOT NULL)
-            OR (a.openedByUser IS NULL AND a.openedBySession IS NOT NULL))
         """,
         [assignment_id]
       )
 
     case rows do
       [[id, work_item, child, owner, opened_user, opened_session, outcome, closed_at, token]] ->
+        {opener_kind, opener_id} = terminal_opener_in_txn(txn, id, opened_user, opened_session)
+
         {:ok,
          %{
            source_kind: "attest",
@@ -1388,9 +1405,9 @@ defmodule Tightbeam.Wakes do
            assignment_id: id,
            work_item_id: work_item,
            child_session_key: child,
-           owner_user_id: owner,
-           opened_by_kind: if(opened_session, do: "session", else: "user"),
-           opened_by_id: opened_session || opened_user,
+           owner_user_id: terminal_owner_in_txn(txn, id, owner),
+           opened_by_kind: opener_kind,
+           opened_by_id: opener_id,
            outcome: outcome,
            terminal_at: closed_at
          }}
@@ -1401,6 +1418,25 @@ defmodule Tightbeam.Wakes do
           "assignment lacks an exact completion/surrender attest and authorized owner relation"
         )
     end
+  end
+
+  defp terminal_owner_in_txn(txn, id, nil) do
+    {_recipient, owner} = Tightbeam.Assignments.process_notification_recipient_in_txn(txn, id)
+    owner
+  end
+
+  defp terminal_owner_in_txn(_txn, _id, owner), do: owner
+
+  defp terminal_opener_in_txn(_txn, _id, _user, session) when is_binary(session),
+    do: {"session", session}
+
+  defp terminal_opener_in_txn(_txn, _id, user, _session) when is_binary(user),
+    do: {"user", user}
+
+  defp terminal_opener_in_txn(txn, id, nil, nil) do
+    "process:" <> name = Tightbeam.Assignments.process_event_in_txn(txn, id)["principal"]
+
+    {"process", name}
   end
 
   defp terminal_notice_recipient_in_txn(txn, event) do
@@ -1431,9 +1467,20 @@ defmodule Tightbeam.Wakes do
          else: nil
 
     candidates =
-      if event.opened_by_kind == "session",
-        do: [delegated_opener, current, event.opened_by_id, personal],
-        else: [current, personal]
+      case event.opened_by_kind do
+        "session" ->
+          [delegated_opener, current, event.opened_by_id, personal]
+
+        "process" ->
+          [
+            Tightbeam.SessionReparent.current_coordination_parent(txn, event.assignment_id),
+            current,
+            personal
+          ]
+
+        "user" ->
+          [current, personal]
+      end
 
     recipient =
       candidates
@@ -1518,6 +1565,8 @@ defmodule Tightbeam.Wakes do
     {class, class_election} = elected_class(input)
 
     {delivery_rule, due_at} = apply_delivery_policy(txn, input, class, created_at, condition_kind)
+    dated_assignment_id = Map.get(input, :dated_continuation_assignment_id)
+    dated_continuation? = is_binary(dated_assignment_id) and due_at > created_at
 
     wake = %{
       wake_id: Map.get(input, :wake_id, "w_" <> Tightbeam.Id.uuid4()),
@@ -1553,7 +1602,8 @@ defmodule Tightbeam.Wakes do
       digest: Map.get(input, :digest, false),
       summon: Map.get(input, :summon, false),
       owner_user_id: owner_user_id,
-      obligation_ref: Map.get(input, :obligation_ref),
+      obligation_ref:
+        if(dated_continuation?, do: dated_assignment_id, else: Map.get(input, :obligation_ref)),
       wait_mode: Map.get(input, :wait_mode),
       predicate: Map.get(input, :predicate),
       resolver_kind: Map.get(input, :resolver_kind),
@@ -1655,6 +1705,10 @@ defmodule Tightbeam.Wakes do
       ]
     )
 
+    if dated_continuation? do
+      admit_continuation_in_txn(txn, wake)
+    end
+
     if schedule = Map.get(input, :cron) do
       Txn.q(txn, "INSERT INTO cron_wake_schedules(wakeId,schedule) VALUES(?1,?2)", [
         wake.wake_id,
@@ -1700,10 +1754,16 @@ defmodule Tightbeam.Wakes do
       NoticeBatcher.record_policy_in_txn(txn, wake, policy_opts)
     end
 
-    if is_binary(wake.assignment_id) and is_binary(wake.creator_session_key) do
+    activity_assignment_id = Map.get(input, :activity_assignment_id, wake.assignment_id)
+
+    if is_binary(wake.assignment_id) and is_nil(activity_assignment_id) do
+      Txn.q(txn, "INSERT INTO wake_activity_exclusions (wakeId) VALUES (?1)", [wake.wake_id])
+    end
+
+    if is_binary(activity_assignment_id) and is_binary(wake.creator_session_key) do
       Tightbeam.Supervision.activity_in_txn(
         txn,
-        wake.assignment_id,
+        activity_assignment_id,
         wake.creator_session_key,
         wake.created_at
       )
@@ -1825,13 +1885,6 @@ defmodule Tightbeam.Wakes do
          declaration <- capture_condition_cursor_in_txn(txn, declaration),
          {:ok, resolver} <-
            resolver_in_txn(txn, declaration.resolver_ref, obligation.owner_user_id),
-         {:ok, verifier} <-
-           verification_assignment_in_txn(
-             txn,
-             declaration.verification_ref,
-             obligation.owner_user_id
-           ),
-         {:ok, selected} <- verification_policy_in_txn(txn, obligation, verifier),
          {:ok, evaluation} <-
            RuleRuntime.evaluate_predicate_in_txn(txn, %{
              owner_user_id: obligation.owner_user_id,
@@ -1859,30 +1912,11 @@ defmodule Tightbeam.Wakes do
           resolver_id: resolver.id,
           resolver_holder: resolver.holder,
           resolver_addressee: resolver.addressee,
-          necessity: declaration.necessity,
-          verification_assignment_id: verifier.id,
-          verification_holder_key: verifier.holder_key,
-          selected_policy_name: selected.name,
-          verification_state: "provisional",
           originating_turn_seq: turn_seq
         })
 
       wake = recognize_from_snapshot_in_txn(txn, wake, evaluation, resolver, nil)
       admit_continuation_in_txn(txn, wake)
-
-      if is_nil(wake.recognition_path) do
-        verifier_wake = schedule_verifier_notice_in_txn(txn, wake, verifier)
-
-        Txn.q(
-          txn,
-          "UPDATE wakes SET verificationNoticeWakeId=?2 WHERE wakeId=?1 AND verificationNoticeWakeId IS NULL",
-          [wake.wake_id, verifier_wake.wake_id]
-        )
-
-        %{wake | verification_notice_wake_id: verifier_wake.wake_id}
-      else
-        wake
-      end
     end
   end
 
@@ -1898,6 +1932,28 @@ defmodule Tightbeam.Wakes do
     )
 
     wake
+  end
+
+  @doc false
+  def dated_continuation_due_in_txn(%Txn{} = txn, assignment_id, at) do
+    [[due_at]] =
+      Txn.q(
+        txn,
+        """
+        SELECT MAX(w.dueAt) FROM wakes w INDEXED BY wakes_assignment
+        JOIN assignments a ON a.id=w.assignmentId AND a.state='open'
+        JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
+          AND s.assignmentId=a.id AND s.controllerOrigin='holder_continuation'
+          AND s.controllerState='pending'
+        WHERE w.assignmentId=?1 AND w.obligationRef=a.id AND w.sessionKey=a.holderKey
+          AND w.creatorSessionKey=a.holderKey AND w.consumer='prompt'
+          AND w.state='pending' AND w.waitMode IS NULL AND w.conditionKind IS NULL
+          AND w.targetRole IS NULL AND w.dueAt>w.createdAt AND w.dueAt>?2
+        """,
+        [assignment_id, at]
+      )
+
+    due_at
   end
 
   defp continuation_facts_in_txn(txn, wake, assignment_id) do
@@ -1952,9 +2008,10 @@ defmodule Tightbeam.Wakes do
 
     complete =
       dependency and is_map(wake.predicate) and
-        is_binary(wake.necessity) and wake.necessity != "" and
         is_binary(wake.prompt) and wake.prompt != "" and
-        is_binary(wake.selected_policy_name)
+        (is_nil(wake.verification_assignment_id) or
+           (is_binary(wake.necessity) and wake.necessity != "" and
+              is_binary(wake.selected_policy_name)))
 
     if complete, do: stored_dependency_contracts!(wake)
 
@@ -1962,7 +2019,8 @@ defmodule Tightbeam.Wakes do
       "wait.obligation_matches" => matches,
       "wait.admitted" => wake.wait_mode in ~w(dependency after-turn),
       "wait.after_turn_eligible" => wait_eligible_in_txn?(txn, wake),
-      "wait.coverage_valid" => not dependency or accountable,
+      "wait.coverage_valid" =>
+        not dependency or is_nil(wake.verification_assignment_id) or accountable,
       "wait.continuation_state" => continuation_state,
       "wait.recognized" => not is_nil(wake.recognition_at),
       "wait.declaration_complete" => complete,
@@ -2116,29 +2174,18 @@ defmodule Tightbeam.Wakes do
           "predicate has unknown keys: #{Enum.join(Enum.sort(unknown), ", ")}"
         )
 
-      not (is_binary(predicate["necessity"]) and String.trim(predicate["necessity"]) != "") ->
-        wait_error("invalid_predicate", "predicate necessity must be nonblank")
-
       true ->
         with {:ok, resolver_ref} <-
                normalize_reference(
                  predicate["resolverRef"],
                  ~w(assignment decision_request),
                  "resolverRef"
-               ),
-             {:ok, verification_ref} <-
-               normalize_reference(
-                 predicate["verificationRef"],
-                 ["assignment"],
-                 "verificationRef"
                ) do
           {:ok,
            %{
              conditions: predicate["conditions"],
              bindings: predicate["bindings"] || %{},
-             resolver_ref: resolver_ref,
-             necessity: String.trim(predicate["necessity"]),
-             verification_ref: verification_ref
+             resolver_ref: resolver_ref
            }}
         end
     end
@@ -2256,51 +2303,6 @@ defmodule Tightbeam.Wakes do
       _ ->
         wait_error("invalid_resolver", "unknown decision request resolver")
     end
-  end
-
-  defp verification_assignment_in_txn(txn, %{kind: "assignment", id: id}, _owner_user_id) do
-    case Txn.q(
-           txn,
-           """
-           SELECT a.state,a.holderKey,s.ownerUserId
-           FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey
-           WHERE a.id=?1
-           """,
-           [id]
-         ) do
-      [["open", holder_key, _owner]] ->
-        {:ok, %{id: id, state: "open", holder_key: holder_key}}
-
-      _ ->
-        wait_error("invalid_verifier", "verificationRef must name an open assignment")
-    end
-  end
-
-  defp verification_policy_in_txn(txn, obligation, verifier) do
-    case RuleRuntime.select_policy_in_txn(txn, "wait-verification-admission", %{
-           verifier_state: verifier.state,
-           verifier_holder_key: verifier.holder_key,
-           obligation_holder_key: obligation.holder_key
-         }) do
-      {:ok, selected} -> {:ok, selected}
-      :none -> wait_error("verification_not_admitted", "no verification admission policy matched")
-    end
-  end
-
-  defp schedule_verifier_notice_in_txn(txn, wake, verifier) do
-    schedule_in_txn(txn, %{
-      session_key: verifier.holder_key,
-      origin: "process:tightbeam",
-      assignment_id: verifier.id,
-      obligation_ref: verifier.id,
-      owner_user_id: wake.owner_user_id,
-      prompt:
-        "Verify dependency wait #{wake.wake_id} for assignment #{wake.assignment_id}. " <>
-          "Predicate: #{JSON.encode!(wake.predicate)}. Necessity: #{wake.necessity}. " <>
-          "File wait-verified or wait-challenged on #{verifier.id} with --wait #{wake.wake_id}.",
-      due_at: now(),
-      sender_scheduled: true
-    })
   end
 
   defp running_turn_seq_in_txn(_txn, nil), do: nil
@@ -5311,6 +5313,19 @@ defmodule Tightbeam.Wakes do
         [wake.wake_id]
       )
 
+      dated_continuation_canceled? =
+        Txn.changes(txn) == 1 and wake.consumer == "prompt" and
+          is_binary(wake.assignment_id) and wake.obligation_ref == wake.assignment_id and
+          Txn.q(
+            txn,
+            "SELECT 1 FROM wakes WHERE wakeId=?1 AND waitMode IS NULL AND conditionKind IS NULL AND targetRole IS NULL AND dueAt>createdAt",
+            [wake.wake_id]
+          ) == [[1]]
+
+      if dated_continuation_canceled? do
+        Supervision.dated_continuation_canceled_in_txn(txn, wake.assignment_id, canceled_at)
+      end
+
       if is_binary(wake.assignment_id) do
         Tightbeam.ReminderDelivery.canceled_in_txn(txn, wake.assignment_id, wake.wake_id)
       end
@@ -7058,9 +7073,17 @@ defmodule Tightbeam.Wakes do
           client_message_id: "wake-undeliverable:#{wake.wake_id}"
         })
 
-      if disposition in [:appended, :duplicate],
-        do: {wake.wake_id, recipient, owner, marker},
-        else: nil
+      case disposition do
+        :appended ->
+          Tightbeam.Firehose.Publisher.message_in_txn(txn, recipient, marker, owner)
+          {wake.wake_id, recipient, owner, marker}
+
+        :duplicate ->
+          {wake.wake_id, recipient, owner, marker}
+
+        _ ->
+          nil
+      end
     else
       _ -> nil
     end
@@ -7392,7 +7415,12 @@ defmodule Tightbeam.Wakes do
 
     # A parent action reminder waits until the turn that delivered its notice
     # has ended, so it never queues behind the notice it follows up.
-    if cause && not terminal_action_reminder_waiting_for_notice_turn?(txn, wake) do
+    wake =
+      if cause && is_nil(wake.fired_at),
+        do: refresh_terminal_action_in_txn(txn, wake),
+        else: wake
+
+    if cause && wake && not terminal_action_reminder_waiting_for_notice_turn?(txn, wake) do
       fired_at = now()
 
       stamp =
@@ -7457,6 +7485,32 @@ defmodule Tightbeam.Wakes do
   end
 
   defp fire_in_txn(_txn, _wake, _fact_id), do: :noop
+
+  defp refresh_terminal_action_in_txn(txn, %{obligation_ref: @terminal_action_marker <> _} = wake) do
+    case terminal_action_root_event_in_txn(txn, wake) do
+      {:ok, root, event} ->
+        case terminal_action_attest_for_event_in_txn(txn, event, wake.session_key) do
+          nil ->
+            prompt = terminal_action_prompt(txn, event, root.wake_id, wake.session_key)
+
+            Txn.q(txn, "UPDATE wakes SET prompt=?2 WHERE wakeId=?1 AND state='pending'", [
+              wake.wake_id,
+              prompt
+            ])
+
+            %{wake | prompt: prompt}
+
+          attest_id ->
+            cancel_terminal_action_reminder_in_txn(txn, wake, attest_id)
+            nil
+        end
+
+      :error ->
+        wake
+    end
+  end
+
+  defp refresh_terminal_action_in_txn(_txn, wake), do: wake
 
   defp terminal_action_reminder_waiting_for_notice_turn?(
          txn,

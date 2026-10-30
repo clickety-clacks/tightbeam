@@ -143,9 +143,9 @@ defmodule Tightbeam.PlacementTest do
     assert Placement.resolve(archetype, "work-1", hosts) == {:ok, "work-1"}
 
     assert {:error, %{code: "host_not_allowed", message: message}} =
-             Placement.resolve(archetype, "tars", hosts)
+             Placement.resolve(archetype, "lab2", hosts)
 
-    assert message =~ "tars"
+    assert message =~ "lab2"
     assert message =~ "work-1, work-2"
 
     assert {:error, %{code: "unknown_host", message: unknown}} =
@@ -289,7 +289,7 @@ defmodule Tightbeam.PlacementTest do
 
     expected =
       "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> " <>
-        "--name eurisko --as-user <adminUserId>"
+        "--name eurisko"
 
     error =
       assert_raise Placement.Refusal, fn ->
@@ -304,23 +304,9 @@ defmodule Tightbeam.PlacementTest do
     assert error.message == expected
   end
 
-  test "effort_observation names a disappeared session host", %{
-    base_dir: base_dir,
-    db: db
-  } do
-    session = %{session_key: "vanished-effort", host: "eurisko", harness: "claude"}
-
-    expected =
-      "host eurisko is not configured for claude; run tightbeam assimilate <ssh-dest> " <>
-        "--name eurisko --as-user <adminUserId>"
-
-    error =
-      assert_raise Placement.Refusal, fn ->
-        Placement.effort_observation(%{base_dir: base_dir, db: db}, session, "/work")
-      end
-
-    assert error.code == "unknown_host"
-    assert error.message == expected
+  test "origin checks name a disappeared host", %{base_dir: base_dir, db: db} do
+    assert %{"/work/file" => {:error, "no host named eurisko is registered"}} =
+             Placement.check_origins(%{base_dir: base_dir, db: db}, "eurisko", ["/work/file"])
   end
 
   test "move_workdir copies local to local", %{base_dir: base_dir, db: db} do
@@ -1574,7 +1560,7 @@ defmodule Tightbeam.PlacementTest do
   test "an overlay is isolated by both host and harness", %{base_dir: base_dir, db: db} do
     Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
 
-    for host <- ["gibson", "other-host"] do
+    for host <- ["node-a", "other-host"] do
       assert {:ok, _} =
                Placement.register_host(db, host, %{
                  ssh: host,
@@ -1586,7 +1572,7 @@ defmodule Tightbeam.PlacementTest do
     assert {:ok, _row} =
              Placement.set_env_overlay(
                db,
-               "gibson",
+               "node-a",
                "claude",
                "EXAMPLE_OVERLAY_VAR",
                "isolated",
@@ -1609,12 +1595,12 @@ defmodule Tightbeam.PlacementTest do
       sh: sh
     }
 
-    gibson_claude = Placement.adapter_opts!(config, {:claude, "default", "gibson"})[:cmd]
-    gibson_codex = Placement.adapter_opts!(config, {:codex, "default", "gibson"})[:cmd]
+    node_a_claude = Placement.adapter_opts!(config, {:claude, "default", "node-a"})[:cmd]
+    node_a_codex = Placement.adapter_opts!(config, {:codex, "default", "node-a"})[:cmd]
     other_claude = Placement.adapter_opts!(config, {:claude, "default", "other-host"})[:cmd]
 
-    assert "EXAMPLE_OVERLAY_VAR='isolated'" in gibson_claude
-    refute Enum.any?(gibson_codex, &String.starts_with?(&1, "EXAMPLE_OVERLAY_VAR="))
+    assert "EXAMPLE_OVERLAY_VAR='isolated'" in node_a_claude
+    refute Enum.any?(node_a_codex, &String.starts_with?(&1, "EXAMPLE_OVERLAY_VAR="))
     refute Enum.any?(other_claude, &String.starts_with?(&1, "EXAMPLE_OVERLAY_VAR="))
   end
 
@@ -1992,11 +1978,8 @@ defmodule Tightbeam.PlacementTest do
     assert Bitwise.band(File.stat!(sentinel).mode, 0o777) == 0o600
   end
 
-  # wi_263814d3 — accepted-then-dead: the claude adapter's offered/accepted model
-  # set follows the projected home's settings.json "model" pin (proven live —
-  # scripts/probe-opus5.mjs + scripts/probe-reread.mjs: a session/new re-reads the
-  # pin, so a home pinned to model X offers+accepts X and refuses everything
-  # else non-alias).
+  # The adapter reads the projected home's settings.json model pin for each new
+  # session. It offers and accepts the pinned model and rejects unrelated models.
   # The durable fix pins the SESSION'S RESOLVED model, not the fixed org default,
   # so acceptance tracks selection by construction. deliver_home must honour a
   # per-session :model; without it a session that SELECTED opus-5 gets a

@@ -44,6 +44,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Devices,
     Tightbeam.Idempotency,
     Tightbeam.ConditionFacts,
+    Tightbeam.FactProducers,
     Tightbeam.SubagentMarkers,
     Tightbeam.Escalation,
     Tightbeam.Wakes,
@@ -404,12 +405,43 @@ defmodule Tightbeam.Schema do
   @notice_source_payload_shape "notice-source-storage-v1-019"
   @decision_request_row_schema_shape "decision-request-row-schema-v2-019"
   @launch_preparation_boot_shape "launch-preparation-boot-v1-0110"
+  @evidence_release_shape "launch-preparation-evidence-v1-0112"
+  @session_identity_shape "session-identity-v1-0114"
+  @closed_assignment_reconciliation_shape "closed-assignment-cannot-proceed-reconciliation-v1-015"
   @identity_publication_denial_diagnostic_previous_shape @artifact_origin_shape
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
   @supervision_receipt_cancellation_shape "supervision-receipt-cancellation-v1-019"
   @cursor_provider_previous_shape @addressed_po_shape
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @cannot_proceed_shape "cannot-proceed-v1-019"
+  @artifact_durability_objects ~w(
+    artifact_contents
+    artifacts_released_requires_content_insert
+    artifacts_released_requires_content_update
+    artifact_contents_released_immutable
+    artifact_contents_released_retained
+  )
+  @artifact_durability_current_shapes [
+    @legacy_cursor_provider_shape,
+    @cannot_proceed_shape,
+    @addressed_po_shape,
+    @pi_shape,
+    @durability_shape,
+    @cursor_provider_shape,
+    @settlement_shape,
+    @terminal_credential_shape,
+    @agent_reparent_shape,
+    @artifact_origin_shape,
+    @identity_publication_denial_diagnostic_shape,
+    @notice_source_payload_shape,
+    @launch_preparation_boot_shape,
+    @session_identity_shape,
+    @closed_assignment_reconciliation_shape,
+    @evidence_release_shape,
+    @decision_request_row_schema_shape,
+    @assignment_source_replacement_shape,
+    @work_item_owner_link_shape
+  ]
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -1706,6 +1738,9 @@ defmodule Tightbeam.Schema do
   @doc false
   def guard_compatible_stamps do
     [
+      @closed_assignment_reconciliation_shape,
+      @session_identity_shape,
+      @evidence_release_shape,
       @launch_preparation_boot_shape,
       @decision_request_row_schema_shape,
       @notice_source_payload_shape,
@@ -1824,6 +1859,7 @@ defmodule Tightbeam.Schema do
     :ok = ensure_stamp_table(db)
     :ok = ensure_fresh_owner_link_origin(db)
     :ok = check_shape(db)
+    :ok = preflight_artifact_durability(db)
     :ok = upgrade_o2(db)
     {:ok, [[predecessor]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
@@ -1848,6 +1884,9 @@ defmodule Tightbeam.Schema do
             @identity_publication_denial_diagnostic_shape,
             @notice_source_payload_shape,
             @launch_preparation_boot_shape,
+            @session_identity_shape,
+            @closed_assignment_reconciliation_shape,
+            @evidence_release_shape,
             @decision_request_row_schema_shape,
             @assignment_source_replacement_shape,
             @work_item_owner_link_shape
@@ -1922,6 +1961,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_work_item_delivery_owner_link(db)
     :ok = upgrade_supervision_receipt_cancellation_v1(db)
     :ok = upgrade_assignment_source_replacement_v1(db)
+    :ok = ensure_assignment_parent(db)
     :ok = ensure_turn_chat_provenance(db)
     :ok = Tightbeam.QueuedMessageSuppression.ensure_schema(db)
     :ok = Tightbeam.NoticeBatcher.ensure_schema(db)
@@ -1971,6 +2011,21 @@ defmodule Tightbeam.Schema do
     # the first and every later boot leave the same objects.
     :ok = ensure_notice_delivery_runtime_indexes(db)
     :ok = upgrade_effort_holder_activity_cancellation_v1(db)
+    :ok = upgrade_evidence_release(db)
+
+    sender_repair_counts = Tightbeam.Projection.repair_missing_human_senders(db)
+
+    if Enum.any?(Map.values(sender_repair_counts), &(&1 > 0)) do
+      Logger.info(
+        "stored human message sender repair turn=#{sender_repair_counts.turn} " <>
+          "wake=#{sender_repair_counts.wake} owner=#{sender_repair_counts.owner} " <>
+          "left_null=#{sender_repair_counts.left_null}"
+      )
+    end
+
+    :ok = Tightbeam.ToolCalls.ensure_schema(db)
+    :ok = upgrade_session_identity(db)
+    :ok = upgrade_closed_assignment_reconciliation(db)
 
     case DB.finish_schema(db) do
       :ok -> Tightbeam.Recognition.activate(db)
@@ -1981,6 +2036,34 @@ defmodule Tightbeam.Schema do
   defp ensure_wake_assignment_index(db) do
     case DB.migration_transaction(db, :wake_assignment_index, [], [], fn txn ->
            Txn.exec(txn, "CREATE INDEX IF NOT EXISTS wakes_assignment ON wakes(assignmentId)")
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  defp ensure_assignment_parent(db) do
+    case DB.migration_transaction(db, :assignment_parent, [], [], fn txn ->
+           columns = Txn.q(txn, "PRAGMA table_info(assignments)")
+
+           case Enum.find(columns, fn [_, name | _] -> name == "parentAssignmentId" end) do
+             nil ->
+               Txn.exec(
+                 txn,
+                 "ALTER TABLE assignments ADD COLUMN parentAssignmentId TEXT NULL REFERENCES assignments(id)"
+               )
+
+             [_, "parentAssignmentId", "TEXT", 0, nil, 0] ->
+               :ok
+
+             _ ->
+               raise ShapeError, message: "incompatible assignment parent column"
+           end
+
+           Txn.exec(
+             txn,
+             "CREATE INDEX IF NOT EXISTS assignments_parent ON assignments(parentAssignmentId,state,closedAt)"
+           )
          end) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
@@ -2285,7 +2368,13 @@ defmodule Tightbeam.Schema do
                  validate_notice_source_payload_in_txn!(txn)
 
                [[shape]]
-               when shape in [@decision_request_row_schema_shape, @launch_preparation_boot_shape] ->
+               when shape in [
+                      @decision_request_row_schema_shape,
+                      @launch_preparation_boot_shape,
+                      @session_identity_shape,
+                      @closed_assignment_reconciliation_shape,
+                      @evidence_release_shape
+                    ] ->
                  validate_notice_source_payload_in_txn!(txn)
 
                [[@assignment_source_replacement_shape]] ->
@@ -3213,7 +3302,15 @@ defmodule Tightbeam.Schema do
       0 ->
         Enum.with_index(@work_item_body_objects, 1)
         |> Enum.each(fn {object, index} ->
-          :ok = Txn.exec(txn, object.sql)
+          sql =
+            if Txn.q(txn, "SELECT shape FROM schema_stamp") in [
+                 [[@session_identity_shape]],
+                 [[@closed_assignment_reconciliation_shape]]
+               ],
+               do: process_actor_table_sql(object.name, object.sql),
+               else: object.sql
+
+          :ok = Txn.exec(txn, sql)
           validate_work_item_body_object!(txn, object)
           maybe_interrupt_activation!(opts, index)
         end)
@@ -3246,6 +3343,14 @@ defmodule Tightbeam.Schema do
   end
 
   defp validate_work_item_body_object!(txn, %{type: type, name: name, sql: expected}) do
+    expected =
+      if Txn.q(txn, "SELECT shape FROM schema_stamp") in [
+           [[@session_identity_shape]],
+           [[@closed_assignment_reconciliation_shape]]
+         ],
+         do: process_actor_table_sql(name, expected),
+         else: expected
+
     case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2", [type, name]) do
       [[actual]] when is_binary(actual) ->
         if normalize_schema_sql(actual) != normalize_schema_sql(expected),
@@ -3288,6 +3393,9 @@ defmodule Tightbeam.Schema do
                  @assignment_source_replacement_shape,
                  @notice_source_payload_shape,
                  @launch_preparation_boot_shape,
+                 @session_identity_shape,
+                 @closed_assignment_reconciliation_shape,
+                 @evidence_release_shape,
                  @decision_request_row_schema_shape
                ],
                do: assignment_source_replacement_liveness_objects(txn),
@@ -3299,6 +3407,9 @@ defmodule Tightbeam.Schema do
           @assignment_source_replacement_shape,
           @notice_source_payload_shape,
           @launch_preparation_boot_shape,
+          @session_identity_shape,
+          @closed_assignment_reconciliation_shape,
+          @evidence_release_shape,
           @decision_request_row_schema_shape
         ] ->
           Logger.warning(
@@ -3380,6 +3491,9 @@ defmodule Tightbeam.Schema do
            @identity_publication_denial_diagnostic_shape,
            @notice_source_payload_shape,
            @launch_preparation_boot_shape,
+           @session_identity_shape,
+           @closed_assignment_reconciliation_shape,
+           @evidence_release_shape,
            @decision_request_row_schema_shape,
            @assignment_source_replacement_shape,
            @work_item_owner_link_shape
@@ -3398,6 +3512,9 @@ defmodule Tightbeam.Schema do
              @assignment_source_replacement_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
+             @closed_assignment_reconciliation_shape,
+             @evidence_release_shape,
              @decision_request_row_schema_shape
            ] and
              object.name == "supervision_liveness_sidecar_insert_coherent" do
@@ -3996,7 +4113,8 @@ defmodule Tightbeam.Schema do
              normalize_schema_sql(current.sql),
              normalize_schema_sql(recorded_continuation_retry_guard(previous).sql),
              normalize_schema_sql(owner_scoped_continuation_guard(previous).sql),
-             normalize_schema_sql(cross_owner_continuation_guard(previous).sql)
+             normalize_schema_sql(cross_owner_continuation_guard(previous).sql),
+             normalize_schema_sql(dated_continuation_guard(previous).sql)
            ],
            do: incompatible_supervision_liveness!("malformed owned object #{previous.name}")
 
@@ -4040,6 +4158,29 @@ defmodule Tightbeam.Schema do
     %{recorded | sql: Regex.replace(ancestry, recorded.sql, "")}
   end
 
+  defp dated_continuation_guard(previous) do
+    previous = cross_owner_continuation_guard(previous)
+    wait_mode = "AND w.waitMode IN ('dependency','after-turn') AND w.prompt IS NOT NULL"
+    true = String.contains?(previous.sql, wait_mode)
+
+    %{
+      previous
+      | sql:
+          String.replace(
+            previous.sql,
+            wait_mode,
+            """
+            AND w.prompt IS NOT NULL AND (
+              w.waitMode IN ('dependency','after-turn') OR
+              (w.waitMode IS NULL AND w.conditionKind IS NULL AND w.targetRole IS NULL
+               AND w.creatorSessionKey=a.holderKey AND w.dueAt>w.createdAt)
+            )
+            """,
+            global: false
+          )
+    }
+  end
+
   defp migrate_continuation_retry_guard(db) do
     previous =
       Enum.find(
@@ -4047,13 +4188,14 @@ defmodule Tightbeam.Schema do
         &(&1.name == "supervision_liveness_sidecar_insert_coherent")
       )
 
-    current = cross_owner_continuation_guard(previous)
+    current = dated_continuation_guard(previous)
 
     supported = [
       previous,
       continuation_retry_guard(previous),
       recorded_continuation_retry_guard(previous),
       owner_scoped_continuation_guard(previous),
+      cross_owner_continuation_guard(previous),
       current
     ]
 
@@ -4140,7 +4282,13 @@ defmodule Tightbeam.Schema do
                1 = Txn.changes(txn)
                :ok
 
-             [[@launch_preparation_boot_shape]] ->
+             [[shape]]
+             when shape in [
+                    @launch_preparation_boot_shape,
+                    @evidence_release_shape,
+                    @session_identity_shape,
+                    @closed_assignment_reconciliation_shape
+                  ] ->
                # A stamped successor missing its required columns is corruption, not a
                # second opportunity to migrate an inferred shape.
                Txn.q(txn, "SELECT preparationBootIdentity FROM harness_processes LIMIT 0")
@@ -4157,6 +4305,303 @@ defmodule Tightbeam.Schema do
 
       {:error, error} ->
         raise ShapeError, message: "launch preparation migration rolled back: #{inspect(error)}"
+    end
+  end
+
+  # This release line already owns producer attribution, captured content, and
+  # attest binding columns. The successor adds only the evidence constraints,
+  # history, and judgment index; it never impersonates another branch's stamp.
+  defp upgrade_session_identity(db) do
+    case DB.migration_transaction(
+           db,
+           :session_identity,
+           [],
+           ["PRAGMA writable_schema = OFF"],
+           fn txn ->
+             case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+               [[@evidence_release_shape]] ->
+                 # The predecessor is declared by the carrier migration and its two
+                 # subsequent column additions. Only the attribution restriction changes.
+                 previous =
+                   @decision_carrier_requests_ddl
+                   |> String.replace("decision_requests_agent_v1", ~s("decision_requests"))
+                   |> String.replace(
+                     "returnedAt        INTEGER,",
+                     "returnedAt        INTEGER, rowVersion INTEGER NOT NULL DEFAULT 1, " <>
+                       "rowSchemaRevision INTEGER NOT NULL DEFAULT 1,"
+                   )
+
+                 validate_owned_object!(txn, %{
+                   type: "table",
+                   name: "decision_requests",
+                   sql: previous
+                 })
+
+                 current = String.replace(previous, "AND ruledBy = 'user:' || ownerUserId", "")
+                 [[version]] = Txn.q(txn, "PRAGMA schema_version")
+                 :ok = Txn.exec(txn, "PRAGMA writable_schema = ON")
+
+                 Txn.q(
+                   txn,
+                   "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='decision_requests'",
+                   [current |> String.trim() |> String.trim_trailing(";")]
+                 )
+
+                 tables =
+                   ~w(work_items work_item_bodies assignments attests assignment_reopenings assignment_revocations assignment_cannot_proceed assignment_commit_ref_corrections memento_history session_reparent_events) ++
+                     for object <- Tightbeam.Toplines.Schema.manifest(),
+                         object.type == "table",
+                         do: object.name
+
+                 for table <- tables do
+                   [[sql]] =
+                     Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1", [
+                       table
+                     ])
+
+                   Txn.q(txn, "UPDATE sqlite_master SET sql=?2 WHERE type='table' AND name=?1", [
+                     table,
+                     process_actor_table_sql(table, sql)
+                   ])
+                 end
+
+                 Txn.q(
+                   txn,
+                   "UPDATE topline_schema_stamp SET shape='standalone-toplines-v7',stampedAt=?1 WHERE singleton=1",
+                   [System.system_time(:millisecond)]
+                 )
+
+                 :ok = Txn.exec(txn, "PRAGMA schema_version = #{version + 1}")
+                 :ok = Txn.exec(txn, "PRAGMA writable_schema = RESET")
+
+                 # Process assignment provenance remains in the event payload. Index
+                 # only those events so later notices do not scan unrelated history.
+                 :ok =
+                   Txn.exec(txn, """
+                   CREATE INDEX events_process_assignment
+                   ON events (json_extract(payload,'$.id'), verb, id)
+                   WHERE kind='verb' AND verb IN ('assign','dispatch','revoke-assignment')
+                     AND substr(principal,1,8)='process:' AND principal!='process:tightbeam'
+                   """)
+
+                 Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                   @session_identity_shape,
+                   System.system_time(:millisecond),
+                   @evidence_release_shape
+                 ])
+
+                 :ok
+
+               [[shape]]
+               when shape in [@session_identity_shape, @closed_assignment_reconciliation_shape] ->
+                 :ok
+
+               rows ->
+                 raise ShapeError,
+                   message: "incompatible session identity predecessor: #{inspect(rows)}"
+             end
+           end
+         ) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError, message: "session identity migration rolled back: #{inspect(error)}"
+    end
+  end
+
+  defp upgrade_closed_assignment_reconciliation(db) do
+    result =
+      DB.migration_transaction(
+        db,
+        :closed_assignment_reconciliation,
+        [],
+        [],
+        fn txn ->
+          case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+            [[@session_identity_shape]] ->
+              report = Tightbeam.Assignments.reconcile_closed_cannot_proceed_in_txn(txn)
+
+              Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                @closed_assignment_reconciliation_shape,
+                System.system_time(:millisecond),
+                @session_identity_shape
+              ])
+
+              if Txn.changes(txn) != 1 do
+                raise ShapeError,
+                  message: "closed assignment reconciliation lost its exact stamp transition"
+              end
+
+              {:migrated, report}
+
+            [[@closed_assignment_reconciliation_shape]] ->
+              :current
+
+            rows ->
+              raise ShapeError,
+                message:
+                  "incompatible closed assignment reconciliation predecessor: #{inspect(rows)}"
+          end
+        end
+      )
+
+    case result do
+      {:ok, :current} ->
+        :ok
+
+      {:ok, {:migrated, %{settled: settled, skipped: skipped}}} ->
+        Logger.info(
+          "closed assignment cannot-proceed reconciliation settled=#{length(settled)} skipped=#{length(skipped)}"
+        )
+
+        Enum.each(skipped, fn row ->
+          Logger.warning(
+            "closed assignment cannot-proceed left standing assignment=#{row.assignment_id} " <>
+              "condition=#{row.condition_id} reason=#{row.reason}"
+          )
+        end)
+
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "closed assignment reconciliation migration rolled back: #{Exception.message(error)}"
+    end
+  end
+
+  # These are the existing attribution clauses in the stamped predecessor.
+  # Process actors are preserved by the existing event stream; typed user and
+  # session fields remain empty. No record data is rewritten.
+  def process_actor_table_sql("work_items", sql),
+    do:
+      String.replace(
+        sql,
+        ~r/,\s*CHECK\(\(createdByUser IS NOT NULL\) != \(createdBySession IS NOT NULL\)\)/,
+        ""
+      )
+
+  def process_actor_table_sql("work_item_bodies", sql),
+    do:
+      String.replace(
+        sql,
+        ~r/,\s*CHECK\(\(updatedByUser IS NOT NULL\) != \(updatedBySession IS NOT NULL\)\)/,
+        ""
+      )
+
+  def process_actor_table_sql("assignments", sql) do
+    sql
+    |> String.replace(
+      ~r/CHECK\(\(openedByUser IS NOT NULL\) != \(openedBySession IS NOT NULL\)\),\s*/,
+      ""
+    )
+    |> String.replace(
+      ~r/ AND\s+\(\(closedByUser IS NOT NULL\) \+ \(closedBySession IS NOT NULL\) \+ \(closedByProcess IS NOT NULL\) = 1\)/,
+      ""
+    )
+  end
+
+  def process_actor_table_sql("attests", sql),
+    do:
+      String.replace(sql, ~r/ AND\s+\(\(bySession IS NOT NULL\) != \(byUser IS NOT NULL\)\)/, "")
+
+  def process_actor_table_sql("assignment_reopenings", sql),
+    do:
+      String.replace(
+        sql,
+        ~r/,\s*CHECK\(\(reopenedByUser IS NOT NULL\) != \(reopenedBySession IS NOT NULL\)\)/,
+        ""
+      )
+
+  def process_actor_table_sql("assignment_revocations", sql),
+    do:
+      String.replace(
+        sql,
+        ~r/CHECK\(\(revokedByUser IS NOT NULL\) \+ \(revokedBySession IS NOT NULL\) \+ \(revokedByProcess IS NOT NULL\) = 1\),\s*/,
+        ""
+      )
+
+  def process_actor_table_sql("assignment_cannot_proceed", sql) do
+    sql
+    |> String.replace("openerRef TEXT NOT NULL", "openerRef TEXT")
+    |> String.replace("disposerRef TEXT NOT NULL", "disposerRef TEXT")
+  end
+
+  def process_actor_table_sql("assignment_commit_ref_corrections", sql),
+    do: String.replace(sql, "CHECK (actorKind IN ('user','session'))", "")
+
+  def process_actor_table_sql("memento_history", sql),
+    do: String.replace(sql, "CHECK(byKind IN ('session','user'))", "")
+
+  def process_actor_table_sql("session_reparent_events", sql) do
+    sql
+    |> String.replace("CHECK (principalKind IN ('user','session'))", "")
+    |> String.replace("CHECK (originAssignmentOpenerKind IN ('user','session'))", "")
+    |> String.replace(
+      ~r/,\s*CHECK \(\s*\(principalKind='user'.*?length\(principalRef\)>8\)\s*\)/s,
+      ""
+    )
+  end
+
+  def process_actor_table_sql("topline" <> _rest, sql) do
+    sql
+    |> String.replace(
+      ~r/,\s*CHECK \(\s*\(cause IN \('created','last_membership_unlinked'\).*?openedActorRef = 'tightbeam'\)\)\)\s*\)/s,
+      ""
+    )
+    |> String.replace(~r/CHECK \(\w*[Aa]ctorKind IN \('user','session'\)\)/, "")
+    |> String.replace(~r/\w*[Aa]ctorKind IN \('user','session'\) AND /, "")
+    |> String.replace(~r/AND\s+\w*[Aa]ctorKind IN \('user','session'\)/, "")
+  end
+
+  def process_actor_table_sql(_name, sql), do: sql
+
+  defp upgrade_evidence_release(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@launch_preparation_boot_shape]] ->
+               :ok = Tightbeam.EvidenceSchemaRelease.stage_in_txn!(txn)
+
+               Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                 @evidence_release_shape,
+                 System.system_time(:millisecond),
+                 @launch_preparation_boot_shape
+               ])
+
+               if Txn.changes(txn) != 1,
+                 do:
+                   raise(ShapeError,
+                     message: "evidence migration lost its exact stamp transition"
+                   )
+
+               :ok
+
+             [[shape]]
+             when shape in [
+                    @evidence_release_shape,
+                    @session_identity_shape,
+                    @closed_assignment_reconciliation_shape
+                  ] ->
+               Tightbeam.EvidenceSchemaRelease.validate_in_txn!(txn)
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible evidence predecessor: #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "evidence migration rolled back: #{Exception.message(error)}"
     end
   end
 
@@ -4181,7 +4626,13 @@ defmodule Tightbeam.Schema do
                :ok
 
              [[shape]]
-             when shape in [@decision_request_row_schema_shape, @launch_preparation_boot_shape] ->
+             when shape in [
+                    @decision_request_row_schema_shape,
+                    @launch_preparation_boot_shape,
+                    @session_identity_shape,
+                    @closed_assignment_reconciliation_shape,
+                    @evidence_release_shape
+                  ] ->
                :ok =
                  Tightbeam.Escalation.validate_decision_row_schema_revision_in_txn(
                    txn,
@@ -4293,6 +4744,9 @@ defmodule Tightbeam.Schema do
              @assignment_source_replacement_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
+             @closed_assignment_reconciliation_shape,
+             @evidence_release_shape,
              @decision_request_row_schema_shape
            ] do
       incompatible_supervision_liveness!(
@@ -4469,6 +4923,9 @@ defmodule Tightbeam.Schema do
              @assignment_source_replacement_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
+             @closed_assignment_reconciliation_shape,
+             @evidence_release_shape,
              @decision_request_row_schema_shape
            ] ->
         :ok = marker_shape.()
@@ -4626,7 +5083,10 @@ defmodule Tightbeam.Schema do
              @assignment_source_replacement_shape,
              @notice_source_payload_shape,
              @decision_request_row_schema_shape,
-             @launch_preparation_boot_shape
+             @launch_preparation_boot_shape,
+             @session_identity_shape,
+             @closed_assignment_reconciliation_shape,
+             @evidence_release_shape
            ] ->
         if effort_holder_activity_cancellation_active?(txn) do
           Enum.each(
@@ -4878,7 +5338,13 @@ defmodule Tightbeam.Schema do
         check_work_item_owner_link_shape(db)
 
       {:ok, [[shape]]}
-      when shape in [@decision_request_row_schema_shape, @launch_preparation_boot_shape] ->
+      when shape in [
+             @decision_request_row_schema_shape,
+             @launch_preparation_boot_shape,
+             @session_identity_shape,
+             @closed_assignment_reconciliation_shape,
+             @evidence_release_shape
+           ] ->
         :ok = check_work_item_owner_link_shape(db)
         check_decision_request_row_schema_shape(db)
 
@@ -4988,7 +5454,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@launch_preparation_boot_shape}
+          this build: #{@closed_assignment_reconciliation_shape}
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
@@ -5003,7 +5469,8 @@ defmodule Tightbeam.Schema do
         #{@artifact_origin_shape}, #{@identity_publication_denial_diagnostic_shape},
         then #{@work_item_owner_link_shape}, #{@assignment_source_replacement_shape},
         and #{@notice_source_payload_shape}, #{@decision_request_row_schema_shape},
-        then #{@launch_preparation_boot_shape}.
+        then #{@launch_preparation_boot_shape}, followed by #{@evidence_release_shape} and
+        #{@closed_assignment_reconciliation_shape}.
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
         """
@@ -5016,7 +5483,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@launch_preparation_boot_shape}
+          this build: #{@closed_assignment_reconciliation_shape}
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
@@ -5104,6 +5571,9 @@ defmodule Tightbeam.Schema do
                     @identity_publication_denial_diagnostic_shape,
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
+                    @session_identity_shape,
+                    @closed_assignment_reconciliation_shape,
+                    @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
@@ -5209,6 +5679,9 @@ defmodule Tightbeam.Schema do
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
+             @closed_assignment_reconciliation_shape,
+             @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
@@ -5238,6 +5711,9 @@ defmodule Tightbeam.Schema do
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
+             @closed_assignment_reconciliation_shape,
+             @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
@@ -5348,6 +5824,9 @@ defmodule Tightbeam.Schema do
                     @identity_publication_denial_diagnostic_shape,
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
+                    @session_identity_shape,
+                    @closed_assignment_reconciliation_shape,
+                    @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
@@ -5412,58 +5891,35 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  # Refuse an unexpected artifact-content schema before bootstrap modules can
+  # write other objects to a predecessor database.
+  defp preflight_artifact_durability(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[shape]] when shape in @artifact_durability_current_shapes ->
+               validate_artifact_content_schema!(txn)
+
+             _ ->
+               ensure_artifact_content_schema_absent!(txn)
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
   @doc false
   # Artifact durability successor over session-reparent-v1-019. Creates the
   # captured-content store only; every historical module DDL is left alone.
   def upgrade_artifact_durability(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[shape]]
-             when shape in [
-                    @cursor_provider_shape,
-                    @settlement_shape,
-                    @terminal_credential_shape,
-                    @agent_reparent_shape,
-                    @artifact_origin_shape,
-                    @identity_publication_denial_diagnostic_shape,
-                    @notice_source_payload_shape,
-                    @launch_preparation_boot_shape,
-                    @decision_request_row_schema_shape,
-                    @assignment_source_replacement_shape,
-                    @work_item_owner_link_shape
-                  ] ->
-               validate_artifact_content_schema!(txn)
-
-             [[@legacy_cursor_provider_shape]] ->
-               validate_artifact_content_schema!(txn)
-
-             [[@cannot_proceed_shape]] ->
-               validate_artifact_content_schema!(txn)
-
-             [[@addressed_po_shape]] ->
-               validate_artifact_content_schema!(txn)
-
-             [[@pi_shape]] ->
-               validate_artifact_content_schema!(txn)
-
-             [[@durability_shape]] ->
+             [[shape]] when shape in @artifact_durability_current_shapes ->
                validate_artifact_content_schema!(txn)
 
              [[@reparent_shape]] ->
-               previous_fk_violations =
-                 []
-
-               existing =
-                 Txn.q(
-                   txn,
-                   "SELECT name FROM sqlite_master WHERE name IN ('artifact_contents', 'artifacts_released_requires_content_insert', 'artifacts_released_requires_content_update', 'artifact_contents_released_immutable', 'artifact_contents_released_retained') ORDER BY name"
-                 )
-
-               if existing != [],
-                 do:
-                   raise(ShapeError,
-                     message: "incompatible artifact durability objects: #{inspect(existing)}"
-                   )
+               ensure_artifact_content_schema_absent!(txn)
+               previous_fk_violations = []
 
                :ok = Tightbeam.ArtifactContent.schema_in_txn(txn)
 
@@ -5497,6 +5953,24 @@ defmodule Tightbeam.Schema do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
     end
+  end
+
+  defp ensure_artifact_content_schema_absent!(txn) do
+    object_names = Enum.map_join(@artifact_durability_objects, ",", &"'#{&1}'")
+
+    existing =
+      Txn.q(
+        txn,
+        "SELECT name FROM sqlite_master WHERE name IN (#{object_names}) ORDER BY name"
+      )
+
+    if existing != [],
+      do:
+        raise(ShapeError,
+          message: "incompatible artifact durability objects: #{inspect(existing)}"
+        )
+
+    :ok
   end
 
   defp validate_artifact_content_schema!(txn) do
@@ -5535,6 +6009,9 @@ defmodule Tightbeam.Schema do
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
+             @closed_assignment_reconciliation_shape,
+             @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
@@ -6658,6 +7135,9 @@ defmodule Tightbeam.Schema do
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
+             @closed_assignment_reconciliation_shape,
+             @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
@@ -6696,6 +7176,9 @@ defmodule Tightbeam.Schema do
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
+             @closed_assignment_reconciliation_shape,
+             @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
@@ -6812,6 +7295,9 @@ defmodule Tightbeam.Schema do
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
+             @closed_assignment_reconciliation_shape,
+             @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
@@ -7074,6 +7560,9 @@ defmodule Tightbeam.Schema do
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
+             @session_identity_shape,
+             @closed_assignment_reconciliation_shape,
+             @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
@@ -7100,6 +7589,9 @@ defmodule Tightbeam.Schema do
                     @identity_publication_denial_diagnostic_shape,
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
+                    @session_identity_shape,
+                    @closed_assignment_reconciliation_shape,
+                    @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
@@ -7139,6 +7631,9 @@ defmodule Tightbeam.Schema do
                     @work_item_owner_link_shape,
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
+                    @session_identity_shape,
+                    @closed_assignment_reconciliation_shape,
+                    @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
                     @identity_publication_denial_diagnostic_shape
@@ -7205,6 +7700,9 @@ defmodule Tightbeam.Schema do
                       @work_item_owner_link_shape,
                       @notice_source_payload_shape,
                       @launch_preparation_boot_shape,
+                      @session_identity_shape,
+                      @closed_assignment_reconciliation_shape,
+                      @evidence_release_shape,
                       @decision_request_row_schema_shape,
                       @assignment_source_replacement_shape,
                       @identity_publication_denial_diagnostic_shape
@@ -7261,6 +7759,9 @@ defmodule Tightbeam.Schema do
                     @work_item_owner_link_shape,
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
+                    @session_identity_shape,
+                    @closed_assignment_reconciliation_shape,
+                    @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
                     @identity_publication_denial_diagnostic_shape
@@ -7325,6 +7826,9 @@ defmodule Tightbeam.Schema do
                     @identity_publication_denial_diagnostic_shape,
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
+                    @session_identity_shape,
+                    @closed_assignment_reconciliation_shape,
+                    @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
@@ -7373,6 +7877,9 @@ defmodule Tightbeam.Schema do
                     @assignment_source_replacement_shape,
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
+                    @session_identity_shape,
+                    @closed_assignment_reconciliation_shape,
+                    @evidence_release_shape,
                     @decision_request_row_schema_shape
                   ] ->
                :ok
