@@ -899,9 +899,10 @@ defmodule Tightbeam.CliIntegrationTest do
     assert dependency.obligation_ref == assignment
     assert dependency.creator_session_key == "cli-holder"
     assert dependency.originating_turn_seq == turn.seq
-    assert dependency.verification_assignment_id == verifier
-    assert dependency.verification_state == "provisional"
-    assert dependency.selected_policy_name == "accountable-dependency-verifier"
+    assert dependency.verification_assignment_id == nil
+    assert dependency.verification_state == nil
+    assert dependency.selected_policy_name == nil
+    assert dependency.verification_notice_wake_id == nil
     assert dependency.resolver_id == resolver
     assert dependency.due_at > System.system_time(:millisecond)
     assert dependency.prompt == dependency_prompt
@@ -1973,7 +1974,9 @@ defmodule Tightbeam.CliIntegrationTest do
           "--brief",
           "Investigate the restored CLI path.",
           "--key",
-          "dispatch-cli"
+          "dispatch-cli",
+          "--parent-assignment",
+          assignment_id
         ],
         cd: ctx.workdir,
         stderr_to_stdout: true
@@ -1981,6 +1984,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     dispatch_id = JSON.decode!(dispatched)["id"]
     assert "asg_" <> _ = dispatch_id
+    assert JSON.decode!(dispatched)["parentAssignmentId"] == assignment_id
 
     assert_receive {:cli_call,
                     %{
@@ -1990,7 +1994,8 @@ defmodule Tightbeam.CliIntegrationTest do
                       params: %{
                         subject: "investigate",
                         brief: "Investigate the restored CLI path.",
-                        idempotency_key: "dispatch-cli"
+                        idempotency_key: "dispatch-cli",
+                        parent_assignment_id: ^assignment_id
                       }
                     }}
 

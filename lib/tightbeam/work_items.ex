@@ -1034,7 +1034,7 @@ defmodule Tightbeam.WorkItems do
               session_key: Org.personal_session_key(owner),
               origin: @origin,
               prompt:
-                "slate clear on #{work_item_id}: close it, card more work, or rule it failed",
+                Tightbeam.Reminders.render(txn, "work-item-slate", %{work_item_id: work_item_id}),
               due_at: now(),
               sender_scheduled: true,
               work_item_id: work_item_id
@@ -1078,7 +1078,8 @@ defmodule Tightbeam.WorkItems do
               Wakes.schedule_in_txn(txn, %{
                 session_key: Org.personal_session_key(owner),
                 origin: @origin,
-                prompt: "slate clear on #{item_id}: close it, card more work, or rule it failed",
+                prompt:
+                  Tightbeam.Reminders.render(txn, "work-item-slate", %{work_item_id: item_id}),
                 due_at: now() + triage_deadline_ms(),
                 sender_scheduled: true,
                 work_item_id: item_id
@@ -1188,7 +1189,8 @@ defmodule Tightbeam.WorkItems do
       Wakes.schedule_in_txn(txn, %{
         session_key: Org.personal_session_key(owner),
         origin: @origin,
-        prompt: "route it or icebox it — work item #{id}: #{title}",
+        prompt:
+          Tightbeam.Reminders.render(txn, "work-item-routing", %{work_item_id: id, title: title}),
         due_at: now() + triage_deadline_ms(),
         sender_scheduled: true,
         work_item_id: id

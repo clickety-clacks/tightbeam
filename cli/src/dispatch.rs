@@ -752,6 +752,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             effect_kind,
             files,
             succeeds,
+            parent_assignment,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -783,6 +784,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = succeeds {
                 params.push(string_field("succeedsAssignmentId", value));
             }
+            if let Some(value) = parent_assignment {
+                params.push(string_field("parentAssignmentId", value));
+            }
             append_mementos(&mut params, mementos);
             Ok(request(identity, "assign", vec![target], params))
         }
@@ -798,6 +802,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             brief,
             idempotency_key,
             succeeds,
+            parent_assignment,
         } => {
             let mut params = vec![
                 string_field("subject", subject),
@@ -820,6 +825,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = succeeds {
                 params.push(string_field("succeedsAssignmentId", value));
+            }
+            if let Some(value) = parent_assignment {
+                params.push(string_field("parentAssignmentId", value));
             }
             append_mementos(&mut params, mementos);
             Ok(request(
@@ -4017,6 +4025,35 @@ fn current_session_key_from(cwd: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parent_assignment_is_forwarded_for_both_opening_routes() {
+        for args in [
+            vec![
+                "assign",
+                "--subject",
+                "child",
+                "--session",
+                "worker",
+                "--parent-assignment",
+                "parent-task",
+            ],
+            vec![
+                "dispatch",
+                "--subject",
+                "child",
+                "--to",
+                "worker",
+                "--brief",
+                "do work",
+                "--parent-assignment",
+                "parent-task",
+            ],
+        ] {
+            let encoded: serde_json::Value = serde_json::from_str(&body(&args)).unwrap();
+            assert_eq!(encoded["params"]["parentAssignmentId"], "parent-task");
+        }
+    }
+
     #[test]
     fn harklight_lifecycle_wire_fields_and_order() {
         let commands = [

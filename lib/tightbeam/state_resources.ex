@@ -58,7 +58,7 @@ defmodule Tightbeam.StateResources do
           WHERE g.assignmentId = a.id AND g.reopeningId IS
             (SELECT reopening.id FROM assignment_reopenings reopening
              WHERE reopening.assignmentId = a.id ORDER BY reopening.id DESC LIMIT 1)),
-         a.workItemId, a.reviewsAssignmentId, a.holderHarness, a.holderProvider,
+         a.workItemId, a.reviewsAssignmentId, a.parentAssignmentId, a.holderHarness, a.holderProvider,
          COALESCE(
            (SELECT json_group_array(path) FROM (
              SELECT path FROM assignment_files
@@ -222,7 +222,7 @@ defmodule Tightbeam.StateResources do
     "work items" =>
       ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority rowVersion),
     "assignments" =>
-      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
+      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
     "attests" =>
       ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs ts rowVersion),
     "wakes" =>
@@ -277,11 +277,11 @@ defmodule Tightbeam.StateResources do
     },
     "assignments" => %{
       strings:
-        ~w(id subject holderKey holderRole openedByUser openedBySession state outcome closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider effectKind derivedStatus),
+        ~w(id subject holderKey holderRole openedByUser openedBySession state outcome closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider effectKind derivedStatus),
       integers: ~w(openedAt closedAt rowVersion),
       booleans: ~w(holderFallback),
       nullable:
-        ~w(holderRole openedByUser openedBySession outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider)
+        ~w(holderRole openedByUser openedBySession outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider)
     },
     "attests" => %{
       strings:
@@ -1783,6 +1783,7 @@ defmodule Tightbeam.StateResources do
          revocation_reason,
          work_item_id,
          reviews_assignment_id,
+         parent_assignment_id,
          holder_harness,
          holder_provider,
          files,
@@ -1808,6 +1809,7 @@ defmodule Tightbeam.StateResources do
       revocation_reason: revocation_reason,
       work_item_id: work_item_id,
       reviews_assignment_id: reviews_assignment_id,
+      parent_assignment_id: parent_assignment_id,
       holder_harness: holder_harness,
       holder_provider: holder_provider,
       files: JSON.decode!(files),

@@ -480,7 +480,11 @@ defmodule Tightbeam.RailRemedy do
               principal: principal,
               session_key: target,
               params: %{
-                prompt: "Remedy #{rule.name} remains pending for #{subject}.",
+                prompt:
+                  Tightbeam.Reminders.render_db(db, "remedy-pending", %{
+                    rule: rule.name,
+                    subject: subject
+                  }),
                 after_ms: 0,
                 nudge: false,
                 idempotency_key: key

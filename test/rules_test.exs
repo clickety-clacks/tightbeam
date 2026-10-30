@@ -91,7 +91,7 @@ defmodule Tightbeam.RulesTest do
     assert Rules.evaluate(ctx.db, call()) == :ok
   end
 
-  test "predicate policy loading refuses incomplete verification and invalid conditions", ctx do
+  test "retired verification policies skip validation without making commands unavailable", ctx do
     valid = """
     [[policy]]
     name = "verifier"
@@ -111,11 +111,12 @@ defmodule Tightbeam.RulesTest do
         ] do
       path = put_raw(ctx, contents)
 
-      error =
-        assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
+      log =
+        ExUnit.CaptureLog.capture_log(fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
-      assert error.message =~ path
-      assert error.message =~ "verifier"
+      assert log =~ path
+      assert log =~ "purpose wait-verification-admission is retired"
+      assert Rules.evaluate(ctx.db, call()) == :ok
     end
   end
 

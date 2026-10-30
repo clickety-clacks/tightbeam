@@ -1,0 +1,1 @@
+FINAL RETIRE INSTRUCTION: clean up critical section '{reason}'; retirement is deferred only until hard deadline {hard_deadline}.

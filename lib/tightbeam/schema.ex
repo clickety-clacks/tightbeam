@@ -1957,6 +1957,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_work_item_delivery_owner_link(db)
     :ok = upgrade_supervision_receipt_cancellation_v1(db)
     :ok = upgrade_assignment_source_replacement_v1(db)
+    :ok = ensure_assignment_parent(db)
     :ok = ensure_turn_chat_provenance(db)
     :ok = Tightbeam.QueuedMessageSuppression.ensure_schema(db)
     :ok = Tightbeam.NoticeBatcher.ensure_schema(db)
@@ -2030,6 +2031,34 @@ defmodule Tightbeam.Schema do
   defp ensure_wake_assignment_index(db) do
     case DB.migration_transaction(db, :wake_assignment_index, [], [], fn txn ->
            Txn.exec(txn, "CREATE INDEX IF NOT EXISTS wakes_assignment ON wakes(assignmentId)")
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  defp ensure_assignment_parent(db) do
+    case DB.migration_transaction(db, :assignment_parent, [], [], fn txn ->
+           columns = Txn.q(txn, "PRAGMA table_info(assignments)")
+
+           case Enum.find(columns, fn [_, name | _] -> name == "parentAssignmentId" end) do
+             nil ->
+               Txn.exec(
+                 txn,
+                 "ALTER TABLE assignments ADD COLUMN parentAssignmentId TEXT NULL REFERENCES assignments(id)"
+               )
+
+             [_, "parentAssignmentId", "TEXT", 0, nil, 0] ->
+               :ok
+
+             _ ->
+               raise ShapeError, message: "incompatible assignment parent column"
+           end
+
+           Txn.exec(
+             txn,
+             "CREATE INDEX IF NOT EXISTS assignments_parent ON assignments(parentAssignmentId,state,closedAt)"
+           )
          end) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error

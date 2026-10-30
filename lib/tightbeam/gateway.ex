@@ -3782,9 +3782,10 @@ defmodule Tightbeam.Gateway do
               owner_user_id: owner,
               origin: "process:tightbeam",
               prompt:
-                "Identity staleness: #{late_count} active " <>
-                  "#{if late_count == 1, do: "session is", else: "sessions are"} late for " <>
-                  "published revision #{revision}.",
+                Tightbeam.Reminders.render(txn, "identity-staleness", %{
+                  late_count: late_count,
+                  revision: revision
+                }),
               due_at: now,
               target_gate: 0
             })
@@ -10359,7 +10360,10 @@ defmodule Tightbeam.Gateway do
             session_key: session_key,
             origin: "user:#{owner}",
             prompt:
-              "FINAL RETIRE INSTRUCTION: clean up critical section '#{lease.reason}'; retirement is deferred only until hard deadline #{lease.hard_deadline}.",
+              Tightbeam.Reminders.render(txn, "critical-lease-retire", %{
+                reason: lease.reason,
+                hard_deadline: lease.hard_deadline
+              }),
             due_at: lease.hard_deadline
           })
 

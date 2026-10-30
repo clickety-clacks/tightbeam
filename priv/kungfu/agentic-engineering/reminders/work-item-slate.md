@@ -1,0 +1,1 @@
+slate clear on {work_item_id}: close it, card more work, or rule it failed

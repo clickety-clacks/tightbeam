@@ -27,10 +27,27 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
       do: {:reply, :ok, parent}
   end
 
-  setup do
+  setup tags do
     db = :"completion_handoff_#{System.unique_integer([:positive])}"
     scheduler = Tightbeam.WakeScheduler
-    start_supervised!({DB, path: ":memory:", name: db})
+    root = Path.join(System.tmp_dir!(), "handoff-files-#{System.unique_integer([:positive])}")
+
+    prepared =
+      if tags[:persistent],
+        do: Tightbeam.GuardRuntimeFixture.prepare!(root, "schema_shape_runtime.exs")
+
+    opts =
+      if prepared,
+        do: [
+          path: Path.join(prepared.base, "state.db"),
+          name: db,
+          guard_inputs: [],
+          payload_root: prepared.payload
+        ],
+        else: [path: ":memory:", name: db]
+
+    start_supervised!({DB, opts})
+    on_exit(fn -> File.rm_rf!(root) end)
     :ok = Tightbeam.Schema.ensure_all(db)
 
     register_hosts(db, %{
@@ -62,7 +79,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
       )
     )
 
-    %{db: db, scheduler: scheduler, handlers: handlers}
+    %{db: db, scheduler: scheduler, handlers: handlers, base: prepared && prepared.base}
   end
 
   test "a delivered finish notice starts successive fallback reminders and survives restart",
@@ -682,6 +699,131 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert turn_count(ctx.db, pending.wake_id) == before
   end
 
+  for retired_before_due <- [false, true] do
+    test "a retired note checks actual child state at filing and due time: #{retired_before_due}",
+         ctx do
+      {parent, child, root} = completed_child(ctx)
+      assert :ok = Wakes.fire_due(ctx.scheduler)
+      carrier = assert_delivered_carrier(ctx.db, root.wake_id)
+      finish_carrier_turn!(ctx.db, carrier)
+      [pending] = await_pending_reminders(ctx.db, root.wake_id)
+      note = action_note(child.id, root, "retired", "requested retirement")
+
+      assert %{attest: %{kind: "progress"}} =
+               handle(ctx, "attest", progress_call({:session, "notice-parent"}, parent.id, note))
+
+      assert Wakes.get(ctx.db, pending.wake_id).state == "pending"
+
+      if unquote(retired_before_due) do
+        {:ok, _} =
+          DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='holder'")
+      end
+
+      set_due_now(ctx.db, pending.wake_id)
+      assert :ok = Wakes.fire_due(ctx.scheduler)
+      result = Wakes.get(ctx.db, pending.wake_id)
+
+      if unquote(retired_before_due) do
+        assert result.state == "canceled"
+        assert turn_count(ctx.db, pending.wake_id) == 0
+      else
+        assert result.state == "fired"
+        assert result.prompt =~ "Child session holder is active"
+        assert result.prompt =~ "UTC ("
+        assert result.prompt =~ "Do not file progress unless something materially changed"
+        refute result.prompt =~ "parked"
+      end
+    end
+  end
+
+  @tag persistent: true
+  test "published terminal wording uses current activity and stored identity still accepts an old receipt",
+       ctx do
+    alias Tightbeam.{Identity, Reminders}
+    Identity.init!(ctx.base)
+    {:ok, candidate} = Identity.learn!(ctx.base, "agentic-engineering", "test")
+    {:ok, _} = Identity.publish_live!(ctx.base, candidate)
+    {parent, child, root} = completed_child(ctx)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    carrier = assert_delivered_carrier(ctx.db, root.wake_id)
+    finish_carrier_turn!(ctx.db, carrier)
+    [pending] = await_pending_reminders(ctx.db, root.wake_id)
+    # Old prompt bytes have no role in the persisted completion identity.
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE wakes SET prompt='Earlier release reminder text' WHERE wakeId=?1",
+        [pending.wake_id]
+      )
+
+    dir = Path.join(ctx.base, "identity")
+
+    File.write!(
+      Path.join(dir, "reminders/terminal-action.md"),
+      "Current {child_session_state}; activity {your_last_activity}; finished {child_finished}"
+    )
+
+    {_, 0} = System.cmd("git", ["add", "-A"], cd: dir)
+
+    {_, 0} =
+      System.cmd(
+        "git",
+        [
+          "-c",
+          "user.name=Test",
+          "-c",
+          "user.email=test@example.invalid",
+          "commit",
+          "-m",
+          "Edit reminder"
+        ],
+        cd: dir
+      )
+
+    {revision, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: dir)
+
+    {:ok, _} =
+      Identity.publish_live!(ctx.base, %{
+        candidate_revision: String.trim(revision),
+        expected_prior: Identity.live_revision!(ctx.base)
+      })
+
+    other =
+      handle(ctx, "assign", assign_call({:user, "flynn"}, "notice-parent", "other work", nil))
+
+    %{attest: attest} =
+      handle(
+        ctx,
+        "attest",
+        progress_call({:session, "notice-parent"}, other.id, "material result")
+      )
+
+    set_due_now(ctx.db, pending.wake_id)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    prompt = Wakes.get(ctx.db, pending.wake_id).prompt
+
+    assert prompt =~
+             "Current active; activity " <>
+               Reminders.activity(attest.ts, System.system_time(:millisecond))
+
+    finish_carrier_turn!(ctx.db, assert_delivered_carrier(ctx.db, pending.wake_id))
+    [successor] = await_pending_reminders(ctx.db, root.wake_id)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE wakes SET prompt='Earlier release reminder text' WHERE wakeId=?1",
+        [successor.wake_id]
+      )
+
+    note = action_note(child.id, root, "kept", "kept for further work")
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(ctx, "attest", progress_call({:session, "notice-parent"}, parent.id, note))
+
+    assert Wakes.get(ctx.db, successor.wake_id).state == "canceled"
+  end
+
   test "a malformed action note does not suppress the first terminal reminder", ctx do
     {parent_assignment, child_assignment, root} = completed_child(ctx)
     [source_kind, source_token] = terminal_source(root.prompt)
@@ -720,6 +862,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
                progress_call({:session, "notice-parent"}, parent_assignment.id, malformed)
              )
 
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='holder'")
     valid = action_note(child_assignment.id, root, "retired", "retired the completed child")
 
     assert %{attest: %{kind: "progress"}} =
@@ -772,6 +915,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     [successor] = await_pending_reminders(ctx.db, root.wake_id)
     assert_delivered_carrier(ctx.db, pending.wake_id)
 
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='holder'")
     action = action_note(child_assignment.id, root, "retired", "retired the idle child session")
 
     assert %{attest: %{kind: "progress"}} =
