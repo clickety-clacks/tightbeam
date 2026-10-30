@@ -1523,6 +1523,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       IO.puts("#{index}: #{plan_text}")
       assert plan_text =~ index, plan_text
       refute plan_text =~ "USE TEMP B-TREE", plan_text
+      refute plan_text =~ "SCAN org_settings", plan_text
     end
 
     for {sql, params, index} <-
@@ -1535,6 +1536,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       plan_text = inspect(plan)
       IO.puts("single-event #{index}: #{plan_text}")
       assert plan_text =~ index, plan_text
+      refute plan_text =~ "SCAN org_settings", plan_text
     end
 
     {notice_sql, notice_params} =
