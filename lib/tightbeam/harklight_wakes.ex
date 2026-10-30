@@ -29,6 +29,17 @@ defmodule Tightbeam.HarklightWakes do
   );
   CREATE UNIQUE INDEX IF NOT EXISTS harklight_send_bound_request
     ON harklight_send_operations(senderId,messageId);
+  CREATE TABLE IF NOT EXISTS harklight_pending_supersedes (
+    opId TEXT NOT NULL REFERENCES harklight_send_operations(opId),
+    senderId TEXT NOT NULL,
+    messageId TEXT NOT NULL,
+    PRIMARY KEY(opId,senderId,messageId)
+  );
+  CREATE INDEX IF NOT EXISTS harklight_pending_supersedes_target
+    ON harklight_pending_supersedes(senderId,messageId,opId);
+  CREATE TABLE IF NOT EXISTS harklight_schema_migrations (
+    migration TEXT PRIMARY KEY
+  );
   CREATE TABLE IF NOT EXISTS harklight_wake_handles (
     handle TEXT PRIMARY KEY,
     sessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
@@ -109,7 +120,10 @@ defmodule Tightbeam.HarklightWakes do
   @uuid4 ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
 
   def ensure_schema(db \\ DB) do
-    with :ok <- DB.execute(db, @ddl), do: HarklightLifecycle.ensure_schema(db)
+    with :ok <- DB.execute(db, @ddl),
+         :ok <- HarklightLifecycle.ensure_schema(db) do
+      backfill_pending_supersedes(db)
+    end
   end
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -127,6 +141,7 @@ defmodule Tightbeam.HarklightWakes do
          %{state: "active", host: host} <- Org.get(db, session_key),
          true <- host == Placement.local_host_name() do
       now = System.system_time(:millisecond)
+      supersedes = pending_supersede_targets(payload)
 
       case DB.transaction(db, fn txn ->
              case Txn.q(
@@ -141,9 +156,20 @@ defmodule Tightbeam.HarklightWakes do
                    [op_id, session_key, host, payload, now]
                  )
 
+                 insert_pending_supersedes(txn, op_id, supersedes)
+
                  {:ok, "pending"}
 
                [[^session_key, ^host, ^payload, state]] ->
+                 if state == "pending" and
+                      Txn.q(
+                        txn,
+                        "SELECT 1 FROM harklight_command_results WHERE opId=?1",
+                        [op_id]
+                      ) == [] do
+                   insert_pending_supersedes(txn, op_id, supersedes)
+                 end
+
                  {:ok, state}
 
                _ ->
@@ -1292,5 +1318,72 @@ defmodule Tightbeam.HarklightWakes do
       "For an answered terminal by a person, reconcile any earlier effect before applying once, then report with `harklight-agent result --session #{handle} --request #{message_id} --in-reply-to #{event_id} --status applied|refused`. An agent-authored terminal is not the person's choice. " <>
       "For cleared, expired or superseded, stop work on that request; do not treat it as approval. " <>
       "If delivered is true, check prior effects before acting again. Do not run listen; the controller listens."
+  end
+
+  defp pending_supersede_targets(payload) do
+    prepared = JSON.decode!(payload)
+    request = prepared["request"] || %{}
+    message = request["message"] || %{}
+    sender = message["sender_id"]
+    targets = message["supersedes"] || []
+
+    if is_binary(sender) and is_list(targets) do
+      targets
+      |> Enum.filter(&(is_binary(&1) and &1 != ""))
+      |> Enum.uniq()
+      |> Enum.map(&{sender, &1})
+    else
+      []
+    end
+  end
+
+  defp insert_pending_supersedes(txn, op_id, targets) do
+    Enum.each(targets, fn {sender, message} ->
+      Txn.q(
+        txn,
+        "INSERT OR IGNORE INTO harklight_pending_supersedes(opId,senderId,messageId) VALUES(?1,?2,?3)",
+        [op_id, sender, message]
+      )
+    end)
+  end
+
+  defp backfill_pending_supersedes(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(
+                  txn,
+                  "SELECT 1 FROM harklight_schema_migrations WHERE migration='pending_supersedes_v1'"
+                ) do
+             [] ->
+               Txn.q(
+                 txn,
+                 """
+                 INSERT OR IGNORE INTO harklight_pending_supersedes(opId,senderId,messageId)
+                 SELECT s.opId,json_extract(s.payload,'$.request.message.sender_id'),target.value
+                 FROM harklight_send_operations s
+                 JOIN json_each(s.payload,'$.request.message.supersedes') target
+                 LEFT JOIN harklight_command_results r ON r.opId=s.opId
+                 WHERE s.state='pending' AND r.opId IS NULL
+                   AND json_type(s.payload,'$.request.message.sender_id')='text'
+                   AND target.type='text' AND target.value<>''
+                 """
+               )
+
+               Txn.q(
+                 txn,
+                 "INSERT INTO harklight_schema_migrations(migration) VALUES('pending_supersedes_v1')"
+               )
+
+               :ok
+
+             [[1]] ->
+               :ok
+
+             rows ->
+               raise "unexpected Harklight supersede migration state: #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
   end
 end

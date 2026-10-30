@@ -1212,6 +1212,81 @@ defmodule Tightbeam.HarklightWakesTest do
     assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_entries")
   end
 
+  test "superseded-terminal lookup uses the sender and target index", %{db: db} do
+    assert {:ok, rows} =
+             DB.query(
+               db,
+               "EXPLAIN QUERY PLAN SELECT 1 FROM harklight_pending_supersedes WHERE senderId=?1 AND messageId=?2 LIMIT 1",
+               ["sender", "request"]
+             )
+
+    assert Enum.any?(rows, fn row ->
+             List.last(row) =~
+               "SEARCH harklight_pending_supersedes USING COVERING INDEX harklight_pending_supersedes_target"
+           end)
+  end
+
+  test "schema backfills unresolved pending supersede targets", %{db: db, call: call} do
+    op = Tightbeam.Id.uuid4()
+
+    payload =
+      JSON.encode!(%{
+        request: %{
+          message: %{sender_id: "sender", message_id: "replacement", supersedes: ["request"]}
+        }
+      })
+
+    assert %{state: "pending"} = HarklightWakes.prepare_send(db, call, op, payload)
+
+    assert {:ok, _} =
+             DB.query(db, "DELETE FROM harklight_pending_supersedes WHERE opId=?1", [op])
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "DELETE FROM harklight_schema_migrations WHERE migration='pending_supersedes_v1'"
+             )
+
+    assert :ok = HarklightWakes.ensure_schema(db)
+
+    assert {:ok, [[^op, "sender", "request"]]} =
+             DB.query(
+               db,
+               "SELECT opId,senderId,messageId FROM harklight_pending_supersedes WHERE opId=?1",
+               [op]
+             )
+
+    assert :ok = HarklightWakes.capture_line(db, @handle, terminal(1, "request"))
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_held_terminals WHERE eventId='1'")
+  end
+
+  test "preparing a settled pending send does not restore supersede targets", %{
+    db: db,
+    call: call
+  } do
+    op = Tightbeam.Id.uuid4()
+
+    payload =
+      JSON.encode!(%{
+        request: %{
+          message: %{sender_id: "sender", message_id: "replacement", supersedes: ["request"]}
+        }
+      })
+
+    assert %{state: "pending"} = HarklightWakes.prepare_send(db, call, op, payload)
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_pending_supersedes WHERE opId=?1", [op])
+
+    assert {:ok, %{wake_effect: "none"}} = HarklightLifecycle.record_refused(db, op)
+    assert %{state: "pending"} = HarklightWakes.prepare_send(db, call, op, payload)
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_pending_supersedes WHERE opId=?1", [op])
+  end
+
   test "superseding another session leaves its terminal wake and never acknowledges it", %{
     db: db,
     call: call,

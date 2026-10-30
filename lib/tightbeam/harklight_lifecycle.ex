@@ -117,6 +117,8 @@ defmodule Tightbeam.HarklightLifecycle do
       JSON.encode!(effects)
     ])
 
+    Txn.q(txn, "DELETE FROM harklight_pending_supersedes WHERE opId=?1", [op_id])
+
     Tightbeam.Wakes.schedule_changed_in_txn(txn, :wake_ready)
     effects
   end
@@ -391,18 +393,9 @@ defmodule Tightbeam.HarklightLifecycle do
       pending =
         Txn.q(
           txn,
-          """
-          SELECT s.payload FROM harklight_send_operations s
-          LEFT JOIN harklight_command_results r ON r.opId=s.opId
-          WHERE s.state='pending' AND r.opId IS NULL
-          """,
-          []
-        )
-        |> Enum.any?(fn [payload] ->
-          prepared = JSON.decode!(payload)
-          m = get_in(prepared, ["request", "message"]) || %{}
-          m["sender_id"] == sender and message in (m["supersedes"] || [])
-        end)
+          "SELECT 1 FROM harklight_pending_supersedes WHERE senderId=?1 AND messageId=?2 LIMIT 1",
+          [sender, message]
+        ) != []
 
       if pending do
         Txn.q(
