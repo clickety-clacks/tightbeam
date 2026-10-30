@@ -190,6 +190,7 @@ defmodule Tightbeam.RecordEvents do
     JOIN turns AS notice_turn ON notice_turn.seq = event_turns.seq
     JOIN messages AS notice ON notice.id = notice_turn.messageId
     WHERE notice.sessionKey = ?2
+      AND notice.role = 'user'
 
     UNION
 
@@ -199,6 +200,7 @@ defmodule Tightbeam.RecordEvents do
     JOIN messages AS notice INDEXED BY messages_record_event_reply
       ON notice.replyToMessageId = notice_turn.messageId
      AND notice.sessionKey = ?2
+     AND notice.role = 'assistant'
 
     UNION
 
