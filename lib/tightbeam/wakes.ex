@@ -143,6 +143,12 @@ defmodule Tightbeam.Wakes do
   );
   INSERT OR IGNORE INTO scheduler_state (id, afterFact) VALUES (0, 0);
   CREATE INDEX IF NOT EXISTS wakes_condition ON wakes (state, conditionKind, conditionScope);
+  -- Scopes the owner-child result-triggered-continuation gate
+  -- (Tightbeam.Supervision.gate_reason_in_txn/3) to its one assignment: without
+  -- this, that lookup falls back to wakes_condition's (state, conditionKind, ...)
+  -- order, which cannot seek on assignmentId and scans every conditional wake in
+  -- the table instead of this assignment's own rows.
+  CREATE INDEX IF NOT EXISTS wakes_assignment ON wakes (assignmentId, sessionKey, state);
   CREATE TABLE IF NOT EXISTS wake_retry_attempts (
     wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId),
     rootWakeId TEXT NOT NULL REFERENCES wakes(wakeId),
