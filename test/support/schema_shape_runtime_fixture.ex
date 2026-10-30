@@ -239,6 +239,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
 
   def upgrade_to_identity_predecessor!(db) do
     {:ok, boundary} = __MODULE__.PreIdentityBoundary.start_link(db)
+
     try do
       assert_raise Schema.ShapeError, ~r/session identity migration rolled back/, fn ->
         Schema.ensure_all(boundary)
@@ -246,6 +247,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     after
       GenServer.stop(boundary)
     end
+
     :ok
   end
 

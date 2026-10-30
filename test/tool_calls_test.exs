@@ -436,7 +436,10 @@ defmodule Tightbeam.ToolCallsTest do
   test "upgrades the named migration while preserving message rows and sequence high water",
        ctx do
     Tightbeam.SchemaShapeRuntimeFixture.downgrade_session_identity!(ctx.db)
-    :ok = DB.execute(ctx.db, "UPDATE schema_stamp SET shape='launch-preparation-evidence-v1-0112'")
+
+    :ok =
+      DB.execute(ctx.db, "UPDATE schema_stamp SET shape='launch-preparation-evidence-v1-0112'")
+
     {:ok, :ok} =
       DB.transaction(ctx.db, fn txn ->
         Tightbeam.DB.Txn.q(
