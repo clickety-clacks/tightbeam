@@ -961,6 +961,11 @@ defmodule Tightbeam.Harness.Support do
     )
 
     File.write!(bundle, profile.source)
+
+    for {name, source} <- Map.get(profile, :adapter_aux_bundles, %{}) do
+      File.write!(Path.join([package_dir, "dist", name]), source)
+    end
+
     bundle
   end
 

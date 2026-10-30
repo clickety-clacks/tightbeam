@@ -9707,6 +9707,29 @@ defmodule Tightbeam.GatewayTest do
 
     children = Gateway.children(config)
 
+    credential = Path.join([base, "auth", "claude", ".credentials.json"])
+    metadata = Path.join([base, "auth", "claude", ".tightbeam", "credential.json"])
+    File.mkdir_p!(Path.dirname(metadata))
+    File.write!(credential, "synthetic\n")
+
+    File.write!(
+      metadata,
+      JSON.encode!(%{
+        "provider" => "anthropic",
+        "kind" => "api_key",
+        "onboarded" => true,
+        "terminal" => false
+      })
+    )
+
+    %{start: {Credentials, :start_link, [credential_opts]}} =
+      Enum.find(children, &match?(%{id: {Credentials, "testhost"}}, &1))
+
+    start_supervised!(%{
+      id: :o6_prompt401_credentials,
+      start: {Credentials, :start_link, [credential_opts]}
+    })
+
     {Tightbeam.LaneManager, lane_opts} =
       Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
 
