@@ -49,7 +49,12 @@ defmodule Tightbeam.AssignmentsTest do
     other = session(db, "other-session", "other")
     gateway_config = %{db: db, wake_tick_ms: 1_000}
     handlers = Gateway.handlers(gateway_config)
-    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
+
+    rule_root =
+      Path.join(System.tmp_dir!(), "assignment-rails-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(rule_root) end)
+    Tightbeam.TerminalReactionFixture.load!(rule_root, Map.keys(handlers))
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
@@ -1119,7 +1124,7 @@ defmodule Tightbeam.AssignmentsTest do
       end
     end
 
-    test "missing accountable recipient stores the terminal notice at Main", ctx do
+    test "missing accountable recipient records an undelivered terminal intent", ctx do
       assignment = handle(ctx, "assign", terminal_notice_assign_call({:user, "flynn"}))
 
       assert %{assignment: %{state: "closed", outcome: "completed"}} =
@@ -1663,7 +1668,7 @@ defmodule Tightbeam.AssignmentsTest do
       assert source_id == assignment.id
     end
 
-    test "ordinary revocation stores a notice at Main when no accountable session is active",
+    test "ordinary revocation records an undelivered intent when no recipient is active",
          ctx do
       assignment = handle(ctx, "assign", terminal_notice_assign_call({:user, "flynn"}))
 
@@ -1675,7 +1680,7 @@ defmodule Tightbeam.AssignmentsTest do
       assert_revocation_notice(ctx, assignment, wake)
     end
 
-    test "retirement stores a notice at Main when no accountable session is active",
+    test "retirement records an undelivered intent when no recipient is active",
          ctx do
       assignment = handle(ctx, "assign", terminal_notice_assign_call({:user, "flynn"}))
 
@@ -1885,22 +1890,35 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   defp assert_stored_terminal_notice(db, assignment_id, wake) do
-    assert wake.state == "pending"
+    assert wake.state == "canceled"
     assert wake.fired_at == nil
-    assert wake.canceled_at == nil
+    assert is_integer(wake.canceled_at)
     assert wake.assignment_id == assignment_id
     assert wake.session_key == Org.personal_session_key("flynn")
     assert wake.obligation_ref == "terminal-child-owner-notification:" <> assignment_id
+    assert wake.delivered_turn_seq == nil
 
-    assert {:ok, []} =
-             DB.query(db, "SELECT wakeId FROM wake_cancellations WHERE wakeId=?1", [wake.wake_id])
+    assert {:ok, [["target_unresolvable", "scheduler_delivery", source_id]]} =
+             DB.query(
+               db,
+               "SELECT reasonKind,causalSourceKind,causalSourceId FROM wake_cancellations WHERE wakeId=?1",
+               [wake.wake_id]
+             )
 
+    assert source_id == wake.wake_id
     assert {:ok, []} = DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
 
-    assert {:ok, []} =
+    assert {:ok, [[_]]} =
              DB.query(
                db,
                "SELECT id FROM lifecycle_events WHERE kind='wake_undeliverable' AND subject=?1",
+               [wake.wake_id]
+             )
+
+    assert {:ok, [["undelivered"]]} =
+             DB.query(
+               db,
+               "SELECT json_extract(result,'$.delivery') FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
                [wake.wake_id]
              )
   end

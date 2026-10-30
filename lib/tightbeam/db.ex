@@ -481,6 +481,19 @@ defmodule Tightbeam.DB do
     def handoff(%__MODULE__{}, _server, _message),
       do: raise(ArgumentError, "transaction handoff used outside its owner")
 
+    @doc false
+    def handoff_checkpoint(%__MODULE__{outbox: token, outbox_owner: owner})
+        when is_reference(token) and owner == self() do
+      {token, Process.get({__MODULE__, :outbox, token})}
+    end
+
+    @doc false
+    def restore_handoffs(%__MODULE__{outbox: token, outbox_owner: owner}, {token, pending})
+        when owner == self() and is_list(pending) do
+      Process.put({__MODULE__, :outbox, token}, pending)
+      :ok
+    end
+
     @doc "Run one SQL statement inside the transaction; returns rows (positional lists)."
     @spec q(t(), String.t(), [term()]) :: [Tightbeam.DB.row()]
     def q(%__MODULE__{conn: conn, query_trace: trace} = txn, sql, params \\ []) do

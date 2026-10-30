@@ -423,8 +423,9 @@ defmodule Tightbeam.Rules do
 
     rules = for {:rule, rule} <- entries, do: rule
     policies = for {:policy, policy} <- entries, do: policy
+    reactions = for {:reaction, reaction} <- entries, do: reaction
 
-    named = rules ++ policies
+    named = rules ++ policies ++ reactions
 
     duplicates = named |> Enum.frequencies_by(& &1.name)
 
@@ -497,12 +498,15 @@ defmodule Tightbeam.Rules do
         end
       end)
 
+    reactions = Enum.reject(reactions, &(duplicates[&1.name] > 1))
+
     :persistent_term.put(@persist_key, rules)
     :persistent_term.put(@policy_key, policies)
 
     :persistent_term.put(@snapshot_key, %{
       rules: rules,
       policies: policies,
+      reactions: reactions,
       declarations: declarations,
       revision: identity_manifest_sha,
       active_admission_contract: %{"attest" => "legacy"}
@@ -518,6 +522,15 @@ defmodule Tightbeam.Rules do
     })
 
     rules
+  end
+
+  @doc false
+  def reaction_plans(event, facts) do
+    Tightbeam.RowReactions.Plan.evaluate(
+      Map.get(effective_snapshot(), :reactions, []),
+      event,
+      facts
+    )
   end
 
   @doc false
@@ -1348,7 +1361,7 @@ defmodule Tightbeam.Rules do
         {:error, error} -> raise ArgumentError, "#{path}: invalid TOML: #{inspect(error)}"
       end
 
-    unknown = unknown_keys(manifest, MapSet.new(["rule", "policy"]))
+    unknown = unknown_keys(manifest, MapSet.new(["rule", "policy", "reaction"]))
 
     if unknown != [],
       do: raise(ArgumentError, "#{path}: unknown root keys: #{Enum.join(unknown, ", ")}")
@@ -1418,13 +1431,22 @@ defmodule Tightbeam.Rules do
           raise ArgumentError, "#{path}: [[policy]] must be a non-empty array of tables"
       end
 
+    reactions =
+      Tightbeam.RowReactions.Loader.compile!(
+        manifest,
+        path,
+        base_dir,
+        identity_manifest_sha,
+        contents
+      )
+
     only_retired_policies? =
       rules == [] and policy_entries != [] and Enum.all?(policy_entries, &retired_policy?/1)
 
-    if rules == [] and policies == [] and not only_retired_policies?,
+    if rules == [] and policies == [] and reactions == [] and not only_retired_policies?,
       do: raise(ArgumentError, "#{path}: must contain one or more [[rule]] or [[policy]] tables")
 
-    rules ++ policies
+    rules ++ policies ++ reactions
   end
 
   defp retired_policy?(policy),

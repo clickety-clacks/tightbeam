@@ -70,7 +70,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 60_000})
-    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
+    law = Tightbeam.TerminalReactionFixture.load!(root, Map.keys(handlers))
 
     start_supervised!(
       Supervisor.child_spec(
@@ -79,7 +79,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
       )
     )
 
-    %{db: db, scheduler: scheduler, handlers: handlers, base: prepared && prepared.base}
+    %{db: db, scheduler: scheduler, handlers: handlers, base: prepared && prepared.base, law: law}
   end
 
   test "a delivered finish notice starts successive fallback reminders and survives restart",
@@ -459,7 +459,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert length(reminders(ctx.db, root.wake_id)) == 2
   end
 
-  test "accountability changes move a pending terminal-action reminder and retain root delivery history",
+  test "loss of recipient eligibility cancels a reminder and retains root delivery history",
        ctx do
     {_parent_assignment, _child_assignment, root} = completed_child(ctx)
 
@@ -490,7 +490,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
                })
              )
 
-    assert %{state: "pending", session_key: "other-parent", prompt: prompt, due_at: due_at} =
+    assert %{state: "canceled", session_key: "notice-parent", prompt: prompt, due_at: due_at} =
              Wakes.get(ctx.db, reminder.wake_id)
 
     assert prompt == reminder.prompt
@@ -699,41 +699,22 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert turn_count(ctx.db, pending.wake_id) == before
   end
 
-  for retired_before_due <- [false, true] do
-    test "a retired note checks actual child state at filing and due time: #{retired_before_due}",
-         ctx do
-      {parent, child, root} = completed_child(ctx)
-      assert :ok = Wakes.fire_due(ctx.scheduler)
-      carrier = assert_delivered_carrier(ctx.db, root.wake_id)
-      finish_carrier_turn!(ctx.db, carrier)
-      [pending] = await_pending_reminders(ctx.db, root.wake_id)
-      note = action_note(child.id, root, "retired", "requested retirement")
+  test "an exact retired receipt stops the reminder without asserting physical retirement", ctx do
+    {parent, child, root} = completed_child(ctx)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    finish_carrier_turn!(ctx.db, assert_delivered_carrier(ctx.db, root.wake_id))
+    [pending] = await_pending_reminders(ctx.db, root.wake_id)
+    note = action_note(child.id, root, "retired", "requested retirement")
 
-      assert %{attest: %{kind: "progress"}} =
-               handle(ctx, "attest", progress_call({:session, "notice-parent"}, parent.id, note))
+    assert %{attest: %{kind: "progress"}} =
+             handle(ctx, "attest", progress_call({:session, "notice-parent"}, parent.id, note))
 
-      assert Wakes.get(ctx.db, pending.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, pending.wake_id).state == "canceled"
 
-      if unquote(retired_before_due) do
-        {:ok, _} =
-          DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='holder'")
-      end
+    assert {:ok, [["active"]]} =
+             DB.query(ctx.db, "SELECT state FROM sessions WHERE sessionKey='holder'")
 
-      set_due_now(ctx.db, pending.wake_id)
-      assert :ok = Wakes.fire_due(ctx.scheduler)
-      result = Wakes.get(ctx.db, pending.wake_id)
-
-      if unquote(retired_before_due) do
-        assert result.state == "canceled"
-        assert turn_count(ctx.db, pending.wake_id) == 0
-      else
-        assert result.state == "fired"
-        assert result.prompt =~ "Child session holder is active"
-        assert result.prompt =~ "UTC ("
-        assert result.prompt =~ "Do not file progress unless something materially changed"
-        refute result.prompt =~ "parked"
-      end
-    end
+    assert turn_count(ctx.db, pending.wake_id) == 0
   end
 
   @tag persistent: true
@@ -929,6 +910,199 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert pending_reminders(ctx.db, root.wake_id) == []
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, successor.wake_id) == 0
+  end
+
+  test "without elected rails a terminal command commits quietly and is never replayed", ctx do
+    item = create_work_item(ctx, "quiet terminal")
+
+    child =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:session, "notice-parent"}, "holder", "child", item.id,
+          effect_kind: "coordination"
+        )
+      )
+
+    Rules.load!(Path.join(ctx.law, "empty"), Map.keys(ctx.handlers))
+
+    assert %{assignment: %{state: "closed"}} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, child.id, "completion"))
+
+    assert terminal_notices(ctx.db) == []
+    Rules.load!(ctx.law, Map.keys(ctx.handlers))
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+
+    assert {:ok, {:ok, nil}} =
+             DB.transaction(
+               ctx.db,
+               &Wakes.admit_terminal_notification_in_txn(&1, child.id)
+             )
+
+    assert terminal_notices(ctx.db) == []
+  end
+
+  test "removing a rail withdraws pending output and restoring it cannot replay delivery", ctx do
+    stop_supervised!(ctx.scheduler)
+    {_parent, _child, root} = completed_child(ctx)
+    Rules.load!(Path.join(ctx.law, "empty"), Map.keys(ctx.handlers))
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+
+    assert Wakes.get(ctx.db, root.wake_id).state == "canceled",
+           inspect(DB.query(ctx.db, "SELECT status,lastError FROM row_reaction_actions"))
+
+    assert {:ok, [["superseded"]]} =
+             DB.query(ctx.db, "SELECT reasonKind FROM wake_cancellations WHERE wakeId=?1", [
+               root.wake_id
+             ])
+
+    Rules.load!(ctx.law, Map.keys(ctx.handlers))
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert Wakes.get(ctx.db, root.wake_id).state == "canceled"
+    assert turn_count(ctx.db, root.wake_id) == 0
+    assert length(terminal_notices(ctx.db)) == 1
+  end
+
+  test "the elected reminder deadline controls pending work without changing identity", ctx do
+    {_parent, _child, root} = completed_child(ctx)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    [reminder] = pending_reminders(ctx.db, root.wake_id)
+    path = Path.join(ctx.law, "identity/rules/row-reaction-terminal-action.toml")
+    File.write!(path, String.replace(File.read!(path), "7200000", "10800000"))
+    Rules.load!(ctx.law, Map.keys(ctx.handlers))
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    [updated] = pending_reminders(ctx.db, root.wake_id)
+    assert updated.wake_id == reminder.wake_id
+    assert updated.due_at == reminder.due_at + 3_600_000
+    assert Wakes.get(ctx.db, root.wake_id).delivered_turn_seq != nil
+  end
+
+  test "a failed effect admission rolls back the terminal write and its evidence", ctx do
+    item = create_work_item(ctx, "atomic terminal")
+
+    child =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:session, "notice-parent"}, "holder", "child", item.id,
+          effect_kind: "coordination"
+        )
+      )
+
+    assert {:ok, _} =
+             DB.query(ctx.db, """
+             CREATE TRIGGER reject_reaction BEFORE INSERT ON row_reaction_actions
+             BEGIN SELECT RAISE(ABORT, 'injected admission failure'); END
+             """)
+
+    assert_raise DB.Error, ~r/injected admission failure/, fn ->
+      ctx.handlers["attest"].(attest_call({:session, "holder"}, child.id, "completion"))
+    end
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [child.id])
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
+               [child.id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM row_reaction_events WHERE json_extract(event,'$.terminal.assignment_id')=?1",
+               [child.id]
+             )
+
+    assert terminal_notices(ctx.db) == []
+  end
+
+  test "cutover adopts pending output once and keeps its terminal occurrence identity", ctx do
+    stop_supervised!(ctx.scheduler)
+    {_parent, child, root} = completed_child(ctx)
+    forget_reaction_ledger!(ctx.db)
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert [adopted] = terminal_notices(ctx.db)
+    assert adopted.wake_id == root.wake_id
+    assert adopted.due_at == root.due_at
+
+    assert {:ok, {:ok, replay}} =
+             DB.transaction(
+               ctx.db,
+               &Wakes.admit_terminal_notification_in_txn(&1, child.id)
+             )
+
+    assert replay.wake_id == root.wake_id
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert length(terminal_notices(ctx.db)) == 1
+    start_scheduler(ctx.db)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert_delivered_carrier(ctx.db, root.wake_id)
+    assert [_] = pending_reminders(ctx.db, root.wake_id)
+  end
+
+  test "cutover keeps an accepted delivery terminal and adopts only its pending successor", ctx do
+    {_parent, _child, root} = completed_child(ctx)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    carrier = assert_delivered_carrier(ctx.db, root.wake_id)
+    [reminder] = pending_reminders(ctx.db, root.wake_id)
+    stop_supervised!(ctx.scheduler)
+    forget_reaction_ledger!(ctx.db)
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert assert_delivered_carrier(ctx.db, root.wake_id) == carrier
+    assert [adopted] = pending_reminders(ctx.db, root.wake_id)
+    assert adopted.wake_id == reminder.wake_id
+    assert adopted.due_at == reminder.due_at
+    assert length(terminal_notices(ctx.db)) == 1
+  end
+
+  test "unproven historical output is held with a reason while other pending output proceeds",
+       ctx do
+    stop_supervised!(ctx.scheduler)
+    {_parent, _child, root} = completed_child(ctx)
+
+    unknown =
+      Wakes.schedule(ctx.db, %{
+        wake_id: "unknown-historical-output",
+        session_key: "other-parent",
+        owner_user_id: "flynn",
+        origin: "process:tightbeam",
+        prompt: "Historical output with no provable source",
+        due_at: System.system_time(:millisecond),
+        obligation_ref: "terminal-child-owner-notification:unknown-assignment"
+      })
+
+    forget_reaction_ledger!(ctx.db)
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+
+    assert {:ok, [["held", reason]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,lastError FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [unknown.wake_id]
+             )
+
+    assert reason =~ "unproven"
+    start_scheduler(ctx.db)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert_delivered_carrier(ctx.db, root.wake_id)
+    assert Wakes.get(ctx.db, unknown.wake_id).state == "pending"
+    assert turn_count(ctx.db, unknown.wake_id) == 0
+  end
+
+  defp forget_reaction_ledger!(db) do
+    # Simulate the declared pre-cutover population: the original wake, source
+    # occurrence and delivery receipts remain, with no reaction ledger yet.
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.DB.Txn.q(txn, "DELETE FROM row_reaction_actions")
+               Tightbeam.DB.Txn.q(txn, "DELETE FROM row_reaction_events")
+               Tightbeam.DB.Txn.q(txn, "DELETE FROM row_reaction_cutovers")
+               :ok
+             end)
   end
 
   defp completed_child(ctx, opts \\ []) do

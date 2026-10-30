@@ -583,6 +583,7 @@ defmodule Tightbeam.Assignments do
       end)
 
     Enum.each(assignments, fn %{assignment_id: assignment_id, work_item_id: work_item_id} ->
+      reaction_before = Tightbeam.RowReactions.Snapshot.assignment(txn, assignment_id)
       ts = now()
 
       reopening_id = current_reopening_id(txn, assignment_id)
@@ -640,7 +641,7 @@ defmodule Tightbeam.Assignments do
       # Incomplete notice cancellation must see the real remaining-work bracket.
       # Both the bracket and notice still roll back with this terminal transition.
       Tightbeam.WorkItems.arm_slate_in_txn(txn, work_item_id)
-      admit_revocation_notice!(txn, assignment_id, revocation_id)
+      admit_revocation_notice!(txn, assignment_id, revocation_id, reaction_before)
 
       append_substrate(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
 
@@ -3136,6 +3137,8 @@ defmodule Tightbeam.Assignments do
   end
 
   defp close_completed_assignment_in_txn(txn, call, assignment, attest) do
+    reaction_before = Tightbeam.RowReactions.Snapshot.assignment(txn, assignment.id)
+
     Txn.q(
       txn,
       """
@@ -3150,15 +3153,10 @@ defmodule Tightbeam.Assignments do
     closed_assignment = fetch_assignment!(txn, assignment.id)
     Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
 
-    case Wakes.admit_terminal_notification_in_txn(txn, assignment.id) do
-      {:ok, wake} ->
-        # The typed terminal notice already reports this attest when it reaches
-        # the card opener. Preserve the separate source only when the canonical
-        # terminal route selects another currently accountable recipient.
-        if wake.session_key != assignment_opener_session(txn, assignment) do
-          notify_assignment_opener_of_attest_in_txn(txn, assignment, attest, call)
-        end
-
+    case Wakes.admit_terminal_notification_in_txn(txn, assignment.id, reaction_before) do
+      {:ok, _wake} ->
+        # The elected terminal handoff owns this transition's notification.
+        # Explicit command and intervention output keep their separate paths.
         :ok
 
       {:error, refusal} ->
@@ -3857,6 +3855,7 @@ defmodule Tightbeam.Assignments do
   end
 
   defp revoke_open_assignment_in_txn(txn, call, assignment_id) do
+    reaction_before = Tightbeam.RowReactions.Snapshot.assignment(txn, assignment_id)
     {closed_user, closed_session} = opener(call.principal)
     closed_at = now()
     revocation_id = id("rev_")
@@ -3902,7 +3901,7 @@ defmodule Tightbeam.Assignments do
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
     revoked_assignment = fetch_assignment!(txn, assignment_id)
     Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
-    admit_revocation_notice!(txn, assignment_id, revocation_id)
+    admit_revocation_notice!(txn, assignment_id, revocation_id, reaction_before)
     liveness_trigger = disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
 
     settle_cannot_proceed_by_disposition_in_txn(
@@ -4203,8 +4202,13 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  defp admit_revocation_notice!(txn, assignment_id, revocation_id) do
-    case Wakes.admit_terminal_revocation_in_txn(txn, assignment_id, revocation_id) do
+  defp admit_revocation_notice!(txn, assignment_id, revocation_id, reaction_before) do
+    case Wakes.admit_terminal_revocation_in_txn(
+           txn,
+           assignment_id,
+           revocation_id,
+           reaction_before
+         ) do
       {:ok, _wake} ->
         :ok
 

@@ -205,6 +205,17 @@ if phase == "deliver" do
   :ignore = Tightbeam.Boot.start_link(%{base_dir: base})
   :ok = GenServer.stop(db)
 
+  # Elect the engineering terminal rules in this isolated recovery fixture.
+  rules = Path.join(base, "identity/rules")
+  File.mkdir_p!(rules)
+
+  for name <- ~w(row-reaction-handoff.toml row-reaction-terminal-action.toml) do
+    File.cp!(
+      Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name]),
+      Path.join(rules, name)
+    )
+  end
+
   File.write!(Path.join(base, ".soak-arena"), "tightbeam recovery acceptance arena v1\n")
   Tightbeam.RecoveryFixture.place_adapter!(base, seed_credential: false)
 else

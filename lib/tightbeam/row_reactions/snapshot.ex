@@ -1,0 +1,174 @@
+defmodule Tightbeam.RowReactions.Snapshot do
+  @moduledoc false
+  alias Tightbeam.{DeliveryResponsibilities, Org, SessionReparent, Wakes}
+  alias Tightbeam.DB.Txn
+
+  @assignment ~w(id holderKey workItemId openedBySession openedByUser openedAt state outcome closedAt closingAttestId closedBySession closedByUser closedByProcess)
+  def assignment(txn, id), do: one(txn, "assignments", @assignment, "id=?1", [id])
+
+  def current(txn, %{"kind" => "assignment"} = event, _recorded) do
+    terminal = event["terminal"]
+
+    item =
+      one(txn, "work_items", ~w(id ownerUserId deliveryOwnerSessionKey), "id=?1", [
+        terminal["work_item_id"]
+      ])
+
+    delivery_owner = DeliveryResponsibilities.current_owner_in_txn(txn, terminal["work_item_id"])
+
+    coordination_parent =
+      SessionReparent.current_coordination_parent(txn, terminal["assignment_id"])
+
+    personal = Org.personal_session_key(terminal["owner_user_id"])
+
+    keys = [
+      terminal["opened_by_id"],
+      terminal["child_session_key"],
+      personal,
+      delivery_owner && delivery_owner["accountableSessionKey"],
+      coordination_parent
+    ]
+
+    %{
+      "work_item" => item,
+      "delivery_owner" => delivery_owner,
+      "coordination_parent" => coordination_parent,
+      "personal_session_key" => personal,
+      "opener_responsibility" =>
+        DeliveryResponsibilities.responsibility_in_txn(
+          txn,
+          terminal["opened_by_id"],
+          terminal["work_item_id"]
+        ),
+      "sessions" => sessions(txn, keys),
+      "assignments" =>
+        rows(txn, "assignments", @assignment, "workItemId=?1", [terminal["work_item_id"]])
+    }
+  end
+
+  def current(txn, %{"kind" => "wake_delivery", "delivery" => delivery} = event, _recorded) do
+    delivered = event["after"]
+
+    root_id =
+      if delivered["obligationNamespace"] == "terminal-child-owner-notification",
+        do: delivered["wakeId"],
+        else: delivered["obligationTarget"]
+
+    root = wake(txn, root_id)
+    roots = if root, do: [root], else: []
+    sources = Enum.flat_map(roots, &terminal_sources(txn, &1))
+    child = List.first(sources)
+
+    child =
+      if child,
+        do:
+          one(txn, "sessions", ~w(sessionKey state), "sessionKey=?1", [child["childSessionKey"]])
+
+    attests =
+      rows(
+        txn,
+        "attests",
+        ~w(id assignmentId kind bySession byUser ts note),
+        "bySession=?1 AND kind='progress'",
+        [delivery["sessionKey"]]
+      )
+      |> Enum.map(&Map.put(&1, "disposition", disposition(&1["note"])))
+
+    %{
+      "sessions" => sessions(txn, [delivery["sessionKey"]]),
+      "assignments" =>
+        rows(txn, "assignments", @assignment, "holderKey=?1", [delivery["sessionKey"]]),
+      "attests" => attests,
+      "wakes" => Enum.uniq_by([delivered | roots], & &1["wakeId"]),
+      "terminal_sources" => sources,
+      "child" => child,
+      "parent_activity_at" =>
+        Tightbeam.Supervision.holder_activity_in_txn(txn, delivery["sessionKey"])
+    }
+  end
+
+  def wake(txn, id) do
+    row =
+      one(
+        txn,
+        "wakes",
+        ~w(wakeId sessionKey ownerUserId creatorSessionKey assignmentId origin obligationRef conditionKind conditionScope dueAt firedAt deliveredTurnSeq state prompt),
+        "wakeId=?1",
+        [id]
+      )
+
+    if row do
+      {namespace, target} =
+        case String.split(row["obligationRef"] || "", ":", parts: 2) do
+          [namespace, target] -> {namespace, target}
+          _ -> {nil, nil}
+        end
+
+      row |> Map.put("obligationNamespace", namespace) |> Map.put("obligationTarget", target)
+    end
+  end
+
+  # A receipt records the accountable actor's statement. Parsing does not
+  # assert that a child was physically retired or select a cancellation policy.
+  def disposition(note) when is_binary(note) do
+    case Regex.run(
+           ~r/\Acompletion-handoff-action ([^\s]+) ([^\s]+) ([^\s]+) (kept|parked|retired): (.+)\z/us,
+           note,
+           capture: :all_but_first
+         ) do
+      [assignment, source, token, action, detail] ->
+        if String.trim(detail) != "",
+          do: %{
+            "assignmentId" => assignment,
+            "sourceKind" => source,
+            "sourceToken" => token,
+            "action" => action,
+            "detail" => detail
+          }
+
+      _ ->
+        nil
+    end
+  end
+
+  def disposition(_), do: nil
+
+  defp terminal_sources(txn, row) do
+    case Wakes.terminal_source_in_txn(txn, row["wakeId"]) do
+      {:ok, source} ->
+        [
+          %{
+            "wakeId" => row["wakeId"],
+            "sourceKind" => source.source_kind,
+            "sourceToken" => source.source_token,
+            "assignmentId" => source.assignment_id,
+            "workItemId" => source.work_item_id,
+            "childSessionKey" => source.child_session_key,
+            "ownerUserId" => source.owner_user_id,
+            "outcome" => source.outcome,
+            "terminalAt" => source.terminal_at
+          }
+        ]
+
+      _ ->
+        []
+    end
+  end
+
+  defp sessions(txn, keys),
+    do:
+      keys
+      |> Enum.filter(&is_binary/1)
+      |> Enum.uniq()
+      |> Enum.flat_map(
+        &rows(txn, "sessions", ~w(sessionKey ownerUserId state), "sessionKey=?1", [&1])
+      )
+
+  defp one(txn, table, fields, where, params),
+    do: List.first(rows(txn, table, fields, where, params))
+
+  defp rows(txn, table, fields, where, params),
+    do:
+      Txn.q(txn, "SELECT #{Enum.join(fields, ",")} FROM #{table} WHERE #{where}", params)
+      |> Enum.map(&Map.new(Enum.zip(fields, &1)))
+end

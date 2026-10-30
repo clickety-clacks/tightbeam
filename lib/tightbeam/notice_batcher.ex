@@ -1220,6 +1220,12 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   defp prepare_due_source_in_txn(txn, wake_id) do
+    if Tightbeam.RowReactions.prepare_in_txn(txn, wake_id) == :ready,
+      do: prepare_elected_source_in_txn(txn, wake_id),
+      else: false
+  end
+
+  defp prepare_elected_source_in_txn(txn, wake_id) do
     case Txn.q(
            txn,
            "SELECT t.sessionKey FROM wakes w JOIN turns t ON t.seq=w.deliveredTurnSeq WHERE w.wakeId=?1",
