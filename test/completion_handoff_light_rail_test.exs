@@ -1123,6 +1123,13 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     personal = Org.personal_session_key("flynn")
     session(ctx.db, personal, "flynn")
 
+    parent =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:user, "flynn"}, personal, "parent", item.id, effect_kind: "coordination")
+      )
+
     assert %{deliveryOwnerSessionKey: ^personal} =
              handle(
                ctx,
@@ -1176,12 +1183,76 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert Wakes.get(ctx.db, failed.wake_id).state == "canceled"
     assert turn_count(ctx.db, failed.wake_id) == 0
 
+    [reminder] = pending_reminders(ctx.db, retry_id)
+
+    assert {:ok, [[delivered_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT t.createdAt FROM wakes w JOIN turns t ON t.seq=w.deliveredTurnSeq WHERE w.wakeId=?1",
+               [retry_id]
+             )
+
+    assert reminder.due_at == delivered_at + 7_200_000
+    assert pending_reminders(ctx.db, failed.wake_id) == []
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call(
+                 {:session, personal},
+                 parent.id,
+                 action_note(
+                   child.id,
+                   Wakes.get(ctx.db, retry_id),
+                   "kept",
+                   "kept the recovered child"
+                 )
+               )
+             )
+
+    assert Wakes.get(ctx.db, reminder.wake_id).state == "canceled"
+
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM lifecycle_events WHERE kind='wake_undeliverable' AND subject=?1",
                [failed.wake_id]
              )
+  end
+
+  test "a changed rail can withdraw an incomplete undelivered intent", ctx do
+    stop_supervised!(ctx.scheduler)
+    item = create_work_item(ctx, "withdraw unavailable handoff")
+
+    child =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:user, "flynn"}, "holder", "child", item.id, effect_kind: "coordination")
+      )
+
+    assert %{assignment: %{state: "closed"}} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, child.id, "completion"))
+
+    [failed] = terminal_notices(ctx.db)
+    assert {:ok, [["pending"]]} = DB.query(ctx.db, "SELECT status FROM row_reaction_actions")
+    path = Path.join(ctx.law, "identity/rules/row-reaction-handoff.toml")
+
+    File.write!(
+      path,
+      String.replace(
+        File.read!(path),
+        "on_unavailable = \"undelivered\"",
+        "on_unavailable = \"skip\""
+      )
+    )
+
+    Rules.load!(ctx.law, Map.keys(ctx.handlers))
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert {:ok, [["canceled"]]} = DB.query(ctx.db, "SELECT status FROM row_reaction_actions")
+    assert [^failed] = terminal_notices(ctx.db)
+    assert turn_count(ctx.db, failed.wake_id) == 0
   end
 
   test "receipt lookup bounds growing progress history and ordinary progress does not reconcile reminders",

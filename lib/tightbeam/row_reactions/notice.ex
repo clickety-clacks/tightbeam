@@ -67,7 +67,8 @@ defmodule Tightbeam.RowReactions.Notice do
         ) == [[1]]
 
     cond do
-      not available and get_in(action, ["result", "delivery"]) == "undelivered" ->
+      not available and value["on_unavailable"] == "undelivered" and
+          get_in(action, ["result", "delivery"]) == "undelivered" ->
         # Retain the same incomplete intent and failed-attempt evidence. Only
         # a later reconciliation with an elected recipient may try delivery.
         :ok
@@ -104,7 +105,8 @@ defmodule Tightbeam.RowReactions.Notice do
               Wakes.get_in_txn(txn, id)
 
             %{state: "canceled", delivered_turn_seq: nil} ->
-              if available and get_in(action, ["result", "delivery"]) == "undelivered" do
+              if (available or value["on_unavailable"] == "schedule") and
+                   get_in(action, ["result", "delivery"]) == "undelivered" do
                 Wakes.retry_undelivered_notice_in_txn(txn, id, input, at)
               else
                 raise ArgumentError, "reaction output identity is already terminal"
