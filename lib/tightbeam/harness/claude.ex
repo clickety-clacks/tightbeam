@@ -126,6 +126,53 @@ defmodule Tightbeam.Harness.Claude do
   @doc false
   def adapter_version, do: @adapter_version
 
+  @doc false
+  def adapter_provenance(target) do
+    binary = adapter_binary(target)
+    node_modules = binary |> Path.dirname() |> Path.dirname()
+    package_dir = Path.join([node_modules, "@agentclientprotocol", @adapter_package])
+    package_path = Path.join(package_dir, "package.json")
+    bundle_path = Path.join([package_dir, "dist", @adapter_bundle])
+
+    if Support.local?(target) do
+      with {:ok, package_bytes} <- File.read(package_path),
+           {:ok, %{"version" => version}} <- JSON.decode(package_bytes),
+           {:ok, source} <- File.read(bundle_path) do
+        %{
+          package: install_package(),
+          version: version,
+          source_sha256: sha256(source)
+        }
+      else
+        _ -> unavailable_adapter_provenance()
+      end
+    else
+      script =
+        "const fs=require('fs'),c=require('crypto');" <>
+          "const p=JSON.parse(fs.readFileSync(#{JSON.encode!(package_path)},'utf8'));" <>
+          "const s=fs.readFileSync(#{JSON.encode!(bundle_path)});" <>
+          "process.stdout.write(JSON.stringify({version:p.version,sourceSha256:c.createHash('sha256').update(s).digest('hex')}));"
+
+      command =
+        ["ssh" | Support.ssh_opts()] ++
+          [target.host_config.ssh, "node", "-e", script]
+
+      case target.sh.(command) do
+        {output, 0} ->
+          case JSON.decode(String.trim(output)) do
+            {:ok, %{"version" => version, "sourceSha256" => digest}} ->
+              %{package: install_package(), version: version, source_sha256: digest}
+
+            _ ->
+              unavailable_adapter_provenance()
+          end
+
+        _ ->
+          unavailable_adapter_provenance()
+      end
+    end
+  end
+
   @impl true
   def id, do: :claude
 
@@ -1077,4 +1124,11 @@ defmodule Tightbeam.Harness.Claude do
       wire_name()
     )
   end
+
+  defp unavailable_adapter_provenance do
+    %{package: install_package(), version: @adapter_version, source_sha256: "unavailable"}
+  end
+
+  defp sha256(bytes),
+    do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 end
