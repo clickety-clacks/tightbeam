@@ -106,7 +106,7 @@ defmodule Tightbeam.RecordEvents do
        "ON messages(replyToMessageId, sessionKey, seq, id) WHERE replyToMessageId IS NOT NULL"},
     {"wakes_record_event_ids",
      "CREATE INDEX IF NOT EXISTS wakes_record_event_ids " <>
-       "ON wakes(recordEventIds, wakeId, deliveredTurnSeq) WHERE recordEventIds IS NOT NULL"}
+       "ON wakes(recordEventIds, wakeId) WHERE recordEventIds IS NOT NULL"}
   ]
 
   @work_item_event_by_id_query """

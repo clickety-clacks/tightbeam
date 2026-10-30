@@ -1555,14 +1555,14 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert notice_plan_text =~ "messages_client_dedupe", notice_plan_text
     assert notice_plan_text =~ "wakes_delivered_turn", notice_plan_text
 
-    assert notice_plan_text =~ "SEARCH direct_wake USING COVERING INDEX wakes_record_event_ids",
+    assert notice_plan_text =~ "SEARCH direct_wake USING INDEX wakes_record_event_ids",
            notice_plan_text
 
     assert notice_plan_text =~
              "SEARCH direct_turn USING COVERING INDEX turns_session (sessionKey=? AND seq=?",
            notice_plan_text
 
-    assert notice_plan_text =~ "SEARCH member_wake USING COVERING INDEX wakes_record_event_ids",
+    assert notice_plan_text =~ "SEARCH member_wake USING INDEX wakes_record_event_ids",
            notice_plan_text
 
     assert notice_plan_text =~ "SEARCH cancellation", notice_plan_text
