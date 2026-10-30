@@ -4823,7 +4823,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       SELECT
         'record-event-plan-message-' || printf('%05d', n),
         'record-event-plan-session-00',
-        CASE WHEN n % 2 = 1 THEN 'user' ELSE 'assistant' END,
+        CASE WHEN n IN (1, 2) OR n % 2 = 1 THEN 'user' ELSE 'assistant' END,
         'production-scale message ' || n,
         n,
         CASE n
@@ -4834,7 +4834,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           WHEN 1 THEN 'record-event-plan-client-01'
           WHEN 2 THEN 'record-event-plan-client-02'
         END,
-        CASE WHEN n % 2 = 0
+        CASE WHEN n > 2 AND n % 2 = 0
           THEN 'record-event-plan-message-' || printf('%05d', n - 1)
         END,
         'record-event-plan-message-' || printf('%05d', n),
