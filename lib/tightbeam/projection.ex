@@ -261,7 +261,7 @@ defmodule Tightbeam.Projection do
               SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                      clientMessageId, replyToMessageId, replyToClientMessageId,
                      llmVisibleMessageId, attachments, attentionTier,
-                     messageType, markerKind, markerFrom, markerTo
+                     recordEventIds, messageType, markerKind, markerFrom, markerTo
               FROM messages
               WHERE sessionKey = ?1 AND deviceId = ?2 AND clientMessageId = ?3
             """,
@@ -444,7 +444,7 @@ defmodule Tightbeam.Projection do
           SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                  clientMessageId, replyToMessageId, replyToClientMessageId,
                  llmVisibleMessageId, attachments, attentionTier,
-                 messageType, markerKind, markerFrom, markerTo
+                 recordEventIds, messageType, markerKind, markerFrom, markerTo
           FROM messages WHERE id = ?1
         """,
         [id]
@@ -480,7 +480,7 @@ defmodule Tightbeam.Projection do
           SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                  clientMessageId, replyToMessageId, replyToClientMessageId,
                  llmVisibleMessageId, attachments, attentionTier,
-                 messageType, markerKind, markerFrom, markerTo
+                 recordEventIds, messageType, markerKind, markerFrom, markerTo
           FROM messages WHERE sessionKey = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3
         """,
         [session_key, after_seq, limit]
