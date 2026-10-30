@@ -245,7 +245,13 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     use GenServer
     def start_link(db), do: GenServer.start_link(__MODULE__, db)
     @impl true
-    def init(db), do: {:ok, db}
+    def init(db) do
+      :persistent_term.put({DB, self()}, :persistent_term.get({DB, db}))
+      {:ok, db}
+    end
+
+    @impl true
+    def terminate(_reason, _db), do: :persistent_term.erase({DB, self()})
     @impl true
     def handle_call({:migration_transaction, :session_identity, _, _, _}, _from, db),
       do: {:reply, {:error, "fixture predecessor boundary"}, db}

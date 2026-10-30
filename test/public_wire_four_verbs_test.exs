@@ -319,7 +319,7 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert {:ok, [[principal]]} =
              DB.query(
                ctx.db,
-               "SELECT principal FROM harness_health_observations WHERE evidenceKind='recovery' AND incidentId=?1",
+               "SELECT principal FROM harness_health_observations WHERE evidenceKind='normal-turn-success' AND incidentId=?1",
                [incident_id]
              )
 
