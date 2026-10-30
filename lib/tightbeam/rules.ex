@@ -1402,7 +1402,7 @@ defmodule Tightbeam.Rules do
               require Logger
 
               Logger.warning(
-                "#{path}: policy #{inspect(Map.get(policy, "name"))} skipped: purpose wait-effort-relief is retired"
+                "#{path}: policy #{inspect(Map.get(policy, "name"))} skipped: purpose #{Map.get(policy, "purpose")} is retired"
               )
 
               []
@@ -1428,7 +1428,9 @@ defmodule Tightbeam.Rules do
   end
 
   defp retired_policy?(policy),
-    do: is_map(policy) and Map.get(policy, "purpose") == "wait-effort-relief"
+    do:
+      is_map(policy) and
+        Map.get(policy, "purpose") in ~w(wait-effort-relief wait-verification-admission)
 
   defp validate_policy!(path, ordinal, policy, identity_manifest_sha) when is_map(policy) do
     raw_name = Map.get(policy, "name")

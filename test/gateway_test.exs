@@ -10395,7 +10395,7 @@ defmodule Tightbeam.GatewayTest do
     assert owner == "flynn"
 
     assert prompt ==
-             "Identity staleness: 2 active sessions are late for published revision #{revision}."
+             "Identity staleness: active sessions late for published revision #{revision}: 2."
 
     for session <- [late_one, late_two, quiet, early, current, retired] do
       refute prompt =~ session.session_key

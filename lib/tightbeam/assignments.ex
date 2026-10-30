@@ -1628,8 +1628,7 @@ defmodule Tightbeam.Assignments do
         "Partial row-condition hint only; it is not a complete --predicate. For any terminal " <>
           "card outcome, use assignment.state with assignmentId=#{assignment_id}. Registering " <>
           "a durable row wait also requires a caller-selected resolverRef (an accessible " <>
-          "same-owner assignment or decision_request), a nonblank necessity, and verificationRef " <>
-          "(an accessible same-owner open assignment)."
+          "assignment or decision_request). No necessity or verifier assignment is required."
     }
 
     %{
@@ -2423,6 +2422,72 @@ defmodule Tightbeam.Assignments do
     end
   end
 
+  defp opening_parent_in_txn(txn, %{principal: {:session, opener}, params: params}) do
+    if Map.has_key?(params, :parent_assignment_id) do
+      supplied = params[:parent_assignment_id]
+
+      cond do
+        parent_held_in_txn?(txn, supplied, opener) ->
+          {supplied, nil}
+
+        is_binary(supplied) ->
+          reason =
+            case Txn.q(txn, "SELECT state,holderKey FROM assignments WHERE id=?1", [supplied]) do
+              [["closed", _]] -> "it is closed"
+              [[_, _]] -> "it is not held by the opener"
+              [] -> "it does not exist"
+            end
+
+          {nil,
+           "Explicit parent #{supplied} was not used because #{reason}; no parent was linked."}
+
+        true ->
+          {nil, "Explicit parent is not an assignment id; no parent was linked."}
+      end
+    else
+      candidates =
+        case Txn.q(
+               txn,
+               "SELECT assignmentId,wakeId FROM turns WHERE sessionKey=?1 AND status='running' ORDER BY seq DESC LIMIT 1",
+               [opener]
+             ) do
+          [[id, _]] when is_binary(id) ->
+            [id]
+
+          [[nil, wake_id]] when is_binary(wake_id) ->
+            Txn.q(
+              txn,
+              """
+              SELECT DISTINCT w.assignmentId FROM notice_batches b
+              JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
+              JOIN wakes w ON w.wakeId=m.sourceWakeId
+              WHERE b.deliveryWakeId=?1 AND b.state='delivered' AND w.assignmentId IS NOT NULL
+              """,
+              [wake_id]
+            )
+            |> List.flatten()
+
+          _ ->
+            []
+        end
+
+      case Enum.filter(candidates, &parent_held_in_txn?(txn, &1, opener)) do
+        [parent] -> {parent, nil}
+        _ -> {nil, nil}
+      end
+    end
+  end
+
+  defp opening_parent_in_txn(_txn, _call), do: {nil, nil}
+
+  defp parent_held_in_txn?(txn, id, opener) do
+    is_binary(id) and
+      Txn.q(txn, "SELECT 1 FROM assignments WHERE id=?1 AND holderKey=?2 AND state='open'", [
+        id,
+        opener
+      ]) == [[1]]
+  end
+
   defp create_assignment(txn, call, owner, key, files, verb) do
     case Txn.q(
            txn,
@@ -2494,6 +2559,7 @@ defmodule Tightbeam.Assignments do
         id = id("asg_")
         now = now()
         {opened_user, opened_session} = opener(call.principal)
+        {parent_id, parent_explanation} = opening_parent_in_txn(txn, call)
 
         Txn.q(
           txn,
@@ -2501,8 +2567,8 @@ defmodule Tightbeam.Assignments do
           INSERT INTO assignments
             (id, subject, holderKey, holderRole, holderFallback, openedByUser,
              openedBySession, openedAt, workItemId, reviewsAssignmentId,
-             holderHarness, holderProvider)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             holderHarness, holderProvider, parentAssignmentId)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
           """,
           [
             id,
@@ -2516,7 +2582,8 @@ defmodule Tightbeam.Assignments do
             work_item_id,
             reviews_assignment_id,
             harness,
-            provider
+            provider,
+            parent_id
           ]
         )
 
@@ -2578,6 +2645,11 @@ defmodule Tightbeam.Assignments do
         end
 
         assignment = fetch_assignment!(txn, id)
+
+        assignment =
+          if parent_explanation,
+            do: Map.put(assignment, :parentExplanation, parent_explanation),
+            else: assignment
 
         append_assignment_marker(txn, assignment, :opened)
 
@@ -5277,7 +5349,7 @@ defmodule Tightbeam.Assignments do
       "WHERE g.assignmentId = assignments.id AND g.reopeningId IS " <>
       "(SELECT reopening.id FROM assignment_reopenings reopening " <>
       "WHERE reopening.assignmentId = assignments.id ORDER BY reopening.id DESC LIMIT 1))" <>
-      ", workItemId, reviewsAssignmentId, holderHarness, holderProvider, " <>
+      ", workItemId, reviewsAssignmentId, holderHarness, holderProvider, parentAssignmentId, " <>
       "COALESCE((SELECT effectKind FROM assignment_effects WHERE assignmentId = assignments.id), " <>
       "CASE WHEN reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END), " <>
       "COALESCE((SELECT priority FROM assignment_priorities WHERE assignmentId=assignments.id), " <>
@@ -5306,6 +5378,7 @@ defmodule Tightbeam.Assignments do
          reviews_assignment_id,
          holder_harness,
          holder_provider,
+         parent_assignment_id,
          effect_kind,
          priority
        ]) do
@@ -5328,6 +5401,7 @@ defmodule Tightbeam.Assignments do
       revocationReason: revocation_reason,
       workItemId: work_item_id,
       reviewsAssignmentId: reviews_assignment_id,
+      parentAssignmentId: parent_assignment_id,
       holderHarness: holder_harness,
       holderProvider: holder_provider,
       effectKind: effect_kind,

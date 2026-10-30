@@ -4236,7 +4236,7 @@ defmodule Tightbeam.Wire.Router do
     "ask" =>
       ~w(assignment_id context idempotency_key params question reason role session_key target user_id verb)a,
     "assign" =>
-      ~w(effect_kind files holder_key idempotency_key mementos prompt reviews reviews_assignment_id role session_key subject succeeds_assignment_id work_item_id owner_user_id)a,
+      ~w(effect_kind files holder_key idempotency_key mementos prompt reviews reviews_assignment_id role session_key subject succeeds_assignment_id parent_assignment_id work_item_id owner_user_id)a,
     "assignment-commitref-correct" =>
       ~w(assignment_id commit_refs evidence_artifact_id idempotency_key reason)a,
     "assignments" => ~w(role session_key state)a,
@@ -4252,7 +4252,7 @@ defmodule Tightbeam.Wire.Router do
     "decision-request" => ~w(request request_id)a,
     "decision-requests" => ~w(status)a,
     "dispatch" =>
-      ~w(brief effect_kind holder_key idempotency_key mementos prompt session_key subject succeeds_assignment_id work_item_id workdir_root owner_user_id)a,
+      ~w(brief effect_kind holder_key idempotency_key mementos prompt session_key subject succeeds_assignment_id parent_assignment_id work_item_id workdir_root owner_user_id)a,
     "effort-rule" => ~w(action request request_id)a,
     "execution-map" => ~w(tree origin owner state spec spec_sha session quiet_over)a,
     "execution-map-select" =>

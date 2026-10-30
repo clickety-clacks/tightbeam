@@ -64,6 +64,12 @@ defmodule Tightbeam.Supervision do
         )
 
       cancel_assignment_sources_in_txn(txn, assignment_id, {:replacement, deadline.wake_id})
+
+      case Txn.q(txn, "SELECT parentAssignmentId FROM assignments WHERE id=?1", [assignment_id]) do
+        [[parent]] when is_binary(parent) -> child_opened_in_txn(txn, parent)
+        _ -> :ok
+      end
+
       :ok
     else
       _ ->
@@ -78,6 +84,46 @@ defmodule Tightbeam.Supervision do
     Logger.warning("invalid assignment inactivity deadline input for #{inspect(assignment_id)}")
     :ok
   end
+
+  @doc false
+  def child_opened_in_txn(txn, parent_id) do
+    if not reminders_disabled?(nil) and
+         Txn.q(txn, "SELECT 1 FROM assignments WHERE id=?1 AND state='open'", [parent_id]) == [
+           [1]
+         ] do
+      [[holder, item, opened]] =
+        Txn.q(txn, "SELECT holderKey,workItemId,openedAt FROM assignments WHERE id=?1", [
+          parent_id
+        ])
+
+      start = activity_start_in_txn(txn, parent_id, opened)
+      {interval, _} = latest_deadline_state_in_txn(txn, parent_id, start)
+      activity = current_activity_time_in_txn(txn, parent_id, holder, start)
+
+      deadline =
+        schedule_deadline_in_txn(
+          txn,
+          parent_id,
+          holder,
+          item,
+          activity,
+          interval,
+          now() + interval
+        )
+
+      cancel_assignment_sources_in_txn(txn, parent_id, {:replacement, deadline.wake_id})
+    end
+
+    :ok
+  end
+
+  defp open_child_in_txn?(txn, assignment_id),
+    do:
+      Txn.q(
+        txn,
+        "SELECT 1 FROM assignments WHERE parentAssignmentId=?1 AND state='open' LIMIT 1",
+        [assignment_id]
+      ) != []
 
   @doc false
   def assignment_closed_in_txn(%Txn{} = txn, assignment_id)
@@ -314,15 +360,21 @@ defmodule Tightbeam.Supervision do
                          last_activity
                        )
 
-                     case restore_boot_climb_in_txn(
-                            txn,
-                            assignment_id,
-                            holder,
-                            work_item_id,
-                            last_activity,
-                            reminder_count,
-                            interval_ms
-                          ) do
+                     restored =
+                       if open_child_in_txn?(txn, assignment_id),
+                         do: :none,
+                         else:
+                           restore_boot_climb_in_txn(
+                             txn,
+                             assignment_id,
+                             holder,
+                             work_item_id,
+                             last_activity,
+                             reminder_count,
+                             interval_ms
+                           )
+
+                     case restored do
                        {:active, climb, visited} ->
                          cancel_boot_sources_in_txn(
                            txn,
@@ -360,7 +412,7 @@ defmodule Tightbeam.Supervision do
                            assignment_id,
                            holder,
                            deadline.wake_id,
-                           false
+                           open_child_in_txn?(txn, assignment_id)
                          )
                      end
                    end
@@ -863,6 +915,9 @@ defmodule Tightbeam.Supervision do
         fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
         :ok
 
+      open_child_in_txn?(txn, assignment_id) ->
+        child_opened_in_txn(txn, assignment_id)
+
       reminder_suppressed_in_txn?(txn, assignment_id, holder, now) ->
         reschedule_climb_in_txn(
           txn,
@@ -954,7 +1009,7 @@ defmodule Tightbeam.Supervision do
               work_item_id,
               episode_ref,
               now,
-              previous.prompt
+              reminder_text_in_txn(txn, assignment_id, "holder-reminder", now)
             )
 
           notice.wake_id
@@ -982,6 +1037,28 @@ defmodule Tightbeam.Supervision do
     :ok
   end
 
+  defp next_climb_target_in_txn(txn, assignment_id, holder, visited) do
+    [[opener]] =
+      Txn.q(txn, "SELECT openedBySession FROM assignments WHERE id=?1", [assignment_id])
+
+    opener =
+      if opener != holder and
+           Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active'", [opener]) ==
+             [[1]],
+         do: opener
+
+    [[owner, parent]] =
+      Txn.q(
+        txn,
+        "SELECT ownerUserId,#{Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey=?1",
+        [holder]
+      )
+
+    ([opener] ++
+       lineage(txn, parent, MapSet.new([holder]), []) ++ [active_personal_key(txn, owner)])
+    |> Enum.find(&(is_binary(&1) and &1 not in visited))
+  end
+
   defp advance_climb_in_txn(
          txn,
          wake,
@@ -995,7 +1072,7 @@ defmodule Tightbeam.Supervision do
          interval_ms,
          now
        ) do
-    target = ladder_target(txn, holder, rung)
+    target = next_climb_target_in_txn(txn, assignment_id, holder, visited)
     previous = Wakes.get_in_txn(txn, previous_wake_id)
 
     cond do
@@ -1063,16 +1140,18 @@ defmodule Tightbeam.Supervision do
   defp next_notice_in_txn(
          txn,
          %{state: "pending"} = previous,
-         _assignment_id,
+         assignment_id,
          _work_item_id,
          _episode_ref,
          target,
-         _now
+         now
        ) do
+    prompt = reminder_text_in_txn(txn, assignment_id, "climb-copy", now)
+    Txn.q(txn, "UPDATE wakes SET prompt=?2 WHERE wakeId=?1", [previous.wake_id, prompt])
     Wakes.readdress_pending_in_txn(txn, previous.wake_id, target)
   end
 
-  defp next_notice_in_txn(txn, previous, assignment_id, work_item_id, episode_ref, target, now) do
+  defp next_notice_in_txn(txn, _previous, assignment_id, work_item_id, episode_ref, target, now) do
     {:ok,
      schedule_notice_with_prompt_in_txn(
        txn,
@@ -1081,7 +1160,7 @@ defmodule Tightbeam.Supervision do
        work_item_id,
        episode_ref,
        now,
-       previous.prompt
+       reminder_text_in_txn(txn, assignment_id, "climb-copy", now)
      )}
   end
 
@@ -1194,9 +1273,9 @@ defmodule Tightbeam.Supervision do
   defp schedule_notice_in_txn(
          txn,
          assignment_id,
-         subject,
-         holder,
-         activity_at,
+         _subject,
+         _holder,
+         _activity_at,
          target,
          work_item_id,
          episode_ref,
@@ -1209,7 +1288,7 @@ defmodule Tightbeam.Supervision do
       work_item_id,
       episode_ref,
       due_at,
-      inactivity_notice_text(assignment_id, subject, holder, activity_at)
+      reminder_text_in_txn(txn, assignment_id, "holder-reminder", due_at)
     )
   end
 
@@ -1233,14 +1312,6 @@ defmodule Tightbeam.Supervision do
       work_item_id: work_item_id,
       obligation_ref: episode_ref
     })
-  end
-
-  defp inactivity_notice_text(assignment_id, subject, holder, activity_at) do
-    subject = if is_binary(subject) and subject != "", do: subject, else: "(subject unavailable)"
-    holder = if is_binary(holder) and holder != "", do: holder, else: "(holder unavailable)"
-
-    "Assignment #{assignment_id} (#{subject}), held by #{holder}, has had no recorded activity since #{activity_at} ms. " <>
-      "Holder: record progress, ask for a decision, or complete it. If this remains unresolved after escalation, the supervisor should record a blocker or decision request."
   end
 
   defp schedule_climb_in_txn(
@@ -1482,6 +1553,13 @@ defmodule Tightbeam.Supervision do
   end
 
   defp reminder_count_since_activity_in_txn(txn, assignment_id, holder, activity_at) do
+    child_closed =
+      max_row(txn, "SELECT MAX(closedAt) FROM assignments WHERE parentAssignmentId=?1", [
+        assignment_id
+      ])
+
+    activity_at = max(activity_at, child_closed || activity_at)
+
     case Txn.q(
            txn,
            """
@@ -1535,6 +1613,9 @@ defmodule Tightbeam.Supervision do
       )
 
     quiet_events = [
+      max_row(txn, "SELECT MAX(closedAt) FROM assignments WHERE parentAssignmentId=?1", [
+        assignment_id
+      ]),
       max_row(
         txn,
         "SELECT MAX(endedAt) FROM turns WHERE sessionKey=?1 AND endedAt IS NOT NULL",
@@ -1601,7 +1682,8 @@ defmodule Tightbeam.Supervision do
           true
       end
 
-    Tightbeam.Assignments.cannot_proceed_standing_in_txn?(txn, assignment_id) or
+    open_child_in_txn?(txn, assignment_id) or
+      Tightbeam.Assignments.cannot_proceed_standing_in_txn?(txn, assignment_id) or
       pending_turn or pending_followup or holder_unavailable
   end
 
@@ -1763,6 +1845,36 @@ defmodule Tightbeam.Supervision do
 
         {@default_interval_ms, activity_start}
     end
+  end
+
+  @doc false
+  def holder_activity_in_txn(txn, holder) do
+    Txn.q(txn, "SELECT id,openedAt FROM assignments WHERE holderKey=?1 AND state='open'", [holder])
+    |> Enum.map(fn [id, opened] ->
+      current_activity_time_in_txn(txn, id, holder, activity_start_in_txn(txn, id, opened))
+    end)
+    |> Enum.max(fn -> nil end)
+  end
+
+  defp reminder_text_in_txn(txn, assignment_id, kind, now) do
+    [[subject, holder, opened]] =
+      Txn.q(txn, "SELECT subject,holderKey,openedAt FROM assignments WHERE id=?1", [assignment_id])
+
+    activity =
+      current_activity_time_in_txn(
+        txn,
+        assignment_id,
+        holder,
+        activity_start_in_txn(txn, assignment_id, opened)
+      )
+
+    Tightbeam.Reminders.render(txn, kind, %{
+      assignment_id: assignment_id,
+      subject:
+        if(is_binary(subject) and subject != "", do: subject, else: "(subject unavailable)"),
+      holder: if(is_binary(holder) and holder != "", do: holder, else: "(holder unavailable)"),
+      last_activity: Tightbeam.Reminders.activity(activity, now)
+    })
   end
 
   defp current_activity_time_in_txn(txn, assignment_id, holder, opened_at) do

@@ -34,7 +34,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "work items" =>
       ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority rowVersion),
     "assignments" =>
-      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
+      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
     "wakes" =>
       ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon deliveryStatus rowVersion),
     "turns" =>
@@ -54,7 +54,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "work items" =>
       ~w(specRefName specRefSha256 ownerUserId failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq),
     "assignments" =>
-      ~w(holderRole openedByUser openedBySession outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider),
+      ~w(holderRole openedByUser openedBySession outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider),
     "wakes" =>
       ~w(targetRole prompt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey workItemId assignmentId canceledAt class classElection deliveryRule deliveryStatus),
     "turns" =>

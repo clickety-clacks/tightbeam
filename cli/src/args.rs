@@ -276,6 +276,7 @@ pub enum Command {
         effect_kind: Option<String>,
         files: Option<Vec<String>>,
         succeeds: Option<String>,
+        parent_assignment: Option<String>,
     },
     Dispatch {
         identity: Identity,
@@ -289,6 +290,7 @@ pub enum Command {
         brief: String,
         idempotency_key: Option<String>,
         succeeds: Option<String>,
+        parent_assignment: Option<String>,
     },
     EffortRule {
         identity: Identity,
@@ -782,8 +784,8 @@ COMMANDS:
       eligible queued messages to that assignment's holder.
       The accountable agent re-reads durable state and decides the next action.
       The fallback timer detects silence only; it does not select an action.
-      A dependency predicate names conditions, bindings, resolverRef, necessity,
-      and verificationRef. --after-turn captures the caller's running turn.
+      A dependency predicate names conditions, optional bindings, and resolverRef.
+      No necessity or verifier assignment is required. --after-turn captures the caller's running turn.
       --prompt is the caller's explicit instruction override.
       Tightbeam carries it without rewriting it.
       --class elects the receiver's delivery policy. Without --class the wake
@@ -992,17 +994,21 @@ COMMANDS:
       Conclude an item (→ closed). Requires zero open assignments.
   work-item-fail <workItemId> [--reason <text>]
       Rule an item failed (→ failed); --reason is recorded on the item.
+  --parent-assignment explicitly links an open assignment held by the opener.
+      It takes precedence over the current turn or delivered batch evidence.
+      An invalid explicit parent leaves the new assignment unlinked, without refusal.
+
   assign --subject "<work>" (--session <key> | --role <name>) [--owner <user>]
          [--key <key>] [--work-item <workItemId>]
          [--reviews <assignmentId>] [--effect-kind <kind>]
-         [--files '["lib/a.ex","test/a_test.exs"]'] [--succeeds <assignmentId>]
+         [--files '["lib/a.ex","test/a_test.exs"]'] [--succeeds <assignmentId>] [--parent-assignment <assignmentId>]
       Open an obligation held by a session; a work item is the durable thread
       across assignments. --files is an advisory suggestion that others can see;
       it reserves no path and does not limit the assignment's work.
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
            --brief "<one sentence>" [--work-item <workItemId>]
            [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
-           [--succeeds <assignmentId>] [--owner <user>]
+           [--succeeds <assignmentId>] [--parent-assignment <assignmentId>] [--owner <user>]
       Atomically open an assignment and wake its holder with the card id.
       For assign/dispatch without a work item, an external process supplies
       --owner <user> for notices. Session callers retain their own attribution.
@@ -2692,6 +2698,7 @@ fn parse_with_optional_catalog(
                     "files",
                     "memento",
                     "succeeds",
+                    "parent-assignment",
                 ],
             )?;
             let targets = [
@@ -2725,6 +2732,7 @@ fn parse_with_optional_catalog(
                 effect_kind: nonempty(flags, "effect-kind"),
                 files,
                 succeeds: nonempty(flags, "succeeds"),
+                parent_assignment: flags.get("parent-assignment").cloned(),
             })
         }
         "dispatch" => {
@@ -2743,6 +2751,7 @@ fn parse_with_optional_catalog(
                     "memento",
                     "key",
                     "succeeds",
+                    "parent-assignment",
                 ],
             )?;
             let holders = [nonempty(flags, "to"), nonempty(flags, "holder")]
@@ -2767,6 +2776,7 @@ fn parse_with_optional_catalog(
                 brief,
                 idempotency_key: nonempty(flags, "key"),
                 succeeds: nonempty(flags, "succeeds"),
+                parent_assignment: flags.get("parent-assignment").cloned(),
             })
         }
         "effort-rule" => {

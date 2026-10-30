@@ -967,6 +967,10 @@ defmodule Tightbeam.Identity do
     }
   end
 
+  @doc "Read a published file without initializing or changing the identity tree."
+  def published_file_bytes!(base_dir, path),
+    do: revision_file_bytes!(base_dir, @live, path)
+
   @doc "The exact bytes of a file in the published identity at `revision`."
   @spec revision_file_bytes!(String.t(), String.t(), String.t()) :: binary()
   def revision_file_bytes!(base_dir, revision, path),

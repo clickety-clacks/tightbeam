@@ -1,0 +1,5 @@
+Assignment {assignment_id} ({subject}), held by {holder}. Last recorded activity: {last_activity}.
+
+If there is work to do, act now. If the work is done, complete the assignment. If truly waiting, wake on the record that will announce it: a child result, decision, PR checks, reply, or fact; use a timed wake only when no record announces it. If a decision is needed, ask for one. Do not file progress unless something materially changed.
+
+If this remains unresolved after escalation, the supervisor should record a blocker or decision request.

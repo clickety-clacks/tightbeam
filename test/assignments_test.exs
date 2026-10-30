@@ -50,6 +50,134 @@ defmodule Tightbeam.AssignmentsTest do
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
+  test "upgrading assignments adds no parent links to existing rows", ctx do
+    existing = ctx.handlers["assign"].(assign_call({:user, "flynn"}, "existing task"))
+
+    {:ok, :ok} =
+      DB.migration_transaction(ctx.db, :prior_assignment_shape, [], [], fn txn ->
+        Tightbeam.DB.Txn.exec(txn, "DROP INDEX assignments_parent")
+        Tightbeam.DB.Txn.exec(txn, "ALTER TABLE assignments DROP COLUMN parentAssignmentId")
+      end)
+
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    readback = ctx.handlers["assignment-get"].(assignment_get_call({:user, "flynn"}, existing.id))
+    assert readback.parentAssignmentId == nil
+    assert readback.subject == "existing task"
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+  end
+
+  test "child parent comes from the current task or explicit override, never sole ownership",
+       ctx do
+    parent = ctx.handlers["assign"].(assign_call({:user, "flynn"}, "parent"))
+    unrelated = ctx.handlers["assign"].(assign_call({:session, "holder"}, "unrelated"))
+    assert unrelated.parentAssignmentId == nil
+    turn = start_running_turn(ctx.db, "holder", "work on parent")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE turns SET assignmentId=?2 WHERE seq=?1", [turn.seq, parent.id])
+
+    child = ctx.handlers["assign"].(assign_call({:session, "holder"}, "linked"))
+    assert child.parentAssignmentId == parent.id
+    invalid = assign_call({:session, "holder"}, "explicit invalid")
+    invalid = put_in(invalid.params[:parent_assignment_id], "missing")
+    unlinked = ctx.handlers["assign"].(invalid)
+    assert unlinked.parentAssignmentId == nil
+    assert unlinked.parentExplanation =~ "no parent was linked"
+    override = put_in(invalid.params[:parent_assignment_id], unrelated.id)
+    linked = ctx.handlers["assign"].(override)
+    assert linked.parentAssignmentId == unrelated.id
+    user_opened = ctx.handlers["assign"].(assign_call({:user, "flynn"}, "user task"))
+    assert user_opened.parentAssignmentId == nil
+    readback = ctx.handlers["assignment-get"].(assignment_get_call({:user, "flynn"}, child.id))
+    assert readback.parentAssignmentId == parent.id
+
+    assert %{state: "closed"} =
+             ctx.handlers["revoke-assignment"].(revoke_call({:session, "holder"}, child.id))
+
+    assert %{state: "open", parentAssignmentId: recorded_parent} =
+             ctx.handlers["reopen-assignment"].(
+               reopen_call({:session, "holder"}, child.id, "continue scope")
+             )
+
+    assert recorded_parent == parent.id
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE assignments SET holderKey=?2 WHERE id=?1", [
+        child.id,
+        ctx.other.session_key
+      ])
+
+    assert ctx.handlers["assignment-get"].(assignment_get_call({:user, "flynn"}, child.id)).parentAssignmentId ==
+             parent.id
+  end
+
+  for count <- [1, 2] do
+    test "parent inference uses unique frozen batch evidence: #{count} assignments", ctx do
+      start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+      start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+
+      parents =
+        for n <- 1..unquote(count),
+            do: ctx.handlers["assign"].(assign_call({:user, "flynn"}, "parent #{n}"))
+
+      for parent <- parents do
+        {:ok, _wake} =
+          DB.transaction(ctx.db, fn txn ->
+            Wakes.schedule_in_txn(txn, %{
+              session_key: "holder",
+              origin: "process:tightbeam",
+              prompt: "parent work",
+              assignment_id: parent.id,
+              due_at: System.system_time(:millisecond)
+            })
+          end)
+      end
+
+      item =
+        WorkItems.__handle__(
+          ctx.db,
+          "work-item-create",
+          work_item_call("work-item-create", {:user, "flynn"}, %{title: "Unrelated work"})
+        )
+
+      {:ok, _wake} =
+        DB.transaction(ctx.db, fn txn ->
+          Wakes.schedule_in_txn(txn, %{
+            session_key: "holder",
+            origin: "process:tightbeam",
+            prompt: "unrelated general message",
+            work_item_id: item.id,
+            due_at: System.system_time(:millisecond)
+          })
+        end)
+
+      assert [_ | _] = NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 60_000)
+      assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "batch-parent-test")
+
+      assert {:ok, [[nil]]} =
+               DB.query(ctx.db, "SELECT assignmentId FROM turns WHERE seq=?1", [turn.seq])
+
+      child = ctx.handlers["assign"].(assign_call({:session, "holder"}, "child from batch"))
+
+      if unquote(count) == 1 do
+        assert child.parentAssignmentId == hd(parents).id
+      else
+        assert child.parentAssignmentId == nil
+        chosen = List.last(parents)
+        explicit = assign_call({:session, "holder"}, "explicit batch child")
+        explicit = put_in(explicit.params[:parent_assignment_id], chosen.id)
+        assert ctx.handlers["assign"].(explicit).parentAssignmentId == chosen.id
+
+        assert %{state: "closed"} =
+                 ctx.handlers["revoke-assignment"].(revoke_call({:session, "holder"}, chosen.id))
+
+        closed = ctx.handlers["assign"].(explicit)
+        assert closed.parentAssignmentId == nil
+        assert closed.parentExplanation =~ "it is closed"
+      end
+    end
+  end
+
   test "gateway opens and retires with supervision reminders off", ctx do
     handlers = Gateway.handlers(%{db: ctx.db, supervision_interval_ms: :off, wake_tick_ms: 101})
 
@@ -503,8 +631,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert hint.record_dependency.bindings == %{"assignmentId" => assignment.id}
     assert hint.record_dependency.message =~ "not a complete --predicate"
     assert hint.record_dependency.message =~ "caller-selected resolverRef"
-    assert hint.record_dependency.message =~ "nonblank necessity"
-    assert hint.record_dependency.message =~ "same-owner open assignment"
+    assert hint.record_dependency.message =~ "No necessity or verifier assignment is required"
     assert hint.message =~ "--when-fact assignment-landed"
     assert hint.message =~ "assignmentId=#{assignment.id}"
     assert hint.message =~ "assignment.state"

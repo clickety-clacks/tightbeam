@@ -215,51 +215,32 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     end
   end
 
-  test "verifier notice is ordinary blocked-holder mail attributed only to V", ctx do
-    dependency = register_wait(ctx.db, due_after(), predicate("R"))
-    notice = Wakes.get(ctx.db, dependency.verification_notice_wake_id)
+  test "dependency registration needs only a resolver and ignores legacy verifier declarations",
+       ctx do
+    suspend_scheduler(ctx)
+    minimal = Map.drop(predicate("R"), ["necessity", "verificationRef"])
+    first = register_wait(ctx.db, due_after(), minimal)
+    assert first.verification_notice_wake_id == nil
+    assert first.verification_assignment_id == nil
+    assert first.selected_policy_name == nil
+    assert first.necessity == nil
+    assert %{outcome: "revoked"} = revoke(ctx.db, "V")
 
-    assert notice.session_key == "verifier"
-    assert notice.assignment_id == "V"
-    assert notice.obligation_ref == "V"
-    assert notice.owner_user_id == "owner-a"
+    legacy =
+      Map.merge(minimal, %{
+        "necessity" => 0,
+        "verificationRef" => %{"kind" => "assignment", "id" => "V"}
+      })
 
-    assert {:ok, []} =
-             DB.query(
-               ctx.db,
-               "SELECT 1 FROM supervision_liveness_sidecar WHERE wakeId=?1",
-               [notice.wake_id]
-             )
+    second = register_wait(ctx.db, due_after(), legacy)
+    assert second.verification_notice_wake_id == nil
 
-    assert {:ok, %{fact_id: _}} =
-             DB.transaction(ctx.db, fn txn ->
-               ConditionFacts.file_in_txn(txn, %{
-                 kind: "work-blocked",
-                 scope: "verifier",
-                 origin: "session:holder"
-               })
-             end)
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE sessionKey='verifier'")
 
-    before = supervision_counts(ctx.db, "V")
-
-    assert :ok = stop_supervised(Wakes)
-
-    start_supervised!(
-      {Wakes,
-       name: ctx.scheduler,
-       db: ctx.db,
-       tick_ms: 60_000,
-       deliver: delivery_fun(ctx.db, ctx.registry, ctx.lane),
-       delivery_opts: [conn_registry: ctx.registry, lane_manager: ctx.lane]}
-    )
-
-    assert :ok = Wakes.fire_due(ctx.scheduler)
-    assert Wakes.get(ctx.db, notice.wake_id).state == "fired"
-
-    assert [["verifier", "V", "wi-verification", "queued", _prompt]] =
-             turn_rows_for_source(ctx.db, notice.wake_id)
-
-    assert supervision_counts(ctx.db, "V") == before
+    assert %{outcome: "revoked"} = revoke(ctx.db, "R")
+    assert Wakes.get(ctx.db, first.wake_id).recognition_reason == "resolver-terminal"
+    assert Wakes.get(ctx.db, second.wake_id).recognition_reason == "resolver-terminal"
   end
 
   test "Firehose internal consume commits once and rollback preserves pending", ctx do
@@ -300,11 +281,11 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     refute_receive {:firehose_notice, _}
   end
 
-  test "unresolved registration is coherent, terminal recognition latches, and T gates one delivery",
+  test "stored provisional wait recognizes a terminal resolver and gates one delivery",
        ctx do
     scheduler_pid = suspend_scheduler(ctx)
     turn = running_turn(ctx.db, "holder")
-    wake = register_wait(ctx.db, due_after(), predicate("R"))
+    wake = register_legacy_wait(ctx.db, due_after(), predicate("R"))
 
     assert wake.wait_mode == "dependency"
     assert wake.assignment_id == "A"
@@ -920,7 +901,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
   end
 
   test "verification verdicts are holder-and-wait-bound and challenge recognizes once", ctx do
-    wake = register_wait(ctx.db, due_after(), predicate("R"))
+    wake = register_legacy_wait(ctx.db, due_after(), predicate("R"))
 
     wrong_holder = attest(ctx.db, "V", "intruder", "verdict", "wait-verified", wake.wake_id)
     assert wrong_holder.code == "invalid_wait_verdict"
@@ -955,7 +936,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
   test "terminal verifier and fallback end provisional waiting without inventing confirmation",
        ctx do
-    verifier_terminal = register_wait(ctx.db, due_after(), predicate("R"))
+    verifier_terminal = register_legacy_wait(ctx.db, due_after(), predicate("R"))
     assert %{outcome: "revoked"} = revoke(ctx.db, "V")
 
     terminal = Wakes.get(ctx.db, verifier_terminal.wake_id)
@@ -968,7 +949,11 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assignment(ctx.db, "V2", "verifier")
 
     fallback =
-      register_wait(ctx.db, System.system_time(:millisecond) - 1, predicate("R", nil, "V2"))
+      register_legacy_wait(
+        ctx.db,
+        System.system_time(:millisecond) - 1,
+        predicate("R", nil, "V2")
+      )
 
     assert fallback.recognition_path == nil
     assert :ok = Wakes.fire_due(ctx.scheduler)
@@ -1065,24 +1050,6 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     assert wake_count(ctx.db) == before
 
-    invalid = put_in(predicate("R"), ["verificationRef", "id"], "missing")
-
-    assert {:ok, {:error, %{code: "invalid_verifier"}}} =
-             DB.transaction(ctx.db, fn txn ->
-               Wakes.register_wait_in_txn(txn, %{
-                 session_key: "holder",
-                 origin: "agent:holder",
-                 prompt: "do not persist",
-                 due_at: due_after(),
-                 assignment_id: "A",
-                 predicate: invalid,
-                 registrant_session_key: "holder",
-                 owner_user_id: "owner-a"
-               })
-             end)
-
-    assert wake_count(ctx.db) == before
-
     invalid_resolver =
       put_in(predicate("R"), ["resolverRef"], %{"kind" => "work_item", "id" => "R"})
 
@@ -1103,59 +1070,25 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert wake_count(ctx.db) == before
   end
 
-  test "verification admission selects bytewise name and never rewrites the stored choice", ctx do
+  test "retired verification policies warn and do not affect registration", ctx do
     rules_dir = Path.join(ctx.base, "identity/rules")
+    File.write!(Path.join(rules_dir, "another.toml"), policy("another-verifier"))
+    log = ExUnit.CaptureLog.capture_log(fn -> Rules.load!(ctx.base, ~w(wake attest)) end)
+    assert log =~ "wait-verification-admission is retired"
+
+    wake =
+      register_wait(
+        ctx.db,
+        due_after(),
+        Map.drop(predicate("R"), ["necessity", "verificationRef"])
+      )
+
+    assert wake.selected_policy_name == nil
+    assert wake.verification_notice_wake_id == nil
     File.rm!(Path.join(rules_dir, "verification.toml"))
-    File.write!(Path.join(rules_dir, "z.toml"), policy("z-verifier"))
-    File.write!(Path.join(rules_dir, "a.toml"), policy("a-verifier"))
+    File.rm!(Path.join(rules_dir, "another.toml"))
     Rules.load!(ctx.base, ~w(wake attest))
-
-    first = register_wait(ctx.db, due_after(), predicate("R"))
-    assert first.selected_policy_name == "a-verifier"
-    assert is_binary(first.verification_notice_wake_id)
-
-    File.rm!(Path.join(rules_dir, "a.toml"))
-    File.rm!(Path.join(rules_dir, "z.toml"))
-
-    File.write!(
-      Path.join(rules_dir, "reversed.toml"),
-      policy("z-verifier") <> policy("a-verifier")
-    )
-
-    Rules.load!(ctx.base, ~w(wake attest))
-
-    reversed = register_wait(ctx.db, due_after(), predicate("R"))
-    assert reversed.selected_policy_name == "a-verifier"
-    assert is_binary(reversed.verification_notice_wake_id)
-    refute reversed.verification_notice_wake_id == first.verification_notice_wake_id
-
-    File.rm!(Path.join(rules_dir, "reversed.toml"))
-    File.write!(Path.join(rules_dir, "z.toml"), policy("z-verifier"))
-    Rules.load!(ctx.base, ~w(wake attest))
-    assert Wakes.get(ctx.db, first.wake_id).selected_policy_name == "a-verifier"
-
-    second = register_wait(ctx.db, due_after(), predicate("R"))
-    assert second.selected_policy_name == "z-verifier"
-
-    File.rm!(Path.join(rules_dir, "z.toml"))
-    Rules.load!(ctx.base, ~w(wake attest))
-    before = wake_count(ctx.db)
-
-    assert {:ok, {:error, %{code: "verification_not_admitted"}}} =
-             DB.transaction(ctx.db, fn txn ->
-               Wakes.register_wait_in_txn(txn, %{
-                 session_key: "holder",
-                 origin: "agent:holder",
-                 prompt: "refuse without a policy",
-                 due_at: due_after(),
-                 assignment_id: "A",
-                 predicate: predicate("R"),
-                 registrant_session_key: "holder",
-                 owner_user_id: "owner-a"
-               })
-             end)
-
-    assert wake_count(ctx.db) == before
+    assert register_wait(ctx.db, due_after(), predicate("R")).wait_mode == "dependency"
   end
 
   for mode <- [:dependency, :after_turn] do
@@ -1478,6 +1411,34 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     :ok = :sys.suspend(pid)
     on_exit(fn -> if Process.alive?(pid), do: :sys.resume(pid) end)
     pid
+  end
+
+  # Historical row shape: compatibility of already-admitted provisional waits.
+  defp register_legacy_wait(db, due_at, predicate) do
+    wake = register_wait(db, due_at, predicate)
+    verifier = predicate["verificationRef"]["id"]
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        notice =
+          Wakes.schedule_in_txn(txn, %{
+            session_key: "verifier",
+            origin: "process:tightbeam",
+            assignment_id: verifier,
+            obligation_ref: verifier,
+            owner_user_id: "owner-a",
+            prompt: "Historical verification request",
+            due_at: System.system_time(:millisecond)
+          })
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          "UPDATE wakes SET necessity=?2,verificationAssignmentId=?3,verificationHolderKey='verifier',selectedPolicyName='accountable-dependency-verifier',verificationState='provisional',verificationNoticeWakeId=?4 WHERE wakeId=?1",
+          [wake.wake_id, predicate["necessity"], verifier, notice.wake_id]
+        )
+      end)
+
+    Wakes.get(db, wake.wake_id)
   end
 
   defp register_wait(db, due_at, predicate) do
