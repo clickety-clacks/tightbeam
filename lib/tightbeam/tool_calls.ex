@@ -87,11 +87,21 @@ defmodule Tightbeam.ToolCalls do
   )
   """
 
-  @messages_with_record_event_ids_ddl String.replace!(
-                                        String.trim(@messages_new_ddl),
-                                        "markerTo               TEXT,\n    CHECK (",
-                                        "markerTo               TEXT, recordEventIds TEXT,\n    CHECK ("
-                                      )
+  @messages_with_record_event_ids_ddl (
+                                           case String.split(
+                                                  String.trim(@messages_new_ddl),
+                                                  "markerTo               TEXT,\n    CHECK ("
+                                                ) do
+                                             [prefix, suffix] ->
+                                               prefix <>
+                                                 "markerTo               TEXT, recordEventIds TEXT,\n    CHECK (" <>
+                                                 suffix
+
+                                             _ ->
+                                               raise ArgumentError,
+                                                     "expected one messages table CHECK marker"
+                                           end
+                                         )
 
   @doc "Apply the one-time tool-call and transition schema migration."
   @spec ensure_schema(DB.server()) :: :ok
