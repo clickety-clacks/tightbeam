@@ -4878,13 +4878,12 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           Tightbeam.DB.Txn.exec(txn, """
           INSERT INTO wake_cancellations(
             wakeId, wakeState, canceledAt, requesterKind, requesterId, reasonKind,
-            causalSourceKind, causalSourceId, outcomeKind, workImpactKind, actionNeeded,
-            rootWakeId, attempt, outcome, observedAt
+            causalSourceKind, causalSourceId, outcomeKind, workImpactKind, actionNeeded
           )
           SELECT
             wakeId, 'canceled', 1, 'session', 'record-event-plan-session-00',
             'requester_withdrew', 'verb_call', 'record-event-plan', 'no_replacement',
-            'no_linked_work', 0, wakeId, 0, 'canceled', 1
+            'no_linked_work', 0
           FROM wakes
           WHERE wakeId BETWEEN 'record-event-plan-wake-00003' AND 'record-event-plan-wake-88481'
           """)
