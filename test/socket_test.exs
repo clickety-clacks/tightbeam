@@ -183,6 +183,136 @@ defmodule Tightbeam.Wire.SocketTest do
              "messageId" => "c_once"
            }
 
+    invalid_attachments = [
+      false,
+      [
+        %{"asset_id" => "a_wrong", "mime_type" => "image/png", "filename" => "x.png", "size" => 1}
+      ],
+      [%{"assetId" => "a_missing", "mimeType" => "image/png", "size" => 1}],
+      [
+        %{
+          "assetId" => "a_string",
+          "mimeType" => "image/png",
+          "filename" => "x.png",
+          "size" => "1"
+        }
+      ],
+      [
+        %{
+          "assetId" => "a_extra",
+          "mimeType" => "image/png",
+          "filename" => "x.png",
+          "size" => 1,
+          "extra" => true
+        }
+      ]
+    ]
+
+    for {attachments, index} <- Enum.with_index(invalid_attachments, 1) do
+      id = "c_bad_attachments_#{index}"
+
+      {:push, {:text, error}, live} =
+        Socket.handle_in(
+          {
+            JSON.encode!(Map.merge(message, %{"id" => id, "attachments" => attachments})),
+            opcode: :text
+          },
+          live
+        )
+
+      assert JSON.decode!(error) == %{
+               "type" => "error",
+               "code" => "invalid_message",
+               "message" => "attachments must be canonical attachment references",
+               "messageId" => id
+             }
+
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE clientMessageId=?1", [id])
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE json_extract(sourceClientIdentity,'$.clientMessageId')=?1",
+                 [id]
+               )
+    end
+
+    canonical_attachments = [
+      %{"assetId" => "a_one", "mimeType" => "image/png", "filename" => "one.png", "size" => 3},
+      %{"assetId" => "a_two", "mimeType" => "image/jpeg", "filename" => "two.jpg", "size" => 5}
+    ]
+
+    for {id, attachments} <- [{"c_null_attachments", nil}, {"c_empty_attachments", []}] do
+      {:push, {:text, ack}, live} =
+        Socket.handle_in(
+          {
+            JSON.encode!(Map.merge(message, %{"id" => id, "attachments" => attachments})),
+            opcode: :text
+          },
+          live
+        )
+
+      assert JSON.decode!(ack) == %{"type" => "ack", "id" => id}
+
+      assert {:ok, [[encoded]]} =
+               DB.query(ctx.db, "SELECT attachments FROM messages WHERE clientMessageId=?1", [id])
+
+      assert JSON.decode!(encoded) == []
+    end
+
+    {:push, {:text, valid_ack}, live} =
+      Socket.handle_in(
+        {
+          JSON.encode!(
+            Map.merge(message, %{
+              "id" => "c_ordered_attachments",
+              "content" => "look at these",
+              "attachments" => canonical_attachments
+            })
+          ),
+          opcode: :text
+        },
+        live
+      )
+
+    assert JSON.decode!(valid_ack) == %{"type" => "ack", "id" => "c_ordered_attachments"}
+
+    assert {:ok, [[encoded]]} =
+             DB.query(
+               ctx.db,
+               "SELECT attachments FROM messages WHERE clientMessageId='c_ordered_attachments'"
+             )
+
+    assert JSON.decode!(encoded) == canonical_attachments
+
+    single_attachment = List.first(canonical_attachments)
+
+    {:push, {:text, attachment_only_ack}, live} =
+      Socket.handle_in(
+        {
+          JSON.encode!(
+            Map.merge(message, %{
+              "id" => "c_attachment_only",
+              "content" => "",
+              "attachments" => [single_attachment]
+            })
+          ),
+          opcode: :text
+        },
+        live
+      )
+
+    assert JSON.decode!(attachment_only_ack) == %{"type" => "ack", "id" => "c_attachment_only"}
+
+    assert {:ok, [["", stored]]} =
+             DB.query(
+               ctx.db,
+               "SELECT content,attachments FROM messages WHERE clientMessageId='c_attachment_only'"
+             )
+
+    assert JSON.decode!(stored) == [single_attachment]
+
     {:push, {:text, bad_prefix}, live} =
       Socket.handle_in(
         {JSON.encode!(%{message | "id" => "bad_prefix"}), opcode: :text},
