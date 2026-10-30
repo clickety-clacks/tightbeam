@@ -64,6 +64,7 @@ defmodule Tightbeam.Gateway do
     AdapterCoordinator,
     AdminProjection,
     Archetypes,
+    Assets,
     Artifacts,
     ArtifactContent,
     Assignments,
@@ -770,19 +771,28 @@ defmodule Tightbeam.Gateway do
       {"post", ["message.created", "session.updated"]} => fn call ->
         p = call.params
 
-        outcome =
-          deliver_prompt(call.session_key, call.origin, p.content,
-            db: db,
-            device_id: p.device_id,
-            client_message_id: p.client_message_id,
-            attachments: Map.get(p, :attachments, []),
-            creator_session_key: call.session_key,
-            queue_when_busy: true
-          )
+        case canonical_post_attachments(Map.get(p, :attachments)) do
+          {:ok, attachments} ->
+            outcome =
+              deliver_prompt(call.session_key, call.origin, p.content,
+                db: db,
+                device_id: p.device_id,
+                client_message_id: p.client_message_id,
+                attachments: attachments,
+                creator_session_key: call.session_key,
+                queue_when_busy: true
+              )
 
-        if outcome in [:appended, :queued],
-          do: %{ack: p.client_message_id},
-          else: %{dedupe: to_string(outcome)}
+            if outcome in [:appended, :queued],
+              do: %{ack: p.client_message_id},
+              else: %{dedupe: to_string(outcome)}
+
+          :error ->
+            %{
+              code: "invalid_message",
+              message: "attachments must be canonical attachment references"
+            }
+        end
       end,
       {"wake",
        ["wake.scheduled", "wake.canceled", "wake.fired", "message.created", "session.updated"]} =>
@@ -1686,6 +1696,22 @@ defmodule Tightbeam.Gateway do
 
     Map.new(specs)
   end
+
+  defp canonical_post_attachments(nil), do: {:ok, []}
+
+  defp canonical_post_attachments(attachments) when is_list(attachments) do
+    if Enum.all?(attachments, &canonical_attachment?/1), do: {:ok, attachments}, else: :error
+  end
+
+  defp canonical_post_attachments(_attachments), do: :error
+
+  defp canonical_attachment?(attachment) when is_map(attachment) do
+    Enum.sort(Map.keys(attachment)) == ~w(assetId filename mimeType size) and
+      is_binary(attachment["assetId"]) and is_binary(attachment["mimeType"]) and
+      is_binary(attachment["filename"]) and is_integer(attachment["size"])
+  end
+
+  defp canonical_attachment?(_attachment), do: false
 
   @doc "The immutable verb-handler table (see moduledoc list) — built once, passed to Dispatch."
   @spec handlers(config()) :: Tightbeam.Dispatch.handlers()
@@ -3405,6 +3431,148 @@ defmodule Tightbeam.Gateway do
     """
   end
 
+  @doc false
+  def turn_prompt_content(db, turn, session_key, harness, base_dir) do
+    messages = turn_human_messages(db, turn, session_key)
+
+    entries =
+      Enum.flat_map(messages, fn message ->
+        message.attachments
+        |> Enum.with_index(1)
+        |> Enum.map(fn {attachment, index} ->
+          turn_attachment_entry(
+            db,
+            base_dir,
+            message,
+            attachment,
+            index,
+            covered_inline_harness?(harness)
+          )
+        end)
+      end)
+
+    case entries do
+      [] ->
+        turn.prompt
+
+      _entries ->
+        append_turn_attachment_labels(turn.prompt, entries)
+    end
+  end
+
+  defp turn_human_messages(db, turn, session_key) do
+    rows =
+      case DB.query(
+             db,
+             """
+             SELECT message.seq,message.attachments,member.publicationSeq
+             FROM wakes AS source
+             JOIN messages AS message
+               ON message.sessionKey=?2
+              AND message.deviceId=json_extract(source.sourceClientIdentity,'$.deviceId')
+              AND message.clientMessageId=json_extract(source.sourceClientIdentity,'$.clientMessageId')
+             LEFT JOIN notice_batch_members AS member
+               ON member.sourceWakeId=source.wakeId AND member.state='included'
+             WHERE source.deliveredTurnSeq=?1
+               AND source.sourceClientIdentity IS NOT NULL
+               AND source.origin LIKE 'user:%'
+             ORDER BY COALESCE(member.publicationSeq,message.seq),message.seq
+             """,
+             [turn.seq, session_key]
+           ) do
+        {:ok, rows} -> rows
+      end
+
+    case rows do
+      [] ->
+        case Projection.get(db, turn.message_id) do
+          %{role: "user"} = message ->
+            [%{seq: message.seq, attachments: message.attachments}]
+
+          _ ->
+            []
+        end
+
+      rows ->
+        Enum.map(rows, fn [seq, encoded_attachments, publication_seq] ->
+          %{
+            seq: seq,
+            attachments: JSON.decode!(encoded_attachments),
+            publication_seq: publication_seq
+          }
+        end)
+    end
+  end
+
+  defp turn_attachment_entry(db, base_dir, message, attachment, index, covered_harness?) do
+    marker =
+      case Map.get(message, :publication_seq) do
+        publication_seq when is_integer(publication_seq) -> "[#{publication_seq}]"
+        _ -> "message [#{message.seq}]"
+      end
+
+    label =
+      "#{marker} attachment #{index} #{inspect(attachment["filename"])} " <>
+        "(#{attachment["mimeType"]}, #{attachment["size"]} bytes): "
+
+    mime_type = attachment["mimeType"]
+    asset_id = attachment["assetId"]
+
+    cond do
+      mime_type not in ["image/jpeg", "image/png"] ->
+        {label <>
+           "original-file delivery is not included in this Gateway release; bytes were not sent.",
+         nil}
+
+      not covered_harness? ->
+        {label <>
+           "image content blocks are not enabled for this harness; bytes were not sent.", nil}
+
+      true ->
+        case Assets.get(db, asset_id) do
+          nil ->
+            {label <> "unavailable: the stored attachment could not be found.", nil}
+
+          _asset ->
+            case File.read(Assets.file_path(base_dir, asset_id)) do
+              {:ok, bytes} ->
+                {label <> "included inline.",
+                 %{type: "image", data: Base.encode64(bytes), mimeType: mime_type}}
+
+              {:error, _reason} ->
+                {label <> "unavailable: the stored attachment bytes could not be read.", nil}
+            end
+        end
+    end
+  end
+
+  defp append_turn_attachment_labels(prompt, entries) do
+    entries = Enum.map(entries, fn {label, image} -> {"#{label}", image} end)
+    [{first_label, first_image} | remaining] = entries
+
+    first_text =
+      [prompt, first_label]
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.join("\n\n")
+
+    blocks = [%{type: "text", text: first_text}]
+    blocks = if first_image, do: blocks ++ [first_image], else: blocks
+
+    blocks =
+      Enum.reduce(remaining, blocks, fn {label, image}, acc ->
+        acc = acc ++ [%{type: "text", text: label}]
+        if image, do: acc ++ [image], else: acc
+      end)
+
+    if Enum.any?(blocks, &(&1.type == "image")) do
+      blocks
+    else
+      Enum.map_join(blocks, "\n\n", & &1.text)
+    end
+  end
+
+  defp covered_inline_harness?(harness), do: harness in [:claude, :codex, "claude", "codex"]
+
   defp turn_runner(config) do
     db = Map.get(config, :db, Tightbeam.DB)
 
@@ -3477,7 +3645,13 @@ defmodule Tightbeam.Gateway do
                  Adapter.prompt(
                    prompt_adapter,
                    harness_session_id,
-                   turn.prompt,
+                   turn_prompt_content(
+                     db,
+                     turn,
+                     active_session.session_key,
+                     active_session.harness,
+                     config.base_dir
+                   ),
                    trace_dispatch: fn request_id ->
                      Tightbeam.TurnLifecycle.append(db, turn.seq, %{
                        event_key: "prompt:dispatched",

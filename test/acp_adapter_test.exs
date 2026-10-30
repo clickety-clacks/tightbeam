@@ -872,6 +872,40 @@ defmodule Tightbeam.Acp.AdapterTest do
             }} = Adapter.prompt(a, "sess-1", "say pong")
   end
 
+  test "prompt preserves the text-only frame and forwards ordered inline image blocks" do
+    {adapter, capture_path} = start_adapter()
+
+    assert {:ok, _} = Adapter.prompt(adapter, "sess-1", "look at this")
+
+    bytes = <<137, 80, 78, 71, 13, 10, 26, 10, 4, 5, 6>>
+
+    assert {:ok, _} =
+             Adapter.prompt(adapter, "sess-1", [
+               %{type: "text", text: "look at this"},
+               %{type: "image", data: Base.encode64(bytes), mimeType: "image/png"}
+             ])
+
+    prompts =
+      capture_path
+      |> captured_requests()
+      |> Enum.filter(&(&1["method"] == "session/prompt"))
+      |> Enum.map(& &1["prompt"])
+
+    assert [
+             [%{"type" => "text", "text" => "look at this"}],
+             [
+               %{"type" => "text", "text" => "look at this"},
+               %{
+                 "type" => "image",
+                 "data" => encoded,
+                 "mimeType" => "image/png"
+               }
+             ]
+           ] = prompts
+
+    assert Base.decode64!(encoded) == bytes
+  end
+
   test "new_session with an unknown record keeps and captures the harness default" do
     {adapter, capture_path} = start_adapter()
 

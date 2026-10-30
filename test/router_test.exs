@@ -6,6 +6,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
   alias Tightbeam.{
     Assignments,
+    Assets,
     Credentials,
     DB,
     Devices,
@@ -318,6 +319,74 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert messages.status == 200
     assert JSON.decode!(messages.resp_body)["resource"] == "transcript messages"
+  end
+
+  test "older message pages preserve canonical attachment order", ctx do
+    session = create_session(ctx.db, "attachment-history", ctx.device.user_id)
+
+    first_attachment = %{
+      "assetId" => "a_first",
+      "mimeType" => "image/png",
+      "filename" => "first.png",
+      "size" => 4
+    }
+
+    second_attachment = %{
+      "assetId" => "a_second",
+      "mimeType" => "image/jpeg",
+      "filename" => "second.jpg",
+      "size" => 8
+    }
+
+    attachment_only = %{
+      "assetId" => "a_only",
+      "mimeType" => "image/png",
+      "filename" => "only.png",
+      "size" => 12
+    }
+
+    {:appended, _} =
+      Tightbeam.Projection.append(ctx.db, %{
+        session_key: session.session_key,
+        role: "user",
+        content: "text and two images",
+        attachments: [first_attachment, second_attachment]
+      })
+
+    {:appended, _} =
+      Tightbeam.Projection.append(ctx.db, %{
+        session_key: session.session_key,
+        role: "user",
+        content: "",
+        attachments: [attachment_only]
+      })
+
+    latest =
+      conn(:get, "/api/sessions/#{session.session_key}/messages?limit=1")
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> Router.call(Router.init(ctx.opts))
+
+    assert latest.status == 200
+    latest_body = JSON.decode!(latest.resp_body)
+    assert [latest_item] = latest_body["items"]
+    assert latest_item["content"] == ""
+    assert latest_item["attachments"] == [attachment_only]
+    assert latest_body["page"]["hasMoreBefore"]
+
+    older =
+      conn(
+        :get,
+        "/api/sessions/#{session.session_key}/messages?limit=1&before=#{latest_body["page"]["oldestCursor"]}"
+      )
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> Router.call(Router.init(ctx.opts))
+
+    assert older.status == 200
+
+    assert [%{"content" => "text and two images", "attachments" => attachments}] =
+             JSON.decode!(older.resp_body)["items"]
+
+    assert attachments == [first_attachment, second_attachment]
   end
 
   test "canonical session collection uses visible rows and the shared item serializer", ctx do
@@ -4347,6 +4416,60 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(response.resp_body) == %{"error" => %{"code" => "payload_too_large"}}
   end
 
+  test "org-token uploads and downloads use the selected owner and preserve bytes", ctx do
+    owner = approved_device(ctx.db, "org-asset-owner", "Owner")
+    stranger = approved_device(ctx.db, "org-asset-stranger", "Stranger")
+    Devices.set_user_admin(ctx.db, owner.user_id, false)
+    Devices.set_user_admin(ctx.db, stranger.user_id, false)
+
+    payloads = [
+      {<<1>>, "one.bin", "application/octet-stream"},
+      {<<137, 80, 78, 71, 13, 10, 26, 10>>, "image.png", "image/png"},
+      {:binary.copy(<<42>>, 20 * 1024 * 1024), "large.bin", "application/octet-stream"}
+    ]
+
+    for {bytes, filename, mime_type} <- payloads do
+      upload =
+        ctx
+        |> org_upload_conn(owner.user_id, bytes, filename, mime_type)
+        |> Router.call(Router.init(ctx.opts))
+
+      assert upload.status == 200
+      body = JSON.decode!(upload.resp_body)
+      assert MapSet.new(Map.keys(body)) == MapSet.new(["assetId", "mimeType", "size"])
+      assert body["mimeType"] == mime_type
+      assert body["size"] == byte_size(bytes)
+      assert %{owner_user_id: owner_user_id} = Assets.get(ctx.db, body["assetId"])
+      assert owner_user_id == owner.user_id
+
+      fetched =
+        ctx
+        |> org_download(owner.user_id, body["assetId"])
+
+      assert fetched.status == 200
+      assert get_resp_header(fetched, "content-type") == [mime_type]
+      assert byte_size(fetched.resp_body) == byte_size(bytes)
+      assert :crypto.hash(:sha256, fetched.resp_body) == :crypto.hash(:sha256, bytes)
+
+      denied = ctx |> org_download(stranger.user_id, body["assetId"])
+      assert denied.status == 404
+      assert JSON.decode!(denied.resp_body) == %{"error" => %{"code" => "not_found"}}
+    end
+  end
+
+  test "org-token upload without a nonempty asUser stores no asset", ctx do
+    assert {:ok, [[before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM assets")
+
+    response =
+      ctx
+      |> org_upload_conn(nil, "private-bytes", "private.txt", "text/plain")
+      |> Router.call(Router.init(ctx.opts))
+
+    assert response.status == 400
+    assert JSON.decode!(response.resp_body) == %{"error" => %{"code" => "invalid_message"}}
+    assert {:ok, [[^before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM assets")
+  end
+
   test "upload rejects a missing file field", ctx do
     request =
       conn(:post, "/upload", %{"other" => "value"})
@@ -4399,6 +4522,17 @@ defmodule Tightbeam.Wire.RouterTest do
     |> put_req_header("authorization", "Bearer #{device.token}")
   end
 
+  defp org_upload_conn(ctx, user_id, data, filename, content_type) do
+    path = Path.join(ctx.base_dir, "org-upload-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(ctx.base_dir)
+    File.write!(path, data)
+    upload = %Plug.Upload{path: path, filename: filename, content_type: content_type}
+    url = if is_binary(user_id), do: "/upload?asUser=#{user_id}", else: "/upload"
+
+    conn(:post, url, %{"file" => upload})
+    |> put_req_header("authorization", "Bearer tbc_test")
+  end
+
   defp approved_device(db, device_id, name) do
     {:pending, pending} =
       Devices.pair(db, %{device_id: device_id, claimed_name: name, platform: nil, model: nil})
@@ -4409,6 +4543,12 @@ defmodule Tightbeam.Wire.RouterTest do
   defp download(ctx, device, asset_id) do
     conn(:get, "/download/#{asset_id}")
     |> put_req_header("authorization", "Bearer #{device.token}")
+    |> Router.call(Router.init(ctx.opts))
+  end
+
+  defp org_download(ctx, user_id, asset_id) do
+    conn(:get, "/download/#{asset_id}?asUser=#{user_id}")
+    |> put_req_header("authorization", "Bearer tbc_test")
     |> Router.call(Router.init(ctx.opts))
   end
 

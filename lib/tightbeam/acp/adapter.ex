@@ -325,7 +325,7 @@ defmodule Tightbeam.Acp.Adapter do
   adjudication closure entirely — no hold, no cause, nothing to heal
   (cross-review F1; the spec names runtime failures an adapter-fault form).
   """
-  @spec prompt(adapter(), String.t(), String.t(), keyword()) ::
+  @spec prompt(adapter(), String.t(), String.t() | [map()], keyword()) ::
           {:ok,
            %{
              stop_reason: String.t(),
@@ -1299,7 +1299,7 @@ defmodule Tightbeam.Acp.Adapter do
           Conn.request(
             state.conn,
             "session/prompt",
-            %{sessionId: sid, prompt: [%{type: "text", text: text}]},
+            %{sessionId: sid, prompt: acp_prompt_content(text)},
             prompt_deadline: Keyword.fetch!(opts, :prompt_deadline),
             cancel_grace: Keyword.fetch!(opts, :cancel_grace),
             session_id: sid,
@@ -1375,6 +1375,11 @@ defmodule Tightbeam.Acp.Adapter do
         teardown_prompt_connection(state, sid, :prompt_timeout)
     end
   end
+
+  defp acp_prompt_content(text) when is_binary(text),
+    do: [%{type: "text", text: text}]
+
+  defp acp_prompt_content(content_blocks) when is_list(content_blocks), do: content_blocks
 
   defp trace_dispatch(opts, request_id) do
     case Keyword.get(opts, :trace_dispatch) do

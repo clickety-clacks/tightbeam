@@ -1612,11 +1612,41 @@ defmodule Tightbeam.GatewayTest do
         class: "fyi"
       })
 
+    image_bytes = <<137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3>>
+    second_image_bytes = <<255, 216, 255, 1, 2, 3, 4>>
+
+    image_asset =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        owner,
+        "image/png",
+        "diagram.png",
+        image_bytes
+      )
+
+    second_image_asset =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        owner,
+        "image/jpeg",
+        "second.jpg",
+        second_image_bytes
+      )
+
     attachment = %{
-      "assetId" => "test-asset",
+      "assetId" => image_asset.asset_id,
       "mimeType" => "image/png",
       "filename" => "diagram.png",
-      "size" => 123
+      "size" => image_asset.size
+    }
+
+    second_attachment = %{
+      "assetId" => second_image_asset.asset_id,
+      "mimeType" => "image/jpeg",
+      "filename" => "second.jpg",
+      "size" => second_image_asset.size
     }
 
     identity = %{
@@ -1654,6 +1684,12 @@ defmodule Tightbeam.GatewayTest do
                  human_source.wake_id,
                  [attachment]
                )
+
+               NoticeBatcher.persist_source_attachments_in_txn(
+                 txn,
+                 second_human_source.wake_id,
+                 [second_attachment]
+               )
              end)
 
     {:appended, accepted_human} =
@@ -1676,7 +1712,8 @@ defmodule Tightbeam.GatewayTest do
         timestamp: second_human_source.created_at,
         sender: human_sender,
         device_id: "chat-device",
-        client_message_id: "second-human-batch-message"
+        client_message_id: "second-human-batch-message",
+        attachments: [second_attachment]
       })
 
     start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
@@ -1795,6 +1832,76 @@ defmodule Tightbeam.GatewayTest do
     assert queued_prompt =~ human_content
     assert queued_prompt =~ second_human_content
     assert queued_prompt =~ agent_content
+
+    assert {:ok, [[carrier_message_id]]} =
+             DB.query(ctx.db, "SELECT messageId FROM turns WHERE seq=?1", [turn_seq])
+
+    prompt_turn = %{seq: turn_seq, message_id: carrier_message_id, prompt: queued_prompt}
+
+    assert [
+             %{type: "text", text: first_label},
+             %{type: "image", mimeType: "image/png", data: first_data},
+             %{type: "text", text: second_label},
+             %{type: "image", mimeType: "image/jpeg", data: second_data}
+           ] =
+             Gateway.turn_prompt_content(
+               ctx.db,
+               prompt_turn,
+               session,
+               "claude",
+               ctx.catalog_base
+             )
+
+    assert first_label =~ "[1] attachment 1"
+    assert first_label =~ "diagram.png"
+    assert second_label =~ "[2] attachment 1"
+    assert second_label =~ "second.jpg"
+    assert Base.decode64!(first_data) == image_bytes
+    assert Base.decode64!(second_data) == second_image_bytes
+
+    assert Gateway.turn_prompt_content(
+             ctx.db,
+             %{seq: -1, message_id: "missing-message", prompt: "text only"},
+             session,
+             "claude",
+             ctx.catalog_base
+           ) == "text only"
+
+    {:appended, attachment_only} =
+      Projection.append(ctx.db, %{
+        session_key: session,
+        role: "user",
+        content: "",
+        attachments: [attachment]
+      })
+
+    assert [
+             %{type: "text", text: attachment_only_label},
+             %{type: "image", mimeType: "image/png", data: attachment_only_data}
+           ] =
+             Gateway.turn_prompt_content(
+               ctx.db,
+               %{seq: -1, message_id: attachment_only.id, prompt: ""},
+               session,
+               "codex",
+               ctx.catalog_base
+             )
+
+    assert attachment_only_label != ""
+    assert attachment_only_label =~ "diagram.png"
+    assert Base.decode64!(attachment_only_data) == image_bytes
+
+    legacy_prompt =
+      Gateway.turn_prompt_content(
+        ctx.db,
+        %{seq: -1, message_id: attachment_only.id, prompt: ""},
+        session,
+        "pi",
+        ctx.catalog_base
+      )
+
+    assert is_binary(legacy_prompt)
+    assert legacy_prompt =~ "diagram.png"
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])

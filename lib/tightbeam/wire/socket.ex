@@ -537,7 +537,7 @@ defmodule Tightbeam.Wire.Socket do
             content: content,
             device_id: state.device_id,
             client_message_id: id,
-            attachments: msg["attachments"] || []
+            attachments: msg["attachments"]
           }
         }
 
