@@ -1546,7 +1546,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       )
 
     {:ok, notice_plan} = DB.query(db, "EXPLAIN QUERY PLAN " <> notice_sql, notice_params)
-    notice_plan_text = inspect(notice_plan)
+    notice_plan_text = inspect(notice_plan, limit: :infinity)
     IO.puts("event notice lookup: #{notice_plan_text}")
 
     assert notice_plan_text =~ "messages_record_event_ids", notice_plan_text
