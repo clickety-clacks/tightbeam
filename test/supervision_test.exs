@@ -256,7 +256,7 @@ defmodule Tightbeam.SupervisionTest do
 
   test "the second holder attempt recomputes elapsed activity time", ctx do
     interval = 1_800_000
-    opened = System.system_time(:millisecond) - interval - 59_000
+    opened = System.system_time(:millisecond) - interval - 30_000
 
     {:ok, _} =
       DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [opened])
@@ -264,7 +264,8 @@ defmodule Tightbeam.SupervisionTest do
     open_deadline!(ctx.db, "asg_inactive", opened, interval)
     assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
     [first] = episode_notices(ctx.db)
-    assert first.prompt =~ "(30 minutes ago)"
+    [_, first_minutes] = Regex.run(~r/\((\d+) minutes ago\)/, first.prompt)
+    assert String.to_integer(first_minutes) == div(first.due_at - opened, 60_000)
 
     {:ok, _} =
       DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1", [
@@ -272,12 +273,20 @@ defmodule Tightbeam.SupervisionTest do
         System.system_time(:millisecond)
       ])
 
-    # Cross the next displayed minute with the real clock; only deadline eligibility
-    # is advanced in the isolated store, as in the other escalation cases.
-    Process.sleep(1_050)
+    # Advance the fixture's elapsed activity by a minute without waiting on a
+    # wall-clock boundary. Each notice's due_at is the time used to render it.
+    older_activity = opened - 60_000
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [
+        older_activity
+      ])
+
     fire_due_climb!(ctx.db, first.wake_id, interval)
     [_, second] = episode_notices(ctx.db)
-    assert second.prompt =~ "(31 minutes ago)"
+    [_, second_minutes] = Regex.run(~r/\((\d+) minutes ago\)/, second.prompt)
+    assert String.to_integer(second_minutes) == div(second.due_at - older_activity, 60_000)
+    assert String.to_integer(second_minutes) > String.to_integer(first_minutes)
     refute second.prompt == first.prompt
   end
 
