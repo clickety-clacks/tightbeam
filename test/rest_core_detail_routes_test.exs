@@ -1554,10 +1554,32 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert notice_plan_text =~ "messages_record_event_reply", notice_plan_text
     assert notice_plan_text =~ "messages_client_dedupe", notice_plan_text
     assert notice_plan_text =~ "wakes_delivered_turn", notice_plan_text
+    assert notice_plan_text =~ "SEARCH direct_wake USING COVERING INDEX wakes_record_event_ids",
+           notice_plan_text
+    assert notice_plan_text =~ "SEARCH direct_turn USING INTEGER PRIMARY KEY", notice_plan_text
+    assert notice_plan_text =~ "SEARCH member_wake USING COVERING INDEX wakes_record_event_ids",
+           notice_plan_text
     assert notice_plan_text =~ "SEARCH cancellation", notice_plan_text
     assert notice_plan_text =~ "wakeId=?", notice_plan_text
+    assert notice_plan_text =~ "SEARCH replacement_turn USING INDEX sqlite_autoindex_turns_2",
+           notice_plan_text
+    assert notice_plan_text =~ "SEARCH notice_turn USING INTEGER PRIMARY KEY", notice_plan_text
+    assert notice_plan_text =~ "SEARCH notice USING INDEX messages_record_event_reply",
+           notice_plan_text
+    assert notice_plan_text =~ "SEARCH source USING INDEX wakes_delivered_turn",
+           notice_plan_text
+    assert notice_plan_text =~
+             "SEARCH source_message USING INDEX messages_client_dedupe (sessionKey=? AND deviceId=? AND clientMessageId=?)",
+           notice_plan_text
     refute notice_plan_text =~ "SCAN cancellation", notice_plan_text
-    refute notice_plan_text =~ "AUTOMATIC COVERING INDEX (replacementWakeId=?", notice_plan_text
+    refute notice_plan_text =~ "SEARCH direct_turn USING COVERING INDEX turns_session",
+           notice_plan_text
+    refute notice_plan_text =~ "SEARCH replacement_turn USING INDEX turns_session",
+           notice_plan_text
+    refute notice_plan_text =~ "SCAN notice_turn USING COVERING INDEX turns_message_id",
+           notice_plan_text
+    refute notice_plan_text =~ "SCAN source USING INDEX wakes_delivered_turn", notice_plan_text
+    refute notice_plan_text =~ "AUTOMATIC", notice_plan_text
   end
 
   test "CLI inspect capabilities match the REST session detail", ctx do

@@ -163,7 +163,7 @@ defmodule Tightbeam.RecordEvents do
     -- members follow the cancellation's primary-key wake link to the carrier.
     SELECT direct_turn.seq
     FROM wakes AS direct_wake INDEXED BY wakes_record_event_ids
-    JOIN turns AS direct_turn ON direct_turn.seq = direct_wake.deliveredTurnSeq
+    CROSS JOIN turns AS direct_turn ON direct_turn.seq = direct_wake.deliveredTurnSeq
     WHERE direct_wake.recordEventIds = json_array(?1)
       AND direct_turn.sessionKey = ?2
       AND NOT EXISTS (
@@ -175,8 +175,8 @@ defmodule Tightbeam.RecordEvents do
 
     SELECT replacement_turn.seq
     FROM wakes AS member_wake INDEXED BY wakes_record_event_ids
-    JOIN wake_cancellations AS cancellation ON cancellation.wakeId = member_wake.wakeId
-    JOIN turns AS replacement_turn ON replacement_turn.wakeId = cancellation.replacementWakeId
+    CROSS JOIN wake_cancellations AS cancellation ON cancellation.wakeId = member_wake.wakeId
+    CROSS JOIN turns AS replacement_turn ON replacement_turn.wakeId = cancellation.replacementWakeId
     WHERE member_wake.recordEventIds = json_array(?1)
       AND cancellation.replacementWakeId IS NOT NULL
       AND replacement_turn.sessionKey = ?2
@@ -197,8 +197,8 @@ defmodule Tightbeam.RecordEvents do
 
     SELECT notice.id, notice.seq
     FROM event_turns
-    JOIN turns AS notice_turn ON notice_turn.seq = event_turns.seq
-    JOIN messages AS notice ON notice.id = notice_turn.messageId
+    CROSS JOIN turns AS notice_turn ON notice_turn.seq = event_turns.seq
+    CROSS JOIN messages AS notice ON notice.id = notice_turn.messageId
     WHERE notice.sessionKey = ?2
       AND notice.role = 'user'
 
@@ -206,8 +206,8 @@ defmodule Tightbeam.RecordEvents do
 
     SELECT notice.id, notice.seq
     FROM event_turns
-    JOIN turns AS notice_turn ON notice_turn.seq = event_turns.seq
-    JOIN messages AS notice INDEXED BY messages_record_event_reply
+    CROSS JOIN turns AS notice_turn ON notice_turn.seq = event_turns.seq
+    CROSS JOIN messages AS notice INDEXED BY messages_record_event_reply
       ON notice.replyToMessageId = notice_turn.messageId
      AND notice.sessionKey = ?2
      AND notice.role = 'assistant'
@@ -216,9 +216,9 @@ defmodule Tightbeam.RecordEvents do
 
     SELECT source_message.id, source_message.seq
     FROM event_turns
-    JOIN wakes AS source INDEXED BY wakes_delivered_turn
+    CROSS JOIN wakes AS source INDEXED BY wakes_delivered_turn
       ON source.deliveredTurnSeq = event_turns.seq
-    JOIN messages AS source_message INDEXED BY messages_client_dedupe
+    CROSS JOIN messages AS source_message INDEXED BY messages_client_dedupe
       ON source_message.sessionKey = json_extract(source.sourceClientIdentity, '$.targetSessionKey')
      AND source_message.deviceId = json_extract(source.sourceClientIdentity, '$.deviceId')
      AND source_message.clientMessageId = json_extract(source.sourceClientIdentity, '$.clientMessageId')
