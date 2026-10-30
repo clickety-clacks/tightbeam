@@ -3172,6 +3172,7 @@ defmodule Tightbeam.Assignments do
       assignment.id,
       principal_id(call.principal),
       attest.ts,
+      %{kind: "completion_attest", id: attest.id},
       liveness_trigger
     )
 
@@ -3909,6 +3910,7 @@ defmodule Tightbeam.Assignments do
       assignment_id,
       principal_id(call.principal),
       closed_at,
+      %{kind: "revocation", id: revocation_id},
       liveness_trigger
     )
 
@@ -3927,11 +3929,213 @@ defmodule Tightbeam.Assignments do
     revoked_assignment
   end
 
+  @doc false
+  def reconcile_closed_cannot_proceed_in_txn(%Txn{} = txn) do
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT cp.id, cp.assignmentId, cp.decisionRequestId, cp.decisionWakeId,
+               a.outcome, a.closedAt, a.closedByUser, a.closedBySession,
+               a.closedByProcess, a.closingAttestId, a.workItemId
+        FROM assignment_cannot_proceed cp
+        JOIN assignments a ON a.id=cp.assignmentId
+        WHERE cp.state='standing' AND a.state='closed'
+        ORDER BY cp.createdAt, cp.id
+        """
+      )
+
+    Enum.reduce(rows, %{settled: [], skipped: []}, fn
+      [
+        condition_id,
+        assignment_id,
+        request_id,
+        wake_id,
+        outcome,
+        closed_at,
+        closed_by_user,
+        closed_by_session,
+        closed_by_process,
+        closing_attest_id,
+        work_item_id
+      ],
+      report ->
+        assignment = %{
+          id: assignment_id,
+          outcome: outcome,
+          closed_at: closed_at,
+          closed_by_user: closed_by_user,
+          closed_by_session: closed_by_session,
+          closed_by_process: closed_by_process,
+          closing_attest_id: closing_attest_id
+        }
+
+        case closed_assignment_record_in_txn(txn, assignment) do
+          {:ok, %{principal: principal} = closure} when is_binary(principal) ->
+            case cannot_proceed_disposition_context_in_txn(
+                   txn,
+                   assignment_id,
+                   request_id,
+                   wake_id
+                 ) do
+              :ok ->
+                liveness_trigger = disposition_liveness_trigger!(txn, work_item_id)
+
+                :settled =
+                  settle_cannot_proceed_by_disposition_in_txn(
+                    txn,
+                    assignment_id,
+                    principal,
+                    closed_at,
+                    closure,
+                    liveness_trigger
+                  )
+
+                %{report | settled: [condition_id | report.settled]}
+
+              {:skip, reason} ->
+                skipped_cannot_proceed(report, condition_id, assignment_id, reason)
+            end
+
+          {:ok, _closure} ->
+            skipped_cannot_proceed(report, condition_id, assignment_id, :missing_closing_actor)
+
+          {:skip, reason} ->
+            skipped_cannot_proceed(report, condition_id, assignment_id, reason)
+        end
+    end)
+    |> Map.update!(:settled, &Enum.reverse/1)
+    |> Map.update!(:skipped, &Enum.reverse/1)
+  end
+
+  defp skipped_cannot_proceed(report, condition_id, assignment_id, reason) do
+    Map.update!(report, :skipped, fn rows ->
+      [%{condition_id: condition_id, assignment_id: assignment_id, reason: reason} | rows]
+    end)
+  end
+
+  defp closed_assignment_record_in_txn(txn, %{outcome: "completed"} = assignment) do
+    case Txn.q(
+           txn,
+           """
+           SELECT ts, byUser, bySession
+           FROM attests
+           WHERE id=?1 AND assignmentId=?2 AND kind='completion'
+           """,
+           [assignment.closing_attest_id, assignment.id]
+         ) do
+      [[closed_at, by_user, by_session]]
+      when closed_at == assignment.closed_at and by_user == assignment.closed_by_user and
+             by_session == assignment.closed_by_session and
+             assignment.closed_by_process == nil ->
+        {:ok,
+         %{
+           kind: "completion_attest",
+           id: assignment.closing_attest_id,
+           principal: stored_principal(by_user, by_session, nil)
+         }}
+
+      [] ->
+        {:skip, :missing_closing_completion_attest}
+
+      _ ->
+        {:skip, :ambiguous_or_mismatched_closing_completion_attest}
+    end
+  end
+
+  defp closed_assignment_record_in_txn(txn, %{outcome: "revoked"} = assignment) do
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT r.id, r.reason, r.revokedByUser, r.revokedBySession, r.revokedByProcess
+        FROM assignment_revocations r
+        JOIN assignment_revocation_generations g ON g.revocationId=r.id
+        WHERE g.assignmentId=?1
+          AND g.reopeningId IS (
+            SELECT reopening.id FROM assignment_reopenings reopening
+            WHERE reopening.assignmentId=?1 ORDER BY reopening.id DESC LIMIT 1
+          )
+          AND r.assignmentId=?1
+          AND r.revokedAt IS ?2
+          AND r.revokedByUser IS ?3
+          AND r.revokedBySession IS ?4
+          AND r.revokedByProcess IS ?5
+        ORDER BY r.id
+        """,
+        [
+          assignment.id,
+          assignment.closed_at,
+          assignment.closed_by_user,
+          assignment.closed_by_session,
+          assignment.closed_by_process
+        ]
+      )
+
+    case rows do
+      [[revocation_id, reason, by_user, by_session, by_process]]
+      when is_binary(revocation_id) and is_binary(reason) ->
+        if String.starts_with?(revocation_id, "legacy:") or reason == "legacy_unknown" do
+          {:skip, :legacy_revocation_provenance}
+        else
+          {:ok,
+           %{
+             kind: "revocation",
+             id: revocation_id,
+             principal: stored_principal(by_user, by_session, by_process)
+           }}
+        end
+
+      [] ->
+        {:skip, :missing_closing_revocation_record}
+
+      [_ | _] ->
+        {:skip, :ambiguous_closing_revocation_record}
+    end
+  end
+
+  defp closed_assignment_record_in_txn(_txn, _assignment),
+    do: {:skip, :unsupported_closed_assignment_outcome}
+
+  defp stored_principal(user, _session, _process) when is_binary(user), do: "user:" <> user
+
+  defp stored_principal(_user, session, _process) when is_binary(session),
+    do: "session:" <> session
+
+  defp stored_principal(_user, _session, process) when is_binary(process), do: process
+  defp stored_principal(_user, _session, _process), do: nil
+
+  defp cannot_proceed_disposition_context_in_txn(txn, assignment_id, request_id, wake_id) do
+    case Txn.q(txn, "SELECT kind,status,assignmentId FROM decision_requests WHERE id=?1", [
+           request_id
+         ]) do
+      [["agent", "open", ^assignment_id]] ->
+        try do
+          current_wake_id = Tightbeam.NoticeAuthority.current!(txn, wake_id)
+
+          case Txn.q(
+                 txn,
+                 "SELECT assignmentId,state FROM wakes WHERE wakeId=?1",
+                 [current_wake_id]
+               ) do
+            [[^assignment_id, state]] when state in ["pending", "fired", "canceled"] -> :ok
+            _ -> {:skip, :missing_or_invalid_decision_wake}
+          end
+        rescue
+          _ -> {:skip, :missing_or_invalid_decision_wake}
+        end
+
+      _ ->
+        {:skip, :linked_question_not_open}
+    end
+  end
+
   defp settle_cannot_proceed_by_disposition_in_txn(
          txn,
          assignment_id,
          principal,
          settled_at,
+         closure,
          liveness_trigger
        ) do
     case Txn.q(
@@ -3952,12 +4156,22 @@ defmodule Tightbeam.Assignments do
 
         if Txn.changes(txn) != 1, do: raise(TransitionRace)
 
+        closure_label =
+          case closure.kind do
+            "completion_attest" -> "completion attest #{closure.id}"
+            "revocation" -> "revocation record #{closure.id}"
+          end
+
+        reason =
+          "cannot-proceed #{condition_id} for assignment #{assignment_id} is moot because " <>
+            "the assignment was closed by #{closure_label}"
+
         :ok =
           Escalation.settle_agent_request_in_txn(
             txn,
             request_id,
             principal,
-            "cannot-proceed assignment disposed"
+            reason
           )
 
         wake_id = Tightbeam.NoticeAuthority.current!(txn, wake_id)
@@ -3982,8 +4196,10 @@ defmodule Tightbeam.Assignments do
             :ok
         end
 
+        :settled
+
       [] ->
-        :ok
+        :unchanged
     end
   end
 
