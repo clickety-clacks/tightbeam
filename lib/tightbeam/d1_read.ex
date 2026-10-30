@@ -66,7 +66,7 @@ defmodule Tightbeam.D1Read do
           limit,
           fn [key, _value, _updated_at] -> [key] end,
           &config_item/1,
-          "key NOT LIKE 'record-event-feed-activation:%'"
+          "key NOT GLOB 'record-event-feed-activation:*'"
         )
 
       :host_environment ->
@@ -166,7 +166,7 @@ defmodule Tightbeam.D1Read do
       DB.query(
         db,
         "SELECT key, value, updatedAt FROM org_settings " <>
-          "WHERE key NOT LIKE 'record-event-feed-activation:%' ORDER BY key"
+          "WHERE key NOT GLOB 'record-event-feed-activation:*' ORDER BY key"
       )
 
     Enum.map(rows, fn [key, value, updated_at] ->

@@ -22,6 +22,17 @@ defmodule Tightbeam.D1ReadTest do
     assert default["value"] == "default"
     assert private["value"] == nil
 
+    assert {:ok, activation_rows} =
+             DB.query(
+               db,
+               "SELECT key FROM org_settings WHERE key GLOB 'record-event-feed-activation:*' ORDER BY key"
+             )
+
+    assert Enum.map(activation_rows, &hd/1) == [
+             "record-event-feed-activation:assignment.opened",
+             "record-event-feed-activation:work_item.filed"
+           ]
+
     assert D1Read.detail(db, "/unused", :config, "record-event-feed-activation:work_item.filed") ==
              nil
 
@@ -60,6 +71,16 @@ defmodule Tightbeam.D1ReadTest do
     refute D1Read.encode(:host_environment, environment) =~ "secret"
   end
 
+  test "config visibility excludes only the exact activation prefix", %{db: db} do
+    key = "Record-event-feed-activation:ordinary-setting"
+    :ok = Org.put_setting(db, key, "ordinary")
+
+    assert [item] = D1Read.collection(db, "/unused", :config, %{"key" => [key]})
+    assert item["key"] == key
+    assert item["value"] == nil
+    assert D1Read.detail(db, "/unused", :config, key) == item
+  end
+
   test "the seam reads current users in stable public tuple order", %{db: db} do
     Devices.add_user(db, "zeta", false)
     Devices.add_user(db, "alpha", true)
@@ -87,6 +108,31 @@ defmodule Tightbeam.D1ReadTest do
 
     assert page.flags.has_more_before == true
     assert page.flags.has_more_after == false
+
+    before_activation =
+      D1Read.page(
+        db,
+        "/unused",
+        :config,
+        %{},
+        {:before, ["record-event-feed-activation:work_item.filed"]},
+        5
+      )
+
+    assert Enum.map(before_activation.items, & &1["key"]) ==
+             Enum.map(76..80, fn index ->
+               "page-setting-#{String.pad_leading(to_string(index), 3, "0")}"
+             end)
+
+    assert before_activation.flags.has_more_before == true
+    assert before_activation.flags.has_more_after == false
+
+    after_visible =
+      D1Read.page(db, "/unused", :config, %{}, {:after, ["page-setting-080"]}, 5)
+
+    assert after_visible.items == []
+    assert after_visible.flags.has_more_before == true
+    assert after_visible.flags.has_more_after == false
 
     exact_keys =
       Enum.map(1..5, fn index ->
@@ -424,6 +470,28 @@ defmodule Tightbeam.D1ReadRouteTest do
       {:ok, plan} = DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> sql, params)
       refute inspect(plan) =~ "USE TEMP B-TREE"
     end
+  end
+
+  test "config routes hide activation metadata without hiding unrelated settings", ctx do
+    case_variant_key = "Record-event-feed-activation:ordinary-setting"
+    :ok = Org.put_setting(ctx.db, case_variant_key, "ordinary")
+
+    newest_config =
+      get(ctx.opts, "/api/config?limit=1", ctx.admin.token)
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(newest_config["items"], & &1["key"]) == ["default-archetype"]
+    assert newest_config["page"]["hasMoreBefore"] == true
+    assert newest_config["page"]["hasMoreAfter"] == false
+
+    hidden_detail =
+      get(ctx.opts, "/api/config/record-event-feed-activation:work_item.filed", ctx.admin.token)
+
+    assert hidden_detail.status == 404
+
+    visible_detail = get(ctx.opts, "/api/config/" <> case_variant_key, ctx.admin.token)
+    assert visible_detail.status == 200
+    assert JSON.decode!(visible_detail.resp_body)["key"] == case_variant_key
   end
 
   @tag rest_r7_encoder: true

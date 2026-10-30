@@ -646,7 +646,7 @@ defmodule Tightbeam.AdminProjection do
     Txn.q(
       txn,
       "DELETE FROM admin_projection_versions " <>
-        "WHERE resource = 'config' AND primaryKey LIKE 'record-event-feed-activation:%'"
+        "WHERE resource = 'config' AND primaryKey GLOB 'record-event-feed-activation:*'"
     )
 
     Txn.q(
@@ -655,7 +655,7 @@ defmodule Tightbeam.AdminProjection do
       INSERT OR IGNORE INTO admin_projection_versions
         (resource, primaryKey, rowVersion, updatedAt)
       SELECT 'config', key, 1, updatedAt FROM org_settings
-      WHERE key NOT LIKE 'record-event-feed-activation:%'
+      WHERE key NOT GLOB 'record-event-feed-activation:*'
       """
     )
 
