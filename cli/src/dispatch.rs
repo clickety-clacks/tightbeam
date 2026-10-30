@@ -556,6 +556,16 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             ))
         }
         Command::List { identity } => Ok(request(identity, "inspect", vec![], vec![])),
+        Command::HarnessHealth {
+            identity,
+            incident_id,
+        } => {
+            let params = incident_id
+                .as_ref()
+                .map(|value| vec![string_field("incidentId", value)])
+                .unwrap_or_default();
+            Ok(request(identity, "harness-health", vec![], params))
+        }
         Command::Retire {
             identity,
             session_key,
@@ -2072,6 +2082,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Activation { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
+        | Command::HarnessHealth { identity, .. }
         | Command::Tune { identity, .. }
         | Command::Retire { identity, .. }
         | Command::Assign { identity, .. }
@@ -4479,6 +4490,10 @@ mod tests {
     #[test]
     fn bare_identity_builds_no_override_and_requires_a_session_file_before_network() {
         assert_eq!(body(&["list"]), r#"{"verb":"inspect","params":{}}"#);
+        assert_eq!(
+            body(&["harness-health", "hhi_1"]),
+            r#"{"verb":"harness-health","params":{"incidentId":"hhi_1"}}"#
+        );
 
         run_with(
             Command::List {
