@@ -1093,6 +1093,206 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert turn_count(ctx.db, unknown.wake_id) == 0
   end
 
+  test "an undelivered intent resumes once through transport lineage when its recipient becomes eligible",
+       ctx do
+    stop_supervised!(ctx.scheduler)
+    item = create_work_item(ctx, "recipient recovery")
+
+    child =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:user, "flynn"}, "holder", "child", item.id, effect_kind: "coordination")
+      )
+
+    assert %{assignment: %{state: "closed"}} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, child.id, "completion"))
+
+    [failed] = terminal_notices(ctx.db)
+    assert failed.state == "canceled"
+
+    assert {:ok, [[action_id, "pending", "undelivered"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,status,json_extract(result,'$.delivery') FROM row_reaction_actions"
+             )
+
+    for _ <- 1..2, do: assert(:ok == Tightbeam.RowReactions.recover(ctx.db))
+    assert [^failed] = terminal_notices(ctx.db)
+
+    personal = Org.personal_session_key("flynn")
+    session(ctx.db, personal, "flynn")
+
+    assert %{deliveryOwnerSessionKey: ^personal} =
+             handle(
+               ctx,
+               "work-item-update",
+               call("work-item-update", {:user, "flynn"}, nil, %{
+                 work_item_id: item.id,
+                 delivery_owner_session_key: personal
+               })
+             )
+
+    assert {:ok, [[^action_id, "pending", retry_id, intent_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,status,json_extract(result,'$.wake_id'),json_extract(result,'$.intent_wake_id') FROM row_reaction_actions"
+             )
+
+    assert intent_id == failed.wake_id
+    refute retry_id == failed.wake_id
+    assert %{session_key: ^personal, state: "pending"} = Wakes.get(ctx.db, retry_id)
+
+    assert {:ok, [[root_id, predecessor, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT rootWakeId,predecessorWakeId,attempt FROM wake_retry_attempts WHERE wakeId=?1",
+               [retry_id]
+             )
+
+    assert root_id == failed.wake_id
+    assert predecessor == failed.wake_id
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert length(terminal_notices(ctx.db)) == 2
+    start_scheduler(ctx.db)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert_delivered_carrier(ctx.db, retry_id)
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+
+    assert {:ok, [[^action_id, "accepted", "delivered"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,status,json_extract(result,'$.delivery') FROM row_reaction_actions WHERE id=?1",
+               [action_id]
+             )
+
+    assert {:ok, {:ok, %{wake_id: ^retry_id, state: "fired"}}} =
+             DB.transaction(
+               ctx.db,
+               &Wakes.admit_terminal_notification_in_txn(&1, child.id)
+             )
+
+    assert length(terminal_notices(ctx.db)) == 2
+    assert Wakes.get(ctx.db, failed.wake_id).state == "canceled"
+    assert turn_count(ctx.db, failed.wake_id) == 0
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM lifecycle_events WHERE kind='wake_undeliverable' AND subject=?1",
+               [failed.wake_id]
+             )
+  end
+
+  test "receipt lookup bounds growing progress history and ordinary progress does not reconcile reminders",
+       ctx do
+    {parent, child, root} = completed_child(ctx)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    [pending] = pending_reminders(ctx.db, root.wake_id)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        WITH RECURSIVE history(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM history WHERE n<3000)
+        INSERT INTO attests(id,assignmentId,kind,bySession,note,ts)
+        SELECT 'history-'||n,?1,'progress','notice-parent',
+          'completion-handoff-action unrelated-child attest unrelated-source kept: historical work',n
+        FROM history
+        """,
+        [parent.id]
+      )
+
+    {:ok, before_attempts} =
+      DB.query(
+        ctx.db,
+        "SELECT attempts FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+        [pending.wake_id]
+      )
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call({:session, "notice-parent"}, parent.id, "ordinary material progress")
+             )
+
+    assert {:ok, ^before_attempts} =
+             DB.query(
+               ctx.db,
+               "SELECT attempts FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [pending.wake_id]
+             )
+
+    [kind, token] = terminal_source(root.prompt)
+    prefix = "completion-handoff-action #{child.id} #{kind} #{token} "
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call(
+                 {:session, "notice-parent"},
+                 parent.id,
+                 prefix <> "kept without a colon"
+               )
+             )
+
+    assert {:ok, facts} =
+             DB.transaction(ctx.db, fn txn ->
+               event = Tightbeam.RowReactions.delivery_event(txn, root.wake_id)
+               Tightbeam.RowReactions.Snapshot.current(txn, event, %{})
+             end)
+
+    assert length(facts["attests"]) == 1
+    assert hd(facts["attests"])["disposition"] == nil
+
+    assert {:ok, plan} =
+             DB.query(
+               ctx.db,
+               """
+               EXPLAIN QUERY PLAN SELECT id,note FROM attests INDEXED BY row_reaction_receipt_candidates
+               WHERE bySession=?1 AND kind='progress' AND note>=?2 AND note<?3
+               """,
+               ["notice-parent", prefix, String.trim_trailing(prefix, " ") <> "!"]
+             )
+
+    assert Enum.any?(plan, fn row ->
+             detail = List.last(row)
+
+             String.contains?(
+               detail,
+               "SEARCH attests USING INDEX row_reaction_receipt_candidates"
+             ) and
+               String.contains?(detail, "note>?") and String.contains?(detail, "note<?")
+           end)
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call(
+                 {:session, "notice-parent"},
+                 parent.id,
+                 prefix <> "kept: retained this child"
+               )
+             )
+
+    assert Wakes.get(ctx.db, pending.wake_id).state == "canceled"
+
+    assert {:ok, facts} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.RowReactions.Snapshot.current(
+                 txn,
+                 Tightbeam.RowReactions.delivery_event(txn, root.wake_id),
+                 %{}
+               )
+             end)
+
+    assert length(facts["attests"]) == 2
+    assert Enum.count(facts["attests"], &is_map(&1["disposition"])) == 1
+  end
+
   defp forget_reaction_ledger!(db) do
     # Simulate the declared pre-cutover population: the original wake, source
     # occurrence and delivery receipts remain, with no reaction ledger yet.

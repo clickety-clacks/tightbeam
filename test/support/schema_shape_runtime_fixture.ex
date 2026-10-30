@@ -1136,6 +1136,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
       DROP TABLE IF EXISTS supervision_liveness_checkpoint_bindings;
       DROP TABLE IF EXISTS supervision_entitlements;
       DROP TABLE IF EXISTS supervision_liveness_epoch;
+      DROP INDEX IF EXISTS row_reaction_receipt_candidates;
       DROP TABLE IF EXISTS row_reaction_actions;
       DROP TABLE IF EXISTS row_reaction_events;
       DROP TABLE IF EXISTS row_reaction_cutovers;

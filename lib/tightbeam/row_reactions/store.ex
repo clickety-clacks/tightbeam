@@ -48,6 +48,31 @@ defmodule Tightbeam.RowReactions.Store do
                :ok
            end
 
+           receipt_index = "terminal-row-reaction-receipts/v1"
+
+           case Txn.q(txn, "SELECT 1 FROM supervision_liveness_migrations WHERE migrationId=?1", [
+                  receipt_index
+                ]) do
+             [[1]] ->
+               :ok
+
+             [] ->
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "CREATE INDEX row_reaction_receipt_candidates ON attests(bySession,note) WHERE kind='progress'"
+                 )
+
+               Txn.q(
+                 txn,
+                 """
+                 INSERT INTO supervision_liveness_migrations(migrationId,appliedAt,affectedRows,cause,principal)
+                 VALUES(?1,?2,0,'release_upgrade','process:tightbeam')
+                 """,
+                 [receipt_index, System.system_time(:millisecond)]
+               )
+           end
+
            Process.put({Tightbeam.RowReactions, txn.conn}, true)
            :ok
          end) do

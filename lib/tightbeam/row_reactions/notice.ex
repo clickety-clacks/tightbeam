@@ -21,7 +21,17 @@ defmodule Tightbeam.RowReactions.Notice do
         )
 
       %{state: "canceled"} ->
-        Store.record(txn, action, "canceled", action["result"], at)
+        if Wakes.undelivered_notice_in_txn?(txn, id) do
+          Store.record(
+            txn,
+            action,
+            "pending",
+            Map.put(action["result"], "delivery", "undelivered"),
+            at
+          )
+        else
+          Store.record(txn, action, "canceled", action["result"], at)
+        end
 
       %{state: "fired"} ->
         Store.record(txn, action, "accepted", Map.put(action["result"], "delivery", "failed"), at)
@@ -57,6 +67,11 @@ defmodule Tightbeam.RowReactions.Notice do
         ) == [[1]]
 
     cond do
+      not available and get_in(action, ["result", "delivery"]) == "undelivered" ->
+        # Retain the same incomplete intent and failed-attempt evidence. Only
+        # a later reconciliation with an elected recipient may try delivery.
+        :ok
+
       not available and value["on_unavailable"] == "skip" ->
         if id = get_in(action, ["result", "wake_id"]),
           do: withdraw(txn, id, action["plan"]["withdraw"], at)
@@ -79,30 +94,39 @@ defmodule Tightbeam.RowReactions.Notice do
         id = get_in(action, ["result", "wake_id"]) || input.wake_id
         input = Map.put(input, :wake_id, id)
 
+        wake =
+          case Wakes.get_in_txn(txn, id) do
+            nil ->
+              Wakes.schedule_in_txn(txn, input)
+
+            %{state: "pending", delivered_turn_seq: nil} = old ->
+              revise(txn, old, input, action["result"])
+              Wakes.get_in_txn(txn, id)
+
+            %{state: "canceled", delivered_turn_seq: nil} ->
+              if available and get_in(action, ["result", "delivery"]) == "undelivered" do
+                Wakes.retry_undelivered_notice_in_txn(txn, id, input, at)
+              else
+                raise ArgumentError, "reaction output identity is already terminal"
+              end
+
+            _ ->
+              raise ArgumentError, "reaction output identity is already terminal"
+          end
+
+        id = wake.wake_id
+        input = Map.put(input, :wake_id, id)
+
         result =
-          Map.merge(
-            action["result"] || %{},
-            %{
-              "wake_id" => id,
-              "delivery" => "queued",
-              "requested_due_at" => input.due_at,
-              "emitted" => Map.new(input, fn {key, value} -> {Atom.to_string(key), value} end)
-            }
-          )
-
-        case Wakes.get_in_txn(txn, id) do
-          nil ->
-            Wakes.schedule_in_txn(txn, input)
-
-          %{state: "pending", delivered_turn_seq: nil} = old ->
-            unless is_nil(action["result"]) or action["result"]["wake_id"] == id,
-              do: raise(ArgumentError, "reaction cannot replace its output identity")
-
-            revise(txn, old, input, action["result"])
-
-          _ ->
-            raise ArgumentError, "reaction output identity is already terminal"
-        end
+          Map.merge(action["result"] || %{}, %{
+            "wake_id" => id,
+            "intent_wake_id" =>
+              get_in(action, ["result", "intent_wake_id"]) ||
+                get_in(action, ["result", "wake_id"]) || id,
+            "delivery" => "queued",
+            "requested_due_at" => input.due_at,
+            "emitted" => Map.new(input, fn {key, value} -> {Atom.to_string(key), value} end)
+          })
 
         Store.record(txn, action, "pending", result, at)
 
@@ -114,7 +138,7 @@ defmodule Tightbeam.RowReactions.Notice do
               Store.record(
                 txn,
                 action,
-                "canceled",
+                "pending",
                 Map.put(result, "delivery", "undelivered"),
                 at
               )

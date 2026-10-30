@@ -73,8 +73,11 @@ defmodule Tightbeam.RowReactions.Cutover do
           "source" => %{"kind" => "wake", "id" => wake.wake_id}
         }
 
+    incomplete = not unresolved and Wakes.undelivered_notice_in_txn?(txn, wake.wake_id)
+
     status =
       cond do
+        incomplete -> "pending"
         wake.state == "canceled" -> "canceled"
         is_integer(wake.delivered_turn_seq) -> "accepted"
         unresolved -> "held"
@@ -104,7 +107,12 @@ defmodule Tightbeam.RowReactions.Cutover do
       "wake_id" => wake.wake_id,
       "adopted" => true,
       "requested_due_at" => wake.due_at,
-      "delivery" => if(is_integer(wake.delivered_turn_seq), do: "delivered", else: wake.state)
+      "delivery" =>
+        cond do
+          incomplete -> "undelivered"
+          is_integer(wake.delivered_turn_seq) -> "delivered"
+          true -> wake.state
+        end
     }
 
     Store.adopt(txn, event, facts, plan, status, result, at)

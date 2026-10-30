@@ -15,8 +15,13 @@ additional terminal update to the opener when another recipient is selected.
 
 If there is no eligible recipient, preserve the terminal change and its one
 undelivered intent with typed undeliverable evidence. The record address does not
-authorize another fallback recipient or assert delivery. If persisting the
-source, intent or required evidence fails, roll back the transaction. With no
+authorize another fallback recipient or assert delivery. The action stays incomplete:
+a later recovery or reconciliation may use the elected recipient to deliver it,
+under the same action identity and existing transport-attempt lineage. The
+failed wake and typed undeliverable evidence remain historical; no timer is
+added, and reevaluation while still unavailable creates no further attempt.
+If persisting the source, intent or required evidence fails, roll back the
+transaction. With no
 matching elected rule, the command still completes and creates no automatic
 handoff. Explicit command results and intervention messages keep their own
 contracts.

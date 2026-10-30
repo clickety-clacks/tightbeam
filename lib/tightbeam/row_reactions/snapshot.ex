@@ -64,15 +64,7 @@ defmodule Tightbeam.RowReactions.Snapshot do
         do:
           one(txn, "sessions", ~w(sessionKey state), "sessionKey=?1", [child["childSessionKey"]])
 
-    attests =
-      rows(
-        txn,
-        "attests",
-        ~w(id assignmentId kind bySession byUser ts note),
-        "bySession=?1 AND kind='progress'",
-        [delivery["sessionKey"]]
-      )
-      |> Enum.map(&Map.put(&1, "disposition", disposition(&1["note"])))
+    attests = Enum.flat_map(sources, &receipt_candidates_in_txn(txn, delivery["sessionKey"], &1))
 
     %{
       "sessions" => sessions(txn, [delivery["sessionKey"]]),
@@ -85,6 +77,24 @@ defmodule Tightbeam.RowReactions.Snapshot do
       "parent_activity_at" =>
         Tightbeam.Supervision.holder_activity_in_txn(txn, delivery["sessionKey"])
     }
+  end
+
+  # A binary prefix range uses the receipt index, so unrelated lifetime
+  # progress is neither scanned nor materialized for each pending handoff.
+  def receipt_candidates_in_txn(txn, parent, source) do
+    prefix =
+      "completion-handoff-action #{source["assignmentId"]} #{source["sourceKind"]} #{source["sourceToken"]} "
+
+    upper = String.trim_trailing(prefix, " ") <> "!"
+
+    rows(
+      txn,
+      "attests INDEXED BY row_reaction_receipt_candidates",
+      ~w(id assignmentId kind bySession byUser ts note),
+      "bySession=?1 AND kind='progress' AND note>=?2 AND note<?3",
+      [parent, prefix, upper]
+    )
+    |> Enum.map(&Map.put(&1, "disposition", disposition(&1["note"])))
   end
 
   def wake(txn, id) do

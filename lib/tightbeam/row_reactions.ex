@@ -143,6 +143,28 @@ defmodule Tightbeam.RowReactions do
     :ok
   end
 
+  def reconcile_receipt_in_txn(txn, recipient, receipt) do
+    for [org, event_id] <-
+          Txn.q(
+            txn,
+            """
+            SELECT DISTINCT a.org,a.eventId FROM row_reaction_actions a
+            JOIN row_reaction_events e ON e.org=a.org AND e.eventId=a.eventId
+            JOIN wakes w ON w.wakeId=json_extract(a.result,'$.wake_id')
+            WHERE a.status='pending' AND w.state='pending' AND w.deliveredTurnSeq IS NULL AND w.sessionKey=?1
+              AND json_extract(e.facts,'$.terminal_sources[0].assignmentId')=?2
+              AND json_extract(e.facts,'$.terminal_sources[0].sourceKind')=?3
+              AND json_extract(e.facts,'$.terminal_sources[0].sourceToken')=?4
+            """,
+            [recipient, receipt["assignmentId"], receipt["sourceKind"], receipt["sourceToken"]]
+          ) do
+      {event, _facts} = Store.event(txn, org, event_id)
+      reconcile(txn, event)
+    end
+
+    :ok
+  end
+
   def reconcile_work_item_in_txn(txn, item_id) do
     for [org, event_id] <-
           Txn.q(

@@ -820,8 +820,12 @@ defmodule Tightbeam.Wakes do
   @doc false
   def record_terminal_handoff_action_in_txn(%Txn{} = txn, holder, attest)
       when is_binary(holder) and is_map(attest) do
-    if attest.kind == "progress" and attest.bySession == holder,
-      do: Tightbeam.RowReactions.reconcile_recipient_in_txn(txn, holder)
+    if attest.kind == "progress" and attest.bySession == holder do
+      case Tightbeam.RowReactions.Snapshot.disposition(Map.get(attest, :note)) do
+        nil -> :ok
+        receipt -> Tightbeam.RowReactions.reconcile_receipt_in_txn(txn, holder, receipt)
+      end
+    end
 
     :ok
   end
@@ -3210,6 +3214,68 @@ defmodule Tightbeam.Wakes do
 
       [[1]] ->
         {:retry, retry_wake_id}
+    end
+  end
+
+  @doc false
+  def undelivered_notice_in_txn?(txn, id) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM wakes w JOIN wake_cancellations c ON c.wakeId=w.wakeId
+      WHERE w.wakeId=?1 AND w.state='canceled' AND w.deliveredTurnSeq IS NULL
+        AND c.reasonKind='target_unresolvable'
+        AND EXISTS (SELECT 1 FROM lifecycle_events e WHERE e.kind='wake_undeliverable' AND e.subject=w.wakeId)
+      """,
+      [id]
+    ) == [[1]]
+  end
+
+  # Reuse transport-attempt lineage without reviving a canceled wake or adding
+  # a timer. The caller owns the incomplete intent and elects this attempt's
+  # recipient and deadline in the same transaction.
+  @doc false
+  def retry_undelivered_notice_in_txn(txn, previous_id, input, at) do
+    unless undelivered_notice_in_txn?(txn, previous_id),
+      do: raise(ArgumentError, "notice has no undelivered attempt to resume")
+
+    {root, attempt} = retry_identity_in_txn(txn, previous_id)
+    id = retry_wake_id(root, attempt + 1)
+
+    Txn.q(
+      txn,
+      """
+      INSERT OR IGNORE INTO wake_retry_attempts
+      (wakeId,rootWakeId,predecessorWakeId,attempt,sourceTurnSeq,outcome,retryWakeId,observedAt)
+      VALUES(?1,?2,NULL,?3,NULL,'failed',NULL,?4)
+      """,
+      [previous_id, root, attempt, at]
+    )
+
+    case get_in_txn(txn, id) do
+      nil ->
+        wake = schedule_in_txn(txn, Map.put(input, :wake_id, id))
+
+        Txn.q(
+          txn,
+          """
+          INSERT INTO wake_retry_attempts
+          (wakeId,rootWakeId,predecessorWakeId,attempt,sourceTurnSeq,outcome,retryWakeId,observedAt)
+          VALUES(?1,?2,?3,?4,NULL,'pending',NULL,?5)
+          """,
+          [id, root, previous_id, attempt + 1, at]
+        )
+
+        Txn.q(
+          txn,
+          "UPDATE wake_retry_attempts SET outcome='failed',retryWakeId=?2 WHERE wakeId=?1",
+          [previous_id, id]
+        )
+
+        wake
+
+      wake ->
+        wake
     end
   end
 
