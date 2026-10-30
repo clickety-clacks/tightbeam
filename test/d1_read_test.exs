@@ -22,6 +22,9 @@ defmodule Tightbeam.D1ReadTest do
     assert default["value"] == "default"
     assert private["value"] == nil
 
+    assert D1Read.detail(db, "/unused", :config, "record-event-feed-activation:work_item.filed") ==
+             nil
+
     assert D1Read.encode(:config, private) ==
              ~s({"key":"private-priority","value":null,"updatedAt":#{private["updatedAt"]},"rowVersion":#{private["rowVersion"]}})
 

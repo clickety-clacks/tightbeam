@@ -1297,6 +1297,7 @@ defmodule Tightbeam.StateResources do
            JOIN admin_projection_versions AS v
              ON v.resource = 'config' AND v.primaryKey = s.key
            WHERE s.key = ?1
+             AND s.key NOT LIKE 'record-event-feed-activation:%'
            """,
            [key]
          ) do

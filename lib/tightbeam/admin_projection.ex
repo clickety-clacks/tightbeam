@@ -645,10 +645,17 @@ defmodule Tightbeam.AdminProjection do
   defp backfill_in_txn(txn, now) do
     Txn.q(
       txn,
+      "DELETE FROM admin_projection_versions " <>
+        "WHERE resource = 'config' AND primaryKey LIKE 'record-event-feed-activation:%'"
+    )
+
+    Txn.q(
+      txn,
       """
       INSERT OR IGNORE INTO admin_projection_versions
         (resource, primaryKey, rowVersion, updatedAt)
       SELECT 'config', key, 1, updatedAt FROM org_settings
+      WHERE key NOT LIKE 'record-event-feed-activation:%'
       """
     )
 

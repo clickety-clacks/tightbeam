@@ -371,6 +371,10 @@ defmodule Tightbeam.AdminProjectionTest do
     assert StateResources.query_config(ctx.db, "default-archetype").row_version ==
              first_config["rowVersion"]
 
+    activation_key = "record-event-feed-activation:work_item.filed"
+    assert StateResources.query_config(ctx.db, activation_key) == nil
+    assert AdminProjection.version(ctx.db, "config", activation_key) == nil
+
     :ok = Org.put_setting(ctx.db, "private-token", "tbc_config_secret_12345678")
     private_config = StateResources.query_config(ctx.db, "private-token")
     private_config_version = private_config.row_version
