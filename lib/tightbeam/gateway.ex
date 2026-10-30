@@ -7531,22 +7531,23 @@ defmodule Tightbeam.Gateway do
   defp create_available_spawn(config, db, call, caller, archetype) do
     p = call.params
     defaults = defaults(config, db)
-    harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
 
-    case spawn_harness_module(harness) do
-      {:error, denial} ->
-        denial
+    override_result =
+      if Map.has_key?(p, :overrides) do
+        Archetypes.normalize_overrides(config.base_dir, archetype, p.overrides)
+      else
+        {:ok, nil}
+      end
 
-      {:ok, module} ->
-        override_result =
-          if Map.has_key?(p, :overrides) do
-            Archetypes.normalize_overrides(config.base_dir, archetype, p.overrides)
-          else
-            {:ok, nil}
-          end
+    case override_result do
+      {:ok, overrides} ->
+        harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
 
-        case override_result do
-          {:ok, overrides} ->
+        case spawn_harness_module(harness) do
+          {:error, denial} ->
+            denial
+
+          {:ok, module} ->
             default_model = archetype.defaults[:model] || defaults.model
 
             with {:ok, placement} <-
@@ -7556,10 +7557,10 @@ defmodule Tightbeam.Gateway do
               {:error, denial} ->
                 classified_spawn_denial(denial, "config_denied", "placement_denied")
             end
-
-          {:error, denial} ->
-            classified_spawn_denial(denial, "config_denied", "placement_denied")
         end
+
+      {:error, denial} ->
+        classified_spawn_denial(denial, "config_denied", "placement_denied")
     end
   end
 
