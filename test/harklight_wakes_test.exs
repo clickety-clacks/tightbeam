@@ -1212,6 +1212,151 @@ defmodule Tightbeam.HarklightWakesTest do
     assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_entries")
   end
 
+  test "due scan preserves legacy owner and follower eligibility", %{
+    db: db,
+    call: call,
+    main: main
+  } do
+    follower = follower_session(db, main, "agent:follower:due")
+
+    assert %{outcome: "committed"} =
+             follow_for_test(
+               db,
+               follow_call(call, follower, %{message_id: "request"}),
+               runner: lifecycle_runner(db)
+             )
+
+    for cursor <- 1..2 do
+      assert :ok =
+               HarklightWakes.capture_line(db, @handle, event(cursor, "discussion", "captured"))
+    end
+
+    # Include both a historical owner wake without a delivery row and the
+    # current owner/follower form in the same production due query.
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "DELETE FROM harklight_wake_deliveries WHERE handle=?1 AND eventId='1' AND sessionKey=?2",
+               [@handle, call.session_key]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE wakes SET dueAt=0,deliveryRule='turn-boundary-digest r1'"
+             )
+
+    assert {:ok, captured} = DB.query(db, "SELECT wakeId,sessionKey FROM wakes")
+    assert length(captured) == 4
+    host = Placement.local_host_name()
+
+    for {owner_state, owner_host, follower_state, follower_host, owner_ok, follower_ok} <- [
+          {"active", host, "active", host, true, true},
+          {"active", "another-host", "active", host, false, true},
+          {"retired", host, "active", host, false, true},
+          {"active", host, "retired", host, true, false},
+          {"retired", host, "retired", host, false, false},
+          {"active", host, "active", "another-host", true, true}
+        ] do
+      assert {:ok, _} =
+               DB.query(db, "UPDATE sessions SET state=?2,host=?3 WHERE sessionKey=?1", [
+                 call.session_key,
+                 owner_state,
+                 owner_host
+               ])
+
+      assert {:ok, _} =
+               DB.query(db, "UPDATE sessions SET state=?2,host=?3 WHERE sessionKey=?1", [
+                 follower.session_key,
+                 follower_state,
+                 follower_host
+               ])
+
+      expected =
+        for [id, session] <- captured,
+            (session == call.session_key and owner_ok) or
+              (session == follower.session_key and follower_ok),
+            into: MapSet.new(),
+            do: id
+
+      assert {:ok, rows} = DB.query(db, Tightbeam.Wakes.due_scan_sql(), [1])
+      assert MapSet.new(rows, &hd/1) == expected
+    end
+  end
+
+  test "production due scan searches indexed candidates as captured history grows", %{
+    db: db,
+    call: call
+  } do
+    assert {:ok, _} =
+             DB.query(
+               db,
+               """
+               WITH RECURSIVE due(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM due WHERE n<3000)
+               INSERT INTO wakes(wakeId,sessionKey,origin,consumer,dueAt,state,createdAt,ownerUserId)
+               SELECT 'ordinary-due-'||n,?1,'test','test',0,'pending',1,'owner' FROM due
+               """,
+               [call.session_key]
+             )
+
+    for {first, last} <- [{1, 100}, {101, 3000}] do
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 """
+                 WITH RECURSIVE history(n) AS (SELECT ?2 UNION ALL SELECT n+1 FROM history WHERE n<?3)
+                 INSERT INTO wakes(wakeId,sessionKey,origin,consumer,dueAt,state,createdAt,ownerUserId)
+                 SELECT 'captured-history-'||n,?1,'test','test',0,'fired',1,'owner' FROM history
+                 """,
+                 [call.session_key, first, last]
+               )
+
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 """
+                 WITH RECURSIVE history(n) AS (SELECT ?2 UNION ALL SELECT n+1 FROM history WHERE n<?3)
+                 INSERT INTO harklight_wake_entries
+                   (handle,eventId,feedCursor,senderId,messageId,entryKind,entryAuthor,rawLine,wakeId,capturedAt)
+                 SELECT ?1,'history-'||n,n,'sender','request','discussion','person','{}',
+                   'captured-history-'||n,1 FROM history
+                 """,
+                 [@handle, first, last]
+               )
+
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 """
+                 INSERT INTO harklight_wake_deliveries(handle,eventId,sessionKey,wakeId)
+                 SELECT handle,eventId,?2,wakeId FROM harklight_wake_entries
+                 WHERE handle=?1 AND feedCursor BETWEEN ?3 AND ?4
+                 """,
+                 [@handle, call.session_key, first, last]
+               )
+
+      assert {:ok, [[^last]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_entries")
+
+      for analyzed <- [false, true] do
+        if analyzed, do: assert({:ok, _} = DB.query(db, "ANALYZE"))
+        sql = Tightbeam.Wakes.due_scan_sql()
+        assert {:ok, [[3000]]} = DB.query(db, "SELECT count(*) FROM (" <> sql <> ")", [1])
+        assert {:ok, plan} = DB.query(db, "EXPLAIN QUERY PLAN " <> sql, [1])
+        details = Enum.map(plan, &List.last/1)
+        refute Enum.any?(details, &Regex.match?(~r/SCAN (e|d)\b/, &1)), inspect(details)
+
+        for table <- ["e", "d"] do
+          assert Enum.any?(
+                   details,
+                   &(String.contains?(&1, "SEARCH " <> table <> " USING") and
+                       String.contains?(&1, "wakeId=?"))
+                 ),
+                 inspect(details)
+        end
+      end
+    end
+  end
+
   test "superseded-terminal lookup uses the sender and target index", %{db: db} do
     assert {:ok, rows} =
              DB.query(
