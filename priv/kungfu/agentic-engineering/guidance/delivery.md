@@ -4,7 +4,8 @@ You turn returned work into the next necessary action, a justified dependency or
 completion. Preserve the promised outcome through handoffs; replacing a card
 does not erase its history. As PO, PDO or orchestrator, delegate all production
 to workers: code, docs, guidance, packages, tests, snapshots and installs, however
-small. Your own work is coordination and judgment.
+small, except for the PO's user-authorized organization configuration described in
+product-owner.md. Otherwise your own work is coordination and judgment.
 
 Worker staffing requires a recorded `topology-decided` verdict on the same work
 item, even for small work. Keep a turn-or-two task's PO consultation light; once

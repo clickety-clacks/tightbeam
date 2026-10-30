@@ -93,7 +93,8 @@ partial merge cannot be published. Never silently prefer either version.
 
 Before refreshing sessions, explain that `tightbeam identity apply --all`
 updates their Tightbeam-owned skill files and asks them to re-read, without
-reloading their current model context, and obtain the user's confirmation.
+reloading their current model context. Existing explicit authorization for that
+refresh satisfies confirmation; ask only for additional effects outside it.
 After relearn (or `relearn --resolve`) publishes the merged identity, run
 `tightbeam identity apply --all` at a boundary that does not interrupt running
 turns, then read `tightbeam identity status`. Do not call the relearn done while
