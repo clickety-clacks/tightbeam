@@ -178,6 +178,15 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
       assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
                DB.query(predecessor, "SELECT shape FROM schema_stamp")
 
+      # Some historical callers remove this older column before undoing identity.
+      unless "deliveryOwnerSessionKey" in table_columns(db, "work_items") do
+        assert :ok =
+                 DB.execute(
+                   predecessor,
+                   "ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey"
+                 )
+      end
+
       tables =
         ~w(decision_requests work_items work_item_bodies assignments attests assignment_reopenings assignment_revocations assignment_cannot_proceed assignment_commit_ref_corrections memento_history session_reparent_events) ++
           for object <- Tightbeam.Toplines.Schema.manifest(),
