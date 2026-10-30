@@ -1226,27 +1226,58 @@ defmodule Tightbeam.HarklightWakesTest do
            end)
   end
 
-  test "schema backfills unresolved pending supersede targets", %{db: db, call: call} do
+  test "schema backfills preexisting pending supersede targets and deduplicates them", %{
+    db: db,
+    call: call
+  } do
     op = Tightbeam.Id.uuid4()
 
     payload =
       JSON.encode!(%{
         request: %{
-          message: %{sender_id: "sender", message_id: "replacement", supersedes: ["request"]}
+          message: %{
+            sender_id: "sender",
+            message_id: "replacement",
+            supersedes: ["request", "request"]
+          }
         }
       })
 
     assert %{state: "pending"} = HarklightWakes.prepare_send(db, call, op, payload)
 
-    assert {:ok, _} =
-             DB.query(db, "DELETE FROM harklight_pending_supersedes WHERE opId=?1", [op])
+    assert :ok = DB.execute(db, "DROP INDEX harklight_pending_supersedes_target")
 
-    assert {:ok, _} =
-             DB.query(
-               db,
-               "DELETE FROM harklight_schema_migrations WHERE migration='pending_supersedes_v1'"
-             )
+    assert :ok = DB.execute(db, "DROP TABLE harklight_pending_supersedes")
+    assert :ok = DB.execute(db, "DROP TABLE harklight_pending_supersedes_migration")
+    assert :ok = HarklightWakes.ensure_schema(db)
 
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_pending_supersedes WHERE opId=?1", [op])
+
+    assert {:ok, _} = DB.query(db, "DELETE FROM harklight_pending_supersedes WHERE opId=?1", [op])
+
+    assert {:ok, _} = DB.query(db, "DELETE FROM harklight_pending_supersedes_migration")
+
+    assert :ok =
+             DB.execute(db, """
+             CREATE TRIGGER fail_harklight_pending_supersedes_marker
+             BEFORE INSERT ON harklight_pending_supersedes_migration
+             BEGIN
+               SELECT RAISE(ABORT, 'simulated interrupted migration');
+             END;
+             """)
+
+    assert {:error, _} = HarklightWakes.ensure_schema(db)
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_pending_supersedes WHERE opId=?1", [op])
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_pending_supersedes_migration")
+
+    assert :ok = DB.execute(db, "DROP TRIGGER fail_harklight_pending_supersedes_marker")
+
+    assert :ok = HarklightWakes.ensure_schema(db)
     assert :ok = HarklightWakes.ensure_schema(db)
 
     assert {:ok, [[^op, "sender", "request"]]} =
@@ -1255,6 +1286,9 @@ defmodule Tightbeam.HarklightWakesTest do
                "SELECT opId,senderId,messageId FROM harklight_pending_supersedes WHERE opId=?1",
                [op]
              )
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_pending_supersedes WHERE opId=?1", [op])
 
     assert :ok = HarklightWakes.capture_line(db, @handle, terminal(1, "request"))
 

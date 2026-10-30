@@ -37,9 +37,6 @@ defmodule Tightbeam.HarklightWakes do
   );
   CREATE INDEX IF NOT EXISTS harklight_pending_supersedes_target
     ON harklight_pending_supersedes(senderId,messageId,opId);
-  CREATE TABLE IF NOT EXISTS harklight_schema_migrations (
-    migration TEXT PRIMARY KEY
-  );
   CREATE TABLE IF NOT EXISTS harklight_wake_handles (
     handle TEXT PRIMARY KEY,
     sessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
@@ -1347,12 +1344,19 @@ defmodule Tightbeam.HarklightWakes do
     end)
   end
 
+  # Keep this one-time pending-payload walk in schema migration, never in
+  # terminal capture. The marker commits with the backfill so interruption retries it.
   defp backfill_pending_supersedes(db) do
-    case DB.transaction(db, fn txn ->
-           case Txn.q(
-                  txn,
-                  "SELECT 1 FROM harklight_schema_migrations WHERE migration='pending_supersedes_v1'"
-                ) do
+    case DB.migration_transaction(db, :harklight_pending_supersedes_backfill, [], [], fn txn ->
+           :ok =
+             Txn.exec(txn, """
+             CREATE TABLE IF NOT EXISTS harklight_pending_supersedes_migration (
+               id INTEGER PRIMARY KEY CHECK(id=0),
+               appliedAt INTEGER NOT NULL CHECK(appliedAt >= 0)
+             )
+             """)
+
+           case Txn.q(txn, "SELECT id,appliedAt FROM harklight_pending_supersedes_migration") do
              [] ->
                Txn.q(
                  txn,
@@ -1370,16 +1374,18 @@ defmodule Tightbeam.HarklightWakes do
 
                Txn.q(
                  txn,
-                 "INSERT INTO harklight_schema_migrations(migration) VALUES('pending_supersedes_v1')"
+                 "INSERT INTO harklight_pending_supersedes_migration(id,appliedAt) VALUES(0,?1)",
+                 [System.system_time(:millisecond)]
                )
 
                :ok
 
-             [[1]] ->
+             [[0, applied_at]] when is_integer(applied_at) and applied_at >= 0 ->
                :ok
 
              rows ->
-               raise "unexpected Harklight supersede migration state: #{inspect(rows)}"
+               raise Tightbeam.Schema.ShapeError,
+                 message: "incompatible_harklight_pending_supersedes_migration: #{inspect(rows)}"
            end
          end) do
       {:ok, :ok} -> :ok
