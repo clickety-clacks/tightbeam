@@ -59,8 +59,45 @@ defmodule Tightbeam.CheckTierTest do
     end)
 
     # Process actors live in the event stream; absence of an actor is refused at the write path.
-    assert %{code: "principal_required"} = verdict(ctx, nil, assignment.id, "tests-passed")
-    assert Assignments.list_attests(ctx.db, assignment.id) == []
+    {:ok, {Assignments, [abstract_code: {:raw_abstract_v1, forms}]}} =
+      :beam_lib.chunks(:code.which(Assignments), [:abstract_code])
+
+    write_path = Tightbeam.CheckTierTest.AssignmentWritePath
+
+    exposed =
+      Enum.flat_map(forms, fn
+        {:attribute, line, :module, Assignments} ->
+          [
+            {:attribute, line, :module, write_path},
+            {:attribute, line, :export, [insert_attest: 4]}
+          ]
+
+        form ->
+          [form]
+      end)
+
+    {:ok, ^write_path, binary} = :compile.forms(exposed, [:binary, :return_errors])
+    {:module, ^write_path} = :code.load_binary(write_path, ~c"assignment-write-path-test", binary)
+
+    try do
+      actorless =
+        call("attest", nil, %{
+          kind: "verdict",
+          verdict_kind: "tests-passed",
+          assignment_id: assignment.id
+        })
+        |> Map.put(:origin, nil)
+
+      assert {:error, %FunctionClauseError{module: ^write_path, function: :opener, arity: 1}} =
+               DB.transaction(ctx.db, fn txn ->
+                 apply(write_path, :insert_attest, [txn, actorless, assignment.id, false])
+               end)
+
+      assert Assignments.list_attests(ctx.db, assignment.id) == []
+    after
+      :code.delete(write_path)
+      :code.purge(write_path)
+    end
 
     progress = attest(ctx, {:session, "holder"}, assignment.id, "progress")
     assert progress.attest.verdictKind == nil
