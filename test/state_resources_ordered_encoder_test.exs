@@ -46,6 +46,7 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
       ~w(sessionKey reason startedAt expiresAt hardDeadline updatedAt rowVersion),
     "config" => ~w(key value updatedAt rowVersion),
     "host environment" => ~w(host harness name value valuePresent updatedAt rowVersion),
+    "harness processes" => ~w(id host harness pid state createdAt resolvedAt),
     "hosts" => ~w(host rowVersion),
     "identity" => ~w(name liveRevision state sessionRevisions staleness conflicts rowVersion),
     "kungfu" =>
@@ -54,7 +55,7 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
 
   # These REST list resources use the shared item encoder but do not emit
   # rebuildable Firehose rows.
-  @rest_read_resources ["coordination share", "digest members"]
+  @rest_read_resources ["coordination share", "digest members", "harness processes"]
   @firehose_field_order Map.drop(@field_order, @rest_read_resources)
 
   @resource_aliases %{
