@@ -491,7 +491,7 @@ defmodule Tightbeam.D1ReadRouteTest do
 
     visible_detail = get(ctx.opts, "/api/config/" <> case_variant_key, ctx.admin.token)
     assert visible_detail.status == 200
-    assert JSON.decode!(visible_detail.resp_body)["key"] == case_variant_key
+    assert JSON.decode!(visible_detail.resp_body)["item"]["key"] == case_variant_key
   end
 
   @tag rest_r7_encoder: true
