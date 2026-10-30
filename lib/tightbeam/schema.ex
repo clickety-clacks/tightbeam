@@ -3590,15 +3590,14 @@ defmodule Tightbeam.Schema do
   end
 
   defp assignment_source_replacement_liveness_objects(txn) do
-    cond do
-      row_reaction_cancellation_active?(txn) ->
-        @row_reaction_cancellation_objects
-
-      effort_holder_activity_cancellation_active?(txn) ->
-        @effort_holder_activity_cancellation_objects
-
-      true ->
-        @assignment_source_replacement_liveness_objects
+    # The migration journal exists only after liveness activation. Its later
+    # successor can be elected only after the stamped prerequisite is active.
+    if effort_holder_activity_cancellation_active?(txn) do
+      if row_reaction_cancellation_active?(txn),
+        do: @row_reaction_cancellation_objects,
+        else: @effort_holder_activity_cancellation_objects
+    else
+      @assignment_source_replacement_liveness_objects
     end
   end
 
