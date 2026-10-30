@@ -798,9 +798,17 @@ COMMANDS:
           --prompt "review is ready"
       Timed:
         tightbeam wake --session agent:coder:app --prompt "recheck the card" --after 5m --as coder
+      Use this plain condition when you only need to be notified of completion;
+      for other terminal outcomes, use a dependency wait on assignment.state.
       Condition:
-        tightbeam wake --session agent:owner:app --when-fact assignment-landed \
-          --when-scope asg_123 --fallback-after 2h --prompt "re-read the card" --as coder
+        tightbeam wake --session <targetSession> --when-fact assignment-landed \
+          --when-scope <assignmentId> --fallback-after 2h --prompt "read the completed assignment"
+      Dependency predicate example (resolverRef is a nested reference object):
+        tightbeam wake --session <holderSession> --assignment <assignmentId> \
+          --predicate '{"conditions":[{"fact":"assignment.state","op":"eq","value":"closed"}],
+            "bindings":{"assignmentId":"<resolverId>"},
+            "resolverRef":{"kind":"assignment","id":"<resolverId>"}}' \
+          --fallback-after 2h --prompt "read the resolver result"
 
   condition --kind <kind> [--scope <scope>] [--key <idempotencyKey>]
       File an observable fact. Matching condition wakes receive the fact as a new
@@ -6158,7 +6166,7 @@ mod tests {
             .unwrap()
             .0;
 
-        assert_eq!(examples.matches("tightbeam wake --").count(), 4);
+        assert_eq!(examples.matches("tightbeam wake --").count(), 5);
         assert!(examples.contains("tightbeam wake --role owner --prompt"));
         assert!(examples.contains("--session agent:recipient:example --assignment <assignmentId>"));
         assert!(examples.contains("--after 5m"));
