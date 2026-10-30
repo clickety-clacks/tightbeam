@@ -119,7 +119,7 @@ defmodule Tightbeam.RequestObservationTest do
     end
   end
 
-  test "real core and d1 state reads carry resolved session then authorized user", %{
+  test "real core and d1 state reads retain the authenticated session", %{
     opts: opts,
     db: db
   } do
@@ -147,7 +147,7 @@ defmodule Tightbeam.RequestObservationTest do
             do: [{"", "session:diagnostic_session"}],
             else: [
               {"", "session:diagnostic_session"},
-              {"?asUser=diagnostic_owner", "user:diagnostic_owner"}
+              {"?asUser=diagnostic_owner", "session:diagnostic_session"}
             ]
           ) do
       id = RequestContext.id("req_")

@@ -1,4 +1,5 @@
 defmodule Tightbeam.ToolCallsTest do
+  @current_shape hd(Tightbeam.Schema.guard_compatible_stamps())
   use Tightbeam.TestCase, async: false
 
   import Plug.Conn
@@ -403,7 +404,7 @@ defmodule Tightbeam.ToolCallsTest do
 
   test "fresh setup applies the feature-local migration without changing the root stamp", ctx do
     {:ok, [[root_shape]]} = DB.query(ctx.db, "SELECT shape FROM schema_stamp", [])
-    assert root_shape == "launch-preparation-evidence-v1-0112"
+    assert root_shape == @current_shape
 
     {:ok, [[0, "tool-call-transition-v1-011"]]} =
       DB.query(ctx.db, "SELECT id, shape FROM tool_call_transition_migration", [])
@@ -491,7 +492,7 @@ defmodule Tightbeam.ToolCallsTest do
       DB.query(ctx.db, "SELECT shape,stampedAt FROM schema_stamp", [])
 
     assert [
-             ["launch-preparation-evidence-v1-0112", _root_stamped_at_before]
+             [@current_shape, _root_stamped_at_before]
            ] = root_stamp_before
 
     {:ok, memento_stamp_before} =

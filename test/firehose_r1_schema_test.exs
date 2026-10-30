@@ -1,4 +1,5 @@
 defmodule Tightbeam.FirehoseR1SchemaTest do
+  @current_shape hd(Tightbeam.Schema.guard_compatible_stamps())
   use Tightbeam.TestCase, async: false
   alias Tightbeam.{DB, Schema}
   @fixture Path.expand("fixtures/r1_o2_v1.sql", __DIR__)
@@ -56,7 +57,7 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
     assert :ok = Schema.ensure_all(db)
 
     assert rows(db, "SELECT shape FROM schema_stamp") ==
-             [["launch-preparation-evidence-v1-0112"]]
+             [[@current_shape]]
 
     for {table, column} <- [
           {"assignments", "reminderState"},

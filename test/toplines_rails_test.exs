@@ -64,7 +64,6 @@ defmodule Tightbeam.ToplinesRailsTest do
       %{linkedActorRef: nil},
       %{linkReason: " "},
       %{unlinkedAt: 20},
-      ended_membership(%{unlinkedActorKind: "process"}),
       ended_membership(%{unlinkedAt: "later"}),
       ended_membership(%{unlinkedAt: 9})
     ]
@@ -76,6 +75,18 @@ defmodule Tightbeam.ToplinesRailsTest do
         Map.merge(membership_row("tlm_invalid", "tl_one", "wi_one", "flynn"), overrides)
       )
     end)
+
+    row =
+      membership_row("tlm_process", "tl_one", "wi_one", "flynn")
+      |> Map.merge(ended_membership(%{unlinkedActorKind: "process"}))
+
+    insert!(db, "topline_work_memberships", row)
+
+    assert {:ok, [["flynn", "process", "flynn"]]} =
+             DB.query(
+               db,
+               "SELECT ownerUserId,unlinkedActorKind,unlinkedActorRef FROM topline_work_memberships WHERE id='tlm_process'"
+             )
   end
 
   test "AC67 rejects invalid Concern actors, time, and titles", %{db: db} do
@@ -130,16 +141,9 @@ defmodule Tightbeam.ToplinesRailsTest do
       %{cause: "other"},
       %{state: "other"},
       %{openedActorRef: nil},
-      %{openedActorKind: "process", openedActorRef: "tightbeam"},
       %{
         cause: "migration",
         causeRef: "migration",
-        openedActorKind: "process",
-        openedActorRef: "other"
-      },
-      %{
-        cause: "reopened",
-        sourceCausalEventSeq: 100,
         openedActorKind: "process",
         openedActorRef: "other"
       },
@@ -147,15 +151,6 @@ defmodule Tightbeam.ToplinesRailsTest do
       %{promptWakeId: " "},
       %{resolutionReason: "done"},
       resolved_placement("left_unlinked", %{resolutionReason: nil}),
-      resolved_placement("linked", %{
-        resolutionActorKind: "process",
-        resolutionActorRef: "tightbeam"
-      }),
-      resolved_placement("work_terminal", %{
-        resolutionActorKind: "process",
-        resolutionActorRef: "tightbeam",
-        resolutionReason: "work_item_closed"
-      }),
       resolved_placement("work_terminal", %{
         resolutionReason: "reupgrade_terminal_reconciliation_closed"
       }),
@@ -201,6 +196,44 @@ defmodule Tightbeam.ToplinesRailsTest do
         Map.merge(placement_row("tlp_invalid"), overrides)
       )
     end)
+
+    process_rows = [
+      %{openedActorKind: "process", openedActorRef: "tightbeam"},
+      %{
+        cause: "reopened",
+        sourceCausalEventSeq: 100,
+        openedActorKind: "process",
+        openedActorRef: "other"
+      },
+      resolved_placement("linked", %{
+        resolutionActorKind: "process",
+        resolutionActorRef: "tightbeam"
+      }),
+      resolved_placement("work_terminal", %{
+        resolutionActorKind: "process",
+        resolutionActorRef: "tightbeam",
+        resolutionReason: "work_item_closed"
+      })
+    ]
+
+    for {overrides, index} <- Enum.with_index(process_rows) do
+      row = Map.merge(placement_row("tlp_process_#{index}"), overrides)
+      insert!(db, "topline_placement_obligations", row)
+
+      assert {:ok, [[owner, opened_kind, opened_ref, resolved_kind, resolved_ref]]} =
+               DB.query(
+                 db,
+                 "SELECT ownerUserId,openedActorKind,openedActorRef,resolutionActorKind,resolutionActorRef FROM topline_placement_obligations WHERE id=?1",
+                 [row.id]
+               )
+
+      assert {owner, opened_kind, opened_ref, resolved_kind, resolved_ref} ==
+               {"flynn", row.openedActorKind, row.openedActorRef, row.resolutionActorKind,
+                row.resolutionActorRef}
+
+      assert {:ok, []} =
+               DB.query(db, "DELETE FROM topline_placement_obligations WHERE id=?1", [row.id])
+    end
 
     insert!(
       db,
@@ -268,7 +301,6 @@ defmodule Tightbeam.ToplinesRailsTest do
     invalid = [
       %{kind: "other"},
       %{actorRef: nil},
-      %{actorKind: "process"},
       %{seq: "one"},
       %{seq: 0},
       %{eventAt: "now"},
@@ -286,6 +318,14 @@ defmodule Tightbeam.ToplinesRailsTest do
         Map.merge(event_row("tl_one"), overrides)
       )
     end)
+
+    insert!(db, "topline_events", Map.put(event_row("tl_one"), :actorKind, "process"))
+
+    assert {:ok, [["flynn", "process", "flynn"]]} =
+             DB.query(
+               db,
+               "SELECT t.ownerUserId,e.actorKind,e.actorRef FROM topline_events e JOIN toplines t ON t.id=e.toplineId WHERE e.toplineId='tl_one'"
+             )
   end
 
   test "AC71 rejects both possible owner values for a cross-owner membership", %{db: db} do

@@ -1,10 +1,11 @@
 defmodule Tightbeam.AssignmentSourceReplacementMigrationTest do
+  @current_shape hd(Tightbeam.Schema.guard_compatible_stamps())
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{DB, Model, Org, Schema, Wakes}
 
   @predecessor "work-item-delivery-owner-v1-019"
-  @successor "launch-preparation-evidence-v1-0112"
+  @successor @current_shape
   @replacement_route ~r/\(requesterId = 'tightbeam:assignments' AND reasonKind = 'superseded' AND\s+causalSourceKind = 'wake' AND outcomeKind = 'replacement'\)\s+OR/
   @cancellation_columns "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
                           "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
