@@ -435,6 +435,8 @@ defmodule Tightbeam.ToolCallsTest do
 
   test "upgrades the named migration while preserving message rows and sequence high water",
        ctx do
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_session_identity!(ctx.db)
+    :ok = DB.execute(ctx.db, "UPDATE schema_stamp SET shape='launch-preparation-evidence-v1-0112'")
     {:ok, :ok} =
       DB.transaction(ctx.db, fn txn ->
         Tightbeam.DB.Txn.q(
@@ -492,7 +494,7 @@ defmodule Tightbeam.ToolCallsTest do
       DB.query(ctx.db, "SELECT shape,stampedAt FROM schema_stamp", [])
 
     assert [
-             [@current_shape, _root_stamped_at_before]
+             ["launch-preparation-evidence-v1-0112", _root_stamped_at_before]
            ] = root_stamp_before
 
     {:ok, memento_stamp_before} =
@@ -513,7 +515,7 @@ defmodule Tightbeam.ToolCallsTest do
 
     rewind_messages_to_predecessor(ctx.db)
 
-    :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    :ok = Tightbeam.SchemaShapeRuntimeFixture.upgrade_to_identity_predecessor!(ctx.db)
     assert :ok = ToolCalls.ensure_schema(ctx.db)
 
     {:ok, [[message_high_water_after]]} =
@@ -597,6 +599,9 @@ defmodule Tightbeam.ToolCallsTest do
              "kind"
            ] ==
              "context-compacted"
+
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    assert {:ok, [[@current_shape]]} = DB.query(ctx.db, "SELECT shape FROM schema_stamp")
 
     :ok = DB.execute(ctx.db, "DROP INDEX tool_calls_session_anchor")
 

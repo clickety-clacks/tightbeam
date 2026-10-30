@@ -73,10 +73,11 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
     assert {:ok, preserved_before} = DB.query(db, preserved_sql)
     assert length(preserved_before) == 4
 
+    assert :ok = Tightbeam.SchemaShapeRuntimeFixture.upgrade_to_identity_predecessor!(db)
+    assert {:ok, ^preserved_before} = DB.query(db, preserved_sql)
     assert :ok = Schema.ensure_all(db)
     assert stamp(db) == @successor
     assert terminal_objects(db) == @terminal_objects
-    assert {:ok, ^preserved_before} = DB.query(db, preserved_sql)
     assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM condition_facts")
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM terminal_credential_incidents")
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
@@ -88,6 +89,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
 
     assert [
              @successor,
+             "launch-preparation-evidence-v1-0112",
              "launch-preparation-boot-v1-0110",
              "decision-request-row-schema-v2-019",
              "notice-source-storage-v1-019",

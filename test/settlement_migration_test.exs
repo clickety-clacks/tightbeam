@@ -50,8 +50,9 @@ defmodule Tightbeam.SettlementMigrationTest do
 
     assert {:ok, before_ddl} = DB.query(db, preserved_sql)
     assert length(before_ddl) == 3
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = Tightbeam.SchemaShapeRuntimeFixture.upgrade_to_identity_predecessor!(db)
     assert {:ok, ^before_ddl} = DB.query(db, preserved_sql)
+    assert :ok = Schema.ensure_all(db)
 
     assert {:ok, [[wake_cancellations_ddl]]} =
              DB.query(

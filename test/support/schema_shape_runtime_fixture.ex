@@ -169,14 +169,11 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   # The interposer stops before the identity migration; no current DDL is relabeled.
   def downgrade_session_identity!(db) do
     {:ok, predecessor} = DB.start_link(path: ":memory:", name: nil)
-    {:ok, boundary} = __MODULE__.PreIdentityBoundary.start_link(predecessor)
 
     try do
       :ok = load_admission_fixture(predecessor)
 
-      assert_raise Schema.ShapeError, ~r/session identity migration rolled back/, fn ->
-        Schema.ensure_all(boundary)
-      end
+      upgrade_to_identity_predecessor!(predecessor)
 
       assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
                DB.query(predecessor, "SELECT shape FROM schema_stamp")
@@ -221,7 +218,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
                    end
 
                    DB.Txn.q(txn, "UPDATE topline_schema_stamp SET shape=?1", [topline_shape])
-                   :ok = DB.Txn.exec(txn, "DROP INDEX events_process_assignment")
+                   :ok = DB.Txn.exec(txn, "DROP INDEX IF EXISTS events_process_assignment")
                    :ok = DB.Txn.exec(txn, "PRAGMA schema_version = #{version + 1}")
                    :ok = DB.Txn.exec(txn, "PRAGMA writable_schema = RESET")
                  end
@@ -236,9 +233,20 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
 
       assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
     after
-      GenServer.stop(boundary)
       GenServer.stop(predecessor)
     end
+  end
+
+  def upgrade_to_identity_predecessor!(db) do
+    {:ok, boundary} = __MODULE__.PreIdentityBoundary.start_link(db)
+    try do
+      assert_raise Schema.ShapeError, ~r/session identity migration rolled back/, fn ->
+        Schema.ensure_all(boundary)
+      end
+    after
+      GenServer.stop(boundary)
+    end
+    :ok
   end
 
   defmodule PreIdentityBoundary do
@@ -246,7 +254,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     def start_link(db), do: GenServer.start_link(__MODULE__, db)
     @impl true
     def init(db) do
-      :persistent_term.put({DB, self()}, :persistent_term.get({DB, db}))
+      :persistent_term.put({DB, self()}, :persistent_term.get({DB, GenServer.whereis(db)}))
       {:ok, db}
     end
 
