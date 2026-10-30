@@ -35,8 +35,10 @@ A role is a responsibility, not a stage. Use `team-planner` for planning advice,
 `spec-writer` for contracts, `coder` for implementation, `reviewer-spec` and
 `reviewer-code` for independent judgment, `recon` for a bounded question and
 `integrator` for commissioned reconciliation. `guidance-writer` and
-`guidance-reviewer` own policy prose and its independent judgment. A missing role
-is a responsibility to describe to delivery ownership, not a name to invent.
+`guidance-reviewer` own policy prose and its independent judgment, subject to the
+PO's direct configuration authority in product-owner.md; independent
+judgment remains separate. A missing role is a responsibility to describe to
+delivery ownership, not a name to invent.
 
 Your archetype's guidance and the installed rules define the process for your role.
 Do not add your own gates, checks, ceremonies or process steps beyond them. If you

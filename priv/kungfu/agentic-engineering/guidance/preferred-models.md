@@ -27,9 +27,12 @@ external effects. Explicit settings do not authorize live tuning or migration.
 
 Follow the engineering core's qualified independent nonauthor review and exact
 integrated-subject coverage. Prefer Claude `claude-opus-5-5/high` for Codex-authored
-work and Codex `gpt-6-sol/high` for Claude-authored work when an eligible qualified
-independent reviewer is available; these are preferences, never gates. If the
-preferred opposite-harness route is unavailable, use the configured capable,
+work and Codex `gpt-6-sol/high` for Claude-authored work, with
+`gpt-6-astra/xhigh` for specification review, when an eligible qualified independent
+reviewer is available; these are preferences, never gates. Preserve each role's
+primary provider order: its Codex fallback is `gpt-6-astra/xhigh` for specification
+review and `gpt-6-sol/high` for code review. If the preferred opposite-harness route
+is unavailable, use the configured capable,
 qualified independent nonauthor fallback, including a reviewer on the same harness.
 Do not force an attempt on a known exhausted route.
 
@@ -42,7 +45,7 @@ Do not force an attempt on a known exhausted route.
 | Executive or delegated lane orchestration | gpt-6-luna[max] | Coordinate within actual scope, carry dependencies and follow-through, route consequential judgment to its qualified owner. |
 | Bounded team design or recovery planning | astra[high], fable[high], sol[xhigh], opus[xhigh] | Discover coupling, ownership, communication and evidence that invalidates the plan. |
 | Difficult sustained topology or recovery exploration | astra[xhigh], fable[xhigh], sol[max], opus[xhigh] | Sustain investigation and revise advice from evidence; the PO decides topology. |
-| Specification under product rulings | claude-opus-5-5[high] | Compose a coherent contract and expose unresolved intent. |
+| Specification under product rulings | claude-opus-5-5[high], gpt-6-astra[high] fallback | Compose a coherent contract and expose unresolved intent. |
 | Well-scoped or sustained implementation under an understood architecture | gpt-6-luna[max] | Implement and verify the contract, expose gaps and carry delivery without growing corrective supervision. |
 | Implementation with unresolved architectural or causal judgment | gpt-6-astra[high], gpt-6-sol[xhigh] | Reason about architecture and interacting failure modes during implementation; choose by the actual uncertainty. |
 | Open-ended recon or investigation | sol[high], opus[high], sonnet[high], astra[high], fable[high] | Distinguish evidence from inference and identify consequential unknowns. |
@@ -50,10 +53,10 @@ Do not force an attempt on a known exhausted route.
 | Mechanical non-code transformations | luna[medium], terra[low], sonnet[low], sol[medium] | Apply an inspectable transformation; code production uses the coder rows. |
 | Guidance or law authoring | astra[high], sol[xhigh], fable[high] | coherent authority and composed behavior |
 
-The complete workflow requires both Codex and Claude. Claude-only operation lacks
-the configured Codex PDO/orchestration and implementation choices. Codex-only
-operation lacks Claude specification. Opposite-harness review is preferred, never
-mandatory; when the preferred route is unavailable, use the configured capable,
+Claude-only operation lacks the configured Codex PDO/orchestration and
+implementation choices. Codex-only operation can use the specification-writing
+and review fallbacks above. Opposite-harness review is preferred, never mandatory;
+when the preferred route is unavailable, use the configured capable,
 qualified independent nonauthor fallback described above. Preserve permitted useful
 work, but state the unmet activity instead of claiming end-to-end support or
 overriding family restrictions.
