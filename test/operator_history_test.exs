@@ -374,7 +374,7 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
       assert_error(read_resource(ctx, ctx.hidden, resource, "asUser=owner"), 404, "not_found")
       assert read_resource(ctx, ctx.hidden, resource, "asUser=#{ctx.admin.user_id}").status == 200
 
-      for {token, kind} <- [{ctx.selected.cli_token, "user-admin"}, {ctx.owner.token, "user"}] do
+      for token <- [ctx.selected.cli_token, ctx.owner.token] do
         assert read_resource(ctx, ctx.selected, resource, "", token).status == 200
       end
     end
