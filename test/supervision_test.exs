@@ -504,6 +504,112 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, %{"intervalMs" => 1_000, "rung" => 1}} = JSON.decode(replacement.prompt)
   end
 
+  test "startup keeps reached-target notices only from the resumed episode", ctx do
+    now = System.system_time(:millisecond)
+    opened_at = now - 3_600_000
+    activity_at = now - 120_000
+    e1 = "assignment-inactivity-episode-v1:earlier"
+    e2 = "assignment-inactivity-episode-v1:resumed"
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [
+               opened_at
+             ])
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests(id,assignmentId,kind,bySession,ts) VALUES('att_r06_a13','asg_inactive','progress',?1,?2)",
+               [ctx.holder.session_key, activity_at]
+             )
+
+    e1_notice =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.parent.session_key,
+        consumer: "prompt",
+        assignment_id: "asg_inactive",
+        origin: "process:supervision-test",
+        prompt: "earlier episode notice",
+        due_at: now + 60_000,
+        obligation_ref: e1
+      })
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET createdAt=?2 WHERE wakeId=?1", [
+               e1_notice.wake_id,
+               activity_at - 1
+             ])
+
+    holder_notice =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        consumer: "prompt",
+        assignment_id: "asg_inactive",
+        origin: "process:supervision-test",
+        prompt: "resumed episode holder reminder",
+        due_at: now + 60_000,
+        obligation_ref: e2
+      })
+
+    reached_notice =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.parent.session_key,
+        consumer: "prompt",
+        assignment_id: "asg_inactive",
+        origin: "process:supervision-test",
+        prompt: "resumed episode escalation",
+        due_at: now + 60_000,
+        obligation_ref: e2
+      })
+
+    climb =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        consumer: "assignment_inactivity_climb",
+        assignment_id: "asg_inactive",
+        origin: "process:supervision-test",
+        prompt:
+          JSON.encode!(%{
+            "version" => 1,
+            "assignmentId" => "asg_inactive",
+            "episodeRef" => e2,
+            "originHolder" => ctx.holder.session_key,
+            "rung" => 2,
+            "intervalMs" => 1_000,
+            "previousWakeId" => reached_notice.wake_id,
+            "visited" => [ctx.holder.session_key, ctx.parent.session_key]
+          }),
+        due_at: now + 60_000,
+        obligation_ref: e2
+      })
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db, 1_000)
+
+    assert Wakes.get(ctx.db, e1_notice.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, holder_notice.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, reached_notice.wake_id).state == "pending"
+
+    resumed_climb = pending_climb!(ctx.db, "asg_inactive")
+    refute resumed_climb.wake_id == climb.wake_id
+
+    assert {:ok, %{"episodeRef" => ^e2, "visited" => visited}} =
+             JSON.decode(resumed_climb.prompt)
+
+    assert visited == [ctx.holder.session_key, ctx.parent.session_key]
+  end
+
+  test "without an assignment inactivity rail startup arms no reminder deadline", ctx do
+    empty =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-no-assignment-inactivity-#{System.unique_integer([:positive])}"
+      )
+
+    assert [] = Tightbeam.Rules.load!(empty, [])
+    assert :ok = Supervision.migrate_open_assignments(ctx.db, 1_800_000)
+    assert deadline_count(ctx.db) == 0
+  end
+
   test "startup upgrades an active one-second climb to the configured quiet interval", ctx do
     opened_at = System.system_time(:millisecond) - 10_000
 

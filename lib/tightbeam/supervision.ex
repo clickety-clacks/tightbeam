@@ -16,8 +16,6 @@ defmodule Tightbeam.Supervision do
   @climb_consumer "assignment_inactivity_climb"
   @deadline_ref "assignment-inactivity-deadline-v1:"
   @episode_ref "assignment-inactivity-episode-v1:"
-  @default_interval_ms 1_800_000
-  @max_holder_reminders 2
 
   # Retained only for the exact predecessor-shape migration in Schema. The
   # current runtime keeps no supervision production tables.
@@ -294,9 +292,25 @@ defmodule Tightbeam.Supervision do
   end
 
   @doc false
-  def migrate_open_assignments(db, default_interval_ms \\ @default_interval_ms)
+  def policy_default_interval_ms do
+    case inactivity_policy() do
+      %{period_ms: period_ms} -> period_ms
+      nil -> :off
+    end
+  end
+
+  def migrate_open_assignments(db), do: migrate_open_assignments(db, configured_interval_ms())
+
+  def migrate_open_assignments(db, default_interval_ms)
       when default_interval_ms == :off or
              (is_integer(default_interval_ms) and default_interval_ms > 0) do
+    case inactivity_policy() do
+      nil -> :ok
+      _policy -> do_migrate_open_assignments(db, default_interval_ms)
+    end
+  end
+
+  defp do_migrate_open_assignments(db, default_interval_ms) do
     case DB.migration_transaction(db, :assignment_inactivity_deadlines_v1, [], [], fn txn ->
            rows =
              Txn.q(
@@ -312,7 +326,7 @@ defmodule Tightbeam.Supervision do
                    configured_off? = default_interval_ms == :off
 
                    if configured_off? do
-                     interval_ms = @default_interval_ms
+                     interval_ms = policy_period_ms!()
 
                      activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
 
@@ -391,7 +405,7 @@ defmodule Tightbeam.Supervision do
 
                          due_at =
                            cond do
-                             reminder_count >= @max_holder_reminders -> now()
+                             reminder_count >= holder_reminder_limit() -> now()
                              suppression? -> now() + interval_ms
                              true -> quiet_start + interval_ms
                            end
@@ -665,7 +679,7 @@ defmodule Tightbeam.Supervision do
                     now
                   )
 
-                reminder_count >= @max_holder_reminders ->
+                reminder_count >= holder_reminder_limit() ->
                   fire_internal_in_txn(txn, wake.wake_id, @deadline_consumer, now)
 
                 quiet_start + interval_ms > now ->
@@ -814,7 +828,7 @@ defmodule Tightbeam.Supervision do
     reminder_count =
       reminder_count_since_activity_in_txn(txn, assignment_id, holder, last_activity)
 
-    if reminder_count < @max_holder_reminders do
+    if reminder_count < holder_reminder_limit() do
       schedule_climb_in_txn(
         txn,
         assignment_id,
@@ -950,7 +964,7 @@ defmodule Tightbeam.Supervision do
           now
         )
 
-      reminder_number == 1 and count < @max_holder_reminders ->
+      reminder_number == 1 and count < holder_reminder_limit() ->
         repeat_holder_or_advance_in_txn(
           txn,
           wake,
@@ -1054,8 +1068,14 @@ defmodule Tightbeam.Supervision do
         [holder]
       )
 
-    ([opener] ++
-       lineage(txn, parent, MapSet.new([holder]), []) ++ [active_personal_key(txn, owner)])
+    targets = %{
+      "opener" => [opener],
+      "active_ancestors" => lineage(txn, parent, MapSet.new([holder]), []),
+      "owner_personal_session" => [active_personal_key(txn, owner)]
+    }
+
+    inactivity_policy!().escalation_order
+    |> Enum.flat_map(&Map.fetch!(targets, &1))
     |> Enum.find(&(is_binary(&1) and &1 not in visited))
   end
 
@@ -1378,7 +1398,7 @@ defmodule Tightbeam.Supervision do
           rung =
             if length(visited) > 1,
               do: length(visited) + 1,
-              else: if(reminder_count < @max_holder_reminders, do: 1, else: 2)
+              else: if(reminder_count < holder_reminder_limit(), do: 1, else: 2)
 
           due_at = max(now(), previous.created_at + interval_ms)
 
@@ -1451,7 +1471,7 @@ defmodule Tightbeam.Supervision do
           if already_climbed? do
             :none
           else
-            rung = if reminder_count < @max_holder_reminders, do: 1, else: 2
+            rung = if reminder_count < holder_reminder_limit(), do: 1, else: 2
 
             climb =
               schedule_climb_in_txn(
@@ -1704,10 +1724,57 @@ defmodule Tightbeam.Supervision do
 
   defp reminders_disabled?(configured_interval)
        when is_integer(configured_interval) and configured_interval > 0,
-       do: false
+       do: is_nil(inactivity_policy())
 
   defp reminders_disabled?(_configured_interval),
-    do: Application.get_env(:tightbeam, :supervision_interval_ms, @default_interval_ms) == :off
+    do: is_nil(inactivity_policy()) or configured_interval_ms() == :off
+
+  defp configured_interval_ms do
+    case Application.get_env(:tightbeam, :supervision_interval_ms) do
+      nil -> policy_default_interval_ms()
+      interval -> interval
+    end
+  end
+
+  defp inactivity_policy do
+    case Tightbeam.Rules.reaction_policy("assignment-inactivity") do
+      nil ->
+        nil
+
+      %{settings: settings} ->
+        keys = Enum.sort(Map.keys(settings))
+        expected = Enum.sort(~w(period_ms holder_reminder_limit escalation_order))
+        period_ms = Map.get(settings, "period_ms")
+        reminder_limit = Map.get(settings, "holder_reminder_limit")
+        escalation_order = Map.get(settings, "escalation_order")
+        allowed_targets = ~w(opener active_ancestors owner_personal_session)
+
+        valid? =
+          keys == expected and is_integer(period_ms) and period_ms > 0 and
+            is_integer(reminder_limit) and reminder_limit in 0..2 and
+            is_list(escalation_order) and
+            Enum.all?(escalation_order, &(&1 in allowed_targets)) and
+            length(escalation_order) == length(Enum.uniq(escalation_order))
+
+        unless valid?,
+          do: raise(ArgumentError, "invalid assignment-inactivity reaction settings")
+
+        %{
+          period_ms: period_ms,
+          holder_reminder_limit: reminder_limit,
+          escalation_order: escalation_order
+        }
+    end
+  end
+
+  defp inactivity_policy! do
+    inactivity_policy() ||
+      raise(ArgumentError, "assignment-inactivity reaction policy is not elected")
+  end
+
+  defp policy_period_ms!, do: inactivity_policy!().period_ms
+
+  defp holder_reminder_limit, do: inactivity_policy!().holder_reminder_limit
 
   defp cancel_assignment_sources_in_txn(txn, assignment_id, disposition, clock \\ &now/0) do
     replacement_id =
@@ -1843,7 +1910,7 @@ defmodule Tightbeam.Supervision do
           "assignment inactivity interval unavailable for #{assignment_id}; using default"
         )
 
-        {@default_interval_ms, activity_start}
+        {policy_period_ms!(), activity_start}
     end
   end
 

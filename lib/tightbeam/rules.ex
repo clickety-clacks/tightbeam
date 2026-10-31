@@ -534,6 +534,27 @@ defmodule Tightbeam.Rules do
   end
 
   @doc false
+  def reaction_policy(family) when is_binary(family) do
+    policies =
+      Map.get(effective_snapshot(), :reactions, [])
+      |> Enum.filter(&(&1.mode == :settings and &1.family == family))
+
+    case policies do
+      [policy] ->
+        %{
+          name: policy.name,
+          family: policy.family,
+          settings: policy.settings,
+          english: policy.english,
+          provenance: policy.provenance
+        }
+
+      _ ->
+        nil
+    end
+  end
+
+  @doc false
   def effective_snapshot do
     Process.get(@call_snapshot_key) ||
       :persistent_term.get(@snapshot_key, %{

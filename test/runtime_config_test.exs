@@ -80,7 +80,7 @@ defmodule Tightbeam.RuntimeConfigTest do
     refute Keyword.has_key?(Keyword.fetch!(production, :tightbeam), :effort_checkin_horizon_ms)
   end
 
-  test "production supervision interval default does not follow the wake tick" do
+  test "production supervision period comes from the elected R06 rail, not the wake tick" do
     previous_interval = Application.get_env(:tightbeam, :supervision_interval_ms)
     previous_tick = Application.get_env(:tightbeam, :wake_tick_ms)
     Application.delete_env(:tightbeam, :supervision_interval_ms)
@@ -99,6 +99,7 @@ defmodule Tightbeam.RuntimeConfigTest do
     {Tightbeam.Boot, config} =
       Enum.find(Tightbeam.Application.children(), &match?({Tightbeam.Boot, _}, &1))
 
-    assert Map.fetch!(config, :supervision_interval_ms) == 1_800_000
+    assert is_nil(Map.fetch!(config, :supervision_interval_ms))
+    assert Tightbeam.Supervision.policy_default_interval_ms() == 1_800_000
   end
 end

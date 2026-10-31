@@ -138,7 +138,7 @@ defmodule Tightbeam.Gateway do
           default_model: Model.t(),
           max_live_sessions_per_user: pos_integer() | nil,
           wake_tick_ms: pos_integer(),
-          supervision_interval_ms: pos_integer() | :off,
+          supervision_interval_ms: pos_integer() | :off | nil,
           prod_limit: non_neg_integer(),
           escalation_decision_deadline_ms: pos_integer(),
           critical_lease_hard_cap_ms: pos_integer(),
@@ -7126,7 +7126,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp supervision_interval_ms(config) do
-    Map.get(config, :supervision_interval_ms, 1_800_000)
+    Map.get(config, :supervision_interval_ms) || Supervision.policy_default_interval_ms()
   end
 
   defp sentinel_post_details(event, values) when is_list(values) do
