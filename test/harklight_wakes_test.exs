@@ -262,6 +262,11 @@ defmodule Tightbeam.HarklightWakesTest do
         "harklight_fyi_has_answer_controls",
         "remove --choices-json and --reply"
       },
+      {
+        Map.merge(valid, %{message_type: "fyi", reply: true}),
+        "harklight_fyi_has_answer_controls",
+        "remove --choices-json and --reply"
+      },
       {Map.put(valid, :reply, false), "harklight_request_needs_answer_controls", "--reply"},
       {Map.put(valid, :message_kind, "update"), "harklight_kind_invalid", "blocker or success"},
       {
@@ -285,6 +290,91 @@ defmodule Tightbeam.HarklightWakesTest do
 
     assert {:ok, [[^existing_operations]]} =
              DB.query(db, "SELECT count(*) FROM harklight_send_operations")
+  end
+
+  test "FYI send forwards Seen-only type through the authenticated origin route", %{
+    db: db,
+    call: call
+  } do
+    handle = "b6a87513-b91d-4314-849a-cb8d80225864"
+    message_id = "seen-notice"
+
+    send_call = %{
+      call
+      | params: %{
+          harklight_session: "new",
+          message_type: "fyi",
+          reply: false,
+          sender_id: "sender",
+          title: "Build finished",
+          body: "The export is ready."
+        }
+    }
+
+    runner = fn args ->
+      op_id = if "--prepare" in args, do: Enum.at(args, 3), else: List.last(args)
+
+      case Enum.take(args, 2) do
+        ["send", "--prepare"] ->
+          assert ["--type", "fyi"] in Enum.chunk_every(args, 2, 1, :discard)
+          refute "--reply" in args
+          refute "--choice" in args
+          assert "--controller" in args
+
+          {JSON.encode!(%{
+             kind: "prepared",
+             op_id: op_id,
+             files: [],
+             request: %{
+               type: "send",
+               op_id: op_id,
+               session_handle: handle,
+               route: "other",
+               message: %{
+                 sender_id: "sender",
+                 message_id: message_id,
+                 title: "Build finished",
+                 body: "The export is ready."
+               }
+             }
+           }) <> "\n", 0}
+
+        ["send", "--execute"] ->
+          assert {:ok, [[session, payload]]} =
+                   DB.query(
+                     db,
+                     "SELECT sessionKey,payload FROM harklight_send_operations WHERE opId=?1",
+                     [op_id]
+                   )
+
+          assert session == call.session_key
+          assert JSON.decode!(payload)["request"]["session_handle"] == handle
+          assert JSON.decode!(payload)["request"]["message"]["message_id"] == message_id
+
+          {JSON.encode!(%{
+             kind: "committed",
+             operation: "send",
+             op_id: op_id,
+             response: %{
+               session_handle: handle,
+               sender_id: "sender",
+               message_id: message_id,
+               revision: 1
+             }
+           }) <> "\n", 0}
+      end
+    end
+
+    assert %{
+             state: "registered",
+             session_key: session,
+             handle: ^handle,
+             message_id: ^message_id,
+             message_type: "fyi",
+             message_type_label: "FYI"
+           } = HarklightSend.send_request(db, send_call, runner: runner)
+
+    assert session == call.session_key
   end
 
   test "uncertain result stays unregistered and same-operation retry can bind it", %{

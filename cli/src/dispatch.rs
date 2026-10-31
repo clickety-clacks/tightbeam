@@ -4108,8 +4108,6 @@ mod tests {
                 assert_eq!(body["params"]["stake"], "the demo slips");
                 assert_eq!(body["params"]["byWhen"], "2026-11-01T17:00:00Z");
                 assert_eq!(body["params"]["reply"], true);
-            } else if verb == "harklight-follow" && body["params"].get("handle").is_some() {
-                assert_eq!(body["params"]["handle"], "h");
             } else {
                 assert_eq!(body["params"]["messageId"], "m");
             }
@@ -4258,6 +4256,30 @@ mod tests {
         assert_eq!(request["params"]["choices"], serde_json::json!(["Yes"]));
         assert!(request.get("sessionKey").is_none());
         assert!(request["params"].get("sessionKey").is_none());
+    }
+
+    #[test]
+    fn fyi_send_builds_seen_only_request_without_caller_origin() {
+        let request: Value = serde_json::from_str(&body(&[
+            "harklight-send",
+            "--session",
+            "new",
+            "--sender-id",
+            "sender",
+            "--title",
+            "Build finished",
+            "--type",
+            "fyi",
+        ]))
+        .unwrap();
+
+        assert_eq!(request["verb"], "harklight-send");
+        assert_eq!(request["params"]["messageType"], "fyi");
+        assert_eq!(request["params"]["reply"], false);
+        assert_eq!(request["params"]["choices"], serde_json::json!([]));
+        assert!(request.get("sessionKey").is_none());
+        assert!(request["params"].get("sessionKey").is_none());
+        assert!(request["params"].get("informational").is_none());
     }
 
     #[test]
