@@ -117,24 +117,13 @@ defmodule Tightbeam.HarnessPiTest do
   end
 
   test "projected extension injects served identity and blocks compiled rails before execution" do
-    root = tmp_dir!("pi-extension")
-    identity = Path.join([root, ".pi", "skills", "tightbeam__served-identity", "SKILL.md"])
+    session_key = "agent:pi:extension"
+    root = pi_session_dir!("pi-extension", session_key)
     extension = Path.join(root, "tightbeam.mjs")
     runner = Path.join(root, "runner.mjs")
     sentinel = Path.join(root, "must-not-exist")
 
-    File.mkdir_p!(Path.dirname(identity))
-
-    File.write!(
-      identity,
-      """
-      ---
-      name: tightbeam-served-identity
-      description: fixture
-      ---
-      SERVED IDENTITY FIXTURE
-      """
-    )
+    materialize_pi_identity!(root, session_key, "SERVED IDENTITY FIXTURE")
 
     settings = %{
       "hooks" => %{
@@ -182,6 +171,77 @@ defmodule Tightbeam.HarnessPiTest do
            }
 
     refute File.exists?(sentinel)
+  end
+
+  test "generated extension refuses invalid identity carriers before any model request" do
+    session_key = "agent:pi:carrier-cases"
+
+    for {case_name, expected_error} <- [
+          {:missing, "missing carrier"},
+          {:unreadable, "unreadable carrier"},
+          {:malformed, "malformed"},
+          {:wrong_session, "wrong-session"},
+          {:correct, nil}
+        ] do
+      root = pi_session_dir!("pi-carrier-#{case_name}", session_key)
+      identity = pi_identity_path(root)
+      extension = Path.join(root, "tightbeam.mjs")
+      runner = Path.join(root, "runner.mjs")
+
+      case case_name do
+        :missing ->
+          :ok
+
+        :unreadable ->
+          materialize_pi_identity!(root, session_key, "SERVED IDENTITY FIXTURE")
+          File.rm!(identity)
+          File.mkdir!(identity)
+
+        :malformed ->
+          File.mkdir_p!(Path.dirname(identity))
+          File.write!(identity, "not a served identity carrier")
+
+        :wrong_session ->
+          materialize_pi_identity!(root, "agent:pi:another-session", "WRONG IDENTITY")
+
+        :correct ->
+          materialize_pi_identity!(root, session_key, "SERVED IDENTITY FIXTURE")
+      end
+
+      File.write!(extension, Pi.extension_source(%{"hooks" => %{}}))
+
+      File.write!(
+        runner,
+        """
+        import extension from #{JSON.encode!(extension)};
+        const handlers = {};
+        let modelRequests = 0;
+        extension({ on(name, handler) { handlers[name] = handler; } });
+
+        try {
+          const identity = await handlers.before_agent_start({ systemPrompt: "BASE" });
+          modelRequests += 1;
+          process.stdout.write(JSON.stringify({ identity, modelRequests }));
+        } catch (error) {
+          process.stdout.write(JSON.stringify({ error: String(error?.message ?? error), modelRequests }));
+        }
+        """
+      )
+
+      {output, 0} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
+      result = JSON.decode!(output)
+
+      if case_name == :correct do
+        assert result == %{
+                 "identity" => %{"systemPrompt" => "BASE\n\nSERVED IDENTITY FIXTURE"},
+                 "modelRequests" => 1
+               }
+      else
+        assert result["modelRequests"] == 0
+        assert result["error"] =~ "Tightbeam identity carrier refused startup"
+        assert result["error"] =~ expected_error
+      end
+    end
   end
 
   test "catalog refuses a provider mismatch instead of relabeling it" do
@@ -412,5 +472,35 @@ defmodule Tightbeam.HarnessPiTest do
     File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf!(root) end)
     root
+  end
+
+  defp pi_session_dir!(label, session_key) do
+    parent = tmp_dir!(label)
+
+    digest =
+      :crypto.hash(:sha256, session_key)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 12)
+
+    root = Path.join(parent, digest)
+    File.mkdir_p!(root)
+    root
+  end
+
+  defp materialize_pi_identity!(root, session_key, guidance) do
+    Pi.materialize_skills(
+      %{host_config: %{ssh: nil}, base_dir: root, session_key: session_key},
+      root,
+      %{
+        revision: "fixture",
+        archetype: "default",
+        guidance: guidance,
+        skills: %{}
+      }
+    )
+  end
+
+  defp pi_identity_path(root) do
+    Path.join([root, ".pi", "skills", "tightbeam__served-identity", "SKILL.md"])
   end
 end
