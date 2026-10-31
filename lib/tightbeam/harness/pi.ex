@@ -588,14 +588,14 @@ defmodule Tightbeam.Harness.Pi do
     }
 
     function identityGuidance() {
-      // Placement's permission-rail probe intentionally has no session identity.
-      if (basename(process.cwd()) === "gate-probe") return undefined;
-
       let carrier;
 
       try {
         carrier = readFileSync(identityPath, "utf8");
       } catch (error) {
+        // Placement's permission-rail probe intentionally has no session identity.
+        if (basename(process.cwd()) === "gate-probe" && error?.code === "ENOENT") return undefined;
+
         const condition = error?.code === "ENOENT" ? "missing" : "unreadable";
         refuseIdentityStartup(`${condition} carrier at ${identityPath}`);
       }
