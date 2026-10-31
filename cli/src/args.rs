@@ -246,6 +246,7 @@ pub enum Command {
         identity: Identity,
         session_key: String,
         idempotency_key: Option<String>,
+        keep_open_descendants: bool,
     },
     SessionReparent {
         identity: Identity,
@@ -940,8 +941,9 @@ COMMANDS:
       default read principal and records sends as process:<name>. Session
       credentials need no identity flag and record sends as their own agent.
 
-  retire --session <key> [--key <idempotencyKey>]
-      End a session deliberately.
+  retire --session <key> [--keep-open-descendants] [--key <idempotencyKey>]
+      End a session deliberately. Open work or role bindings below it refuse by default;
+      --keep-open-descendants preserves those sessions under an active parent.
 
   tune --session <key> (--harness <harness> [--model <model>] |
        --model <model> | --effort <level> | --fast on|off | --host <host>)
@@ -1359,6 +1361,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "help",
     "history",
     "json",
+    "keep-open-descendants",
     "manifest",
     "redaction-confirmed",
     "resolve",
@@ -2691,18 +2694,24 @@ fn parse_with_optional_catalog(
             identity: identity(flags)?,
         }),
         "retire" => {
+            closed_command_flags(
+                "retire",
+                flags,
+                &["session", "key", "keep-open-descendants"],
+            )?;
             let session_key = nonempty(flags, "session");
             if parsed.positional.get(1).is_some()
                 || session_key.is_none()
                 || nonempty(flags, "role").is_some()
                 || nonempty(flags, "user").is_some()
             {
-                return Err("usage: tightbeam retire --session <key>".to_owned());
+                return Err("usage: tightbeam retire --session <key> [--keep-open-descendants] [--key <idempotencyKey>]".to_owned());
             }
             Ok(Command::Retire {
                 identity: identity(flags)?,
                 session_key: session_key.expect("checked above"),
                 idempotency_key: nonempty(flags, "key"),
+                keep_open_descendants: flags.contains_key("keep-open-descendants"),
             })
         }
         "session-reparent" => {
@@ -7244,9 +7253,31 @@ mod tests {
         ] {
             assert_eq!(
                 parse(args),
-                Err("usage: tightbeam retire --session <key>".to_owned())
+                Err("usage: tightbeam retire --session <key> [--keep-open-descendants] [--key <idempotencyKey>]".to_owned())
             );
         }
+    }
+
+    #[test]
+    fn retire_accepts_explicit_keep_open_descendants() {
+        assert_eq!(
+            parse(strings(&[
+                "retire",
+                "--session",
+                "agent:parent",
+                "--keep-open-descendants",
+                "--key",
+                "retire-1",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::Retire {
+                identity: Identity::User("flynn".to_owned()),
+                session_key: "agent:parent".to_owned(),
+                idempotency_key: Some("retire-1".to_owned()),
+                keep_open_descendants: true,
+            })
+        );
     }
 
     #[test]
@@ -8084,6 +8115,7 @@ mod tests {
                     identity: Identity::Role("owner".to_owned()),
                     session_key: "agent:x".to_owned(),
                     idempotency_key: Some("retire-k".to_owned()),
+                    keep_open_descendants: false,
                 },
             ),
             (

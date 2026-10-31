@@ -304,16 +304,16 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
       )
 
     # Reconstruct the pre-reparent form from the checked-in predecessor carrier
-    # before boot replaces it. Pasting a copy of that DDL here would let the two
-    # drift apart silently.
+    # using its reparent-only resolver before boot replaces it. Pasting a copy
+    # of that DDL here would let the two drift apart silently.
     pre_reparent =
       reparented_predecessor
       |> String.replace(
-        "SELECT sessionKey,#{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions",
+        "SELECT sessionKey,#{Tightbeam.Org.current_parent_reparent_sql("sessions")} FROM sessions",
         "SELECT sessionKey,spawnedBy FROM sessions"
       )
       |> String.replace(
-        "SELECT ancestor.sessionKey,#{Tightbeam.Org.current_parent_sql("ancestor")}",
+        "SELECT ancestor.sessionKey,#{Tightbeam.Org.current_parent_reparent_sql("ancestor")}",
         "SELECT ancestor.sessionKey,ancestor.spawnedBy"
       )
 
