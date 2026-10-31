@@ -264,7 +264,7 @@ defmodule Tightbeam.SessionReparent do
         {_change, _session, response} =
           Org.mutate_session_in_txn(txn, child, fn ->
             event = "trp_" <> Tightbeam.Id.uuid4()
-            at = System.system_time(:millisecond)
+            at = Org.next_current_parent_event_at_in_txn(txn, child)
 
             response = %{
               "eventId" => event,

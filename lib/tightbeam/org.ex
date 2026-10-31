@@ -30,10 +30,114 @@ defmodule Tightbeam.Org do
   @doc false
   # SQL consumers (including recursive authority queries) use the same resolver.
   # The alias is source-owned SQL, never caller input.
+  # Keep eventSeq order within each history; writers use createdAt strictly after
+  # both histories so their latest entries can be compared across the two tables.
   def current_parent_sql(session_alias) do
+    key = "#{session_alias}.sessionKey"
+
+    "COALESCE((CASE WHEN EXISTS (" <>
+      "SELECT 1 FROM session_retirement_parent_moves rm " <>
+      "WHERE rm.childSessionKey=#{key}) THEN CASE WHEN " <>
+      "COALESCE((SELECT rp.createdAt FROM session_reparent_events rp " <>
+      "WHERE rp.childSessionKey=#{key} ORDER BY rp.eventSeq DESC LIMIT 1), -1) > " <>
+      "(SELECT rm.createdAt FROM session_retirement_parent_moves rm " <>
+      "WHERE rm.childSessionKey=#{key} ORDER BY rm.eventSeq DESC LIMIT 1) THEN " <>
+      "(SELECT rp.newCurrentParentSessionKey FROM session_reparent_events rp " <>
+      "WHERE rp.childSessionKey=#{key} ORDER BY rp.eventSeq DESC LIMIT 1) ELSE " <>
+      "(SELECT rm.newCurrentParentSessionKey FROM session_retirement_parent_moves rm " <>
+      "WHERE rm.childSessionKey=#{key} ORDER BY rm.eventSeq DESC LIMIT 1) END ELSE " <>
+      "(SELECT rp.newCurrentParentSessionKey FROM session_reparent_events rp " <>
+      "WHERE rp.childSessionKey=#{key} ORDER BY rp.eventSeq DESC LIMIT 1) END), " <>
+      "#{session_alias}.spawnedBy)"
+  end
+
+  @doc false
+  # Historical schema migrations keep the predecessor trigger byte shape; the
+  # retirement-move resolver is installed by its own later migration.
+  def current_parent_reparent_sql(session_alias) do
     "COALESCE((SELECT rp.newCurrentParentSessionKey FROM session_reparent_events rp " <>
       "WHERE rp.childSessionKey=#{session_alias}.sessionKey ORDER BY rp.eventSeq DESC LIMIT 1), " <>
       "#{session_alias}.spawnedBy)"
+  end
+
+  @doc false
+  def next_current_parent_event_at_in_txn(%Txn{} = txn, session_key) do
+    [[latest]] =
+      Txn.q(
+        txn,
+        """
+        SELECT MAX(createdAt) FROM (
+          SELECT createdAt FROM session_reparent_events WHERE childSessionKey=?1
+          UNION ALL
+          SELECT createdAt FROM session_retirement_parent_moves WHERE childSessionKey=?1
+        )
+        """,
+        [session_key]
+      )
+
+    max(now(), (latest || 0) + 1)
+  end
+
+  @doc false
+  def record_retirement_parent_move_in_txn(
+        %Txn{} = txn,
+        owner_user_id,
+        session_key,
+        retired_target_session_key,
+        new_parent_session_key,
+        principal_ref,
+        retirement_request_id,
+        idempotency_key
+      ) do
+    previous_parent_session_key = current_parent(txn, session_key)
+
+    if previous_parent_session_key == new_parent_session_key do
+      :unchanged
+    else
+      event_id = "trm_" <> Tightbeam.Id.uuid4()
+      created_at = next_current_parent_event_at_in_txn(txn, session_key)
+
+      {_change, session, event} =
+        mutate_session_in_txn(txn, session_key, fn ->
+          Txn.q(
+            txn,
+            """
+            INSERT INTO session_retirement_parent_moves
+              (eventId,ownerUserId,childSessionKey,retiredTargetSessionKey,
+               previousCurrentParentSessionKey,newCurrentParentSessionKey,
+               retirementRequestId,principalRef,idempotencyKey,createdAt)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+            """,
+            [
+              event_id,
+              owner_user_id,
+              session_key,
+              retired_target_session_key,
+              previous_parent_session_key,
+              new_parent_session_key,
+              retirement_request_id,
+              principal_ref,
+              idempotency_key,
+              created_at
+            ]
+          )
+
+          %{event_id: event_id, created_at: created_at}
+        end)
+
+      [[new_parent_display_name]] =
+        Txn.q(txn, "SELECT displayName FROM sessions WHERE sessionKey=?1", [
+          new_parent_session_key
+        ])
+
+      Map.merge(event, %{
+        session_key: session_key,
+        display_name: session.display_name,
+        previous_parent_session_key: previous_parent_session_key,
+        new_parent_session_key: new_parent_session_key,
+        new_parent_display_name: new_parent_display_name
+      })
+    end
   end
 
   alias Tightbeam.Firehose.Publisher
@@ -123,6 +227,61 @@ defmodule Tightbeam.Org do
                        do: ",'fixture_provider'",
                        else: ""
                      )
+
+  @retirement_parent_moves_schema_objects [
+    %{
+      type: "table",
+      name: "session_retirement_parent_moves",
+      sql: """
+      CREATE TABLE session_retirement_parent_moves (
+        eventSeq INTEGER PRIMARY KEY AUTOINCREMENT,
+        eventId TEXT NOT NULL UNIQUE,
+        ownerUserId TEXT NOT NULL,
+        childSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+        retiredTargetSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+        previousCurrentParentSessionKey TEXT REFERENCES sessions(sessionKey),
+        newCurrentParentSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+        retirementRequestId TEXT NOT NULL,
+        principalRef TEXT NOT NULL CHECK (length(principalRef)>0),
+        idempotencyKey TEXT,
+        createdAt INTEGER NOT NULL CHECK (createdAt>=0)
+      )
+      """
+    },
+    %{
+      type: "index",
+      name: "session_retirement_parent_moves_child",
+      sql:
+        "CREATE INDEX session_retirement_parent_moves_child ON session_retirement_parent_moves(childSessionKey,eventSeq)"
+    },
+    %{
+      type: "index",
+      name: "session_retirement_parent_moves_request",
+      sql:
+        "CREATE INDEX session_retirement_parent_moves_request ON session_retirement_parent_moves(retirementRequestId,eventSeq)"
+    },
+    %{
+      type: "index",
+      name: "session_retirement_parent_moves_idempotency",
+      sql:
+        "CREATE INDEX session_retirement_parent_moves_idempotency ON session_retirement_parent_moves(retiredTargetSessionKey,ownerUserId,idempotencyKey,eventSeq)"
+    },
+    %{
+      type: "trigger",
+      name: "session_retirement_parent_moves_no_update",
+      sql:
+        "CREATE TRIGGER session_retirement_parent_moves_no_update BEFORE UPDATE ON session_retirement_parent_moves BEGIN SELECT RAISE(ABORT,'session_retirement_parent_moves is append-only'); END"
+    },
+    %{
+      type: "trigger",
+      name: "session_retirement_parent_moves_no_delete",
+      sql:
+        "CREATE TRIGGER session_retirement_parent_moves_no_delete BEFORE DELETE ON session_retirement_parent_moves BEGIN SELECT RAISE(ABORT,'session_retirement_parent_moves is append-only'); END"
+    }
+  ]
+
+  @doc false
+  def retirement_parent_moves_schema_objects, do: @retirement_parent_moves_schema_objects
 
   @ddl """
   CREATE TABLE IF NOT EXISTS sessions (

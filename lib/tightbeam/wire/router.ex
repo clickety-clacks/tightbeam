@@ -746,11 +746,14 @@ defmodule Tightbeam.Wire.Router do
     with {:ok, device} <- device_auth(conn) do
       with_json(conn, fn body, conn ->
         with {:ok, decoded_key} <- decode_session_key_param(key),
-             {:ok, session_key} <- retire_target(decoded_key, body, device, conn) do
+             {:ok, session_key} <- retire_target(decoded_key, body, device, conn),
+             {:ok, keep_open_descendants} <- optional_boolean(body, "keepOpenDescendants") do
           params =
             if is_binary(body["idempotencyKey"]),
               do: %{idempotency_key: body["idempotencyKey"]},
               else: %{}
+
+          params = Map.put(params, :keep_open_descendants, keep_open_descendants == true)
 
           call = %{
             verb: "retire",
@@ -3956,6 +3959,14 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  defp optional_boolean(body, key) do
+    case Map.fetch(body, key) do
+      :error -> {:ok, false}
+      {:ok, value} when is_boolean(value) -> {:ok, value}
+      {:ok, _value} -> {:error, 400, "invalid_message", "#{key} must be a boolean"}
+    end
+  end
+
   # A model identity crosses the wire as NAMED FIELDS. The router carries them
   # across unchanged — it does not parse `model`, because a bracket in that
   # value is the vendor's context variant and reading it as one of our effort
@@ -4352,7 +4363,7 @@ defmodule Tightbeam.Wire.Router do
     "reopen-assignment" => ~w(assignment_id reason)a,
     "repair-assignment" =>
       ~w(action assignment_id context effort idempotency_key model outcome turn_seq)a,
-    "retire" => ~w(idempotency_key session_key)a,
+    "retire" => ~w(idempotency_key keep_open_descendants session_key)a,
     "return" => ~w(idempotency_key reason request request_id)a,
     "revoke-assignment" => ~w(assignment_id reason)a,
     "read-marker-clear" => ~w(expected_current scope_key)a,

@@ -2659,7 +2659,7 @@ defmodule Tightbeam.GatewayTest do
       DB.query(
         ctx.db,
         "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_retire', 'work', ?1, 'flynn', 1)",
-        [child.session_key]
+        [root.session_key]
       )
 
     parent = self()
@@ -2699,7 +2699,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [["closed", "revoked"]]} =
              DB.query(ctx.db, "SELECT state, outcome FROM assignments WHERE id='asg_retire'")
 
-    assert {:ok, [["cascade-child", "interrupted-by-retire"]]} =
+    assert {:ok, [["cascade-root", "interrupted-by-retire"]]} =
              DB.query(
                ctx.db,
                "SELECT sessionKey, reason FROM assignment_interruptions WHERE assignmentId='asg_retire'"

@@ -2055,6 +2055,7 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.ToolCalls.ensure_schema(db)
     :ok = upgrade_session_identity(db)
     :ok = upgrade_closed_assignment_reconciliation(db)
+    :ok = upgrade_retirement_parent_moves(db)
 
     case DB.finish_schema(db) do
       :ok -> Tightbeam.Recognition.activate(db)
@@ -3504,31 +3505,41 @@ defmodule Tightbeam.Schema do
 
     validate_activation_epoch!(txn)
 
+    retirement_parent_moves_present? =
+      owned_object_present?(txn, %{type: "table", name: "session_retirement_parent_moves"})
+
     enforcement_objects =
-      if shape in [
-           @reparent_shape,
-           @durability_shape,
-           @pi_shape,
-           @addressed_po_shape,
-           @legacy_cursor_provider_shape,
-           @cursor_provider_shape,
-           @cannot_proceed_shape,
-           @settlement_shape,
-           @terminal_credential_shape,
-           @agent_reparent_shape,
-           @artifact_origin_shape,
-           @identity_publication_denial_diagnostic_shape,
-           @notice_source_payload_shape,
-           @launch_preparation_boot_shape,
-           @session_identity_shape,
-           @closed_assignment_reconciliation_shape,
-           @evidence_release_shape,
-           @decision_request_row_schema_shape,
-           @assignment_source_replacement_shape,
-           @work_item_owner_link_shape
-         ],
-         do: reparent_liveness_enforcement_objects(),
-         else: @supervision_liveness_enforcement_objects
+      cond do
+        retirement_parent_moves_present? ->
+          retirement_parent_move_liveness_enforcement_objects()
+
+        shape in [
+          @reparent_shape,
+          @durability_shape,
+          @pi_shape,
+          @addressed_po_shape,
+          @legacy_cursor_provider_shape,
+          @cursor_provider_shape,
+          @cannot_proceed_shape,
+          @settlement_shape,
+          @terminal_credential_shape,
+          @agent_reparent_shape,
+          @artifact_origin_shape,
+          @identity_publication_denial_diagnostic_shape,
+          @notice_source_payload_shape,
+          @launch_preparation_boot_shape,
+          @session_identity_shape,
+          @closed_assignment_reconciliation_shape,
+          @evidence_release_shape,
+          @decision_request_row_schema_shape,
+          @assignment_source_replacement_shape,
+          @work_item_owner_link_shape
+        ] ->
+          reparent_liveness_enforcement_objects()
+
+        true ->
+          @supervision_liveness_enforcement_objects
+      end
 
     batch_delivery_guard_names =
       Enum.map(@supervision_batch_delivery_previous_triggers, &elem(&1, 0))
@@ -4217,11 +4228,24 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_continuation_retry_guard(db) do
+    parent_objects =
+      case DB.query(
+             db,
+             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_retirement_parent_moves'"
+           ) do
+        {:ok, [[1]]} ->
+          retirement_parent_move_liveness_enforcement_objects()
+
+        {:ok, []} ->
+          reparent_liveness_enforcement_objects()
+
+        other ->
+          raise ShapeError,
+            message: "incompatible retirement parent move table probe: #{inspect(other)}"
+      end
+
     previous =
-      Enum.find(
-        reparent_liveness_enforcement_objects(),
-        &(&1.name == "supervision_liveness_sidecar_insert_coherent")
-      )
+      Enum.find(parent_objects, &(&1.name == "supervision_liveness_sidecar_insert_coherent"))
 
     current = dated_continuation_guard(previous)
 
@@ -4251,6 +4275,82 @@ defmodule Tightbeam.Schema do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
     end
+  end
+
+  # Keep the new parent-move table and the trigger that reads it in one
+  # transaction. Earlier historical migrations continue to use their exact
+  # session-reparent-only resolver.
+  defp upgrade_retirement_parent_moves(db) do
+    case DB.transaction(db, &upgrade_retirement_parent_moves_in_txn/1) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "retirement parent move schema failed: #{Exception.message(error)}"
+    end
+  end
+
+  defp upgrade_retirement_parent_moves_in_txn(%Txn{} = txn) do
+    Enum.each(Tightbeam.Org.retirement_parent_moves_schema_objects(), fn object ->
+      case Txn.q(
+             txn,
+             "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+             [object.type, object.name]
+           ) do
+        [] ->
+          :ok = Txn.exec(txn, object.sql)
+
+        [[actual]] when is_binary(actual) ->
+          unless normalize_schema_sql(actual) == normalize_schema_sql(object.sql) do
+            raise ShapeError,
+              message: "incompatible retirement parent move schema: malformed #{object.name}"
+          end
+
+        rows ->
+          raise ShapeError,
+            message:
+              "incompatible retirement parent move schema object #{object.name}: #{inspect(rows)}"
+      end
+    end)
+
+    previous =
+      Enum.find(
+        reparent_liveness_enforcement_objects(),
+        &(&1.name == "supervision_liveness_sidecar_insert_coherent")
+      )
+      |> dated_continuation_guard()
+
+    current =
+      Enum.find(
+        retirement_parent_move_liveness_enforcement_objects(),
+        &(&1.name == "supervision_liveness_sidecar_insert_coherent")
+      )
+      |> dated_continuation_guard()
+
+    [[actual]] =
+      Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1", [
+        current.name
+      ])
+
+    cond do
+      normalize_schema_sql(actual) == normalize_schema_sql(current.sql) ->
+        :ok
+
+      normalize_schema_sql(actual) == normalize_schema_sql(previous.sql) ->
+        :ok = Txn.exec(txn, "DROP TRIGGER #{current.name}")
+        :ok = Txn.exec(txn, current.sql)
+        validate_owned_object!(txn, current)
+
+      true ->
+        raise ShapeError,
+          message: "incompatible retirement parent move trigger: malformed #{current.name}"
+    end
+
+    :ok
   end
 
   # Two additive columns, selected by the predecessor stamp: the launch row's
@@ -5896,17 +5996,30 @@ defmodule Tightbeam.Schema do
   # Historical migrations retain their exact DDL. Only the reparent successor
   # resolves current lineage in the holder-continuation admission trigger.
   defp reparent_liveness_enforcement_objects do
+    parent_resolver = &Tightbeam.Org.current_parent_reparent_sql/1
+    parent_liveness_enforcement_objects(parent_resolver)
+  end
+
+  defp retirement_parent_move_liveness_enforcement_objects do
+    parent_resolver = &Tightbeam.Org.current_parent_sql/1
+    parent_liveness_enforcement_objects(parent_resolver)
+  end
+
+  defp parent_liveness_enforcement_objects(parent_resolver) do
     Enum.map(@supervision_liveness_enforcement_objects, fn
       %{name: "supervision_liveness_sidecar_insert_coherent"} = object ->
+        sessions_parent = parent_resolver.("sessions")
+        ancestor_parent = parent_resolver.("ancestor")
+
         sql =
           object.sql
           |> String.replace(
             "SELECT sessionKey,spawnedBy FROM sessions",
-            "SELECT sessionKey,#{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions"
+            "SELECT sessionKey,#{sessions_parent} FROM sessions"
           )
           |> String.replace(
             "SELECT ancestor.sessionKey,ancestor.spawnedBy",
-            "SELECT ancestor.sessionKey,#{Tightbeam.Org.current_parent_sql("ancestor")}"
+            "SELECT ancestor.sessionKey,#{ancestor_parent}"
           )
 
         %{object | sql: sql}

@@ -10441,15 +10441,12 @@ defmodule Tightbeam.Gateway do
       prior && prior.session_key == call.session_key ->
         retired_keys = retired_subtree_keys(db, call.session_key)
 
-        retire_replay_observation(
-          db,
-          call,
-          %{
-            deleted_session_key: call.session_key,
-            retired_session_keys: retired_keys,
-            deferred: []
-          }
-        )
+        kept_descendants =
+          retirement_move_replay(db, call.session_key, owner, p[:idempotency_key])
+
+        %{deleted_session_key: call.session_key, retired_session_keys: retired_keys, deferred: []}
+        |> maybe_put_kept_descendants(kept_descendants)
+        |> then(&retire_replay_observation(db, call, &1))
 
       true ->
         case Org.get(db, call.session_key) do
@@ -10465,67 +10462,87 @@ defmodule Tightbeam.Gateway do
 
           %{owner_user_id: ^owner} = session ->
             if session.state == "active" do
+              principal = retirement_principal_ref(call.principal)
+              retirement_request_id = "rtr_" <> Tightbeam.Id.uuid4()
+
               {:ok, result} =
                 DB.transaction_then(
                   db,
                   fn txn ->
-                    Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+                    case retirement_plan_in_txn(
+                           txn,
+                           session.session_key,
+                           owner,
+                           p[:keep_open_descendants] == true
+                         ) do
+                      %{code: _} = refusal ->
+                        refusal
 
-                    result =
-                      retire_cascade_in_txn(
-                        txn,
-                        session.session_key,
-                        owner,
-                        case call.principal do
-                          {:user, id} -> "user:" <> id
-                          {:session, key} -> "session:" <> key
-                          {:process, name} -> "process:" <> name
-                        end,
-                        supervision_interval_ms(config),
-                        "retired: session retired before execution"
-                      )
+                      %{target_active?: false} ->
+                        %{retired: [], deferred: [], kept_descendants: []}
 
-                    if result.retired != [] and p[:idempotency_key] do
-                      Idempotency.put_in_txn(txn, %{
-                        owner_user_id: owner,
-                        operation: "retire",
-                        idempotency_key: p.idempotency_key,
-                        session_key: session.session_key
-                      })
+                      plan ->
+                        Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+                        result =
+                          retire_cascade_in_txn(
+                            txn,
+                            plan,
+                            owner,
+                            principal,
+                            supervision_interval_ms(config),
+                            "retired: session retired before execution",
+                            retirement_request_id,
+                            p[:idempotency_key]
+                          )
+
+                        if result.retired != [] and p[:idempotency_key] do
+                          Idempotency.put_in_txn(txn, %{
+                            owner_user_id: owner,
+                            operation: "retire",
+                            idempotency_key: p.idempotency_key,
+                            session_key: session.session_key
+                          })
+                        end
+
+                        result
                     end
-
-                    result
                   end,
                   fn txn, result ->
-                    Tightbeam.Wakes.row_commit_in_txn(txn, [])
+                    unless result[:code], do: Tightbeam.Wakes.row_commit_in_txn(txn, [])
                     result
                   end
                 )
 
-              Enum.each(result.retired, fn retired ->
-                try do
-                  broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
-                  Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
+              if result[:code] do
+                result
+              else
+                Enum.each(result.retired, fn retired ->
+                  try do
+                    broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
+                    Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
 
-                  Enum.each(retired.assignments, fn assignment ->
-                    emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
-                  end)
-                rescue
-                  error ->
-                    best_effort_failed("retire_notifications", :error, error, __STACKTRACE__)
-                catch
-                  kind, reason ->
-                    best_effort_failed("retire_notifications", kind, reason, __STACKTRACE__)
-                end
-              end)
+                    Enum.each(retired.assignments, fn assignment ->
+                      emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
+                    end)
+                  rescue
+                    error ->
+                      best_effort_failed("retire_notifications", :error, error, __STACKTRACE__)
+                  catch
+                    kind, reason ->
+                      best_effort_failed("retire_notifications", kind, reason, __STACKTRACE__)
+                  end
+                end)
 
-              reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
+                reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
 
-              %{
-                deleted_session_key: session.session_key,
-                retired_session_keys: Enum.map(result.retired, & &1.session_key),
-                deferred: result.deferred
-              }
+                %{
+                  deleted_session_key: session.session_key,
+                  retired_session_keys: Enum.map(result.retired, & &1.session_key),
+                  deferred: result.deferred
+                }
+                |> maybe_put_kept_descendants(result.kept_descendants)
+              end
             else
               retire_replay_observation(
                 db,
@@ -10573,25 +10590,210 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp retire_subtree_in_txn(txn, root_key) do
+  defp retirement_plan_in_txn(txn, root_key, owner, keep_open_descendants?) do
     rows =
       Txn.q(
         txn,
-        "SELECT sessionKey, #{Org.current_parent_sql("sessions")} FROM sessions WHERE state='active' ORDER BY createdAt, sessionKey"
+        "SELECT sessionKey, #{Org.current_parent_sql("sessions")}, state, displayName " <>
+          "FROM sessions ORDER BY createdAt, sessionKey"
       )
+
+    sessions_by_key =
+      Map.new(rows, fn [key, parent_key, state, display_name] ->
+        {key,
+         %{
+           session_key: key,
+           parent_session_key: parent_key,
+           state: state,
+           display_name: display_name
+         }}
+      end)
 
     children = Enum.group_by(rows, &Enum.at(&1, 1))
 
+    case Map.get(sessions_by_key, root_key) do
+      nil ->
+        %{code: "not_found"}
+
+      %{state: "retired"} ->
+        %{target_active?: false}
+
+      %{state: "active"} = root ->
+        subtree = session_subtree(sessions_by_key, children, root_key)
+        active_subtree = Enum.filter(subtree, &(&1.state == "active"))
+        descendants = Enum.reject(active_subtree, &(&1.session_key == root_key))
+        protected = Enum.flat_map(descendants, &protected_descendant_in_txn(txn, &1))
+        protected_keys = MapSet.new(Enum.map(protected, & &1.session_key))
+
+        frontiers =
+          Enum.reject(protected, fn session ->
+            has_protected_ancestor?(
+              session.parent_session_key,
+              root_key,
+              protected_keys,
+              sessions_by_key
+            )
+          end)
+
+        accountable_parent =
+          if protected == [], do: nil, else: accountable_parent(root, sessions_by_key, owner)
+
+        kept_keys =
+          frontiers
+          |> Enum.reduce(MapSet.new(), fn frontier, keys ->
+            children
+            |> subtree_keys(frontier.session_key)
+            |> Enum.reduce(keys, &MapSet.put(&2, &1))
+          end)
+
+        retired = Enum.reject(active_subtree, &MapSet.member?(kept_keys, &1.session_key))
+
+        if protected != [] and not keep_open_descendants? do
+          %{
+            code: "open_descendants",
+            message:
+              "retire refused because active descendants hold open work or roles; no sessions or descendant work were changed",
+            protected_descendants: Enum.map(protected, &protected_descendant_details/1),
+            retired_sessions: Enum.map(retired, &session_details/1),
+            accountable_parent: session_details(accountable_parent)
+          }
+        else
+          %{
+            target_active?: true,
+            root_key: root_key,
+            owner: owner,
+            retired: retired,
+            frontiers: frontiers,
+            accountable_parent: accountable_parent
+          }
+        end
+    end
+  end
+
+  defp session_subtree(sessions_by_key, children, root_key) do
     walk = fn walk, key ->
       descendants =
         children
         |> Map.get(key, [])
-        |> Enum.flat_map(fn [child_key, _parent] -> walk.(walk, child_key) end)
+        |> Enum.flat_map(fn [child_key | _] -> walk.(walk, child_key) end)
 
-      descendants ++ [%{session_key: key}]
+      case Map.get(sessions_by_key, key) do
+        nil -> descendants
+        session -> descendants ++ [session]
+      end
     end
 
     walk.(walk, root_key)
+  end
+
+  defp subtree_keys(children, root_key) do
+    descendants =
+      children
+      |> Map.get(root_key, [])
+      |> Enum.flat_map(fn [child_key | _] -> subtree_keys(children, child_key) end)
+
+    [root_key | descendants]
+  end
+
+  defp has_protected_ancestor?(nil, _root_key, _protected_keys, _sessions_by_key), do: false
+  defp has_protected_ancestor?(root_key, root_key, _protected_keys, _sessions_by_key), do: false
+
+  defp has_protected_ancestor?(key, root_key, protected_keys, sessions_by_key) do
+    MapSet.member?(protected_keys, key) or
+      case Map.get(sessions_by_key, key) do
+        %{parent_session_key: parent_key} ->
+          has_protected_ancestor?(parent_key, root_key, protected_keys, sessions_by_key)
+
+        nil ->
+          false
+      end
+  end
+
+  defp protected_descendant_in_txn(txn, session) do
+    assignments =
+      Txn.q(
+        txn,
+        "SELECT id, subject FROM assignments WHERE holderKey=?1 AND state='open' ORDER BY id",
+        [session.session_key]
+      )
+      |> Enum.map(fn [id, subject] -> %{assignment_id: id, subject: subject} end)
+
+    roles =
+      Txn.q(txn, "SELECT name FROM roles WHERE boundSessionKey=?1 ORDER BY name", [
+        session.session_key
+      ])
+      |> Enum.map(fn [name] -> name end)
+
+    if assignments == [] and roles == [] do
+      []
+    else
+      [Map.merge(session, %{assignments: assignments, roles: roles})]
+    end
+  end
+
+  defp accountable_parent(root, sessions_by_key, owner) do
+    nearest_active_parent(root.parent_session_key, sessions_by_key, MapSet.new()) ||
+      Map.fetch!(sessions_by_key, Org.personal_session_key(owner))
+  end
+
+  defp nearest_active_parent(nil, _sessions_by_key, _seen), do: nil
+
+  defp nearest_active_parent(key, sessions_by_key, seen) do
+    if MapSet.member?(seen, key) do
+      nil
+    else
+      case Map.get(sessions_by_key, key) do
+        %{state: "active"} = session ->
+          session
+
+        %{parent_session_key: parent_key} ->
+          nearest_active_parent(parent_key, sessions_by_key, MapSet.put(seen, key))
+
+        nil ->
+          nil
+      end
+    end
+  end
+
+  defp session_details(session) do
+    %{session_key: session.session_key, display_name: session.display_name}
+  end
+
+  defp protected_descendant_details(session) do
+    %{
+      session_key: session.session_key,
+      display_name: session.display_name,
+      assignments: session.assignments,
+      roles: session.roles
+    }
+  end
+
+  defp maybe_put_kept_descendants(result, []), do: result
+  defp maybe_put_kept_descendants(result, kept), do: Map.put(result, :kept_descendants, kept)
+
+  defp retirement_move_replay(db, root_key, owner, idempotency_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT m.childSessionKey,s.displayName,m.newCurrentParentSessionKey,p.displayName
+        FROM session_retirement_parent_moves m
+        JOIN sessions s ON s.sessionKey=m.childSessionKey
+        JOIN sessions p ON p.sessionKey=m.newCurrentParentSessionKey
+        WHERE m.retiredTargetSessionKey=?1 AND m.ownerUserId=?2 AND m.idempotencyKey=?3
+        ORDER BY m.eventSeq
+        """,
+        [root_key, owner, idempotency_key]
+      )
+
+    Enum.map(rows, fn [session_key, display_name, parent_session_key, parent_display_name] ->
+      %{
+        session_key: session_key,
+        display_name: display_name,
+        parent_session_key: parent_session_key,
+        parent_display_name: parent_display_name
+      }
+    end)
   end
 
   defp retired_subtree_keys(db, root_key) do
@@ -10623,16 +10825,18 @@ defmodule Tightbeam.Gateway do
 
   defp retire_cascade_in_txn(
          txn,
-         root_key,
+         plan,
          owner,
          principal,
          supervision_interval_ms,
-         drain_reason
+         drain_reason,
+         retirement_request_id,
+         idempotency_key
        ) do
-    # Invariant: this spawnedBy walk visits each active member of the target's
-    # transitive subtree exactly once, parent-last. This is the lifecycle
-    # seam's canonical subtree ordering; do not duplicate it.
-    subtree = retire_subtree_in_txn(txn, root_key)
+    # The plan was read from this transaction's tree snapshot. The walk is
+    # parent-last so each member's own active descendants have already been
+    # handled when its retirement effects run.
+    subtree = plan.retired
     now = System.system_time(:millisecond)
 
     leased =
@@ -10644,6 +10848,33 @@ defmodule Tightbeam.Gateway do
       end)
 
     if leased == [] do
+      kept_descendants =
+        Enum.flat_map(plan.frontiers, fn frontier ->
+          case Org.record_retirement_parent_move_in_txn(
+                 txn,
+                 owner,
+                 frontier.session_key,
+                 plan.root_key,
+                 plan.accountable_parent.session_key,
+                 principal,
+                 retirement_request_id,
+                 idempotency_key
+               ) do
+            :unchanged ->
+              []
+
+            move ->
+              [
+                %{
+                  session_key: move.session_key,
+                  display_name: move.display_name,
+                  parent_session_key: move.new_parent_session_key,
+                  parent_display_name: move.new_parent_display_name
+                }
+              ]
+          end
+        end)
+
       retired =
         Enum.map(subtree, fn member ->
           assignments =
@@ -10659,7 +10890,7 @@ defmodule Tightbeam.Gateway do
           %{session_key: member.session_key, assignments: assignments}
         end)
 
-      %{retired: retired, deferred: []}
+      %{retired: retired, deferred: [], kept_descendants: kept_descendants}
     else
       deadline = Enum.max_by(leased, & &1.hard_deadline).hard_deadline
 
@@ -10668,7 +10899,7 @@ defmodule Tightbeam.Gateway do
           direct = Enum.find(leased, &(&1.session_key == member.session_key))
 
           if direct do
-            schedule_retire_intent_in_txn(txn, root_key, member.session_key, owner, direct)
+            schedule_retire_intent_in_txn(txn, plan.root_key, member.session_key, owner, direct)
           end
 
           %{
@@ -10678,9 +10909,13 @@ defmodule Tightbeam.Gateway do
           }
         end)
 
-      %{retired: [], deferred: deferred}
+      %{retired: [], deferred: deferred, kept_descendants: []}
     end
   end
+
+  defp retirement_principal_ref({:user, id}), do: "user:" <> id
+  defp retirement_principal_ref({:session, key}), do: "session:" <> key
+  defp retirement_principal_ref({:process, name}), do: "process:" <> name
 
   defp schedule_retire_intent_in_txn(txn, root_key, session_key, owner, lease) do
     wake_id = retire_intent_wake_id(root_key, session_key)
