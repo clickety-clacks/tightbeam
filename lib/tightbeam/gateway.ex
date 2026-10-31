@@ -138,7 +138,7 @@ defmodule Tightbeam.Gateway do
           default_model: Model.t(),
           max_live_sessions_per_user: pos_integer() | nil,
           wake_tick_ms: pos_integer(),
-          supervision_interval_ms: pos_integer() | :off,
+          supervision_interval_ms: pos_integer() | :off | nil,
           prod_limit: non_neg_integer(),
           escalation_decision_deadline_ms: pos_integer(),
           critical_lease_hard_cap_ms: pos_integer(),
@@ -5244,6 +5244,7 @@ defmodule Tightbeam.Gateway do
 
       {:noop, revision} ->
         load_law!(config)
+        reconcile_assignment_inactivity_after_law_change!(db)
         %{state: "already-learned", kungfu: call.params.name, live_revision: revision}
 
       {:conflict, paths} ->
@@ -5296,6 +5297,7 @@ defmodule Tightbeam.Gateway do
                case Identity.publish_live!(config.base_dir, candidate) do
                  {:ok, revision} ->
                    load_law!(config)
+                   reconcile_assignment_inactivity_after_law_change!(db)
                    {:published, marker, revision}
 
                  {:error, error} ->
@@ -5394,6 +5396,7 @@ defmodule Tightbeam.Gateway do
           case Identity.publish_live!(config.base_dir, candidate) do
             {:ok, revision} ->
               load_law!(config)
+              reconcile_assignment_inactivity_after_law_change!(db)
 
               stamp_served_publication(
                 config,
@@ -5591,6 +5594,13 @@ defmodule Tightbeam.Gateway do
 
     Tightbeam.RowReactions.recover(Map.get(config, :db, Tightbeam.DB))
     rules
+  end
+
+  defp reconcile_assignment_inactivity_after_law_change!(db) do
+    case Supervision.migrate_open_assignments(db) do
+      :ok -> :ok
+      {:error, error} -> raise error
+    end
   end
 
   defp identity_status_result(config, db, call) do
@@ -7126,7 +7136,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp supervision_interval_ms(config) do
-    Map.get(config, :supervision_interval_ms, 1_800_000)
+    Map.get(config, :supervision_interval_ms) || Supervision.policy_default_interval_ms()
   end
 
   defp sentinel_post_details(event, values) when is_list(values) do

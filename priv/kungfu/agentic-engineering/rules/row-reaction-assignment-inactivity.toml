@@ -1,0 +1,5 @@
+[[reaction]]
+name = "assignment-inactivity-reminders"
+family = "assignment-inactivity"
+settings = { period_ms = 1800000, holder_reminder_limit = 2, escalation_order = ["opener", "active_ancestors", "owner_personal_session"] }
+english = "After the holder's last activity on an open assignment, wait for the configured quiet period (30 minutes by default). If an open child, standing cannot-proceed, queued or running holder turn, pending covering follow-up, inactive holder, or open host health incident does not cover the assignment, remind the holder at most twice. If it stays quiet, notify the opener, active ancestors, and the owner's personal session in order, one per period, readdressing an undelivered notice instead of adding another. Holder activity, a new child, or assignment closure ends the episode. Setting the period to off disables reminders. At startup, keep reached-target notices only when they belong to the same resumable episode."

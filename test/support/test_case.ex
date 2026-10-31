@@ -66,10 +66,25 @@ defmodule Tightbeam.TestCase do
     snapshot = snapshot()
     on_exit(fn -> restore(snapshot) end)
 
-    Tightbeam.Rules.load!(
-      Path.join(System.tmp_dir!(), "tightbeam-empty-rules-#{System.unique_integer([:positive])}"),
-      []
-    )
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-default-r06-rules-#{System.unique_integer([:positive])}"
+      )
+
+    rule_dir = Path.join(base_dir, "identity/rules")
+    File.mkdir_p!(rule_dir)
+
+    rule_source =
+      Path.join([
+        :code.priv_dir(:tightbeam),
+        "kungfu/agentic-engineering/rules",
+        "row-reaction-assignment-inactivity.toml"
+      ])
+
+    File.cp!(rule_source, Path.join(rule_dir, "row-reaction-assignment-inactivity.toml"))
+    Tightbeam.Rules.load!(base_dir, [])
+    on_exit(fn -> File.rm_rf!(base_dir) end)
 
     # The ONE place the episode writer starts for tests. Not per-suite ceremony and
     # deliberately not lazy: call sites use the named process and a missing one is loud,

@@ -3850,6 +3850,7 @@ defmodule Tightbeam.Wakes do
     "tightbeam:effort-checkin" => ~w(superseded obligation_disposed),
     "tightbeam:supervision" => ~w(superseded),
     "tightbeam:row-reactions" => ~w(superseded),
+    "tightbeam:rail-remedy" => ~w(superseded),
     "tightbeam:retirement" => ~w(target_retired obligation_disposed),
     # The batcher consumes a digest MEMBER exactly one way: superseded by the
     # digest that carries it, named as the replacement. It has no other verb —
@@ -4564,7 +4565,8 @@ defmodule Tightbeam.Wakes do
         end
 
       nil ->
-        if retirement_no_replacement_without_liveness?(command, outcome) or
+        if inactivity_policy_action_cancellation?(command, outcome, wake, primary) or
+             retirement_no_replacement_without_liveness?(command, outcome) or
              exact_terminal_effort_request?(txn, command, outcome, wake, primary) or
              cleared_effort_holder_prod_without_liveness?(txn, command, outcome, wake, primary) or
              completed_assignment_without_liveness?(txn, command, outcome, wake, primary) or
@@ -4577,6 +4579,30 @@ defmodule Tightbeam.Wakes do
         :error
     end
   end
+
+  defp inactivity_policy_action_cancellation?(
+         %{
+           requester: %{kind: "process", id: "tightbeam:rail-remedy"},
+           reason_kind: "superseded",
+           causal_source: %{kind: "wake", id: wake_id}
+         },
+         %{kind: "no_replacement"},
+         %{wake_id: wake_id, assignment_id: assignment_id} = wake,
+         primary
+       )
+       when is_binary(assignment_id) do
+    linked_to_assignment? =
+      case primary do
+        %{kind: "assignment", id: ^assignment_id} -> true
+        %{kind: "work_item", id: work_item_id} -> wake.work_item_id == work_item_id
+        _ -> false
+      end
+
+    linked_to_assignment? and Supervision.assignment_inactivity_action?(wake)
+  end
+
+  defp inactivity_policy_action_cancellation?(_command, _outcome, _wake, _primary),
+    do: false
 
   # Past inactivity ladder end (SN12(e)) open work has no pending trigger to
   # cite. Only the source-owned shapes the stored cancellation CHECK admits
