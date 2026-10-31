@@ -328,13 +328,29 @@ defmodule Tightbeam.AssignmentsTest do
       assert prompt =~ result.attest.id
     end
 
-    test "only the first assignment-bound holder turn emits a start notice", ctx do
+    test "idle dispatch start emits once and a later wake-carried turn stays quiet", ctx do
       session(ctx.db, "notice-parent", "flynn")
 
       assignment =
-        handle(ctx, "assign", assign_call({:session, "notice-parent"}, "started card"))
+        dispatch!(
+          ctx,
+          dispatch_call({:session, "notice-parent"}, "started card", "Start the card.")
+        )
 
-      first = queue_assignment_turn!(ctx, assignment)
+      assert {:ok, [[first, nil]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT seq,wakeId FROM turns WHERE assignmentId=?1",
+                 [assignment.id]
+               )
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'The first holder turn %'",
+                 [assignment.id]
+               )
+
       assert {:ok, first_turn} = Ledger.claim_next(ctx.db, "holder", "r01-start-test")
       assert first_turn.seq == first
 
@@ -352,6 +368,13 @@ defmodule Tightbeam.AssignmentsTest do
       assert {:ok, second_turn} = Ledger.claim_next(ctx.db, "holder", "r01-start-test")
       assert second_turn.seq == second
       finish_running_turn(ctx.db, second_turn)
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'The first holder turn %'",
+                 [assignment.id]
+               )
 
       unbound = start_running_turn(ctx.db, "holder", "unbound turn")
       finish_running_turn(ctx.db, unbound)

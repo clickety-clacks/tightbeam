@@ -117,15 +117,21 @@ defmodule Tightbeam.RowReactions do
   def turn_started_in_txn(txn, seq) do
     Cutover.adopt(txn)
 
+    # An idle-holder dispatch records assignmentId directly on its turn without
+    # a wake. Wake-carried turns must match the wake that delivered that turn.
     case Txn.q(
            txn,
            """
            SELECT t.seq,t.sessionKey,t.createdAt,t.startedAt,t.assignmentId,t.wakeId,
                   w.assignmentId,w.sessionKey,w.deliveredTurnSeq,a.holderKey,a.workItemId
            FROM turns t
-           JOIN wakes w ON w.wakeId=t.wakeId
+           LEFT JOIN wakes w ON w.wakeId=t.wakeId
            JOIN assignments a ON a.id=t.assignmentId
            WHERE t.seq=?1 AND t.status='running' AND t.startedAt IS NOT NULL
+             AND t.sessionKey=a.holderKey
+             AND (t.wakeId IS NULL OR
+                  (w.assignmentId=t.assignmentId AND w.sessionKey=t.sessionKey
+                   AND w.deliveredTurnSeq=t.seq))
            """,
            [seq]
          ) do
@@ -144,18 +150,23 @@ defmodule Tightbeam.RowReactions do
           _work_item_id
         ]
       ]
-      when wake_assignment_id == assignment_id and wake_session == session and wake_seq == seq and
-             holder == session ->
+      when holder == session and
+             (is_nil(wake_id) or
+                (wake_assignment_id == assignment_id and wake_session == session and
+                   wake_seq == seq)) ->
         [[started_count]] =
           Txn.q(
             txn,
             """
             SELECT COUNT(*) FROM turns t
-            JOIN wakes w ON w.wakeId=t.wakeId
+            LEFT JOIN wakes w ON w.wakeId=t.wakeId
+            JOIN assignments a ON a.id=t.assignmentId
             WHERE t.assignmentId=?1 AND t.startedAt IS NOT NULL
               AND (t.startedAt<?2 OR (t.startedAt=?2 AND t.seq<=?3))
-              AND w.assignmentId=t.assignmentId AND w.sessionKey=t.sessionKey
-              AND w.deliveredTurnSeq=t.seq
+              AND t.sessionKey=a.holderKey
+              AND (t.wakeId IS NULL OR
+                   (w.assignmentId=t.assignmentId AND w.sessionKey=t.sessionKey
+                    AND w.deliveredTurnSeq=t.seq))
             """,
             [assignment_id, started_at, seq]
           )
