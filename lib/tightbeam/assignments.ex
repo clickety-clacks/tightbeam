@@ -3475,7 +3475,6 @@ defmodule Tightbeam.Assignments do
 
                   attest = insert_attest(txn, admitted, assignment_id)
                   Mementos.append_inline!(txn, "attest", attest.id, admitted)
-                  notify_assignment_opener_of_attest_in_txn(txn, assignment, attest, call)
 
                   :ok =
                     Wakes.verification_verdict_in_txn(txn, %{
@@ -3736,7 +3735,6 @@ defmodule Tightbeam.Assignments do
         [] ->
           resolved_call = put_in(call, [:params, :verdict_kind], verdict_kind)
           attest = insert_attest(txn, resolved_call, assignment.id, true)
-          notify_assignment_opener_of_attest_in_txn(txn, assignment, attest, call)
 
           append_attest_marker(txn, attest)
           %{assignment: assignment, attest: attest}
@@ -4439,37 +4437,6 @@ defmodule Tightbeam.Assignments do
 
   defp append_attest_marker_summary(text, _note), do: text
 
-  defp notify_assignment_opener_of_attest_in_txn(txn, assignment, attest, call) do
-    recipient = assignment_opener_session(txn, assignment)
-
-    recipient_exists? =
-      case assignment do
-        %{openedByUser: user} when is_binary(user) ->
-          Txn.q(
-            txn,
-            "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2",
-            [recipient, user]
-          ) == [[1]]
-
-        _ ->
-          Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey=?1", [recipient]) == [[1]]
-      end
-
-    if recipient_exists? and not same_attest_principal_as_opener?(assignment, attest) do
-      Wakes.schedule_in_txn(txn, %{
-        session_key: recipient,
-        origin: attest_notice_origin(attest, call),
-        creator_session_key: attest.bySession,
-        prompt: "Attest #{attest.id} (#{attest.kind}) was filed on assignment #{assignment.id}.",
-        due_at: attest.ts,
-        assignment_id: assignment.id,
-        work_item_id: assignment.workItemId
-      })
-    else
-      :ok
-    end
-  end
-
   @doc false
   def settle_cannot_proceed_by_answer_in_txn(
         %Txn{} = txn,
@@ -4516,29 +4483,6 @@ defmodule Tightbeam.Assignments do
     :ok
   end
 
-  defp same_attest_principal_as_opener?(
-         %{openedByUser: opener, openedBySession: nil},
-         %{byUser: opener, bySession: nil}
-       )
-       when is_binary(opener),
-       do: true
-
-  defp same_attest_principal_as_opener?(
-         %{openedByUser: nil, openedBySession: opener},
-         %{byUser: nil, bySession: opener}
-       )
-       when is_binary(opener),
-       do: true
-
-  defp same_attest_principal_as_opener?(_assignment, _attest), do: false
-
-  defp attest_notice_origin(%{bySession: session}, _call) when is_binary(session),
-    do: "agent:" <> session
-
-  defp attest_notice_origin(%{byUser: user}, _call) when is_binary(user), do: "user:" <> user
-
-  defp attest_notice_origin(_attest, %{principal: {:process, name}}), do: "process:" <> name
-
   defp append_assignment_marker(txn, assignment, :opened) do
     append_substrate(txn, assignment.holderKey, "[assignment opened: #{assignment.id}]")
   end
@@ -4571,24 +4515,28 @@ defmodule Tightbeam.Assignments do
     {by_user, by_session} = opener(call.principal)
     {by_harness, by_provider} = verdict_author_family(txn, call.params.kind, by_session)
 
-    insert_attest_row(txn, %{
-      assignment_id: assignment_id,
-      kind: call.params.kind,
-      verdict_kind: call.params[:verdict_kind],
-      note: call.params[:note],
-      by_session: by_session,
-      by_user: by_user,
-      producer: nil,
-      producer_command: nil,
-      by_harness: by_harness,
-      by_provider: by_provider,
-      commit_refs: call.params[:commit_refs],
-      allow_closed: allow_closed,
-      artifact_id: call.params[:artifact_id],
-      content_sha256: call.params[:content_sha256],
-      wait_id: call.params[:wait_id],
-      supervision_interval_ms: Map.get(call, :supervision_interval_ms)
-    })
+    attest =
+      insert_attest_row(txn, %{
+        assignment_id: assignment_id,
+        kind: call.params.kind,
+        verdict_kind: call.params[:verdict_kind],
+        note: call.params[:note],
+        by_session: by_session,
+        by_user: by_user,
+        producer: nil,
+        producer_command: nil,
+        by_harness: by_harness,
+        by_provider: by_provider,
+        commit_refs: call.params[:commit_refs],
+        allow_closed: allow_closed,
+        artifact_id: call.params[:artifact_id],
+        content_sha256: call.params[:content_sha256],
+        wait_id: call.params[:wait_id],
+        supervision_interval_ms: Map.get(call, :supervision_interval_ms)
+      })
+
+    Tightbeam.RowReactions.attest_in_txn(txn, attest, call.principal)
+    attest
   end
 
   defp insert_attest_row(txn, attrs) do

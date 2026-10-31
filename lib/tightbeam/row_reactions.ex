@@ -74,6 +74,141 @@ defmodule Tightbeam.RowReactions do
     :ok
   end
 
+  def attest_in_txn(txn, attest, principal) do
+    Cutover.adopt(txn)
+    event = attest_event(txn, attest, principal)
+    admit(txn, event)
+    :ok
+  end
+
+  @doc false
+  def attest_event(txn, attest, principal, owner_user_id_override \\ nil) do
+    attest = stringify(attest)
+    assignment_id = attest["assignmentId"]
+    context = Snapshot.assignment_context(txn, assignment_id)
+    assignment = context.assignment
+    owner_user_id = owner_user_id_override || context.owner_user_id
+
+    unless is_binary(owner_user_id),
+      do: raise(ArgumentError, "attest source has no owning user")
+
+    late_request_id = receipt_request_id(attest)
+
+    event = %{
+      "id" => "attest:" <> attest["id"],
+      "org" => owner_user_id,
+      "kind" => "assignment_attest",
+      "at" => attest["ts"],
+      "generation" => attest["id"],
+      "principal" => attest_principal(attest, principal),
+      "source" => %{"kind" => "attest", "id" => attest["id"]},
+      "before" => %{"attest" => nil, "assignment" => assignment},
+      "after" => %{
+        "attest" => attest,
+        "assignment" => assignment,
+        "inserted" => true,
+        "lateRequestId" => late_request_id
+      }
+    }
+
+    event
+  end
+
+  def turn_started_in_txn(txn, seq) do
+    Cutover.adopt(txn)
+
+    case Txn.q(
+           txn,
+           """
+           SELECT t.seq,t.sessionKey,t.createdAt,t.startedAt,t.assignmentId,t.wakeId,
+                  w.assignmentId,w.sessionKey,w.deliveredTurnSeq,a.holderKey,a.workItemId
+           FROM turns t
+           JOIN wakes w ON w.wakeId=t.wakeId
+           JOIN assignments a ON a.id=t.assignmentId
+           WHERE t.seq=?1 AND t.status='running' AND t.startedAt IS NOT NULL
+           """,
+           [seq]
+         ) do
+      [
+        [
+          ^seq,
+          session,
+          created_at,
+          started_at,
+          assignment_id,
+          wake_id,
+          wake_assignment_id,
+          wake_session,
+          wake_seq,
+          holder,
+          _work_item_id
+        ]
+      ]
+      when wake_assignment_id == assignment_id and wake_session == session and wake_seq == seq and
+             holder == session ->
+        [[started_count]] =
+          Txn.q(
+            txn,
+            """
+            SELECT COUNT(*) FROM turns t
+            JOIN wakes w ON w.wakeId=t.wakeId
+            WHERE t.assignmentId=?1 AND t.startedAt IS NOT NULL
+              AND (t.startedAt<?2 OR (t.startedAt=?2 AND t.seq<=?3))
+              AND w.assignmentId=t.assignmentId AND w.sessionKey=t.sessionKey
+              AND w.deliveredTurnSeq=t.seq
+            """,
+            [assignment_id, started_at, seq]
+          )
+
+        if started_count == 1 do
+          assignment = Snapshot.assignment(txn, assignment_id)
+
+          turn = %{
+            "seq" => seq,
+            "sessionKey" => session,
+            "createdAt" => created_at,
+            "startedAt" => started_at,
+            "assignmentId" => assignment_id,
+            "wakeId" => wake_id
+          }
+
+          queued_turn = turn |> Map.delete("startedAt") |> Map.put("status", "queued")
+          running_turn = Map.put(turn, "status", "running")
+
+          delivery = %{
+            "wakeId" => wake_id,
+            "assignmentId" => assignment_id,
+            "sessionKey" => session,
+            "deliveredTurnSeq" => seq
+          }
+
+          event = %{
+            "id" => "assignment-start:" <> assignment_id,
+            "org" => assignment_owner!(txn, assignment),
+            "kind" => "assignment_start",
+            "at" => started_at,
+            "generation" => seq,
+            "principal" => %{"kind" => "process", "id" => "tightbeam"},
+            "source" => %{"kind" => "turn", "id" => seq},
+            "before" => %{"status" => "queued", "turn" => queued_turn, "delivery" => delivery},
+            "after" => %{
+              "status" => "running",
+              "turn" => running_turn,
+              "delivery" => delivery,
+              "assignment" => assignment
+            }
+          }
+
+          admit(txn, event)
+        end
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
+
   def delivery_event(txn, wake_id) do
     case Txn.q(
            txn,
@@ -277,5 +412,42 @@ defmodule Tightbeam.RowReactions do
     end
   end
 
-  defp stringify(map), do: Map.new(map, fn {key, value} -> {Atom.to_string(key), value} end)
+  defp assignment_owner!(txn, assignment) do
+    case Snapshot.assignment_context(txn, assignment["id"]).owner_user_id do
+      owner when is_binary(owner) -> owner
+      _ -> raise ArgumentError, "assignment start source has no owning user"
+    end
+  end
+
+  defp receipt_request_id(%{"kind" => "verdict", "verdictKind" => verdict})
+       when is_binary(verdict) do
+    case Regex.run(
+           ~r/\Aruling-consumed:(dr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\z/u,
+           verdict,
+           capture: :all_but_first
+         ) do
+      [request_id] -> request_id
+      _ -> nil
+    end
+  end
+
+  defp receipt_request_id(_attest), do: nil
+
+  defp attest_principal(%{"bySession" => session}, _principal) when is_binary(session),
+    do: %{"kind" => "session", "id" => session}
+
+  defp attest_principal(%{"byUser" => user}, _principal) when is_binary(user),
+    do: %{"kind" => "user", "id" => user}
+
+  defp attest_principal(_attest, {:process, process}),
+    do: %{"kind" => "process", "id" => process}
+
+  defp attest_principal(_attest, principal),
+    do: raise(ArgumentError, "attest source has unsupported principal: #{inspect(principal)}")
+
+  defp stringify(map),
+    do:
+      Map.new(map, fn {key, value} ->
+        {if(is_atom(key), do: Atom.to_string(key), else: key), value}
+      end)
 end
