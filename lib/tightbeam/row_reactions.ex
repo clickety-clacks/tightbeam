@@ -158,7 +158,10 @@ defmodule Tightbeam.RowReactions do
           Txn.q(
             txn,
             """
-            SELECT COUNT(*) FROM turns t
+            -- Keep this assignment-scoped probe on the assignment index. Without
+            -- the pin SQLite may choose turns_session and scan the holder's full
+            -- turn history for every assignment-bound start.
+            SELECT COUNT(*) FROM turns t INDEXED BY turns_assignment_id
             LEFT JOIN wakes w ON w.wakeId=t.wakeId
             JOIN assignments a ON a.id=t.assignmentId
             WHERE t.assignmentId=?1 AND t.startedAt IS NOT NULL
