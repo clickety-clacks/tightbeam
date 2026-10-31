@@ -3,12 +3,29 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 
 
 class WatcherError(Exception):
     pass
+
+
+USER_ID_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9._=/+@:-])@[a-z0-9._=/+-]+:"
+    r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*(?::[0-9]+)?"
+)
+
+
+def mentioned_users(content, sender):
+    if "m.mentions" in content:
+        mentions = content["m.mentions"]
+        users = mentions.get("user_ids") if isinstance(mentions, dict) else None
+        users = users if isinstance(users, list) else []
+    else:
+        users = USER_ID_TOKEN.findall(content["body"])
+    return sorted({user for user in users if isinstance(user, str)} - {sender})
 
 
 def required_path(name):
@@ -65,6 +82,18 @@ def post_event(output):
     result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if result.returncode != 0:
         raise WatcherError("event post failed")
+
+    for user in mentioned_users(content, values["sender"]):
+        mention_command = command.copy()
+        mention_command[4] = "sentinels/matrix/mention"
+        # A JSON pair preserves the identity of both strings without delimiter collisions.
+        mention_command[6] = json.dumps([values["event_id"], user], ensure_ascii=False)
+        mention_command.extend(["--detail", "mentioned=" + user])
+        result = subprocess.run(
+            mention_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        if result.returncode != 0:
+            raise WatcherError("event post failed")
 
 
 def stop(process):
