@@ -112,10 +112,7 @@ defmodule Tightbeam.OrgTest do
     assert Org.get_setting(db, "default-archetype") == "reviewer"
 
     assert {:ok, [["default-archetype", "reviewer", updated_at]]} =
-             DB.query(
-               db,
-               "SELECT key, value, updatedAt FROM org_settings WHERE key = 'default-archetype'"
-             )
+             DB.query(db, "SELECT key, value, updatedAt FROM org_settings")
 
     assert is_integer(updated_at)
   end

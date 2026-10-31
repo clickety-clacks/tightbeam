@@ -159,7 +159,6 @@ defmodule Tightbeam.WorkItems do
                   ]
                 )
 
-                publish_work_item_filed_record_event_in_txn(txn, id)
                 put_priority_in_txn(txn, id, priority)
                 stamp_version_in_txn(txn, id, created_at)
                 routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
@@ -425,7 +424,6 @@ defmodule Tightbeam.WorkItems do
         ]
       )
 
-      publish_work_item_filed_record_event_in_txn(txn, id)
       put_priority_in_txn(txn, id, priority)
       stamp_version_in_txn(txn, id, created_at)
       item = fetch_in_txn(txn, id)
@@ -532,21 +530,6 @@ defmodule Tightbeam.WorkItems do
 
   defp publish_item_result_in_txn(txn, call, _item, false),
     do: Publisher.maybe_observed_accepted_in_txn(txn, call)
-
-  defp publish_work_item_filed_record_event_in_txn(txn, work_item_id) do
-    case Tightbeam.RecordEvents.work_item_filed_in_txn(txn, work_item_id) do
-      nil ->
-        :ok
-
-      {session_key, item} ->
-        Publisher.committed_in_txn(
-          txn,
-          "session_record_event.created",
-          item,
-          %{"sessionKey" => session_key}
-        )
-    end
-  end
 
   defp update_in_txn(txn, params) do
     case fetch_in_txn(txn, params[:work_item_id]) do

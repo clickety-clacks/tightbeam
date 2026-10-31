@@ -162,29 +162,7 @@ defmodule Tightbeam.StateResources do
            ) THEN NULL
            WHEN t.origin LIKE 'agent:%' OR t.origin LIKE 'process:%' THEN 0
            ELSE NULL
-         END,
-         COALESCE((
-           SELECT json_group_array(event_id)
-           FROM (
-             SELECT DISTINCT event_id
-             FROM (
-               SELECT direct_id.value AS event_id
-               FROM json_each(COALESCE(m.recordEventIds, '[]')) AS direct_id
-               UNION ALL
-               SELECT wake_id.value AS event_id
-               FROM wakes AS notice_wake
-               CROSS JOIN json_each(COALESCE(notice_wake.recordEventIds, '[]')) AS wake_id
-               WHERE notice_wake.wakeId = t.wakeId
-               UNION ALL
-               SELECT member_id.value AS event_id
-               FROM wake_cancellations AS cancellation
-               JOIN wakes AS member_wake ON member_wake.wakeId = cancellation.wakeId
-               CROSS JOIN json_each(COALESCE(member_wake.recordEventIds, '[]')) AS member_id
-               WHERE cancellation.replacementWakeId = t.wakeId
-             )
-             ORDER BY event_id
-           )
-         ), '[]') AS recordEventIds
+         END
   FROM messages AS m
   LEFT JOIN turns AS t
     ON t.seq IN (
@@ -263,7 +241,7 @@ defmodule Tightbeam.StateResources do
       ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
     "read markers" => ~w(userId scopeKey marker updatedAt rowVersion),
     "transcript messages" =>
-      ~w(id seq sessionKey role messageType marker content at sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments recordEventIds attentionTier turnSeq turnIncludesHuman isBatchCarrier assignmentId jobRef harness provider model effort context rowVersion),
+      ~w(id seq sessionKey role messageType marker content at sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier turnSeq turnIncludesHuman isBatchCarrier assignmentId jobRef harness provider model effort context rowVersion),
     "tool calls" =>
       ~w(id seq sessionKey turnSeq afterMessageSeq harnessToolCallId title kind toolName status rawInput rawOutput content truncated startedAt endedAt rowVersion),
     "condition facts" => ~w(id ts kind scope origin rowVersion),
@@ -452,7 +430,6 @@ defmodule Tightbeam.StateResources do
     {"sessions", "capabilities"} => :session_capabilities,
     {"read markers", "marker"} => :read_marker,
     {"transcript messages", "attachments"} => {:array, :attachment, :preserve},
-    {"transcript messages", "recordEventIds"} => {:array, :string, :sort},
     {"transcript messages", "marker"} => :transition_marker,
     {"transcript messages", "context"} => :json,
     {"tool calls", "rawInput"} => :json,
@@ -854,13 +831,6 @@ defmodule Tightbeam.StateResources do
     end)
     |> then(fn page -> %{rows: Enum.map(page.rows, &message_row/1), flags: page} end)
   end
-
-  @doc "Return one bounded page of active record events tied to a session."
-  def query_record_events_for_session_page(source, session_key, boundary, limit),
-    do: Tightbeam.RecordEvents.query_for_session_page(source, session_key, boundary, limit)
-
-  @doc false
-  def record_event(item) when is_map(item), do: item
 
   @doc "Return one bounded page of visible tool-call records for a session."
   def query_tool_calls_for_session_page(
@@ -1297,7 +1267,6 @@ defmodule Tightbeam.StateResources do
            JOIN admin_projection_versions AS v
              ON v.resource = 'config' AND v.primaryKey = s.key
            WHERE s.key = ?1
-             AND s.key NOT GLOB 'record-event-feed-activation:*'
            """,
            [key]
          ) do
@@ -2088,7 +2057,6 @@ defmodule Tightbeam.StateResources do
         nullable_string!(value(row, :reply_to_client_message_id), "replyToClientMessageId"),
       "llmVisibleMessageId" => required_string!(row, :llm_visible_message_id),
       "attachments" => required_list!(value(row, :attachments), "attachments"),
-      "recordEventIds" => message_record_event_ids!(row),
       "attentionTier" => required_integer!(row, :attention_tier),
       "turnSeq" => nullable_integer!(value(row, :turn_seq), "turnSeq"),
       "assignmentId" => nullable_string!(value(row, :assignment_id), "assignmentId"),
@@ -2120,20 +2088,6 @@ defmodule Tightbeam.StateResources do
         else: Map.put(item, "turnIncludesHuman", required_boolean!(row, :turn_includes_human))
 
     exact!("transcript messages", item)
-  end
-
-  defp message_record_event_ids!(row) do
-    ids =
-      case value(row, :record_event_ids) do
-        ids when is_list(ids) -> ids
-        encoded when is_binary(encoded) -> JSON.decode!(encoded)
-        nil -> []
-        _ -> raise ArgumentError, "recordEventIds must be an array"
-      end
-
-    if is_list(ids) and Enum.all?(ids, &(is_binary(&1) and &1 != "")),
-      do: ids |> Enum.uniq() |> Enum.sort(),
-      else: raise(ArgumentError, "recordEventIds must contain non-empty strings")
   end
 
   def tool_call(row) do
@@ -3023,8 +2977,7 @@ defmodule Tightbeam.StateResources do
          effort,
          context,
          is_batch_carrier,
-         turn_includes_human,
-         record_event_ids
+         turn_includes_human
        ]) do
     {harness, model, effort, context} =
       if role == "assistant",
@@ -3058,7 +3011,6 @@ defmodule Tightbeam.StateResources do
           0 -> false
           nil -> nil
         end,
-      record_event_ids: JSON.decode!(record_event_ids),
       assignment_id: assignment_id,
       job_ref: job_ref,
       harness: harness,
