@@ -576,13 +576,16 @@ defmodule Tightbeam.Harness.Pi do
 
     """
     import { readFileSync } from "node:fs";
-    import { join } from "node:path";
+    import { basename, join } from "node:path";
     import { spawnSync } from "node:child_process";
 
     const settings = JSON.parse(Buffer.from(#{JSON.encode!(encoded)}, "base64").toString("utf8"));
     const identityPath = join(process.cwd(), #{JSON.encode!(@identity_relative)});
 
     function identityGuidance() {
+      // Placement's permission-rail probe intentionally has no session identity.
+      if (basename(process.cwd()) === "gate-probe") return undefined;
+
       let carrier;
 
       try {
@@ -624,6 +627,7 @@ defmodule Tightbeam.Harness.Pi do
     export default function (pi) {
       pi.on("before_agent_start", async (event) => {
         const guidance = identityGuidance();
+        if (guidance === undefined) return undefined;
         return { systemPrompt: `${event.systemPrompt}\\n\\n${guidance}` };
       });
 
