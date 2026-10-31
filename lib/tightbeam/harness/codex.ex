@@ -202,7 +202,9 @@ defmodule Tightbeam.Harness.Codex do
 
     command =
       if Support.local?(target) do
-        env = Enum.map(Keyword.fetch!(opts, :common_env), fn {key, value} -> "#{key}=#{value}" end)
+        env =
+          Enum.map(Keyword.fetch!(opts, :common_env), fn {key, value} -> "#{key}=#{value}" end)
+
         ["env" | env] ++ ["node", "-e", script]
       else
         ["ssh" | Support.ssh_opts()] ++

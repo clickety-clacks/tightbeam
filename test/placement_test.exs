@@ -1135,8 +1135,8 @@ defmodule Tightbeam.PlacementTest do
       cli_bin: "/local/bin",
       default_model: Model.new("fable"),
       sh: fn command ->
-        send(parent, {:unexpected_sh, command})
-        {"", 0}
+        if "node" not in command, do: send(parent, {:unexpected_sh, command})
+        inventory_shell(command)
       end
     }
 
@@ -1158,7 +1158,7 @@ defmodule Tightbeam.PlacementTest do
     # The identity hook is mandatory even when this org has no statutes.
     assert opts[:probe_cwd] == Path.join(base_dir, "work/gate-probe")
     refute Keyword.has_key?(opts, :probe_model)
-    assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
+    assert {"CODEX_CONFIG", inventory_config()} in opts[:env]
     refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
     refute_receive {:unexpected_sh, _}
   end
@@ -1174,7 +1174,7 @@ defmodule Tightbeam.PlacementTest do
         cwd: "/work",
         cli_bin: "/local/bin",
         default_model: model,
-        sh: fn _command -> {"", 0} end
+        sh: &inventory_shell/1
       }
     end
 
@@ -1244,7 +1244,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      sh: fn _command -> {"", 0} end
+      sh: &inventory_shell/1
     }
 
     handler = Placement.adapter_opts!(config, {:codex, "default", "testhost"})[:on_auth_event]
@@ -1386,7 +1386,7 @@ defmodule Tightbeam.PlacementTest do
       if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
            Enum.any?(command, &String.contains?(&1, "cat")),
          do: {"", 42},
-         else: {"", 0}
+         else: inventory_shell(command)
     end
 
     config = %{
@@ -1533,7 +1533,7 @@ defmodule Tightbeam.PlacementTest do
       if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
            Enum.any?(command, &String.contains?(&1, "cat")),
          do: {"", 42},
-         else: {"", 0}
+         else: inventory_shell(command)
     end
 
     config = %{
@@ -1583,7 +1583,7 @@ defmodule Tightbeam.PlacementTest do
       if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
            Enum.any?(command, &String.contains?(&1, "cat")),
          do: {"", 42},
-         else: {"", 0}
+         else: inventory_shell(command)
     end
 
     config = %{
@@ -1626,9 +1626,55 @@ defmodule Tightbeam.PlacementTest do
       default_model: Model.new("fable")
     }
 
+    personal_home = Path.join(base_dir, "personal home'quoted")
+    personal = Path.join([personal_home, ".agents", "skills", "example", "SKILL.md"])
+    legacy = Path.join([personal_home, ".codex", "skills", "legacy", "SKILL.md"])
+    retained = Path.join([personal_home, ".agents", "skills", "lavish", "SKILL.md"])
+    typesafe = Path.join([personal_home, ".codex", "skills", "typesafe-ai", "SKILL.md"])
+    workspace = Path.join([base_dir, "work", ".codex", "skills", "example", "SKILL.md"])
+
+    for document <- [personal, legacy, retained, typesafe, workspace] do
+      File.mkdir_p!(Path.dirname(document))
+      File.write!(document, "synthetic skill")
+    end
+
+    File.ln_s!(Path.dirname(retained), Path.join([personal_home, ".codex", "skills", "alias"]))
+
+    assert {:ok, _} =
+             Placement.set_env_overlay(
+               db,
+               "testhost",
+               "codex",
+               "HOME",
+               personal_home,
+               "agent:test"
+             )
+
     opts = Placement.adapter_opts!(config, {:codex, "default", "testhost"})
 
-    assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
+    read_config = fn launch ->
+      {"CODEX_CONFIG", json} = List.keyfind(launch[:env], "CODEX_CONFIG", 0)
+      JSON.decode!(json)
+    end
+
+    expected_paths = Enum.sort([personal, legacy])
+    actual = read_config.(opts)
+    assert actual["bypass_hook_trust"] == true
+
+    assert actual["skills"]["config"] ==
+             Enum.map(expected_paths, &%{"path" => &1, "enabled" => false})
+
+    added = Path.join([personal_home, ".agents", "skills", "added", "SKILL.md"])
+    File.mkdir_p!(Path.dirname(added))
+    File.write!(added, "added after first launch preparation")
+    refreshed = Placement.adapter_opts!(config, {:codex, "default", "testhost"}) |> read_config.()
+
+    assert Enum.sort(Enum.map(refreshed["skills"]["config"], & &1["path"])) ==
+             Enum.sort([personal, legacy, added])
+
+    assert File.read!(workspace) == "synthetic skill"
+    assert File.read!(retained) == "synthetic skill"
+    assert File.read!(typesafe) == "synthetic skill"
     refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
     assert opts[:probe_cwd] == probe_cwd
     refute Keyword.has_key?(opts, :probe_model)
@@ -1691,7 +1737,7 @@ defmodule Tightbeam.PlacementTest do
       if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
            Enum.any?(command, &String.contains?(&1, "cat")),
          do: {"", 42},
-         else: {"", 0}
+         else: inventory_shell(command)
     end
 
     config = %{
@@ -1722,7 +1768,7 @@ defmodule Tightbeam.PlacementTest do
              "PATH=/srv/tb/bin:$PATH",
              "TIGHTBEAM_LINEAGE=tb1-Y29kZXhAd29ya2Vy",
              "GH_CONFIG_DIR='/srv/tb/auth/github/gh'",
-             ~s(CODEX_CONFIG='{"bypass_hook_trust":true}'),
+             "CODEX_CONFIG=#{Tightbeam.Harness.Support.shell_quote(inventory_config())}",
              "/srv/tb/adapters/node_modules/.bin/codex-acp"
            ]
 
@@ -1764,7 +1810,7 @@ defmodule Tightbeam.PlacementTest do
       if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
            Enum.any?(command, &String.contains?(&1, "cat")),
          do: {"", 42},
-         else: {"", 0}
+         else: inventory_shell(command)
     end
 
     config = %{
@@ -1777,7 +1823,11 @@ defmodule Tightbeam.PlacementTest do
     }
 
     opts = Placement.adapter_opts!(config, {:codex, "default", "worker"})
-    assert ~s(CODEX_CONFIG='{"bypass_hook_trust":true}') in opts[:cmd]
+
+    assert "CODEX_CONFIG=#{Tightbeam.Harness.Support.shell_quote(inventory_config())}" in opts[
+             :cmd
+           ]
+
     assert opts[:probe_cwd] == "/srv/tb/work/gate-probe"
     refute Keyword.has_key?(opts, :probe_model)
 
@@ -1794,7 +1844,11 @@ defmodule Tightbeam.PlacementTest do
     File.rm_rf!(Path.join([base_dir, "identity", "rails"]))
     Rails.load!(base_dir)
     lawless_opts = Placement.adapter_opts!(config, {:codex, "default", "worker"})
-    assert ~s(CODEX_CONFIG='{"bypass_hook_trust":true}') in lawless_opts[:cmd]
+
+    assert "CODEX_CONFIG=#{Tightbeam.Harness.Support.shell_quote(inventory_config())}" in lawless_opts[
+             :cmd
+           ]
+
     assert lawless_opts[:probe_cwd] == "/srv/tb/work/gate-probe"
     refute Keyword.has_key?(lawless_opts, :probe_model)
   end
@@ -2024,6 +2078,19 @@ defmodule Tightbeam.PlacementTest do
 
     settings = home |> Path.join("settings.json") |> File.read!() |> JSON.decode!()
     assert settings["model"] == "claude-sonnet-5"
+  end
+
+  defp inventory_config do
+    JSON.encode!(%{
+      "bypass_hook_trust" => true,
+      "skills" => %{"config" => [%{"path" => "/personal/skill/SKILL.md", "enabled" => false}]}
+    })
+  end
+
+  defp inventory_shell(command) do
+    if "node" in command and "-e" in command,
+      do: {inventory_config(), 0},
+      else: {"", 0}
   end
 
   defp collect_commands(acc) do
