@@ -158,6 +158,19 @@ defmodule Tightbeam.Harness.Codex do
     const fs = require("node:fs");
     const path = require("node:path");
     const home = require("node:os").homedir();
+    const roots = [".agents", ".codex"].map(dir => path.join(home, dir, "skills"));
+    // Retain these personal copies until their migration is explicitly approved.
+    // Canonical paths also preserve aliases reached through either personal root.
+    const retained = new Set();
+    for (const root of roots) {
+      for (const name of ["lavish", "typesafe-ai"]) {
+        try {
+          retained.add(fs.realpathSync(path.join(root, name, "SKILL.md")));
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+      }
+    }
     const visited = new Set();
     const skills = new Set();
     function visit(entry) {
@@ -176,11 +189,11 @@ defmodule Tightbeam.Harness.Codex do
           if (!name.startsWith(".")) visit(path.join(entry, name));
         }
       } else if (stat.isFile() && path.basename(entry) === "SKILL.md") {
-        skills.add(fs.realpathSync(entry));
+        const canonical = fs.realpathSync(entry);
+        if (!retained.has(canonical)) skills.add(canonical);
       }
     }
-    visit(path.join(home, ".agents", "skills"));
-    visit(path.join(home, ".codex", "skills"));
+    for (const root of roots) visit(root);
     process.stdout.write(JSON.stringify({
       bypass_hook_trust: true,
       skills: {config: [...skills].sort().map(path => ({path, enabled: false}))}
