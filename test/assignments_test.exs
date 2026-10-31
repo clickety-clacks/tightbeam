@@ -392,37 +392,95 @@ defmodule Tightbeam.AssignmentsTest do
                )
     end
 
-    test "cutover withdraws a pending legacy unlinked-verdict notice", ctx do
+    test "cutover reconciles legacy notices without replaying terminal or ambiguous rows", ctx do
       session(ctx.db, "notice-parent", "flynn")
       assignment = handle(ctx, "assign", assign_call({:session, "notice-parent"}, "legacy card"))
-      attest_id = "att_legacy_r01_#{System.unique_integer([:positive])}"
 
-      assert {:ok, _} =
-               DB.query(
-                 ctx.db,
-                 "INSERT INTO attests (id,assignmentId,kind,verdictKind,bySession,ts) VALUES(?1,?2,'verdict','verified','holder',?3)",
-                 [attest_id, assignment.id, System.system_time(:millisecond)]
-               )
+      ordinary = legacy_attest_notice!(ctx, assignment, "verified")
+      blocked = legacy_attest_notice!(ctx, assignment, "blocked")
+      accepted = legacy_attest_notice!(ctx, assignment, "verified")
+      accepted_seq = enqueue_existing_wake!(ctx, assignment, accepted)
+      canceled = legacy_attest_notice!(ctx, assignment, "verified")
 
-      legacy_wake =
+      cancellation = %{
+        wake_id: canceled.wake_id,
+        expected_origin: "agent:holder",
+        requester: %{kind: "session", id: "holder"},
+        reason_kind: "requester_withdrew",
+        causal_source: %{
+          kind: "verb_call",
+          accepted_event: %{
+            origin: "agent:holder",
+            session_key: "holder",
+            principal: {:session, "holder"}
+          }
+        },
+        outcome: %{kind: "no_replacement"}
+      }
+
+      assert {:ok, {:accepted_in_txn, _event_id, %{canceled: true}}} =
+               DB.transaction(ctx.db, fn txn -> Wakes.cancel_in_txn(txn, cancellation) end)
+
+      ambiguous =
         Wakes.schedule(ctx.db, %{
           session_key: "notice-parent",
           origin: "agent:holder",
           creator_session_key: "holder",
-          prompt: "Attest #{attest_id} (verdict) was filed on assignment #{assignment.id}.",
+          prompt:
+            "Attest att_missing_#{System.unique_integer([:positive])} (verdict) was filed on assignment #{assignment.id}.",
           due_at: System.system_time(:millisecond),
           assignment_id: assignment.id,
           work_item_id: assignment.workItemId
         })
 
       assert :ok = Tightbeam.RowReactions.recover(ctx.db)
-      assert Wakes.get(ctx.db, legacy_wake.wake_id).state == "canceled"
+
+      assert Wakes.get(ctx.db, ordinary.wake_id).state == "canceled"
+      assert Wakes.get(ctx.db, blocked.wake_id).state == "pending"
+      assert Wakes.get(ctx.db, accepted.wake_id).delivered_turn_seq == accepted_seq
+      assert Wakes.get(ctx.db, canceled.wake_id).state == "canceled"
+      assert Wakes.get(ctx.db, ambiguous.wake_id).state == "pending"
 
       assert {:ok, [["canceled"]]} =
                DB.query(
                  ctx.db,
                  "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
-                 [legacy_wake.wake_id]
+                 [ordinary.wake_id]
+               )
+
+      assert {:ok, [["pending"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+                 [blocked.wake_id]
+               )
+
+      assert {:ok, [["accepted"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+                 [accepted.wake_id]
+               )
+
+      assert {:ok, [["canceled"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+                 [canceled.wake_id]
+               )
+
+      assert {:ok, [["held"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+                 [ambiguous.wake_id]
+               )
+
+      assert {:ok, [[5]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'Attest %'",
+                 [assignment.id]
                )
     end
   end
@@ -7939,6 +7997,50 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, seq} =
              Ledger.enqueue(ctx.db, %{
                session_key: "holder",
+               message_id: message.id,
+               wake_id: wake.wake_id,
+               origin: wake.origin,
+               prompt: wake.prompt,
+               assignment_id: assignment.id,
+               work_item_id: assignment.workItemId
+             })
+
+    seq
+  end
+
+  defp legacy_attest_notice!(ctx, assignment, verdict_kind) do
+    attest_id = "att_legacy_r01_#{System.unique_integer([:positive])}"
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests (id,assignmentId,kind,verdictKind,bySession,ts) VALUES(?1,?2,'verdict',?3,'holder',?4)",
+               [attest_id, assignment.id, verdict_kind, System.system_time(:millisecond)]
+             )
+
+    Wakes.schedule(ctx.db, %{
+      session_key: "notice-parent",
+      origin: "agent:holder",
+      creator_session_key: "holder",
+      prompt: "Attest #{attest_id} (verdict) was filed on assignment #{assignment.id}.",
+      due_at: System.system_time(:millisecond),
+      assignment_id: assignment.id,
+      work_item_id: assignment.workItemId
+    })
+  end
+
+  defp enqueue_existing_wake!(ctx, assignment, wake) do
+    {:appended, message} =
+      Projection.append(ctx.db, %{
+        session_key: wake.session_key,
+        role: "user",
+        content: "[from test:r01-cutover]\n\n" <> wake.prompt,
+        sender: "test:r01-cutover"
+      })
+
+    assert {:ok, seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: wake.session_key,
                message_id: message.id,
                wake_id: wake.wake_id,
                origin: wake.origin,
