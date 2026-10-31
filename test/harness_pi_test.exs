@@ -244,6 +244,64 @@ defmodule Tightbeam.HarnessPiTest do
     end
   end
 
+  test "generated extension lets the carrier-less gate probe reach the permission rail" do
+    parent = tmp_dir!("pi-gate-probe")
+    root = Path.join(parent, "gate-probe")
+    extension = Path.join(root, "tightbeam.mjs")
+    runner = Path.join(root, "runner.mjs")
+
+    File.mkdir_p!(root)
+
+    settings = %{
+      "hooks" => %{
+        "PreToolUse" => [
+          %{
+            "matcher" => "Bash",
+            "hooks" => [
+              %{
+                "type" => "command",
+                "command" =>
+                  "sh -c 'grep -q tightbeam-gate-probe - || exit 0; echo fixture-refusal >&2; exit 2'"
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+    File.write!(extension, Pi.extension_source(settings))
+
+    File.write!(
+      runner,
+      """
+      import extension from #{JSON.encode!(extension)};
+      const handlers = {};
+      let modelRequests = 0;
+      extension({ on(name, handler) { handlers[name] = handler; } });
+
+      const identity = await handlers.before_agent_start({ systemPrompt: "BASE" });
+      modelRequests += 1;
+      const gate = await handlers.tool_call({
+        toolName: "bash",
+        input: { command: "tightbeam-gate-probe" }
+      });
+      process.stdout.write(JSON.stringify({ identity: identity ?? null, gate, modelRequests }));
+      """
+    )
+
+    {output, 0} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
+
+    assert JSON.decode!(output) == %{
+             "identity" => nil,
+             "gate" => %{
+               "block" => true,
+               "reason" => "fixture-refusal",
+               "terminate" => true
+             },
+             "modelRequests" => 1
+           }
+  end
+
   test "catalog refuses a provider mismatch instead of relabeling it" do
     base = tmp_dir!("pi-catalog-mismatch")
 
