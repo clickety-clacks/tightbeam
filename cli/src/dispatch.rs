@@ -688,11 +688,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             identity,
             session_key,
             idempotency_key,
+            keep_open_descendants,
         } => {
-            let params = idempotency_key
-                .as_ref()
-                .map(|value| vec![string_field("idempotencyKey", value)])
-                .unwrap_or_default();
+            let mut params = Vec::new();
+            if let Some(value) = idempotency_key.as_ref() {
+                params.push(string_field("idempotencyKey", value));
+            }
+            if *keep_open_descendants {
+                params.push("\"keepOpenDescendants\":true".to_owned());
+            }
             Ok(request(
                 identity,
                 "retire",
@@ -6180,6 +6184,17 @@ mod tests {
                     "flynn",
                 ][..],
                 r#"{"asUser":"flynn","verb":"retire","sessionKey":"agent:r","params":{"idempotencyKey":"retire-k"}}"#,
+            ),
+            (
+                &[
+                    "retire",
+                    "--session",
+                    "agent:r",
+                    "--keep-open-descendants",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"retire","sessionKey":"agent:r","params":{"keepOpenDescendants":true}}"#,
             ),
             (
                 &[

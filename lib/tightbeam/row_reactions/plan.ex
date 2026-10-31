@@ -2,6 +2,30 @@ defmodule Tightbeam.RowReactions.Plan do
   @moduledoc false
   alias Tightbeam.RowReactions.Expression
 
+  def compile!(%{"settings" => _settings} = rail, provenance) do
+    fields!(rail, ~w(name family settings english), [])
+    Enum.each(~w(name family english), &text!(rail[&1]))
+
+    settings = rail["settings"]
+
+    unless is_map(settings) and settings != %{},
+      do: raise(ArgumentError, "reaction settings must be a nonempty table")
+
+    Enum.each(settings, fn {key, value} ->
+      text!(key)
+      validate_setting!(value)
+    end)
+
+    %{
+      mode: :settings,
+      name: rail["name"],
+      family: rail["family"],
+      settings: settings,
+      english: rail["english"],
+      provenance: provenance
+    }
+  end
+
   def compile!(rail, provenance) do
     fields!(rail, ~w(name family events when effects), ~w(bind))
     Enum.each(~w(name family), &text!(rail[&1]))
@@ -40,6 +64,7 @@ defmodule Tightbeam.RowReactions.Plan do
     unique!(Enum.map(effects, & &1["slot"]))
 
     %{
+      mode: :event,
       name: rail["name"],
       family: rail["family"],
       events: rail["events"],
@@ -55,6 +80,7 @@ defmodule Tightbeam.RowReactions.Plan do
   def evaluate(rails, event, facts) do
     plans =
       for rail <- rails,
+          rail.mode == :event,
           event["kind"] in rail.events,
           context = context(rail, event, facts),
           effect <- rail.effects do
@@ -93,6 +119,22 @@ defmodule Tightbeam.RowReactions.Plan do
 
   defp text!(value) when is_binary(value) and value != "", do: value
   defp text!(_), do: raise(ArgumentError, "reaction name must be nonempty text")
+
+  defp validate_setting!(value)
+       when is_binary(value) or is_integer(value) or is_float(value) or is_boolean(value),
+       do: :ok
+
+  defp validate_setting!(values) when is_list(values), do: Enum.each(values, &validate_setting!/1)
+
+  defp validate_setting!(values) when is_map(values) do
+    Enum.each(values, fn {key, value} ->
+      text!(key)
+      validate_setting!(value)
+    end)
+  end
+
+  defp validate_setting!(_),
+    do: raise(ArgumentError, "reaction settings must contain only static TOML values")
 
   defp unique!(values) do
     unless length(values) == length(Enum.uniq(values)),

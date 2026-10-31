@@ -2659,7 +2659,7 @@ defmodule Tightbeam.GatewayTest do
       DB.query(
         ctx.db,
         "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_retire', 'work', ?1, 'flynn', 1)",
-        [child.session_key]
+        [root.session_key]
       )
 
     parent = self()
@@ -2699,7 +2699,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [["closed", "revoked"]]} =
              DB.query(ctx.db, "SELECT state, outcome FROM assignments WHERE id='asg_retire'")
 
-    assert {:ok, [["cascade-child", "interrupted-by-retire"]]} =
+    assert {:ok, [["cascade-root", "interrupted-by-retire"]]} =
              DB.query(
                ctx.db,
                "SELECT sessionKey, reason FROM assignment_interruptions WHERE assignmentId='asg_retire'"
@@ -3428,6 +3428,123 @@ defmodule Tightbeam.GatewayTest do
     } do
       Tightbeam.GuardRuntimeFixture.run!(tmp, unquote(script), "guarded-gateway-liveness: ok")
     end
+  end
+
+  test "invalid inactivity settings leave gateway assignment operations available", ctx do
+    rule_base =
+      Path.join(
+        System.tmp_dir!(),
+        "gateway-invalid-assignment-inactivity-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(rule_base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+
+    source =
+      Path.join(
+        :code.priv_dir(:tightbeam),
+        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
+      )
+
+    invalid =
+      source
+      |> File.read!()
+      |> String.replace("period_ms = 1800000", "period_ms = 0", global: false)
+
+    File.write!(Path.join(rules_dir, "row-reaction-assignment-inactivity.toml"), invalid)
+    on_exit(fn -> File.rm_rf!(rule_base) end)
+
+    config = gateway_config(ctx.catalog_base, ctx.db, 0)
+    handlers = Gateway.handlers(config)
+    assert [] = Rules.load!(rule_base, Map.keys(handlers))
+    assert %{settings: %{"period_ms" => 0}} = Rules.reaction_policy("assignment-inactivity")
+    assert :off = Tightbeam.Supervision.policy_default_interval_ms()
+
+    # This is the same recovery call Gateway.children makes after law loading.
+    assert :ok = Tightbeam.Supervision.migrate_open_assignments(ctx.db, 1_800_000)
+
+    common = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: "k1",
+      target_role: nil,
+      role_fallback: false
+    }
+
+    assert %{id: assignment_id} =
+             handlers["assign"].(
+               Map.merge(common, %{
+                 verb: "assign",
+                 params: %{subject: "invalid rail assignment"}
+               })
+             )
+
+    assert %{id: dispatch_id} =
+             handlers["dispatch"].(
+               Map.merge(common, %{
+                 verb: "dispatch",
+                 params: %{subject: "invalid rail dispatch", brief: "continue without reminders"}
+               })
+             )
+
+    for assignment_id <- [assignment_id, dispatch_id] do
+      assert %{attest: %{id: _}} =
+               handlers["attest"].(%{
+                 origin: "agent:k1",
+                 principal: {:session, "k1"},
+                 session_key: "k1",
+                 params: %{assignment_id: assignment_id, kind: "progress"}
+               })
+    end
+
+    assert %{state: "closed"} =
+             handlers["revoke-assignment"].(%{
+               origin: "agent:k1",
+               principal: {:session, "k1"},
+               session_key: "k1",
+               params: %{assignment_id: assignment_id, reason: "reopen after progress"}
+             })
+
+    assert %{state: "open"} =
+             handlers["reopen-assignment"].(%{
+               origin: "agent:k1",
+               principal: {:session, "k1"},
+               session_key: "k1",
+               params: %{assignment_id: assignment_id, reason: "continue work"}
+             })
+
+    retiree = create_session(ctx.db, "invalid-rail-retiree", "flynn")
+
+    assert %{id: _} =
+             handlers["assign"].(
+               Map.merge(common, %{
+                 session_key: retiree.session_key,
+                 verb: "assign",
+                 params: %{subject: "assignment closed on retirement"}
+               })
+             )
+
+    assert %{retired_session_keys: [retired_key]} =
+             handlers["retire"].(%{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: retiree.session_key,
+               params: %{}
+             })
+
+    assert retired_key == retiree.session_key
+    assert Org.get(ctx.db, retiree.session_key).state == "retired"
+  end
+
+  @tag cold_gateway: true, gateway_cadence: true, tmp_dir: true
+  test "gateway startup treats invalid inactivity settings as an unavailable reaction", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "invalid_assignment_inactivity_startup.exs",
+      "invalid-assignment-inactivity-startup: ok"
+    )
   end
 
   @tag cold_gateway: true, gateway_retired: true, tmp_dir: true
@@ -4460,8 +4577,8 @@ defmodule Tightbeam.GatewayTest do
         due_at: 1_000
       })
 
-    :ok =
-      DB.execute(
+    {:ok, _} =
+      DB.query(
         ctx.db,
         """
         CREATE TRIGGER force_gateway_cancel_rollback
@@ -10926,8 +11043,57 @@ defmodule Tightbeam.GatewayTest do
     assert setting_message =~ "default-archetype setting: coder"
     :ok = Org.put_setting(ctx.db, "default-archetype", "default")
 
+    opened_at = System.system_time(:millisecond) - 5_000
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state) " <>
+          "VALUES ('asg_runtime_r06_removal','runtime removal','k1','flynn',?1,'open')",
+        [opened_at]
+      )
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.Supervision.assignment_opened_in_txn(
+                 txn,
+                 "asg_runtime_r06_removal",
+                 opened_at,
+                 1_000
+               )
+             end)
+
+    assert {:ok, [[deadline_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE assignmentId='asg_runtime_r06_removal' " <>
+                 "AND consumer='assignment_inactivity_deadline' AND state='pending'"
+             )
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline_id])
+    assert {:ok, :ok} = Tightbeam.Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline_id))
+
+    assert {:ok, [[notice_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE assignmentId='asg_runtime_r06_removal' " <>
+                 "AND consumer='prompt' AND state='pending' " <>
+                 "AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
+
+    assert {:ok, [[climb_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE assignmentId='asg_runtime_r06_removal' " <>
+                 "AND consumer='assignment_inactivity_climb' AND state='pending'"
+             )
+
     assert %{state: "published", kungfu: "agentic-engineering"} =
              unlearn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+
+    assert is_nil(Rules.reaction_policy("assignment-inactivity"))
+    assert Wakes.get(ctx.db, notice_id).state == "canceled"
+    assert Wakes.get(ctx.db, climb_id).state == "canceled"
 
     assert Archetypes.get("coder") == nil
     refute Rails.statutes?()

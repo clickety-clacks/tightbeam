@@ -329,9 +329,9 @@ defmodule Tightbeam.SupervisionTest do
     assert :ok = Supervision.migrate_open_assignments(ctx.db)
 
     deadline = pending_deadline!(ctx.db, "asg_inactive")
-    assert deadline.wake_id != stale.wake_id
+    assert deadline.wake_id == stale.wake_id
     assert deadline.due_at == opened_at + 1_800_000
-    assert Wakes.get(ctx.db, stale.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, stale.wake_id).state == "pending"
     assert {:ok, %{"intervalMs" => 1_800_000}} = JSON.decode(deadline.prompt)
 
     assert {:ok, [[0]]} =
@@ -504,7 +504,269 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, %{"intervalMs" => 1_000, "rung" => 1}} = JSON.decode(replacement.prompt)
   end
 
-  test "startup upgrades an active one-second climb to the configured quiet interval", ctx do
+  test "startup keeps reached-target notices only from the resumed episode", ctx do
+    now = System.system_time(:millisecond)
+    opened_at = now - 3_600_000
+    activity_at = now - 120_000
+    e1 = "assignment-inactivity-episode-v1:earlier"
+    e2 = "assignment-inactivity-episode-v1:resumed"
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [
+               opened_at
+             ])
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests(id,assignmentId,kind,bySession,ts) VALUES('att_startup_episode_activity','asg_inactive','progress',?1,?2)",
+               [ctx.holder.session_key, activity_at]
+             )
+
+    e1_notice =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.parent.session_key,
+        consumer: "prompt",
+        assignment_id: "asg_inactive",
+        origin: "process:supervision-test",
+        prompt: "earlier episode notice",
+        due_at: now + 60_000,
+        obligation_ref: e1
+      })
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET createdAt=?2 WHERE wakeId=?1", [
+               e1_notice.wake_id,
+               activity_at - 1
+             ])
+
+    holder_notice =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        consumer: "prompt",
+        assignment_id: "asg_inactive",
+        origin: "process:supervision-test",
+        prompt: "resumed episode holder reminder",
+        due_at: now + 60_000,
+        obligation_ref: e2
+      })
+
+    reached_notice =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.parent.session_key,
+        consumer: "prompt",
+        assignment_id: "asg_inactive",
+        origin: "process:supervision-test",
+        prompt: "resumed episode escalation",
+        due_at: now + 60_000,
+        obligation_ref: e2
+      })
+
+    climb =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        consumer: "assignment_inactivity_climb",
+        assignment_id: "asg_inactive",
+        origin: "process:supervision-test",
+        prompt:
+          JSON.encode!(%{
+            "version" => 1,
+            "assignmentId" => "asg_inactive",
+            "episodeRef" => e2,
+            "originHolder" => ctx.holder.session_key,
+            "rung" => 2,
+            "intervalMs" => 1_000,
+            "previousWakeId" => reached_notice.wake_id,
+            "visited" => [ctx.holder.session_key, ctx.parent.session_key]
+          }),
+        due_at: now + 60_000,
+        obligation_ref: e2
+      })
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db, 1_000)
+
+    assert Wakes.get(ctx.db, e1_notice.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, holder_notice.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, reached_notice.wake_id).state == "pending"
+
+    resumed_climb = pending_climb!(ctx.db, "asg_inactive")
+    refute resumed_climb.wake_id == climb.wake_id
+
+    assert {:ok, %{"episodeRef" => ^e2, "visited" => visited}} =
+             JSON.decode(resumed_climb.prompt)
+
+    assert visited == [ctx.holder.session_key, ctx.parent.session_key]
+  end
+
+  test "without an assignment inactivity rail startup arms no reminder deadline", ctx do
+    empty =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-no-assignment-inactivity-#{System.unique_integer([:positive])}"
+      )
+
+    assert [] = Tightbeam.Rules.load!(empty, [])
+    assert :ok = Supervision.migrate_open_assignments(ctx.db, 1_800_000)
+    assert deadline_count(ctx.db) == 0
+  end
+
+  test "invalid inactivity settings suppress the rail and startup reconciliation cancels its actions",
+       ctx do
+    opened_at = System.system_time(:millisecond) - 10_000
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    policy_base = inactivity_policy_base()
+    write_inactivity_policy!(policy_base, 0)
+    assert [] = Tightbeam.Rules.load!(policy_base, [])
+
+    assert %{settings: %{"period_ms" => 0}} =
+             Tightbeam.Rules.reaction_policy("assignment-inactivity")
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db, 1_800_000)
+    assert Wakes.get(ctx.db, deadline.wake_id).state == "canceled"
+    assert Org.get(ctx.db, ctx.holder.session_key).state == "active"
+    assert deadline_count(ctx.db) == 1
+  end
+
+  test "removing the rail cancels pending deadlines, checks, and escalation notices", ctx do
+    opened_at = System.system_time(:millisecond) - 10_000
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [opened_at])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, deadline)
+    first_notice = List.first(episode_notices(ctx.db))
+    assert is_map(first_notice)
+    pending_climb = pending_climb!(ctx.db, "asg_inactive")
+
+    assert {:ok, {:appended, _, _, _}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 first_notice.session_key,
+                 first_notice.origin,
+                 first_notice.prompt,
+                 wake_id: first_notice.wake_id,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state) " <>
+          "VALUES ('asg_pending_deadline','another task',?1,'flynn',?2,'open')",
+        [ctx.holder.session_key, opened_at]
+      )
+
+    open_deadline!(ctx.db, "asg_pending_deadline", opened_at, 1_000)
+    pending_deadline = pending_deadline!(ctx.db, "asg_pending_deadline")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state) " <>
+          "VALUES ('asg_pending_holder','holder reminder task',?1,'flynn',?2,'open')",
+        [ctx.holder.session_key, opened_at]
+      )
+
+    holder_notice =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        consumer: "prompt",
+        assignment_id: "asg_pending_holder",
+        origin: "process:tightbeam",
+        prompt: "Continue the open assignment.",
+        due_at: System.system_time(:millisecond) + 60_000,
+        obligation_ref: "assignment-inactivity-episode-v1:holder"
+      })
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state) " <>
+          "VALUES ('asg_pending_escalation','escalation task',?1,'flynn',?2,'open')",
+        [ctx.parent.session_key, opened_at]
+      )
+
+    escalation_notice =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.parent.session_key,
+        consumer: "prompt",
+        assignment_id: "asg_pending_escalation",
+        origin: "process:tightbeam",
+        prompt: "Continue the open assignment.",
+        due_at: System.system_time(:millisecond) + 60_000,
+        obligation_ref: "assignment-inactivity-episode-v1:escalation"
+      })
+
+    empty =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-removed-assignment-inactivity-#{System.unique_integer([:positive])}"
+      )
+
+    assert [] = Tightbeam.Rules.load!(empty, [])
+    assert :ok = Supervision.migrate_open_assignments(ctx.db)
+
+    assert Wakes.get(ctx.db, pending_deadline.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, pending_climb.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, holder_notice.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, escalation_notice.wake_id).state == "canceled"
+
+    assert %{state: "fired", delivered_turn_seq: delivered_seq} =
+             Wakes.get(ctx.db, first_notice.wake_id)
+
+    assert is_integer(delivered_seq)
+  end
+
+  test "a matching period change updates the pending deadline and climb in place", ctx do
+    policy_base = inactivity_policy_base()
+    write_inactivity_policy!(policy_base, 1_000)
+    assert [] = Tightbeam.Rules.load!(policy_base, [])
+
+    opened_at = System.system_time(:millisecond) - 10_000
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [opened_at])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
+    first_deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    write_inactivity_policy!(policy_base, 2_000)
+    assert [] = Tightbeam.Rules.load!(policy_base, [])
+    assert :ok = Supervision.migrate_open_assignments(ctx.db, 2_000)
+
+    revised_deadline = pending_deadline!(ctx.db, "asg_inactive")
+    assert revised_deadline.wake_id == first_deadline.wake_id
+    assert revised_deadline.due_at == opened_at + 2_000
+    assert {:ok, %{"intervalMs" => 2_000}} = JSON.decode(revised_deadline.prompt)
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, revised_deadline)
+    first_notice = List.first(episode_notices(ctx.db))
+    first_climb = pending_climb!(ctx.db, "asg_inactive")
+
+    write_inactivity_policy!(policy_base, 3_000)
+    assert [] = Tightbeam.Rules.load!(policy_base, [])
+    assert :ok = Supervision.migrate_open_assignments(ctx.db, 3_000)
+
+    revised_climb = pending_climb!(ctx.db, "asg_inactive")
+    assert revised_climb.wake_id == first_climb.wake_id
+    assert revised_climb.due_at >= first_notice.created_at + 3_000
+    assert {:ok, %{"intervalMs" => 3_000}} = JSON.decode(revised_climb.prompt)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='assignment_inactivity_climb' AND state='pending'"
+             )
+  end
+
+  test "startup updates an active one-second climb in place to the configured quiet interval",
+       ctx do
     opened_at = System.system_time(:millisecond) - 10_000
 
     assert {:ok, _} =
@@ -520,8 +782,8 @@ defmodule Tightbeam.SupervisionTest do
     assert :ok = Supervision.migrate_open_assignments(ctx.db)
 
     upgraded = pending_climb!(ctx.db, "asg_inactive")
-    assert upgraded.wake_id != old_climb.wake_id
-    assert Wakes.get(ctx.db, old_climb.wake_id).state == "canceled"
+    assert upgraded.wake_id == old_climb.wake_id
+    assert Wakes.get(ctx.db, old_climb.wake_id).state == "pending"
     assert Wakes.get(ctx.db, first.wake_id).state == "pending"
     assert upgraded.due_at == first.created_at + 1_800_000
     assert {:ok, %{"intervalMs" => 1_800_000, "rung" => 1}} = JSON.decode(upgraded.prompt)
@@ -873,8 +1135,9 @@ defmodule Tightbeam.SupervisionTest do
 
     assert :ok = Supervision.migrate_open_assignments(ctx.db, 1)
     updated = pending_deadline!(ctx.db, "asg_inactive")
-    assert updated.wake_id != migrated.wake_id
-    assert Wakes.get(ctx.db, migrated.wake_id).state == "canceled"
+    assert updated.wake_id == migrated.wake_id
+    assert Wakes.get(ctx.db, migrated.wake_id).state == "pending"
+    assert {:ok, %{"intervalMs" => 1}} = JSON.decode(updated.prompt)
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -1656,6 +1919,33 @@ defmodule Tightbeam.SupervisionTest do
       )
 
     count
+  end
+
+  defp inactivity_policy_base do
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-assignment-inactivity-policy-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(base) end)
+    base
+  end
+
+  defp write_inactivity_policy!(base, period_ms) do
+    rules = Path.join(base, "identity/rules")
+    File.mkdir_p!(rules)
+
+    File.write!(
+      Path.join(rules, "row-reaction-assignment-inactivity.toml"),
+      """
+      [[reaction]]
+      name = "assignment-inactivity-reminders"
+      family = "assignment-inactivity"
+      settings = { period_ms = #{period_ms}, holder_reminder_limit = 2, escalation_order = ["opener", "active_ancestors", "owner_personal_session"] }
+      english = "Wait for the configured quiet period (30 minutes by default) and remind the holder at most twice during the same resumable episode."
+      """
+    )
   end
 
   defp open_deadline!(db, assignment_id, opened_at, interval_ms) do

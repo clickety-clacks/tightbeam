@@ -60,6 +60,11 @@ defmodule Tightbeam.Wire.RouterTest do
              "fastMode" => "on",
              "reasoningLevel" => "high"
            }) == %{fastMode: "on", reasoningLevel: "high"}
+
+    assert Router.atomize_params_for_test("retire", %{
+             "keepOpenDescendants" => true,
+             "idempotencyKey" => "retry-retire"
+           }) == %{keep_open_descendants: true, idempotency_key: "retry-retire"}
   end
 
   test "effort and health parameters preserve accepted aliases" do
@@ -2480,6 +2485,51 @@ defmodule Tightbeam.Wire.RouterTest do
     assert response.status == 200
     assert_receive {:call, %{verb: "retire", session_key: ^key}}
     assert JSON.decode!(response.resp_body) == %{"deletedSessionKey" => key}
+  end
+
+  test "DELETE /api/streams/:key forwards the explicit keep-open disposition", ctx do
+    key = "session:retire-keep"
+    create_session(ctx.db, key, ctx.device.user_id)
+
+    opts =
+      with_handler(ctx.opts, "retire", fn call ->
+        send_call(call)
+        %{deleted_session_key: call.session_key}
+      end)
+
+    response =
+      conn(
+        :delete,
+        "/api/streams/#{key}",
+        JSON.encode!(%{"idempotencyKey" => "keep-retire-1", "keepOpenDescendants" => true})
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+
+    assert_receive {:call,
+                    %{
+                      verb: "retire",
+                      session_key: ^key,
+                      params: %{idempotency_key: "keep-retire-1", keep_open_descendants: true}
+                    }}
+  end
+
+  test "DELETE /api/streams/:key requires a boolean keep-open disposition", ctx do
+    key = "session:retire-invalid-keep"
+    create_session(ctx.db, key, ctx.device.user_id)
+
+    opts = with_handler(ctx.opts, "retire", &send_call/1)
+
+    response =
+      conn(:delete, "/api/streams/#{key}", JSON.encode!(%{"keepOpenDescendants" => "true"}))
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 400
+    assert JSON.decode!(response.resp_body)["error"]["code"] == "invalid_message"
+    refute_receive {:call, %{verb: "retire"}}
   end
 
   test "PATCH /api/streams/:key still accepts a single-encoded %20 space in the key", ctx do
