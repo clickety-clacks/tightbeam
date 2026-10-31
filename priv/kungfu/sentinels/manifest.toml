@@ -14,3 +14,13 @@ details = [
   { name = "sender", description = "User ID of the message author." },
   { name = "text", description = "Full message body reported by Matrix." },
 ]
+
+[[sentinels.events]]
+name = "mention"
+description = "One event for each distinct user a Matrix message mentions."
+details = [
+  { name = "room", description = "Room ID reported by the Matrix event." },
+  { name = "sender", description = "User ID of the message author." },
+  { name = "mentioned", description = "Exact Matrix user ID mentioned by the message." },
+  { name = "text", description = "Full message body reported by Matrix." },
+]
