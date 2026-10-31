@@ -308,6 +308,52 @@ defmodule Tightbeam.HarnessPiTest do
            }
   end
 
+  test "generated extension refuses a present invalid carrier in a gate-probe workdir" do
+    for case_name <- [:malformed, :wrong_session] do
+      root = Path.join([tmp_dir!("pi-gate-probe-invalid-#{case_name}"), "gate-probe"])
+      identity = pi_identity_path(root)
+      extension = Path.join(root, "tightbeam.mjs")
+      runner = Path.join(root, "runner.mjs")
+      model_request = Path.join(root, "model-requested")
+
+      case case_name do
+        :malformed ->
+          File.mkdir_p!(Path.dirname(identity))
+          File.write!(identity, "not a served identity carrier")
+
+        :wrong_session ->
+          materialize_pi_identity!(root, "agent:pi:another-session", "WRONG IDENTITY")
+      end
+
+      File.write!(extension, Pi.extension_source(%{"hooks" => %{}}))
+
+      File.write!(
+        runner,
+        """
+        import extension from #{JSON.encode!(extension)};
+        import { writeFileSync } from "node:fs";
+        const handlers = {};
+        extension({ on(name, handler) { handlers[name] = handler; } });
+
+        try {
+          await handlers.before_agent_start({ systemPrompt: "BASE" });
+          writeFileSync(#{JSON.encode!(model_request)}, "requested");
+        } catch (error) {
+          console.error(String(error?.message ?? error));
+          writeFileSync(#{JSON.encode!(model_request)}, "requested-after-caught-hook-error");
+        }
+        """
+      )
+
+      {output, status} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
+
+      assert status == 78
+      refute File.exists?(model_request)
+      assert output =~ "Tightbeam identity carrier refused startup"
+      assert output =~ if(case_name == :malformed, do: "malformed", else: "wrong-session")
+    end
+  end
+
   test "catalog refuses a provider mismatch instead of relabeling it" do
     base = tmp_dir!("pi-catalog-mismatch")
 
