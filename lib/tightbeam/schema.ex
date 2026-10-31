@@ -4543,7 +4543,11 @@ defmodule Tightbeam.Schema do
 
   def process_actor_table_sql("attests", sql),
     do:
-      String.replace(sql, ~r/ AND\s+\(\(bySession IS NOT NULL\) != \(byUser IS NOT NULL\)\)/, "")
+      String.replace(
+        sql,
+        ~r/ AND\s+\(\(bySession IS NOT NULL\) != \(byUser IS NOT NULL\)\)/,
+        " AND (bySession IS NULL OR byUser IS NULL)"
+      )
 
   def process_actor_table_sql("assignment_reopenings", sql),
     do:
@@ -4584,14 +4588,7 @@ defmodule Tightbeam.Schema do
   end
 
   def process_actor_table_sql("topline" <> _rest, sql) do
-    sql
-    |> String.replace(
-      ~r/,\s*CHECK \(\s*\(cause IN \('created','last_membership_unlinked'\).*?openedActorRef = 'tightbeam'\)\)\)\s*\)/s,
-      ""
-    )
-    |> String.replace(~r/CHECK \(\w*[Aa]ctorKind IN \('user','session'\)\)/, "")
-    |> String.replace(~r/\w*[Aa]ctorKind IN \('user','session'\) AND /, "")
-    |> String.replace(~r/AND\s+\w*[Aa]ctorKind IN \('user','session'\)/, "")
+    String.replace(sql, "IN ('user','session')", "IN ('user','session','process')")
   end
 
   def process_actor_table_sql(_name, sql), do: sql
