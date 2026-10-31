@@ -582,6 +582,11 @@ defmodule Tightbeam.Harness.Pi do
     const settings = JSON.parse(Buffer.from(#{JSON.encode!(encoded)}, "base64").toString("utf8"));
     const identityPath = join(process.cwd(), #{JSON.encode!(@identity_relative)});
 
+    function refuseIdentityStartup(reason) {
+      console.error(`Tightbeam identity carrier refused startup: ${reason}`);
+      process.exit(78);
+    }
+
     function identityGuidance() {
       // Placement's permission-rail probe intentionally has no session identity.
       if (basename(process.cwd()) === "gate-probe") return undefined;
@@ -592,19 +597,19 @@ defmodule Tightbeam.Harness.Pi do
         carrier = readFileSync(identityPath, "utf8");
       } catch (error) {
         const condition = error?.code === "ENOENT" ? "missing" : "unreadable";
-        throw new Error(`Tightbeam identity carrier refused startup: ${condition} carrier at ${identityPath}`);
+        refuseIdentityStartup(`${condition} carrier at ${identityPath}`);
       }
 
       const parsed = carrier.match(/^---\\r?\\n([\\s\\S]*?)\\r?\\n---(?:\\r?\\n|$)([\\s\\S]*)$/);
       if (!parsed) {
-        throw new Error("Tightbeam identity carrier refused startup: malformed frontmatter");
+        refuseIdentityStartup("malformed frontmatter");
       }
 
       const fields = new Map();
       for (const line of parsed[1].split(/\\r?\\n/)) {
         const field = line.match(/^([a-z0-9-]+):\\s*(.*?)\\s*$/);
         if (!field || fields.has(field[1])) {
-          throw new Error("Tightbeam identity carrier refused startup: malformed frontmatter");
+          refuseIdentityStartup("malformed frontmatter");
         }
         fields.set(field[1], field[2]);
       }
@@ -618,7 +623,7 @@ defmodule Tightbeam.Harness.Pi do
           !/^[a-f0-9]{64}$/.test(binding ?? "") ||
           currentWorkdir !== binding.slice(0, 12) ||
           !guidance) {
-        throw new Error("Tightbeam identity carrier refused startup: malformed or wrong-session carrier");
+        refuseIdentityStartup("malformed or wrong-session carrier");
       }
 
       return guidance;

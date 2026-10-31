@@ -187,6 +187,7 @@ defmodule Tightbeam.HarnessPiTest do
       identity = pi_identity_path(root)
       extension = Path.join(root, "tightbeam.mjs")
       runner = Path.join(root, "runner.mjs")
+      model_request = Path.join(root, "model-requested")
 
       case case_name do
         :missing ->
@@ -214,32 +215,37 @@ defmodule Tightbeam.HarnessPiTest do
         runner,
         """
         import extension from #{JSON.encode!(extension)};
+        import { writeFileSync } from "node:fs";
         const handlers = {};
-        let modelRequests = 0;
         extension({ on(name, handler) { handlers[name] = handler; } });
 
         try {
           const identity = await handlers.before_agent_start({ systemPrompt: "BASE" });
-          modelRequests += 1;
-          process.stdout.write(JSON.stringify({ identity, modelRequests }));
+          writeFileSync(#{JSON.encode!(model_request)}, "requested");
+          process.stdout.write(JSON.stringify({ identity }));
         } catch (error) {
-          process.stdout.write(JSON.stringify({ error: String(error?.message ?? error), modelRequests }));
+          // Pi 0.84.1 catches hook errors and continues to the model request.
+          console.error(String(error?.message ?? error));
+          writeFileSync(#{JSON.encode!(model_request)}, "requested-after-caught-hook-error");
         }
         """
       )
 
-      {output, 0} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
-      result = JSON.decode!(output)
+      {output, status} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
 
       if case_name == :correct do
-        assert result == %{
-                 "identity" => %{"systemPrompt" => "BASE\n\nSERVED IDENTITY FIXTURE"},
-                 "modelRequests" => 1
+        assert status == 0
+
+        assert JSON.decode!(output) == %{
+                 "identity" => %{"systemPrompt" => "BASE\n\nSERVED IDENTITY FIXTURE"}
                }
+
+        assert File.read!(model_request) == "requested"
       else
-        assert result["modelRequests"] == 0
-        assert result["error"] =~ "Tightbeam identity carrier refused startup"
-        assert result["error"] =~ expected_error
+        assert status == 78
+        refute File.exists?(model_request)
+        assert output =~ "Tightbeam identity carrier refused startup"
+        assert output =~ expected_error
       end
     end
   end
