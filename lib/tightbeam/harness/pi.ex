@@ -384,7 +384,10 @@ defmodule Tightbeam.Harness.Pi do
       if String.trim(snapshot.guidance) == "" do
         snapshot
       else
-        put_in(snapshot.skills[@identity_skill], identity_skill(snapshot.guidance))
+        put_in(
+          snapshot.skills[@identity_skill],
+          identity_skill(snapshot.guidance, Map.fetch!(target, :session_key))
+        )
       end
 
     Tightbeam.Identity.materialize_for_harness!(
@@ -573,24 +576,63 @@ defmodule Tightbeam.Harness.Pi do
 
     """
     import { readFileSync } from "node:fs";
-    import { join } from "node:path";
+    import { basename, join } from "node:path";
     import { spawnSync } from "node:child_process";
 
     const settings = JSON.parse(Buffer.from(#{JSON.encode!(encoded)}, "base64").toString("utf8"));
     const identityPath = join(process.cwd(), #{JSON.encode!(@identity_relative)});
 
+    function refuseIdentityStartup(reason) {
+      console.error(`Tightbeam identity carrier refused startup: ${reason}`);
+      process.exit(78);
+    }
+
     function identityGuidance() {
+      let carrier;
+
       try {
-        return readFileSync(identityPath, "utf8").replace(/^---\\n[\\s\\S]*?\\n---\\n?/, "").trim();
-      } catch {
-        return "";
+        carrier = readFileSync(identityPath, "utf8");
+      } catch (error) {
+        // Placement's permission-rail probe intentionally has no session identity.
+        if (basename(process.cwd()) === "gate-probe" && error?.code === "ENOENT") return undefined;
+
+        const condition = error?.code === "ENOENT" ? "missing" : "unreadable";
+        refuseIdentityStartup(`${condition} carrier at ${identityPath}`);
       }
+
+      const parsed = carrier.match(/^---\\r?\\n([\\s\\S]*?)\\r?\\n---(?:\\r?\\n|$)([\\s\\S]*)$/);
+      if (!parsed) {
+        refuseIdentityStartup("malformed frontmatter");
+      }
+
+      const fields = new Map();
+      for (const line of parsed[1].split(/\\r?\\n/)) {
+        const field = line.match(/^([a-z0-9-]+):\\s*(.*?)\\s*$/);
+        if (!field || fields.has(field[1])) {
+          refuseIdentityStartup("malformed frontmatter");
+        }
+        fields.set(field[1], field[2]);
+      }
+
+      const binding = fields.get("tightbeam-session-sha256");
+      const currentWorkdir = process.cwd().split(/[\\/\\\\]/).filter(Boolean).at(-1) ?? "";
+      const guidance = parsed[2].trim();
+
+      if (fields.get("name") !== "tightbeam-served-identity" ||
+          fields.get("disable-model-invocation") !== "true" ||
+          !/^[a-f0-9]{64}$/.test(binding ?? "") ||
+          currentWorkdir !== binding.slice(0, 12) ||
+          !guidance) {
+        refuseIdentityStartup("malformed or wrong-session carrier");
+      }
+
+      return guidance;
     }
 
     export default function (pi) {
       pi.on("before_agent_start", async (event) => {
         const guidance = identityGuidance();
-        if (!guidance) return undefined;
+        if (guidance === undefined) return undefined;
         return { systemPrompt: `${event.systemPrompt}\\n\\n${guidance}` };
       });
 
@@ -625,12 +667,15 @@ defmodule Tightbeam.Harness.Pi do
     """
   end
 
-  defp identity_skill(guidance) do
+  defp identity_skill(guidance, session_key) do
+    binding = :crypto.hash(:sha256, session_key) |> Base.encode16(case: :lower)
+
     """
     ---
     name: tightbeam-served-identity
     description: Tightbeam's reserved served-identity carrier. Do not invoke directly.
     disable-model-invocation: true
+    tightbeam-session-sha256: #{binding}
     ---
     #{guidance}
     """
