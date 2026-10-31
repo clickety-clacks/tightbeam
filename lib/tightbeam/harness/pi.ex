@@ -386,7 +386,7 @@ defmodule Tightbeam.Harness.Pi do
       else
         put_in(
           snapshot.skills[@identity_skill],
-          identity_skill(snapshot.guidance, Map.fetch!(target, :session_key))
+          identity_skill(snapshot.guidance, Map.fetch!(target, :session_key), cwd)
         )
       end
 
@@ -575,7 +575,7 @@ defmodule Tightbeam.Harness.Pi do
     encoded = settings |> JSON.encode!() |> Base.encode64()
 
     """
-    import { readFileSync } from "node:fs";
+    import { readFileSync, realpathSync } from "node:fs";
     import { basename, join } from "node:path";
     import { spawnSync } from "node:child_process";
 
@@ -615,18 +615,40 @@ defmodule Tightbeam.Harness.Pi do
       }
 
       const binding = fields.get("tightbeam-session-sha256");
-      const currentWorkdir = process.cwd().split(/[\\/\\\\]/).filter(Boolean).at(-1) ?? "";
       const guidance = parsed[2].trim();
 
       if (fields.get("name") !== "tightbeam-served-identity" ||
           fields.get("disable-model-invocation") !== "true" ||
           !/^[a-f0-9]{64}$/.test(binding ?? "") ||
-          currentWorkdir !== binding.slice(0, 12) ||
+          !boundToCurrentWorkdir(fields.get("tightbeam-workdir")) ||
           !guidance) {
         refuseIdentityStartup("malformed or wrong-session carrier");
       }
 
       return guidance;
+    }
+
+    // The gateway stamps the exact cwd it materialized the carrier into. Durable
+    // sessions work in a session-derived directory; ephemeral helpers work in a
+    // per-turn temporary directory, so the binding cannot depend on how the
+    // directory is named. Both sides resolve through realpath so a symlinked
+    // configured path still matches the physical path getcwd() reports.
+    function boundToCurrentWorkdir(encodedWorkdir) {
+      let workdir;
+
+      try {
+        workdir = JSON.parse(encodedWorkdir ?? "");
+      } catch {
+        return false;
+      }
+
+      if (typeof workdir !== "string" || workdir === "") return false;
+
+      try {
+        return realpathSync(workdir) === realpathSync(process.cwd());
+      } catch {
+        return false;
+      }
     }
 
     export default function (pi) {
@@ -667,7 +689,12 @@ defmodule Tightbeam.Harness.Pi do
     """
   end
 
-  defp identity_skill(guidance, session_key) do
+  # The carrier names the session it was composed for and the exact workdir it
+  # was materialized into. The extension accepts it only from that workdir, so a
+  # carrier copied or left over from another session's directory fails closed.
+  # The workdir is JSON-encoded to stay a single frontmatter scalar whatever
+  # characters the path holds.
+  defp identity_skill(guidance, session_key, cwd) do
     binding = :crypto.hash(:sha256, session_key) |> Base.encode16(case: :lower)
 
     """
@@ -676,6 +703,7 @@ defmodule Tightbeam.Harness.Pi do
     description: Tightbeam's reserved served-identity carrier. Do not invoke directly.
     disable-model-invocation: true
     tightbeam-session-sha256: #{binding}
+    tightbeam-workdir: #{JSON.encode!(cwd)}
     ---
     #{guidance}
     """
