@@ -173,7 +173,9 @@ defmodule Tightbeam.Supervision do
             actor_session_key,
             work_item_id,
             effective_at,
-            interval_ms
+            interval_ms,
+            nil,
+            :activity
           )
 
         # Stamp the replacement at the activity itself: cancellation also
@@ -305,7 +307,7 @@ defmodule Tightbeam.Supervision do
       when default_interval_ms == :off or
              (is_integer(default_interval_ms) and default_interval_ms > 0) do
     case inactivity_policy() do
-      nil -> :ok
+      nil -> cancel_unavailable_inactivity_actions(db)
       _policy -> do_migrate_open_assignments(db, default_interval_ms)
     end
   end
@@ -326,7 +328,7 @@ defmodule Tightbeam.Supervision do
                    configured_off? = default_interval_ms == :off
 
                    if configured_off? do
-                     interval_ms = policy_period_ms!()
+                     interval_ms = policy_period_ms()
 
                      activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
 
@@ -341,7 +343,8 @@ defmodule Tightbeam.Supervision do
                          work_item_id,
                          last_activity,
                          interval_ms,
-                         now() + interval_ms
+                         now() + interval_ms,
+                         :period_change
                        )
 
                      cancel_boot_sources_in_txn(
@@ -418,7 +421,8 @@ defmodule Tightbeam.Supervision do
                              work_item_id,
                              quiet_start,
                              interval_ms,
-                             due_at
+                             due_at,
+                             :period_change
                            )
 
                          cancel_boot_sources_in_txn(
@@ -780,7 +784,8 @@ defmodule Tightbeam.Supervision do
         work_item_id,
         activity_at,
         interval_ms,
-        due_at
+        due_at,
+        :replace
       )
 
     fire_internal_in_txn(txn, wake.wake_id, @deadline_consumer, now)
@@ -1074,7 +1079,13 @@ defmodule Tightbeam.Supervision do
       "owner_personal_session" => [active_personal_key(txn, owner)]
     }
 
-    inactivity_policy!().escalation_order
+    escalation_order =
+      case inactivity_policy() do
+        %{escalation_order: order} -> order
+        nil -> []
+      end
+
+    escalation_order
     |> Enum.flat_map(&Map.fetch!(targets, &1))
     |> Enum.find(&(is_binary(&1) and &1 not in visited))
   end
@@ -1208,7 +1219,8 @@ defmodule Tightbeam.Supervision do
       interval_ms,
       previous_wake_id,
       visited,
-      due_at
+      due_at,
+      false
     )
 
     fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
@@ -1222,19 +1234,30 @@ defmodule Tightbeam.Supervision do
          work_item_id,
          activity_at,
          interval_ms,
-         due_override \\ nil
+         due_override \\ nil,
+         pending_action_mode \\ :replace
        ) do
     due_at = due_override || activity_at + interval_ms
 
-    reusable_deadline_in_txn(
-      txn,
-      assignment_id,
-      holder,
-      work_item_id,
-      activity_at,
-      interval_ms,
-      due_at
-    ) ||
+    reusable =
+      case pending_action_mode do
+        :replace ->
+          nil
+
+        mode ->
+          reusable_deadline_in_txn(
+            txn,
+            assignment_id,
+            holder,
+            work_item_id,
+            activity_at,
+            interval_ms,
+            due_at,
+            mode
+          )
+      end
+
+    reusable ||
       Wakes.schedule_in_txn(txn, %{
         session_key: holder,
         origin: "process:tightbeam",
@@ -1260,26 +1283,45 @@ defmodule Tightbeam.Supervision do
          work_item_id,
          activity_at,
          interval_ms,
-         due_at
+         due_at,
+         mode
        ) do
     # Walk this assignment's wakes newest first, stopping at its pending
     # deadline, rather than every pending wake.
     Txn.q(
       txn,
-      "SELECT wakeId,prompt,sessionKey,work_item_id,dueAt FROM wakes INDEXED BY wakes_assignment WHERE assignmentId=?1 AND consumer=?2 AND state='pending' ORDER BY rowid DESC LIMIT 1",
+      "SELECT wakeId,prompt,sessionKey,work_item_id,dueAt,obligationRef FROM wakes INDEXED BY wakes_assignment WHERE assignmentId=?1 AND consumer=?2 AND state='pending' AND deliveredTurnSeq IS NULL ORDER BY rowid DESC LIMIT 1",
       [assignment_id, @deadline_consumer]
     )
     |> Enum.find_value(fn
-      [wake_id, prompt, ^holder, ^work_item_id, ^due_at]
-      when is_binary(wake_id) and is_binary(prompt) ->
+      [wake_id, prompt, ^holder, ^work_item_id, previous_due, @deadline_ref <> ^assignment_id]
+      when is_binary(wake_id) and is_binary(prompt) and is_integer(previous_due) ->
         case decode_payload(%{consumer: @deadline_consumer, prompt: prompt}, @deadline_consumer) do
-          {:ok,
-           %{
-             "assignmentId" => ^assignment_id,
-             "intervalMs" => ^interval_ms,
-             "activityAt" => ^activity_at
-           }} ->
-            Wakes.get_in_txn(txn, wake_id)
+          {:ok, %{"assignmentId" => ^assignment_id} = payload} ->
+            previous_interval = Map.get(payload, "intervalMs")
+
+            if mode == :activity or previous_interval != interval_ms do
+              revised_prompt =
+                payload
+                |> Map.put("activityAt", activity_at)
+                |> Map.put("intervalMs", interval_ms)
+                |> JSON.encode!()
+
+              if previous_due != due_at or prompt != revised_prompt do
+                Txn.q(
+                  txn,
+                  "UPDATE wakes SET prompt=?2,dueAt=?3,firedAt=NULL WHERE wakeId=?1 AND state='pending' AND deliveredTurnSeq IS NULL",
+                  [wake_id, revised_prompt, due_at]
+                )
+
+                if Txn.changes(txn) == 1 do
+                  Wakes.schedule_changed_in_txn(txn, {:schedule_changed, due_at})
+                  Wakes.get_in_txn(txn, wake_id)
+                end
+              else
+                Wakes.get_in_txn(txn, wake_id)
+              end
+            end
 
           _ ->
             nil
@@ -1344,28 +1386,108 @@ defmodule Tightbeam.Supervision do
          interval_ms,
          previous_wake_id,
          visited,
+         due_at,
+         reconcile_pending? \\ true
+       ) do
+    prompt =
+      JSON.encode!(%{
+        "version" => 1,
+        "assignmentId" => assignment_id,
+        "episodeRef" => episode_ref,
+        "originHolder" => origin_holder,
+        "rung" => rung,
+        "intervalMs" => interval_ms,
+        "previousWakeId" => previous_wake_id,
+        "visited" => visited
+      })
+
+    reconciled =
+      if reconcile_pending? do
+        reconcile_pending_climb_in_txn(
+          txn,
+          assignment_id,
+          origin_holder,
+          work_item_id,
+          episode_ref,
+          rung,
+          previous_wake_id,
+          visited,
+          interval_ms,
+          prompt,
+          due_at
+        )
+      end
+
+    reconciled ||
+      Wakes.schedule_in_txn(txn, %{
+        session_key: origin_holder,
+        origin: "process:tightbeam",
+        consumer: @climb_consumer,
+        prompt: prompt,
+        due_at: due_at,
+        assignment_id: assignment_id,
+        work_item_id: work_item_id,
+        obligation_ref: episode_ref
+      })
+  end
+
+  defp reconcile_pending_climb_in_txn(
+         txn,
+         assignment_id,
+         origin_holder,
+         work_item_id,
+         episode_ref,
+         rung,
+         previous_wake_id,
+         visited,
+         interval_ms,
+         prompt,
          due_at
        ) do
-    Wakes.schedule_in_txn(txn, %{
-      session_key: origin_holder,
-      origin: "process:tightbeam",
-      consumer: @climb_consumer,
-      prompt:
-        JSON.encode!(%{
-          "version" => 1,
-          "assignmentId" => assignment_id,
-          "episodeRef" => episode_ref,
-          "originHolder" => origin_holder,
-          "rung" => rung,
-          "intervalMs" => interval_ms,
-          "previousWakeId" => previous_wake_id,
-          "visited" => visited
-        }),
-      due_at: due_at,
-      assignment_id: assignment_id,
-      work_item_id: work_item_id,
-      obligation_ref: episode_ref
-    })
+    case Txn.q(
+           txn,
+           "SELECT wakeId,prompt,dueAt FROM wakes INDEXED BY wakes_assignment WHERE assignmentId=?1 AND consumer=?2 AND sessionKey=?3 AND work_item_id IS ?4 AND obligationRef=?5 AND state='pending' AND deliveredTurnSeq IS NULL ORDER BY rowid DESC LIMIT 1",
+           [assignment_id, @climb_consumer, origin_holder, work_item_id, episode_ref]
+         ) do
+      [[wake_id, previous_prompt, previous_due]]
+      when is_binary(wake_id) and is_binary(previous_prompt) and is_integer(previous_due) ->
+        case decode_payload(
+               %{consumer: @climb_consumer, prompt: previous_prompt},
+               @climb_consumer
+             ) do
+          {:ok,
+           %{
+             "assignmentId" => ^assignment_id,
+             "episodeRef" => ^episode_ref,
+             "originHolder" => ^origin_holder,
+             "rung" => ^rung,
+             "intervalMs" => previous_interval_ms,
+             "previousWakeId" => ^previous_wake_id,
+             "visited" => ^visited
+           }}
+          when previous_interval_ms != interval_ms ->
+            if previous_prompt != prompt or previous_due != due_at do
+              Txn.q(
+                txn,
+                "UPDATE wakes SET prompt=?2,dueAt=?3,firedAt=NULL WHERE wakeId=?1 AND state='pending' AND deliveredTurnSeq IS NULL",
+                [wake_id, prompt, due_at]
+              )
+
+              if Txn.changes(txn) == 1 do
+                Wakes.schedule_changed_in_txn(txn, {:schedule_changed, due_at})
+                Wakes.get_in_txn(txn, wake_id)
+              end
+            else
+              nil
+            end
+
+          _ ->
+            nil
+        end
+
+      _ ->
+        nil
+    end
   end
 
   defp restore_boot_climb_in_txn(
@@ -1741,7 +1863,7 @@ defmodule Tightbeam.Supervision do
       nil ->
         nil
 
-      %{settings: settings} ->
+      %{settings: settings} when is_map(settings) ->
         keys = Enum.sort(Map.keys(settings))
         expected = Enum.sort(~w(period_ms holder_reminder_limit escalation_order))
         period_ms = Map.get(settings, "period_ms")
@@ -1756,25 +1878,96 @@ defmodule Tightbeam.Supervision do
             Enum.all?(escalation_order, &(&1 in allowed_targets)) and
             length(escalation_order) == length(Enum.uniq(escalation_order))
 
-        unless valid?,
-          do: raise(ArgumentError, "invalid assignment-inactivity reaction settings")
+        if valid? do
+          %{
+            period_ms: period_ms,
+            holder_reminder_limit: reminder_limit,
+            escalation_order: escalation_order
+          }
+        else
+          nil
+        end
 
-        %{
-          period_ms: period_ms,
-          holder_reminder_limit: reminder_limit,
-          escalation_order: escalation_order
-        }
+      _ ->
+        nil
     end
   end
 
-  defp inactivity_policy! do
-    inactivity_policy() ||
-      raise(ArgumentError, "assignment-inactivity reaction policy is not elected")
+  defp policy_period_ms do
+    case inactivity_policy() do
+      %{period_ms: period_ms} -> period_ms
+      nil -> 1_800_000
+    end
   end
 
-  defp policy_period_ms!, do: inactivity_policy!().period_ms
+  defp holder_reminder_limit do
+    case inactivity_policy() do
+      %{holder_reminder_limit: limit} -> limit
+      nil -> 0
+    end
+  end
 
-  defp holder_reminder_limit, do: inactivity_policy!().holder_reminder_limit
+  @doc false
+  def assignment_inactivity_action?(%{
+        consumer: @deadline_consumer,
+        assignment_id: assignment_id,
+        obligation_ref: obligation_ref
+      })
+      when is_binary(assignment_id) and is_binary(obligation_ref),
+      do: obligation_ref == @deadline_ref <> assignment_id
+
+  def assignment_inactivity_action?(%{
+        consumer: @climb_consumer,
+        obligation_ref: obligation_ref
+      })
+      when is_binary(obligation_ref),
+      do: String.starts_with?(obligation_ref, @episode_ref)
+
+  def assignment_inactivity_action?(%{consumer: "prompt", obligation_ref: obligation_ref})
+      when is_binary(obligation_ref),
+      do: String.starts_with?(obligation_ref, @episode_ref)
+
+  def assignment_inactivity_action?(_wake), do: false
+
+  defp cancel_unavailable_inactivity_actions(db) do
+    case DB.transaction(db, fn txn ->
+           Txn.q(
+             txn,
+             """
+             SELECT wakeId FROM wakes
+             WHERE state='pending' AND deliveredTurnSeq IS NULL
+               AND (consumer IN (?1,?2) OR
+                    (consumer='prompt' AND substr(obligationRef,1,length(?3))=?3))
+             ORDER BY createdAt,wakeId
+             """,
+             [@deadline_consumer, @climb_consumer, @episode_ref]
+           )
+           |> Enum.each(fn
+             [wake_id] when is_binary(wake_id) ->
+               command = %{
+                 wake_id: wake_id,
+                 requester: %{kind: "process", id: "tightbeam:rail-remedy"},
+                 reason_kind: "superseded",
+                 causal_source: %{kind: "wake", id: wake_id},
+                 outcome: %{kind: "no_replacement"}
+               }
+
+               unless Wakes.cancel_in_txn(txn, command) do
+                 raise DB.Error,
+                   message:
+                     "unavailable assignment-inactivity wake could not be canceled: #{wake_id}"
+               end
+
+             _ ->
+               raise DB.Error, message: "malformed unavailable assignment-inactivity wake"
+           end)
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> {:error, error}
+    end
+  end
 
   defp cancel_assignment_sources_in_txn(txn, assignment_id, disposition, clock \\ &now/0) do
     replacement_id =
@@ -1910,7 +2103,7 @@ defmodule Tightbeam.Supervision do
           "assignment inactivity interval unavailable for #{assignment_id}; using default"
         )
 
-        {policy_period_ms!(), activity_start}
+        {policy_period_ms(), activity_start}
     end
   end
 
