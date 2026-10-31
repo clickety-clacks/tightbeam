@@ -242,6 +242,11 @@ pub enum Command {
     List {
         identity: Identity,
     },
+    RoleBind {
+        identity: Identity,
+        role: String,
+        session_key: String,
+    },
     Retire {
         identity: Identity,
         session_key: String,
@@ -931,6 +936,10 @@ COMMANDS:
 
   session-po-set --session <key> --po-role <role> --key <key>
       Explicitly associate an exact session with its addressed product-owner role.
+
+  role-bind --role <name> --session <key>
+      Move one office to an active session. The gateway applies its existing
+      role-binding authorization.
 
   session-connect --session <sessionKey> [--as-user <userId> | --as-process <name>]
       Run the persistent NDJSON stdin/stdout connection for one selected session.
@@ -2690,6 +2699,25 @@ fn parse_with_optional_catalog(
         "list" => Ok(Command::List {
             identity: identity(flags)?,
         }),
+        "role-bind" => {
+            let role = nonempty(flags, "role");
+            let session_key = nonempty(flags, "session");
+            let allowed = ["as", "as-user", "as-process", "role", "session"];
+
+            if parsed.positional.len() != 1
+                || role.is_none()
+                || session_key.is_none()
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam role-bind --role <name> --session <key>".to_owned());
+            }
+
+            Ok(Command::RoleBind {
+                identity: identity(flags)?,
+                role: role.expect("checked above"),
+                session_key: session_key.expect("checked above"),
+            })
+        }
         "retire" => {
             let session_key = nonempty(flags, "session");
             if parsed.positional.get(1).is_some()
@@ -6293,6 +6321,7 @@ mod tests {
                 "operator-rule",
                 "operator-withdraw",
                 "retire",
+                "role-bind",
                 "sentinel",
                 "session-connect",
                 "session-reparent",
@@ -6363,6 +6392,7 @@ mod tests {
             "kungfu list",
             "kungfu setup <bundle>",
             "sentinel list",
+            "role-bind --role <name> --session <key>",
             "sentinel events",
             "sentinel post --event <event> --key <key> --detail <name=value>...",
             "sentinel subscribe --event <event> [--where <name=value>...]",
@@ -6587,6 +6617,42 @@ mod tests {
                 if harnesses == vec!["fixture".to_owned()]
                     && parsed_catalog == catalog
         ));
+    }
+
+    #[test]
+    fn role_bind_selects_one_office_and_session() {
+        assert_eq!(
+            parse(strings(&[
+                "role-bind",
+                "--role",
+                "product-office",
+                "--session",
+                "agent:successor",
+                "--as-user",
+                "owner",
+            ])),
+            Ok(Command::RoleBind {
+                identity: Identity::User("owner".to_owned()),
+                role: "product-office".to_owned(),
+                session_key: "agent:successor".to_owned(),
+            })
+        );
+
+        for args in [
+            vec!["role-bind", "--session", "agent:successor"],
+            vec!["role-bind", "--role", "product-office"],
+            vec![
+                "role-bind",
+                "--role",
+                "product-office",
+                "--session",
+                "agent:successor",
+                "--key",
+                "unused",
+            ],
+        ] {
+            assert!(parse(strings(&args)).is_err());
+        }
     }
 
     // The blocking code-review finding on the first cut: the CLI attached roster

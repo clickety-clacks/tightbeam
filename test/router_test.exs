@@ -4819,6 +4819,35 @@ defmodule Tightbeam.Wire.RouterTest do
     refute Map.has_key?(omitted, :context)
   end
 
+  test "spawn name refusal is returned as a named client error", ctx do
+    opts =
+      with_handler(ctx.opts, "spawn", fn _call ->
+        %{code: "name_taken", message: "spawn name demo is already held"}
+      end)
+
+    response =
+      conn(
+        :post,
+        "/api/streams",
+        JSON.encode!(%{
+          "displayName" => "Successor",
+          "idempotencyKey" => "held-name",
+          "handle" => "demo"
+        })
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 400
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{
+               "code" => "name_taken",
+               "message" => "spawn name demo is already held"
+             }
+           }
+  end
+
   test "a disappeared placement host reaches HTTP as a named refusal", ctx do
     opts =
       with_handler(ctx.opts, "spawn", fn _call ->

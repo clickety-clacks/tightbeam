@@ -79,6 +79,7 @@ impl CommandContext {
             ToolCallObserved => ("cli.tool_call_observed", Requests::ToolCallObserved),
             Spawn { .. } => ("cli.spawn", CatalogAndDispatch),
             List { .. } => ("cli.list", DispatchPath),
+            RoleBind { .. } => ("cli.role_bind", DispatchPath),
             Retire { .. } => ("cli.retire", DispatchPath),
             SessionReparent { .. } => ("cli.session_reparent", DispatchPath),
             SessionPoSet { .. } => ("cli.session_po_set", DispatchPath),
@@ -448,6 +449,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | HarklightSettle { .. }
         | HarklightFollow { .. }
         | ToolCallObserved
+        | RoleBind { .. }
         | Tune { .. }
         | EffortRule { .. }
         | Ask { .. }
@@ -556,6 +558,31 @@ mod tests {
         assert!(!debug.contains("PRIVATE_USER"));
         assert!(!debug.contains("PRIVATE_ASSIGNMENT"));
         assert!(!debug.contains("PRIVATE_REASON"));
+    }
+
+    #[test]
+    fn role_bind_is_an_unkeyed_dispatch_write_without_retained_target_data() {
+        let command = Command::RoleBind {
+            identity: Identity::User("PRIVATE_USER".into()),
+            role: "PRIVATE_ROLE".into(),
+            session_key: "PRIVATE_SESSION".into(),
+        };
+        let context = CommandContext::for_command(&command).unwrap();
+        assert_eq!(
+            context
+                .operation_for_request("POST", "/agent/dispatch")
+                .unwrap()
+                .as_str(),
+            "cli.role_bind"
+        );
+        assert_eq!(
+            effect(context, "POST", "/agent/dispatch"),
+            EffectContract::WriteWithoutIdempotency
+        );
+        let debug = format!("{context:?}");
+        assert!(!debug.contains("PRIVATE_USER"));
+        assert!(!debug.contains("PRIVATE_ROLE"));
+        assert!(!debug.contains("PRIVATE_SESSION"));
     }
 
     #[test]
