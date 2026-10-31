@@ -80,7 +80,7 @@ defmodule Tightbeam.RuntimeConfigTest do
     refute Keyword.has_key?(Keyword.fetch!(production, :tightbeam), :effort_checkin_horizon_ms)
   end
 
-  test "production supervision period comes from the elected R06 rail, not the wake tick" do
+  test "production supervision period comes from the elected inactivity rail, not the wake tick" do
     previous_interval = Application.get_env(:tightbeam, :supervision_interval_ms)
     previous_tick = Application.get_env(:tightbeam, :wake_tick_ms)
     Application.delete_env(:tightbeam, :supervision_interval_ms)

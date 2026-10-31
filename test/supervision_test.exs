@@ -519,7 +519,7 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, _} =
              DB.query(
                ctx.db,
-               "INSERT INTO attests(id,assignmentId,kind,bySession,ts) VALUES('att_r06_a13','asg_inactive','progress',?1,?2)",
+               "INSERT INTO attests(id,assignmentId,kind,bySession,ts) VALUES('att_startup_episode_activity','asg_inactive','progress',?1,?2)",
                [ctx.holder.session_key, activity_at]
              )
 
