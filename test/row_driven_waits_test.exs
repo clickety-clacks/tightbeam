@@ -1240,6 +1240,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     previous =
       File.read!(Path.join(__DIR__, "fixtures/row_wakes/prewrite-continuation-21a4cb0e.sql"))
+      |> Tightbeam.SchemaShapeRuntimeFixture.continuation_retry_predecessor_guard!()
 
     assert {:ok, :ok} =
              DB.transaction(ctx.db, fn txn ->

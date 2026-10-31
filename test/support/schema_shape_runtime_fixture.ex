@@ -856,27 +856,67 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     assert {:ok, :ok} =
              DB.transaction(db, fn txn ->
                :ok = DB.Txn.exec(txn, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
-               DB.Txn.exec(txn, previous)
+
+               :ok = DB.Txn.exec(txn, previous)
+
+               # This rewind creates a pre-retirement schema. The parent-move
+               # table and its trigger are one migration state, so neither may
+               # remain alone.
+               case DB.Txn.q(
+                      txn,
+                      "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                      ["session_retirement_parent_moves"]
+                    ) do
+                 [] ->
+                   :ok
+
+                 [[1]] ->
+                   [[0]] =
+                     DB.Txn.q(txn, "SELECT COUNT(*) FROM session_retirement_parent_moves")
+
+                   DB.Txn.exec(txn, "DROP TABLE session_retirement_parent_moves")
+               end
              end)
 
     assert {:ok, ^before} =
              DB.query(db, "SELECT rowid,* FROM supervision_liveness_sidecar ORDER BY rowid")
   end
 
-  def continuation_retry_successor_guard!(sql) do
+  def continuation_retry_predecessor_guard!(sql) do
     reparented =
-      sql
-      |> String.replace(
-        "SELECT sessionKey,spawnedBy FROM sessions",
-        "SELECT sessionKey,#{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions"
-      )
-      |> String.replace(
-        "SELECT ancestor.sessionKey,ancestor.spawnedBy",
-        "SELECT ancestor.sessionKey,#{Tightbeam.Org.current_parent_sql("ancestor")}"
-      )
+      substitute_parent_resolver(sql, &Tightbeam.Org.current_parent_reparent_sql/1)
 
     assert normalize_guard(reparented) == normalize_guard(previous_continuation_guard!())
-    current_continuation_guard!() |> String.trim()
+
+    substitute_parent_resolver(sql, &Tightbeam.Org.current_parent_sql/1)
+  end
+
+  def continuation_retry_successor_guard!(sql) do
+    _predecessor = continuation_retry_predecessor_guard!(sql)
+
+    current_continuation_guard!()
+    |> substitute_parent_resolver(&Tightbeam.Org.current_parent_sql/1)
+    |> String.trim()
+  end
+
+  defp substitute_parent_resolver(sql, parent_resolver) do
+    sql
+    |> String.replace(
+      "SELECT sessionKey,spawnedBy FROM sessions",
+      "SELECT sessionKey,#{parent_resolver.("sessions")} FROM sessions"
+    )
+    |> String.replace(
+      "SELECT ancestor.sessionKey,ancestor.spawnedBy",
+      "SELECT ancestor.sessionKey,#{parent_resolver.("ancestor")}"
+    )
+    |> String.replace(
+      Tightbeam.Org.current_parent_reparent_sql("sessions"),
+      parent_resolver.("sessions")
+    )
+    |> String.replace(
+      Tightbeam.Org.current_parent_reparent_sql("ancestor"),
+      parent_resolver.("ancestor")
+    )
   end
 
   def assert_timed_holder_continuation_guard!(sql) do
