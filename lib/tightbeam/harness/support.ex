@@ -443,7 +443,7 @@ defmodule Tightbeam.Harness.Support do
         cursor_api_key_loader: fn _ -> {:ok, "vector-token"} end,
         cursor_rails_sha256: String.duplicate("a", 64),
         ensure_workdir: fn _host, _cwd, _content, _opts -> :ok end,
-        sh_out: nil
+        sh_out: launch_probe_shell(profile)
       ]
 
       with {:ok, checked} <- Tightbeam.Harness.preflight_launch(module, target, home, opts),

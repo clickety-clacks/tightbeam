@@ -1137,7 +1137,8 @@ defmodule Tightbeam.PlacementTest do
       sh: fn command ->
         if "node" not in command, do: send(parent, {:unexpected_sh, command})
         inventory_shell(command)
-      end
+      end,
+      sh_out: &inventory_shell/1
     }
 
     opts = Placement.adapter_opts!(config, {:codex, "default", "testhost"})
@@ -1174,7 +1175,8 @@ defmodule Tightbeam.PlacementTest do
         cwd: "/work",
         cli_bin: "/local/bin",
         default_model: model,
-        sh: &inventory_shell/1
+        sh: &inventory_shell/1,
+        sh_out: &inventory_shell/1
       }
     end
 
@@ -1244,7 +1246,8 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: "/local/bin",
-      sh: &inventory_shell/1
+      sh: &inventory_shell/1,
+      sh_out: &inventory_shell/1
     }
 
     handler = Placement.adapter_opts!(config, {:codex, "default", "testhost"})[:on_auth_event]
@@ -1395,7 +1398,8 @@ defmodule Tightbeam.PlacementTest do
       cwd: "/work",
       cli_bin: "/local/bin",
       default_model: Model.new("fable"),
-      sh: sh
+      sh: sh,
+      sh_out: &inventory_shell/1
     }
 
     command = Placement.adapter_opts!(config, {:codex, "default", "worker"})[:cmd]
@@ -1542,7 +1546,8 @@ defmodule Tightbeam.PlacementTest do
       cwd: "/work",
       cli_bin: "/local/bin",
       default_model: Model.new("fable"),
-      sh: sh
+      sh: sh,
+      sh_out: &inventory_shell/1
     }
 
     command = Placement.adapter_opts!(config, {:codex, "default", "worker"})[:cmd]
@@ -1592,7 +1597,8 @@ defmodule Tightbeam.PlacementTest do
       cwd: "/work",
       cli_bin: "/local/bin",
       default_model: Model.new("fable"),
-      sh: sh
+      sh: sh,
+      sh_out: &inventory_shell/1
     }
 
     node_a_claude = Placement.adapter_opts!(config, {:claude, "default", "node-a"})[:cmd]
@@ -1617,6 +1623,17 @@ defmodule Tightbeam.PlacementTest do
 
     cli_bin = Path.join(base_dir, "bin")
     File.mkdir_p!(cli_bin)
+
+    node = System.find_executable("node")
+    shim = Path.join(cli_bin, "node")
+
+    File.write!(
+      shim,
+      "#!/bin/sh\nprintf 'synthetic Node warning\\n' >&2\nexec " <>
+        Tightbeam.Harness.Support.shell_quote(node) <> " \"$@\"\n"
+    )
+
+    File.chmod!(shim, 0o755)
 
     config = %{
       base_dir: base_dir,
@@ -1675,6 +1692,17 @@ defmodule Tightbeam.PlacementTest do
     assert File.read!(workspace) == "synthetic skill"
     assert File.read!(retained) == "synthetic skill"
     assert File.read!(typesafe) == "synthetic skill"
+
+    assert_raise RuntimeError, "Codex personal skill inventory failed with exit 9", fn ->
+      failed = Map.put(config, :sh_out, fn _ -> {inventory_config(), 9} end)
+      Placement.adapter_opts!(failed, {:codex, "default", "testhost"})
+    end
+
+    assert_raise JSON.DecodeError, fn ->
+      invalid = Map.put(config, :sh_out, fn _ -> {"invalid stdout", 0} end)
+      Placement.adapter_opts!(invalid, {:codex, "default", "testhost"})
+    end
+
     refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
     assert opts[:probe_cwd] == probe_cwd
     refute Keyword.has_key?(opts, :probe_model)
@@ -1746,7 +1774,8 @@ defmodule Tightbeam.PlacementTest do
       cwd: "/work",
       cli_bin: "/local/bin",
       default_model: Model.new("fable"),
-      sh: sh
+      sh: sh,
+      sh_out: &inventory_shell/1
     }
 
     opts = Placement.adapter_opts!(config, {:codex, "default", "worker"})
@@ -1810,7 +1839,11 @@ defmodule Tightbeam.PlacementTest do
       if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
            Enum.any?(command, &String.contains?(&1, "cat")),
          do: {"", 42},
-         else: inventory_shell(command)
+         else:
+           if("node" in command,
+             do: {"synthetic SSH warning\n" <> inventory_config(), 0},
+             else: {"", 0}
+           )
     end
 
     config = %{
@@ -1819,7 +1852,8 @@ defmodule Tightbeam.PlacementTest do
       cwd: "/work",
       cli_bin: "/local/bin",
       default_model: Model.new("fable"),
-      sh: sh
+      sh: sh,
+      sh_out: &inventory_shell/1
     }
 
     opts = Placement.adapter_opts!(config, {:codex, "default", "worker"})

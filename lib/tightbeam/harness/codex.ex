@@ -212,7 +212,10 @@ defmodule Tightbeam.Harness.Codex do
           ["node", "-e", Support.shell_quote(script)]
       end
 
-    case target.sh.(command) do
+    # SSH and Node may emit warnings on stderr even when stdout is valid JSON.
+    sh_out = Keyword.get(opts, :sh_out) || (&Support.system_cmd_out/1)
+
+    case sh_out.(command) do
       {json, 0} -> JSON.decode!(json) |> JSON.encode!()
       {_output, exit} -> raise "Codex personal skill inventory failed with exit #{exit}"
     end
