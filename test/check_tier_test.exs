@@ -39,22 +39,65 @@ defmodule Tightbeam.CheckTierTest do
 
     invalid = [
       ["bad1", assignment.id, "verdict", nil, nil, "reviewer", nil, 1],
-      ["bad2", assignment.id, "verdict", "tests-passed", nil, nil, nil, 1],
       ["bad3", assignment.id, "verdict", "tests-passed", nil, "reviewer", "other", 1],
       ["bad4", assignment.id, "progress", "tests-passed", nil, "holder", nil, 1],
       ["bad5", assignment.id, "progress", nil, nil, nil, "flynn", 1]
     ]
 
     Enum.each(invalid, fn params ->
-      assert {:error, %DB.Error{message: message}} =
-               DB.query(
-                 ctx.db,
-                 "INSERT INTO attests (id, assignmentId, kind, verdictKind, note, bySession, byUser, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                 params
-               )
+      result =
+        DB.query(
+          ctx.db,
+          "INSERT INTO attests (id, assignmentId, kind, verdictKind, note, bySession, byUser, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+          params
+        )
+
+      assert {:error, %DB.Error{message: message}} = result,
+             "invalid tuple: #{inspect(params)}; result: #{inspect(result)}"
 
       assert message =~ "CHECK constraint"
     end)
+
+    # Process actors live in the event stream; absence of an actor is refused at the write path.
+    {:ok, {Assignments, [abstract_code: {:raw_abstract_v1, forms}]}} =
+      :beam_lib.chunks(:code.which(Assignments), [:abstract_code])
+
+    write_path = Tightbeam.CheckTierTest.AssignmentWritePath
+
+    exposed =
+      Enum.flat_map(forms, fn
+        {:attribute, line, :module, Assignments} ->
+          [
+            {:attribute, line, :module, write_path},
+            {:attribute, line, :export, [insert_attest: 4]}
+          ]
+
+        form ->
+          [form]
+      end)
+
+    {:ok, ^write_path, binary} = :compile.forms(exposed, [:binary, :return_errors])
+    {:module, ^write_path} = :code.load_binary(write_path, ~c"assignment-write-path-test", binary)
+
+    try do
+      actorless =
+        call("attest", nil, %{
+          kind: "verdict",
+          verdict_kind: "tests-passed",
+          assignment_id: assignment.id
+        })
+        |> Map.put(:origin, nil)
+
+      assert {:error, %FunctionClauseError{module: ^write_path, function: :opener, arity: 1}} =
+               DB.transaction(ctx.db, fn txn ->
+                 apply(write_path, :insert_attest, [txn, actorless, assignment.id, false])
+               end)
+
+      assert Assignments.list_attests(ctx.db, assignment.id) == []
+    after
+      :code.delete(write_path)
+      :code.purge(write_path)
+    end
 
     progress = attest(ctx, {:session, "holder"}, assignment.id, "progress")
     assert progress.attest.verdictKind == nil
@@ -84,7 +127,30 @@ defmodule Tightbeam.CheckTierTest do
 
     assert length(Assignments.list_attests(ctx.db, assignment.id)) == 3
     assert Assignments.verdict_kinds(ctx.db, assignment.id) == ["tests-passed"]
-    assert %{code: "process_denied"} = verdict(ctx, {:process, "cron"}, assignment.id, "reviewed")
+
+    assert {:ok, result} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               call("attest", {:process, "cron"}, %{
+                 assignment_id: assignment.id,
+                 kind: "verdict",
+                 verdict_kind: "reviewed"
+               })
+             )
+
+    assert result.assignment.state == "open"
+    assert result.attest.byUser == nil
+    assert result.attest.bySession == nil
+    assert result.attest.verdictKind == "reviewed"
+
+    assert {:ok, [["process:cron", payload]]} =
+             DB.query(
+               ctx.db,
+               "SELECT principal,payload FROM events WHERE kind='verb' AND verb='attest' ORDER BY id DESC LIMIT 1"
+             )
+
+    assert payload =~ result.attest.id
     assert %{code: "principal_required"} = verdict(ctx, nil, assignment.id, "reviewed")
 
     assert %{code: "unknown_assignment"} =
@@ -156,7 +222,7 @@ defmodule Tightbeam.CheckTierTest do
     assert Enum.map(rows, & &1.id) == expected
     assert Enum.all?(rows, &Map.has_key?(&1, :verdictKind))
     assert %{attests: [_ | _]} = query_attests(ctx, {:user, "flynn"}, assignment.id)
-    assert %{code: "process_denied"} = query_attests(ctx, {:process, "cron"}, assignment.id)
+    assert %{attests: ^rows} = query_attests(ctx, {:process, "cron"}, assignment.id)
     assert %{code: "principal_required"} = query_attests(ctx, nil, assignment.id)
     assert %{code: "unknown_assignment"} = query_attests(ctx, {:user, "flynn"}, "missing")
   end
