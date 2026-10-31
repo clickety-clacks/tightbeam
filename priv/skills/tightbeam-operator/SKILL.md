@@ -5,7 +5,7 @@ description: Operate a Tightbeam organization from outside it on behalf of a nam
 
 # Operate a Tightbeam organization as an outside operator
 
-Written for Tightbeam 0.1.14. If `tightbeam --version` prints a different version, run
+Written for Tightbeam 0.1.15. If `tightbeam --version` prints a different version, run
 `tightbeam skill install` locally, without `--as-user`, to replace this skill with the
 edition that ships with the installed CLI, then start a fresh agent session. This command
 installs local skill files; it does not act on the organization.

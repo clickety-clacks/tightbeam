@@ -2255,7 +2255,10 @@ mod tests {
             "{request}"
         );
         assert!(
-            lower.contains("x-tightbeam-cli-version: 0.1.14\r\n"),
+            lower.contains(&format!(
+                "x-tightbeam-cli-version: {}\r\n",
+                env!("CARGO_PKG_VERSION")
+            )),
             "{request}"
         );
     }
