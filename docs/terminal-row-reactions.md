@@ -1,7 +1,22 @@
-The engineering bundle elects two terminal-work reactions. Loading the runtime
-alone elects neither. Their source events and pending actions are stored in the
-same transaction as the writes they observe. Rule identity and revision are
-recorded with the action; the recipient and prompt do not define its identity.
+The engineering bundle elects three row reactions. Loading the runtime alone
+elects none. Their source events and pending actions are stored in the same
+transaction as the writes they observe. Rule identity and revision are recorded
+with the action; the recipient and prompt do not define its identity.
+
+`r01-attest-notice` in `row-reaction-attest-notice.toml` means: tell the opener
+once when the holder's first turn delivered for an assignment actually starts.
+Use R02's single handoff for completion or revocation. Tell the opener about an
+unlinked `blocked` verdict, a first late `ruling-consumed` receipt unless the
+explicit ruling result already goes to that same recipient, and a linked review
+verdict. Keep progress and other ordinary unlinked verdicts quiet. `cannot-proceed`
+keeps its separate request path, and replaying a receipt sends nothing. Raising
+a decision request or recording its ordinary ruling adds no extra opener notice;
+the asked party and raiser keep their existing notifications. The opener uses the
+existing session, personal-session, or process-recipient route;
+missing or other-owner recipients are skipped, as is a notice when its author
+and opener are the same session or user. The first-start notice is also skipped
+when the session opener is the holder. The verdict-quiet and first-start notices
+are intentional changes from the prior release line.
 
 `assignment-terminal-handoff` in `row-reaction-handoff.toml` means: when an open
 assignment actually completes or is revoked, create one durable handoff for that

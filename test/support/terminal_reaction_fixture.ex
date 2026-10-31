@@ -6,7 +6,11 @@ defmodule Tightbeam.TerminalReactionFixture do
     rules = Path.join(law, "identity/rules")
     File.mkdir_p!(rules)
 
-    for name <- ~w(row-reaction-handoff.toml row-reaction-terminal-action.toml) do
+    for name <- ~w(
+          row-reaction-attest-notice.toml
+          row-reaction-handoff.toml
+          row-reaction-terminal-action.toml
+        ) do
       source = Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name])
       File.cp!(source, Path.join(rules, name))
     end
