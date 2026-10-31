@@ -931,7 +931,7 @@ defmodule Tightbeam.JobForensicsTest do
       ALTER TABLE wakes ADD COLUMN idleCleanupRecorded INTEGER NOT NULL DEFAULT 0;
       """)
 
-    # A predecessor fixture must exclude later delivery, source, and record-event stamp columns.
+    # A predecessor fixture must exclude later delivery and source columns.
     :ok =
       DB.execute(legacy_db, """
       ALTER TABLE wakes DROP COLUMN sourceClientIdentity;
@@ -939,7 +939,6 @@ defmodule Tightbeam.JobForensicsTest do
       ALTER TABLE wakes DROP COLUMN sourceVisibilityScope;
       ALTER TABLE wakes DROP COLUMN sourceAddress;
       ALTER TABLE wakes DROP COLUMN deliveredTurnSeq;
-      ALTER TABLE wakes DROP COLUMN recordEventIds;
       """)
 
     assert {:ok, []} =

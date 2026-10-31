@@ -65,8 +65,7 @@ defmodule Tightbeam.D1Read do
           boundary,
           limit,
           fn [key, _value, _updated_at] -> [key] end,
-          &config_item/1,
-          "key NOT GLOB 'record-event-feed-activation:*'"
+          &config_item/1
         )
 
       :host_environment ->
@@ -162,12 +161,7 @@ defmodule Tightbeam.D1Read do
   end
 
   defp rows(:config, db, _base_dir) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT key, value, updatedAt FROM org_settings " <>
-          "WHERE key NOT GLOB 'record-event-feed-activation:*' ORDER BY key"
-      )
+    {:ok, rows} = DB.query(db, "SELECT key, value, updatedAt FROM org_settings ORDER BY key")
 
     Enum.map(rows, fn [key, value, updated_at] ->
       %{
@@ -239,20 +233,8 @@ defmodule Tightbeam.D1Read do
     |> Enum.map(&Identity.public_kungfu(base_dir, &1))
   end
 
-  defp sql_page(
-         db,
-         select_from,
-         probe_from,
-         filters,
-         order,
-         boundary,
-         limit,
-         tuple,
-         mapper,
-         base_where \\ nil
-       ) do
-    {filter_where, params} = in_filters(filters)
-    where = join_where(base_where, filter_where)
+  defp sql_page(db, select_from, probe_from, filters, order, boundary, limit, tuple, mapper) do
+    {where, params} = in_filters(filters)
 
     case DB.transaction(db, fn txn ->
            query = fn sql, query_params -> Txn.q(txn, sql, query_params) end
@@ -276,10 +258,6 @@ defmodule Tightbeam.D1Read do
       {:error, error} -> raise error
     end
   end
-
-  defp join_where(nil, where), do: where
-  defp join_where(where, nil), do: where
-  defp join_where(base, filter), do: "(" <> base <> ") AND (" <> filter <> ")"
 
   defp finite_page(rows, resource, boundary, limit) do
     tuple = &tuple(resource, &1)

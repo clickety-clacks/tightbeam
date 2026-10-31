@@ -10,7 +10,6 @@ defmodule Tightbeam.Firehose.Registry do
 
   @observational ~w(
     verb.accepted verb.denied rail.denied lifecycle.boot lifecycle.clean_shutdown
-    session_record_event.created
     lifecycle.dirty_exit lifecycle.takeover prod.fired
     lifecycle.terminal_credential_opened
     lifecycle.terminal_credential_suppression_activated
