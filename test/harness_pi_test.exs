@@ -203,35 +203,13 @@ defmodule Tightbeam.HarnessPiTest do
           File.write!(identity, "not a served identity carrier")
 
         :wrong_session ->
-          materialize_pi_identity!(root, "agent:pi:another-session", "WRONG IDENTITY")
+          copy_foreign_pi_identity!(root, "agent:pi:another-session", "WRONG IDENTITY")
 
         :correct ->
           materialize_pi_identity!(root, session_key, "SERVED IDENTITY FIXTURE")
       end
 
-      File.write!(extension, Pi.extension_source(%{"hooks" => %{}}))
-
-      File.write!(
-        runner,
-        """
-        import extension from #{JSON.encode!(extension)};
-        import { writeFileSync } from "node:fs";
-        const handlers = {};
-        extension({ on(name, handler) { handlers[name] = handler; } });
-
-        try {
-          const identity = await handlers.before_agent_start({ systemPrompt: "BASE" });
-          writeFileSync(#{JSON.encode!(model_request)}, "requested");
-          process.stdout.write(JSON.stringify({ identity }));
-        } catch (error) {
-          // Pi 0.84.1 catches hook errors and continues to the model request.
-          console.error(String(error?.message ?? error));
-          writeFileSync(#{JSON.encode!(model_request)}, "requested-after-caught-hook-error");
-        }
-        """
-      )
-
-      {output, status} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
+      {output, status} = run_pi_identity_startup(root, extension, runner, model_request)
 
       if case_name == :correct do
         assert status == 0
@@ -322,36 +300,75 @@ defmodule Tightbeam.HarnessPiTest do
           File.write!(identity, "not a served identity carrier")
 
         :wrong_session ->
-          materialize_pi_identity!(root, "agent:pi:another-session", "WRONG IDENTITY")
+          copy_foreign_pi_identity!(root, "agent:pi:another-session", "WRONG IDENTITY")
       end
 
-      File.write!(extension, Pi.extension_source(%{"hooks" => %{}}))
-
-      File.write!(
-        runner,
-        """
-        import extension from #{JSON.encode!(extension)};
-        import { writeFileSync } from "node:fs";
-        const handlers = {};
-        extension({ on(name, handler) { handlers[name] = handler; } });
-
-        try {
-          await handlers.before_agent_start({ systemPrompt: "BASE" });
-          writeFileSync(#{JSON.encode!(model_request)}, "requested");
-        } catch (error) {
-          console.error(String(error?.message ?? error));
-          writeFileSync(#{JSON.encode!(model_request)}, "requested-after-caught-hook-error");
-        }
-        """
-      )
-
-      {output, status} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
+      {output, status} = run_pi_identity_startup(root, extension, runner, model_request)
 
       assert status == 78
       refute File.exists?(model_request)
       assert output =~ "Tightbeam identity carrier refused startup"
       assert output =~ if(case_name == :malformed, do: "malformed", else: "wrong-session")
     end
+  end
+
+  test "generated extension binds the carrier to the workdir, not to the directory name" do
+    session_key = "agent:pi:ephemeral-helper"
+
+    # Placement.with_turn_directory gives an ephemeral helper a `mktemp -d
+    # /tmp/tightbeam-helper.XXXXXXXXXX` workdir, so nothing in the directory
+    # name derives from the session key. Mirror that layout under tmp_dir!.
+    ephemeral_root =
+      Path.join(tmp_dir!("pi-ephemeral"), "tightbeam-helper.#{random_mktemp_suffix()}")
+
+    File.mkdir_p!(ephemeral_root)
+
+    # A durable session may be reached through a symlinked configured path while
+    # getcwd() reports the physical one; the binding must survive that.
+    symlink_parent = tmp_dir!("pi-symlinked-workdir")
+    physical_root = pi_session_dir!("pi-symlinked-physical", session_key)
+    symlinked_root = Path.join(symlink_parent, "linked")
+    File.ln_s!(physical_root, symlinked_root)
+
+    for {label, root, materialize_at} <- [
+          {:ephemeral, ephemeral_root, ephemeral_root},
+          {:symlinked, symlinked_root, symlinked_root}
+        ] do
+      extension = Path.join(root, "tightbeam.mjs")
+      runner = Path.join(root, "runner.mjs")
+      model_request = Path.join(root, "model-requested")
+
+      materialize_pi_identity!(materialize_at, session_key, "SERVED IDENTITY #{label}")
+
+      {output, 0} = run_pi_identity_startup(root, extension, runner, model_request)
+
+      assert JSON.decode!(output) == %{
+               "identity" => %{"systemPrompt" => "BASE\n\nSERVED IDENTITY #{label}"}
+             }
+
+      assert File.read!(model_request) == "requested"
+    end
+
+    # The same ephemeral helper refuses a carrier that another helper's turn
+    # directory materialized for the same session key: the binding is the
+    # workdir the gateway wrote into, not a name the directory happens to have.
+    stale_root =
+      Path.join(tmp_dir!("pi-ephemeral-stale"), "tightbeam-helper.#{random_mktemp_suffix()}")
+
+    File.mkdir_p!(stale_root)
+    File.rm_rf!(Path.join(ephemeral_root, ".pi"))
+    copy_foreign_pi_identity!(ephemeral_root, session_key, "STALE IDENTITY", stale_root)
+
+    extension = Path.join(ephemeral_root, "tightbeam.mjs")
+    runner = Path.join(ephemeral_root, "runner.mjs")
+    model_request = Path.join(ephemeral_root, "model-requested")
+    File.rm!(model_request)
+
+    {output, 78} = run_pi_identity_startup(ephemeral_root, extension, runner, model_request)
+
+    refute File.exists?(model_request)
+    assert output =~ "Tightbeam identity carrier refused startup"
+    assert output =~ "wrong-session"
   end
 
   test "catalog refuses a provider mismatch instead of relabeling it" do
@@ -608,6 +625,50 @@ defmodule Tightbeam.HarnessPiTest do
         skills: %{}
       }
     )
+  end
+
+  # A carrier the gateway materialized into another session's workdir, then
+  # found in `root`: the realistic wrong-session case (a copied or left-over
+  # carrier), since the gateway itself only ever writes a carrier in place.
+  defp copy_foreign_pi_identity!(root, session_key, guidance, foreign_root \\ nil) do
+    foreign_root = foreign_root || pi_session_dir!("pi-foreign-workdir", session_key)
+    materialize_pi_identity!(foreign_root, session_key, guidance)
+
+    identity = pi_identity_path(root)
+    File.mkdir_p!(Path.dirname(identity))
+    File.cp!(pi_identity_path(foreign_root), identity)
+  end
+
+  defp run_pi_identity_startup(root, extension, runner, model_request) do
+    File.write!(extension, Pi.extension_source(%{"hooks" => %{}}))
+
+    File.write!(
+      runner,
+      """
+      import extension from #{JSON.encode!(extension)};
+      import { writeFileSync } from "node:fs";
+      const handlers = {};
+      extension({ on(name, handler) { handlers[name] = handler; } });
+
+      try {
+        const identity = await handlers.before_agent_start({ systemPrompt: "BASE" });
+        writeFileSync(#{JSON.encode!(model_request)}, "requested");
+        process.stdout.write(JSON.stringify({ identity }));
+      } catch (error) {
+        // Pi 0.84.1 catches hook errors and continues to the model request.
+        console.error(String(error?.message ?? error));
+        writeFileSync(#{JSON.encode!(model_request)}, "requested-after-caught-hook-error");
+      }
+      """
+    )
+
+    System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
+  end
+
+  defp random_mktemp_suffix do
+    :crypto.strong_rand_bytes(8)
+    |> Base.encode32(case: :upper, padding: false)
+    |> binary_part(0, 10)
   end
 
   defp pi_identity_path(root) do
