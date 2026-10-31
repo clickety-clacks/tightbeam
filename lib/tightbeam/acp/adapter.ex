@@ -1048,7 +1048,7 @@ defmodule Tightbeam.Acp.Adapter do
            %{
              cwd: cwd,
              mcpServers: mcp_servers,
-             _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
+             _meta: Harness.module!(state.harness).session_config(%{cwd: cwd}, guidance).meta
            },
            timeout: request_timeout,
            diagnostic: true
@@ -1111,7 +1111,7 @@ defmodule Tightbeam.Acp.Adapter do
                sessionId: sid,
                cwd: cwd,
                mcpServers: mcp_servers,
-               _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
+               _meta: Harness.module!(state.harness).session_config(%{cwd: cwd}, guidance).meta
              },
              timeout: request_timeout,
              diagnostic: true
@@ -1176,7 +1176,7 @@ defmodule Tightbeam.Acp.Adapter do
              sessionId: sid,
              cwd: cwd,
              mcpServers: mcp_servers,
-             _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
+             _meta: Harness.module!(state.harness).session_config(%{cwd: cwd}, guidance).meta
            },
            timeout: request_timeout,
            diagnostic: true

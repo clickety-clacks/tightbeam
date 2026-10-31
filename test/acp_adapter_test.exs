@@ -2438,13 +2438,21 @@ defmodule Tightbeam.Acp.AdapterTest do
       assert loaded["cwd"] == cwd
       assert loaded["mcpServers"] == mcp
 
-      assert loaded["meta"] == %{
+      assert Map.delete(loaded["meta"], "claudeCode") == %{
                "systemPrompt" => %{
                  "type" => "preset",
                  "preset" => "claude_code",
                  "append" => guidance
                }
              }
+
+      exclusions =
+        get_in(loaded, ["meta", "claudeCode", "options", "settings", "claudeMdExcludes"])
+
+      assert is_list(exclusions)
+      assert Path.join(Path.dirname(cwd), ".claude/CLAUDE.md") in exclusions
+      refute Path.join(cwd, "CLAUDE.md") in exclusions
+      assert created["meta"]["claudeCode"] == loaded["meta"]["claudeCode"]
 
       assert prompted["sessionId"] == "sess-1"
       load_index = Enum.find_index(requests, &(&1["method"] == "session/load"))
@@ -2488,6 +2496,13 @@ defmodule Tightbeam.Acp.AdapterTest do
           {:codex, %{}},
           {:claude,
            %{
+             "claudeCode" => %{
+               "options" => %{
+                 "settings" => %{
+                   "claudeMdExcludes" => ["/CLAUDE.md", "/.claude/CLAUDE.md", "/CLAUDE.local.md"]
+                 }
+               }
+             },
              "systemPrompt" => %{
                "type" => "preset",
                "preset" => "claude_code",
@@ -2940,6 +2955,20 @@ defmodule Tightbeam.Acp.AdapterTest do
              Adapter.switch_model_session(adapter, "sess-1", requested, "/tmp", [], "guidance")
 
     assert {:ok, ^selected} = Adapter.current_model(adapter, "sess-fork-1")
+
+    requests =
+      captured_requests(capture_path)
+      |> Enum.filter(&(&1["method"] in ["session/new", "session/load", "session/fork"]))
+
+    assert Enum.map(requests, & &1["method"]) == ["session/new", "session/load", "session/fork"]
+
+    for request <- requests do
+      assert get_in(request, ["meta", "claudeCode", "options", "settings"]) == %{
+               "claudeMdExcludes" => ["/CLAUDE.md", "/.claude/CLAUDE.md", "/CLAUDE.local.md"]
+             }
+
+      assert get_in(request, ["meta", "systemPrompt", "append"]) == "guidance"
+    end
 
     model_writes =
       captured_requests(capture_path)
