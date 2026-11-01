@@ -7,8 +7,12 @@ defmodule Tightbeam.HarklightWakes do
   """
 
   use GenServer
-  alias Tightbeam.{DB, HarklightLifecycle, Org, Placement, Supervision, Wakes}
+  alias Tightbeam.{DB, ErrorDiagnostic, HarklightLifecycle, Org, Placement, Supervision, Wakes}
   alias Tightbeam.DB.Txn
+
+  @max_diagnostic_lines 3
+  @max_diagnostic_line_chars 240
+  @max_diagnostic_chars 768
 
   @ddl """
   CREATE TABLE IF NOT EXISTS harklight_send_operations (
@@ -690,7 +694,8 @@ defmodule Tightbeam.HarklightWakes do
         now = System.system_time(:millisecond)
         completed = status == :complete
         next_state = if completed, do: "complete", else: "unavailable"
-        error = if completed, do: nil, else: to_string(status)
+        {error, operation, diagnostic} =
+          if completed, do: {nil, nil, nil}, else: failure_details(status)
 
         Txn.q(
           txn,
@@ -711,6 +716,8 @@ defmodule Tightbeam.HarklightWakes do
                 else: "listener_failure"
               ),
               error,
+              operation,
+              diagnostic,
               now
             )
 
@@ -735,6 +742,8 @@ defmodule Tightbeam.HarklightWakes do
             handle,
             "origin_unavailable",
             "origin_unavailable",
+            nil,
+            nil,
             System.system_time(:millisecond)
           )
 
@@ -744,11 +753,29 @@ defmodule Tightbeam.HarklightWakes do
     end)
   end
 
-  defp notify_owner_in_txn(txn, session_key, handle, notice_kind, error, now) do
+  defp notify_owner_in_txn(
+         txn,
+         session_key,
+         handle,
+         notice_kind,
+         error,
+         operation,
+         diagnostic,
+         now
+       ) do
     wake_id = "w_harklight_notice_" <> notice_kind <> "_" <> handle
 
     if Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id]) == [] do
       if recipient = Supervision.ladder_target(txn, session_key, 1) do
+        cli_output =
+          case {operation, diagnostic} do
+            {operation, diagnostic} when operation in ["attach", "listen"] and is_binary(diagnostic) ->
+              " Failure cause is unknown. Sanitized #{String.upcase(operation)} CLI output: #{diagnostic}."
+
+            _ ->
+              " Failure cause is unknown. No safe Agent CLI diagnostic was captured."
+          end
+
         wake =
           Wakes.schedule_in_txn(txn, %{
             wake_id: wake_id,
@@ -756,7 +783,7 @@ defmodule Tightbeam.HarklightWakes do
             origin: "process:tightbeam",
             creator_session_key: session_key,
             prompt:
-              "Harklight listening for session #{session_key} and handle #{handle} stopped (#{error}). Pending entries remain at the origin. Restore only that session on its original host; do not transfer the conversation.",
+              "Harklight listening for session #{session_key} and handle #{handle} stopped (#{error}).#{cli_output} Pending entries remain at the origin. Restore only that session on its original host; do not transfer the conversation.",
             due_at: now,
             class: "blocker"
           })
@@ -841,6 +868,9 @@ defmodule Tightbeam.HarklightWakes do
               {:error, reason} -> finish(manager, handle, reason)
             end
 
+          {:error, reason, diagnostic} ->
+            finish(manager, handle, failure_status(reason, "attach", diagnostic))
+
           {:error, reason} ->
             finish(manager, handle, reason)
         end
@@ -851,17 +881,19 @@ defmodule Tightbeam.HarklightWakes do
 
   defp attach(executable, args) do
     case attach_once(executable, args) do
-      {:unknown, op_id} ->
+      {:unknown, op_id, diagnostic} ->
         case System.cmd(executable, ["retry", "--op-id", op_id], stderr_to_stdout: true) do
           {_output, 0} -> attach_once(executable, args) |> attach_result()
-          _ -> {:error, "attachment_outcome_unknown"}
+          {output, _} ->
+            {:error, "attachment_outcome_unknown",
+             combine_diagnostics(diagnostic, sanitize_refusal_output(output))}
         end
 
       result ->
         attach_result(result)
     end
   rescue
-    _ -> {:error, "attachment_cli_failed"}
+    _ -> {:error, "attachment_cli_failed", nil}
   end
 
   defp attach_once(executable, args) do
@@ -869,7 +901,7 @@ defmodule Tightbeam.HarklightWakes do
       {output, 0} ->
         if Enum.any?(String.split(output, "\n", trim: true), fn line ->
              match?({:ok, %{"kind" => "attached", "ready_for_listen" => true}}, JSON.decode(line))
-           end), do: :ok, else: {:error, "attachment_unconfirmed"}
+           end), do: :ok, else: {:error, "attachment_unconfirmed", sanitize_refusal_output(output)}
 
       {output, _} ->
         unknown =
@@ -882,11 +914,17 @@ defmodule Tightbeam.HarklightWakes do
             end
           end)
 
-        if unknown, do: {:unknown, unknown}, else: {:error, "attachment_refused"}
+        if unknown,
+          do: {:unknown, unknown, sanitize_refusal_output(output)},
+          else: {:error, "attachment_refused", sanitize_refusal_output(output)}
     end
   end
 
-  defp attach_result({:unknown, _}), do: {:error, "attachment_outcome_unknown"}
+  defp attach_result({:unknown, _op_id, diagnostic}),
+    do: {:error, "attachment_outcome_unknown", diagnostic}
+
+  defp attach_result({:unknown, _}), do: {:error, "attachment_outcome_unknown", nil}
+  defp attach_result({:error, reason}), do: {:error, reason, nil}
   defp attach_result(result), do: result
 
   defp follow(manager, executable, handle) do
@@ -894,13 +932,14 @@ defmodule Tightbeam.HarklightWakes do
       Port.open({:spawn_executable, executable}, [
         :binary,
         :exit_status,
+        :stderr_to_stdout,
         args: ["listen", "--follow", "--controller", "--session", handle]
       ])
 
-    receive_lines(manager, port, handle, "")
+    receive_lines(manager, port, handle, "", [])
   end
 
-  defp receive_lines(manager, port, handle, pending) do
+  defp receive_lines(manager, port, handle, pending, diagnostics) do
     receive do
       {^port, {:data, bytes}} ->
         data = pending <> bytes
@@ -910,29 +949,168 @@ defmodule Tightbeam.HarklightWakes do
         result =
           lines
           |> Enum.drop(-1)
-          |> Enum.reduce_while(:ok, fn line, _ ->
-            case GenServer.call(manager, {:capture, handle, line}, :infinity) do
-              :ok -> {:cont, :ok}
-              {:error, reason} -> {:halt, {:error, reason}}
+          |> Enum.reduce_while({:ok, diagnostics}, fn line, {:ok, current_diagnostics} ->
+            case receive_listener_line(manager, handle, line, current_diagnostics) do
+              {:ok, next_diagnostics} -> {:cont, {:ok, next_diagnostics}}
+              {:error, reason, next_diagnostics} ->
+                {:halt, {:error, reason, next_diagnostics}}
             end
           end)
 
         case result do
-          :ok ->
-            receive_lines(manager, port, handle, remainder)
+          {:ok, next_diagnostics} ->
+            receive_lines(manager, port, handle, remainder, next_diagnostics)
 
-          {:error, reason} ->
+          {:error, reason, next_diagnostics} ->
             Port.close(port)
-            finish(manager, handle, reason)
+            finish(
+              manager,
+              handle,
+              failure_status(reason, "listen", joined_diagnostics(next_diagnostics))
+            )
         end
 
       {^port, {:exit_status, 0}} ->
-        finish(manager, handle, if(pending == "", do: :complete, else: "incomplete_line"))
+        status =
+          if pending == "",
+            do: :complete,
+            else:
+              failure_status(
+                "incomplete_line",
+                "listen",
+                joined_diagnostics(append_diagnostic(diagnostics, pending))
+              )
+
+        finish(manager, handle, status)
 
       {^port, {:exit_status, _}} ->
-        finish(manager, handle, "listener_stopped")
+        finish(
+          manager,
+          handle,
+          failure_status("listener_stopped", "listen", joined_diagnostics(diagnostics))
+        )
     end
   end
+
+  # The Agent emits JSON events on stdout and reconnect/refusal messages on
+  # stderr. The port merges them; keep plain-text diagnostics without treating
+  # them as events, and leave every JSON line on the existing capture path.
+  defp receive_listener_line(manager, handle, line, diagnostics) do
+    case JSON.decode(line) do
+      {:ok, _event} ->
+        case GenServer.call(manager, {:capture, handle, line}, :infinity) do
+          :ok -> {:ok, diagnostics}
+          {:error, reason} -> {:error, reason, append_diagnostic(diagnostics, line)}
+        end
+
+      {:error, _} ->
+        if structured_output_line?(line) do
+          {:error, "invalid_listener_line", diagnostics}
+        else
+          {:ok, append_diagnostic(diagnostics, line)}
+        end
+    end
+  end
+
+  defp failure_status(error, operation, diagnostic),
+    do: {:harklight_failure, error, operation, diagnostic}
+
+  defp failure_details({:harklight_failure, error, operation, diagnostic}),
+    do: {to_string(error), operation, sanitize_refusal_output(diagnostic)}
+
+  defp failure_details(error), do: {to_string(error), nil, nil}
+
+  @doc false
+  def sanitize_refusal_output(output) when is_binary(output) do
+    output
+    |> String.split(~r/[\r\n]+/, trim: true)
+    |> Enum.flat_map(&refusal_detail_lines/1)
+    |> Enum.map(&sanitize_diagnostic_text/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+    |> Enum.take(@max_diagnostic_lines)
+    |> Enum.join(" | ")
+    |> String.slice(0, @max_diagnostic_chars)
+    |> blank_to_nil()
+  end
+
+  def sanitize_refusal_output(_), do: nil
+
+  defp refusal_detail_lines(line) do
+    case JSON.decode(String.trim(line)) do
+      {:ok, %{"kind" => kind, "reason" => reason}}
+      when kind in ["error", "unsupported"] and is_binary(reason) ->
+        [reason]
+
+      {:ok, %{"type" => "error", "reason" => reason}} when is_binary(reason) ->
+        [reason]
+
+      {:ok,
+       %{
+         "kind" => "attached",
+         "ready_for_listen" => false,
+         "listening_support" => %{"unsupported_reason" => reason}
+       }}
+      when is_binary(reason) ->
+        [reason]
+
+      {:ok, _structured_output} ->
+        []
+
+      {:error, _} ->
+        if structured_output_line?(line), do: [], else: [line]
+    end
+  end
+
+  defp sanitize_diagnostic_text(text) do
+    text =
+      text
+      |> String.trim()
+      |> String.replace(~r/\{.*\}|\[(?!REDACTED:)[^\]]*\]/u, "[REDACTED:structured output]")
+      |> String.replace(~r/https?:\/\/[^\s]+/i, "[REDACTED:url]")
+      |> String.replace(
+        ~r/\b(payload|body|content|title|message)\s*[:=].*$/i,
+        "\\1=[REDACTED:content]"
+      )
+      |> ErrorDiagnostic.redact_text()
+      |> String.replace(~r/[\x00-\x1F\x7F]+/u, " ")
+      |> String.replace(~r/\s+/, " ")
+      |> String.trim()
+
+    if text == "" do
+      nil
+    else
+      String.slice(text, 0, @max_diagnostic_line_chars)
+    end
+  end
+
+  defp structured_output_line?(line) do
+    String.starts_with?(String.trim_leading(line), ["{", "["])
+  end
+
+  defp append_diagnostic(diagnostics, output) do
+    case sanitize_refusal_output(output) do
+      nil -> diagnostics
+      diagnostic -> Enum.take(diagnostics ++ [diagnostic], -@max_diagnostic_lines)
+    end
+  end
+
+  defp joined_diagnostics([]), do: nil
+
+  defp joined_diagnostics(diagnostics),
+    do: diagnostics |> Enum.join(" | ") |> String.slice(0, @max_diagnostic_chars)
+
+  defp combine_diagnostics(left, right) do
+    [left, right]
+    |> Enum.reject(&(not is_binary(&1) or &1 == ""))
+    |> Enum.uniq()
+    |> Enum.join(" | ")
+    |> String.slice(0, @max_diagnostic_chars)
+    |> blank_to_nil()
+  end
+
+  defp blank_to_nil(""), do: nil
+  defp blank_to_nil(value), do: value
 
   defp finish(manager, handle, status),
     do: GenServer.call(manager, {:finished, handle, status}, :infinity)

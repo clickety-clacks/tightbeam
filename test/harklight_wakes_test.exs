@@ -657,6 +657,103 @@ defmodule Tightbeam.HarklightWakesTest do
     assert String.contains?(prompt, @handle)
   end
 
+  test "an attach refusal is sanitized and readable in the owner wake", %{db: db, call: call} do
+    fake_harklight_agent!("""
+    if [ "$1" = "attach" ]; then
+      printf '%s\\n' 'origin refused attachment: token=attach-secret-canary' >&2
+      exit 7
+    fi
+    exit 0
+    """)
+
+    assert %{state: "registered"} = HarklightWakes.register(db, call)
+    start_supervised!({HarklightWakes, db: db})
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ]) == {:ok, [["unavailable", "attachment_refused"]]}
+           end)
+
+    assert {:ok, [[prompt]]} =
+             DB.query(
+               db,
+               "SELECT prompt FROM wakes WHERE wakeId=?1",
+               ["w_harklight_notice_listener_failure_" <> @handle]
+             )
+
+    assert prompt =~ "Failure cause is unknown."
+    assert prompt =~ "Sanitized ATTACH CLI output"
+    assert prompt =~ "origin refused attachment"
+    assert prompt =~ "[REDACTED:secret_field]"
+    refute prompt =~ "attach-secret-canary"
+  end
+
+  test "structured refusal output keeps only its safe reason field" do
+    refusal =
+      JSON.encode!(%{
+        kind: "unsupported",
+        reason: "route unavailable token=structured-secret-canary",
+        payload: "structured-payload-canary"
+      })
+
+    assert "route unavailable token=[REDACTED:secret_field]" ==
+             HarklightWakes.sanitize_refusal_output(refusal)
+
+    assert is_nil(
+             HarklightWakes.sanitize_refusal_output(
+               JSON.encode!(%{kind: "event", entry: %{content: "event-payload-canary"}})
+             )
+           )
+  end
+
+  test "listen stderr is reported without exposing captured event payloads", %{db: db, call: call} do
+    attached = JSON.encode!(%{kind: "attached", ready_for_listen: true})
+    event_line = event(1, "discussion", "listen-payload-canary")
+
+    fake_harklight_agent!("""
+    if [ "$1" = "attach" ]; then
+      printf '%s\\n' '#{attached}'
+      exit 0
+    fi
+
+    if [ "$1" = "listen" ]; then
+      printf '%s\\n' 'origin stream refused: token=listen-secret-canary' >&2
+      printf '%s\\n' '#{event_line}'
+      exit 9
+    fi
+    exit 0
+    """)
+
+    assert %{state: "registered"} = HarklightWakes.register(db, call)
+    start_supervised!({HarklightWakes, db: db})
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ]) == {:ok, [["unavailable", "listener_stopped"]]}
+           end)
+
+    assert {:ok, [[prompt]]} =
+             DB.query(
+               db,
+               "SELECT prompt FROM wakes WHERE wakeId=?1",
+               ["w_harklight_notice_listener_failure_" <> @handle]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_entries WHERE handle=?1", [
+               @handle
+             ])
+
+    assert prompt =~ "Failure cause is unknown."
+    assert prompt =~ "Sanitized LISTEN CLI output"
+    assert prompt =~ "origin stream refused"
+    assert prompt =~ "[REDACTED:secret_field]"
+    refute prompt =~ "listen-secret-canary"
+    refute prompt =~ "listen-payload-canary"
+  end
+
   test "retirement and host movement fence new captures without losing old wakes", %{
     db: db,
     call: call,
@@ -2445,5 +2542,35 @@ defmodule Tightbeam.HarklightWakesTest do
         transport_session_key: session.session_key,
         params: params
     }
+  end
+
+  defp fake_harklight_agent!(body) do
+    directory =
+      Path.join(System.tmp_dir!(), "harklight-agent-test-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(directory)
+    executable = Path.join(directory, "harklight-agent")
+    File.write!(executable, "#!/bin/sh\n" <> body)
+    File.chmod!(executable, 0o755)
+
+    previous_path = System.get_env("PATH")
+    System.put_env("PATH", Enum.join([directory, previous_path] |> Enum.reject(&is_nil/1), ":"))
+
+    on_exit(fn ->
+      if is_nil(previous_path), do: System.delete_env("PATH"), else: System.put_env("PATH", previous_path)
+      File.rm_rf!(directory)
+    end)
+  end
+
+  defp eventually(fun, attempts \\ 100)
+  defp eventually(fun, 0), do: fun.()
+
+  defp eventually(fun, attempts) do
+    if fun.() do
+      true
+    else
+      Process.sleep(10)
+      eventually(fun, attempts - 1)
+    end
   end
 end
