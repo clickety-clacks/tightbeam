@@ -299,6 +299,12 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
     assert read(ctx, ctx.selected, "asUser=owner&before=" <> cursor).status == 200
     assert_error(read(ctx, ctx.sibling, "asUser=owner&before=" <> cursor), 400, "invalid_cursor")
 
+    admin_view =
+      read(ctx, ctx.selected, "asUser=" <> ctx.admin.user_id <> "&before=" <> cursor)
+
+    assert admin_view.status == 200
+    assert Enum.map(body(admin_view)["items"], & &1["content"]) == ["one", "two"]
+
     other_principal =
       read(ctx, ctx.selected, "asUser=owner&before=" <> cursor, ctx.admin.token) |> body()
 
