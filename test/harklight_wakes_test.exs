@@ -809,7 +809,7 @@ defmodule Tightbeam.HarklightWakesTest do
     assert eventually(fn ->
              DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
                @handle
-             ]) == {:ok, [["unavailable", "attachment_outcome_unknown"]]}
+             ]) == {:ok, [["unavailable", "attachment_cli_failed"]]}
            end)
 
     assert {:ok, [[prompt]]} =
@@ -845,7 +845,6 @@ defmodule Tightbeam.HarklightWakesTest do
     call: call
   } do
     attached = JSON.encode!(%{kind: "attached", ready_for_listen: true})
-
     fake_harklight_agent!("""
     if [ "$1" = "attach" ]; then
       printf '%s\\n' '#{attached}'
@@ -861,12 +860,6 @@ defmodule Tightbeam.HarklightWakesTest do
 
     assert %{state: "registered"} = HarklightWakes.register(db, call)
     start_supervised!({HarklightWakes, db: db})
-
-    assert eventually(fn ->
-             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
-               @handle
-             ]) == {:ok, [["unavailable", "listener_stopped"]]}
-           end)
 
     assert {:ok, [[prompt]]} =
              DB.query(
@@ -943,8 +936,69 @@ defmodule Tightbeam.HarklightWakesTest do
     fi
 
     if [ "$1" = "listen" ]; then
+      printf '%s\\n' 'https://diagnostic.example/path Harklight origin stream unavailable; retrying after disconnect: prior cursor was accepted but no next event followed because the origin stream remained closed' >&2
+      printf '%s\\n' 'Harklight origin stream unavailable; retrying after disconnect: message=the original event remains unavailable while the source continues trying to reconnect' >&2
       printf '%s' 'final refusal token=unterminated-secret-canary' >&2
       exit 19
+    fi
+    exit 0
+    """)
+
+    assert %{state: "registered"} = HarklightWakes.register(db, call)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        start_supervised!({HarklightWakes, db: db})
+
+        assert eventually(fn ->
+                 DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+                   @handle
+                 ]) == {:ok, [["unavailable", "listener_stopped"]]}
+               end)
+      end)
+
+    assert {:ok, [[prompt]]} =
+             DB.query(
+               db,
+               "SELECT prompt FROM wakes WHERE wakeId=?1",
+               ["w_harklight_notice_listener_failure_" <> @handle]
+             )
+
+    assert prompt =~ "LISTEN attempt; exit status: 19"
+    assert prompt =~ "Harklight origin stream unavailable; retrying after disconnect"
+    assert prompt =~ "[REDACTED:url]"
+    assert prompt =~ "message=[REDACTED:content]"
+    assert prompt =~ "final refusal"
+    assert prompt =~ "[REDACTED:secret_field]"
+    refute prompt =~ "unterminated-secret-canary"
+    assert log =~ "final refusal"
+    assert log =~ "[REDACTED:url]"
+    assert log =~ "message=[REDACTED:content]"
+    refute log =~ "unterminated-secret-canary"
+  end
+
+  test "invalid bytes in a structured event preserve the listener parse failure", %{
+    db: db,
+    call: call
+  } do
+    attached = JSON.encode!(%{kind: "attached", ready_for_listen: true})
+    event_line = event(1, "discussion", "invalid-byte-event-canary")
+    event_line = :binary.replace(event_line, "invalid-byte-event-canary", "bad" <> <<255>> <> "event-payload")
+
+    printf_format =
+      event_line
+      |> :binary.bin_to_list()
+      |> Enum.map_join(fn byte -> "\\" <> Integer.to_string(byte, 8) end)
+
+    fake_harklight_agent!("""
+    if [ "$1" = "attach" ]; then
+      printf '%s\\n' '#{attached}'
+      exit 0
+    fi
+
+    if [ "$1" = "listen" ]; then
+      printf '#{printf_format}\\n'
+      exit 0
     fi
     exit 0
     """)
@@ -955,8 +1009,13 @@ defmodule Tightbeam.HarklightWakesTest do
     assert eventually(fn ->
              DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
                @handle
-             ]) == {:ok, [["unavailable", "listener_stopped"]]}
+             ]) == {:ok, [["unavailable", "invalid_listener_line"]]}
            end)
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_entries WHERE handle=?1", [
+               @handle
+             ])
 
     assert {:ok, [[prompt]]} =
              DB.query(
@@ -965,10 +1024,8 @@ defmodule Tightbeam.HarklightWakesTest do
                ["w_harklight_notice_listener_failure_" <> @handle]
              )
 
-    assert prompt =~ "LISTEN attempt; exit status: 19"
-    assert prompt =~ "final refusal"
-    assert prompt =~ "[REDACTED:secret_field]"
-    refute prompt =~ "unterminated-secret-canary"
+    refute prompt =~ "invalid-byte-event-canary"
+    refute prompt =~ "event-payload"
   end
 
   test "a failed attempt on an unavailable handle is logged without another owner wake", %{
@@ -1066,7 +1123,8 @@ defmodule Tightbeam.HarklightWakesTest do
                ["w_harklight_notice_listener_failure_" <> @handle]
              )
 
-    assert prompt =~ "LISTEN attempt (Port exit status); exit status: unknown (not observed)"
+    assert prompt =~
+             "LISTEN attempt (Port unavailable or receive failed); exit status: unknown (not observed)"
   end
 
   test "retirement and host movement fence new captures without losing old wakes", %{

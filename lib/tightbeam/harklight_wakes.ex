@@ -918,6 +918,9 @@ defmodule Tightbeam.HarklightWakes do
 
           {:error, retry_diagnostic} ->
             {:error, "attachment_outcome_unknown", [initial_diagnostic, retry_diagnostic]}
+
+          {:error, reason, retry_diagnostic} ->
+            {:error, reason, [initial_diagnostic, retry_diagnostic]}
         end
 
       result ->
@@ -938,7 +941,8 @@ defmodule Tightbeam.HarklightWakes do
     end
   rescue
     _ ->
-      {:error, attempt_diagnostic("ATTACH existing same-operation retry", nil, nil)}
+      {:error, "attachment_cli_failed",
+       attempt_diagnostic("ATTACH existing same-operation retry", nil, nil)}
   end
 
   defp attach_once(executable, args, attempt) do
@@ -979,18 +983,31 @@ defmodule Tightbeam.HarklightWakes do
   defp attach_result(result), do: result
 
   defp attempt_diagnostic(attempt, exit_status, output) do
-    status =
-      case exit_status do
-        status when is_integer(status) -> "exit status: #{status}"
-        _ -> "exit status: unknown (not observed)"
-      end
+    status = exit_status_detail(exit_status)
 
     output = sanitize_refusal_output(output)
     output_detail = if output, do: "sanitized output: #{output}", else: "no safe output captured"
 
     "#{attempt}; #{status}; #{output_detail}"
-    |> sanitize_diagnostic_text()
+    |> String.slice(0, @max_diagnostic_line_chars)
   end
+
+  defp listen_attempt_diagnostics(attempt, exit_status, diagnostics) do
+    status = exit_status_detail(exit_status)
+
+    case diagnostics do
+      [] ->
+        ["#{attempt}; #{status}; no safe output captured"]
+
+      [first | rest] ->
+        ["#{attempt}; #{status}; sanitized output: #{first}" | Enum.map(rest, &"sanitized output: #{&1}")]
+    end
+    |> Enum.take(@max_diagnostic_lines)
+    |> Enum.map(&String.slice(&1, 0, @max_diagnostic_line_chars))
+  end
+
+  defp exit_status_detail(status) when is_integer(status), do: "exit status: #{status}"
+  defp exit_status_detail(_), do: "exit status: unknown (not observed)"
 
   defp follow(manager, executable, handle) do
     port =
@@ -1010,7 +1027,7 @@ defmodule Tightbeam.HarklightWakes do
         failure_status(
           "listener_failed",
           "listen",
-          attempt_diagnostic("LISTEN attempt (Port exit status)", nil, nil)
+          attempt_diagnostic("LISTEN attempt (Port unavailable or receive failed)", nil, nil)
         )
       )
   end
@@ -1048,7 +1065,7 @@ defmodule Tightbeam.HarklightWakes do
               failure_status(
                 reason,
                 "listen",
-                attempt_diagnostic("LISTEN attempt", nil, joined_diagnostics(next_diagnostics))
+                listen_attempt_diagnostics("LISTEN attempt", nil, next_diagnostics)
               )
             )
         end
@@ -1061,10 +1078,10 @@ defmodule Tightbeam.HarklightWakes do
               failure_status(
                 "incomplete_line",
                 "listen",
-                attempt_diagnostic(
+                listen_attempt_diagnostics(
                   "LISTEN attempt",
                   0,
-                  joined_diagnostics(append_diagnostic(diagnostics, pending))
+                  append_diagnostic(diagnostics, pending)
                 )
               )
 
@@ -1079,7 +1096,7 @@ defmodule Tightbeam.HarklightWakes do
           failure_status(
             "listener_stopped",
             "listen",
-            attempt_diagnostic("LISTEN attempt", exit_status, joined_diagnostics(diagnostics))
+            listen_attempt_diagnostics("LISTEN attempt", exit_status, diagnostics)
           )
         )
     end
@@ -1089,8 +1106,6 @@ defmodule Tightbeam.HarklightWakes do
   # stderr. The port merges them; keep plain-text diagnostics without treating
   # them as events, and leave every JSON line on the existing capture path.
   defp receive_listener_line(manager, handle, line, diagnostics) do
-    line = String.replace_invalid(line)
-
     case JSON.decode(line) do
       {:ok, _event} ->
         case GenServer.call(manager, {:capture, handle, line}, :infinity) do
@@ -1099,10 +1114,12 @@ defmodule Tightbeam.HarklightWakes do
         end
 
       {:error, _} ->
-        if structured_output_line?(line) do
+        diagnostic_line = String.replace_invalid(line)
+
+        if structured_output_line?(diagnostic_line) do
           {:error, "invalid_listener_line", diagnostics}
         else
-          {:ok, append_diagnostic(diagnostics, line)}
+          {:ok, append_diagnostic(diagnostics, diagnostic_line)}
         end
     end
   end
@@ -1141,8 +1158,7 @@ defmodule Tightbeam.HarklightWakes do
 
   defp format_failure_diagnostics(diagnostics) when is_list(diagnostics) do
     diagnostics
-    |> Enum.map(&sanitize_diagnostic_text/1)
-    |> Enum.reject(&is_nil/1)
+    |> Enum.reject(&(not is_binary(&1) or &1 == ""))
     |> Enum.uniq()
     |> Enum.take(@max_diagnostic_lines)
     |> Enum.join(" | ")
@@ -1226,11 +1242,6 @@ defmodule Tightbeam.HarklightWakes do
       diagnostic -> Enum.take(diagnostics ++ [diagnostic], -@max_diagnostic_lines)
     end
   end
-
-  defp joined_diagnostics([]), do: nil
-
-  defp joined_diagnostics(diagnostics),
-    do: diagnostics |> Enum.join(" | ") |> String.slice(0, @max_diagnostic_chars)
 
   defp combine_diagnostics(left, right) do
     [left, right]
