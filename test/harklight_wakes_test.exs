@@ -736,6 +736,63 @@ defmodule Tightbeam.HarklightWakesTest do
     refute prompt =~ "same-op-canary"
   end
 
+  test "a successful same-operation retry and failed re-attach retain all stage output", %{
+    db: db,
+    call: call
+  } do
+    fake_harklight_agent!("""
+    case "$1" in
+      attach)
+        count_file="$0.attach-count"
+        if [ -f "$count_file" ]; then
+          printf '%s\\n' 'reattach refused: token=reattach-secret-canary' >&2
+          exit 12
+        fi
+        touch "$count_file"
+        printf '%s\\n' '{"kind":"outcome_unknown","op_id":"same-op-retained-canary"}' >&2
+        printf '%s\\n' 'initial attachment response: token=initial-secret-canary' >&2
+        exit 7
+        ;;
+      retry)
+        if [ "$2" != "--op-id" ] || [ "$3" != "same-op-retained-canary" ]; then
+          exit 99
+        fi
+        printf '%s\\n' 'same-operation retry completed: token=retry-secret-canary' >&2
+        exit 0
+        ;;
+    esac
+    exit 0
+    """)
+
+    assert %{state: "registered"} = HarklightWakes.register(db, call)
+    start_supervised!({HarklightWakes, db: db})
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ]) == {:ok, [["unavailable", "attachment_refused"]]}
+           end)
+
+    assert {:ok, [[prompt]]} =
+             DB.query(
+               db,
+               "SELECT prompt FROM wakes WHERE wakeId=?1",
+               ["w_harklight_notice_listener_failure_" <> @handle]
+             )
+
+    assert prompt =~ "ATTACH initial attempt; exit status: 7"
+    assert prompt =~ "initial attachment response"
+    assert prompt =~ "ATTACH existing same-operation retry; exit status: 0"
+    assert prompt =~ "same-operation retry completed"
+    assert prompt =~ "ATTACH after same-operation retry; exit status: 12"
+    assert prompt =~ "reattach refused"
+    assert prompt =~ "[REDACTED:secret_field]"
+    refute prompt =~ "initial-secret-canary"
+    refute prompt =~ "retry-secret-canary"
+    refute prompt =~ "reattach-secret-canary"
+    refute prompt =~ "same-op-retained-canary"
+  end
+
   test "an unavailable retry subprocess reports an unobserved exit status", %{db: db, call: call} do
     fake_harklight_agent!("""
     if [ "$1" = "attach" ]; then
@@ -781,6 +838,48 @@ defmodule Tightbeam.HarklightWakesTest do
                JSON.encode!(%{kind: "event", entry: %{content: "event-payload-canary"}})
              )
            )
+  end
+
+  test "invalid bytes in refusal output do not change its failure classification", %{
+    db: db,
+    call: call
+  } do
+    attached = JSON.encode!(%{kind: "attached", ready_for_listen: true})
+
+    fake_harklight_agent!("""
+    if [ "$1" = "attach" ]; then
+      printf '%s\\n' '#{attached}'
+      exit 0
+    fi
+
+    if [ "$1" = "listen" ]; then
+      printf 'origin refused \\377 token=invalid-byte-secret-canary\\n' >&2
+      exit 17
+    fi
+    exit 0
+    """)
+
+    assert %{state: "registered"} = HarklightWakes.register(db, call)
+    start_supervised!({HarklightWakes, db: db})
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ]) == {:ok, [["unavailable", "listener_stopped"]]}
+           end)
+
+    assert {:ok, [[prompt]]} =
+             DB.query(
+               db,
+               "SELECT prompt FROM wakes WHERE wakeId=?1",
+               ["w_harklight_notice_listener_failure_" <> @handle]
+             )
+
+    assert String.valid?(prompt)
+    assert prompt =~ "LISTEN attempt; exit status: 17"
+    assert prompt =~ "origin refused"
+    assert prompt =~ "[REDACTED:secret_field]"
+    refute prompt =~ "invalid-byte-secret-canary"
   end
 
   test "listen stderr is reported without exposing captured event payloads", %{db: db, call: call} do
@@ -829,6 +928,114 @@ defmodule Tightbeam.HarklightWakesTest do
     assert prompt =~ "[REDACTED:secret_field]"
     refute prompt =~ "listen-secret-canary"
     refute prompt =~ "listen-payload-canary"
+  end
+
+  test "a final unterminated listen refusal remains in the failure details", %{
+    db: db,
+    call: call
+  } do
+    attached = JSON.encode!(%{kind: "attached", ready_for_listen: true})
+
+    fake_harklight_agent!("""
+    if [ "$1" = "attach" ]; then
+      printf '%s\\n' '#{attached}'
+      exit 0
+    fi
+
+    if [ "$1" = "listen" ]; then
+      printf '%s' 'final refusal token=unterminated-secret-canary' >&2
+      exit 19
+    fi
+    exit 0
+    """)
+
+    assert %{state: "registered"} = HarklightWakes.register(db, call)
+    start_supervised!({HarklightWakes, db: db})
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ]) == {:ok, [["unavailable", "listener_stopped"]]}
+           end)
+
+    assert {:ok, [[prompt]]} =
+             DB.query(
+               db,
+               "SELECT prompt FROM wakes WHERE wakeId=?1",
+               ["w_harklight_notice_listener_failure_" <> @handle]
+             )
+
+    assert prompt =~ "LISTEN attempt; exit status: 19"
+    assert prompt =~ "final refusal"
+    assert prompt =~ "[REDACTED:secret_field]"
+    refute prompt =~ "unterminated-secret-canary"
+  end
+
+  test "a failed attempt on an unavailable handle is logged without another owner wake", %{
+    db: db,
+    call: call
+  } do
+    assert %{state: "registered"} = HarklightWakes.register(db, call)
+    test_pid = self()
+
+    initial_listener = fn manager, handle, _vendor_id ->
+      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = GenServer.call(manager, {:finished, handle, "listener_stopped"})
+      send(test_pid, :initial_failure_recorded)
+    end
+
+    start_supervised!({HarklightWakes, db: db, listener: initial_listener})
+    assert_receive :initial_failure_recorded
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM wakes WHERE wakeId=?1",
+               ["w_harklight_notice_listener_failure_" <> @handle]
+             )
+
+    stop_supervised!(HarklightWakes)
+
+    retry_listener = fn manager, handle, _vendor_id ->
+      :ok =
+        GenServer.call(
+          manager,
+          {
+            :finished,
+            handle,
+            {:harklight_failure, "listener_stopped", "listen",
+             "LISTEN restore attempt; exit status: 23; sanitized output: retry refused token=repeat-secret-canary"}
+          },
+          :infinity
+        )
+
+      send(test_pid, :restored_failure_recorded)
+    end
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        start_supervised!({HarklightWakes, db: db, listener: retry_listener})
+        assert_receive :restored_failure_recorded, 2_000
+        Process.sleep(20)
+      end)
+
+    assert log =~ "Harklight listener failure"
+    assert log =~ "LISTEN restore attempt; exit status: 23"
+    assert log =~ "retry refused"
+    assert log =~ "[REDACTED:secret_field]"
+    refute log =~ "repeat-secret-canary"
+
+    assert {:ok, [["unavailable", "listener_stopped"]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ])
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM wakes WHERE wakeId=?1",
+               ["w_harklight_notice_listener_failure_" <> @handle]
+             )
   end
 
   test "an unavailable listen Port reports an unobserved exit status", %{db: db, call: call} do
@@ -2673,7 +2880,7 @@ defmodule Tightbeam.HarklightWakesTest do
     end)
   end
 
-  defp eventually(fun, attempts \\ 100)
+  defp eventually(fun, attempts \\ 200)
   defp eventually(fun, 0), do: fun.()
 
   defp eventually(fun, attempts) do

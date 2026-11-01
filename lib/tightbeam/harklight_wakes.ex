@@ -7,6 +7,7 @@ defmodule Tightbeam.HarklightWakes do
   """
 
   use GenServer
+  require Logger
   alias Tightbeam.{DB, ErrorDiagnostic, HarklightLifecycle, Org, Placement, Supervision, Wakes}
   alias Tightbeam.DB.Txn
 
@@ -672,9 +673,14 @@ defmodule Tightbeam.HarklightWakes do
 
   def handle_call({:finished, handle, status}, from, state) do
     result =
-      if valid_worker?(state, handle, from),
-        do: mark_finished(state.db, handle, status),
-        else: :ok
+      if valid_worker?(state, handle, from) do
+        # Later restoration failures still matter when the durable handle is
+        # already unavailable; owner wake/state gating remains in the writer.
+        if status != :complete, do: log_listener_failure(handle, status)
+        mark_finished(state.db, handle, status)
+      else
+        :ok
+      end
 
     {:reply, result, state}
   end
@@ -1065,6 +1071,8 @@ defmodule Tightbeam.HarklightWakes do
         finish(manager, handle, status)
 
       {^port, {:exit_status, exit_status}} ->
+        diagnostics = append_diagnostic(diagnostics, pending)
+
         finish(
           manager,
           handle,
@@ -1081,6 +1089,8 @@ defmodule Tightbeam.HarklightWakes do
   # stderr. The port merges them; keep plain-text diagnostics without treating
   # them as events, and leave every JSON line on the existing capture path.
   defp receive_listener_line(manager, handle, line, diagnostics) do
+    line = String.replace_invalid(line)
+
     case JSON.decode(line) do
       {:ok, _event} ->
         case GenServer.call(manager, {:capture, handle, line}, :infinity) do
@@ -1105,6 +1115,24 @@ defmodule Tightbeam.HarklightWakes do
 
   defp failure_details(error), do: {to_string(error), nil, nil}
 
+  defp log_listener_failure(handle, status) do
+    {error, operation, diagnostic} = failure_details(status)
+    handle = sanitize_diagnostic_text(handle) || "unknown"
+    error = sanitize_diagnostic_text(error) || "unknown"
+    operation =
+      if is_binary(operation),
+        do: sanitize_diagnostic_text(operation) || "unknown",
+        else: "unknown"
+
+    diagnostic =
+      diagnostic ||
+        "stage/attempt: unknown; exit status: unknown (not observed); no safe output captured"
+
+    Logger.warning(
+      "Harklight listener failure handle=#{handle} error=#{error} operation=#{operation}; #{diagnostic}"
+    )
+  end
+
   defp format_failure_diagnostics(nil), do: nil
 
   defp format_failure_diagnostics(diagnostics) when is_binary(diagnostics),
@@ -1124,6 +1152,7 @@ defmodule Tightbeam.HarklightWakes do
   @doc false
   def sanitize_refusal_output(output) when is_binary(output) do
     output
+    |> String.replace_invalid()
     |> String.split(~r/[\r\n]+/, trim: true)
     |> Enum.flat_map(&refusal_detail_lines/1)
     |> Enum.map(&sanitize_diagnostic_text/1)
@@ -1166,6 +1195,7 @@ defmodule Tightbeam.HarklightWakes do
   defp sanitize_diagnostic_text(text) do
     text =
       text
+      |> String.replace_invalid()
       |> String.trim()
       |> String.replace(~r/\{.*\}|\[(?!REDACTED:)[^\]]*\]/u, "[REDACTED:structured output]")
       |> String.replace(~r/https?:\/\/[^\s]+/i, "[REDACTED:url]")
