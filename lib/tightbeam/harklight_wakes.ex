@@ -772,7 +772,7 @@ defmodule Tightbeam.HarklightWakes do
           case {operation, diagnostic} do
             {operation, diagnostic}
             when operation in ["attach", "listen"] and is_binary(diagnostic) ->
-              " Failure cause is unknown. Sanitized #{String.upcase(operation)} CLI output: #{diagnostic}."
+              " Failure cause is unknown. Sanitized #{String.upcase(operation)} CLI failure details: #{diagnostic}."
 
             _ ->
               " Failure cause is unknown. No safe Agent CLI diagnostic was captured."
@@ -849,7 +849,19 @@ defmodule Tightbeam.HarklightWakes do
   defp run_listener(manager, handle, vendor_id) do
     case System.find_executable("harklight-agent") do
       nil ->
-        finish(manager, handle, "cli_missing")
+        finish(
+          manager,
+          handle,
+          failure_status(
+            "cli_missing",
+            "attach",
+            attempt_diagnostic(
+              "ATTACH startup (CLI unavailable; subprocess not launched)",
+              nil,
+              nil
+            )
+          )
+        )
 
       executable ->
         args = [
@@ -882,34 +894,57 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   defp attach(executable, args) do
-    case attach_once(executable, args) do
-      {:unknown, op_id, diagnostic} ->
-        case System.cmd(executable, ["retry", "--op-id", op_id], stderr_to_stdout: true) do
-          {_output, 0} ->
-            attach_once(executable, args) |> attach_result()
+    case attach_once(executable, args, "ATTACH initial attempt") do
+      {:unknown, op_id, initial_diagnostic} ->
+        case retry_existing_operation(executable, op_id) do
+          {:ok, retry_diagnostic} ->
+            case attach_once(executable, args, "ATTACH after same-operation retry") do
+              :ok ->
+                :ok
 
-          {output, _} ->
-            {:error, "attachment_outcome_unknown",
-             combine_diagnostics(diagnostic, sanitize_refusal_output(output))}
+              {:unknown, _op_id, diagnostic} ->
+                {:error, "attachment_outcome_unknown",
+                 [initial_diagnostic, retry_diagnostic, diagnostic]}
+
+              {:error, reason, diagnostic} ->
+                {:error, reason, [initial_diagnostic, retry_diagnostic, diagnostic]}
+            end
+
+          {:error, retry_diagnostic} ->
+            {:error, "attachment_outcome_unknown", [initial_diagnostic, retry_diagnostic]}
         end
 
       result ->
         attach_result(result)
     end
   rescue
-    _ -> {:error, "attachment_cli_failed", nil}
+    _ ->
+      {:error, "attachment_cli_failed", attempt_diagnostic("ATTACH initial attempt", nil, nil)}
   end
 
-  defp attach_once(executable, args) do
+  defp retry_existing_operation(executable, op_id) do
+    case System.cmd(executable, ["retry", "--op-id", op_id], stderr_to_stdout: true) do
+      {output, 0} ->
+        {:ok, attempt_diagnostic("ATTACH existing same-operation retry", 0, output)}
+
+      {output, exit_status} ->
+        {:error, attempt_diagnostic("ATTACH existing same-operation retry", exit_status, output)}
+    end
+  rescue
+    _ ->
+      {:error, attempt_diagnostic("ATTACH existing same-operation retry", nil, nil)}
+  end
+
+  defp attach_once(executable, args, attempt) do
     case System.cmd(executable, args, stderr_to_stdout: true) do
       {output, 0} ->
         if Enum.any?(String.split(output, "\n", trim: true), fn line ->
              match?({:ok, %{"kind" => "attached", "ready_for_listen" => true}}, JSON.decode(line))
            end),
            do: :ok,
-           else: {:error, "attachment_unconfirmed", sanitize_refusal_output(output)}
+           else: {:error, "attachment_unconfirmed", attempt_diagnostic(attempt, 0, output)}
 
-      {output, _} ->
+      {output, exit_status} ->
         unknown =
           output
           |> String.split("\n", trim: true)
@@ -920,10 +955,14 @@ defmodule Tightbeam.HarklightWakes do
             end
           end)
 
+        diagnostic = attempt_diagnostic(attempt, exit_status, output)
+
         if unknown,
-          do: {:unknown, unknown, sanitize_refusal_output(output)},
-          else: {:error, "attachment_refused", sanitize_refusal_output(output)}
+          do: {:unknown, unknown, diagnostic},
+          else: {:error, "attachment_refused", diagnostic}
     end
+  rescue
+    _ -> {:error, "attachment_cli_failed", attempt_diagnostic(attempt, nil, nil)}
   end
 
   defp attach_result({:unknown, _op_id, diagnostic}),
@@ -932,6 +971,20 @@ defmodule Tightbeam.HarklightWakes do
   defp attach_result({:unknown, _}), do: {:error, "attachment_outcome_unknown", nil}
   defp attach_result({:error, reason}), do: {:error, reason, nil}
   defp attach_result(result), do: result
+
+  defp attempt_diagnostic(attempt, exit_status, output) do
+    status =
+      case exit_status do
+        status when is_integer(status) -> "exit status: #{status}"
+        _ -> "exit status: unknown (not observed)"
+      end
+
+    output = sanitize_refusal_output(output)
+    output_detail = if output, do: "sanitized output: #{output}", else: "no safe output captured"
+
+    "#{attempt}; #{status}; #{output_detail}"
+    |> sanitize_diagnostic_text()
+  end
 
   defp follow(manager, executable, handle) do
     port =
@@ -943,6 +996,17 @@ defmodule Tightbeam.HarklightWakes do
       ])
 
     receive_lines(manager, port, handle, "", [])
+  rescue
+    _ ->
+      finish(
+        manager,
+        handle,
+        failure_status(
+          "listener_failed",
+          "listen",
+          attempt_diagnostic("LISTEN attempt (Port exit status)", nil, nil)
+        )
+      )
   end
 
   defp receive_lines(manager, port, handle, pending, diagnostics) do
@@ -975,7 +1039,11 @@ defmodule Tightbeam.HarklightWakes do
             finish(
               manager,
               handle,
-              failure_status(reason, "listen", joined_diagnostics(next_diagnostics))
+              failure_status(
+                reason,
+                "listen",
+                attempt_diagnostic("LISTEN attempt", nil, joined_diagnostics(next_diagnostics))
+              )
             )
         end
 
@@ -987,16 +1055,24 @@ defmodule Tightbeam.HarklightWakes do
               failure_status(
                 "incomplete_line",
                 "listen",
-                joined_diagnostics(append_diagnostic(diagnostics, pending))
+                attempt_diagnostic(
+                  "LISTEN attempt",
+                  0,
+                  joined_diagnostics(append_diagnostic(diagnostics, pending))
+                )
               )
 
         finish(manager, handle, status)
 
-      {^port, {:exit_status, _}} ->
+      {^port, {:exit_status, exit_status}} ->
         finish(
           manager,
           handle,
-          failure_status("listener_stopped", "listen", joined_diagnostics(diagnostics))
+          failure_status(
+            "listener_stopped",
+            "listen",
+            attempt_diagnostic("LISTEN attempt", exit_status, joined_diagnostics(diagnostics))
+          )
         )
     end
   end
@@ -1024,10 +1100,26 @@ defmodule Tightbeam.HarklightWakes do
   defp failure_status(error, operation, diagnostic),
     do: {:harklight_failure, error, operation, diagnostic}
 
-  defp failure_details({:harklight_failure, error, operation, diagnostic}),
-    do: {to_string(error), operation, sanitize_refusal_output(diagnostic)}
+  defp failure_details({:harklight_failure, error, operation, diagnostics}),
+    do: {to_string(error), operation, format_failure_diagnostics(diagnostics)}
 
   defp failure_details(error), do: {to_string(error), nil, nil}
+
+  defp format_failure_diagnostics(nil), do: nil
+
+  defp format_failure_diagnostics(diagnostics) when is_binary(diagnostics),
+    do: format_failure_diagnostics([diagnostics])
+
+  defp format_failure_diagnostics(diagnostics) when is_list(diagnostics) do
+    diagnostics
+    |> Enum.map(&sanitize_diagnostic_text/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+    |> Enum.take(@max_diagnostic_lines)
+    |> Enum.join(" | ")
+    |> String.slice(0, @max_diagnostic_chars)
+    |> blank_to_nil()
+  end
 
   @doc false
   def sanitize_refusal_output(output) when is_binary(output) do

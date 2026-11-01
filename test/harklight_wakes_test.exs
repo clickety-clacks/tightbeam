@@ -683,10 +683,86 @@ defmodule Tightbeam.HarklightWakesTest do
              )
 
     assert prompt =~ "Failure cause is unknown."
-    assert prompt =~ "Sanitized ATTACH CLI output"
+    assert prompt =~ "Sanitized ATTACH CLI failure details"
+    assert prompt =~ "ATTACH initial attempt; exit status: 7"
     assert prompt =~ "origin refused attachment"
     assert prompt =~ "[REDACTED:secret_field]"
     refute prompt =~ "attach-secret-canary"
+  end
+
+  test "an exact-operation retry refusal reports each observed stage and status", %{
+    db: db,
+    call: call
+  } do
+    fake_harklight_agent!("""
+    case "$1" in
+      attach)
+        printf '%s\\n' '{"kind":"outcome_unknown","op_id":"same-op-canary"}' >&2
+        exit 7
+        ;;
+      retry)
+        if [ "$2" != "--op-id" ] || [ "$3" != "same-op-canary" ]; then
+          printf '%s\\n' 'unexpected operation id' >&2
+          exit 99
+        fi
+        printf '%s\\n' 'same operation retry refused: token=retry-secret-canary' >&2
+        exit 8
+        ;;
+    esac
+    exit 0
+    """)
+
+    assert %{state: "registered"} = HarklightWakes.register(db, call)
+    start_supervised!({HarklightWakes, db: db})
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ]) == {:ok, [["unavailable", "attachment_outcome_unknown"]]}
+           end)
+
+    assert {:ok, [[prompt]]} =
+             DB.query(
+               db,
+               "SELECT prompt FROM wakes WHERE wakeId=?1",
+               ["w_harklight_notice_listener_failure_" <> @handle]
+             )
+
+    assert prompt =~ "ATTACH initial attempt; exit status: 7"
+    assert prompt =~ "ATTACH existing same-operation retry; exit status: 8"
+    assert prompt =~ "same operation retry refused"
+    assert prompt =~ "[REDACTED:secret_field]"
+    refute prompt =~ "retry-secret-canary"
+    refute prompt =~ "same-op-canary"
+  end
+
+  test "an unavailable retry subprocess reports an unobserved exit status", %{db: db, call: call} do
+    fake_harklight_agent!("""
+    if [ "$1" = "attach" ]; then
+      printf '%s\\n' '{"kind":"outcome_unknown","op_id":"missing-retry-canary"}' >&2
+      rm "$0"
+      exit 7
+    fi
+    exit 0
+    """)
+
+    assert %{state: "registered"} = HarklightWakes.register(db, call)
+    start_supervised!({HarklightWakes, db: db})
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ]) == {:ok, [["unavailable", "attachment_outcome_unknown"]]}
+           end)
+
+    assert {:ok, [[prompt]]} =
+             DB.query(
+               db,
+               "SELECT prompt FROM wakes WHERE wakeId=?1",
+               ["w_harklight_notice_listener_failure_" <> @handle]
+             )
+
+    assert prompt =~ "ATTACH existing same-operation retry; exit status: unknown (not observed)"
   end
 
   test "structured refusal output keeps only its safe reason field" do
@@ -747,11 +823,43 @@ defmodule Tightbeam.HarklightWakesTest do
              ])
 
     assert prompt =~ "Failure cause is unknown."
-    assert prompt =~ "Sanitized LISTEN CLI output"
+    assert prompt =~ "Sanitized LISTEN CLI failure details"
+    assert prompt =~ "LISTEN attempt; exit status: 9"
     assert prompt =~ "origin stream refused"
     assert prompt =~ "[REDACTED:secret_field]"
     refute prompt =~ "listen-secret-canary"
     refute prompt =~ "listen-payload-canary"
+  end
+
+  test "an unavailable listen Port reports an unobserved exit status", %{db: db, call: call} do
+    attached = JSON.encode!(%{kind: "attached", ready_for_listen: true})
+
+    fake_harklight_agent!("""
+    if [ "$1" = "attach" ]; then
+      printf '%s\\n' '#{attached}'
+      rm "$0"
+      exit 0
+    fi
+    exit 0
+    """)
+
+    assert %{state: "registered"} = HarklightWakes.register(db, call)
+    start_supervised!({HarklightWakes, db: db})
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ]) == {:ok, [["unavailable", "listener_failed"]]}
+           end)
+
+    assert {:ok, [[prompt]]} =
+             DB.query(
+               db,
+               "SELECT prompt FROM wakes WHERE wakeId=?1",
+               ["w_harklight_notice_listener_failure_" <> @handle]
+             )
+
+    assert prompt =~ "LISTEN attempt (Port exit status); exit status: unknown (not observed)"
   end
 
   test "retirement and host movement fence new captures without losing old wakes", %{
