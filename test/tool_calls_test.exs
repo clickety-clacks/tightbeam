@@ -691,6 +691,7 @@ defmodule Tightbeam.ToolCallsTest do
       do: value,
       else: trim_utf8_tail(binary_part(value, 0, byte_size(value) - 1))
   end
+
   # Historical DML, not a current enqueue: the latter reads newer Org tables.
   defp insert_historical_turn(db, attrs) do
     DB.transaction(db, fn txn ->
