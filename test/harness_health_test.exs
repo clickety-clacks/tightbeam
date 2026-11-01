@@ -2130,6 +2130,13 @@ defmodule Tightbeam.HarnessHealthTest do
     assert incident.failureClass == "model_unavailable"
     assert incident.repair.action == "tune"
 
+    assert ConditionFacts.harness_failure_standing?(
+             ctx.db,
+             "claude",
+             "testhost",
+             "model_unavailable"
+           )
+
     assert HarnessHealth.get(ctx.db, incident.id).observations
            |> Enum.map(& &1.correlation_id)
            |> MapSet.new() ==
@@ -2139,6 +2146,13 @@ defmodule Tightbeam.HarnessHealthTest do
              |> MapSet.new()
 
     _restoration = restore_health_turn!(ctx.db, healthy.session, "pi-route-restoration")
+
+    refute ConditionFacts.harness_failure_standing?(
+             ctx.db,
+             "claude",
+             "testhost",
+             "model_unavailable"
+           )
 
     assert {:ok, [[3]]} =
              DB.query(
