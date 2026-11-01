@@ -9,7 +9,7 @@ defmodule Tightbeam.ToolCallsTest do
   alias Tightbeam.ToolCalls
   alias Tightbeam.Wire.Router
 
-  setup do
+  setup context do
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-tool-calls-#{System.unique_integer([:positive])}")
 
@@ -20,7 +20,17 @@ defmodule Tightbeam.ToolCallsTest do
     db = String.to_atom("tool_calls_db_#{System.unique_integer([:positive])}")
     start_supervised!({DB, path: ":memory:", name: db})
     start_supervised!({Hub, name: Hub})
-    :ok = ensure_all_schemas(db)
+
+    if context[:historical_messages] do
+      # Exact pre-tool-call bootstrap, including its evidence root stamp.
+      Tightbeam.HistoricalSchemaFixture.load!(
+        db,
+        "tool_calls_predecessor_51de4df3",
+        "cbd036156edb64eec721bc1cbde4800f0cfc5c9c672d34a9284ad487f8199d91"
+      )
+    else
+      :ok = ensure_all_schemas(db)
+    end
 
     {:paired, device} =
       Devices.pair(db, %{
@@ -30,7 +40,29 @@ defmodule Tightbeam.ToolCallsTest do
         model: nil
       })
 
-    session = ensure_main_session(db, "tool-call-owner")
+    session =
+      if context[:historical_messages] do
+        # Seed only columns in the pinned predecessor. Current Org readers also
+        # require retirement tables that did not exist at this migration boundary.
+        session_key = Org.personal_session_key("tool-call-owner")
+
+        {:ok, _} =
+          DB.query(
+            db,
+            """
+            INSERT INTO sessions
+              (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
+               archetype, harness, provider, model, host, createdAt, updatedAt)
+            VALUES (?1, 'Main', 'main', 1, 'tool-call-owner', 'user:tool-call-owner',
+                    'default', 'claude', 'anthropic', 'fable', 'testhost', 1, 1)
+            """,
+            [session_key]
+          )
+
+        %{session_key: session_key}
+      else
+        ensure_main_session(db, "tool-call-owner")
+      end
 
     {:appended, prompt_message} =
       Projection.append(db, %{
@@ -39,13 +71,17 @@ defmodule Tightbeam.ToolCallsTest do
         content: "Record the prompt before the tool call."
       })
 
+    turn_attrs = %{
+      session_key: session.session_key,
+      message_id: prompt_message.id,
+      origin: "user:tool-call-owner",
+      prompt: prompt_message.content
+    }
+
     {:ok, turn_seq} =
-      Ledger.enqueue(db, %{
-        session_key: session.session_key,
-        message_id: prompt_message.id,
-        origin: "user:tool-call-owner",
-        prompt: prompt_message.content
-      })
+      if context[:historical_messages],
+        do: insert_historical_turn(db, turn_attrs),
+        else: Ledger.enqueue(db, turn_attrs)
 
     opts = [
       db: db,
@@ -403,7 +439,7 @@ defmodule Tightbeam.ToolCallsTest do
 
   test "fresh setup applies the feature-local migration without changing the root stamp", ctx do
     {:ok, [[root_shape]]} = DB.query(ctx.db, "SELECT shape FROM schema_stamp", [])
-    assert root_shape == "launch-preparation-evidence-v1-0112"
+    assert root_shape == "closed-assignment-cannot-proceed-reconciliation-v1-015"
 
     {:ok, [[0, "tool-call-transition-v1-011"]]} =
       DB.query(ctx.db, "SELECT id, shape FROM tool_call_transition_migration", [])
@@ -432,6 +468,7 @@ defmodule Tightbeam.ToolCallsTest do
       )
   end
 
+  @tag :historical_messages
   test "upgrades the named migration while preserving message rows and sequence high water",
        ctx do
     {:ok, :ok} =
@@ -467,7 +504,7 @@ defmodule Tightbeam.ToolCallsTest do
       })
 
     {:ok, _repair_turn_seq} =
-      Ledger.enqueue(ctx.db, %{
+      insert_historical_turn(ctx.db, %{
         session_key: ctx.session_key,
         message_id: repair_message.id,
         origin: "user:recorded-before-rebuild",
@@ -510,10 +547,17 @@ defmodule Tightbeam.ToolCallsTest do
         "UPDATE sqlite_sequence SET seq = #{preserved_high_water} WHERE name = 'messages'"
       )
 
-    rewind_messages_to_predecessor(ctx.db)
+    # The feature-local migration must leave the historical root stamp intact.
+    assert :ok = ToolCalls.ensure_schema(ctx.db)
+
+    assert {:ok, ^root_stamp_before} =
+             DB.query(ctx.db, "SELECT shape,stampedAt FROM schema_stamp", [])
 
     :ok = Tightbeam.Schema.ensure_all(ctx.db)
     assert :ok = ToolCalls.ensure_schema(ctx.db)
+
+    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015", _]]} =
+             DB.query(ctx.db, "SELECT shape,stampedAt FROM schema_stamp", [])
 
     {:ok, [[message_high_water_after]]} =
       DB.query(ctx.db, "SELECT seq FROM sqlite_sequence WHERE name = 'messages'", [])
@@ -560,9 +604,6 @@ defmodule Tightbeam.ToolCallsTest do
 
     assert Enum.map(dedupe_index_columns, fn [_seq, _cid, name] -> name end) ==
              ["sessionKey", "deviceId", "clientMessageId"]
-
-    assert {:ok, ^root_stamp_before} =
-             DB.query(ctx.db, "SELECT shape,stampedAt FROM schema_stamp", [])
 
     assert {:ok, ^memento_stamp_before} =
              DB.query(ctx.db, "SELECT version FROM memento_judgment_index_version", [])
@@ -638,82 +679,6 @@ defmodule Tightbeam.ToolCallsTest do
     |> trim_utf8_tail()
   end
 
-  defp rewind_messages_to_predecessor(db) do
-    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
-
-    {:ok, :ok} =
-      DB.transaction(db, fn txn ->
-        Tightbeam.DB.Txn.exec(txn, """
-        DROP INDEX messages_session;
-        DROP INDEX messages_client_dedupe;
-        CREATE TABLE messages_legacy (
-          seq                    INTEGER PRIMARY KEY AUTOINCREMENT,
-          id                     TEXT NOT NULL UNIQUE,
-          sessionKey             TEXT NOT NULL,
-          role                   TEXT NOT NULL CHECK (role IN ('user','assistant')),
-          content                TEXT NOT NULL,
-          timestamp              INTEGER NOT NULL,
-          sender                 TEXT,
-          deviceId               TEXT,
-          clientMessageId        TEXT,
-          replyToMessageId       TEXT,
-          replyToClientMessageId TEXT,
-          llmVisibleMessageId    TEXT NOT NULL,
-          attachments            TEXT NOT NULL DEFAULT '[]',
-          attentionTier          INTEGER NOT NULL DEFAULT 0,
-          messageType            TEXT,
-          markerKind             TEXT CHECK (
-            markerKind IS NULL OR markerKind IN ('harness-switch','model-retune','session-restart')
-          ),
-          markerFrom             TEXT,
-          markerTo               TEXT,
-          CHECK (
-            (messageType IS 'marker' AND markerKind IS NOT NULL AND markerFrom IS NOT NULL AND markerTo IS NOT NULL)
-            OR
-            (messageType IS NOT 'marker' AND markerKind IS NULL AND markerFrom IS NULL AND markerTo IS NULL)
-          )
-        );
-        INSERT INTO messages_legacy (
-          seq, id, sessionKey, role, content, timestamp, sender, deviceId,
-          clientMessageId, replyToMessageId, replyToClientMessageId,
-          llmVisibleMessageId, attachments, attentionTier, messageType,
-          markerKind, markerFrom, markerTo
-        )
-        SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
-          clientMessageId, replyToMessageId, replyToClientMessageId,
-          llmVisibleMessageId, attachments, attentionTier, messageType,
-          markerKind, markerFrom, markerTo
-        FROM messages;
-        DROP TABLE messages;
-        ALTER TABLE messages_legacy RENAME TO messages;
-        CREATE INDEX messages_session ON messages (sessionKey, seq);
-        CREATE UNIQUE INDEX messages_client_dedupe
-          ON messages (sessionKey, deviceId, clientMessageId)
-          WHERE clientMessageId IS NOT NULL AND deviceId IS NOT NULL;
-        DROP TABLE tool_calls;
-        DROP TABLE tool_call_transition_migration;
-        """)
-      end)
-
-    :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
-
-    {:ok, [[high_water]]} =
-      DB.query(db, "SELECT seq FROM sqlite_sequence WHERE name = 'messages'", [])
-
-    {:ok, [[preserved_high_water]]} =
-      DB.query(
-        db,
-        "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'messages'), 0) + 100",
-        []
-      )
-
-    :ok =
-      DB.execute(
-        db,
-        "UPDATE sqlite_sequence SET seq = #{max(high_water, preserved_high_water)} WHERE name = 'messages'"
-      )
-  end
-
   defp foreign_key_check(db) do
     case DB.query(db, "PRAGMA foreign_key_check", []) do
       {:ok, []} -> :ok
@@ -725,5 +690,22 @@ defmodule Tightbeam.ToolCallsTest do
     if String.valid?(value),
       do: value,
       else: trim_utf8_tail(binary_part(value, 0, byte_size(value) - 1))
+  end
+
+  # Historical DML, not a current enqueue: the latter reads newer Org tables.
+  defp insert_historical_turn(db, attrs) do
+    DB.transaction(db, fn txn ->
+      Tightbeam.DB.Txn.q(
+        txn,
+        """
+        INSERT INTO turns (sessionKey, messageId, origin, prompt, createdAt)
+        VALUES (?1, ?2, ?3, ?4, 1)
+        """,
+        [attrs.session_key, attrs.message_id, attrs.origin, attrs.prompt]
+      )
+
+      [[seq]] = Tightbeam.DB.Txn.q(txn, "SELECT last_insert_rowid()")
+      seq
+    end)
   end
 end

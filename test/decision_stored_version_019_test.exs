@@ -2,10 +2,65 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.{DB, Escalation, Schema, StateResources}
 
+  defmodule DecisionMigrationCheckpoint do
+    use GenServer
+
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+    def init(opts), do: {:ok, Map.new(opts)}
+
+    def handle_call({:transaction, callback} = request, _from, state) do
+      {:module, module} = :erlang.fun_info(callback, :module)
+      {:name, name} = :erlang.fun_info(callback, :name)
+
+      if module == Tightbeam.Schema and
+           String.starts_with?(
+             Atom.to_string(name),
+             "-upgrade_decision_request_row_schema_revision/"
+           ) do
+        # Observe the real startup boundary without substituting a migration or
+        # pre-installing any current objects into the historical fixture.
+        snapshot =
+          for sql <- [
+                "SELECT type,name,sql FROM sqlite_master ORDER BY type,name",
+                "SELECT * FROM schema_stamp",
+                "SELECT * FROM decision_requests ORDER BY id"
+              ] do
+            {:ok, rows} = DB.query(state.db, sql)
+            rows
+          end
+
+        send(state.owner, {:decision_migration_start, snapshot})
+      end
+
+      {:reply, GenServer.call(state.db, request, :infinity), state}
+    end
+
+    def handle_call(request, _from, state),
+      do: {:reply, GenServer.call(state.db, request, :infinity), state}
+  end
+
   setup context do
     db = :"decision_version_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    unless context[:historical_r1], do: :ok = Schema.ensure_all(db)
+
+    cond do
+      context[:historical_notice] ->
+        Tightbeam.HistoricalSchemaFixture.load!(
+          db,
+          "notice_storage_predecessor_686aecf9",
+          "2abcbd3bc38cb6497d953a4134e2eb37de564efe980688e16d5c10e0b5ea98e2"
+        )
+
+        assert {:ok, [["notice-source-storage-v1-019"]]} =
+                 DB.query(db, "SELECT shape FROM schema_stamp")
+
+      context[:historical_r1] ->
+        :ok
+
+      true ->
+        :ok = Schema.ensure_all(db)
+    end
+
     %{db: db}
   end
 
@@ -340,7 +395,7 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [[1], [1], [1]]} =
@@ -352,19 +407,38 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
   end
 
+  @tag :historical_notice
   test "decision row revision adoption requires the exact stamped predecessor shape", %{db: db} do
-    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='notice-source-storage-v1-019'")
-    before = decision_schema_snapshot(db)
+    :ok =
+      DB.execute(
+        db,
+        "ALTER TABLE decision_requests ADD COLUMN rowSchemaRevision INTEGER NOT NULL DEFAULT 2"
+      )
+
+    historical = decision_schema_snapshot(db)
+    refute Enum.any?(hd(historical), fn [_, name, _] -> name == "assignments_parent" end)
+    checkpoint = start_supervised!({DecisionMigrationCheckpoint, db: db, owner: self()})
 
     assert_raise Schema.ShapeError, ~r/decision request row schema migration failed/, fn ->
-      Schema.ensure_all(db)
+      Schema.ensure_all(checkpoint)
     end
 
+    assert_received {:decision_migration_start, before}
+    refute_received {:decision_migration_start, _}
     assert decision_schema_snapshot(db) == before
+    assert Enum.at(before, 1) == Enum.at(historical, 1)
+    assert Enum.at(before, 2) == Enum.at(historical, 2)
+
+    for name <- ["assignments_parent", "row_reaction_actions", "sentinel_subscriptions"] do
+      assert Enum.any?(hd(before), fn [_, object, _] -> object == name end)
+    end
+
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
   end
 
+  @tag :historical_notice
   test "decision row revision and successor stamp roll back as one migration", %{db: db} do
-    insert_decision_rows(db)
+    insert_decision_rows(db, true)
 
     :ok =
       DB.execute(db, """
@@ -376,15 +450,6 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
 
     :ok =
       DB.execute(db, """
-      DROP TRIGGER decision_requests_row_schema_revision_insert_guard;
-      DROP TRIGGER decision_requests_row_schema_revision_update_guard;
-      ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision;
-      """)
-
-    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='notice-source-storage-v1-019'")
-
-    :ok =
-      DB.execute(db, """
       CREATE TRIGGER reject_decision_revision_stamp
       BEFORE UPDATE ON schema_stamp
       WHEN NEW.shape='decision-request-row-schema-v2-019'
@@ -393,18 +458,30 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
       END
       """)
 
-    before = decision_schema_snapshot(db)
+    historical = decision_schema_snapshot(db)
+    refute Enum.any?(hd(historical), fn [_, name, _] -> name == "assignments_parent" end)
+    checkpoint = start_supervised!({DecisionMigrationCheckpoint, db: db, owner: self()})
 
     assert_raise Schema.ShapeError, ~r/decision request row schema migration failed/, fn ->
-      Schema.ensure_all(db)
+      Schema.ensure_all(checkpoint)
     end
 
+    assert_received {:decision_migration_start, before}
+    refute_received {:decision_migration_start, _}
     assert decision_schema_snapshot(db) == before
+    assert Enum.at(before, 1) == Enum.at(historical, 1)
+    assert Enum.at(before, 2) == Enum.at(historical, 2)
+
+    for name <- ["assignments_parent", "row_reaction_actions", "sentinel_subscriptions"] do
+      assert Enum.any?(hd(before), fn [_, object, _] -> object == name end)
+    end
+
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
 
     :ok = DB.execute(db, "DROP TRIGGER reject_decision_revision_stamp")
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [[1], [1]]} =
@@ -771,49 +848,55 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
     end
   end
 
-  defp insert_decision_rows(db) do
-    assert {:ok, _} =
-             DB.query(
-               db,
-               """
-               INSERT INTO decision_requests
-                 (id,kind,raiserId,raiserSessionKey,ownerUserId,assignmentId,
-                  raisedAt,deadlineAt,statuteName,actionKey,question,options,context,status,
-                  rowSchemaRevision)
-               VALUES
-                 ('dr_statute_r7','statute','session:raiser','agent:raiser','mike','asg_r7',
-                  10,20,'ship-law','ship-action','May this ship?',
-                  NULL,'{"verb":"ship"}','open',2)
-               """
-             )
+  defp insert_decision_rows(db, historical \\ false) do
+    query = fn sql ->
+      # The authentic predecessor predates only this revision column. Keep the
+      # exact same row values for adoption and returned-row inference.
+      sql =
+        if historical do
+          sql
+          |> String.replace(~r/,\s*rowSchemaRevision\b/, "")
+          |> String.replace(~r/,2\)\s*$/, ")")
+        else
+          sql
+        end
+
+      DB.query(db, sql)
+    end
 
     assert {:ok, _} =
-             DB.query(
-               db,
-               """
-               INSERT INTO decision_requests
-                 (id,kind,raiserId,raiserSessionKey,ownerUserId,assignmentId,
-                  expecterSessionKey,expecterUserId,raisedAt,question,context,status,askedOfRole,
-                  rowSchemaRevision)
-               VALUES
-                 ('dr_agent_r7','agent','session:agent:raiser','agent:raiser','mike','asg_r7',
-                  'agent:asked','mike',11,'Which path?','{"verb":"ask"}','open','reviewer:r7',2)
-               """
-             )
+             query.("""
+             INSERT INTO decision_requests
+               (id,kind,raiserId,raiserSessionKey,ownerUserId,assignmentId,
+                raisedAt,deadlineAt,statuteName,actionKey,question,options,context,status,
+                rowSchemaRevision)
+             VALUES
+               ('dr_statute_r7','statute','session:raiser','agent:raiser','mike','asg_r7',
+                10,20,'ship-law','ship-action','May this ship?',
+                NULL,'{"verb":"ship"}','open',2)
+             """)
 
     assert {:ok, _} =
-             DB.query(
-               db,
-               """
-               INSERT INTO decision_requests
-                 (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,
-                  lineageRung,effortGeneration,deadlineWakeId,raisedAt,deadlineAt,
-                  question,options,context,status,rowSchemaRevision)
-               VALUES
-                 ('dr_effort_r7','effort','process:tightbeam','mike','asg_r7','agent:expecter',
-                  4,7,'w_effort_r7',12,22,'Continue or dismiss?',
-                  '["wake","continue","dismiss"]','{"actions":["wake","continue","dismiss"]}','open',2)
-               """
-             )
+             query.("""
+             INSERT INTO decision_requests
+               (id,kind,raiserId,raiserSessionKey,ownerUserId,assignmentId,
+                expecterSessionKey,expecterUserId,raisedAt,question,context,status,askedOfRole,
+                rowSchemaRevision)
+             VALUES
+               ('dr_agent_r7','agent','session:agent:raiser','agent:raiser','mike','asg_r7',
+                'agent:asked','mike',11,'Which path?','{"verb":"ask"}','open','reviewer:r7',2)
+             """)
+
+    assert {:ok, _} =
+             query.("""
+             INSERT INTO decision_requests
+               (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,
+                lineageRung,effortGeneration,deadlineWakeId,raisedAt,deadlineAt,
+                question,options,context,status,rowSchemaRevision)
+             VALUES
+               ('dr_effort_r7','effort','process:tightbeam','mike','asg_r7','agent:expecter',
+                4,7,'w_effort_r7',12,22,'Continue or dismiss?',
+                '["wake","continue","dismiss"]','{"actions":["wake","continue","dismiss"]}','open',2)
+             """)
   end
 end

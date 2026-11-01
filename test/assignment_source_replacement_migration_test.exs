@@ -1,20 +1,23 @@
 defmodule Tightbeam.AssignmentSourceReplacementMigrationTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Model, Org, Schema, Wakes}
+  alias Tightbeam.{DB, Schema}
 
   @predecessor "work-item-delivery-owner-v1-019"
-  @successor "launch-preparation-evidence-v1-0112"
+  @successor "closed-assignment-cannot-proceed-reconciliation-v1-015"
   @replacement_route ~r/\(requesterId = 'tightbeam:assignments' AND reasonKind = 'superseded' AND\s+causalSourceKind = 'wake' AND outcomeKind = 'replacement'\)\s+OR/
-  @cancellation_columns "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
-                          "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
-                          "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
-                          "livenessTriggerKind,livenessTriggerId,actionNeeded"
 
   setup do
     db = :"assignment_source_replacement_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    assert :ok = Schema.ensure_all(db)
+
+    Tightbeam.HistoricalSchemaFixture.load!(
+      db,
+      "delivery_predecessor_940ac483",
+      "3b6e52b240291a125c87449c203fe5b32a1bc5c8c6e79efb2f5415681e06a3a9"
+    )
+
+    assert rows(db, "SELECT shape FROM schema_stamp") == [[@predecessor]]
 
     assert :ok =
              DB.execute(
@@ -22,52 +25,39 @@ defmodule Tightbeam.AssignmentSourceReplacementMigrationTest do
                "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',1,1)"
              )
 
-    session_key = "assignment-replacement-holder"
+    # Current Org readers require retirement tables absent in this predecessor.
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO sessions
+               (sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,
+                host,createdAt,updatedAt)
+             VALUES ('assignment-replacement-holder','Replacement holder','flynn',
+               'agent:assignment-replacement-holder','default','claude','anthropic','fable',
+               'testhost',1,1);
+             """)
 
-    Org.create(db, %{
-      session_key: session_key,
-      display_name: "Replacement holder",
-      owner_user_id: "flynn",
-      origin: "agent:#{session_key}",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("fable")
-    })
-
-    wake =
-      Wakes.schedule(db, %{
-        session_key: session_key,
-        origin: "agent:#{session_key}",
-        creator_session_key: session_key,
-        prompt: "withdraw this wake",
-        due_at: System.system_time(:millisecond) + 60_000
-      })
-
-    assert {:ok, {:accepted_in_txn, _event_id, %{canceled: true}}} =
+    # Seed through the historical columns and typed cancellation guards.
+    # Current wake APIs require source columns added after this predecessor.
+    assert {:ok, :ok} =
              DB.transaction(db, fn txn ->
-               Wakes.cancel_in_txn(txn, %{
-                 wake_id: wake.wake_id,
-                 expected_origin: "agent:#{session_key}",
-                 requester: %{kind: "session", id: session_key},
-                 reason_kind: "requester_withdrew",
-                 causal_source: %{
-                   kind: "verb_call",
-                   accepted_event: %{
-                     origin: "agent:#{session_key}",
-                     session_key: session_key,
-                     principal: {:session, session_key}
-                   }
-                 },
-                 outcome: %{kind: "no_replacement"}
-               })
+               Tightbeam.DB.Txn.exec(txn, """
+               INSERT INTO events(id,ts,kind,verb,origin,principal,sessionKey,payload)
+               VALUES (1,2,'verb','cancel-wake','agent:assignment-replacement-holder',
+                 'session:assignment-replacement-holder','assignment-replacement-holder','{}');
+               INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt,creatorSessionKey)
+               VALUES ('historical-wake','assignment-replacement-holder','agent:assignment-replacement-holder',
+                 'withdraw this wake',60000,1,'assignment-replacement-holder');
+               INSERT INTO wake_cancellations(wakeId,canceledAt,requesterKind,requesterId,reasonKind,
+                 causalSourceKind,causalSourceId,outcomeKind,workImpactKind,actionNeeded)
+               VALUES ('historical-wake',2,'session','assignment-replacement-holder','requester_withdrew',
+                 'verb_call','1','no_replacement','no_linked_work',0);
+               UPDATE wakes SET state='canceled',canceledAt=2 WHERE wakeId='historical-wake';
+               """)
              end)
 
     before_rows = rows(db, "SELECT * FROM wake_cancellations ORDER BY wakeId")
     assert length(before_rows) == 1
 
-    downgrade_to_receipt_cancellation_predecessor!(db)
     assert rows(db, "SELECT shape FROM schema_stamp") == [[@predecessor]]
     %{db: db, before_rows: before_rows}
   end
@@ -88,49 +78,6 @@ defmodule Tightbeam.AssignmentSourceReplacementMigrationTest do
     assert Regex.match?(@replacement_route, table_sql)
     assert :ok = Schema.ensure_all(db)
     assert rows(db, "SELECT * FROM wake_cancellations ORDER BY wakeId") == before_rows
-  end
-
-  defp downgrade_to_receipt_cancellation_predecessor!(db) do
-    Tightbeam.SchemaShapeRuntimeFixture.downgrade_effort_holder_activity_cancellation!(db)
-    Tightbeam.SchemaShapeRuntimeFixture.downgrade_notice_source_storage!(db)
-
-    assert [[current_sql]] =
-             rows(
-               db,
-               "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
-             )
-
-    predecessor_sql = Regex.replace(@replacement_route, current_sql, "", global: false)
-    refute predecessor_sql == current_sql
-
-    assert {:ok, trigger_rows} =
-             DB.query(
-               db,
-               "SELECT sql FROM sqlite_master WHERE type='trigger' AND name IN ('wake_cancellations_pending_insert','wakes_typed_cancellation_required') ORDER BY name"
-             )
-
-    assert length(trigger_rows) == 2
-    trigger_sql = Enum.map_join(trigger_rows, ";\n", &hd/1)
-
-    assert :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
-    assert :ok = DB.execute(db, "PRAGMA legacy_alter_table=ON")
-
-    assert :ok =
-             DB.execute(db, """
-             DROP TRIGGER wake_cancellations_pending_insert;
-             DROP TRIGGER wakes_typed_cancellation_required;
-             ALTER TABLE wake_cancellations RENAME TO wake_cancellations_assignment_replacement_current;
-             #{predecessor_sql};
-             INSERT INTO wake_cancellations (#{@cancellation_columns})
-               SELECT #{@cancellation_columns} FROM wake_cancellations_assignment_replacement_current;
-             DROP TABLE wake_cancellations_assignment_replacement_current;
-             #{trigger_sql};
-             UPDATE schema_stamp SET shape='#{@predecessor}',stampedAt=1;
-             """)
-
-    assert :ok = DB.execute(db, "PRAGMA legacy_alter_table=OFF")
-    assert :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
-    assert rows(db, "PRAGMA foreign_key_check") == []
   end
 
   defp rows(db, sql) do

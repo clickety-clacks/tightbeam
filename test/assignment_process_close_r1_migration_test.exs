@@ -4,13 +4,21 @@ defmodule Tightbeam.AssignmentProcessCloseR1MigrationTest do
 
   setup do
     db = start_supervised!({DB, name: :process_close_r1_db, path: ":memory:"})
-    :ok = Schema.ensure_all(db)
+    # Original settlement bootstrap: before parentAssignmentId and its index.
+    Tightbeam.HistoricalSchemaFixture.load!(
+      db,
+      "settlement_predecessor_9f47967f",
+      "6a3bfab2fd5ef2ba8a132a19537f4f124c67d2018c64c0486ae37c1866f7085d"
+    )
+
+    assert rows(db, "SELECT shape FROM schema_stamp") == [["stale-turn-settlement-v1-019"]]
     %{db: db}
   end
 
   test "upgrade preserves raw reminder bytes, references and attached objects", %{db: db} do
     seed(db)
     before = snapshot(db)
+    reminders_before = rows(db, "SELECT id,reminderState FROM assignments ORDER BY id")
     assert {:ok, :ok} = rebuild(db)
     assert retained(db) == elem(before, 0)
     assert objects(db) == elem(before, 2)
@@ -27,6 +35,17 @@ defmodule Tightbeam.AssignmentProcessCloseR1MigrationTest do
     assert rows(db, "SELECT path FROM assignment_files") == [["synthetic"]]
     assert rows(db, "SELECT assignmentId FROM attests") == [["a"]]
     assert {:error, _} = DB.query(db, "UPDATE assignments SET subject='forbidden' WHERE id='a'")
+    assert rows(db, "SELECT * FROM schema_stamp") == elem(before, 3)
+
+    # The historical rebuild preserves its attached objects; ordinary startup
+    # subsequently installs the current parent relation and its complete index.
+    assert :ok = Schema.ensure_all(db)
+
+    assert Enum.map(rows(db, "PRAGMA index_info(assignments_parent)"), &Enum.at(&1, 2)) ==
+             ["parentAssignmentId", "state", "closedAt"]
+
+    assert rows(db, "SELECT id,reminderState FROM assignments ORDER BY id") == reminders_before
+    assert rows(db, "PRAGMA foreign_key_check") == []
   end
 
   test "empty R1 target retains nullable column and process actor checks", %{db: db} do

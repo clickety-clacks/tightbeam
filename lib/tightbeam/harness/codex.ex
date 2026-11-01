@@ -55,6 +55,9 @@ defmodule Tightbeam.Harness.Codex do
   def id, do: :codex
 
   @impl true
+  def supports_inline_attachments?, do: true
+
+  @impl true
   def records_tool_calls?, do: true
 
   @impl true
