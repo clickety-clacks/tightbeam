@@ -862,6 +862,12 @@ defmodule Tightbeam.HarklightWakesTest do
     assert %{state: "registered"} = HarklightWakes.register(db, call)
     start_supervised!({HarklightWakes, db: db})
 
+    assert eventually(fn ->
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ]) == {:ok, [["unavailable", "listener_stopped"]]}
+           end)
+
     assert {:ok, [[prompt]]} =
              DB.query(
                db,
