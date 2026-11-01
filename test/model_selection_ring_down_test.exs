@@ -15,7 +15,8 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     Ledger,
     Model,
     Org,
-    Schema
+    Schema,
+    Wakes
   }
 
   alias Tightbeam.GatewayTurnFixture.CoordinatorStub
@@ -791,6 +792,130 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
       queued = "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND status='queued'"
       assert {:ok, [[0]]} = DB.query(db, queued, [session_key])
     end)
+  end
+
+  for {label, typed?} <- [{"a Pi typed", true}, {"an untyped", false}] do
+    @tag typed: typed?
+    test "#{label} rate-limit failure of a wake-delivered prompt and its wake retry", ctx do
+      with_gateway(fn %{db: db, config: config} ->
+        first = Model.new("synthetic-first", effort: "low")
+        session_key = "pi-typed-wake-failure"
+        final_error = "429 rate limit exceeded"
+
+        failure = %{
+          "code" => -32_603,
+          "message" => "Internal error: pi retry exhausted after 4 attempts: " <> final_error,
+          "data" => %{
+            "errorKind" => "pi_retry_exhausted",
+            "piAttempts" => 4,
+            "transportAttempts" => "unobserved",
+            "finalError" => final_error
+          }
+        }
+
+        failure =
+          if ctx.typed,
+            do: failure,
+            else: update_in(failure, ["data"], &Map.delete(&1, "errorKind"))
+
+        {:ok, adapter} =
+          RingDownAdapter.start_link(
+            parent: self(),
+            outcomes: %{first.family => {:ok, "pi-typed-wake-session"}},
+            prompt_outcome: {:error, failure},
+            readback: %{"pi-typed-wake-session" => first}
+          )
+
+        {:ok, _coordinator} = CoordinatorStub.start_link({adapter, self()})
+
+        Org.create(db, %{
+          session_key: session_key,
+          display_name: "Synthetic Pi wake failure",
+          owner_user_id: "synthetic-owner",
+          origin: "user:synthetic-owner",
+          archetype: "synthetic-ring",
+          host: "testhost",
+          harness: "fixture",
+          provider: "fixture_provider",
+          model: first
+        })
+
+        wake =
+          Wakes.schedule(db, %{
+            session_key: session_key,
+            origin: "agent:sender",
+            prompt: "continue the work",
+            due_at: 1
+          })
+
+        {:ok, _} =
+          DB.query(db, "UPDATE wakes SET state='fired', firedAt=10 WHERE wakeId=?1", [
+            wake.wake_id
+          ])
+
+        {:ok, _seq} =
+          Ledger.enqueue(db, %{
+            session_key: session_key,
+            message_id: "pi-typed-wake-turn",
+            wake_id: wake.wake_id,
+            origin: "agent:sender",
+            prompt: "continue the work"
+          })
+
+        assert {:ok, turn} = Ledger.claim_next(db, session_key, "pi-typed-wake-test")
+        assert turn.wake_id == wake.wake_id
+
+        assert {:error, %{reason: ^failure, record_in_txn: record, terminal_publish: publish}} =
+                 runner(config).(Map.put(turn, :session_key, session_key))
+
+        # turns.error as SessionLane writes it for a JSON-RPC error map.
+        assert {:ok, publication} =
+                 DB.transaction(db, fn txn ->
+                   assert true =
+                            Ledger.finish_in_txn(txn, turn.seq, "failed", inspect(failure),
+                              owner_lease: turn.owner_lease
+                            )
+
+                   record.(txn)
+                 end)
+
+        if is_function(publication, 0), do: publication.()
+        publish.("failed")
+
+        # Rate-limit observation evidence is kept either way.
+        assert {:ok, [[1]]} =
+                 DB.query(
+                   db,
+                   "SELECT COUNT(*) FROM harness_health_observations WHERE correlationId=?1",
+                   ["harness-turn:#{turn.seq}:rate-limit-dead"]
+                 )
+
+        {:ok, [[wake_retries]]} = DB.query(db, "SELECT COUNT(*) FROM wake_retry_attempts")
+
+        {:ok, [[health_redeliveries]]} =
+          DB.query(db, "SELECT COUNT(*) FROM health_redelivery_attempts")
+
+        {:ok, [[successors]]} =
+          DB.query(
+            db,
+            "SELECT COUNT(*) FROM wakes WHERE sessionKey=?1 AND wakeId!=?2 AND state='pending'",
+            [session_key, wake.wake_id]
+          )
+
+        {:ok, [[queued]]} =
+          DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND status='queued'", [
+            session_key
+          ])
+
+        if ctx.typed do
+          assert {wake_retries, health_redeliveries, successors, queued} == {0, 0, 0, 0}
+        else
+          # Control: without the Pi kind the existing rate-limit wake retry stands,
+          # one row for the failed source and one for its pending successor.
+          assert {wake_retries, successors} == {2, 1}
+        end
+      end)
+    end
   end
 
   test "turn advances through production model and effort carriers and preserves evidence" do

@@ -3538,7 +3538,10 @@ defmodule Tightbeam.Gateway do
                 Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, prewrite_evidence)
               end
 
-              Tightbeam.Wakes.preserve_failed_intent_for_terminal_in_txn(txn, turn.seq)
+              # Pi has already retried a typed Pi failure; its wake is not retried either.
+              unless HarnessHealth.pi_typed_turn_failure?(raw_reason) do
+                Tightbeam.Wakes.preserve_failed_intent_for_terminal_in_txn(txn, turn.seq)
+              end
 
               HarnessHealth.observe_turn_failure_in_txn(
                 txn,
