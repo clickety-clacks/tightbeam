@@ -40,7 +40,29 @@ defmodule Tightbeam.ToolCallsTest do
         model: nil
       })
 
-    session = ensure_main_session(db, "tool-call-owner")
+    session =
+      if context[:historical_messages] do
+        # Seed only columns in the pinned predecessor. Current Org readers also
+        # require retirement tables that did not exist at this migration boundary.
+        session_key = Org.personal_session_key("tool-call-owner")
+
+        {:ok, _} =
+          DB.query(
+            db,
+            """
+            INSERT INTO sessions
+              (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
+               archetype, harness, provider, model, host, createdAt, updatedAt)
+            VALUES (?1, 'Main', 'main', 1, 'tool-call-owner', 'user:tool-call-owner',
+                    'default', 'claude', 'anthropic', 'fable', 'testhost', 1, 1)
+            """,
+            [session_key]
+          )
+
+        %{session_key: session_key}
+      else
+        ensure_main_session(db, "tool-call-owner")
+      end
 
     {:appended, prompt_message} =
       Projection.append(db, %{
@@ -49,13 +71,17 @@ defmodule Tightbeam.ToolCallsTest do
         content: "Record the prompt before the tool call."
       })
 
+    turn_attrs = %{
+      session_key: session.session_key,
+      message_id: prompt_message.id,
+      origin: "user:tool-call-owner",
+      prompt: prompt_message.content
+    }
+
     {:ok, turn_seq} =
-      Ledger.enqueue(db, %{
-        session_key: session.session_key,
-        message_id: prompt_message.id,
-        origin: "user:tool-call-owner",
-        prompt: prompt_message.content
-      })
+      if context[:historical_messages],
+        do: insert_historical_turn(db, turn_attrs),
+        else: Ledger.enqueue(db, turn_attrs)
 
     opts = [
       db: db,
@@ -478,7 +504,7 @@ defmodule Tightbeam.ToolCallsTest do
       })
 
     {:ok, _repair_turn_seq} =
-      Ledger.enqueue(ctx.db, %{
+      insert_historical_turn(ctx.db, %{
         session_key: ctx.session_key,
         message_id: repair_message.id,
         origin: "user:recorded-before-rebuild",
@@ -664,5 +690,21 @@ defmodule Tightbeam.ToolCallsTest do
     if String.valid?(value),
       do: value,
       else: trim_utf8_tail(binary_part(value, 0, byte_size(value) - 1))
+  end
+  # Historical DML, not a current enqueue: the latter reads newer Org tables.
+  defp insert_historical_turn(db, attrs) do
+    DB.transaction(db, fn txn ->
+      Tightbeam.DB.Txn.q(
+        txn,
+        """
+        INSERT INTO turns (sessionKey, messageId, origin, prompt, createdAt)
+        VALUES (?1, ?2, ?3, ?4, 1)
+        """,
+        [attrs.session_key, attrs.message_id, attrs.origin, attrs.prompt]
+      )
+
+      [[seq]] = Tightbeam.DB.Txn.q(txn, "SELECT last_insert_rowid()")
+      seq
+    end)
   end
 end

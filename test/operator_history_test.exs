@@ -335,13 +335,20 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
       assert response.status == 200, response.resp_body
       assert Enum.any?(body(response)["items"], &(&1["content"] == "ordinary reads"))
 
-      identity =
-        body(response)["page"]["oldestCursor"]
-        |> Base.url_decode64!(padding: false)
-        |> JSON.decode!()
+      cursor = body(response)["page"]["oldestCursor"]
+      previous = read(ctx, ctx.selected, "asUser=owner&before=" <> cursor, token) |> body()
+      assert previous["items"] == []
 
-      assert identity["principalKind"] == "user"
-      assert identity["principalId"] == "owner"
+      assert_error(
+        read(ctx, ctx.sibling, "asUser=owner&before=" <> cursor, token),
+        400,
+        "invalid_cursor"
+      )
+
+      other_view = read(ctx, ctx.selected, "before=" <> cursor, ctx.admin.token) |> body()
+      admin_default = read(ctx, ctx.selected, "", ctx.admin.token) |> body()
+      assert other_view["items"] == admin_default["items"]
+      assert Enum.map(other_view["items"], & &1["content"]) == ["ordinary reads"]
     end
 
     assert_error(read(ctx, ctx.hidden, "", ctx.owner.token), 404, "not_found")
