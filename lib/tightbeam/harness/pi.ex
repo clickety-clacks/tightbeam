@@ -23,16 +23,40 @@ defmodule Tightbeam.Harness.Pi do
   // outcome as events. A failed turn reaches the ACP client as a typed JSON-RPC
   // error carrying Pi's logical attempt count, never as end_turn. Transport
   // retries below Pi and provider billing are not observable here.
+  // Port of Tightbeam.ErrorDiagnostic.redact_text/1; harness_pi_test keeps the
+  // two equal. Redaction runs before whitespace collapse and the length bound.
+  function tightbeamPiMaskValue(value) {
+    if (value[0] === '"' || value[0] === "'") return `${value[0]}[REDACTED:secret_field]${value[0]}`;
+    const scheme = /^(bearer|basic|token)(\s+)/i.exec(value);
+    return scheme ? `${scheme[1]}${scheme[2]}[REDACTED:secret_field]` : "[REDACTED:secret_field]";
+  }
+  function tightbeamPiRedact(text) {
+    return text
+      .replace(
+        /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gs,
+        () => "[REDACTED:private_key]"
+      )
+      .replace(
+        /\b((?:proxy[-_]?)?authorization|x[-_]api[-_]key|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|client[-_]?secret|private[-_]?key|token|password|passwd|secret|cookie)(["']?\s*(?:=>|[:=])\s*)((?:bearer|basic|token)\s+(?:\[REDACTED:secret_field\]|[^\s,;"'&}\]]+)|"(?:[^"\\]|\\(?:[\s\S]|$))*(?:"|$)|'(?:[^'\\]|\\(?:[\s\S]|$))*(?:'|$)|\[REDACTED:secret_field\]|[^\s,;&}\]"']+)/gi,
+        (_all, key, separator, value) => `${key}${separator}${tightbeamPiMaskValue(value)}`
+      )
+      .replace(
+        /\b(bearer)(\s+)[A-Za-z0-9._~+\/-]{12,}=*/gi,
+        (_all, scheme, space) => `${scheme}${space}[REDACTED:token]`
+      )
+      .replace(
+        /\b([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\/\s:@\[]+(?::[^\/\s@]*)?@/g,
+        (_all, scheme) => `${scheme}[REDACTED:userinfo]@`
+      )
+      .replace(
+        /\b(?:github_pat_|gh[opusr]_|sk-|sk_|xox[abprs]-|tbc_|tbs_|tbt_|tbp_)[A-Za-z0-9_-]{8,}/g,
+        () => "[REDACTED:token]"
+      );
+  }
   function tightbeamPiSafeError(raw) {
-    const text = String(raw ?? "")
+    const text = tightbeamPiRedact(String(raw ?? ""))
       .replace(/\s+/g, " ")
       .replace(/[\u0000-\u001f\u007f]/g, "")
-      .replace(/\bbearer\s+[^\s"',;]+/gi, "Bearer [REDACTED]")
-      .replace(
-        /\b(api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|token|secret|password|authorization)(["']?\s*[:=]\s*["']?)[^\s"',;}&]+/gi,
-        (_match, name, separator) => `${name}${separator}[REDACTED]`
-      )
-      .replace(/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}/g, "[REDACTED]")
       .trim();
     if (!text) return "unknown error";
     return text.length > 300 ? `${text.slice(0, 300)}...` : text;

@@ -70,11 +70,14 @@ async function loadBundle(source) {
     ...["getAuthMethods", "terminalAuthLaunchSpec", "maybeAuthRequiredError", "expandSlashCommand",
       "formatAutoRetryMessage"].map((name) => extractFunction(source, name)),
     // Present only in the Tightbeam-patched bundle.
+    extractFunction(source, "tightbeamPiMaskValue", { optional: true }),
+    extractFunction(source, "tightbeamPiRedact", { optional: true }),
     extractFunction(source, "tightbeamPiSafeError", { optional: true }),
     extractFunction(source, "tightbeamPiTurnError", { optional: true }),
     extractClass(source, "PiRpcProcess"),
     extractClass(source, "PiAcpSession"),
-    "export { PiAcpSession, PiRpcProcess };"
+    "export { PiAcpSession, PiRpcProcess };",
+    source.includes("\nfunction tightbeamPiRedact(") ? "export { tightbeamPiRedact };" : ""
   ].join("\n");
   const path = join(tmpdir(), `pi-acp-turn-contract-${process.pid}-${Date.now()}.mjs`);
   writeFileSync(path, module);
@@ -149,8 +152,10 @@ const scripts = {
   unsafeError: (version) =>
     scripts.exhausted(
       version,
-      "401 from provider\nAuthorization: Bearer sk-live-abcdefghijklmnop api_key=SECRETVALUE token: tok_abcdef " +
-        "echoed sk-proj-ABCDEFGHIJKLMNOP " +
+      "401 echoed sk-proj-ABCDEFGHIJKLMNOP\nAuthorization: Bearer sk-live-abcdefghijklmnop api_key=SECRETVALUE " +
+        "Authorization: Basic dXNlcjpwYXNzd29yZA== Cookie: session=topsecret " +
+        "https://alice:hunter2@example.test/fail ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 " +
+        'password="secret phrase with spaces" ' +
         "x".repeat(5000)
     )
 };
@@ -208,6 +213,12 @@ class Turns {
       .filter((update) => update.sessionUpdate === "agent_message_chunk")
       .map((update) => update.content.text);
   }
+}
+
+// The adapter's redaction applied to each text, for parity with ErrorDiagnostic.
+export async function runRedaction(source, texts) {
+  const { tightbeamPiRedact } = await loadBundle(source);
+  return texts.map((text) => tightbeamPiRedact(text));
 }
 
 export async function runTurnContract(source, version) {

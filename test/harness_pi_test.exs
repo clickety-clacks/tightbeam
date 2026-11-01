@@ -4,6 +4,7 @@ defmodule Tightbeam.HarnessPiTest do
   # so two concurrent tests under this template race for one global name.
   use Tightbeam.TestCase, async: false
 
+  alias Tightbeam.ErrorDiagnostic
   alias Tightbeam.Harness.Pi
 
   @close_only_close_session """
@@ -504,18 +505,87 @@ defmodule Tightbeam.HarnessPiTest do
       final_error = data["finalError"]
 
       assert data["errorKind"] == "pi_retry_exhausted"
+      assert data["piAttempts"] == 4
       assert String.length(final_error) == 303
       assert String.ends_with?(final_error, "...")
-      assert final_error =~ "401 from provider Authorization: [REDACTED]"
-      assert final_error =~ "api_key=[REDACTED]"
-      assert final_error =~ "token: [REDACTED]"
-      assert final_error =~ "echoed [REDACTED]"
       refute final_error =~ "\n"
 
-      for secret <- ["sk-live-abcdefghijklmnop", "SECRETVALUE", "tok_abcdef", "sk-proj-"] do
+      for redacted <- [
+            "401 echoed [REDACTED:token] Authorization: Bearer [REDACTED:secret_field]",
+            "api_key=[REDACTED:secret_field]",
+            "Authorization: Basic [REDACTED:secret_field]",
+            "Cookie: [REDACTED:secret_field]",
+            "https://[REDACTED:userinfo]@example.test/fail",
+            ~s(password="[REDACTED:secret_field]")
+          ] do
+        assert final_error =~ redacted
+      end
+
+      for secret <- [
+            "sk-live-abcdefghijklmnop",
+            "SECRETVALUE",
+            "dXNlcjpwYXNzd29yZA",
+            "topsecret",
+            "alice",
+            "hunter2",
+            "ghp_ABCDEFGH",
+            "phrase with spaces",
+            "sk-proj-"
+          ] do
         refute message =~ secret
+        refute final_error =~ secret
         refute Enum.any?(results["unsafeError"]["text"], &(&1 =~ secret))
       end
+    end
+
+    test "the adapter's redaction matches ErrorDiagnostic.redact_text" do
+      texts = [
+        "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+        "Cookie: session=topsecret",
+        "upstream https://alice:hunter2@example.test/fail",
+        "provider token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
+        ~s(password="secret phrase with spaces"),
+        "password='single quoted' and passwd: plain",
+        ~s({"api_key":"abc def","client_secret": "x\\"y"}),
+        "Proxy-Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+        "header bearer abcdefghijklmnopqrstuvwxyz== trailing",
+        "x-api-key => k-123 access_token=a refresh-token:b id_token=c private_key=d",
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEabc\n-----END RSA PRIVATE KEY----- after",
+        "-----BEGIN PRIVATE KEY-----\nunterminated",
+        "github_pat_ABCDEFGHIJKL sk_ABCDEFGHIJ xoxb-ABCDEFGHIJ tbc_ABCDEFGHIJ tbt_ABCDEFGHIJ",
+        "ftp://user@host.example/path and https://u:p@h/x",
+        "token: [REDACTED:secret_field] secret=\"unterminated",
+        "Request timed out.",
+        "429 rate limit exceeded; retry after 30s"
+      ]
+
+      root = tmp_dir!("pi-acp-redaction")
+      runner = Path.join(root, "runner.mjs")
+      bundle = Path.join(root, "bundle.js")
+      fixture = Path.expand("fixtures/pi_acp/0.0.33-turn-failure-contract.mjs", __DIR__)
+      File.write!(bundle, Pi.patch_adapter_source(release_bundle()))
+
+      File.write!(
+        runner,
+        """
+        import { readFileSync } from "node:fs";
+        import { runRedaction } from #{JSON.encode!(fixture)};
+        const source = readFileSync(#{JSON.encode!(bundle)}, "utf8");
+        const texts = JSON.parse(readFileSync(0, "utf8"));
+        process.stdout.write(JSON.stringify(await runRedaction(source, texts)));
+        """
+      )
+
+      input = Path.join(root, "texts.json")
+      File.write!(input, JSON.encode!(texts))
+
+      {output, 0} =
+        System.cmd("sh", ["-c", "node runner.mjs < texts.json"],
+          cd: root,
+          env: [{"TMPDIR", root}]
+        )
+
+      assert JSON.decode!(output) == Enum.map(texts, &ErrorDiagnostic.redact_text/1)
     end
 
     test "the unpatched release reports every failed turn as a normal end_turn" do
