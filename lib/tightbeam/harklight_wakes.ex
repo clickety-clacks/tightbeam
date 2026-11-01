@@ -1109,7 +1109,14 @@ defmodule Tightbeam.HarklightWakes do
   # stderr. The port merges them; keep plain-text diagnostics without treating
   # them as events, and leave every JSON line on the existing capture path.
   defp receive_listener_line(manager, handle, line, diagnostics) do
-    case JSON.decode(line) do
+    decoded =
+      try do
+        JSON.decode(line)
+      rescue
+        _ -> {:error, :invalid_listener_line}
+      end
+
+    case decoded do
       {:ok, _event} ->
         case GenServer.call(manager, {:capture, handle, line}, :infinity) do
           :ok -> {:ok, diagnostics}
@@ -1161,6 +1168,8 @@ defmodule Tightbeam.HarklightWakes do
 
   defp format_failure_diagnostics(diagnostics) when is_list(diagnostics) do
     diagnostics
+    |> Enum.map(&sanitize_diagnostic_text/1)
+    |> Enum.reject(&is_nil/1)
     |> Enum.reject(&(not is_binary(&1) or &1 == ""))
     |> Enum.uniq()
     |> Enum.take(@max_diagnostic_lines)
