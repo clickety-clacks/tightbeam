@@ -2097,6 +2097,98 @@ defmodule Tightbeam.HarnessHealthTest do
              )
   end
 
+  test "Pi typed turn failures keep incident evidence but are never redelivered", ctx do
+    [first, second, healthy] = ctx.sessions
+
+    sources =
+      for {ref, message_id, kind, attempts, final_error} <- [
+            {first, "pi-exhausted-timeout", "pi_retry_exhausted", 4, "Request timed out."},
+            {first, "pi-exhausted-rate-limit", "pi_retry_exhausted", 4,
+             "429 rate limit exceeded"},
+            {second, "pi-failed-rate-limit", "pi_turn_failed", 1, "429 rate limit exceeded"}
+          ] do
+        fail_health_turn!(
+          ctx.db,
+          ref.session,
+          message_id,
+          "do not replay this prompt",
+          pi_typed_turn_failure(kind, attempts, final_error),
+          assignment_id: ref.assignment
+        )
+      end
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq IN (?1,?2,?3)",
+               Enum.map(sources, & &1.seq)
+             )
+
+    # Incident and fact observability is unchanged: the classified failures
+    # still open the rate-limit incident with their own observations.
+    assert [incident] = HarnessHealth.active(ctx.db)
+    assert incident.failureClass == "rate-limit-dead"
+
+    assert ConditionFacts.harness_failure_standing?(
+             ctx.db,
+             "claude",
+             "testhost",
+             "rate-limit-dead"
+           )
+
+    assert HarnessHealth.get(ctx.db, incident.id).observations
+           |> Enum.map(& &1.correlation_id)
+           |> MapSet.new() ==
+             sources
+             |> Enum.drop(1)
+             |> Enum.map(&"harness-turn:#{&1.seq}:rate-limit-dead")
+             |> MapSet.new()
+
+    _restoration = restore_health_turn!(ctx.db, healthy.session, "pi-typed-restoration")
+
+    refute ConditionFacts.harness_failure_standing?(
+             ctx.db,
+             "claude",
+             "testhost",
+             "rate-limit-dead"
+           )
+
+    assert {:ok, [[3, 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT SUM(status='failed'),SUM(status='queued') FROM turns WHERE messageId IN " <>
+                 "('pi-exhausted-timeout','pi-exhausted-rate-limit','pi-failed-rate-limit')"
+             )
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM health_redelivery_attempts")
+  end
+
+  test "the same failure without a Pi error kind keeps its redelivery source", ctx do
+    [first | _] = ctx.sessions
+
+    untyped =
+      pi_typed_turn_failure("pi_retry_exhausted", 4, "Request timed out.")
+      |> update_in(["data"], &Map.delete(&1, "errorKind"))
+
+    source =
+      fail_health_turn!(
+        ctx.db,
+        first.session,
+        "untyped-timeout",
+        "untyped prompt",
+        untyped,
+        assignment_id: first.assignment
+      )
+
+    assert {:ok, [["unclassified"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT failureClass FROM health_redelivery_attempts WHERE sourceTurnSeq=?1",
+               [source.seq]
+             )
+  end
+
   test "unclassified and compaction failures redeliver once on same-harness success", ctx do
     [first, second, healthy | _] = ctx.sessions
 
@@ -3239,6 +3331,25 @@ defmodule Tightbeam.HarnessHealthTest do
              end)
 
     turn
+  end
+
+  # The JSON-RPC error the patched pi-acp 0.0.33 sends (Tightbeam.Harness.Pi).
+  defp pi_typed_turn_failure(kind, attempts, final_error) do
+    message =
+      if kind == "pi_retry_exhausted",
+        do: "pi retry exhausted after #{attempts} attempts: #{final_error}",
+        else: "pi turn failed: #{final_error}"
+
+    %{
+      "code" => -32_603,
+      "message" => "Internal error: " <> message,
+      "data" => %{
+        "errorKind" => kind,
+        "piAttempts" => attempts,
+        "transportAttempts" => "unobserved",
+        "finalError" => final_error
+      }
+    }
   end
 
   defp failure(ref, failure_class, observed_at, correlation_id) do

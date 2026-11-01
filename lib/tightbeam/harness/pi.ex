@@ -13,6 +13,154 @@ defmodule Tightbeam.Harness.Pi do
   @adapter_version "0.0.33"
   @adapter_package "pi-acp"
   @adapter_bundle "index.js"
+
+  # pi-acp 0.0.33 ends every Pi turn as end_turn: it prints "Retry finished,
+  # resuming." for a failed or exhausted auto-retry, ignores the final
+  # assistant error, and maps a rejected RPC prompt to end_turn. These
+  # replacements reject the ACP prompt with a typed JSON-RPC error instead.
+  @pi_turn_failure_helpers ~S"""
+  // Tightbeam: Pi retries a failed provider request itself and reports the
+  // outcome as events. A failed turn reaches the ACP client as a typed JSON-RPC
+  // error carrying Pi's logical attempt count, never as end_turn. Transport
+  // retries below Pi and provider billing are not observable here.
+  function tightbeamPiSafeError(raw) {
+    const text = String(raw ?? "")
+      .replace(/\s+/g, " ")
+      .replace(/[\u0000-\u001f\u007f]/g, "")
+      .replace(/\bbearer\s+[^\s"',;]+/gi, "Bearer [REDACTED]")
+      .replace(
+        /\b(api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|token|secret|password|authorization)(["']?\s*[:=]\s*["']?)[^\s"',;}&]+/gi,
+        (_match, name, separator) => `${name}${separator}[REDACTED]`
+      )
+      .replace(/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}/g, "[REDACTED]")
+      .trim();
+    if (!text) return "unknown error";
+    return text.length > 300 ? `${text.slice(0, 300)}...` : text;
+  }
+  function tightbeamPiTurnError(errorKind, piAttempts, raw) {
+    const finalError = tightbeamPiSafeError(raw);
+    const attempts = piAttempts === null ? "" : ` after ${piAttempts} attempts`;
+    const message =
+      errorKind === "pi_retry_exhausted"
+        ? `pi retry exhausted${attempts}: ${finalError}`
+        : `pi turn failed: ${finalError}`;
+    return RequestError.internalError(
+      { errorKind, piAttempts, transportAttempts: "unobserved", finalError },
+      message
+    );
+  }
+  function formatAutoRetryMessage(ev) {
+  """
+
+  @pi_start_turn ~S"""
+    startTurn(t) {
+      this.cancelRequested = false;
+      this.inAgentLoop = false;
+  """
+
+  @pi_start_turn_patched ~S"""
+    startTurn(t) {
+      this.cancelRequested = false;
+      this.inAgentLoop = false;
+      this.piRunError = null;
+      this.piRetryFailure = null;
+  """
+
+  @pi_prompt_rejected ~S"""
+          if (authErr) {
+            this.pendingTurn?.reject(authErr);
+          } else {
+            const reason = this.cancelRequested ? "cancelled" : "error";
+            this.pendingTurn?.resolve(reason);
+          }
+  """
+
+  @pi_prompt_rejected_patched ~S"""
+          if (authErr) {
+            this.pendingTurn?.reject(authErr);
+          } else if (this.cancelRequested) {
+            this.pendingTurn?.resolve("cancelled");
+          } else {
+            // Pi refused the prompt before its run started: no provider request.
+            this.pendingTurn?.reject(tightbeamPiTurnError("pi_turn_failed", 0, err?.message ?? err));
+          }
+  """
+
+  @pi_auto_retry_end ~S"""
+        case "auto_retry_end": {
+          this.emit({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Retry finished, resuming." }
+          });
+          break;
+        }
+  """
+
+  @pi_auto_retry_end_patched ~S"""
+        case "auto_retry_end": {
+          let text = "Retry finished, resuming.";
+          if (ev.success === false) {
+            const retries = Number(ev.attempt);
+            const piAttempts = Number.isInteger(retries) && retries >= 0 ? retries + 1 : null;
+            this.piRetryFailure = { piAttempts, finalError: ev.finalError };
+            const attempts = piAttempts === null ? "" : ` after ${piAttempts} attempts`;
+            text = this.cancelRequested
+              ? "Retry cancelled."
+              : `Retry exhausted${attempts}: ${tightbeamPiSafeError(ev.finalError)}`;
+          }
+          this.emit({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text }
+          });
+          break;
+        }
+  """
+
+  @pi_agent_end ~S"""
+        case "agent_end": {
+          this.inAgentLoop = false;
+          break;
+        }
+  """
+
+  @pi_agent_end_patched ~S"""
+        case "agent_end": {
+          this.inAgentLoop = false;
+          // Pi reports a failed retry chain after the agent_end of its last run,
+          // and a later run (retry or compaction) supersedes an earlier failure.
+          const messages = Array.isArray(ev.messages) ? ev.messages : [];
+          const last = messages.findLast((message) => message?.role === "assistant");
+          this.piRunError = last?.stopReason === "error" ? { finalError: last.errorMessage } : null;
+          this.piRetryFailure = null;
+          break;
+        }
+  """
+
+  @pi_agent_settled ~S"""
+          void this.flushEmits().finally(() => {
+            const reason = this.cancelRequested ? "cancelled" : "end_turn";
+            this.pendingTurn?.resolve(reason);
+            this.pendingTurn = null;
+  """
+
+  @pi_agent_settled_patched ~S"""
+          void this.flushEmits().finally(() => {
+            const retryFailure = this.piRetryFailure;
+            const runError = this.piRunError;
+            this.piRetryFailure = null;
+            this.piRunError = null;
+            const failure = this.cancelRequested
+              ? null
+              : retryFailure
+                ? tightbeamPiTurnError("pi_retry_exhausted", retryFailure.piAttempts, retryFailure.finalError)
+                : runError
+                  ? tightbeamPiTurnError("pi_turn_failed", 1, runError.finalError)
+                  : null;
+            if (failure) this.pendingTurn?.reject(failure);
+            else this.pendingTurn?.resolve(this.cancelRequested ? "cancelled" : "end_turn");
+            this.pendingTurn = null;
+  """
+
   @adapter_replacements [
     {
       "          list: {},\n          delete: {}",
@@ -34,7 +182,13 @@ defmodule Tightbeam.Harness.Pi do
     {
       "  async cancel(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (!session) return;\n    await session.cancel();\n  }\n  async listSessions(params) {",
       "  async cancel(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (!session) return;\n    await session.cancel();\n  }\n  async closeSession(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    try {\n      if (session) await session.cancel();\n    } finally {\n      this.sessions.close(params.sessionId);\n    }\n    return {};\n  }\n  async listSessions(params) {"
-    }
+    },
+    {"function formatAutoRetryMessage(ev) {\n", @pi_turn_failure_helpers},
+    {@pi_start_turn, @pi_start_turn_patched},
+    {@pi_prompt_rejected, @pi_prompt_rejected_patched},
+    {@pi_auto_retry_end, @pi_auto_retry_end_patched},
+    {@pi_agent_end, @pi_agent_end_patched},
+    {@pi_agent_settled, @pi_agent_settled_patched}
   ]
   @credential_file "auth.json"
   @probe_model %Model{family: "opencode-go/gpt-5.6-luna", effort: "medium", context: nil}
@@ -717,7 +871,13 @@ defmodule Tightbeam.Harness.Pi do
       "          list: {},\n          delete: {}",
       "    this.sessions.closeAllExcept?.(session.sessionId);\n    const response = {",
       "    const fileCommands = loadSlashCommands(params.cwd);\n    this.sessions.closeAllExcept?.(session.sessionId);\n    this.store.upsert({",
-      "  async cancel(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (!session) return;\n    await session.cancel();\n  }\n  async listSessions(params) {"
+      "  async cancel(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (!session) return;\n    await session.cancel();\n  }\n  async listSessions(params) {",
+      @pi_start_turn,
+      @pi_prompt_rejected,
+      @pi_auto_retry_end,
+      @pi_agent_end,
+      @pi_agent_settled,
+      "function formatAutoRetryMessage(ev) {\n"
     ]
     |> Enum.join("\n")
   end

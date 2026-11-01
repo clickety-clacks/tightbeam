@@ -349,12 +349,238 @@ defmodule Tightbeam.HarnessPiTest do
     assert script =~ "const rs=JSON.parse"
   end
 
+  describe "typed Pi turn failures in the pi-acp 0.0.33 patch" do
+    test "the release bundle takes the full patch set once and stays valid JavaScript" do
+      source = release_bundle()
+      patched = Pi.patch_adapter_source(source)
+
+      assert Pi.patch_adapter_source(patched) == patched
+
+      for marker <- [
+            "function tightbeamPiSafeError(raw) {",
+            "function tightbeamPiTurnError(errorKind, piAttempts, raw) {",
+            "    this.piRunError = null;\n    this.piRetryFailure = null;",
+            ~s|tightbeamPiTurnError("pi_turn_failed", 0, err?.message ?? err)|,
+            ~s|: `Retry exhausted${attempts}: ${tightbeamPiSafeError(ev.finalError)}`;|,
+            ~s|messages.findLast((message) => message?.role === "assistant")|,
+            ~s|tightbeamPiTurnError("pi_retry_exhausted", retryFailure.piAttempts|
+          ] do
+        assert patched =~ marker
+      end
+
+      refute patched =~ ~s|const reason = this.cancelRequested ? "cancelled" : "error";|
+      refute patched =~ ~s|const reason = this.cancelRequested ? "cancelled" : "end_turn";|
+
+      root = tmp_dir!("pi-acp-patched-bundle")
+      bundle = Path.join(root, "index.mjs")
+      File.write!(bundle, patched)
+      assert {_output, 0} = System.cmd("node", ["--check", bundle], stderr_to_stdout: true)
+    end
+
+    test "the adapter patch is pinned to 0.0.33 and leaves another release untouched" do
+      for {version, expect_patched?} <- [{"0.0.34", false}, {"0.0.33", true}] do
+        root = tmp_dir!("pi-acp-pin-#{version}")
+        package = Path.join([root, "node_modules", "pi-acp"])
+        bundle = Path.join([package, "dist", "index.js"])
+        binary = Path.join([root, "node_modules", ".bin", "pi-acp"])
+        File.mkdir_p!(Path.dirname(bundle))
+        File.mkdir_p!(Path.dirname(binary))
+        File.write!(Path.join(package, "package.json"), JSON.encode!(%{"version" => version}))
+        File.write!(bundle, release_bundle())
+        File.write!(binary, "")
+
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert {:ok, "adapters present"} =
+                     Pi.ensure_adapter(%{
+                       adapter_binary: binary,
+                       host_name: "local",
+                       host_config: %{ssh: nil}
+                     })
+          end)
+
+        if expect_patched? do
+          assert File.read!(bundle) == Pi.patch_adapter_source(release_bundle())
+        else
+          assert File.read!(bundle) == release_bundle()
+          assert log =~ "unsupported installed version 0.0.34; expected 0.0.33"
+        end
+      end
+    end
+
+    for version <- ["0.84.1", "1.4.0"] do
+      @tag pi_version: version
+      test "exhausted retries, assistant errors and RPC refusals reject typed on Pi #{version}",
+           ctx do
+        results = turn_contract(Pi.patch_adapter_source(release_bundle()), ctx.pi_version)
+
+        # A1: turn 38756's shape, one logical prompt and four Pi request attempts.
+        assert results["exhausted"]["error"] == %{
+                 "code" => -32_603,
+                 "message" =>
+                   "Internal error: pi retry exhausted after 4 attempts: Request timed out.",
+                 "data" => %{
+                   "errorKind" => "pi_retry_exhausted",
+                   "piAttempts" => 4,
+                   "transportAttempts" => "unobserved",
+                   "finalError" => "Request timed out."
+                 }
+               }
+
+        assert List.last(results["exhausted"]["text"]) ==
+                 "Retry exhausted after 4 attempts: Request timed out."
+
+        refute "Retry finished, resuming." in results["exhausted"]["text"]
+        assert results["exhausted"]["requests"] == ["prompt"]
+
+        # A4: a non-retryable final assistant error.
+        assert results["assistantError"]["error"]["data"] == %{
+                 "errorKind" => "pi_turn_failed",
+                 "piAttempts" => 1,
+                 "transportAttempts" => "unobserved",
+                 "finalError" => "400 invalid_request_error: bad schema"
+               }
+
+        # A5: Pi refused the RPC prompt before running it.
+        assert results["rpcRejected"]["error"]["code"] == -32_603
+
+        assert results["rpcRejected"]["error"]["data"] == %{
+                 "errorKind" => "pi_turn_failed",
+                 "piAttempts" => 0,
+                 "transportAttempts" => "unobserved",
+                 "finalError" => "pi prompt failed: No model selected"
+               }
+
+        refute Map.has_key?(results["rpcRejected"], "stopReason")
+
+        # An authentication refusal keeps pi-acp's own authRequired error.
+        assert results["rpcAuthRejected"]["error"]["code"] == -32_000
+        assert results["rpcAuthRejected"]["error"]["data"]["authMethods"] != []
+      end
+
+      @tag pi_version: version
+      test "success, recovery, cancellation and later runs keep their outcome on Pi #{version}",
+           ctx do
+        results = turn_contract(Pi.patch_adapter_source(release_bundle()), ctx.pi_version)
+
+        assert results["success"]["stopReason"] == "end_turn"
+        assert results["success"]["text"] == ["hello"]
+
+        # A2: a retry that recovers is a normal turn.
+        assert results["recovered"]["stopReason"] == "end_turn"
+        assert "Retry finished, resuming." in results["recovered"]["text"]
+
+        # A failed retry chain superseded by a later successful run (compaction).
+        assert results["supersededByLaterRun"]["stopReason"] == "end_turn"
+
+        # A3: cancellation during a retry wait stays cancelled, with no error.
+        assert results["cancelled"]["stopReason"] == "cancelled"
+        assert results["cancelled"]["requests"] == ["prompt", "abort"]
+        assert List.last(results["cancelled"]["text"]) == "Retry cancelled."
+        assert results["cancelledRejection"] == %{"stopReason" => "cancelled"}
+      end
+
+      @tag pi_version: version
+      test "consecutive prompts and separate sessions do not share a failure on Pi #{version}",
+           ctx do
+        results = turn_contract(Pi.patch_adapter_source(release_bundle()), ctx.pi_version)
+
+        assert [
+                 %{"error" => %{"data" => %{"errorKind" => "pi_retry_exhausted"}}},
+                 %{"stopReason" => "end_turn"},
+                 %{"error" => %{"data" => %{"errorKind" => "pi_turn_failed", "piAttempts" => 1}}}
+               ] = results["consecutive"]
+
+        assert %{
+                 "failed" => %{"error" => %{"data" => %{"errorKind" => "pi_retry_exhausted"}}},
+                 "delivered" => %{"stopReason" => "end_turn"}
+               } = results["isolated"]
+      end
+    end
+
+    test "failure text is bounded and carries no credential material" do
+      results = turn_contract(Pi.patch_adapter_source(release_bundle()), "1.4.0")
+      %{"message" => message, "data" => data} = results["unsafeError"]["error"]
+      final_error = data["finalError"]
+
+      assert data["errorKind"] == "pi_retry_exhausted"
+      assert String.length(final_error) == 303
+      assert String.ends_with?(final_error, "...")
+      assert final_error =~ "401 from provider Authorization: [REDACTED]"
+      assert final_error =~ "api_key=[REDACTED]"
+      assert final_error =~ "token: [REDACTED]"
+      assert final_error =~ "echoed [REDACTED]"
+      refute final_error =~ "\n"
+
+      for secret <- ["sk-live-abcdefghijklmnop", "SECRETVALUE", "tok_abcdef", "sk-proj-"] do
+        refute message =~ secret
+        refute Enum.any?(results["unsafeError"]["text"], &(&1 =~ secret))
+      end
+    end
+
+    test "the unpatched release reports every failed turn as a normal end_turn" do
+      # Negative control: the same scripts against pristine 0.0.33 reproduce the
+      # defect. PiAcpAgent.prompt maps a session result of "error" to end_turn.
+      results = turn_contract(release_bundle(), "1.4.0")
+
+      assert results["exhausted"]["stopReason"] == "end_turn"
+      assert List.last(results["exhausted"]["text"]) == "Retry finished, resuming."
+      assert results["assistantError"]["stopReason"] == "end_turn"
+      assert results["rpcRejected"]["stopReason"] == "error"
+      assert results["isolated"]["failed"]["stopReason"] == "end_turn"
+    end
+  end
+
+  # pi-acp@0.0.33 dist/index.js exactly as published (npm integrity sha512-vX9kY1tK...,
+  # MIT, github.com/svkozak/pi-acp), gzip -9n and base64 encoded.
+  defp release_bundle do
+    bundle =
+      Path.expand("fixtures/pi_acp/pi-acp-0.0.33-dist-index.js.gz.b64", __DIR__)
+      |> File.read!()
+      |> String.replace(~r/\s+/u, "")
+      |> Base.decode64!()
+      |> :zlib.gunzip()
+
+    assert Base.encode16(:crypto.hash(:sha256, bundle), case: :lower) ==
+             "24ff73fda6e3c76ddce2d359a79f5c4b8f292eb290e4d2ab85aac94676b2c2dc"
+
+    bundle
+  end
+
+  defp turn_contract(source, pi_version) do
+    root = tmp_dir!("pi-turn-contract")
+    runner = Path.join(root, "runner.mjs")
+    bundle = Path.join(root, "bundle.js")
+    fixture = Path.expand("fixtures/pi_acp/0.0.33-turn-failure-contract.mjs", __DIR__)
+    File.write!(bundle, source)
+
+    File.write!(
+      runner,
+      """
+      import { readFileSync } from "node:fs";
+      import { runTurnContract } from #{JSON.encode!(fixture)};
+      const source = readFileSync(#{JSON.encode!(bundle)}, "utf8");
+      const result = await runTurnContract(source, #{JSON.encode!(pi_version)});
+      process.stdout.write(JSON.stringify(result));
+      """
+    )
+
+    {output, 0} = System.cmd("node", [runner], cd: root, env: [{"TMPDIR", root}])
+    JSON.decode!(output)
+  end
+
   defp pristine_adapter_fixture do
     [
       "          list: {},\n          delete: {}",
       "    this.sessions.closeAllExcept?.(session.sessionId);\n    const response = {",
       "    const fileCommands = loadSlashCommands(params.cwd);\n    this.sessions.closeAllExcept?.(session.sessionId);\n    this.store.upsert({",
-      "  async cancel(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (!session) return;\n    await session.cancel();\n  }\n  async listSessions(params) {"
+      "  async cancel(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (!session) return;\n    await session.cancel();\n  }\n  async listSessions(params) {",
+      "  startTurn(t) {\n    this.cancelRequested = false;\n    this.inAgentLoop = false;\n",
+      "        if (authErr) {\n          this.pendingTurn?.reject(authErr);\n        } else {\n          const reason = this.cancelRequested ? \"cancelled\" : \"error\";\n          this.pendingTurn?.resolve(reason);\n        }\n",
+      "      case \"auto_retry_end\": {\n        this.emit({\n          sessionUpdate: \"agent_message_chunk\",\n          content: { type: \"text\", text: \"Retry finished, resuming.\" }\n        });\n        break;\n      }\n",
+      "      case \"agent_end\": {\n        this.inAgentLoop = false;\n        break;\n      }\n",
+      "        void this.flushEmits().finally(() => {\n          const reason = this.cancelRequested ? \"cancelled\" : \"end_turn\";\n          this.pendingTurn?.resolve(reason);\n          this.pendingTurn = null;\n",
+      "function formatAutoRetryMessage(ev) {\n"
     ]
     |> Enum.join("\n")
   end
