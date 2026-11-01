@@ -2098,46 +2098,62 @@ defmodule Tightbeam.HarnessHealthTest do
   end
 
   test "pre-request model refusal is not recorded or redelivered after route recovery", ctx do
-    [failed, _second, healthy] = ctx.sessions
+    [failed, second, healthy] = ctx.sessions
 
     sources =
-      for {message_id, reason} <- [
-            {"pi-model-refusal",
+      for {ref, message_id, reason} <- [
+            {failed, "pi-model-refusal",
              %{"code" => -32_603, "message" => "pi set_model failed: Model not found"}},
-            {"mapped-model-refusal", {:model_apply_failed, :model_unavailable}}
+            {failed, "mapped-model-refusal", {:model_apply_failed, :model_unavailable}},
+            {second, "second-mapped-model-refusal", {:model_apply_failed, :model_unavailable}}
           ] do
         fail_health_turn!(
           ctx.db,
-          failed.session,
+          ref.session,
           message_id,
           "do not replay this prompt",
           reason,
           stage: :session,
-          assignment_id: failed.assignment
+          assignment_id: ref.assignment
         )
       end
 
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT COUNT(*) FROM health_redelivery_attempts WHERE sourceTurnSeq IN (?1,?2)",
+               "SELECT COUNT(*) FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq IN (?1,?2,?3)",
                Enum.map(sources, & &1.seq)
              )
 
+    assert [incident] = HarnessHealth.active(ctx.db)
+    assert incident.failureClass == "model_unavailable"
+    assert incident.repair.action == "tune"
+
+    assert HarnessHealth.get(ctx.db, incident.id).observations
+           |> Enum.map(& &1.correlation_id)
+           |> MapSet.new() ==
+             sources
+             |> Enum.drop(1)
+             |> Enum.map(&"harness-turn:#{&1.seq}:model_unavailable")
+             |> MapSet.new()
+
     _restoration = restore_health_turn!(ctx.db, healthy.session, "pi-route-restoration")
 
-    assert {:ok, [[2]]} =
+    assert {:ok, [[3]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM turns WHERE messageId IN " <>
-                 "('pi-model-refusal','mapped-model-refusal') AND status='failed'"
+                 "('pi-model-refusal','mapped-model-refusal','second-mapped-model-refusal') " <>
+                 "AND status='failed'"
              )
 
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM turns WHERE messageId IN " <>
-                 "('pi-model-refusal','mapped-model-refusal') AND status='queued'"
+                 "('pi-model-refusal','mapped-model-refusal','second-mapped-model-refusal') " <>
+                 "AND status='queued'"
              )
   end
 

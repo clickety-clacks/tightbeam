@@ -1078,20 +1078,17 @@ defmodule Tightbeam.HarnessHealth do
   @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term()) ::
           nil | (-> :ok)
   def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason) do
-    if pre_request_model_selection_refusal?(failed_stage, reason) do
-      nil
-    else
-      observe_redeliverable_turn_failure_in_txn(txn, session, turn, failed_stage, reason)
-    end
-  end
+    pre_request_refusal? = pre_request_model_selection_refusal?(failed_stage, reason)
 
-  defp observe_redeliverable_turn_failure_in_txn(txn, session, turn, failed_stage, reason) do
     case classify_turn_failure(reason) do
       nil ->
         # The terminal failure path has no assistant output. Preserve a
         # message-bearing unclassified failure so the next successful turn on
         # this harness and host can act as the bounded recovery signal.
-        Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, "unclassified")
+        unless pre_request_refusal? do
+          Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, "unclassified")
+        end
+
         nil
 
       failure_class ->
@@ -1127,17 +1124,19 @@ defmodule Tightbeam.HarnessHealth do
             principal: turn.origin || "process:tightbeam"
           })
 
-        redelivery_failure_class =
-          case typed_redelivery_failure_class(reason) do
-            ^failure_class -> failure_class
-            _ -> "unclassified"
-          end
+        unless pre_request_refusal? do
+          redelivery_failure_class =
+            case typed_redelivery_failure_class(reason) do
+              ^failure_class -> failure_class
+              _ -> "unclassified"
+            end
 
-        Wakes.record_health_redelivery_source_in_txn(
-          txn,
-          turn.seq,
-          redelivery_failure_class
-        )
+          Wakes.record_health_redelivery_source_in_txn(
+            txn,
+            turn.seq,
+            redelivery_failure_class
+          )
+        end
 
         Tightbeam.RateLimitReset.schedule_in_txn(txn, session, result, reason, observed_at)
 
