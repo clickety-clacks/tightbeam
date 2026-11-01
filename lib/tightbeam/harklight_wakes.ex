@@ -1119,6 +1119,7 @@ defmodule Tightbeam.HarklightWakes do
     {error, operation, diagnostic} = failure_details(status)
     handle = sanitize_diagnostic_text(handle) || "unknown"
     error = sanitize_diagnostic_text(error) || "unknown"
+
     operation =
       if is_binary(operation),
         do: sanitize_diagnostic_text(operation) || "unknown",
