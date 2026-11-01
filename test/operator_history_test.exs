@@ -296,24 +296,15 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
     append(ctx, ctx.selected, "two")
     page = read(ctx, ctx.selected, "asUser=owner&limit=1") |> body()
     cursor = page["page"]["oldestCursor"]
-    identity = cursor |> Base.url_decode64!(padding: false) |> JSON.decode!()
-    assert identity["principalKind"] == "user"
-    assert identity["principalId"] == "owner"
+    assert read(ctx, ctx.selected, "asUser=owner&before=" <> cursor).status == 200
     assert_error(read(ctx, ctx.sibling, "asUser=owner&before=" <> cursor), 400, "invalid_cursor")
 
-    mismatched_principal =
-      read(ctx, ctx.selected, "asUser=" <> ctx.admin.user_id <> "&before=" <> cursor)
+    other_principal =
+      read(ctx, ctx.selected, "asUser=owner&before=" <> cursor, ctx.admin.token) |> body()
 
-    assert mismatched_principal.status == 200
-    assert Enum.map(body(mismatched_principal)["items"], & &1["content"]) == ["one", "two"]
-
-    changed_cursor =
-      body(mismatched_principal)["page"]["oldestCursor"]
-      |> Base.url_decode64!(padding: false)
-      |> JSON.decode!()
-
-    assert changed_cursor["principalKind"] == "user-admin"
-    assert changed_cursor["principalId"] == ctx.admin.user_id
+    admin_default = read(ctx, ctx.selected, "", ctx.admin.token) |> body()
+    assert other_principal["items"] == admin_default["items"]
+    assert Enum.map(other_principal["items"], & &1["content"]) == ["one", "two"]
   end
 
   test "org reads expose session collections with unchanged owner and admin visibility", ctx do

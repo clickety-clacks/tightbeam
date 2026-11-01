@@ -340,7 +340,7 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [[1], [1], [1]]} =

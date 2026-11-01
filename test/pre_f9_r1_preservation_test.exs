@@ -1,10 +1,18 @@
 defmodule Tightbeam.PreF9R1PreservationTest do
   use Tightbeam.TestCase, async: false
-  alias Tightbeam.{DB, Schema}
+  alias Tightbeam.DB
 
   test "assignment-only historical helper preserves R1 bytes and schema stamp" do
     db = start_supervised!({DB, path: ":memory:", name: nil})
-    :ok = Schema.ensure_all(db)
+
+    Tightbeam.HistoricalSchemaFixture.load!(
+      db,
+      "settlement_predecessor_9f47967f",
+      "6a3bfab2fd5ef2ba8a132a19537f4f124c67d2018c64c0486ae37c1866f7085d"
+    )
+
+    assert {:ok, [["stale-turn-settlement-v1-019"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
 
     :ok =
       DB.execute(db, """
@@ -23,5 +31,6 @@ defmodule Tightbeam.PreF9R1PreservationTest do
     assert {:ok, ^stamp} = DB.query(db, "SELECT * FROM schema_stamp")
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
     assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA legacy_alter_table")
   end
 end

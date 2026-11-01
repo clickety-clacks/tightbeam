@@ -13,8 +13,6 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
     Wakes
   }
 
-  alias Tightbeam.DB.Txn
-
   setup do
     db = :"notice_source_payload_#{System.unique_integer([:positive])}"
     base = Path.join(System.tmp_dir!(), "#{db}")
@@ -121,12 +119,15 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
              )
 
     assert {:ok, history_before} = DB.query(db, "SELECT rowid,* FROM notice_batch_members")
-    assert {:ok, batch_before} = DB.query(db, "SELECT rowid,* FROM notice_batches")
+    assert {:ok, batch_columns} = DB.query(db, "PRAGMA table_info(notice_batches)")
+    batch_columns = "rowid," <> Enum.map_join(batch_columns, ",", &Enum.at(&1, 1))
+    batch_sql = "SELECT #{batch_columns} FROM notice_batches"
+    assert {:ok, batch_before} = DB.query(db, batch_sql)
 
     assert :ok = Schema.ensure_all(db)
     assert source_snapshot(db, source.wake_id) == before
     assert {:ok, ^history_before} = DB.query(db, "SELECT rowid,* FROM notice_batch_members")
-    assert {:ok, ^batch_before} = DB.query(db, "SELECT rowid,* FROM notice_batches")
+    assert {:ok, ^batch_before} = DB.query(db, batch_sql)
 
     assert {:ok, [["original-private", "role:original"]]} =
              DB.query(
@@ -186,7 +187,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
                "SELECT name FROM sqlite_master WHERE name IN ('notice_batch_source_attachments','staged_message_dedupes','notice_delivery_policies','notice_batching_lane_policies')"
              )
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
@@ -230,7 +231,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
 
     assert source_snapshot(db, source.wake_id) == before
     assert {:ok, ^history_before} = DB.query(db, "SELECT rowid,* FROM notice_batch_members")
-    assert {:ok, ^batch_before} = DB.query(db, "SELECT rowid,* FROM notice_batches")
+    assert {:ok, ^batch_before} = DB.query(db, batch_sql)
 
     assert {:ok, [[1], [1]]} =
              DB.query(
@@ -295,7 +296,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
 
       assert Wakes.get(db, ordinary.wake_id).state == "pending"
 
-      assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+      assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
                DB.query(db, "SELECT shape FROM schema_stamp")
 
       assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM turns")
@@ -358,7 +359,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
                  [condition.wake_id]
                )
 
-      assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+      assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
                DB.query(db, "SELECT shape FROM schema_stamp")
 
       before = current_storage_snapshot(db)
@@ -530,7 +531,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
     assert :ok =
              DB.execute(
                db,
-               "CREATE TRIGGER refuse_payload_copy BEFORE UPDATE ON wakes BEGIN SELECT RAISE(ABORT,'forced source payload copy failure'); END"
+               "CREATE TRIGGER refuse_payload_copy BEFORE UPDATE OF sourceAttachments ON wakes BEGIN SELECT RAISE(ABORT,'forced source payload copy failure'); END"
              )
 
     assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~
@@ -546,7 +547,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
     assert {:ok, [[nil]]} =
              DB.query(db, "SELECT sourceAttachments FROM wakes WHERE wakeId=?1", [source.wake_id])
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert :ok = Schema.ensure_all(db)
@@ -590,44 +591,43 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
   end
 
   defp predecessor!(db, db_opts) do
-    :ok =
-      DB.execute(
-        db,
-        "DROP TRIGGER decision_requests_row_schema_revision_insert_guard; " <>
-          "DROP TRIGGER decision_requests_row_schema_revision_update_guard; " <>
-          "ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision; " <>
-          "DROP INDEX notice_source_client_identity; " <>
-          "ALTER TABLE wakes DROP COLUMN sourceClientIdentity; " <>
-          "ALTER TABLE wakes DROP COLUMN sourceAttachments; " <>
-          "ALTER TABLE wakes DROP COLUMN sourceVisibilityScope; " <>
-          "ALTER TABLE wakes DROP COLUMN sourceAddress;"
-      )
+    # Preserve the authored source rows, but rebuild the entire synthetic database
+    # from the original bootstrap, rather than relabeling current actor DDL.
+    assert {:ok, columns} = DB.query(db, "PRAGMA table_info(wakes)")
+    columns = ["rowid" | Enum.map(columns, &Enum.at(&1, 1))]
+    assert {:ok, rows} = DB.query(db, "SELECT rowid,* FROM wakes ORDER BY rowid")
+    sources = Enum.map(rows, &Map.new(Enum.zip(columns, &1)))
 
-    frozen = File.read!(Path.expand("fixtures/notice_source_payload_6642ee93.sql", __DIR__))
+    stop_supervised!(db)
+    start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: db}, id: db))
 
-    assert Base.encode16(:crypto.hash(:sha256, frozen), case: :lower) ==
-             "3bb006a3ae09f0bf310af1b0390958f3dbebfe2c7bbb3bad08cb6c5044ae8665"
+    # Captured from 6642ee9387627b7fac85da989039ffe42d425787 through
+    # that revision's unmodified Schema.ensure_all/1 and canonical wrapper.
+    Tightbeam.HistoricalSchemaFixture.load!(
+      db,
+      "notice_predecessor_6642ee93",
+      "0261f23ea702c137171499269e58fba02345a4952abba8ec013f4957ce5f3e76"
+    )
 
-    assert {:ok, :ok} =
-             DB.migration_transaction(
-               db,
-               :source_payload_test_predecessor,
-               ["PRAGMA foreign_keys=OFF", "PRAGMA legacy_alter_table=ON"],
-               ["PRAGMA legacy_alter_table=OFF", "PRAGMA foreign_keys=ON"],
-               fn txn ->
-                 :ok = Txn.exec(txn, "DROP TABLE notice_batch_members")
-                 :ok = Txn.exec(txn, frozen)
-               end
-             )
+    assert {:ok, [["assignment-source-replacement-v1-019"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
 
-    {:ok, _} =
-      DB.query(
-        db,
-        "UPDATE schema_stamp SET shape='assignment-source-replacement-v1-019',stampedAt=1"
-      )
+    assert {:ok, columns} = DB.query(db, "PRAGMA table_info(wakes)")
+    columns = ["rowid" | Enum.map(columns, &Enum.at(&1, 1))]
+    placeholders = Enum.map_join(columns, ",", fn _ -> "?" end)
 
-    # Admit the completed predecessor from disk, rather than mutating a stamp
-    # after this connection's guarded inspection.
+    for source <- sources do
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 "INSERT INTO wakes (#{Enum.join(columns, ",")}) VALUES (#{placeholders})",
+                 Enum.map(columns, &Map.fetch!(source, &1))
+               )
+    end
+
+    # Admit the coherent historical database from disk before exercising upgrade.
+    File.rm!(db_opts[:path])
+    assert {:ok, _} = DB.query(db, "VACUUM INTO ?1", [db_opts[:path]])
     stop_supervised!(db)
     start_supervised!(Supervisor.child_spec({DB, db_opts}, id: db))
   end

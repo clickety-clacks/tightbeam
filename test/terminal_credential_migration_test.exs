@@ -7,7 +7,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
   @terminal_shape "terminal-credential-failure-v1-019"
   @artifact_origin_shape "artifact-origin-v1-019"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
-  @successor "launch-preparation-evidence-v1-0112"
+  @successor "closed-assignment-cannot-proceed-reconciliation-v1-015"
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
 
   @terminal_objects ~w(
@@ -34,25 +34,13 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
   setup do
     db = :"terminal_credential_migration_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = Schema.ensure_all(db)
-    Tightbeam.SchemaShapeRuntimeFixture.downgrade_assignment_source_replacement_cancellation!(db)
-
-    # The credential successor is additive, so removing exactly its owned objects
-    # recreates the landed settlement predecessor without rewriting any historical
-    # table or pretending a different stored shape has the same schema.
-    :ok =
-      DB.execute(db, """
-      DROP TRIGGER artifacts_origin_immutable;
-      ALTER TABLE artifacts DROP COLUMN originHost;
-      ALTER TABLE artifacts DROP COLUMN originWorkspace;
-      DROP TABLE terminal_credential_deliveries;
-      DROP TABLE terminal_credential_redirects;
-      DROP TABLE terminal_credential_observations;
-      DROP TABLE terminal_credential_incidents;
-      ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey;
-      ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic;
-      UPDATE schema_stamp SET shape='#{@predecessor}';
-      """)
+    # Captured from 9f47967fb5656a53c33b5d28ee437efb89c0f582 through
+    # that revision's unmodified Schema.ensure_all/1 and canonical wrapper.
+    Tightbeam.HistoricalSchemaFixture.load!(
+      db,
+      "settlement_predecessor_9f47967f",
+      "6a3bfab2fd5ef2ba8a132a19537f4f124c67d2018c64c0486ae37c1866f7085d"
+    )
 
     assert stamp(db) == @predecessor
     assert terminal_objects(db) == []
@@ -72,10 +60,44 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
     assert {:ok, preserved_before} = DB.query(db, preserved_sql)
     assert length(preserved_before) == 4
 
+    # Check the additive credential transition at its own stamp. Later migrations
+    # legitimately change process-actor nullability before ensure_all returns.
+    assert :ok =
+             DB.execute(db, """
+             CREATE TABLE credential_schema_checkpoint AS #{preserved_sql} LIMIT 0;
+             CREATE TRIGGER capture_credential_schema AFTER UPDATE ON schema_stamp
+             WHEN NEW.shape='#{@terminal_shape}'
+             BEGIN
+               INSERT INTO credential_schema_checkpoint #{preserved_sql};
+             END;
+             """)
+
     assert :ok = Schema.ensure_all(db)
     assert stamp(db) == @successor
     assert terminal_objects(db) == @terminal_objects
-    assert {:ok, ^preserved_before} = DB.query(db, preserved_sql)
+
+    assert {:ok, ^preserved_before} =
+             DB.query(
+               db,
+               "SELECT type,name,sql FROM credential_schema_checkpoint ORDER BY type,name"
+             )
+
+    expected_current =
+      Enum.map(preserved_before, fn
+        [type, "assignment_cannot_proceed", sql] ->
+          [
+            type,
+            "assignment_cannot_proceed",
+            sql
+            |> String.replace("openerRef TEXT NOT NULL", "openerRef TEXT")
+            |> String.replace("disposerRef TEXT NOT NULL", "disposerRef TEXT")
+          ]
+
+        object ->
+          object
+      end)
+
+    assert {:ok, ^expected_current} = DB.query(db, preserved_sql)
     assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM condition_facts")
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM terminal_credential_incidents")
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
@@ -87,6 +109,8 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
 
     assert [
              @successor,
+             "session-identity-v1-0114",
+             "launch-preparation-evidence-v1-0112",
              "launch-preparation-boot-v1-0110",
              "decision-request-row-schema-v2-019",
              "notice-source-storage-v1-019",
