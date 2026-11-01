@@ -2557,7 +2557,10 @@ defmodule Tightbeam.HarklightWakesTest do
     System.put_env("PATH", Enum.join([directory, previous_path] |> Enum.reject(&is_nil/1), ":"))
 
     on_exit(fn ->
-      if is_nil(previous_path), do: System.delete_env("PATH"), else: System.put_env("PATH", previous_path)
+      if is_nil(previous_path),
+        do: System.delete_env("PATH"),
+        else: System.put_env("PATH", previous_path)
+
       File.rm_rf!(directory)
     end)
   end

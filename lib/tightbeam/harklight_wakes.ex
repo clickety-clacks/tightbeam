@@ -694,6 +694,7 @@ defmodule Tightbeam.HarklightWakes do
         now = System.system_time(:millisecond)
         completed = status == :complete
         next_state = if completed, do: "complete", else: "unavailable"
+
         {error, operation, diagnostic} =
           if completed, do: {nil, nil, nil}, else: failure_details(status)
 
@@ -769,7 +770,8 @@ defmodule Tightbeam.HarklightWakes do
       if recipient = Supervision.ladder_target(txn, session_key, 1) do
         cli_output =
           case {operation, diagnostic} do
-            {operation, diagnostic} when operation in ["attach", "listen"] and is_binary(diagnostic) ->
+            {operation, diagnostic}
+            when operation in ["attach", "listen"] and is_binary(diagnostic) ->
               " Failure cause is unknown. Sanitized #{String.upcase(operation)} CLI output: #{diagnostic}."
 
             _ ->
@@ -883,7 +885,9 @@ defmodule Tightbeam.HarklightWakes do
     case attach_once(executable, args) do
       {:unknown, op_id, diagnostic} ->
         case System.cmd(executable, ["retry", "--op-id", op_id], stderr_to_stdout: true) do
-          {_output, 0} -> attach_once(executable, args) |> attach_result()
+          {_output, 0} ->
+            attach_once(executable, args) |> attach_result()
+
           {output, _} ->
             {:error, "attachment_outcome_unknown",
              combine_diagnostics(diagnostic, sanitize_refusal_output(output))}
@@ -901,7 +905,9 @@ defmodule Tightbeam.HarklightWakes do
       {output, 0} ->
         if Enum.any?(String.split(output, "\n", trim: true), fn line ->
              match?({:ok, %{"kind" => "attached", "ready_for_listen" => true}}, JSON.decode(line))
-           end), do: :ok, else: {:error, "attachment_unconfirmed", sanitize_refusal_output(output)}
+           end),
+           do: :ok,
+           else: {:error, "attachment_unconfirmed", sanitize_refusal_output(output)}
 
       {output, _} ->
         unknown =
@@ -951,7 +957,9 @@ defmodule Tightbeam.HarklightWakes do
           |> Enum.drop(-1)
           |> Enum.reduce_while({:ok, diagnostics}, fn line, {:ok, current_diagnostics} ->
             case receive_listener_line(manager, handle, line, current_diagnostics) do
-              {:ok, next_diagnostics} -> {:cont, {:ok, next_diagnostics}}
+              {:ok, next_diagnostics} ->
+                {:cont, {:ok, next_diagnostics}}
+
               {:error, reason, next_diagnostics} ->
                 {:halt, {:error, reason, next_diagnostics}}
             end
@@ -963,6 +971,7 @@ defmodule Tightbeam.HarklightWakes do
 
           {:error, reason, next_diagnostics} ->
             Port.close(port)
+
             finish(
               manager,
               handle,
