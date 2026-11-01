@@ -652,6 +652,14 @@ defmodule Tightbeam.Harness.Pi do
     }
 
     export default function (pi) {
+      // Pi awaits session_start while binding extensions, before RPC input can
+      // reach compaction or a model request. Keep the per-turn check below: it
+      // catches later carrier invalidation, though Pi may compact before that
+      // next-turn check if the carrier changes after this startup validation.
+      pi.on("session_start", async () => {
+        identityGuidance();
+      });
+
       pi.on("before_agent_start", async (event) => {
         const guidance = identityGuidance();
         if (guidance === undefined) return undefined;

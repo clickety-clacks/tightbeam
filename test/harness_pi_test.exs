@@ -150,6 +150,7 @@ defmodule Tightbeam.HarnessPiTest do
       import extension from #{JSON.encode!(extension)};
       const handlers = {};
       extension({ on(name, handler) { handlers[name] = handler; } });
+      await handlers.session_start({ type: "session_start", reason: "startup" });
       const identity = await handlers.before_agent_start({ systemPrompt: "BASE" });
       const gate = await handlers.tool_call({
         toolName: "bash",
@@ -263,6 +264,7 @@ defmodule Tightbeam.HarnessPiTest do
       let modelRequests = 0;
       extension({ on(name, handler) { handlers[name] = handler; } });
 
+      await handlers.session_start({ type: "session_start", reason: "startup" });
       const identity = await handlers.before_agent_start({ systemPrompt: "BASE" });
       modelRequests += 1;
       const gate = await handlers.tool_call({
@@ -651,6 +653,7 @@ defmodule Tightbeam.HarnessPiTest do
       extension({ on(name, handler) { handlers[name] = handler; } });
 
       try {
+        await handlers.session_start({ type: "session_start", reason: "startup" });
         const identity = await handlers.before_agent_start({ systemPrompt: "BASE" });
         writeFileSync(#{JSON.encode!(model_request)}, "requested");
         process.stdout.write(JSON.stringify({ identity }));
