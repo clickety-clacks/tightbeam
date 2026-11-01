@@ -661,6 +661,7 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
 
   test "a Pi typed prompt failure fails the turn without resolving or replaying anything" do
     with_gateway(fn %{db: db, config: config, lane: lane} ->
+      config = Map.put(config, :model_catalog, route_catalog("pi"))
       first = Model.new("synthetic-first", effort: "low")
       session_key = "pi-typed-prompt-failure"
 
@@ -693,13 +694,13 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
         origin: "user:synthetic-owner",
         archetype: "synthetic-ring",
         host: "testhost",
-        harness: "fixture",
-        provider: "fixture_provider",
+        harness: "pi",
+        provider: "opencode_go",
         model: first
       })
 
       assert {:opened, %{id: incident_id}} =
-               HarnessHealth.observe(db, health_incident_input("pi-typed-open", "fixture"))
+               HarnessHealth.observe(db, health_incident_input("pi-typed-open", "pi"))
 
       run_turn = fn message_id, prompt ->
         assert :appended =
@@ -794,10 +795,15 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     end)
   end
 
-  for {label, typed?} <- [{"a Pi typed", true}, {"an untyped", false}] do
-    @tag typed: typed?
+  for {label, harness, typed?} <- [
+        {"a Pi typed", "pi", true},
+        {"a non-Pi typed", "fixture", true},
+        {"an untyped Pi", "pi", false}
+      ] do
+    @tag harness: harness, typed: typed?
     test "#{label} rate-limit failure of a wake-delivered prompt and its wake retry", ctx do
       with_gateway(fn %{db: db, config: config} ->
+        config = Map.put(config, :model_catalog, route_catalog(ctx.harness))
         first = Model.new("synthetic-first", effort: "low")
         session_key = "pi-typed-wake-failure"
         final_error = "429 rate limit exceeded"
@@ -835,8 +841,8 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
           origin: "user:synthetic-owner",
           archetype: "synthetic-ring",
           host: "testhost",
-          harness: "fixture",
-          provider: "fixture_provider",
+          harness: ctx.harness,
+          provider: route_provider(ctx.harness),
           model: first
         })
 
@@ -907,11 +913,12 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
             session_key
           ])
 
-        if ctx.typed do
+        if ctx.typed and ctx.harness == "pi" do
           assert {wake_retries, health_redeliveries, successors, queued} == {0, 0, 0, 0}
         else
-          # Control: without the Pi kind the existing rate-limit wake retry stands,
-          # one row for the failed source and one for its pending successor.
+          # Controls: another harness's typed failure, or a Pi failure without the
+          # Pi kind, keeps the existing rate-limit wake retry, one row for the
+          # failed source and one for its pending successor.
           assert {wake_retries, successors} == {2, 1}
         end
       end)
@@ -1523,6 +1530,26 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
       File.write!(adapter_path, "#!/bin/sh\n")
       File.chmod!(adapter_path, 0o755)
     end
+  end
+
+  defp route_provider("pi"), do: "opencode_go"
+  defp route_provider("fixture"), do: "fixture_provider"
+
+  defp route_catalog(harness) do
+    {:ok, catalog} =
+      CatalogStub.start_link(%{
+        {"testhost", harness} =>
+          Enum.map(@default_preferences, fn {family, effort, context} ->
+            %{
+              family: family,
+              context: context,
+              efforts: [effort],
+              provider: String.to_existing_atom(route_provider(harness))
+            }
+          end)
+      })
+
+    catalog
   end
 
   defp health_incident_input(correlation_id, harness) do

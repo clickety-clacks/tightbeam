@@ -1080,7 +1080,7 @@ defmodule Tightbeam.HarnessHealth do
   @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term()) ::
           nil | (-> :ok)
   def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason) do
-    redeliverable? = not pi_typed_turn_failure?(reason)
+    redeliverable? = not pi_typed_turn_failure?(session, reason)
 
     case classify_turn_failure(reason) do
       nil ->
@@ -1147,18 +1147,20 @@ defmodule Tightbeam.HarnessHealth do
   end
 
   @doc """
-  Whether a turn failure is a typed Pi failure from the Tightbeam pi-acp patch.
+  Whether a turn failure on this session is a typed Pi failure from the
+  Tightbeam pi-acp patch. Only a Pi session's failure qualifies; the same error
+  kind from any other harness keeps the normal replay paths.
 
   Pi retries a failed provider request itself before reporting these kinds, and
   the turn may have run tools before failing. Replaying the prompt would add
   attempts Pi already spent, so these failures keep their incident and fact
   evidence but are never redelivered or retried as a wake.
   """
-  @spec pi_typed_turn_failure?(term()) :: boolean()
-  def pi_typed_turn_failure?(%{"data" => %{"errorKind" => kind}}),
-    do: kind in @pi_typed_turn_failure_kinds
+  @spec pi_typed_turn_failure?(map(), term()) :: boolean()
+  def pi_typed_turn_failure?(%{harness: harness}, %{"data" => %{"errorKind" => kind}}),
+    do: to_string(harness) == "pi" and kind in @pi_typed_turn_failure_kinds
 
-  def pi_typed_turn_failure?(_reason), do: false
+  def pi_typed_turn_failure?(_session, _reason), do: false
 
   @doc "Record a terminal class whose owner is the lane or boot reconciler."
   @spec observe_terminal_in_txn(Txn.t(), integer(), String.t(), String.t(), String.t()) ::

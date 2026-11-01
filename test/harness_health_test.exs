@@ -2098,7 +2098,7 @@ defmodule Tightbeam.HarnessHealthTest do
   end
 
   test "Pi typed turn failures keep incident evidence but are never redelivered", ctx do
-    [first, second, healthy] = ctx.sessions
+    [first, second, healthy] = pi_sessions!(ctx.db)
 
     sources =
       for {ref, message_id, kind, attempts, final_error} <- [
@@ -2109,11 +2109,10 @@ defmodule Tightbeam.HarnessHealthTest do
           ] do
         fail_health_turn!(
           ctx.db,
-          ref.session,
+          ref,
           message_id,
           "do not replay this prompt",
-          pi_typed_turn_failure(kind, attempts, final_error),
-          assignment_id: ref.assignment
+          pi_typed_turn_failure(kind, attempts, final_error)
         )
       end
 
@@ -2130,9 +2129,11 @@ defmodule Tightbeam.HarnessHealthTest do
     assert [incident] = HarnessHealth.active(ctx.db)
     assert incident.failureClass == "rate-limit-dead"
 
+    assert incident.harness == "pi"
+
     assert ConditionFacts.harness_failure_standing?(
              ctx.db,
-             "claude",
+             "pi",
              "testhost",
              "rate-limit-dead"
            )
@@ -2145,11 +2146,11 @@ defmodule Tightbeam.HarnessHealthTest do
              |> Enum.map(&"harness-turn:#{&1.seq}:rate-limit-dead")
              |> MapSet.new()
 
-    _restoration = restore_health_turn!(ctx.db, healthy.session, "pi-typed-restoration")
+    _restoration = restore_health_turn!(ctx.db, healthy, "pi-typed-restoration")
 
     refute ConditionFacts.harness_failure_standing?(
              ctx.db,
-             "claude",
+             "pi",
              "testhost",
              "rate-limit-dead"
            )
@@ -2164,29 +2165,28 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM health_redelivery_attempts")
   end
 
-  test "the same failure without a Pi error kind keeps its redelivery source", ctx do
-    [first | _] = ctx.sessions
+  test "only a Pi session's typed failure skips its redelivery source", ctx do
+    [claude | _] = ctx.sessions
+    [pi | _] = pi_sessions!(ctx.db)
+    typed = pi_typed_turn_failure("pi_retry_exhausted", 4, "Request timed out.")
+    untyped = update_in(typed, ["data"], &Map.delete(&1, "errorKind"))
 
-    untyped =
-      pi_typed_turn_failure("pi_retry_exhausted", 4, "Request timed out.")
-      |> update_in(["data"], &Map.delete(&1, "errorKind"))
+    # Controls: the same typed carrier on another harness, and a Pi failure
+    # without the Pi kind, keep the existing unclassified redelivery source.
+    for {session_key, message_id, reason, expected} <- [
+          {pi, "pi-typed-timeout", typed, []},
+          {claude.session, "non-pi-typed-timeout", typed, [["unclassified"]]},
+          {pi, "pi-untyped-timeout", untyped, [["unclassified"]]}
+        ] do
+      source = fail_health_turn!(ctx.db, session_key, message_id, "prompt", reason)
 
-    source =
-      fail_health_turn!(
-        ctx.db,
-        first.session,
-        "untyped-timeout",
-        "untyped prompt",
-        untyped,
-        assignment_id: first.assignment
-      )
-
-    assert {:ok, [["unclassified"]]} =
-             DB.query(
-               ctx.db,
-               "SELECT failureClass FROM health_redelivery_attempts WHERE sourceTurnSeq=?1",
-               [source.seq]
-             )
+      assert {:ok, ^expected} =
+               DB.query(
+                 ctx.db,
+                 "SELECT failureClass FROM health_redelivery_attempts WHERE sourceTurnSeq=?1",
+                 [source.seq]
+               )
+    end
   end
 
   test "unclassified and compaction failures redeliver once on same-harness success", ctx do
@@ -3331,6 +3331,26 @@ defmodule Tightbeam.HarnessHealthTest do
              end)
 
     turn
+  end
+
+  defp pi_sessions!(db) do
+    for index <- 1..3 do
+      session_key = "agent:harness-health:pi-#{index}"
+
+      Org.create(db, %{
+        session_key: session_key,
+        display_name: "Pi harness health #{index}",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "testhost",
+        harness: "pi",
+        provider: "opencode_go",
+        model: Model.new("opencode-go/gpt-5.6-luna")
+      })
+
+      session_key
+    end
   end
 
   # The JSON-RPC error the patched pi-acp 0.0.33 sends (Tightbeam.Harness.Pi).

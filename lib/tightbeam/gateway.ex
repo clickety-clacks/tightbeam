@@ -3539,7 +3539,7 @@ defmodule Tightbeam.Gateway do
               end
 
               # Pi has already retried a typed Pi failure; its wake is not retried either.
-              unless HarnessHealth.pi_typed_turn_failure?(raw_reason) do
+              unless HarnessHealth.pi_typed_turn_failure?(active_session, raw_reason) do
                 Tightbeam.Wakes.preserve_failed_intent_for_terminal_in_txn(txn, turn.seq)
               end
 
