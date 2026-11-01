@@ -2097,6 +2097,168 @@ defmodule Tightbeam.HarnessHealthTest do
              )
   end
 
+  test "pre-request model refusal is not recorded or redelivered after route recovery", ctx do
+    [failed, second, healthy] = ctx.sessions
+
+    sources =
+      for {ref, message_id, reason} <- [
+            {failed, "pi-model-refusal",
+             %{"code" => -32_603, "message" => "pi set_model failed: Model not found"}},
+            {failed, "mapped-model-refusal", {:model_apply_failed, :model_unavailable}},
+            {second, "second-mapped-model-refusal", {:model_apply_failed, :model_unavailable}}
+          ] do
+        fail_health_turn!(
+          ctx.db,
+          ref.session,
+          message_id,
+          "do not replay this prompt",
+          reason,
+          stage: :session,
+          assignment_id: ref.assignment
+        )
+      end
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq IN (?1,?2,?3)",
+               Enum.map(sources, & &1.seq)
+             )
+
+    assert [incident] = HarnessHealth.active(ctx.db)
+    assert incident.failureClass == "model_unavailable"
+    assert incident.repair.action == "tune"
+
+    assert ConditionFacts.harness_failure_standing?(
+             ctx.db,
+             "claude",
+             "testhost",
+             "model_unavailable"
+           )
+
+    assert HarnessHealth.get(ctx.db, incident.id).observations
+           |> Enum.map(& &1.correlation_id)
+           |> MapSet.new() ==
+             sources
+             |> Enum.drop(1)
+             |> Enum.map(&"harness-turn:#{&1.seq}:model_unavailable")
+             |> MapSet.new()
+
+    _restoration = restore_health_turn!(ctx.db, healthy.session, "pi-route-restoration")
+
+    refute ConditionFacts.harness_failure_standing?(
+             ctx.db,
+             "claude",
+             "testhost",
+             "model_unavailable"
+           )
+
+    assert {:ok, [[3]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE messageId IN " <>
+                 "('pi-model-refusal','mapped-model-refusal','second-mapped-model-refusal') " <>
+                 "AND status='failed'"
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE messageId IN " <>
+                 "('pi-model-refusal','mapped-model-refusal','second-mapped-model-refusal') " <>
+                 "AND status='queued'"
+             )
+  end
+
+  test "closed assignment source is skipped while open assignment recovery proceeds", ctx do
+    [closed, open, healthy] = ctx.sessions
+    auth_refusal = %{"status" => 401, "error" => "unauthorized"}
+
+    closed_source =
+      fail_health_turn!(
+        ctx.db,
+        closed.session,
+        "closed-assignment-source",
+        "closed assignment prompt",
+        auth_refusal,
+        assignment_id: closed.assignment
+      )
+
+    open_source =
+      fail_health_turn!(
+        ctx.db,
+        open.session,
+        "open-assignment-source",
+        "open assignment prompt",
+        auth_refusal,
+        assignment_id: open.assignment
+      )
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(
+                 txn,
+                 "INSERT INTO assignment_revocations " <>
+                   "(id,assignmentId,revokedAt,revokedBySession,reason) " <>
+                   "VALUES ('rev_health_closed',?1,100,?2,'closed source fixture')",
+                 [closed.assignment, closed.session]
+               )
+
+               DB.Txn.q(
+                 txn,
+                 "INSERT INTO assignment_revocation_generations " <>
+                   "(revocationId,assignmentId,reopeningId) " <>
+                   "VALUES ('rev_health_closed',?1,NULL)",
+                 [closed.assignment]
+               )
+
+               DB.Txn.q(
+                 txn,
+                 "UPDATE assignments SET state='closed',outcome='revoked',closedAt=100," <>
+                   "closedBySession=?2 WHERE id=?1",
+                 [closed.assignment, closed.session]
+               )
+
+               :ok
+             end)
+
+    restoration = restore_health_turn!(ctx.db, healthy.session, "closed-source-restoration")
+
+    assert {:ok, [[nil, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT restorationTurnSeq,redeliveryTurnSeq FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq=?1",
+               [closed_source.seq]
+             )
+
+    assert {:ok, [[restoration_seq, redelivery_seq]]} =
+             DB.query(
+               ctx.db,
+               "SELECT restorationTurnSeq,redeliveryTurnSeq FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq=?1",
+               [open_source.seq]
+             )
+
+    assert restoration_seq == restoration.seq
+    assert is_integer(redelivery_seq)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns " <>
+                 "WHERE messageId='closed-assignment-source' AND status='queued'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns " <>
+                 "WHERE messageId='open-assignment-source' AND status='queued'"
+             )
+  end
+
   test "unclassified and compaction failures redeliver once on same-harness success", ctx do
     [first, second, healthy | _] = ctx.sessions
 
@@ -3165,6 +3327,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
   defp fail_health_turn!(db, session_key, message_id, prompt, reason, opts \\ []) do
     terminal = Keyword.get(opts, :terminal, "failed")
+    failed_stage = Keyword.get(opts, :stage, :prompt)
 
     {:ok, source_seq} =
       Ledger.enqueue(db, %{
@@ -3206,7 +3369,7 @@ defmodule Tightbeam.HarnessHealthTest do
                    txn,
                    session,
                    turn,
-                   :prompt,
+                   failed_stage,
                    reason
                  )
                end

@@ -1078,12 +1078,17 @@ defmodule Tightbeam.HarnessHealth do
   @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term()) ::
           nil | (-> :ok)
   def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason) do
+    pre_request_refusal? = pre_request_model_selection_refusal?(failed_stage, reason)
+
     case classify_turn_failure(reason) do
       nil ->
         # The terminal failure path has no assistant output. Preserve a
         # message-bearing unclassified failure so the next successful turn on
         # this harness and host can act as the bounded recovery signal.
-        Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, "unclassified")
+        unless pre_request_refusal? do
+          Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, "unclassified")
+        end
+
         nil
 
       failure_class ->
@@ -1119,23 +1124,40 @@ defmodule Tightbeam.HarnessHealth do
             principal: turn.origin || "process:tightbeam"
           })
 
-        redelivery_failure_class =
-          case typed_redelivery_failure_class(reason) do
-            ^failure_class -> failure_class
-            _ -> "unclassified"
-          end
+        unless pre_request_refusal? do
+          redelivery_failure_class =
+            case typed_redelivery_failure_class(reason) do
+              ^failure_class -> failure_class
+              _ -> "unclassified"
+            end
 
-        Wakes.record_health_redelivery_source_in_txn(
-          txn,
-          turn.seq,
-          redelivery_failure_class
-        )
+          Wakes.record_health_redelivery_source_in_txn(
+            txn,
+            turn.seq,
+            redelivery_failure_class
+          )
+        end
 
         Tightbeam.RateLimitReset.schedule_in_txn(txn, session, result, reason, observed_at)
 
         post_commit(result)
     end
   end
+
+  defp pre_request_model_selection_refusal?(:session, reason) do
+    evidence = reason |> evidence_text() |> String.downcase()
+
+    contains_any?(evidence, [
+      "model_unavailable",
+      "model unavailable",
+      "model is not available",
+      "model not found",
+      "unknown model",
+      "unsupported model"
+    ])
+  end
+
+  defp pre_request_model_selection_refusal?(_failed_stage, _reason), do: false
 
   @doc "Record a terminal class whose owner is the lane or boot reconciler."
   @spec observe_terminal_in_txn(Txn.t(), integer(), String.t(), String.t(), String.t()) ::
