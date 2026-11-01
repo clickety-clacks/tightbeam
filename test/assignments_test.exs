@@ -260,7 +260,7 @@ defmodule Tightbeam.AssignmentsTest do
                )
     end
 
-    test "user-opened cards route a ruling notice to the opener's Main session", ctx do
+    test "an unlinked ordinary verdict stays quiet for a user opener", ctx do
       personal = Org.personal_session_key("flynn")
       session(ctx.db, personal, "flynn")
       assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "user-opened card"))
@@ -272,33 +272,238 @@ defmodule Tightbeam.AssignmentsTest do
 
       assert result.attest.bySession == "other-session"
 
-      assert {:ok, [[wake_id, ^personal, "agent:other-session", "other-session", prompt]]} =
+      assert {:ok, [[0]]} =
                DB.query(
                  ctx.db,
-                 """
-                 SELECT wakeId, sessionKey, origin, creatorSessionKey, prompt
-                 FROM wakes WHERE sessionKey=?1 AND assignmentId=?2
-                 """,
+                 "SELECT COUNT(*) FROM wakes WHERE sessionKey=?1 AND assignmentId=?2 AND prompt LIKE 'Attest %'",
                  [personal, assignment.id]
+               )
+    end
+
+    test "an unlinked blocked verdict sends one opener notice", ctx do
+      session(ctx.db, "notice-parent", "flynn")
+      assignment = handle(ctx, "assign", assign_call({:session, "notice-parent"}, "blocked card"))
+
+      result =
+        attest_call({:session, "holder"}, assignment.id, "verdict")
+        |> put_in([:params, :verdict_kind], "blocked")
+        |> then(&handle(ctx, "attest", &1))
+
+      assert result.fact.kind == "assignment-blocked"
+      assert result.fact.scope == assignment.id
+
+      assert {:ok, [[_wake_id, "notice-parent", prompt]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT wakeId,sessionKey,prompt FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'Attest %'",
+                 [assignment.id]
                )
 
       assert prompt =~ result.attest.id
-      assert prompt =~ "verdict"
+      assert prompt =~ "(verdict)"
+    end
 
-      assert {:ok, [["pending", "prompt", 0, ^prompt]]} =
+    test "a linked review verdict notifies its review opener", ctx do
+      session(ctx.db, "review-opener", "flynn")
+      producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "review target"))
+
+      review_call =
+        assign_call({:session, "review-opener"}, "review result")
+        |> put_in([:params, :reviews_assignment_id], producer.id)
+
+      review = handle(ctx, "assign", review_call)
+
+      result =
+        attest_call({:session, "holder"}, review.id, "verdict")
+        |> put_in([:params, :verdict_kind], "reviewed-clean")
+        |> then(&handle(ctx, "attest", &1))
+
+      assert {:ok, [[_wake_id, "review-opener", prompt]]} =
                DB.query(
                  ctx.db,
-                 "SELECT state,consumer,digest,prompt FROM wakes WHERE wakeId=?1",
-                 [
-                   wake_id
-                 ]
+                 "SELECT wakeId,sessionKey,prompt FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'Attest %'",
+                 [review.id]
+               )
+
+      assert prompt =~ result.attest.id
+    end
+
+    test "idle dispatch start emits once and a later wake-carried turn stays quiet", ctx do
+      session(ctx.db, "notice-parent", "flynn")
+
+      assignment =
+        dispatch!(
+          ctx,
+          dispatch_call({:session, "notice-parent"}, "started card", "Start the card.")
+        )
+
+      assert {:ok, [[first, nil]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT seq,wakeId FROM turns WHERE assignmentId=?1",
+                 [assignment.id]
                )
 
       assert {:ok, [[0]]} =
                DB.query(
                  ctx.db,
-                 "SELECT COUNT(*) FROM notice_batch_members WHERE sourceWakeId=?1",
-                 [wake_id]
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'The first holder turn %'",
+                 [assignment.id]
+               )
+
+      assert {:ok, first_turn} = Ledger.claim_next(ctx.db, "holder", "r01-start-test")
+      assert first_turn.seq == first
+
+      assert {:ok, [[_wake_id, "notice-parent", prompt]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT wakeId,sessionKey,prompt FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'The first holder turn %'",
+                 [assignment.id]
+               )
+
+      assert prompt =~ assignment.id
+      finish_running_turn(ctx.db, first_turn)
+
+      second = queue_assignment_turn!(ctx, assignment)
+      assert {:ok, second_turn} = Ledger.claim_next(ctx.db, "holder", "r01-start-test")
+      assert second_turn.seq == second
+      finish_running_turn(ctx.db, second_turn)
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'The first holder turn %'",
+                 [assignment.id]
+               )
+
+      unbound = start_running_turn(ctx.db, "holder", "unbound turn")
+      finish_running_turn(ctx.db, unbound)
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId IS NULL AND prompt LIKE 'The first holder turn %'"
+               )
+
+      self_opened = handle(ctx, "assign", assign_call({:session, "holder"}, "self-opened"))
+      _self_turn = queue_assignment_turn!(ctx, self_opened)
+      assert {:ok, self_turn} = Ledger.claim_next(ctx.db, "holder", "r01-start-test")
+      finish_running_turn(ctx.db, self_turn)
+
+      never_started =
+        handle(ctx, "assign", assign_call({:session, "notice-parent"}, "never started"))
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'The first holder turn %'",
+                 [assignment.id]
+               )
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'The first holder turn %'",
+                 [self_opened.id]
+               )
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'The first holder turn %'",
+                 [never_started.id]
+               )
+    end
+
+    test "cutover reconciles legacy notices without replaying terminal or ambiguous rows", ctx do
+      session(ctx.db, "notice-parent", "flynn")
+      assignment = handle(ctx, "assign", assign_call({:session, "notice-parent"}, "legacy card"))
+
+      ordinary = legacy_attest_notice!(ctx, assignment, "verified")
+      blocked = legacy_attest_notice!(ctx, assignment, "blocked")
+      accepted = legacy_attest_notice!(ctx, assignment, "verified")
+      accepted_seq = enqueue_existing_wake!(ctx, assignment, accepted)
+      canceled = legacy_attest_notice!(ctx, assignment, "verified")
+
+      cancellation = %{
+        wake_id: canceled.wake_id,
+        expected_origin: "agent:holder",
+        requester: %{kind: "session", id: "holder"},
+        reason_kind: "requester_withdrew",
+        causal_source: %{
+          kind: "verb_call",
+          accepted_event: %{
+            origin: "agent:holder",
+            session_key: "holder",
+            principal: {:session, "holder"}
+          }
+        },
+        outcome: %{kind: "no_replacement"}
+      }
+
+      assert {:ok, {:accepted_in_txn, _event_id, %{canceled: true}}} =
+               DB.transaction(ctx.db, fn txn -> Wakes.cancel_in_txn(txn, cancellation) end)
+
+      ambiguous =
+        Wakes.schedule(ctx.db, %{
+          session_key: "notice-parent",
+          origin: "agent:holder",
+          creator_session_key: "holder",
+          prompt:
+            "Attest att_missing_#{System.unique_integer([:positive])} (verdict) was filed on assignment #{assignment.id}.",
+          due_at: System.system_time(:millisecond),
+          assignment_id: assignment.id,
+          work_item_id: assignment.workItemId
+        })
+
+      assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+
+      assert Wakes.get(ctx.db, ordinary.wake_id).state == "canceled"
+      assert Wakes.get(ctx.db, blocked.wake_id).state == "pending"
+      assert Wakes.get(ctx.db, accepted.wake_id).delivered_turn_seq == accepted_seq
+      assert Wakes.get(ctx.db, canceled.wake_id).state == "canceled"
+      assert Wakes.get(ctx.db, ambiguous.wake_id).state == "pending"
+
+      assert {:ok, [["canceled"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+                 [ordinary.wake_id]
+               )
+
+      assert {:ok, [["pending"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+                 [blocked.wake_id]
+               )
+
+      assert {:ok, [["accepted"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+                 [accepted.wake_id]
+               )
+
+      assert {:ok, [["canceled"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+                 [canceled.wake_id]
+               )
+
+      assert {:ok, [["held"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+                 [ambiguous.wake_id]
+               )
+
+      assert {:ok, [[5]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'Attest %'",
+                 [assignment.id]
                )
     end
   end
@@ -7788,6 +7993,86 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert {:ok, turn} = Ledger.claim_next(db, session_key, "notice-batching-fixture")
     turn
+  end
+
+  defp queue_assignment_turn!(ctx, assignment) do
+    prompt = "Work on #{assignment.id}"
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        origin: "agent:holder",
+        creator_session_key: "holder",
+        prompt: prompt,
+        due_at: System.system_time(:millisecond),
+        assignment_id: assignment.id,
+        work_item_id: assignment.workItemId
+      })
+
+    {:appended, message} =
+      Projection.append(ctx.db, %{
+        session_key: "holder",
+        role: "user",
+        content: "[from test:r01-start]\n\n" <> prompt,
+        sender: "test:r01-start"
+      })
+
+    assert {:ok, seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: "holder",
+               message_id: message.id,
+               wake_id: wake.wake_id,
+               origin: wake.origin,
+               prompt: wake.prompt,
+               assignment_id: assignment.id,
+               work_item_id: assignment.workItemId
+             })
+
+    seq
+  end
+
+  defp legacy_attest_notice!(ctx, assignment, verdict_kind) do
+    attest_id = "att_legacy_r01_#{System.unique_integer([:positive])}"
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests (id,assignmentId,kind,verdictKind,bySession,ts) VALUES(?1,?2,'verdict',?3,'holder',?4)",
+               [attest_id, assignment.id, verdict_kind, System.system_time(:millisecond)]
+             )
+
+    Wakes.schedule(ctx.db, %{
+      session_key: "notice-parent",
+      origin: "agent:holder",
+      creator_session_key: "holder",
+      prompt: "Attest #{attest_id} (verdict) was filed on assignment #{assignment.id}.",
+      due_at: System.system_time(:millisecond),
+      assignment_id: assignment.id,
+      work_item_id: assignment.workItemId
+    })
+  end
+
+  defp enqueue_existing_wake!(ctx, assignment, wake) do
+    {:appended, message} =
+      Projection.append(ctx.db, %{
+        session_key: wake.session_key,
+        role: "user",
+        content: "[from test:r01-cutover]\n\n" <> wake.prompt,
+        sender: "test:r01-cutover"
+      })
+
+    assert {:ok, seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: wake.session_key,
+               message_id: message.id,
+               wake_id: wake.wake_id,
+               origin: wake.origin,
+               prompt: wake.prompt,
+               assignment_id: assignment.id,
+               work_item_id: assignment.workItemId
+             })
+
+    seq
   end
 
   defp finish_running_turn(db, turn) do

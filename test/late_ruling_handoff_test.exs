@@ -150,6 +150,12 @@ defmodule Tightbeam.LateRulingHandoffTest do
   end
 
   test "late ruling survives revocation, successor handoff, and consumption", ctx do
+    rule_root =
+      Path.join(System.tmp_dir!(), "late-ruling-r01-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(rule_root) end)
+    Tightbeam.TerminalReactionFixture.load!(rule_root, [])
+
     source_item = work_item(ctx.db, ctx.opener.session_key, "source item")
 
     source =
@@ -326,8 +332,8 @@ defmodule Tightbeam.LateRulingHandoffTest do
 
     receipt_call = %{
       verb: "attest",
-      origin: ctx.opener.session_key,
-      principal: {:session, ctx.opener.session_key},
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
       params: %{
         assignment_id: source.id,
         kind: "verdict",
@@ -346,11 +352,25 @@ defmodule Tightbeam.LateRulingHandoffTest do
     assert assignment_row(ctx.db, source.id) == before_source
     assert request_row(ctx.db, @incident_request_id) == before_request
 
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'Attest %'",
+               [source.id]
+             )
+
     assert %{attest: replayed_receipt} = Assignments.__handle__(ctx.db, "attest", receipt_call)
     assert replayed_receipt.id == first_receipt.id
     assert replayed_receipt.artifactId == first_receipt.artifactId
     assert replayed_receipt.contentSha256 == first_receipt.contentSha256
     assert replayed_receipt.waitId == first_receipt.waitId
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'Attest %'",
+               [source.id]
+             )
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -390,6 +410,92 @@ defmodule Tightbeam.LateRulingHandoffTest do
                "Ruled-but-unconsumed decisions carried from #{replacement.id}: none"
 
     refute second.subject =~ @incident_request_id
+  end
+
+  test "a late receipt reaches the opener when the ruling result went elsewhere", ctx do
+    rule_root =
+      Path.join(System.tmp_dir!(), "late-ruling-r01-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(rule_root) end)
+    Tightbeam.TerminalReactionFixture.load!(rule_root, [])
+
+    retired_opener = session(ctx.db, "agent:retired-opener:test", "flynn")
+    source_item = work_item(ctx.db, retired_opener.session_key, "source item")
+
+    source =
+      assign(
+        ctx.db,
+        retired_opener.session_key,
+        ctx.raiser.session_key,
+        "source assignment",
+        source_item.id
+      )
+
+    request =
+      Escalation.operator_ask(ctx.db, %{
+        verb: "operator-ask",
+        origin: ctx.raiser.session_key,
+        principal: {:session, ctx.raiser.session_key},
+        transport_session_key: ctx.raiser.session_key,
+        params: %{question: "apply the ruling?", assignment_id: source.id}
+      })
+
+    assert %{state: "closed"} =
+             Assignments.__handle__(ctx.db, "revoke-assignment", %{
+               verb: "revoke-assignment",
+               origin: retired_opener.session_key,
+               principal: {:session, retired_opener.session_key},
+               params: %{assignment_id: source.id, reason: "close before the ruling"}
+             })
+
+    assert %{state: "retired"} =
+             Org.retire(ctx.db, retired_opener.session_key, "user:flynn", 1_000)
+
+    assert %{status: "ruled"} =
+             Escalation.operator_rule(
+               ctx.db,
+               %{
+                 verb: "operator-rule",
+                 origin: "user:flynn",
+                 principal: {:user, "flynn"},
+                 transport_session_key: ctx.raiser.session_key,
+                 params: %{request: request.id, decision: "accept"}
+               },
+               scheduler: ctx.scheduler
+             )
+
+    assert {:ok, [[personal]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    assert personal == Org.personal_session_key("flynn")
+
+    receipt =
+      Assignments.__handle__(ctx.db, "attest", %{
+        verb: "attest",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        params: %{
+          assignment_id: source.id,
+          kind: "verdict",
+          verdict_kind: "ruling-consumed:" <> request.id,
+          note: "operational-action: applied the ruling"
+        }
+      })
+
+    assert %{attest: %{kind: "verdict"}} = receipt
+
+    assert {:ok, [[_wake_id, "agent:retired-opener:test", prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,sessionKey,prompt FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'Attest %'",
+               [source.id]
+             )
+
+    assert prompt =~ receipt.attest.id
   end
 
   test "late ruling and successor refusals leave every mutation surface unchanged", ctx do

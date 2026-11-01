@@ -668,6 +668,7 @@ defmodule Tightbeam.Ledger do
                   DB.record_row_commit(txn, transition)
                 end
 
+                Tightbeam.RowReactions.turn_started_in_txn(txn, seq)
                 Publisher.turn_in_txn(txn, "turn.started", seq)
                 Org.sync_mechanical_status_in_txn(txn, session_key)
 
