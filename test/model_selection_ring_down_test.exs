@@ -15,7 +15,8 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     Ledger,
     Model,
     Org,
-    Schema
+    Schema,
+    Wakes
   }
 
   alias Tightbeam.GatewayTurnFixture.CoordinatorStub
@@ -658,6 +659,272 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     )
   end
 
+  test "a Pi typed prompt failure fails the turn without resolving or replaying anything" do
+    with_gateway(fn %{db: db, config: config, lane: lane} ->
+      config = Map.put(config, :model_catalog, route_catalog("pi"))
+      first = Model.new("synthetic-first", effort: "low")
+      session_key = "pi-typed-prompt-failure"
+
+      # The JSON-RPC error the patched pi-acp 0.0.33 sends for turn 38756's shape.
+      exhausted = %{
+        "code" => -32_603,
+        "message" => "Internal error: pi retry exhausted after 4 attempts: Request timed out.",
+        "data" => %{
+          "errorKind" => "pi_retry_exhausted",
+          "piAttempts" => 4,
+          "transportAttempts" => "unobserved",
+          "finalError" => "Request timed out."
+        }
+      }
+
+      {:ok, adapter} =
+        RingDownAdapter.start_link(
+          parent: self(),
+          outcomes: %{first.family => {:ok, "pi-typed-session"}},
+          prompt_outcome: {:error, exhausted},
+          readback: %{"pi-typed-session" => first}
+        )
+
+      {:ok, _coordinator} = CoordinatorStub.start_link({adapter, self()})
+
+      Org.create(db, %{
+        session_key: session_key,
+        display_name: "Synthetic Pi typed failure",
+        owner_user_id: "synthetic-owner",
+        origin: "user:synthetic-owner",
+        archetype: "synthetic-ring",
+        host: "testhost",
+        harness: "pi",
+        provider: "opencode_go",
+        model: first
+      })
+
+      assert {:opened, %{id: incident_id}} =
+               HarnessHealth.observe(db, health_incident_input("pi-typed-open", "pi"))
+
+      run_turn = fn message_id, prompt ->
+        assert :appended =
+                 Gateway.deliver_prompt(session_key, "user:synthetic-owner", prompt,
+                   db: db,
+                   lane_manager: lane,
+                   conn_registry: ConnRegistry,
+                   client_message_id: message_id
+                 )
+
+        assert {:ok, turn} = Ledger.claim_next(db, session_key, "pi-typed-test")
+        {turn, runner(config).(Map.put(turn, :session_key, session_key))}
+      end
+
+      {failed_turn, outcome} = run_turn.("pi-typed-failed", "fails after Pi retries")
+
+      assert {:error, %{reason: ^exhausted, record_in_txn: record, terminal_publish: publish}} =
+               outcome
+
+      assert {:ok, publication} =
+               DB.transaction(db, fn txn ->
+                 assert true =
+                          Ledger.finish_in_txn(
+                            txn,
+                            failed_turn.seq,
+                            "failed",
+                            "Internal error: pi retry exhausted after 4 attempts: Request timed out.",
+                            owner_lease: failed_turn.owner_lease
+                          )
+
+                 record.(txn)
+               end)
+
+      if is_function(publication, 0), do: publication.()
+      publish.("failed")
+
+      assert {:ok, [["open"]]} =
+               DB.query(db, "SELECT state FROM harness_health_incidents WHERE id=?1", [
+                 incident_id
+               ])
+
+      assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM health_redelivery_attempts")
+
+      assert [error_event] =
+               EventLog.lifecycle_events(db)
+               |> Enum.filter(&(&1.kind == "harness_turn_error"))
+
+      assert error_event.detail =~ "pi_retry_exhausted"
+      assert error_event.detail =~ "piAttempts"
+
+      :sys.replace_state(adapter, fn state ->
+        Map.put(
+          state,
+          :prompt_outcome,
+          {:ok,
+           %{
+             text: "synthetic reply",
+             messages: [%{message_id: "synthetic-reply", text: "synthetic reply"}],
+             stop_reason: "end_turn"
+           }}
+        )
+      end)
+
+      {delivered_turn, outcome} = run_turn.("pi-typed-delivered", "succeeds on the route")
+      assert {:ok, %{record_in_txn: record, terminal_publish: publish}} = outcome
+
+      assert {:ok, publication} =
+               DB.transaction(db, fn txn ->
+                 assert true =
+                          Ledger.finish_in_txn(txn, delivered_turn.seq, "delivered", nil,
+                            owner_lease: delivered_turn.owner_lease
+                          )
+
+                 record.(txn)
+               end)
+
+      if is_function(publication, 0), do: publication.()
+      publish.("delivered")
+
+      # A real success on the route resolves the incident; the failed prompt
+      # is not queued again.
+      assert {:ok, [["resolved"]]} =
+               DB.query(db, "SELECT state FROM harness_health_incidents WHERE id=?1", [
+                 incident_id
+               ])
+
+      assert {:ok, [["failed"]]} =
+               DB.query(db, "SELECT status FROM turns WHERE seq=?1", [failed_turn.seq])
+
+      queued = "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND status='queued'"
+      assert {:ok, [[0]]} = DB.query(db, queued, [session_key])
+    end)
+  end
+
+  for {label, harness, typed?} <- [
+        {"a Pi typed", "pi", true},
+        {"a non-Pi typed", "fixture", true},
+        {"an untyped Pi", "pi", false}
+      ] do
+    @tag harness: harness, typed: typed?
+    test "#{label} rate-limit failure of a wake-delivered prompt and its wake retry", ctx do
+      with_gateway(fn %{db: db, config: config} ->
+        config = Map.put(config, :model_catalog, route_catalog(ctx.harness))
+        first = Model.new("synthetic-first", effort: "low")
+        session_key = "pi-typed-wake-failure"
+        final_error = "429 rate limit exceeded"
+
+        failure = %{
+          "code" => -32_603,
+          "message" => "Internal error: pi retry exhausted after 4 attempts: " <> final_error,
+          "data" => %{
+            "errorKind" => "pi_retry_exhausted",
+            "piAttempts" => 4,
+            "transportAttempts" => "unobserved",
+            "finalError" => final_error
+          }
+        }
+
+        failure =
+          if ctx.typed,
+            do: failure,
+            else: update_in(failure, ["data"], &Map.delete(&1, "errorKind"))
+
+        {:ok, adapter} =
+          RingDownAdapter.start_link(
+            parent: self(),
+            outcomes: %{first.family => {:ok, "pi-typed-wake-session"}},
+            prompt_outcome: {:error, failure},
+            readback: %{"pi-typed-wake-session" => first}
+          )
+
+        {:ok, _coordinator} = CoordinatorStub.start_link({adapter, self()})
+
+        Org.create(db, %{
+          session_key: session_key,
+          display_name: "Synthetic Pi wake failure",
+          owner_user_id: "synthetic-owner",
+          origin: "user:synthetic-owner",
+          archetype: "synthetic-ring",
+          host: "testhost",
+          harness: ctx.harness,
+          provider: route_provider(ctx.harness),
+          model: first
+        })
+
+        wake =
+          Wakes.schedule(db, %{
+            session_key: session_key,
+            origin: "agent:sender",
+            prompt: "continue the work",
+            due_at: 1
+          })
+
+        {:ok, _} =
+          DB.query(db, "UPDATE wakes SET state='fired', firedAt=10 WHERE wakeId=?1", [
+            wake.wake_id
+          ])
+
+        {:ok, _seq} =
+          Ledger.enqueue(db, %{
+            session_key: session_key,
+            message_id: "pi-typed-wake-turn",
+            wake_id: wake.wake_id,
+            origin: "agent:sender",
+            prompt: "continue the work"
+          })
+
+        assert {:ok, turn} = Ledger.claim_next(db, session_key, "pi-typed-wake-test")
+        assert turn.wake_id == wake.wake_id
+
+        assert {:error, %{reason: ^failure, record_in_txn: record, terminal_publish: publish}} =
+                 runner(config).(Map.put(turn, :session_key, session_key))
+
+        # turns.error as SessionLane writes it for a JSON-RPC error map.
+        assert {:ok, publication} =
+                 DB.transaction(db, fn txn ->
+                   assert true =
+                            Ledger.finish_in_txn(txn, turn.seq, "failed", inspect(failure),
+                              owner_lease: turn.owner_lease
+                            )
+
+                   record.(txn)
+                 end)
+
+        if is_function(publication, 0), do: publication.()
+        publish.("failed")
+
+        # Rate-limit observation evidence is kept either way.
+        assert {:ok, [[1]]} =
+                 DB.query(
+                   db,
+                   "SELECT COUNT(*) FROM harness_health_observations WHERE correlationId=?1",
+                   ["harness-turn:#{turn.seq}:rate-limit-dead"]
+                 )
+
+        {:ok, [[wake_retries]]} = DB.query(db, "SELECT COUNT(*) FROM wake_retry_attempts")
+
+        {:ok, [[health_redeliveries]]} =
+          DB.query(db, "SELECT COUNT(*) FROM health_redelivery_attempts")
+
+        {:ok, [[successors]]} =
+          DB.query(
+            db,
+            "SELECT COUNT(*) FROM wakes WHERE sessionKey=?1 AND wakeId!=?2 AND state='pending'",
+            [session_key, wake.wake_id]
+          )
+
+        {:ok, [[queued]]} =
+          DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND status='queued'", [
+            session_key
+          ])
+
+        if ctx.typed and ctx.harness == "pi" do
+          assert {wake_retries, health_redeliveries, successors, queued} == {0, 0, 0, 0}
+        else
+          # Controls: another harness's typed failure, or a Pi failure without the
+          # Pi kind, keeps the existing rate-limit wake retry, one row for the
+          # failed source and one for its pending successor.
+          assert {wake_retries, successors} == {2, 1}
+        end
+      end)
+    end
+  end
+
   test "turn advances through production model and effort carriers and preserves evidence" do
     preferences = [
       {"synthetic-not-selectable", "low", nil},
@@ -1263,6 +1530,26 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
       File.write!(adapter_path, "#!/bin/sh\n")
       File.chmod!(adapter_path, 0o755)
     end
+  end
+
+  defp route_provider("pi"), do: "opencode_go"
+  defp route_provider("fixture"), do: "fixture_provider"
+
+  defp route_catalog(harness) do
+    {:ok, catalog} =
+      CatalogStub.start_link(%{
+        {"testhost", harness} =>
+          Enum.map(@default_preferences, fn {family, effort, context} ->
+            %{
+              family: family,
+              context: context,
+              efforts: [effort],
+              provider: String.to_existing_atom(route_provider(harness))
+            }
+          end)
+      })
+
+    catalog
   end
 
   defp health_incident_input(correlation_id, harness) do

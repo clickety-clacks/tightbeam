@@ -40,6 +40,8 @@ defmodule Tightbeam.HarnessHealth do
     auth-dead rate-limit-dead adapter_unavailable model_unavailable task_crash
     interrupted-outcome-unknown
   )
+  # Typed turn failures from the Tightbeam pi-acp patch (Harness.Pi).
+  @pi_typed_turn_failure_kinds ~w(pi_retry_exhausted pi_turn_failed)
   @prod_shape_consumers ["assignment_prodder"]
   @failure_evidence ~w(authoritative-provider terminal-failure)
   @evidence_window_ms 120_000
@@ -1078,12 +1080,17 @@ defmodule Tightbeam.HarnessHealth do
   @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term()) ::
           nil | (-> :ok)
   def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason) do
+    redeliverable? = not pi_typed_turn_failure?(session, reason)
+
     case classify_turn_failure(reason) do
       nil ->
         # The terminal failure path has no assistant output. Preserve a
         # message-bearing unclassified failure so the next successful turn on
         # this harness and host can act as the bounded recovery signal.
-        Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, "unclassified")
+        if redeliverable? do
+          Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, "unclassified")
+        end
+
         nil
 
       failure_class ->
@@ -1119,23 +1126,41 @@ defmodule Tightbeam.HarnessHealth do
             principal: turn.origin || "process:tightbeam"
           })
 
-        redelivery_failure_class =
-          case typed_redelivery_failure_class(reason) do
-            ^failure_class -> failure_class
-            _ -> "unclassified"
-          end
+        if redeliverable? do
+          redelivery_failure_class =
+            case typed_redelivery_failure_class(reason) do
+              ^failure_class -> failure_class
+              _ -> "unclassified"
+            end
 
-        Wakes.record_health_redelivery_source_in_txn(
-          txn,
-          turn.seq,
-          redelivery_failure_class
-        )
+          Wakes.record_health_redelivery_source_in_txn(
+            txn,
+            turn.seq,
+            redelivery_failure_class
+          )
+        end
 
         Tightbeam.RateLimitReset.schedule_in_txn(txn, session, result, reason, observed_at)
 
         post_commit(result)
     end
   end
+
+  @doc """
+  Whether a turn failure on this session is a typed Pi failure from the
+  Tightbeam pi-acp patch. Only a Pi session's failure qualifies; the same error
+  kind from any other harness keeps the normal replay paths.
+
+  Pi retries a failed provider request itself before reporting these kinds, and
+  the turn may have run tools before failing. Replaying the prompt would add
+  attempts Pi already spent, so these failures keep their incident and fact
+  evidence but are never redelivered or retried as a wake.
+  """
+  @spec pi_typed_turn_failure?(map(), term()) :: boolean()
+  def pi_typed_turn_failure?(%{harness: harness}, %{"data" => %{"errorKind" => kind}}),
+    do: to_string(harness) == "pi" and kind in @pi_typed_turn_failure_kinds
+
+  def pi_typed_turn_failure?(_session, _reason), do: false
 
   @doc "Record a terminal class whose owner is the lane or boot reconciler."
   @spec observe_terminal_in_txn(Txn.t(), integer(), String.t(), String.t(), String.t()) ::
