@@ -1039,7 +1039,7 @@ defmodule Tightbeam.HarklightWakes do
     receive do
       {^port, {:data, bytes}} ->
         data = pending <> bytes
-        lines = String.split(data, "\n")
+        lines = :binary.split(data, "\n", [:global])
         remainder = List.last(lines)
 
         result =
