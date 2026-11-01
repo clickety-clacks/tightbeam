@@ -36,7 +36,8 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
     old = create_session.("agent:old")
     new = create_session.("agent:new")
     Roles.create!(db, "reviewer", "flynn", old.session_key)
-    wake_handler = Gateway.handlers(Map.put(config, :wake_scheduler, scheduler))["wake"]
+    handlers = Gateway.handlers(Map.put(config, :wake_scheduler, scheduler))
+    wake_handler = handlers["wake"]
     future = System.system_time(:millisecond) + 60_000
 
     scheduled =
@@ -50,15 +51,38 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
       })
 
     assert Wakes.get(db, scheduled.wake_id).target_role == "reviewer"
-    assert :ok = Roles.bind(db, "reviewer", new.session_key)
+    assert Wakes.get(db, scheduled.wake_id).session_key == old.session_key
+
+    assert %{role: %{bound_session_key: "agent:new"}} =
+             handlers["role-bind"].(%{
+               origin: "user:#{old.owner_user_id}",
+               principal: {:user, old.owner_user_id},
+               params: %{name: "reviewer", session_key: new.session_key}
+             })
+
+    scheduled_after =
+      wake_handler.(%{
+        origin: "user:#{new.owner_user_id}",
+        principal: {:user, new.owner_user_id},
+        session_key: new.session_key,
+        target_role: "reviewer",
+        role_fallback: false,
+        params: %{prompt: "review this later", at: future}
+      })
 
     {:ok, _} =
-      DB.query(db, "UPDATE wakes SET dueAt = 0 WHERE wakeId = ?1", [scheduled.wake_id])
+      DB.query(db, "UPDATE wakes SET dueAt = 0 WHERE wakeId IN (?1, ?2)", [
+        scheduled.wake_id,
+        scheduled_after.wake_id
+      ])
 
     assert :ok = Wakes.fire_due(scheduler)
 
     assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
              NoticeBatcher.source_refs(db, scheduled.wake_id)
+
+    assert [%{delivery_wake_id: ^carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, scheduled_after.wake_id)
 
     assert {:ok, [["agent:new", nil, 0]]} =
              DB.query(
@@ -70,6 +94,8 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
     # The carrier addresses the resolved concrete session; the source retains
     # the role authority used to resolve it at this boundary.
     assert Wakes.get(db, scheduled.wake_id).target_role == "reviewer"
+    assert Wakes.get(db, scheduled.wake_id).session_key == old.session_key
+    assert Wakes.get(db, scheduled_after.wake_id).session_key == new.session_key
     assert :ok = Wakes.fire_due(scheduler)
 
     assert {:ok, [[1]]} =

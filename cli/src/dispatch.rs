@@ -671,6 +671,19 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             Ok(request(identity, "spawn", vec![], params))
         }
         Command::List { identity } => Ok(request(identity, "inspect", vec![], vec![])),
+        Command::RoleBind {
+            identity,
+            role,
+            session_key,
+        } => Ok(request(
+            identity,
+            "role-bind",
+            vec![],
+            vec![
+                string_field("name", role),
+                string_field("sessionKey", session_key),
+            ],
+        )),
         Command::Retire {
             identity,
             session_key,
@@ -3944,6 +3957,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarklightFollow { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
+        | Command::RoleBind { identity, .. }
         | Command::Retire { identity, .. }
         | Command::Tune { identity, .. }
         | Command::SessionReparent { identity, .. }
@@ -6181,6 +6195,18 @@ mod tests {
                     "flynn",
                 ][..],
                 r#"{"asUser":"flynn","verb":"retire","sessionKey":"agent:r","params":{"keepOpenDescendants":true}}"#,
+            ),
+            (
+                &[
+                    "role-bind",
+                    "--role",
+                    "product-office",
+                    "--session",
+                    "agent:successor",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"role-bind","params":{"name":"product-office","sessionKey":"agent:successor"}}"#,
             ),
             (
                 &["cancel-wake", "wake-1", "--as-process", "cron"][..],

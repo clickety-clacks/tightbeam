@@ -7850,16 +7850,24 @@ defmodule Tightbeam.Gateway do
       caller ->
         prior = Idempotency.get(db, caller.owner_user_id, "spawn", p.idempotency_key)
 
-        cond do
-          prior ->
-            spawn_replay(db, prior.session_key)
+        case prior do
+          %{session_key: session_key} ->
+            spawn_replay(db, session_key)
 
-          is_integer(max_live_sessions) and max_live_sessions > 0 and
-              length(Org.list_for_user(db, caller.owner_user_id, false)) >= max_live_sessions ->
-            spawn_cap_exceeded(max_live_sessions, caller.owner_user_id)
+          nil ->
+            case held_spawn_name_refusal(db, p[:handle]) do
+              nil ->
+                if is_integer(max_live_sessions) and max_live_sessions > 0 and
+                     length(Org.list_for_user(db, caller.owner_user_id, false)) >=
+                       max_live_sessions do
+                  spawn_cap_exceeded(max_live_sessions, caller.owner_user_id)
+                else
+                  create_spawn(config, db, call, caller)
+                end
 
-          true ->
-            create_spawn(config, db, call, caller)
+              refusal ->
+                refusal
+            end
         end
     end
   end
@@ -8244,7 +8252,8 @@ defmodule Tightbeam.Gateway do
                  p.idempotency_key
                ) do
             nil ->
-              if Archetypes.get(archetype.name) do
+              with nil <- held_spawn_name_refusal(txn, p[:handle]),
+                   true <- not is_nil(Archetypes.get(archetype.name)) do
                 if spawn_cap_reached_in_txn?(
                      txn,
                      caller.owner_user_id,
@@ -8307,7 +8316,11 @@ defmodule Tightbeam.Gateway do
                   end
                 end
               else
-                {:error, :unknown_archetype}
+                false ->
+                  {:error, :unknown_archetype}
+
+                refusal ->
+                  {:name_taken, refusal}
               end
 
             prior ->
@@ -8318,6 +8331,9 @@ defmodule Tightbeam.Gateway do
       case session_result do
         {:ok, {:cap_exceeded, cap}} ->
           spawn_cap_exceeded(cap, caller.owner_user_id)
+
+        {:ok, {:name_taken, refusal}} ->
+          refusal
 
         {:ok, {:error, :unknown_archetype}} ->
           %{code: "unknown_archetype", message: "no such archetype: #{archetype.name}"}
@@ -8419,6 +8435,91 @@ defmodule Tightbeam.Gateway do
       requested: published_identity(session.model),
       running_status: "not reported by #{session.harness}"
     }
+  end
+
+  defp held_spawn_name_refusal(_db, nil), do: nil
+
+  defp held_spawn_name_refusal(db, name) when is_binary(name) and name != "" do
+    {handle_rows, office_rows} = spawn_name_holders(db, name)
+
+    case {handle_rows, office_rows} do
+      {[], []} ->
+        nil
+
+      _ ->
+        handle_detail =
+          case handle_rows do
+            [[session_key, state] | _] -> "session #{session_key} (#{state}) holds the name"
+            [] -> nil
+          end
+
+        office_detail =
+          case office_rows do
+            [[session_key, state] | _] when is_binary(session_key) and is_binary(state) ->
+              "office #{name} is currently bound to session #{session_key} (#{state})"
+
+            [[session_key, _state] | _] when is_binary(session_key) ->
+              "office #{name} is currently bound to session #{session_key} (state unavailable)"
+
+            [[nil, _state] | _] ->
+              "office #{name} is currently unbound"
+
+            [] ->
+              nil
+          end
+
+        held_detail = handle_detail || "office #{name} holds the name"
+        details = Enum.reject([held_detail, office_detail], &is_nil/1)
+
+        %{
+          code: "name_taken",
+          message: "spawn name #{name} is already held: " <> Enum.join(details, "; ")
+        }
+    end
+  end
+
+  defp held_spawn_name_refusal(_db, _name), do: nil
+
+  defp spawn_name_holders(%Tightbeam.DB.Txn{} = txn, name) do
+    handles =
+      DB.Txn.q(
+        txn,
+        "SELECT sessionKey, state FROM sessions WHERE handle = ?1 LIMIT 1",
+        [name]
+      )
+
+    offices =
+      DB.Txn.q(
+        txn,
+        """
+        SELECT roles.boundSessionKey, sessions.state
+        FROM roles
+        LEFT JOIN sessions ON sessions.sessionKey = roles.boundSessionKey
+        WHERE roles.name = ?1
+        """,
+        [name]
+      )
+
+    {handles, offices}
+  end
+
+  defp spawn_name_holders(db, name) do
+    {:ok, handles} =
+      DB.query(db, "SELECT sessionKey, state FROM sessions WHERE handle = ?1 LIMIT 1", [name])
+
+    {:ok, offices} =
+      DB.query(
+        db,
+        """
+        SELECT roles.boundSessionKey, sessions.state
+        FROM roles
+        LEFT JOIN sessions ON sessions.sessionKey = roles.boundSessionKey
+        WHERE roles.name = ?1
+        """,
+        [name]
+      )
+
+    {handles, offices}
   end
 
   defp tune_result(config, db, call) do

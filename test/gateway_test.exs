@@ -4769,7 +4769,7 @@ defmodule Tightbeam.GatewayTest do
              })
   end
 
-  test "spawn --name creates a bound role and role_exists rolls back the session", ctx do
+  test "spawn --name refuses held names clearly and replays the successful key", ctx do
     base_dir = role_test_base("spawn")
     Archetypes.load!(base_dir)
 
@@ -4780,16 +4780,17 @@ defmodule Tightbeam.GatewayTest do
 
     spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
 
-    created =
-      spawn.(%{
-        origin: "user:flynn",
-        session_key: nil,
-        params: %{
-          display_name: "Builder",
-          handle: "builder",
-          idempotency_key: "spawn-builder"
-        }
-      })
+    spawn_call = %{
+      origin: "user:flynn",
+      session_key: nil,
+      params: %{
+        display_name: "Builder",
+        handle: "builder",
+        idempotency_key: "spawn-builder"
+      }
+    }
+
+    created = spawn.(spawn_call)
 
     assert %{name: "builder", bound_session_key: key, owner_user_id: "flynn"} =
              Roles.get(ctx.db, "builder")
@@ -4797,23 +4798,88 @@ defmodule Tightbeam.GatewayTest do
     assert key == created.session_key
     assert Org.get(ctx.db, key).handle == "builder"
     assert Org.get(ctx.db, key).model == Model.new("claude-fable-5")
+    workdir_paths_before = Path.wildcard(Path.join(base_dir, "**/*")) |> Enum.sort()
+
+    replay = spawn.(spawn_call)
+
+    assert %{session_key: ^key, handle: "builder"} = replay
+
+    spawn_with_name = fn handle, idempotency_key, display_name ->
+      spawn.(%{
+        spawn_call
+        | params:
+            Map.merge(spawn_call.params, %{
+              display_name: display_name,
+              handle: handle,
+              idempotency_key: idempotency_key
+            })
+      })
+    end
+
+    {:ok, [[sessions_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
+    {:ok, [[roles_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM roles")
+    {:ok, [[wakes_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+
+    assert %{code: "name_taken", message: active_message} =
+             spawn_with_name.(
+               "builder",
+               "spawn-builder-active-duplicate",
+               "Duplicate active handle"
+             )
+
+    assert active_message =~ key
+    assert active_message =~ "(active)"
+    assert active_message =~ "office builder is currently bound to session #{key} (active)"
+    assert Roles.get(ctx.db, "builder").bound_session_key == key
+    assert {:ok, [[^sessions_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
+    assert {:ok, [[^roles_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM roles")
+    assert {:ok, [[^wakes_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+    assert Path.wildcard(Path.join(base_dir, "**/*")) |> Enum.sort() == workdir_paths_before
+    owner_user_id = String.replace_prefix(spawn_call.origin, "user:", "")
+
+    assert Idempotency.get(ctx.db, owner_user_id, "spawn", "spawn-builder-active-duplicate") ==
+             nil
+
+    Org.retire(ctx.db, key, spawn_call.origin, 1_000)
+    assert Org.get(ctx.db, key).state == "retired"
+
+    {:ok, [[sessions_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
+    {:ok, [[roles_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM roles")
+    {:ok, [[wakes_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
 
     Roles.create!(ctx.db, "taken", "flynn", nil)
-    {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
 
-    assert %{code: "config_denied", detail: %{code: "role_exists"}} =
-             spawn.(%{
-               origin: "user:flynn",
-               session_key: nil,
-               params: %{
-                 display_name: "Must roll back",
-                 handle: "taken",
-                 idempotency_key: "spawn-taken"
-               }
-             })
+    assert %{code: "name_taken", message: retired_message} =
+             spawn_with_name.(
+               "builder",
+               "spawn-builder-retired-duplicate",
+               "Must refuse retired handle"
+             )
 
-    assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
-    assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-taken") == nil
+    assert retired_message =~ key
+    assert retired_message =~ "(retired)"
+    assert retired_message =~ "office builder is currently bound to session #{key} (retired)"
+    assert Roles.get(ctx.db, "builder").bound_session_key == key
+    assert {:ok, [[^sessions_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
+    assert {:ok, [[roles_after]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM roles")
+    assert roles_after == roles_before + 1
+    assert {:ok, [[^wakes_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+    assert Path.wildcard(Path.join(base_dir, "**/*")) |> Enum.sort() == workdir_paths_before
+
+    assert Idempotency.get(ctx.db, owner_user_id, "spawn", "spawn-builder-retired-duplicate") ==
+             nil
+
+    assert %{code: "name_taken", message: office_message} =
+             spawn_with_name.("taken", "spawn-office-only", "Office only")
+
+    assert office_message =~ "office taken holds the name"
+    assert office_message =~ "office taken is currently unbound"
+    assert Roles.get(ctx.db, "taken").bound_session_key == nil
+    assert {:ok, [[^sessions_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
+    assert {:ok, [[^roles_after]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM roles")
+    assert {:ok, [[^wakes_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+    assert Path.wildcard(Path.join(base_dir, "**/*")) |> Enum.sort() == workdir_paths_before
+    assert Idempotency.get(ctx.db, owner_user_id, "spawn", "spawn-office-only") == nil
   end
 
   test "fresh PDO and orchestrator spawns resolve their defaults without changing coder choice",
@@ -9025,6 +9091,209 @@ defmodule Tightbeam.GatewayTest do
              &(&1.name == "flynn-office" and
                  &1.fallback_target == Org.personal_session_key("flynn"))
            )
+  end
+
+  test "role-bind moves one office and preserves traffic and historical references", ctx do
+    owner = Org.get(ctx.db, "k1").owner_user_id
+    old = create_session(ctx.db, "agent:old-holder", owner)
+    old_key = old.session_key
+    successor = create_session(ctx.db, "agent:successor", owner)
+    inactive = create_session(ctx.db, "agent:inactive-target", owner)
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE sessions SET handle = ?2 WHERE sessionKey = ?1", [
+               old_key,
+               "office-a"
+             ])
+
+    Org.retire(ctx.db, inactive.session_key, "user:#{owner}", 1_000)
+
+    Roles.create!(ctx.db, "office-a", owner, old.session_key)
+    Roles.create!(ctx.db, "office-b", owner, old.session_key)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO work_items(id,title,ownerUserId,createdByUser,createdAt) VALUES(?1,?2,?3,?3,?4)",
+               [
+                 "example-office-history",
+                 "Office history",
+                 owner,
+                 System.system_time(:millisecond)
+               ]
+             )
+
+    prior_artifact =
+      Tightbeam.Artifacts.record(ctx.db, %{
+        principal: {:session, old.session_key},
+        session_key: old.session_key,
+        params: %{
+          kind: "report",
+          title: "Earlier office work",
+          origin_path: "reports/earlier-office-work.md",
+          work_item_id: "example-office-history"
+        }
+      })
+
+    assert prior_artifact.created_by_session == old.session_key
+
+    handlers = Gateway.handlers(gateway_config("/tmp", ctx.db, 0))
+    future = System.system_time(:millisecond) + 60_000
+
+    scheduled_before =
+      handlers["wake"].(%{
+        origin: "user:#{owner}",
+        principal: {:user, owner},
+        session_key: old.session_key,
+        target_role: "office-a",
+        role_fallback: false,
+        params: %{prompt: "scheduled before rebinding", at: future}
+      })
+
+    assignment_before =
+      handlers["assign"].(%{
+        origin: "user:#{owner}",
+        principal: {:user, owner},
+        session_key: old.session_key,
+        target_role: "office-a",
+        role_fallback: false,
+        params: %{subject: "Existing office assignment"}
+      })
+
+    assert %{id: assignment_id} = assignment_before
+
+    assert %{attest: %{id: attest_id}} =
+             handlers["attest"].(%{
+               origin: "agent:office-a",
+               principal: {:session, old.session_key},
+               session_key: old.session_key,
+               params: %{assignment_id: assignment_id, kind: "progress", note: "Before rebinding"}
+             })
+
+    {:appended, prior_turn_message} =
+      Tightbeam.Projection.append(ctx.db, %{
+        session_key: old.session_key,
+        role: "assistant",
+        content: "Turn resolved before rebinding",
+        timestamp: System.system_time(:millisecond),
+        sender: "agent:office-a"
+      })
+
+    assert {:ok, turn_seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: old.session_key,
+               message_id: prior_turn_message.id,
+               origin: "agent:office-a",
+               prompt: prior_turn_message.content,
+               role_ref: "office-a"
+             })
+
+    Org.retire(ctx.db, old.session_key, "user:#{owner}", 1_000)
+    assert Org.get(ctx.db, old.session_key).state == "retired"
+
+    assert %{role: %{bound_session_key: new_key}} =
+             handlers["role-bind"].(%{
+               origin: "user:#{owner}",
+               principal: {:user, owner},
+               params: %{name: "office-a", session_key: successor.session_key}
+             })
+
+    assert new_key == successor.session_key
+    assert Roles.get(ctx.db, "office-b").bound_session_key == old.session_key
+    assert {:ok, ^new_key, false} = Tightbeam.Origin.resolve_agent(ctx.db, "office-a")
+
+    scheduled_after =
+      handlers["wake"].(%{
+        origin: "user:#{owner}",
+        principal: {:user, owner},
+        session_key: new_key,
+        target_role: "office-a",
+        role_fallback: false,
+        params: %{prompt: "scheduled after rebinding", at: future}
+      })
+
+    for wake <- [scheduled_before, scheduled_after] do
+      stored_wake = Wakes.get(ctx.db, wake.wake_id)
+
+      assert {:ok, {^new_key, "office-a", false}} =
+               DB.transaction(ctx.db, fn txn ->
+                 Gateway.delivery_target(txn, stored_wake.session_key, %{
+                   target_role: stored_wake.target_role
+                 })
+               end)
+    end
+
+    assert Org.get(ctx.db, old.session_key).handle == "office-a"
+
+    assert Tightbeam.Artifacts.get(ctx.db, prior_artifact.artifact_id).created_by_session ==
+             old.session_key
+
+    assert Wakes.get(ctx.db, scheduled_before.wake_id).session_key == old.session_key
+    assert Wakes.get(ctx.db, scheduled_before.wake_id).target_role == "office-a"
+
+    assert {:ok, [[^old_key, "office-a"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT holderKey, holderRole FROM assignments WHERE id = ?1",
+               [assignment_id]
+             )
+
+    assert {:ok, [[^old_key]]} =
+             DB.query(ctx.db, "SELECT bySession FROM attests WHERE id = ?1", [attest_id])
+
+    assert {:ok, [[^old_key, "office-a"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey, roleRef FROM turns WHERE seq = ?1",
+               [turn_seq]
+             )
+
+    assert %{id: new_assignment_id} =
+             handlers["assign"].(%{
+               origin: "user:#{owner}",
+               principal: {:user, owner},
+               session_key: new_key,
+               target_role: "office-a",
+               role_fallback: false,
+               params: %{subject: "Successor office assignment"}
+             })
+
+    assert %{attest: %{id: successor_attest_id}} =
+             handlers["attest"].(%{
+               origin: "agent:office-a",
+               principal: {:session, new_key},
+               session_key: new_key,
+               params: %{
+                 assignment_id: new_assignment_id,
+                 kind: "progress",
+                 note: "Act through the rebound office"
+               }
+             })
+
+    assert {:ok, [[^new_key]]} =
+             DB.query(ctx.db, "SELECT bySession FROM attests WHERE id = ?1", [successor_attest_id])
+
+    assert {:ok, [[^new_key, "office-a"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT holderKey, holderRole FROM assignments WHERE id = ?1",
+               [new_assignment_id]
+             )
+
+    assert %{code: "unknown_session"} =
+             handlers["role-bind"].(%{
+               origin: "user:#{owner}",
+               principal: {:user, owner},
+               params: %{name: "office-a", session_key: inactive.session_key}
+             })
+
+    assert Roles.get(ctx.db, "office-a").bound_session_key == new_key
+
+    Org.retire(ctx.db, new_key, "user:#{owner}", 1_000)
+
+    assert Org.get(ctx.db, new_key).state == "retired"
+    assert Roles.get(ctx.db, "office-a").bound_session_key == new_key
+    assert Roles.get(ctx.db, "office-b").bound_session_key == old.session_key
   end
 
   test "set_host denies on workdir sync failure and leaves Org unchanged", ctx do
