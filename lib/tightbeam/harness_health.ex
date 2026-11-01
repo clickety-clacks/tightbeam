@@ -1078,6 +1078,14 @@ defmodule Tightbeam.HarnessHealth do
   @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term()) ::
           nil | (-> :ok)
   def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason) do
+    if pre_request_model_selection_refusal?(failed_stage, reason) do
+      nil
+    else
+      observe_redeliverable_turn_failure_in_txn(txn, session, turn, failed_stage, reason)
+    end
+  end
+
+  defp observe_redeliverable_turn_failure_in_txn(txn, session, turn, failed_stage, reason) do
     case classify_turn_failure(reason) do
       nil ->
         # The terminal failure path has no assistant output. Preserve a
@@ -1136,6 +1144,21 @@ defmodule Tightbeam.HarnessHealth do
         post_commit(result)
     end
   end
+
+  defp pre_request_model_selection_refusal?(:session, reason) do
+    evidence = reason |> evidence_text() |> String.downcase()
+
+    contains_any?(evidence, [
+      "model_unavailable",
+      "model unavailable",
+      "model is not available",
+      "model not found",
+      "unknown model",
+      "unsupported model"
+    ])
+  end
+
+  defp pre_request_model_selection_refusal?(_failed_stage, _reason), do: false
 
   @doc "Record a terminal class whose owner is the lane or boot reconciler."
   @spec observe_terminal_in_txn(Txn.t(), integer(), String.t(), String.t(), String.t()) ::
