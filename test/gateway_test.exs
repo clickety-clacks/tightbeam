@@ -1897,17 +1897,19 @@ defmodule Tightbeam.GatewayTest do
     assert attachment_only_label =~ "diagram.png"
     assert Base.decode64!(attachment_only_data) == image_bytes
 
-    legacy_prompt =
-      Gateway.turn_prompt_content(
-        ctx.db,
-        %{seq: -1, message_id: attachment_only.id, prompt: ""},
-        session,
-        "pi",
-        ctx.catalog_base
-      )
+    for harness <- [:pi, "pi", :cursor, "cursor", :fixture, "fixture"] do
+      legacy_prompt =
+        Gateway.turn_prompt_content(
+          ctx.db,
+          %{seq: -1, message_id: attachment_only.id, prompt: ""},
+          session,
+          harness,
+          ctx.catalog_base
+        )
 
-    assert is_binary(legacy_prompt)
-    assert legacy_prompt =~ "diagram.png"
+      assert is_binary(legacy_prompt)
+      assert legacy_prompt =~ "diagram.png"
+    end
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])

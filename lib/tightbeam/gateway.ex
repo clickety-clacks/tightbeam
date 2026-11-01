@@ -3451,7 +3451,7 @@ defmodule Tightbeam.Gateway do
             message,
             attachment,
             index,
-            covered_inline_harness?(harness)
+            Harness.supports_inline_attachments?(harness)
           )
         end)
       end)
@@ -3575,8 +3575,6 @@ defmodule Tightbeam.Gateway do
       Enum.map_join(blocks, "\n\n", & &1.text)
     end
   end
-
-  defp covered_inline_harness?(harness), do: harness in [:claude, :codex, "claude", "codex"]
 
   defp turn_runner(config) do
     db = Map.get(config, :db, Tightbeam.DB)

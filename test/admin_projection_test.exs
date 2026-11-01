@@ -50,26 +50,13 @@ defmodule Tightbeam.AdminProjectionTest do
     {:ok, db} = DB.start_link(path: ":memory:", name: nil, guard_inputs: [])
 
     try do
-      assert :ok = Schema.ensure_all(db)
-      assert :ok = AdminProjection.ensure_storage(db)
-
-      Tightbeam.SchemaShapeRuntimeFixture.downgrade_assignment_source_replacement_cancellation!(
-        db
+      Tightbeam.HistoricalSchemaFixture.load!(
+        db,
+        "origins_predecessor_8d03748e",
+        "a68e01971b05ad8fa8f33dce39c97fd664e427628de2213fa8fcc0b6755dfa1e"
       )
 
-      assert :ok = DB.execute(db, "ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey")
-
-      assert :ok =
-               DB.execute(
-                 db,
-                 "ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic"
-               )
-
-      assert {:ok, _} =
-               DB.query(
-                 db,
-                 "UPDATE schema_stamp SET shape='artifact-origin-v1-019', stampedAt=1"
-               )
+      assert {:ok, [["artifact-origin-v1-019"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
       assert {:ok, :ok} =
                DB.transaction(db, fn txn ->

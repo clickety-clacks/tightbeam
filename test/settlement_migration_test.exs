@@ -7,37 +7,20 @@ defmodule Tightbeam.SettlementMigrationTest do
   setup do
     db = :"settlement_migration_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = Schema.ensure_all(db)
-    Tightbeam.SchemaShapeRuntimeFixture.downgrade_assignment_source_replacement_cancellation!(db)
 
-    # Build the exact six-column predecessor, including reparent and PO replay contracts.
-    # This is an isolated fixture, never a live downgrade or runtime repair.
+    Tightbeam.HistoricalSchemaFixture.load!(
+      db,
+      "cannot_proceed_predecessor_2d70e49b",
+      "4fd9dd1992166594cd3da01c56a5cd50587463dce2dcb1b76106b1c2c6c21131"
+    )
+
+    assert {:ok, [["cannot-proceed-v1-019"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
     :ok =
       DB.execute(db, """
-      DROP TABLE turn_lifecycle_events;
-      DROP TABLE turn_lifecycle_epoch;
-      DROP TABLE wire_idempotency;
-      ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic;
-      CREATE TABLE wire_idempotency (
-        ownerUserId TEXT NOT NULL,
-        operation TEXT NOT NULL CHECK(operation IN
-          ('spawn','retire','wake','assign','condition','work-item-create','session-reparent','session-po-set')),
-        idempotencyKey TEXT NOT NULL,
-        sessionKey TEXT NOT NULL,
-        requestFingerprint TEXT,
-        canonicalResponse TEXT,
-        PRIMARY KEY(ownerUserId,operation,idempotencyKey),
-        CHECK(operation NOT IN ('session-reparent','session-po-set') OR
-          (requestFingerprint IS NOT NULL AND canonicalResponse IS NOT NULL))
-      );
       INSERT INTO wire_idempotency VALUES
         ('mike','session-reparent','prior-key','prior-event','prior-fingerprint','{"prior":true}'),
-      ('mike','session-po-set','po-key','po-event','po-fingerprint','{"po":true}');
-      DROP TRIGGER artifacts_origin_immutable;
-      ALTER TABLE artifacts DROP COLUMN originHost;
-      ALTER TABLE artifacts DROP COLUMN originWorkspace;
-      ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey;
-      UPDATE schema_stamp SET shape='cannot-proceed-v1-019';
+        ('mike','session-po-set','po-key','po-event','po-fingerprint','{"po":true}');
       """)
 
     %{db: db}
@@ -49,8 +32,20 @@ defmodule Tightbeam.SettlementMigrationTest do
 
     assert {:ok, before_ddl} = DB.query(db, preserved_sql)
     assert length(before_ddl) == 3
+    # Preserve the settlement transition's objects at its own boundary, before
+    # subsequent migrations update assignment and actor schemas.
+    assert :ok =
+             DB.execute(db, """
+             CREATE TABLE settlement_schema_checkpoint AS #{preserved_sql} LIMIT 0;
+             CREATE TRIGGER capture_settlement_schema AFTER UPDATE ON schema_stamp
+             WHEN NEW.shape='stale-turn-settlement-v1-019'
+             BEGIN INSERT INTO settlement_schema_checkpoint #{preserved_sql}; END;
+             """)
+
     assert :ok = Schema.ensure_all(db)
-    assert {:ok, ^before_ddl} = DB.query(db, preserved_sql)
+
+    assert {:ok, ^before_ddl} =
+             DB.query(db, "SELECT name,sql FROM settlement_schema_checkpoint ORDER BY name")
 
     assert {:ok, [[wake_cancellations_ddl]]} =
              DB.query(
@@ -61,7 +56,7 @@ defmodule Tightbeam.SettlementMigrationTest do
     assert Regex.match?(@assignment_replacement_route, wake_cancellations_ddl)
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [["prior-fingerprint", ~s({"prior":true}), nil]]} =

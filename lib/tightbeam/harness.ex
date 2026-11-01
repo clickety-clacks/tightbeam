@@ -126,11 +126,13 @@ defmodule Tightbeam.Harness do
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
 
   @callback records_tool_calls?() :: boolean()
+  @callback supports_inline_attachments?() :: boolean()
 
   @optional_callbacks preflight_launch: 3,
                       warm_home: 2,
                       materialize_legacy_credential_link: 2,
                       records_tool_calls?: 0,
+                      supports_inline_attachments?: 0,
                       submission_text_limit: 0,
                       project_session_identity: 3,
                       verify_session_identity_hook: 2
@@ -189,6 +191,20 @@ defmodule Tightbeam.Harness do
     if function_exported?(module, :submission_text_limit, 0),
       do: module.submission_text_limit(),
       else: nil
+  end
+
+  @doc "Whether the registered harness receives attachments as inline image blocks."
+  def supports_inline_attachments?(harness) do
+    Enum.any?(known(), fn module ->
+      if harness in [module.id(), module.wire_name()] do
+        Code.ensure_loaded!(module)
+
+        function_exported?(module, :supports_inline_attachments?, 0) and
+          module.supports_inline_attachments?()
+      else
+        false
+      end
+    end)
   end
 
   def records_tool_calls?(harness) do

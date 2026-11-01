@@ -28,6 +28,9 @@ defmodule Tightbeam.Harness.Claude do
   def id, do: :claude
 
   @impl true
+  def supports_inline_attachments?, do: true
+
+  @impl true
   def records_tool_calls?, do: true
 
   @impl true
