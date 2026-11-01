@@ -1000,7 +1000,10 @@ defmodule Tightbeam.HarklightWakes do
         ["#{attempt}; #{status}; no safe output captured"]
 
       [first | rest] ->
-        ["#{attempt}; #{status}; sanitized output: #{first}" | Enum.map(rest, &"sanitized output: #{&1}")]
+        [
+          "#{attempt}; #{status}; sanitized output: #{first}"
+          | Enum.map(rest, &"sanitized output: #{&1}")
+        ]
     end
     |> Enum.take(@max_diagnostic_lines)
     |> Enum.map(&String.slice(&1, 0, @max_diagnostic_line_chars))

@@ -845,6 +845,7 @@ defmodule Tightbeam.HarklightWakesTest do
     call: call
   } do
     attached = JSON.encode!(%{kind: "attached", ready_for_listen: true})
+
     fake_harklight_agent!("""
     if [ "$1" = "attach" ]; then
       printf '%s\\n' '#{attached}'
@@ -951,9 +952,13 @@ defmodule Tightbeam.HarklightWakesTest do
         start_supervised!({HarklightWakes, db: db})
 
         assert eventually(fn ->
-                 DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
-                   @handle
-                 ]) == {:ok, [["unavailable", "listener_stopped"]]}
+                 DB.query(
+                   db,
+                   "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1",
+                   [
+                     @handle
+                   ]
+                 ) == {:ok, [["unavailable", "listener_stopped"]]}
                end)
       end)
 
@@ -983,7 +988,13 @@ defmodule Tightbeam.HarklightWakesTest do
   } do
     attached = JSON.encode!(%{kind: "attached", ready_for_listen: true})
     event_line = event(1, "discussion", "invalid-byte-event-canary")
-    event_line = :binary.replace(event_line, "invalid-byte-event-canary", "bad" <> <<255>> <> "event-payload")
+
+    event_line =
+      :binary.replace(
+        event_line,
+        "invalid-byte-event-canary",
+        "bad" <> <<255>> <> "event-payload"
+      )
 
     printf_format =
       event_line
