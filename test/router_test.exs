@@ -4118,6 +4118,50 @@ defmodule Tightbeam.Wire.RouterTest do
           params: %{assignmentId: assignment["id"], kind: "completion", note: "Done"}
         })
 
+      if not @personal_session do
+        # Read the original admission ledger before the explicit replay below.
+        # Do not reconstruct election or availability from current rules/sessions.
+        admission_evidence =
+          DB.query(
+            ctx.db,
+            """
+            SELECT e.org,e.eventId,e.event,e.facts,e.admittedAt,
+                   a.id,a.family,a.slot,a.plan,a.payloadDigest,a.status,a.result,
+                   a.attempts,a.lastError,a.updatedAt,
+                   w.wakeId,w.sessionKey,w.ownerUserId,w.state,w.dueAt,w.firedAt,
+                   w.canceledAt,w.deliveredTurnSeq,t.sessionKey,t.status,t.createdAt,
+                   c.reasonKind,c.canceledAt,c.causalSourceKind,c.causalSourceId,
+                   c.outcomeKind,c.replacementWakeId,l.id,l.ts,l.detail
+            FROM row_reaction_events e
+            LEFT JOIN row_reaction_actions a ON a.org=e.org AND a.eventId=e.eventId
+            LEFT JOIN wakes w ON w.wakeId=json_extract(a.result,'$.wake_id')
+            LEFT JOIN turns t ON t.seq=w.deliveredTurnSeq
+            LEFT JOIN wake_cancellations c ON c.wakeId=w.wakeId
+            LEFT JOIN lifecycle_events l
+              ON l.kind='wake_undeliverable' AND l.subject=w.wakeId
+            WHERE json_extract(e.event,'$.kind')='assignment'
+              AND json_extract(e.event,'$.source.kind')='attest'
+              AND json_extract(e.event,'$.terminal.assignment_id')=?1
+            ORDER BY e.admittedAt,e.eventId,a.id,l.id
+            """,
+            [assignment["id"]]
+          )
+
+        IO.inspect(
+          %{
+            assignment_id: assignment["id"],
+            completion_status: completed.status,
+            stage: "original-admission-ledger-before-replay",
+            columns:
+              ~w(org event_id event_json event_facts_json admitted_at action_id action_family action_slot action_plan_json action_payload_digest action_status action_result_json action_attempts action_error action_updated_at wake_id wake_session wake_owner wake_state wake_due_at wake_fired_at wake_canceled_at delivered_turn_seq turn_session turn_status turn_created_at cancellation_reason_kind cancellation_at cancellation_source_kind cancellation_source_id cancellation_outcome_kind replacement_wake_id undelivered_event_id undelivered_at undelivered_reason),
+            rows: admission_evidence
+          },
+          label: "Itemless terminal admission evidence",
+          limit: :infinity,
+          printable_limit: :infinity
+        )
+      end
+
       assert completed.status == 200, completed.resp_body
 
       assert {:ok, {:ok, terminal}} =
