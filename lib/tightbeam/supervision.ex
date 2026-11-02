@@ -142,24 +142,38 @@ defmodule Tightbeam.Supervision do
 
   @doc false
   def assignment_hold_released_in_txn(%Txn{} = txn, assignment_id, released_at) do
+    suppression_released_in_txn(txn, assignment_id, released_at)
+  end
+
+  @doc false
+  def cannot_proceed_settled_in_txn(%Txn{} = txn, assignment_id, settled_at) do
+    suppression_released_in_txn(txn, assignment_id, settled_at)
+  end
+
+  defp suppression_released_in_txn(txn, assignment_id, released_at) do
     if not reminders_disabled?(nil) do
       case Txn.q(txn, "SELECT holderKey,workItemId,state FROM assignments WHERE id=?1", [
              assignment_id
            ]) do
-        [[holder, work_item_id, "open"]] ->
-          interval_ms = policy_period_ms()
+        [[holder, work_item_id, "open"]]
+        when not is_nil(holder) ->
+          if AssignmentHolds.active_in_txn?(txn, assignment_id) do
+            :ok
+          else
+            interval_ms = policy_period_ms()
 
-          deadline =
-            schedule_deadline_in_txn(
-              txn,
-              assignment_id,
-              holder,
-              work_item_id,
-              released_at,
-              interval_ms
-            )
+            deadline =
+              schedule_deadline_in_txn(
+                txn,
+                assignment_id,
+                holder,
+                work_item_id,
+                released_at,
+                interval_ms
+              )
 
-          cancel_assignment_sources_in_txn(txn, assignment_id, {:replacement, deadline.wake_id})
+            cancel_assignment_sources_in_txn(txn, assignment_id, {:replacement, deadline.wake_id})
+          end
 
         _ ->
           :ok
@@ -2265,6 +2279,11 @@ defmodule Tightbeam.Supervision do
         txn,
         "SELECT MAX(raisedAt) FROM decision_requests WHERE assignmentId=?1 AND raiserSessionKey=?2 AND raisedAt>=?3",
         [assignment_id, holder, opened_at]
+      ),
+      max_row(
+        txn,
+        "SELECT MAX(releasedAt) FROM assignment_hold WHERE assignmentId=?1 AND releasedAt>=?2",
+        [assignment_id, opened_at]
       )
     ]
 

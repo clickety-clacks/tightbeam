@@ -864,6 +864,8 @@ defmodule Tightbeam.Assignments do
             "cannot-proceed released by condition fact #{fact.fact_id}"
           )
 
+        :ok = Supervision.cannot_proceed_settled_in_txn(txn, assignment_id, fact.ts)
+
         case fetch_assignment(txn, assignment_id) do
           %{holderKey: holder} ->
             append_substrate(
@@ -4550,6 +4552,8 @@ defmodule Tightbeam.Assignments do
         )
 
         if Txn.changes(txn) != 1, do: raise(TransitionRace)
+
+        :ok = Supervision.cannot_proceed_settled_in_txn(txn, assignment_id, settled_at)
 
         case fetch_assignment(txn, assignment_id) do
           %{holderKey: holder} ->
