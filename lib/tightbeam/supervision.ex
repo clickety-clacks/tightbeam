@@ -274,14 +274,18 @@ defmodule Tightbeam.Supervision do
              WHERE s.state='retired' AND a.state='open'
              ORDER BY s.sessionKey
              """)
-             |> Enum.each(fn [session_key, owner_user_id] ->
+             |> Enum.flat_map(fn [session_key, owner_user_id] ->
                Tightbeam.Assignments.interrupt_for_retire_in_txn(
                  txn,
                  session_key,
                  owner_user_id,
                  "process:tightbeam"
                )
+               |> Enum.map(& &1.work_item_id)
              end)
+             |> Enum.filter(&is_binary/1)
+             |> Enum.uniq()
+             |> Enum.each(&Tightbeam.WorkItemSummary.publish_change_in_txn(txn, &1, %{}))
            end,
            fn txn, result ->
              Wakes.row_commit_in_txn(txn, [])

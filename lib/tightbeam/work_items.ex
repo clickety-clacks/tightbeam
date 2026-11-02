@@ -1778,6 +1778,10 @@ defmodule Tightbeam.WorkItems do
     )
   end
 
+  @doc false
+  def touch_version_in_txn(%Txn{} = txn, work_item_id) when is_binary(work_item_id),
+    do: stamp_version_in_txn(txn, work_item_id, now())
+
   # The wake-id columns are INTERNAL substrate truth — never surfaced in a
   # response object (§Response shapes).
   defp columns do

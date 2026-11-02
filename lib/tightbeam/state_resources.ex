@@ -202,7 +202,8 @@ defmodule Tightbeam.StateResources do
     ReadMarkers,
     StateVisibility,
     Wakes,
-    WorkItems
+    WorkItems,
+    WorkItemSummary
   }
 
   alias Tightbeam.DB.Txn
@@ -220,7 +221,7 @@ defmodule Tightbeam.StateResources do
 
   @item_field_order %{
     "work items" =>
-      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority rowVersion),
+      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings rowVersion),
     "assignments" =>
       ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
     "attests" =>
@@ -271,7 +272,7 @@ defmodule Tightbeam.StateResources do
       strings:
         ~w(id title specRefName specRefSha256 ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession),
       integers: ~w(createdInTurnSeq createdAt priority rowVersion),
-      booleans: ~w(isBug createdContextKnown),
+      booleans: ~w(isBug createdContextKnown started),
       nullable:
         ~w(specRefName specRefSha256 ownerUserId failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq)
     },
@@ -422,6 +423,11 @@ defmodule Tightbeam.StateResources do
   }
 
   @item_complex_types %{
+    {"work items", "holders"} => {:array, :string, :sort},
+    {"work items", "attestCounts"} => :json,
+    {"work items", "verdictCounts"} => :json,
+    {"work items", "effectiveCommitRefs"} => {:array, :commit_ref, :preserve},
+    {"work items", "landings"} => {:array, :landing, :preserve},
     {"assignments", "files"} => {:array, :string, :preserve},
     {"attests", "commitRefs"} => {:array, :commit_ref, :preserve},
     {"decision requests", "options"} => {:array, :decision_option, :preserve},
@@ -502,10 +508,11 @@ defmodule Tightbeam.StateResources do
     trace_core_detail(principal, {:au4_visibility, "work items"})
 
     rows =
-      observed_query(
-        db,
-        principal,
-        """
+      with_read_transaction(db, fn txn ->
+        observed_query(
+          txn,
+          principal,
+          """
         SELECT wi.id, wi.title, wi.specRefName, wi.specRefSha256, wi.isBug,
                wi.ownerUserId, wi.state, wi.failReason, wi.routingWakeId,
                wi.slateWakeId, wi.createdByUser, wi.createdBySession,
@@ -534,21 +541,23 @@ defmodule Tightbeam.StateResources do
         ))
         ORDER BY wi.createdAt, wi.id
         """,
-        [
-          id,
-          bool_int(is_admin),
-          principal_kind,
-          principal_id,
-          filters["state"],
-          filters["ownerUserId"],
-          filters["createdBySession"],
-          filters["createdByUser"],
-          filters["isBug"],
-          filters["specRefName"],
-          filters["holderKey"]
-        ]
-      )
-      |> Enum.map(&work_item_query_row/1)
+          [
+            id,
+            bool_int(is_admin),
+            principal_kind,
+            principal_id,
+            filters["state"],
+            filters["ownerUserId"],
+            filters["createdBySession"],
+            filters["createdByUser"],
+            filters["isBug"],
+            filters["specRefName"],
+            filters["holderKey"]
+          ]
+        )
+        |> Enum.map(&work_item_query_row/1)
+        |> Enum.map(&WorkItemSummary.attach(txn, &1))
+      end)
 
     if is_map(selection), do: rows, else: List.first(rows)
   end
@@ -599,7 +608,8 @@ defmodule Tightbeam.StateResources do
     case DB.transaction(db, fn txn ->
            query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
 
-           Keyset.page(
+           page =
+             Keyset.page(
              query,
              select_from,
              probe_from,
@@ -610,10 +620,17 @@ defmodule Tightbeam.StateResources do
              limit,
              fn row -> [Enum.at(row, 14), hd(row)] end
            )
+
+           rows =
+             Enum.map(page.rows, fn row ->
+               WorkItemSummary.attach(txn, work_item_query_row(row))
+             end)
+
+           %{page | rows: rows}
          end) do
       {:ok, page} ->
         %{
-          rows: Enum.map(page.rows, &work_item_query_row/1),
+          rows: page.rows,
           has_more_before: page.has_more_before,
           has_more_after: page.has_more_after
         }
@@ -2795,6 +2812,25 @@ defmodule Tightbeam.StateResources do
 
   defp encode_item_field("attests", "commitRefs", value) do
     encode_closed_list!(value, ~w(repo commit), "attests.commitRefs")
+  end
+
+  defp encode_item_field("work items", "holders", value),
+    do: value |> Enum.sort() |> JSON.encode!()
+
+  defp encode_item_field("work items", field, value)
+       when field in ~w(attestCounts verdictCounts),
+       do: encode_j!(value)
+
+  defp encode_item_field("work items", "effectiveCommitRefs", value) do
+    encode_closed_list!(value, ~w(repo commit), "work items.effectiveCommitRefs")
+  end
+
+  defp encode_item_field("work items", "landings", value) do
+    encode_closed_list!(
+      value,
+      ~w(repository branch commit headCommit pullRequest observedAt),
+      "work items.landings"
+    )
   end
 
   defp encode_item_field("decision requests", "options", value) do

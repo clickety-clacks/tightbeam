@@ -1453,11 +1453,12 @@ defmodule Tightbeam.Gateway do
             end)
             |> Map.put(:on_work_item_handoff_in_txn, fn txn, item, created? ->
               class = if created?, do: "work_item.created", else: "work_item.updated"
+              row = StateResources.query_work_item(txn, item.id, call) || item
 
               Tightbeam.Firehose.Publisher.committed_in_txn(
                 txn,
                 class,
-                Tightbeam.StateResources.work_item(item),
+                Tightbeam.StateResources.work_item(row),
                 %{"workItemId" => item.id}
               )
             end)
@@ -1569,7 +1570,7 @@ defmodule Tightbeam.Gateway do
         Tightbeam.AssignmentCommitRefCorrections.__handle__(
           db,
           "assignment-commitref-correct",
-          call
+          Map.put(call, :firehose_work_item_summary, true)
         )
       end,
       {"revoke-assignment", ["assignment.closed"]} => fn call ->
@@ -10604,7 +10605,8 @@ defmodule Tightbeam.Gateway do
                             supervision_interval_ms(config),
                             "retired: session retired before execution",
                             retirement_request_id,
-                            p[:idempotency_key]
+                            p[:idempotency_key],
+                            call
                           )
 
                         if result.retired != [] and p[:idempotency_key] do
@@ -10942,7 +10944,8 @@ defmodule Tightbeam.Gateway do
          supervision_interval_ms,
          drain_reason,
          retirement_request_id,
-         idempotency_key
+         idempotency_key,
+         call
        ) do
     # The plan was read from this transaction's tree snapshot. The walk is
     # parent-last so each member's own active descendants have already been
@@ -11000,6 +11003,13 @@ defmodule Tightbeam.Gateway do
 
           %{session_key: member.session_key, assignments: assignments}
         end)
+
+      retired
+      |> Enum.flat_map(& &1.assignments)
+      |> Enum.map(& &1.work_item_id)
+      |> Enum.filter(&is_binary/1)
+      |> Enum.uniq()
+      |> Enum.each(&Tightbeam.WorkItemSummary.publish_change_in_txn(txn, &1, call))
 
       %{retired: retired, deferred: [], kept_descendants: kept_descendants}
     else

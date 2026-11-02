@@ -32,7 +32,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   @r7_fields %{
     "work items" =>
-      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority rowVersion),
+      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings rowVersion),
     "assignments" =>
       ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
     "wakes" =>
@@ -84,7 +84,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   }
 
   @boolean_fields %{
-    "work items" => ~w(isBug createdContextKnown),
+    "work items" => ~w(isBug createdContextKnown started),
     "assignments" => ~w(holderFallback),
     "wakes" => ~w(rumination digest summon),
     "turns" => [],
@@ -2868,6 +2868,32 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         {resource, field} == {"assignments", "files"} ->
           assert Enum.all?(value, &is_binary/1)
 
+        {resource, field} == {"work items", "holders"} ->
+          assert Enum.all?(value, &is_binary/1)
+
+        {resource, field} in [
+          {"work items", "attestCounts"},
+          {"work items", "verdictCounts"}
+        ] ->
+          assert Enum.all?(value, fn {key, count} ->
+                   is_binary(key) and is_integer(count) and count > 0
+                 end)
+
+        {resource, field} == {"work items", "effectiveCommitRefs"} ->
+          assert Enum.all?(value, fn ref ->
+                   Map.keys(ref) |> Enum.sort() == ~w(commit repo) and
+                     is_binary(ref["repo"]) and is_binary(ref["commit"])
+                 end)
+
+        {resource, field} == {"work items", "landings"} ->
+          assert Enum.all?(value, fn landing ->
+                   Map.keys(landing) |> Enum.sort() ==
+                     ~w(branch commit headCommit observedAt pullRequest repository) and
+                     is_binary(landing["repository"]) and is_binary(landing["branch"]) and
+                     is_binary(landing["commit"]) and is_binary(landing["headCommit"]) and
+                     is_integer(landing["pullRequest"]) and is_integer(landing["observedAt"])
+                 end)
+
         {resource, field} == {"decision requests", "options"} ->
           assert Enum.all?(value, fn option ->
                    Map.keys(option) == ["label"] and is_binary(option["label"])
@@ -2934,6 +2960,12 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   defp assert_populated_contract("work items", item) do
     assert item["specRefSha256"] == String.duplicate("a", 64)
     assert item["isBug"] and item["createdContextKnown"]
+    assert is_list(item["holders"])
+    assert is_boolean(item["started"])
+    assert is_map(item["attestCounts"])
+    assert is_map(item["verdictCounts"])
+    assert is_list(item["effectiveCommitRefs"])
+    assert is_list(item["landings"])
     assert is_integer(item["createdInTurnSeq"])
     assert is_nil(item["createdBySession"])
     assert_opaque(item["title"])
