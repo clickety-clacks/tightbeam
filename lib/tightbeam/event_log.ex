@@ -294,7 +294,7 @@ defmodule Tightbeam.EventLog do
         SELECT id, ts, verb, origin, principal, payload,
           json_extract(payload, '$.rule'), json_extract(payload, '$.afterMessageSeq')
         FROM events
-        WHERE sessionKey = ?1 AND principal = ?2 AND kind = 'denied'
+        WHERE (sessionKey = ?1 OR principal = ?2) AND kind = 'denied'
           AND json_valid(payload) AND json_type(payload, '$.rule') = 'text'
         ORDER BY CASE
           WHEN json_type(payload, '$.afterMessageSeq') = 'integer' THEN 0
