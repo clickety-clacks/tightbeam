@@ -404,9 +404,22 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     assert Tightbeam.Wakes.get(ctx.db, wake_id).state == "canceled"
   end
 
+  test "the wake scheduler processes the subscription deadline without polling", ctx do
+    Tightbeam.Rules.load!(ctx.base, Map.keys(ctx.handlers))
+    parent = self()
+    once = subscribe(ctx, "sub-a", [], %{mode: "once", fallback_ms: 50})
+    start_supervised!({Tightbeam.Wakes, db: ctx.db, name: Tightbeam.WakeScheduler,
+      deliver: fn wake -> send(parent, {:timer_delivery, wake.prompt}); :ok end})
+    assert_receive {:timer_delivery, prompt}, 2_000
+    assert prompt =~ "Cause: fallback"
+    assert prompt =~ once.id
+    assert SentinelSubscriptions.demand(ctx.db).demand == []
+    assert count(ctx.db, "sentinel_subscription_wake_matches", "subscriptionId=?1", [once.id]) == 1
+  end
+
   test "retirement forwards legacy fact waits but ends new interests", ctx do
     successor = Org.personal_session_key("owner")
-    create_session!(ctx.db, successor)
+    {:ok, _} = DB.query(ctx.db, "INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,host,state,createdAt,updatedAt) VALUES (?1,'successor','owner','user:owner','default','claude','anthropic','fable','testhost','active',1,1)", [successor])
     legacy = Tightbeam.Wakes.schedule(ctx.db, %{
       session_key: "sub-normal", origin: "session:sub-normal", prompt: "original legacy prompt",
       condition_kind: "sample.finished", condition_scope: "object", due_at: System.system_time(:millisecond) + 60_000
