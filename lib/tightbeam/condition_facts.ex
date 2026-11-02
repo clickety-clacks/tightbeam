@@ -139,9 +139,7 @@ defmodule Tightbeam.ConditionFacts do
              :ok <- consequence_admission(txn, input) do
           case consequence_replay(txn, input) do
             :new ->
-              with :ok <- prepare_sentinel_event_in_txn(txn, input) do
-                file_admitted_in_txn(txn, kind, origin, input)
-              end
+              file_admitted_in_txn(txn, kind, origin, input)
 
             result ->
               result
@@ -157,7 +155,7 @@ defmodule Tightbeam.ConditionFacts do
     event = input[:sentinel_event]
 
     cond do
-      SentinelSubscriptions.event_kind?(kind) and is_map(event) ->
+      is_map(event) ->
         details = event[:details]
         declaration = event[:declaration]
 
@@ -169,6 +167,7 @@ defmodule Tightbeam.ConditionFacts do
             kind == SentinelSubscriptions.event_kind(event.qualified) and
             event.qualified == declaration.qualified and is_map(details) and
             input[:payload] == details and
+            (is_nil(input[:scope]) or details["scope"] == input[:scope]) and
             Enum.sort(Map.keys(details)) == Enum.sort(declared_names) and
             Enum.all?(details, fn {name, value} -> is_binary(name) and is_binary(value) end) and
             match?({:process, _}, event[:principal])
@@ -176,9 +175,6 @@ defmodule Tightbeam.ConditionFacts do
         if valid,
           do: :ok,
           else: {:error, %{code: "invalid", message: "invalid declared sentinel event"}}
-
-      SentinelSubscriptions.event_kind?(kind) ->
-        {:error, %{code: "invalid", message: "sentinel event requires declared event metadata"}}
 
       is_nil(event) ->
         :ok
@@ -190,13 +186,6 @@ defmodule Tightbeam.ConditionFacts do
 
   defp sentinel_event_admission(_input),
     do: {:error, %{code: "invalid", message: "condition fact requires a kind"}}
-
-  defp prepare_sentinel_event_in_txn(txn, %{sentinel_event: event, origin: origin})
-       when is_map(event) do
-    SentinelSubscriptions.prepare_event_in_txn(txn, event.declaration, event.details, origin)
-  end
-
-  defp prepare_sentinel_event_in_txn(_txn, _input), do: :ok
 
   defp consequence_admission(txn, %{kind: "obligation-consequence-changed"} = input) do
     payload = input[:payload]
@@ -279,7 +268,7 @@ defmodule Tightbeam.ConditionFacts do
   end
 
   defp consequence_admission(_txn, %{kind: kind} = input) do
-    if SentinelSubscriptions.event_kind?(kind) do
+    if is_map(input[:sentinel_event]) do
       if is_map(input[:payload]),
         do: :ok,
         else: {:error, %{code: "invalid", message: "sentinel event requires detail values"}}
@@ -417,6 +406,7 @@ defmodule Tightbeam.ConditionFacts do
       payload: input[:payload]
     }
 
+    :ok = SentinelSubscriptions.fulfill_fact_in_txn(txn, fact)
     :ok = Tightbeam.Assignments.release_cannot_proceed_in_txn(txn, fact)
 
     EventLog.lifecycle_in_txn(

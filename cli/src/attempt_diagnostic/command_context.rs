@@ -145,6 +145,7 @@ impl CommandContext {
             SentinelEnable { .. } => ("cli.sentinel_enable", DispatchPath),
             SentinelDisable { .. } => ("cli.sentinel_disable", DispatchPath),
             SentinelList { .. } => ("cli.sentinel_list", DispatchPath),
+            SentinelDemand { .. } => ("cli.sentinel_demand", DispatchPath),
             SentinelEvents { .. } => ("cli.sentinel_events", DispatchPath),
             SentinelPost { .. } => ("cli.sentinel_post", DispatchPath),
             SentinelSubscribe { .. } => ("cli.sentinel_subscribe", DispatchPath),
@@ -344,6 +345,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | KungfuSetup { .. }
         | SentinelList { .. }
         | SentinelEvents { .. }
+        | SentinelDemand { .. }
         | SentinelSubscriptions { .. }
         | SentinelEnvList { .. }
         | ConfigGet { .. }
@@ -875,6 +877,8 @@ mod tests {
             ),
             (
                 Command::SentinelSubscribe {
+                    mode: "standing".to_owned(),
+                    fallback_ms: None,
                     identity: identity.clone(),
                     event: "sample/demo/ping".into(),
                     where_values: vec!["channel=!a:x".into()],

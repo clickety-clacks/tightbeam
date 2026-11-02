@@ -12,7 +12,7 @@ Settings (environment):
 The program calls `gh` and `tightbeam` from PATH. It files `landing.settled`
 for pull requests, `pr.checks-completed` when every required check on an open
 pull request's head has finished, and `landing.branch-attention` for branches
-with `tightbeam condition --key`, and wakes a branch's owner role when a required
+with `tightbeam sentinel post --key`, and wakes a branch's owner role when a required
 check fails on the branch tip. Keys make every filing replayable, so repeated
 polls and restarts file nothing new.
 
@@ -651,9 +651,12 @@ class Watcher:
     # Filing
 
     def condition(self, kind: str, scope: str, key: str, payload: dict | None = None) -> bool:
-        args = ["condition", "--kind", kind, "--scope", scope, "--key", key]
-        if payload is not None:
-            args.extend(["--payload", json.dumps(payload, sort_keys=True, separators=(",", ":"))])
+        if kind in {SETTLED, CHECKS_COMPLETED, BRANCH_ATTENTION}:
+            args = ["sentinel", "post", "--event", kind, "--key", key, "--detail", f"scope={scope}"]
+        else:
+            args = ["condition", "--kind", kind, "--scope", scope, "--key", key]
+            if payload is not None:
+                args.extend(["--payload", json.dumps(payload, sort_keys=True, separators=(",", ":"))])
         ok, detail = self.runner.tightbeam(args)
         if not ok:
             self.log.line(f"refused fact key={key} reason={detail}")
@@ -697,24 +700,30 @@ class Watcher:
 
 
 def demanded_scopes(runner, log: Log) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-    data = runner.tightbeam_json(["fact-demand", "--kind-prefix", "landing.", "--kind-prefix", "pr."])
+    data = runner.tightbeam_json(["sentinel", "demand", "--kind-prefix", "landing.", "--kind-prefix", "pr."])
     pairs = data.get("demand")
     if not isinstance(pairs, list):
-        raise ReadError("fact-demand returned no demand array")
+        raise ReadError("sentinel demand returned no demand array")
     prs: dict[str, set[str]] = {}
     branches: dict[str, set[str]] = {}
     served = {SETTLED, CHECKS_COMPLETED, BRANCH_ATTENTION}
     for pair in pairs:
         if not isinstance(pair, dict) or not isinstance(pair.get("kind"), str):
-            raise ReadError("fact-demand returned a malformed pair")
-        kind, scope = pair["kind"], pair.get("scope")
+            raise ReadError("sentinel demand returned a malformed pair")
+        kind, filters = pair["kind"], pair.get("filter")
+        if not isinstance(filters, dict):
+            raise ReadError("sentinel demand returned a malformed filter")
         if kind not in served:
             continue
+        scopes = filters.get("scope", [None])
+        if not isinstance(scopes, list):
+            raise ReadError("sentinel demand returned malformed scope alternatives")
         pattern = BRANCH_SCOPE if kind == BRANCH_ATTENTION else PR_SCOPE
-        if not isinstance(scope, str) or not pattern.fullmatch(scope):
-            log.episode(f"invalid-demand:{kind}:{scope}", f"ignored invalid demand kind={kind} scope={scope!r}")
-            continue
-        (branches if kind == BRANCH_ATTENTION else prs).setdefault(scope, set()).add(kind)
+        for scope in scopes:
+            if not isinstance(scope, str) or not pattern.fullmatch(scope):
+                log.episode(f"invalid-demand:{kind}:{scope}", f"ignored invalid demand kind={kind} scope={scope!r}")
+                continue
+            (branches if kind == BRANCH_ATTENTION else prs).setdefault(scope, set()).add(kind)
     return prs, branches
 
 

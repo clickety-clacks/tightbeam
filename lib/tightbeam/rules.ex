@@ -2969,42 +2969,10 @@ defmodule Tightbeam.Rules do
     fact_id = Map.get(bindings, "conditionFactId")
     owner_user_id = Map.get(call, :predicate_owner_user_id)
 
-    {owner_clause, params} =
-      if owner_user_id == "legacy-unscoped" do
-        {"ownerUserId IS NULL", [after_id, kind]}
-      else
-        {"(ownerUserId IS NULL OR ownerUserId=?3)", [after_id, kind, owner_user_id]}
-      end
-
-    {scope_clause, params} =
-      if is_nil(scope) do
-        {"", params}
-      else
-        {" AND scope=?#{length(params) + 1}", params ++ [scope]}
-      end
-
-    {id_clause, params} =
-      if is_integer(fact_id) do
-        {" AND id=?#{length(params) + 1}", params ++ [fact_id]}
-      else
-        {"", params}
-      end
-
-    rows =
-      case DB.query(
-             db,
-             "SELECT id, scope FROM condition_facts WHERE id>?1 AND kind=?2 AND #{owner_clause}#{scope_clause}#{id_clause} ORDER BY id LIMIT 1",
-             params
-           ) do
-        {:ok, rows} -> rows
-      end
-
-    case rows do
-      [[id, matched_scope]] ->
-        {true, Map.put(cache, "$condition_match", %{id: id, scope: matched_scope})}
-
-      [] ->
-        {false, cache}
+    filter = if is_nil(scope), do: %{}, else: %{"scope" => [scope]}
+    case Tightbeam.SentinelSubscriptions.matching_fact(db, kind, filter, after_id, owner_user_id, fact_id) do
+      nil -> {false, cache}
+      match -> {true, Map.put(cache, "$condition_match", Map.take(match, [:id, :scope]))}
     end
   end
 
