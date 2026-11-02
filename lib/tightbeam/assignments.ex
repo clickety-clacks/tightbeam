@@ -19,7 +19,8 @@ defmodule Tightbeam.Assignments do
     RailRemedy,
     Rules,
     Supervision,
-    Wakes
+    Wakes,
+    WorkItemSummary
   }
 
   @effect_kinds ~w(code policy release live_mutation evidence review coordination)
@@ -1829,9 +1830,11 @@ defmodule Tightbeam.Assignments do
 
               case result do
                 {:accepted_in_txn, _event_id, {:created, assignment, _delivery, _effects}} ->
+                  WorkItemSummary.publish_change_in_txn(txn, assignment.workItemId, call)
                   Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, assignment)
 
                 {:created, assignment, _delivery, _effects} ->
+                  WorkItemSummary.publish_change_in_txn(txn, assignment.workItemId, call)
                   Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, assignment)
 
                 {:replayed, _assignment} ->
@@ -2007,6 +2010,7 @@ defmodule Tightbeam.Assignments do
                   Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
 
                 not Map.has_key?(result, :code) ->
+                  WorkItemSummary.publish_assignment_change_in_txn(txn, assignment_id, call)
                   Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, public_result)
 
                 true ->
@@ -2225,8 +2229,10 @@ defmodule Tightbeam.Assignments do
             result = revoke_in_txn(txn, call)
 
             if is_map(result) and not Map.has_key?(result, :code) and
-                 not Map.get(result, :revocation_replayed, false),
-               do: Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, result)
+                 not Map.get(result, :revocation_replayed, false) do
+              WorkItemSummary.publish_assignment_change_in_txn(txn, assignment_id, call)
+              Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, result)
+            end
 
             result
           end,
@@ -2263,8 +2269,10 @@ defmodule Tightbeam.Assignments do
           fn txn ->
             result = reopen_in_txn(txn, call)
 
-            if is_map(result) and not Map.has_key?(result, :code),
-              do: Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, result)
+            if is_map(result) and not Map.has_key?(result, :code) do
+              WorkItemSummary.publish_assignment_change_in_txn(txn, assignment_id, call)
+              Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, result)
+            end
 
             result
           end,

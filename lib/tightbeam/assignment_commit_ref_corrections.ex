@@ -11,7 +11,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
 
   require Logger
 
-  alias Tightbeam.{DB, Placement}
+  alias Tightbeam.{DB, Placement, WorkItemSummary}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Harness.Support
 
@@ -306,6 +306,12 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
                     verified_at,
                     created_at
                   ]
+                )
+
+                WorkItemSummary.publish_assignment_change_in_txn(
+                  txn,
+                  context.assignment_id,
+                  call
                 )
 
                 %{correction: fetch!(txn, id)}

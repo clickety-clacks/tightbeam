@@ -4,12 +4,14 @@ defmodule Tightbeam.WorkItemsTest do
 
   alias Tightbeam.{
     Assignments,
+    ConditionFacts,
     DB,
     Dispatch,
     Gateway,
     Ledger,
     Org,
     Rules,
+    StateResources,
     WorkItems
   }
 
@@ -581,6 +583,13 @@ defmodule Tightbeam.WorkItemsTest do
 
   test "handoff creates or binds an item and delivers its brief without opening an assignment",
        ctx do
+    alias Tightbeam.Firehose.Hub
+
+    hub = start_supervised!({Hub, name: nil})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    on_exit(fn -> Hub.unregister(hub, self()) end)
+
     owner = ctx.other.session_key
     new_brief = "Take ownership of the new item."
 
@@ -593,10 +602,28 @@ defmodule Tightbeam.WorkItemsTest do
                  delivery_owner_session_key: owner,
                  brief: new_brief
                })
+               |> Map.put(:firehose_hub, hub)
              )
 
     assert new_item.deliveryOwnerSessionKey == owner
     assert new_item.title == "New handoff"
+
+    created_notice =
+      drain_firehose_notices(hub)
+      |> Enum.find(&(&1["class"] == "work_item.created"))
+
+    assert created_notice
+    assert created_notice["payload"]["id"] == new_item.id
+    assert created_notice["payload"]["holders"] == []
+    assert created_notice["payload"]["started"] == false
+    assert created_notice["payload"]["attestCounts"] == %{}
+    assert created_notice["payload"]["verdictCounts"] == %{}
+    assert created_notice["payload"]["effectiveCommitRefs"] == []
+    assert created_notice["payload"]["landings"] == []
+
+    new_detail = get(ctx, {:user, "flynn"}, new_item.id).workItem
+    assert created_notice["payload"]["rowVersion"] == new_detail.rowVersion
+    assert created_notice["payload"]["landings"] == new_detail.landings
 
     assert {:ok, [[^owner, new_prompt, "pending"]]} =
              DB.query(
@@ -619,11 +646,29 @@ defmodule Tightbeam.WorkItemsTest do
                  delivery_owner_session_key: owner,
                  brief: existing_brief
                })
+               |> Map.put(:firehose_hub, hub)
              )
 
     assert existing_item.id == existing.id
     assert existing_item.title == existing.title
     assert existing_item.deliveryOwnerSessionKey == owner
+
+    updated_notice =
+      drain_firehose_notices(hub)
+      |> Enum.find(&(&1["class"] == "work_item.updated"))
+
+    assert updated_notice
+    assert updated_notice["payload"]["id"] == existing.id
+    assert updated_notice["payload"]["holders"] == []
+    assert updated_notice["payload"]["started"] == false
+    assert updated_notice["payload"]["attestCounts"] == %{}
+    assert updated_notice["payload"]["verdictCounts"] == %{}
+    assert updated_notice["payload"]["effectiveCommitRefs"] == []
+    assert updated_notice["payload"]["landings"] == []
+
+    existing_detail = get(ctx, {:user, "flynn"}, existing.id).workItem
+    assert updated_notice["payload"]["rowVersion"] == existing_detail.rowVersion
+    assert updated_notice["payload"]["landings"] == existing_detail.landings
 
     assert {:ok, [[^owner, existing_prompt, "pending"]]} =
              DB.query(
@@ -1254,8 +1299,26 @@ defmodule Tightbeam.WorkItemsTest do
     first = create(ctx, {:user, "flynn"}, %{title: "First"})
     assert %{workItem: detail, assignments: []} = get(ctx, {:session, "holder"}, first.id)
 
-    assert Map.drop(detail, [:body, :bodyUpdatedByUser, :bodyUpdatedBySession, :bodyUpdatedAt]) ==
-             first
+    assert Map.drop(detail, [
+             :body,
+             :bodyUpdatedByUser,
+             :bodyUpdatedBySession,
+             :bodyUpdatedAt,
+             :holders,
+             :started,
+             :attestCounts,
+             :verdictCounts,
+             :effectiveCommitRefs,
+             :landings
+           ]) ==
+             Map.drop(first, [
+               :holders,
+               :started,
+               :attestCounts,
+               :verdictCounts,
+               :effectiveCommitRefs,
+               :landings
+             ])
 
     assert detail.body == nil
     second = create(ctx, {:user, "flynn"}, %{title: "Second"})
@@ -1296,17 +1359,508 @@ defmodule Tightbeam.WorkItemsTest do
 
     assert Enum.count(detail.assignments, &(&1.state == "open")) == 2
     assert Enum.count(detail.assignments, &(&1.state == "closed")) == 1
+    assert detail.workItem.holders == ["holder", "other-holder"]
+    assert detail.workItem.started == true
+
+    listed_item =
+      list(ctx, {:user, "flynn"}).workItems
+      |> Enum.find(&(&1.id == first.id))
+
+    assert listed_item.holders == detail.workItem.holders
+    assert listed_item.started == detail.workItem.started
+    assert listed_item.attestCounts == detail.workItem.attestCounts
+    assert listed_item.verdictCounts == detail.workItem.verdictCounts
+    assert listed_item.effectiveCommitRefs == detail.workItem.effectiveCommitRefs
+    assert listed_item.landings == detail.workItem.landings
+  end
+
+  test "detail and page reads summarize holders, started state, raw evidence, and effective commits",
+       ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Summary fields"})
+
+    initial = get(ctx, {:user, "flynn"}, item.id).workItem
+    assert initial.holders == []
+    assert initial.started == false
+    assert initial.attestCounts == %{}
+    assert initial.verdictCounts == %{}
+    assert initial.effectiveCommitRefs == []
+    assert initial.landings == []
+
+    first = assign(ctx, "holder", "First", item.id)
+    second = assign(ctx, "other-holder", "Second", item.id)
+    third = assign(ctx, "holder", "Third", item.id)
+
+    assert %{attest: %{kind: "progress"}} =
+             file_attest(ctx, {:session, "holder"}, first.id, %{kind: "progress", note: "one"})
+
+    assert %{attest: %{kind: "progress"}} =
+             file_attest(ctx, {:session, "other-holder"}, second.id, %{
+               kind: "progress",
+               note: "two"
+             })
+
+    assert %{attest: %{kind: "verdict", verdictKind: "future-vocabulary"}} =
+             file_attest(ctx, {:session, "holder"}, first.id, %{
+               kind: "verdict",
+               verdict_kind: "future-vocabulary"
+             })
+
+    assert %{attest: %{kind: "verdict", verdictKind: "reviewed-clean"}} =
+             file_attest(ctx, {:session, "holder"}, third.id, %{
+               kind: "verdict",
+               verdict_kind: "reviewed-clean"
+             })
+
+    ref_a = %{"repo" => "repo-a", "commit" => "c1"}
+    ref_b = %{"repo" => "repo-a", "commit" => "c2"}
+    ref_c = %{"repo" => "repo-a", "commit" => "c3"}
+    insert_attest_refs(ctx.db, first.id, "holder", [[ref_b], [ref_a]])
+    insert_attest_refs(ctx.db, second.id, "other-holder", [[ref_c, ref_a]])
+
+    detail = get(ctx, {:user, "flynn"}, item.id).workItem
+    assert detail.holders == ["holder", "other-holder"]
+    assert detail.started == true
+    assert detail.attestCounts == %{"completion" => 3, "progress" => 2, "verdict" => 2}
+    assert detail.verdictCounts == %{"future-vocabulary" => 1, "reviewed-clean" => 1}
+    assert detail.effectiveCommitRefs == [ref_a, ref_b, ref_c]
+    assert detail.landings == []
+
+    page =
+      StateResources.query_work_item_page(
+        ctx.db,
+        %{},
+        %{rest_principal: %{kind: "user", id: "flynn", is_admin: false}},
+        :earliest,
+        10
+      )
+
+    page_item = Enum.find(page.rows, &(&1.id == item.id))
+    assert page_item.holders == detail.holders
+    assert page_item.started == detail.started
+    assert page_item.attest_counts == detail.attestCounts
+    assert page_item.verdict_counts == detail.verdictCounts
+    assert page_item.effective_commit_refs == detail.effectiveCommitRefs
+    assert page_item.landings == detail.landings
+
+    _ = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call(first.id))
+    _ = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call(third.id))
+    _ = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call(second.id))
+
+    closed = get(ctx, {:user, "flynn"}, item.id).workItem
+    assert closed.holders == []
+    assert closed.started == true
+    assert closed.attestCounts == detail.attestCounts
+    assert closed.verdictCounts == detail.verdictCounts
+    assert closed.effectiveCommitRefs == detail.effectiveCommitRefs
+    assert closed.landings == detail.landings
+
+    page =
+      StateResources.query_work_item_page(
+        ctx.db,
+        %{},
+        %{rest_principal: %{kind: "user", id: "flynn", is_admin: false}},
+        :earliest,
+        10
+      )
+
+    assert Enum.find(page.rows, &(&1.id == item.id)).holders == []
+    assert Enum.find(page.rows, &(&1.id == item.id)).started == true
+    assert Enum.find(page.rows, &(&1.id == item.id)).landings == []
+  end
+
+  if Code.ensure_loaded?(ConditionFacts) and
+       function_exported?(ConditionFacts, :landings_for_commits, 2) do
+    test "observed merges update each matching item and a later matching attest", ctx do
+      alias Tightbeam.Firehose.Hub
+
+      hub = start_supervised!({Hub, name: nil})
+
+      :ok =
+        Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+      merge_commit = String.duplicate("a", 40)
+      head_commit = String.duplicate("b", 40)
+      unrelated_commit = String.duplicate("c", 40)
+
+      merge_item = create(ctx, {:user, "flynn"}, %{title: "Merge commit association"})
+      head_item = create(ctx, {:user, "flynn"}, %{title: "Head commit association"})
+      late_item = create(ctx, {:user, "flynn"}, %{title: "Late commit association"})
+      unrelated_item = create(ctx, {:user, "flynn"}, %{title: "Unrelated commit"})
+
+      merge_assignment = assign(ctx, "holder", "merge", merge_item.id, "evidence")
+      head_assignment = assign(ctx, "other-holder", "head", head_item.id, "evidence")
+      late_assignment = assign(ctx, "holder", "late", late_item.id, "evidence")
+
+      unrelated_assignment =
+        assign(ctx, "other-holder", "unrelated", unrelated_item.id, "evidence")
+
+      assert %{attest: %{kind: "completion"}} =
+               file_attest(ctx, {:session, "holder"}, merge_assignment.id, %{
+                 kind: "completion",
+                 note: "cites the merge commit",
+                 commit_refs: [%{"repo" => "unrelated/repository", "commit" => merge_commit}]
+               })
+
+      assert %{attest: %{kind: "completion"}} =
+               file_attest(ctx, {:session, "other-holder"}, head_assignment.id, %{
+                 kind: "completion",
+                 note: "cites the head commit",
+                 commit_refs: [%{"repo" => "another/repository", "commit" => head_commit}]
+               })
+
+      assert %{attest: %{kind: "completion"}} =
+               file_attest(ctx, {:session, "other-holder"}, unrelated_assignment.id, %{
+                 kind: "completion",
+                 note: "cites a different commit",
+                 commit_refs: [%{"repo" => "Example/Repo", "commit" => unrelated_commit}]
+               })
+
+      before =
+        Map.new([merge_item.id, head_item.id, late_item.id, unrelated_item.id], fn id ->
+          {id, get(ctx, {:user, "flynn"}, id).workItem}
+        end)
+
+      assert Enum.all?(before, fn {_id, row} -> row.landings == [] end)
+      _ = drain_firehose_notices(hub)
+
+      input = %{
+        kind: "landing.observed-merge",
+        scope: "Example/Repo#12",
+        origin: "process:landing-watch",
+        payload: %{
+          "branch" => "main",
+          "commit" => merge_commit,
+          "headCommit" => head_commit
+        },
+        idempotency_key: "landing-record:Example/Repo#12:merged:#{merge_commit}"
+      }
+
+      call = %{
+        verb: "condition",
+        principal: {:user, "flynn"},
+        rest_principal: %{kind: "user", id: "flynn", is_admin: false},
+        params: %{kind: input.kind, scope: input.scope},
+        firehose_in_txn: true,
+        firehose_hub: hub
+      }
+
+      assert {%{kind: "landing.observed-merge"}, true} =
+               ConditionFacts.file_idempotent_with_effect(
+                 ctx.db,
+                 :work_item_summary_test_scheduler,
+                 input,
+                 call
+               )
+
+      landing_updates =
+        drain_firehose_notices(hub)
+        |> Enum.filter(&(&1["class"] == "work_item.updated"))
+
+      assert Enum.map(landing_updates, & &1["payload"]["id"]) |> Enum.sort() ==
+               Enum.sort([merge_item.id, head_item.id])
+
+      expected_landing = %{
+        "repository" => "Example/Repo",
+        "branch" => "main",
+        "commit" => merge_commit,
+        "headCommit" => head_commit,
+        "pullRequest" => 12
+      }
+
+      for item_id <- [merge_item.id, head_item.id] do
+        previous = Map.fetch!(before, item_id)
+        detail = get(ctx, {:user, "flynn"}, item_id).workItem
+        [landing] = detail.landings
+        assert Map.drop(landing, ["observedAt"]) == expected_landing
+        assert landing["observedAt"] > 0
+        assert detail.rowVersion > previous.rowVersion
+
+        notice = Enum.find(landing_updates, &(&1["payload"]["id"] == item_id))
+        assert notice["payload"]["rowVersion"] == detail.rowVersion
+        assert notice["payload"]["holders"] == detail.holders
+        assert notice["payload"]["started"] == detail.started
+        assert notice["payload"]["attestCounts"] == detail.attestCounts
+        assert notice["payload"]["verdictCounts"] == detail.verdictCounts
+        assert notice["payload"]["effectiveCommitRefs"] == detail.effectiveCommitRefs
+        assert notice["payload"]["landings"] == detail.landings
+      end
+
+      matched_versions =
+        Map.new(landing_updates, fn notice ->
+          {notice["payload"]["id"], notice["payload"]["rowVersion"]}
+        end)
+
+      assert {%{kind: "landing.observed-merge"}, false} =
+               ConditionFacts.file_idempotent_with_effect(
+                 ctx.db,
+                 :work_item_summary_test_scheduler,
+                 input,
+                 call
+               )
+
+      replay_notices = drain_firehose_notices(hub)
+      refute Enum.any?(replay_notices, &(&1["class"] == "work_item.updated"))
+
+      for item_id <- [merge_item.id, head_item.id] do
+        detail = get(ctx, {:user, "flynn"}, item_id).workItem
+        assert detail.rowVersion == matched_versions[item_id]
+      end
+
+      page =
+        StateResources.query_work_item_page(
+          ctx.db,
+          %{},
+          %{rest_principal: %{kind: "user", id: "flynn", is_admin: false}},
+          :earliest,
+          10
+        )
+
+      assert Enum.find(page.rows, &(&1.id == merge_item.id)).landings ==
+               get(ctx, {:user, "flynn"}, merge_item.id).workItem.landings
+
+      late_call =
+        call("attest", {:session, "holder"}, %{
+          assignment_id: late_assignment.id,
+          kind: "completion",
+          note: "adds the already-observed head commit",
+          commit_refs: [%{"repo" => "different/repository", "commit" => head_commit}]
+        })
+        |> Map.merge(%{firehose_in_txn: true, firehose_hub: hub})
+
+      assert %{attest: %{kind: "completion"}} =
+               Assignments.__handle__(ctx.db, "attest", late_call)
+
+      late_notices = drain_firehose_notices(hub)
+      late_update = Enum.find(late_notices, &(&1["class"] == "work_item.updated"))
+      late_detail = get(ctx, {:user, "flynn"}, late_item.id).workItem
+      head_detail = get(ctx, {:user, "flynn"}, head_item.id).workItem
+
+      assert late_update["payload"]["landings"] == late_detail.landings
+      assert late_update["payload"]["landings"] == head_detail.landings
+      assert late_update["payload"]["rowVersion"] == late_detail.rowVersion
+      refute Enum.any?(landing_updates, &(&1["payload"]["id"] == unrelated_item.id))
+
+      on_exit(fn -> Hub.unregister(hub, self()) end)
+    end
+  end
+
+  test "assignment and attest changes publish complete summary rows at the new row version",
+       ctx do
+    alias Tightbeam.Firehose.Hub
+
+    hub = start_supervised!({Hub, name: nil})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+    item = create(ctx, {:user, "flynn"}, %{title: "Summary notices"})
+    before_version = get(ctx, {:user, "flynn"}, item.id).workItem.rowVersion
+
+    assignment_call =
+      call("assign", {:user, "flynn"}, %{
+        subject: "Summary notice",
+        work_item_id: item.id,
+        effect_kind: "evidence"
+      })
+      |> Map.merge(%{
+        session_key: "holder",
+        target_role: nil,
+        role_fallback: false,
+        firehose_in_txn: true,
+        firehose_hub: hub
+      })
+
+    assignment = Assignments.__handle__(ctx.db, "assign", assignment_call)
+    assignment_notices = drain_firehose_notices(hub)
+    assignment_update = Enum.find(assignment_notices, &(&1["class"] == "work_item.updated"))
+    assert assignment_update
+    assert assignment_update["payload"]["id"] == item.id
+    assert assignment_update["payload"]["holders"] == ["holder"]
+    assert assignment_update["payload"]["started"] == true
+    assert assignment_update["payload"]["attestCounts"] == %{}
+    assert assignment_update["payload"]["verdictCounts"] == %{}
+    assert assignment_update["payload"]["effectiveCommitRefs"] == []
+    assert assignment_update["payload"]["landings"] == []
+    assert assignment_update["payload"]["rowVersion"] > before_version
+
+    detail = get(ctx, {:user, "flynn"}, item.id).workItem
+    assert assignment_update["payload"]["rowVersion"] == detail.rowVersion
+    assert assignment_update["payload"]["holders"] == detail.holders
+    assert assignment_update["payload"]["started"] == detail.started
+    assert assignment_update["payload"]["attestCounts"] == detail.attestCounts
+    assert assignment_update["payload"]["verdictCounts"] == detail.verdictCounts
+    assert assignment_update["payload"]["effectiveCommitRefs"] == detail.effectiveCommitRefs
+    assert assignment_update["payload"]["landings"] == detail.landings
+
+    attest_call =
+      call("attest", {:session, "holder"}, %{
+        assignment_id: assignment.id,
+        kind: "progress",
+        note: "Summary updated"
+      })
+      |> Map.merge(%{firehose_in_txn: true, firehose_hub: hub})
+
+    assert %{attest: %{kind: "progress"}} = Assignments.__handle__(ctx.db, "attest", attest_call)
+    attest_notices = drain_firehose_notices(hub)
+    assert Enum.any?(attest_notices, &(&1["class"] == "attest.filed"))
+    attest_update = Enum.find(attest_notices, &(&1["class"] == "work_item.updated"))
+    assert attest_update
+    assert attest_update["payload"]["attestCounts"] == %{"progress" => 1}
+    assert attest_update["payload"]["rowVersion"] > assignment_update["payload"]["rowVersion"]
+
+    detail = get(ctx, {:user, "flynn"}, item.id).workItem
+    assert attest_update["payload"]["rowVersion"] == detail.rowVersion
+    assert attest_update["payload"]["holders"] == detail.holders
+    assert attest_update["payload"]["started"] == detail.started
+    assert attest_update["payload"]["attestCounts"] == detail.attestCounts
+    assert attest_update["payload"]["verdictCounts"] == detail.verdictCounts
+    assert attest_update["payload"]["effectiveCommitRefs"] == detail.effectiveCommitRefs
+    assert attest_update["payload"]["landings"] == detail.landings
+
+    completion_call =
+      call("attest", {:session, "holder"}, %{
+        assignment_id: assignment.id,
+        kind: "completion",
+        note: "Complete the summarized assignment"
+      })
+      |> Map.merge(%{firehose_in_txn: true, firehose_hub: hub})
+
+    assert %{attest: %{kind: "completion"}} =
+             Assignments.__handle__(ctx.db, "attest", completion_call)
+
+    completion_update =
+      drain_firehose_notices(hub)
+      |> Enum.find(&(&1["class"] == "work_item.updated"))
+
+    assert completion_update
+    assert completion_update["payload"]["holders"] == []
+    assert completion_update["payload"]["started"] == true
+
+    assert completion_update["payload"]["attestCounts"] == %{
+             "completion" => 1,
+             "progress" => 1
+           }
+
+    assert completion_update["payload"]["verdictCounts"] == %{}
+    assert completion_update["payload"]["effectiveCommitRefs"] == []
+    assert completion_update["payload"]["landings"] == []
+    assert completion_update["payload"]["rowVersion"] > attest_update["payload"]["rowVersion"]
+
+    reopen_call =
+      call("reopen-assignment", {:user, "flynn"}, %{
+        assignment_id: assignment.id,
+        reason: "Continue summarized work"
+      })
+      |> Map.merge(%{firehose_in_txn: true, firehose_hub: hub})
+
+    assert %{state: "open"} = Assignments.__handle__(ctx.db, "reopen-assignment", reopen_call)
+
+    reopen_update =
+      drain_firehose_notices(hub)
+      |> Enum.find(&(&1["class"] == "work_item.updated"))
+
+    assert reopen_update
+    assert reopen_update["payload"]["holders"] == ["holder"]
+    assert reopen_update["payload"]["started"] == true
+
+    assert reopen_update["payload"]["attestCounts"] ==
+             completion_update["payload"]["attestCounts"]
+
+    assert reopen_update["payload"]["verdictCounts"] ==
+             completion_update["payload"]["verdictCounts"]
+
+    assert reopen_update["payload"]["effectiveCommitRefs"] == []
+    assert reopen_update["payload"]["landings"] == []
+    assert reopen_update["payload"]["rowVersion"] > completion_update["payload"]["rowVersion"]
+
+    revoke_call =
+      Map.merge(revoke_call(assignment.id), %{firehose_in_txn: true, firehose_hub: hub})
+
+    assert %{state: "closed"} = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call)
+
+    revoke_update =
+      drain_firehose_notices(hub)
+      |> Enum.find(&(&1["class"] == "work_item.updated"))
+
+    assert revoke_update
+    assert revoke_update["payload"]["holders"] == []
+    assert revoke_update["payload"]["started"] == true
+
+    assert revoke_update["payload"]["attestCounts"] ==
+             completion_update["payload"]["attestCounts"]
+
+    assert revoke_update["payload"]["verdictCounts"] ==
+             completion_update["payload"]["verdictCounts"]
+
+    assert revoke_update["payload"]["effectiveCommitRefs"] == []
+    assert revoke_update["payload"]["landings"] == []
+    assert revoke_update["payload"]["rowVersion"] > reopen_update["payload"]["rowVersion"]
+  end
+
+  test "retiring an assignment holder publishes the final work-item summary", ctx do
+    alias Tightbeam.Firehose.Hub
+
+    hub = start_supervised!({Hub, name: nil})
+    item = create(ctx, {:user, "flynn"}, %{title: "Retired holder summary"})
+    assignment = assign(ctx, "holder", "Retire this assignment", item.id)
+    before = get(ctx, {:user, "flynn"}, item.id).workItem
+
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    retirement_call =
+      call("retire", {:session, "holder"}, %{idempotency_key: "retire-summary-holder"})
+      |> Map.merge(%{session_key: "holder", firehose_in_txn: true, firehose_hub: hub})
+
+    assert {:ok, result} = Dispatch.dispatch(ctx.db, ctx.handlers, retirement_call)
+    assert "holder" in result.retired_session_keys
+
+    summary_update =
+      drain_firehose_notices(hub)
+      |> Enum.find(&(&1["class"] == "work_item.updated"))
+
+    assert summary_update
+    assert summary_update["payload"]["id"] == item.id
+    assert summary_update["payload"]["holders"] == []
+    assert summary_update["payload"]["started"] == true
+    assert summary_update["payload"]["attestCounts"] == %{}
+    assert summary_update["payload"]["verdictCounts"] == %{}
+    assert summary_update["payload"]["effectiveCommitRefs"] == []
+    assert summary_update["payload"]["landings"] == []
+
+    after_retirement = get(ctx, {:user, "flynn"}, item.id).workItem
+    assert summary_update["payload"]["rowVersion"] > before.rowVersion
+    assert summary_update["payload"]["rowVersion"] == after_retirement.rowVersion
+
+    assert %{state: "closed", outcome: "revoked"} =
+             Assignments.__handle__(ctx.db, "assignment-get", %{
+               principal: {:user, "flynn"},
+               params: %{assignment_id: assignment.id}
+             })
+
+    on_exit(fn -> Hub.unregister(hub, self()) end)
   end
 
   test "work-item and assignment lifecycles are independent", ctx do
     item = create(ctx, {:user, "flynn"}, %{title: "Independent"})
     assignment = assign(ctx, "holder", "work", item.id)
 
-    # The OBSERVABLE item (title/spec/owner/state — never the internal bracket
-    # wake-id columns, which a last-close does write) is untouched by closure.
+    # Core item metadata is untouched by assignment closure; the summary and
+    # row version reflect the changed assignment set.
     before_item = get(ctx, {:user, "flynn"}, item.id).workItem
     _ = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call(assignment.id))
-    assert get(ctx, {:user, "flynn"}, item.id).workItem == before_item
+    after_item = get(ctx, {:user, "flynn"}, item.id).workItem
+
+    assert Map.take(after_item, [:id, :title, :specRefName, :specRefSha256, :ownerUserId, :state]) ==
+             Map.take(before_item, [
+               :id,
+               :title,
+               :specRefName,
+               :specRefSha256,
+               :ownerUserId,
+               :state
+             ])
+
+    assert before_item.holders == ["holder"]
+    assert after_item.holders == []
+    assert after_item.started == true
+    assert after_item.rowVersion > before_item.rowVersion
 
     before_assignment = row(ctx.db, "SELECT * FROM assignments WHERE id = ?1", assignment.id)
     _ = update(ctx, {:user, "flynn"}, item.id, %{title: "Changed"})
@@ -1410,9 +1964,12 @@ defmodule Tightbeam.WorkItemsTest do
     }
   end
 
-  defp assign(ctx, holder, subject, work_item_id) do
+  defp assign(ctx, holder, subject, work_item_id, effect_kind \\ nil) do
+    params = %{subject: subject, work_item_id: work_item_id}
+    params = if is_nil(effect_kind), do: params, else: Map.put(params, :effect_kind, effect_kind)
+
     assignment_call =
-      call("assign", {:user, "flynn"}, %{subject: subject, work_item_id: work_item_id})
+      call("assign", {:user, "flynn"}, params)
       |> Map.merge(%{session_key: holder, target_role: nil, role_fallback: false})
 
     Assignments.__handle__(ctx.db, "assign", assignment_call)
@@ -1424,6 +1981,39 @@ defmodule Tightbeam.WorkItemsTest do
         assignment_id: id,
         reason: "work item disposition"
       })
+
+  defp file_attest(ctx, principal, assignment_id, attrs) do
+    params = Map.merge(%{assignment_id: assignment_id}, attrs)
+    Assignments.__handle__(ctx.db, "attest", call("attest", principal, params))
+  end
+
+  defp insert_attest_refs(db, assignment_id, session_key, refs_by_attest) do
+    Enum.with_index(refs_by_attest, 1)
+    |> Enum.each(fn {refs, index} ->
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 "INSERT INTO attests (id, assignmentId, kind, bySession, commitRefs, ts) VALUES (?1, ?2, 'completion', ?3, ?4, ?5)",
+                 [
+                   "att_summary_#{assignment_id}_#{index}",
+                   assignment_id,
+                   session_key,
+                   JSON.encode!(refs),
+                   index
+                 ]
+               )
+    end)
+  end
+
+  defp drain_firehose_notices(hub, acc \\ []) do
+    receive do
+      {:firehose_notice, notice} ->
+        Tightbeam.Firehose.Hub.delivered(hub, self())
+        drain_firehose_notices(hub, [notice | acc])
+    after
+      250 -> Enum.reverse(acc)
+    end
+  end
 
   defp dispatch!(ctx, call) do
     assert {:ok, result} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
