@@ -188,6 +188,7 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
     changes = connect(ctx, "/ws/changes?protocolVersion=2")
     send_frame(changes, auth())
     {_auth_reply, changes} = recv_frame(changes)
+
     send_frame(changes, %{
       type: "subscribe",
       protocolVersion: 2,
@@ -214,6 +215,7 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
       sessionKey: "selected",
       content: content
     }
+
     frame = JSON.encode!(message)
     assert byte_size(frame) < 10_000_000
     assert :ok = WS.send_text(chat, frame)
