@@ -12,8 +12,8 @@ defmodule Tightbeam.ClientE2E.Provenance do
 
   - `{:clean, sha}` — the worktree matches HEAD; the sha is the whole story.
   - `{:dirty, sha, fingerprint, listing}` — it does not, with a fingerprint of
-    what differs. The caller decides whether to refuse (the default) or run and
-    stamp the scorecard DIRTY.
+    what differs. The runner warns and continues, recording the dirty paths and
+    stamping the scorecard DIRTY.
 
   The fingerprint covers UNTRACKED files by content, not just by name.
   `git diff HEAD` omits untracked files entirely, so a driver source that exists
@@ -86,8 +86,17 @@ defmodule Tightbeam.ClientE2E.Provenance do
     |> Enum.sort()
   end
 
-  defp git(nil, args), do: elem(System.cmd("git", args, stderr_to_stdout: true), 0)
-  defp git(root, args), do: elem(System.cmd("git", args, cd: root, stderr_to_stdout: true), 0)
+  defp git(root, args) do
+    opts = if root, do: [cd: root, stderr_to_stdout: true], else: [stderr_to_stdout: true]
+
+    case System.cmd("git", args, opts) do
+      {output, 0} ->
+        output
+
+      {output, status} ->
+        raise "provenance git command failed (#{status}): #{String.trim(output)}"
+    end
+  end
 
   defp hex(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 end
