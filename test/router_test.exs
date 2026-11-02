@@ -4147,19 +4147,74 @@ defmodule Tightbeam.Wire.RouterTest do
             [assignment["id"]]
           )
 
+        evidence_columns =
+          ~w(org event_id event_json event_facts_json admitted_at action_id action_family action_slot action_plan_json action_payload_digest action_status action_result_json action_attempts action_error action_updated_at wake_id wake_session wake_owner wake_state wake_due_at wake_fired_at wake_canceled_at delivered_turn_seq turn_session turn_status turn_created_at cancellation_reason_kind cancellation_at cancellation_source_kind cancellation_source_id cancellation_outcome_kind replacement_wake_id undelivered_event_id undelivered_at undelivered_reason)
+
         IO.inspect(
           %{
             assignment_id: assignment["id"],
             completion_status: completed.status,
             stage: "original-admission-ledger-before-replay",
-            columns:
-              ~w(org event_id event_json event_facts_json admitted_at action_id action_family action_slot action_plan_json action_payload_digest action_status action_result_json action_attempts action_error action_updated_at wake_id wake_session wake_owner wake_state wake_due_at wake_fired_at wake_canceled_at delivered_turn_seq turn_session turn_status turn_created_at cancellation_reason_kind cancellation_at cancellation_source_kind cancellation_source_id cancellation_outcome_kind replacement_wake_id undelivered_event_id undelivered_at undelivered_reason),
+            columns: evidence_columns,
             rows: admission_evidence
           },
           label: "Itemless terminal admission evidence",
           limit: :infinity,
           printable_limit: :infinity
         )
+
+        assert {:ok, [_ | _] = admission_rows} = admission_evidence
+
+        Enum.each(admission_rows, fn row ->
+          record = Map.new(Enum.zip(evidence_columns, row))
+          event = JSON.decode!(record["event_json"])
+          facts = JSON.decode!(record["event_facts_json"])
+          plan = JSON.decode!(record["action_plan_json"])
+          result = JSON.decode!(record["action_result_json"])
+
+          assert event["id"] == record["event_id"]
+          assert event["org"] == record["org"]
+          assert event["terminal"]["assignment_id"] == assignment["id"]
+          assert is_map(facts) and is_list(facts["sessions"])
+          assert facts["personal_session_key"] == personal
+          assert plan["source_event_id"] == event["id"]
+
+          assert plan["identity"] == [
+                   record["org"],
+                   record["action_family"],
+                   record["event_id"],
+                   record["action_slot"]
+                 ]
+
+          assert record["action_id"] == Tightbeam.RowReactions.Store.id(plan["identity"])
+          assert is_binary(plan["rule"]) and plan["rule"] != ""
+          assert plan["selected"] == true
+          assert plan["provenance"]["content_sha256"] =~ ~r/\A[0-9a-f]{64}\z/
+          assert plan["value"]["assignment_id"] == assignment["id"]
+          assert is_binary(record["wake_id"])
+          assert result["wake_id"] == record["wake_id"]
+          assert result["emitted"]["session_key"] == record["wake_session"]
+          assert result["emitted"]["owner_user_id"] == record["wake_owner"]
+
+          queued_wake? = result["delivery"] == "queued" and record["wake_state"] == "pending"
+
+          delivered? =
+            result["delivery"] == "delivered" and
+              is_integer(record["delivered_turn_seq"]) and
+              record["turn_session"] == record["wake_session"]
+
+          undelivered? =
+            result["delivery"] == "undelivered" and record["wake_state"] == "canceled" and
+              is_nil(record["delivered_turn_seq"]) and
+              record["cancellation_reason_kind"] == "target_unresolvable" and
+              record["cancellation_source_kind"] == "scheduler_delivery" and
+              record["cancellation_source_id"] == record["wake_id"] and
+              is_integer(record["undelivered_event_id"]) and
+              is_binary(record["undelivered_reason"]) and
+              String.trim(record["undelivered_reason"]) != ""
+
+          assert queued_wake? or delivered? or undelivered?
+        end)
       end
 
       assert completed.status == 200, completed.resp_body
