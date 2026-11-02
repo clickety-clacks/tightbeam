@@ -4042,7 +4042,10 @@ fn parse_sentinel(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Com
             if parsed.duplicates.contains("event") {
                 return Err(usage.to_owned());
             }
-            let mode = flags.get("mode").cloned().unwrap_or_else(|| "standing".to_owned());
+            let mode = flags
+                .get("mode")
+                .cloned()
+                .unwrap_or_else(|| "standing".to_owned());
             let fallback_ms = flags
                 .get("fallback-after")
                 .map(|v| parse_duration("fallback-after", v))
