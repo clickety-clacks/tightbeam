@@ -366,6 +366,14 @@ defmodule Tightbeam.LiveBaseAdmission do
   end
 
   defp checked!({:ok, value}), do: value
+
+  defp checked!({:error, %{code: "build_transition_required"}}) do
+    refuse!(
+      "build_transition_required: the build identity does not match a recorded owner for this database. " <>
+        "No migration was applied. Use TIGHTBEAM_LIVE_BASE_TRANSITION to explicitly authorize the intended build transition."
+    )
+  end
+
   defp checked!({:error, reason}), do: refuse!(inspect(reason))
   defp refuse!(message), do: raise(Refusal, message: message)
 end

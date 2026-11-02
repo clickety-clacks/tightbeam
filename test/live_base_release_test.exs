@@ -71,9 +71,9 @@ defmodule Tightbeam.LiveBaseReleaseTest do
 
           refusal_log =
             capture_log(fn ->
-              assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_required/, fn ->
+              assert_transition_refusal(fn ->
                 LiveBaseAdmission.prepare!(case_base, payload_root: app)
-              end
+              end)
             end)
 
           assert_warning_once(refusal_log)
@@ -105,9 +105,9 @@ defmodule Tightbeam.LiveBaseReleaseTest do
 
     refusal_log =
       capture_log(fn ->
-        assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_required/, fn ->
+        assert_transition_refusal(fn ->
           LiveBaseAdmission.prepare!(base, payload_root: app)
-        end
+        end)
       end)
 
     assert_warning_once(refusal_log)
@@ -176,9 +176,9 @@ defmodule Tightbeam.LiveBaseReleaseTest do
 
           refusal_log =
             capture_log(fn ->
-              assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_required/, fn ->
+              assert_transition_refusal(fn ->
                 LiveBaseAdmission.prepare!(case_base, payload_root: app)
-              end
+              end)
             end)
 
           assert_warning_once(refusal_log)
@@ -828,6 +828,14 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     after
       :ok = GenServer.stop(db)
     end
+  end
+
+  defp assert_transition_refusal(fun) do
+    refusal = assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_required/, fun
+    assert refusal.message =~ "the build identity does not match a recorded owner for this database"
+    assert refusal.message =~ "No migration was applied."
+    assert refusal.message =~ "TIGHTBEAM_LIVE_BASE_TRANSITION"
+    refute refusal.message =~ "%{"
   end
 
   defp assert_warning_once(log) do
