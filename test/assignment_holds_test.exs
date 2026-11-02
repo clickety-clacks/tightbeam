@@ -413,7 +413,10 @@ defmodule Tightbeam.AssignmentHoldsTest do
     assert revoked.releaseKind == "assignment-closed"
   end
 
-  test "T10 hold preserves decision, terminal-action, dependency and explicit wakes row for row",
+  # T10's action half (real child completion, decision answer, cannot-proceed
+  # settlement by fact and by answer, handoff discharge) and T13 run on real
+  # lifecycle paths in assignment_holds_real_path_test.exs.
+  test "T10 imposition preserves decision, terminal-action, dependency and explicit wakes",
        ctx do
     insert_assignment(ctx, "asg_control", "control")
 
@@ -438,29 +441,6 @@ defmodule Tightbeam.AssignmentHoldsTest do
     end
 
     hold(ctx, {:user, "flynn"}, "held", nil)
-
-    assert non_inactivity_wakes(ctx.db, "asg_hold") ==
-             non_inactivity_wakes(ctx.db, "asg_control")
-
-    # Later child/result, decision settlement, cannot-proceed settlement and
-    # handoff-discharge traffic remains ordinary traffic on both cards.
-    for {suffix, prompt} <- [
-          {"child", "child completed"},
-          {"answer", "decision answered"},
-          {"fact", "cannot-proceed released"},
-          {"handoff", "completion-handoff-action accepted"}
-        ],
-        assignment_id <- ["asg_hold", "asg_control"] do
-      Wakes.schedule(ctx.db, %{
-        session_key: ctx.holder.session_key,
-        origin: "process:tightbeam",
-        prompt: prompt,
-        class: "fyi",
-        assignment_id: assignment_id,
-        obligation_ref: "fixture:#{suffix}",
-        due_at: 9_999_999_999_999
-      })
-    end
 
     assert non_inactivity_wakes(ctx.db, "asg_hold") ==
              non_inactivity_wakes(ctx.db, "asg_control")
@@ -499,6 +479,96 @@ defmodule Tightbeam.AssignmentHoldsTest do
     assert JSON.decode!(prompt)["activityAt"] >= settled_at
   end
 
+  test "cannot-proceed settled under an active hold arms nothing while unheld controls resume",
+       ctx do
+    # Each held card settles while its hold stands: one by release fact, one by
+    # an accepted answer. Settlement re-arms supervision from settledAt only when
+    # no hold is active; the controls show that resumption.
+    cards = [
+      {"asg_hold", :answer},
+      {"asg_hold_fact", :fact},
+      {"asg_control", :answer},
+      {"asg_control_fact", :fact}
+    ]
+
+    for {id, _} <- cards, id != "asg_hold", do: insert_assignment(ctx, id, id)
+    for {id, _} <- cards, do: open_deadline_for(ctx.db, id, 1, 1_000)
+
+    filed =
+      Map.new(cards, fn
+        {id, :answer} ->
+          {id, file_cannot_proceed(ctx, id, "blocked #{id}")}
+
+        {id, :fact} ->
+          {id,
+           ctx.handlers["attest"].(%{
+             principal: {:session, ctx.holder.session_key},
+             origin: "agent:#{ctx.holder.session_key}",
+             params: %{
+               assignment_id: id,
+               kind: "cannot-proceed",
+               note: "blocked #{id}",
+               release_fact_kind: "dependency-ready",
+               release_fact_scope: id,
+               release_fact_principal_ref: "agent:#{ctx.holder.session_key}"
+             }
+           })}
+      end)
+
+    for id <- ["asg_hold", "asg_hold_fact"], do: hold_for(ctx, id, {:user, "flynn"}, "held")
+
+    for {id, path} <- cards do
+      case path do
+        :answer ->
+          answer(ctx, filed[id].decisionRequest.id)
+
+        :fact ->
+          assert {:ok, _fact} =
+                   DB.transaction(ctx.db, fn txn ->
+                     ConditionFacts.file_in_txn(txn, %{
+                       kind: "dependency-ready",
+                       scope: id,
+                       origin: "agent:#{ctx.holder.session_key}"
+                     })
+                   end)
+      end
+    end
+
+    for {id, path} <- cards do
+      assert {:ok, [["settled", kind, settled_at]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT state,settlementKind,settledAt FROM assignment_cannot_proceed WHERE assignmentId=?1",
+                 [id]
+               )
+
+      assert kind == if(path == :fact, do: "release-fact", else: "disposed")
+
+      {:ok, deadlines} =
+        DB.query(
+          ctx.db,
+          "SELECT prompt FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+          [id]
+        )
+
+      if String.starts_with?(id, "asg_hold") do
+        assert deadlines == []
+        assert pending_count(ctx.db, id, "assignment_inactivity_climb") == 0
+        assert prompt_count(ctx.db, id) == 0
+
+        assert {:ok, [["held"]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT kind FROM assignment_hold WHERE assignmentId=?1 AND releasedAt IS NULL",
+                   [id]
+                 )
+      else
+        assert [[prompt]] = deadlines
+        assert JSON.decode!(prompt)["activityAt"] == settled_at
+      end
+    end
+  end
+
   test "T12 standing cannot-proceed alone suppresses ten periods of reminders and climbs", ctx do
     blocked = file_cannot_proceed(ctx, "asg_hold", "standing dependency")
     assert blocked.cannotProceed.state == "standing"
@@ -513,26 +583,6 @@ defmodule Tightbeam.AssignmentHoldsTest do
     assert get(ctx).hold == nil
     assert prompt_count(ctx.db, "asg_hold") == 0
     assert pending_count(ctx.db, "asg_hold", "assignment_inactivity_climb") == 0
-  end
-
-  test "T13 standing holds preserve repeated child-result notices and suppress inactivity", ctx do
-    hold(ctx, {:user, "flynn"}, "standing", nil)
-
-    notices =
-      for n <- 1..3 do
-        Wakes.schedule(ctx.db, %{
-          session_key: ctx.holder.session_key,
-          origin: "agent:child-#{n}",
-          prompt: "child result #{n}",
-          assignment_id: "asg_hold",
-          due_at: 0
-        })
-      end
-
-    assert Enum.all?(notices, &(Wakes.get(ctx.db, &1.wake_id).state == "pending"))
-    assert get(ctx).hold.kind == "standing"
-    assert prompt_count(ctx.db, "asg_hold", "assignment-inactivity-episode-v1:%") == 0
-    assert pending_count(ctx.db, "asg_hold", "assignment_inactivity_deadline") == 0
   end
 
   test "T14 held listing returns held, standing and cannot-proceed cards only", ctx do
