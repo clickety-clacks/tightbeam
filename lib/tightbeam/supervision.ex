@@ -2124,7 +2124,7 @@ defmodule Tightbeam.Supervision do
   defp active_hold_id_in_txn(txn, assignment_id) do
     case Txn.q(
            txn,
-           "SELECT id FROM assignment_holds WHERE assignmentId=?1 AND releasedAt IS NULL",
+           "SELECT id FROM assignment_hold WHERE assignmentId=?1 AND releasedAt IS NULL",
            [assignment_id]
          ) do
       [[hold_id]] -> hold_id

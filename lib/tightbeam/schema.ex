@@ -2059,7 +2059,7 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.ToolCalls.ensure_schema(db)
     :ok = upgrade_session_identity(db)
     :ok = upgrade_closed_assignment_reconciliation(db)
-    :ok = upgrade_assignment_holds(db)
+    :ok = upgrade_assignment_hold(db)
     :ok = upgrade_retirement_parent_moves(db)
 
     case DB.finish_schema(db) do
@@ -4629,11 +4629,11 @@ defmodule Tightbeam.Schema do
     end
   end
 
-  defp upgrade_assignment_holds(db) do
-    case DB.migration_transaction(db, :assignment_holds, [], [], fn txn ->
+  defp upgrade_assignment_hold(db) do
+    case DB.migration_transaction(db, :assignment_hold, [], [], fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
              [[@closed_assignment_reconciliation_shape]] ->
-               :ok = Tightbeam.AssignmentHolds.migrate_schema_in_txn(txn)
+               :ok = Tightbeam.AssignmentHolds.install_schema_in_txn(txn)
 
                Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
                  @assignment_hold_shape,
@@ -4650,7 +4650,7 @@ defmodule Tightbeam.Schema do
                :ok
 
              [[@assignment_hold_shape]] ->
-               Tightbeam.AssignmentHolds.migrate_schema_in_txn(txn)
+               Tightbeam.AssignmentHolds.validate_schema_in_txn(txn)
 
              rows ->
                raise ShapeError,

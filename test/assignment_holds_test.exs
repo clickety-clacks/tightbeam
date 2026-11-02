@@ -4,7 +4,7 @@ defmodule Tightbeam.AssignmentHoldsTest do
   alias Tightbeam.{Assignments, ConditionFacts, DB, Gateway, Model, Org, Supervision, Wakes}
 
   setup do
-    db = String.to_atom("assignment_holds_#{System.unique_integer([:positive])}")
+    db = String.to_atom("assignment_hold_#{System.unique_integer([:positive])}")
     start_supervised!({DB, path: ":memory:", name: db})
     ensure_all_schemas(db)
 
@@ -42,6 +42,21 @@ defmodule Tightbeam.AssignmentHoldsTest do
         due_at: 9_999_999_999_999
       })
 
+    [holder_reminder, climb_copy] =
+      for {session_key, prompt} <- [
+            {ctx.holder.session_key, "inactivity holder reminder"},
+            {ctx.opener.session_key, "inactivity climb copy"}
+          ] do
+        Wakes.schedule(ctx.db, %{
+          session_key: session_key,
+          origin: "process:tightbeam",
+          prompt: prompt,
+          assignment_id: "asg_hold",
+          obligation_ref: "assignment-inactivity-episode-v1:fixture",
+          due_at: 9_999_999_999_999
+        })
+      end
+
     hold = hold(ctx, {:session, ctx.holder.session_key}, "held", "hold-key")
     assert String.starts_with?(hold.id, "hold_")
     assert hold.assignmentId == "asg_hold"
@@ -65,6 +80,8 @@ defmodule Tightbeam.AssignmentHoldsTest do
              )
 
     assert Wakes.get(ctx.db, explicit.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, holder_reminder.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, climb_copy.wake_id).state == "canceled"
 
     assert {:ok, [[marker]]} =
              DB.query(
@@ -205,7 +222,21 @@ defmodule Tightbeam.AssignmentHoldsTest do
     assert {:ok, [["assignment-hold-v1-015"]]} =
              DB.query(ctx.db, "SELECT shape FROM schema_stamp")
 
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM assignment_holds")
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM assignment_hold")
+  end
+
+  test "a damaged current hold shape refuses instead of recreating storage", ctx do
+    assert :ok = DB.execute(ctx.db, "DROP TABLE assignment_hold")
+
+    assert_raise Tightbeam.Schema.ShapeError, ~r/assignment hold migration rolled back/, fn ->
+      Tightbeam.Schema.ensure_all(ctx.db)
+    end
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT name FROM sqlite_master WHERE type='table' AND name='assignment_hold'"
+             )
   end
 
   defp hold(ctx, principal, kind, key, extra \\ %{}) do

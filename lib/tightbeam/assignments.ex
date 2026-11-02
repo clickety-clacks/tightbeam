@@ -501,7 +501,6 @@ defmodule Tightbeam.Assignments do
     :ok = DB.execute(db, @assignments_ddl)
     :ok = DB.execute(db, @attests_ddl)
     :ok = DB.execute(db, @cannot_proceed_ddl)
-    :ok = AssignmentHolds.ensure_schema(db)
     :ok = DB.execute(db, @assignment_files_ddl)
     :ok = DB.execute(db, @assignment_effects_ddl)
     :ok = DB.execute(db, @assignment_priorities_ddl)
@@ -1022,7 +1021,7 @@ defmodule Tightbeam.Assignments do
       if held do
         clauses ++
           [
-            "(EXISTS(SELECT 1 FROM assignment_holds h WHERE h.assignmentId=assignments.id AND h.releasedAt IS NULL) OR EXISTS(SELECT 1 FROM assignment_cannot_proceed cp WHERE cp.assignmentId=assignments.id AND cp.state='standing'))"
+            "(EXISTS(SELECT 1 FROM assignment_hold h WHERE h.assignmentId=assignments.id AND h.releasedAt IS NULL) OR EXISTS(SELECT 1 FROM assignment_cannot_proceed cp WHERE cp.assignmentId=assignments.id AND cp.state='standing'))"
           ]
       else
         clauses

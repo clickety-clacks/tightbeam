@@ -5,7 +5,7 @@ defmodule Tightbeam.AssignmentHolds do
   alias Tightbeam.DB.Txn
 
   @ddl """
-  CREATE TABLE IF NOT EXISTS assignment_holds (
+  CREATE TABLE IF NOT EXISTS assignment_hold (
     id TEXT PRIMARY KEY,
     assignmentId TEXT NOT NULL REFERENCES assignments(id),
     kind TEXT NOT NULL CHECK(kind IN ('held','standing')),
@@ -39,17 +39,17 @@ defmodule Tightbeam.AssignmentHolds do
     CHECK(releaseKind != 'release-fact' OR releaseFactId IS NOT NULL),
     CHECK(releaseKind != 'assignment-closed' OR releasedByRef = 'process:tightbeam')
   );
-  CREATE UNIQUE INDEX IF NOT EXISTS assignment_holds_active
-    ON assignment_holds(assignmentId) WHERE releasedAt IS NULL;
-  CREATE INDEX IF NOT EXISTS assignment_holds_history
-    ON assignment_holds(assignmentId, imposedAt DESC, id DESC);
-  CREATE INDEX IF NOT EXISTS assignment_holds_release_fact
-    ON assignment_holds(releaseFactKind, releaseFactScope, releaseFactPrincipalRef)
+  CREATE UNIQUE INDEX IF NOT EXISTS assignment_hold_active
+    ON assignment_hold(assignmentId) WHERE releasedAt IS NULL;
+  CREATE INDEX IF NOT EXISTS assignment_hold_history
+    ON assignment_hold(assignmentId, imposedAt DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS assignment_hold_release_fact
+    ON assignment_hold(releaseFactKind, releaseFactScope, releaseFactPrincipalRef)
     WHERE releasedAt IS NULL AND releaseFactKind IS NOT NULL;
-  CREATE UNIQUE INDEX IF NOT EXISTS assignment_holds_impose_key
-    ON assignment_holds(imposedByRef, imposeKey) WHERE imposeKey IS NOT NULL;
-  CREATE UNIQUE INDEX IF NOT EXISTS assignment_holds_release_key
-    ON assignment_holds(releasedByRef, releaseKey) WHERE releaseKey IS NOT NULL;
+  CREATE UNIQUE INDEX IF NOT EXISTS assignment_hold_impose_key
+    ON assignment_hold(imposedByRef, imposeKey) WHERE imposeKey IS NOT NULL;
+  CREATE UNIQUE INDEX IF NOT EXISTS assignment_hold_release_key
+    ON assignment_hold(releasedByRef, releaseKey) WHERE releaseKey IS NOT NULL;
   """
 
   @columns "id,assignmentId,kind,reason,releaseCondition,releaseFactKind,releaseFactScope," <>
@@ -60,25 +60,29 @@ defmodule Tightbeam.AssignmentHolds do
   def ensure_schema_in_txn(%Txn{} = txn), do: Txn.exec(txn, @ddl)
 
   @doc false
-  def migrate_schema_in_txn(%Txn{} = txn) do
+  def install_schema_in_txn(%Txn{} = txn) do
     :ok = ensure_schema_in_txn(txn)
+    validate_schema_in_txn(txn)
+  end
 
+  @doc false
+  def validate_schema_in_txn(%Txn{} = txn) do
     expected = ~w(id assignmentId kind reason releaseCondition releaseFactKind releaseFactScope
                   releaseFactPrincipalRef imposedByRef imposedAt releasedAt releasedByRef
                   releaseKind releaseNote releaseFactId imposeKey releaseKey)
 
-    actual = Enum.map(Txn.q(txn, "PRAGMA table_info(assignment_holds)"), &Enum.at(&1, 1))
+    actual = Enum.map(Txn.q(txn, "PRAGMA table_info(assignment_hold)"), &Enum.at(&1, 1))
 
     indexes =
       Txn.q(
         txn,
-        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='assignment_holds' ORDER BY name"
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='assignment_hold' ORDER BY name"
       )
       |> Enum.map(&hd/1)
       |> Enum.reject(&String.starts_with?(&1, "sqlite_autoindex_"))
 
-    required = ~w(assignment_holds_active assignment_holds_history assignment_holds_impose_key
-                  assignment_holds_release_fact assignment_holds_release_key)
+    required = ~w(assignment_hold_active assignment_hold_history assignment_hold_impose_key
+                  assignment_hold_release_fact assignment_hold_release_key)
 
     unless actual == expected and Enum.sort(indexes) == Enum.sort(required) do
       raise DB.Error,
@@ -90,7 +94,7 @@ defmodule Tightbeam.AssignmentHolds do
   end
 
   def active_in_txn?(%Txn{} = txn, assignment_id) do
-    Txn.q(txn, "SELECT 1 FROM assignment_holds WHERE assignmentId=?1 AND releasedAt IS NULL", [
+    Txn.q(txn, "SELECT 1 FROM assignment_hold WHERE assignmentId=?1 AND releasedAt IS NULL", [
       assignment_id
     ]) != []
   end
@@ -98,7 +102,7 @@ defmodule Tightbeam.AssignmentHolds do
   def active(db, assignment_id) do
     case DB.query(
            db,
-           "SELECT #{@columns} FROM assignment_holds WHERE assignmentId=?1 AND releasedAt IS NULL",
+           "SELECT #{@columns} FROM assignment_hold WHERE assignmentId=?1 AND releasedAt IS NULL",
            [assignment_id]
          ) do
       {:ok, [row]} -> hold(row)
@@ -110,7 +114,7 @@ defmodule Tightbeam.AssignmentHolds do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT #{@columns} FROM assignment_holds WHERE assignmentId=?1 ORDER BY imposedAt DESC,id DESC",
+        "SELECT #{@columns} FROM assignment_hold WHERE assignmentId=?1 ORDER BY imposedAt DESC,id DESC",
         [assignment_id]
       )
 
@@ -127,7 +131,7 @@ defmodule Tightbeam.AssignmentHolds do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT #{@columns} FROM assignment_holds WHERE releasedAt IS NULL AND assignmentId IN (SELECT value FROM json_each(?1))",
+        "SELECT #{@columns} FROM assignment_hold WHERE releasedAt IS NULL AND assignmentId IN (SELECT value FROM json_each(?1))",
         [JSON.encode!(ids)]
       )
 
@@ -154,7 +158,7 @@ defmodule Tightbeam.AssignmentHolds do
     Txn.q(
       txn,
       """
-      SELECT id,assignmentId FROM assignment_holds
+      SELECT id,assignmentId FROM assignment_hold
       WHERE releasedAt IS NULL AND releaseFactKind=?1 AND releaseFactScope=?2
         AND releaseFactPrincipalRef=?3 ORDER BY imposedAt,id
       """,
@@ -222,7 +226,7 @@ defmodule Tightbeam.AssignmentHolds do
             Txn.q(
               txn,
               """
-              INSERT INTO assignment_holds
+              INSERT INTO assignment_hold
                 (id,assignmentId,kind,reason,releaseCondition,releaseFactKind,
                  releaseFactScope,releaseFactPrincipalRef,imposedByRef,imposedAt,imposeKey)
               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
@@ -308,7 +312,7 @@ defmodule Tightbeam.AssignmentHolds do
     Txn.q(
       txn,
       """
-      UPDATE assignment_holds SET releasedAt=?2,releasedByRef=?3,releaseKind=?4,
+      UPDATE assignment_hold SET releasedAt=?2,releasedByRef=?3,releaseKind=?4,
         releaseNote=?5,releaseFactId=?6,releaseKey=?7
       WHERE id=?1 AND releasedAt IS NULL
       """,
@@ -422,7 +426,7 @@ defmodule Tightbeam.AssignmentHolds do
   defp impose_replay_in_txn(txn, principal, key, params) do
     case Txn.q(
            txn,
-           "SELECT #{@columns} FROM assignment_holds WHERE imposedByRef=?1 AND imposeKey=?2",
+           "SELECT #{@columns} FROM assignment_hold WHERE imposedByRef=?1 AND imposeKey=?2",
            [principal, key]
          ) do
       [] ->
@@ -447,7 +451,7 @@ defmodule Tightbeam.AssignmentHolds do
   defp release_replay_in_txn(txn, principal, key, assignment_id, reason) do
     case Txn.q(
            txn,
-           "SELECT #{@columns} FROM assignment_holds WHERE releasedByRef=?1 AND releaseKey=?2",
+           "SELECT #{@columns} FROM assignment_hold WHERE releasedByRef=?1 AND releaseKey=?2",
            [principal, key]
          ) do
       [] ->
@@ -467,7 +471,7 @@ defmodule Tightbeam.AssignmentHolds do
   defp active_row_in_txn(txn, assignment_id) do
     case Txn.q(
            txn,
-           "SELECT #{@columns} FROM assignment_holds WHERE assignmentId=?1 AND releasedAt IS NULL",
+           "SELECT #{@columns} FROM assignment_hold WHERE assignmentId=?1 AND releasedAt IS NULL",
            [assignment_id]
          ) do
       [row] -> hold(row)
@@ -476,7 +480,7 @@ defmodule Tightbeam.AssignmentHolds do
   end
 
   defp hold_row_in_txn(txn, id) do
-    [row] = Txn.q(txn, "SELECT #{@columns} FROM assignment_holds WHERE id=?1", [id])
+    [row] = Txn.q(txn, "SELECT #{@columns} FROM assignment_hold WHERE id=?1", [id])
     hold(row)
   end
 
