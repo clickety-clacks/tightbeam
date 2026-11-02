@@ -1,5 +1,6 @@
 defmodule Tightbeam.LiveBaseAdmission do
   @moduledoc false
+  require Logger
   alias Tightbeam.{LiveBaseGuard, Schema}
 
   defmodule Refusal do
@@ -11,12 +12,27 @@ defmodule Tightbeam.LiveBaseAdmission do
   # also recheck inside migration.
   def revalidate!(previous) do
     current =
-      prepare!(previous.base,
-        payload_root: previous.payload_root,
-        transition: previous.transition
+      prepare!(
+        previous.base,
+        [payload_root: previous.payload_root, transition: previous.transition],
+        false
       )
 
-    fields = [:base, :payload_root, :files, :marker, :stamp, :identity, :decision]
+    if current.files != previous.files and current.manifest_problem == :mismatch,
+      do: refuse!("payload_manifest_mismatch before write")
+
+    fields = [
+      :base,
+      :payload_root,
+      :files,
+      :marker,
+      :stamp,
+      :identity,
+      :manifest_status,
+      :manifest_observation,
+      :manifest_problem,
+      :decision
+    ]
 
     unless Map.take(current, fields) == Map.take(previous, fields),
       do: refuse!("admission inputs changed before write")
@@ -62,13 +78,13 @@ defmodule Tightbeam.LiveBaseAdmission do
 
     files = payload_files!(previous.payload_root)
 
-    manifest =
-      previous.payload_root |> Path.join("build-manifest.json") |> File.read!() |> JSON.decode!()
+    manifest = observed_manifest!(previous.payload_root, files)
 
-    identity = checked!(LiveBaseGuard.verify_manifest(manifest, files))
-
-    unless files == previous.files and identity == previous.identity,
-      do: refuse!("payload changed after admission")
+    unless files == previous.files and manifest.identity == previous.identity and
+             manifest.status == previous.manifest_status and
+             manifest.observation == previous.manifest_observation and
+             manifest.problem == previous.manifest_problem,
+           do: refuse!("payload changed after admission")
 
     path = Path.join(previous.base, "build-owner.json")
 
@@ -90,23 +106,27 @@ defmodule Tightbeam.LiveBaseAdmission do
 
   # Options name immutable inputs, never a verified/admitted Boolean. The
   # manifest cannot choose the observed file set. No base writes occur here.
-  def prepare!(base, options) do
+  def prepare!(base, options), do: prepare!(base, options, true)
+
+  defp prepare!(base, options, warn_unverified?) do
     base = canonical!(Path.expand(base))
     payload = canonical!(Keyword.fetch!(options, :payload_root))
     files = payload_files!(payload)
-    manifest = payload |> Path.join("build-manifest.json") |> File.read!() |> JSON.decode!()
-    identity = checked!(LiveBaseGuard.verify_manifest(manifest, files))
+    manifest = observed_manifest!(payload, files)
 
     # Reread the payload after the first observation: a set that changed under
     # us is dirt to report, not a race to serialize away.
     observed = payload_files!(payload)
+    current_manifest = observed_manifest!(payload, observed)
 
-    current_manifest =
-      payload |> Path.join("build-manifest.json") |> File.read!() |> JSON.decode!()
+    unless observed == files and current_manifest == manifest,
+      do: refuse!("payload changed during admission")
 
-    unless observed == files and
-             checked!(LiveBaseGuard.verify_manifest(current_manifest, observed)) == identity,
-           do: refuse!("payload changed during admission")
+    if warn_unverified? and manifest.status == :unverified do
+      Logger.warning("build identity could not be verified from build-manifest.json")
+    end
+
+    identity = manifest.identity
 
     marker_path = Path.join(base, "build-owner.json")
 
@@ -155,6 +175,7 @@ defmodule Tightbeam.LiveBaseAdmission do
 
     transition =
       if transition == nil and state == :existing and source_marker != nil and
+           manifest.status == :verified and
            (source_marker == :absent or
               Tightbeam.LiveBaseRelease.automatic_transition_candidate?(payload)) do
         stamp = read_schema_stamp!(database)
@@ -181,12 +202,76 @@ defmodule Tightbeam.LiveBaseAdmission do
       transition: Keyword.get(options, :transition),
       decision: admission,
       stamp: stamp,
-      identity: identity,
+      identity: manifest.identity,
       payload_root: payload,
       files: files,
-      marker: marker
+      marker: marker,
+      manifest_status: manifest.status,
+      manifest_observation: manifest.observation,
+      manifest_problem: manifest.problem
     }
   end
+
+  defp observed_manifest!(payload, files) do
+    actual = checked!(LiveBaseGuard.generate_manifest(files))["buildIdentity"]
+    path = Path.join(payload, "build-manifest.json")
+
+    case File.lstat(path) do
+      {:error, :enoent} ->
+        unverified_manifest(actual, :missing, :missing)
+
+      {:error, reason} ->
+        unverified_manifest(actual, {:unreadable, reason}, :unreadable)
+
+      {:ok, %{type: :regular}} ->
+        read_manifest!(path, files, actual)
+
+      {:ok, %{type: :symlink}} ->
+        case File.stat(path) do
+          {:ok, %{type: :regular}} ->
+            read_manifest!(path, files, actual)
+
+          {:error, reason} when reason in [:eacces, :eperm] ->
+            unverified_manifest(actual, {:unreadable, reason}, :unreadable)
+
+          other ->
+            refuse!("invalid build manifest file: #{inspect(other)}")
+        end
+
+      {:ok, %{type: type}} ->
+        refuse!("invalid build manifest file: #{inspect(type)}")
+    end
+  end
+
+  defp read_manifest!(path, files, actual) do
+    case File.read(path) do
+      {:ok, bytes} ->
+        observation = {:readable, digest(bytes)}
+
+        case JSON.decode(bytes) do
+          {:ok, manifest} ->
+            case LiveBaseGuard.verify_manifest(manifest, files) do
+              {:ok, identity} ->
+                %{status: :verified, identity: identity, observation: observation, problem: nil}
+
+              {:error, _reason} ->
+                unverified_manifest(actual, observation, :mismatch)
+            end
+
+          {:error, _reason} ->
+            unverified_manifest(actual, observation, :mismatch)
+        end
+
+      {:error, reason} ->
+        unverified_manifest(actual, {:unreadable, reason}, :unreadable)
+    end
+  end
+
+  defp unverified_manifest(identity, observation, problem) do
+    %{status: :unverified, identity: identity, observation: observation, problem: problem}
+  end
+
+  defp digest(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 
   # Onboarding, CLI provisioning and launchers write neighboring files before
   # first boot. Only the DB and marker determine whether history already exists.
@@ -281,6 +366,14 @@ defmodule Tightbeam.LiveBaseAdmission do
   end
 
   defp checked!({:ok, value}), do: value
+
+  defp checked!({:error, %{code: "build_transition_required"}}) do
+    refuse!(
+      "build_transition_required: the build identity does not match a recorded owner for this database. " <>
+        "No migration was applied. Use TIGHTBEAM_LIVE_BASE_TRANSITION to explicitly authorize the intended build transition."
+    )
+  end
+
   defp checked!({:error, reason}), do: refuse!(inspect(reason))
   defp refuse!(message), do: raise(Refusal, message: message)
 end
