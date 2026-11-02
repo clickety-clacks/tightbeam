@@ -2007,6 +2007,7 @@ defmodule Tightbeam.Schema do
     :ok = ensure_rest_collection_indexes(db)
     :ok = ensure_decision_request_collection_indexes(db)
     :ok = ensure_rest_wake_collection_indexes(db)
+    :ok = ensure_denied_principal_index(db)
 
     # Batch-aware supervision guards reference notice_batches, so install them
     # only after all predecessor migrations and refusal checks have completed
@@ -3243,6 +3244,26 @@ defmodule Tightbeam.Schema do
         raise ShapeError,
           message:
             "REST decision-request collection index migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  # Session history reads routed denials by sessionKey and actor denials by
+  # principal, including rows whose sessionKey is NULL. Keep the actor path
+  # selective across the denied event subset.
+  defp ensure_denied_principal_index(db) do
+    case DB.migration_transaction(db, :denied_principal_index, [], [], fn txn ->
+           Txn.exec(
+             txn,
+             "CREATE INDEX IF NOT EXISTS events_denied_principal " <>
+               "ON events(principal) WHERE kind='denied'"
+           )
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "denied-principal history index migration failed: #{Exception.message(error)}"
     end
   end
 

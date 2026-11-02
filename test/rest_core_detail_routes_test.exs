@@ -782,6 +782,166 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert first_denial_at < items[after_message.id]["at"]
   end
 
+  test "actor history includes keyed and NULL-key rule denials routed by principal", ctx do
+    actor = ctx.admin_session
+    actor_origin = "agent:history-routing-fixture"
+    actor_principal = {:session, actor.session_key}
+    actor_principal_ref = "session:#{actor.session_key}"
+
+    target =
+      Org.create(ctx.db, %{
+        session_key: "denial-target-#{System.unique_integer([:positive])}",
+        display_name: "Denial target",
+        kind: "custom",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable"),
+        host: "testhost"
+      })
+
+    rule_error = fn rule ->
+      %{
+        code: "rule_denied",
+        rule: rule,
+        edge: "verb",
+        reason: "blocked",
+        script_exit_class: "denied",
+        ref: "history-routing-fixture",
+        producer: nil,
+        identity_manifest_sha: String.duplicate("b", 64),
+        message: "sample rule denial"
+      }
+    end
+
+    append_denial = fn call, error, ts ->
+      DB.transaction(ctx.db, fn txn ->
+        EventLog.append_event_in_txn(
+          txn,
+          "denied",
+          call.verb,
+          call.origin,
+          call.session_key,
+          JSON.encode!(error),
+          call.principal,
+          ts
+        )
+      end)
+    end
+
+    actor_call = %{
+      verb: "attest",
+      origin: actor_origin,
+      principal: actor_principal,
+      session_key: nil,
+      params: %{}
+    }
+
+    actor_error = rule_error.("actor-rule")
+    [_, actor_live_frame] = Publisher.denied_notices(actor_call, actor_error)
+    assert actor_live_frame["refs"]["principal"] == actor_principal_ref
+    refute Map.has_key?(actor_live_frame["refs"], "sessionKey")
+
+    now = System.system_time(:millisecond)
+    {:ok, actor_event_id} = append_denial.(actor_call, actor_error, now)
+
+    keyed_actor_dispatch_call = %{
+      actor_call
+      | verb: "dispatch",
+        session_key: target.session_key,
+        params: %{session_key: target.session_key}
+    }
+
+    keyed_actor_dispatch_error = rule_error.("actor-dispatch-rule")
+
+    [_, keyed_actor_dispatch_live_frame] =
+      Publisher.denied_notices(keyed_actor_dispatch_call, keyed_actor_dispatch_error)
+
+    assert keyed_actor_dispatch_live_frame["refs"]["sessionKey"] == target.session_key
+    assert keyed_actor_dispatch_live_frame["refs"]["principal"] == actor_principal_ref
+
+    assert Hub.matches?(keyed_actor_dispatch_live_frame, %{
+             "classes" => ["rail.denied"],
+             "sessionKey" => target.session_key
+           })
+
+    refute Hub.matches?(keyed_actor_dispatch_live_frame, %{
+             "classes" => ["rail.denied"],
+             "sessionKey" => actor.session_key
+           })
+
+    {:ok, keyed_actor_dispatch_event_id} =
+      append_denial.(keyed_actor_dispatch_call, keyed_actor_dispatch_error, now + 1)
+
+    no_rule_call = %{actor_call | verb: "unknown-cli-command"}
+    no_rule_error = %{code: "unknown_verb"}
+    [no_rule_live_frame] = Publisher.denied_notices(no_rule_call, no_rule_error)
+    assert no_rule_live_frame["class"] == "verb.denied"
+
+    {:ok, no_rule_event_id} = append_denial.(no_rule_call, no_rule_error, now + 2)
+
+    actor_denial_ids =
+      EventLog.rail_denials_for_session(ctx.db, actor.session_key)
+      |> Enum.map(& &1.id)
+
+    target_denial_ids =
+      EventLog.rail_denials_for_session(ctx.db, target.session_key)
+      |> Enum.map(& &1.id)
+
+    assert actor_denial_ids == [actor_event_id, keyed_actor_dispatch_event_id]
+    assert Enum.count(actor_denial_ids, &(&1 == keyed_actor_dispatch_event_id)) == 1
+    assert target_denial_ids == [keyed_actor_dispatch_event_id]
+    assert Enum.count(target_denial_ids, &(&1 == keyed_actor_dispatch_event_id)) == 1
+    refute no_rule_event_id in actor_denial_ids
+    refute no_rule_event_id in target_denial_ids
+
+    actor_history =
+      get(
+        ctx,
+        "/api/sessions/#{actor.session_key}/messages?limit=20&tail=true",
+        ctx.admin_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    target_history =
+      get(
+        ctx,
+        "/api/sessions/#{target.session_key}/messages?limit=20&tail=true",
+        ctx.admin_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    actor_rows = actor_history["railDenials"]
+    target_rows = target_history["railDenials"]
+
+    assert Enum.map(actor_rows, & &1["id"]) == [
+             "rail:#{actor_event_id}",
+             "rail:#{keyed_actor_dispatch_event_id}"
+           ]
+
+    assert Enum.count(actor_rows, &(&1["id"] == "rail:#{keyed_actor_dispatch_event_id}")) == 1
+    assert Enum.map(target_rows, & &1["id"]) == ["rail:#{keyed_actor_dispatch_event_id}"]
+    assert Enum.count(target_rows, &(&1["id"] == "rail:#{keyed_actor_dispatch_event_id}")) == 1
+    refute Enum.any?(actor_rows, &(&1["id"] == "rail:#{no_rule_event_id}"))
+    refute Enum.any?(target_rows, &(&1["id"] == "rail:#{no_rule_event_id}"))
+
+    actor_dispatch_row =
+      Enum.find(actor_rows, &(&1["id"] == "rail:#{keyed_actor_dispatch_event_id}"))
+
+    target_dispatch_row =
+      Enum.find(target_rows, &(&1["id"] == "rail:#{keyed_actor_dispatch_event_id}"))
+
+    for row <- [actor_dispatch_row, target_dispatch_row] do
+      assert row["principal"] == actor_principal_ref
+      assert row["origin"] == actor_origin
+      assert row["verb"] == "dispatch"
+      assert row["rule"] == "actor-dispatch-rule"
+      assert row["payload"] == keyed_actor_dispatch_live_frame["payload"]
+    end
+  end
+
   test "session and retained transcript collections use bounded exclusive keysets", ctx do
     outsider_device = outsider_device(ctx)
     owner = "outsider"
