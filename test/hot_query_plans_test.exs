@@ -41,6 +41,34 @@ defmodule Tightbeam.HotQueryPlansTest do
     assert Enum.map(Ledger.unpublished_terminals(db), & &1.seq) == [1, 2, 3]
   end
 
+  test "denial history selection seeks both target and actor branches", %{db: db} do
+    plan =
+      plan!(
+        db,
+        """
+        SELECT id FROM events
+        WHERE id IN (
+          SELECT id FROM events
+          WHERE sessionKey = ?1 AND kind = 'denied'
+            AND json_valid(payload) AND json_type(payload, '$.rule') = 'text'
+          UNION
+          SELECT id FROM events
+          WHERE principal = ?2 AND kind = 'denied'
+            AND json_valid(payload) AND json_type(payload, '$.rule') = 'text'
+        )
+        ORDER BY CASE
+          WHEN json_type(payload, '$.afterMessageSeq') = 'integer' THEN 0
+          ELSE 1
+        END, json_extract(payload, '$.afterMessageSeq'), ts, id
+        """,
+        ["target-session", "session:actor"]
+      )
+
+    assert Enum.any?(plan, &(&1 =~ "SEARCH" and &1 =~ "events_session"))
+    assert Enum.any?(plan, &(&1 =~ "SEARCH" and &1 =~ "events_denied_principal"))
+    refute Enum.any?(plan, &String.contains?(&1, "SCAN events"))
+  end
+
   test "review verdict counts find review assignments through their subject index", %{db: db} do
     assignment_verdict_plan =
       plan!(db, Assignments.commissioned_review_authors_sql(), ["subject", "session"])
