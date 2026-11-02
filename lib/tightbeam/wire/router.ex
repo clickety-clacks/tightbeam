@@ -76,6 +76,7 @@ defmodule Tightbeam.Wire.Router do
   @agent_verbs @agent_verbs ++
                  [
                    "fact-demand",
+                   "sentinel-demand",
                    "fact-producer-claim",
                    "fact-producers",
                    "artifact-content-fetch",
@@ -4377,8 +4378,9 @@ defmodule Tightbeam.Wire.Router do
     "sentinel-enable" => ~w(name)a,
     "sentinel-list" => ~w()a,
     "sentinel-events" => ~w()a,
+    "sentinel-demand" => ~w(kind_prefixes)a,
     "sentinel-post" => ~w(detail event key)a,
-    "sentinel-subscribe" => ~w(event where)a,
+    "sentinel-subscribe" => ~w(event where mode fallback_ms)a,
     "sentinel-subscriptions" => ~w()a,
     "sentinel-unsubscribe" => ~w(subscription_id)a,
     "session-po-set" => ~w(idempotency_key po_role po_session_key session_key)a,

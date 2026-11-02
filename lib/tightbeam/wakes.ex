@@ -1237,7 +1237,7 @@ defmodule Tightbeam.Wakes do
     condition_after_id =
       if is_binary(condition_kind) do
         [[cursor]] = Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM condition_facts")
-        cursor
+        Map.get(input, :condition_after_id, cursor)
       end
 
     created_at = now()
@@ -6385,6 +6385,7 @@ defmodule Tightbeam.Wakes do
              end), do: clear_retry(acc, id), else: acc
       end)
 
+    transaction!(db, &Tightbeam.SentinelSubscriptions.fulfill_due_in_txn(&1, now()))
     Tightbeam.CronWake.fire_due(db, now())
     recognize_due_dependency_waits(db)
     evaluate_conditions(state, :tick)
@@ -7486,8 +7487,13 @@ defmodule Tightbeam.Wakes do
             DB.query(
               state.db,
               """
-              SELECT MIN(dueAt) FROM wakes INDEXED BY wakes_due
-              WHERE state='pending' AND typeof(dueAt)='integer' AND dueAt>?1 AND dueAt<253402300799000
+              SELECT MIN(deadline) FROM (
+                SELECT dueAt AS deadline FROM wakes INDEXED BY wakes_due
+                WHERE state='pending' AND typeof(dueAt)='integer' AND dueAt>?1 AND dueAt<253402300799000
+                UNION ALL
+                SELECT fallbackAt AS deadline FROM sentinel_subscriptions
+                WHERE endedAt IS NULL AND fulfilledAt IS NULL AND fallbackAt>?1
+              )
               """,
               [state.scanned_through]
             )

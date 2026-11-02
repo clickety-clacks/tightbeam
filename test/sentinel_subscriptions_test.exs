@@ -96,6 +96,41 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
   end
 
+  test "ordinary scripts share the catalog and duplicate global kinds refuse atomically", ctx do
+    path = Path.join([ctx.bundles, "script", "manifest.toml"])
+    File.mkdir_p!(Path.dirname(path))
+
+    File.write!(path, """
+    purpose = "A script producer without a supervised process."
+    root_archetype = "default"
+
+    [[events]]
+    name = "sample.done"
+    description = "An object finished processing."
+    details = [{ name = "object", description = "The completed object." }]
+    """)
+
+    learn!(ctx.base, "script")
+    events = ctx.handlers["sentinel-events"].(%{params: %{}}).events
+    assert Enum.map(events, & &1.qualified) == [@event, "sample.done"]
+
+    assert Enum.find(events, &(&1.qualified == "sample.done")).details == [
+             %{name: "object", description: "The completed object."}
+           ]
+
+    duplicate = Path.join([ctx.bundles, "duplicate", "manifest.toml"])
+    File.mkdir_p!(Path.dirname(duplicate))
+    File.cp!(path, duplicate)
+    before = identity_refs!(Path.join(ctx.base, "identity"))
+
+    assert_raise ArgumentError, ~r/duplicate event sample.done/, fn ->
+      Identity.learn!(ctx.base, "duplicate", "test")
+    end
+
+    assert identity_refs!(Path.join(ctx.base, "identity")) == before
+    assert ctx.handlers["sentinel-events"].(%{params: %{}}).events == events
+  end
+
   test "filters match exact values, empty filters match all, and event keys deduplicate posts",
        ctx do
     first = subscribe(ctx, "sub-a", ["channel=!a:x", "channel=!b:x", "who=@mike:x"])
@@ -280,8 +315,9 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
                end)
            end}
         ] do
-      first = subscribe(ctx, session, ["channel=!a:x"])
+      first = subscribe(ctx, session, ["channel=!a:x"], %{mode: "once", fallback_ms: 60_000})
       second = subscribe(ctx, session, ["who=@mike:x"])
+      pending = subscribe(ctx, session, ["channel=other"], %{mode: "once", fallback_ms: 60_000})
       posted = post(ctx, "retire-#{session}", "!a:x", "@mike:x")
       wake = wake_for(ctx.db, posted.event.fact_id, session)
 
@@ -295,7 +331,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
 
       assert count(ctx.db, "sentinel_subscriptions", "sessionKey=?1 AND endedAt IS NOT NULL", [
                session
-             ]) == 2
+             ]) == 3
 
       assert Tightbeam.Wakes.get(ctx.db, wake.wake_id).session_key == session
       assert wake_sessions(ctx.db, posted.event.fact_id) == [session]
@@ -304,6 +340,15 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
       after_retire = post(ctx, "after-retire-#{session}", "!a:x", "@mike:x")
       assert wake_sessions(ctx.db, after_retire.event.fact_id) == []
       assert first.id != second.id
+
+      assert {:ok, :ok} =
+               DB.transaction(
+                 ctx.db,
+                 &SentinelSubscriptions.fulfill_due_in_txn(&1, pending.fallback_at)
+               )
+
+      assert count(ctx.db, "sentinel_subscription_wake_matches", "subscriptionId=?1", [pending.id]) ==
+               0
     end
   end
 
@@ -323,12 +368,389 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
            ) == 1
   end
 
-  defp subscribe(ctx, session, where) do
+  test "once and standing share a delivery, consume demand, and retain queued justification",
+       ctx do
+    once = subscribe(ctx, "sub-a", [], %{mode: "once", fallback_ms: 60_000})
+    standing = subscribe(ctx, "sub-a", ["channel=a"])
+    :ok = SentinelSubscriptions.ensure_schema(ctx.db)
+    assert subscribe(ctx, "sub-a", [], %{mode: "once", fallback_ms: 60_000}) == once
+    assert %{code: "invalid"} = subscribe(ctx, "sub-a", [], %{fallback_ms: 60_000})
+
+    assert %{code: "invalid"} =
+             subscribe(ctx, "sub-a", [], %{mode: "standing", fallback_ms: 60_000})
+
+    assert length(SentinelSubscriptions.demand(ctx.db).demand) == 2
+
+    first = post(ctx, "once-first", "a", "x")
+    wake = wake_for(ctx.db, first.event.fact_id, "sub-a")
+    assert wake.prompt =~ once.id
+    assert wake.prompt =~ standing.id
+    assert [%{filter: %{"channel" => ["a"]}}] = SentinelSubscriptions.demand(ctx.db).demand
+
+    assert [%{id: id}] =
+             ctx.handlers["sentinel-subscriptions"].(%{principal: {:session, "sub-a"}}).subscriptions
+
+    assert id == standing.id
+    unsubscribe(ctx, "sub-a", standing.id)
+    assert Tightbeam.Wakes.get(ctx.db, wake.wake_id).state == "pending"
+    assert %{ended: true} = unsubscribe(ctx, "sub-a", once.id)
+    assert Tightbeam.Wakes.get(ctx.db, wake.wake_id).state == "canceled"
+    assert %{ended: true} = unsubscribe(ctx, "sub-a", once.id)
+    second = post(ctx, "once-second", "a", "x")
+    assert wakes_for(ctx.db, second.event.fact_id, "sub-a") == []
+  end
+
+  test "once fallback fires only once and cancellation withdraws its deadline", ctx do
+    once = subscribe(ctx, "sub-a", [], %{mode: "once", fallback_ms: 60_000})
+    cancelled = subscribe(ctx, "sub-b", [], %{mode: "once", fallback_ms: 60_000})
+    unsubscribe(ctx, "sub-b", cancelled.id)
+
+    assert {:ok, :ok} =
+             DB.transaction(
+               ctx.db,
+               &SentinelSubscriptions.fulfill_due_in_txn(&1, once.fallback_at)
+             )
+
+    assert SentinelSubscriptions.demand(ctx.db).demand == []
+
+    assert {:ok, [[wake_id, prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT w.wakeId,w.prompt FROM wakes w JOIN sentinel_subscription_wake_matches m ON w.wakeId=m.wakeId WHERE m.subscriptionId=?1",
+               [once.id]
+             )
+
+    assert prompt =~ "Cause: fallback"
+    assert prompt =~ "Deadline: #{once.fallback_at}"
+
+    assert {:ok, :ok} =
+             DB.transaction(
+               ctx.db,
+               &SentinelSubscriptions.fulfill_due_in_txn(&1, once.fallback_at + 1)
+             )
+
+    assert count(ctx.db, "sentinel_subscription_wake_matches", "subscriptionId=?1", [once.id]) ==
+             1
+
+    event = post(ctx, "after-fallback", "a", "x")
+    assert wakes_for(ctx.db, event.event.fact_id, "sub-a") == []
+    unsubscribe(ctx, "sub-a", once.id)
+    assert Tightbeam.Wakes.get(ctx.db, wake_id).state == "canceled"
+  end
+
+  test "the wake scheduler processes the subscription deadline", ctx do
+    Tightbeam.Rules.load!(ctx.base, Map.keys(ctx.handlers))
+    once = subscribe(ctx, "sub-a", [], %{mode: "once", fallback_ms: 50})
+
+    start_supervised!(
+      {Tightbeam.Wakes, db: ctx.db, name: Tightbeam.WakeScheduler, deliver: fn _wake -> :ok end}
+    )
+
+    # Prompt delivery now goes through notice batching, not the legacy callback.
+    # Observe this subscription's committed fulfillment and its actual wake.
+    fulfilled =
+      Enum.find_value(1..100, fn _ ->
+        {:ok, [[at]]} =
+          DB.query(
+            ctx.db,
+            "SELECT fulfilledAt FROM sentinel_subscriptions WHERE subscriptionId=?1",
+            [once.id]
+          )
+
+        if at,
+          do: at,
+          else:
+            (
+              Process.sleep(10)
+              nil
+            )
+      end)
+
+    assert is_integer(fulfilled)
+
+    assert {:ok, [[prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT w.prompt FROM wakes w JOIN sentinel_subscription_wake_matches m ON m.wakeId=w.wakeId WHERE m.subscriptionId=?1",
+               [once.id]
+             )
+
+    assert prompt =~ "Cause: fallback"
+    assert prompt =~ once.id
+    assert SentinelSubscriptions.demand(ctx.db).demand == []
+
+    assert count(ctx.db, "sentinel_subscription_wake_matches", "subscriptionId=?1", [once.id]) ==
+             1
+  end
+
+  test "retirement forwards legacy fact waits but ends new interests", ctx do
+    successor = Org.personal_session_key("owner")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,host,state,createdAt,updatedAt) VALUES (?1,'successor','owner','user:owner','default','claude','anthropic','fable','testhost','active',1,1)",
+        [successor]
+      )
+
+    legacy =
+      Tightbeam.Wakes.schedule(ctx.db, %{
+        session_key: "sub-normal",
+        origin: "session:sub-normal",
+        prompt: "original legacy prompt",
+        condition_kind: "sample.finished",
+        condition_scope: "object",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    subscribe(ctx, "sub-normal", [], %{mode: "once", fallback_ms: 60_000})
+    Org.retire(ctx.db, "sub-normal", "user:owner", :off)
+    forwarded = Tightbeam.Wakes.get(ctx.db, legacy.wake_id)
+    assert forwarded.session_key == successor
+    assert forwarded.prompt == legacy.prompt
+    assert forwarded.due_at == legacy.due_at
+    assert forwarded.condition_after_id == legacy.condition_after_id
+
+    assert [%{kind: "sample.finished", filter: %{"scope" => ["object"]}}] =
+             SentinelSubscriptions.demand(ctx.db).demand
+
+    Tightbeam.ConditionFacts.file(ctx.db, :missing_subscription_scheduler, %{
+      kind: "sample.finished",
+      scope: "object",
+      origin: "process:fixture"
+    })
+
+    assert Tightbeam.Wakes.get(ctx.db, legacy.wake_id).fired_by == "condition"
+    assert SentinelSubscriptions.demand(ctx.db).demand == []
+  end
+
+  test "both candidate watchers traverse the real CLI and gateway subscription routes", ctx do
+    for {bundle, watcher} <- [{"sentinels", "matrix"}, {"agentic-engineering", "landing-watch"}] do
+      shipped = Path.expand("../priv/kungfu/#{bundle}", __DIR__)
+      destination = Path.join(ctx.bundles, bundle)
+      File.mkdir_p!(Path.join(destination, "sentinels"))
+
+      manifest =
+        File.read!(Path.join(shipped, "manifest.toml"))
+        |> String.replace("root_archetype = \"orchestrator\"", "root_archetype = \"default\"")
+
+      File.write!(Path.join(destination, "manifest.toml"), manifest)
+
+      File.cp!(
+        Path.join(shipped, "sentinels/#{watcher}"),
+        Path.join(destination, "sentinels/#{watcher}")
+      )
+
+      learn!(ctx.base, bundle)
+    end
+
+    Tightbeam.Rules.load!(ctx.base, Map.keys(ctx.handlers))
+
+    router =
+      Tightbeam.Wire.Router.init(
+        db: ctx.db,
+        base_dir: ctx.base,
+        handlers: ctx.handlers,
+        cli_token: "route-fixture-token",
+        session_status: fn _ -> nil end
+      )
+
+    server =
+      start_supervised!(
+        {Bandit,
+         plug: {Tightbeam.Wire.Router, router}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
+      )
+
+    {:ok, {_, port}} = ThousandIsland.listener_info(server)
+    binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
+    {:ok, [[token]]} = DB.query(ctx.db, "SELECT cliToken FROM sessions WHERE sessionKey='sub-a'")
+
+    File.write!(
+      Path.join(ctx.root, ".tightbeam-session"),
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{port}",
+        token: token,
+        sessionKey: "sub-a"
+      })
+    )
+
+    env = [
+      {"TIGHTBEAM_URL", "http://127.0.0.1:#{port}"},
+      {"TIGHTBEAM_TOKEN", token},
+      {"TIGHTBEAM_BASE_DIR", ctx.base},
+      {"TIGHTBEAM_AS_PROCESS", nil}
+    ]
+
+    cli = fn args ->
+      {output, status} = System.cmd(binary, args, cd: ctx.root, env: env)
+      assert status == 0, output
+      JSON.decode!(output)
+    end
+
+    once =
+      cli.(["sentinel", "subscribe", "--event", "sentinels/matrix/message", "--mode", "once"])
+
+    standing = cli.(["sentinel", "subscribe", "--event", "sentinels/matrix/message"])
+    assert once["id"] != standing["id"]
+
+    cli.([
+      "sentinel",
+      "subscribe",
+      "--event",
+      "landing.settled",
+      "--mode",
+      "once",
+      "--where",
+      "scope=example/repo#7"
+    ])
+
+    legacy =
+      for prompt <- ["legacy first", "legacy second"] do
+        cli.([
+          "wake",
+          "--session",
+          "sub-a",
+          "--when-fact",
+          "landing.settled",
+          "--when-scope",
+          "example/repo#7",
+          "--fallback-after",
+          "1h",
+          "--prompt",
+          prompt
+        ])["wakeId"]
+      end
+
+    bin = Path.join(ctx.root, "bin")
+    File.mkdir_p!(bin)
+    File.ln_s!(binary, Path.join(bin, "tightbeam"))
+    sample = Path.expand("fixtures/matrix-commander-message.jsonl", __DIR__)
+    File.write!(Path.join(bin, "matrix-commander"), "#!/bin/sh\ncat \"$MATRIX_SAMPLE\"\n")
+    File.chmod!(Path.join(bin, "matrix-commander"), 0o755)
+    # Only the outside service response is a fixture; watcher, CLI, HTTP router,
+    # condition store, subscription matching and wake creation are real.
+    File.write!(Path.join(bin, "gh"), """
+    #!/usr/bin/env python3
+    import json, sys
+    if sys.argv[1:3] == ['api', 'user']:
+        print('route-fixture')
+        sys.exit(0)
+    print(json.dumps({'data': {'repository': {'pullRequest': {
+      'number': 7, 'state': 'CLOSED', 'merged': False, 'mergeCommit': None,
+      'headRefOid': 'a' * 40, 'baseRefName': 'main', 'autoMergeRequest': None,
+      'mergeQueueEntry': None, 'timelineItems': {
+        'pageInfo': {'hasNextPage': False, 'endCursor': None},
+        'nodes': [{'__typename': 'ClosedEvent', 'id': 'closed-seven', 'createdAt': '2026-01-01T00:00:00Z'}]
+      }}}}}))
+    """)
+
+    File.chmod!(Path.join(bin, "gh"), 0o755)
+
+    producer_env =
+      env ++
+        [
+          {"TIGHTBEAM_TOKEN", "route-fixture-token"},
+          {"TIGHTBEAM_AS_PROCESS", "route-fixture"},
+          {"PATH", bin <> ":" <> System.get_env("PATH")},
+          {"MATRIX_SAMPLE", sample},
+          {"MATRIX_COMMANDER_CREDENTIALS", Path.join(ctx.root, "unused-login")},
+          {"MATRIX_COMMANDER_STORE", Path.join(ctx.root, "unused-store")},
+          {"GH_CONFIG_DIR", ctx.root},
+          {"LANDING_REPOS", ""}
+        ]
+
+    cli.([
+      "sentinel",
+      "subscribe",
+      "--event",
+      "landing.settled",
+      "--mode",
+      "once",
+      "--where",
+      "scope=example/repo#8"
+    ])
+
+    {legacy_output, legacy_status} =
+      System.cmd(
+        binary,
+        [
+          "condition",
+          "--kind",
+          "landing.settled",
+          "--scope",
+          "example/repo#8",
+          "--key",
+          "legacy-condition"
+        ],
+        cd: Path.dirname(ctx.root),
+        env: producer_env,
+        stderr_to_stdout: true
+      )
+
+    assert legacy_status == 0, legacy_output
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM sentinel_subscription_wake_matches")
+
+    matrix = Path.expand("../priv/kungfu/sentinels/sentinels/matrix", __DIR__)
+
+    {output, code} =
+      System.cmd("python3", [matrix],
+        cd: Path.dirname(ctx.root),
+        env: producer_env,
+        stderr_to_stdout: true
+      )
+
+    assert code != 0
+    assert output =~ "matrix-commander exited"
+
+    assert {:ok, [[payload]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload FROM condition_facts WHERE kind='sentinels/matrix/message'"
+             )
+
+    assert JSON.decode!(payload)["text"] == "first line\na=b\nsecond line"
+
+    assert {:ok, [[3]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM sentinel_subscription_wake_matches")
+
+    landing = Path.expand("../priv/kungfu/agentic-engineering/sentinels/landing-watch", __DIR__)
+
+    {output, code} =
+      System.cmd("python3", [landing, "--once"],
+        cd: Path.dirname(ctx.root),
+        env: producer_env,
+        stderr_to_stdout: true
+      )
+
+    assert code == 0, output
+
+    assert {:ok, [["example/repo#7"], ["example/repo#8"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT scope FROM condition_facts WHERE kind='landing.settled' ORDER BY scope"
+             )
+
+    for {id, prompt} <- Enum.zip(legacy, ["legacy first", "legacy second"]) do
+      wake = Tightbeam.Wakes.get(ctx.db, id)
+      assert wake.prompt == prompt
+      assert wake.fired_by == "condition"
+    end
+
+    assert %{"demand" => [%{"kind" => "sentinels/matrix/message"}]} = cli.(["sentinel", "demand"])
+    assert %{"subscriptions" => [%{"mode" => "standing"}]} = cli.(["sentinel", "subscriptions"])
+    cli.(["sentinel", "unsubscribe", standing["id"]])
+    cli.(["sentinel", "unsubscribe", once["id"]])
+    assert %{"demand" => []} = cli.(["sentinel", "demand"])
+  end
+
+  defp subscribe(ctx, session, where, options \\ %{}) do
     ctx.handlers["sentinel-subscribe"].(%{
       origin: "session:" <> session,
       principal: {:session, session},
       session_key: session,
-      params: %{event: @event, where: where}
+      params: Map.merge(%{event: @event, where: where}, options)
     })
   end
 

@@ -119,8 +119,7 @@ defmodule Tightbeam.Sentinels do
 
   @doc "List the event declarations published by all learned bundles."
   def learned_events(base_dir) do
-    %{sentinels: sentinels} = Identity.learned_sentinels(base_dir)
-    Enum.flat_map(sentinels, & &1.events)
+    Identity.learned_events(base_dir)
   end
 
   @doc "Every durable state row on `host`, keyed by qualified name."

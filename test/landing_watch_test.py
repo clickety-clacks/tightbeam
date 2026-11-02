@@ -172,8 +172,8 @@ class FakeRunner:
         self.claims = 0
 
     def tightbeam_json(self, args):
-        self.operations.append(args[0])
-        if args[0] == 'fact-demand':
+        self.operations.append(' '.join(args[:2]) if args[0] == 'sentinel' else args[0])
+        if args[:2] == ['sentinel', 'demand']:
             if self.demand_error:
                 raise self.demand_error
             return {'demand': self.demand}
@@ -191,14 +191,14 @@ class FakeRunner:
     def tightbeam(self, args):
         if self.refuse and self.refuse(args):
             return False, 'refused by fake gateway'
-        if '--kind' in args and args[args.index('--kind') + 1] == lw.CHECKS_COMPLETED:
+        if '--event' in args and args[args.index('--event') + 1] == lw.CHECKS_COMPLETED:
             self.checks.append(list(args))
             return True, '{}'
         self.filed.append(list(args))
         return True, '{}'
 
     def keys(self, verb='condition'):
-        return [a[a.index('--key') + 1] for a in self.filed if a[0] == verb]
+        return [a[a.index('--key') + 1] for a in self.filed if a[0] == verb or (verb == 'condition' and a[:2] == ['sentinel', 'post'])]
 
 
 class WatcherCase(unittest.TestCase):
@@ -298,10 +298,10 @@ class Settings(unittest.TestCase):
 
 class RunningPath(WatcherCase):
     def demand_pr(self, number, *kinds):
-        self.runner.demand = [{'kind': kind, 'scope': f'example/repo#{number}'} for kind in kinds]
+        self.runner.demand = [{'kind': kind, 'filter': {'scope': [f'example/repo#{number}']}} for kind in kinds]
 
     def demand_branch(self):
-        self.runner.demand = [{'kind': lw.BRANCH_ATTENTION, 'scope': 'example/repo@main'}]
+        self.runner.demand = [{'kind': lw.BRANCH_ATTENTION, 'filter': {'scope': ['example/repo@main']}}]
 
     def keys(self):
         return self.runner.keys()
@@ -313,7 +313,7 @@ class RunningPath(WatcherCase):
         self.github.add(pull(7, checks=[check_run('C1', 'build', 'SUCCESS', required=True)]))
         self.demand_pr(7, lw.CHECKS_COMPLETED)
         self.assertEqual(self.run_once(), 0)
-        self.assertEqual(self.runner.operations[:2], ['fact-producer-claim', 'fact-demand'])
+        self.assertEqual(self.runner.operations[:2], ['fact-producer-claim', 'sentinel demand'])
         self.assertEqual(self.runner.claims, 1)
         self.assertEqual(self.check_keys(), ['pr-checks:example/repo#7:head1:pass'])
         self.assertFalse(any(op in ('LandingOpen', 'LandingRecent', 'LandingTip') for op, _ in self.github.calls))
@@ -321,6 +321,18 @@ class RunningPath(WatcherCase):
         self.runner.demand = []
         self.assertEqual(self.run_once(), 0)
         self.assertEqual(len(self.github.calls), before)
+
+    def test_scope_alternatives_are_all_observed(self):
+        for number in (7, 8):
+            self.github.add(pull(number, checks=[check_run(f'C{number}', 'build', 'SUCCESS', required=True)]))
+        self.runner.demand = [{'kind': lw.CHECKS_COMPLETED,
+                               'filter': {'scope': ['example/repo#7', 'example/repo#8']}}]
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(set(self.check_keys()), {
+            'pr-checks:example/repo#7:head1:pass', 'pr-checks:example/repo#8:head1:pass'})
+        for args in self.runner.checks:
+            self.assertEqual(args[:2], ['sentinel', 'post'])
+            self.assertIn('--detail', args)
 
     def test_merged_fact_uses_merge_commit(self):
         merge_oid = 'a' * 40
@@ -423,7 +435,7 @@ class RunningPath(WatcherCase):
         self.github.add(pull(7, checks=[check_run('C1', 'build', 'SUCCESS', required=True)]),
                         pull(8, checks=[check_run('C2', 'build', 'FAILURE', required=True)]),
                         pull(9, checks=[check_run('C3', 'build', status='IN_PROGRESS', required=True)]))
-        self.runner.demand = [{'kind': lw.CHECKS_COMPLETED, 'scope': f'example/repo#{n}'} for n in (7, 8, 9)]
+        self.runner.demand = [{'kind': lw.CHECKS_COMPLETED, 'filter': {'scope': [f'example/repo#{n}']}} for n in (7, 8, 9)]
         self.assertEqual(self.run_once(), 0)
         self.assertEqual(self.check_keys(), ['pr-checks:example/repo#7:head1:pass',
                                              'pr-checks:example/repo#8:head1:fail'])
@@ -454,7 +466,7 @@ class RunningPath(WatcherCase):
         self.assertEqual(self.run_once('Example/Repo@main=pdo:example'), 0)
         self.assertEqual([op for op, _ in self.github.calls if op != 'rest'], ['LandingTip'])
         self.assertEqual(self.runner.filed[0][0], 'wake')
-        self.assertEqual(self.runner.filed[1][0], 'condition')
+        self.assertEqual(self.runner.filed[1][:2], ['sentinel', 'post'])
 
     def test_failed_demand_read_fails_poll_without_github_read(self):
         self.runner.demand_error = lw.ReadError('gateway read failed')
@@ -481,7 +493,7 @@ class RunningPath(WatcherCase):
 
     def test_real_missing_pr_error_is_skipped_and_other_pr_proceeds(self):
         self.github.add(pull(7, checks=[check_run('C1', 'build', 'SUCCESS', required=True)]))
-        self.runner.demand = [{'kind': lw.CHECKS_COMPLETED, 'scope': f'example/repo#{n}'} for n in (8, 7)]
+        self.runner.demand = [{'kind': lw.CHECKS_COMPLETED, 'filter': {'scope': [f'example/repo#{n}']}} for n in (8, 7)]
         self.assertEqual(self.run_once(), 0)
         self.assertEqual(self.check_keys(), ['pr-checks:example/repo#7:head1:pass'])
         self.assertIn('Could not resolve to a PullRequest', self.stream.getvalue())
@@ -495,7 +507,7 @@ class RunningPath(WatcherCase):
     def test_refused_fact_fails_poll_and_retries_with_same_key(self):
         self.github.add(pull(7, state='MERGED', merged=True, merge_oid='abc'))
         self.demand_pr(7, lw.SETTLED)
-        self.runner.refuse = lambda args: args[0] == 'condition'
+        self.runner.refuse = lambda args: args[0] in ('condition', 'sentinel')
         self.assertEqual(self.run_once(), 1)
         self.runner.refuse = None
         self.assertEqual(self.run_once(), 0)
@@ -507,8 +519,8 @@ class RunningPath(WatcherCase):
 
     def test_invalid_demand_logged_once_and_other_pr_continues(self):
         self.runner.demand = [
-            {'kind': lw.CHECKS_COMPLETED, 'scope': None},
-            {'kind': lw.CHECKS_COMPLETED, 'scope': 'example/repo#7'},
+            {'kind': lw.CHECKS_COMPLETED, 'filter': {}},
+            {'kind': lw.CHECKS_COMPLETED, 'filter': {'scope': ['example/repo#7']}},
         ]
         self.github.add(pull(7, checks=[check_run('pass', 'build', 'SUCCESS', required=True)]))
         self.assertEqual(self.run_once(), 0)
@@ -593,7 +605,7 @@ FAKE_TIGHTBEAM = r'''#!{python}
 import sys
 with open({log!r}, 'a') as handle:
     handle.write(' '.join(sys.argv[1:]) + '\n')
-if sys.argv[1] == 'fact-demand':
+if sys.argv[1:3] == ['sentinel', 'demand']:
     print('{{"demand": []}}')
 else:
     print('{{}}')
@@ -642,12 +654,12 @@ class Process(unittest.TestCase):
         self.assertIn('start login=example-bot branches=example/repo@main', done.stderr)
         calls = self.calls.read_text()
         self.assertIn('fact-producer-claim', calls)
-        self.assertIn('fact-demand --kind-prefix landing. --kind-prefix pr.', calls)
+        self.assertIn('sentinel demand --kind-prefix landing. --kind-prefix pr.', calls)
 
     def test_once_without_static_repositories(self):
         done = self.run_program('--once', LANDING_REPOS='')
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn('fact-demand', self.calls.read_text())
+        self.assertIn('sentinel demand', self.calls.read_text())
 
 
 if __name__ == '__main__':

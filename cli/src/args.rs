@@ -621,6 +621,12 @@ pub enum Command {
         identity: Identity,
         event: String,
         where_values: Vec<String>,
+        mode: String,
+        fallback_ms: Option<String>,
+    },
+    SentinelDemand {
+        identity: Identity,
+        prefixes: Vec<String>,
     },
     SentinelSubscriptions {
         identity: Identity,
@@ -1146,6 +1152,10 @@ COMMANDS:
       Subscribe this session to an event. Repeated values for one detail are
       alternatives; different details must all match. With no --where, every
       event of that name matches.
+      Use --mode once for a single event, optionally with --fallback-after <duration>.
+      Omitted mode means standing; standing subscriptions do not accept fallback.
+  sentinel demand [--kind-prefix <prefix>]...
+      List distinct open kind/filter interests without subscriber information.
   sentinel subscriptions
       List this session's active event subscriptions.
   sentinel unsubscribe <id>
@@ -3992,7 +4002,7 @@ fn sentinel_scope(flags: &HashMap<String, String>) -> Result<Option<String>, Str
 }
 
 fn parse_sentinel(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
-    let usage = "usage: tightbeam sentinel enable <sentinel> | disable <sentinel> | list | events | post --event <event> --key <key> --detail <name=value>... | subscribe --event <event> [--where <name=value>...] | subscriptions | unsubscribe <id>";
+    let usage = "usage: tightbeam sentinel enable <sentinel> | disable <sentinel> | list | events | post --event <event> --key <key> --detail <name=value>... | subscribe --event <event> [--where <name=value>...] [--mode once|standing] [--fallback-after <duration>] | demand [--kind-prefix <prefix>] | subscriptions | unsubscribe <id>";
     match parsed.positional.as_slice() {
         [_, list] if list == "list" => Ok(Command::SentinelList {
             identity: identity(flags)?,
@@ -4013,12 +4023,41 @@ fn parse_sentinel(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Com
                 details: parsed.repeated.get("detail").cloned().unwrap_or_default(),
             })
         }
+        [_, demand] if demand == "demand" => {
+            let prefixes = parsed
+                .repeated
+                .get("kind-prefix")
+                .cloned()
+                .unwrap_or_default();
+            if prefixes.iter().any(String::is_empty) {
+                return Err("--kind-prefix requires a nonempty prefix".to_owned());
+            }
+            Ok(Command::SentinelDemand {
+                identity: identity(flags)?,
+                prefixes,
+            })
+        }
         [_, subscribe] if subscribe == "subscribe" => {
             let event = nonempty(flags, "event").ok_or_else(|| usage.to_owned())?;
             if parsed.duplicates.contains("event") {
                 return Err(usage.to_owned());
             }
+            let mode = flags
+                .get("mode")
+                .cloned()
+                .unwrap_or_else(|| "standing".to_owned());
+            let fallback_ms = flags
+                .get("fallback-after")
+                .map(|v| parse_duration("fallback-after", v))
+                .transpose()?;
+            if !["once", "standing"].contains(&mode.as_str())
+                || (mode == "standing" && fallback_ms.is_some())
+            {
+                return Err("mode must be once or standing; fallback requires once".to_owned());
+            }
             Ok(Command::SentinelSubscribe {
+                mode,
+                fallback_ms,
                 identity: identity(flags)?,
                 event,
                 where_values: parsed.repeated.get("where").cloned().unwrap_or_default(),
@@ -5391,6 +5430,8 @@ mod tests {
                 "who=@mike:x",
             ])),
             Ok(Command::SentinelSubscribe {
+                mode: "standing".to_owned(),
+                fallback_ms: None,
                 identity: Identity::Session,
                 event: "sample/demo/ping".to_owned(),
                 where_values: vec![
@@ -5408,6 +5449,8 @@ mod tests {
                 "sample/demo/ping"
             ])),
             Ok(Command::SentinelSubscribe {
+                mode: "standing".to_owned(),
+                fallback_ms: None,
                 identity: Identity::Session,
                 event: "sample/demo/ping".to_owned(),
                 where_values: vec![],
@@ -5441,7 +5484,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse(args),
-                Err("usage: tightbeam sentinel enable <sentinel> | disable <sentinel> | list | events | post --event <event> --key <key> --detail <name=value>... | subscribe --event <event> [--where <name=value>...] | subscriptions | unsubscribe <id>".to_owned())
+                Err("usage: tightbeam sentinel enable <sentinel> | disable <sentinel> | list | events | post --event <event> --key <key> --detail <name=value>... | subscribe --event <event> [--where <name=value>...] [--mode once|standing] [--fallback-after <duration>] | demand [--kind-prefix <prefix>] | subscriptions | unsubscribe <id>".to_owned())
             );
         }
         assert_eq!(

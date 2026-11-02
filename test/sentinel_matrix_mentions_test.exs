@@ -180,7 +180,7 @@ defmodule Tightbeam.SentinelMatrixMentionsTest do
     assert {:ok, [[6]]} =
              DB.query(
                db,
-               "SELECT COUNT(*) FROM condition_facts WHERE kind LIKE 'sentinel-event:%'"
+               "SELECT COUNT(*) FROM condition_facts WHERE kind IN ('sentinels/matrix/message', 'sentinels/matrix/mention')"
              )
 
     assert {:ok, rows} =
@@ -199,11 +199,11 @@ defmodule Tightbeam.SentinelMatrixMentionsTest do
     refute Enum.any?(rows, fn [session, _, _] -> session == "case-only" end)
 
     assert Enum.count(rows, fn [s, kind, _] ->
-             s == "both" and kind == "sentinel-event:" <> @mention
+             s == "both" and kind == @mention
            end) == 2
 
     assert Enum.count(rows, fn [s, kind, _] ->
-             s == "both" and kind == "sentinel-event:" <> @message
+             s == "both" and kind == @message
            end) == 2
 
     assert Enum.all?(rows, fn [_, _, prompt] -> prompt =~ "tightbeam sentinel unsubscribe" end)
