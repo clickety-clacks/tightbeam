@@ -853,7 +853,9 @@ COMMANDS:
       Advertise the exact fact kinds this producer serves for a bounded time.
       Repeating the claim replaces its kinds and renews its live period.
   fact-producers
-      List producer claims and whether each is live now.
+      List producers that announced the fact kinds they serve and whether they
+      are currently live. Built-in Tightbeam facts (such as assignment-landed)
+      and facts agents file for each other are not listed.
 
   harness-health-observe-other --harness <harness> --host <host>
       --source-session <session> --description <text> --evidence-mode exact_error|probe_digest
