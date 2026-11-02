@@ -172,6 +172,13 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
   end
 
   test "real script staffing, default-archetype and query paths with loaded rules", ctx do
+    File.cp!(
+      "priv/kungfu/agentic-engineering/rules/row-reaction-handoff.toml",
+      Path.join(ctx.base, "identity/rules/row-reaction-handoff.toml")
+    )
+
+    Rules.load!(ctx.base, Map.keys(ctx.handlers))
+
     ExUnit.CaptureIO.capture_io(fn ->
       Driver.check_facts_read(ctx.state)
       Driver.check_config_default_archetype(ctx.state)

@@ -18,7 +18,7 @@ defmodule Tightbeam.WorkItemsTest do
   @sha String.duplicate("a", 64)
   @sha2 String.duplicate("b", 64)
 
-  setup do
+  setup context do
     db = :work_items_db
     start_supervised!({DB, path: ":memory:", name: db})
 
@@ -33,7 +33,24 @@ defmodule Tightbeam.WorkItemsTest do
     holder = session(db, "holder", "flynn")
     other = session(db, "other-holder", "other")
     handlers = Gateway.handlers(%{db: db})
-    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
+    law_base =
+      if context[:terminal_handoff] do
+        base = Path.join(System.tmp_dir!(), "work-item-law-#{System.unique_integer([:positive])}")
+        rules = Path.join(base, "identity/rules")
+        File.mkdir_p!(rules)
+        on_exit(fn -> File.rm_rf!(base) end)
+
+        File.cp!(
+          "priv/kungfu/agentic-engineering/rules/row-reaction-handoff.toml",
+          Path.join(rules, "row-reaction-handoff.toml")
+        )
+
+        base
+      else
+        System.tmp_dir!()
+      end
+
+    Rules.load!(law_base, Map.keys(handlers))
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
@@ -1292,6 +1309,7 @@ defmodule Tightbeam.WorkItemsTest do
     assert get(ctx, {:user, "flynn"}, item.id).workItem.specRefSha256 == @sha
   end
 
+  @tag :terminal_handoff
   test "get and list return deterministic eras, aspects, and ordering", ctx do
     assert %{workItems: []} = list(ctx, {:user, "flynn"})
     assert %{code: "unknown_work_item"} = get(ctx, {:user, "flynn"}, "missing")
@@ -1330,6 +1348,31 @@ defmodule Tightbeam.WorkItemsTest do
     era = assign(ctx, "holder", "era", first.id)
     revoked = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call(era.id))
     assert revoked.state == "closed"
+
+    # Separate election, notice, linkage and slate evidence before the joined check.
+    terminal_evidence = %{
+      rules: Rules.effective_snapshot(),
+      events: DB.query(ctx.db, "SELECT eventId,event,facts FROM row_reaction_events ORDER BY eventId"),
+      actions:
+        DB.query(
+          ctx.db,
+          "SELECT eventId,family,slot,status,result,lastError FROM row_reaction_actions ORDER BY id"
+        ),
+      notices:
+        DB.query(
+          ctx.db,
+          "SELECT wakeId,state,work_item_id,sessionKey FROM wakes WHERE assignmentId=?1 AND obligationRef=?2",
+          [era.id, "terminal-child-owner-notification:" <> era.id]
+        ),
+      item: DB.query(ctx.db, "SELECT id,slateWakeId FROM work_items WHERE id=?1", [first.id]),
+      slate:
+        DB.query(
+          ctx.db,
+          "SELECT wakeId,state FROM wakes WHERE wakeId=(SELECT slateWakeId FROM work_items WHERE id=?1)",
+          [first.id]
+        )
+    }
+
     # Closure stores the terminal report and independently schedules the slate.
     # Recipient availability is decided when delivery is attempted, not here.
     assert {:ok, [["pending", nil, nil, item_id, "pending"]]} =
@@ -1343,7 +1386,8 @@ defmodule Tightbeam.WorkItemsTest do
                WHERE notice.assignmentId=?1 AND notice.obligationRef=?2
                """,
                [era.id, "terminal-child-owner-notification:" <> era.id]
-             )
+             ),
+           "terminal evidence: #{inspect(terminal_evidence, limit: :infinity)}"
 
     assert item_id == first.id
     restaffed = assign(ctx, "other-holder", "restaffed", first.id)

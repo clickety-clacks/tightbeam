@@ -101,6 +101,20 @@ defmodule Tightbeam.JobTraceTest do
 
   test "proofs 3-5: exact trace schema, review join, wake fact, authorization, and commit refs",
        %{db: db} do
+    law = Path.join(System.tmp_dir!(), "job-trace-law-#{System.unique_integer([:positive])}")
+    rules = Path.join(law, "identity/rules")
+    File.mkdir_p!(rules)
+    on_exit(fn -> File.rm_rf!(law) end)
+
+    for name <- ~w(row-reaction-assignment-inactivity.toml row-reaction-handoff.toml) do
+      File.cp!(
+        Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name]),
+        Path.join(rules, name)
+      )
+    end
+
+    Tightbeam.Rules.load!(law, Map.keys(Tightbeam.Gateway.handlers(%{db: db})))
+
     repo = init_repo()
     on_exit(fn -> File.rm_rf!(repo) end)
     commit = git_output!(repo, ["rev-parse", "HEAD"])

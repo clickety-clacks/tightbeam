@@ -3791,6 +3791,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
   test "direct process ownership is data and actor provenance stays in events", ctx do
     ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, observed_real_handlers(ctx))}
+    load_terminal_handoff_rules!(ctx)
     holder = create_session(ctx.db, "process-task-holder", "flynn")
     create_session(ctx.db, Org.personal_session_key("flynn"), "flynn")
 
@@ -4049,6 +4050,7 @@ defmodule Tightbeam.Wire.RouterTest do
     test "itemless process assignment uses explicit notice owner, personal session=#{@personal_session}",
          ctx do
       ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, observed_real_handlers(ctx))}
+      load_terminal_handoff_rules!(ctx)
       holder = create_session(ctx.db, "itemless-process-holder", "mike")
       personal = Org.personal_session_key("flynn")
       if @personal_session, do: create_session(ctx.db, personal, "flynn")
@@ -4641,6 +4643,20 @@ defmodule Tightbeam.Wire.RouterTest do
   # when it assigns to a role, and the one the phantom specimens came in on.
   defp dispatch_session(ctx, session, body) do
     dispatch_cli(ctx, session.cli_token, body)
+  end
+
+  defp load_terminal_handoff_rules!(ctx) do
+    rules = Path.join(ctx.base_dir, "identity/rules")
+    File.mkdir_p!(rules)
+
+    for name <- ~w(row-reaction-assignment-inactivity.toml row-reaction-handoff.toml) do
+      File.cp!(
+        Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name]),
+        Path.join(rules, name)
+      )
+    end
+
+    Tightbeam.Rules.load!(ctx.base_dir, Map.keys(Keyword.fetch!(ctx.opts, :handlers)))
   end
 
   # The real handler table, each verb announcing its call before it runs. A mock
