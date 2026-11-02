@@ -13,3 +13,18 @@ phrases = [
 name = "landing-watch"
 command = "sentinels/landing-watch"
 requires = ["GH_CONFIG_DIR"]
+
+[[events]]
+name = "landing.settled"
+description = "A watched pull request stopped moving on its own."
+details = [{ name = "scope", description = "Repository and pull request number." }]
+
+[[events]]
+name = "pr.checks-completed"
+description = "Required checks for a watched pull request completed."
+details = [{ name = "scope", description = "Repository and pull request number." }]
+
+[[events]]
+name = "landing.branch-attention"
+description = "A configured branch needs its owner's attention."
+details = [{ name = "scope", description = "Repository and branch." }]

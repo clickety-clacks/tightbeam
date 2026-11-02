@@ -821,8 +821,51 @@ defmodule Tightbeam.Identity do
       purpose: purpose,
       phrases: phrases,
       root_archetype: Map.fetch!(manifest, "root_archetype"),
-      sentinels: sentinel_declarations!(Map.get(manifest, "sentinels", []), path)
+      sentinels: sentinel_declarations!(Map.get(manifest, "sentinels", []), path),
+      events: outside_events!(Map.get(manifest, "events", []), path)
     }
+  end
+
+  defp outside_events!(entries, path) when is_list(entries) do
+    entries
+    |> Enum.map(&sentinel_event!(&1, path, nil))
+    |> unique_events!()
+  end
+
+  defp outside_events!(_entries, path),
+    do: raise(ArgumentError, "events must be an array of tables: #{path}")
+
+  defp unique_events!(events) do
+    names = Enum.map(events, & &1.qualified)
+
+    case names -- Enum.uniq(names) do
+      [] -> events
+      [duplicate | _] -> raise ArgumentError, "duplicate event #{duplicate}"
+    end
+  end
+
+  defp manifest_events(manifest, bundle) do
+    manifest.events ++
+      Enum.flat_map(manifest.sentinels, fn sentinel ->
+        Enum.map(sentinel.events, fn event ->
+          Map.put(event, :qualified, "#{bundle}/#{sentinel.name}/#{event.name}")
+        end)
+      end)
+  end
+
+  @doc "The single event catalog, including declarations from ordinary scripts."
+  def learned_events(base_dir) do
+    dir = identity_dir(base_dir)
+    revision = git_output!(dir, ["rev-parse", @live])
+
+    learned_bundle_names(dir, revision)
+    |> Enum.flat_map(fn bundle ->
+      path = Path.join(["kungfu", bundle, "manifest.toml"])
+      manifest = bundle_manifest!(git_show!(dir, revision, path), path)
+      manifest_events(manifest, bundle)
+    end)
+    |> unique_events!()
+    |> Enum.sort_by(& &1.qualified)
   end
 
   defp sentinel_declarations!(entries, path) when is_list(entries) do
@@ -908,7 +951,7 @@ defmodule Tightbeam.Identity do
 
   defp sentinel_event!(entry, path, prefix) when is_map(entry) do
     name = Map.get(entry, "name")
-    event_ref = if is_binary(name), do: "#{prefix}/#{name}", else: "#{prefix}/<unnamed>"
+    event_ref = if is_nil(prefix), do: name || "<unnamed>", else: "#{prefix}/#{name || "<unnamed>"}"
 
     case Map.keys(entry) -- @sentinel_event_keys do
       [] ->
@@ -919,9 +962,9 @@ defmodule Tightbeam.Identity do
               "event #{event_ref} has unknown keys #{Enum.join(Enum.sort(keys), ", ")}: #{path}"
     end
 
-    unless is_binary(name) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/, name) do
+    unless is_binary(name) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9_.\/-]*$/, name) do
       raise ArgumentError,
-            "event #{event_ref} name must match [A-Za-z0-9][A-Za-z0-9_-]*: #{path}"
+            "event #{event_ref} name must contain letters, digits, dots, slashes, underscores or hyphens: #{path}"
     end
 
     description = Map.get(entry, "description")
@@ -942,7 +985,7 @@ defmodule Tightbeam.Identity do
         raise ArgumentError, "event #{event_ref} has duplicate detail #{duplicate}: #{path}"
     end
 
-    %{name: name, description: description, details: details}
+    %{name: name, qualified: event_ref, description: description, details: details}
   end
 
   defp sentinel_event!(entry, path, prefix),
@@ -1699,6 +1742,15 @@ defmodule Tightbeam.Identity do
 
   defp validate_tree!(dir) do
     refuse_reserved_substrate_skills!(dir)
+
+    dir
+    |> Path.join("kungfu/*/manifest.toml")
+    |> Path.wildcard()
+    |> Enum.flat_map(fn path ->
+      manifest = bundle_manifest!(File.read!(path), path)
+      manifest_events(manifest, Path.basename(Path.dirname(path)))
+    end)
+    |> unique_events!()
 
     entries =
       dir

@@ -96,6 +96,39 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
   end
 
+  test "ordinary scripts share the catalog and duplicate global kinds refuse atomically", ctx do
+    path = Path.join([ctx.bundles, "script", "manifest.toml"])
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, """
+    purpose = "A script producer without a supervised process."
+    root_archetype = "default"
+
+    [[events]]
+    name = "sample.done"
+    description = "An object finished processing."
+    details = [{ name = "object", description = "The completed object." }]
+    """)
+
+    learn!(ctx.base, "script")
+    events = ctx.handlers["sentinel-events"].(%{params: %{}}).events
+    assert Enum.map(events, & &1.qualified) == [@event, "sample.done"]
+    assert Enum.find(events, &(&1.qualified == "sample.done")).details == [
+             %{name: "object", description: "The completed object."}
+           ]
+
+    duplicate = Path.join([ctx.bundles, "duplicate", "manifest.toml"])
+    File.mkdir_p!(Path.dirname(duplicate))
+    File.cp!(path, duplicate)
+    before = identity_refs!(Path.join(ctx.base, "identity"))
+
+    assert_raise ArgumentError, ~r/duplicate event sample.done/, fn ->
+      Identity.learn!(ctx.base, "duplicate", "test")
+    end
+
+    assert identity_refs!(Path.join(ctx.base, "identity")) == before
+    assert ctx.handlers["sentinel-events"].(%{params: %{}}).events == events
+  end
+
   test "filters match exact values, empty filters match all, and event keys deduplicate posts",
        ctx do
     first = subscribe(ctx, "sub-a", ["channel=!a:x", "channel=!b:x", "who=@mike:x"])
