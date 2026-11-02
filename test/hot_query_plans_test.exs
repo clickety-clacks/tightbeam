@@ -47,10 +47,15 @@ defmodule Tightbeam.HotQueryPlansTest do
         db,
         """
         SELECT id FROM events
-        WHERE (sessionKey = ?1 OR principal = ?2)
-          AND kind = 'denied'
-          AND json_valid(payload)
-          AND json_type(payload, '$.rule') = 'text'
+        WHERE id IN (
+          SELECT id FROM events
+          WHERE sessionKey = ?1 AND kind = 'denied'
+            AND json_valid(payload) AND json_type(payload, '$.rule') = 'text'
+          UNION
+          SELECT id FROM events
+          WHERE principal = ?2 AND kind = 'denied'
+            AND json_valid(payload) AND json_type(payload, '$.rule') = 'text'
+        )
         ORDER BY CASE
           WHEN json_type(payload, '$.afterMessageSeq') = 'integer' THEN 0
           ELSE 1
@@ -59,8 +64,8 @@ defmodule Tightbeam.HotQueryPlansTest do
         ["target-session", "session:actor"]
       )
 
-    assert Enum.any?(plan, &String.contains?(&1, "events_session"))
-    assert Enum.any?(plan, &String.contains?(&1, "events_denied_principal"))
+    assert Enum.any?(plan, &(&1 =~ "SEARCH" and &1 =~ "events_session"))
+    assert Enum.any?(plan, &(&1 =~ "SEARCH" and &1 =~ "events_denied_principal"))
     refute Enum.any?(plan, &String.contains?(&1, "SCAN events"))
   end
 
