@@ -1872,6 +1872,15 @@ defmodule Tightbeam.ClientE2ETest do
         "guarded-client-wire-2: ok"
       )
     end
+
+    @tag :tmp_dir
+    test "an oversized-context harness refusal reaches the posting client", %{tmp_dir: tmp} do
+      Tightbeam.GuardRuntimeFixture.run!(
+        tmp,
+        "gateway_harness_refusal.exs",
+        "gateway-harness-refusal: ok"
+      )
+    end
   end
 
   defp closed_port do
