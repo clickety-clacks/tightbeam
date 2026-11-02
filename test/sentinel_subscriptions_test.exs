@@ -442,7 +442,10 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     # condition store, subscription matching and wake creation are real.
     File.write!(Path.join(bin, "gh"), """
     #!/usr/bin/env python3
-    import json
+    import json, sys
+    if sys.argv[1:3] == ['api', 'user']:
+        print('route-fixture')
+        sys.exit(0)
     print(json.dumps({'data': {'repository': {'pullRequest': {
       'number': 7, 'state': 'CLOSED', 'merged': False, 'mergeCommit': None,
       'headRefOid': 'a' * 40, 'baseRefName': 'main', 'autoMergeRequest': None,

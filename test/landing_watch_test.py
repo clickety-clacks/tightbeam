@@ -605,7 +605,7 @@ FAKE_TIGHTBEAM = r'''#!{python}
 import sys
 with open({log!r}, 'a') as handle:
     handle.write(' '.join(sys.argv[1:]) + '\n')
-if sys.argv[1] == 'fact-demand':
+if sys.argv[1:3] == ['sentinel', 'demand']:
     print('{{"demand": []}}')
 else:
     print('{{}}')
@@ -654,12 +654,12 @@ class Process(unittest.TestCase):
         self.assertIn('start login=example-bot branches=example/repo@main', done.stderr)
         calls = self.calls.read_text()
         self.assertIn('fact-producer-claim', calls)
-        self.assertIn('fact-demand --kind-prefix landing. --kind-prefix pr.', calls)
+        self.assertIn('sentinel demand --kind-prefix landing. --kind-prefix pr.', calls)
 
     def test_once_without_static_repositories(self):
         done = self.run_program('--once', LANDING_REPOS='')
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn('fact-demand', self.calls.read_text())
+        self.assertIn('sentinel demand', self.calls.read_text())
 
 
 if __name__ == '__main__':
