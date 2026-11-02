@@ -1459,7 +1459,8 @@ defmodule Tightbeam.Gateway do
                 txn,
                 class,
                 Tightbeam.StateResources.work_item(row),
-                %{"workItemId" => item.id}
+                %{"workItemId" => item.id},
+                Map.get(call, :firehose_hub, Tightbeam.Firehose.Hub)
               )
             end)
           )
