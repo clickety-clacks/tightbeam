@@ -475,9 +475,20 @@ System.put_env("TMPDIR", arena_tmp)
 
 # Both boots read the same elected policy from the retained arena identity.
 inactivity_policy = Tightbeam.Rules.reaction_policy("assignment-inactivity")
-%{name: "assignment-inactivity-reminders"} = inactivity_policy
+policy_bytes = :erlang.term_to_binary(inactivity_policy, [:deterministic])
 
-File.write!(Path.join(evidence, "#{phase}-law.json"), JSON.encode!(inactivity_policy))
+policy_receipt =
+  JSON.encode!(%{
+    phase: phase,
+    policy: inactivity_policy,
+    canonical_encoding: "erlang-external-term/deterministic",
+    canonical_base64: Base.encode64(policy_bytes),
+    sha256: Base.encode16(:crypto.hash(:sha256, policy_bytes), case: :lower)
+  })
+
+IO.puts("Recovery #{phase}-law.json: #{policy_receipt}")
+File.write!(Path.join(evidence, "#{phase}-law.json"), policy_receipt)
+%{name: "assignment-inactivity-reminders"} = inactivity_policy
 
 if phase == "prepare" do
   # Use the existing synthetic provider onboarding lifecycle, not live auth files.

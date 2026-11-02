@@ -255,7 +255,7 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
       end
 
       for name <-
-            ~w(candidate.json prepare-state.json restart-state.json prepare-boot.json restart-boot.json recovery-result.json) do
+            ~w(candidate.json prepare-law.json restart-law.json prepare-state.json restart-state.json prepare-boot.json restart-boot.json recovery-result.json) do
         case File.read(Path.join(arena, name)) do
           {:ok, bytes} -> IO.puts("Recovery #{name}: #{bytes}")
           {:error, :enoent} -> IO.puts("Recovery #{name}: absent")
