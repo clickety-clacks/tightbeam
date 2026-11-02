@@ -7314,15 +7314,21 @@ mod tests {
         ] {
             assert!(parse(args).unwrap_err().contains("exactly one of"));
         }
-        for args in [
-            strings(&["retire", "s", "--as-user", "flynn"]),
-            strings(&["retire", "--role", "r", "--as-user", "flynn"]),
-            strings(&["retire", "--user", "u", "--as-user", "flynn"]),
+        for (args, expected) in [
+            (
+                strings(&["retire", "s", "--as-user", "flynn"]),
+                "usage: tightbeam retire --session <key> [--keep-open-descendants] [--key <idempotencyKey>]",
+            ),
+            (
+                strings(&["retire", "--role", "r", "--as-user", "flynn"]),
+                "usage: tightbeam retire does not accept --role",
+            ),
+            (
+                strings(&["retire", "--user", "u", "--as-user", "flynn"]),
+                "usage: tightbeam retire does not accept --user",
+            ),
         ] {
-            assert_eq!(
-                parse(args),
-                Err("usage: tightbeam retire --session <key> [--keep-open-descendants] [--key <idempotencyKey>]".to_owned())
-            );
+            assert_eq!(parse(args), Err(expected.to_owned()));
         }
     }
 
