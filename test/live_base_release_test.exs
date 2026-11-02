@@ -832,7 +832,10 @@ defmodule Tightbeam.LiveBaseReleaseTest do
 
   defp assert_transition_refusal(fun) do
     refusal = assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_required/, fun
-    assert refusal.message =~ "the build identity does not match a recorded owner for this database"
+
+    assert refusal.message =~
+             "the build identity does not match a recorded owner for this database"
+
     assert refusal.message =~ "No migration was applied."
     assert refusal.message =~ "TIGHTBEAM_LIVE_BASE_TRANSITION"
     refute refusal.message =~ "%{"
