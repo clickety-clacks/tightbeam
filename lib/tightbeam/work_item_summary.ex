@@ -3,7 +3,7 @@ defmodule Tightbeam.WorkItemSummary do
 
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.{Hub, Publisher}
-  alias Tightbeam.{ConditionFacts, DB, JSON, StateResources, WorkItems}
+  alias Tightbeam.{ConditionFacts, DB, StateResources, WorkItems}
 
   @doc false
   def attach(db, %{id: work_item_id} = row) do
