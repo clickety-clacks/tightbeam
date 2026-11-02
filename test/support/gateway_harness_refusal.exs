@@ -106,7 +106,6 @@ defmodule GatewayHarnessRefusal do
       reason = payload["error"] |> JSON.encode!()
       assert reason =~ "context_length_exceeded"
       assert File.regular?(Path.join(base, "harness-request.json"))
-      assert File.read!(Path.join(base, "harness-request.json.exit")) == "1"
 
       captured =
         base

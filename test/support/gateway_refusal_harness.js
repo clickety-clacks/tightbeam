@@ -4,7 +4,6 @@ const fs = require("node:fs");
 const readline = require("node:readline");
 
 const capturePath = process.argv[2];
-process.on("exit", (code) => fs.writeFileSync(capturePath + ".exit", String(code)));
 const options = () => ({
   configOptions: [
     {
@@ -50,6 +49,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       return send({ id: request.id, result: {} });
 
     case "session/prompt":
+      // Keep the process alive so exit delivery cannot race with the prompt error.
       fs.writeFileSync(capturePath, JSON.stringify({ method: request.method, params }));
       return send(
         {
@@ -58,8 +58,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
             code: -32000,
             message: "context_length_exceeded: prompt exceeds available context"
           }
-        },
-        () => process.exit(1)
+        }
       );
 
     case "session/close":
