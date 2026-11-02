@@ -364,6 +364,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
   test "once and standing share a delivery, consume demand, and retain queued justification", ctx do
     once = subscribe(ctx, "sub-a", [], %{mode: "once", fallback_ms: 60_000})
     standing = subscribe(ctx, "sub-a", ["channel=a"])
+    :ok = SentinelSubscriptions.ensure_schema(ctx.db)
     assert subscribe(ctx, "sub-a", [], %{mode: "once", fallback_ms: 60_000}) == once
     assert %{code: "invalid"} = subscribe(ctx, "sub-a", [], %{fallback_ms: 60_000})
     assert %{code: "invalid"} = subscribe(ctx, "sub-a", [], %{mode: "standing", fallback_ms: 60_000})
@@ -403,6 +404,28 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     assert Tightbeam.Wakes.get(ctx.db, wake_id).state == "canceled"
   end
 
+  test "retirement forwards legacy fact waits but ends new interests", ctx do
+    successor = Org.personal_session_key("owner")
+    create_session!(ctx.db, successor)
+    legacy = Tightbeam.Wakes.schedule(ctx.db, %{
+      session_key: "sub-normal", origin: "session:sub-normal", prompt: "original legacy prompt",
+      condition_kind: "sample.finished", condition_scope: "object", due_at: System.system_time(:millisecond) + 60_000
+    })
+    subscribe(ctx, "sub-normal", [], %{mode: "once", fallback_ms: 60_000})
+    Org.retire(ctx.db, "sub-normal", "user:owner", :off)
+    forwarded = Tightbeam.Wakes.get(ctx.db, legacy.wake_id)
+    assert forwarded.session_key == successor
+    assert forwarded.prompt == legacy.prompt
+    assert forwarded.due_at == legacy.due_at
+    assert forwarded.condition_after_id == legacy.condition_after_id
+    assert [%{kind: "sample.finished", filter: %{"scope" => ["object"]}}] = SentinelSubscriptions.demand(ctx.db).demand
+    Tightbeam.ConditionFacts.file(ctx.db, :missing_subscription_scheduler, %{
+      kind: "sample.finished", scope: "object", origin: "process:fixture"
+    })
+    assert Tightbeam.Wakes.get(ctx.db, legacy.wake_id).fired_by == "condition"
+    assert SentinelSubscriptions.demand(ctx.db).demand == []
+  end
+
   test "both candidate watchers traverse the real CLI and gateway subscription routes", ctx do
     for {bundle, watcher} <- [{"sentinels", "matrix"}, {"agentic-engineering", "landing-watch"}] do
       shipped = Path.expand("../priv/kungfu/#{bundle}", __DIR__)
@@ -429,7 +452,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     env = [{"TIGHTBEAM_URL", "http://127.0.0.1:#{port}"}, {"TIGHTBEAM_TOKEN", token},
       {"TIGHTBEAM_BASE_DIR", ctx.base}, {"TIGHTBEAM_AS_PROCESS", nil}]
     cli = fn args ->
-      {output, status} = System.cmd(binary, args, cd: ctx.root, env: env, stderr_to_stdout: true)
+      {output, status} = System.cmd(binary, args, cd: ctx.root, env: env)
       assert status == 0, output
       JSON.decode!(output)
     end
@@ -437,6 +460,11 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     standing = cli.(["sentinel", "subscribe", "--event", "sentinels/matrix/message"])
     assert once["id"] != standing["id"]
     cli.(["sentinel", "subscribe", "--event", "landing.settled", "--mode", "once", "--where", "scope=example/repo#7"])
+
+    legacy = for prompt <- ["legacy first", "legacy second"] do
+      cli.(["wake", "--session", "sub-a", "--when-fact", "landing.settled", "--when-scope", "example/repo#7",
+        "--fallback-after", "1h", "--prompt", prompt])["wakeId"]
+    end
 
     bin = Path.join(ctx.root, "bin")
     File.mkdir_p!(bin)
@@ -466,18 +494,29 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
       {"MATRIX_SAMPLE", sample}, {"MATRIX_COMMANDER_CREDENTIALS", Path.join(ctx.root, "unused-login")},
       {"MATRIX_COMMANDER_STORE", Path.join(ctx.root, "unused-store")},
       {"GH_CONFIG_DIR", ctx.root}, {"LANDING_REPOS", ""}]
+    cli.(["sentinel", "subscribe", "--event", "landing.settled", "--mode", "once", "--where", "scope=example/repo#8"])
+    {legacy_output, legacy_status} = System.cmd(binary,
+      ["condition", "--kind", "landing.settled", "--scope", "example/repo#8", "--key", "legacy-condition"],
+      cd: Path.dirname(ctx.root), env: producer_env, stderr_to_stdout: true)
+    assert legacy_status == 0, legacy_output
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM sentinel_subscription_wake_matches")
     matrix = Path.expand("../priv/kungfu/sentinels/sentinels/matrix", __DIR__)
     {output, code} = System.cmd("python3", [matrix], cd: Path.dirname(ctx.root), env: producer_env, stderr_to_stdout: true)
     assert code != 0
     assert output =~ "matrix-commander exited"
     assert {:ok, [[payload]]} = DB.query(ctx.db, "SELECT payload FROM condition_facts WHERE kind='sentinels/matrix/message'")
     assert JSON.decode!(payload)["text"] == "first line\na=b\nsecond line"
-    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT count(*) FROM sentinel_subscription_wake_matches")
+    assert {:ok, [[3]]} = DB.query(ctx.db, "SELECT count(*) FROM sentinel_subscription_wake_matches")
 
     landing = Path.expand("../priv/kungfu/agentic-engineering/sentinels/landing-watch", __DIR__)
     {output, code} = System.cmd("python3", [landing, "--once"], cd: Path.dirname(ctx.root), env: producer_env, stderr_to_stdout: true)
     assert code == 0, output
-    assert {:ok, [["example/repo#7"]]} = DB.query(ctx.db, "SELECT scope FROM condition_facts WHERE kind='landing.settled'")
+    assert {:ok, [["example/repo#7"], ["example/repo#8"]]} = DB.query(ctx.db, "SELECT scope FROM condition_facts WHERE kind='landing.settled' ORDER BY scope")
+    for {id, prompt} <- Enum.zip(legacy, ["legacy first", "legacy second"]) do
+      wake = Tightbeam.Wakes.get(ctx.db, id)
+      assert wake.prompt == prompt
+      assert wake.fired_by == "condition"
+    end
     assert %{"demand" => [%{"kind" => "sentinels/matrix/message"}]} = cli.(["sentinel", "demand"])
     assert %{"subscriptions" => [%{"mode" => "standing"}]} = cli.(["sentinel", "subscriptions"])
     cli.(["sentinel", "unsubscribe", standing["id"]])
