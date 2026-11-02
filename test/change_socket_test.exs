@@ -1,7 +1,7 @@
 defmodule Tightbeam.Wire.ChangeSocketTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Devices, Gateway, Model, Org, StateResources}
+  alias Tightbeam.{DB, Devices, Gateway, Ledger, Model, Org, StateResources}
   alias Tightbeam.Firehose.{Hub, Registry}
   alias Tightbeam.Wire.ChangeSocket
 
@@ -194,6 +194,102 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     ChangeSocket.terminate(:normal, state)
   end
 
+  test "an unbuildable active notice is reported and subscriptions stay open", ctx do
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:notice-recovery",
+        display_name: "Notice recovery",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    enqueue = fn message_id ->
+      Ledger.enqueue(ctx.db, %{
+        session_key: session.session_key,
+        message_id: message_id,
+        origin: "user:flynn",
+        prompt: "queued prompt"
+      })
+    end
+
+    assert {:ok, malformed_seq} = enqueue.("malformed-notice")
+    assert {:ok, valid_seq} = enqueue.("valid-notice")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE turns SET roleFallback=2 WHERE seq=?1", [malformed_seq])
+
+    {:push, {:text, auth}, state} =
+      inbound(%{"type" => "auth", "token" => session.cli_token}, ctx.state)
+
+    assert JSON.decode!(auth)["success"]
+
+    {{:push, {:text, ready}, state}, log} =
+      ExUnit.CaptureLog.with_log(fn ->
+        subscribe(
+          %{
+            "type" => "subscribe",
+            "protocolVersion" => 2,
+            "subscriptionId" => "recovery",
+            "filters" => %{"sessionKey" => session.session_key, "classes" => ["turn."]}
+          },
+          state
+        )
+      end)
+
+    assert log =~ "active turn notice build failed class=turn.queued turnSeq=#{malformed_seq}"
+    assert log =~ "error=ArgumentError"
+    assert JSON.decode!(ready)["type"] == "subscription_ready"
+    assert state.phase == :live
+
+    assert_receive {:firehose_notice, notice}
+    assert notice["class"] == "turn.queued"
+    assert notice["refs"]["turnSeq"] == valid_seq
+
+    assert {:push, {:text, queued_event}, state} =
+             ChangeSocket.handle_info({:firehose_notice, notice}, state)
+
+    assert JSON.decode!(queued_event)["class"] == "turn.queued"
+
+    assert {:push, {:text, heartbeat}, state} =
+             ChangeSocket.handle_info(:firehose_heartbeat, state)
+
+    assert JSON.decode!(heartbeat)["type"] == "heartbeat"
+
+    {{:push, {:text, excluded_ready}, state}, excluded_log} =
+      ExUnit.CaptureLog.with_log(fn ->
+        subscribe(
+          %{
+            "type" => "subscribe",
+            "protocolVersion" => 2,
+            "subscriptionId" => "without-turns",
+            "filters" => %{
+              "sessionKey" => session.session_key,
+              "classes" => ["work_item."]
+            }
+          },
+          state
+        )
+      end)
+
+    assert excluded_log =~
+             "active turn notice build failed class=turn.queued turnSeq=#{malformed_seq}"
+
+    assert JSON.decode!(excluded_ready)["type"] == "subscription_ready"
+    assert state.phase == :live
+    refute_receive {:firehose_notice, %{"class" => "turn.queued"}}
+
+    assert {:push, {:text, heartbeat}, state} =
+             ChangeSocket.handle_info(:firehose_heartbeat, state)
+
+    assert JSON.decode!(heartbeat)["type"] == "heartbeat"
+    ChangeSocket.terminate(:normal, state)
+  end
+
   test "a first subscribe starts a credentialless observer for the connection lifetime", ctx do
     {:push, {:text, ready}, observer_state} =
       subscribe(
@@ -271,7 +367,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     ChangeSocket.terminate(:normal, live_state)
   end
 
-  test "a non-admin session receives another session's active-turn snapshot", ctx do
+  test "a stored queued turn precedes another session's running-turn snapshot", ctx do
     Devices.add_user(ctx.db, "other", false)
 
     subscriber =
@@ -299,6 +395,14 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
         provider: "anthropic",
         model: Model.new("fable")
       })
+
+    assert {:ok, queued_seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: target.session_key,
+               message_id: "queued-message",
+               origin: "user:flynn",
+               prompt: "queued prompt"
+             })
 
     assert {:ok, _} =
              DB.query(
@@ -331,6 +435,16 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       )
 
     assert JSON.decode!(ready)["subscriptionId"] == "other-session-turn"
+    assert_receive {:firehose_notice, queued_notice}
+    assert queued_notice["class"] == "turn.queued"
+    assert queued_notice["refs"]["turnSeq"] == queued_seq
+    assert queued_notice["payload"]["status"] == "queued"
+
+    assert {:push, {:text, queued_event}, state} =
+             ChangeSocket.handle_info({:firehose_notice, queued_notice}, state)
+
+    assert JSON.decode!(queued_event)["class"] == "turn.queued"
+
     assert_receive {:firehose_notice, notice}
     assert notice["class"] == "turn.started"
     assert notice["refs"]["sessionKey"] == target.session_key
@@ -339,6 +453,11 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
              ChangeSocket.handle_info({:firehose_notice, notice}, state)
 
     assert JSON.decode!(turn_event)["class"] == "turn.started"
+
+    assert {:push, {:text, heartbeat}, state} =
+             ChangeSocket.handle_info(:firehose_heartbeat, state)
+
+    assert JSON.decode!(heartbeat)["type"] == "heartbeat"
     ChangeSocket.terminate(:normal, state)
   end
 
@@ -787,7 +906,12 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     declared = Enum.sort(Gateway.emitted_state_classes(handler_effects))
 
-    registered = rows |> Map.keys() |> Enum.sort()
+    registered =
+      rows
+      |> Enum.reject(fn {_class, row} -> row[:snapshot_only] end)
+      |> Enum.map(fn {class, _row} -> class end)
+      |> Enum.sort()
+
     extra = declared -- registered
     missing = registered -- declared
 
