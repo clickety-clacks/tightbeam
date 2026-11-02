@@ -372,6 +372,23 @@ pub enum Command {
         assignment_id: String,
         reason: String,
     },
+    AssignmentHold {
+        identity: Identity,
+        assignment_id: String,
+        kind: String,
+        reason: String,
+        release: String,
+        release_fact_kind: Option<String>,
+        release_fact_scope: Option<String>,
+        release_fact_principal_ref: Option<String>,
+        idempotency_key: Option<String>,
+    },
+    AssignmentReleaseHold {
+        identity: Identity,
+        assignment_id: String,
+        reason: String,
+        idempotency_key: Option<String>,
+    },
     RepairAssignment {
         identity: Identity,
         assignment_id: String,
@@ -530,6 +547,7 @@ pub enum Command {
         identity: Identity,
         target: Option<Target>,
         state: Option<String>,
+        held: bool,
     },
     CancelWake {
         identity: Identity,
@@ -1087,6 +1105,12 @@ COMMANDS:
       Revoke when the assignment handler already authorizes your principal.
   reopen-assignment <assignmentId> --reason <reason>
       Reopen an authorized closed assignment and record the reason.
+  assignment-hold <assignmentId> --kind held|standing --reason <text> --release <text>
+      [--release-fact-kind <kind> --release-fact-scope <scope>
+       --release-fact-principal-ref <principal>] [--key <idempotencyKey>]
+      Keep an open assignment intentionally quiet from inactivity supervision.
+  assignment-release-hold <assignmentId> --reason <text> [--key <idempotencyKey>]
+      Release an active hold and start a fresh inactivity episode.
   repair-assignment <assignmentId> --action tune|restart|rerun|resume|relaunch --key <key>
       Repair a failed or never-launched holder without revoking its work.
       tune also requires --model; rerun requires --outcome not-completed.
@@ -1113,8 +1137,9 @@ COMMANDS:
       Read the assignment's current cannot-proceed release tuple and state. When
       --fact-id is supplied, also read that existing fact and report the stored
       tuple predicate, current eligibility, and any recorded settlement.
-  assignments [--session <key> | --role <name>] [--state open|closed|all]
-      List assignments (open by default).
+  assignments [--session <key> | --role <name>] [--state open|closed|all] [--held]
+      List assignments (open by default). --held selects active assignment holds
+      and standing cannot-proceed records.
 
   cancel-wake <wakeId>
       Cancel a pending (scheduled) wake by its id (from the wake command's
@@ -1368,6 +1393,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "daemon-credential",
     "dry-run",
     "help",
+    "held",
     "history",
     "json",
     "keep-open-descendants",
@@ -3104,6 +3130,56 @@ fn parse_with_optional_catalog(
                 reason,
             })
         }
+        "assignment-hold" => {
+            let usage = "usage: tightbeam assignment-hold <assignmentId> --kind held|standing --reason <text> --release <text> [--release-fact-kind <kind> --release-fact-scope <scope> --release-fact-principal-ref <principal>] [--key <idempotencyKey>]";
+            if parsed.positional.len() != 2 {
+                return Err(usage.to_owned());
+            }
+            let kind = nonempty(flags, "kind").ok_or_else(|| usage.to_owned())?;
+            if !["held", "standing"].contains(&kind.as_str()) {
+                return Err("--kind must be held or standing".to_owned());
+            }
+            let release_fact_kind = nonempty(flags, "release-fact-kind");
+            let release_fact_scope = nonempty(flags, "release-fact-scope");
+            let release_fact_principal_ref = nonempty(flags, "release-fact-principal-ref");
+            let tuple_count = [
+                release_fact_kind.as_ref(),
+                release_fact_scope.as_ref(),
+                release_fact_principal_ref.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .count();
+            if tuple_count != 0 && tuple_count != 3 {
+                return Err("release fact flags must be supplied together".to_owned());
+            }
+            if kind == "standing" && tuple_count != 0 {
+                return Err("standing holds do not accept release fact flags".to_owned());
+            }
+            Ok(Command::AssignmentHold {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+                kind,
+                reason: nonempty(flags, "reason").ok_or_else(|| usage.to_owned())?,
+                release: nonempty(flags, "release").ok_or_else(|| usage.to_owned())?,
+                release_fact_kind,
+                release_fact_scope,
+                release_fact_principal_ref,
+                idempotency_key: nonempty(flags, "key"),
+            })
+        }
+        "assignment-release-hold" => {
+            let usage = "usage: tightbeam assignment-release-hold <assignmentId> --reason <text> [--key <idempotencyKey>]";
+            if parsed.positional.len() != 2 {
+                return Err(usage.to_owned());
+            }
+            Ok(Command::AssignmentReleaseHold {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+                reason: nonempty(flags, "reason").ok_or_else(|| usage.to_owned())?,
+                idempotency_key: nonempty(flags, "key"),
+            })
+        }
         "repair-assignment" => {
             let usage = "usage: tightbeam repair-assignment <assignmentId> --action tune|restart|rerun|resume|relaunch --key <key> [--model <model> --effort <tier> --context <window>] [--outcome not-completed] [--turn <seq>]";
             let action = nonempty(flags, "action");
@@ -3744,12 +3820,13 @@ fn parse_with_optional_catalog(
             .flatten()
             .collect::<Vec<_>>();
             if parsed.positional.get(1).is_some() || targets.len() > 1 {
-                return Err("usage: tightbeam assignments [--session <key> | --role <name>] [--state <state>]".to_owned());
+                return Err("usage: tightbeam assignments [--session <key> | --role <name>] [--state <state>] [--held]".to_owned());
             }
             Ok(Command::Assignments {
                 identity: identity(flags)?,
                 target: targets.into_iter().next(),
                 state: nonempty(flags, "state"),
+                held: flags.contains_key("held"),
             })
         }
         "cancel-wake" => {
@@ -3886,7 +3963,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-follow, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignment-hold, assignment-release-hold, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-follow, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -6284,6 +6361,8 @@ mod tests {
                 "assimilate",
                 "assign",
                 "assignment-get",
+                "assignment-hold",
+                "assignment-release-hold",
                 "assignments",
                 "artifact-record",
                 "artifact-content-fetch",
@@ -7461,7 +7540,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-follow, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignment-hold, assignment-release-hold, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-follow, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
@@ -7680,6 +7759,73 @@ mod tests {
         let entry = render_command_help(None, "assignment-get").unwrap();
         assert!(entry.starts_with("  assignment-get <assignmentId>"));
         assert!(entry.contains("--fact-id <id>"), "{entry}");
+    }
+
+    #[test]
+    fn assignment_hold_surface_is_typed_and_closed() {
+        assert!(matches!(
+            parse(strings(&[
+                "assignment-hold",
+                "asg_1",
+                "--kind",
+                "held",
+                "--reason",
+                "owner pause",
+                "--release",
+                "owner resumes",
+                "--release-fact-kind",
+                "ready",
+                "--release-fact-scope",
+                "lane",
+                "--release-fact-principal-ref",
+                "user:flynn",
+                "--key",
+                "hold-1",
+            ])),
+            Ok(Command::AssignmentHold {
+                assignment_id,
+                kind,
+                release_fact_kind: Some(fact_kind),
+                ..
+            }) if assignment_id == "asg_1" && kind == "held" && fact_kind == "ready"
+        ));
+
+        assert!(matches!(
+            parse(strings(&[
+                "assignment-release-hold",
+                "asg_1",
+                "--reason",
+                "resumed",
+                "--key",
+                "release-1",
+            ])),
+            Ok(Command::AssignmentReleaseHold { assignment_id, .. }) if assignment_id == "asg_1"
+        ));
+
+        assert!(matches!(
+            parse(strings(&["assignments", "--held"])),
+            Ok(Command::Assignments { held: true, .. })
+        ));
+
+        assert_eq!(
+            parse(strings(&[
+                "assignment-hold",
+                "asg_1",
+                "--kind",
+                "standing",
+                "--reason",
+                "standing duty",
+                "--release",
+                "lane closes",
+                "--release-fact-kind",
+                "ready",
+                "--release-fact-scope",
+                "lane",
+                "--release-fact-principal-ref",
+                "user:flynn",
+            ])),
+            Err("standing holds do not accept release fact flags".to_owned())
+        );
     }
 
     #[test]

@@ -1567,6 +1567,12 @@ defmodule Tightbeam.Gateway do
       end,
       {"attests", []} => fn call -> Assignments.__handle__(db, "attests", call) end,
       {"assignment-get", []} => fn call -> Assignments.__handle__(db, "assignment-get", call) end,
+      {"assignment-hold", ["wake.canceled"]} => fn call ->
+        Assignments.__handle__(db, "assignment-hold", call)
+      end,
+      {"assignment-release-hold", []} => fn call ->
+        Assignments.__handle__(db, "assignment-release-hold", call)
+      end,
       {"assignment-commitref-correct", []} => fn call ->
         Tightbeam.AssignmentCommitRefCorrections.__handle__(
           db,

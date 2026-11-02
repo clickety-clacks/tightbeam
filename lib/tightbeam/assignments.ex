@@ -7,6 +7,7 @@ defmodule Tightbeam.Assignments do
   alias Tightbeam.DB.Txn
 
   alias Tightbeam.{
+    AssignmentHolds,
     AttestEvidence,
     ConditionFacts,
     Dispatch,
@@ -500,6 +501,7 @@ defmodule Tightbeam.Assignments do
     :ok = DB.execute(db, @assignments_ddl)
     :ok = DB.execute(db, @attests_ddl)
     :ok = DB.execute(db, @cannot_proceed_ddl)
+    :ok = AssignmentHolds.ensure_schema(db)
     :ok = DB.execute(db, @assignment_files_ddl)
     :ok = DB.execute(db, @assignment_effects_ddl)
     :ok = DB.execute(db, @assignment_priorities_ddl)
@@ -1006,6 +1008,7 @@ defmodule Tightbeam.Assignments do
   def list(db, filters) do
     state = Map.get(filters, :state, "open")
     holder = Map.get(filters, :holder_key)
+    held = Map.get(filters, :held, false)
 
     {clauses, params} =
       [{state != "all", "state", state}, {not is_nil(holder), "holderKey", holder}]
@@ -1014,6 +1017,16 @@ defmodule Tightbeam.Assignments do
       |> Enum.map_reduce([], fn {{_present, column, value}, index}, values ->
         {"#{column} = ?#{index}", values ++ [value]}
       end)
+
+    clauses =
+      if held do
+        clauses ++
+          [
+            "(EXISTS(SELECT 1 FROM assignment_holds h WHERE h.assignmentId=assignments.id AND h.releasedAt IS NULL) OR EXISTS(SELECT 1 FROM assignment_cannot_proceed cp WHERE cp.assignmentId=assignments.id AND cp.state='standing'))"
+          ]
+      else
+        clauses
+      end
 
     where = if clauses == [], do: "1 = 1", else: Enum.join(clauses, " AND ")
 
@@ -1037,12 +1050,32 @@ defmodule Tightbeam.Assignments do
     files = Enum.group_by(file_rows, &hd/1, &List.last/1)
     corrections = Tightbeam.AssignmentCommitRefCorrections.list_many(db, ids)
 
-    Enum.map(assignments, fn assignment ->
-      assignment
-      |> Map.put(:files, Map.get(files, assignment.id, []))
-      |> Map.put(:commitRefCorrections, Map.get(corrections, assignment.id, []))
-      |> then(&Mementos.attach(db, "assignment", &1))
-    end)
+    assignments =
+      Enum.map(assignments, fn assignment ->
+        assignment
+        |> Map.put(:files, Map.get(files, assignment.id, []))
+        |> Map.put(:commitRefCorrections, Map.get(corrections, assignment.id, []))
+        |> then(&Mementos.attach(db, "assignment", &1))
+      end)
+      |> AssignmentHolds.attach_many(db)
+
+    if held do
+      Enum.map(assignments, fn
+        %{hold: nil, id: id} = assignment ->
+          case latest_cannot_proceed_for_assignment(db, id) do
+            %{state: "standing"} = cannot_proceed ->
+              Map.put(assignment, :cannotProceed, cannot_proceed)
+
+            _ ->
+              assignment
+          end
+
+        assignment ->
+          assignment
+      end)
+    else
+      assignments
+    end
   end
 
   @doc "Return distinct verdict kinds filed against an assignment."
@@ -1455,7 +1488,9 @@ defmodule Tightbeam.Assignments do
         [work_item_id]
       )
 
-    Enum.map(rows, fn row -> assignment(row) |> then(&Mementos.attach(db, "assignment", &1)) end)
+    rows
+    |> Enum.map(fn row -> assignment(row) |> then(&Mementos.attach(db, "assignment", &1)) end)
+    |> AssignmentHolds.attach_many(db)
   end
 
   @doc "Resolve an assignment's story membership without changing direct ownership readers."
@@ -1511,6 +1546,8 @@ defmodule Tightbeam.Assignments do
   def __handle__(db, "attest", call), do: attest_result(db, call)
   def __handle__(db, "attests", call), do: attests_result(db, call)
   def __handle__(db, "assignment-get", call), do: assignment_get_result(db, call)
+  def __handle__(db, "assignment-hold", call), do: AssignmentHolds.impose(db, call)
+  def __handle__(db, "assignment-release-hold", call), do: AssignmentHolds.release(db, call)
   def __handle__(db, "revoke-assignment", call), do: revoke_result(db, call)
   def __handle__(db, "reopen-assignment", call), do: reopen_result(db, call)
   def __handle__(db, "assignments", call), do: assignments_result(db, call)
@@ -2296,7 +2333,11 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_state(call.params[:state]) do
       %{
         assignments:
-          list(db, %{holder_key: call.session_key, state: call.params[:state] || "open"})
+          list(db, %{
+            holder_key: call.session_key,
+            state: call.params[:state] || "open",
+            held: call.params[:held] || false
+          })
       }
     end
   end
@@ -2313,6 +2354,8 @@ defmodule Tightbeam.Assignments do
           result =
             assignment(row)
             |> then(&Mementos.attach(db, "assignment", &1))
+            |> Map.put(:hold, AssignmentHolds.active(db, assignment_id))
+            |> Map.put(:holds, AssignmentHolds.history(db, assignment_id))
             |> Map.put(:reopenings, list_reopenings(db, assignment_id))
             |> Map.put(
               :commitRefCorrections,

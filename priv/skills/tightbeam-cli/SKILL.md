@@ -66,6 +66,21 @@ Recover the card in this order:
 After context loss, repeat this recovery from rows. Do not reconstruct state from chat
 memory.
 
+## Hold an intentionally quiet assignment
+
+Use `tightbeam assignment-hold <assignment-id> --kind held|standing --reason "..."
+--release "..."` when an open assignment remains intentionally held or is a standing
+duty. The holder, opener, or an organization user may impose and release a hold. A held
+disposition may name one complete release-fact tuple with `--release-fact-kind`,
+`--release-fact-scope`, and `--release-fact-principal-ref`; a standing hold cannot.
+
+The hold suppresses only assignment inactivity reminders and their escalation. Other
+notices still arrive. Read the active hold and its history with `assignment-get`, and use
+`assignments --held` to list open assignments covered by an active hold or a standing
+cannot-proceed record. When the stated condition is met, run `tightbeam
+assignment-release-hold <assignment-id> --reason "..."`. Release starts a fresh
+inactivity episode; closing the assignment releases its hold automatically.
+
 ## Perform only the obligation
 
 Read the assignment subject, its attests, the work item, and the named artifacts before

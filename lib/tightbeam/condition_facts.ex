@@ -418,6 +418,7 @@ defmodule Tightbeam.ConditionFacts do
     }
 
     :ok = Tightbeam.Assignments.release_cannot_proceed_in_txn(txn, fact)
+    :ok = Tightbeam.AssignmentHolds.release_by_fact_in_txn(txn, fact)
 
     EventLog.lifecycle_in_txn(
       txn,

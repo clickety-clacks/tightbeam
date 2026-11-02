@@ -1062,6 +1062,52 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("reason", reason),
             ],
         )),
+        Command::AssignmentHold {
+            identity,
+            assignment_id,
+            kind,
+            reason,
+            release,
+            release_fact_kind,
+            release_fact_scope,
+            release_fact_principal_ref,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("assignmentId", assignment_id),
+                string_field("kind", kind),
+                string_field("reason", reason),
+                string_field("release", release),
+            ];
+            if let Some(value) = release_fact_kind {
+                params.push(string_field("releaseFactKind", value));
+            }
+            if let Some(value) = release_fact_scope {
+                params.push(string_field("releaseFactScope", value));
+            }
+            if let Some(value) = release_fact_principal_ref {
+                params.push(string_field("releaseFactPrincipalRef", value));
+            }
+            if let Some(value) = idempotency_key {
+                params.push(string_field("idempotencyKey", value));
+            }
+            Ok(request(identity, "assignment-hold", vec![], params))
+        }
+        Command::AssignmentReleaseHold {
+            identity,
+            assignment_id,
+            reason,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("assignmentId", assignment_id),
+                string_field("reason", reason),
+            ];
+            if let Some(value) = idempotency_key {
+                params.push(string_field("idempotencyKey", value));
+            }
+            Ok(request(identity, "assignment-release-hold", vec![], params))
+        }
         Command::RepairAssignment {
             identity,
             assignment_id,
@@ -1516,6 +1562,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             identity,
             target,
             state,
+            held,
         } => {
             let fields = target
                 .as_ref()
@@ -1526,10 +1573,13 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 })
                 .into_iter()
                 .collect();
-            let params = state
+            let mut params = state
                 .as_ref()
                 .map(|value| vec![string_field("state", value)])
                 .unwrap_or_default();
+            if *held {
+                params.push("\"held\":true".to_owned());
+            }
             Ok(request(identity, "assignments", fields, params))
         }
         Command::CancelWake { identity, wake_id } => Ok(request(
@@ -3978,6 +4028,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::CancelTurn { identity, .. }
         | Command::RevokeAssignment { identity, .. }
         | Command::ReopenAssignment { identity, .. }
+        | Command::AssignmentHold { identity, .. }
+        | Command::AssignmentReleaseHold { identity, .. }
         | Command::RepairAssignment { identity, .. }
         | Command::AssignmentCommitRefCorrect { identity, .. }
         | Command::WorkItemCreate { identity, .. }

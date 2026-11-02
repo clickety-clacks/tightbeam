@@ -3,7 +3,7 @@ defmodule Tightbeam.AssignmentsTest do
   alias Tightbeam.Model
 
   @session_identity_shape "session-identity-v1-0114"
-  @closed_assignment_reconciliation_shape "closed-assignment-cannot-proceed-reconciliation-v1-015"
+  @closed_assignment_reconciliation_shape "assignment-hold-v1-015"
 
   alias Tightbeam.{
     Assignments,
