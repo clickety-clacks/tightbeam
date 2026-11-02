@@ -2164,7 +2164,8 @@ defmodule Tightbeam.Acp.Adapter do
          state,
          sid,
          %{"sessionUpdate" => "config_option_update", "configOptions" => options}
-       ) do
+       )
+       when is_list(options) do
     state =
       state
       |> remember_switchable_models(sid, %{"configOptions" => options})
@@ -2177,6 +2178,15 @@ defmodule Tightbeam.Acp.Adapter do
         else: record_notification_fields(state, sid, [:switchable_models])
 
     remember_reported_config_model(state, sid, options)
+  end
+
+  defp remember_config_model(
+         state,
+         _sid,
+         %{"sessionUpdate" => "config_option_update", "configOptions" => _options}
+       ) do
+    Logger.warning("Ignoring ACP config_option_update because configOptions is not a list")
+    state
   end
 
   defp remember_config_model(state, _sid, _update), do: state

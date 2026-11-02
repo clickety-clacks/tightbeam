@@ -529,6 +529,11 @@ defmodule Tightbeam.Acp.AdapterTest do
         if (text === "fail after dispatch") {
           return send({ id: m.id, error: { code: -32000, message: "post-dispatch failure" } });
         }
+        if (failMode === "malformed-config-update" && text === "malformed config update") {
+          for (const configOptions of [null, { unexpected: true }]) {
+            send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "config_option_update", configOptions } } });
+          }
+        }
         if (["stall-turn", "ignore-cancel-turn", "late-success-turn"].includes(gateMode)) {
           stalledPrompts.set(sid, m.id);
           return;
@@ -2282,6 +2287,40 @@ defmodule Tightbeam.Acp.AdapterTest do
       assert {:ok, [_ | _]} = Adapter.switchable_models(adapter, "sess-1")
       assert after_setup.config_options["other"] == []
     end
+  end
+
+  test "malformed configuration updates preserve model state and another turn succeeds" do
+    {adapter, _capture_path} = start_adapter(fail_mode: "malformed-config-update")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+    assert {:ok, _} = Adapter.load_session(adapter, "peer-session", nil, "/tmp", [], "guidance")
+
+    prior = :sys.get_state(adapter)
+    prior_model = prior.models["sess-1"]
+    prior_options = prior.config_options["sess-1"]
+    prior_switchable_models = prior.switchable_models["sess-1"]
+
+    log =
+      capture_log(fn ->
+        assert {:ok, %{stop_reason: "end_turn", text: "pong[allow-once]"}} =
+                 Adapter.prompt(adapter, "sess-1", "malformed config update")
+      end)
+
+    assert String.count(log, "configOptions is not a list") == 2
+    assert Process.alive?(adapter)
+
+    after_malformed = :sys.get_state(adapter)
+    assert after_malformed.models["sess-1"] == prior_model
+    assert after_malformed.config_options["sess-1"] == prior_options
+    assert after_malformed.switchable_models["sess-1"] == prior_switchable_models
+    assert {:ok, ^prior_model} = Adapter.current_model(adapter, "sess-1")
+
+    assert {:ok, %{stop_reason: "end_turn", text: "pong[allow-once]"}} =
+             Adapter.prompt(adapter, "peer-session", "valid turn")
+
+    assert Process.alive?(adapter)
   end
 
   test "turn setup retains its per-request timeout across setup requests" do
