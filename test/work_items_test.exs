@@ -1585,6 +1585,27 @@ defmodule Tightbeam.WorkItemsTest do
         assert notice["payload"]["landings"] == detail.landings
       end
 
+      matched_versions =
+        Map.new(landing_updates, fn notice ->
+          {notice["payload"]["id"], notice["payload"]["rowVersion"]}
+        end)
+
+      assert {%{kind: "landing.observed-merge"}, false} =
+               ConditionFacts.file_idempotent_with_effect(
+                 ctx.db,
+                 :work_item_summary_test_scheduler,
+                 input,
+                 call
+               )
+
+      replay_notices = drain_firehose_notices(hub)
+      refute Enum.any?(replay_notices, &(&1["class"] == "work_item.updated"))
+
+      for item_id <- [merge_item.id, head_item.id] do
+        detail = get(ctx, {:user, "flynn"}, item_id).workItem
+        assert detail.rowVersion == matched_versions[item_id]
+      end
+
       page =
         StateResources.query_work_item_page(
           ctx.db,
