@@ -171,9 +171,6 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
       assert %{"code" => "not_found", "messageId" => "c_wrong"} = error
     end
 
-    send_frame(retry, %{post | id: "c_big", content: String.duplicate("x", 65_537)})
-    {error, retry} = recv_frame(retry)
-    assert error["code"] == "payload_too_large"
     send_frame(retry, %{post | id: "invalid"})
     {error, retry} = recv_frame(retry)
     assert error["code"] == "invalid_message"
@@ -185,6 +182,63 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
              DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey='selected'")
 
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+  end
+
+  test "accepts and delivers a multi-megabyte human prompt without changing it", ctx do
+    changes = connect(ctx, "/ws/changes?protocolVersion=2")
+    send_frame(changes, auth())
+    {_auth_reply, changes} = recv_frame(changes)
+    send_frame(changes, %{
+      type: "subscribe",
+      protocolVersion: 2,
+      subscriptionId: "large-prompt",
+      filters: %{sessionKey: "selected", classes: ["message."]}
+    })
+
+    {ready, changes} = recv_frame(changes)
+    assert ready == %{"type" => "subscription_ready", "subscriptionId" => "large-prompt"}
+
+    chat = connect(ctx, "/ws")
+    send_frame(chat, Map.put(auth(), :deviceId, "browser-large-prompt"))
+    {auth_reply, chat} = recv_frame(chat)
+    assert auth_reply["success"] == true
+    {_sync, chat} = recv_frame(chat)
+
+    content = String.duplicate("abΩ☃", 600_000)
+    bytes = byte_size(content)
+    assert bytes == 4_200_000
+
+    message = %{
+      type: "message",
+      id: "c_multi_mib",
+      sessionKey: "selected",
+      content: content
+    }
+    frame = JSON.encode!(message)
+    assert byte_size(frame) < 10_000_000
+    assert :ok = WS.send_text(chat, frame)
+
+    {ack, chat} = recv_frame(chat)
+    assert ack == %{"type" => "ack", "id" => "c_multi_mib"}
+    assert_receive {:ensure_lane, "selected"}
+
+    assert {:ok, [[message_id, stored, stored_bytes]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,content,length(CAST(content AS BLOB)) FROM messages WHERE clientMessageId=?1",
+               ["c_multi_mib"]
+             )
+
+    assert stored == content
+    assert stored_bytes == bytes
+
+    assert {:ok, [["user:reader"]]} =
+             DB.query(ctx.db, "SELECT origin FROM turns WHERE messageId=?1", [message_id])
+
+    {notice, _changes} = recv_frame(changes)
+    assert notice["class"] == "message.created"
+    assert notice["refs"]["sessionKey"] == "selected"
+    assert notice["refs"]["messageId"] == message_id
   end
 
   test "missing user identity and unauthorized selected sessions cannot authenticate", ctx do

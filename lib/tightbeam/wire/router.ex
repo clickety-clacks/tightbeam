@@ -259,7 +259,6 @@ defmodule Tightbeam.Wire.Router do
       conn = Tightbeam.Wire.ResponseObservationAdapter.unwrap(conn)
 
       WebSockAdapter.upgrade(conn, Socket, deps(conn),
-        max_frame_size: 2 * 1024 * 1024,
         timeout: @websocket_read_timeout
       )
     else

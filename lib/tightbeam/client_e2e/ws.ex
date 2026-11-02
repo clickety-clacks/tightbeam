@@ -11,7 +11,8 @@ defmodule Tightbeam.ClientE2E.WS do
 
   Scope is deliberately the client half only:
   - client→server frames are always masked (RFC 6455 §5.3) and never
-    fragmented; the gateway's `max_frame_size` is 2 MiB.
+    fragmented; the /ws upgrade uses WebSockAdapter's default frame limit.
+    The separate /ws/changes route keeps its 2 MiB frame limit.
   - server→client frames are never masked. Continuation frames ARE
     reassembled: nothing in the contract forbids Bandit fragmenting a large
     replay frame, and a driver that dropped the tail would fail as a client

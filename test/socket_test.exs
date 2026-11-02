@@ -325,18 +325,19 @@ defmodule Tightbeam.Wire.SocketTest do
              "message" => "message id must start with c_"
            }
 
-    {:push, {:text, too_large}, live} =
+    large_content = String.duplicate("prompt Ω☃ ", 8_192)
+
+    {:push, {:text, large_ack}, live} =
       Socket.handle_in(
-        {JSON.encode!(%{message | "id" => "c_big", "content" => String.duplicate("x", 65_537)}),
-         opcode: :text},
+        {JSON.encode!(%{message | "id" => "c_big", "content" => large_content}), opcode: :text},
         live
       )
 
-    assert JSON.decode!(too_large) == %{
-             "type" => "error",
-             "code" => "payload_too_large",
-             "messageId" => "c_big"
-           }
+    assert byte_size(large_content) > 64 * 1024
+    assert JSON.decode!(large_ack) == %{"type" => "ack", "id" => "c_big"}
+
+    assert {:ok, [[^large_content]]} =
+             DB.query(ctx.db, "SELECT content FROM messages WHERE clientMessageId='c_big'")
 
     :ok =
       DB.execute(

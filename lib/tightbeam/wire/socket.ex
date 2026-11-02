@@ -45,9 +45,8 @@ defmodule Tightbeam.Wire.Socket do
     device_not_approved, allowlisted-but-stale-token → token_revoked, unknown
     → auth_failed. Success: seed the main stream if absent (defaults come
     from the gateway config — NEVER hardcoded here), register, replay, live.
-  - message: id must start with "c_" (else invalid_message); content ≤ 64KiB
-    utf8 (else payload_too_large); session ownership enforced (not_found);
-    then verb "post" through Dispatch. dedupe: :duplicate → ack again;
+  - message: id must start with "c_" (else invalid_message); session ownership
+    enforced (not_found); then verb "post" through Dispatch. dedupe: :duplicate → ack again;
     :conflict → invalid_message and NO ack.
   - stream_read: write read state, echo stream_read_state.
   - typing: rate-limited, otherwise dropped silently (not fanned out in v1).
@@ -58,8 +57,6 @@ defmodule Tightbeam.Wire.Socket do
 
   alias Tightbeam.{ConnRegistry, DB, Devices, Dispatch, ErrorDiagnostic, Org, Projection}
   alias Tightbeam.Wire.{OperatorSession, Payloads}
-
-  @max_content_bytes 64 * 1024
 
   @typedoc "Socket state; `conn_ref` is nil until authed."
   @type t :: %__MODULE__{
@@ -521,9 +518,6 @@ defmodule Tightbeam.Wire.Socket do
 
       not String.starts_with?(id, "c_") ->
         push(Payloads.wire_error("invalid_message", "message id must start with c_"), state)
-
-      byte_size(content) > @max_content_bytes ->
-        push(Payloads.wire_error("payload_too_large", nil, id), state)
 
       is_nil(session) or (session.owner_user_id != state.user_id and not state.is_admin) ->
         push(Payloads.wire_error("not_found", nil, id), state)
