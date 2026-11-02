@@ -400,6 +400,82 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     assert Tightbeam.Wakes.get(ctx.db, wake_id).state == "canceled"
   end
 
+  test "both candidate watchers traverse the real CLI and gateway subscription routes", ctx do
+    for {bundle, watcher} <- [{"sentinels", "matrix"}, {"agentic-engineering", "landing-watch"}] do
+      shipped = Path.expand("../priv/kungfu/#{bundle}", __DIR__)
+      destination = Path.join(ctx.bundles, bundle)
+      File.mkdir_p!(Path.join(destination, "sentinels"))
+      manifest = File.read!(Path.join(shipped, "manifest.toml"))
+        |> String.replace("root_archetype = \"orchestrator\"", "root_archetype = \"default\"")
+      File.write!(Path.join(destination, "manifest.toml"), manifest)
+      File.cp!(Path.join(shipped, "sentinels/#{watcher}"), Path.join(destination, "sentinels/#{watcher}"))
+      learn!(ctx.base, bundle)
+    end
+
+    Tightbeam.Rules.load!(ctx.base, Map.keys(ctx.handlers))
+    router = Tightbeam.Wire.Router.init(db: ctx.db, base_dir: ctx.base,
+      handlers: ctx.handlers, cli_token: "route-fixture-token", session_status: fn _ -> nil end)
+    server = start_supervised!({Bandit, plug: {Tightbeam.Wire.Router, router},
+      port: 0, ip: {127,0,0,1}, startup_log: false})
+    {:ok, {_, port}} = ThousandIsland.listener_info(server)
+    binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
+    {:ok, [[token]]} = DB.query(ctx.db, "SELECT cliToken FROM sessions WHERE sessionKey='sub-a'")
+    env = [{"TIGHTBEAM_URL", "http://127.0.0.1:#{port}"}, {"TIGHTBEAM_TOKEN", token},
+      {"TIGHTBEAM_BASE_DIR", ctx.base}, {"TIGHTBEAM_AS_PROCESS", nil}]
+    cli = fn args ->
+      {output, status} = System.cmd(binary, args, cd: ctx.root, env: env, stderr_to_stdout: true)
+      assert status == 0, output
+      JSON.decode!(output)
+    end
+    once = cli.(["sentinel", "subscribe", "--event", "sentinels/matrix/message", "--mode", "once"])
+    standing = cli.(["sentinel", "subscribe", "--event", "sentinels/matrix/message"])
+    assert once["id"] != standing["id"]
+    cli.(["sentinel", "subscribe", "--event", "landing.settled", "--mode", "once", "--where", "scope=example/repo#7"])
+
+    bin = Path.join(ctx.root, "bin")
+    File.mkdir_p!(bin)
+    File.ln_s!(binary, Path.join(bin, "tightbeam"))
+    sample = Path.expand("fixtures/matrix-commander-message.jsonl", __DIR__)
+    File.write!(Path.join(bin, "matrix-commander"), "#!/bin/sh\ncat \"$MATRIX_SAMPLE\"\n")
+    File.chmod!(Path.join(bin, "matrix-commander"), 0o755)
+    # Only the outside service response is a fixture; watcher, CLI, HTTP router,
+    # condition store, subscription matching and wake creation are real.
+    File.write!(Path.join(bin, "gh"), """
+    #!/usr/bin/env python3
+    import json
+    print(json.dumps({'data': {'repository': {'pullRequest': {
+      'number': 7, 'state': 'CLOSED', 'merged': False, 'mergeCommit': None,
+      'headRefOid': 'a' * 40, 'baseRefName': 'main', 'autoMergeRequest': None,
+      'mergeQueueEntry': None, 'timelineItems': {
+        'pageInfo': {'hasNextPage': False, 'endCursor': None},
+        'nodes': [{'__typename': 'ClosedEvent', 'id': 'closed-seven', 'createdAt': '2026-01-01T00:00:00Z'}]
+      }}}}}))
+    """)
+    File.chmod!(Path.join(bin, "gh"), 0o755)
+    producer_env = env ++ [{"TIGHTBEAM_TOKEN", "route-fixture-token"},
+      {"TIGHTBEAM_AS_PROCESS", "route-fixture"}, {"PATH", bin <> ":" <> System.get_env("PATH")},
+      {"MATRIX_SAMPLE", sample}, {"MATRIX_COMMANDER_CREDENTIALS", Path.join(ctx.root, "unused-login")},
+      {"MATRIX_COMMANDER_STORE", Path.join(ctx.root, "unused-store")},
+      {"GH_CONFIG_DIR", ctx.root}, {"LANDING_REPOS", ""}]
+    matrix = Path.expand("../priv/kungfu/sentinels/sentinels/matrix", __DIR__)
+    {output, code} = System.cmd("python3", [matrix], cd: ctx.root, env: producer_env, stderr_to_stdout: true)
+    assert code != 0
+    assert output =~ "matrix-commander exited"
+    assert {:ok, [[payload]]} = DB.query(ctx.db, "SELECT payload FROM condition_facts WHERE kind='sentinels/matrix/message'")
+    assert JSON.decode!(payload)["text"] == "first line\na=b\nsecond line"
+    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT count(*) FROM sentinel_subscription_wake_matches")
+
+    landing = Path.expand("../priv/kungfu/agentic-engineering/sentinels/landing-watch", __DIR__)
+    {output, code} = System.cmd("python3", [landing, "--once"], cd: ctx.root, env: producer_env, stderr_to_stdout: true)
+    assert code == 0, output
+    assert {:ok, [["example/repo#7"]]} = DB.query(ctx.db, "SELECT scope FROM condition_facts WHERE kind='landing.settled'")
+    assert %{"demand" => [%{"kind" => "sentinels/matrix/message"}]} = cli.(["sentinel", "demand"])
+    assert %{"subscriptions" => [%{"mode" => "standing"}]} = cli.(["sentinel", "subscriptions"])
+    cli.(["sentinel", "unsubscribe", standing["id"]])
+    cli.(["sentinel", "unsubscribe", once["id"]])
+    assert %{"demand" => []} = cli.(["sentinel", "demand"])
+  end
+
   defp subscribe(ctx, session, where, options \\ %{}) do
     ctx.handlers["sentinel-subscribe"].(%{
       origin: "session:" <> session,

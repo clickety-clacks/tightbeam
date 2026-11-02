@@ -1152,6 +1152,10 @@ COMMANDS:
       Subscribe this session to an event. Repeated values for one detail are
       alternatives; different details must all match. With no --where, every
       event of that name matches.
+      Use --mode once for a single event, optionally with --fallback-after <duration>.
+      Omitted mode means standing; standing subscriptions do not accept fallback.
+  sentinel demand [--kind-prefix <prefix>]...
+      List distinct open kind/filter interests without subscriber information.
   sentinel subscriptions
       List this session's active event subscriptions.
   sentinel unsubscribe <id>
@@ -4038,7 +4042,7 @@ fn parse_sentinel(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Com
             if parsed.duplicates.contains("event") {
                 return Err(usage.to_owned());
             }
-            let mode = nonempty(flags, "mode").unwrap_or_else(|| "standing".to_owned());
+            let mode = flags.get("mode").cloned().unwrap_or_else(|| "standing".to_owned());
             let fallback_ms = flags
                 .get("fallback-after")
                 .map(|v| parse_duration("fallback-after", v))
