@@ -438,22 +438,43 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     assert Tightbeam.Wakes.get(ctx.db, wake_id).state == "canceled"
   end
 
-  test "the wake scheduler processes the subscription deadline without polling", ctx do
+  test "the wake scheduler processes the subscription deadline", ctx do
     Tightbeam.Rules.load!(ctx.base, Map.keys(ctx.handlers))
-    parent = self()
     once = subscribe(ctx, "sub-a", [], %{mode: "once", fallback_ms: 50})
 
     start_supervised!(
-      {Tightbeam.Wakes,
-       db: ctx.db,
-       name: Tightbeam.WakeScheduler,
-       deliver: fn wake ->
-         send(parent, {:timer_delivery, wake.prompt})
-         :ok
-       end}
+      {Tightbeam.Wakes, db: ctx.db, name: Tightbeam.WakeScheduler, deliver: fn _wake -> :ok end}
     )
 
-    assert_receive {:timer_delivery, prompt}, 2_000
+    # Prompt delivery now goes through notice batching, not the legacy callback.
+    # Observe this subscription's committed fulfillment and its actual wake.
+    fulfilled =
+      Enum.find_value(1..100, fn _ ->
+        {:ok, [[at]]} =
+          DB.query(
+            ctx.db,
+            "SELECT fulfilledAt FROM sentinel_subscriptions WHERE subscriptionId=?1",
+            [once.id]
+          )
+
+        if at,
+          do: at,
+          else:
+            (
+              Process.sleep(10)
+              nil
+            )
+      end)
+
+    assert is_integer(fulfilled)
+
+    assert {:ok, [[prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT w.prompt FROM wakes w JOIN sentinel_subscription_wake_matches m ON m.wakeId=w.wakeId WHERE m.subscriptionId=?1",
+               [once.id]
+             )
+
     assert prompt =~ "Cause: fallback"
     assert prompt =~ once.id
     assert SentinelSubscriptions.demand(ctx.db).demand == []
