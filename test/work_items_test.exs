@@ -585,9 +585,10 @@ defmodule Tightbeam.WorkItemsTest do
        ctx do
     alias Tightbeam.Firehose.Hub
 
-    :ok = Hub.register(Hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+    hub = start_supervised!({Hub, name: nil})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
 
-    on_exit(fn -> Hub.unregister(Hub, self()) end)
+    on_exit(fn -> Hub.unregister(hub, self()) end)
 
     owner = ctx.other.session_key
     new_brief = "Take ownership of the new item."
@@ -601,13 +602,14 @@ defmodule Tightbeam.WorkItemsTest do
                  delivery_owner_session_key: owner,
                  brief: new_brief
                })
+               |> Map.put(:firehose_hub, hub)
              )
 
     assert new_item.deliveryOwnerSessionKey == owner
     assert new_item.title == "New handoff"
 
     created_notice =
-      drain_firehose_notices(Hub)
+      drain_firehose_notices(hub)
       |> Enum.find(&(&1["class"] == "work_item.created"))
 
     assert created_notice
@@ -644,6 +646,7 @@ defmodule Tightbeam.WorkItemsTest do
                  delivery_owner_session_key: owner,
                  brief: existing_brief
                })
+               |> Map.put(:firehose_hub, hub)
              )
 
     assert existing_item.id == existing.id
@@ -651,7 +654,7 @@ defmodule Tightbeam.WorkItemsTest do
     assert existing_item.deliveryOwnerSessionKey == owner
 
     updated_notice =
-      drain_firehose_notices(Hub)
+      drain_firehose_notices(hub)
       |> Enum.find(&(&1["class"] == "work_item.updated"))
 
     assert updated_notice
