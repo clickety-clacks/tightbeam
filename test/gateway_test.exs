@@ -2111,7 +2111,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert ended_seq == base_socket_seq + 2
 
-    assert {:push, {:text, heartbeat_frame}, heartbeat_state} =
+    assert {:push, [{:text, heartbeat_frame}, {:ping, <<>>}], heartbeat_state} =
              ChangeSocket.handle_info(:firehose_heartbeat, socket_state)
 
     assert JSON.decode!(heartbeat_frame) == %{"type" => "heartbeat", "seq" => base_socket_seq + 2}
