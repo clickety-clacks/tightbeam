@@ -1427,7 +1427,7 @@ defmodule Tightbeam.WorkItemsTest do
         ctx.db,
         %{},
         %{rest_principal: %{kind: "user", id: "flynn", is_admin: false}},
-        nil,
+        :earliest,
         10
       )
 
@@ -1456,7 +1456,7 @@ defmodule Tightbeam.WorkItemsTest do
         ctx.db,
         %{},
         %{rest_principal: %{kind: "user", id: "flynn", is_admin: false}},
-        nil,
+        :earliest,
         10
       )
 
@@ -1484,10 +1484,10 @@ defmodule Tightbeam.WorkItemsTest do
       late_item = create(ctx, {:user, "flynn"}, %{title: "Late commit association"})
       unrelated_item = create(ctx, {:user, "flynn"}, %{title: "Unrelated commit"})
 
-      merge_assignment = assign(ctx, "holder", "merge", merge_item.id)
-      head_assignment = assign(ctx, "other-holder", "head", head_item.id)
-      late_assignment = assign(ctx, "holder", "late", late_item.id)
-      unrelated_assignment = assign(ctx, "other-holder", "unrelated", unrelated_item.id)
+      merge_assignment = assign(ctx, "holder", "merge", merge_item.id, "evidence")
+      head_assignment = assign(ctx, "other-holder", "head", head_item.id, "evidence")
+      late_assignment = assign(ctx, "holder", "late", late_item.id, "evidence")
+      unrelated_assignment = assign(ctx, "other-holder", "unrelated", unrelated_item.id, "evidence")
 
       assert %{attest: %{kind: "completion"}} =
                file_attest(ctx, {:session, "holder"}, merge_assignment.id, %{
@@ -1585,7 +1585,7 @@ defmodule Tightbeam.WorkItemsTest do
           ctx.db,
           %{},
           %{rest_principal: %{kind: "user", id: "flynn", is_admin: false}},
-          nil,
+          :earliest,
           10
         )
 
@@ -1628,7 +1628,11 @@ defmodule Tightbeam.WorkItemsTest do
     before_version = get(ctx, {:user, "flynn"}, item.id).workItem.rowVersion
 
     assignment_call =
-      call("assign", {:user, "flynn"}, %{subject: "Summary notice", work_item_id: item.id})
+      call("assign", {:user, "flynn"}, %{
+        subject: "Summary notice",
+        work_item_id: item.id,
+        effect_kind: "evidence"
+      })
       |> Map.merge(%{
         session_key: "holder",
         target_role: nil,
@@ -1934,9 +1938,12 @@ defmodule Tightbeam.WorkItemsTest do
     }
   end
 
-  defp assign(ctx, holder, subject, work_item_id) do
+  defp assign(ctx, holder, subject, work_item_id, effect_kind \\ nil) do
+    params = %{subject: subject, work_item_id: work_item_id}
+    params = if is_nil(effect_kind), do: params, else: Map.put(params, :effect_kind, effect_kind)
+
     assignment_call =
-      call("assign", {:user, "flynn"}, %{subject: subject, work_item_id: work_item_id})
+      call("assign", {:user, "flynn"}, params)
       |> Map.merge(%{session_key: holder, target_role: nil, role_fallback: false})
 
     Assignments.__handle__(ctx.db, "assign", assignment_call)
