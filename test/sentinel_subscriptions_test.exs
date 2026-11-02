@@ -315,8 +315,9 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
                end)
            end}
         ] do
-      first = subscribe(ctx, session, ["channel=!a:x"])
+      first = subscribe(ctx, session, ["channel=!a:x"], %{mode: "once", fallback_ms: 60_000})
       second = subscribe(ctx, session, ["who=@mike:x"])
+      pending = subscribe(ctx, session, ["channel=other"], %{mode: "once", fallback_ms: 60_000})
       posted = post(ctx, "retire-#{session}", "!a:x", "@mike:x")
       wake = wake_for(ctx.db, posted.event.fact_id, session)
 
@@ -330,7 +331,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
 
       assert count(ctx.db, "sentinel_subscriptions", "sessionKey=?1 AND endedAt IS NOT NULL", [
                session
-             ]) == 2
+             ]) == 3
 
       assert Tightbeam.Wakes.get(ctx.db, wake.wake_id).session_key == session
       assert wake_sessions(ctx.db, posted.event.fact_id) == [session]
@@ -339,6 +340,8 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
       after_retire = post(ctx, "after-retire-#{session}", "!a:x", "@mike:x")
       assert wake_sessions(ctx.db, after_retire.event.fact_id) == []
       assert first.id != second.id
+      assert {:ok, :ok} = DB.transaction(ctx.db, &SentinelSubscriptions.fulfill_due_in_txn(&1, pending.fallback_at))
+      assert count(ctx.db, "sentinel_subscription_wake_matches", "subscriptionId=?1", [pending.id]) == 0
     end
   end
 
@@ -420,6 +423,9 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     {:ok, {_, port}} = ThousandIsland.listener_info(server)
     binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
     {:ok, [[token]]} = DB.query(ctx.db, "SELECT cliToken FROM sessions WHERE sessionKey='sub-a'")
+    File.write!(Path.join(ctx.root, ".tightbeam-session"), JSON.encode!(%{
+      url: "http://127.0.0.1:#{port}", token: token, sessionKey: "sub-a"
+    }))
     env = [{"TIGHTBEAM_URL", "http://127.0.0.1:#{port}"}, {"TIGHTBEAM_TOKEN", token},
       {"TIGHTBEAM_BASE_DIR", ctx.base}, {"TIGHTBEAM_AS_PROCESS", nil}]
     cli = fn args ->
