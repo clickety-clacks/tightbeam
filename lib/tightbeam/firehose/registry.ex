@@ -33,6 +33,7 @@ defmodule Tightbeam.Firehose.Registry do
     {"wake.scheduled", "wakes", "upsert", "wakeId"},
     {"wake.fired", "wakes", "upsert", "wakeId"},
     {"wake.canceled", "wakes", "upsert", "wakeId"},
+    {"turn.queued", "turns", "upsert", "turnSeq"},
     {"turn.started", "turns", "upsert", "turnSeq"},
     {"turn.ended", "turns", "upsert", "turnSeq"},
     {"decision_request.opened", "decision requests", "upsert", "decisionRequestId"},
@@ -224,6 +225,9 @@ defmodule Tightbeam.Firehose.Registry do
              serializer: Map.fetch!(@serializers, resource)
            }}
         end)
+        # Queued turns are represented by the subscribe snapshot; the ledger
+        # emits their committed transition as turn.started when claimed.
+        |> Map.update!("turn.queued", &Map.put(&1, :snapshot_only, true))
         |> Map.update!("user.added", fn row ->
           Map.merge(row, %{
             query: :query_user,
