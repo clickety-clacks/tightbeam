@@ -271,7 +271,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     ChangeSocket.terminate(:normal, live_state)
   end
 
-  test "a non-admin session receives another session's active-turn snapshot", ctx do
+  test "a queued turn does not block another session's active-turn snapshot", ctx do
     Devices.add_user(ctx.db, "other", false)
 
     subscriber =
@@ -299,6 +299,15 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
         provider: "anthropic",
         model: Model.new("fable")
       })
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO turns " <>
+                 "(sessionKey, messageId, origin, prompt, status, createdAt) " <>
+                 "VALUES (?1, ?2, ?3, ?4, 'queued', ?5)",
+               [target.session_key, "queued-message", "user:flynn", "queued prompt", 0]
+             )
 
     assert {:ok, _} =
              DB.query(
@@ -339,6 +348,11 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
              ChangeSocket.handle_info({:firehose_notice, notice}, state)
 
     assert JSON.decode!(turn_event)["class"] == "turn.started"
+
+    assert {:push, {:text, heartbeat}, state} =
+             ChangeSocket.handle_info(:firehose_heartbeat, state)
+
+    assert JSON.decode!(heartbeat)["type"] == "heartbeat"
     ChangeSocket.terminate(:normal, state)
   end
 
