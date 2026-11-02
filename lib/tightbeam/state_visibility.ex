@@ -142,7 +142,8 @@ defmodule Tightbeam.StateVisibility do
 
     not is_nil(
       Tightbeam.StateResources.query_work_item(source, work_item_id, %{
-        rest_principal: principal
+        rest_principal: principal,
+        include_work_item_summary: false
       })
     )
   end

@@ -26,7 +26,8 @@ defmodule Tightbeam.WorkItems do
     Rules,
     StateResources,
     StateVisibility,
-    Wakes
+    Wakes,
+    WorkItemSummary
   }
 
   alias Tightbeam.DB.Txn
@@ -200,10 +201,10 @@ defmodule Tightbeam.WorkItems do
 
           best_effort(fn -> on_change(call).(item.id, "metadata") end)
           best_effort(fn -> on_routing_wake_scheduled(call).(routing_wake) end)
-          public_work_item(item) |> then(&Mementos.attach(db, "work_item", &1))
+          handler_summary_work_item(db, item) |> then(&Mementos.attach(db, "work_item", &1))
 
         {:replayed, item} ->
-          public_work_item(item) |> then(&Mementos.attach(db, "work_item", &1))
+          handler_summary_work_item(db, item) |> then(&Mementos.attach(db, "work_item", &1))
       end
     end
   rescue
@@ -265,7 +266,8 @@ defmodule Tightbeam.WorkItems do
         {:updated, item, changed?} ->
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
 
-          result = public_work_item(item) |> then(&Mementos.attach(db, "work_item", &1))
+          result =
+            handler_summary_work_item(db, item) |> then(&Mementos.attach(db, "work_item", &1))
 
           if Map.has_key?(call.params, :body) or Map.get(call.params, :clear_body, false),
             do: %{workItem: result, bodyUpdate: body_update_descriptor(item, changed?)},
@@ -337,7 +339,7 @@ defmodule Tightbeam.WorkItems do
           end
 
           %{
-            workItem: Mementos.attach(db, "work_item", public_work_item(item)),
+            workItem: Mementos.attach(db, "work_item", handler_summary_work_item(db, item)),
             created: created?,
             wakeScheduled: true
           }
@@ -802,7 +804,11 @@ defmodule Tightbeam.WorkItems do
       case result do
         {:disposed, item, changed?, _old_state} ->
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
-          %{ok: true, workItem: Mementos.attach(db, "work_item", public_work_item(item))}
+
+          %{
+            ok: true,
+            workItem: Mementos.attach(db, "work_item", handler_summary_work_item(db, item))
+          }
 
         error ->
           error
@@ -1215,7 +1221,7 @@ defmodule Tightbeam.WorkItems do
 
         item ->
           %{
-            workItem: Mementos.attach(db, "work_item", public_detail_work_item(item)),
+            workItem: Mementos.attach(db, "work_item", handler_detail_work_item(db, item)),
             assignments: Tightbeam.Assignments.__for_work_item__(db, item.id)
           }
       end
@@ -1552,17 +1558,16 @@ defmodule Tightbeam.WorkItems do
   defp list_result(db, call) do
     with :ok <- ensure_body_schema_for_use(db),
          :ok <- principal_allowed(call.principal) do
-      {:ok, rows} =
-        DB.query(db, "SELECT #{columns()} FROM work_items ORDER BY createdAt DESC, id DESC")
+      {:ok, items} =
+        DB.read_transaction(db, fn txn ->
+          Txn.q(txn, "SELECT #{columns()} FROM work_items ORDER BY createdAt DESC, id DESC")
+          |> Enum.map(&work_item/1)
+          |> then(&WorkItemSummary.attach_handler_rows(txn, &1))
+          |> Enum.map(&public_summary/1)
+        end)
 
       %{
-        workItems:
-          Enum.map(rows, fn row ->
-            row
-            |> work_item()
-            |> public_work_item()
-            |> then(&Mementos.attach(db, "work_item", &1))
-          end)
+        workItems: Enum.map(items, &Mementos.attach(db, "work_item", &1))
       }
     end
   end
@@ -1778,6 +1783,10 @@ defmodule Tightbeam.WorkItems do
     )
   end
 
+  @doc false
+  def touch_version_in_txn(%Txn{} = txn, work_item_id) when is_binary(work_item_id),
+    do: stamp_version_in_txn(txn, work_item_id, now())
+
   # The wake-id columns are INTERNAL substrate truth — never surfaced in a
   # response object (§Response shapes).
   defp columns do
@@ -1836,6 +1845,18 @@ defmodule Tightbeam.WorkItems do
       bodyUpdatedBySession: body_updated_by_session,
       bodyUpdatedAt: body_updated_at
     }
+  end
+
+  defp handler_summary_work_item(db, item) do
+    item
+    |> then(&WorkItemSummary.attach_handler_row(db, &1))
+    |> public_summary()
+  end
+
+  defp handler_detail_work_item(db, item) do
+    item
+    |> then(&WorkItemSummary.attach_handler_row(db, &1))
+    |> public_detail_work_item()
   end
 
   defp public_work_item(item), do: public_summary(item)

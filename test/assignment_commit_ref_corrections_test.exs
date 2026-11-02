@@ -4,6 +4,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
   alias Tightbeam.{
     AssignmentCommitRefCorrections,
     Assignments,
+    ConditionFacts,
     DB,
     Gateway,
     Model,
@@ -72,6 +73,177 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     assert entry.actorRef == "po-owner"
     assert entry.cause == "historical_canonical_commitref_correction"
     assert entry.verifiedAt == correction.verifiedAt
+  end
+
+  test "a correction replaces an assignment's attest refs in the work-item summary", ctx do
+    original_refs = [
+      %{"repo" => "old-host:/old/repository", "commit" => String.duplicate("a", 40)},
+      %{"repo" => "old-host:/old/repository", "commit" => String.duplicate("b", 40)}
+    ]
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests (id, assignmentId, kind, bySession, commitRefs, ts) VALUES ('att_old_refs', 'asg_closed', 'completion', 'holder-owner', ?1, 4)",
+               [JSON.encode!(original_refs)]
+             )
+
+    before =
+      WorkItems.__handle__(ctx.db, "work-item-get", %{
+        principal: {:user, "owner"},
+        params: %{work_item_id: "wi_history"}
+      }).workItem
+
+    assert before.attestCounts == %{"completion" => 1}
+    assert before.effectiveCommitRefs == original_refs
+
+    assert %{correction: correction} = correct(ctx, {:session, "po-owner"})
+    [%{"repo" => corrected_repo, "commit" => corrected_commit} | _] = correction.commitRefs
+
+    after_correction =
+      WorkItems.__handle__(ctx.db, "work-item-get", %{
+        principal: {:user, "owner"},
+        params: %{work_item_id: "wi_history"}
+      }).workItem
+
+    assert after_correction.attestCounts == before.attestCounts
+    assert after_correction.verdictCounts == %{}
+
+    assert after_correction.effectiveCommitRefs == [
+             %{"repo" => corrected_repo, "commit" => corrected_commit}
+           ]
+
+    assert after_correction.rowVersion > before.rowVersion
+  end
+
+  test "a correction publishes the complete updated work-item summary", ctx do
+    alias Tightbeam.Firehose.Hub
+
+    hub = start_supervised!({Hub, name: nil})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "owner", is_admin: false})
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests (id, assignmentId, kind, bySession, commitRefs, ts) VALUES ('att_notice_refs', 'asg_closed', 'completion', 'holder-owner', ?1, 4)",
+               [
+                 JSON.encode!([
+                   %{"repo" => "old-repository", "commit" => String.duplicate("a", 40)}
+                 ])
+               ]
+             )
+
+    before =
+      WorkItems.__handle__(ctx.db, "work-item-get", %{
+        principal: {:user, "owner"},
+        params: %{work_item_id: "wi_history"}
+      }).workItem
+
+    handler = Gateway.handlers(%{db: ctx.db})["assignment-commitref-correct"]
+
+    assert %{correction: %{assignmentId: "asg_closed"}} =
+             handler.(%{
+               principal: {:session, "po-owner"},
+               params: params(ctx),
+               firehose_hub: hub
+             })
+
+    assert_receive {:firehose_notice, %{"class" => "work_item.updated", "payload" => payload}}
+    refute_receive {:firehose_notice, %{"class" => "work_item.updated"}}
+
+    after_correction =
+      WorkItems.__handle__(ctx.db, "work-item-get", %{
+        principal: {:user, "owner"},
+        params: %{work_item_id: "wi_history"}
+      }).workItem
+
+    assert payload["id"] == "wi_history"
+    assert payload["holders"] == after_correction.holders
+    assert payload["started"] == after_correction.started
+    assert payload["attestCounts"] == after_correction.attestCounts
+    assert payload["verdictCounts"] == after_correction.verdictCounts
+    assert payload["effectiveCommitRefs"] == after_correction.effectiveCommitRefs
+    assert payload["landings"] == after_correction.landings
+    assert payload["rowVersion"] > before.rowVersion
+    assert payload["rowVersion"] == after_correction.rowVersion
+  end
+
+  if Code.ensure_loaded?(ConditionFacts) and
+       function_exported?(ConditionFacts, :landings_for_commits, 2) do
+    test "a correction removes a landing association without deleting its observed record", ctx do
+      alias Tightbeam.Firehose.Hub
+
+      merge_commit = String.duplicate("a", 40)
+      head_commit = String.duplicate("b", 40)
+
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO attests (id, assignmentId, kind, bySession, commitRefs, ts) VALUES ('att_landing_refs', 'asg_closed', 'completion', 'holder-owner', ?1, 4)",
+                 [
+                   JSON.encode!([
+                     %{"repo" => "unrelated/repository", "commit" => merge_commit}
+                   ])
+                 ]
+               )
+
+      assert %{kind: "landing.observed-merge"} =
+               ConditionFacts.file_idempotent(
+                 ctx.db,
+                 :work_item_summary_test_scheduler,
+                 %{
+                   kind: "landing.observed-merge",
+                   scope: "Example/Repo#12",
+                   origin: "process:landing-watch",
+                   payload: %{
+                     "branch" => "main",
+                     "commit" => merge_commit,
+                     "headCommit" => head_commit
+                   },
+                   idempotency_key: "landing-record:Example/Repo#12:merged:#{merge_commit}"
+                 }
+               )
+
+      before =
+        WorkItems.__handle__(ctx.db, "work-item-get", %{
+          principal: {:user, "owner"},
+          params: %{work_item_id: "wi_history"}
+        }).workItem
+
+      assert [%{"commit" => ^merge_commit}] = before.landings
+
+      hub = start_supervised!({Hub, name: nil})
+
+      :ok =
+        Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "owner", is_admin: false})
+
+      handler = Gateway.handlers(%{db: ctx.db})["assignment-commitref-correct"]
+
+      assert %{correction: %{assignmentId: "asg_closed"}} =
+               handler.(%{
+                 principal: {:session, "po-owner"},
+                 params: params(ctx),
+                 firehose_hub: hub
+               })
+
+      assert_receive {:firehose_notice, %{"class" => "work_item.updated", "payload" => payload}}
+
+      after_correction =
+        WorkItems.__handle__(ctx.db, "work-item-get", %{
+          principal: {:user, "owner"},
+          params: %{work_item_id: "wi_history"}
+        }).workItem
+
+      assert after_correction.landings == []
+      assert payload["landings"] == after_correction.landings
+      assert payload["rowVersion"] > before.rowVersion
+      assert payload["rowVersion"] == after_correction.rowVersion
+
+      assert [%{"commit" => ^merge_commit}] =
+               apply(ConditionFacts, :landings_for_commits, [ctx.db, [merge_commit]])
+
+      on_exit(fn -> Hub.unregister(hub, self()) end)
+    end
   end
 
   test "schema upgrade makes verification time nullable without changing prior corrections",
