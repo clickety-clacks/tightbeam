@@ -267,7 +267,7 @@ defmodule Tightbeam.ConditionFacts do
     end
   end
 
-  defp consequence_admission(_txn, %{kind: kind} = input) do
+  defp consequence_admission(_txn, %{kind: _kind} = input) do
     if is_map(input[:sentinel_event]) do
       if is_map(input[:payload]),
         do: :ok,

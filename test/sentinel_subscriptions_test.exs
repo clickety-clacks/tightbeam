@@ -660,7 +660,11 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
           "example/repo#8",
           "--key",
           "legacy-condition"
-        ], cd: Path.dirname(ctx.root), env: producer_env, stderr_to_stdout: true)
+        ],
+        cd: Path.dirname(ctx.root),
+        env: producer_env,
+        stderr_to_stdout: true
+      )
 
     assert legacy_status == 0, legacy_output
 
