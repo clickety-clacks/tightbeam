@@ -52,6 +52,21 @@ defmodule Tightbeam.AssignmentHolds do
     ON assignment_hold(releasedByRef, releaseKey) WHERE releaseKey IS NOT NULL;
   """
 
+  @schema_objects @ddl
+                  |> String.split(";", trim: true)
+                  |> Enum.map(&String.trim/1)
+                  |> Enum.reject(&(&1 == ""))
+                  |> Enum.map(fn sql ->
+                    [type, name] =
+                      Regex.run(
+                        ~r/\ACREATE\s+(?:UNIQUE\s+)?(TABLE|INDEX)\s+IF NOT EXISTS\s+(\w+)/,
+                        sql,
+                        capture: :all_but_first
+                      )
+
+                    {String.downcase(type), name, sql}
+                  end)
+
   @columns "id,assignmentId,kind,reason,releaseCondition,releaseFactKind,releaseFactScope," <>
              "releaseFactPrincipalRef,imposedByRef,imposedAt,releasedAt,releasedByRef," <>
              "releaseKind,releaseNote,releaseFactId"
@@ -67,27 +82,27 @@ defmodule Tightbeam.AssignmentHolds do
 
   @doc false
   def validate_schema_in_txn(%Txn{} = txn) do
-    expected = ~w(id assignmentId kind reason releaseCondition releaseFactKind releaseFactScope
-                  releaseFactPrincipalRef imposedByRef imposedAt releasedAt releasedByRef
-                  releaseKind releaseNote releaseFactId imposeKey releaseKey)
-
-    actual = Enum.map(Txn.q(txn, "PRAGMA table_info(assignment_hold)"), &Enum.at(&1, 1))
-
-    indexes =
+    actual =
       Txn.q(
         txn,
-        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='assignment_hold' ORDER BY name"
+        """
+        SELECT type,name,sql FROM sqlite_master
+        WHERE tbl_name='assignment_hold' AND sql IS NOT NULL
+          AND type IN ('table','index','trigger')
+        ORDER BY type,name
+        """
       )
-      |> Enum.map(&hd/1)
-      |> Enum.reject(&String.starts_with?(&1, "sqlite_autoindex_"))
+      |> Enum.map(fn [type, name, sql] -> {type, name, normalize_schema_sql(sql)} end)
 
-    required = ~w(assignment_hold_active assignment_hold_history assignment_hold_impose_key
-                  assignment_hold_release_fact assignment_hold_release_key)
+    expected =
+      @schema_objects
+      |> Enum.map(fn {type, name, sql} -> {type, name, normalize_schema_sql(sql)} end)
+      |> Enum.sort()
 
-    unless actual == expected and Enum.sort(indexes) == Enum.sort(required) do
+    unless actual == expected do
       raise DB.Error,
         message:
-          "incompatible assignment_hold schema: columns=#{inspect(actual)} indexes=#{inspect(indexes)}"
+          "incompatible assignment_hold schema: objects=#{inspect(Enum.map(actual, &elem(&1, 1)))}"
     end
 
     :ok
@@ -285,7 +300,10 @@ defmodule Tightbeam.AssignmentHolds do
             with :ok <- authorized(assignment, call.principal) do
               case active_row_in_txn(txn, assignment_id) do
                 nil ->
-                  error("no_active_hold", "assignment has no active hold to release")
+                  error(
+                    "no_active_hold",
+                    "assignment has no active hold; read assignment-get before retrying"
+                  )
 
                 row ->
                   release_in_txn(
@@ -375,12 +393,22 @@ defmodule Tightbeam.AssignmentHolds do
   end
 
   defp nonblank(value, field) when is_binary(value) do
-    if String.length(value) in 1..2000 and String.trim(value) != "",
+    trimmed = String.trim(value)
+
+    if String.length(trimmed) in 1..2000,
       do: :ok,
       else: error("invalid_hold", "#{field} must be 1..2000 non-blank characters")
   end
 
   defp nonblank(_, field), do: error("invalid_hold", "#{field} is required")
+
+  defp normalize_schema_sql(sql) do
+    sql
+    |> String.downcase()
+    |> String.replace(~r/\bif\s+not\s+exists\b/u, "")
+    |> String.replace(~r/\s+/u, "")
+    |> String.trim_trailing(";")
+  end
 
   defp open_assignment(txn, id) do
     case assignment_row_in_txn(txn, id) do

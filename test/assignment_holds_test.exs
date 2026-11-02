@@ -119,6 +119,14 @@ defmodule Tightbeam.AssignmentHoldsTest do
     assert %{code: "invalid_hold"} =
              hold(ctx, {:user, "flynn"}, "held", nil, %{release_fact_kind: "ready"})
 
+    assert %{code: "no_active_hold", message: no_hold_message} =
+             release(ctx, {:user, "flynn"}, "nothing to release", nil)
+
+    assert no_hold_message =~ "assignment-get"
+
+    reason = String.duplicate("x", 2_000)
+    assert %{reason: ^reason} = hold(ctx, {:user, "flynn"}, "held", nil, %{reason: " #{reason} "})
+
     assert %{state: "closed"} =
              Assignments.__handle__(ctx.db, "revoke-assignment", %{
                principal: {:session, ctx.holder.session_key},
@@ -237,6 +245,48 @@ defmodule Tightbeam.AssignmentHoldsTest do
                ctx.db,
                "SELECT name FROM sqlite_master WHERE type='table' AND name='assignment_hold'"
              )
+  end
+
+  test "a stamped hold table with altered constraints is refused", ctx do
+    assert {:ok, [[sql]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sql FROM sqlite_master WHERE type='table' AND name='assignment_hold'"
+             )
+
+    altered =
+      String.replace(
+        sql,
+        "kind IN ('held','standing')",
+        "kind IN ('held','standing','unknown')"
+      )
+
+    assert altered != sql
+
+    assert {:ok, :ok} =
+             DB.migration_transaction(
+               ctx.db,
+               :damage_assignment_hold_shape,
+               [],
+               ["PRAGMA writable_schema=OFF"],
+               fn txn ->
+                 [[version]] = Tightbeam.DB.Txn.q(txn, "PRAGMA schema_version")
+                 :ok = Tightbeam.DB.Txn.exec(txn, "PRAGMA writable_schema=ON")
+
+                 Tightbeam.DB.Txn.q(
+                   txn,
+                   "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='assignment_hold'",
+                   [altered]
+                 )
+
+                 :ok = Tightbeam.DB.Txn.exec(txn, "PRAGMA schema_version=#{version + 1}")
+                 :ok = Tightbeam.DB.Txn.exec(txn, "PRAGMA writable_schema=RESET")
+               end
+             )
+
+    assert_raise Tightbeam.Schema.ShapeError, ~r/assignment hold migration rolled back/, fn ->
+      Tightbeam.Schema.ensure_all(ctx.db)
+    end
   end
 
   defp hold(ctx, principal, kind, key, extra \\ %{}) do
