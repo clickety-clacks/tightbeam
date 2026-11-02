@@ -58,6 +58,28 @@ defmodule Tightbeam.LiveBaseReleaseTest do
 
         restart_log = capture_log(fn -> boot_release!(case_base, app, identity) end)
         assert_warning_once(restart_log)
+
+        if condition == :mismatched do
+          database_path = Path.join(case_base, "state.db")
+          marker_path = Path.join(case_base, "build-owner.json")
+          before_database = File.read!(database_path)
+          other_identity = String.duplicate("f", 64)
+          refute other_identity == identity
+          other_marker = owner_marker(other_identity)
+          File.write!(marker_path, JSON.encode!(other_marker))
+          before_marker = File.read!(marker_path)
+
+          refusal_log =
+            capture_log(fn ->
+              assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_required/, fn ->
+                LiveBaseAdmission.prepare!(case_base, payload_root: app)
+              end
+            end)
+
+          assert_warning_once(refusal_log)
+          assert File.read!(database_path) == before_database
+          assert File.read!(marker_path) == before_marker
+        end
       after
         if File.exists?(manifest_path), do: File.chmod(manifest_path, 0o600)
         File.rm_rf!(case_base)
@@ -113,6 +135,85 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     assert_warning_once(override_log)
     assert File.read!(database_path) == before
     refute File.exists?(Path.join(base, "build-owner.json"))
+  end
+
+  @tag :missing_build_identity
+  test "unverified released package refuses a different owner until the explicit transition", %{
+    root: root,
+    app: app,
+    base: base
+  } do
+    write_provenance!(root)
+    assert LiveBaseRelease.automatic_transition_candidate?(app)
+    {:ok, manifest} = LiveBaseGuard.generate_manifest(LiveBaseAdmission.payload_files!(app))
+    identity = manifest["buildIdentity"]
+    other_identity = String.duplicate("f", 64)
+    refute other_identity == identity
+    manifest_path = Path.join(app, "build-manifest.json")
+    manifest_bytes = JSON.encode!(manifest)
+
+    try do
+      for condition <- [:missing, :unreadable] do
+        case condition do
+          :missing -> File.rm(manifest_path)
+
+          :unreadable ->
+            File.write!(manifest_path, manifest_bytes)
+            :ok = File.chmod(manifest_path, 0o000)
+        end
+
+        case_base = Path.join(base, Atom.to_string(condition))
+
+        try do
+          seed_predecessor!(case_base)
+
+          marker_path = Path.join(case_base, "build-owner.json")
+          previous_marker = owner_marker(other_identity)
+          File.write!(marker_path, JSON.encode!(previous_marker))
+          before_database = File.read!(Path.join(case_base, "state.db"))
+          before_marker = File.read!(marker_path)
+
+          refusal_log =
+            capture_log(fn ->
+              assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_required/, fn ->
+                LiveBaseAdmission.prepare!(case_base, payload_root: app)
+              end
+            end)
+
+          assert_warning_once(refusal_log)
+          assert File.read!(Path.join(case_base, "state.db")) == before_database
+          assert File.read!(marker_path) == before_marker
+
+          transition =
+            JSON.encode!(%{
+              "base" => LiveBaseAdmission.canonical!(case_base),
+              "source" => other_identity,
+              "target" => identity
+            })
+
+          override_log =
+            capture_log(fn ->
+              admission =
+                LiveBaseAdmission.prepare!(case_base,
+                  payload_root: app,
+                  transition: transition
+                )
+
+              assert admission.decision.source == other_identity
+              assert admission.decision.target == identity
+              assert admission.decision.expected_schema == nil
+            end)
+
+          assert_warning_once(override_log)
+          assert File.read!(Path.join(case_base, "state.db")) == before_database
+          assert File.read!(marker_path) == before_marker
+        after
+          File.rm_rf!(case_base)
+        end
+      end
+    after
+      if File.exists?(manifest_path), do: File.chmod(manifest_path, 0o600)
+    end
   end
 
   test "a released package derives the exact unmarked transition without operator input", %{
