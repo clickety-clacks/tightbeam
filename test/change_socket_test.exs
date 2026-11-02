@@ -257,7 +257,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     assert JSON.decode!(queued_event)["class"] == "turn.queued"
 
-    assert {:push, {:text, heartbeat}, state} =
+    assert {:push, [{:text, heartbeat}, {:ping, <<>>}], state} =
              ChangeSocket.handle_info(:firehose_heartbeat, state)
 
     assert JSON.decode!(heartbeat)["type"] == "heartbeat"
@@ -285,7 +285,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert state.phase == :live
     refute_receive {:firehose_notice, %{"class" => "turn.queued"}}
 
-    assert {:push, {:text, heartbeat}, state} =
+    assert {:push, [{:text, heartbeat}, {:ping, <<>>}], state} =
              ChangeSocket.handle_info(:firehose_heartbeat, state)
 
     assert JSON.decode!(heartbeat)["type"] == "heartbeat"
@@ -456,7 +456,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     assert JSON.decode!(turn_event)["class"] == "turn.started"
 
-    assert {:push, {:text, heartbeat}, state} =
+    assert {:push, [{:text, heartbeat}, {:ping, <<>>}], state} =
              ChangeSocket.handle_info(:firehose_heartbeat, state)
 
     assert JSON.decode!(heartbeat)["type"] == "heartbeat"
