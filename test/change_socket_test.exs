@@ -219,7 +219,9 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     assert {:ok, malformed_seq} = enqueue.("malformed-notice")
     assert {:ok, valid_seq} = enqueue.("valid-notice")
-    assert {:ok, _} = DB.query(ctx.db, "UPDATE turns SET roleFallback=2 WHERE seq=?1", [malformed_seq])
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE turns SET roleFallback=2 WHERE seq=?1", [malformed_seq])
 
     {:push, {:text, auth}, state} =
       inbound(%{"type" => "auth", "token" => session.cli_token}, ctx.state)
@@ -881,6 +883,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       |> Enum.reject(fn {_class, row} -> row[:snapshot_only] end)
       |> Enum.map(fn {class, _row} -> class end)
       |> Enum.sort()
+
     extra = declared -- registered
     missing = registered -- declared
 
