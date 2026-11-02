@@ -4214,6 +4214,16 @@ defmodule Tightbeam.Wire.RouterTest do
               String.trim(record["undelivered_reason"]) != ""
 
           assert queued_wake? or delivered? or undelivered?
+
+          refute Enum.any?(facts["sessions"], &(&1["sessionKey"] == personal))
+          assert plan["rule"] == "assignment-terminal-handoff"
+          assert plan["value"]["on_unavailable"] == "undelivered"
+          assert plan["value"]["unavailable"]["session_key"] == personal
+          assert record["action_status"] == "pending"
+          assert record["wake_session"] == personal
+          assert record["wake_owner"] == "flynn"
+          assert undelivered?
+          assert record["undelivered_reason"] == "terminal_notification_recipient_unavailable"
         end)
       end
 
