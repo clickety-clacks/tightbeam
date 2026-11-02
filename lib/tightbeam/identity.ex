@@ -951,7 +951,9 @@ defmodule Tightbeam.Identity do
 
   defp sentinel_event!(entry, path, prefix) when is_map(entry) do
     name = Map.get(entry, "name")
-    event_ref = if is_nil(prefix), do: name || "<unnamed>", else: "#{prefix}/#{name || "<unnamed>"}"
+
+    event_ref =
+      if is_nil(prefix), do: name || "<unnamed>", else: "#{prefix}/#{name || "<unnamed>"}"
 
     case Map.keys(entry) -- @sentinel_event_keys do
       [] ->

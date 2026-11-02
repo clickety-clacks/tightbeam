@@ -2970,7 +2970,15 @@ defmodule Tightbeam.Rules do
     owner_user_id = Map.get(call, :predicate_owner_user_id)
 
     filter = if is_nil(scope), do: %{}, else: %{"scope" => [scope]}
-    case Tightbeam.SentinelSubscriptions.matching_fact(db, kind, filter, after_id, owner_user_id, fact_id) do
+
+    case Tightbeam.SentinelSubscriptions.matching_fact(
+           db,
+           kind,
+           filter,
+           after_id,
+           owner_user_id,
+           fact_id
+         ) do
       nil -> {false, cache}
       match -> {true, Map.put(cache, "$condition_match", Map.take(match, [:id, :scope]))}
     end

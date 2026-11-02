@@ -99,6 +99,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
   test "ordinary scripts share the catalog and duplicate global kinds refuse atomically", ctx do
     path = Path.join([ctx.bundles, "script", "manifest.toml"])
     File.mkdir_p!(Path.dirname(path))
+
     File.write!(path, """
     purpose = "A script producer without a supervised process."
     root_archetype = "default"
@@ -112,6 +113,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     learn!(ctx.base, "script")
     events = ctx.handlers["sentinel-events"].(%{params: %{}}).events
     assert Enum.map(events, & &1.qualified) == [@event, "sample.done"]
+
     assert Enum.find(events, &(&1.qualified == "sample.done")).details == [
              %{name: "object", description: "The completed object."}
            ]
@@ -356,12 +358,54 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
            ) == 1
   end
 
-  defp subscribe(ctx, session, where) do
+  test "once and standing share a delivery, consume demand, and retain queued justification", ctx do
+    once = subscribe(ctx, "sub-a", [], %{mode: "once", fallback_ms: 60_000})
+    standing = subscribe(ctx, "sub-a", ["channel=a"])
+    assert subscribe(ctx, "sub-a", [], %{mode: "once", fallback_ms: 60_000}) == once
+    assert %{code: "invalid"} = subscribe(ctx, "sub-a", [], %{fallback_ms: 60_000})
+    assert %{code: "invalid"} = subscribe(ctx, "sub-a", [], %{mode: "standing", fallback_ms: 60_000})
+    assert length(SentinelSubscriptions.demand(ctx.db).demand) == 2
+
+    first = post(ctx, "once-first", "a", "x")
+    wake = wake_for(ctx.db, first.event.fact_id, "sub-a")
+    assert wake.prompt =~ once.id
+    assert wake.prompt =~ standing.id
+    assert [%{filter: %{"channel" => ["a"]}}] = SentinelSubscriptions.demand(ctx.db).demand
+    assert [%{id: id}] = ctx.handlers["sentinel-subscriptions"].(%{principal: {:session, "sub-a"}}).subscriptions
+    assert id == standing.id
+    unsubscribe(ctx, "sub-a", standing.id)
+    assert Tightbeam.Wakes.get(ctx.db, wake.wake_id).state == "pending"
+    assert %{ended: true} = unsubscribe(ctx, "sub-a", once.id)
+    assert Tightbeam.Wakes.get(ctx.db, wake.wake_id).state == "canceled"
+    assert %{ended: true} = unsubscribe(ctx, "sub-a", once.id)
+    second = post(ctx, "once-second", "a", "x")
+    assert wakes_for(ctx.db, second.event.fact_id, "sub-a") == []
+  end
+
+  test "once fallback fires only once and cancellation withdraws its deadline", ctx do
+    once = subscribe(ctx, "sub-a", [], %{mode: "once", fallback_ms: 60_000})
+    cancelled = subscribe(ctx, "sub-b", [], %{mode: "once", fallback_ms: 60_000})
+    unsubscribe(ctx, "sub-b", cancelled.id)
+    assert {:ok, :ok} = DB.transaction(ctx.db, &SentinelSubscriptions.fulfill_due_in_txn(&1, once.fallback_at))
+    assert SentinelSubscriptions.demand(ctx.db).demand == []
+    assert {:ok, [[wake_id, prompt]]} = DB.query(ctx.db,
+      "SELECT w.wakeId,w.prompt FROM wakes w JOIN sentinel_subscription_wake_matches m ON w.wakeId=m.wakeId WHERE m.subscriptionId=?1", [once.id])
+    assert prompt =~ "Cause: fallback"
+    assert prompt =~ "Deadline: #{once.fallback_at}"
+    assert {:ok, :ok} = DB.transaction(ctx.db, &SentinelSubscriptions.fulfill_due_in_txn(&1, once.fallback_at + 1))
+    assert count(ctx.db, "sentinel_subscription_wake_matches", "subscriptionId=?1", [once.id]) == 1
+    event = post(ctx, "after-fallback", "a", "x")
+    assert wakes_for(ctx.db, event.event.fact_id, "sub-a") == []
+    unsubscribe(ctx, "sub-a", once.id)
+    assert Tightbeam.Wakes.get(ctx.db, wake_id).state == "canceled"
+  end
+
+  defp subscribe(ctx, session, where, options \\ %{}) do
     ctx.handlers["sentinel-subscribe"].(%{
       origin: "session:" <> session,
       principal: {:session, session},
       session_key: session,
-      params: %{event: @event, where: where}
+      params: Map.merge(%{event: @event, where: where}, options)
     })
   end
 

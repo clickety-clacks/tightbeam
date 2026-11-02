@@ -1713,12 +1713,29 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 string_list_field("detail", details),
             ],
         )),
-        Command::SentinelDemand { identity, prefixes } => Ok(request(identity, "sentinel-demand", vec![], vec![string_list_field("kindPrefixes", prefixes)])),
-        Command::SentinelSubscribe { identity, event, where_values, mode, fallback_ms } => {
-            let mut params = vec![string_field("event", event), string_list_field("where", where_values), string_field("mode", mode)];
-            if let Some(ms) = fallback_ms { params.push(format!("\"fallbackMs\":{ms}")); }
+        Command::SentinelDemand { identity, prefixes } => Ok(request(
+            identity,
+            "sentinel-demand",
+            vec![],
+            vec![string_list_field("kindPrefixes", prefixes)],
+        )),
+        Command::SentinelSubscribe {
+            identity,
+            event,
+            where_values,
+            mode,
+            fallback_ms,
+        } => {
+            let mut params = vec![
+                string_field("event", event),
+                string_list_field("where", where_values),
+                string_field("mode", mode),
+            ];
+            if let Some(ms) = fallback_ms {
+                params.push(format!("\"fallbackMs\":{ms}"));
+            }
             Ok(request(identity, "sentinel-subscribe", vec![], params))
-        },
+        }
         Command::SentinelSubscriptions { identity } => {
             Ok(request(identity, "sentinel-subscriptions", vec![], vec![]))
         }

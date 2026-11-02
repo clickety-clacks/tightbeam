@@ -624,7 +624,10 @@ pub enum Command {
         mode: String,
         fallback_ms: Option<String>,
     },
-    SentinelDemand { identity: Identity, prefixes: Vec<String> },
+    SentinelDemand {
+        identity: Identity,
+        prefixes: Vec<String>,
+    },
     SentinelSubscriptions {
         identity: Identity,
     },
@@ -4017,11 +4020,18 @@ fn parse_sentinel(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Com
             })
         }
         [_, demand] if demand == "demand" => {
-            let prefixes = parsed.repeated.get("kind-prefix").cloned().unwrap_or_default();
+            let prefixes = parsed
+                .repeated
+                .get("kind-prefix")
+                .cloned()
+                .unwrap_or_default();
             if prefixes.iter().any(String::is_empty) {
                 return Err("--kind-prefix requires a nonempty prefix".to_owned());
             }
-            Ok(Command::SentinelDemand { identity: identity(flags)?, prefixes })
+            Ok(Command::SentinelDemand {
+                identity: identity(flags)?,
+                prefixes,
+            })
         }
         [_, subscribe] if subscribe == "subscribe" => {
             let event = nonempty(flags, "event").ok_or_else(|| usage.to_owned())?;
@@ -4029,8 +4039,13 @@ fn parse_sentinel(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Com
                 return Err(usage.to_owned());
             }
             let mode = nonempty(flags, "mode").unwrap_or_else(|| "standing".to_owned());
-            let fallback_ms = flags.get("fallback-after").map(|v| parse_duration("fallback-after", v)).transpose()?;
-            if !["once", "standing"].contains(&mode.as_str()) || (mode == "standing" && fallback_ms.is_some()) {
+            let fallback_ms = flags
+                .get("fallback-after")
+                .map(|v| parse_duration("fallback-after", v))
+                .transpose()?;
+            if !["once", "standing"].contains(&mode.as_str())
+                || (mode == "standing" && fallback_ms.is_some())
+            {
                 return Err("mode must be once or standing; fallback requires once".to_owned());
             }
             Ok(Command::SentinelSubscribe {

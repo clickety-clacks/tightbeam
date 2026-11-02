@@ -1142,6 +1142,7 @@ defmodule Tightbeam.Gateway do
       end,
       {"sentinel-demand", []} => fn call ->
         prefixes = call.params[:kind_prefixes] || []
+
         if is_list(prefixes) and Enum.all?(prefixes, &(is_binary(&1) and &1 != "")),
           do: SentinelSubscriptions.demand(db, prefixes),
           else: %{code: "invalid", message: "--kind-prefix requires nonempty strings"}
@@ -1195,7 +1196,10 @@ defmodule Tightbeam.Gateway do
              {:ok, event} <- Sentinels.resolve_event(config.base_dir, p[:event]),
              {:ok, where_pairs} <- sentinel_filter_pairs(p[:where]) do
           case DB.transaction(db, fn txn ->
-                 SentinelSubscriptions.subscribe_in_txn(txn, session_key, event, where_pairs, %{mode: p[:mode], fallback_ms: p[:fallback_ms]})
+                 SentinelSubscriptions.subscribe_in_txn(txn, session_key, event, where_pairs, %{
+                   mode: p[:mode],
+                   fallback_ms: p[:fallback_ms]
+                 })
                end) do
             {:ok, result} -> result
             {:error, error} -> raise error

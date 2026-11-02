@@ -15,13 +15,15 @@ defmodule Tightbeam.FactProducers do
   def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
 
   def demand(db \\ DB, prefixes \\ []) do
-    demand = Tightbeam.SentinelSubscriptions.demand(db, prefixes).demand
+    demand =
+      Tightbeam.SentinelSubscriptions.demand(db, prefixes).demand
       |> Enum.filter(fn %{filter: filter} -> Map.keys(filter) -- ["scope"] == [] end)
       |> Enum.flat_map(fn %{kind: kind, filter: filter} ->
         Enum.map(Map.get(filter, "scope", [nil]), &%{kind: kind, scope: &1})
       end)
       |> Enum.uniq()
       |> Enum.sort_by(&{&1.kind, &1.scope})
+
     %{demand: demand}
   end
 
