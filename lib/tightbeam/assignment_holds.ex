@@ -268,7 +268,7 @@ defmodule Tightbeam.AssignmentHolds do
     principal = principal_ref(call.principal)
     key = call.params[:idempotency_key]
 
-    case release_replay_in_txn(txn, principal, key, call.params[:reason]) do
+    case release_replay_in_txn(txn, principal, key, assignment_id, call.params[:reason]) do
       {:replay, existing} ->
         existing
 
@@ -442,9 +442,9 @@ defmodule Tightbeam.AssignmentHolds do
     end
   end
 
-  defp release_replay_in_txn(_txn, _principal, nil, _reason), do: :new
+  defp release_replay_in_txn(_txn, _principal, nil, _assignment_id, _reason), do: :new
 
-  defp release_replay_in_txn(txn, principal, key, reason) do
+  defp release_replay_in_txn(txn, principal, key, assignment_id, reason) do
     case Txn.q(
            txn,
            "SELECT #{@columns} FROM assignment_holds WHERE releasedByRef=?1 AND releaseKey=?2",
@@ -456,10 +456,11 @@ defmodule Tightbeam.AssignmentHolds do
       [row] ->
         existing = hold(row)
 
-        if existing.releaseKind == "released" and existing.releaseNote == String.trim(reason),
-          do: {:replay, existing},
-          else:
-            error("conflict", "release idempotency key already has different immutable content")
+        if existing.assignmentId == assignment_id and existing.releaseKind == "released" and
+             existing.releaseNote == String.trim(reason),
+           do: {:replay, existing},
+           else:
+             error("conflict", "release idempotency key already has different immutable content")
     end
   end
 
