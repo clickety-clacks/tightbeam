@@ -11,6 +11,20 @@ defmodule Tightbeam.WorkItemSummary do
   end
 
   @doc false
+  def attach_handler_row(db, %{id: work_item_id} = row) do
+    summary = fields(db, work_item_id)
+
+    Map.merge(row, %{
+      holders: summary.holders,
+      started: summary.started,
+      attestCounts: summary.attest_counts,
+      verdictCounts: summary.verdict_counts,
+      effectiveCommitRefs: summary.effective_commit_refs,
+      landings: summary.landings
+    })
+  end
+
+  @doc false
   def fields(db, work_item_id) do
     holders =
       query(db,

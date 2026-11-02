@@ -85,7 +85,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
              DB.query(
                ctx.db,
                "INSERT INTO attests (id, assignmentId, kind, bySession, commitRefs, ts) VALUES ('att_old_refs', 'asg_closed', 'completion', 'holder-owner', ?1, 4)",
-               [Tightbeam.JSON.encode!(original_refs)]
+               [JSON.encode!(original_refs)]
              )
 
     before =
@@ -124,7 +124,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
              DB.query(
                ctx.db,
                "INSERT INTO attests (id, assignmentId, kind, bySession, commitRefs, ts) VALUES ('att_notice_refs', 'asg_closed', 'completion', 'holder-owner', ?1, 4)",
-               [Tightbeam.JSON.encode!([%{"repo" => "old-repository", "commit" => String.duplicate("a", 40)}])]
+               [JSON.encode!([%{"repo" => "old-repository", "commit" => String.duplicate("a", 40)}])]
              )
 
     before =
@@ -175,7 +175,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
                  ctx.db,
                  "INSERT INTO attests (id, assignmentId, kind, bySession, commitRefs, ts) VALUES ('att_landing_refs', 'asg_closed', 'completion', 'holder-owner', ?1, 4)",
                  [
-                   Tightbeam.JSON.encode!([
+                   JSON.encode!([
                      %{"repo" => "unrelated/repository", "commit" => merge_commit}
                    ])
                  ]

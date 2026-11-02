@@ -200,10 +200,10 @@ defmodule Tightbeam.WorkItems do
 
           best_effort(fn -> on_change(call).(item.id, "metadata") end)
           best_effort(fn -> on_routing_wake_scheduled(call).(routing_wake) end)
-          public_work_item(item) |> then(&Mementos.attach(db, "work_item", &1))
+          handler_summary_work_item(db, item) |> then(&Mementos.attach(db, "work_item", &1))
 
         {:replayed, item} ->
-          public_work_item(item) |> then(&Mementos.attach(db, "work_item", &1))
+          handler_summary_work_item(db, item) |> then(&Mementos.attach(db, "work_item", &1))
       end
     end
   rescue
@@ -265,7 +265,7 @@ defmodule Tightbeam.WorkItems do
         {:updated, item, changed?} ->
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
 
-          result = public_work_item(item) |> then(&Mementos.attach(db, "work_item", &1))
+          result = handler_summary_work_item(db, item) |> then(&Mementos.attach(db, "work_item", &1))
 
           if Map.has_key?(call.params, :body) or Map.get(call.params, :clear_body, false),
             do: %{workItem: result, bodyUpdate: body_update_descriptor(item, changed?)},
@@ -337,7 +337,7 @@ defmodule Tightbeam.WorkItems do
           end
 
           %{
-            workItem: Mementos.attach(db, "work_item", public_work_item(item)),
+            workItem: Mementos.attach(db, "work_item", handler_summary_work_item(db, item)),
             created: created?,
             wakeScheduled: true
           }
@@ -802,7 +802,10 @@ defmodule Tightbeam.WorkItems do
       case result do
         {:disposed, item, changed?, _old_state} ->
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
-          %{ok: true, workItem: Mementos.attach(db, "work_item", public_work_item(item))}
+          %{
+            ok: true,
+            workItem: Mementos.attach(db, "work_item", handler_summary_work_item(db, item))
+          }
 
         error ->
           error
@@ -1215,7 +1218,7 @@ defmodule Tightbeam.WorkItems do
 
         item ->
           %{
-            workItem: Mementos.attach(db, "work_item", public_detail_work_item(item)),
+            workItem: Mementos.attach(db, "work_item", handler_detail_work_item(db, item)),
             assignments: Tightbeam.Assignments.__for_work_item__(db, item.id)
           }
       end
@@ -1560,7 +1563,7 @@ defmodule Tightbeam.WorkItems do
           Enum.map(rows, fn row ->
             row
             |> work_item()
-            |> public_work_item()
+            |> then(&handler_summary_work_item(db, &1))
             |> then(&Mementos.attach(db, "work_item", &1))
           end)
       }
@@ -1840,6 +1843,18 @@ defmodule Tightbeam.WorkItems do
       bodyUpdatedBySession: body_updated_by_session,
       bodyUpdatedAt: body_updated_at
     }
+  end
+
+  defp handler_summary_work_item(db, item) do
+    item
+    |> then(&WorkItemSummary.attach_handler_row(db, &1))
+    |> public_summary()
+  end
+
+  defp handler_detail_work_item(db, item) do
+    item
+    |> then(&WorkItemSummary.attach_handler_row(db, &1))
+    |> public_detail_work_item()
   end
 
   defp public_work_item(item), do: public_summary(item)

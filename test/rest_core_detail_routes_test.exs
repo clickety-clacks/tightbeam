@@ -300,7 +300,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     }
   end
 
-  test "real reopen returns the canonical REST assignment and one notice", ctx do
+  test "real reopen returns the canonical REST assignment and summary notice", ctx do
     call = %{
       verb: "revoke-assignment",
       origin: "user:flynn",
@@ -348,10 +348,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
              "wake.canceled" => [%{"payload" => canceled}],
              "message.created" => [%{"payload" => message}],
              "verb.accepted" => [_accepted],
-             "assignment.reopened" => [%{"payload" => payload, "refs" => refs}]
+             "assignment.reopened" => [%{"payload" => payload, "refs" => refs}],
+             "work_item.updated" => [%{"payload" => work_item}]
            } = notices
 
-    assert map_size(notices) == 4
+    assert map_size(notices) == 5
     assert canceled["workItemId"] == ctx.work_item.id
     assert canceled["state"] == "canceled"
     assert message["sessionKey"] == ctx.assignment.holderKey
@@ -361,6 +362,13 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
              "[assignment reopened: #{ctx.assignment.id} by user:flynn — REST parity]"
 
     assert refs["assignmentId"] == ctx.assignment.id
+    assert work_item["id"] == ctx.work_item.id
+    assert work_item["holders"] == [ctx.assignment.holderKey]
+    assert work_item["started"] == true
+    assert is_map(work_item["attestCounts"])
+    assert is_map(work_item["verdictCounts"])
+    assert is_list(work_item["effectiveCommitRefs"])
+    assert is_list(work_item["landings"])
     response = get(ctx, "/api/assignments/#{ctx.assignment.id}")
     assert response.status == 200
     assert JSON.decode!(response.resp_body)["item"] == payload

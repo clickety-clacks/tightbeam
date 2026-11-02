@@ -1307,7 +1307,15 @@ defmodule Tightbeam.WorkItemsTest do
              :verdictCounts,
              :effectiveCommitRefs,
              :landings
-           ]) == first
+           ]) ==
+           Map.drop(first, [
+             :holders,
+             :started,
+             :attestCounts,
+             :verdictCounts,
+             :effectiveCommitRefs,
+             :landings
+           ])
 
     assert detail.body == nil
     second = create(ctx, {:user, "flynn"}, %{title: "Second"})
@@ -1348,6 +1356,19 @@ defmodule Tightbeam.WorkItemsTest do
 
     assert Enum.count(detail.assignments, &(&1.state == "open")) == 2
     assert Enum.count(detail.assignments, &(&1.state == "closed")) == 1
+    assert detail.workItem.holders == ["holder", "other-holder"]
+    assert detail.workItem.started == true
+
+    listed_item =
+      list(ctx, {:user, "flynn"}).workItems
+      |> Enum.find(&(&1.id == first.id))
+
+    assert listed_item.holders == detail.workItem.holders
+    assert listed_item.started == detail.workItem.started
+    assert listed_item.attestCounts == detail.workItem.attestCounts
+    assert listed_item.verdictCounts == detail.workItem.verdictCounts
+    assert listed_item.effectiveCommitRefs == detail.workItem.effectiveCommitRefs
+    assert listed_item.landings == detail.workItem.landings
   end
 
   test "detail and page reads summarize holders, started state, raw evidence, and effective commits",
@@ -1468,23 +1489,23 @@ defmodule Tightbeam.WorkItemsTest do
       late_assignment = assign(ctx, "holder", "late", late_item.id)
       unrelated_assignment = assign(ctx, "other-holder", "unrelated", unrelated_item.id)
 
-      assert %{attest: %{kind: "progress"}} =
+      assert %{attest: %{kind: "completion"}} =
                file_attest(ctx, {:session, "holder"}, merge_assignment.id, %{
-                 kind: "progress",
+                 kind: "completion",
                  note: "cites the merge commit",
                  commit_refs: [%{"repo" => "unrelated/repository", "commit" => merge_commit}]
                })
 
-      assert %{attest: %{kind: "progress"}} =
+      assert %{attest: %{kind: "completion"}} =
                file_attest(ctx, {:session, "other-holder"}, head_assignment.id, %{
-                 kind: "progress",
+                 kind: "completion",
                  note: "cites the head commit",
                  commit_refs: [%{"repo" => "another/repository", "commit" => head_commit}]
                })
 
-      assert %{attest: %{kind: "progress"}} =
+      assert %{attest: %{kind: "completion"}} =
                file_attest(ctx, {:session, "other-holder"}, unrelated_assignment.id, %{
-                 kind: "progress",
+                 kind: "completion",
                  note: "cites a different commit",
                  commit_refs: [%{"repo" => "Example/Repo", "commit" => unrelated_commit}]
                })
@@ -1574,13 +1595,13 @@ defmodule Tightbeam.WorkItemsTest do
       late_call =
         call("attest", {:session, "holder"}, %{
           assignment_id: late_assignment.id,
-          kind: "progress",
+          kind: "completion",
           note: "adds the already-observed head commit",
           commit_refs: [%{"repo" => "different/repository", "commit" => head_commit}]
         })
         |> Map.merge(%{firehose_in_txn: true, firehose_hub: hub})
 
-      assert %{attest: %{kind: "progress"}} =
+      assert %{attest: %{kind: "completion"}} =
                Assignments.__handle__(ctx.db, "attest", late_call)
 
       late_notices = drain_firehose_notices(hub)
@@ -1921,7 +1942,7 @@ defmodule Tightbeam.WorkItemsTest do
                    "att_summary_#{assignment_id}_#{index}",
                    assignment_id,
                    session_key,
-                   Tightbeam.JSON.encode!(refs),
+                   JSON.encode!(refs),
                    index
                  ]
                )
