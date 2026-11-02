@@ -84,7 +84,7 @@ defmodule Tightbeam.LiveBaseAdmission do
              manifest.status == previous.manifest_status and
              manifest.observation == previous.manifest_observation and
              manifest.problem == previous.manifest_problem,
-      do: refuse!("payload changed after admission")
+           do: refuse!("payload changed after admission")
 
     path = Path.join(previous.base, "build-owner.json")
 
@@ -120,7 +120,7 @@ defmodule Tightbeam.LiveBaseAdmission do
     current_manifest = observed_manifest!(payload, observed)
 
     unless observed == files and current_manifest == manifest,
-           do: refuse!("payload changed during admission")
+      do: refuse!("payload changed during admission")
 
     if warn_unverified? and manifest.status == :unverified do
       Logger.warning("build identity could not be verified from build-manifest.json")
@@ -228,7 +228,8 @@ defmodule Tightbeam.LiveBaseAdmission do
 
       {:ok, %{type: :symlink}} ->
         case File.stat(path) do
-          {:ok, %{type: :regular}} -> read_manifest!(path, files, actual)
+          {:ok, %{type: :regular}} ->
+            read_manifest!(path, files, actual)
 
           {:error, reason} when reason in [:eacces, :eperm] ->
             unverified_manifest(actual, {:unreadable, reason}, :unreadable)

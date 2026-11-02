@@ -720,7 +720,9 @@ defmodule Tightbeam.LiveBaseReleaseTest do
       :ok = Schema.ensure_all(db)
       target = hd(Schema.guard_compatible_stamps())
       assert {:ok, [[^target]]} = DB.query(db, "SELECT shape FROM schema_stamp")
-      assert JSON.decode!(File.read!(Path.join(base, "build-owner.json"))) == owner_marker(identity)
+
+      assert JSON.decode!(File.read!(Path.join(base, "build-owner.json"))) ==
+               owner_marker(identity)
     after
       :ok = GenServer.stop(db)
     end

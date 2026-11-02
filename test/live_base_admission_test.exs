@@ -482,10 +482,11 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
   test "changed and extra payload bytes warn and remain fresh before base creation", ctx do
     cases = [
       {"changed file", fn -> File.write!(Path.join(ctx.payload, "priv/rule"), "changed") end},
-      {"extra file", fn ->
-        File.write!(Path.join(ctx.payload, "priv/rule"), "synthetic rule")
-        File.write!(Path.join(ctx.payload, "priv/extra"), "extra")
-      end}
+      {"extra file",
+       fn ->
+         File.write!(Path.join(ctx.payload, "priv/rule"), "synthetic rule")
+         File.write!(Path.join(ctx.payload, "priv/extra"), "extra")
+       end}
     ]
 
     for {_name, alter_payload} <- cases do
