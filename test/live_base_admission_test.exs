@@ -1,5 +1,6 @@
 defmodule Tightbeam.LiveBaseAdmissionTest do
   use Tightbeam.TestCase, async: false
+  import ExUnit.CaptureLog
 
   @tag :marker_publication
   test "publication requires target schema and refreshes the retained owner", ctx do
@@ -478,22 +479,33 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
     refute File.exists?(ctx.base)
   end
 
-  test "changed and extra payload bytes refuse before base creation", ctx do
-    File.write!(Path.join(ctx.payload, "priv/rule"), "changed")
+  test "changed and extra payload bytes warn and remain fresh before base creation", ctx do
+    cases = [
+      {"changed file", fn -> File.write!(Path.join(ctx.payload, "priv/rule"), "changed") end},
+      {"extra file", fn ->
+        File.write!(Path.join(ctx.payload, "priv/rule"), "synthetic rule")
+        File.write!(Path.join(ctx.payload, "priv/extra"), "extra")
+      end}
+    ]
 
-    assert_raise LiveBaseAdmission.Refusal, ~r/payload_manifest_mismatch/, fn ->
-      LiveBaseAdmission.prepare!(ctx.base, ctx.options)
+    for {_name, alter_payload} <- cases do
+      alter_payload.()
+
+      log =
+        capture_log(fn ->
+          admission = LiveBaseAdmission.prepare!(ctx.base, ctx.options)
+          actual_files = LiveBaseAdmission.payload_files!(ctx.payload)
+          {:ok, actual_manifest} = LiveBaseGuard.generate_manifest(actual_files)
+
+          assert admission.stamp == :fresh
+          assert admission.manifest_status == :unverified
+          assert admission.identity == actual_manifest["buildIdentity"]
+          assert admission.marker == :absent
+        end)
+
+      assert_warning_once(log)
+      refute File.exists?(ctx.base)
     end
-
-    refute File.exists?(ctx.base)
-    File.write!(Path.join(ctx.payload, "priv/rule"), "synthetic rule")
-    File.write!(Path.join(ctx.payload, "priv/extra"), "extra")
-
-    assert_raise LiveBaseAdmission.Refusal, ~r/payload_manifest_mismatch/, fn ->
-      LiveBaseAdmission.prepare!(ctx.base, ctx.options)
-    end
-
-    refute File.exists?(ctx.base)
   end
 
   test "unknown schema refuses read-only without changing database inventory", ctx do
@@ -533,5 +545,11 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
     |> Enum.map(fn name ->
       {name, File.read!(Path.join(base, name))}
     end)
+  end
+
+  defp assert_warning_once(log) do
+    warning = "build identity could not be verified from build-manifest.json"
+    assert log =~ warning
+    assert length(Regex.scan(Regex.compile!(Regex.escape(warning)), log)) == 1
   end
 end
