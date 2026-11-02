@@ -491,6 +491,12 @@ defmodule Tightbeam.ConditionFacts do
 
              case {outcome, firehose_call} do
                {{%{fact_id: _} = fact, true}, %{} = call} ->
+                 if fact.kind == "landing.observed-merge" do
+                   # Keep rowVersion changes and complete work-item notices atomic with the
+                   # observer fact. Replays take the `false` branch and do not republish.
+                   Tightbeam.WorkItemSummary.publish_observed_merge_in_txn(txn, fact, call)
+                 end
+
                  Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, fact)
 
                {{%{fact_id: _}, false}, %{} = call} ->
