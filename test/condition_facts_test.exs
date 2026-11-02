@@ -705,6 +705,123 @@ defmodule Tightbeam.ConditionFactsTest do
     end
   end
 
+  test "observed merge payloads persist once and associate by exact merge or head commit", ctx do
+    merge_commit = String.duplicate("a", 40)
+    head_commit = String.duplicate("b", 40)
+
+    prior_settlement =
+      ConditionFacts.file_idempotent(ctx.db, ctx.scheduler, %{
+        kind: "landing.settled",
+        scope: "Example/Repo#7",
+        origin: "process:landing-watch",
+        idempotency_key: "landing-fact:Example/Repo#7:merged:#{merge_commit}"
+      })
+
+    assert prior_settlement.kind == "landing.settled"
+    assert ConditionFacts.landings_for_commits(ctx.db, [merge_commit]) == []
+
+    assert {:error, %{code: "invalid"}} =
+             ConditionFacts.file_idempotent(ctx.db, ctx.scheduler, %{
+               kind: "landing.observed-merge",
+               scope: "Example/Repo#7",
+               origin: "process:landing-watch",
+               idempotency_key: "landing-record-without-payload"
+             })
+
+    input = %{
+      kind: "landing.observed-merge",
+      scope: "Example/Repo#7",
+      origin: "process:landing-watch",
+      payload: %{
+        "branch" => "release/1.2",
+        "commit" => merge_commit,
+        "headCommit" => head_commit
+      },
+      idempotency_key: "landing-record:Example/Repo#7:merged:#{merge_commit}"
+    }
+
+    first = ConditionFacts.file_idempotent(ctx.db, ctx.scheduler, input)
+
+    replay =
+      ConditionFacts.file_idempotent(ctx.db, ctx.scheduler, %{
+        input
+        | idempotency_key: "landing-record-replay:Example/Repo#7:merged:#{merge_commit}"
+      })
+
+    assert replay == first
+
+    assert ConditionFacts.landings_for_commits(ctx.db, [merge_commit]) == [
+             %{
+               "repository" => "Example/Repo",
+               "branch" => "release/1.2",
+               "commit" => merge_commit,
+               "headCommit" => head_commit,
+               "pullRequest" => 7,
+               "observedAt" => first.ts
+             }
+           ]
+
+    assert ConditionFacts.landings_for_commits(ctx.db, [head_commit]) ==
+             ConditionFacts.landings_for_commits(ctx.db, [merge_commit])
+
+    assert ConditionFacts.landings_for_commits(ctx.db, [String.duplicate("c", 40)]) == []
+    assert ConditionFacts.landings_for_commits(ctx.db, []) == []
+
+    other_merge_commit = String.duplicate("e", 40)
+    other_head_commit = String.duplicate("f", 40)
+
+    earlier_pull =
+      ConditionFacts.file_idempotent(ctx.db, ctx.scheduler, %{
+        kind: "landing.observed-merge",
+        scope: "example/repo#3",
+        origin: "process:landing-watch",
+        payload: %{
+          "branch" => "main",
+          "commit" => other_merge_commit,
+          "headCommit" => other_head_commit
+        },
+        idempotency_key: "landing-record:example/repo#3:merged:#{other_merge_commit}"
+      })
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE condition_facts SET ts=?1 WHERE id=?2", [
+               first.ts,
+               earlier_pull.fact_id
+             ])
+
+    assert [earlier_landing, later_landing] =
+             ConditionFacts.landings_for_commits(ctx.db, [merge_commit, other_head_commit])
+
+    assert earlier_landing["pullRequest"] == 3
+    assert later_landing["pullRequest"] == 7
+
+    assert {:error, %{code: "conflict"}} =
+             ConditionFacts.file_idempotent(ctx.db, ctx.scheduler, %{
+               input
+               | payload: %{input.payload | "headCommit" => String.duplicate("d", 40)},
+                 idempotency_key: "landing-conflict-7"
+             })
+
+    settlement =
+      ConditionFacts.file_idempotent(ctx.db, ctx.scheduler, %{
+        kind: "landing.settled",
+        scope: "Example/Repo#8",
+        origin: "process:landing-watch",
+        idempotency_key: "landing-closed-8"
+      })
+
+    assert settlement.kind == "landing.settled"
+
+    assert ConditionFacts.landings_for_commits(ctx.db, [head_commit]) ==
+             ConditionFacts.landings_for_commits(ctx.db, [merge_commit])
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM condition_facts WHERE kind='landing.observed-merge' AND payload IS NOT NULL"
+             )
+  end
+
   test "facts-read returns the latest fact by kind and optional scope", ctx do
     first =
       ConditionFacts.file(ctx.db, ctx.scheduler, %{

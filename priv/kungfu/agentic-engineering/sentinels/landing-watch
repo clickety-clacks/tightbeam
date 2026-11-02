@@ -40,6 +40,7 @@ GH_TIMEOUT = 120
 TIGHTBEAM_TIMEOUT = 60
 
 SETTLED = "landing.settled"
+OBSERVED_MERGE = "landing.observed-merge"
 BRANCH_ATTENTION = "landing.branch-attention"
 CHECKS_COMPLETED = "pr.checks-completed"
 
@@ -71,7 +72,7 @@ Q_PULL = """
 query LandingPull($owner: String!, $name: String!, $number: Int!, $since: DateTime, $cursor: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      number state merged mergeCommit { oid } headRefOid
+      number state merged mergeCommit { oid } headRefOid baseRefName
       autoMergeRequest { enabledAt }
       mergeQueueEntry { id }
       timelineItems(itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT, AUTO_MERGE_DISABLED_EVENT, CLOSED_EVENT],
@@ -509,8 +510,14 @@ class Watcher:
             variables = {**self._repo_vars(), "number": number, "since": iso(since) if since else None, "cursor": cursor}
             node = dig(self.runner.graphql(Q_PULL, variables), "repository", "pullRequest")
             if "state" not in pull:
-                for field in ("state", "merged", "mergeCommit", "headRefOid", "autoMergeRequest", "mergeQueueEntry"):
+                for field in ("state", "merged", "mergeCommit", "headRefOid", "baseRefName", "autoMergeRequest", "mergeQueueEntry"):
                     pull[field] = node.get(field)
+                merge = pull.get("mergeCommit") or {}
+                if pull.get("merged") is True and merge.get("oid") and (
+                    not isinstance(pull.get("headRefOid"), str) or not pull["headRefOid"] or
+                    not isinstance(pull.get("baseRefName"), str) or not pull["baseRefName"]
+                ):
+                    raise ReadError(f"pull request {number} merge record lacks branch or head commit")
             connection = node.get("timelineItems")
             if connection is None:
                 raise ReadError(f"pull request {number} timeline is null")
@@ -643,8 +650,11 @@ class Watcher:
 
     # Filing
 
-    def condition(self, kind: str, scope: str, key: str) -> bool:
-        ok, detail = self.runner.tightbeam(["condition", "--kind", kind, "--scope", scope, "--key", key])
+    def condition(self, kind: str, scope: str, key: str, payload: dict | None = None) -> bool:
+        args = ["condition", "--kind", kind, "--scope", scope, "--key", key]
+        if payload is not None:
+            args.extend(["--payload", json.dumps(payload, sort_keys=True, separators=(",", ":"))])
+        ok, detail = self.runner.tightbeam(args)
         if not ok:
             self.log.line(f"refused fact key={key} reason={detail}")
         return ok
@@ -753,7 +763,18 @@ def poll_demanded_pr(scope: str, kinds: set[str], runner, log: Log) -> bool:
     if SETTLED in kinds:
         merge = pull.get("mergeCommit") or {}
         if pull.get("merged") is True and merge.get("oid"):
+            payload = {
+                "branch": pull["baseRefName"],
+                "commit": merge["oid"],
+                "headCommit": pull["headRefOid"],
+            }
             ok &= watcher.condition(SETTLED, scope, f"landing-fact:{scope}:merged:{merge['oid']}")
+            ok &= watcher.condition(
+                OBSERVED_MERGE,
+                scope,
+                f"landing-record:{scope}:merged:{merge['oid']}",
+                payload,
+            )
         for event in pull.get("events", []):
             event_kind = event.get("__typename")
             if event_kind == "RemovedFromMergeQueueEvent":

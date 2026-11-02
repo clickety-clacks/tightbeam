@@ -258,6 +258,26 @@ defmodule Tightbeam.ConditionFacts do
     end
   end
 
+  defp consequence_admission(_txn, %{kind: "landing.observed-merge"} = input) do
+    case input[:payload] do
+      payload when is_map(payload) ->
+        fields = ~w(branch commit headCommit)
+
+        valid =
+          Enum.sort(Map.keys(payload)) == Enum.sort(fields) and
+            valid_landing_scope?(input[:scope]) and
+            is_binary(payload["branch"]) and payload["branch"] != "" and
+            valid_commit_oid?(payload["commit"]) and valid_commit_oid?(payload["headCommit"])
+
+        if valid,
+          do: :ok,
+          else: {:error, %{code: "invalid", message: "invalid observed merge payload or scope"}}
+
+      _ ->
+        {:error, %{code: "invalid", message: "invalid observed merge payload or scope"}}
+    end
+  end
+
   defp consequence_admission(_txn, %{kind: kind} = input) do
     if SentinelSubscriptions.event_kind?(kind) do
       if is_map(input[:payload]),
@@ -312,6 +332,33 @@ defmodule Tightbeam.ConditionFacts do
           {[id, _], false} -> fact_in_txn(txn, id)
           _ -> :new
         end
+    end
+  end
+
+  defp consequence_replay(txn, %{kind: "landing.observed-merge", payload: payload} = input)
+       when is_map(payload) do
+    rows =
+      Txn.q(
+        txn,
+        "SELECT id, payload FROM condition_facts WHERE kind=?1 AND scope=?2 AND payload IS NOT NULL ORDER BY id",
+        [input.kind, input.scope]
+      )
+
+    case Enum.find(rows, fn [_id, encoded] ->
+           JSON.decode!(encoded)["commit"] == payload["commit"]
+         end) do
+      [id, encoded] ->
+        if JSON.decode!(encoded) == payload,
+          do: fact_in_txn(txn, id),
+          else:
+            {:error,
+             %{
+               code: "conflict",
+               message: "observed merge already has different immutable content"
+             }}
+
+      nil ->
+        :new
     end
   end
 
@@ -764,6 +811,98 @@ defmodule Tightbeam.ConditionFacts do
     {:ok, rows} = DB.query(db, "SELECT 1 FROM condition_facts WHERE kind = ?1 LIMIT 1", [kind])
     rows != []
   end
+
+  @doc "Read observed successful merges associated with any of the supplied commit ids."
+  @spec landings_for_commits(DB.server() | Txn.t(), [String.t()]) :: [map()]
+  def landings_for_commits(source, commits) when is_list(commits) do
+    commits = commits |> Enum.filter(&(is_binary(&1) and &1 != "")) |> Enum.uniq()
+
+    if commits == [] do
+      []
+    else
+      rows =
+        query_landing_rows(
+          source,
+          """
+          SELECT id, ts, scope, payload
+          FROM condition_facts
+          WHERE kind = ?1 AND payload IS NOT NULL AND (
+            json_extract(payload, '$.commit') IN (SELECT value FROM json_each(?2)) OR
+            json_extract(payload, '$.headCommit') IN (SELECT value FROM json_each(?2))
+          )
+          ORDER BY ts, id
+          """,
+          ["landing.observed-merge", JSON.encode!(commits)]
+        )
+
+      rows
+      |> Enum.map(&landing_record!/1)
+      |> Enum.sort_by(fn {record, id} ->
+        {record["observedAt"], record["pullRequest"], id}
+      end)
+      |> Enum.map(&elem(&1, 0))
+    end
+  end
+
+  defp query_landing_rows(%Txn{} = txn, sql, params), do: Txn.q(txn, sql, params)
+
+  defp query_landing_rows(db, sql, params) do
+    {:ok, rows} = DB.query(db, sql, params)
+    rows
+  end
+
+  defp landing_record!([id, ts, scope, encoded_payload]) do
+    payload = JSON.decode!(encoded_payload)
+    fields = ~w(branch commit headCommit)
+
+    unless is_integer(id) and is_integer(ts) and is_map(payload) and
+             Enum.sort(Map.keys(payload)) == Enum.sort(fields) and
+             is_binary(payload["branch"]) and payload["branch"] != "" and
+             valid_commit_oid?(payload["commit"]) and valid_commit_oid?(payload["headCommit"]) do
+      raise ArgumentError, "invalid stored observed merge record"
+    end
+
+    {repository, pull_request} = landing_scope_identity!(scope)
+
+    {
+      %{
+        "repository" => repository,
+        "branch" => payload["branch"],
+        "commit" => payload["commit"],
+        "headCommit" => payload["headCommit"],
+        "pullRequest" => pull_request,
+        "observedAt" => ts
+      },
+      id
+    }
+  end
+
+  defp landing_scope_identity!(scope) when is_binary(scope) do
+    if valid_landing_scope?(scope) do
+      [repository, number] = String.split(scope, "#", parts: 2)
+      {pull_request, ""} = Integer.parse(number)
+      {repository, pull_request}
+    else
+      raise ArgumentError, "invalid stored observed merge scope"
+    end
+  end
+
+  defp landing_scope_identity!(_scope),
+    do: raise(ArgumentError, "invalid stored observed merge scope")
+
+  defp valid_landing_scope?(scope) when is_binary(scope) do
+    Regex.match?(
+      ~r/\A[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?\/[A-Za-z0-9._-]+#[1-9][0-9]*\z/,
+      scope
+    )
+  end
+
+  defp valid_landing_scope?(_scope), do: false
+
+  defp valid_commit_oid?(value) when is_binary(value),
+    do: Regex.match?(~r/\A(?:[a-f0-9]{40}|[a-f0-9]{64})\z/, value)
+
+  defp valid_commit_oid?(_value), do: false
 
   defp fact_in_txn(txn, fact_id) do
     case Txn.q(

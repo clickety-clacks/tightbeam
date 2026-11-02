@@ -58,11 +58,11 @@ def status(context, state='FAILURE', created=5, required=None):
 
 def pull(number, state='OPEN', merged=False, merge_oid=None, head='head1', auto=None, queued=False,
          updated=1, events=(), checks=None, checks_oid=None, merge_checks=None,
-         test_merge='test-merge', merge_parent=None):
+         test_merge='test-merge', merge_parent=None, base='main'):
     return {
         'number': number, 'state': state, 'merged': merged,
         'mergeCommit': {'oid': merge_oid} if merge_oid else None,
-        'headRefOid': head,
+        'headRefOid': head, 'baseRefName': base,
         'autoMergeRequest': {'enabledAt': auto} if auto else None,
         'mergeQueueEntry': {'id': f'MQ_{number}'} if queued else None,
         'updatedAt': ts(updated), 'events': list(events),
@@ -126,7 +126,7 @@ class FakeGitHub:
                 )
             since = variables.get('since')
             events = [e for e in item['events'] if since is None or e['createdAt'] >= since]
-            node = {k: item[k] for k in ('number', 'state', 'merged', 'mergeCommit', 'headRefOid',
+            node = {k: item[k] for k in ('number', 'state', 'merged', 'mergeCommit', 'headRefOid', 'baseRefName',
                                          'autoMergeRequest', 'mergeQueueEntry')}
             node['timelineItems'] = self._page(events, variables)
             return {'repository': {'pullRequest': node}}
@@ -323,10 +323,40 @@ class RunningPath(WatcherCase):
         self.assertEqual(len(self.github.calls), before)
 
     def test_merged_fact_uses_merge_commit(self):
-        self.github.add(pull(7, state='MERGED', merged=True, merge_oid='abc'))
+        merge_oid = 'a' * 40
+        head_oid = 'b' * 40
+        self.github.add(pull(7, state='MERGED', merged=True, merge_oid=merge_oid,
+                             head=head_oid, base='release/1.2'))
         self.demand_pr(7, lw.SETTLED)
         self.assertEqual(self.run_once(), 0)
-        self.assertEqual(self.keys(), ['landing-fact:example/repo#7:merged:abc'])
+        self.assertEqual(
+            self.keys(),
+            [f'landing-fact:example/repo#7:merged:{merge_oid}',
+             f'landing-record:example/repo#7:merged:{merge_oid}'],
+        )
+        filed = next(args for args in self.runner.filed if args[0] == 'condition' and '--payload' in args)
+        self.assertEqual(
+            filed[filed.index('--payload') + 1],
+            json.dumps({'branch': 'release/1.2', 'commit': merge_oid, 'headCommit': head_oid},
+                       sort_keys=True, separators=(',', ':')),
+        )
+        self.assertIn('baseRefName', lw.Q_PULL)
+        self.assertEqual([op for op, _ in self.github.calls].count('LandingPull'), 1)
+
+    def test_merged_pull_without_merge_commit_does_not_file_landing(self):
+        self.github.add(pull(7, state='MERGED', merged=True, merge_oid=None))
+        self.demand_pr(7, lw.SETTLED)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.keys(), [])
+
+    def test_merged_pull_missing_head_or_base_does_not_file_partial_landing(self):
+        for item in (pull(7, state='MERGED', merged=True, merge_oid='a' * 40, head=None),
+                     pull(8, state='MERGED', merged=True, merge_oid='b' * 40, base=None)):
+            with self.subTest(number=item['number']):
+                self.github.add(item)
+                self.demand_pr(item['number'], lw.SETTLED)
+                self.assertEqual(self.run_once(), 1)
+                self.assertEqual(self.keys(), [])
 
     def test_every_queue_removal_has_own_fact(self):
         self.github.add(pull(7, events=[event('RemovedFromMergeQueueEvent', 'RM1'),
@@ -335,6 +365,7 @@ class RunningPath(WatcherCase):
         self.assertEqual(self.run_once(), 0)
         self.assertEqual(self.keys(), ['landing-fact:example/repo#7:removed:RM1',
                                        'landing-fact:example/repo#7:removed:RM2'])
+        self.assertFalse(any('--payload' in args for args in self.runner.filed))
 
     def test_automerge_disabled_and_closed_are_settled(self):
         self.github.add(pull(7, state='CLOSED', events=[event('AutoMergeDisabledEvent', 'AD'),
@@ -446,7 +477,11 @@ class RunningPath(WatcherCase):
         self.assertEqual(self.run_once(), 1)
         self.runner.refuse = None
         self.assertEqual(self.run_once(), 0)
-        self.assertEqual(self.keys(), ['landing-fact:example/repo#7:merged:abc'])
+        self.assertEqual(
+            self.keys(),
+            ['landing-fact:example/repo#7:merged:abc',
+             'landing-record:example/repo#7:merged:abc'],
+        )
 
     def test_invalid_demand_logged_once_and_other_pr_continues(self):
         self.runner.demand = [
