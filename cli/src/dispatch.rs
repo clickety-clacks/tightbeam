@@ -6079,7 +6079,7 @@ mod tests {
                 "--as",
                 "reader",
             ]),
-            r#"{"as":"reader","verb":"sentinel-subscribe","params":{"event":"sample/demo/ping","where":["channel=!a:x","who=@mike:x"]}}"#
+            r#"{"as":"reader","verb":"sentinel-subscribe","params":{"event":"sample/demo/ping","where":["channel=!a:x","who=@mike:x"],"mode":"standing"}}"#
         );
         assert_eq!(
             body(&["sentinel", "subscriptions", "--as-user", "flynn"]),
