@@ -30,11 +30,24 @@ after-turn continuation covers only its named obligation, not unrelated work.
 
 ## Ending a cannot-proceed block
 
-`cannot-proceed` retains custody and raises one decision to the opener. A reply
-alone does not release the block: its named release fact must arrive, or the
-opener must dispose of the obligation through the supported seam. Read the
-assignment's actual state and the requested release evidence before resuming.
-Do not file completion for unfulfilled work or treat a wake as the release.
+`cannot-proceed` retains custody and files one decision request to the opener.
+The block settles at the first of:
+
+- its named release fact is recorded (settled as released);
+- the assignment is completed or revoked (settled as disposed);
+- `tightbeam answer` is accepted on that decision request (settled as disposed).
+  Any authenticated session holding the request id may answer, including the
+  holder, as may the asked owner user. The holder is woken with the answer text.
+
+An accepted answer ends the block whatever it says. `return` and `withdraw` are
+refused for these requests. To discuss a block without ending it, send a `wake`
+to the other party or record a `progress` attest; neither touches the decision
+request. Answer as the asked party, once the holder may resume or the block
+should end. When the block waits on a specific fact, record that fact instead:
+a disposed settlement is not evidence that the release action happened.
+
+Read the assignment's actual state and the release evidence before resuming. Do
+not file completion for unfulfilled work or treat a wake as the release.
 
 ## Delegated rulings
 
