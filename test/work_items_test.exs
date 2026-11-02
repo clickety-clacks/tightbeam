@@ -1487,7 +1487,9 @@ defmodule Tightbeam.WorkItemsTest do
       merge_assignment = assign(ctx, "holder", "merge", merge_item.id, "evidence")
       head_assignment = assign(ctx, "other-holder", "head", head_item.id, "evidence")
       late_assignment = assign(ctx, "holder", "late", late_item.id, "evidence")
-      unrelated_assignment = assign(ctx, "other-holder", "unrelated", unrelated_item.id, "evidence")
+
+      unrelated_assignment =
+        assign(ctx, "other-holder", "unrelated", unrelated_item.id, "evidence")
 
       assert %{attest: %{kind: "completion"}} =
                file_attest(ctx, {:session, "holder"}, merge_assignment.id, %{
