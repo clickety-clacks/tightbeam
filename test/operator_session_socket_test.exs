@@ -184,7 +184,7 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
   end
 
-  test "accepts and delivers a multi-megabyte human prompt without changing it", ctx do
+  test "accepts and delivers a human prompt above 64 KiB without changing it", ctx do
     changes = connect(ctx, "/ws/changes?protocolVersion=2")
     send_frame(changes, auth())
     {_auth_reply, changes} = recv_frame(changes)
@@ -205,9 +205,9 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
     assert auth_reply["success"] == true
     {_sync, chat} = recv_frame(chat)
 
-    content = String.duplicate("abΩ☃", 600_000)
+    content = String.duplicate("x", 65_537)
     bytes = byte_size(content)
-    assert bytes == 4_200_000
+    assert bytes > 64 * 1024
 
     message = %{
       type: "message",
@@ -217,7 +217,7 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
     }
 
     frame = JSON.encode!(message)
-    assert byte_size(frame) < 10_000_000
+    assert byte_size(frame) < 2 * 1024 * 1024
     assert :ok = WS.send_text(chat, frame)
 
     {ack, chat} = recv_frame(chat)

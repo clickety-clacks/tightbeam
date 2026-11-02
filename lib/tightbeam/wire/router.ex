@@ -258,7 +258,10 @@ defmodule Tightbeam.Wire.Router do
     if Plug.Conn.get_req_header(conn, "upgrade") == ["websocket"] do
       conn = Tightbeam.Wire.ResponseObservationAdapter.unwrap(conn)
 
-      WebSockAdapter.upgrade(conn, Socket, deps(conn), timeout: @websocket_read_timeout)
+      WebSockAdapter.upgrade(conn, Socket, deps(conn),
+        max_frame_size: 2 * 1024 * 1024,
+        timeout: @websocket_read_timeout
+      )
     else
       error(conn, 404, "not_found")
     end
