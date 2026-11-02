@@ -28,6 +28,93 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     %{root: root, app: app, base: base}
   end
 
+  @tag :missing_build_identity
+  test "unverified package identity warns once while fresh and matching-owner bases boot", %{
+    app: app,
+    base: base
+  } do
+    manifest_path = Path.join(app, "build-manifest.json")
+    {:ok, manifest} = LiveBaseGuard.generate_manifest(LiveBaseAdmission.payload_files!(app))
+    identity = manifest["buildIdentity"]
+
+    for condition <- [:missing, :unreadable, :mismatched] do
+      case condition do
+        :missing ->
+          File.rm(manifest_path)
+
+        :unreadable ->
+          File.write!(manifest_path, JSON.encode!(manifest))
+          :ok = File.chmod(manifest_path, 0o000)
+
+        :mismatched ->
+          File.write!(manifest_path, JSON.encode!(%{"buildIdentity" => "unmatched"}))
+      end
+
+      case_base = Path.join(base, Atom.to_string(condition))
+
+      try do
+        first_log = capture_log(fn -> boot_release!(case_base, app, identity) end)
+        assert_warning_once(first_log)
+
+        restart_log = capture_log(fn -> boot_release!(case_base, app, identity) end)
+        assert_warning_once(restart_log)
+      after
+        if File.exists?(manifest_path), do: File.chmod(manifest_path, 0o600)
+        File.rm_rf!(case_base)
+      end
+    end
+  end
+
+  @tag :missing_build_identity
+  test "unverified identity blocks automatic migration but preserves the exact override", %{
+    root: root,
+    app: app,
+    base: base
+  } do
+    write_provenance!(root)
+    assert LiveBaseRelease.automatic_transition_candidate?(app)
+
+    {:ok, generated} = LiveBaseGuard.generate_manifest(LiveBaseAdmission.payload_files!(app))
+    identity = generated["buildIdentity"]
+    seed_predecessor!(base)
+    database_path = Path.join(base, "state.db")
+    before = File.read!(database_path)
+    refute File.exists?(Path.join(app, "build-manifest.json"))
+
+    refusal_log =
+      capture_log(fn ->
+        assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_required/, fn ->
+          LiveBaseAdmission.prepare!(base, payload_root: app)
+        end
+      end)
+
+    assert_warning_once(refusal_log)
+    assert File.read!(database_path) == before
+    refute File.exists?(Path.join(base, "build-owner.json"))
+
+    transition =
+      JSON.encode!(%{
+        "base" => LiveBaseAdmission.canonical!(base),
+        "expectedSchema" => Schema.live_base_upgrade_predecessor(),
+        "source" => "unmarked",
+        "target" => identity
+      })
+
+    override_log =
+      capture_log(fn ->
+        admission =
+          LiveBaseAdmission.prepare!(base, payload_root: app, transition: transition)
+
+        assert admission.decision.source == "unmarked"
+        assert admission.decision.target == identity
+        assert admission.decision.expected_schema == Schema.live_base_upgrade_predecessor()
+      end)
+
+    assert_warning_once(override_log)
+    assert File.read!(database_path) == before
+    refute File.exists?(Path.join(base, "build-owner.json"))
+  end
+
   test "a released package derives the exact unmarked transition without operator input", %{
     root: root,
     app: app,
@@ -618,6 +705,31 @@ defmodule Tightbeam.LiveBaseReleaseTest do
 
   defp owner_marker(identity) do
     %{"format" => "tightbeam-build-owner/v1", "buildIdentity" => identity}
+  end
+
+  defp boot_release!(base, app, identity) do
+    {:ok, db} =
+      DB.start_link(
+        path: Path.join(base, "state.db"),
+        name: nil,
+        guard_inputs: [],
+        payload_root: app
+      )
+
+    try do
+      :ok = Schema.ensure_all(db)
+      target = hd(Schema.guard_compatible_stamps())
+      assert {:ok, [[^target]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+      assert JSON.decode!(File.read!(Path.join(base, "build-owner.json"))) == owner_marker(identity)
+    after
+      :ok = GenServer.stop(db)
+    end
+  end
+
+  defp assert_warning_once(log) do
+    warning = "build identity could not be verified from build-manifest.json"
+    assert log =~ warning
+    assert length(Regex.scan(Regex.compile!(Regex.escape(warning)), log)) == 1
   end
 
   defp seed_migration_population!(base) do
