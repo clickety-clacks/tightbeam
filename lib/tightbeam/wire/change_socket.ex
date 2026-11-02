@@ -6,6 +6,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
   alias Tightbeam.Devices
   alias Tightbeam.Org
   alias Tightbeam.Wire.OperatorSession
+  require Logger
   @max_subscriptions 100
   @turn_classes ~w(turn.queued turn.started turn.ended)
   @filter_keys ~w(classes sessionKey workItemId origin principal)
@@ -377,9 +378,20 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
     if is_binary(session_key) do
       StateResources.query_active_turns_for_session(db(state), session_key)
-      |> Enum.filter(&(&1.status == "running"))
-      |> Enum.map(fn turn ->
-        Publisher.committed_notice("turn.started", turn, %{"sessionKey" => session_key})
+      |> Enum.flat_map(fn turn ->
+        class = if turn.status == "queued", do: "turn.queued", else: "turn.started"
+
+        try do
+          [Publisher.committed_notice(class, turn, %{"sessionKey" => session_key})]
+        rescue
+          error ->
+            Logger.error(
+              "active turn notice build failed class=#{class} turnSeq=#{turn.seq} " <>
+                "error=#{inspect(error.__struct__)}"
+            )
+
+            []
+        end
       end)
       |> Enum.filter(&class_filter_matches?(filters["classes"], &1["class"]))
     else
