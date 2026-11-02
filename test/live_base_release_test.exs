@@ -155,7 +155,8 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     try do
       for condition <- [:missing, :unreadable] do
         case condition do
-          :missing -> File.rm(manifest_path)
+          :missing ->
+            File.rm(manifest_path)
 
           :unreadable ->
             File.write!(manifest_path, manifest_bytes)
