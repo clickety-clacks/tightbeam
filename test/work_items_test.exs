@@ -1308,14 +1308,14 @@ defmodule Tightbeam.WorkItemsTest do
              :effectiveCommitRefs,
              :landings
            ]) ==
-           Map.drop(first, [
-             :holders,
-             :started,
-             :attestCounts,
-             :verdictCounts,
-             :effectiveCommitRefs,
-             :landings
-           ])
+             Map.drop(first, [
+               :holders,
+               :started,
+               :attestCounts,
+               :verdictCounts,
+               :effectiveCommitRefs,
+               :landings
+             ])
 
     assert detail.body == nil
     second = create(ctx, {:user, "flynn"}, %{title: "Second"})
@@ -1618,7 +1618,8 @@ defmodule Tightbeam.WorkItemsTest do
     end
   end
 
-  test "assignment and attest changes publish complete summary rows at the new row version", ctx do
+  test "assignment and attest changes publish complete summary rows at the new row version",
+       ctx do
     alias Tightbeam.Firehose.Hub
 
     hub = start_supervised!({Hub, name: nil})
@@ -1701,10 +1702,12 @@ defmodule Tightbeam.WorkItemsTest do
     assert completion_update
     assert completion_update["payload"]["holders"] == []
     assert completion_update["payload"]["started"] == true
+
     assert completion_update["payload"]["attestCounts"] == %{
              "completion" => 1,
              "progress" => 1
            }
+
     assert completion_update["payload"]["verdictCounts"] == %{}
     assert completion_update["payload"]["effectiveCommitRefs"] == []
     assert completion_update["payload"]["landings"] == []
@@ -1726,13 +1729,20 @@ defmodule Tightbeam.WorkItemsTest do
     assert reopen_update
     assert reopen_update["payload"]["holders"] == ["holder"]
     assert reopen_update["payload"]["started"] == true
-    assert reopen_update["payload"]["attestCounts"] == completion_update["payload"]["attestCounts"]
-    assert reopen_update["payload"]["verdictCounts"] == completion_update["payload"]["verdictCounts"]
+
+    assert reopen_update["payload"]["attestCounts"] ==
+             completion_update["payload"]["attestCounts"]
+
+    assert reopen_update["payload"]["verdictCounts"] ==
+             completion_update["payload"]["verdictCounts"]
+
     assert reopen_update["payload"]["effectiveCommitRefs"] == []
     assert reopen_update["payload"]["landings"] == []
     assert reopen_update["payload"]["rowVersion"] > completion_update["payload"]["rowVersion"]
 
-    revoke_call = Map.merge(revoke_call(assignment.id), %{firehose_in_txn: true, firehose_hub: hub})
+    revoke_call =
+      Map.merge(revoke_call(assignment.id), %{firehose_in_txn: true, firehose_hub: hub})
+
     assert %{state: "closed"} = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call)
 
     revoke_update =
@@ -1742,8 +1752,13 @@ defmodule Tightbeam.WorkItemsTest do
     assert revoke_update
     assert revoke_update["payload"]["holders"] == []
     assert revoke_update["payload"]["started"] == true
-    assert revoke_update["payload"]["attestCounts"] == completion_update["payload"]["attestCounts"]
-    assert revoke_update["payload"]["verdictCounts"] == completion_update["payload"]["verdictCounts"]
+
+    assert revoke_update["payload"]["attestCounts"] ==
+             completion_update["payload"]["attestCounts"]
+
+    assert revoke_update["payload"]["verdictCounts"] ==
+             completion_update["payload"]["verdictCounts"]
+
     assert revoke_update["payload"]["effectiveCommitRefs"] == []
     assert revoke_update["payload"]["landings"] == []
     assert revoke_update["payload"]["rowVersion"] > reopen_update["payload"]["rowVersion"]
@@ -1782,6 +1797,7 @@ defmodule Tightbeam.WorkItemsTest do
     after_retirement = get(ctx, {:user, "flynn"}, item.id).workItem
     assert summary_update["payload"]["rowVersion"] > before.rowVersion
     assert summary_update["payload"]["rowVersion"] == after_retirement.rowVersion
+
     assert %{state: "closed", outcome: "revoked"} =
              Assignments.__handle__(ctx.db, "assignment-get", %{
                principal: {:user, "flynn"},
@@ -1802,7 +1818,14 @@ defmodule Tightbeam.WorkItemsTest do
     after_item = get(ctx, {:user, "flynn"}, item.id).workItem
 
     assert Map.take(after_item, [:id, :title, :specRefName, :specRefSha256, :ownerUserId, :state]) ==
-             Map.take(before_item, [:id, :title, :specRefName, :specRefSha256, :ownerUserId, :state])
+             Map.take(before_item, [
+               :id,
+               :title,
+               :specRefName,
+               :specRefSha256,
+               :ownerUserId,
+               :state
+             ])
 
     assert before_item.holders == ["holder"]
     assert after_item.holders == []

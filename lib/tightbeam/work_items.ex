@@ -265,7 +265,8 @@ defmodule Tightbeam.WorkItems do
         {:updated, item, changed?} ->
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
 
-          result = handler_summary_work_item(db, item) |> then(&Mementos.attach(db, "work_item", &1))
+          result =
+            handler_summary_work_item(db, item) |> then(&Mementos.attach(db, "work_item", &1))
 
           if Map.has_key?(call.params, :body) or Map.get(call.params, :clear_body, false),
             do: %{workItem: result, bodyUpdate: body_update_descriptor(item, changed?)},
@@ -802,6 +803,7 @@ defmodule Tightbeam.WorkItems do
       case result do
         {:disposed, item, changed?, _old_state} ->
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
+
           %{
             ok: true,
             workItem: Mementos.attach(db, "work_item", handler_summary_work_item(db, item))

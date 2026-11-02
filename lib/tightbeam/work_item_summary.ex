@@ -27,7 +27,8 @@ defmodule Tightbeam.WorkItemSummary do
   @doc false
   def fields(db, work_item_id) do
     holders =
-      query(db,
+      query(
+        db,
         "SELECT DISTINCT holderKey FROM assignments WHERE workItemId=?1 AND state='open' ORDER BY holderKey",
         [work_item_id]
       )
@@ -38,14 +39,16 @@ defmodule Tightbeam.WorkItemSummary do
         [[1]]
 
     attest_counts =
-      query(db,
+      query(
+        db,
         "SELECT att.kind, COUNT(*) FROM attests att JOIN assignments a ON a.id=att.assignmentId WHERE a.workItemId=?1 GROUP BY att.kind ORDER BY att.kind",
         [work_item_id]
       )
       |> counts_map()
 
     verdict_counts =
-      query(db,
+      query(
+        db,
         "SELECT att.verdictKind, COUNT(*) FROM attests att JOIN assignments a ON a.id=att.assignmentId WHERE a.workItemId=?1 AND att.kind='verdict' AND att.verdictKind IS NOT NULL GROUP BY att.verdictKind ORDER BY att.verdictKind",
         [work_item_id]
       )

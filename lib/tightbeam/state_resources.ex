@@ -513,34 +513,34 @@ defmodule Tightbeam.StateResources do
           txn,
           principal,
           """
-        SELECT wi.id, wi.title, wi.specRefName, wi.specRefSha256, wi.isBug,
-               wi.ownerUserId, wi.state, wi.failReason, wi.routingWakeId,
-               wi.slateWakeId, wi.createdByUser, wi.createdBySession,
-               wi.createdInTurnSeq, wi.createdContextKnown, wi.createdAt,
-               CASE WHEN p.workItemId IS NULL THEN
-                 CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
-               ELSE p.priority END,
-               COALESCE(v.rowVersion, wi.createdAt)
-        FROM work_items AS wi
-        LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
-        LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id
-        WHERE (?1 IS NULL OR wi.id = ?1) AND (
-          ?2 = 1 OR
-          (?3 = 'user' AND wi.ownerUserId = ?4) OR
-          ?3 = 'session'
-        )
-        AND (?5 IS NULL OR wi.state = ?5)
-        AND (?6 IS NULL OR wi.ownerUserId = ?6)
-        AND (?7 IS NULL OR wi.createdBySession = ?7)
-        AND (?8 IS NULL OR wi.createdByUser = ?8)
-        AND (?9 IS NULL OR wi.isBug = ?9)
-        AND (?10 IS NULL OR wi.specRefName = ?10)
-        AND (?11 IS NULL OR EXISTS (
-          SELECT 1 FROM assignments AS selected_holder
-          WHERE selected_holder.workItemId = wi.id AND selected_holder.holderKey = ?11
-        ))
-        ORDER BY wi.createdAt, wi.id
-        """,
+          SELECT wi.id, wi.title, wi.specRefName, wi.specRefSha256, wi.isBug,
+                 wi.ownerUserId, wi.state, wi.failReason, wi.routingWakeId,
+                 wi.slateWakeId, wi.createdByUser, wi.createdBySession,
+                 wi.createdInTurnSeq, wi.createdContextKnown, wi.createdAt,
+                 CASE WHEN p.workItemId IS NULL THEN
+                   CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
+                 ELSE p.priority END,
+                 COALESCE(v.rowVersion, wi.createdAt)
+          FROM work_items AS wi
+          LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
+          LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id
+          WHERE (?1 IS NULL OR wi.id = ?1) AND (
+            ?2 = 1 OR
+            (?3 = 'user' AND wi.ownerUserId = ?4) OR
+            ?3 = 'session'
+          )
+          AND (?5 IS NULL OR wi.state = ?5)
+          AND (?6 IS NULL OR wi.ownerUserId = ?6)
+          AND (?7 IS NULL OR wi.createdBySession = ?7)
+          AND (?8 IS NULL OR wi.createdByUser = ?8)
+          AND (?9 IS NULL OR wi.isBug = ?9)
+          AND (?10 IS NULL OR wi.specRefName = ?10)
+          AND (?11 IS NULL OR EXISTS (
+            SELECT 1 FROM assignments AS selected_holder
+            WHERE selected_holder.workItemId = wi.id AND selected_holder.holderKey = ?11
+          ))
+          ORDER BY wi.createdAt, wi.id
+          """,
           [
             id,
             bool_int(is_admin),
@@ -610,16 +610,16 @@ defmodule Tightbeam.StateResources do
 
            page =
              Keyset.page(
-             query,
-             select_from,
-             probe_from,
-             where,
-             params,
-             ["wi.createdAt", "wi.id"],
-             boundary,
-             limit,
-             fn row -> [Enum.at(row, 14), hd(row)] end
-           )
+               query,
+               select_from,
+               probe_from,
+               where,
+               params,
+               ["wi.createdAt", "wi.id"],
+               boundary,
+               limit,
+               fn row -> [Enum.at(row, 14), hd(row)] end
+             )
 
            rows =
              Enum.map(page.rows, fn row ->

@@ -108,9 +108,11 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
 
     assert after_correction.attestCounts == before.attestCounts
     assert after_correction.verdictCounts == %{}
+
     assert after_correction.effectiveCommitRefs == [
              %{"repo" => corrected_repo, "commit" => corrected_commit}
            ]
+
     assert after_correction.rowVersion > before.rowVersion
   end
 
@@ -124,7 +126,11 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
              DB.query(
                ctx.db,
                "INSERT INTO attests (id, assignmentId, kind, bySession, commitRefs, ts) VALUES ('att_notice_refs', 'asg_closed', 'completion', 'holder-owner', ?1, 4)",
-               [JSON.encode!([%{"repo" => "old-repository", "commit" => String.duplicate("a", 40)}])]
+               [
+                 JSON.encode!([
+                   %{"repo" => "old-repository", "commit" => String.duplicate("a", 40)}
+                 ])
+               ]
              )
 
     before =
@@ -207,7 +213,10 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
       assert [%{"commit" => ^merge_commit}] = before.landings
 
       hub = start_supervised!({Hub, name: nil})
-      :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "owner", is_admin: false})
+
+      :ok =
+        Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "owner", is_admin: false})
+
       handler = Gateway.handlers(%{db: ctx.db})["assignment-commitref-correct"]
 
       assert %{correction: %{assignmentId: "asg_closed"}} =
@@ -229,6 +238,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
       assert payload["landings"] == after_correction.landings
       assert payload["rowVersion"] > before.rowVersion
       assert payload["rowVersion"] == after_correction.rowVersion
+
       assert [%{"commit" => ^merge_commit}] =
                apply(ConditionFacts, :landings_for_commits, [ctx.db, [merge_commit]])
 
