@@ -760,21 +760,26 @@ def poll_demanded_pr(scope: str, kinds: set[str], runner, log: Log) -> bool:
         return unavailable_scope(error)
 
     ok = True
-    if SETTLED in kinds:
-        merge = pull.get("mergeCommit") or {}
-        if pull.get("merged") is True and merge.get("oid"):
-            payload = {
-                "branch": pull["baseRefName"],
-                "commit": merge["oid"],
-                "headCommit": pull["headRefOid"],
-            }
+    merge = pull.get("mergeCommit") or {}
+    if pull.get("merged") is True and merge.get("oid"):
+        # This scope is already being read for an existing landing.* or pr.* demand.
+        # Record every merge observed here, even when only a pr.* condition is pending.
+        payload = {
+            "branch": pull["baseRefName"],
+            "commit": merge["oid"],
+            "headCommit": pull["headRefOid"],
+        }
+        if SETTLED in kinds:
             ok &= watcher.condition(SETTLED, scope, f"landing-fact:{scope}:merged:{merge['oid']}")
-            ok &= watcher.condition(
-                OBSERVED_MERGE,
-                scope,
-                f"landing-record:{scope}:merged:{merge['oid']}",
-                payload,
-            )
+
+        ok &= watcher.condition(
+            OBSERVED_MERGE,
+            scope,
+            f"landing-record:{scope}:merged:{merge['oid']}",
+            payload,
+        )
+
+    if SETTLED in kinds:
         for event in pull.get("events", []):
             event_kind = event.get("__typename")
             if event_kind == "RemovedFromMergeQueueEvent":

@@ -343,6 +343,28 @@ class RunningPath(WatcherCase):
         self.assertIn('baseRefName', lw.Q_PULL)
         self.assertEqual([op for op, _ in self.github.calls].count('LandingPull'), 1)
 
+    def test_pr_checks_demand_also_records_observed_merge_without_settlement(self):
+        merge_oid = 'c' * 40
+        head_oid = 'd' * 40
+        self.github.add(pull(7, state='MERGED', merged=True, merge_oid=merge_oid,
+                             head=head_oid, base='release/1.2'))
+        self.demand_pr(7, lw.CHECKS_COMPLETED)
+
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(
+            self.keys(),
+            [f'landing-record:example/repo#7:merged:{merge_oid}'],
+        )
+        filed = self.runner.filed[0]
+        self.assertEqual(filed[filed.index('--kind') + 1], lw.OBSERVED_MERGE)
+        self.assertEqual(
+            filed[filed.index('--payload') + 1],
+            json.dumps({'branch': 'release/1.2', 'commit': merge_oid, 'headCommit': head_oid},
+                       sort_keys=True, separators=(',', ':')),
+        )
+        self.assertFalse(self.check_keys())
+        self.assertEqual([op for op, _ in self.github.calls].count('LandingPull'), 1)
+
     def test_merged_pull_without_merge_commit_does_not_file_landing(self):
         self.github.add(pull(7, state='MERGED', merged=True, merge_oid=None))
         self.demand_pr(7, lw.SETTLED)
