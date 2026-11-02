@@ -467,7 +467,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
       {"MATRIX_COMMANDER_STORE", Path.join(ctx.root, "unused-store")},
       {"GH_CONFIG_DIR", ctx.root}, {"LANDING_REPOS", ""}]
     matrix = Path.expand("../priv/kungfu/sentinels/sentinels/matrix", __DIR__)
-    {output, code} = System.cmd("python3", [matrix], cd: ctx.root, env: producer_env, stderr_to_stdout: true)
+    {output, code} = System.cmd("python3", [matrix], cd: Path.dirname(ctx.root), env: producer_env, stderr_to_stdout: true)
     assert code != 0
     assert output =~ "matrix-commander exited"
     assert {:ok, [[payload]]} = DB.query(ctx.db, "SELECT payload FROM condition_facts WHERE kind='sentinels/matrix/message'")
@@ -475,7 +475,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT count(*) FROM sentinel_subscription_wake_matches")
 
     landing = Path.expand("../priv/kungfu/agentic-engineering/sentinels/landing-watch", __DIR__)
-    {output, code} = System.cmd("python3", [landing, "--once"], cd: ctx.root, env: producer_env, stderr_to_stdout: true)
+    {output, code} = System.cmd("python3", [landing, "--once"], cd: Path.dirname(ctx.root), env: producer_env, stderr_to_stdout: true)
     assert code == 0, output
     assert {:ok, [["example/repo#7"]]} = DB.query(ctx.db, "SELECT scope FROM condition_facts WHERE kind='landing.settled'")
     assert %{"demand" => [%{"kind" => "sentinels/matrix/message"}]} = cli.(["sentinel", "demand"])
