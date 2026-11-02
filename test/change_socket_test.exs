@@ -876,7 +876,11 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     declared = Enum.sort(Gateway.emitted_state_classes(handler_effects))
 
-    registered = rows |> Map.keys() |> Enum.sort()
+    registered =
+      rows
+      |> Enum.reject(fn {_class, row} -> row[:snapshot_only] end)
+      |> Enum.map(fn {class, _row} -> class end)
+      |> Enum.sort()
     extra = declared -- registered
     missing = registered -- declared
 
