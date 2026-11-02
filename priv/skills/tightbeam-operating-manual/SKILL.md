@@ -49,6 +49,19 @@ a disposed settlement is not evidence that the release action happened.
 Read the assignment's actual state and the release evidence before resuming. Do
 not file completion for unfulfilled work or treat a wake as the release.
 
+A settled block no longer quiets inactivity supervision. To keep an open card
+quiet on purpose, after its question is answered or for a standing duty, its
+holder, its opener or a user records a hold:
+`tightbeam assignment-hold <id> --kind held|standing --reason "<text>" --release
+"<condition>"`, adding the three release-fact flags when one named fact ends a
+`held` hold (a `standing` hold takes none). Release it with
+`tightbeam assignment-release-hold <id> --reason "<text>"` once the condition is
+met; a matching fact or the card's closure also releases it. A hold quiets only
+inactivity reminders and their escalations: every other notice still arrives,
+and custody is unchanged. A hold and a cannot-proceed are independent, so
+answering a block does not release a hold. `tightbeam assignments --held` lists
+the open held cards.
+
 ## Delegated rulings
 
 A presenter's recommendation is its opinion, not the user's ruling. A presenter
