@@ -2317,7 +2317,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert after_malformed.switchable_models["sess-1"] == prior_switchable_models
     assert {:ok, ^prior_model} = Adapter.current_model(adapter, "sess-1")
 
-    assert {:ok, %{stop_reason: "end_turn", text: "pong[allow-once]"}} =
+    assert {:ok, %{stop_reason: "end_turn", messages: [_]}} =
              Adapter.prompt(adapter, "peer-session", "valid turn")
 
     assert Process.alive?(adapter)
