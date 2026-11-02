@@ -1,7 +1,7 @@
 defmodule Tightbeam.AssignmentHoldsTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, ConditionFacts, DB, Model, Org, Supervision, Wakes}
+  alias Tightbeam.{Assignments, ConditionFacts, DB, Gateway, Model, Org, Supervision, Wakes}
 
   setup do
     db = String.to_atom("assignment_holds_#{System.unique_integer([:positive])}")
@@ -26,7 +26,8 @@ defmodule Tightbeam.AssignmentHoldsTest do
         [holder.session_key, opener.session_key]
       )
 
-    %{db: db, main: main, holder: holder, opener: opener, sibling: sibling}
+    handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+    %{db: db, main: main, holder: holder, opener: opener, sibling: sibling, handlers: handlers}
   end
 
   test "hold is durable, visible and withdraws only assignment inactivity sources", ctx do
@@ -116,6 +117,12 @@ defmodule Tightbeam.AssignmentHoldsTest do
     held = hold(ctx, {:session, ctx.opener.session_key}, "held", nil)
     before_release = System.system_time(:millisecond)
 
+    assert %{code: "hold_not_authorized"} =
+             release(ctx, {:session, ctx.sibling.session_key}, "not mine", nil)
+
+    assert %{code: "hold_not_authorized"} =
+             release(ctx, {:process, "fixture"}, "not a judgment principal", nil)
+
     released =
       release(ctx, {:session, ctx.opener.session_key}, "condition cleared", "release-key")
 
@@ -123,6 +130,9 @@ defmodule Tightbeam.AssignmentHoldsTest do
     assert released.releaseKind == "released"
     assert released.releasedByRef == "session:#{ctx.opener.session_key}"
     assert released.releaseNote == "condition cleared"
+
+    assert List.last(release_markers(ctx)) ==
+             "[assignment hold released: asg_hold #{held.id} released by session:#{ctx.opener.session_key}]"
 
     assert release(ctx, {:session, ctx.opener.session_key}, "condition cleared", "release-key").id ==
              released.id
@@ -157,6 +167,9 @@ defmodule Tightbeam.AssignmentHoldsTest do
     assert fact_history.releaseKind == "release-fact"
     assert fact_history.releaseFactId == fact.fact_id
 
+    assert List.last(release_markers(ctx)) ==
+             "[assignment hold released: asg_hold #{fact_hold.id} release-fact by user:flynn fact #{fact.fact_id}]"
+
     closing = hold(ctx, {:user, "flynn"}, "standing", nil)
 
     assert %{state: "closed"} =
@@ -170,6 +183,9 @@ defmodule Tightbeam.AssignmentHoldsTest do
     assert closed_history.id == closing.id
     assert closed_history.releaseKind == "assignment-closed"
     assert closed_history.releasedByRef == "process:tightbeam"
+
+    assert List.last(release_markers(ctx)) ==
+             "[assignment hold released: asg_hold #{closing.id} assignment-closed by process:tightbeam]"
 
     assert %{state: "open"} =
              Assignments.__handle__(ctx.db, "reopen-assignment", %{
@@ -193,7 +209,7 @@ defmodule Tightbeam.AssignmentHoldsTest do
   end
 
   defp hold(ctx, principal, kind, key, extra \\ %{}) do
-    Assignments.__handle__(ctx.db, "assignment-hold", %{
+    ctx.handlers["assignment-hold"].(%{
       principal: principal,
       origin: origin(principal),
       params:
@@ -214,7 +230,7 @@ defmodule Tightbeam.AssignmentHoldsTest do
   end
 
   defp release(ctx, principal, reason, key) do
-    Assignments.__handle__(ctx.db, "assignment-release-hold", %{
+    ctx.handlers["assignment-release-hold"].(%{
       principal: principal,
       origin: origin(principal),
       params: %{assignment_id: "asg_hold", reason: reason, idempotency_key: key}
@@ -222,14 +238,14 @@ defmodule Tightbeam.AssignmentHoldsTest do
   end
 
   defp get(ctx) do
-    Assignments.__handle__(ctx.db, "assignment-get", %{
+    ctx.handlers["assignment-get"].(%{
       principal: {:user, "flynn"},
       params: %{assignment_id: "asg_hold", fact_id: nil}
     })
   end
 
   defp list(ctx, held) do
-    Assignments.__handle__(ctx.db, "assignments", %{
+    ctx.handlers["assignments"].(%{
       principal: {:user, "flynn"},
       session_key: nil,
       params: %{state: "open", held: held}
@@ -251,6 +267,17 @@ defmodule Tightbeam.AssignmentHoldsTest do
       )
 
     Wakes.get(db, id)
+  end
+
+  defp release_markers(ctx) do
+    {:ok, rows} =
+      DB.query(
+        ctx.db,
+        "SELECT content FROM messages WHERE sessionKey=?1 AND content LIKE '[assignment hold released:%' ORDER BY timestamp,id",
+        [ctx.holder.session_key]
+      )
+
+    List.flatten(rows)
   end
 
   defp session(db, key, owner) do
