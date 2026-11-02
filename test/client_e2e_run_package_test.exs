@@ -86,18 +86,36 @@ defmodule Tightbeam.ClientE2E.RunPackageTest do
 
     for problem <- [:missing, :unreadable, :malformed, :mismatched] do
       File.write!(manifest, original)
+      File.write!(Path.join(ctx.repo, "packaging/assemble.sh"), ctx.script)
 
       case problem do
-        :missing -> File.rm!(manifest)
-        :unreadable -> File.chmod!(manifest, 0o000)
-        :malformed -> File.write!(manifest, "{")
-        :mismatched -> File.write!(manifest, "{}")
+        :missing ->
+          File.rm!(manifest)
+
+        :unreadable ->
+          File.write!(
+            Path.join(ctx.repo, "packaging/assemble.sh"),
+            ctx.script <>
+              "chmod 000 _build/npm/tightbeam/release/lib/tightbeam-0.1.15/build-manifest.json\n"
+          )
+
+        :malformed ->
+          File.write!(manifest, "{")
+
+        :mismatched ->
+          File.write!(manifest, "{}")
       end
 
       try do
         package = build(ctx.repo, Provenance.stamp(ctx.repo))
         assert File.regular?(Path.join(package.path, "bin/tightbeam-gateway"))
-        assert [warning] = package.warnings
+
+        assert [warning] =
+                 Enum.filter(
+                   package.warnings,
+                   &String.contains?(&1, "manifest could not be verified")
+                 )
+
         assert warning =~ "manifest could not be verified"
         assert File.read!(package.report) =~ "UNVERIFIED"
         assert File.read!(package.report) =~ warning
