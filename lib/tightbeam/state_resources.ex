@@ -556,7 +556,7 @@ defmodule Tightbeam.StateResources do
           ]
         )
         |> Enum.map(&work_item_query_row/1)
-        |> Enum.map(&WorkItemSummary.attach(txn, &1))
+        |> then(&attach_work_item_summaries(txn, &1, selection, call))
       end)
 
     if is_map(selection), do: rows, else: List.first(rows)
@@ -605,7 +605,7 @@ defmodule Tightbeam.StateResources do
       "work_items AS wi LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id " <>
         "LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id"
 
-    case DB.transaction(db, fn txn ->
+    case DB.read_transaction(db, fn txn ->
            query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
 
            page =
@@ -622,9 +622,9 @@ defmodule Tightbeam.StateResources do
              )
 
            rows =
-             Enum.map(page.rows, fn row ->
-               WorkItemSummary.attach(txn, work_item_query_row(row))
-             end)
+             page.rows
+             |> Enum.map(&work_item_query_row/1)
+             |> then(&WorkItemSummary.attach_many(txn, &1))
 
            %{page | rows: rows}
          end) do
@@ -637,6 +637,22 @@ defmodule Tightbeam.StateResources do
 
       {:error, error} ->
         raise error
+    end
+  end
+
+  defp attach_work_item_summaries(txn, rows, selection, call) do
+    case Map.get(call, :work_item_summary_fields_by_id) do
+      fields_by_id when is_map(fields_by_id) ->
+        Enum.map(rows, fn row ->
+          WorkItemSummary.attach_fields(row, Map.fetch!(fields_by_id, row.id))
+        end)
+
+      _ ->
+        if Map.get(call, :include_work_item_summary, not is_map(selection)) do
+          WorkItemSummary.attach_many(txn, rows)
+        else
+          rows
+        end
     end
   end
 

@@ -1558,17 +1558,16 @@ defmodule Tightbeam.WorkItems do
   defp list_result(db, call) do
     with :ok <- ensure_body_schema_for_use(db),
          :ok <- principal_allowed(call.principal) do
-      {:ok, rows} =
-        DB.query(db, "SELECT #{columns()} FROM work_items ORDER BY createdAt DESC, id DESC")
+      {:ok, items} =
+        DB.read_transaction(db, fn txn ->
+          Txn.q(txn, "SELECT #{columns()} FROM work_items ORDER BY createdAt DESC, id DESC")
+          |> Enum.map(&work_item/1)
+          |> then(&WorkItemSummary.attach_handler_rows(txn, &1))
+          |> Enum.map(&public_summary/1)
+        end)
 
       %{
-        workItems:
-          Enum.map(rows, fn row ->
-            row
-            |> work_item()
-            |> then(&handler_summary_work_item(db, &1))
-            |> then(&Mementos.attach(db, "work_item", &1))
-          end)
+        workItems: Enum.map(items, &Mementos.attach(db, "work_item", &1))
       }
     end
   end
