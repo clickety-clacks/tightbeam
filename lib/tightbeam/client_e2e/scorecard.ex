@@ -76,10 +76,11 @@ defmodule Tightbeam.ClientE2E.Scorecard do
           gateway_sha: String.t() | nil,
           client_build: String.t() | nil,
           date: String.t() | nil,
-          legs: [Leg.t()]
+          legs: [Leg.t()],
+          warnings: [String.t()]
         }
 
-  defstruct gateway_sha: nil, client_build: nil, date: nil, legs: []
+  defstruct gateway_sha: nil, client_build: nil, date: nil, legs: [], warnings: []
 
   @doc "A pass row. `divergence_ref` cites the harness-support.md row when this leg diverges."
   @spec pass(String.t(), String.t(), keyword()) :: Row.t()
@@ -238,7 +239,16 @@ defmodule Tightbeam.ClientE2E.Scorecard do
   defp header(scorecard) do
     "# Client-e2e scorecard — #{scorecard.date || "<date>"} @ " <>
       "#{scorecard.gateway_sha || "<gateway sha>"}\n\n" <>
-      "Client build: #{scorecard.client_build || "<client build>"}"
+      "Client build: #{scorecard.client_build || "<client build>"}\n\n" <>
+      warning_report(scorecard.warnings)
+  end
+
+  @doc "Run warnings affect evidence provenance, never row or run verdicts."
+  def warning_report([]), do: ""
+
+  def warning_report(warnings) do
+    "UNVERIFIED: this run is not verified evidence for its commit.\n" <>
+      Enum.map_join(warnings, "\n", &("WARNING: " <> &1))
   end
 
   defp ordered_steps(legs) do

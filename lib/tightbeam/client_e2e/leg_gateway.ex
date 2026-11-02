@@ -52,7 +52,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
           log_path: String.t()
         }
 
-  defstruct [:base_dir, :port, :os_pid, :os_command, :port_ref, :log_path]
+  defstruct [:base_dir, :port, :os_pid, :os_command, :port_ref, :log_path, boot_opts: []]
 
   @copied ~w(adapters homes identity)
 
@@ -108,9 +108,15 @@ defmodule Tightbeam.ClientE2E.LegGateway do
     log_path = Path.join(base_dir, "gateway.log")
     repo_root = Keyword.get(opts, :repo_root, File.cwd!())
 
+    package_dir = opts |> Keyword.fetch!(:package_dir) |> Path.expand()
+    launcher = Path.join(package_dir, "bin/tightbeam-gateway")
+    unless File.regular?(launcher), do: raise("no packaged gateway launcher at #{launcher}")
+    opts = Keyword.put(opts, :package_dir, package_dir)
+
     env =
       [
-        {~c"MIX_ENV", ~c"dev"},
+        {~c"RELEASE_NODE", false},
+        {~c"TIGHTBEAM_NODE", false},
         # A leg is a real child BEAM, but it does not need the host's full
         # scheduler count. Two parallel fixtures plus a restart can otherwise
         # ask a busy test host for hundreds of scheduler and dirty-scheduler
@@ -122,13 +128,13 @@ defmodule Tightbeam.ClientE2E.LegGateway do
         {~c"TIGHTBEAM_PORT", to_charlist(Integer.to_string(port))}
       ] ++ extra_env(opts)
 
-    command = "exec mix run --no-halt >> #{Path.expand(log_path)} 2>&1"
+    command = "exec \"$1\" >> \"$2\" 2>&1"
 
     port_ref =
       Port.open({:spawn_executable, System.find_executable("sh")}, [
         :binary,
         :exit_status,
-        args: ["-c", command],
+        args: ["-c", command, "packaged-leg", launcher, Path.expand(log_path)],
         cd: repo_root,
         env: env
       ])
@@ -146,13 +152,14 @@ defmodule Tightbeam.ClientE2E.LegGateway do
       # command line still matches what was captured.
       os_command: process_command(os_pid),
       port_ref: port_ref,
-      log_path: log_path
+      log_path: log_path,
+      boot_opts: opts
     }
 
     case await_ready(gateway, Keyword.get(opts, :boot_timeout_ms, 60_000)) do
       :ok ->
-        # Re-read the identity NOW, not at spawn: `sh -c "exec mix run"` is an
-        # EXEC CHAIN (sh → mix → elixir → beam.smp) that rewrites this pid's
+        # Re-read the identity NOW, not at spawn: the packaged launcher is an
+        # EXEC CHAIN (sh → release launcher → beam.smp) that rewrites this pid's
         # argv while it boots. An identity captured at spawn never matches the
         # booted process again, so every ours?-gated signal silently skips and
         # the gateway survives its own teardown/restart (found by the codex J7
@@ -386,7 +393,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
          :ok <- await_unreachable(gateway, Keyword.get(opts, :unreachable_timeout_ms, 30_000)) do
       if gateway.port_ref && Port.info(gateway.port_ref), do: Port.close(gateway.port_ref)
 
-      case boot(gateway.base_dir, gateway.port, opts) do
+      case boot(gateway.base_dir, gateway.port, Keyword.merge(gateway.boot_opts, opts)) do
         {:ok, restarted} ->
           if restarted.os_pid == old_pid do
             {:error, {:same_pid, old_pid}}

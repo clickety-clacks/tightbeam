@@ -24,15 +24,14 @@
 #   5. SIGTERM, await exit, remove the directory — and if the process outlives
 #      the window, KEEP the directory and say so out loud.
 #
-# PROVENANCE: the run refuses to start on a dirty worktree, so a scorecard's sha
-# names the code that actually produced it. TIGHTBEAM_CLIENT_E2E_ALLOW_DIRTY=1
-# runs anyway and stamps the scorecard DIRTY with a hash of the diff.
+# PROVENANCE: dirty source and unverified package identity warn and continue.
+# The scorecard and run log retain the warning and mark the evidence unverified.
 #
 # Exits 0 only on RUN VERDICT PASS (1 on FAIL, 2 on INCOMPLETE), and writes the
 # scorecard to TIGHTBEAM_CLIENT_E2E_OUT when set.
 
 alias Tightbeam.ClientE2E
-alias Tightbeam.ClientE2E.{LegGateway, Provenance, Scorecard}
+alias Tightbeam.ClientE2E.{LegGateway, Provenance, RunPackage, Scorecard}
 
 defmodule ClientE2ERunner do
   def run do
@@ -47,27 +46,30 @@ defmodule ClientE2ERunner do
       )
     end
 
-    provenance = provenance!()
-    IO.puts("building client-e2e CLI from candidate #{provenance}")
-    candidate_cli = build_cli!(repo_root)
+    stamp = Provenance.stamp(repo_root)
+    provenance = Provenance.to_header(stamp)
+    IO.puts("building client-e2e package from candidate #{provenance}")
+    package = RunPackage.build!(repo_root, stamp)
 
     legs =
       legs()
       |> Enum.with_index()
       |> Enum.map(fn {harness, index} ->
-        run_leg(harness, template, candidate_cli, base_port + index, repo_root, journeys)
+        run_leg(harness, template, package, base_port + index, repo_root, journeys)
       end)
 
     scorecard = %Scorecard{
       legs: legs,
       date: Date.utc_today() |> Date.to_iso8601(),
       gateway_sha: provenance,
-      client_build: "sim-client (driver)"
+      client_build: "sim-client (driver); packaged CLI SHA-256 #{package.cli_sha256}",
+      warnings: package.warnings
     }
 
     registered = Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
     markdown = Scorecard.to_markdown(scorecard, registered)
     IO.puts("\n" <> markdown)
+    File.write!(package.report, "\n" <> markdown, [:append])
 
     if out = System.get_env("TIGHTBEAM_CLIENT_E2E_OUT") do
       File.write!(out, markdown)
@@ -81,10 +83,10 @@ defmodule ClientE2ERunner do
     end
   end
 
-  defp run_leg(harness, template, candidate_cli, port, repo_root, journeys) do
+  defp run_leg(harness, template, package, port, repo_root, journeys) do
     base_dir = Path.expand("~/.tightbeam-client-e2e-#{harness}-#{System.os_time(:second)}")
     IO.puts("\nclient-e2e leg #{harness} port=#{port} base_dir=#{base_dir}")
-    LegGateway.provision!(template, base_dir, candidate_cli)
+    LegGateway.provision!(template, base_dir, package.cli)
 
     # Preflight FIRST, against the provisioned org, while no gateway exists.
     preflight_row = ClientE2E.preflight(harness, base_dir)
@@ -101,15 +103,19 @@ defmodule ClientE2ERunner do
       File.rm_rf(base_dir)
       leg
     else
-      run_booted_leg(harness, base_dir, port, repo_root, journeys, preflight_row)
+      run_booted_leg(harness, base_dir, port, repo_root, package.path, journeys, preflight_row)
     end
   end
 
-  defp run_booted_leg(harness, base_dir, port, repo_root, journeys, preflight_row) do
+  defp run_booted_leg(harness, base_dir, port, repo_root, package_dir, journeys, preflight_row) do
     try do
       # Boot INSIDE the try so the after-block owns teardown on every path,
       # including a boot that half-succeeds and leaves a process behind.
-      case LegGateway.boot(base_dir, port, repo_root: repo_root, env: leg_env(harness)) do
+      case LegGateway.boot(base_dir, port,
+             repo_root: repo_root,
+             package_dir: package_dir,
+             env: leg_env(harness)
+           ) do
         {:error, reason, gateway} ->
           Process.put(:leg_gateway, gateway)
 
@@ -210,40 +216,6 @@ defmodule ClientE2ERunner do
     end
   end
 
-  defp build_cli!(repo_root) do
-    target_dir = Path.join(repo_root, "cli/target")
-    cli_path = Path.join(target_dir, "release/tightbeam")
-
-    {output, status} =
-      System.cmd(
-        "cargo",
-        [
-          "build",
-          "--locked",
-          "--offline",
-          "--release",
-          "--manifest-path",
-          Path.join(repo_root, "cli/Cargo.toml"),
-          "--target-dir",
-          target_dir
-        ],
-        cd: repo_root,
-        stderr_to_stdout: true
-      )
-
-    IO.write(output)
-
-    if status != 0 do
-      raise "candidate CLI build failed with exit status #{status}"
-    end
-
-    unless File.regular?(cli_path) do
-      raise "candidate CLI build produced no binary at #{cli_path}"
-    end
-
-    cli_path
-  end
-
   # BOTH FIELDS, ALWAYS. A model and its effort are separate fields now
   # (model-identity-v1), and a tiered model named without a tier is an INCOMPLETE
   # selection — unplaceable, so the leg boots NOT READY. Passing the model alone
@@ -270,32 +242,6 @@ defmodule ClientE2ERunner do
     case System.get_env("TIGHTBEAM_CLIENT_E2E_HARNESSES") do
       nil -> Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
       value -> value |> String.split(",", trim: true) |> Enum.map(&String.trim/1)
-    end
-  end
-
-  # The scorecard's sha must name the code that produced it, or a PASS proves an
-  # unrecorded working-tree state. The stamp itself lives in
-  # Tightbeam.ClientE2E.Provenance, where the suite can hold it — both review
-  # rounds found their provenance defects in script code no test could reach.
-  defp provenance! do
-    case Provenance.stamp() do
-      {:clean, sha} ->
-        sha
-
-      {:dirty, _sha, fingerprint, listing} = stamp ->
-        if System.get_env("TIGHTBEAM_CLIENT_E2E_ALLOW_DIRTY") == "1" do
-          Provenance.to_header(stamp)
-        else
-          raise """
-          refusing to run on a dirty worktree — a scorecard from an uncommitted tree \
-          cannot be reproduced from its sha.
-
-          #{String.trim(listing)}
-
-          Commit, or set TIGHTBEAM_CLIENT_E2E_ALLOW_DIRTY=1 to run with the scorecard \
-          stamped DIRTY (diff #{fingerprint}).
-          """
-        end
     end
   end
 
