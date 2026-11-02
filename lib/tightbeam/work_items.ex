@@ -26,7 +26,8 @@ defmodule Tightbeam.WorkItems do
     Rules,
     StateResources,
     StateVisibility,
-    Wakes
+    Wakes,
+    WorkItemSummary
   }
 
   alias Tightbeam.DB.Txn
