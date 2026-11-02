@@ -2100,7 +2100,8 @@ defmodule Tightbeam.Supervision do
       """
       SELECT wakeId FROM wakes INDEXED BY wakes_assignment
       WHERE assignmentId=?1 AND state='pending'
-        AND (consumer IN (?2,?3) OR obligationRef LIKE ?4)
+        AND (consumer IN (?2,?3) OR
+             (obligationRef LIKE ?4 AND deliveredTurnSeq IS NULL))
       ORDER BY createdAt,wakeId
       """,
       [assignment_id, @deadline_consumer, @climb_consumer, @episode_ref <> "%"]
