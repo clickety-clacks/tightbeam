@@ -283,7 +283,14 @@ defmodule WorkItemBodySmoke do
 
   defp port!(value) do
     port = String.to_integer(value)
-    if port < @min_port, do: raise("R41 port must be >= #{@min_port}"), else: port
+
+    if port < @min_port do
+      IO.warn(
+        "work-item body smoke port #{port} is below #{@min_port} and may collide with another service; continuing"
+      )
+    end
+
+    port
   rescue
     ArgumentError -> raise("R41 invalid port: #{value}")
   end

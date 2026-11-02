@@ -42,7 +42,9 @@ defmodule ClientE2ERunner do
     repo_root = File.cwd!()
 
     if base_port < 12_000 do
-      raise "client-e2e runs on throwaway ports >= 12000 (got #{base_port})"
+      IO.warn(
+        "client-e2e base port #{base_port} is below 12000 and may collide with another service; continuing"
+      )
     end
 
     provenance = provenance!()
