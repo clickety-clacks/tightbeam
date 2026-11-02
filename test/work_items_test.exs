@@ -1373,6 +1373,8 @@ defmodule Tightbeam.WorkItemsTest do
         )
     }
 
+    IO.inspect(terminal_evidence, label: "terminal evidence", limit: :infinity)
+
     # Closure stores the terminal report and independently schedules the slate.
     # Recipient availability is decided when delivery is attempted, not here.
     assert {:ok, [["pending", nil, nil, item_id, "pending"]]} =
@@ -1386,8 +1388,7 @@ defmodule Tightbeam.WorkItemsTest do
                WHERE notice.assignmentId=?1 AND notice.obligationRef=?2
                """,
                [era.id, "terminal-child-owner-notification:" <> era.id]
-             ),
-           "terminal evidence: #{inspect(terminal_evidence, limit: :infinity)}"
+             )
 
     assert item_id == first.id
     restaffed = assign(ctx, "other-holder", "restaffed", first.id)
