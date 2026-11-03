@@ -38,11 +38,13 @@ defmodule Tightbeam.TestSupport.PreF9Assignments do
                      "ALTER TABLE assignments RENAME TO assignments_fixture_current"
                    )
 
-                 :ok =
-                   DB.Txn.exec(
-                     txn,
-                     File.read!(Path.join(__DIR__, "../fixtures/f6e78ae0_assignments.sql"))
-                   )
+                 ddl = File.read!(Path.join(__DIR__, "../fixtures/f6e78ae0_assignments.sql"))
+                 # Retained verbatim in a6e8846e0bfcc6d289b9539457406ce479d2f0d9;
+                 # the assignments definition also matches 9f47967f's baseline DDL.
+                 assert Base.encode16(:crypto.hash(:sha256, ddl), case: :lower) ==
+                          "9c746fb964a076f9a75dd05a7863ac0dc7b191f1d85badc8188ceb036c08ec58"
+
+                 :ok = DB.Txn.exec(txn, ddl)
 
                  :ok =
                    DB.Txn.exec(txn, "ALTER TABLE assignments ADD COLUMN reminderState TEXT NULL")

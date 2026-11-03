@@ -2,9 +2,21 @@ defmodule Tightbeam.ArtifactOriginsTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.{ArtifactOrigins, Artifacts, DB, Org, Placement, Schema}
 
-  setup do
+  setup context do
     db = start_supervised!({DB, path: ":memory:", name: :artifact_origins_test})
-    :ok = Schema.ensure_all(db)
+
+    if context[:historical_origin] do
+      Tightbeam.HistoricalSchemaFixture.load!(
+        db,
+        "reparent_predecessor_23c0a075",
+        "0170ddc9581eee46e349012ecee15afde98a7646ccce0cccc911778f9f68dbe9"
+      )
+
+      assert {:ok, [["delivery-owner-reparent-v1-019"]]} =
+               DB.query(db, "SELECT shape FROM schema_stamp")
+    else
+      :ok = Schema.ensure_all(db)
+    end
 
     :ok =
       DB.execute(db, """
@@ -146,47 +158,41 @@ defmodule Tightbeam.ArtifactOriginsTest do
     end
   end
 
+  @tag :historical_origin
   test "exact predecessor upgrade leaves legacy origins unknown and preserves every named byte of the row",
        %{db: db} do
-    row = record(db, "/same/base/report.md")
-    Tightbeam.SchemaShapeRuntimeFixture.downgrade_assignment_source_replacement_cancellation!(db)
-
     :ok =
       DB.execute(db, """
-      DROP TRIGGER artifacts_origin_immutable;
-      ALTER TABLE artifacts DROP COLUMN originHost;
-      ALTER TABLE artifacts DROP COLUMN originWorkspace;
-      ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey;
-      ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic;
-      UPDATE schema_stamp SET shape='delivery-owner-reparent-v1-019';
+      INSERT INTO artifacts(artifactId,kind,title,createdBySession,workItemId,originPath,
+        contentSha256,recordedTurnEvidence,createdAt,updatedAt)
+      VALUES ('legacy-origin','report','Preserved report','origin-owner','origin-work',
+        '/same/base/report.md','synthetic-hash','tool-call-observed',1,2);
       """)
 
+    assert {:ok, columns} = DB.query(db, "PRAGMA table_info(artifacts)")
+    names = Enum.map_join(columns, ",", &Enum.at(&1, 1))
+    preserved_sql = "SELECT #{names} FROM artifacts WHERE artifactId='legacy-origin'"
+    assert {:ok, before_row} = DB.query(db, preserved_sql)
+
     assert :ok = Schema.ensure_all(db)
-    migrated = Artifacts.get(db, row.artifact_id)
+    migrated = Artifacts.get(db, "legacy-origin")
     assert migrated.origin_host == nil
     assert migrated.origin_workspace == nil
 
-    assert Map.drop(migrated, [:origin_host, :origin_workspace]) ==
-             Map.drop(row, [:origin_host, :origin_workspace])
+    assert {:ok, ^before_row} = DB.query(db, preserved_sql)
 
     assert ArtifactOrigins.resolve(migrated) == {:error, :unknown_origin}
     assert :ok = Schema.ensure_all(db)
-    assert Artifacts.get(db, row.artifact_id) == migrated
+    assert Artifacts.get(db, "legacy-origin") == migrated
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
+  @tag :historical_origin
   test "migration stamp failure rolls the provenance columns back", %{db: db} do
-    Tightbeam.SchemaShapeRuntimeFixture.downgrade_assignment_source_replacement_cancellation!(db)
-
     :ok =
       DB.execute(db, """
-      DROP TRIGGER artifacts_origin_immutable;
-      ALTER TABLE artifacts DROP COLUMN originHost;
-      ALTER TABLE artifacts DROP COLUMN originWorkspace;
-      ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey;
-      UPDATE schema_stamp SET shape='delivery-owner-reparent-v1-019';
       CREATE TRIGGER reject_origin_stamp BEFORE UPDATE ON schema_stamp
       WHEN NEW.shape='artifact-origin-v1-019'
       BEGIN SELECT RAISE(ABORT,'synthetic stamp failure'); END;

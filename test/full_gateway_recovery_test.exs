@@ -177,7 +177,7 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
         assert notice_turn["status"] == "delivered"
         assert is_integer(notice_turn["endedAt"])
 
-        assert notice["prompt"] =~ "has had no recorded activity"
+        assert notice["prompt"] =~ "Last recorded activity:"
 
         assert notice_turn["origin"] == notice["origin"]
 

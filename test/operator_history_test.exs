@@ -296,24 +296,21 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
     append(ctx, ctx.selected, "two")
     page = read(ctx, ctx.selected, "asUser=owner&limit=1") |> body()
     cursor = page["page"]["oldestCursor"]
-    identity = cursor |> Base.url_decode64!(padding: false) |> JSON.decode!()
-    assert identity["principalKind"] == "user"
-    assert identity["principalId"] == "owner"
+    assert read(ctx, ctx.selected, "asUser=owner&before=" <> cursor).status == 200
     assert_error(read(ctx, ctx.sibling, "asUser=owner&before=" <> cursor), 400, "invalid_cursor")
 
-    mismatched_principal =
+    admin_view =
       read(ctx, ctx.selected, "asUser=" <> ctx.admin.user_id <> "&before=" <> cursor)
 
-    assert mismatched_principal.status == 200
-    assert Enum.map(body(mismatched_principal)["items"], & &1["content"]) == ["one", "two"]
+    assert admin_view.status == 200
+    assert Enum.map(body(admin_view)["items"], & &1["content"]) == ["one", "two"]
 
-    changed_cursor =
-      body(mismatched_principal)["page"]["oldestCursor"]
-      |> Base.url_decode64!(padding: false)
-      |> JSON.decode!()
+    other_principal =
+      read(ctx, ctx.selected, "asUser=owner&before=" <> cursor, ctx.admin.token) |> body()
 
-    assert changed_cursor["principalKind"] == "user-admin"
-    assert changed_cursor["principalId"] == ctx.admin.user_id
+    admin_default = read(ctx, ctx.selected, "", ctx.admin.token) |> body()
+    assert other_principal["items"] == admin_default["items"]
+    assert Enum.map(other_principal["items"], & &1["content"]) == ["one", "two"]
   end
 
   test "org reads expose session collections with unchanged owner and admin visibility", ctx do
@@ -344,13 +341,20 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
       assert response.status == 200, response.resp_body
       assert Enum.any?(body(response)["items"], &(&1["content"] == "ordinary reads"))
 
-      identity =
-        body(response)["page"]["oldestCursor"]
-        |> Base.url_decode64!(padding: false)
-        |> JSON.decode!()
+      cursor = body(response)["page"]["oldestCursor"]
+      previous = read(ctx, ctx.selected, "asUser=owner&before=" <> cursor, token) |> body()
+      assert previous["items"] == []
 
-      assert identity["principalKind"] == "user"
-      assert identity["principalId"] == "owner"
+      assert_error(
+        read(ctx, ctx.sibling, "asUser=owner&before=" <> cursor, token),
+        400,
+        "invalid_cursor"
+      )
+
+      other_view = read(ctx, ctx.selected, "before=" <> cursor, ctx.admin.token) |> body()
+      admin_default = read(ctx, ctx.selected, "", ctx.admin.token) |> body()
+      assert other_view["items"] == admin_default["items"]
+      assert Enum.map(other_view["items"], & &1["content"]) == ["ordinary reads"]
     end
 
     assert_error(read(ctx, ctx.hidden, "", ctx.owner.token), 404, "not_found")

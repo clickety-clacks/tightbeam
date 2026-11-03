@@ -100,6 +100,13 @@ defmodule Tightbeam.IdentityTest do
                  "I want to know a change was actually tested, not just claimed."
                ],
                root_archetype: "orchestrator"
+             },
+             %{
+               name: "sentinels",
+               purpose:
+                 "Share generic event subscription tools and a read-only Matrix event watcher.",
+               phrases: [],
+               root_archetype: "default"
              }
            ]
   end
@@ -183,7 +190,21 @@ defmodule Tightbeam.IdentityTest do
     purpose = "Help a team ship dependable work."
     """)
 
-    assert [%{phrases: []}] = Identity.available_bundles()
+    assert [
+             %{
+               name: "agentic-engineering",
+               purpose: "Help a team ship dependable work.",
+               phrases: [],
+               root_archetype: "product-owner"
+             },
+             %{
+               name: "sentinels",
+               purpose:
+                 "Share generic event subscription tools and a read-only Matrix event watcher.",
+               phrases: [],
+               root_archetype: "default"
+             }
+           ] = Identity.available_bundles()
   end
 
   test "a manifest with invalid phrases is refused before identity mutation", ctx do
@@ -646,7 +667,9 @@ defmodule Tightbeam.IdentityTest do
     git!(dir, ["add", "rails/scripts/synthetic-check"])
     git!(dir, ["commit", "-m", "synthetic executable check"], "test")
     edit!(ctx.base, "coder", :guidance, "local customization", "test")
-    Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :ok = Schema.ensure_all(db)
+    Gateway.load_law!(%{base_dir: ctx.base, db: db}, ["post"])
     hooks = Rails.hook_settings()
     File.write!(Path.join(ctx.source, "guidance/coder.md"), "incoming guidance")
     assert {:conflict, [_]} = relearn!(ctx.base, "test")
@@ -661,7 +684,7 @@ defmodule Tightbeam.IdentityTest do
       "#!/bin/sh\nprintf unpublished\n"
     )
 
-    assert [rule] = Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+    assert [rule] = Gateway.load_law!(%{base_dir: ctx.base, db: db}, ["post"])
     assert Rails.hook_settings() == hooks
     assert rule.base_dir == ctx.base
     assert rule.identity_manifest_sha == live
@@ -670,8 +693,6 @@ defmodule Tightbeam.IdentityTest do
     assert File.read!(Path.join(dir, ".git/MERGE_HEAD")) == merge
     assert Identity.live_revision!(ctx.base) == live
 
-    db = start_supervised!({DB, path: ":memory:", name: nil})
-    :ok = Schema.ensure_all(db)
     File.mkdir_p!(Path.join(ctx.base, "bin"))
     File.cp!(Path.expand("cli/target/release/tightbeam"), Path.join(ctx.base, "bin/tightbeam"))
 
@@ -689,7 +710,11 @@ defmodule Tightbeam.IdentityTest do
 
   test "recovery keeps invalid published law closed and preserves the merge",
        ctx do
-    alias Tightbeam.Gateway
+    alias Tightbeam.{DB, Gateway, Schema}
+
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :ok = Schema.ensure_all(db)
+
     learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")
     File.mkdir_p!(Path.join(dir, "rules"))
@@ -700,7 +725,7 @@ defmodule Tightbeam.IdentityTest do
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        assert [] = Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+        assert [] = Gateway.load_law!(%{base_dir: ctx.base, db: db}, ["post"])
       end)
 
     assert log =~ "invalid.toml"
@@ -717,7 +742,7 @@ defmodule Tightbeam.IdentityTest do
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        assert [] = Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+        assert [] = Gateway.load_law!(%{base_dir: ctx.base, db: db}, ["post"])
       end)
 
     assert log =~ "invalid.toml"
@@ -730,7 +755,7 @@ defmodule Tightbeam.IdentityTest do
     git!(dir, ["branch", "-D", "tightbeam/live"])
 
     assert_raise RuntimeError, ~r/git .* failed/, fn ->
-      Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+      Gateway.load_law!(%{base_dir: ctx.base, db: db}, ["post"])
     end
 
     assert File.read!(Path.join(dir, ".git/index")) == index
@@ -954,7 +979,7 @@ defmodule Tightbeam.IdentityTest do
       end
 
     assert error.message =~ "unknown kungfu bundle missing"
-    assert error.message =~ "available bundles: agentic-engineering"
+    assert error.message =~ "available bundles: agentic-engineering, sentinels"
 
     traversal =
       assert_raise ArgumentError, fn ->
@@ -962,7 +987,7 @@ defmodule Tightbeam.IdentityTest do
       end
 
     assert traversal.message =~ "unknown kungfu bundle ../guidance"
-    assert traversal.message =~ "available bundles: agentic-engineering"
+    assert traversal.message =~ "available bundles: agentic-engineering, sentinels"
   end
 
   test "legacy enriched roots mint one receipt without changing their seed-owned paths", ctx do

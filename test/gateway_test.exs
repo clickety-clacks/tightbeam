@@ -1897,17 +1897,19 @@ defmodule Tightbeam.GatewayTest do
     assert attachment_only_label =~ "diagram.png"
     assert Base.decode64!(attachment_only_data) == image_bytes
 
-    legacy_prompt =
-      Gateway.turn_prompt_content(
-        ctx.db,
-        %{seq: -1, message_id: attachment_only.id, prompt: ""},
-        session,
-        "pi",
-        ctx.catalog_base
-      )
+    for harness <- [:pi, "pi", :cursor, "cursor", :fixture, "fixture"] do
+      legacy_prompt =
+        Gateway.turn_prompt_content(
+          ctx.db,
+          %{seq: -1, message_id: attachment_only.id, prompt: ""},
+          session,
+          harness,
+          ctx.catalog_base
+        )
 
-    assert is_binary(legacy_prompt)
-    assert legacy_prompt =~ "diagram.png"
+      assert is_binary(legacy_prompt)
+      assert legacy_prompt =~ "diagram.png"
+    end
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
@@ -11105,23 +11107,36 @@ defmodule Tightbeam.GatewayTest do
     base_dir = role_test_base("kungfu-list")
     list = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["kungfu-list"]
 
+    result = list.(%{origin: "agent:k1", params: %{}})
+
     assert %{
              bundles: [
                %{
                  name: "agentic-engineering",
-                 purpose: purpose,
-                 phrases: phrases,
+                 purpose:
+                   "Give your organization a disciplined way to turn product ideas and bug reports into shipped software, with tracked work, independent review, and verification.",
+                 phrases: [
+                   "I want my code reviewed before it merges.",
+                   "We keep shipping bugs that someone should have caught.",
+                   "I want a spec agreed before anyone starts writing code.",
+                   "My agents rewrite things I never asked them to touch.",
+                   "The same bug keeps coming back and nobody finds the cause.",
+                   "I want to know a change was actually tested, not just claimed."
+                 ],
                  root_archetype: "orchestrator"
+               },
+               %{
+                 name: "sentinels",
+                 purpose:
+                   "Share generic event subscription tools and a read-only Matrix event watcher.",
+                 phrases: [],
+                 root_archetype: "default"
                }
              ]
-           } = list.(%{origin: "agent:k1", params: %{}})
+           } = result
 
-    assert purpose =~ "turn product ideas and bug reports into shipped software"
-    assert "I want my code reviewed before it merges." in phrases
-
-    # The point of phrases is DISCRIMINATION: a phrase another domain's bundle could
-    # honestly claim buys nothing. This one could only be a software-engineering bundle.
-    refute Enum.any?(phrases, &(&1 == "I keep losing track of what I asked for."))
+    engineering = Enum.find(result.bundles, &(&1.name == "agentic-engineering"))
+    refute Enum.any?(engineering.phrases, &(&1 == "I keep losing track of what I asked for."))
   end
 
   test "every unlearn reference kind supplies supported commands that clear it", ctx do
