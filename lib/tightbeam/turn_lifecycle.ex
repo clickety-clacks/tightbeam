@@ -9,7 +9,7 @@ defmodule Tightbeam.TurnLifecycle do
   a lawful retention transition.
   """
 
-  alias Tightbeam.DB
+  alias Tightbeam.{DB, ProviderTurnFailure}
   alias Tightbeam.DB.Txn
 
   require Logger
@@ -284,7 +284,8 @@ defmodule Tightbeam.TurnLifecycle do
               ended_at: ended_at,
               legacy: seq < epoch
             },
-            events: events(db, seq)
+            events: events(db, seq),
+            failure_evidence: ProviderTurnFailure.read(db, seq)
           }
         else
           not_found()

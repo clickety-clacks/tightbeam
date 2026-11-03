@@ -88,6 +88,7 @@ defmodule Tightbeam.Gateway do
     NoticeBatcher,
     Org,
     Projection,
+    ProviderTurnFailure,
     Rails,
     Rules,
     Roles,
@@ -1248,6 +1249,7 @@ defmodule Tightbeam.Gateway do
         completion_disposition_result(config, db, call)
       end,
       {"inspect", []} => fn call -> inspect_result(config, db, call) end,
+      {"harness-health", []} => fn call -> harness_health_result(db, call) end,
       {"cancel", ["turn.ended", "session.updated"]} => fn call -> cancel_result(db, call) end,
       {"critical", ["critical_lease.updated"]} => fn call -> critical_result(config, db, call) end,
       {"spawn", ["session.spawned"]} => fn call -> spawn_result(config, db, call) end,
@@ -2779,6 +2781,9 @@ defmodule Tightbeam.Gateway do
             raw_reason = reason
             safe_failure = safe_process_failure(failed_stage, raw_reason)
 
+            failure_snapshot =
+              ProviderTurnFailure.capture(session, failed_stage, raw_reason)
+
             {reason, credential_refused?} =
               case turn_credential_refusal(session) do
                 {:refused, message} -> {message, true}
@@ -2855,6 +2860,7 @@ defmodule Tightbeam.Gateway do
                 end
 
               EventLog.lifecycle_in_txn(txn, "harness_turn_error", turn.session_key, detail)
+              :ok = ProviderTurnFailure.record_in_txn(txn, turn.seq, failure_snapshot)
 
               notice =
                 assignment_process_failure_notice_in_txn(
@@ -5127,6 +5133,38 @@ defmodule Tightbeam.Gateway do
 
         maybe_put_inspected_batch(result, db, call, caller)
     end
+  end
+
+  defp harness_health_result(db, call) do
+    case resolve_caller(db, call.origin) do
+      nil ->
+        %{code: "unknown_caller"}
+
+      _caller ->
+        case call.params[:incident_id] do
+          incident_id when is_binary(incident_id) and incident_id != "" ->
+            case HarnessHealth.get(db, incident_id) do
+              nil -> %{code: "unknown_harness_health_incident"}
+              incident -> %{incident: redacted_harness_health_incident(incident)}
+            end
+
+          _ ->
+            %{incidents: HarnessHealth.active(db)}
+        end
+    end
+  end
+
+  defp redacted_harness_health_incident(incident) do
+    Map.take(incident, [
+      :id,
+      :harness,
+      :host,
+      :failureClass,
+      :state,
+      :openedAt,
+      :resolvedAt,
+      :credentialHealthTrace
+    ])
   end
 
   defp inspect_wake(db, wake, principal) do
