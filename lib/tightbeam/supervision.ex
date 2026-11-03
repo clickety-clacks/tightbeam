@@ -7,7 +7,7 @@ defmodule Tightbeam.Supervision do
   Delivery remains the ordinary wake and notice-batching path.
   """
 
-  alias Tightbeam.{DB, EventLog, Org, Wakes}
+  alias Tightbeam.{AssignmentHolds, DB, EventLog, Org, Wakes}
   alias Tightbeam.DB.Txn
 
   require Logger
@@ -86,6 +86,7 @@ defmodule Tightbeam.Supervision do
   @doc false
   def child_opened_in_txn(txn, parent_id) do
     if not reminders_disabled?(nil) and
+         not AssignmentHolds.active_in_txn?(txn, parent_id) and
          Txn.q(txn, "SELECT 1 FROM assignments WHERE id=?1 AND state='open'", [parent_id]) == [
            [1]
          ] do
@@ -126,12 +127,61 @@ defmodule Tightbeam.Supervision do
   @doc false
   def assignment_closed_in_txn(%Txn{} = txn, assignment_id)
       when is_binary(assignment_id) do
+    :ok = AssignmentHolds.release_for_closure_in_txn(txn, assignment_id)
     :ok = Wakes.assignment_closed_in_txn(txn, assignment_id)
     cancel_assignment_sources_in_txn(txn, assignment_id, :disposed)
     :ok
   end
 
   def assignment_closed_in_txn(_txn, _assignment_id), do: :ok
+
+  @doc false
+  def assignment_hold_imposed_in_txn(%Txn{} = txn, assignment_id, hold_id) do
+    cancel_assignment_sources_for_hold_in_txn(txn, assignment_id, hold_id)
+  end
+
+  @doc false
+  def assignment_hold_released_in_txn(%Txn{} = txn, assignment_id, released_at) do
+    suppression_released_in_txn(txn, assignment_id, released_at)
+  end
+
+  @doc false
+  def cannot_proceed_settled_in_txn(%Txn{} = txn, assignment_id, settled_at) do
+    suppression_released_in_txn(txn, assignment_id, settled_at)
+  end
+
+  defp suppression_released_in_txn(txn, assignment_id, released_at) do
+    if not reminders_disabled?(nil) do
+      case Txn.q(txn, "SELECT holderKey,workItemId,state FROM assignments WHERE id=?1", [
+             assignment_id
+           ]) do
+        [[holder, work_item_id, "open"]]
+        when not is_nil(holder) ->
+          if AssignmentHolds.active_in_txn?(txn, assignment_id) do
+            :ok
+          else
+            interval_ms = policy_period_ms()
+
+            deadline =
+              schedule_deadline_in_txn(
+                txn,
+                assignment_id,
+                holder,
+                work_item_id,
+                released_at,
+                interval_ms
+              )
+
+            cancel_assignment_sources_in_txn(txn, assignment_id, {:replacement, deadline.wake_id})
+          end
+
+        _ ->
+          :ok
+      end
+    end
+
+    :ok
+  end
 
   @doc false
   def activity_in_txn(%Txn{} = txn, assignment_id, actor_session_key, at, interval_ms \\ nil)
@@ -146,51 +196,55 @@ defmodule Tightbeam.Supervision do
   def activity_in_txn(_txn, _assignment_id, _actor_session_key, _at, _interval_ms), do: :ignored
 
   defp activity_start_result(txn, assignment_id, actor_session_key, at, configured_interval) do
-    case Txn.q(
-           txn,
-           "SELECT holderKey,workItemId,openedAt,state FROM assignments WHERE id=?1",
-           [assignment_id]
-         ) do
-      [[^actor_session_key, work_item_id, opened_at, "open"]]
-      when is_integer(opened_at) ->
-        activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
+    if AssignmentHolds.active_in_txn?(txn, assignment_id) do
+      :held
+    else
+      case Txn.q(
+             txn,
+             "SELECT holderKey,workItemId,openedAt,state FROM assignments WHERE id=?1",
+             [assignment_id]
+           ) do
+        [[^actor_session_key, work_item_id, opened_at, "open"]]
+        when is_integer(opened_at) ->
+          activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
 
-        {stored_interval_ms, last_activity} =
-          latest_deadline_state_in_txn(txn, assignment_id, activity_start)
+          {stored_interval_ms, last_activity} =
+            latest_deadline_state_in_txn(txn, assignment_id, activity_start)
 
-        interval_ms =
-          case configured_interval do
-            value when is_integer(value) and value > 0 -> value
-            _ -> stored_interval_ms
-          end
+          interval_ms =
+            case configured_interval do
+              value when is_integer(value) and value > 0 -> value
+              _ -> stored_interval_ms
+            end
 
-        effective_at = max(activity_start, max(last_activity, at))
+          effective_at = max(activity_start, max(last_activity, at))
 
-        deadline =
-          schedule_deadline_in_txn(
+          deadline =
+            schedule_deadline_in_txn(
+              txn,
+              assignment_id,
+              actor_session_key,
+              work_item_id,
+              effective_at,
+              interval_ms,
+              nil,
+              :activity
+            )
+
+          # Stamp the replacement at the activity itself: cancellation also
+          # settles effort relief, which must start when a wait was registered.
+          cancel_assignment_sources_in_txn(
             txn,
             assignment_id,
-            actor_session_key,
-            work_item_id,
-            effective_at,
-            interval_ms,
-            nil,
-            :activity
+            {:replacement, deadline.wake_id},
+            fn -> at end
           )
 
-        # Stamp the replacement at the activity itself: cancellation also
-        # settles effort relief, which must start when a wait was registered.
-        cancel_assignment_sources_in_txn(
-          txn,
-          assignment_id,
-          {:replacement, deadline.wake_id},
-          fn -> at end
-        )
+          :reset
 
-        :reset
-
-      _ ->
-        :ignored
+        _ ->
+          :ignored
+      end
     end
   end
 
@@ -331,111 +385,119 @@ defmodule Tightbeam.Supervision do
                  isolated_side_task(txn, assignment_id, "migration", fn ->
                    configured_off? = default_interval_ms == :off
 
-                   if configured_off? do
-                     interval_ms = policy_period_ms()
-
-                     activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
-
-                     last_activity =
-                       current_activity_time_in_txn(txn, assignment_id, holder, activity_start)
-
-                     disabled_deadline =
-                       schedule_deadline_in_txn(
-                         txn,
-                         assignment_id,
-                         holder,
-                         work_item_id,
-                         last_activity,
-                         interval_ms,
-                         now() + interval_ms,
-                         :period_change
-                       )
-
-                     cancel_boot_sources_in_txn(
+                   if AssignmentHolds.active_in_txn?(txn, assignment_id) do
+                     cancel_assignment_sources_for_hold_in_txn(
                        txn,
                        assignment_id,
-                       holder,
-                       disabled_deadline.wake_id,
-                       true
+                       active_hold_id_in_txn(txn, assignment_id)
                      )
                    else
-                     interval_ms = default_interval_ms
-                     activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
+                     if configured_off? do
+                       interval_ms = policy_period_ms()
 
-                     last_activity =
-                       current_activity_time_in_txn(txn, assignment_id, holder, activity_start)
+                       activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
 
-                     quiet_start =
-                       quiet_start_in_txn(
-                         txn,
-                         assignment_id,
-                         holder,
-                         max(opened_at, last_activity)
-                       )
+                       last_activity =
+                         current_activity_time_in_txn(txn, assignment_id, holder, activity_start)
 
-                     reminder_count =
-                       reminder_count_since_activity_in_txn(
-                         txn,
-                         assignment_id,
-                         holder,
-                         last_activity
-                       )
-
-                     restored =
-                       if open_child_in_txn?(txn, assignment_id),
-                         do: :none,
-                         else:
-                           restore_boot_climb_in_txn(
-                             txn,
-                             assignment_id,
-                             holder,
-                             work_item_id,
-                             last_activity,
-                             reminder_count,
-                             interval_ms
-                           )
-
-                     case restored do
-                       {:active, climb, visited} ->
-                         cancel_boot_sources_in_txn(
+                       disabled_deadline =
+                         schedule_deadline_in_txn(
                            txn,
                            assignment_id,
                            holder,
-                           climb.wake_id,
-                           false,
-                           {climb.obligation_ref, visited}
+                           work_item_id,
+                           last_activity,
+                           interval_ms,
+                           now() + interval_ms,
+                           :period_change
                          )
 
-                       :none ->
-                         suppression? =
-                           reminder_suppressed_in_txn?(txn, assignment_id, holder, now())
+                       cancel_boot_sources_in_txn(
+                         txn,
+                         assignment_id,
+                         holder,
+                         disabled_deadline.wake_id,
+                         true
+                       )
+                     else
+                       interval_ms = default_interval_ms
+                       activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
 
-                         due_at =
-                           cond do
-                             reminder_count >= holder_reminder_limit() -> now()
-                             suppression? -> now() + interval_ms
-                             true -> quiet_start + interval_ms
-                           end
+                       last_activity =
+                         current_activity_time_in_txn(txn, assignment_id, holder, activity_start)
 
-                         deadline =
-                           schedule_deadline_in_txn(
-                             txn,
-                             assignment_id,
-                             holder,
-                             work_item_id,
-                             quiet_start,
-                             interval_ms,
-                             due_at,
-                             :period_change
-                           )
-
-                         cancel_boot_sources_in_txn(
+                       quiet_start =
+                         quiet_start_in_txn(
                            txn,
                            assignment_id,
                            holder,
-                           deadline.wake_id,
-                           open_child_in_txn?(txn, assignment_id)
+                           max(opened_at, last_activity)
                          )
+
+                       reminder_count =
+                         reminder_count_since_activity_in_txn(
+                           txn,
+                           assignment_id,
+                           holder,
+                           last_activity
+                         )
+
+                       restored =
+                         if open_child_in_txn?(txn, assignment_id),
+                           do: :none,
+                           else:
+                             restore_boot_climb_in_txn(
+                               txn,
+                               assignment_id,
+                               holder,
+                               work_item_id,
+                               last_activity,
+                               reminder_count,
+                               interval_ms
+                             )
+
+                       case restored do
+                         {:active, climb, visited} ->
+                           cancel_boot_sources_in_txn(
+                             txn,
+                             assignment_id,
+                             holder,
+                             climb.wake_id,
+                             false,
+                             {climb.obligation_ref, visited}
+                           )
+
+                         :none ->
+                           suppression? =
+                             reminder_suppressed_in_txn?(txn, assignment_id, holder, now())
+
+                           due_at =
+                             cond do
+                               reminder_count >= holder_reminder_limit() -> now()
+                               suppression? -> now() + interval_ms
+                               true -> quiet_start + interval_ms
+                             end
+
+                           deadline =
+                             schedule_deadline_in_txn(
+                               txn,
+                               assignment_id,
+                               holder,
+                               work_item_id,
+                               quiet_start,
+                               interval_ms,
+                               due_at,
+                               :period_change
+                             )
+
+                           cancel_boot_sources_in_txn(
+                             txn,
+                             assignment_id,
+                             holder,
+                             deadline.wake_id,
+                             open_child_in_txn?(txn, assignment_id)
+                           )
+                       end
                      end
                    end
 
@@ -646,6 +708,13 @@ defmodule Tightbeam.Supervision do
                 )
 
               cond do
+                AssignmentHolds.active_in_txn?(txn, assignment_id) ->
+                  cancel_assignment_sources_for_hold_in_txn(
+                    txn,
+                    assignment_id,
+                    active_hold_id_in_txn(txn, assignment_id)
+                  )
+
                 reminders_disabled?(nil) ->
                   fire_internal_in_txn(txn, wake.wake_id, @deadline_consumer, now)
 
@@ -934,6 +1003,13 @@ defmodule Tightbeam.Supervision do
     count = reminder_count_since_activity_in_txn(txn, assignment_id, holder, latest_activity)
 
     cond do
+      AssignmentHolds.active_in_txn?(txn, assignment_id) ->
+        cancel_assignment_sources_for_hold_in_txn(
+          txn,
+          assignment_id,
+          active_hold_id_in_txn(txn, assignment_id)
+        )
+
       reminders_disabled?(nil) ->
         fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
         :ok
@@ -1829,6 +1905,7 @@ defmodule Tightbeam.Supervision do
       end
 
     open_child_in_txn?(txn, assignment_id) or
+      AssignmentHolds.active_in_txn?(txn, assignment_id) or
       Tightbeam.Assignments.cannot_proceed_standing_in_txn?(txn, assignment_id) or
       pending_turn or pending_followup or holder_unavailable
   end
@@ -2031,6 +2108,44 @@ defmodule Tightbeam.Supervision do
     :ok
   end
 
+  defp cancel_assignment_sources_for_hold_in_txn(txn, assignment_id, _hold_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT wakeId FROM wakes INDEXED BY wakes_assignment
+      WHERE assignmentId=?1 AND state='pending'
+        AND (consumer IN (?2,?3) OR
+             (obligationRef LIKE ?4 AND deliveredTurnSeq IS NULL))
+      ORDER BY createdAt,wakeId
+      """,
+      [assignment_id, @deadline_consumer, @climb_consumer, @episode_ref <> "%"]
+    )
+    |> Enum.each(fn [wake_id] ->
+      unless Wakes.cancel_in_txn(txn, %{
+               wake_id: wake_id,
+               requester: %{kind: "process", id: "tightbeam:rail-remedy"},
+               reason_kind: "superseded",
+               causal_source: %{kind: "wake", id: wake_id},
+               outcome: %{kind: "no_replacement"}
+             }) do
+        raise DB.Error, message: "assignment hold could not cancel inactivity wake #{wake_id}"
+      end
+    end)
+
+    :ok
+  end
+
+  defp active_hold_id_in_txn(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           "SELECT id FROM assignment_hold WHERE assignmentId=?1 AND releasedAt IS NULL",
+           [assignment_id]
+         ) do
+      [[hold_id]] -> hold_id
+      [] -> raise DB.Error, message: "active assignment hold disappeared during supervision"
+    end
+  end
+
   defp fire_internal_in_txn(txn, wake_id, consumer, at) do
     Txn.q(
       txn,
@@ -2164,6 +2279,11 @@ defmodule Tightbeam.Supervision do
         txn,
         "SELECT MAX(raisedAt) FROM decision_requests WHERE assignmentId=?1 AND raiserSessionKey=?2 AND raisedAt>=?3",
         [assignment_id, holder, opened_at]
+      ),
+      max_row(
+        txn,
+        "SELECT MAX(releasedAt) FROM assignment_hold WHERE assignmentId=?1 AND releasedAt>=?2",
+        [assignment_id, opened_at]
       )
     ]
 

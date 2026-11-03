@@ -72,7 +72,7 @@ defmodule Tightbeam.Wire.Router do
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
   @read_marker_verbs ~w(read-marker-set read-marker-clear)
-  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-follow spawn session-reparent session-po-set retire critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
+  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-follow spawn session-reparent session-po-set retire critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get assignment-hold assignment-release-hold attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
   @agent_verbs @agent_verbs ++
                  [
                    "fact-demand",
@@ -4293,6 +4293,9 @@ defmodule Tightbeam.Wire.Router do
     "deny-device" => ~w(device_id)a,
     "approve-device" => ~w(device_id user_id)a,
     "assignment-get" => ~w(assignment_id fact_id)a,
+    "assignment-hold" =>
+      ~w(assignment_id idempotency_key kind reason release release_fact_kind release_fact_scope release_fact_principal_ref)a,
+    "assignment-release-hold" => ~w(assignment_id idempotency_key reason)a,
     "add-user" => ~w(is_admin user_id)a,
     "answer" => ~w(answer idempotency_key reason request request_id)a,
     "artifact-content-fetch" => ~w(artifact_id)a,
@@ -4308,7 +4311,7 @@ defmodule Tightbeam.Wire.Router do
       ~w(effect_kind files holder_key idempotency_key mementos prompt reviews reviews_assignment_id role session_key subject succeeds_assignment_id parent_assignment_id work_item_id owner_user_id)a,
     "assignment-commitref-correct" =>
       ~w(assignment_id commit_refs evidence_artifact_id idempotency_key reason)a,
-    "assignments" => ~w(role session_key state)a,
+    "assignments" => ~w(held role session_key state)a,
     "attend" => ~w(high)a,
     "attest" =>
       ~w(artifact_id assignment_id commit_refs content_sha256 kind mementos note release_fact_kind release_fact_principal_ref release_fact_scope verdict_kind wait_id)a,

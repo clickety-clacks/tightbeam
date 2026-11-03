@@ -30,11 +30,37 @@ after-turn continuation covers only its named obligation, not unrelated work.
 
 ## Ending a cannot-proceed block
 
-`cannot-proceed` retains custody and raises one decision to the opener. A reply
-alone does not release the block: its named release fact must arrive, or the
-opener must dispose of the obligation through the supported seam. Read the
-assignment's actual state and the requested release evidence before resuming.
-Do not file completion for unfulfilled work or treat a wake as the release.
+`cannot-proceed` retains custody and files one decision request to the opener.
+The block settles at the first of:
+
+- its named release fact is recorded (settled as released);
+- the assignment is completed or revoked (settled as disposed);
+- `tightbeam answer` is accepted on that decision request (settled as disposed).
+  Any authenticated session holding the request id may answer, including the
+  holder, as may the asked owner user. The holder is woken with the answer text.
+
+An accepted answer ends the block whatever it says. `return` and `withdraw` are
+refused for these requests. To discuss a block without ending it, send a `wake`
+to the other party or record a `progress` attest; neither touches the decision
+request. Answer as the asked party, once the holder may resume or the block
+should end. When the block waits on a specific fact, record that fact instead:
+a disposed settlement is not evidence that the release action happened.
+
+Read the assignment's actual state and the release evidence before resuming. Do
+not file completion for unfulfilled work or treat a wake as the release.
+
+A settled block no longer quiets inactivity supervision. To keep an open card
+quiet on purpose, after its question is answered or for a standing duty, its
+holder, its opener or a user records a hold:
+`tightbeam assignment-hold <id> --kind held|standing --reason "<text>" --release
+"<condition>"`, adding the three release-fact flags when one named fact ends a
+`held` hold (a `standing` hold takes none). Release it with
+`tightbeam assignment-release-hold <id> --reason "<text>"` once the condition is
+met; a matching fact or the card's closure also releases it. A hold quiets only
+inactivity reminders and their escalations: every other notice still arrives,
+and custody is unchanged. A hold and a cannot-proceed are independent, so
+answering a block does not release a hold. `tightbeam assignments --held` lists
+the open held cards.
 
 ## Delegated rulings
 

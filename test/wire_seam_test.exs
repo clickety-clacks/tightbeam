@@ -339,6 +339,45 @@ defmodule Tightbeam.Wire.SeamTest do
            }) == %{subject: "review the fix", reviews_assignment_id: "asg_reviewed"}
   end
 
+  test "assignment hold verbs are admitted and normalize their wire parameters" do
+    verbs = Router.__info__(:attributes)[:agent_verbs] |> List.flatten()
+
+    assert "assignment-hold" in verbs
+    assert "assignment-release-hold" in verbs
+
+    assert Router.atomize_params_for_test("assignment-hold", %{
+             "assignmentId" => "asg_held",
+             "idempotencyKey" => "hold-key",
+             "kind" => "held",
+             "reason" => "waiting on a ruling",
+             "release" => "the ruling arrives",
+             "releaseFactKind" => "decision",
+             "releaseFactScope" => "dr_1",
+             "releaseFactPrincipalRef" => "user:flynn"
+           }) == %{
+             assignment_id: "asg_held",
+             idempotency_key: "hold-key",
+             kind: "held",
+             reason: "waiting on a ruling",
+             release: "the ruling arrives",
+             release_fact_kind: "decision",
+             release_fact_scope: "dr_1",
+             release_fact_principal_ref: "user:flynn"
+           }
+
+    assert Router.atomize_params_for_test("assignment-release-hold", %{
+             "assignmentId" => "asg_held",
+             "idempotencyKey" => "release-key",
+             "reason" => "ruling received"
+           }) == %{
+             assignment_id: "asg_held",
+             idempotency_key: "release-key",
+             reason: "ruling received"
+           }
+
+    assert Router.atomize_params_for_test("assignments", %{"held" => true}) == %{held: true}
+  end
+
   test "a session token supplies transport provenance independently of the asserted actor", ctx do
     session = create_session(ctx.db, "transport-provenance", "flynn")
 
