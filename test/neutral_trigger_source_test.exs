@@ -50,6 +50,11 @@ defmodule Tightbeam.NeutralTriggerSourceTest do
   } do
     seq = enqueue!(db, "k1", "historical human turn")
     install_legacy_turns_table!(db, :constrained)
+    objects_before = table_bound_objects(db)
+    high_water = seq + 50
+
+    assert {:ok, []} =
+             DB.query(db, "UPDATE sqlite_sequence SET seq=?1 WHERE name='turns'", [high_water])
 
     assert {:ok, [[@legacy_source]]} =
              DB.query(db, "SELECT triggerSource FROM turns WHERE seq=?1", [seq])
@@ -62,7 +67,13 @@ defmodule Tightbeam.NeutralTriggerSourceTest do
     assert StateResources.turn(StateResources.query_turn_by_seq(db, seq))["triggerSource"] ==
              "human"
 
+    assert table_bound_objects(db) == objects_before
+
+    assert {:ok, [[^high_water]]} =
+             DB.query(db, "SELECT seq FROM sqlite_sequence WHERE name='turns'")
+
     next_seq = enqueue!(db, "k2", "new human turn")
+    assert next_seq == high_water + 1
 
     assert {:ok, [["human"]]} =
              DB.query(db, "SELECT triggerSource FROM turns WHERE seq=?1", [next_seq])
@@ -109,6 +120,20 @@ defmodule Tightbeam.NeutralTriggerSourceTest do
     {:ok, seq} = Ledger.enqueue(db, attrs)
 
     seq
+  end
+
+  defp table_bound_objects(db) do
+    {:ok, objects} =
+      DB.query(
+        db,
+        """
+        SELECT type,name,sql FROM sqlite_master
+        WHERE tbl_name='turns' AND sql IS NOT NULL AND type IN ('index','trigger')
+        ORDER BY type,name
+        """
+      )
+
+    objects
   end
 
   defp install_legacy_turns_table!(db, constraint_mode) do
