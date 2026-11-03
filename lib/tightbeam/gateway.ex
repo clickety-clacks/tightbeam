@@ -1670,6 +1670,7 @@ defmodule Tightbeam.Gateway do
       {"session-po-set", ["wake.scheduled"]} => fn call ->
         SessionPoAssociations.handle(db, call)
       end,
+      {"retire-withdraw", []} => fn call -> retire_withdraw_result(db, call) end,
       {"retire", ["session.retired", "wake.scheduled"]} => fn call ->
         retire_result(config, db, call)
       end
@@ -10347,6 +10348,13 @@ defmodule Tightbeam.Gateway do
                            owner,
                            p[:keep_open_descendants] == true
                          ) do
+                      %{code: "open_descendants"} = refusal ->
+                        unfinished = Tightbeam.Retirements.stopped_in_txn(
+                          txn, session.session_key, call.principal,
+                          p[:keep_open_descendants] == true, refusal.accountable_parent, refusal
+                        )
+                        Map.put(refusal, :unfinished_retirement, unfinished)
+
                       %{code: _} = refusal ->
                         refusal
 
@@ -10415,6 +10423,10 @@ defmodule Tightbeam.Gateway do
                   deferred: result.deferred
                 }
                 |> maybe_put_kept_descendants(result.kept_descendants)
+                |> then(fn response ->
+                  if result[:unfinished_retirement],
+                    do: Map.put(response, :unfinished_retirement, result.unfinished_retirement), else: response
+                end)
               end
             else
               retire_replay_observation(
@@ -10431,6 +10443,25 @@ defmodule Tightbeam.Gateway do
           _ ->
             %{code: "not_found"}
         end
+    end
+  end
+
+  defp retire_withdraw_result(db, call) do
+    owner = case call.principal do
+      {:process, _} ->
+        case Org.get(db, call.session_key) do
+          %{owner_user_id: owner} -> owner
+          _ -> nil
+        end
+      _ -> principal_caller(db, call)[:owner_user_id]
+    end
+    case Org.get(db, call.session_key) do
+      %{owner_user_id: ^owner} ->
+        {:ok, result} = DB.transaction(db, fn txn ->
+          Tightbeam.Retirements.withdraw_in_txn(txn, call.session_key, call.principal, call.params[:reason])
+        end)
+        result
+      _ -> %{code: "not_found"}
     end
   end
 
@@ -10509,7 +10540,7 @@ defmodule Tightbeam.Gateway do
           end)
 
         accountable_parent =
-          if protected == [], do: nil, else: accountable_parent(root, sessions_by_key, owner)
+          accountable_parent(root, sessions_by_key, owner)
 
         kept_keys =
           frontiers
@@ -10535,6 +10566,7 @@ defmodule Tightbeam.Gateway do
             target_active?: true,
             root_key: root_key,
             owner: owner,
+            keep_open_descendants: keep_open_descendants?,
             retired: retired,
             frontiers: frontiers,
             accountable_parent: accountable_parent
@@ -10722,6 +10754,7 @@ defmodule Tightbeam.Gateway do
       end)
 
     if leased == [] do
+      Tightbeam.Retirements.retiring_in_txn(txn, Enum.map(subtree, & &1.session_key))
       kept_descendants =
         Enum.flat_map(plan.frontiers, fn frontier ->
           case Org.record_retirement_parent_move_in_txn(
@@ -10774,13 +10807,17 @@ defmodule Tightbeam.Gateway do
       %{retired: retired, deferred: [], kept_descendants: kept_descendants}
     else
       deadline = Enum.max_by(leased, & &1.hard_deadline).hard_deadline
+      unfinished = Tightbeam.Retirements.stopped_in_txn(
+        txn, plan.root_key, call.principal, plan.keep_open_descendants,
+        plan.accountable_parent, %{hard_deadline: deadline}
+      )
 
       deferred =
         Enum.map(subtree, fn member ->
           direct = Enum.find(leased, &(&1.session_key == member.session_key))
 
           if direct do
-            schedule_retire_intent_in_txn(txn, plan.root_key, member.session_key, owner, direct)
+            schedule_retire_intent_in_txn(txn, plan.root_key, member.session_key, owner, direct, unfinished.owner.session_key, deadline)
           end
 
           %{
@@ -10790,7 +10827,7 @@ defmodule Tightbeam.Gateway do
           }
         end)
 
-      %{retired: [], deferred: deferred, kept_descendants: []}
+      %{retired: [], deferred: deferred, kept_descendants: [], unfinished_retirement: unfinished}
     end
   end
 
@@ -10798,7 +10835,7 @@ defmodule Tightbeam.Gateway do
   defp retirement_principal_ref({:session, key}), do: "session:" <> key
   defp retirement_principal_ref({:process, name}), do: "process:" <> name
 
-  defp schedule_retire_intent_in_txn(txn, root_key, session_key, owner, lease) do
+  defp schedule_retire_intent_in_txn(txn, root_key, session_key, owner, lease, retry_owner, retry_deadline) do
     wake_id = retire_intent_wake_id(root_key, session_key)
 
     case Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id]) do
@@ -10811,7 +10848,9 @@ defmodule Tightbeam.Gateway do
             prompt:
               Tightbeam.Reminders.render(txn, "critical-lease-retire", %{
                 reason: lease.reason,
-                hard_deadline: lease.hard_deadline
+                hard_deadline: lease.hard_deadline,
+                retry_owner: retry_owner,
+                retry_deadline: retry_deadline
               }),
             due_at: lease.hard_deadline
           })

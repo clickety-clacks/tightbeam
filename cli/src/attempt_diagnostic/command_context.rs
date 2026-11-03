@@ -81,6 +81,7 @@ impl CommandContext {
             List { .. } => ("cli.list", DispatchPath),
             RoleBind { .. } => ("cli.role_bind", DispatchPath),
             Retire { .. } => ("cli.retire", DispatchPath),
+            RetireWithdraw { .. } => ("cli.retire_withdraw", DispatchPath),
             SessionReparent { .. } => ("cli.session_reparent", DispatchPath),
             SessionPoSet { .. } => ("cli.session_po_set", DispatchPath),
             Tune { .. } => ("cli.tune", DispatchPath),
@@ -362,7 +363,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
 
         // A handoff commits the owner change and notification together, but
         // the command does not accept an idempotency key.
-        WorkItemHandoff { .. } => WriteWithoutIdempotency,
+        WorkItemHandoff { .. } | RetireWithdraw { .. } => WriteWithoutIdempotency,
 
         Wake {
             idempotency_key, ..

@@ -2057,6 +2057,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_session_identity(db)
     :ok = upgrade_closed_assignment_reconciliation(db)
     :ok = upgrade_retirement_parent_moves(db)
+    :ok = Tightbeam.Retirements.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> Tightbeam.Recognition.activate(db)

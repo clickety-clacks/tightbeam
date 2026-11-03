@@ -834,6 +834,7 @@ defmodule Tightbeam.Wakes do
 
   @doc false
   def assignment_closed_in_txn(%Txn{} = txn, assignment_id) do
+    Tightbeam.Retirements.blocker_changed_in_txn(txn, "assignment", assignment_id)
     case Txn.q(txn, "SELECT holderKey FROM assignments WHERE id=?1 AND state='closed'", [
            assignment_id
          ]) do
@@ -3851,7 +3852,7 @@ defmodule Tightbeam.Wakes do
     "tightbeam:supervision" => ~w(superseded),
     "tightbeam:row-reactions" => ~w(superseded),
     "tightbeam:rail-remedy" => ~w(superseded),
-    "tightbeam:retirement" => ~w(target_retired obligation_disposed),
+    "tightbeam:retirement" => ~w(target_retired obligation_disposed superseded),
     # The batcher consumes a digest MEMBER exactly one way: superseded by the
     # digest that carries it, named as the replacement. It has no other verb —
     # it cannot withdraw, dispose, or retire anyone's mail.
