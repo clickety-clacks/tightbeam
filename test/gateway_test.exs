@@ -3340,6 +3340,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "critical lease renewal is hard-capped and defers the entire cascade idempotently", ctx do
+    ensure_main_session(ctx.db, "flynn")
     root = create_session(ctx.db, "leased-root", "flynn")
     child = create_session(ctx.db, "leased-child", "flynn", root.session_key)
 
