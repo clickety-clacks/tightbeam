@@ -403,6 +403,50 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     assert Wakes.get(db, handoff_id).state == "canceled"
   end
 
+  test "lease deadline wakes the owner once for a fresh keep retry and uses truthful wording", %{db: db} do
+    tree = protected_tree(db)
+    scheduler = scheduler(db)
+    lease = Tightbeam.CriticalLeases.declare(db, tree.intermediary, 1_000, "finish write", 1_000)
+    deferred = retire(db, tree.target, %{keep_open_descendants: true})
+    intent = deferred.unfinished_retirement
+    wake = Wakes.get(db, record(db, intent.id).wake)
+    assert wake.due_at == lease.hard_deadline
+    assert wake.prompt =~ "--keep-open-descendants"
+    assert Wakes.fire_due(scheduler) == :ok
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+    assert Org.get(db, tree.target).state == "active"
+    leased_wake = Enum.find(Wakes.list_pending(db), &(&1.session_key == tree.intermediary))
+    assert leased_wake.prompt =~ "finish write"
+    assert leased_wake.prompt =~ to_string(lease.hard_deadline)
+    assert leased_wake.prompt =~ tree.coordinator
+    refute leased_wake.prompt =~ "retirement is deferred only until"
+    # Wait for the declared deadline itself, then observe the scheduler barrier.
+    Process.send_after(self(), :hard_deadline, max(0, lease.hard_deadline - System.system_time(:millisecond)))
+    assert_receive :hard_deadline, 2_000
+    assert Wakes.fire_due(scheduler) == :ok
+    assert Wakes.get(db, wake.wake_id).state == "fired"
+    assert Org.get(db, tree.target).state == "active"
+    result = retire_as(db, tree.target, tree.coordinator, %{keep_open_descendants: true})
+    assert result.retired_session_keys == [tree.intermediary, tree.target]
+    assert Org.get(db, tree.role_holder).state == "active"
+    assert Org.current_parent(db, tree.role_holder) == tree.coordinator
+    assert record(db, intent.id).state == "retired"
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM unfinished_retirements")
+  end
+
+  test "reopening the schema preserves a stopped retirement and its pending continuation", %{db: db} do
+    tree = protected_tree(db)
+    intent = retire(db, tree.target, %{}).unfinished_retirement
+    before = record(db, intent.id)
+    wake = Wakes.get(db, before.wake)
+    assert :ok = Tightbeam.Schema.ensure_all(db)
+    assert record(db, intent.id) == before
+    assert Wakes.get(db, before.wake) == wake
+    close_work(db, tree)
+    Roles.rm(db, "conversation-owner")
+    assert Wakes.get(db, before.wake).due_at <= System.system_time(:millisecond)
+  end
+
   defp retire_as(db, target, caller, params \\ %{}) do
     Gateway.handlers(%{db: db})["retire"].(%{
       origin: "session:" <> caller, principal: {:session, caller}, session_key: target, params: params})

@@ -3836,8 +3836,8 @@ defmodule Tightbeam.Wakes do
 
   @requester_kinds ~w(user session process)
   @reason_kinds ~w(requester_withdrew superseded obligation_disposed cannot_proceed_released routing_bracket_satisfied target_retired production_unmatched consumer_unavailable target_unresolvable condition_cleared)
-  @source_kinds ~w(verb_call wake progress_attest condition_fact assignment_transition work_item_transition decision_request routing_bracket session_transition scheduler_delivery sentinel_transition harness_health_transition)
-  @disposition_kinds ~w(assignment_transition work_item_transition decision_request_transition)
+  @source_kinds ~w(retirement_transition verb_call wake progress_attest condition_fact assignment_transition work_item_transition decision_request routing_bracket session_transition scheduler_delivery sentinel_transition harness_health_transition)
+  @disposition_kinds ~w(retirement_transition assignment_transition work_item_transition decision_request_transition)
   @liveness_kinds ~w(pending_wake routing_bracket)
 
   @process_reasons %{
@@ -3852,7 +3852,7 @@ defmodule Tightbeam.Wakes do
     "tightbeam:supervision" => ~w(superseded),
     "tightbeam:row-reactions" => ~w(superseded),
     "tightbeam:rail-remedy" => ~w(superseded),
-    "tightbeam:retirement" => ~w(target_retired obligation_disposed superseded),
+    "tightbeam:retirement" => ~w(target_retired obligation_disposed),
     # The batcher consumes a digest MEMBER exactly one way: superseded by the
     # digest that carries it, named as the replacement. It has no other verb —
     # it cannot withdraw, dispose, or retire anyone's mail.
@@ -3865,7 +3865,7 @@ defmodule Tightbeam.Wakes do
       {~w(wake progress_attest monitor_generation decision_request),
        ~w(replacement no_replacement)},
     "obligation_disposed" =>
-      {~w(assignment_transition work_item_transition decision_request monitor_generation),
+      {~w(assignment_transition work_item_transition decision_request monitor_generation retirement_transition),
        ~w(disposition)},
     "cannot_proceed_released" => {~w(condition_fact), ~w(no_replacement)},
     "routing_bracket_satisfied" =>
@@ -4392,6 +4392,9 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  defp validate_source(txn, "retirement_transition", source_id, _wake),
+    do: validate_disposition(txn, "retirement_transition", source_id)
+
   defp validate_source(txn, "wake", source_id, _wake),
     do: row_exists(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", source_id)
 
@@ -4880,6 +4883,9 @@ defmodule Tightbeam.Wakes do
   # "replacement" outcome gets a pass on matching its primary work.
   defp digest_carrier_exemption?("tightbeam:batcher", 1), do: true
   defp digest_carrier_exemption?(_requester_id, _digest), do: false
+
+  defp validate_disposition(txn, "retirement_transition", id),
+    do: row_exists(txn, "SELECT 1 FROM unfinished_retirements WHERE id=?1 AND state!='open'", id)
 
   defp validate_disposition(txn, "assignment_transition", id),
     do: row_exists(txn, "SELECT 1 FROM assignments WHERE id=?1", id)

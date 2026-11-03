@@ -256,6 +256,31 @@ defmodule Tightbeam.CliIntegrationTest do
     end
   end
 
+  test "retirement withdrawal crosses the CLI wire and requires a reason", ctx do
+    run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+    target = Org.create(ctx.db, %{
+      session_key: "retirement-target", display_name: "Retirement target", owner_user_id: "flynn",
+      origin: "user:flynn", spawned_by: "cli-holder", archetype: "default", host: "testhost",
+      harness: "claude", provider: "anthropic", model: Model.new("fable")
+    })
+    protected = Org.create(ctx.db, %{
+      session_key: "retirement-child", display_name: "Protected child", owner_user_id: "flynn",
+      origin: "user:flynn", spawned_by: target.session_key, archetype: "default", host: "testhost",
+      harness: "claude", provider: "anthropic", model: Model.new("fable")
+    })
+    Roles.create!(ctx.db, "retirement-role", "flynn", protected.session_key)
+    assert {refused, 1} = run.(["retire", "--session", target.session_key])
+    assert refused =~ "open_descendants"
+    assert {_, 1} = run.(["retire-withdraw", "--session", target.session_key])
+    assert {_, 1} = run.(["retire-withdraw", "--session", target.session_key, "--reason", " "])
+    assert {withdrawn, 0} = run.(["retire-withdraw", "--session", target.session_key, "--reason", "still needed"])
+    assert JSON.decode!(withdrawn)["state"] == "withdrawn"
+    assert Org.get(ctx.db, target.session_key).state == "active"
+    assert Org.get(ctx.db, protected.session_key).state == "active"
+    assert {:ok, [["withdrawn", "still needed", "session:cli-holder"]]} = DB.query(ctx.db,
+      "SELECT state,withdrawalReason,withdrawnBy FROM unfinished_retirements WHERE targetSessionKey=?1", [target.session_key])
+  end
+
   test "session reparent crosses the real CLI wire and preserves assignment continuity", ctx do
     run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
 

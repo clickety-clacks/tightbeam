@@ -257,8 +257,8 @@ defmodule Tightbeam.Retirements do
       if match?(%{state: "pending"}, Wakes.get_in_txn(txn, wake)) do
         true = Wakes.cancel_in_txn(txn, %{
           wake_id: wake, requester: %{kind: "process", id: "tightbeam:retirement"},
-          reason_kind: "superseded", causal_source: %{kind: "wake", id: wake},
-          outcome: %{kind: "no_replacement"}
+          reason_kind: "obligation_disposed", causal_source: %{kind: "retirement_transition", id: id},
+          outcome: %{kind: "disposition", disposition_kind: "retirement_transition", disposition_id: id}
         })
       end
     end)

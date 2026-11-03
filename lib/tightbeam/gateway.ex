@@ -10540,7 +10540,7 @@ defmodule Tightbeam.Gateway do
           end)
 
         accountable_parent =
-          accountable_parent(root, sessions_by_key, owner)
+          if protected == [], do: nil, else: accountable_parent(root, sessions_by_key, owner)
 
         kept_keys =
           frontiers
@@ -10809,7 +10809,8 @@ defmodule Tightbeam.Gateway do
       deadline = Enum.max_by(leased, & &1.hard_deadline).hard_deadline
       unfinished = Tightbeam.Retirements.stopped_in_txn(
         txn, plan.root_key, call.principal, plan.keep_open_descendants,
-        plan.accountable_parent, %{hard_deadline: deadline}
+        plan.accountable_parent || Org.get_in_txn(txn,
+          Tightbeam.Retirements.accountable_parent_in_txn(txn, plan.root_key)), %{hard_deadline: deadline}
       )
 
       deferred =
