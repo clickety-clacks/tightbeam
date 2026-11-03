@@ -75,7 +75,13 @@ defmodule Tightbeam.Wire.ChangeSocket do
   def handle_info(:firehose_heartbeat, %{phase: :live} = state) do
     if credential_current?(state) do
       state = schedule_heartbeat(state)
-      push(%{"type" => "heartbeat", "seq" => Hub.sequence(hub(state), self())}, state)
+
+      {:push, heartbeat, state} =
+        push(%{"type" => "heartbeat", "seq" => Hub.sequence(hub(state), self())}, state)
+
+      # Standard clients answer PING without application traffic. Their PONG
+      # refreshes the transport read timeout; an unresponsive peer still expires.
+      {:push, [heartbeat, {:ping, <<>>}], state}
     else
       {:stop, :normal, 1008, state}
     end

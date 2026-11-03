@@ -485,7 +485,10 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
       })
 
     {:push, _, live} = ChangeSocket.handle_in({JSON.encode!(auth()), opcode: :text}, initial)
-    {:push, {:text, bytes}, live} = ChangeSocket.handle_info(:firehose_heartbeat, live)
+
+    {:push, [{:text, bytes}, {:ping, <<>>}], live} =
+      ChangeSocket.handle_info(:firehose_heartbeat, live)
+
     assert JSON.decode!(bytes)["type"] == "heartbeat"
 
     :ok =
