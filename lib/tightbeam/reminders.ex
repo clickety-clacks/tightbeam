@@ -9,7 +9,7 @@ defmodule Tightbeam.Reminders do
       ~w(child_assignment_id source_kind source_token notice_id child_session child_session_state your_last_activity child_finished),
     "work-item-routing" => ~w(work_item_id title),
     "work-item-slate" => ~w(work_item_id),
-    "critical-lease-retire" => ~w(reason hard_deadline),
+    "critical-lease-retire" => ~w(reason hard_deadline retry_owner retry_deadline),
     "identity-staleness" => ~w(late_count revision),
     "remedy-pending" => ~w(rule subject)
   }

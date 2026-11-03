@@ -3340,6 +3340,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "critical lease renewal is hard-capped and defers the entire cascade idempotently", ctx do
+    ensure_main_session(ctx.db, "flynn")
     root = create_session(ctx.db, "leased-root", "flynn")
     child = create_session(ctx.db, "leased-child", "flynn", root.session_key)
 
@@ -3378,15 +3379,20 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.map(deferred.deferred, & &1.session_key) == [child.session_key, root.session_key]
     assert Org.get(ctx.db, root.session_key).state == "active"
     assert Org.get(ctx.db, child.session_key).state == "active"
-    assert [wake] = Wakes.list_pending(ctx.db)
-    assert wake.session_key == child.session_key
+    assert pending = Wakes.list_pending(ctx.db)
+    assert length(pending) == 2
+    wake = Enum.find(pending, &(&1.session_key == child.session_key))
     assert wake.due_at == first.hard_deadline
-    assert wake.prompt =~ "FINAL RETIRE INSTRUCTION"
+    assert wake.prompt =~ "was deferred"
+    assert wake.prompt =~ "will be woken to retry"
+    refute wake.prompt =~ "retirement is deferred only until"
 
     again = handlers["retire"].(call)
     assert again.deferred == deferred.deferred
-    assert [same_wake] = Wakes.list_pending(ctx.db)
+    assert length(Wakes.list_pending(ctx.db)) == 2
+    same_wake = Enum.find(Wakes.list_pending(ctx.db), &(&1.session_key == child.session_key))
     assert same_wake.wake_id == wake.wake_id
+    refute again.unfinished_retirement.id == deferred.unfinished_retirement.id
   end
 
   @tag cold_gateway: true, tmp_dir: true

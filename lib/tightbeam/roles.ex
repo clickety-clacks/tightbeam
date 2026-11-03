@@ -106,6 +106,8 @@ defmodule Tightbeam.Roles do
           [name, session_key, now()]
         )
 
+        Tightbeam.Retirements.blocker_changed_in_txn(txn, "role", name)
+
         :ok
       end
     end)
@@ -121,6 +123,8 @@ defmodule Tightbeam.Roles do
           "UPDATE roles SET boundSessionKey = ?2, updatedAt = ?3 WHERE name = ?1",
           [name, session_key, now()]
         )
+
+        Tightbeam.Retirements.blocker_changed_in_txn(txn, "role", name)
 
         Publisher.maybe_accepted_in_txn(txn, call, %{role: firehose_role_in_txn(txn, name)})
         :ok
@@ -145,6 +149,7 @@ defmodule Tightbeam.Roles do
     transaction!(db, fn txn ->
       with :ok <- role_present(txn, name) do
         Txn.q(txn, "DELETE FROM roles WHERE name = ?1", [name])
+        Tightbeam.Retirements.blocker_changed_in_txn(txn, "role", name)
         :ok
       end
     end)
@@ -157,6 +162,7 @@ defmodule Tightbeam.Roles do
         snapshot = firehose_role_in_txn(txn, name)
         snapshot = Map.put(snapshot, :row_version, max(now(), snapshot.updated_at + 1))
         Txn.q(txn, "DELETE FROM roles WHERE name = ?1", [name])
+        Tightbeam.Retirements.blocker_changed_in_txn(txn, "role", name)
         Publisher.maybe_accepted_in_txn(txn, call, %{role: snapshot, removed: name})
         :ok
       end
