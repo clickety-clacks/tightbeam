@@ -117,6 +117,15 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
       do: GenServer.start_link(__MODULE__, parent, name: Tightbeam.LaneManager)
 
     def init(parent), do: {:ok, parent}
+
+    def handle_call({:register_lane, session_key}, _from, parent) do
+      {:ok, _} = Registry.register(Tightbeam.LaneRegistry, session_key, nil)
+      {:reply, :ok, parent}
+    end
+
+    def handle_call({:at_turn_boundary, fun}, _from, parent),
+      do: {:reply, {:ok, fun.()}, parent}
+
     def handle_call(_message, _from, parent), do: {:reply, :ok, parent}
   end
 
@@ -160,6 +169,9 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     def handle_call({:knows_session?, _sid}, _from, state), do: {:reply, false, state}
 
     def handle_call({:new_session, model, _cwd, _mcp, _guidance}, _from, state),
+      do: new_session_reply(model, state)
+
+    def handle_call({:new_candidate_session, model, _cwd, _mcp, _guidance}, _from, state),
       do: new_session_reply(model, state)
 
     def handle_call(
@@ -213,7 +225,7 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     end
   end
 
-  test "turn advances from a refused configured entry to the next exact model and readback" do
+  test "turn keeps the first model refusal and does not advance the role list" do
     with_gateway(fn %{db: db, config: config, lane: lane} ->
       first = Model.new("synthetic-first", effort: "low")
       second = Model.new("synthetic-second", effort: "high")
@@ -255,12 +267,13 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
 
       assert {:ok, turn} = Ledger.claim_next(db, "ring-success", "ring-test")
 
-      assert {:ok, %{terminal_publish: publish}} =
+      assert {:error, %{reason: reason, terminal_publish: publish}} =
                runner.(Map.put(turn, :session_key, "ring-success"))
 
+      assert reason =~ "Invalid params"
       assert_receive {:model_attempt, ^first}
-      assert_receive {:model_attempt, ^second}
-      assert Org.get(db, "ring-success").model == second
+      refute_receive {:model_attempt, ^second}
+      assert Org.get(db, "ring-success").model == first
 
       attempts =
         EventLog.lifecycle_events(db)
@@ -269,15 +282,15 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
       assert Enum.map(attempts, & &1.detail) |> Enum.join("\n") =~ "synthetic-first"
       assert Enum.map(attempts, & &1.detail) |> Enum.join("\n") =~ "not selectable"
       assert Enum.map(attempts, & &1.detail) |> Enum.join("\n") =~ "diagnostic"
-      assert Enum.map(attempts, & &1.detail) |> Enum.join("\n") =~ "synthetic-second"
+      refute Enum.map(attempts, & &1.detail) |> Enum.join("\n") =~ "synthetic-second"
 
-      assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+      assert :ok = Ledger.finish(db, turn.seq, "failed", reason, owner_lease: turn.owner_lease)
 
-      publish.("delivered")
+      publish.("failed")
     end)
   end
 
-  test "turn tries an unlisted preference after a raw harness model refusal" do
+  test "raw harness refusal never selects an unlisted role preference" do
     with_gateway(fn %{db: db, config: config, lane: lane} ->
       first = Model.new("synthetic-first", effort: "low")
       second = Model.new("synthetic-second", effort: "high")
@@ -335,11 +348,13 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
                )
 
       assert {:ok, turn} = Ledger.claim_next(db, "ring-unlisted", "ring-test")
-      assert {:ok, _} = runner(config).(Map.put(turn, :session_key, "ring-unlisted"))
+
+      assert {:error, %{reason: %{"code" => -32603, "message" => "Requested model was refused"}}} =
+               runner(config).(Map.put(turn, :session_key, "ring-unlisted"))
 
       assert_receive {:model_attempt, ^first}
-      assert_receive {:model_attempt, ^second}
-      assert Org.get(db, "ring-unlisted").model == second
+      refute_receive {:model_attempt, ^second}
+      assert Org.get(db, "ring-unlisted").model == first
 
       details =
         EventLog.lifecycle_events(db)
@@ -348,11 +363,11 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
         |> Enum.join("\n")
 
       assert details =~ "Requested model was refused"
-      assert details =~ "synthetic-second"
+      refute details =~ "synthetic-second"
     end)
   end
 
-  test "turn exhaustion stops at the configured entries and keeps the typed refusal" do
+  test "unavailable first model stops after one harness attempt" do
     with_gateway(fn %{db: db, config: config, lane: lane} ->
       first = Model.new("synthetic-first", effort: "low")
       second = Model.new("synthetic-second", effort: "high")
@@ -392,130 +407,147 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
 
       assert {:ok, turn} = Ledger.claim_next(db, "ring-exhausted", "ring-test")
 
-      assert {:error, %{reason: %{code: "model_selection_exhausted", message: message}}} =
+      assert {:error, %{reason: :model_unavailable}} =
                runner.(Map.put(turn, :session_key, "ring-exhausted"))
 
-      assert message =~ "all configured model preferences were exhausted"
-      assert message =~ "synthetic-second"
-
       assert_receive {:model_attempt, ^first}
-      assert_receive {:model_attempt, ^second}
+      refute_receive {:model_attempt, ^second}
       refute_receive {:model_attempt, _}
 
       attempts =
         EventLog.lifecycle_events(db)
         |> Enum.filter(&(&1.kind == "model_selection_attempt"))
 
-      assert length(attempts) == 2
+      assert length(attempts) == 1
     end)
   end
 
-  test "cross-harness configured candidates are tried before clear exhaustion" do
+  test "user-started first-turn refusal keeps the harness text and lists literal role choices" do
     preferences = [
-      {"synthetic-first", "low", nil},
-      {"gpt-cross-harness-failure", "medium", nil}
+      {"synthetic-first", "low", nil, "fixture"},
+      {"synthetic-second", "high", "wide", "codex"}
     ]
 
     with_gateway(
       fn %{db: db, config: config, lane: lane} ->
         first = Model.new("synthetic-first", effort: "low")
-        cross_harness = Model.new("gpt-cross-harness-failure", effort: "medium")
-        session_key = "ring-cross-harness"
+        second = Model.new("synthetic-second", effort: "high", context: "wide")
+        corrected = Model.new("synthetic-corrected")
+        [refusal] = production_model_use_failures([first])
 
-        [cross_harness_reason] = production_model_use_failures([cross_harness], :codex)
+        spawn = Gateway.handlers(config)["spawn"]
 
-        assert %{"code" => -32602, "message" => "Invalid params"} =
-                 ErrorDiagnostic.classified(cross_harness_reason)
+        assert %{session_key: session_key} =
+                 spawn.(%{
+                   origin: "user:synthetic-owner",
+                   session_key: nil,
+                   params: %{
+                     archetype: "synthetic-ring",
+                     display_name: "Role choice",
+                     idempotency_key: "role-choice"
+                   }
+                 })
 
-        assert %{"phase" => "model", "configId" => "model"} =
-                 ErrorDiagnostic.of(cross_harness_reason)
+        {:ok, adapter} =
+          RingDownAdapter.start_link(
+            parent: self(),
+            outcomes: %{
+              first.family => {:error, refusal},
+              corrected.family => {:ok, "chosen-session"}
+            },
+            readback: %{"chosen-session" => corrected}
+          )
 
-        {:ok, catalog} =
-          CatalogStub.start_link(%{
-            {"testhost", "codex"} => [
-              %{
-                family: cross_harness.family,
-                context: nil,
-                efforts: ["medium"],
-                provider: :openai
-              }
-            ]
+        {:ok, _coordinator} = CoordinatorStub.start_link({adapter, self()})
+
+        {:ok, _ref, nil} =
+          ConnRegistry.register(ConnRegistry, %{
+            pid: self(),
+            user_id: "synthetic-owner",
+            device_id: "role-choice",
+            is_admin: false,
+            subscriptions: MapSet.new(["chat"])
           })
 
-        {:ok, fixture_adapter} =
-          RingDownAdapter.start_link(
-            parent: self(),
-            outcomes: %{first.family => {:error, :model_unavailable}},
-            readback: %{}
-          )
-
-        {:ok, codex_adapter} =
-          RingDownAdapter.start_link(
-            parent: self(),
-            outcomes: %{cross_harness.family => {:error, cross_harness_reason}},
-            readback: %{}
-          )
-
-        coordinator = fn
-          {:fixture, "shared", "testhost"} -> {:ok, fixture_adapter, 1}
-          {:codex, "shared", "testhost"} -> {:ok, codex_adapter, 2}
-        end
-
-        {:ok, _coordinator} = CoordinatorStub.start_link({coordinator, self()})
-        config = Map.put(config, :model_catalog, catalog)
-
-        Org.create(db, %{
-          session_key: session_key,
-          display_name: "Synthetic cross-harness exhaustion",
-          owner_user_id: "synthetic-owner",
-          origin: "user:synthetic-owner",
-          archetype: "synthetic-ring",
-          host: "testhost",
-          harness: "fixture",
-          provider: "fixture_provider",
-          model: first
-        })
-
-        runner = runner(config)
-
         assert :appended =
-                 Gateway.deliver_prompt(session_key, "user:synthetic-owner", "cross-harness",
+                 Gateway.deliver_prompt(session_key, "user:synthetic-owner", "select",
                    db: db,
                    lane_manager: lane,
                    conn_registry: ConnRegistry,
-                   client_message_id: "ring-cross-harness-client"
+                   client_message_id: "role-choice-client"
                  )
 
         assert {:ok, turn} = Ledger.claim_next(db, session_key, "ring-test")
 
-        assert {:error, %{reason: %{code: "model_selection_exhausted", message: message}}} =
-                 runner.(Map.put(turn, :session_key, session_key))
+        assert {:error,
+                %{reason: reason, terminal_publish: publish, record_in_txn: record_in_txn}} =
+                 runner(config).(Map.put(turn, :session_key, session_key))
 
-        assert message =~ "all configured model preferences were exhausted"
-        assert message =~ "gpt-cross-harness-failure"
-
-        assert_receive {:adapter_key, {:fixture, "shared", "testhost"}}
-        assert_receive {:adapter_key, {:codex, "shared", "testhost"}}
+        assert reason =~ "Invalid params"
         assert_receive {:model_attempt, ^first}
-        assert_receive {:model_attempt, ^cross_harness}
-        refute_receive {:model_attempt, _}
+        refute_receive {:model_attempt, ^second}
 
-        details =
-          EventLog.lifecycle_events(db)
-          |> Enum.filter(&(&1.kind == "model_selection_attempt"))
-          |> Enum.map(& &1.detail)
-          |> Enum.join("\n")
+        assert {:ok, _} =
+                 DB.transaction(db, fn txn ->
+                   assert Ledger.finish_in_txn(txn, turn.seq, "failed", reason,
+                            owner_lease: turn.owner_lease
+                          )
 
-        assert details =~ "gpt-cross-harness-failure"
-        assert details =~ "Invalid params"
-        assert details =~ "original_reason"
-        assert Org.get(db, session_key).harness == "fixture"
+                   record_in_txn.(txn)
+                 end)
+
+        publish.("failed")
+
+        assert_receive {:push,
+                        %{
+                          "event" => "prompt_turn_state",
+                          "payload" => %{
+                            "state" => "failed",
+                            "error" => ^reason,
+                            "roleModelChoices" => [
+                              %{
+                                "model" => "synthetic-second",
+                                "harness" => "codex",
+                                "context" => "wide",
+                                "effort" => "high"
+                              }
+                            ]
+                          }
+                        }}
+
+        assert %{lastTurnError: ^reason, roleModelChoices: choices} =
+                 Gateway.session_status(session_key, db)
+
+        assert choices == [
+                 %{
+                   "model" => "synthetic-second",
+                   "harness" => "codex",
+                   "context" => "wide",
+                   "effort" => "high"
+                 }
+               ]
+
+        assert :ok =
+                 GenServer.call(Tightbeam.LaneManager, {:register_lane, session_key})
+
+        assert %{ok: true, requested: %{model: "synthetic-corrected"}} =
+                 Gateway.handlers(config)["tune"].(%{
+                   origin: "user:synthetic-owner",
+                   session_key: session_key,
+                   params: %{setting: "set_model", model: "synthetic-corrected"}
+                 })
+
+        assert_receive {:model_attempt, ^corrected}
+        assert Org.get(db, session_key).model == corrected
+
+        assert {:ok, [["failed"]]} =
+                 DB.query(db, "SELECT status FROM turns WHERE seq = ?1", [turn.seq])
       end,
       preferences
     )
   end
 
-  test "cross-harness configured success moves the durable session before prompt" do
+  test "a refused role entry does not infer another harness from the catalog" do
     preferences = [
       {"synthetic-first", "low", nil},
       {"gpt-cross-harness-success", "medium", nil}
@@ -524,18 +556,12 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     with_gateway(
       fn %{db: db, config: config, lane: lane} ->
         first = Model.new("synthetic-first", effort: "low")
-        cross_harness = Model.new("gpt-cross-harness-success", effort: "medium")
-        session_key = "ring-cross-harness-success"
+        second = Model.new("gpt-cross-harness-success", effort: "medium")
 
         {:ok, catalog} =
           CatalogStub.start_link(%{
             {"testhost", "codex"} => [
-              %{
-                family: cross_harness.family,
-                context: nil,
-                efforts: ["medium"],
-                provider: :openai
-              }
+              %{family: second.family, context: nil, efforts: ["medium"], provider: :openai}
             ]
           })
 
@@ -549,8 +575,8 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
         {:ok, codex_adapter} =
           RingDownAdapter.start_link(
             parent: self(),
-            outcomes: %{cross_harness.family => {:ok, "cross-harness-session"}},
-            readback: %{"cross-harness-session" => cross_harness}
+            outcomes: %{second.family => {:ok, "must-not-run"}},
+            readback: %{"must-not-run" => second}
           )
 
         coordinator = fn
@@ -562,10 +588,10 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
         config = Map.put(config, :model_catalog, catalog)
 
         Org.create(db, %{
-          session_key: session_key,
-          display_name: "Synthetic cross-harness success",
+          session_key: "no-cross-harness",
+          display_name: "No inferred harness",
           owner_user_id: "synthetic-owner",
-          origin: "user:synthetic-owner",
+          origin: "agent:creator",
           archetype: "synthetic-ring",
           host: "testhost",
           harness: "fixture",
@@ -574,172 +600,83 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
         })
 
         assert :appended =
-                 Gateway.deliver_prompt(session_key, "user:synthetic-owner", "cross-harness",
+                 Gateway.deliver_prompt("no-cross-harness", "user:synthetic-owner", "select",
                    db: db,
                    lane_manager: lane,
                    conn_registry: ConnRegistry,
-                   client_message_id: "ring-cross-harness-success-client"
+                   client_message_id: "no-cross-harness-client"
                  )
 
-        assert {:ok, turn} = Ledger.claim_next(db, session_key, "ring-test")
+        assert {:ok, turn} = Ledger.claim_next(db, "no-cross-harness", "ring-test")
 
-        assert {:opened, _} =
-                 HarnessHealth.observe(
-                   db,
-                   health_incident_input("ring-cross-harness-success-old", "fixture")
-                 )
-
-        assert {:opened, _} =
-                 HarnessHealth.observe(
-                   db,
-                   health_incident_input("ring-cross-harness-success-new", "codex")
-                 )
-
-        assert {:ok, %{terminal_publish: publish, record_in_txn: record_in_txn}} =
-                 runner(config).(Map.put(turn, :session_key, session_key))
+        assert {:error, %{reason: :model_unavailable}} =
+                 runner(config).(Map.put(turn, :session_key, "no-cross-harness"))
 
         assert_receive {:adapter_key, {:fixture, "shared", "testhost"}}
-        assert_receive {:adapter_key, {:codex, "shared", "testhost"}}
+        refute_receive {:adapter_key, {:codex, "shared", "testhost"}}
         assert_receive {:model_attempt, ^first}
-        assert_receive {:model_attempt, ^cross_harness}
-
-        assert %{harness: "codex", provider: "openai", model: ^cross_harness} =
-                 Org.get(db, session_key)
-
-        assert {:ok, publication} = DB.transaction(db, record_in_txn)
-        if is_function(publication, 0), do: publication.()
-
-        assert {:ok, incidents} =
-                 DB.query(
-                   db,
-                   "SELECT harness,host,failureClass,state FROM harness_health_incidents ORDER BY harness"
-                 )
-
-        assert ["fixture", "testhost", "adapter_unavailable", "open"] in incidents
-        assert ["codex", "testhost", "adapter_unavailable", "resolved"] in incidents
-
-        assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
-        publish.("delivered")
+        refute_receive {:model_attempt, ^second}
+        assert %{harness: "fixture", model: ^first} = Org.get(db, "no-cross-harness")
       end,
       preferences
     )
   end
 
-  test "cross-harness prompt failure records health against the moved session" do
-    preferences = [
-      {"synthetic-first", "low", nil},
-      {"gpt-cross-harness-health-failure", "medium", nil}
-    ]
+  test "prompt failure is charged to the selected harness without a role retry" do
+    with_gateway(fn %{db: db, config: config, lane: lane} ->
+      first = Model.new("synthetic-first", effort: "low")
+      second = Model.new("synthetic-second", effort: "high")
+      rate_limit = %{"data" => %{"codexErrorInfo" => "usageLimitExceeded"}}
 
-    with_gateway(
-      fn %{db: db, config: config, lane: lane} ->
-        first = Model.new("synthetic-first", effort: "low")
-        cross_harness = Model.new("gpt-cross-harness-health-failure", effort: "medium")
-        session_key = "ring-cross-harness-health-failure"
+      Org.create(db, %{
+        session_key: "same-harness-prompt-failure",
+        display_name: "Selected harness prompt failure",
+        owner_user_id: "synthetic-owner",
+        origin: "user:synthetic-owner",
+        archetype: "synthetic-ring",
+        host: "testhost",
+        harness: "fixture",
+        provider: "fixture_provider",
+        model: first
+      })
 
-        {:ok, catalog} =
-          CatalogStub.start_link(%{
-            {"testhost", "codex"} => [
-              %{
-                family: cross_harness.family,
-                context: nil,
-                efforts: ["medium"],
-                provider: :openai
-              }
-            ]
-          })
+      {:ok, adapter} =
+        RingDownAdapter.start_link(
+          parent: self(),
+          outcomes: %{
+            first.family => {:ok, "selected-session"},
+            second.family => {:ok, "must-not-run"}
+          },
+          prompt_outcome: {:error, rate_limit},
+          readback: %{"selected-session" => first}
+        )
 
-        {:ok, fixture_adapter} =
-          RingDownAdapter.start_link(
-            parent: self(),
-            outcomes: %{first.family => {:error, :model_unavailable}},
-            readback: %{}
-          )
+      {:ok, _coordinator} = CoordinatorStub.start_link({adapter, self()})
 
-        rate_limit = %{"data" => %{"codexErrorInfo" => "usageLimitExceeded"}}
+      assert :appended =
+               Gateway.deliver_prompt(
+                 "same-harness-prompt-failure",
+                 "user:synthetic-owner",
+                 "prompt",
+                 db: db,
+                 lane_manager: lane,
+                 conn_registry: ConnRegistry,
+                 client_message_id: "same-harness-prompt-failure-client"
+               )
 
-        {:ok, codex_adapter} =
-          RingDownAdapter.start_link(
-            parent: self(),
-            outcomes: %{cross_harness.family => {:ok, "cross-harness-health-session"}},
-            prompt_outcome: {:error, rate_limit},
-            readback: %{"cross-harness-health-session" => cross_harness}
-          )
+      assert {:ok, turn} = Ledger.claim_next(db, "same-harness-prompt-failure", "ring-test")
 
-        coordinator = fn
-          {:fixture, "shared", "testhost"} -> {:ok, fixture_adapter, 1}
-          {:codex, "shared", "testhost"} -> {:ok, codex_adapter, 2}
-        end
+      assert {:error, %{record_in_txn: record_in_txn}} =
+               runner(config).(Map.put(turn, :session_key, "same-harness-prompt-failure"))
 
-        {:ok, _coordinator} = CoordinatorStub.start_link({coordinator, self()})
-        config = Map.put(config, :model_catalog, catalog)
-
-        Org.create(db, %{
-          session_key: session_key,
-          display_name: "Synthetic cross-harness health failure",
-          owner_user_id: "synthetic-owner",
-          origin: "user:synthetic-owner",
-          archetype: "synthetic-ring",
-          host: "testhost",
-          harness: "fixture",
-          provider: "fixture_provider",
-          model: first
-        })
-
-        assert :appended =
-                 Gateway.deliver_prompt(session_key, "user:synthetic-owner", "health failure",
-                   db: db,
-                   lane_manager: lane,
-                   conn_registry: ConnRegistry,
-                   client_message_id: "ring-cross-harness-health-failure-client"
-                 )
-
-        assert {:ok, turn} = Ledger.claim_next(db, session_key, "ring-test")
-
-        assert {:error, %{record_in_txn: record_in_txn, terminal_publish: publish}} =
-                 runner(config).(Map.put(turn, :session_key, session_key))
-
-        assert_receive {:adapter_key, {:fixture, "shared", "testhost"}}
-        assert_receive {:adapter_key, {:codex, "shared", "testhost"}}
-        assert_receive {:model_attempt, ^first}
-        assert_receive {:model_attempt, ^cross_harness}
-
-        assert {:ok, publication} =
-                 DB.transaction(db, fn txn ->
-                   assert true =
-                            Ledger.finish_in_txn(
-                              txn,
-                              turn.seq,
-                              "failed",
-                              "synthetic rate limit",
-                              owner_lease: turn.owner_lease
-                            )
-
-                   record_in_txn.(txn)
-                 end)
-
-        if is_function(publication, 0), do: publication.()
-        publish.("failed")
-
-        assert {:ok, [["codex", "testhost"]]} =
-                 DB.query(
-                   db,
-                   "SELECT harness,host FROM harness_health_observations WHERE correlationId=?1",
-                   ["harness-turn:#{turn.seq}:rate-limit-dead"]
-                 )
-
-        assert {:ok, []} =
-                 DB.query(
-                   db,
-                   "SELECT harness,host FROM harness_health_observations WHERE correlationId=?1 AND harness=?2",
-                   ["harness-turn:#{turn.seq}:rate-limit-dead", "fixture"]
-                 )
-      end,
-      preferences
-    )
+      assert_receive {:model_attempt, ^first}
+      refute_receive {:model_attempt, ^second}
+      assert Org.get(db, "same-harness-prompt-failure").harness == "fixture"
+      assert {:ok, _publication} = DB.transaction(db, record_in_txn)
+    end)
   end
 
-  test "turn advances through production model and effort carriers and preserves evidence" do
+  test "production model refusal preserves evidence without trying later entries" do
     preferences = [
       {"synthetic-not-selectable", "low", nil},
       {"synthetic-unsupported-effort", "medium", nil},
@@ -802,14 +739,15 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
 
         assert {:ok, turn} = Ledger.claim_next(db, session_key, "ring-test")
 
-        assert {:ok, %{terminal_publish: publish}} =
+        assert {:error, %{reason: reason, terminal_publish: publish}} =
                  runner.(Map.put(turn, :session_key, session_key))
 
+        assert reason =~ "Invalid params"
         assert_receive {:model_attempt, ^not_selectable}
-        assert_receive {:model_attempt, ^unsupported_effort}
-        assert_receive {:model_attempt, ^selected}
+        refute_receive {:model_attempt, ^unsupported_effort}
+        refute_receive {:model_attempt, ^selected}
         refute_receive {:model_attempt, _}
-        assert Org.get(db, session_key).model == selected
+        assert Org.get(db, session_key).model == not_selectable
 
         details =
           EventLog.lifecycle_events(db)
@@ -824,9 +762,9 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
         assert details =~ "\"$type\":\"tuple\""
         assert details =~ "diagnostic"
 
-        assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+        assert :ok = Ledger.finish(db, turn.seq, "failed", reason, owner_lease: turn.owner_lease)
 
-        publish.("delivered")
+        publish.("failed")
       end,
       preferences
     )
@@ -904,7 +842,7 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     end)
   end
 
-  test "turn advances through recorded invalid-params effort carrier" do
+  test "recorded invalid-params effort carrier does not advance the role list" do
     preferences = [
       {"synthetic-invalid-effort", "max", nil},
       {"synthetic-success", "high", "wide"}
@@ -958,13 +896,14 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
 
         assert {:ok, turn} = Ledger.claim_next(db, session_key, "ring-test")
 
-        assert {:ok, %{terminal_publish: publish}} =
+        assert {:error, %{reason: reason, terminal_publish: publish}} =
                  runner.(Map.put(turn, :session_key, session_key))
 
+        assert reason =~ "Invalid params"
         assert_receive {:model_attempt, ^effort_model}
-        assert_receive {:model_attempt, ^selected}
+        refute_receive {:model_attempt, ^selected}
         refute_receive {:model_attempt, _}
-        assert Org.get(db, session_key).model == selected
+        assert Org.get(db, session_key).model == effort_model
 
         details =
           EventLog.lifecycle_events(db)
@@ -977,9 +916,9 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
         assert details =~ "original_reason"
         assert details =~ "diagnostic"
 
-        assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+        assert :ok = Ledger.finish(db, turn.seq, "failed", reason, owner_lease: turn.owner_lease)
 
-        publish.("delivered")
+        publish.("failed")
       end,
       preferences
     )
@@ -1267,7 +1206,8 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     {:ok, catalog} =
       CatalogStub.start_link(%{
         {"testhost", "fixture"} =>
-          Enum.map(preferences, fn {family, effort, context} ->
+          Enum.map(preferences, fn preference ->
+            {family, effort, context, _harness} = preference_fields(preference)
             %{family: family, context: context, efforts: [effort], provider: :fixture_provider}
           end)
       })
@@ -1277,6 +1217,19 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     Application.put_env(:tightbeam, :local_host_name, "testhost")
 
     _registry = start_supervised!({ConnRegistry, name: ConnRegistry}, id: :model_ring_registry)
+
+    _lane_registry =
+      start_supervised!(
+        {Registry, keys: :unique, name: Tightbeam.LaneRegistry},
+        id: :model_ring_lane_registry
+      )
+
+    _turn_tasks =
+      start_supervised!(
+        {Task.Supervisor, name: Tightbeam.TurnTaskSupervisor},
+        id: :model_ring_turn_tasks
+      )
+
     lane = start_supervised!({LaneDoorbell, self()}, id: :model_ring_lane)
 
     config = %{
@@ -1301,15 +1254,21 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     path = Path.join([base, "identity", "archetypes", "synthetic-ring.toml"])
 
     entries =
-      Enum.map_join(preferences, <<10>>, fn {family, effort, context} ->
+      Enum.map_join(preferences, <<10>>, fn preference ->
+        {family, effort, context, harness} = preference_fields(preference)
+
         context_line =
           if is_binary(context), do: "context = " <> inspect(context) <> <<10>>, else: ""
+
+        harness_line =
+          if is_binary(harness), do: "harness = " <> inspect(harness) <> <<10>>, else: ""
 
         """
         [[model_preferences]]
         model = "#{family}"
         effort = "#{effort}"
         #{context_line}
+        #{harness_line}
         """
       end)
 
@@ -1320,6 +1279,12 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
     #{entries}
     """)
   end
+
+  defp preference_fields({family, effort, context}),
+    do: {family, effort, context, nil}
+
+  defp preference_fields({family, effort, context, harness}),
+    do: {family, effort, context, harness}
 
   defp write_fixture_binaries!(base) do
     bin = Path.join(base, "bin")
