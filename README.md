@@ -1,767 +1,195 @@
 # Tightbeam
 
-**Tightbeam runs an organization of AI agents that works for you.**
+Tightbeam runs an organization of AI agents on one or more machines. It gives each agent a role, passes messages between agents, records the work and enforces your rules. If an agent crashes or loses its context, it picks up from the record. Tightbeam provides:
 
-Agents like OpenClaw and Hermes give you a capable individual: one
-persistent mind that chats, remembers, acts, and improves. Tightbeam is the
-layer such individuals work *inside*. It is the difference between hiring a
-brilliant freelancer and owning a company. Agents plug in as staff, each
-running in its vendor's own harness: Claude in Claude Code, Codex in Codex.
-Tightbeam adds what turns staff into an institution: durable work, review
-across competing model vendors, enforceable rules, and a paper trail behind
-every claim.
+- **Messaging between agents.** Any agent can message any other agent in the organization, across sessions and machines. Agents hand off work, ask questions and report results to each other directly.
+- **Event-based waking.** Agents wake when other agents or processes have something for them to act on, such as completed work or a pull request's checks finishing. Timed waits and polling are kept to a minimum. A sleeping agent uses no model turns.
+- **Guidance and skill isolation.** An "archetype" gives an agent only the guidance and skills its job needs. Its context stays focused on the work it has to do.
+- **Message queue manipulation.** A sender can cancel a queued message, replace changed instructions or mark a message's urgency, so agents do not act on outdated instructions.
+- **Message batching.** Messages batch so they can be handled in one turn.
+- **Durable records.** Tasks, responsibilities and results are stored as records that outlast conversations. An agent that crashes, restarts or loses its context picks up from the records.
+- **Observability.** Every change to a record is streamed, so reports and user interfaces can show live activity across the organization and explain what happened.
+- **Decisions that come to you.** When an agent needs a product choice it is not allowed to make, it files a decision request. You get the question, the agent's recommendation and the choices. When you answer, the agent wakes with your answer.
+- **Deterministic rails.** Agents sometimes ignore guidance and skills. A rail is a rule Tightbeam enforces, so agents cannot skip it. For example, a rail can require a review before any work counts as done.
+- **Ordinary agent harnesses.** Agents run in ordinary harnesses such as Claude Code and Codex. Tightbeam passes your model and settings through unchanged and shows you the harness's own output, including failures.
 
-You act as the owner. File what you want as tickets.
-Decisions that only an owner can make reach you pre-triaged, even on your
-phone. The organization handles the rest. At times it goes further and
-[improves itself unasked](https://tightbeam.clawline.chat/watchdog/).
+Tightbeam is a construction set. Rules, roles and process are not built in. You and your agents decide who writes, who reviews, who decides scope and when a change counts as done. You can build a software team, a research desk, a support rotation or a one-person shop with specialists on call. Tightbeam ships with a software engineering template called a "kung fu". You can use it, change it or write your own.
 
-Three properties make that safe to trust:
+A software dark factory runs one fixed process unattended. A personal agent such as OpenClaw puts many tools behind one assistant. Tightbeam runs many agents as an organization you design, and it keeps running when you are away.
 
-- **Everything is on the record.** Tightbeam keeps a permanent, attributed
-  history of the organization: every job, hire, and claim, and who made it.
-  You can always establish what happened, straight from the record.
-- **You and your agents write the law.** Guidance shapes how agents work.
-  On top of it, you and your agents can create deterministic rules that
-  govern the system itself: guarantees the organization keeps automatically,
-  whichever model is doing the work.
-- **The organization belongs to its agents, and to you.** Every decision
-  stays with you and them. Tightbeam remembers, reminds, and enforces the
-  rules you have written. That is why the organization survives failure: any
-  agent, or the substrate itself, can go down, and work resumes from the
-  record.
+## Tightbeam in detail
 
-Tightbeam is a standalone service: install it and run it, the way you would
-a database.
+![How the pieces fit](docs/images/tightbeam-shape.svg)
 
-## External-agent operation skill
+The gateway runs a graph of agents and keeps a permanent record of what each agent is working on, what it has done and what has been checked. Agents run on any machine in your network, in the harness you choose.
 
-Choose one transport edition for an external agent:
+## Principles
 
-- [Current-line CLI edition](priv/skills/tightbeam-cli/SKILL.md)
-- [REST 0.2.0 edition](priv/skills/tightbeam-rest-0-2-0/SKILL.md)
+These principles decide what Tightbeam is and how it changes.
 
-Copy that edition's whole directory to `.codex/skills/<skill-name>/` or
-`.claude/skills/<skill-name>/` in the external agent's project. Keep the directory name
-and `SKILL.md` filename unchanged. Start a fresh agent session after the copy so the agent
-rediscovers the skill metadata.
+**User and agent agency.** You and your agents decide the shape of your organization, its process and its teams.
 
-The skill does not install Tightbeam, create a session, supply a credential, operate a
-kungfu bundle, or change a Tightbeam identity. Provision those prerequisites separately.
+**Domain knowledge belongs in "kung fu".** A kung fu bundle supplies the roles, guidance, skills and rules for a kind of work. The core handles records, messages and agents without needing to know what a pull request, a support ticket or a research paper is. You can teach Tightbeam more than one domain.
 
-## Install only a verified release package
+**Only enough guidance for the job.** Each agent gets the guidance and skills it needs for the work it has to do. Its context stays focused on that job.
 
-To install Tightbeam, follow [From a release package](#from-a-release-package)
-and verify the package against its published checksums and release provenance.
-This is the only installation path for users and agents installing for them.
+**Rails where you want them, agency everywhere else.** Tightbeam "rails" ensure agents behave deterministically at critical moments in your workflows. You choose the rules, such as requiring a review before work counts as done. Tightbeam applies them the same way every time. Everything else is left to the agents' judgment.
 
-A git checkout is for developing Tightbeam. Nothing built from a checkout is a
-release, including a build from `main` or a release tag. See
-[Developing Tightbeam](#developing-tightbeam) for source builds; do not use them
-as an installation or upgrade substitute.
+**Built for your tailnet.** Tightbeam assumes one operator on a private network, so there is no security setup to get through before you start.
 
-## Prerequisites
+**The record is the truth, not the context.** Records show what needs doing, who is responsible, what has been done and what has been checked. Agents recover their work from these records after compaction or restart. You can see why anything happened without reading chat logs.
 
-None of these are installed for you, and a missing one is not always obvious
-from the failure — see `mix tightbeam.doctor` and the notes below.
+**Wake on events.** Agents sleep until another agent or process has something for them to act on. Timed waits and polling are kept to a minimum.
 
-Needed to install and run a release package:
+**Keep the natural harness and augment it.** Each agent runs in the harness its model was built to use. Tightbeam adds the tools for agents to communicate and work together as an organization.
 
-- **A registered harness CLI** — `claude` and/or `codex` — installed and on
-  PATH *before* you start. Boot refuses by name when it cannot find a usable
-  registered harness. `mix tightbeam.doctor` reports each as
-  `harness_binary:<harness>`.
-- **node + npm.** The ACP adapters are npm packages, and the gateway installs
-  them into `<base_dir>/adapters` itself on first spawn. Without npm that
-  install fails and no turn can start. The release package is also an npm
-  package, so this is how you install it.
-- **git**, for the identity repository.
+**Let modern models orchestrate.** Modern models can plan work, choose tools and delegate. Tightbeam gives them shared records, messages, wakes and other agents to work with. The models decide how to put those tools to use.
 
-## Linux: unprivileged user namespaces, and the Codex sandbox
+**Agnostic to harness and model, compatible with their features.** Claude and Codex agents run in the same organization, and each can use its own harness's features. You can change an agent's model or harness while it works.
 
-**macOS is unaffected.** This section is Linux only.
+**Tightbeam is headless.** You know best how you should interact with it. There is no required user interface. That said, we've written some great UIs for it: the [chat component](https://github.com/clickety-clacks/tightbeam-chat), the [air-traffic-control view](https://github.com/clickety-clacks/tightbeam-atc), the [tuner](https://github.com/clickety-clacks/tightbeam-tuner) and the [decisions widget](https://github.com/clickety-clacks/tightbeam-decisions-omarchy). Use them or build your own.
 
-Codex runs every shell command inside a [bubblewrap](https://github.com/containers/bubblewrap)
-sandbox, and bubblewrap needs an **unprivileged user namespace** to build it.
-Several distributions restrict exactly that, as hardening. Where they do, no
-Codex agent on that host can run any command at all.
+## The tools
 
-The failure is severe and nearly silent, so know the shape of it:
-
-```
-bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted
-```
-
-It reads like a networking fault. It is not. bubblewrap creates the network
-namespace, then tries to bring up `lo` inside it, which needs a capability it
-should have inherited from the user namespace it was denied. The loopback line
-is simply the first place the missing namespace surfaces.
-
-**Why it is worse than an ordinary broken dependency:** an agent that cannot
-start a command cannot run `tightbeam` either. It cannot file an attest, record
-a blocker, or schedule a continuation. It fails, stays silent, and its card
-looks like ordinary open work. Expect to find it by noticing turns that produce
-no attests, not by seeing an error.
-
-### Check before you onboard a Linux host
+**Work items, assignments and evidence.** A work item is a goal. An assignment makes one agent responsible for a part of that work, with someone expecting the result. An attest records what happened: progress, a review, completion or an explanation of why the agent cannot continue. An artifact is a recorded file with its hash. Every agent can read these records, so a coordinator recovers from them instead of from memory.
 
 ```sh
-bwrap --unshare-net --ro-bind / / /bin/true   # exit 0 = sandbox works
-unshare --user --map-root-user true           # exit 0 = userns available
+tightbeam work-item-create --title "Fix the login timeout"
+tightbeam dispatch --session <key> --subject "..." --work-item <id> --brief "..."
+tightbeam attest <assignmentId> --kind progress --note "..."
+tightbeam artifact-record --kind report --title "..." --path ./report.md --work-item <id>
 ```
 
-If the first command prints the error above, agents on that host will not run.
-
-### Fix: Ubuntu 23.10 and later (including 24.04 LTS)
-
-Ubuntu ships `kernel.apparmor_restrict_unprivileged_userns=1` by default. It
-does not forbid the namespace outright — it transitions the process into the
-`unprivileged_userns` AppArmor profile, whose first rule is `audit deny
-capability`. You get a user namespace with every capability stripped, which is
-useless for building a sandbox. Nothing is written to the kernel log, so the
-only symptom is the `EPERM` above.
-
-Grant the capability to `bwrap` alone, using the same pattern Ubuntu ships for
-Chrome and VS Code. Create `/etc/apparmor.d/bwrap`:
-
-```
-abi <abi/4.0>,
-include <tunables/global>
-
-profile bwrap /usr/bin/bwrap flags=(unconfined) {
-  userns,
-  include if exists <local/bwrap>
-}
-```
+**The agent graph.** Spawn a session under yourself with an archetype, a harness, a model and a machine. Move it to another parent, retire it, or ask the gateway who reports to whom. Each session carries its own conversation, identity and work directory. A failed turn is carried to a parent who can act on it.
 
 ```sh
-sudo apparmor_parser -Q /etc/apparmor.d/bwrap   # parse-check first
-sudo apparmor_parser -r /etc/apparmor.d/bwrap   # load
-bwrap --unshare-net --ro-bind / / /bin/true     # verify
+tightbeam spawn --display "<Role>: login timeout" --name <function>:login-timeout \
+  --archetype <archetype> --harness codex --model <model> --host <host>
+tightbeam retire --session <key>
 ```
 
-Existing sessions recover on their next turn; no gateway or adapter restart is
-needed. The profile reloads at boot via the `apparmor` service.
+**Archetypes.** An archetype is the identity a session wakes up with: who it is, what it owns, how it works, which skills it has. Archetypes live in a git repository the gateway serves to every session, so a change to one applies to every agent built from it. Edit them with `tightbeam identity edit`, or write new ones.
 
-Prefer this to `sysctl kernel.apparmor_restrict_unprivileged_userns=0`. That
-one line also works, and it disables the restriction for **every** binary on
-the host — unprivileged user namespaces are a well-worn local privilege
-escalation route, which is why the restriction exists. The per-binary profile
-keeps it in force everywhere else. After the profile is installed,
-`unshare --user` still fails for other programs; that is correct, not a partial
-fix.
+**Skills and guidance built from basic tools.** Guidance is prose an agent reads and weighs. Skills are procedures it can load when the work calls for them. Both are files in the identity repository. Subtree guidance applies a note to a whole branch of the organization, or to some archetypes within it. A kung fu is a bundle that defines a domain-specific organization: its archetypes, skills, guidance and rules. Tightbeam learns a kung fu to work in that domain. The shipped kung fu, agentic-engineering, is a software engineering organization: archetypes that own the product's intent, plan the work, write the contracts, build, review independently and watch pull requests until their checks finish, with rules such as "a completion needs an independent review" wired in as rails. You can change its archetypes, delete its rules or write a kung fu for different work.
 
-Rollback: `sudo rm /etc/apparmor.d/bwrap && sudo systemctl reload apparmor`.
+```sh
+tightbeam learn agentic-engineering
+tightbeam subtree-guidance set release-freeze --archetype <archetype>,<archetype> --file freeze.md
+```
 
-### What might need doing on other distributions
+**Rails.** A rail is a rule Tightbeam enforces. Agents cannot weigh it and skip it. There are two kinds. One guards records: when an agent tries to mark work complete, Tightbeam checks the rule first, and if the rule is not met the agent is told which rule stopped it and what is missing. The shipped template has rails such as "completion requires review" and "a repeated fix carries a diagnosis". The other kind guards commands and is called a statute. A statute names a command pattern no agent may run, such as pushing to main or rewriting git history. When an agent tries, the harness refuses the command before it runs and shows the agent the statute that refused it. You write both as small configuration files, and you can have none.
 
-Not verified here — treat as leads, and use the two check commands above to
-confirm before and after.
+**Decisions that come to you.** An agent that needs a product choice it is not allowed to make files a decision request naming you. You see the question, the recommendation and the choices in the phone app, a desktop bar widget or chat. When you answer, the agent wakes with the answer. Until then, it keeps working on anything that does not depend on it.
 
-- **Debian** — some configurations ship `kernel.unprivileged_userns_clone=0`.
-  Set it to `1`, persisted in `/etc/sysctl.d/`. Debian has no AppArmor
-  userns-transition profile to add, so the sysctl is the lever.
-- **RHEL, CentOS Stream, Rocky, Alma** — older releases capped
-  `user.max_user_namespaces` at `0`. Raise it in `/etc/sysctl.d/`. Current
-  releases generally ship a usable default.
-- **Arch and derivatives** — stock kernels are fine; `linux-hardened` restricts
-  userns and needs `kernel.unprivileged_userns_clone=1`.
-- **SELinux hosts** — a denial appears in the audit log rather than as silent
-  capability stripping, so `ausearch -m avc` is the place to look.
-- **Containers and unprivileged LXC** — nested user namespaces may be
-  unavailable regardless of sysctl, and the runtime may need
-  `--security-opt seccomp=unconfined` or an equivalent. A host that cannot
-  provide the namespace at all cannot run Codex agents.
+```sh
+tightbeam operator-ask --question "..." --note "..." --assignment <id>
+tightbeam decision-requests
+```
 
-If a host cannot be fixed, it can still run `claude` harness sessions, which do
-not use bubblewrap.
+**Wakes triggered by facts.** When an agent ends its turn, it can ask to be woken at a time, on a repeating schedule, when a named fact arrives, or when another agent's assignment reaches a state it describes. Anything that can run the CLI can record a fact, including a script with no agent behind it. The shipped pull request watcher records a fact when every required check on a pull request has finished, so an agent can sleep until its checks are green instead of asking every minute.
+
+```sh
+tightbeam wake --session <key> --after 30m --prompt "re-read the card"
+tightbeam wake --session <key> --when-fact pr.checks-completed \
+  --when-scope owner/repo#42 --fallback-after 2h --prompt "checks finished"
+tightbeam condition --kind deploy.finished --scope prod
+```
+
+**Model and harness switching.** Change a running agent's model, effort or speed and it keeps its conversation. Change its harness and it starts a fresh engine context while keeping its place, role and work in the organization. You can run Claude and Codex agents together and move an agent from one to the other.
+
+```sh
+tightbeam tune --session <key> --model <model>
+tightbeam tune --session <key> --harness claude --model <model>
+```
+
+**One stream for everything.** The firehose is a WebSocket feed of every record change. The bundled [chat component](https://github.com/clickety-clacks/tightbeam-chat), the [air-traffic-control view](https://github.com/clickety-clacks/tightbeam-atc), the [tuner](https://github.com/clickety-clacks/tightbeam-tuner) and the [decisions widget](https://github.com/clickety-clacks/tightbeam-decisions-omarchy) all read it. So can your own scripts.
+
+## Is Tightbeam for you?
+
+Tightbeam suits you if you want to run your own software factory, or any other kind of agent organization, on machines you control. It suits you if you want to decide which models run, where your code goes and what counts as done. It suits you if no vendor's defaults fit your process and you want to write the rules yourself.
+
+It is not for you if you want one assistant in one window. It is not for you if you want a software-as-a-service agent such as Devin. Devin lets you pick its model, steer it with prompts and playbooks, and run its workspace on your own hardware, but its agent loop runs in Cognition's cloud and its way of working is Cognition's. Tightbeam can also be hosted anywhere. The difference is that you decide how it works.
 
 ## Install
 
-Install at least one harness first. These are the vendors' install commands;
-install both if you want both harnesses:
+Install Tightbeam from a published release package, and check the package against the checksums that ship with it. Do not install from a git checkout. A checkout is for working on Tightbeam itself.
+
+Run it on a private network such as a tailnet. You also need a machine that stays on to run the gateway, and these on that machine:
+
+- At least one harness CLI on PATH, `claude` or `codex` or both.
+- node and npm. The release is an npm package, and the gateway installs its adapters with npm.
+- git, for the identity repository.
+
+Install a harness first if you have not:
 
 ```sh
 npm install -g @anthropic-ai/claude-code
 claude --version
 ```
 
-and/or:
-
 ```sh
 npm install -g @openai/codex
 codex --version
 ```
 
-### From a release package
-
-Download the package for your platform from the
-[GitHub Releases](https://github.com/clickety-clacks/tightbeam/releases) page.
-Each release contains packages for `darwin-aarch64` and `linux-x86_64`, a
-`SHA256SUMS` file, and `release-provenance.json` naming the exact tagged commit
-and workflow run that produced them. Verify the downloaded package before
-installing it:
+Download the package for your platform from the [releases page](https://github.com/clickety-clacks/tightbeam/releases). Each release ships packages for darwin-aarch64 and linux-x86_64, a `SHA256SUMS` file and a `release-provenance.json` naming the exact commit and workflow run that produced them. Verify before you install:
 
 ```sh
-# Linux
-sha256sum -c SHA256SUMS --ignore-missing
-
-# macOS
-shasum -a 256 -c SHA256SUMS --ignore-missing
+sha256sum -c SHA256SUMS --ignore-missing    # Linux
+shasum -a 256 -c SHA256SUMS --ignore-missing # macOS
 ```
-
-For an existing installation, complete the review in
-[UPGRADING AN EARLIER INSTALLATION](#upgrading-an-earlier-installation) before
-installing the verified package. For a fresh installation:
 
 ```sh
 npm install -g ./tightbeam-<version>-<os>-<arch>-<commit>.tgz
 tightbeam --version
-tightbeam-gateway                  # boots the gateway in the foreground
+tightbeam-gateway
 ```
 
-For a service-managed installation, `npm install -g` replaces the executable on
-disk but does not restart the running gateway. Restart the service after every
-upgrade, then verify it is active:
+The first boot creates the base directory, sets up the identity repository and starts serving. It cannot run a turn yet, so it prints a NOT READY summary naming each gap and the command that closes it. Leave it running and finish from another terminal.
+
+Pair a client first. The first client to pair creates the admin user and that user's built-in Main session. Then, as that admin, give Tightbeam a credential for each provider you will use. Tightbeam keeps its own credential and does not read your vendor login:
 
 ```sh
-# Linux
-sudo systemctl restart tightbeam.service
-systemctl is-active tightbeam.service
+tightbeam onboard anthropic --as-user <userId>
+tightbeam onboard openai --as-user <userId>
 ```
 
-On macOS, restart the installed Tightbeam launchd service, then verify it with
-`sudo launchctl print system/com.tightbeam.gateway`.
-
-`tightbeam-gateway` is the release equivalent of `mix run --no-halt`: same
-foreground process, same environment contract, same first-boot behaviour. It
-creates the base dir, seeds the identity repository, creates `state.db` and
-`bin/`, and prints the NOT READY summary described below. Continue from
-**Connect your first client** to continue setting up the installed release.
-
-The CLI and the gateway ship in one package on purpose, so their version
-handshake holds by construction — you cannot end up with a CLI that its gateway
-refuses. `npm install -g` installs both in npm's global bin directory. If you
-want easy access to the Tightbeam CLI, make sure npm's global bin directory is
-in your `PATH`. Tightbeam does not change your `PATH` for you. Nothing else is
-added to the machine, and neither Elixir nor Rust is needed to run either one.
-
-### UPGRADING AN EARLIER INSTALLATION
-
-Review runtime overrides before replacing an existing installation. A persisted
-override can select an older executable instead of a new adapter's bundled
-runtime. Cleanup is conditional: keep intentional pins that the target supports.
-
-1. Inventory every host and harness before the upgrade. As an admin, run:
-
-   ```sh
-   tightbeam host-env-list --as-user <adminUserId>
-   ```
-
-   Record each persisted `CODEX_PATH` and `CLAUDE_CODE_EXECUTABLE` value,
-   including its host and harness. Separately inspect the gateway service's
-   environment: systemd unit, drop-ins and environment files, or launchd plist.
-   Record those values too; your interactive shell is not the service environment.
-   Keep the record private if other environment entries contain secrets.
-
-2. Record the current Tightbeam package/build, each effective harness executable
-   path, exact version and SHA-256, and each installed ACP adapter's exact package version.
-   Retain the prior runtime/package and service configuration for rollback.
-   Check the target's release notes and compatibility evidence for those exact
-   runtime/adapter combinations. Do not infer compatibility from a branch name
-   or assume an upgrade refreshes every adapter.
-
-3. Keep each intentional, supported pin. Remove an override only when you confirm
-   it was temporary, is obsolete for the target, and its replacement is compatible.
-   For a persisted host/harness overlay, use the matching command below; replace
-   the placeholders with the recorded host and admin user:
-
-   ```sh
-   tightbeam host-env-unset --host <host> --harness codex CODEX_PATH --as-user <adminUserId>
-   tightbeam host-env-unset --host <host> --harness claude CLAUDE_CODE_EXECUTABLE --as-user <adminUserId>
-   ```
-
-   These commands remove only the named overlay. They do not edit a service's
-   environment. Remove an obsolete service override separately from its recorded
-   configuration source, using that service manager's configuration reload procedure.
-   Removing one source can expose a value from another; inspect both.
-
-4. Wait until affected sessions finish their turns before activation. An overlay
-   change takes effect on the next adapter start; it does not replace a running
-   adapter. Install the verified target package using the release instructions
-   above, then restart the installed service as documented there. Apply the same
-   idle boundary to affected remote adapters before their next start.
-   Do not treat a successful unset or an active service as proof of activation.
-
-5. After activation, verify the effective executable path, exact runtime
-   version and SHA-256 for each affected host/harness, plus the adapter package version.
-   Use the actual adapter launch/process information and the selected binary's
-   version output and file hash, not just the executable on your shell's PATH.
-   Package-managed vendor paths can move or contain different bytes after an
-   update; a saved path alone does not pin a runtime version.
-   Run one real model turn per affected host/harness. Verify the expected hook
-   fires and enforces its result, then resume an existing session and verify
-   its conversation continues. Record the results before calling the upgrade
-   successful. This checklist is not proof that an untested release works.
-
-If verification fails, stop the rollout. Restore each changed overlay to its
-recorded value with `tightbeam host-env-set --host <host> --harness <harness>
-'NAME=previous-value' --as-user <adminUserId>`. Restore the prior service
-environment and compatible runtime/adapter versions through the supported
-installation procedure. Use the same idle/restart boundary and repeat verification.
-Check the target's state-migration rollback restrictions before reverting a
-Tightbeam package; restoring an executable alone does not undo a database migration.
-
-Set `TIGHTBEAM_BASE_DIR` to choose `base_dir`; the gateway otherwise uses
-`TIGHTBEAM_HOME`, then `~/.tightbeam`. The CLI uses the same fallback order. The
-CLI finds the gateway through `<base_dir>/gateway.json`. `TIGHTBEAM_PORT`
-overrides the port. Whatever you set for the service, set for the shell you run
-the CLI from: if they disagree, the CLI looks for its gateway in a directory
-that does not have one.
-
-### More than one gateway on one machine
-
-Supported. Give each instance its own `TIGHTBEAM_BASE_DIR` and its own
-`TIGHTBEAM_PORT` and you are done.
-
-A release build also runs a named Erlang node, and two nodes on one machine
-cannot share a name. `tightbeam-gateway` derives the name from the port, so
-distinct ports already give distinct names and there is nothing extra to set.
-`TIGHTBEAM_NODE` names it yourself if you want to; the only way to collide is to
-give two instances the same port, or to pin them to the same name by hand.
-
-That name is also how `tightbeam-gateway stop`, `remote` and `pid` FIND a running
-gateway — so **run them the same way you started it**. Same port (or same
-`TIGHTBEAM_NODE`), same machine name. When they disagree you do not get a clear
-message; you get a connection failure like
-
-```
---rpc-eval : RPC failed with reason :noconnection
-```
-
-about a gateway that is running perfectly well. It means the name they looked for
-is not the name it started under. Same discipline as the CLI, for the same
-reason.
-
-With at least one usable harness through preflight, the first boot creates the
-base dir and serves, but **cannot run a turn yet**: it has no credentials, so it
-prints a NOT READY summary naming every gap. Harness homes are projected per
-machine and harness during reconciliation or launch, not necessarily at boot.
-Leave this process running and complete the remaining steps from another
-terminal.
-
-### Connect your first client — do this BEFORE onboarding
-
-A fresh org supports two bootstrap sequences. Choose one.
-
-For a human-first install:
-
-1. Start the gateway.
-2. Point the client at `TIGHTBEAM_ADVERTISED_URL` and pair with the intended
-   user name.
-3. Verify that pairing created the admin user and that user's built-in `Main`.
-4. Onboard provider credentials as that admin.
-5. Learn the working identity.
-6. Send a real turn to `Main`.
-7. Add later users through authenticated `tightbeam add-user` requests.
-
-For a headless install on the gateway host:
-
-1. Start the gateway, then reserve the intended first user locally:
-
-   ```sh
-   <base_dir>/bin/tightbeam add-user <userId>
-   ```
-
-2. The gateway creates the forced-admin user and built-in `Main`. `tightbeam doctor`
-   reports the cold-start state as `reserved`.
-3. Complete the authorized headless onboarding or spawn flow.
-4. Pair a client with the same normalized user name.
-5. Verify that `tightbeam doctor` reports the state as `claimed`.
-6. Onboard credentials, learn the identity, and send a real turn to `Main`.
-7. Add later users through authenticated `tightbeam add-user` requests.
-
-The bare `add-user` command is a loopback-only gateway request. It never writes
-SQLite directly. A remote bare request is refused. After cold start, use an
-explicit authenticated identity, for example `tightbeam add-user <userId>
---as-user <adminUserId>`. Pass `--admin` only when the later user must also be
-an admin.
-
-Do one sequence first. Onboarding is admin-only, so it fails with `forbidden:
-admin required` until the first admin exists.
-
-Every client after this one pairs as `pending` and must be approved by the admin.
-
-A replay-capable client keeps its claim replay secret until its first
-authenticated handshake succeeds. If the first pairing response is lost, it
-repeats the exact pair request with that secret. A legacy client, or a client
-that loses the secret, receives `bootstrap_closed`. Use the recovery below
-only when that fresh installation is safe to discard.
-
-### Recover an unusable fresh database
-
-Use this recovery only for an incomplete identity graph or a lost first-pair
-response before activation in a fresh installation that the operator intends
-to discard. The database contains organization identity, sessions, work, and
-audit history. Restore or investigate a non-fresh database instead of
-resetting it.
-
-1. Stop the gateway.
-2. Locate `state.db` and its `state.db-wal` and `state.db-shm` companions, if
-   they exist.
-3. Verify that no gateway process still has the database open.
-4. Move the complete database set to a timestamped backup directory. Do not
-   delete it.
-5. Keep the gateway configuration, authentication files, binaries, and
-   provider credentials in place.
-6. Restart the gateway and run `tightbeam doctor`. Verify that cold start is
-   `open`.
-7. Choose the human-first or headless sequence above.
-8. Verify exactly one admin user, one allowlisted first device, one complete
-   cold-start receipt, and one active, self-parented built-in `Main` for that
-   user.
-
-### Then onboard a credential, per provider
-
-An existing vendor CLI login is invisible to Tightbeam; Tightbeam keeps its own
-credential. This command is the only supported credential path — running the
-vendor's own `login` does not onboard Tightbeam:
+Have Tightbeam learn the shipped kung fu, or skip this and build your own:
 
 ```sh
-<base_dir>/bin/tightbeam onboard <provider> --as-user <userId>
+tightbeam learn agentic-engineering --as-user <userId>
 ```
 
-`<provider>` is the credential provider — **`anthropic`** or **`openai`** — not
-the harness name. `<userId>` is the admin created by that first pairing. From a
-release install `tightbeam` is already on PATH, so the `<base_dir>/bin/` prefix
-is only needed on a source install.
+Open Main in your client and send a message. A reply means turns are working.
 
-**RUN IT ONCE PER HARNESS YOU INTEND TO USE.** A credential is per provider, and
-onboarding one leaves the other unusable — a session placed on an un-onboarded
-harness fails naming the credential it lacks. The boot summary already lists
-exactly what is missing, one line per provider, with the command for each: if it
-named two, run two. With both installed and nothing chosen, a fresh org defaults
-to the first registered harness; with only one installed, that one is the
-default and its own model comes with it, so a single-harness box needs no model
-configuration at all.
+The last required step is installing the gateway as a service, so it survives logout and reboot and restarts on failure. This needs root. Unit files for systemd and launchd, and the full step by step including the Linux sandbox setup, are in [docs/INSTALL.md](docs/INSTALL.md). Run `tightbeam doctor` at any point to see what is still missing.
 
-### Then learn the working identity
+Upgrading an existing installation has its own review in [docs/UPGRADE.md](docs/UPGRADE.md). Back up before you do: [docs/BACKUP.md](docs/BACKUP.md).
 
-```sh
-<base_dir>/bin/tightbeam learn agentic-engineering --as-user <userId>
-```
+## Connect agents and clients
 
-`<base_dir>/bin/tightbeam unlearn agentic-engineering --as-user <userId>` is its
-inverse. Credentials are per provider/harness per machine, while harness homes
-are per machine and harness; learning or unlearning changes neither, so it
-never requires onboarding again.
+Your agents reach the gateway through the `tightbeam` CLI, which ships in the same package as the gateway so the two never disagree about versions. A session spawned by the gateway already has its identity. An agent you run outside Tightbeam, such as a terminal session on your desk, gets the same CLI and a skill that teaches it the commands.
 
-### Then run a real turn
+Clients read the firehose and send turns. The ones that exist today are open source and in sibling repositories:
 
-In the connected client, open Main and send `hello, who are you?`. The turn
-loop works when the assistant reply arrives and the typing indicator clears.
+- [tightbeam-chat](https://github.com/clickety-clacks/tightbeam-chat), an embeddable chat component for talking to one session.
+- [tightbeam-atc](https://github.com/clickety-clacks/tightbeam-atc), a live three-dimensional view of the whole organization that shows how active it is.
+- [tightbeam-tuner](https://github.com/clickety-clacks/tightbeam-tuner), a desktop and iOS browser of the agent tree that opens tightbeam-chat on any agent.
+- [tightbeam-decisions-omarchy](https://github.com/clickety-clacks/tightbeam-decisions-omarchy), a desktop bar widget for ruling on decision requests.
 
-**This is not the end of the install.** One required step remains — installing
-the service (below). Until that is done you have a gateway that dies with your
-terminal and does not come back after a reboot.
+[harklight-app](https://github.com/clickety-clacks/harklight-app) is different: it does not read the firehose. An agent sends you a notice, a question or a decision through its [agent CLI](https://github.com/clickety-clacks/harklight-agent), the [server](https://github.com/clickety-clacks/harklight-server) pushes it to your phone, and your reply goes back to the agent that asked.
 
-You do not install the ACP adapters by hand. `<base_dir>/adapters` stays empty
-until the first session spawns, at which point the gateway installs both
-adapters at their pinned versions. A first boot reporting them missing is
-expected, not a failed install.
-
-## Reading the boot summary
-
-Boot ends with a readiness verdict, because serving is not the same as being
-able to run a turn. A ready install says so in one line. An install with gaps
-says `NOT READY` and then names each one per harness, with the command that
-closes it:
-
-```
-NOT READY: no harness on this instance can run a turn. The gateway is
-serving, so clients can connect, but every turn will fail until the
-gaps below are closed.
-
-  claude:
-    ACP adapter missing at <base_dir>/adapters/node_modules/.bin/claude-agent-acp
-      — no turn can start.
-    Tightbeam has no credential for anthropic on <host>. It does not use or
-      import your normal claude CLI login; Tightbeam keeps its own credential
-      under <base_dir>/auth. Run on <host>:
-      tightbeam onboard anthropic --as-user <userId>
-```
-
-A row saying UNKNOWN is not a claim that the credential is bad. Use
-`mix tightbeam.doctor` for additional diagnostics; check credential liveness in
-the boot summary or the running gateway's catalog.
-
-## Installing as a service — REQUIRED, and the install is not complete without it
-
-**This is the last required step of installation, not an optional extra
-afterwards.** A foreground gateway — `tightbeam-gateway` in a terminal, in tmux,
-under `mix run --no-halt` — dies when you log out and does not come back after a
-reboot. An install that leaves you with a foreground process is not finished.
-
-**THIS STEP NEEDS ROOT, AND A HUMAN.** Both unit files below are installed with
-`sudo`. An agent performing this install on someone's behalf must STOP HERE and
-hand the remaining commands to a person; it cannot complete the install alone.
-Say so plainly rather than substituting a foreground workaround.
-
-**What skipping it actually costs:**
-
-- the machine rebooted and the gateway did not come back — every client sat
-  timing out until someone noticed and started it by hand;
-- the log was gone. A foreground launcher usually redirects with `tee`, which
-  TRUNCATES on restart, so the run you need after a crash is destroyed by the
-  restart. Under a service manager the log is the journal (linux) or the
-  `StandardOutPath` files (macOS), and the previous boot is still readable —
-  `journalctl -u tightbeam -b -1`. That difference is the whole post-mortem.
-
-The service must **start with no interactive login**, **survive logout**,
-**survive reboot**, and **restart on failure**.
-
-The service must **start with no interactive login**, **survive logout**,
-**survive reboot**, and **restart on failure**.
-
-### The environment that matters
-
-| variable | why |
-|---|---|
-| `TIGHTBEAM_LOCAL_HOST_NAME` | **Set this. It is the one that bites.** The homes tree is keyed `homes/<machine>/<harness>`, and the machine name defaults to the OS hostname. If the hostname is unstable — a container that gets a new id per start, a renamed machine — every restart projects a NEW home tree and silently orphans the durable harness state (codex `sessions/`, claude `projects/`) under the old name. It does not fail; it just quietly stops finding the old conversations. Pin it to a name you choose and never change it. |
-| `TIGHTBEAM_BASE_DIR` | The org: `auth/`, `identity/`, `homes/`, `state.db`, `work/`. Defaults to `TIGHTBEAM_HOME`, else `~/.tightbeam`. |
-| `TIGHTBEAM_PORT` | Rewritten into `gateway.json` at every boot. |
-| `TIGHTBEAM_NODE` | The release's Erlang node name. Defaults to `tightbeam_gateway_<port>`, which is already unique per instance — set it only if you want to choose the name. |
-| `TIGHTBEAM_ADVERTISED_URL` | The URL clients are told to connect back on. `mix tightbeam.doctor` fails without it. |
-| `TIGHTBEAM_DEFAULT_MODEL` | The default model itself, undecorated (`claude-sonnet-5`). Must be live for the default harness. It is a single global, so on a two-harness host one harness will report its default as unselectable — that is expected, not a fault. |
-| `TIGHTBEAM_DEFAULT_EFFORT` | The default reasoning level (`low`…`max`). Required when the default model offers effort tiers — a model is selected by FIELDS, never one packed string. |
-| `TIGHTBEAM_DEFAULT_CONTEXT` | The vendor's context-window variant, when it offers more than one (`1m`). Omit for the model's default window. |
-| `CODEX_PATH` | Pin the codex binary. Harness CLIs auto-update underneath you; an unpinned one changes behaviour without warning. |
-
-Run the service **as an ordinary user, not root** — set the account explicitly
-(`User=` / `UserName=`) rather than letting the init system default to root. It
-needs write access to `TIGHTBEAM_BASE_DIR` and read access to the harness CLIs on
-`PATH`. No dedicated service account is required: run it as the account that
-installed it.
-
-Keep `base_dir` somewhere durable; it holds the org's credentials, identity,
-sessions, and work.
-
-### macOS — launchd
-
-`/Library/LaunchDaemons/com.tightbeam.gateway.plist`, owned `root:wheel` mode
-`644`, loaded with `sudo launchctl bootstrap system <path>`.
-
-Use a **LaunchDaemon**, not a LaunchAgent. A LaunchAgent is per-user and starts at
-*login*, so it dies at logout and does not exist until someone signs in — it cannot
-meet the requirements above. `UserName` keeps the process off root.
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.tightbeam.gateway</string>
-  <key>UserName</key><string>you</string>
-  <key>ProgramArguments</key>
-  <array>
-    <!-- npm decides where -g bins land; ask it: `command -v tightbeam-gateway` -->
-    <string>/Users/you/.local/bin/tightbeam-gateway</string>
-  </array>
-  <key>WorkingDirectory</key><string>/Users/you</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>TIGHTBEAM_LOCAL_HOST_NAME</key><string>your-host</string>
-    <key>TIGHTBEAM_BASE_DIR</key><string>/Users/you/.tightbeam</string>
-    <key>TIGHTBEAM_PORT</key><string>11373</string>
-    <key>TIGHTBEAM_ADVERTISED_URL</key><string>ws://your-host.local:11373</string>
-    <key>PATH</key><string>/Users/you/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key>
-  <dict><key>SuccessfulExit</key><false/></dict>
-  <key>StandardOutPath</key><string>/Users/you/.tightbeam/gateway.log</string>
-  <key>StandardErrorPath</key><string>/Users/you/.tightbeam/gateway.err.log</string>
-</dict>
-</plist>
-```
-
-`KeepAlive`/`SuccessfulExit=false` restarts on crash but respects a deliberate
-clean stop. launchd does not rotate logs — point them at a path you rotate, or
-`newsyslog.conf` will not do it for you.
-
-Verify: `sudo launchctl print system/com.tightbeam.gateway`.
-
-### Linux — systemd
-
-`/etc/systemd/system/tightbeam.service`, enabled with
-`sudo systemctl enable --now tightbeam`.
-
-Use a **system** unit. A user unit stops at logout unless you also enable
-lingering, and it will not start until that user's manager does — `WantedBy=
-multi-user.target` starts at boot with no login at all.
-
-```ini
-[Unit]
-Description=Tightbeam gateway
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=exec
-User=you
-Group=you
-WorkingDirectory=/home/you
-# npm decides where -g bins land; use the output of: command -v tightbeam-gateway
-ExecStart=/home/you/.local/bin/tightbeam-gateway
-Environment=TIGHTBEAM_LOCAL_HOST_NAME=your-host
-Environment=TIGHTBEAM_BASE_DIR=/home/you/.tightbeam
-Environment=TIGHTBEAM_PORT=11373
-Environment=TIGHTBEAM_ADVERTISED_URL=ws://your-host.local:11373
-Environment=PATH=/home/you/.local/bin:/usr/local/bin:/usr/bin:/bin
-Restart=on-failure
-RestartSec=5s
-TimeoutStopSec=30s
-
-[Install]
-WantedBy=multi-user.target
-```
-
-`User=`/`Group=` are required in a system unit — without them systemd runs it as
-root. `%h` does NOT work here: in a system unit it expands to `/root`, not to the
-user's home, so every path is spelled out. Set `PATH` explicitly too — a system
-unit inherits almost none of your login environment, and `mix`, `elixir`, `node`
-and the harness CLIs must all be findable.
-
-`WantedBy=multi-user.target` is what makes it start at boot with nobody logged in.
-`Restart=on-failure` rather than `always`, so a deliberate `systemctl stop` stays
-stopped. Logs go to the journal — `journalctl -u tightbeam -f` (no `--user`).
-Give `TimeoutStopSec` room: shutdown drains in-flight turns.
-
-Verify: `systemctl is-enabled tightbeam` reports `enabled` (starts at boot) and
-`systemctl is-active tightbeam` reports `active`.
-
-### Verifying the service — the four things that define it
-
-A running process proves none of these. Check them explicitly:
-
-| property | Linux | macOS |
-|---|---|---|
-| starts with no login | `systemctl is-enabled tightbeam` → `enabled` | `sudo launchctl print system/com.tightbeam.gateway` |
-| survives logout | log out, then re-check `is-active` | log out, then re-check `print` |
-| survives reboot | reboot; `is-active` without intervention | reboot; `print` without intervention |
-| restarts on failure | kill the pid; it returns | kill the pid; it returns |
-
-Then confirm it can actually work — read the boot summary below, and run a real
-turn. A service that starts perfectly and cannot run a turn is not installed.
-
-### Uninstalling
-
-**NOT YET IMPLEMENTED.** There is no `tightbeam uninstall`. Until there is,
-removal is manual, and the order matters — stop the service before removing
-anything it holds open:
-
-```sh
-# Linux
-sudo systemctl disable --now tightbeam
-sudo rm /etc/systemd/system/tightbeam.service
-sudo systemctl daemon-reload
-
-# macOS
-sudo launchctl bootout system/com.tightbeam.gateway
-sudo rm /Library/LaunchDaemons/com.tightbeam.gateway.plist
-```
-
-Then verify nothing is left: no unit or plist, no process, nothing listening on
-your `TIGHTBEAM_PORT`.
-
-`base_dir` is **left alone** by the steps above, and that is deliberate — it holds
-your identity repo, sessions, work items, and credentials. Removing the service
-does not throw away the org. Delete `base_dir` yourself only when you mean to
-destroy that state; it is not recoverable.
-
-### Confirming it actually came up
-
-A clean start is not a working install. Read the **last** lines of the log, not
-the `Running … (http)` line above them: boot ends with a readiness summary that
-says either `READY: <harness> can run turns.` or `NOT READY` followed by each
-gap and the command that closes it. That summary is the check — `systemctl
-is-active` and a listening port will both look healthy on an instance that
-cannot run a single turn.
+To add a machine so agents can run on it, see [docs/SATELLITE.md](docs/SATELLITE.md). One ssh-reachable host becomes part of the organization with `tightbeam assimilate`.
 
 ## Operating
 
-- `docs/SMOKE.md` — the manual acceptance runbook; it follows this README's
-  authoritative fresh-org install path.
-- `docs/ARCHITECTURE.md` — the substrate's shape.
-- `docs/SATELLITE.md` — adding a machine to an existing org.
+- [docs/SMOKE.md](docs/SMOKE.md), the manual acceptance runbook after an install.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), the shape of the gateway and its records.
+- [docs/firehose.md](docs/firehose.md), the change stream clients read.
+- [docs/statutes.toml.example](docs/statutes.toml.example), the format for your own statutes.
+- [docs/SATELLITE.md](docs/SATELLITE.md), adding a machine.
+- [docs/BACKUP.md](docs/BACKUP.md) and [docs/UPGRADE.md](docs/UPGRADE.md).
 
 ## Developing Tightbeam
 
-Use a checkout only for development, outside any service-selected installation.
-Development builds and local packages are not verified releases.
-
-Needed to build **from source only** — a release package has all of these
-already compiled into it:
-
-- **Elixir + OTP.** Built against Elixir 1.19 / OTP 28. With no Elixir on PATH
-  every command below fails as `mix: command not found`; nothing in this
-  repository can report that for you.
-- **Rust >= 1.85**, to build the `tightbeam` CLI (`cargo build --release
-  --manifest-path cli/Cargo.toml`). The CLI is edition 2024, so older toolchains
-  cannot build it at all. **Install via [rustup](https://rustup.rs), not your
-  distro** — Ubuntu 24.04 LTS packages 1.75, which looks like a satisfied
-  prerequisite and then fails the build. `cargo --version` must report 1.85 or
-  newer before you start.
-
-  Do not skip this step and continue. Gateway boot still succeeds without the
-  CLI and installs a `bin/tightbeam` that refuses to run — but the very next
-  documented step, onboarding a credential, *is* that binary. You would get a
-  gateway that looks healthy, cannot be onboarded, cannot run a turn, and
-  reports its problem as missing credentials rather than a missing CLI.
-- **A C toolchain** (`gcc`/`clang` + `make`) — `exqlite` builds a native NIF.
-- **Hex and rebar3**, Elixir's package and build tools. They do NOT ship with
-  Elixir. Without them `mix deps.get` cannot fetch anything, and on a machine
-  that has never had them it stops on an interactive prompt — `Shall I install
-  Hex? [Yn]` — which fails outright under any non-interactive install. Install
-  them explicitly with the first two commands below rather than answering that
-  prompt; `--if-missing` makes both a no-op when you already have them.
-
-### From source
-
-Only after a harness is on PATH, build and run a development checkout:
-
-```sh
-git clone https://github.com/clickety-clacks/tightbeam.git
-cd tightbeam
-
-mix local.hex --force --if-missing      # Hex; no-op if already installed
-mix local.rebar --force --if-missing    # rebar3, to build Erlang deps
-
-mix deps.get
-mix compile
-cargo build --release --manifest-path cli/Cargo.toml
-
-mix tightbeam.init                 # creates <base_dir>/identity
-mix run --no-halt                  # boots the gateway; creates state.db and bin/
-```
-
-### Cutting a release
-
-Releases are version tags on canonical `main`, not release branches. First set
-the version in `cli/Cargo.toml`, land it on `main`, and wait for the ordinary
-`main` CI run to pass. Then create and push the matching annotated tag:
-
-```sh
-git fetch origin
-git merge --ff-only origin/main
-git tag -a v<version> -m "Tightbeam v<version>"
-git push origin v<version>
-```
-
-The tag must be exactly `v<major>.<minor>.<patch>`, must match the Cargo package
-version, and must point to the current `origin/main` tip. The tag workflow reruns
-the unchanged macOS and Linux test gates, builds both packages from that tagged
-commit, and creates one GitHub Release containing the packages, checksums, and
-provenance record. If any gate or either platform build fails, no GitHub Release
-is created.
+The gateway is Elixir and the CLI is Rust. Source builds, the test suite and how a release gets cut are in [CONTRIBUTING.md](CONTRIBUTING.md). A source build is for working on Tightbeam, not for running it.
