@@ -874,7 +874,12 @@ defmodule Tightbeam.SchemaShapeTest do
              Tightbeam.Roles.create!(db, "owner-a-role", "owner-a", "owner-a-session")
 
     # A role's current binding cannot prove who owned a historical agent-origin fact.
-    assert :ok = Tightbeam.Roles.bind(db, "owner-a-role", "owner-b-session")
+    # Build the predecessor binding before retirement continuations exist.
+    assert :ok =
+             DB.execute(
+               db,
+               "UPDATE roles SET boundSessionKey='owner-b-session' WHERE name='owner-a-role'"
+             )
 
     assert :ok =
              DB.execute(db, """
