@@ -125,12 +125,15 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
 
     assert receive_notices() |> Enum.map(& &1["class"]) == [
              "verb.accepted",
+             "wake.scheduled",
              "wake.scheduled"
            ]
 
     assert {:ok, %{retired_session_keys: []}} = Dispatch.dispatch(db, handlers, call)
 
-    assert receive_notices() |> Enum.map(& &1["class"]) == ["verb.accepted"]
+    assert receive_notices() |> Enum.map(& &1["class"]) == [
+      "verb.accepted", "wake.canceled", "wake.scheduled"
+    ]
   end
 
   test "subtree retirement emits one committed session notice per retired row" do

@@ -133,6 +133,7 @@ defmodule Tightbeam.Retirements do
       for role <- descendant.roles, do: blocker_row(txn, id, "role", role, descendant.session_key)
     end
 
+    Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
     %{id: id, owner: session_details(txn, owner)}
   end
 
@@ -250,6 +251,8 @@ defmodule Tightbeam.Retirements do
                 due_at: now()
               }).wake_id
             end
+
+          if handoff, do: Wakes.publish_change_in_txn(txn, "wake.scheduled", handoff)
 
           if handoff && existing == [] do
             Txn.q(txn, "UPDATE unfinished_retirements SET wakeId=?2 WHERE id=?1", [id, handoff])

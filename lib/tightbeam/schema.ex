@@ -1788,6 +1788,13 @@ defmodule Tightbeam.Schema do
   def live_base_upgrade_predecessor, do: @operator_decision_shape
 
   @doc false
+  def retirement_cancellation_predecessor_ddl do
+    @row_reaction_cancellation_objects
+    |> Enum.find(&(&1.name == "wake_cancellations"))
+    |> Map.fetch!(:sql)
+  end
+
+  @doc false
   def assignment_source_replacement_cancellation_ddl do
     @assignment_source_replacement_liveness_objects
     |> Enum.find(&(&1.name == "wake_cancellations"))

@@ -1670,7 +1670,7 @@ defmodule Tightbeam.Gateway do
       {"session-po-set", ["wake.scheduled"]} => fn call ->
         SessionPoAssociations.handle(db, call)
       end,
-      {"retire-withdraw", []} => fn call -> retire_withdraw_result(db, call) end,
+      {"retire-withdraw", ["wake.canceled"]} => fn call -> retire_withdraw_result(db, call) end,
       {"retire", ["session.retired", "wake.scheduled"]} => fn call ->
         retire_result(config, db, call)
       end

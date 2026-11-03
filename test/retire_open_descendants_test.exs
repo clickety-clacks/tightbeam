@@ -502,6 +502,42 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     assert Wakes.get(db, before.wake).due_at <= System.system_time(:millisecond)
   end
 
+  test "retiring a target and its intent owner closes the duty before any transfer", %{db: db} do
+    tree = protected_tree(db)
+    intent = retire_as(db, tree.target, tree.coordinator).unfinished_retirement
+    result = retire(db, tree.coordinator, %{keep_open_descendants: true})
+    assert tree.target in result.retired_session_keys
+    assert tree.coordinator in result.retired_session_keys
+    assert record(db, intent.id).state == "retired"
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM retirement_owner_transfers")
+    assert Org.get(db, tree.role_holder).state == "active"
+  end
+
+  test "a delivered duty can be handed on again and then retired without another continuation", %{db: db} do
+    tree = protected_tree(db)
+    create_session(db, "middle-owner", @main, "Middle owner")
+    create_session(db, "requester", "middle-owner", "Requester")
+    intent = retire_as(db, tree.target, "requester").unfinished_retirement
+    close_work(db, tree)
+    Roles.rm(db, "conversation-owner")
+    scheduler = scheduler(db)
+    Wakes.fire_due(scheduler)
+    assert Wakes.get(db, record(db, intent.id).wake).state == "fired"
+    retire(db, "requester", %{})
+    Wakes.fire_due(scheduler)
+    first_handoff = record(db, intent.id).wake
+    assert Wakes.get(db, first_handoff).state == "fired"
+    retire(db, "middle-owner", %{})
+    second_handoff = record(db, intent.id).wake
+    refute second_handoff == first_handoff
+    assert record(db, intent.id).owner == @main
+    assert Wakes.get(db, second_handoff).prompt =~ "Former owner: Middle owner"
+    assert retire_as(db, tree.target, @main).retired_session_keys != []
+    assert record(db, intent.id).state == "retired"
+    assert Wakes.get(db, second_handoff).state == "canceled"
+    assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM retirement_owner_transfers")
+  end
+
   defp retire_as(db, target, caller, params \\ %{}) do
     Gateway.handlers(%{db: db})["retire"].(%{
       origin: "session:" <> caller,
