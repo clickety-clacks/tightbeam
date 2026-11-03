@@ -704,8 +704,14 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
-        Command::RetireWithdraw { identity, session_key, reason } => Ok(request(
-            identity, "retire-withdraw", vec![string_field("sessionKey", session_key)],
+        Command::RetireWithdraw {
+            identity,
+            session_key,
+            reason,
+        } => Ok(request(
+            identity,
+            "retire-withdraw",
+            vec![string_field("sessionKey", session_key)],
             vec![string_field("reason", reason)],
         )),
         Command::SessionReparent {

@@ -120,6 +120,7 @@ defmodule Tightbeam.Ephemeral do
   def retire_in_txn(txn, key) do
     if session?(txn, key) do
       Tightbeam.Retirements.retiring_in_txn(txn, [key])
+
       Txn.q(
         txn,
         """

@@ -835,6 +835,7 @@ defmodule Tightbeam.Wakes do
   @doc false
   def assignment_closed_in_txn(%Txn{} = txn, assignment_id) do
     Tightbeam.Retirements.blocker_changed_in_txn(txn, "assignment", assignment_id)
+
     case Txn.q(txn, "SELECT holderKey FROM assignments WHERE id=?1 AND state='closed'", [
            assignment_id
          ]) do

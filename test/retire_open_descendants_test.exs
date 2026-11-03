@@ -55,10 +55,16 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     assert diagnostic["details"]["accountable_parent"]
     after_refusal = retirement_snapshot(db, tree)
     assert Map.drop(after_refusal, [:wakes]) == Map.drop(before, [:wakes])
+
     assert after_refusal.wakes -- before.wakes == [
-      [record(db, refusal.unfinished_retirement.id).wake, tree.coordinator, "pending",
-       Wakes.get(db, record(db, refusal.unfinished_retirement.id).wake).prompt]
-    ]
+             [
+               record(db, refusal.unfinished_retirement.id).wake,
+               tree.coordinator,
+               "pending",
+               Wakes.get(db, record(db, refusal.unfinished_retirement.id).wake).prompt
+             ]
+           ]
+
     assert before.wakes -- after_refusal.wakes == []
 
     assert Enum.any?(
@@ -250,7 +256,9 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
              )
   end
 
-  test "stopped requests supersede only the same target and owner and withdraw with a reason", %{db: db} do
+  test "stopped requests supersede only the same target and owner and withdraw with a reason", %{
+    db: db
+  } do
     tree = protected_tree(db)
     create_session(db, "requester", @main, "Requester")
     first = retire(db, tree.target, %{}).unfinished_retirement
@@ -262,10 +270,12 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     assert Wakes.get(db, record(db, first.id).wake).state == "canceled"
     assert record(db, other.id).state == "open"
     assert record(db, second.id).state == "open"
+
     for reason <- [nil, "", "  "] do
       assert withdraw(db, tree.target, tree.coordinator, reason).code == "invalid"
       assert record(db, second.id).state == "open"
     end
+
     assert withdraw(db, tree.target, @main, "not mine").code == "not_found"
     assert withdraw(db, tree.target, tree.coordinator, "still needed").state == "withdrawn"
     assert record(db, second.id).reason == "still needed"
@@ -276,7 +286,8 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     assert Wakes.get(db, record(db, other.id).wake).due_at <= System.system_time(:millisecond)
   end
 
-  test "recorded work and role must both clear before one real retry wake; a retry evaluates new work", %{db: db} do
+  test "recorded work and role must both clear before one real retry wake; a retry evaluates new work",
+       %{db: db} do
     tree = protected_tree(db)
     scheduler = scheduler(db)
     first = retire(db, tree.target, %{}).unfinished_retirement
@@ -300,15 +311,28 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     insert_assignment(db, "new-work", tree.assignment_holder, tree.coordinator)
     second = retire_as(db, tree.target, tree.coordinator).unfinished_retirement
     assert record(db, first.id).state == "superseded"
-    assert {:ok, [["assignment", "new-work"]]} = DB.query(db,
-      "SELECT kind,reference FROM retirement_blockers WHERE retirementId=?1", [second.id])
+
+    assert {:ok, [["assignment", "new-work"]]} =
+             DB.query(
+               db,
+               "SELECT kind,reference FROM retirement_blockers WHERE retirementId=?1",
+               [second.id]
+             )
+
     close_assignment(db, "new-work")
     finish_turns(db, tree.coordinator)
     assert :ok = Wakes.fire_due(scheduler)
     assert Wakes.get(db, record(db, second.id).wake).state == "fired"
     result = retire_as(db, tree.target, tree.coordinator)
-    assert Enum.sort(result.retired_session_keys) == Enum.sort([
-      tree.target, tree.intermediary, tree.role_holder, tree.assignment_holder])
+
+    assert Enum.sort(result.retired_session_keys) ==
+             Enum.sort([
+               tree.target,
+               tree.intermediary,
+               tree.role_holder,
+               tree.assignment_holder
+             ])
+
     assert record(db, second.id).state == "retired"
   end
 
@@ -319,14 +343,17 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     two = retire_as(db, tree.target, "requester").unfinished_retirement
     result = retire(db, tree.target, %{keep_open_descendants: true})
     assert result.retired_session_keys == [tree.intermediary, tree.target]
+
     for id <- [one.id, two.id] do
       assert record(db, id).state == "retired"
       assert Wakes.get(db, record(db, id).wake).state == "canceled"
     end
+
     assert Org.get(db, tree.assignment_holder).state == "active"
   end
 
-  test "pending ownership passes beyond the entire retiring set and merges with the receiving record", %{db: db} do
+  test "pending ownership passes beyond the entire retiring set and merges with the receiving record",
+       %{db: db} do
     tree = protected_tree(db)
     create_session(db, "outer-owner", @main, "Outer owner")
     create_session(db, "requester", "outer-owner", "Requester")
@@ -345,10 +372,16 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     assert record(db, merging.id).state == "superseded"
     assert record(db, existing.id).state == "open"
     assert Wakes.get(db, record(db, merging.id).wake).state == "canceled"
-    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM retirement_owner_transfers WHERE handoffWakeId IS NOT NULL")
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM retirement_owner_transfers WHERE handoffWakeId IS NOT NULL"
+             )
   end
 
-  test "a delivered continuation hands off once and a new refusal replaces the transferred duty", %{db: db} do
+  test "a delivered continuation hands off once and a new refusal replaces the transferred duty",
+       %{db: db} do
     tree = protected_tree(db)
     create_session(db, "requester", tree.coordinator, "Requester")
     intent = retire_as(db, tree.target, "requester").unfinished_retirement
@@ -363,8 +396,14 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     handoff = Wakes.get(db, transferred.wake)
     assert handoff.session_key == tree.coordinator
     assert handoff.prompt =~ "Former owner: Requester (requester)"
-    assert {:ok, [["requester", owner, handoff_id]]} = DB.query(db,
-      "SELECT formerOwnerSessionKey,newOwnerSessionKey,handoffWakeId FROM retirement_owner_transfers WHERE retirementId=?1", [intent.id])
+
+    assert {:ok, [["requester", owner, handoff_id]]} =
+             DB.query(
+               db,
+               "SELECT formerOwnerSessionKey,newOwnerSessionKey,handoffWakeId FROM retirement_owner_transfers WHERE retirementId=?1",
+               [intent.id]
+             )
+
     assert owner == tree.coordinator
     assert handoff_id == handoff.wake_id
     insert_assignment(db, "new-work", tree.assignment_holder, tree.coordinator)
@@ -375,7 +414,8 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     assert withdraw(db, tree.target, tree.coordinator, "keeping target").state == "withdrawn"
   end
 
-  test "a delivered incoming record hands off even when merged into a still-blocked owner record", %{db: db} do
+  test "a delivered incoming record hands off even when merged into a still-blocked owner record",
+       %{db: db} do
     tree = protected_tree(db)
     create_session(db, "requester", tree.coordinator, "Requester")
     incoming = retire_as(db, tree.target, "requester").unfinished_retirement
@@ -391,8 +431,14 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     assert record(db, incoming.id).state == "superseded"
     assert record(db, existing.id).wake == original_wake
     assert Wakes.get(db, original_wake).due_at == 253_402_300_799_000
-    assert {:ok, [[handoff_id]]} = DB.query(db,
-      "SELECT handoffWakeId FROM retirement_owner_transfers WHERE retirementId=?1", [incoming.id])
+
+    assert {:ok, [[handoff_id]]} =
+             DB.query(
+               db,
+               "SELECT handoffWakeId FROM retirement_owner_transfers WHERE retirementId=?1",
+               [incoming.id]
+             )
+
     handoff = Wakes.get(db, handoff_id)
     assert handoff.session_key == tree.coordinator
     assert handoff.prompt =~ "Former owner: Requester"
@@ -403,7 +449,9 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     assert Wakes.get(db, handoff_id).state == "canceled"
   end
 
-  test "lease deadline wakes the owner once for a fresh keep retry and uses truthful wording", %{db: db} do
+  test "lease deadline wakes the owner once for a fresh keep retry and uses truthful wording", %{
+    db: db
+  } do
     tree = protected_tree(db)
     scheduler = scheduler(db)
     lease = Tightbeam.CriticalLeases.declare(db, tree.intermediary, 1_000, "finish write", 1_000)
@@ -421,7 +469,12 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     assert leased_wake.prompt =~ tree.coordinator
     refute leased_wake.prompt =~ "retirement is deferred only until"
     # Wait for the declared deadline itself, then observe the scheduler barrier.
-    Process.send_after(self(), :hard_deadline, max(0, lease.hard_deadline - System.system_time(:millisecond)))
+    Process.send_after(
+      self(),
+      :hard_deadline,
+      max(0, lease.hard_deadline - System.system_time(:millisecond))
+    )
+
     assert_receive :hard_deadline, 2_000
     assert Wakes.fire_due(scheduler) == :ok
     assert Wakes.get(db, wake.wake_id).state == "fired"
@@ -434,7 +487,9 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM unfinished_retirements")
   end
 
-  test "reopening the schema preserves a stopped retirement and its pending continuation", %{db: db} do
+  test "reopening the schema preserves a stopped retirement and its pending continuation", %{
+    db: db
+  } do
     tree = protected_tree(db)
     intent = retire(db, tree.target, %{}).unfinished_retirement
     before = record(db, intent.id)
@@ -449,36 +504,64 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
 
   defp retire_as(db, target, caller, params \\ %{}) do
     Gateway.handlers(%{db: db})["retire"].(%{
-      origin: "session:" <> caller, principal: {:session, caller}, session_key: target, params: params})
+      origin: "session:" <> caller,
+      principal: {:session, caller},
+      session_key: target,
+      params: params
+    })
   end
 
   defp withdraw(db, target, caller, reason) do
     Gateway.handlers(%{db: db})["retire-withdraw"].(%{
-      origin: "session:" <> caller, principal: {:session, caller}, session_key: target, params: %{reason: reason}})
+      origin: "session:" <> caller,
+      principal: {:session, caller},
+      session_key: target,
+      params: %{reason: reason}
+    })
   end
 
   defp record(db, id) do
-    {:ok, [[state, owner, wake, reason, withdrawer]]} = DB.query(db,
-      "SELECT state,ownerSessionKey,wakeId,withdrawalReason,withdrawnBy FROM unfinished_retirements WHERE id=?1", [id])
+    {:ok, [[state, owner, wake, reason, withdrawer]]} =
+      DB.query(
+        db,
+        "SELECT state,ownerSessionKey,wakeId,withdrawalReason,withdrawnBy FROM unfinished_retirements WHERE id=?1",
+        [id]
+      )
+
     %{state: state, owner: owner, wake: wake, reason: reason, withdrawer: withdrawer}
   end
 
   defp close_work(db, tree), do: close_assignment(db, tree.assignment_id)
+
   defp close_assignment(db, id) do
-    result = Gateway.handlers(%{db: db})["revoke-assignment"].(%{
-      verb: "revoke-assignment", origin: "user:" <> @owner, principal: {:user, @owner},
-      session_key: nil, params: %{assignment_id: id, reason: "work no longer needed"}})
+    result =
+      Gateway.handlers(%{db: db})["revoke-assignment"].(%{
+        verb: "revoke-assignment",
+        origin: "user:" <> @owner,
+        principal: {:user, @owner},
+        session_key: nil,
+        params: %{assignment_id: id, reason: "work no longer needed"}
+      })
+
     assert result.outcome == "revoked"
   end
 
   defp insert_assignment(db, id, holder, opener) do
-    assert {:ok, []} = DB.query(db,
-      "INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt) VALUES(?1,'New work',?2,?3,1)", [id, holder, opener])
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt) VALUES(?1,'New work',?2,?3,1)",
+               [id, holder, opener]
+             )
   end
 
   defp finish_turns(db, owner) do
-    assert {:ok, []} = DB.query(db,
-      "UPDATE turns SET status='delivered',endedAt=?2 WHERE sessionKey=?1 AND status='queued'", [owner, System.system_time(:millisecond)])
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "UPDATE turns SET status='delivered',endedAt=?2 WHERE sessionKey=?1 AND status='queued'",
+               [owner, System.system_time(:millisecond)]
+             )
   end
 
   defp scheduler(db) do
@@ -488,8 +571,16 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     name = String.to_atom("retirement_scheduler_#{suffix}")
     start_supervised!({Tightbeam.ConnRegistry, name: registry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
-    start_supervised!({Wakes, db: db, name: name, tick_ms: 60_000,
-      delivery_opts: [conn_registry: registry, lane_manager: lane], deliver: fn _ -> :ok end})
+
+    start_supervised!(
+      {Wakes,
+       db: db,
+       name: name,
+       tick_ms: 60_000,
+       delivery_opts: [conn_registry: registry, lane_manager: lane],
+       deliver: fn _ -> :ok end}
+    )
+
     name
   end
 

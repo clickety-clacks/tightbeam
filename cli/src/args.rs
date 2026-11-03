@@ -2763,12 +2763,17 @@ fn parse_with_optional_catalog(
         "retire-withdraw" => {
             closed_command_flags("retire-withdraw", flags, &["session", "reason"])?;
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam retire-withdraw --session <key> --reason <text>".to_owned());
+                return Err(
+                    "usage: tightbeam retire-withdraw --session <key> --reason <text>".to_owned(),
+                );
             }
             Ok(Command::RetireWithdraw {
                 identity: identity(flags)?,
-                session_key: nonempty(flags, "session").ok_or("retire-withdraw requires --session")?,
-                reason: nonempty(flags, "reason").filter(|s| !s.trim().is_empty()).ok_or("retire-withdraw requires a nonempty --reason")?,
+                session_key: nonempty(flags, "session")
+                    .ok_or("retire-withdraw requires --session")?,
+                reason: nonempty(flags, "reason")
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or("retire-withdraw requires a nonempty --reason")?,
             })
         }
         "session-reparent" => {

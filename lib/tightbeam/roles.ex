@@ -105,6 +105,7 @@ defmodule Tightbeam.Roles do
           "UPDATE roles SET boundSessionKey = ?2, updatedAt = ?3 WHERE name = ?1",
           [name, session_key, now()]
         )
+
         Tightbeam.Retirements.blocker_changed_in_txn(txn, "role", name)
 
         :ok
@@ -122,6 +123,7 @@ defmodule Tightbeam.Roles do
           "UPDATE roles SET boundSessionKey = ?2, updatedAt = ?3 WHERE name = ?1",
           [name, session_key, now()]
         )
+
         Tightbeam.Retirements.blocker_changed_in_txn(txn, "role", name)
 
         Publisher.maybe_accepted_in_txn(txn, call, %{role: firehose_role_in_txn(txn, name)})

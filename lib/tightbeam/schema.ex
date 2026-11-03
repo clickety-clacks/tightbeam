@@ -1753,18 +1753,36 @@ defmodule Tightbeam.Schema do
 
   @retirement_cancellation_migration "retirement-continuation-cancellation/v1"
   @retirement_cancellation_objects Enum.map(@row_reaction_cancellation_objects, fn
-    %{name: "wake_cancellations", sql: sql} = object ->
-      anchor = "(requesterId = 'tightbeam:retirement' AND"
-      route = "(requesterId = 'tightbeam:retirement' AND reasonKind = 'obligation_disposed' AND " <>
-        "causalSourceKind = 'retirement_transition' AND outcomeKind = 'disposition' AND " <>
-        "dispositionKind = 'retirement_transition' AND causalSourceId = dispositionId) OR "
-      [_, _] = String.split(sql, anchor)
-      %{object | sql: sql
-        |> String.replace("'session_transition','scheduler_delivery'", "'session_transition','scheduler_delivery','retirement_transition'")
-        |> String.replace("'decision_request_transition','monitor_generation_transition'", "'decision_request_transition','monitor_generation_transition','retirement_transition'")
-        |> String.replace(anchor, route <> anchor, global: false)}
-    object -> object
-  end)
+                                     %{name: "wake_cancellations", sql: sql} = object ->
+                                       anchor = "(requesterId = 'tightbeam:retirement' AND"
+
+                                       route =
+                                         "(requesterId = 'tightbeam:retirement' AND reasonKind = 'obligation_disposed' AND " <>
+                                           "causalSourceKind = 'retirement_transition' AND outcomeKind = 'disposition' AND " <>
+                                           "dispositionKind = 'retirement_transition' AND causalSourceId = dispositionId) OR "
+
+                                       [_, _] = String.split(sql, anchor)
+
+                                       %{
+                                         object
+                                         | sql:
+                                             sql
+                                             |> String.replace(
+                                               "'session_transition','scheduler_delivery'",
+                                               "'session_transition','scheduler_delivery','retirement_transition'"
+                                             )
+                                             |> String.replace(
+                                               "'decision_request_transition','monitor_generation_transition'",
+                                               "'decision_request_transition','monitor_generation_transition','retirement_transition'"
+                                             )
+                                             |> String.replace(anchor, route <> anchor,
+                                               global: false
+                                             )
+                                       }
+
+                                     object ->
+                                       object
+                                   end)
 
   @doc false
   def live_base_upgrade_predecessor, do: @operator_decision_shape
@@ -5361,33 +5379,63 @@ defmodule Tightbeam.Schema do
   end
 
   defp upgrade_retirement_cancellation(db) do
-    case DB.migration_transaction(db, :retirement_cancellation, [], ["PRAGMA writable_schema = OFF"], fn txn ->
-      current = Enum.find(@retirement_cancellation_objects, &(&1.name == "wake_cancellations"))
-      if retirement_cancellation_active?(txn) do
-        validate_owned_object!(txn, current)
-      else
-        unless row_reaction_cancellation_active?(txn),
-          do: raise(ShapeError, message: "retirement cancellation requires its stamped predecessor")
-        previous = Enum.find(@row_reaction_cancellation_objects, &(&1.name == "wake_cancellations"))
-        validate_owned_object!(txn, previous)
-        sql = current.sql
-          |> String.replace(~r/\bIF\s+NOT\s+EXISTS\s+/u, "", global: false)
-          |> String.trim()
-          |> String.trim_trailing(";")
-        [[version]] = Txn.q(txn, "PRAGMA schema_version")
-        :ok = Txn.exec(txn, "PRAGMA writable_schema = ON")
-        Txn.q(txn, "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='wake_cancellations'", [sql])
-        1 = Txn.changes(txn)
-        :ok = Txn.exec(txn, "PRAGMA schema_version = #{version + 1}")
-        :ok = Txn.exec(txn, "PRAGMA writable_schema = RESET")
-        Txn.q(txn, """
-        INSERT INTO supervision_liveness_migrations(migrationId,appliedAt,affectedRows,cause,principal)
-        VALUES(?1,?2,0,'release_upgrade','process:tightbeam')
-        """, [@retirement_cancellation_migration, System.system_time(:millisecond)])
-        validate_owned_object!(txn, current)
-      end
-      :ok
-    end) do
+    case DB.migration_transaction(
+           db,
+           :retirement_cancellation,
+           [],
+           ["PRAGMA writable_schema = OFF"],
+           fn txn ->
+             current =
+               Enum.find(@retirement_cancellation_objects, &(&1.name == "wake_cancellations"))
+
+             if retirement_cancellation_active?(txn) do
+               validate_owned_object!(txn, current)
+             else
+               unless row_reaction_cancellation_active?(txn),
+                 do:
+                   raise(ShapeError,
+                     message: "retirement cancellation requires its stamped predecessor"
+                   )
+
+               previous =
+                 Enum.find(@row_reaction_cancellation_objects, &(&1.name == "wake_cancellations"))
+
+               validate_owned_object!(txn, previous)
+
+               sql =
+                 current.sql
+                 |> String.replace(~r/\bIF\s+NOT\s+EXISTS\s+/u, "", global: false)
+                 |> String.trim()
+                 |> String.trim_trailing(";")
+
+               [[version]] = Txn.q(txn, "PRAGMA schema_version")
+               :ok = Txn.exec(txn, "PRAGMA writable_schema = ON")
+
+               Txn.q(
+                 txn,
+                 "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='wake_cancellations'",
+                 [sql]
+               )
+
+               1 = Txn.changes(txn)
+               :ok = Txn.exec(txn, "PRAGMA schema_version = #{version + 1}")
+               :ok = Txn.exec(txn, "PRAGMA writable_schema = RESET")
+
+               Txn.q(
+                 txn,
+                 """
+                 INSERT INTO supervision_liveness_migrations(migrationId,appliedAt,affectedRows,cause,principal)
+                 VALUES(?1,?2,0,'release_upgrade','process:tightbeam')
+                 """,
+                 [@retirement_cancellation_migration, System.system_time(:millisecond)]
+               )
+
+               validate_owned_object!(txn, current)
+             end
+
+             :ok
+           end
+         ) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
     end
@@ -5405,8 +5453,15 @@ defmodule Tightbeam.Schema do
                Enum.find(@row_reaction_cancellation_objects, &(&1.name == "wake_cancellations"))
 
              if row_reaction_cancellation_active?(txn) do
-               expected = if retirement_cancellation_active?(txn),
-                 do: Enum.find(@retirement_cancellation_objects, &(&1.name == "wake_cancellations")), else: current
+               expected =
+                 if retirement_cancellation_active?(txn),
+                   do:
+                     Enum.find(
+                       @retirement_cancellation_objects,
+                       &(&1.name == "wake_cancellations")
+                     ),
+                   else: current
+
                validate_owned_object!(txn, expected)
              else
                unless effort_holder_activity_cancellation_active?(txn),
