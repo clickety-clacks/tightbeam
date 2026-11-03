@@ -67,7 +67,7 @@ defmodule Tightbeam.Ledger do
     endedAt    INTEGER,
     publishedAt INTEGER,
     triggerSource TEXT CHECK (
-      triggerSource IS NULL OR triggerSource IN ('batch','mike','agent','process','other')
+      triggerSource IS NULL OR triggerSource IN ('batch','human','agent','process','other')
     ),
     batchMemberCount INTEGER CHECK (
       batchMemberCount IS NULL OR batchMemberCount >= 0
@@ -247,7 +247,7 @@ defmodule Tightbeam.Ledger do
       nil
     else
       cond do
-        String.starts_with?(origin, "user:") -> "mike"
+        String.starts_with?(origin, "user:") -> "human"
         String.starts_with?(origin, "agent:") -> "agent"
         String.starts_with?(origin, "process:") -> "process"
         true -> "other"
