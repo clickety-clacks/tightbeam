@@ -513,7 +513,9 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     assert Org.get(db, tree.role_holder).state == "active"
   end
 
-  test "a delivered duty can be handed on again and then retired without another continuation", %{db: db} do
+  test "a delivered duty can be handed on again and then retired without another continuation", %{
+    db: db
+  } do
     tree = protected_tree(db)
     create_session(db, "middle-owner", @main, "Middle owner")
     create_session(db, "requester", "middle-owner", "Requester")
