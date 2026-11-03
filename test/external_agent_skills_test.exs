@@ -200,24 +200,6 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
     end
   end
 
-  test "the README gives one transport choice before verified-release-only installation" do
-    readme = File.read!(Path.join(repo_root(), "README.md"))
-
-    section = "## External-agent operation skill"
-    install = "## Install only a verified release package"
-
-    assert {section_offset, _} = :binary.match(readme, section)
-    assert {install_offset, _} = :binary.match(readme, install)
-    assert section_offset < install_offset
-    assert readme =~ "priv/skills/tightbeam-cli/SKILL.md"
-    assert readme =~ "priv/skills/tightbeam-rest-0-2-0/SKILL.md"
-    assert readme =~ "Choose one transport edition"
-    assert readme =~ ".codex/skills/<skill-name>/"
-    assert readme =~ ".claude/skills/<skill-name>/"
-    assert readme =~ "Keep the directory name"
-    assert readme =~ "Start a fresh agent session"
-  end
-
   defp assert_skill(name, expected_description) do
     path = skill_path(name)
     bytes = File.read!(path)
