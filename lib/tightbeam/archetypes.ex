@@ -22,6 +22,7 @@ defmodule Tightbeam.Archetypes do
           defaults: %{optional(:harness) => atom(), optional(:model) => Tightbeam.Model.t()},
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
           model_preferences: [Tightbeam.Model.t()],
+          model_preference_entries: [%{model: Tightbeam.Model.t(), harness: String.t() | nil}],
           ephemeral: boolean(),
           containment: %{fs: :off, network: :open},
           mcp: [
@@ -601,6 +602,7 @@ defmodule Tightbeam.Archetypes do
       defaults: %{},
       references: [],
       model_preferences: [],
+      model_preference_entries: [],
       ephemeral: false,
       containment: %{fs: :off, network: :open},
       mcp: [],
@@ -695,8 +697,10 @@ defmodule Tightbeam.Archetypes do
         %{name: reference_name, location: location, access: reference["access"]}
       end)
 
-    model_preferences =
-      validate_model_preferences!(Map.get(manifest, "model_preferences", []), path)
+    model_preference_entries =
+      validate_model_preference_entries!(Map.get(manifest, "model_preferences", []), path)
+
+    model_preferences = Enum.map(model_preference_entries, & &1.model)
 
     mcp = validate_mcp!(Map.get(manifest, "mcp", %{}))
     containment = validate_containment!(Map.get(manifest, "containment", %{}), path)
@@ -706,6 +710,7 @@ defmodule Tightbeam.Archetypes do
       skills: skills,
       where: where,
       model_preferences: model_preferences,
+      model_preference_entries: model_preference_entries,
       ephemeral: ephemeral,
       containment: containment,
       defaults: defaults,
@@ -726,7 +731,7 @@ defmodule Tightbeam.Archetypes do
   # name rather than parsed. Splitting `claude-fable-5[1m]` here is exactly the
   # guess that lost the 1M model, and a file an older version wrote deserves a
   # bug report, not an inference.
-  defp validate_model_preferences!(raw, path) do
+  defp validate_model_preference_entries!(raw, path) do
     unless is_list(raw) do
       raise ArgumentError, "archetype model_preferences must be a list of tables: #{path}"
     end
@@ -739,7 +744,16 @@ defmodule Tightbeam.Archetypes do
                   "archetype model_preferences entry is missing model: #{path}"
 
           model ->
-            model
+            harness = Map.get(preference, "harness")
+
+            if not is_nil(harness) and
+                 (not is_binary(harness) or
+                    not Enum.any?(Tightbeam.Harness.all(), &(&1.wire_name() == harness))) do
+              raise ArgumentError,
+                    "archetype model_preferences entry has invalid harness: #{path}"
+            end
+
+            %{model: model, harness: harness}
         end
 
       packed when is_binary(packed) ->
