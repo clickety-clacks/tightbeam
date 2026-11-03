@@ -2225,9 +2225,9 @@ defmodule Tightbeam.Schema do
             :current
 
           length(values) == length(@generic_trigger_sources) + 1 and
-              length(Enum.uniq(values)) == length(values) and
-              "human" not in values and
-              Enum.sort(generic_values) == Enum.sort(@generic_trigger_sources) and
+            length(Enum.uniq(values)) == length(values) and
+            "human" not in values and
+            Enum.sort(generic_values) == Enum.sort(@generic_trigger_sources) and
               length(legacy_values) == 1 ->
             {:legacy, hd(legacy_values)}
 
