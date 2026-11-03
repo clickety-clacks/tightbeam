@@ -1980,6 +1980,70 @@ defmodule Tightbeam.GatewayTest do
     end)
   end
 
+  test "harness-health handler retrieves active and historical redacted provenance", ctx do
+    secret = "historical-credential-like-cause"
+
+    trace = %{
+      captured_at: 1_000,
+      health: %{
+        available: true,
+        terminal: false,
+        last_health: "onboarded",
+        initial_auth_none_ignored: nil
+      },
+      adapter: %{
+        package: "@agentclientprotocol/claude-agent-acp",
+        version: "0.73.0",
+        source_sha256: String.duplicate("b", 64),
+        tightbeam_build: 2_883,
+        tightbeam_sha: "d72599c8"
+      },
+      auth: %{
+        signal: "authStatus",
+        kind: "none",
+        classification: "terminal",
+        mapping: "claude:classify_auth_event/1"
+      }
+    }
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "historical-auth-observation",
+               harness: "codex",
+               host: "testhost",
+               failure_class: "auth-dead",
+               evidence_kind: "authoritative-provider",
+               session_key: nil,
+               assignment_id: nil,
+               observed_at: 1_000,
+               cause: secret,
+               principal: "process:historical-provider/#{secret}",
+               credential_trace: trace,
+               conn_registry: :missing_harness_health_registry
+             })
+
+    handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["harness-health"]
+    call = %{origin: "user:flynn", session_key: nil, params: %{}}
+
+    assert %{incidents: incidents} = handler.(call)
+    assert Enum.any?(incidents, &(&1.id == incident.id))
+
+    assert %{incident: detail} =
+             handler.(put_in(call, [:params, :incident_id], incident.id))
+
+    assert detail.id == incident.id
+    assert [retained] = detail.credentialHealthTrace
+    assert retained.adapterSourceSha256 == String.duplicate("b", 64)
+    assert retained.authMapping == "claude:classify_auth_event/1"
+
+    encoded = JSON.encode!(detail)
+    refute encoded =~ secret
+    refute Map.has_key?(detail, :observations)
+    refute Map.has_key?(detail, :affectedSessions)
+    refute Map.has_key?(detail, :affectedAssignments)
+    refute Map.has_key?(detail, :repair)
+  end
+
   test "reconciliation cannot delete a rate-limit fence opened at its cleanup boundary", ctx do
     assignment_id = "asg_rate_reconcile_race"
     adapter_key = {:claude, "shared", "testhost"}

@@ -1332,6 +1332,9 @@ defmodule Tightbeam.Placement do
         sh_out: Map.get(config, :sh_out)
       )
 
+    adapter_provenance =
+      Map.get_lazy(config, :adapter_provenance, fn -> adapter_provenance(module, target) end)
+
     [
       harness: harness,
       home: home,
@@ -1340,7 +1343,7 @@ defmodule Tightbeam.Placement do
       process_ssh: host_config.ssh,
       process_identity_dir: host_config.base_dir,
       process_helper: Path.join(host_config[:cli_bin] || config.cli_bin, "tightbeam"),
-      on_auth_event: auth_event_handler(config, host, module),
+      on_auth_event: auth_event_handler(config, host, module, adapter_provenance),
       on_subagent_event: subagent_event_handler(config, host, module),
       env: []
     ]
@@ -1446,34 +1449,65 @@ defmodule Tightbeam.Placement do
     })
   end
 
-  defp auth_event_handler(config, host, module) do
+  defp auth_event_handler(config, host, module, adapter_provenance) do
     db = Map.get(config, :db, DB)
 
     fn classification, event ->
       if classification == :terminal do
         Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
-          try do
-            HarnessHealth.observe_provider_invalidation(db, module.id(), host, event,
-              principal: "process:tightbeam/provider:#{module.credential_provider()}"
-            )
-          rescue
-            error ->
-              Logger.error(
-                "harness auth incident record failed for #{module.id()} on #{host}: " <>
-                  Exception.format(:error, error, __STACKTRACE__)
+          auth = auth_event_mapping(module, classification, event)
+          credential_server = Tightbeam.Credentials.server(host)
+          observed_health = credential_health_snapshot(module, credential_server)
+
+          observation_result =
+            try do
+              HarnessHealth.observe_provider_invalidation(db, module.id(), host, event,
+                principal: "process:tightbeam/provider:#{module.credential_provider()}",
+                credential_trace: credential_trace(observed_health, adapter_provenance, auth, nil)
               )
-          end
+            rescue
+              error ->
+                Logger.error(
+                  "harness auth incident record failed for #{module.id()} on #{host}: " <>
+                    Exception.format(:error, error, __STACKTRACE__)
+                )
+
+                nil
+            end
 
           mark_result =
             try do
               Tightbeam.Credentials.mark_terminal(
                 module.credential_provider(),
                 event,
-                Tightbeam.Credentials.server(host)
+                credential_server
               )
             catch
               :exit, reason -> {:error, {:credential_owner_exit, reason}}
             end
+
+          with {_disposition, %{observationId: observation_id}} <- observation_result do
+            transitioned_health = credential_health_snapshot(module, credential_server)
+
+            try do
+              HarnessHealth.record_credential_transition(
+                db,
+                observation_id,
+                credential_trace(
+                  transitioned_health,
+                  adapter_provenance,
+                  auth,
+                  transition_result(mark_result)
+                )
+              )
+            rescue
+              error ->
+                Logger.error(
+                  "credential health transition record failed for #{module.id()} on #{host}: " <>
+                    Exception.format(:error, error, __STACKTRACE__)
+                )
+            end
+          end
 
           case mark_result do
             :ok ->
@@ -1490,6 +1524,65 @@ defmodule Tightbeam.Placement do
       end
     end
   end
+
+  defp adapter_provenance(Tightbeam.Harness.Claude, target) do
+    Tightbeam.Harness.Claude.adapter_provenance(target)
+    |> Map.put(:tightbeam_build, Tightbeam.BuildStamp.build())
+    |> Map.put(:tightbeam_sha, Tightbeam.BuildStamp.sha())
+  end
+
+  defp adapter_provenance(module, _target) do
+    %{
+      package: module.install_package(),
+      version: module.adapter_version(),
+      source_sha256: "unavailable",
+      tightbeam_build: Tightbeam.BuildStamp.build(),
+      tightbeam_sha: Tightbeam.BuildStamp.sha()
+    }
+  end
+
+  defp credential_health_snapshot(module, server) do
+    Tightbeam.Credentials.health_snapshot(module.credential_provider(), server)
+  catch
+    :exit, _reason ->
+      %{available: false, terminal: nil, last_health: nil, initial_auth_none_ignored: nil}
+  end
+
+  defp auth_event_mapping(module, classification, event) do
+    {signal, kind} =
+      case event do
+        %{"authStatus" => %{"kind" => kind}} -> {"authStatus", kind}
+        %{"authMode" => mode} -> {"account-update", if(is_nil(mode), do: "none", else: "account")}
+        _ -> {"other", "other"}
+      end
+
+    %{
+      signal: signal,
+      kind: auth_kind(kind),
+      classification: Atom.to_string(classification),
+      mapping: "#{module.id()}:classify_auth_event/1"
+    }
+  end
+
+  defp auth_kind(kind) when kind in ["none", "account", "api_key", "gateway", "external"],
+    do: kind
+
+  defp auth_kind(_kind), do: "other"
+
+  defp credential_trace(health, adapter, auth, transition_result) do
+    %{
+      captured_at: System.system_time(:millisecond),
+      health: health,
+      adapter: adapter,
+      auth: auth,
+      transition_result: transition_result
+    }
+  end
+
+  defp transition_result(:ok), do: "ok"
+  defp transition_result(:ignored), do: "ignored"
+  defp transition_result({:error, _reason}), do: "error"
+  defp transition_result(_other), do: "unchanged"
 
   defp subagent_event_handler(config, host, module) do
     db = Map.get(config, :db, Tightbeam.DB)
