@@ -154,11 +154,14 @@ defmodule Tightbeam.NeutralTriggerSourceTest do
                   global: false
                 )
             end
-            |> Regex.replace(
-              @turns_name_regex,
-              "CREATE TABLE turns_legacy_test",
-              global: false
-            )
+            |> then(fn source_schema_sql ->
+              Regex.replace(
+                @turns_name_regex,
+                source_schema_sql,
+                "CREATE TABLE turns_legacy_test",
+                global: false
+              )
+            end)
 
           :ok = Txn.exec(txn, legacy_sql)
 

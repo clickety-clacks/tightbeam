@@ -2370,17 +2370,20 @@ defmodule Tightbeam.Schema do
     previous_foreign_key_violations = Txn.q(txn, "PRAGMA foreign_key_check")
 
     migration_sql =
-      table_sql
-      |> Regex.replace(
+      Regex.replace(
         @turns_table_name_regex,
+        table_sql,
         "CREATE TABLE turns_neutral_source_migration",
         global: false
       )
-      |> Regex.replace(
-        @trigger_source_constraint_regex,
-        @neutral_trigger_source_constraint,
-        global: false
-      )
+      |> then(fn renamed_table_sql ->
+        Regex.replace(
+          @trigger_source_constraint_regex,
+          renamed_table_sql,
+          @neutral_trigger_source_constraint,
+          global: false
+        )
+      end)
 
     :ok = Txn.exec(txn, migration_sql)
 
