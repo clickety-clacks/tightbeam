@@ -128,6 +128,96 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
+  @doc false
+  def ack2_for_dispatched_turn(db, turn_seq, session_key, agent_name, opts \\ []) do
+    query = """
+    SELECT e.handle,e.eventId,h.sessionKey
+    FROM harklight_wake_deliveries d
+    JOIN harklight_wake_entries e ON e.handle=d.handle AND e.eventId=d.eventId
+    JOIN harklight_wake_handles h ON h.handle=e.handle
+    JOIN wakes w ON w.wakeId=d.wakeId AND w.sessionKey=d.sessionKey
+    WHERE w.deliveredTurnSeq=?1 AND d.sessionKey=?2
+      AND e.entryKind IN ('discussion','terminal') AND e.entryAuthor='person'
+      AND EXISTS (
+        SELECT 1 FROM turn_lifecycle_events event
+        WHERE event.turnSeq=w.deliveredTurnSeq AND event.kind='prompt_dispatched'
+      )
+    ORDER BY e.feedCursor,e.handle,e.eventId
+    """
+
+    case DB.query(db, query, [turn_seq, session_key]) do
+      {:ok, []} ->
+        :ok
+
+      {:ok, entries} ->
+        case ack2_runner(opts) do
+          {:ok, runner} ->
+            Enum.each(entries, fn [handle, event_id, owner_session_key] ->
+              args =
+                ["ack2", "--session", handle, "--event", event_id, "--agent", agent_name]
+
+              args = if owner_session_key == session_key, do: args, else: args ++ ["--rerouted"]
+
+              case safe_ack2_call(runner, args) do
+                {:ok, {_output, 0}} ->
+                  :ok
+
+                {:ok, {_output, status}} ->
+                  Logger.error(
+                    "Harklight ACK2 failed for dispatched turn #{turn_seq} (exit status #{inspect(status)})"
+                  )
+
+                :error ->
+                  Logger.error("Harklight ACK2 could not run for dispatched turn #{turn_seq}")
+              end
+            end)
+
+            :ok
+
+          {:error, reason} ->
+            Logger.error(
+              "Harklight ACK2 could not run for dispatched turn #{turn_seq}: #{reason}"
+            )
+
+            :ok
+        end
+
+      {:error, reason} ->
+        Logger.error(
+          "Harklight ACK2 lookup failed for dispatched turn #{turn_seq}: #{inspect(reason)}"
+        )
+
+        :ok
+    end
+  end
+
+  defp ack2_runner(opts) do
+    case Keyword.get(opts, :runner) do
+      runner when is_function(runner, 1) ->
+        {:ok, runner}
+
+      nil ->
+        case System.find_executable("harklight-agent") do
+          nil ->
+            {:error, "harklight_cli_missing"}
+
+          executable ->
+            {:ok, fn args -> System.cmd(executable, args, stderr_to_stdout: true) end}
+        end
+    end
+  end
+
+  defp safe_ack2_call(runner, args) do
+    case runner.(args) do
+      result when is_tuple(result) and tuple_size(result) == 2 -> {:ok, result}
+      _other -> :error
+    end
+  rescue
+    _ -> :error
+  catch
+    _, _ -> :error
+  end
+
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
   @doc false
@@ -1052,7 +1142,8 @@ defmodule Tightbeam.HarklightWakes do
           vendor_id || "none",
           "--route",
           "other",
-          "--controller"
+          "--controller",
+          "--ack2"
         ]
 
         case attach(executable, args) do
@@ -1192,7 +1283,7 @@ defmodule Tightbeam.HarklightWakes do
         :binary,
         :exit_status,
         :stderr_to_stdout,
-        args: ["listen", "--follow", "--controller", "--session", handle]
+        args: ["listen", "--follow", "--controller", "--session", handle, "--ack2"]
       ])
 
     try do

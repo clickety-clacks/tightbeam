@@ -3692,20 +3692,33 @@ defmodule Tightbeam.Gateway do
                      config.base_dir
                    ),
                    trace_dispatch: fn request_id ->
-                     Tightbeam.TurnLifecycle.append(db, turn.seq, %{
-                       event_key: "prompt:dispatched",
-                       producer_event_id:
-                         "acp:#{turn.owner_lease}:request:#{request_id}:prompt-dispatched",
-                       kind: "prompt_dispatched",
-                       stage: "prompt",
-                       outcome: "dispatched",
-                       cause: "acp:port-write",
-                       principal: "process:tightbeam",
-                       owner_lease: turn.owner_lease,
-                       adapter_gen: prompt_generation,
-                       acp_request_id: request_id,
-                       detail: %{v: 1}
-                     })
+                     case Tightbeam.TurnLifecycle.append(db, turn.seq, %{
+                            event_key: "prompt:dispatched",
+                            producer_event_id:
+                              "acp:#{turn.owner_lease}:request:#{request_id}:prompt-dispatched",
+                            kind: "prompt_dispatched",
+                            stage: "prompt",
+                            outcome: "dispatched",
+                            cause: "acp:port-write",
+                            principal: "process:tightbeam",
+                            owner_lease: turn.owner_lease,
+                            adapter_gen: prompt_generation,
+                            acp_request_id: request_id,
+                            detail: %{v: 1}
+                          }) do
+                       result when result in [:ok, :duplicate] ->
+                         Tightbeam.HarklightWakes.ack2_for_dispatched_turn(
+                           db,
+                           turn.seq,
+                           turn.session_key,
+                           active_session.session.display_name
+                         )
+
+                         result
+
+                       result ->
+                         result
+                     end
                    end,
                    progress:
                      progress_fun(db, turn.session_key, session.owner_user_id, correlation),
