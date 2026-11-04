@@ -53,6 +53,8 @@ defmodule Tightbeam.AdminProjectionTest do
       assert :ok = Schema.ensure_all(db)
       assert :ok = AdminProjection.ensure_storage(db)
 
+      Tightbeam.IdentityPredecessorFixture.restore!(db)
+
       Tightbeam.SchemaShapeRuntimeFixture.downgrade_assignment_source_replacement_cancellation!(
         db
       )

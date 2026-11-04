@@ -340,7 +340,7 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [[1], [1], [1]]} =
@@ -353,6 +353,7 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
   end
 
   test "decision row revision adoption requires the exact stamped predecessor shape", %{db: db} do
+    Tightbeam.IdentityPredecessorFixture.restore!(db)
     :ok = DB.execute(db, "UPDATE schema_stamp SET shape='notice-source-storage-v1-019'")
     before = decision_schema_snapshot(db)
 
@@ -364,6 +365,7 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
   end
 
   test "decision row revision and successor stamp roll back as one migration", %{db: db} do
+    Tightbeam.IdentityPredecessorFixture.restore!(db)
     insert_decision_rows(db)
 
     :ok =
@@ -404,7 +406,7 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
     :ok = DB.execute(db, "DROP TRIGGER reject_decision_revision_stamp")
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [[1], [1]]} =
