@@ -841,8 +841,15 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     newest = denial.("newest", start_at + 7_000, nil)
 
     page = fn suffix ->
-      get(ctx, "/api/sessions/#{session_key}/messages?limit=2" <> suffix, ctx.admin_device.token)
-      |> then(&JSON.decode!(&1.resp_body))
+      conn =
+        get(
+          ctx,
+          "/api/sessions/#{session_key}/messages?limit=2" <> suffix,
+          ctx.admin_device.token
+        )
+
+      assert conn.status == 200, conn.resp_body
+      JSON.decode!(conn.resp_body)
     end
 
     latest = page.("&tail=true")
@@ -879,6 +886,85 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
            ) == Enum.sort([oldest, middle, explicit, newest])
 
     assert page.("&before=" <> earliest["page"]["oldestCursor"])["railDenials"] == []
+  end
+
+  test "page denial placement remains bounded on a long generated transcript", ctx do
+    session =
+      Org.create(ctx.db, %{
+        session_key: "denial-scale-#{System.unique_integer([:positive])}",
+        display_name: "Denial scale",
+        kind: "custom",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable"),
+        host: "testhost"
+      })
+
+    session_key = session.session_key
+    start_at = System.system_time(:millisecond) - 100_000_000
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 75000)
+               INSERT INTO messages (id, sessionKey, role, content, timestamp, llmVisibleMessageId)
+               SELECT 'scale-message-' || x, ?1, 'user', 'scale', ?2 + x * 1000,
+                 'scale-message-' || x FROM n
+               """,
+               [session_key, start_at]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 300)
+               INSERT INTO events (ts, kind, verb, origin, principal, sessionKey, payload)
+               SELECT ?2 + (x * 250 - 100) * 1000, 'denied', 'assign', ?1,
+                 ?1, NULL, '{"rule":"scale"}' FROM n
+               """,
+               ["session:" <> session_key, start_at]
+             )
+
+    page_messages = fn offset ->
+      {:ok, rows} =
+        DB.query(
+          ctx.db,
+          "SELECT seq, timestamp FROM messages WHERE sessionKey = ?1 ORDER BY seq LIMIT 5 OFFSET ?2",
+          [session_key, offset]
+        )
+
+      Enum.map(rows, fn [seq, timestamp] -> %{seq: seq, timestamp: timestamp} end)
+    end
+
+    latest_messages = page_messages.(74_995)
+    deep_messages = page_messages.(49_897)
+
+    started = System.monotonic_time(:microsecond)
+
+    latest_denials =
+      EventLog.rail_denials_for_session_page(ctx.db, session_key, latest_messages, true)
+
+    latest_us = System.monotonic_time(:microsecond) - started
+
+    started = System.monotonic_time(:microsecond)
+
+    deep_denials =
+      EventLog.rail_denials_for_session_page(ctx.db, session_key, deep_messages, true)
+
+    deep_us = System.monotonic_time(:microsecond) - started
+
+    IO.puts(
+      "denial page scale: 75000 messages, 300 denials, newest=#{latest_us}us deep=#{deep_us}us"
+    )
+
+    assert latest_denials == []
+    assert Enum.map(deep_denials, & &1.rule) == ["scale"]
+    assert hd(deep_denials).after_message_seq == Enum.at(deep_messages, 2).seq
   end
 
   test "actor history includes keyed and NULL-key rule denials routed by principal", ctx do
