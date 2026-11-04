@@ -119,8 +119,9 @@ defmodule GuardAck2Turn do
                  )
 
         assert {:ok, turn} = Ledger.claim_next(db, @session_key, "ack2-gateway-turn")
+        turn_seq = turn.seq
 
-        assert {:ok, [[turn.seq]]} =
+        assert {:ok, [[^turn_seq]]} =
                  DB.query(db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [wake_id])
 
         task = Task.async(fn -> runner.(turn) end)
