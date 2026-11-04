@@ -3052,9 +3052,25 @@ defmodule Tightbeam.Assignments do
 
               case call.params.kind do
                 "cannot-proceed" ->
-                  case latest_cannot_proceed(txn, assignment_id) do
-                    nil -> insert_and_apply_lifecycle_attest(txn, call, assignment, holder)
-                    prior -> cannot_proceed_replay(call.params, assignment, prior)
+                  case standing_cannot_proceed(txn, assignment_id) do
+                    %{} = prior ->
+                      cannot_proceed_replay(call.params, assignment, prior)
+
+                    nil ->
+                      case latest_cannot_proceed(txn, assignment_id) do
+                        nil ->
+                          insert_and_apply_lifecycle_attest(txn, call, assignment, holder)
+
+                        %{state: "settled"} = prior ->
+                          if same_cannot_proceed_filing?(call.params, prior) do
+                            cannot_proceed_replay(call.params, assignment, prior)
+                          else
+                            insert_and_apply_lifecycle_attest(txn, call, assignment, holder)
+                          end
+
+                        prior ->
+                          cannot_proceed_replay(call.params, assignment, prior)
+                      end
                   end
 
                 "completion" ->
@@ -3203,7 +3219,7 @@ defmodule Tightbeam.Assignments do
     release_scope = call.params[:release_fact_scope]
     release_principal = call.params[:release_fact_principal_ref]
 
-    case latest_cannot_proceed(txn, assignment.id) do
+    case standing_cannot_proceed(txn, assignment.id) do
       nil ->
         condition_id = id("cp_")
         opener_ref = assignment_opener_ref(assignment)
@@ -3279,14 +3295,7 @@ defmodule Tightbeam.Assignments do
   end
 
   defp cannot_proceed_replay(params, assignment, prior) do
-    supplied =
-      {params[:note], params[:release_fact_kind], params[:release_fact_scope],
-       params[:release_fact_principal_ref]}
-
-    recorded =
-      {prior.reason, prior.releaseFactKind, prior.releaseFactScope, prior.releaseFactPrincipalRef}
-
-    if supplied == recorded do
+    if same_cannot_proceed_filing?(params, prior) do
       %{assignment: assignment, cannotProceed: prior, replayed: true}
     else
       error(
@@ -3294,6 +3303,17 @@ defmodule Tightbeam.Assignments do
         "assignment already has a different cannot-proceed record"
       )
     end
+  end
+
+  defp same_cannot_proceed_filing?(params, prior) do
+    supplied =
+      {params[:note], params[:release_fact_kind], params[:release_fact_scope],
+       params[:release_fact_principal_ref]}
+
+    recorded =
+      {prior.reason, prior.releaseFactKind, prior.releaseFactScope, prior.releaseFactPrincipalRef}
+
+    supplied == recorded
   end
 
   defp latest_cannot_proceed(txn, assignment_id) do
