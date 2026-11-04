@@ -619,7 +619,7 @@ defmodule Tightbeam.HarklightWakesTest do
   test "a stopped listener leaves the handle durable and notifies its owner", %{
     db: db,
     call: call,
-    main: main
+    session: session
   } do
     assert %{state: "registered"} = HarklightWakes.register(db, call)
     test_pid = self()
@@ -632,20 +632,260 @@ defmodule Tightbeam.HarklightWakesTest do
 
     start_supervised!({HarklightWakes, db: db, listener: listener})
     assert_receive :listener_failed
-    main_key = main.session_key
+    origin_key = session.session_key
 
     assert {:ok, [["unavailable", "listener_stopped"]]} =
              DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
                @handle
              ])
 
-    assert {:ok, [[^main_key, prompt]]} =
+    assert {:ok, [[^origin_key, prompt]]} =
              DB.query(
                db,
                "SELECT sessionKey,prompt FROM wakes WHERE prompt LIKE 'Harklight listening%'"
              )
 
     assert String.contains?(prompt, @handle)
+  end
+
+  for saved_error <- ["listener_stopped", "attachment_refused"] do
+    @saved_error saved_error
+    test "restart restores an existing #{@saved_error} handle without changing captured state", %{
+      db: db,
+      session: session
+    } do
+      lines =
+        for {cursor, delivered, acted} <- [{1, false, false}, {2, true, false}, {3, true, true}] do
+          event(cursor, "discussion", "retained")
+          |> JSON.decode!()
+          |> Map.merge(%{"delivered" => delivered, "acted" => acted})
+          |> JSON.encode!()
+        end
+
+      for line <- lines, do: assert(:ok = HarklightWakes.capture_line(db, @handle, line))
+      {:ok, before_entries} = DB.query(db, "SELECT * FROM harklight_wake_entries")
+      {:ok, before_requests} = DB.query(db, "SELECT * FROM harklight_wake_requests")
+      {:ok, before_wakes} = DB.query(db, "SELECT * FROM wakes WHERE wakeId LIKE 'w_harklight_%'")
+      {:ok, before_results} = DB.query(db, "SELECT * FROM harklight_command_results")
+      {:ok, before_sends} = DB.query(db, "SELECT * FROM harklight_send_operations")
+
+      {:ok, _} =
+        DB.query(db, "UPDATE harklight_wake_handles SET state='unavailable',lastError=?1", [
+          @saved_error
+        ])
+
+      parent = self()
+
+      listener = fn manager, handle, vendor ->
+        :ok = GenServer.call(manager, {:attached, handle})
+        for line <- lines, do: :ok = GenServer.call(manager, {:capture, handle, line})
+        send(parent, {:restored, self(), handle, vendor})
+
+        receive do
+          :never -> :ok
+        end
+      end
+
+      start_supervised!({HarklightWakes, db: db, listener: listener})
+      assert_receive {:restored, worker, @handle, nil}
+      ref = Process.monitor(worker)
+      :ok = stop_supervised(HarklightWakes)
+      assert_receive {:DOWN, ^ref, :process, ^worker, :shutdown}
+      start_supervised!({HarklightWakes, db: db, listener: listener})
+      assert_receive {:restored, next, @handle, nil}
+      refute next == worker
+      assert {:ok, ^before_entries} = DB.query(db, "SELECT * FROM harklight_wake_entries")
+      assert {:ok, ^before_requests} = DB.query(db, "SELECT * FROM harklight_wake_requests")
+
+      assert {:ok, ^before_wakes} =
+               DB.query(db, "SELECT * FROM wakes WHERE wakeId LIKE 'w_harklight_%'")
+
+      assert {:ok, ^before_results} = DB.query(db, "SELECT * FROM harklight_command_results")
+      assert {:ok, ^before_sends} = DB.query(db, "SELECT * FROM harklight_send_operations")
+      origin = session.session_key
+
+      assert {:ok, [[^origin, "active", nil, 3]]} =
+               DB.query(
+                 db,
+                 "SELECT sessionKey,state,lastError,lastCursor FROM harklight_wake_handles"
+               )
+
+      assert {:ok, [[3]]} =
+               DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_harklight_%'")
+    end
+  end
+
+  test "failed restoration refreshes the actual reason and notifies the origin once", %{
+    db: db,
+    session: session
+  } do
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE harklight_wake_handles SET state='unavailable',lastError='listener_stopped'"
+      )
+
+    parent = self()
+
+    listener = fn manager, handle, _ ->
+      :ok =
+        GenServer.call(
+          manager,
+          {:finished, handle,
+           {:harklight_failure, "attachment_refused", "attach",
+            "The existing local listener lock is held; no replacement was attempted."}}
+        )
+
+      send(parent, :refused)
+    end
+
+    start_supervised!({HarklightWakes, db: db, listener: listener})
+    assert_receive :refused
+    :ok = stop_supervised(HarklightWakes)
+    start_supervised!({HarklightWakes, db: db, listener: listener})
+    assert_receive :refused
+
+    assert {:ok, [["unavailable", reason]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+
+    assert reason =~ "attachment_refused"
+    assert reason =~ "listener lock is held"
+    origin = session.session_key
+
+    assert {:ok, [[^origin, prompt]]} =
+             DB.query(
+               db,
+               "SELECT sessionKey,prompt FROM wakes WHERE wakeId LIKE 'w_harklight_notice_%'"
+             )
+
+    assert prompt =~ "listener lock is held"
+    assert prompt =~ "Replies on this thread will not reach"
+  end
+
+  test "startup records an ineligible origin without launching a listener", %{
+    db: db,
+    session: session
+  } do
+    Org.set_host(db, session.session_key, "other-host")
+    parent = self()
+    listener = fn _, _, _ -> send(parent, :unexpected_listener) end
+    start_supervised!({HarklightWakes, db: db, listener: listener})
+    :sys.get_state(HarklightWakes)
+
+    assert {:ok, [["unavailable", "origin_unavailable"]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+
+    refute_receive :unexpected_listener
+  end
+
+  test "controller shutdown releases its own idle subprocess before restoring", %{db: db} do
+    root = Path.join(System.tmp_dir!(), "harklight-child-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    script = Path.join(root, "harklight-agent")
+
+    File.write!(script, """
+    #!/bin/sh
+    if [ "$1" = attach ]; then
+      printf '%s\n' '{"kind":"attached","ready_for_listen":true}'
+    else
+      exec sleep 300
+    fi
+    """)
+
+    File.chmod!(script, 0o700)
+    old_path = System.fetch_env!("PATH")
+    System.put_env("PATH", root <> ":" <> old_path)
+
+    on_exit(fn ->
+      System.put_env("PATH", old_path)
+      File.rm_rf!(root)
+    end)
+
+    start_supervised!({HarklightWakes, db: db})
+    port = await_listener_port()
+    {:os_pid, pid} = Port.info(port, :os_pid)
+
+    assert {_, 0} =
+             System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true)
+
+    :ok = stop_supervised(HarklightWakes)
+
+    assert {_, status} =
+             System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true)
+
+    assert status != 0
+    start_supervised!({HarklightWakes, db: db})
+    new_port = await_listener_port()
+    refute new_port == port
+  end
+
+  defp await_listener_port(attempts \\ 100)
+  defp await_listener_port(0), do: flunk("listener port did not start")
+
+  defp await_listener_port(attempts) do
+    case :sys.get_state(HarklightWakes).ports do
+      %{@handle => port} ->
+        port
+
+      _ ->
+        Process.sleep(10)
+        await_listener_port(attempts - 1)
+    end
+  end
+
+  if System.get_env("HARKLIGHT_ACCEPTANCE_BINARY") do
+    test "published Agent reports missing configuration as an attach failure", %{db: db} do
+      # The isolated gate supplies the hash-verified published binary. Ordinary
+      # runs use the existing source-level controller tests.
+      binary = System.fetch_env!("HARKLIGHT_ACCEPTANCE_BINARY")
+
+      root =
+        Path.join(System.tmp_dir!(), "harklight-restart-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(root)
+      script = Path.join(root, "harklight-agent")
+
+      File.write!(
+        script,
+        "#!/bin/sh\nexec '" <>
+          binary <>
+          "' --identity-dir '" <> root <> "/missing' --state-dir '" <> root <> "/state' \"$@\"\n"
+      )
+
+      File.chmod!(script, 0o700)
+      old_path = System.fetch_env!("PATH")
+      System.put_env("PATH", root <> ":" <> old_path)
+
+      on_exit(fn ->
+        System.put_env("PATH", old_path)
+        File.rm_rf!(root)
+      end)
+
+      start_supervised!({HarklightWakes, db: db})
+      await_handle_error(db, "configuration")
+
+      assert {:ok, [["unavailable", error]]} =
+               DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+
+      assert error =~ "attachment_refused"
+      assert error =~ "configuration"
+    end
+  end
+
+  defp await_handle_error(db, text, attempts \\ 100)
+  defp await_handle_error(_db, _text, 0), do: flunk("controller did not record the failure")
+
+  defp await_handle_error(db, text, attempts) do
+    case DB.query(db, "SELECT lastError FROM harklight_wake_handles") do
+      {:ok, [[error]]} when is_binary(error) ->
+        if String.contains?(error, text),
+          do: :ok,
+          else: await_handle_error(db, text, attempts - 1)
+
+      _ ->
+        Process.sleep(10)
+        await_handle_error(db, text, attempts - 1)
+    end
   end
 
   test "retirement and host movement fence new captures without losing old wakes", %{
@@ -761,7 +1001,7 @@ defmodule Tightbeam.HarklightWakesTest do
              DB.query(
                db,
                "SELECT sessionKey FROM wakes WHERE wakeId=?1",
-               ["w_harklight_notice_origin_unavailable_" <> @handle]
+               ["w_harklight_notice_recovery_" <> @handle]
              )
   end
 
