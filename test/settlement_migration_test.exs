@@ -8,6 +8,13 @@ defmodule Tightbeam.SettlementMigrationTest do
     db = :"settlement_migration_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Schema.ensure_all(db)
+    # Full startup reapplies the released identity migration after the feature upgrade.
+    assert {:ok, current_objects} =
+             DB.query(
+               db,
+               "SELECT name,sql FROM sqlite_master WHERE name IN ('assignments','attests','assignment_cannot_proceed') ORDER BY name"
+             )
+
     Tightbeam.IdentityPredecessorFixture.restore!(db)
     Tightbeam.SchemaShapeRuntimeFixture.downgrade_assignment_source_replacement_cancellation!(db)
 
@@ -41,17 +48,20 @@ defmodule Tightbeam.SettlementMigrationTest do
       UPDATE schema_stamp SET shape='cannot-proceed-v1-019';
       """)
 
-    %{db: db}
+    %{db: db, current_objects: current_objects}
   end
 
-  test "named transition preserves reparent and PO replay and is idempotent", %{db: db} do
+  test "named transition preserves reparent and PO replay and is idempotent", %{
+    db: db,
+    current_objects: current_objects
+  } do
     preserved_sql =
       "SELECT name,sql FROM sqlite_master WHERE name IN ('assignments','attests','assignment_cannot_proceed') ORDER BY name"
 
     assert {:ok, before_ddl} = DB.query(db, preserved_sql)
     assert length(before_ddl) == 3
     assert :ok = Schema.ensure_all(db)
-    assert {:ok, ^before_ddl} = DB.query(db, preserved_sql)
+    assert {:ok, ^current_objects} = DB.query(db, preserved_sql)
 
     assert {:ok, [[wake_cancellations_ddl]]} =
              DB.query(
