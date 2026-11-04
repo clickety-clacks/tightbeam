@@ -33,7 +33,7 @@ defmodule Tightbeam.GatewayTest do
       expected ++
         ~w(kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe)
 
-    expected = expected ++ ~w(memento-set mementos)
+    expected = expected ++ ~w(memento-set mementos retire-withdraw sentinel-demand)
 
     expected =
       expected ++ ~w(subtree-guidance-set subtree-guidance-withdraw subtree-guidance-show)
@@ -716,6 +716,16 @@ defmodule Tightbeam.GatewayTest do
         is_admin: false,
         subscriptions: MapSet.new(["chat"])
       })
+
+    File.mkdir_p!(Path.join(catalog_base, "identity/rules"))
+
+    File.cp!(
+      Path.join([
+        :code.priv_dir(:tightbeam),
+        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
+      ]),
+      Path.join(catalog_base, "identity/rules/row-reaction-assignment-inactivity.toml")
+    )
 
     Rules.load!(catalog_base, Map.keys(Gateway.handlers(%{db: db})))
 

@@ -1,5 +1,5 @@
 import ExUnit.Assertions
-alias Tightbeam.{DB, Gateway, Org, Model}
+alias Tightbeam.{DB, Gateway, Identity, Org, Model}
 
 Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
   Org.create(db, %{
@@ -19,6 +19,11 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
       db,
       "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_boot_recovery', 'boot recovery', 'k1', 'flynn', 1)"
     )
+
+  Identity.init_after_admission!(config.base_dir, db)
+
+  assert {:ok, _revision} =
+           Identity.learn!(config.base_dir, "agentic-engineering", "user:fixture")
 
   _children = Gateway.children(config |> Map.put(:wake_tick_ms, 1_234) |> Map.merge(%{}))
 

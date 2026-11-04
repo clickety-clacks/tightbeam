@@ -646,7 +646,9 @@ defmodule Tightbeam.IdentityTest do
     git!(dir, ["add", "rails/scripts/synthetic-check"])
     git!(dir, ["commit", "-m", "synthetic executable check"], "test")
     edit!(ctx.base, "coder", :guidance, "local customization", "test")
-    Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :ok = Schema.ensure_all(db)
+    Gateway.load_law!(%{base_dir: ctx.base, db: db}, ["post"])
     hooks = Rails.hook_settings()
     File.write!(Path.join(ctx.source, "guidance/coder.md"), "incoming guidance")
     assert {:conflict, [_]} = relearn!(ctx.base, "test")
@@ -661,7 +663,7 @@ defmodule Tightbeam.IdentityTest do
       "#!/bin/sh\nprintf unpublished\n"
     )
 
-    assert [rule] = Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+    assert [rule] = Gateway.load_law!(%{base_dir: ctx.base, db: db}, ["post"])
     assert Rails.hook_settings() == hooks
     assert rule.base_dir == ctx.base
     assert rule.identity_manifest_sha == live
@@ -670,8 +672,6 @@ defmodule Tightbeam.IdentityTest do
     assert File.read!(Path.join(dir, ".git/MERGE_HEAD")) == merge
     assert Identity.live_revision!(ctx.base) == live
 
-    db = start_supervised!({DB, path: ":memory:", name: nil})
-    :ok = Schema.ensure_all(db)
     File.mkdir_p!(Path.join(ctx.base, "bin"))
     File.cp!(Path.expand("cli/target/release/tightbeam"), Path.join(ctx.base, "bin/tightbeam"))
 
@@ -689,7 +689,7 @@ defmodule Tightbeam.IdentityTest do
 
   test "recovery keeps invalid published law closed and preserves the merge",
        ctx do
-    alias Tightbeam.Gateway
+    alias Tightbeam.{DB, Gateway, Schema}
     learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")
     File.mkdir_p!(Path.join(dir, "rules"))
@@ -698,9 +698,12 @@ defmodule Tightbeam.IdentityTest do
     git!(dir, ["commit", "-m", "synthetic invalid published law"], "test")
     git!(dir, ["branch", "-f", "tightbeam/live", "HEAD"])
 
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :ok = Schema.ensure_all(db)
+
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        assert [] = Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+        assert [] = Gateway.load_law!(%{base_dir: ctx.base, db: db}, ["post"])
       end)
 
     assert log =~ "invalid.toml"
@@ -717,7 +720,7 @@ defmodule Tightbeam.IdentityTest do
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        assert [] = Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+        assert [] = Gateway.load_law!(%{base_dir: ctx.base, db: db}, ["post"])
       end)
 
     assert log =~ "invalid.toml"
@@ -730,7 +733,7 @@ defmodule Tightbeam.IdentityTest do
     git!(dir, ["branch", "-D", "tightbeam/live"])
 
     assert_raise RuntimeError, ~r/git .* failed/, fn ->
-      Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+      Gateway.load_law!(%{base_dir: ctx.base, db: db}, ["post"])
     end
 
     assert File.read!(Path.join(dir, ".git/index")) == index
