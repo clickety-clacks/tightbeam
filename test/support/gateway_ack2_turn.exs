@@ -13,7 +13,7 @@ end
 defmodule GuardAck2Turn do
   import ExUnit.Assertions
 
-  alias Tightbeam.{ConnRegistry, DB, Gateway, HarklightWakes, Ledger, Org}
+  alias Tightbeam.{ConnRegistry, DB, Gateway, HarklightWakes, Ledger, Model, Org, Placement}
   alias Tightbeam.GatewayTurnFixture.{AdapterStub, CoordinatorStub}
 
   @handle "7d737f62-bbd7-4c51-978d-f6ff5b4d8146"
@@ -22,9 +22,28 @@ defmodule GuardAck2Turn do
 
   def run do
     Tightbeam.GuardGatewayFixture.run!(fn %{base: base, db: db, config: config} ->
-      session = Org.get(db, @session_key)
-
       now = System.system_time(:millisecond)
+
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 "INSERT INTO users(userId,isAdmin,creationKind,createdAt) VALUES(?1,0,'admin_add',?2)",
+                 ["fixture-owner", now]
+               )
+
+      session =
+        Org.create(db, %{
+          session_key: @session_key,
+          display_name: "ACK2 fixture agent",
+          kind: "main",
+          owner_user_id: "fixture-owner",
+          origin: "user:fixture-owner",
+          archetype: "default",
+          host: Placement.local_host_name(),
+          harness: "codex",
+          provider: "openai",
+          model: Model.new("fable")
+        })
 
       assert {:ok, _} =
                DB.query(
