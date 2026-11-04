@@ -64,7 +64,6 @@ defmodule Tightbeam.ToplinesRailsTest do
       %{linkedActorRef: nil},
       %{linkReason: " "},
       %{unlinkedAt: 20},
-      ended_membership(%{unlinkedActorKind: "process"}),
       ended_membership(%{unlinkedAt: "later"}),
       ended_membership(%{unlinkedAt: 9})
     ]
@@ -76,6 +75,15 @@ defmodule Tightbeam.ToplinesRailsTest do
         Map.merge(membership_row("tlm_invalid", "tl_one", "wi_one", "flynn"), overrides)
       )
     end)
+
+    insert!(
+      db,
+      "topline_work_memberships",
+      Map.merge(
+        membership_row("tlm_process", "tl_one", "wi_one", "flynn"),
+        ended_membership(%{unlinkedActorKind: "process"})
+      )
+    )
   end
 
   test "AC67 rejects invalid Concern actors, time, and titles", %{db: db} do
@@ -130,16 +138,9 @@ defmodule Tightbeam.ToplinesRailsTest do
       %{cause: "other"},
       %{state: "other"},
       %{openedActorRef: nil},
-      %{openedActorKind: "process", openedActorRef: "tightbeam"},
       %{
         cause: "migration",
         causeRef: "migration",
-        openedActorKind: "process",
-        openedActorRef: "other"
-      },
-      %{
-        cause: "reopened",
-        sourceCausalEventSeq: 100,
         openedActorKind: "process",
         openedActorRef: "other"
       },
@@ -201,6 +202,26 @@ defmodule Tightbeam.ToplinesRailsTest do
         Map.merge(placement_row("tlp_invalid"), overrides)
       )
     end)
+
+    # Process actors are valid; isolate each existing row from the pending/source indexes.
+    for overrides <- [
+          %{openedActorKind: "process", openedActorRef: "tightbeam"},
+          %{
+            cause: "reopened",
+            sourceCausalEventSeq: 100,
+            openedActorKind: "process",
+            openedActorRef: "other"
+          }
+        ] do
+      insert!(
+        db,
+        "topline_placement_obligations",
+        Map.merge(placement_row("tlp_process"), overrides)
+      )
+
+      assert :ok =
+               DB.execute(db, "DELETE FROM topline_placement_obligations WHERE id = 'tlp_process'")
+    end
 
     insert!(
       db,
@@ -268,7 +289,6 @@ defmodule Tightbeam.ToplinesRailsTest do
     invalid = [
       %{kind: "other"},
       %{actorRef: nil},
-      %{actorKind: "process"},
       %{seq: "one"},
       %{seq: 0},
       %{eventAt: "now"},
@@ -286,6 +306,8 @@ defmodule Tightbeam.ToplinesRailsTest do
         Map.merge(event_row("tl_one"), overrides)
       )
     end)
+
+    insert!(db, "topline_events", Map.merge(event_row("tl_one"), %{actorKind: "process"}))
   end
 
   test "AC71 rejects both possible owner values for a cross-owner membership", %{db: db} do
