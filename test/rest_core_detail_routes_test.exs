@@ -835,6 +835,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     middle_page = page.("&before=" <> latest["page"]["oldestCursor"])
     earliest = page.("&before=" <> middle_page["page"]["oldestCursor"])
 
+    assert Enum.map(latest["items"], & &1["seq"]) == Enum.map(Enum.take(messages, -2), & &1.seq)
+    assert Enum.map(middle_page["items"], & &1["seq"]) ==
+             Enum.map(Enum.slice(messages, 2, 2), & &1.seq)
+    assert Enum.map(earliest["items"], & &1["seq"]) == Enum.map(Enum.take(messages, 2), & &1.seq)
+
     assert Enum.map(latest["railDenials"], & &1["id"]) == [newest]
     assert Enum.map(middle_page["railDenials"], & &1["id"]) == [middle, explicit]
     assert Enum.map(earliest["railDenials"], & &1["id"]) == [oldest]
