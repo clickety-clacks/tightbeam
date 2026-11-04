@@ -560,27 +560,11 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   def handle_cast({:origin_changed, session_key}, state) do
-    {:ok, rows} =
-      DB.query(
-        state.db,
-        "SELECT handle,host,state FROM harklight_wake_handles WHERE sessionKey=?1",
-        [session_key]
-      )
+    {:noreply, reconcile_origin(state, session_key, false)}
+  end
 
-    state =
-      Enum.reduce(rows, state, fn [handle, host, handle_state], acc ->
-        if listener_eligible?(acc.db, handle, session_key, host) do
-          if handle_state == "complete", do: acc, else: start_worker(acc, handle)
-        else
-          # Persist invalidation before the worker's DOWN can reach observers.
-          mark_finished(acc.db, handle, "origin_unavailable")
-          acc = stop_worker(acc, handle)
-          notify_pending_origin_unavailable(acc.db, handle)
-          acc
-        end
-      end)
-
-    {:noreply, state}
+  def handle_cast({:origin_retired, session_key}, state) do
+    {:noreply, reconcile_origin(state, session_key, true)}
   end
 
   @impl true
@@ -599,6 +583,87 @@ defmodule Tightbeam.HarklightWakes do
       )
 
     {:noreply, Enum.reduce(rows, state, fn [handle], acc -> start_worker(acc, handle) end)}
+  end
+
+  defp reconcile_origin(state, session_key, deliberate_retirement?) do
+    {:ok, rows} =
+      DB.query(
+        state.db,
+        "SELECT handle,host,state FROM harklight_wake_handles WHERE sessionKey=?1",
+        [session_key]
+      )
+
+    Enum.reduce(rows, state, fn [handle, host, handle_state], acc ->
+      if listener_eligible?(acc.db, handle, session_key, host) do
+        if handle_state == "complete", do: acc, else: start_worker(acc, handle)
+      else
+        # Persist invalidation before the worker's DOWN can reach observers.
+        mark_finished(acc.db, handle, "origin_unavailable")
+        acc = stop_worker(acc, handle)
+        notify_pending_origin_unavailable(acc.db, handle)
+
+        if deliberate_retirement? and retired_origin_without_follow?(acc.db, handle, session_key) do
+          mark_origin_gone_async(handle)
+        end
+
+        acc
+      end
+    end)
+  end
+
+  defp retired_origin_without_follow?(db, handle, session_key) do
+    match?(%{state: "retired"}, Org.get(db, session_key)) and
+      match?(
+        {:ok, []},
+        DB.query(
+          db,
+          "SELECT 1 FROM harklight_wake_follows WHERE handle=?1 AND state='open' LIMIT 1",
+          [handle]
+        )
+      )
+  end
+
+  defp mark_origin_gone_async(handle) do
+    case Task.start(fn -> send_origin_gone(handle) end) do
+      {:ok, _pid} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "Harklight origin #{handle} could not be marked gone: session-end task did not start (#{inspect(reason)})"
+        )
+    end
+  end
+
+  defp send_origin_gone(handle) do
+    case System.find_executable("harklight-agent") do
+      nil ->
+        Logger.warning(
+          "Harklight origin #{handle} could not be marked gone: harklight-agent is unavailable"
+        )
+
+      executable ->
+        try do
+          case System.cmd(
+                 executable,
+                 ["session", "end", "--session", handle, "--gone"],
+                 stderr_to_stdout: true
+               ) do
+            {_output, 0} ->
+              :ok
+
+            {_output, status} ->
+              Logger.warning(
+                "Harklight origin #{handle} session-end gone command failed with exit status #{status}"
+              )
+          end
+        rescue
+          error ->
+            Logger.warning(
+              "Harklight origin #{handle} session-end gone command could not run (#{inspect(error.__struct__)})"
+            )
+        end
+    end
   end
 
   defp force_worker(state, handle) do

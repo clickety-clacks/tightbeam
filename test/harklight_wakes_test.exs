@@ -1406,6 +1406,134 @@ defmodule Tightbeam.HarklightWakesTest do
              ])
   end
 
+  test "deliberate retirement marks a handle gone when no receiver remains", %{
+    db: db,
+    session: session
+  } do
+    calls = fake_harklight_session_end_agent!()
+    test_pid = self()
+
+    listener = fn manager, handle, _vendor_id ->
+      :ok = GenServer.call(manager, {:attached, handle})
+      send(test_pid, {:listener_running, self()})
+
+      receive do
+        :never -> :ok
+      end
+    end
+
+    start_supervised!({HarklightWakes, db: db, listener: listener})
+    assert_receive {:listener_running, worker}
+
+    retired = Org.retire(db, session.session_key, "user:owner", 60_000)
+    assert retired.state == "retired"
+    :sys.get_state(HarklightWakes)
+
+    assert eventually(fn -> File.exists?(calls) end)
+    assert File.read!(calls) == "session end --session #{@handle} --gone\n"
+
+    assert {:ok, [["unavailable", "origin_unavailable"]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ])
+
+    refute Process.alive?(worker)
+  end
+
+  test "deliberate retirement preserves an accepted open follow", %{
+    db: db,
+    call: call,
+    main: main,
+    session: session
+  } do
+    calls = fake_harklight_session_end_agent!()
+    follower = follower_session(db, main, "agent:follower:retirement")
+
+    assert %{outcome: "committed"} =
+             follow_for_test(
+               db,
+               follow_call(call, follower, %{message_id: "request"}),
+               runner: lifecycle_runner(db)
+             )
+
+    test_pid = self()
+
+    listener = fn manager, handle, _vendor_id ->
+      :ok = GenServer.call(manager, {:attached, handle})
+      send(test_pid, {:listener_running, self()})
+
+      receive do
+        :never -> :ok
+      end
+    end
+
+    start_supervised!({HarklightWakes, db: db, listener: listener})
+    assert_receive {:listener_running, worker}
+
+    retired = Org.retire(db, session.session_key, "user:owner", 60_000)
+    assert retired.state == "retired"
+    :sys.get_state(HarklightWakes)
+
+    assert Process.alive?(worker)
+
+    assert :ok =
+             HarklightWakes.capture_line(db, @handle, event(1, "discussion", "After retirement"))
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [follower.session_key])
+
+    refute File.exists?(calls)
+  end
+
+  test "an attach failure does not mark the origin gone", %{db: db} do
+    calls = fake_harklight_session_end_agent!()
+    start_supervised!({HarklightWakes, db: db})
+
+    assert eventually(fn ->
+             match?(
+               {:ok, [["unavailable", _]]},
+               DB.query(
+                 db,
+                 "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1",
+                 [
+                   @handle
+                 ]
+               )
+             )
+           end)
+
+    output = File.read!(calls)
+    assert output =~ "attach --session #{@handle}"
+    refute output =~ "session end"
+  end
+
+  test "a failed gone command leaves retirement nonblocking", %{db: db, session: session} do
+    calls = fake_harklight_session_end_agent!(17)
+    test_pid = self()
+
+    listener = fn manager, handle, _vendor_id ->
+      :ok = GenServer.call(manager, {:attached, handle})
+      send(test_pid, {:listener_running, self()})
+
+      receive do
+        :never -> :ok
+      end
+    end
+
+    start_supervised!({HarklightWakes, db: db, listener: listener})
+    assert_receive {:listener_running, _worker}
+
+    retired = Org.retire(db, session.session_key, "user:owner", 60_000)
+    assert retired.state == "retired"
+    :sys.get_state(HarklightWakes)
+
+    assert eventually(fn -> File.exists?(calls) end)
+    assert File.read!(calls) == "session end --session #{@handle} --gone\n"
+
+    assert {:ok, [["unavailable"]]} =
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+  end
+
   test "moving the origin stops its running controller", %{db: db, call: call, session: session} do
     assert %{state: "registered"} = HarklightWakes.register(db, call)
     test_pid = self()
@@ -3187,6 +3315,39 @@ defmodule Tightbeam.HarklightWakesTest do
 
       File.rm_rf!(directory)
     end)
+  end
+
+  defp fake_harklight_session_end_agent!(exit_status \\ 0) do
+    directory =
+      Path.join(
+        System.tmp_dir!(),
+        "harklight-session-end-test-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(directory)
+    executable = Path.join(directory, "harklight-agent")
+    calls = Path.join(directory, "calls.log")
+
+    File.write!(
+      executable,
+      "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"#{calls}\"\n" <>
+        "if [ \"$1\" = \"attach\" ]; then exit 1; fi\nexit #{exit_status}\n"
+    )
+
+    File.chmod!(executable, 0o755)
+
+    previous_path = System.get_env("PATH")
+    System.put_env("PATH", Enum.join([directory, previous_path] |> Enum.reject(&is_nil/1), ":"))
+
+    on_exit(fn ->
+      if is_nil(previous_path),
+        do: System.delete_env("PATH"),
+        else: System.put_env("PATH", previous_path)
+
+      File.rm_rf!(directory)
+    end)
+
+    calls
   end
 
   defp eventually(fun, attempts \\ 200)
