@@ -465,6 +465,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
              "message.created",
              "session.updated",
              "message.created",
+             "work_item.updated",
              "verb.accepted",
              "assignment.opened"
            ]
