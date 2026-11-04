@@ -87,8 +87,12 @@ defmodule Tightbeam.WorkStateTest do
     assert Enum.find(assignment_snapshot.work, &(&1.id == linked.id)).workItemId == item.id
     assert Enum.find(assignment_snapshot.work, &(&1.id == unlinked.id)).workItemId == nil
     assert assignment_detail.assignment.status == "active"
-    assert [%{workItem: ^item, assignments: [%{id: id, status: "active"}]}] = item_snapshot.items
-    assert item_detail.workItem == item
+
+    assert [%{workItem: snapshot_item, assignments: [%{id: id, status: "active"}]}] =
+             item_snapshot.items
+
+    assert snapshot_item.id == item.id
+    assert item_detail.workItem == snapshot_item
     assert id == linked.id
     refute Map.has_key?(hd(item_snapshot.items), :status)
     refute Map.has_key?(item_detail, :status)
