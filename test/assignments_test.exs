@@ -54,7 +54,17 @@ defmodule Tightbeam.AssignmentsTest do
       Path.join(System.tmp_dir!(), "assignment-rails-#{System.unique_integer([:positive])}")
 
     on_exit(fn -> File.rm_rf!(rule_root) end)
-    Tightbeam.TerminalReactionFixture.load!(rule_root, Map.keys(handlers))
+    law = Tightbeam.TerminalReactionFixture.load!(rule_root, Map.keys(handlers))
+
+    File.cp!(
+      Path.join([
+        :code.priv_dir(:tightbeam),
+        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
+      ]),
+      Path.join(law, "identity/rules/row-reaction-assignment-inactivity.toml")
+    )
+
+    Rules.load!(law, Map.keys(handlers))
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 

@@ -52,6 +52,14 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
       File.cp!(Path.expand(source, __DIR__), Path.join(base, "identity/rules/#{name}"))
     end
 
+    File.cp!(
+      Path.join([
+        :code.priv_dir(:tightbeam),
+        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
+      ]),
+      Path.join(base, "identity/rules/row-reaction-assignment-inactivity.toml")
+    )
+
     rules = Rules.load!(base, Map.keys(handlers))
     assert Enum.any?(rules, &(&1.name == "assign-worker-staffing-needs-topology"))
     assert Enum.any?(rules, &(&1.name == "dispatch-worker-staffing-needs-topology"))

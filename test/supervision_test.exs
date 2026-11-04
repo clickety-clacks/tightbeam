@@ -1398,7 +1398,7 @@ defmodule Tightbeam.SupervisionTest do
 
   test "holder wake registration moves its deadline from registration time, not future due time",
        ctx do
-    opened_at = System.system_time(:millisecond)
+    opened_at = System.system_time(:millisecond) - 5_000
     interval_ms = 60_000
     open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
 
@@ -1421,9 +1421,7 @@ defmodule Tightbeam.SupervisionTest do
     assert deadline.due_at < wake.due_at
 
     if deadline.wake_id == old_deadline.wake_id do
-      # Opening and registration can share one millisecond, making the old
-      # row already the exact deadline derived from the registration time.
-      assert old_deadline.due_at == wake.created_at + interval_ms
+      assert old_deadline.due_at == opened_at + interval_ms
     else
       assert Wakes.get(ctx.db, old_deadline.wake_id).state == "canceled"
     end

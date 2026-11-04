@@ -34,7 +34,7 @@ defmodule Tightbeam.FirehoseReadDependencyTest do
       item = Map.put(row, "priority", priority)
       bytes = StateResources.encode_item("work items", item, %{})
       assert JSON.decode!(bytes) == item
-      assert bytes =~ "\"priority\":#{priority},\"rowVersion\":"
+      assert bytes =~ "\"priority\":#{priority},\"holders\":[]"
     end
 
     for priority <- [nil, "4", 4.5, -1, 9] do
@@ -234,8 +234,9 @@ defmodule Tightbeam.FirehoseReadDependencyTest do
     assert StateResources.query_work_item(db, %{"ownerUserId" => "other-owner"}, principal) == []
 
     for row <- rows do
-      assert StateResources.query_work_item(db, row.id, principal) == row
-      item = StateResources.work_item(row)
+      detail = StateResources.query_work_item(db, row.id, principal)
+      assert Map.take(detail, Map.keys(row)) == row
+      item = StateResources.work_item(detail)
       assert item["priority"] in [2, 7]
       assert JSON.decode!(StateResources.encode_item("work items", item, %{})) == item
 
