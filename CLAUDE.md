@@ -70,9 +70,12 @@ For 0.2 work start with:
   github.com/zed-industries/agent-client-protocol and the zed source BEFORE concluding
   a capability exists or is missing. Two stale conclusions were already overturned by
   it (per-session unload EXISTS as session/close; hook semantics).
-- **Harness CLIs auto-update under us** (codex 0.144.5→0.144.6→0.145.0 in two days).
-  Pin binaries explicitly (CODEX_PATH); re-probe behavior per version; never trust
-  yesterday's diagnosis against today's binary.
+- **Prefer a host-installed harness CLI, with the adapter's bundled CLI as
+  fallback when the host copy is missing or unusable.** Current Codex and Claude
+  adapters use their bundled CLI unless CODEX_PATH or CLAUDE_CODE_EXECUTABLE is
+  explicitly pinned; no automatic host-first resolver ships. Doctor reports the
+  selected copy and version when it can observe them. Harness CLIs auto-update
+  (codex 0.144.5→0.144.6→0.145.0 in two days), so re-probe behavior per version.
 - **codex hooks are TRUST-GATED, not inert, under `codex app-server`** (established
   2026-07-23, reversing the earlier "exec-only" conclusion — that was a bundled-binary
   + untrusted-state artifact at 0.144.x). Hooks run through the same core engine in

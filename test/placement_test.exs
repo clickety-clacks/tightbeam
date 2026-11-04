@@ -13,6 +13,8 @@ defmodule Tightbeam.PlacementTest do
     Rails
   }
 
+  alias Tightbeam.Harness.BinaryDiagnostics
+
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-placement-#{System.unique_integer([:positive])}")
     File.mkdir_p!(base_dir)
@@ -79,6 +81,36 @@ defmodule Tightbeam.PlacementTest do
                run: fn _ -> Process.sleep(100) end,
                timeout: 10
              )
+  end
+
+  test "binary diagnostics include every enabled harness, including unsupported adapters", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    register_hosts(db, %{
+      "remote" => %{ssh: "remote.example", base_dir: "/srv/tightbeam", cli_bin: "/srv/bin"}
+    })
+
+    run = fn _command ->
+      {JSON.encode!(%{
+         status: "observed",
+         source: "bundled_fallback",
+         path: "/srv/tightbeam/adapters/vendor-cli",
+         version: "vendor 1"
+       }) <> "\n", 0}
+    end
+
+    assert {:ok, %{"rows" => rows}} =
+             BinaryDiagnostics.report(base_dir, db, :offline_coordinator, run: run)
+
+    hosts = rows |> Enum.map(& &1["host"]) |> Enum.uniq()
+    assert "remote" in hosts
+
+    for host <- hosts do
+      assert Enum.all?(Tightbeam.Harness.all(), fn module ->
+               Enum.any?(rows, &(&1["host"] == host and &1["harness"] == module.wire_name()))
+             end)
+    end
   end
 
   test "hosts registers the gateway machine under its real name; nothing redefines it", %{
@@ -732,6 +764,7 @@ defmodule Tightbeam.PlacementTest do
 
     assert opts[:harness] == :codex
     assert opts[:cmd] == [expected_binary]
+    assert is_function(opts[:harness_binary_capture], 0)
     assert opts[:home] == expected_home
     assert opts[:cwd] == "/work"
     assert is_function(opts[:on_auth_event], 2)

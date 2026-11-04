@@ -40,6 +40,14 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     ]
 
     {status, report} = evaluate(catalog, inputs)
+
+    report =
+      Map.put(
+        report,
+        :harness_binary_diagnostics,
+        Tightbeam.Harness.BinaryDiagnostics.fetch_gateway(base_dir)
+      )
+
     Mix.shell().info(format(report, if(options[:json], do: :json, else: :human)))
 
     if status != 0 do
@@ -142,8 +150,18 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     widths = column_widths([headings | rows])
     divider = Enum.map_join(widths, "-+-", &String.duplicate("-", &1))
 
-    ([format_row(headings, widths), divider] ++ Enum.map(rows, &format_row(&1, widths)))
-    |> Enum.join("\n")
+    table = [format_row(headings, widths), divider] ++ Enum.map(rows, &format_row(&1, widths))
+
+    diagnostics =
+      case Map.get(report, :harness_binary_diagnostics) do
+        nil ->
+          []
+
+        value ->
+          ["", "harness binary diagnostics:"] ++ Tightbeam.Harness.BinaryDiagnostics.human(value)
+      end
+
+    (table ++ diagnostics) |> Enum.join("\n")
   end
 
   defp default_model_check(catalog, harness, model, credential_state, base_dir, host) do

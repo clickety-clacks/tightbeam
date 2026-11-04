@@ -1332,7 +1332,14 @@ defmodule Tightbeam.Placement do
         sh_out: Map.get(config, :sh_out)
       )
 
-    [
+    binary_capture =
+      Tightbeam.Harness.BinaryDiagnostics.launch_capture(
+        module,
+        Map.put(target, :adapter_path, binary_diagnostic_path(config, host_config)),
+        overlay_env
+      )
+
+    base = [
       harness: harness,
       home: home,
       cwd: config.cwd,
@@ -1344,7 +1351,26 @@ defmodule Tightbeam.Placement do
       on_subagent_event: subagent_event_handler(config, host, module),
       env: []
     ]
-    |> Keyword.merge(plan)
+
+    base =
+      if is_function(binary_capture, 0),
+        do: Keyword.put(base, :harness_binary_capture, binary_capture),
+        else: base
+
+    Keyword.merge(base, plan)
+  end
+
+  @doc "Preview the PATH an adapter on a configured host receives."
+  def toolchain_path_preview(config, host) do
+    binary_diagnostic_path(config, Map.fetch!(hosts_for(config), host))
+  end
+
+  defp binary_diagnostic_path(config, %{ssh: nil}) do
+    config.cli_bin <> ":" <> (System.get_env("PATH") || "")
+  end
+
+  defp binary_diagnostic_path(_config, host_config) do
+    "#{host_config[:cli_bin] || ""}:$PATH"
   end
 
   @doc """

@@ -101,6 +101,18 @@ defmodule Tightbeam.Harness.Codex do
   @impl true
   def cli_binary, do: "codex"
 
+  @doc false
+  def binary_cli_env_name, do: "CODEX_PATH"
+
+  @doc false
+  def binary_cli_probe_script do
+    "const fs=require('node:fs'),path=require('node:path'),{createRequire}=require('node:module'),{spawnSync}=require('node:child_process');" <>
+      "const [root,mode,pin]=process.argv.slice(1);" <>
+      "function resolve(name){if(name.includes(path.sep)||path.isAbsolute(name))return path.resolve(name);for(const dir of (process.env.PATH||'').split(path.delimiter)){const file=path.join(dir,name);try{fs.accessSync(file,fs.constants.X_OK);return file}catch{}}return null;}" <>
+      "function bundle(){const r=createRequire(path.join(root,'package.json'));const entry=r.resolve('@agentclientprotocol/codex-acp');return createRequire(entry).resolve('@openai/codex/bin/codex.js');}" <>
+      "try{const remotePin=mode==='remote'?(process.env.TIGHTBEAM_DIAGNOSTIC_PIN||''):'';const selectedPin=mode==='pinned'?pin:remotePin;const source=selectedPin?'pinned_override':'bundled_fallback';const bin=selectedPin?resolve(selectedPin):bundle();if(!bin){process.stdout.write(JSON.stringify({status:'missing',source,reason:'selected CLI was not found'}));process.exit(0)}const js=bin.endsWith('.js'),runner=js?process.execPath:bin,args=js?[bin,'--version']:['--version'];const out=spawnSync(runner,args,{encoding:'utf8',timeout:1200,env:{PATH:process.env.PATH||''}});if(out.error||out.status!==0){process.stdout.write(JSON.stringify({status:'unprobeable',source,reason:String(out.error||out.stderr||'version command failed')}));process.exit(0)}process.stdout.write(JSON.stringify({status:'observed',source,path:bin,version:(out.stdout||out.stderr||'').trim()}));}catch(e){const source=mode==='pinned'||(mode==='remote'&&(process.env.TIGHTBEAM_DIAGNOSTIC_PIN||''))?'pinned_override':'bundled_fallback';process.stdout.write(JSON.stringify({status:'missing',source,reason:String(e.message||e)}));}"
+  end
+
   @impl true
   def wire_projection do
     JSON.encode!(%{
