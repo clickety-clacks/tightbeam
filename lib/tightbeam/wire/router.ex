@@ -54,6 +54,7 @@ defmodule Tightbeam.Wire.Router do
   alias Tightbeam.{
     Assets,
     CliCompatibility,
+    DB,
     ConditionFacts,
     D1Read,
     Devices,
@@ -1673,7 +1674,16 @@ defmodule Tightbeam.Wire.Router do
 
       body =
         if resource == "transcript messages" do
-          Map.put(body, "railDenials", session_rail_denials(db(conn), session_key))
+          Map.put(
+            body,
+            "railDenials",
+            session_rail_denials(
+              db(conn),
+              session_key,
+              page_result.rows,
+              page_result.flags.has_more_before
+            )
+          )
         else
           body
         end
@@ -1688,9 +1698,30 @@ defmodule Tightbeam.Wire.Router do
       state_error(conn, resource, 500, "projection_invalid", nil)
   end
 
-  defp session_rail_denials(db, session_key) do
-    db
-    |> EventLog.rail_denials_for_session(session_key)
+  defp session_rail_denials(db, session_key, [], _has_more_before) do
+    # A session with no messages has one empty transcript page; keep its denials
+    # reachable there. An empty page beyond an existing message has none.
+    {:ok, rows} =
+      DB.query(db, "SELECT 1 FROM messages WHERE sessionKey = ?1 LIMIT 1", [session_key])
+
+    if rows == [], do: session_rail_denials_wire(db, session_key, nil), else: []
+  end
+
+  defp session_rail_denials(db, session_key, messages, has_more_before) do
+    session_rail_denials_wire(db, session_key, {messages, has_more_before})
+  end
+
+  defp session_rail_denials_wire(db, session_key, bounds) do
+    denials =
+      case bounds do
+        nil ->
+          EventLog.rail_denials_for_session(db, session_key)
+
+        {messages, has_more_before} ->
+          EventLog.rail_denials_for_session_page(db, session_key, messages, has_more_before)
+      end
+
+    denials
     |> Enum.map(fn denial ->
       %{
         "id" => "rail:#{denial.id}",
