@@ -31,6 +31,9 @@ defmodule Tightbeam.Harness.Claude do
   def records_tool_calls?, do: true
 
   @impl true
+  def inline_images?, do: true
+
+  @impl true
   def wire_name, do: "claude"
 
   @impl true
