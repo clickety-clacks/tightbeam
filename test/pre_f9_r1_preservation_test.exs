@@ -5,6 +5,12 @@ defmodule Tightbeam.PreF9R1PreservationTest do
   test "assignment-only historical helper preserves R1 bytes and schema stamp" do
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = Schema.ensure_all(db)
+    # Parent links activate after this historical rebuild in ordinary startup.
+    :ok =
+      DB.execute(
+        db,
+        "DROP INDEX assignments_parent; ALTER TABLE assignments DROP COLUMN parentAssignmentId"
+      )
 
     :ok =
       DB.execute(db, """
