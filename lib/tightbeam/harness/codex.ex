@@ -62,6 +62,9 @@ defmodule Tightbeam.Harness.Codex do
   def records_tool_calls?, do: true
 
   @impl true
+  def accepts_inline_images?, do: true
+
+  @impl true
   def wire_name, do: "codex"
 
   @impl true

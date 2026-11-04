@@ -128,12 +128,14 @@ defmodule Tightbeam.Harness do
   @doc "Whether this harness's installed local client owns acceptance of an uncataloged model id."
   @callback local_client_model_authority?(Tightbeam.Model.t()) :: boolean()
   @callback records_tool_calls?() :: boolean()
+  @callback accepts_inline_images?() :: boolean()
 
   @optional_callbacks preflight_launch: 3,
                       warm_home: 2,
                       materialize_legacy_credential_link: 2,
                       local_client_model_authority?: 1,
                       records_tool_calls?: 0,
+                      accepts_inline_images?: 0,
                       submission_text_limit: 0,
                       project_session_identity: 3,
                       verify_session_identity_hook: 2
@@ -207,6 +209,23 @@ defmodule Tightbeam.Harness do
     module = module!(harness)
     Code.ensure_loaded!(module)
     function_exported?(module, :records_tool_calls?, 0) and module.records_tool_calls?()
+  end
+
+  @doc "Whether this registered harness accepts inline image content blocks."
+  @spec accepts_inline_images?(term()) :: boolean()
+  def accepts_inline_images?(harness) do
+    module =
+      Enum.find(known(), fn module ->
+        module == harness or module.id() == harness or module.wire_name() == harness
+      end)
+
+    if module do
+      Code.ensure_loaded!(module)
+
+      function_exported?(module, :accepts_inline_images?, 0) and module.accepts_inline_images?()
+    else
+      false
+    end
   end
 
   @callback conformance_vectors() :: %{

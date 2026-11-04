@@ -920,7 +920,7 @@ defmodule Tightbeam.Wire.Router do
   end
 
   post "/upload" do
-    with {:ok, device} <- device_auth(conn),
+    with {:ok, principal} <- asset_upload_principal(conn),
          {:ok, upload, conn} <- read_upload(conn) do
       data = File.read!(upload.path)
 
@@ -928,7 +928,7 @@ defmodule Tightbeam.Wire.Router do
         Assets.put(
           db(conn),
           deps(conn).base_dir,
-          device.user_id,
+          principal.user_id,
           upload.content_type,
           upload.filename,
           data
@@ -941,8 +941,8 @@ defmodule Tightbeam.Wire.Router do
   end
 
   get "/download/:asset_id" do
-    with {:ok, device} <- device_auth(conn),
-         {:ok, asset} <- visible_asset(asset_id, device, conn) do
+    with {:ok, principal} <- asset_download_principal(conn),
+         {:ok, asset} <- visible_asset(asset_id, principal, conn) do
       conn
       |> Plug.Conn.put_resp_header("content-type", asset.mime_type)
       |> Plug.Conn.send_file(
@@ -3521,6 +3521,61 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  defp asset_upload_principal(conn) do
+    case asset_auth(conn) do
+      {:ok, {:device, device}} ->
+        {:ok, %{user_id: device.user_id, is_admin: device.is_admin}}
+
+      {:ok, :org} ->
+        with {:ok, query} <- decode_state_query(conn) do
+          case Map.get(query, "asUser", []) do
+            [user_id] when user_id != "" ->
+              with {:ok, principal} <- state_principal(:org, query, conn) do
+                {:ok, %{user_id: principal.id, is_admin: principal.is_admin}}
+              end
+
+            [] ->
+              {:error, 400, "invalid_message", nil}
+
+            [""] ->
+              {:error, 400, "invalid_message", nil}
+
+            _repeated ->
+              {:error, 400, "invalid_as_user", nil}
+          end
+        end
+
+      {:error, _status, _code, _message} = error ->
+        error
+    end
+  end
+
+  defp asset_download_principal(conn) do
+    case asset_auth(conn) do
+      {:ok, {:device, device}} ->
+        {:ok, %{user_id: device.user_id, is_admin: device.is_admin}}
+
+      {:ok, :org} ->
+        with {:ok, query} <- decode_state_query(conn),
+             {:ok, principal} <- state_principal(:org, query, conn) do
+          {:ok, %{user_id: principal.id, is_admin: principal.is_admin}}
+        end
+
+      {:error, _status, _code, _message} = error ->
+        error
+    end
+  end
+
+  defp asset_auth(conn) do
+    token = bearer_token(conn)
+
+    if is_binary(token) and token == deps(conn).cli_token do
+      {:ok, :org}
+    else
+      with {:ok, device} <- device_auth(conn), do: {:ok, {:device, device}}
+    end
+  end
+
   defp allowed_agent_verb(verb) do
     if verb in @agent_verbs,
       do: :ok,
@@ -3864,9 +3919,10 @@ defmodule Tightbeam.Wire.Router do
   defp work_state_filter(value) when value in ~w(open closed all), do: {:ok, value}
   defp work_state_filter(_), do: {:error, 400, "invalid_state_filter", nil}
 
-  defp visible_asset(asset_id, device, conn) do
+  defp visible_asset(asset_id, principal, conn) do
     case Assets.get(db(conn), asset_id) do
-      %{owner_user_id: owner} = asset when owner == device.user_id or device.is_admin ->
+      %{owner_user_id: owner} = asset
+      when owner == principal.user_id or principal.is_admin ->
         {:ok, asset}
 
       _ ->
