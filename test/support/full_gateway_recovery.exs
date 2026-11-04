@@ -383,6 +383,18 @@ if phase == "prepare" do
   {:ok, db} =
     DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [])
 
+  :initialized = Tightbeam.Identity.init!(base)
+  rules = Path.join(base, "identity/rules")
+  File.mkdir_p!(rules)
+
+  File.cp!(
+    Path.join([
+      :code.priv_dir(:tightbeam),
+      "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
+    ]),
+    Path.join(rules, "row-reaction-assignment-inactivity.toml")
+  )
+
   :ignore = Boot.start_link(%{base_dir: base})
   true = File.regular?(Path.join(base, "build-owner.json"))
   :ok = GenServer.stop(db)
@@ -460,6 +472,23 @@ File.mkdir_p!(arena_tmp)
 System.put_env("TMPDIR", arena_tmp)
 
 {:ok, _apps} = Application.ensure_all_started(:tightbeam)
+
+# Both boots read the same elected policy from the retained arena identity.
+inactivity_policy = Tightbeam.Rules.reaction_policy("assignment-inactivity")
+policy_bytes = :erlang.term_to_binary(inactivity_policy, [:deterministic])
+
+policy_receipt =
+  JSON.encode!(%{
+    phase: phase,
+    policy: inactivity_policy,
+    canonical_encoding: "erlang-external-term/deterministic",
+    canonical_base64: Base.encode64(policy_bytes),
+    sha256: Base.encode16(:crypto.hash(:sha256, policy_bytes), case: :lower)
+  })
+
+IO.puts("Recovery #{phase}-law.json: #{policy_receipt}")
+File.write!(Path.join(evidence, "#{phase}-law.json"), policy_receipt)
+%{name: "assignment-inactivity-reminders"} = inactivity_policy
 
 if phase == "prepare" do
   # Use the existing synthetic provider onboarding lifecycle, not live auth files.
