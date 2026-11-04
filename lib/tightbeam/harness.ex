@@ -126,11 +126,14 @@ defmodule Tightbeam.Harness do
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
 
   @callback records_tool_calls?() :: boolean()
+  @doc "Whether the harness accepts inline image content blocks."
+  @callback inline_images?() :: boolean()
 
   @optional_callbacks preflight_launch: 3,
                       warm_home: 2,
                       materialize_legacy_credential_link: 2,
                       records_tool_calls?: 0,
+                      inline_images?: 0,
                       submission_text_limit: 0,
                       project_session_identity: 3,
                       verify_session_identity_hook: 2
@@ -195,6 +198,22 @@ defmodule Tightbeam.Harness do
     module = module!(harness)
     Code.ensure_loaded!(module)
     function_exported?(module, :records_tool_calls?, 0) and module.records_tool_calls?()
+  end
+
+  @doc "Whether a registered harness accepts inline image content blocks."
+  @spec inline_images?(atom() | String.t()) :: boolean()
+  def inline_images?(harness) do
+    module =
+      Enum.find(known(), fn module ->
+        module == harness or module.id() == harness or module.wire_name() == harness
+      end)
+
+    if module do
+      Code.ensure_loaded!(module)
+      function_exported?(module, :inline_images?, 0) and module.inline_images?()
+    else
+      false
+    end
   end
 
   @callback conformance_vectors() :: %{
