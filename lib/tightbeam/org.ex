@@ -467,6 +467,7 @@ defmodule Tightbeam.Org do
       :ok = TerminalCredentialFailure.reconcile_personal_session_in_txn(txn, owner_user_id)
     end
 
+    publish_session_in_txn(txn, "session.spawned", session)
     session
   end
 

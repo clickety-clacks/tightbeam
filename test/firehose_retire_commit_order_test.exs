@@ -142,6 +142,13 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
 
     root = create_session(db, "firehose-retired-root", nil)
     child = create_session(db, "firehose-retired-child", root.session_key)
+
+    assert Enum.map(receive_notices(), & &1["class"]) == [
+             "session.spawned",
+             "session.spawned",
+             "session.spawned"
+           ]
+
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000, base_dir: System.tmp_dir!()})
 
     call = %{

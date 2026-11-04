@@ -2116,7 +2116,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert ended_seq == base_socket_seq + 2
 
-    assert {:push, {:text, heartbeat_frame}, heartbeat_state} =
+    assert {:push, [{:text, heartbeat_frame}, {:ping, <<>>}], heartbeat_state} =
              ChangeSocket.handle_info(:firehose_heartbeat, socket_state)
 
     assert JSON.decode!(heartbeat_frame) == %{"type" => "heartbeat", "seq" => base_socket_seq + 2}
@@ -13143,5 +13143,134 @@ defmodule Tightbeam.GatewayTest do
         {Supervisor, :start_link,
          [[], [strategy: :one_for_one, name: Tightbeam.RuntimeSupervisor]]}
     })
+  end
+
+  @tag firehose_creation_wire: true
+  test "ordinary spawn and fresh Main publish committed creation frames matching REST", ctx do
+    alias Tightbeam.ClientE2E.WS
+    alias Tightbeam.Firehose.Hub
+    base = role_test_base("creation-wire")
+    Archetypes.load!(base)
+    start_supervised!({Hub, name: Hub})
+
+    start_supervised!(%{
+      id: :creation_wire_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    handlers = Gateway.handlers(gateway_config(base, ctx.db, 0))
+
+    opts =
+      Tightbeam.Wire.Router.init(
+        db: ctx.db,
+        handlers: handlers,
+        base_dir: base,
+        defaults: %{harness: :claude, provider: "anthropic", model: Model.new("claude-fable-5")}
+      )
+
+    server =
+      start_supervised!(
+        {Bandit,
+         plug: {Tightbeam.Wire.Router, opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
+      )
+
+    {:ok, {_, port}} = ThousandIsland.listener_info(server)
+    {:ok, observer} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
+    on_exit(fn -> WS.close(observer) end)
+
+    :ok =
+      WS.send_text(
+        observer,
+        JSON.encode!(%{
+          type: "subscribe",
+          protocolVersion: 2,
+          subscriptionId: "creation",
+          filters: %{classes: ["session.spawned"]}
+        })
+      )
+
+    {:ok, {:text, ready}, observer} = WS.recv(observer, 5_000)
+    assert JSON.decode!(ready)["type"] == "subscription_ready"
+
+    call = %{
+      verb: "spawn",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{display_name: "Created worker", idempotency_key: "creation-wire"}
+    }
+
+    assert {:ok, created} = Tightbeam.Dispatch.dispatch(ctx.db, handlers, call)
+    observer = assert_creation_wire(observer, port, created.session_key)
+    # Retrying an idempotent spawn returns the same row and emits no extra creation.
+    assert {:ok, %{session_key: key}} = Tightbeam.Dispatch.dispatch(ctx.db, handlers, call)
+    assert key == created.session_key
+
+    main_key = Org.personal_session_key(ctx.device.user_id)
+    assert Org.get(ctx.db, main_key) == nil
+    {:ok, client} = WS.connect("127.0.0.1", port, "/ws")
+    on_exit(fn -> WS.close(client) end)
+    auth = JSON.encode!(%{type: "auth", token: ctx.device.token, deviceId: ctx.device.device_id})
+    :ok = WS.send_text(client, auth)
+    {:ok, {:text, auth_result}, _client} = WS.recv(client, 5_000)
+    assert JSON.decode!(auth_result)["success"] == true
+    observer = assert_creation_wire(observer, port, main_key)
+    {:ok, returning} = WS.connect("127.0.0.1", port, "/ws")
+    on_exit(fn -> WS.close(returning) end)
+    :ok = WS.send_text(returning, auth)
+    {:ok, {:text, auth_result}, _returning} = WS.recv(returning, 5_000)
+    assert JSON.decode!(auth_result)["success"] == true
+    :sys.get_state(Hub)
+    assert {:error, :timeout, _} = WS.recv(observer, 200)
+
+    # A creating transaction that rolls back must not leak a creation frame.
+    assert {:error, _} =
+             DB.transaction(ctx.db, fn txn ->
+               Org.create_in_txn(txn, %{
+                 session_key: "rolled-back-creation",
+                 display_name: "Rollback",
+                 owner_user_id: "flynn",
+                 origin: "user:flynn",
+                 archetype: "default",
+                 host: "testhost",
+                 harness: "claude",
+                 provider: "anthropic",
+                 model: Model.new("claude-fable-5")
+               })
+
+               raise "rollback creation"
+             end)
+
+    :sys.get_state(Hub)
+    assert Org.get(ctx.db, "rolled-back-creation") == nil
+    assert {:error, :timeout, _} = WS.recv(observer, 200)
+  end
+
+  defp assert_creation_wire(observer, port, key) do
+    {:ok, {:text, bytes}, observer} = Tightbeam.ClientE2E.WS.recv(observer, 5_000)
+    frame = JSON.decode!(bytes)
+    assert frame["type"] == "change"
+    assert frame["class"] == "session.spawned"
+    assert frame["refs"]["sessionKey"] == key
+    url = ~c"http://127.0.0.1:#{port}/api/sessions/#{URI.encode(key, &URI.char_unreserved?/1)}"
+
+    assert {:ok, {{_, 200, _}, _, body}} =
+             :httpc.request(:get, {url, []}, [], body_format: :binary)
+
+    row = JSON.decode!(body)["item"]
+    assert row["sessionKey"] == key
+    assert is_integer(frame["payload"]["createdAt"])
+    assert frame["payload"]["createdAt"] == row["createdAt"]
+
+    IO.puts(
+      "creation wire evidence: " <>
+        JSON.encode!(%{
+          sessionKey: key,
+          frameCreatedAt: frame["payload"]["createdAt"],
+          restCreatedAt: row["createdAt"]
+        })
+    )
+
+    observer
   end
 end
