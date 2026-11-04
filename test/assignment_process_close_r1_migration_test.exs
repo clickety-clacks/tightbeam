@@ -5,6 +5,13 @@ defmodule Tightbeam.AssignmentProcessCloseR1MigrationTest do
   setup do
     db = start_supervised!({DB, name: :process_close_r1_db, path: ":memory:"})
     :ok = Schema.ensure_all(db)
+    # Parent links activate after this historical rebuild in ordinary startup.
+    :ok =
+      DB.execute(
+        db,
+        "DROP INDEX assignments_parent; ALTER TABLE assignments DROP COLUMN parentAssignmentId"
+      )
+
     %{db: db}
   end
 
