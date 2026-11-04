@@ -743,13 +743,13 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert Enum.map(rail_denials, & &1["afterMessageSeq"]) == [
              before_message.seq,
              before_message.seq,
-             nil
+             before_message.seq
            ]
 
     assert Enum.map(rail_denials, & &1["order"]["afterMessageSeq"]) == [
              before_message.seq,
              before_message.seq,
-             nil
+             before_message.seq
            ]
 
     assert Enum.map(rail_denials, & &1["order"]["occurredAt"]) == [
