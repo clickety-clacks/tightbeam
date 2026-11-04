@@ -2115,6 +2115,48 @@ defmodule Tightbeam.HarklightWakesTest do
     end
   end
 
+  test "successful quiet reattachments reset the consecutive failure budget", %{db: db} do
+    calls = fake_harklight_session_end_agent!()
+    test_pid = self()
+
+    listener = fn manager, handle, _vendor_id ->
+      send(test_pid, {:listener_started, self()})
+
+      receive do
+        :attach ->
+          :ok = GenServer.call(manager, {:attached, handle})
+          send(test_pid, {:listener_attached, self()})
+          receive do: (:drop -> :ok)
+
+        :fail ->
+          :ok = GenServer.call(manager, {:finished, handle, "listener_terminated"})
+      end
+    end
+
+    start_supervised!({HarklightWakes, db: db, listener: listener, retry_delays: [1, 1]})
+
+    for _ <- 1..7 do
+      assert_receive {:listener_started, worker}, 1_000
+      send(worker, :attach)
+      assert_receive {:listener_attached, ^worker}, 1_000
+      refute File.exists?(calls)
+      send(worker, :drop)
+    end
+
+    # No captured event replenished the budget. After the final drop, its
+    # recovery attempt and one further retry can fail before reaching gone.
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_entries")
+
+    for _ <- 1..2 do
+      assert_receive {:listener_started, worker}, 1_000
+      send(worker, :fail)
+    end
+
+    assert eventually(fn ->
+             File.read(calls) == {:ok, "session end --session #{@handle} --gone\n"}
+           end)
+  end
+
   test "a releasing listener lock retries once then completes without gone", %{db: db} do
     path = Path.join(System.tmp_dir!(), "releasing-lock-#{System.unique_integer([:positive])}")
     File.write!(path, "")

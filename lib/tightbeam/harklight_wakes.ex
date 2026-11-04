@@ -1092,6 +1092,11 @@ defmodule Tightbeam.HarklightWakes do
         {:error, "listener_fenced"}
       end
 
+    # Quiet conversations may reconnect without capturing another event. Only
+    # consecutive failed attachments consume the recovery budget.
+    state =
+      if result == :ok, do: %{state | attempts: Map.delete(state.attempts, handle)}, else: state
+
     {:reply, result, state}
   end
 
