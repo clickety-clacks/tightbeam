@@ -54,6 +54,7 @@ defmodule Tightbeam.Wire.Router do
   alias Tightbeam.{
     Assets,
     CliCompatibility,
+    DB,
     ConditionFacts,
     D1Read,
     Devices,
