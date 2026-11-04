@@ -35,6 +35,13 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
     db = :"terminal_credential_migration_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Schema.ensure_all(db)
+    # Full startup reapplies the released identity migration after the feature upgrade.
+    assert {:ok, current_objects} =
+             DB.query(
+               db,
+               "SELECT type,name,sql FROM sqlite_master WHERE name IN ('assignment_cannot_proceed','turn_lifecycle_epoch','turn_lifecycle_events','wire_idempotency') ORDER BY type,name"
+             )
+
     Tightbeam.IdentityPredecessorFixture.restore!(db)
     Tightbeam.SchemaShapeRuntimeFixture.downgrade_assignment_source_replacement_cancellation!(db)
 
@@ -57,10 +64,13 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
 
     assert stamp(db) == @predecessor
     assert terminal_objects(db) == []
-    %{db: db}
+    %{db: db, current_objects: current_objects}
   end
 
-  test "exact settlement successor is additive, replay-safe, and infers no incident", %{db: db} do
+  test "exact settlement successor is additive, replay-safe, and infers no incident", %{
+    db: db,
+    current_objects: current_objects
+  } do
     assert {:ok, _} =
              DB.query(
                db,
@@ -76,7 +86,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
     assert :ok = Schema.ensure_all(db)
     assert stamp(db) == @successor
     assert terminal_objects(db) == @terminal_objects
-    assert {:ok, ^preserved_before} = DB.query(db, preserved_sql)
+    assert {:ok, ^current_objects} = DB.query(db, preserved_sql)
     assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM condition_facts")
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM terminal_credential_incidents")
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
