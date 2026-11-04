@@ -1429,8 +1429,9 @@ defmodule Tightbeam.HarklightWakesTest do
     assert retired.state == "retired"
     :sys.get_state(HarklightWakes)
 
-    assert eventually(fn -> File.exists?(calls) end)
-    assert File.read!(calls) == "session end --session #{@handle} --gone\n"
+    assert eventually(fn ->
+             File.read(calls) == {:ok, "session end --session #{@handle} --gone\n"}
+           end)
 
     assert {:ok, [["unavailable", "origin_unavailable"]]} =
              DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
@@ -1527,8 +1528,9 @@ defmodule Tightbeam.HarklightWakesTest do
     assert retired.state == "retired"
     :sys.get_state(HarklightWakes)
 
-    assert eventually(fn -> File.exists?(calls) end)
-    assert File.read!(calls) == "session end --session #{@handle} --gone\n"
+    assert eventually(fn ->
+             File.read(calls) == {:ok, "session end --session #{@handle} --gone\n"}
+           end)
 
     assert {:ok, [["unavailable"]]} =
              DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
