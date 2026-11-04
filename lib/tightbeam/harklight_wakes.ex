@@ -478,6 +478,7 @@ defmodule Tightbeam.HarklightWakes do
 
   @impl true
   def init(opts) do
+    Process.flag(:trap_exit, true)
     send(self(), :restore)
 
     {:ok,
@@ -486,6 +487,7 @@ defmodule Tightbeam.HarklightWakes do
        listener: Keyword.get(opts, :listener, &run_listener/3),
        send_runner: Keyword.get(opts, :send_runner),
        workers: %{},
+       ports: %{},
        refs: %{},
        restart: MapSet.new(),
        stopping: MapSet.new()
@@ -514,7 +516,12 @@ defmodule Tightbeam.HarklightWakes do
         {:noreply, state}
 
       {handle, refs} ->
-        state = %{state | refs: refs, workers: Map.delete(state.workers, handle)}
+        state = %{
+          state
+          | refs: refs,
+            workers: Map.delete(state.workers, handle),
+            ports: Map.delete(state.ports, handle)
+        }
 
         cond do
           MapSet.member?(state.stopping, handle) ->
@@ -525,10 +532,20 @@ defmodule Tightbeam.HarklightWakes do
             {:noreply, start_worker(state, handle)}
 
           true ->
-            mark_finished(state.db, handle, "listener_terminated")
+            mark_terminated(state.db, handle)
             {:noreply, state}
         end
     end
+  end
+
+  # DOWN owns worker bookkeeping. Linked exits ensure a controller crash cannot
+  # leave a worker holding the original handle's listener lock.
+  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
+
+  @impl true
+  def terminate(_reason, state) do
+    Enum.each(state.ports, fn {_handle, port} -> close_listener_port(port) end)
+    Enum.each(state.workers, fn {_handle, worker} -> Process.exit(worker, :shutdown) end)
   end
 
   def handle_cast({:pointer_changed, session_key}, state) do
@@ -587,6 +604,7 @@ defmodule Tightbeam.HarklightWakes do
   defp force_worker(state, handle) do
     case Map.fetch(state.workers, handle) do
       {:ok, worker} ->
+        if port = Map.get(state.ports, handle), do: close_listener_port(port)
         Process.exit(worker, :shutdown)
         %{state | restart: MapSet.put(state.restart, handle)}
 
@@ -598,6 +616,7 @@ defmodule Tightbeam.HarklightWakes do
   defp stop_worker(state, handle) do
     case Map.fetch(state.workers, handle) do
       {:ok, worker} ->
+        if port = Map.get(state.ports, handle), do: close_listener_port(port)
         Process.exit(worker, :shutdown)
 
         %{
@@ -653,6 +672,14 @@ defmodule Tightbeam.HarklightWakes do
     {:reply, result, state}
   end
 
+  def handle_call({:listener_port, handle, port}, from, state) do
+    if valid_worker?(state, handle, from) do
+      {:reply, :ok, %{state | ports: Map.put(state.ports, handle, port)}}
+    else
+      {:reply, {:error, "listener_fenced"}, state}
+    end
+  end
+
   def handle_call({:attached, handle}, from, state) do
     result =
       if valid_worker?(state, handle, from) do
@@ -685,6 +712,15 @@ defmodule Tightbeam.HarklightWakes do
     {:reply, result, state}
   end
 
+  defp mark_terminated(db, handle) do
+    DB.transaction(db, fn txn ->
+      case Txn.q(txn, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [handle]) do
+        [["active"]] -> mark_finished_in_txn(txn, handle, "listener_terminated")
+        _ -> :ok
+      end
+    end)
+  end
+
   defp mark_finished(db, handle, status) do
     case DB.transaction(db, fn txn -> mark_finished_in_txn(txn, handle, status) end) do
       {:ok, result} -> result
@@ -696,7 +732,7 @@ defmodule Tightbeam.HarklightWakes do
     case Txn.q(txn, "SELECT sessionKey,state FROM harklight_wake_handles WHERE handle=?1", [
            handle
          ]) do
-      [[session_key, "active"]] ->
+      [[session_key, current_state]] when current_state in ["active", "unavailable"] ->
         now = System.system_time(:millisecond)
         completed = status == :complete
         next_state = if completed, do: "complete", else: "unavailable"
@@ -707,7 +743,7 @@ defmodule Tightbeam.HarklightWakes do
         Txn.q(
           txn,
           "UPDATE harklight_wake_handles SET state=?2,lastError=?3,updatedAt=?4 WHERE handle=?1",
-          [handle, next_state, error, now]
+          [handle, next_state, if(diagnostic, do: error <> ": " <> diagnostic, else: error), now]
         )
 
         if completed, do: HarklightLifecycle.complete_in_txn(txn, handle)
@@ -764,21 +800,33 @@ defmodule Tightbeam.HarklightWakes do
          txn,
          session_key,
          handle,
-         notice_kind,
+         _notice_kind,
          error,
          operation,
          diagnostic,
          now
        ) do
-    wake_id = "w_harklight_notice_" <> notice_kind <> "_" <> handle
+    wake_id = "w_harklight_notice_recovery_" <> handle
 
     if Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id]) == [] do
-      if recipient = Supervision.ladder_target(txn, session_key, 1) do
+      recipient =
+        case Org.get_in_txn(txn, session_key) do
+          %{state: "active"} -> session_key
+          _ -> Supervision.ladder_target(txn, session_key, 1)
+        end
+
+      if recipient do
         cli_output =
-          case {operation, diagnostic} do
-            {operation, diagnostic}
+          case {error, operation, diagnostic} do
+            {_, operation, diagnostic}
             when operation in ["attach", "listen"] and is_binary(diagnostic) ->
-              " Failure cause is unknown. Sanitized #{String.upcase(operation)} CLI failure details: #{diagnostic}."
+              " #{String.upcase(operation)} failure: #{diagnostic}."
+
+            {"origin_unavailable", _, _} ->
+              " The original session is inactive or no longer belongs to the recorded host."
+
+            {"origin_host_mismatch", _, _} ->
+              " The original session belongs to another host; this controller cannot attach it."
 
             _ ->
               " Failure cause is unknown. No safe Agent CLI diagnostic was captured."
@@ -791,7 +839,7 @@ defmodule Tightbeam.HarklightWakes do
             origin: "process:tightbeam",
             creator_session_key: session_key,
             prompt:
-              "Harklight listening for session #{session_key} and handle #{handle} stopped (#{error}).#{cli_output} Pending entries remain at the origin. Restore only that session on its original host; do not transfer the conversation.",
+              "Harklight listening for session #{session_key} and handle #{handle} stopped (#{error}).#{cli_output} Replies on this thread will not reach the originating session while it is unavailable. Pending entries remain at the origin. The origin may re-ask; do not transfer the conversation.",
             due_at: now,
             class: "blocker"
           })
@@ -834,7 +882,7 @@ defmodule Tightbeam.HarklightWakes do
             end
 
             manager = self()
-            {:ok, pid} = Task.start(fn -> state.listener.(manager, handle, vendor_id) end)
+            {:ok, pid} = Task.start_link(fn -> state.listener.(manager, handle, vendor_id) end)
             ref = Process.monitor(pid)
 
             %{
@@ -843,6 +891,12 @@ defmodule Tightbeam.HarklightWakes do
                 refs: Map.put(state.refs, ref, handle)
             }
           else
+            reason =
+              if host == Placement.local_host_name(),
+                do: "origin_unavailable",
+                else: "origin_host_mismatch"
+
+            mark_finished(state.db, handle, reason)
             state
           end
 
@@ -853,6 +907,8 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   defp run_listener(manager, handle, vendor_id) do
+    Process.flag(:trap_exit, true)
+
     case System.find_executable("harklight-agent") do
       nil ->
         finish(
@@ -1021,7 +1077,14 @@ defmodule Tightbeam.HarklightWakes do
         args: ["listen", "--follow", "--controller", "--session", handle]
       ])
 
-    receive_lines(manager, port, handle, "", [])
+    try do
+      case GenServer.call(manager, {:listener_port, handle, port}, :infinity) do
+        :ok -> receive_lines(manager, port, handle, "", [])
+        {:error, reason} -> finish(manager, handle, reason)
+      end
+    after
+      close_listener_port(port)
+    end
   rescue
     _ ->
       finish(
@@ -1035,8 +1098,31 @@ defmodule Tightbeam.HarklightWakes do
       )
   end
 
+  # Closing stdin alone does not stop a CLI blocked on its SSE stream. Only
+  # signal this controller's still-open port child, never another lock holder.
+  defp close_listener_port(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, pid} ->
+        System.cmd("/bin/kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
+        if Port.info(port), do: Port.close(port)
+
+      _ ->
+        :ok
+    end
+  rescue
+    # The worker and its manager both clean up on shutdown. A closed port
+    # means the other owner already completed that cleanup.
+    ArgumentError -> :ok
+  end
+
   defp receive_lines(manager, port, handle, pending, diagnostics) do
     receive do
+      {:EXIT, ^manager, reason} ->
+        exit(reason)
+
+      {:EXIT, _sender, :shutdown} ->
+        exit(:shutdown)
+
       {^port, {:data, bytes}} ->
         data = pending <> bytes
         lines = :binary.split(data, "\n", [:global])
@@ -1060,7 +1146,7 @@ defmodule Tightbeam.HarklightWakes do
             receive_lines(manager, port, handle, remainder, next_diagnostics)
 
           {:error, reason, next_diagnostics} ->
-            Port.close(port)
+            close_listener_port(port)
 
             finish(
               manager,
@@ -1117,6 +1203,10 @@ defmodule Tightbeam.HarklightWakes do
       end
 
     case decoded do
+      {:ok, %{"kind" => kind}}
+      when kind in ["refused", "connection_error", "outcome_unknown", "error"] ->
+        {:error, "listener_stopped", append_diagnostic(diagnostics, line)}
+
       {:ok, _event} ->
         case GenServer.call(manager, {:capture, handle, line}, :infinity) do
           :ok -> {:ok, diagnostics}
@@ -1198,7 +1288,8 @@ defmodule Tightbeam.HarklightWakes do
   defp refusal_detail_lines(line) do
     case JSON.decode(String.trim(line)) do
       {:ok, %{"kind" => kind, "reason" => reason}}
-      when kind in ["error", "unsupported"] and is_binary(reason) ->
+      when kind in ["error", "unsupported", "refused", "outcome_unknown", "connection_error"] and
+             is_binary(reason) ->
         [reason]
 
       {:ok, %{"type" => "error", "reason" => reason}} when is_binary(reason) ->
