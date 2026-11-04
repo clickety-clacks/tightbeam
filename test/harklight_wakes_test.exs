@@ -3,6 +3,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
   alias Tightbeam.{
     DB,
+    Ephemeral,
     HarklightFollows,
     HarklightLifecycle,
     HarklightSend,
@@ -1441,7 +1442,7 @@ defmodule Tightbeam.HarklightWakesTest do
     refute Process.alive?(worker)
   end
 
-  test "the last actual follow receiver retires after the origin", %{
+  test "an ephemeral last actual follow receiver retires after the origin", %{
     db: db,
     call: call,
     main: main,
@@ -1449,6 +1450,12 @@ defmodule Tightbeam.HarklightWakesTest do
   } do
     calls = fake_harklight_session_end_agent!()
     follower = follower_session(db, main, "agent:follower:retirement")
+
+    assert {:ok, _} =
+             DB.transaction(
+               db,
+               &Ephemeral.stamp_in_txn(&1, follower.session_key, main.session_key)
+             )
 
     assert %{outcome: "committed"} =
              follow_for_test(
@@ -1485,8 +1492,10 @@ defmodule Tightbeam.HarklightWakesTest do
 
     refute File.exists?(calls)
 
-    retired_follower = Org.retire(db, follower.session_key, "user:owner", 60_000)
-    assert retired_follower.state == "retired"
+    assert {:ok, :ok} =
+             DB.transaction(db, &Ephemeral.retire_in_txn(&1, follower.session_key))
+
+    assert Org.get(db, follower.session_key).state == "retired"
 
     assert {:ok, [["retired", "open"]]} =
              DB.query(
