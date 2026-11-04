@@ -130,7 +130,18 @@ defmodule Tightbeam.Ephemeral do
         [key, System.system_time(:millisecond)]
       )
 
+      retired? = Txn.changes(txn) == 1
+
       Tightbeam.Retirements.session_retired_in_txn(txn, key)
+
+      if retired? do
+        Txn.handoff(
+          txn,
+          Tightbeam.HarklightWakes,
+          Tightbeam.HarklightWakes.retirement_handoff_in_txn(txn, key)
+        )
+      end
+
       Tightbeam.SentinelSubscriptions.end_session_in_txn(txn, key)
 
       session = Org.get_in_txn(txn, key)
