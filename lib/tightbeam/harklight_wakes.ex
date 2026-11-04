@@ -130,6 +130,34 @@ defmodule Tightbeam.HarklightWakes do
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
+  @doc false
+  def retirement_handoff_in_txn(%Txn{} = txn, session_key) do
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT handle,sessionKey,host,state
+        FROM harklight_wake_handles
+        WHERE sessionKey=?1
+        UNION
+        SELECT h.handle,h.sessionKey,h.host,h.state
+        FROM harklight_wake_handles h
+        JOIN harklight_wake_follows f ON f.handle=h.handle
+        WHERE f.sessionKey=?1 AND f.state='open'
+        """,
+        [session_key]
+      )
+
+    handles = Enum.map(rows, fn [handle, _origin_session_key, _host, _state] -> handle end)
+
+    gone_handles =
+      for [handle, origin_session_key, host, _state] <- rows,
+          not actual_receiver_eligible_in_txn?(txn, handle, origin_session_key, host),
+          do: handle
+
+    {:origin_retired, session_key, handles, gone_handles}
+  end
+
   # The caller of these functions is the runtime-owned send boundary. Its
   # external adapter must execute or recover only this persisted operation and
   # must pass the original confirmed result to bind_send/8. No wire command may
@@ -560,11 +588,11 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   def handle_cast({:origin_changed, session_key}, state) do
-    {:noreply, reconcile_origin(state, session_key, false)}
+    {:noreply, reconcile_origin(state, session_key)}
   end
 
-  def handle_cast({:origin_retired, session_key}, state) do
-    {:noreply, reconcile_origin(state, session_key, true)}
+  def handle_cast({:origin_retired, _session_key, handles, gone_handles}, state) do
+    {:noreply, reconcile_retirement(state, handles, MapSet.new(gone_handles))}
   end
 
   @impl true
@@ -585,16 +613,33 @@ defmodule Tightbeam.HarklightWakes do
     {:noreply, Enum.reduce(rows, state, fn [handle], acc -> start_worker(acc, handle) end)}
   end
 
-  defp reconcile_origin(state, session_key, deliberate_retirement?) do
+  defp reconcile_origin(state, session_key) do
     {:ok, rows} =
       DB.query(
         state.db,
-        "SELECT handle,host,state FROM harklight_wake_handles WHERE sessionKey=?1",
+        "SELECT handle,sessionKey,host,state FROM harklight_wake_handles WHERE sessionKey=?1",
         [session_key]
       )
 
-    Enum.reduce(rows, state, fn [handle, host, handle_state], acc ->
-      if listener_eligible?(acc.db, handle, session_key, host) do
+    reconcile_rows(state, rows, MapSet.new())
+  end
+
+  defp reconcile_retirement(state, handles, gone_handles) do
+    Enum.reduce(handles, state, fn handle, acc ->
+      {:ok, rows} =
+        DB.query(
+          acc.db,
+          "SELECT handle,sessionKey,host,state FROM harklight_wake_handles WHERE handle=?1",
+          [handle]
+        )
+
+      reconcile_rows(acc, rows, gone_handles)
+    end)
+  end
+
+  defp reconcile_rows(state, rows, gone_handles) do
+    Enum.reduce(rows, state, fn [handle, origin_session_key, host, handle_state], acc ->
+      if listener_eligible?(acc.db, handle, origin_session_key, host) do
         if handle_state == "complete", do: acc, else: start_worker(acc, handle)
       else
         # Persist invalidation before the worker's DOWN can reach observers.
@@ -602,7 +647,7 @@ defmodule Tightbeam.HarklightWakes do
         acc = stop_worker(acc, handle)
         notify_pending_origin_unavailable(acc.db, handle)
 
-        if deliberate_retirement? and retired_origin_without_follow?(acc.db, handle, session_key) do
+        if MapSet.member?(gone_handles, handle) do
           mark_origin_gone_async(handle)
         end
 
@@ -611,16 +656,37 @@ defmodule Tightbeam.HarklightWakes do
     end)
   end
 
-  defp retired_origin_without_follow?(db, handle, session_key) do
-    match?(%{state: "retired"}, Org.get(db, session_key)) and
+  defp actual_receiver_eligible?(db, handle, session_key, host) do
+    match?(%{state: "active", host: ^host}, Org.get(db, session_key)) or
       match?(
-        {:ok, []},
+        {:ok, [[1]]},
         DB.query(
           db,
-          "SELECT 1 FROM harklight_wake_follows WHERE handle=?1 AND state='open' LIMIT 1",
-          [handle]
+          """
+          SELECT 1
+          FROM harklight_wake_follows f
+          JOIN sessions s ON s.sessionKey=f.sessionKey
+          WHERE f.handle=?1 AND f.state='open' AND s.state='active' AND s.host=?2
+          LIMIT 1
+          """,
+          [handle, host]
         )
       )
+  end
+
+  defp actual_receiver_eligible_in_txn?(txn, handle, session_key, host) do
+    match?(%{state: "active", host: ^host}, Org.get_in_txn(txn, session_key)) or
+      Txn.q(
+        txn,
+        """
+        SELECT 1
+        FROM harklight_wake_follows f
+        JOIN sessions s ON s.sessionKey=f.sessionKey
+        WHERE f.handle=?1 AND f.state='open' AND s.state='active' AND s.host=?2
+        LIMIT 1
+        """,
+        [handle, host]
+      ) != []
   end
 
   defp mark_origin_gone_async(handle) do
@@ -703,25 +769,12 @@ defmodule Tightbeam.HarklightWakes do
 
   defp listener_eligible?(db, handle, session_key, host) do
     host == Placement.local_host_name() and
-      (match?(%{state: "active", host: ^host}, Org.get(db, session_key)) or
-         match?(
-           {:ok, [[1]]},
-           DB.query(
-             db,
-             "SELECT 1 FROM harklight_wake_follows WHERE handle=?1 AND state='open' LIMIT 1",
-             [handle]
-           )
-         ))
+      actual_receiver_eligible?(db, handle, session_key, host)
   end
 
   defp listener_eligible_in_txn?(txn, handle, session_key, host) do
     host == Placement.local_host_name() and
-      (match?(%{state: "active", host: ^host}, Org.get_in_txn(txn, session_key)) or
-         Txn.q(
-           txn,
-           "SELECT 1 FROM harklight_wake_follows WHERE handle=?1 AND state='open' LIMIT 1",
-           [handle]
-         ) != [])
+      actual_receiver_eligible_in_txn?(txn, handle, session_key, host)
   end
 
   @impl true

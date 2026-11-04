@@ -1151,7 +1151,11 @@ defmodule Tightbeam.Org do
     if Txn.changes(txn) != 1, do: raise("retirement state changed before commit")
     Tightbeam.Retirements.session_retired_in_txn(txn, session_key)
 
-    Txn.handoff(txn, Tightbeam.HarklightWakes, {:origin_retired, session_key})
+    Txn.handoff(
+      txn,
+      Tightbeam.HarklightWakes,
+      Tightbeam.HarklightWakes.retirement_handoff_in_txn(txn, session_key)
+    )
 
     Tightbeam.SentinelSubscriptions.end_session_in_txn(txn, session_key)
 
