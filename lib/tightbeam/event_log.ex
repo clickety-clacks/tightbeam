@@ -327,53 +327,91 @@ defmodule Tightbeam.EventLog do
   end
 
   @doc "Rail denials anchored to the messages in one transcript page."
-  def rail_denials_for_session_page(db, session_key, first_seq, last_seq) do
+  def rail_denials_for_session_page(db, session_key, messages, has_more_before) do
+    first_seq = hd(messages).seq
+    last_seq = List.last(messages).seq
+    first_page = not has_more_before
+    earliest_page_time = messages |> Enum.map(&message_time/1) |> Enum.min()
+
+    # A later message wins placement even if its timestamp is out of sequence.
+    # Read that boundary once, rather than searching later messages per denial.
+    {:ok, [[next_seq, earliest_later_time]]} =
+      DB.query(
+        db,
+        "SELECT MIN(seq), MIN(timestamp) FROM messages WHERE sessionKey = ?1 AND seq > ?2",
+        [session_key, last_seq]
+      )
+
+    # A later message would own a denial at or beyond either upper boundary.
+    # The first page also owns denials preceding the session's first message.
     {:ok, rows} =
       DB.query(
         db,
         """
-        WITH session_denials AS (
-          SELECT e.id, e.ts, e.verb, e.origin, e.principal, e.payload,
-            json_extract(e.payload, '$.rule') AS rule,
-            CASE WHEN json_type(e.payload, '$.afterMessageSeq') = 'integer'
-              THEN json_extract(e.payload, '$.afterMessageSeq')
-              ELSE NULL END AS stated_seq
-          FROM events AS e
-          WHERE e.kind = 'denied' AND json_valid(e.payload)
-            AND json_type(e.payload, '$.rule') = 'text'
-            AND (e.sessionKey = ?1 OR e.principal = ?2)
-        ), placed AS (
-          SELECT d.*,
-            COALESCE(
-              (SELECT MAX(m.seq) FROM messages AS m
-                WHERE m.sessionKey = ?1 AND
-                  (CASE WHEN d.stated_seq IS NOT NULL
-                    THEN m.seq <= d.stated_seq ELSE m.timestamp <= d.ts END)),
-              (SELECT MIN(m.seq) FROM messages AS m WHERE m.sessionKey = ?1)
-            ) AS anchor_seq
-          FROM session_denials AS d
+        WITH member_ids AS (
+          SELECT id FROM events WHERE sessionKey = ?1 AND kind = 'denied'
+          UNION
+          SELECT id FROM events WHERE principal = ?2 AND kind = 'denied'
         )
-        SELECT id, ts, verb, origin, principal, payload, rule, anchor_seq
-        FROM placed
-        WHERE anchor_seq BETWEEN ?3 AND ?4
-        ORDER BY anchor_seq, ts, id
+        SELECT e.id, e.ts, e.verb, e.origin, e.principal, e.payload,
+          json_extract(e.payload, '$.rule'),
+          CASE WHEN json_type(e.payload, '$.afterMessageSeq') = 'integer'
+            THEN json_extract(e.payload, '$.afterMessageSeq') ELSE NULL END
+        FROM events AS e
+        WHERE e.id IN member_ids AND json_valid(e.payload)
+          AND json_type(e.payload, '$.rule') = 'text'
+          AND (
+            (json_type(e.payload, '$.afterMessageSeq') = 'integer'
+              AND (?3 = 1 OR json_extract(e.payload, '$.afterMessageSeq') >= ?4)
+              AND (?5 IS NULL OR json_extract(e.payload, '$.afterMessageSeq') < ?5))
+            OR
+            ((json_type(e.payload, '$.afterMessageSeq') IS NULL
+                OR json_type(e.payload, '$.afterMessageSeq') != 'integer')
+              AND (?3 = 1 OR e.ts >= ?6)
+              AND (?7 IS NULL OR e.ts < ?7))
+          )
         """,
-        [session_key, "session:" <> session_key, first_seq, last_seq]
+        [
+          session_key,
+          "session:" <> session_key,
+          if(first_page, do: 1, else: 0),
+          first_seq,
+          next_seq,
+          earliest_page_time,
+          earliest_later_time
+        ]
       )
 
-    Enum.map(rows, fn [id, ts, verb, origin, principal, payload, rule, anchor_seq] ->
-      %{
-        id: id,
-        ts: ts,
-        verb: verb,
-        origin: origin,
-        principal: principal,
-        rule: rule,
-        payload: denial_payload_for_history(payload, verb),
-        after_message_seq: anchor_seq
-      }
+    rows
+    |> Enum.flat_map(fn [id, ts, verb, origin, principal, payload, rule, stated_seq] ->
+      anchor =
+        Enum.find_value(Enum.reverse(messages), fn message ->
+          if (stated_seq != nil and message.seq <= stated_seq) or
+               (stated_seq == nil and message_time(message) <= ts),
+             do: message.seq
+        end) || if(first_page, do: first_seq)
+
+      if anchor do
+        [
+          %{
+            id: id,
+            ts: ts,
+            verb: verb,
+            origin: origin,
+            principal: principal,
+            rule: rule,
+            payload: denial_payload_for_history(payload, verb),
+            after_message_seq: anchor
+          }
+        ]
+      else
+        []
+      end
     end)
+    |> Enum.sort_by(&{&1.after_message_seq, &1.ts, &1.id})
   end
+
+  defp message_time(message), do: message[:timestamp] || message[:at]
 
   defp denial_payload_for_history(payload, verb) do
     # Event JSON stores atom keys as snake_case strings; live denial notices pass
