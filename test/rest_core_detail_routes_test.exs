@@ -775,7 +775,21 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   end
 
   test "denials belong to one message page and remain reachable by paging back", ctx do
-    session_key = ctx.admin_session.session_key
+    session =
+      Org.create(ctx.db, %{
+        session_key: "denial-pages-#{System.unique_integer([:positive])}",
+        display_name: "Denial pages",
+        kind: "custom",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable"),
+        host: "testhost"
+      })
+
+    session_key = session.session_key
     start_at = System.system_time(:millisecond) - 100_000
 
     messages =
@@ -810,6 +824,14 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           )
         end)
 
+      # The live writer stamps the latest sequence. Recreate historical rows
+      # with their original placement metadata for this paging regression.
+      assert {:ok, _} =
+               DB.query(ctx.db, "UPDATE events SET payload = ?1 WHERE id = ?2", [
+                 JSON.encode!(payload),
+                 id
+               ])
+
       "rail:#{id}"
     end
 
@@ -832,7 +854,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
              Enum.map(Enum.slice(messages, 2, 2), & &1.seq)
     assert Enum.map(earliest["items"], & &1["seq"]) == Enum.map(Enum.take(messages, 2), & &1.seq)
 
-    assert Enum.map(latest["railDenials"], & &1["id"]) == [newest]
+    assert Enum.map(latest["railDenials"], &{&1["id"], &1["afterMessageSeq"]}) ==
+             [{newest, List.last(messages).seq}]
     assert Enum.map(middle_page["railDenials"], & &1["id"]) == [middle, explicit]
     assert Enum.map(earliest["railDenials"], & &1["id"]) == [oldest]
 
