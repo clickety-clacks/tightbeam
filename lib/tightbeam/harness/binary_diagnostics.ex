@@ -378,19 +378,17 @@ defmodule Tightbeam.Harness.BinaryDiagnostics do
 
     command = probe_command(target, args, remote_env_name)
     runner = Keyword.get(opts, :run, target.sh)
+    timeout = Keyword.get(opts, :probe_timeout_ms, @probe_timeout_ms)
+    timeout_reason = "timed out after #{timeout}ms"
 
-    case Support.bounded_run(
-           runner,
-           command,
-           Keyword.get(opts, :probe_timeout_ms, @probe_timeout_ms)
-         ) do
+    case Support.bounded_run(runner, command, timeout) do
       {:ok, {output, 0}} ->
         decode_probe(output)
 
       {:ok, {output, exit}} ->
         {:error, classify_exit(exit, output, target), failure_reason(exit, output)}
 
-      {:error, {:timeout, timeout}} ->
+      {:error, ^timeout_reason} ->
         status = if is_nil(target.host_config.ssh), do: "unprobeable", else: "unknown"
 
         {:error, status,

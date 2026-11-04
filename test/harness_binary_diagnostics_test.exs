@@ -391,6 +391,35 @@ defmodule Tightbeam.Harness.BinaryDiagnosticsTest do
     assert warning =~ "bundled CLI"
   end
 
+  test "a bounded remote probe timeout does not establish host unreachability" do
+    run = fn _command ->
+      receive do
+        :finish -> {"unused", 0}
+      end
+    end
+
+    assert Tightbeam.Harness.Support.bounded_run(run, [], 10) ==
+             {:error, "timed out after 10ms"}
+
+    for {ssh, expected_status} <- [{"worker.example", "unknown"}, {nil, "unprobeable"}] do
+      target =
+        @target
+        |> Map.put(:host_config, %{base_dir: "/srv/tightbeam", ssh: ssh})
+        |> Map.put(:sh, run)
+
+      selection =
+        BinaryDiagnostics.observe(Tightbeam.Harness.Codex, target, {:known, nil},
+          probe_timeout_ms: 10
+        )
+
+      assert selection["status"] == expected_status
+      assert selection["source"] == "bundled_fallback"
+
+      assert selection["reason"] =~
+               "version probe did not finish within 10ms; target reachability is not established"
+    end
+  end
+
   test "missing, unprobeable, unreachable, and unknown remain distinct" do
     for status <- ["missing", "unprobeable", "unreachable", "unknown"] do
       probe = fn _module, _target, _mode, _pin -> {:error, status, "synthetic #{status}"} end
