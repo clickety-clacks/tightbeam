@@ -17,7 +17,7 @@ defmodule GuardAck2Turn do
   alias Tightbeam.GatewayTurnFixture.{AdapterStub, CoordinatorStub}
 
   @handle "7d737f62-bbd7-4c51-978d-f6ff5b4d8146"
-  @session_key "k1"
+  @session_key "agent:main:clawline:fixture-owner:main"
   @event_id "707"
 
   def run do
