@@ -487,11 +487,21 @@ defmodule Tightbeam.ToolCallsTest do
 
     sender_index = Enum.find_index(message_columns, &(&1 == "sender"))
 
+    Tightbeam.IdentityPredecessorFixture.restore!(ctx.db)
+
+    :ok =
+      DB.execute(ctx.db, """
+      UPDATE schema_stamp SET shape='launch-preparation-evidence-v1-0112';
+      CREATE TRIGGER stop_after_tool_call_upgrade BEFORE UPDATE ON schema_stamp
+      WHEN NEW.shape='session-identity-v1-0114'
+      BEGIN SELECT RAISE(ABORT, 'tool-call fixture boundary'); END;
+      """)
+
     {:ok, root_stamp_before} =
       DB.query(ctx.db, "SELECT shape,stampedAt FROM schema_stamp", [])
 
     assert [
-             ["closed-assignment-cannot-proceed-reconciliation-v1-015", _root_stamped_at_before]
+             ["launch-preparation-evidence-v1-0112", _root_stamped_at_before]
            ] = root_stamp_before
 
     {:ok, memento_stamp_before} =
@@ -512,7 +522,11 @@ defmodule Tightbeam.ToolCallsTest do
 
     rewind_messages_to_predecessor(ctx.db)
 
-    :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    # Observe the feature-local migration before the later root-stamp upgrade.
+    assert_raise Tightbeam.Schema.ShapeError, ~r/session identity migration rolled back/, fn ->
+      Tightbeam.Schema.ensure_all(ctx.db)
+    end
+
     assert :ok = ToolCalls.ensure_schema(ctx.db)
 
     {:ok, [[message_high_water_after]]} =
@@ -596,6 +610,12 @@ defmodule Tightbeam.ToolCallsTest do
              "kind"
            ] ==
              "context-compacted"
+
+    :ok = DB.execute(ctx.db, "DROP TRIGGER stop_after_tool_call_upgrade")
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+
+    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
+             DB.query(ctx.db, "SELECT shape FROM schema_stamp")
 
     :ok = DB.execute(ctx.db, "DROP INDEX tool_calls_session_anchor")
 
