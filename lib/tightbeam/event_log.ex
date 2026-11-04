@@ -326,6 +326,55 @@ defmodule Tightbeam.EventLog do
     end)
   end
 
+  @doc "Rail denials anchored to the messages in one transcript page."
+  def rail_denials_for_session_page(db, session_key, first_seq, last_seq) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        WITH session_denials AS (
+          SELECT e.id, e.ts, e.verb, e.origin, e.principal, e.payload,
+            json_extract(e.payload, '$.rule') AS rule,
+            CASE WHEN json_type(e.payload, '$.afterMessageSeq') = 'integer'
+              THEN json_extract(e.payload, '$.afterMessageSeq')
+              ELSE NULL END AS stated_seq
+          FROM events AS e
+          WHERE e.kind = 'denied' AND json_valid(e.payload)
+            AND json_type(e.payload, '$.rule') = 'text'
+            AND (e.sessionKey = ?1 OR e.principal = ?2)
+        ), placed AS (
+          SELECT d.*,
+            COALESCE(
+              (SELECT MAX(m.seq) FROM messages AS m
+                WHERE m.sessionKey = ?1 AND
+                  (CASE WHEN d.stated_seq IS NOT NULL
+                    THEN m.seq <= d.stated_seq ELSE m.timestamp <= d.ts END)),
+              (SELECT MIN(m.seq) FROM messages AS m WHERE m.sessionKey = ?1)
+            ) AS anchor_seq
+          FROM session_denials AS d
+        )
+        SELECT id, ts, verb, origin, principal, payload, rule, anchor_seq
+        FROM placed
+        WHERE anchor_seq BETWEEN ?3 AND ?4
+        ORDER BY anchor_seq, ts, id
+        """,
+        [session_key, "session:" <> session_key, first_seq, last_seq]
+      )
+
+    Enum.map(rows, fn [id, ts, verb, origin, principal, payload, rule, anchor_seq] ->
+      %{
+        id: id,
+        ts: ts,
+        verb: verb,
+        origin: origin,
+        principal: principal,
+        rule: rule,
+        payload: denial_payload_for_history(payload, verb),
+        after_message_seq: anchor_seq
+      }
+    end)
+  end
+
   defp denial_payload_for_history(payload, verb) do
     # Event JSON stores atom keys as snake_case strings; live denial notices pass
     # those atom-keyed errors through the shared public wire projection.
