@@ -1550,6 +1550,9 @@ defmodule Tightbeam.GatewayTest do
       assert Tightbeam.Harness.accepts_inline_images?(harness.id()) == expected
       assert Tightbeam.Harness.accepts_inline_images?(harness.wire_name()) == expected
     end
+
+    refute Tightbeam.Harness.accepts_inline_images?("unregistered-harness")
+    refute Tightbeam.Harness.accepts_inline_images?(:unregistered_harness)
   end
 
   @tag recipient_readiness: true
@@ -1898,6 +1901,18 @@ defmodule Tightbeam.GatewayTest do
 
     assert is_binary(legacy_prompt)
     assert legacy_prompt =~ "diagram.png"
+
+    unknown_harness_prompt =
+      Gateway.turn_prompt_content(
+        ctx.db,
+        %{seq: -1, message_id: attachment_only.id, prompt: ""},
+        session,
+        "unregistered-harness",
+        ctx.catalog_base
+      )
+
+    assert is_binary(unknown_harness_prompt)
+    assert unknown_harness_prompt =~ "diagram.png"
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])

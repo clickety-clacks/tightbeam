@@ -212,20 +212,20 @@ defmodule Tightbeam.Harness do
   end
 
   @doc "Whether this registered harness accepts inline image content blocks."
-  @spec accepts_inline_images?(binary() | atom() | module()) :: boolean()
-  def accepts_inline_images?(harness) when is_binary(harness) do
+  @spec accepts_inline_images?(term()) :: boolean()
+  def accepts_inline_images?(harness) do
     module =
-      Enum.find(known(), &(&1.wire_name() == harness)) ||
-        raise ArgumentError, "unknown harness: #{inspect(harness)}"
+      Enum.find(known(), fn module ->
+        module == harness or module.id() == harness or module.wire_name() == harness
+      end)
 
-    accepts_inline_images?(module)
-  end
+    if module do
+      Code.ensure_loaded!(module)
 
-  def accepts_inline_images?(harness) when is_atom(harness) do
-    module = module!(harness)
-    Code.ensure_loaded!(module)
-
-    function_exported?(module, :accepts_inline_images?, 0) and module.accepts_inline_images?()
+      function_exported?(module, :accepts_inline_images?, 0) and module.accepts_inline_images?()
+    else
+      false
+    end
   end
 
   @callback conformance_vectors() :: %{
