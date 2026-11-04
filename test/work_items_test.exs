@@ -18,7 +18,7 @@ defmodule Tightbeam.WorkItemsTest do
   @sha String.duplicate("a", 64)
   @sha2 String.duplicate("b", 64)
 
-  setup do
+  setup context do
     db = :work_items_db
     start_supervised!({DB, path: ":memory:", name: db})
 
@@ -33,7 +33,24 @@ defmodule Tightbeam.WorkItemsTest do
     holder = session(db, "holder", "flynn")
     other = session(db, "other-holder", "other")
     handlers = Gateway.handlers(%{db: db})
-    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
+    law_base =
+      if context[:terminal_handoff] do
+        base = Path.join(System.tmp_dir!(), "work-item-law-#{System.unique_integer([:positive])}")
+        rules = Path.join(base, "identity/rules")
+        File.mkdir_p!(rules)
+        on_exit(fn -> File.rm_rf!(base) end)
+
+        File.cp!(
+          "priv/kungfu/agentic-engineering/rules/row-reaction-handoff.toml",
+          Path.join(rules, "row-reaction-handoff.toml")
+        )
+
+        base
+      else
+        System.tmp_dir!()
+      end
+
+    Rules.load!(law_base, Map.keys(handlers))
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
@@ -1292,6 +1309,7 @@ defmodule Tightbeam.WorkItemsTest do
     assert get(ctx, {:user, "flynn"}, item.id).workItem.specRefSha256 == @sha
   end
 
+  @tag :terminal_handoff
   test "get and list return deterministic eras, aspects, and ordering", ctx do
     assert %{workItems: []} = list(ctx, {:user, "flynn"})
     assert %{code: "unknown_work_item"} = get(ctx, {:user, "flynn"}, "missing")
@@ -1330,9 +1348,104 @@ defmodule Tightbeam.WorkItemsTest do
     era = assign(ctx, "holder", "era", first.id)
     revoked = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call(era.id))
     assert revoked.state == "closed"
-    # Closure stores the terminal report and independently schedules the slate.
-    # Recipient availability is decided when delivery is attempted, not here.
-    assert {:ok, [["pending", nil, nil, item_id, "pending"]]} =
+
+    admission_evidence =
+      DB.query(
+        ctx.db,
+        """
+        SELECT e.eventId,e.event,e.facts,a.id,a.plan,a.status,a.result,
+               w.wakeId,c.reasonKind,c.causalSourceKind,c.causalSourceId,
+               l.id,l.detail
+        FROM row_reaction_events e
+        LEFT JOIN row_reaction_actions a ON a.org=e.org AND a.eventId=e.eventId
+          AND a.family='terminal-handoff' AND a.slot='handoff'
+        LEFT JOIN wakes w ON w.wakeId=json_extract(a.result,'$.wake_id')
+        LEFT JOIN wake_cancellations c ON c.wakeId=w.wakeId
+        LEFT JOIN lifecycle_events l ON l.kind='wake_undeliverable' AND l.subject=w.wakeId
+        WHERE json_extract(e.event,'$.terminal.assignment_id')=?1
+          AND json_extract(e.event,'$.source.kind')='assignment_revocation'
+        ORDER BY e.eventId,a.id,l.id
+        """,
+        [era.id]
+      )
+
+    # Separate election, notice, linkage and slate evidence before the joined check.
+    terminal_evidence = %{
+      admission: admission_evidence,
+      rules: Rules.effective_snapshot(),
+      events: DB.query(ctx.db, "SELECT eventId,event,facts FROM row_reaction_events ORDER BY eventId"),
+      actions:
+        DB.query(
+          ctx.db,
+          "SELECT eventId,family,slot,status,result,lastError FROM row_reaction_actions ORDER BY id"
+        ),
+      notices:
+        DB.query(
+          ctx.db,
+          "SELECT wakeId,state,work_item_id,sessionKey FROM wakes WHERE assignmentId=?1 AND obligationRef=?2",
+          [era.id, "terminal-child-owner-notification:" <> era.id]
+        ),
+      item: DB.query(ctx.db, "SELECT id,slateWakeId FROM work_items WHERE id=?1", [first.id]),
+      slate:
+        DB.query(
+          ctx.db,
+          "SELECT wakeId,state FROM wakes WHERE wakeId=(SELECT slateWakeId FROM work_items WHERE id=?1)",
+          [first.id]
+        )
+    }
+
+    IO.inspect(terminal_evidence,
+      label: "terminal evidence",
+      limit: :infinity,
+      printable_limit: :infinity
+    )
+
+    assert {:ok, [admission_row]} = admission_evidence
+
+    assert [
+             event_id,
+             event_json,
+             facts_json,
+             action_id,
+             plan_json,
+             "pending",
+             result_json,
+             notice_id,
+             "target_unresolvable",
+             "scheduler_delivery",
+             cancellation_wake_id,
+             lifecycle_id,
+             "terminal_notification_recipient_unavailable"
+           ] = admission_row
+
+    event = JSON.decode!(event_json)
+    facts = JSON.decode!(facts_json)
+    plan = JSON.decode!(plan_json)
+    result = JSON.decode!(result_json)
+    assert event["id"] == event_id
+    assert event["terminal"]["assignment_id"] == era.id
+    assert event["source"]["kind"] == "assignment_revocation"
+    assert plan["source_event_id"] == event_id
+    assert plan["identity"] == [event["org"], "terminal-handoff", event_id, "handoff"]
+    assert action_id == Tightbeam.RowReactions.Store.id(plan["identity"])
+    assert plan["rule"] == "assignment-terminal-handoff"
+    assert plan["selected"] == true
+    assert plan["provenance"]["content_sha256"] =~ ~r/\A[0-9a-f]{64}\z/
+    assert plan["value"]["assignment_id"] == era.id
+    assert plan["value"]["on_unavailable"] == "undelivered"
+    assert facts["personal_session_key"] == Org.personal_session_key("flynn")
+    refute Enum.any?(facts["sessions"], &(&1["sessionKey"] == Org.personal_session_key("flynn")))
+    assert result["delivery"] == "undelivered"
+    assert result["wake_id"] == notice_id
+    assert result["intent_wake_id"] == notice_id
+    assert result["emitted"]["session_key"] == Org.personal_session_key("flynn")
+    assert result["emitted"]["assignment_id"] == era.id
+    assert cancellation_wake_id == notice_id
+    assert is_integer(lifecycle_id)
+
+    # The handoff action remains pending after its unavailable attempt is recorded.
+    # The independent last-close slate remains pending as well.
+    assert {:ok, [["canceled", nil, ^notice_id, item_id, "pending"]]} =
              DB.query(
                ctx.db,
                """
