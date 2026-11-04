@@ -2756,6 +2756,50 @@ defmodule Tightbeam.Wakes do
 
   def preserve_failed_intent_for_terminal_in_txn(%Txn{}, _turn_seq), do: :not_retryable
 
+  # A captured discussion remains in custody until its carrying turn finishes
+  # normally. Restore each original source, including sources inside a batch;
+  # never replay the other notices in that batch on the discussion's authority.
+  # The existing wake retry lineage supplies persistence and exponential backoff.
+  @doc false
+  def preserve_harklight_discussions_in_txn(%Txn{} = txn, turn_seq, terminal) do
+    sources =
+      Txn.q(
+        txn,
+        """
+        SELECT w.wakeId,t.endedAt
+        FROM turns t JOIN wakes w ON w.deliveredTurnSeq=t.seq
+        LEFT JOIN wake_retry_attempts retry ON retry.wakeId=w.wakeId
+        JOIN harklight_wake_deliveries delivery
+          ON delivery.wakeId=COALESCE(retry.rootWakeId,w.wakeId)
+        JOIN harklight_wake_entries entry
+          ON entry.handle=delivery.handle AND entry.eventId=delivery.eventId
+        JOIN sessions session ON session.sessionKey=delivery.sessionKey
+        WHERE t.seq=?1 AND t.status=?2 AND entry.entryKind='discussion'
+          AND delivery.sessionKey=t.sessionKey AND w.sessionKey=t.sessionKey
+          AND session.state='active' AND w.consumer='prompt' AND w.digest=0
+        ORDER BY w.wakeId
+        """,
+        [turn_seq, terminal]
+      )
+
+    Enum.each(sources, fn [wake_id, ended_at] ->
+      if terminal == "delivered" do
+        settle_retry_attempt_in_txn(txn, wake_id, turn_seq, "acted", ended_at)
+      else
+        wake = get_in_txn(txn, wake_id)
+
+        schedule_retry_in_txn(
+          txn,
+          wake,
+          %{seq: turn_seq, prompt: wake.prompt, ended_at: ended_at},
+          "harklight-discussion-unreceived"
+        )
+      end
+    end)
+
+    :ok
+  end
+
   @doc false
   @spec record_health_redelivery_source_in_txn(Txn.t(), integer(), String.t()) :: :ok
   def record_health_redelivery_source_in_txn(%Txn{} = txn, source_turn_seq, failure_class)
@@ -2981,6 +3025,11 @@ defmodule Tightbeam.Wakes do
           AND NOT EXISTS (
             SELECT 1 FROM wake_retry_attempts retry
             WHERE retry.sourceTurnSeq=a.sourceTurnSeq AND retry.retryWakeId IS NOT NULL
+              AND (retry.wakeId=a.sourceWakeId OR NOT EXISTS (
+                SELECT 1 FROM harklight_wake_deliveries d
+                JOIN harklight_wake_entries e ON e.handle=d.handle AND e.eventId=d.eventId
+                WHERE d.wakeId=retry.rootWakeId AND e.entryKind='discussion'
+              ))
           )
         ORDER BY a.sourceTurnSeq
         """,
@@ -3062,6 +3111,11 @@ defmodule Tightbeam.Wakes do
         AND NOT EXISTS (
           SELECT 1 FROM wake_retry_attempts retry
           WHERE retry.sourceTurnSeq=observed.seq AND retry.retryWakeId IS NOT NULL
+            AND (retry.wakeId=a.sourceWakeId OR NOT EXISTS (
+              SELECT 1 FROM harklight_wake_deliveries d
+              JOIN harklight_wake_entries e ON e.handle=d.handle AND e.eventId=d.eventId
+              WHERE d.wakeId=retry.rootWakeId AND e.entryKind='discussion'
+            ))
         )
       ORDER BY a.sourceTurnSeq
       """,
@@ -3164,7 +3218,7 @@ defmodule Tightbeam.Wakes do
       not String.starts_with?(turn.request_ref || "", "bubble:")
   end
 
-  defp schedule_retry_in_txn(txn, wake, turn) do
+  defp schedule_retry_in_txn(txn, wake, turn, cause \\ "rate-limit-dead") do
     {root_wake_id, attempt} = retry_identity_in_txn(txn, wake.wake_id)
     next_attempt = attempt + 1
     retry_wake_id = retry_wake_id(root_wake_id, next_attempt)
@@ -3195,7 +3249,24 @@ defmodule Tightbeam.Wakes do
     case Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [retry_wake_id]) do
       [] ->
         due_at = observed_at + retry_delay_ms(next_attempt)
-        insert_retry_wake_in_txn(txn, wake, turn.prompt, retry_wake_id, due_at, observed_at)
+
+        if cause == "harklight-discussion-unreceived" do
+          # Retain source ownership/visibility and prewrite authority when a
+          # discussion was carried with other notices. The existing source
+          # copier preserves those facts as well as the unchanged raw prompt.
+          Tightbeam.NoticeSubmission.copy_source_in_txn(txn, wake.wake_id, retry_wake_id, due_at)
+
+          Tightbeam.QueuedMessageSuppression.copy_replacement_request_in_txn(
+            txn,
+            wake.wake_id,
+            retry_wake_id
+          )
+
+          publish_change_in_txn(txn, "wake.scheduled", retry_wake_id)
+          schedule_changed_in_txn(txn, {:schedule_changed, due_at})
+        else
+          insert_retry_wake_in_txn(txn, wake, turn.prompt, retry_wake_id, due_at, observed_at)
+        end
 
         Tightbeam.ReminderDelivery.rebind_wake_in_txn(
           txn,
@@ -3226,7 +3297,7 @@ defmodule Tightbeam.Wakes do
           txn,
           "wake_retry_scheduled",
           root_wake_id,
-          "sourceTurnSeq=#{turn.seq} failedWakeId=#{wake.wake_id} retryWakeId=#{retry_wake_id} attempt=#{next_attempt} dueAt=#{due_at} cause=rate-limit-dead principal=process:tightbeam"
+          "sourceTurnSeq=#{turn.seq} failedWakeId=#{wake.wake_id} retryWakeId=#{retry_wake_id} attempt=#{next_attempt} dueAt=#{due_at} cause=#{cause} principal=process:tightbeam"
         )
 
         {:retry, retry_wake_id}
