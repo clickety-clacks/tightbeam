@@ -119,7 +119,7 @@ defmodule Tightbeam.RequestObservationTest do
     end
   end
 
-  test "real core and d1 state reads carry resolved session then authorized user", %{
+  test "real core and d1 state reads retain session actor with an asUser view", %{
     opts: opts,
     db: db
   } do
@@ -142,13 +142,10 @@ defmodule Tightbeam.RequestObservationTest do
           {"/api/work-items", 200},
           {"/api/sessions/diagnostic_session/messages", 200}
         ],
-        {query, principal} <-
+        query <-
           if(path == "/api/sessions/diagnostic_session/messages",
-            do: [{"", "session:diagnostic_session"}],
-            else: [
-              {"", "session:diagnostic_session"},
-              {"?asUser=diagnostic_owner", "user:diagnostic_owner"}
-            ]
+            do: [""],
+            else: ["", "?asUser=diagnostic_owner"]
           ) do
       id = RequestContext.id("req_")
 
@@ -160,7 +157,7 @@ defmodule Tightbeam.RequestObservationTest do
 
       assert response.status == status, "#{path}#{query}: #{response.resp_body}"
       assert_receive {:diagnostic, %{event: "http_response_terminal", request_id: ^id} = terminal}
-      assert terminal.principal_ref == principal
+      assert terminal.principal_ref == "session:diagnostic_session"
 
       records =
         Diagnostics.records()
@@ -169,7 +166,7 @@ defmodule Tightbeam.RequestObservationTest do
       assert [%{principal_kind: "unknown", operation: "auth.session_by_cli_token"} | later] =
                records
 
-      assert Enum.any?(later, &(&1.principal_ref == principal))
+      assert Enum.any?(later, &(&1.principal_ref == "session:diagnostic_session"))
     end
 
     refute inspect(Diagnostics.records()) =~ session.cli_token
