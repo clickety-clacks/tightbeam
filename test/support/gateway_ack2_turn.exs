@@ -19,6 +19,9 @@ defmodule GuardAck2Turn do
   @handle "7d737f62-bbd7-4c51-978d-f6ff5b4d8146"
   @session_key "agent:main:clawline:fixture-owner:main"
   @event_id "707"
+  @send_op "0bdb87a0-3a09-4f61-bff4-9a4a704324c8"
+  @send_payload ~s({"type":"send","message":{"sender_id":"sender","message_id":"request"}})
+  @send_result ~s({"kind":"sent","session":"7d737f62-bbd7-4c51-978d-f6ff5b4d8146","sender_id":"sender","request":"request"})
 
   def run do
     Tightbeam.GuardGatewayFixture.run!(fn %{base: base, db: db, config: config} ->
@@ -45,11 +48,30 @@ defmodule GuardAck2Turn do
           model: Model.new("fable")
         })
 
-      assert {:ok, _} =
-               DB.query(
+      call = %{
+        session_key: session.session_key,
+        principal: {:session, session.session_key},
+        transport_session_key: session.session_key,
+        params: %{
+          harklight_handle: @handle,
+          harklight_sender_id: "sender",
+          harklight_message_id: "request"
+        }
+      }
+
+      assert %{code: "harklight_send_pending"} = HarklightWakes.register(db, call)
+      assert %{state: "pending"} = HarklightWakes.prepare_send(db, call, @send_op, @send_payload)
+
+      assert %{state: "registered"} =
+               HarklightWakes.bind_send(
                  db,
-                 "INSERT INTO harklight_wake_handles(handle,sessionKey,host,vendorSessionId,state,createdAt,updatedAt) VALUES(?1,?2,?3,'vendor-session','active',?4,?4)",
-                 [@handle, session.session_key, session.host, now]
+                 call,
+                 @send_op,
+                 @send_payload,
+                 @send_result,
+                 @handle,
+                 "sender",
+                 "request"
                )
 
       assert :ok =
