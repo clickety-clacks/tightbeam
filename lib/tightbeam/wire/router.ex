@@ -247,7 +247,7 @@ defmodule Tightbeam.Wire.Router do
 
       WebSockAdapter.upgrade(conn, ChangeSocket, deps(conn),
         max_frame_size: 2 * 1024 * 1024,
-        timeout: @websocket_read_timeout
+        timeout: 60_000
       )
     else
       Plug.Conn.send_resp(conn, 426, "")

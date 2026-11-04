@@ -168,6 +168,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
     {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
     register_testhost(db)
+    assert observed_state_classes() == ["session.spawned"]
 
     handlers = Gateway.handlers(%{db: db})
 
@@ -215,6 +216,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
     {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
     register_testhost(db)
+    assert observed_state_classes() == ["session.spawned"]
     start_supervised!({ConnRegistry, name: registry})
     start_supervised!({LaneStub, name: lane})
 
@@ -229,6 +231,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
       provider: "anthropic",
       model: Tightbeam.Model.new("fable")
     })
+
+    assert observed_state_classes() == ["session.spawned"]
 
     assert :appended =
              Gateway.deliver_prompt(
@@ -273,6 +277,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
     {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
     register_testhost(db)
+    assert observed_state_classes() == ["session.spawned"]
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneStub, name: Tightbeam.LaneManager})
 
@@ -299,6 +304,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
       provider: "anthropic",
       model: Tightbeam.Model.new("fable")
     })
+
+    assert observed_state_classes() == ["session.spawned", "session.spawned"]
 
     start_supervised!(
       {Wakes,
@@ -1057,6 +1064,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
     {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
     register_testhost(db)
+    assert observed_state_classes() == ["session.spawned"]
 
     Org.create(db, %{
       session_key: "operator-raiser",
@@ -1069,6 +1077,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
       provider: "anthropic",
       model: Tightbeam.Model.new("fable")
     })
+
+    assert observed_state_classes() == ["session.spawned"]
 
     handlers = Gateway.handlers(%{db: db, wake_scheduler: scheduler})
 
@@ -1203,6 +1213,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
     {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
     register_testhost(db)
+    assert observed_state_classes() == ["session.spawned"]
 
     for key <- ["agent-asker", "agent-reader"] do
       Org.create(db, %{
@@ -1217,6 +1228,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
         model: Tightbeam.Model.new("fable")
       })
     end
+
+    assert observed_state_classes() == ["session.spawned", "session.spawned"]
 
     handlers = Gateway.handlers(%{db: db})
 
@@ -1312,6 +1325,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
     {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
     register_testhost(db)
+    assert observed_state_classes() == ["session.spawned"]
 
     Org.create(db, %{
       session_key: "turn-target",
@@ -1324,6 +1338,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
       provider: "anthropic",
       model: Tightbeam.Model.new("fable")
     })
+
+    assert observed_state_classes() == ["session.spawned"]
 
     assert {:ok, seq} =
              Ledger.enqueue(db, %{
@@ -1575,6 +1591,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
     {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn',1,1)")
     register_testhost(db)
+    assert observed_state_classes() == ["session.spawned"]
     handlers = Gateway.handlers(%{db: db})
 
     call = %{

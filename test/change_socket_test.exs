@@ -189,7 +189,9 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
              "subscriptionId" => "one-session"
            }
 
-    {:push, {:text, heartbeat}, state} = ChangeSocket.handle_info(:firehose_heartbeat, state)
+    {:push, [{:text, heartbeat}, {:ping, <<>>}], state} =
+      ChangeSocket.handle_info(:firehose_heartbeat, state)
+
     assert JSON.decode!(heartbeat)["type"] == "heartbeat"
     ChangeSocket.terminate(:normal, state)
   end
@@ -255,10 +257,11 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     assert JSON.decode!(queued_event)["class"] == "turn.queued"
 
-    assert {:push, {:text, heartbeat}, state} =
+    assert {:push, [{:text, heartbeat}, {:ping, <<>>}], state} =
              ChangeSocket.handle_info(:firehose_heartbeat, state)
 
     assert JSON.decode!(heartbeat)["type"] == "heartbeat"
+
     ChangeSocket.terminate(:normal, state)
   end
 
@@ -297,7 +300,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert {:ok, ^observer_state} =
              inbound(%{"type" => "auth", "token" => "ignored-after-observer"}, observer_state)
 
-    assert {:push, {:text, heartbeat}, heartbeat_state} =
+    assert {:push, [{:text, heartbeat}, {:ping, <<>>}], heartbeat_state} =
              ChangeSocket.handle_info(:firehose_heartbeat, observer_state)
 
     assert JSON.decode!(heartbeat)["type"] == "heartbeat"
@@ -426,7 +429,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     assert JSON.decode!(turn_event)["class"] == "turn.started"
 
-    assert {:push, {:text, heartbeat}, state} =
+    assert {:push, [{:text, heartbeat}, {:ping, <<>>}], state} =
              ChangeSocket.handle_info(:firehose_heartbeat, state)
 
     assert JSON.decode!(heartbeat)["type"] == "heartbeat"
@@ -556,7 +559,9 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     Hub.publish(ctx.hub, notice(ctx, "wi_trailing"))
     assert_receive {:firehose_notice, _suppressed_delivery}
 
-    assert {:push, {:text, bytes}, _state} = ChangeSocket.handle_info(:firehose_heartbeat, state)
+    assert {:push, [{:text, bytes}, {:ping, <<>>}], _state} =
+             ChangeSocket.handle_info(:firehose_heartbeat, state)
+
     assert JSON.decode!(bytes) == %{"type" => "heartbeat", "seq" => 1}
     assert bytes == JSON.encode!(%{"type" => "heartbeat", "seq" => 1})
     assert state.credential_digest == :crypto.hash(:sha256, ctx.device.token)
