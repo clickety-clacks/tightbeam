@@ -100,6 +100,13 @@ defmodule Tightbeam.IdentityTest do
                  "I want to know a change was actually tested, not just claimed."
                ],
                root_archetype: "orchestrator"
+             },
+             %{
+               name: "sentinels",
+               purpose:
+                 "Share generic event subscription tools and a read-only Matrix event watcher.",
+               phrases: [],
+               root_archetype: "default"
              }
            ]
   end
@@ -183,7 +190,10 @@ defmodule Tightbeam.IdentityTest do
     purpose = "Help a team ship dependable work."
     """)
 
-    assert [%{phrases: []}] = Identity.available_bundles()
+    assert [
+             %{name: "agentic-engineering", phrases: []},
+             %{name: "sentinels", phrases: []}
+           ] = Identity.available_bundles()
   end
 
   test "a manifest with invalid phrases is refused before identity mutation", ctx do

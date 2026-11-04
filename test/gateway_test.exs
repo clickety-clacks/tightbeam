@@ -11128,6 +11128,13 @@ defmodule Tightbeam.GatewayTest do
                  purpose: purpose,
                  phrases: phrases,
                  root_archetype: "orchestrator"
+               },
+               %{
+                 name: "sentinels",
+                 purpose:
+                   "Share generic event subscription tools and a read-only Matrix event watcher.",
+                 phrases: [],
+                 root_archetype: "default"
                }
              ]
            } = list.(%{origin: "agent:k1", params: %{}})
