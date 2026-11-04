@@ -140,7 +140,11 @@ defmodule Tightbeam.GatewayTurnFixture do
     def handle_call({:prompt, _sid, "fail with " <> json, _opts}, _from, parent),
       do: {:reply, {:error, JSON.decode!(json)}, parent}
 
-    def handle_call({:prompt, _sid, prompt, _opts}, from, parent) do
+    def handle_call({:prompt, _sid, prompt, opts}, from, parent) do
+      if is_binary(prompt) and String.contains?(prompt, "HARKLIGHT_ACK2_GATEWAY_FIXTURE") do
+        :ok = Keyword.fetch!(opts, :trace_dispatch).(4242)
+      end
+
       send(parent, {:prompt_started, self()})
 
       messages =

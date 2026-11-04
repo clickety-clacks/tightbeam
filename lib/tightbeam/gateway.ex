@@ -3707,12 +3707,22 @@ defmodule Tightbeam.Gateway do
                             detail: %{v: 1}
                           }) do
                        result when result in [:ok, :duplicate] ->
-                         Tightbeam.HarklightWakes.ack2_for_dispatched_turn(
-                           db,
-                           turn.seq,
-                           turn.session_key,
-                           active_session.session.display_name
-                         )
+                         case Task.start(fn ->
+                                Tightbeam.HarklightWakes.ack2_for_dispatched_turn(
+                                  db,
+                                  turn.seq,
+                                  turn.session_key,
+                                  active_session.display_name
+                                )
+                              end) do
+                           {:ok, _pid} ->
+                             :ok
+
+                           {:error, reason} ->
+                             Logger.error(
+                               "Harklight ACK2 task could not start for dispatched turn #{turn.seq}: #{inspect(reason)}"
+                             )
+                         end
 
                          result
 

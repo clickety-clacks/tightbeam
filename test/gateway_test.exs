@@ -10265,6 +10265,17 @@ defmodule Tightbeam.GatewayTest do
     )
   end
 
+  @tag timeout: 180_000, cold_gateway: true, tmp_dir: true
+  test "a dispatched Harklight wake records ACK2 without blocking the adapter turn", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "gateway_ack2_turn.exs",
+      "guarded-gateway-ack2-turn: ok"
+    )
+  end
+
   @tag cold_gateway: true, gateway_missing_host: true, tmp_dir: true
   test "a disappeared turn host reaches the socket turn-state payload by name", %{tmp_dir: tmp} do
     Tightbeam.GuardRuntimeFixture.run!(
