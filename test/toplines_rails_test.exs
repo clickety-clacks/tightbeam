@@ -148,15 +148,6 @@ defmodule Tightbeam.ToplinesRailsTest do
       %{promptWakeId: " "},
       %{resolutionReason: "done"},
       resolved_placement("left_unlinked", %{resolutionReason: nil}),
-      resolved_placement("linked", %{
-        resolutionActorKind: "process",
-        resolutionActorRef: "tightbeam"
-      }),
-      resolved_placement("work_terminal", %{
-        resolutionActorKind: "process",
-        resolutionActorRef: "tightbeam",
-        resolutionReason: "work_item_closed"
-      }),
       resolved_placement("work_terminal", %{
         resolutionReason: "reupgrade_terminal_reconciliation_closed"
       }),
@@ -211,7 +202,16 @@ defmodule Tightbeam.ToplinesRailsTest do
             sourceCausalEventSeq: 100,
             openedActorKind: "process",
             openedActorRef: "other"
-          }
+          },
+          resolved_placement("linked", %{
+            resolutionActorKind: "process",
+            resolutionActorRef: "tightbeam"
+          }),
+          resolved_placement("work_terminal", %{
+            resolutionActorKind: "process",
+            resolutionActorRef: "tightbeam",
+            resolutionReason: "work_item_closed"
+          })
         ] do
       insert!(
         db,
