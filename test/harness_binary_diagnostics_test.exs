@@ -206,8 +206,9 @@ defmodule Tightbeam.Harness.BinaryDiagnosticsTest do
     remote_target =
       Map.merge(@target, %{
         host_config: %{base_dir: root, ssh: "worker@example-host"},
+        adapter_path: path_with_system_copy,
         sh: fn command ->
-          System.cmd("sh", ["-c", List.last(command)],
+          System.cmd("sh", ["-c", command |> Enum.take(-3) |> Enum.join(" ")],
             env: [{"CODEX_PATH", inherited_pin}],
             stderr_to_stdout: true
           )
@@ -221,7 +222,8 @@ defmodule Tightbeam.Harness.BinaryDiagnosticsTest do
         "CODEX_PATH"
       )
 
-    remote_script = List.last(command)
+    # SSH joins these arguments for the remote shell, which removes the outer quoting.
+    remote_script = command |> Enum.take(-3) |> Enum.join(" ")
     assert remote_script =~ "TIGHTBEAM_DIAGNOSTIC_PIN=\"${CODEX_PATH-}\""
     assert remote_script =~ "TIGHTBEAM_DIAGNOSTIC_PIN=\"$TIGHTBEAM_DIAGNOSTIC_PIN\""
 
@@ -247,7 +249,7 @@ defmodule Tightbeam.Harness.BinaryDiagnosticsTest do
     assert %{
              "status" => "observed",
              "source" => "bundled_fallback",
-             "path" => ^bundled,
+             "path" => ^canonical_bundled,
              "version" => "bundled-version"
            } = JSON.decode!(remote_bundled_output)
 

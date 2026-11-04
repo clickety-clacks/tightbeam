@@ -554,13 +554,13 @@ defmodule Tightbeam.Harness.BinaryDiagnostics do
 
   defp adapter_identity(module) do
     %{
-      "package" => optional_module_value(module, :install_package),
-      "version" => optional_module_value(module, :adapter_version)
+      "package" => module.install_package(),
+      "version" =>
+        if(function_exported?(module, :adapter_version, 0),
+          do: module.adapter_version(),
+          else: "unknown"
+        )
     }
-  end
-
-  defp optional_module_value(module, function) do
-    if function_exported?(module, function, 0), do: apply(module, function, []), else: "unknown"
   end
 
   defp selection_warnings(%{"source" => "bundled_fallback", "status" => "observed"}, label) do
