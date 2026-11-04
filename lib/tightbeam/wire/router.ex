@@ -285,15 +285,48 @@ defmodule Tightbeam.Wire.Router do
   end
 
   get "/harnesses" do
-    with {:ok, _auth} <- cli_auth(conn) do
-      bytes =
-        "[" <>
-          Enum.map_join(Tightbeam.Harness.all(), ",", & &1.wire_projection()) <>
-          "]"
+    conn = Plug.Conn.fetch_query_params(conn)
 
-      conn
-      |> Plug.Conn.put_resp_content_type("application/json")
-      |> Plug.Conn.send_resp(200, bytes)
+    with {:ok, _auth} <- cli_auth(conn) do
+      if conn.query_params["doctor"] == "1" do
+        coordinator = deps(conn)[:adapter_coordinator] || Tightbeam.AdapterCoordinator
+        report_fun = deps(conn)[:harness_binary_report]
+
+        report =
+          case if(is_function(report_fun, 0),
+                 do: report_fun.(),
+                 else:
+                   Tightbeam.Harness.BinaryDiagnostics.report(
+                     deps(conn).base_dir,
+                     db(conn),
+                     coordinator
+                   )
+               ) do
+            {:ok, report} ->
+              report
+
+            report when is_map(report) ->
+              report
+
+            {:error, reason} ->
+              Tightbeam.Harness.BinaryDiagnostics.unavailable(reason)
+
+            _ ->
+              Tightbeam.Harness.BinaryDiagnostics.unavailable("diagnostic report was unavailable")
+          end
+
+        harnesses = Enum.map(Tightbeam.Harness.all(), &JSON.decode!(&1.wire_projection()))
+        json(conn, 200, %{"harnesses" => harnesses, "binary_diagnostics" => report})
+      else
+        bytes =
+          "[" <>
+            Enum.map_join(Tightbeam.Harness.all(), ",", & &1.wire_projection()) <>
+            "]"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, bytes)
+      end
     else
       {:error, status, code, message} -> error(conn, status, code, message)
     end

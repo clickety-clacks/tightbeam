@@ -115,6 +115,9 @@ defmodule Tightbeam.AdapterCoordinator do
   @spec harness_processes(GenServer.server()) :: [Tightbeam.HarnessProcess.row()]
   def harness_processes(server \\ __MODULE__), do: GenServer.call(server, :harness_processes)
 
+  @doc "Ready adapter generations with optional non-blocking vendor CLI selection evidence."
+  def binary_launches(server \\ __MODULE__), do: GenServer.call(server, :binary_launches)
+
   @doc """
   The reason the adapter for `key` most recently DIED, or nil once it is ready
   again. Boot is lazy and fast-failing, so a turn's first call can arrive after
@@ -263,6 +266,30 @@ defmodule Tightbeam.AdapterCoordinator do
 
   def handle_call(:harness_processes, _from, state) do
     {:reply, Tightbeam.HarnessProcess.list(state.db), state}
+  end
+
+  def handle_call(:binary_launches, _from, state) do
+    launches =
+      state.adapters
+      |> Enum.flat_map(fn
+        {{harness, _identity, host}, %{ready: true} = entry} ->
+          [
+            %{
+              "host" => host,
+              "harness" => Atom.to_string(harness),
+              "generation" => entry.generation,
+              "adapter_generation_started_at_ms" => entry.generation_started_at_ms,
+              "ready" => true,
+              "capture" => entry.binary_capture,
+              "capture_pending" => entry.binary_capture_pending
+            }
+          ]
+
+        _ ->
+          []
+      end)
+
+    {:reply, launches, state}
   end
 
   def handle_call(
@@ -654,6 +681,33 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
+  def handle_info({:binary_capture_start, key, pid, fun}, state) do
+    case state.adapters[key] do
+      %{pid: ^pid} = entry ->
+        {:noreply, start_binary_capture(key, Map.put(entry, :binary_capture_fun, fun), state)}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:binary_capture_result, key, generation, token, capture}, state) do
+    case state.adapters[key] do
+      %{generation: ^generation, binary_capture_token: ^token} = entry ->
+        entry = %{
+          entry
+          | binary_capture: capture,
+            binary_capture_pending: false,
+            binary_capture_token: nil
+        }
+
+        {:noreply, put_in(state.adapters[key], entry)}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   defp start_adapter(key, entry, state, context) do
     if Tightbeam.HarnessProcess.fenced?(state.db, key) do
       {{:error, {:park_fenced, key_name(key)}}, state}
@@ -673,6 +727,7 @@ defmodule Tightbeam.AdapterCoordinator do
     # dead host. Boot failures arrive as :DOWN — the uniform recovery path.
     adapter_opts = state.adapter_opts
     coordinator = self()
+    generation_started_at_ms = System.system_time(:millisecond)
 
     boot = fn ->
       opts = adapter_opts.(key, adapter_context) |> Keyword.put(:db, state.db)
@@ -683,6 +738,11 @@ defmodule Tightbeam.AdapterCoordinator do
         else
           opts
         end
+
+      {capture, opts} = Keyword.pop(opts, :harness_binary_capture)
+
+      if is_function(capture, 0),
+        do: send(coordinator, {:binary_capture_start, key, self(), capture})
 
       # The message NAMES THE INSTANCE that booted. `on_ready` runs in the
       # adapter's own process, so self here is that adapter. Without it the
@@ -712,6 +772,11 @@ defmodule Tightbeam.AdapterCoordinator do
           | pid: pid,
             monitor: ref,
             generation: generation,
+            generation_started_at_ms: generation_started_at_ms,
+            binary_capture_fun: nil,
+            binary_capture: nil,
+            binary_capture_pending: false,
+            binary_capture_token: nil,
             timer: nil,
             ready: false,
             context: normalize_context(adapter_context)
@@ -751,6 +816,11 @@ defmodule Tightbeam.AdapterCoordinator do
       pid: nil,
       monitor: nil,
       generation: 0,
+      generation_started_at_ms: nil,
+      binary_capture_fun: nil,
+      binary_capture: nil,
+      binary_capture_pending: false,
+      binary_capture_token: nil,
       failures: 0,
       circuit: :closed,
       timer: nil,
@@ -759,6 +829,59 @@ defmodule Tightbeam.AdapterCoordinator do
       context: nil
     }
   end
+
+  defp start_binary_capture(key, %{binary_capture_fun: fun} = entry, state)
+       when is_function(fun, 0) do
+    coordinator = self()
+    generation = entry.generation
+    # Each launch has its own token so a late probe cannot overwrite its successor.
+    token = make_ref()
+
+    spawn(fn ->
+      capture =
+        try do
+          fun.()
+        rescue
+          error ->
+            %{
+              "selection" => %{
+                "status" => "unknown",
+                "source" => "unknown",
+                "reason" => Exception.message(error)
+              },
+              "observation_started_at_ms" => System.system_time(:millisecond),
+              "observation_completed_at_ms" => System.system_time(:millisecond),
+              "evidence_boundary" =>
+                "selection capture failed before vendor child identity could be established"
+            }
+        catch
+          kind, reason ->
+            %{
+              "selection" => %{
+                "status" => "unknown",
+                "source" => "unknown",
+                "reason" => inspect({kind, reason})
+              },
+              "observation_started_at_ms" => System.system_time(:millisecond),
+              "observation_completed_at_ms" => System.system_time(:millisecond),
+              "evidence_boundary" =>
+                "selection capture failed before vendor child identity could be established"
+            }
+        end
+
+      send(coordinator, {:binary_capture_result, key, generation, token, capture})
+    end)
+
+    put_in(state.adapters[key], %{
+      entry
+      | binary_capture_fun: nil,
+        binary_capture: nil,
+        binary_capture_pending: true,
+        binary_capture_token: token
+    })
+  end
+
+  defp start_binary_capture(_key, _entry, state), do: state
 
   defp capture_adapter_context(key, purpose, state) do
     owner = self()

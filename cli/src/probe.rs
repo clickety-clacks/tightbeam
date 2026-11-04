@@ -1503,6 +1503,16 @@ fn report_json(report: &Report) -> String {
     pretty_json(&report_value(report))
 }
 
+fn report_json_with_diagnostics(report: &Report, binary_diagnostics: Value) -> String {
+    let mut value = report_value(report);
+    if !binary_diagnostics.is_null() {
+        if let Some(fields) = value.as_object_mut() {
+            fields.insert("harness_binary_diagnostics".to_owned(), binary_diagnostics);
+        }
+    }
+    pretty_json(&value)
+}
+
 pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
     let wall = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1511,7 +1521,8 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
     let monotonic = Instant::now();
     let io = SystemIo;
     let resolved_base_dir = resolve_base_dir(base_dir);
-    let (harness_catalog, harness_notes) = doctor_harness_catalog(&resolved_base_dir);
+    let (harness_catalog, harness_notes, binary_diagnostics) =
+        doctor_harness_catalog(&resolved_base_dir);
     let (mut raw, collection_failure) = match std::env::consts::OS {
         "linux" => (
             collect_linux(&io, std::process::id(), harness_catalog.as_ref())?,
@@ -1536,7 +1547,7 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
         },
         _ => return Err("probe: unsupported platform".to_owned()),
     };
-    raw.notes.extend(harness_notes);
+    raw.notes.extend(harness_notes.iter().cloned());
     add_elapsed(&io, &mut raw);
     let hostname = hostname(&io, &mut raw.notes);
     let base_dir = inspect_base_dir(&io, &resolved_base_dir, &mut raw.notes);
@@ -1544,10 +1555,29 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
     report.cold_start = crate::dispatch::cold_start_for_doctor(&resolved_base_dir).ok();
     report.credential_health = inspect_credential_health(&resolved_base_dir);
     report.collection_ms = u64::try_from(monotonic.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let binary_diagnostics = binary_diagnostics.unwrap_or_else(|| {
+        let reason = harness_notes
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "gateway diagnostics were not available".to_owned());
+        serde_json::json!({
+            "status": "unavailable",
+            "reason": reason,
+            "boundary": "A failed gateway read cannot establish which binary a running adapter selected.",
+            "rows": []
+        })
+    });
     if json {
-        println!("{}", report_json(&report));
+        println!(
+            "{}",
+            report_json_with_diagnostics(&report, binary_diagnostics)
+        );
     } else {
         println!("{}", human(&report));
+        println!(
+            "{}",
+            crate::harnesses::binary_diagnostics_human(&binary_diagnostics).join("\n")
+        );
     }
     require_runnable_harness_cli(harness_catalog.as_ref())?;
     require_credential_integrity(&report.credential_health)?;
@@ -1597,22 +1627,78 @@ fn require_runnable_harness_cli(
 
 fn doctor_harness_catalog(
     base_dir: &Path,
-) -> (Option<crate::harnesses::HarnessCatalog>, Vec<String>) {
+) -> (
+    Option<crate::harnesses::HarnessCatalog>,
+    Vec<String>,
+    Option<Value>,
+) {
     doctor_harness_catalog_from(crate::harnesses::load_for_doctor(base_dir))
 }
 
 fn doctor_harness_catalog_from(
     result: crate::harnesses::DoctorCatalog,
-) -> (Option<crate::harnesses::HarnessCatalog>, Vec<String>) {
+) -> (
+    Option<crate::harnesses::HarnessCatalog>,
+    Vec<String>,
+    Option<Value>,
+) {
     match result {
-        crate::harnesses::DoctorCatalog::Live(catalog) => (Some(catalog), Vec::new()),
-        crate::harnesses::DoctorCatalog::GatewayError(reason) => (None, vec![reason]),
+        crate::harnesses::DoctorCatalog::Live {
+            catalog,
+            binary_diagnostics,
+        } => (Some(catalog), Vec::new(), binary_diagnostics),
+        crate::harnesses::DoctorCatalog::GatewayError(reason) => (None, vec![reason], None),
         crate::harnesses::DoctorCatalog::Offline { catalog, reason } => {
             let search_path = std::env::var("PATH").unwrap_or_default();
+            let diagnostics = binary_diagnostics_unavailable(&reason);
             let notes = offline_harness_notes(&catalog, reason, &search_path);
-            (Some(catalog), notes)
+            (Some(catalog), notes, Some(diagnostics))
+        }
+        crate::harnesses::DoctorCatalog::Unavailable { catalog, reason } => {
+            let search_path = std::env::var("PATH").unwrap_or_default();
+            let notes = unavailable_harness_notes(&catalog, reason.clone(), &search_path);
+            (
+                Some(catalog),
+                notes,
+                Some(binary_diagnostics_unavailable(&reason)),
+            )
         }
     }
+}
+
+fn binary_diagnostics_unavailable(reason: &str) -> Value {
+    serde_json::json!({
+        "status": "unavailable",
+        "reason": reason,
+        "boundary": "A failed gateway read cannot establish which binary a running adapter selected.",
+        "rows": []
+    })
+}
+
+fn unavailable_harness_notes(
+    catalog: &crate::harnesses::HarnessCatalog,
+    reason: String,
+    search_path: &str,
+) -> Vec<String> {
+    let mut notes = vec![
+        "gateway harness report unavailable; local registered harness checks still ran".to_owned(),
+        reason,
+    ];
+    notes.extend(catalog.harnesses.iter().map(|harness| {
+        match crate::preflight::on_path(&harness.cli_binary, search_path) {
+            Some(path) => format!(
+                "harness {}: {} is present at {}",
+                harness.wire_name,
+                harness.cli_binary,
+                path.display()
+            ),
+            None => format!(
+                "harness {}: {} is missing from PATH; install it and run Tight Beam again",
+                harness.wire_name, harness.cli_binary
+            ),
+        }
+    }));
+    notes
 }
 
 fn offline_harness_notes(
@@ -1731,11 +1817,12 @@ mod tests {
     #[test]
     fn unavailable_harness_checks_are_named_and_fail_doctor() {
         let reason = r#"harness checks unavailable: {"error":{"code":"auth_failed"}}"#;
-        let (catalog, notes) = doctor_harness_catalog_from(
+        let (catalog, notes, diagnostics) = doctor_harness_catalog_from(
             crate::harnesses::DoctorCatalog::GatewayError(reason.to_owned()),
         );
 
         assert_eq!(notes, vec![reason]);
+        assert!(diagnostics.is_none());
         assert!(!notes[0].contains("run tightbeam doctor"));
         let error = require_runnable_harness_cli(catalog.as_ref()).unwrap_err();
         assert_eq!(
@@ -1743,6 +1830,28 @@ mod tests {
             "doctor: could not check harnesses; cannot establish that a harness can run"
         );
         assert!(!error.contains("no registered harness CLI is available"));
+    }
+
+    #[test]
+    fn cached_harness_catalog_keeps_binary_fetch_failure_and_its_boundary() {
+        let reason = "gateway denied the doctor projection";
+        let (catalog, notes, diagnostics) =
+            doctor_harness_catalog_from(crate::harnesses::DoctorCatalog::Unavailable {
+                catalog: crate::harnesses::local_registry().unwrap(),
+                reason: reason.to_owned(),
+            });
+
+        assert!(catalog.is_some());
+        assert!(notes.iter().any(|note| note == reason));
+        let diagnostics = diagnostics.unwrap();
+        assert_eq!(diagnostics["status"], "unavailable");
+        assert_eq!(diagnostics["reason"], reason);
+        assert!(
+            diagnostics["boundary"]
+                .as_str()
+                .unwrap()
+                .contains("cannot establish")
+        );
     }
 
     #[test]
@@ -2555,6 +2664,12 @@ mod tests {
             )
             .unwrap()
         );
+
+        let diagnostics = serde_json::json!({"status": "observed", "rows": []});
+        let with_diagnostics: Value =
+            serde_json::from_str(&report_json_with_diagnostics(&report, diagnostics.clone()))
+                .unwrap();
+        assert_eq!(with_diagnostics["harness_binary_diagnostics"], diagnostics);
     }
 
     #[test]

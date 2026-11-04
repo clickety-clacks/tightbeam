@@ -327,6 +327,44 @@ defmodule Tightbeam.Wire.RouterTest do
     assert response.resp_body == expected
   end
 
+  test "doctor query adds read-only binary diagnostics without changing the normal projection",
+       ctx do
+    diagnostics = %{
+      "status" => "observed",
+      "rows" => [
+        %{
+          "host" => "testhost",
+          "harness" => "codex",
+          "adapter" => %{"package" => "codex-acp", "version" => "1.12.0"},
+          "running" => [],
+          "next_launch" => %{
+            "status" => "observed",
+            "source" => "bundled_fallback",
+            "path" => "/adapters/codex",
+            "version" => "codex 8"
+          },
+          "warnings" => []
+        }
+      ]
+    }
+
+    request =
+      conn(:get, "/harnesses?doctor=1")
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+
+    response =
+      Router.call(
+        request,
+        Router.init(ctx.opts ++ [harness_binary_report: fn -> {:ok, diagnostics} end])
+      )
+
+    assert response.status == 200
+    body = JSON.decode!(response.resp_body)
+    assert is_list(body["harnesses"])
+    assert body["binary_diagnostics"] == diagnostics
+  end
+
   test "/version states which bytes the gateway is: version + build stamp", ctx do
     response = Router.call(conn(:get, "/version"), Router.init(ctx.opts))
 

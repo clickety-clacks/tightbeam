@@ -26,6 +26,84 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     %{db: db, sup: sup, test_dir: test_dir}
   end
 
+  test "binary diagnostics are captured asynchronously and stay pinned to a ready generation",
+       ctx do
+    parent = self()
+    node = System.find_executable("node")
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :codex,
+             cmd: [node, "-e", @fake],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir,
+             harness_binary_capture: fn ->
+               send(parent, {:binary_capture_started, self()})
+
+               receive do
+                 :release_binary_capture -> :ok
+               after
+                 5_000 -> :timeout
+               end
+
+               started_at_ms = System.system_time(:millisecond)
+
+               %{
+                 "adapter" => %{"package" => "codex-acp", "version" => "test-adapter"},
+                 "observation_started_at_ms" => started_at_ms,
+                 "observation_completed_at_ms" => System.system_time(:millisecond),
+                 "selection" => %{
+                   "status" => "observed",
+                   "source" => "pinned_override",
+                   "path" => "/tmp/codex",
+                   "version" => "codex test"
+                 }
+               }
+             end
+           ]
+         end,
+         db: ctx.db,
+         name: :binary_capture_coordinator}
+      )
+
+    key = {:codex, "shared", "testhost"}
+    assert {:ok, _adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert_receive {:binary_capture_started, capture_pid}
+
+    assert eventually(fn -> AdapterCoordinator.ready?(coordinator, key) end)
+
+    assert [%{"ready" => true, "capture_pending" => true}] =
+             AdapterCoordinator.binary_launches(coordinator)
+
+    send(capture_pid, :release_binary_capture)
+
+    assert eventually(fn ->
+             case AdapterCoordinator.binary_launches(coordinator) do
+               [
+                 %{
+                   "generation" => 1,
+                   "adapter_generation_started_at_ms" => generation_started_at_ms,
+                   "capture_pending" => false,
+                   "capture" => capture
+                 }
+               ] ->
+                 capture["selection"]["path"] == "/tmp/codex" and
+                   capture["adapter"]["version"] == "test-adapter" and
+                   is_integer(generation_started_at_ms) and
+                   generation_started_at_ms <= capture["observation_started_at_ms"] and
+                   capture["observation_started_at_ms"] <= capture["observation_completed_at_ms"]
+
+               _ ->
+                 false
+             end
+           end)
+  end
+
   test "five consecutive boot failures latch the circuit across restart races", ctx do
     path = Path.join(ctx.test_dir, "recovery_fake.js")
     File.write!(path, @fake)

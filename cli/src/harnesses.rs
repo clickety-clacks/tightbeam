@@ -43,6 +43,22 @@ fn home_dir() -> PathBuf {
 
 fn parse(encoded: &str) -> Result<HarnessCatalog, String> {
     let rows: Vec<Value> = serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+    parse_rows(rows)
+}
+
+fn parse_doctor_response(encoded: &str) -> Result<(HarnessCatalog, Option<Value>), String> {
+    let value: Value = serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+    let Value::Object(mut object) = value else {
+        return Err("doctor harness response must be an object".to_owned());
+    };
+    let rows = object
+        .remove("harnesses")
+        .and_then(|value| value.as_array().cloned())
+        .ok_or_else(|| "doctor harness response missing harnesses".to_owned())?;
+    Ok((parse_rows(rows)?, object.remove("binary_diagnostics")))
+}
+
+fn parse_rows(rows: Vec<Value>) -> Result<HarnessCatalog, String> {
     let harnesses = rows
         .into_iter()
         .map(|row| {
@@ -81,8 +97,15 @@ pub fn local_registry() -> Result<HarnessCatalog, String> {
 }
 
 pub(crate) enum DoctorCatalog {
-    Live(HarnessCatalog),
+    Live {
+        catalog: HarnessCatalog,
+        binary_diagnostics: Option<Value>,
+    },
     Offline {
+        catalog: HarnessCatalog,
+        reason: String,
+    },
+    Unavailable {
         catalog: HarnessCatalog,
         reason: String,
     },
@@ -99,11 +122,15 @@ pub(crate) fn load_for_doctor(base_dir: &Path) -> DoctorCatalog {
     };
 
     match load_endpoint_for_doctor(&endpoint) {
-        Ok(live) => DoctorCatalog::Live(cached.unwrap_or(live)),
+        Ok((live, binary_diagnostics)) => DoctorCatalog::Live {
+            catalog: cached.unwrap_or(live),
+            binary_diagnostics,
+        },
         Err(DoctorLoadError::Offline(reason)) => offline_doctor_catalog(cached, reason),
-        Err(DoctorLoadError::Gateway(_reason)) if cached.is_some() => {
-            DoctorCatalog::Live(cached.expect("checked above"))
-        }
+        Err(DoctorLoadError::Gateway(reason)) if cached.is_some() => DoctorCatalog::Unavailable {
+            catalog: cached.expect("checked above"),
+            reason,
+        },
         Err(DoctorLoadError::Gateway(reason)) => DoctorCatalog::GatewayError(reason),
     }
 }
@@ -130,25 +157,27 @@ enum DoctorLoadError {
 
 fn load_endpoint_for_doctor(
     endpoint: &dispatch::Endpoint,
-) -> Result<HarnessCatalog, DoctorLoadError> {
-    let response = match dispatch::gateway_request("GET", endpoint, "/harnesses", None).call() {
-        Ok(response) => response,
-        Err(ureq::Error::Transport(error)) => {
-            return Err(DoctorLoadError::Offline(doctor_unavailable(
-                &error.to_string(),
-            )));
-        }
-        Err(ureq::Error::Status(status, response)) => {
-            let encoded = response
-                .into_string()
-                .unwrap_or_else(|_| format!("HTTP {status}"));
-            return Err(DoctorLoadError::Gateway(doctor_unavailable(&encoded)));
-        }
-    };
+) -> Result<(HarnessCatalog, Option<Value>), DoctorLoadError> {
+    let response =
+        match dispatch::gateway_request("GET", endpoint, "/harnesses?doctor=1", None).call() {
+            Ok(response) => response,
+            Err(ureq::Error::Transport(error)) => {
+                return Err(DoctorLoadError::Offline(doctor_unavailable(
+                    &error.to_string(),
+                )));
+            }
+            Err(ureq::Error::Status(status, response)) => {
+                let encoded = response
+                    .into_string()
+                    .unwrap_or_else(|_| format!("HTTP {status}"));
+                return Err(DoctorLoadError::Gateway(doctor_unavailable(&encoded)));
+            }
+        };
     let encoded = response
         .into_string()
         .map_err(|error| DoctorLoadError::Gateway(doctor_unavailable(&error.to_string())))?;
-    parse(&encoded).map_err(|reason| DoctorLoadError::Gateway(doctor_unavailable(&reason)))
+    parse_doctor_response(&encoded)
+        .map_err(|reason| DoctorLoadError::Gateway(doctor_unavailable(&reason)))
 }
 
 pub fn load() -> Result<HarnessCatalog, String> {
@@ -283,6 +312,162 @@ pub fn catalog() -> Result<HarnessCatalog, String> {
     })
 }
 
+pub(crate) fn binary_diagnostics_human(value: &Value) -> Vec<String> {
+    const BOUNDARY: &str =
+        "A failed gateway read cannot establish which binary a running adapter selected.";
+    if value.get("status").and_then(Value::as_str) == Some("unavailable") {
+        let reason = value
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown reason");
+        let boundary = value
+            .get("boundary")
+            .and_then(Value::as_str)
+            .unwrap_or(BOUNDARY);
+        return vec![format!(
+            "harness binary diagnostics unavailable: {reason}; {boundary}"
+        )];
+    }
+
+    let Some(rows) = value.get("rows").and_then(Value::as_array) else {
+        return vec![format!("harness binary diagnostics unknown; {BOUNDARY}")];
+    };
+
+    rows.iter()
+        .flat_map(|row| {
+            let host = row.get("host").and_then(Value::as_str).unwrap_or("?");
+            let harness = row.get("harness").and_then(Value::as_str).unwrap_or("?");
+            let prefix = format!("harness binary {harness} on {host}");
+            let adapter = row.get("adapter");
+            let package = adapter
+                .and_then(|value| value.get("package"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let version = adapter
+                .and_then(|value| value.get("version"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let next = row
+                .get("next_launch")
+                .map(render_selection)
+                .unwrap_or_else(|| "unknown".to_owned());
+            let mut lines = vec![
+                format!("{prefix}: adapter {package} {version}"),
+                format!("{prefix}: next launch {next}"),
+            ];
+            let running_observation = row.get("running_observation");
+            let launches = row
+                .get("running")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let running_status = running_observation
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("observed");
+            if running_status == "unavailable" {
+                let reason = running_observation
+                    .and_then(|value| value.get("reason"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown reason");
+                let boundary = running_observation
+                    .and_then(|value| value.get("boundary"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("the ready-generation query did not complete");
+                lines.push(format!(
+                    "{prefix}: running generation query unavailable ({reason}); {boundary}"
+                ));
+            } else if launches.is_empty() {
+                lines.push(format!("{prefix}: running adapter not observed"));
+            } else {
+                for launch in launches {
+                    let generation = launch
+                        .get("generation")
+                        .and_then(Value::as_u64)
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "?".to_owned());
+                    let selection = launch
+                        .get("selection_observation")
+                        .map(render_selection)
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let child = launch
+                        .get("vendor_cli_child")
+                        .map(render_selection)
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let adapter = launch.get("adapter");
+                    let running_package = adapter
+                        .and_then(|value| value.get("package"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let running_version = adapter
+                        .and_then(|value| value.get("version"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let started = launch
+                        .get("selection_observation_started_at_ms")
+                        .and_then(Value::as_u64)
+                        .map(|value| format!("{value}ms since Unix epoch"))
+                        .unwrap_or_else(|| "unknown time".to_owned());
+                    let completed = launch
+                        .get("selection_observation_completed_at_ms")
+                        .and_then(Value::as_u64)
+                        .map(|value| format!("{value}ms since Unix epoch"))
+                        .unwrap_or_else(|| "unknown time".to_owned());
+                    let generation_started = launch
+                        .get("adapter_generation_started_at_ms")
+                        .and_then(Value::as_u64)
+                        .map(|value| format!("{value}ms since Unix epoch"))
+                        .unwrap_or_else(|| "unknown time".to_owned());
+                    let child_started = launch
+                        .get("vendor_cli_child")
+                        .and_then(|value| value.get("started_at_ms"))
+                        .and_then(Value::as_u64)
+                        .map(|value| format!("{value}ms since Unix epoch"))
+                        .unwrap_or_else(|| "unknown time".to_owned());
+                    let boundary = launch
+                        .get("evidence_boundary")
+                        .and_then(Value::as_str)
+                        .unwrap_or("launch selection probe; vendor child identity is not established");
+                    lines.push(format!(
+                        "{prefix}: running generation {generation}: adapter {running_package} {running_version}; vendor CLI child {child} (start time {child_started}); adapter generation started at {generation_started}; launch selection probe observed {selection} from {started} to {completed}; {boundary}"
+                    ));
+                }
+            }
+            if let Some(warnings) = row.get("warnings").and_then(Value::as_array) {
+                lines.extend(
+                    warnings
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|warning| format!("{prefix}: warning: {warning}")),
+                );
+            }
+            lines
+        })
+        .collect()
+}
+
+fn render_selection(value: &Value) -> String {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let source = value
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if status == "observed" {
+        let path = value.get("path").and_then(Value::as_str).unwrap_or("?");
+        let version = value.get("version").and_then(Value::as_str).unwrap_or("?");
+        format!("{source} {path} version {version}")
+    } else {
+        let reason = value
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("no evidence");
+        format!("{status} ({source}; {reason})")
+    }
+}
+
 fn unavailable(reason: &str) -> String {
     format!("harness checks unavailable: {reason}; run tightbeam doctor")
 }
@@ -307,6 +492,91 @@ mod tests {
         assert_eq!(catalog.harnesses[0].install_package, "pkg");
         assert_eq!(catalog.harnesses[0].cli_binary, "third-cli");
         assert_eq!(catalog.harnesses[0].process_markers, vec!["marker"]);
+    }
+
+    #[test]
+    fn doctor_response_keeps_diagnostics_and_catalog_together() {
+        let (catalog, diagnostics) = parse_doctor_response(
+            r#"{"harnesses":[{"id":"codex","wire_name":"codex","install_package":"codex-acp","cli_binary":"codex","process_markers":["codex-acp"]}],"binary_diagnostics":{"status":"observed","rows":[]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(catalog.names(), vec!["codex"]);
+        assert_eq!(diagnostics.unwrap()["status"], "observed");
+    }
+
+    #[test]
+    fn doctor_binary_human_output_matches_running_and_next_launch_json_fields() {
+        let diagnostics = serde_json::json!({
+            "status": "observed",
+            "rows": [{
+                "host": "example-host",
+                "harness": "codex",
+                "adapter": {"package": "codex-acp", "version": "1.12.0"},
+                "running_observation": {"status": "observed", "boundary": "coordinator ready-generation list"},
+                "running": [{
+                    "generation": 3,
+                    "adapter_generation_started_at_ms": 1789999999000u64,
+                    "adapter": {"package": "codex-acp", "version": "1.12.0"},
+                    "selection_observation_started_at_ms": 1790000000000u64,
+                    "selection_observation_completed_at_ms": 1790000001000u64,
+                    "evidence_boundary": "separate probe; does not inspect or fingerprint the vendor child",
+                    "vendor_cli_child": {"status": "unknown", "source": "unknown", "started_at_ms": null, "reason": "independent probe does not inspect child"},
+                    "selection_observation": {"status": "observed", "source": "pinned_override", "path": "/usr/local/bin/codex", "version": "codex 9.1"}
+                }],
+                "next_launch": {"status": "observed", "source": "bundled_fallback", "path": "/srv/tb/codex", "version": "codex 8.0"},
+                "warnings": ["versions differ"]
+            }]
+        });
+
+        let lines = binary_diagnostics_human(&diagnostics).join("\n");
+        assert!(lines.contains(
+            "selection probe observed pinned_override /usr/local/bin/codex version codex 9.1"
+        ));
+        assert!(lines.contains(
+            "vendor CLI child unknown (unknown; independent probe does not inspect child)"
+        ));
+        assert!(lines.contains("vendor CLI child unknown (unknown; independent probe does not inspect child) (start time unknown time)"));
+        assert!(lines.contains("adapter generation started at 1789999999000ms since Unix epoch"));
+        assert!(lines.contains("does not inspect or fingerprint the vendor child"));
+        assert!(!lines.contains(
+            "running pinned_override /usr/local/bin/codex version codex 9.1 (generation"
+        ));
+        assert!(lines.contains("next launch bundled_fallback /srv/tb/codex version codex 8.0"));
+        assert!(lines.contains("warning: versions differ"));
+        assert_eq!(
+            diagnostics["rows"][0]["running"][0]["selection_observation"]["path"],
+            "/usr/local/bin/codex"
+        );
+        assert_eq!(
+            diagnostics["rows"][0]["next_launch"]["version"],
+            "codex 8.0"
+        );
+    }
+
+    #[test]
+    fn doctor_human_output_keeps_coordinator_failure_distinct_from_empty_running_state() {
+        let diagnostics = serde_json::json!({
+            "status": "observed",
+            "rows": [{
+                "host": "example-host",
+                "harness": "codex",
+                "adapter": {"package": "codex-acp", "version": "1.12.0"},
+                "running_observation": {
+                    "status": "unavailable",
+                    "reason": "coordinator timed out",
+                    "boundary": "ready-generation query did not complete"
+                },
+                "running": [],
+                "next_launch": {"status": "observed", "source": "pinned_override", "path": "/opt/codex", "version": "codex 9"},
+                "warnings": []
+            }]
+        });
+
+        let lines = binary_diagnostics_human(&diagnostics).join("\n");
+        assert!(lines.contains("running generation query unavailable (coordinator timed out)"));
+        assert!(lines.contains("next launch pinned_override /opt/codex version codex 9"));
+        assert!(!lines.contains("running adapter not observed"));
     }
 
     #[test]
@@ -355,13 +625,11 @@ mod tests {
     /// die on `claude: command not found` (#76).
     #[test]
     fn a_projection_without_a_cli_binary_is_rejected_rather_than_probed_loosely() {
-        assert!(
-            parse(
-                r#"[{"id":"third","wire_name":"third","install_package":"pkg","process_markers":[]}]"#
-            )
-            .unwrap_err()
-            .contains("missing cli_binary")
-        );
+        assert!(parse(
+            r#"[{"id":"third","wire_name":"third","install_package":"pkg","process_markers":[]}]"#
+        )
+        .unwrap_err()
+        .contains("missing cli_binary"));
     }
 
     #[test]
