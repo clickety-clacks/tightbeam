@@ -1088,7 +1088,7 @@ defmodule Tightbeam.RailRemedyTest do
 
     expected = %{
       code: "process_denied",
-      message: "process principals cannot use assignment verbs"
+      message: "remedy principal cannot use this assignment verb"
     }
 
     calls = [
