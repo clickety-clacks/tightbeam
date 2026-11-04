@@ -774,6 +774,79 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert first_denial_at < items[after_message.id]["at"]
   end
 
+  test "denials belong to one message page and remain reachable by paging back", ctx do
+    session_key = ctx.admin_session.session_key
+    start_at = System.system_time(:millisecond) - 100_000
+
+    messages =
+      for index <- 1..6 do
+        {:appended, message} =
+          Projection.append(ctx.db, %{
+            session_key: session_key,
+            role: "user",
+            content: "page message #{index}",
+            timestamp: start_at + index * 1_000,
+            attachments: []
+          })
+
+        message
+      end
+
+    denial = fn rule, timestamp, after_seq ->
+      payload = %{"rule" => rule, "reason" => "blocked"}
+      payload = if after_seq, do: Map.put(payload, "afterMessageSeq", after_seq), else: payload
+
+      {:ok, id} =
+        DB.transaction(ctx.db, fn txn ->
+          EventLog.append_event_in_txn(
+            txn,
+            "denied",
+            "assign",
+            "session:#{session_key}",
+            session_key,
+            JSON.encode!(payload),
+            {:session, session_key},
+            timestamp
+          )
+        end)
+
+      "rail:#{id}"
+    end
+
+    oldest = denial.("before-first", start_at, nil)
+    middle = denial.("middle", start_at + 3_500, nil)
+    explicit = denial.("explicit", start_at + 5_500, Enum.at(messages, 2).seq)
+    newest = denial.("newest", start_at + 7_000, nil)
+
+    page = fn suffix ->
+      get(ctx, "/api/sessions/#{session_key}/messages?limit=2" <> suffix, ctx.admin_device.token)
+      |> then(&JSON.decode!(&1.resp_body))
+    end
+
+    latest = page.("&tail=true")
+    middle_page = page.("&before=" <> latest["page"]["oldestCursor"])
+    earliest = page.("&before=" <> middle_page["page"]["oldestCursor"])
+
+    assert Enum.map(latest["railDenials"], & &1["id"]) == [newest]
+    assert Enum.map(middle_page["railDenials"], & &1["id"]) == [middle, explicit]
+    assert Enum.map(earliest["railDenials"], & &1["id"]) == [oldest]
+
+    assert Enum.map(earliest["railDenials"], & &1["afterMessageSeq"]) == [hd(messages).seq]
+
+    assert Enum.map(middle_page["railDenials"], & &1["afterMessageSeq"]) ==
+             [Enum.at(messages, 2).seq, Enum.at(messages, 2).seq]
+
+    assert Enum.map(latest["railDenials"], & &1["afterMessageSeq"]) ==
+             [List.last(messages).seq]
+
+    assert earliest["page"]["hasMoreBefore"] == false
+    assert Enum.sort(Enum.flat_map([latest, middle_page, earliest], fn p ->
+             Enum.map(p["railDenials"], & &1["id"])
+           end)) == Enum.sort([oldest, middle, explicit, newest])
+
+    assert page.("&before=" <> earliest["page"]["oldestCursor"])["railDenials"] == []
+  end
+
   test "actor history includes keyed and NULL-key rule denials routed by principal", ctx do
     actor = ctx.admin_session
     actor_origin = "agent:history-routing-fixture"
