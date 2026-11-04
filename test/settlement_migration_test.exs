@@ -8,6 +8,7 @@ defmodule Tightbeam.SettlementMigrationTest do
     db = :"settlement_migration_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Schema.ensure_all(db)
+    Tightbeam.IdentityPredecessorFixture.restore!(db)
     Tightbeam.SchemaShapeRuntimeFixture.downgrade_assignment_source_replacement_cancellation!(db)
 
     # Build the exact six-column predecessor, including reparent and PO replay contracts.
@@ -61,7 +62,7 @@ defmodule Tightbeam.SettlementMigrationTest do
     assert Regex.match?(@assignment_replacement_route, wake_cancellations_ddl)
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
 
-    assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
+    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [["prior-fingerprint", ~s({"prior":true}), nil]]} =
