@@ -27,7 +27,7 @@ defmodule GuardAck2Turn do
       assert {:ok, _} =
                DB.query(
                  db,
-                 "INSERT INTO users(userId,isAdmin,creationKind,createdAt) VALUES(?1,0,'admin_add',?2)",
+                 "INSERT INTO users(userId,isAdmin,createdAt) VALUES(?1,0,?2)",
                  ["fixture-owner", now]
                )
 
