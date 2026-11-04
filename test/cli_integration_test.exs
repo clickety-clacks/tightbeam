@@ -688,6 +688,14 @@ defmodule Tightbeam.CliIntegrationTest do
       Path.join(ctx.base_dir, "identity/rules/verification.toml")
     )
 
+    File.cp!(
+      Path.expand(
+        "../priv/kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml",
+        __DIR__
+      ),
+      Path.join(ctx.base_dir, "identity/rules/row-reaction-assignment-inactivity.toml")
+    )
+
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     registry = start_supervised!({Tightbeam.ConnRegistry, name: :d3_cli_registry})
     # Stop at the durable notification boundary; do not start an agent/provider lane.
@@ -756,10 +764,10 @@ defmodule Tightbeam.CliIntegrationTest do
              )
 
     assert_activity_refresh = fn timing_args, prompt ->
-      assert {:ok, [[prior_wake_id]]} =
+      assert {:ok, [[prior_wake_id, prior_due_at]]} =
                DB.query(
                  ctx.db,
-                 "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+                 "SELECT wakeId,dueAt FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
                  [assignment]
                )
 
@@ -776,17 +784,17 @@ defmodule Tightbeam.CliIntegrationTest do
       wake = Wakes.get(ctx.db, JSON.decode!(output)["wakeId"])
       assert wake.assignment_id == assignment
 
-      assert {:ok, [["canceled"]]} =
+      assert {:ok, [["pending"]]} =
                DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId=?1", [prior_wake_id])
 
-      assert {:ok, [[replacement_wake_id]]} =
+      assert {:ok, [[^prior_wake_id, new_due_at]]} =
                DB.query(
                  ctx.db,
-                 "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+                 "SELECT wakeId,dueAt FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
                  [assignment]
                )
 
-      refute replacement_wake_id == prior_wake_id
+      assert new_due_at > prior_due_at
       wake
     end
 
@@ -883,17 +891,16 @@ defmodule Tightbeam.CliIntegrationTest do
     timed_id = JSON.decode!(timed_output)["wakeId"]
     assert Wakes.get(ctx.db, timed_id).assignment_id == assignment
 
-    assert {:ok, [["canceled"]]} =
+    assert {:ok, [["pending"]]} =
              DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId=?1", [inactivity_wake_id])
 
-    assert {:ok, [[new_inactivity_wake_id, new_inactivity_due_at]]} =
+    assert {:ok, [[^inactivity_wake_id, new_inactivity_due_at]]} =
              DB.query(
                ctx.db,
                "SELECT wakeId,dueAt FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
                [assignment]
              )
 
-    refute new_inactivity_wake_id == inactivity_wake_id
     assert new_inactivity_due_at > inactivity_due_at
 
     fact_wake =
