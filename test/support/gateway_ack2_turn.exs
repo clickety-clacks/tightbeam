@@ -160,6 +160,7 @@ defmodule GuardAck2Turn do
                  )
 
         assert {:ok, turn} = Ledger.claim_next(db, @session_key, "ack2-gateway-turn")
+        turn = Map.put(turn, :session_key, session.session_key)
         turn_seq = turn.seq
 
         assert {:ok, [[^turn_seq]]} =
