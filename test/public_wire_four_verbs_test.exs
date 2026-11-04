@@ -87,11 +87,11 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     owner = ctx.device.user_id
     caller = wire_session(ctx.db, "wire-commit-owner", owner, "product-owner")
     holder = wire_session(ctx.db, "wire-commit-holder", owner, "coder", caller.session_key)
-    stranger = wire_session(ctx.db, "wire-commit-stranger", owner, "product-owner")
+    peer = wire_session(ctx.db, "wire-commit-peer", owner, "product-owner")
     caller_role = "coder:wire-commit-owner"
-    stranger_role = "coder:wire-commit-stranger"
+    peer_role = "coder:wire-commit-peer"
     Roles.create!(ctx.db, caller_role, owner, caller.session_key)
-    Roles.create!(ctx.db, stranger_role, owner, stranger.session_key)
+    Roles.create!(ctx.db, peer_role, owner, peer.session_key)
 
     {repo, remote, commit} = canonical_repo_fixture!()
     on_exit(fn -> File.rm_rf!(Path.dirname(repo)) end)
@@ -141,17 +141,6 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     body = %{verb: "assignment-commitref-correct", as: caller_role, params: params}
     before = correction_count(ctx.db)
 
-    unauthorized =
-      dispatch_cli(ctx, stranger.cli_token, %{
-        body
-        | as: stranger_role,
-          params: %{params | idempotencyKey: "wire-commit-stranger"}
-      })
-
-    assert unauthorized.status == 404
-    assert JSON.decode!(unauthorized.resp_body)["error"]["code"] == "unknown_assignment"
-    assert correction_count(ctx.db) == before
-
     wrong_target =
       dispatch_cli(ctx, caller.cli_token, %{
         body
@@ -166,11 +155,22 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert JSON.decode!(wrong_target.resp_body)["error"]["code"] == "unknown_assignment"
     assert correction_count(ctx.db) == before
 
-    accepted = dispatch_cli(ctx, caller.cli_token, body)
+    peer_body = %{body | as: peer_role}
+    accepted = dispatch_cli(ctx, peer.cli_token, peer_body)
     assert accepted.status == 200, accepted.resp_body
     accepted_json = JSON.decode!(accepted.resp_body)
     assert accepted_json["result"]["correction"]["assignmentId"] == "asg_wire_commit"
     assert correction_count(ctx.db) == before + 1
+
+    assert accepted_json["result"]["correction"]["actorKind"] == "session"
+    assert accepted_json["result"]["correction"]["actorRef"] == peer.session_key
+    peer_key = peer.session_key
+
+    assert {:ok, [["session", ^peer_key]]} =
+             DB.query(
+               ctx.db,
+               "SELECT actorKind,actorRef FROM assignment_commit_ref_corrections WHERE assignmentId='asg_wire_commit'"
+             )
 
     correction_exists =
       dispatch_cli(ctx, caller.cli_token, %{
@@ -182,7 +182,7 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert JSON.decode!(correction_exists.resp_body)["error"]["code"] == "correction_exists"
     assert correction_count(ctx.db) == before + 1
 
-    replay = dispatch_cli(ctx, caller.cli_token, body)
+    replay = dispatch_cli(ctx, peer.cli_token, peer_body)
     assert replay.status == 200, replay.resp_body
     assert JSON.decode!(replay.resp_body)["result"] == accepted_json["result"]
     assert correction_count(ctx.db) == before + 1
@@ -192,11 +192,20 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
        ctx do
     owner = ctx.device.user_id
     source = wire_session(ctx.db, "wire-health-source", owner, "coder")
-    stranger = wire_session(ctx.db, "wire-health-stranger", owner, "coder")
+    peer = wire_session(ctx.db, "wire-health-peer", owner, "coder")
+    :ok =
+      DB.execute(
+        ctx.db,
+        "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('wire-other-owner',0,1)"
+      )
+
+    outsider = wire_session(ctx.db, "wire-health-outsider", "wire-other-owner", "coder")
+    outsider_role = "coder:wire-health-outsider"
+    Roles.create!(ctx.db, outsider_role, "wire-other-owner", outsider.session_key)
     source_role = "coder:wire-health-source"
-    stranger_role = "coder:wire-health-stranger"
+    peer_role = "coder:wire-health-peer"
     Roles.create!(ctx.db, source_role, owner, source.session_key)
-    Roles.create!(ctx.db, stranger_role, owner, stranger.session_key)
+    Roles.create!(ctx.db, peer_role, owner, peer.session_key)
     ctx = %{ctx | opts: real_opts(ctx)}
 
     at = System.system_time(:millisecond)
@@ -237,19 +246,28 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert JSON.decode!(repeated.resp_body)["result"]["status"] == "duplicate"
     assert other_incident_count(ctx.db) == 1
 
-    unauthorized =
-      dispatch_cli(ctx, stranger.cli_token, %{
+    attached =
+      dispatch_cli(ctx, peer.cli_token, %{
         observe_body
-        | as: stranger_role,
+        | as: peer_role,
           params: %{
             observe_params
             | sourceSessionKey: source.session_key,
-              idempotencyKey: "wire-health-stranger"
+              idempotencyKey: "wire-health-peer"
           }
       })
 
-    assert unauthorized.status == 403
-    assert JSON.decode!(unauthorized.resp_body)["error"]["code"] == "not_authorized"
+    assert attached.status == 200, attached.resp_body
+    attached_json = JSON.decode!(attached.resp_body)
+    assert attached_json["result"]["status"] == "attached"
+    assert attached_json["result"]["incident"]["id"] == incident_id
+    actor = "session:#{peer.session_key}"
+
+    assert {:ok, [[^actor]]} =
+             DB.query(ctx.db, "SELECT principal FROM harness_health_observations WHERE id=?1", [
+               attached_json["result"]["incident"]["observationId"]
+             ])
+
     assert other_incident_count(ctx.db) == 1
 
     wrong_target =
@@ -257,7 +275,7 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
         observe_body
         | params: %{
             observe_params
-            | sourceSessionKey: stranger.session_key,
+            | sourceSessionKey: outsider.session_key,
               idempotencyKey: "wire-health-target"
           }
       })
@@ -303,9 +321,9 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert JSON.decode!(missing.resp_body)["error"]["code"] == "not_authorized"
 
     refused =
-      dispatch_cli(ctx, stranger.cli_token, %{
+      dispatch_cli(ctx, outsider.cli_token, %{
         resolve_body
-        | as: stranger_role,
+        | as: outsider_role,
           params: %{resolve_params | idempotencyKey: "wire-health-refused"}
       })
 
@@ -313,12 +331,20 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert JSON.decode!(refused.resp_body)["error"]["code"] == "not_authorized"
     assert incident_state(ctx.db, incident_id) == "open"
 
-    resolved = dispatch_cli(ctx, source.cli_token, resolve_body)
+    peer_resolve_body = %{resolve_body | as: peer_role}
+    resolved = dispatch_cli(ctx, peer.cli_token, peer_resolve_body)
     assert resolved.status == 200, resolved.resp_body
     assert JSON.decode!(resolved.resp_body)["result"]["status"] == "resolved"
     assert incident_state(ctx.db, incident_id) == "resolved"
 
-    resolve_replay = dispatch_cli(ctx, source.cli_token, resolve_body)
+    assert {:ok, [[^actor]]} =
+             DB.query(
+               ctx.db,
+               "SELECT o.principal FROM harness_health_incidents i JOIN harness_health_observations o ON o.id=i.resolutionObservationId WHERE i.id=?1",
+               [incident_id]
+             )
+
+    resolve_replay = dispatch_cli(ctx, peer.cli_token, peer_resolve_body)
     assert resolve_replay.status == 403
     assert JSON.decode!(resolve_replay.resp_body)["error"]["code"] == "not_authorized"
     assert incident_state(ctx.db, incident_id) == "resolved"
@@ -328,13 +354,13 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
        ctx do
     owner = ctx.device.user_id
     source = wire_session(ctx.db, "wire-promotion-source", owner, "coder")
-    stranger = wire_session(ctx.db, "wire-promotion-stranger", owner, "coder")
+    peer = wire_session(ctx.db, "wire-promotion-peer", owner, "coder")
     reviewer = wire_session(ctx.db, "wire-promotion-reviewer", owner, "coder")
     candidate_holder = wire_session(ctx.db, "wire-promotion-candidate", owner, "coder")
     source_role = "coder:wire-promotion-source"
-    stranger_role = "coder:wire-promotion-stranger"
+    peer_role = "coder:wire-promotion-peer"
     Roles.create!(ctx.db, source_role, owner, source.session_key)
-    Roles.create!(ctx.db, stranger_role, owner, stranger.session_key)
+    Roles.create!(ctx.db, peer_role, owner, peer.session_key)
 
     at = System.system_time(:millisecond)
 
@@ -469,17 +495,6 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
 
     body = %{verb: "harness-health-close-promotion", as: source_role, params: params}
 
-    unauthorized =
-      dispatch_cli(ctx, stranger.cli_token, %{
-        body
-        | as: stranger_role,
-          params: %{params | idempotencyKey: "wire-promotion-stranger"}
-      })
-
-    assert unauthorized.status == 403
-    assert JSON.decode!(unauthorized.resp_body)["error"]["code"] == "not_authorized"
-    assert promotion_state(ctx.db, promotion_id) == "open"
-
     missing =
       dispatch_cli(ctx, source.cli_token, %{
         body
@@ -494,11 +509,21 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert JSON.decode!(missing.resp_body)["error"]["code"] == "promotion_not_found"
     assert promotion_state(ctx.db, promotion_id) == "open"
 
-    closed = dispatch_cli(ctx, source.cli_token, body)
+    peer_body = %{body | as: peer_role}
+    closed = dispatch_cli(ctx, peer.cli_token, peer_body)
     assert closed.status == 200, closed.resp_body
     assert JSON.decode!(closed.resp_body)["result"]["promotion"]["state"] == "closed"
 
-    replay = dispatch_cli(ctx, source.cli_token, body)
+    actor = "session:#{peer.session_key}"
+
+    assert {:ok, [[^actor]]} =
+             DB.query(
+               ctx.db,
+               "SELECT closedBy FROM harness_health_class_promotions WHERE id=?1",
+               [promotion_id]
+             )
+
+    replay = dispatch_cli(ctx, peer.cli_token, peer_body)
     assert replay.status == 200, replay.resp_body
     assert JSON.decode!(replay.resp_body)["result"]["promotion"]["state"] == "closed"
     assert promotion_state(ctx.db, promotion_id) == "closed"

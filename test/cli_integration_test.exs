@@ -1879,6 +1879,16 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "session-auth --as-user retains agent attribution for verdicts and revocation",
        ctx do
+    rules = Path.join(ctx.base_dir, "identity/rules")
+    File.mkdir_p!(rules)
+
+    File.cp!(
+      "priv/kungfu/agentic-engineering/rules/row-reaction-handoff.toml",
+      Path.join(rules, "row-reaction-handoff.toml")
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
     {:ok, _} =
       DB.query(
         ctx.db,
