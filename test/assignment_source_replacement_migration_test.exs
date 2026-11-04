@@ -4,7 +4,7 @@ defmodule Tightbeam.AssignmentSourceReplacementMigrationTest do
   alias Tightbeam.{DB, Model, Org, Schema, Wakes}
 
   @predecessor "work-item-delivery-owner-v1-019"
-  @successor "launch-preparation-evidence-v1-0112"
+  @successor "closed-assignment-cannot-proceed-reconciliation-v1-015"
   @replacement_route ~r/\(requesterId = 'tightbeam:assignments' AND reasonKind = 'superseded' AND\s+causalSourceKind = 'wake' AND outcomeKind = 'replacement'\)\s+OR/
   @cancellation_columns "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
                           "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
@@ -67,6 +67,7 @@ defmodule Tightbeam.AssignmentSourceReplacementMigrationTest do
     before_rows = rows(db, "SELECT * FROM wake_cancellations ORDER BY wakeId")
     assert length(before_rows) == 1
 
+    Tightbeam.IdentityPredecessorFixture.restore!(db)
     downgrade_to_receipt_cancellation_predecessor!(db)
     assert rows(db, "SELECT shape FROM schema_stamp") == [[@predecessor]]
     %{db: db, before_rows: before_rows}
