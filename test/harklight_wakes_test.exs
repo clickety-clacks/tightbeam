@@ -8,9 +8,12 @@ defmodule Tightbeam.HarklightWakesTest do
     HarklightLifecycle,
     HarklightSend,
     HarklightWakes,
+    Ledger,
     Model,
     Org,
-    Placement
+    Placement,
+    TurnLifecycle,
+    Wakes
   }
 
   @handle "7d737f62-bbd7-4c51-978d-f6ff5b4d8146"
@@ -795,6 +798,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     File.write!(script, """
     #!/bin/sh
+    printf '%s\\n' "$*" >> "$0.calls"
     if [ "$1" = attach ]; then
       printf '%s\n' '{"kind":"attached","ready_for_listen":true}'
     else
@@ -814,6 +818,14 @@ defmodule Tightbeam.HarklightWakesTest do
     start_supervised!({HarklightWakes, db: db})
     port = await_listener_port()
     {:os_pid, pid} = Port.info(port, :os_pid)
+
+    listen_call = "listen --follow --controller --session #{@handle} --ack2"
+    assert eventually(fn -> File.read!(script <> ".calls") =~ listen_call end)
+
+    calls = File.read!(script <> ".calls")
+    assert calls =~ "attach --session #{@handle}"
+    assert calls =~ "--controller --ack2"
+    assert calls =~ listen_call
 
     assert {_, 0} =
              System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true)
@@ -3367,8 +3379,217 @@ defmodule Tightbeam.HarklightWakesTest do
              DB.query(db, "SELECT count(*) FROM wakes WHERE sessionKey=?1", [follower.session_key])
   end
 
+  test "ACK2 follows prompt dispatch for each person entry on the delivered turn", %{
+    db: db,
+    main: main,
+    session: session
+  } do
+    follower = follower_session(db, main, "agent:follower:ack2")
+    owner_turn = running_ack2_turn!(db, session.session_key)
+    follower_turn = running_ack2_turn!(db, follower.session_key)
+
+    ack2_fixture_entry!(
+      db,
+      @handle,
+      "101",
+      session.session_key,
+      owner_turn.seq,
+      "discussion",
+      "person"
+    )
+
+    ack2_fixture_entry!(
+      db,
+      @handle,
+      "102",
+      session.session_key,
+      owner_turn.seq,
+      "terminal",
+      "person"
+    )
+
+    ack2_fixture_entry!(
+      db,
+      @handle,
+      "103",
+      session.session_key,
+      owner_turn.seq,
+      "terminal",
+      "server"
+    )
+
+    ack2_fixture_entry!(db, @handle, "104", session.session_key, nil, "discussion", "person")
+
+    ack2_fixture_entry!(
+      db,
+      @handle,
+      "105",
+      follower.session_key,
+      follower_turn.seq,
+      "discussion",
+      "person"
+    )
+
+    ack2_fixture_entry!(
+      db,
+      @handle,
+      "106",
+      session.session_key,
+      owner_turn.seq,
+      "discussion",
+      "agent"
+    )
+
+    test_pid = self()
+
+    runner = fn args ->
+      send(test_pid, {:ack2, args})
+      {"", 0}
+    end
+
+    assert :ok =
+             HarklightWakes.ack2_for_dispatched_turn(
+               db,
+               owner_turn.seq,
+               session.session_key,
+               session.display_name,
+               runner: runner
+             )
+
+    refute_receive {:ack2, _args}
+
+    record_prompt_dispatched!(db, owner_turn)
+
+    assert :ok =
+             HarklightWakes.ack2_for_dispatched_turn(
+               db,
+               owner_turn.seq,
+               session.session_key,
+               session.display_name,
+               runner: runner
+             )
+
+    assert_receive {:ack2, ["ack2", "--session", @handle, "--event", "101", "--agent", "Origin"]}
+
+    assert_receive {:ack2, ["ack2", "--session", @handle, "--event", "102", "--agent", "Origin"]}
+
+    refute_receive {:ack2, _args}
+
+    record_prompt_dispatched!(db, follower_turn)
+
+    assert :ok =
+             HarklightWakes.ack2_for_dispatched_turn(
+               db,
+               follower_turn.seq,
+               follower.session_key,
+               follower.display_name,
+               runner: runner
+             )
+
+    assert_receive {:ack2,
+                    [
+                      "ack2",
+                      "--session",
+                      @handle,
+                      "--event",
+                      "105",
+                      "--agent",
+                      "Follower",
+                      "--rerouted"
+                    ]}
+
+    refute_receive {:ack2, _args}
+  end
+
+  test "Harklight wake instructions leave ACK2 to the receiving system", %{db: db} do
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "Person prompt"))
+
+    wake_id = "w_harklight_#{@handle}_" <> String.pad_leading("1", 20, "0")
+
+    assert {:ok, [[prompt]]} = DB.query(db, "SELECT prompt FROM wakes WHERE wakeId=?1", [wake_id])
+    refute prompt =~ "ack2"
+  end
+
   defp follow_for_test(db, call, opts),
     do: HarklightFollows.follow(db, call, Keyword.put(opts, :activate, false))
+
+  defp running_ack2_turn!(db, session_key) do
+    message_id = "ack2-test-#{System.unique_integer([:positive])}"
+
+    assert {:ok, seq} =
+             Ledger.enqueue(db, %{
+               session_key: session_key,
+               message_id: message_id,
+               origin: "process:tightbeam",
+               prompt: "ACK2 fixture turn"
+             })
+
+    assert {:ok, %{seq: ^seq, owner_lease: _lease} = turn} =
+             Ledger.claim_next(db, session_key, "ack2-test")
+
+    assert :ok = Ledger.stamp_adapter(db, seq, 1)
+    turn
+  end
+
+  defp record_prompt_dispatched!(db, turn) do
+    assert :ok =
+             TurnLifecycle.append(db, turn.seq, %{
+               event_key: "prompt:dispatched",
+               producer_event_id: "fixture:ack2:#{turn.seq}",
+               kind: "prompt_dispatched",
+               stage: "prompt",
+               outcome: "dispatched",
+               cause: "acp:port-write",
+               principal: "process:tightbeam",
+               owner_lease: turn.owner_lease,
+               adapter_gen: 1,
+               acp_request_id: turn.seq,
+               detail: %{v: 1}
+             })
+  end
+
+  defp ack2_fixture_entry!(db, handle, event_id, session_key, turn_seq, kind, author) do
+    wake_id = "ack2_fixture_#{event_id}_#{System.unique_integer([:positive])}"
+
+    assert %{wake_id: ^wake_id} =
+             Wakes.schedule(db, %{
+               wake_id: wake_id,
+               session_key: session_key,
+               origin: "process:tightbeam",
+               prompt: "ACK2 fixture entry",
+               due_at: System.system_time(:millisecond)
+             })
+
+    if is_integer(turn_seq) do
+      assert {:ok, _} =
+               DB.query(db, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [
+                 wake_id,
+                 turn_seq
+               ])
+    end
+
+    cursor = String.to_integer(event_id)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               """
+               INSERT INTO harklight_wake_entries
+                 (handle,eventId,feedCursor,senderId,messageId,requestRevision,entryKind,entryAuthor,rawLine,wakeId,capturedAt)
+               VALUES(?1,?2,?3,'sender','request',1,?4,?5,'{}',?6,?7)
+               """,
+               [handle, event_id, cursor, kind, author, wake_id, System.system_time(:millisecond)]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO harklight_wake_deliveries(handle,eventId,sessionKey,wakeId) VALUES(?1,?2,?3,?4)",
+               [handle, event_id, session_key, wake_id]
+             )
+
+    :ok
+  end
 
   defp frame(value), do: {JSON.encode!(value) <> "\n", 0}
 
