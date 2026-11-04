@@ -1534,7 +1534,7 @@ defmodule Tightbeam.Gateway do
         work_item_disposition(db, "work-item-close", item_change),
       {"work-item-fail", ["work_item.failed"]} =>
         work_item_disposition(db, "work-item-fail", item_change),
-      {"assign", ["assignment.opened"]} => fn call ->
+      {"assign", ["assignment.opened", "work_item.updated"]} => fn call ->
         call =
           call
           |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
@@ -1549,7 +1549,8 @@ defmodule Tightbeam.Gateway do
          "message.created",
          "wake.scheduled",
          "wake.canceled",
-         "session.updated"
+         "session.updated",
+         "work_item.updated"
        ]} => fn call ->
         call =
           call
