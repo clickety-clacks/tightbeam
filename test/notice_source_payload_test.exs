@@ -591,6 +591,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
 
   defp predecessor!(db, db_opts) do
     Tightbeam.IdentityPredecessorFixture.restore!(db)
+
     :ok =
       DB.execute(
         db,
